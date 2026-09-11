@@ -88,6 +88,15 @@ describe("keybindings migration", () => {
 		expect(effective["app.interrupt"]).toBe("ctrl+x");
 	});
 
+	it("binds model cycling without colliding with the editor Ctrl+P expansion binding", () => {
+		const keybindings = new KeybindingsManager({});
+
+		expect(keybindings.getKeys("app.model.cycleForward")).toEqual(["alt+m"]);
+		expect(keybindings.getKeys("app.model.cycleBackward")).toEqual(["shift+alt+m"]);
+		// Ctrl+P remains the shipped editor message-expansion binding.
+		expect(keybindings.getKeys("app.messages.expand")).toEqual(["ctrl+p"]);
+	});
+
 	it("gives explicit editor bindings precedence over application defaults", () => {
 		const keybindings = new KeybindingsManager({
 			"tui.editor.cursorUp": ["up", "ctrl+p"],

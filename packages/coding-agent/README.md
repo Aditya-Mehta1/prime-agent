@@ -148,7 +148,7 @@ Type `/` in the editor to trigger commands. [Extensions](#extensions) can regist
 | `/login`, `/logout` | OAuth authentication |
 | `/model` | Switch models |
 | `/effort` | Set reasoning/thinking level |
-| `/scoped-models` | Enable/disable models for Ctrl+P cycling |
+| `/scoped-models` | Enable/disable models for Alt+M cycling |
 | `/settings` | Thinking level, theme, message delivery, transport |
 | `/resume [id\|path]` | Open the agents view, or resume a session directly |
 | `/new`, `/clear` | Start a new session |
@@ -182,7 +182,7 @@ See `/hotkeys` for the full list. Customize via `~/.prime/agent/keybindings.json
 | Escape | Clear the input without interrupting active work |
 | Escape twice | Open `/tree` |
 | Ctrl+L | Open model selector |
-| Ctrl+P / Shift+Ctrl+P | Cycle scoped models forward/backward |
+| Alt+M / Shift+Alt+M | Cycle scoped models forward/backward |
 | Ctrl+O | Collapse/expand tool output |
 | Ctrl+T | Collapse/expand thinking blocks |
 
@@ -556,7 +556,7 @@ cat README.md | prime-agent -p "Summarize this text"
 | `--model <pattern>` | Model pattern or ID (supports `provider/id` and optional `:<thinking>`) |
 | `--api-key <key>` | API key (overrides env vars) |
 | `--thinking <level>` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh` |
-| `--models <patterns>` | Comma-separated patterns for Ctrl+P cycling |
+| `--models <patterns>` | Comma-separated patterns for Alt+M cycling |
 
 Use `prime-agent model list [search]` to list available models.
 

@@ -4228,6 +4228,8 @@ export class InteractiveMode {
 			void this.handleDebugCommand();
 		};
 		this.defaultEditor.onAction("app.model.select", () => this.showModelSelector());
+		this.defaultEditor.onAction("app.model.cycleForward", () => this.handleModelCycle("forward"));
+		this.defaultEditor.onAction("app.model.cycleBackward", () => this.handleModelCycle("backward"));
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
 		this.defaultEditor.onAction("app.messages.expand", () => this.toggleAgentMessageExpansion());
 		this.defaultEditor.onAction("app.edits.expand", () => this.toggleEditDiffExpansion());
@@ -8134,6 +8136,21 @@ export class InteractiveMode {
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
 				this.showStatus(`Thinking level: ${level}`);
+			})
+			.catch((error) => {
+				this.showError(error instanceof Error ? error.message : String(error));
+			});
+	}
+
+	private handleModelCycle(direction: "forward" | "backward"): void {
+		void this.agentConnection
+			.cycleModel(direction)
+			.then((result) => {
+				if (!result) {
+					this.showStatus("No scoped models available to cycle (see /scoped-models)");
+					return;
+				}
+				this.showStatus(`Model: ${result.model.provider}/${result.model.id}`);
 			})
 			.catch((error) => {
 				this.showError(error instanceof Error ? error.message : String(error));
