@@ -295,6 +295,11 @@ async function runOpen(parsed: ParsedDaemonClientCommand): Promise<void> {
 		if (!isLiveSessionSummary(data)) {
 			throw new Error("Daemon returned an invalid create response");
 		}
+		if (parsed.json) {
+			// Machine-readable open has no terminal to attach; match create's --json shape.
+			printJson(data);
+			return;
+		}
 		await runAttach(client, data.activeSessionId);
 	} finally {
 		client.close();
