@@ -30,7 +30,8 @@
        "nodes": [
         {
          "author": {
-          "login": "cursor"
+          "login": "cursor",
+          "__typename": "Bot"
          },
          "state": "PENDING",
          "submittedAt": null
@@ -119,7 +120,8 @@
        "nodes": [
         {
          "author": {
-          "login": "kevinjosethomas"
+          "login": "kevinjosethomas",
+          "__typename": "User"
          },
          "state": "CHANGES_REQUESTED",
          "submittedAt": "2026-08-15T10:00:00Z"

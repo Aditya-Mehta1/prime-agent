@@ -64,7 +64,7 @@ QUEUE_QUERY = """query($owner: String!, $name: String!, $first: Int, $after: Str
         mergeStateStatus
         reviewDecision
         reviewThreads(first: 50) { pageInfo { hasNextPage } nodes { isResolved comments(first: 1) { nodes { author { login } } } } }
-        reviews(last: 30) { nodes { author { login } state submittedAt } }
+        reviews(last: 30) { nodes { author { login __typename } state submittedAt } }
       }
     }
   }
@@ -123,13 +123,16 @@ def _bot_label(login: str | None) -> str | None:
     return KNOWN_BOTS.get(stripped)
 
 
-def _is_bot(login: str | None) -> bool:
-    """True for any bot account: the review bots or any "[bot]"-suffixed actor.
+def _is_bot(login: str | None, author_type: str | None = None) -> bool:
+    """True for any bot account, whether or not the login carries a suffix.
 
-    Generic bot accounts (GitHub Actions, Dependabot, ...) report a
-    "[bot]"-suffixed login; the review bots are App actors whose logins appear
-    with and without the suffix, so KNOWN_BOTS covers them after stripping.
+    GraphQL reports App and machine actors (cursor, dependabot, ...) with a
+    BARE login and `__typename: "Bot"`, while REST appends "[bot]"; rely on the
+    actor type when present and fall back to login matching (KNOWN_BOTS after
+    suffix stripping, or a "[bot]" suffix) for data without the type.
     """
+    if author_type == "Bot":
+        return True
     if not login:
         return False
     return _bot_label(login) is not None or login.endswith("[bot]")
@@ -256,7 +259,7 @@ def _pr_from_node(node: dict[str, Any]) -> PR:
         if review.get("state") == "PENDING" or not review.get("submittedAt"):
             continue
         author = review.get("author") or {}
-        if _is_bot(author.get("login")):
+        if _is_bot(author.get("login"), author.get("__typename")):
             continue
         submitted = _parse_ts(review["submittedAt"])
         if submitted > last_human:

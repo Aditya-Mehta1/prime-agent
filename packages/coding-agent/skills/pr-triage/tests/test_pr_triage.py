@@ -424,11 +424,25 @@ class TruncationTests(unittest.TestCase):
         self.assertIn("thread list truncated", reasons[0])
 
     def test_unknown_bot_review_is_not_human_touch(self):
-        # github-actions[bot] and dependabot[bot] reviews must not reset the
-        # last-human timestamp; only human reviews do.
+        # Suffix logins (REST form) and bare-slug Bot actors (GraphQL form:
+        # dependabot, github-actions) must not reset the last-human timestamp.
         pr = m._pr_from_node(
             self.node(
                 reviews={"nodes": [{"author": {"login": "github-actions[bot]"}, "state": "COMMENTED", "submittedAt": "2026-09-10T00:00:00Z"}]},
+            )
+        )
+        self.assertEqual(pr.last_human_at, pr.created_at)
+        pr = m._pr_from_node(
+            self.node(
+                reviews={
+                    "nodes": [
+                        {
+                            "author": {"login": "dependabot", "__typename": "Bot"},
+                            "state": "COMMENTED",
+                            "submittedAt": "2026-09-10T00:00:00Z",
+                        }
+                    ]
+                },
             )
         )
         self.assertEqual(pr.last_human_at, pr.created_at)

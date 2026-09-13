@@ -51,8 +51,9 @@ thorough for high-stakes work).
   500 open PRs per queue; hit caps are reported as coverage notes so a CLEAR
   verdict is never overstated.
 - Staleness uses the latest review by a human as a proxy for the last human
-  touch; reviews from ANY bot account (Cursor, Macroscope, Codex, GitHub
-  Actions, Dependabot, ...) are ignored, and PRs without human reviews fall
-  back to their creation date.
+  touch; reviews from ANY bot account are ignored (GraphQL reports App and
+  machine actors — Cursor, Macroscope, Codex, GitHub Actions, Dependabot —
+  with bare logins and type Bot, REST appends "[bot]"; both forms are
+  covered), and PRs without human reviews fall back to their creation date.
 - Both functions return setup guidance instead of raising when `gh` is
   missing, and error text when a `gh` call fails or times out.

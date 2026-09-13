@@ -149,9 +149,10 @@ Notes: thread counts cap at the 50 most recent threads per PR (truncated
 lists withhold the READY verdict), the file pre-flight at 300 files per PR
 and the title screen at 500 open PRs (hit caps are reported as coverage
 notes), and `gh` is invoked through `asyncio.to_thread` so the kernel stays
-responsive. Staleness ignores reviews from any bot account. Both functions
-return setup guidance instead of raising when `gh` is missing, and error
-text when a `gh` call fails or times out.
+responsive. Staleness ignores reviews from any bot account (GraphQL App and
+machine actors without a login suffix included). Both functions return setup
+guidance instead of raising when `gh` is missing, and error text when a `gh`
+call fails or times out.
 
 ### Using Skills from Other Harnesses
 
