@@ -415,6 +415,9 @@ export function resolveDiscardProbeTarget(
 				} else if (/\b(cd|pushd)\b/.test(trimmed)) {
 					return UNRESOLVABLE_DISCARD_TARGET; // group content we cannot replay
 				}
+				// A closed group's cds do not persist and must not leak into a
+				// later still-open group's chain.
+				if (parenDepth === 0) groupedCdArgs.length = 0;
 				continue;
 			}
 			if (trimmed === "pushd" || trimmed.startsWith("pushd ")) return UNRESOLVABLE_DISCARD_TARGET;

@@ -777,6 +777,24 @@ describe("bash tool destructive-git dirty-tree guard", () => {
 		);
 	});
 
+	it("drops closed-group cds from later open groups' probe chains", async () => {
+		const calls: string[] = [];
+		const operations: BashOperations = {
+			exec: async (command, _cwd, _options) => {
+				calls.push(command);
+				return { exitCode: 0 };
+			},
+		};
+		const bash = createBashTool(testDir, { operations });
+
+		await bash.execute("guard-group-leak", { command: "(cd a) && (cd b && git reset --hard)" });
+
+		expect(calls).toEqual([
+			"cd b && git status --porcelain --untracked-files=all",
+			"(cd a) && (cd b && git reset --hard)",
+		]);
+	});
+
 	it("propagates aborts raised while probing", async () => {
 		const operations: BashOperations = {
 			exec: async (command, _cwd, _options) => {
