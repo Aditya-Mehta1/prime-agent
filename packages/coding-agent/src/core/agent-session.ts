@@ -11813,11 +11813,15 @@ export class AgentSession {
 
 		const retryGeneration = this._retryGeneration;
 		setTimeout(() => {
+			// A retry aborted between the sleep and this scheduled start must not
+			// re-issue the turn (e.g. onto a quota-blocked primary after a restore).
+			if (this._retryGeneration !== retryGeneration || !this.isRetrying) return;
 			this.agent.continue().catch((error: unknown) => {
 				// A continue that never starts must still resolve the retry (else isRetrying
 				// sticks forever) — unless a newer retry owns the state by now.
 				if (this._retryGeneration !== retryGeneration || !this.isRetrying) return;
 				this._markProviderAuthStaleForRetryFailure(message, options);
+				const restoredModel = this._restorePrimaryModelAfterBackup();
 				const attempt = this._retryAttempt;
 				this._retryAttempt = 0;
 				this._providerWait = undefined;
@@ -11827,6 +11831,7 @@ export class AgentSession {
 					success: false,
 					attempt,
 					finalError: error instanceof Error ? error.message : String(error),
+					...(restoredModel ? { restoredModel } : {}),
 				});
 				this._resolveRetry();
 			});

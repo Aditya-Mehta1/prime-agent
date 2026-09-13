@@ -1085,4 +1085,68 @@ describe("AgentSession retry and event characterization", () => {
 		expect(harness.session.serviceTier).toBe(tierBeforeSwitch);
 		expect(harness.session.model?.id).toBe("faux-1");
 	});
+
+	it("restores the primary model when the scheduled backup retry continue cannot run", async () => {
+		const harness = await createHarness({
+			models: [{ id: "faux-1" }, { id: "faux-backup" }],
+			settings: {
+				providerBackupModel: "faux/faux-backup",
+				retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 },
+			},
+		});
+		harnesses.push(harness);
+		harness.setResponses([quotaFailure()]);
+		vi.spyOn(harness.session.agent, "continue").mockRejectedValueOnce(
+			new AgentContinueError("nothing-to-continue", "Nothing to continue"),
+		);
+
+		await harness.session.prompt("test");
+
+		const retryEnd = harness.eventsOfType("auto_retry_end").at(-1);
+		expect(retryEnd?.success).toBe(false);
+		expect(retryEnd?.finalError).toBe("Nothing to continue");
+		expect(retryEnd?.restoredModel).toBe("faux/faux-1");
+		expect(harness.session.model?.id).toBe("faux-1");
+	});
+
+	it("does not re-issue a wait retry cancelled between the delay and the scheduled continue", async () => {
+		const harness = await createHarness({
+			models: [{ id: "faux-1" }, { id: "faux-backup" }],
+			settings: {
+				providerBackupModel: "faux/faux-backup",
+				retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 },
+			},
+		});
+		harnesses.push(harness);
+		// Primary fails quota -> backup route; the backup fails quota -> wait ping.
+		harness.setResponses([quotaFailure(), quotaFailure(), fauxAssistantMessage("never reached")]);
+		const continueSpy = vi.spyOn(harness.session.agent, "continue");
+		const sawWaitStart = new Promise<void>((resolve) => {
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type === "auto_retry_start" && event.reason === "usage") {
+					unsubscribe();
+					resolve();
+				}
+			});
+		});
+		const internals = harness.session as unknown as { _retryAbortController?: AbortController };
+
+		const promptPromise = harness.session.prompt("test");
+		await sawWaitStart;
+		expect(harness.session.model?.id).toBe("faux-backup");
+
+		// Wait for the wait-ping sleep to resolve (controller cleared), then cancel
+		// before the scheduled continue fires: the abort lands in the window
+		// deterministically because microtasks run before timers.
+		await vi.waitFor(() => expect(internals._retryAbortController).toBeUndefined(), { timeout: 5000 });
+		harness.session.abortRetry();
+		await promptPromise;
+
+		// Only the backup-route continue ran; the cancelled wait continue never fired.
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(harness.session.model?.id).toBe("faux-1");
+		const retryEnd = harness.eventsOfType("auto_retry_end").at(-1);
+		expect(retryEnd?.finalError).toBe("Retry cancelled");
+		expect(retryEnd?.restoredModel).toBe("faux/faux-1");
+	});
 });
