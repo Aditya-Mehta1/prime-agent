@@ -12,7 +12,9 @@ export interface HistoryNavigationHost {
 	getRetryPolicy(): ProviderRetryPolicy;
 	getModel(): Model<Api> | undefined;
 	getExtensions(): Pick<ExtensionRunner, "hasHandlers" | "emit">;
-	getRequiredAuth(model: Model<Api>): Promise<{ apiKey: string; headers?: Record<string, string> }>;
+	getRequiredAuth(
+		model: Model<Api>,
+	): Promise<{ apiKey: string; headers?: Record<string, string>; requestModel?: Model<Api> }>;
 	acquireQueuedWorkPause(): { release(): void };
 	acquireCommitFence(): Promise<SessionCommitLease>;
 	runWithCommitFence<T>(lease: SessionCommitLease, run: () => T): T;
@@ -192,10 +194,11 @@ export class SessionHistoryNavigation {
 			let summaryUsage: Usage | undefined;
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
 				const model = this.host.getModel()!;
-				const { apiKey, headers } = await this.host.getRequiredAuth(model);
+				const { apiKey, headers, requestModel } = await this.host.getRequiredAuth(model);
 				const branchSummarySettings = this.host.settingsManager.getBranchSummarySettings();
 				const result = await generateBranchSummary(entriesToSummarize, {
-					model,
+					model: requestModel ?? model,
+					sessionId: this.host.sessionManager.getSessionId(),
 					apiKey,
 					headers,
 					signal: this._branchSummaryAbortController.signal,

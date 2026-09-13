@@ -596,6 +596,7 @@ export class AgentSession {
 		getExtensions: () => this._extensionRunner,
 		getThinkingLevel: () => this.thinkingLevel,
 		getRetryPolicy: () => providerRetryPolicy(this.settingsManager),
+		getSessionId: () => this.sessionId,
 		getHarnessDigest: () => this._harnessDigest(),
 		rebuildContext: () => {
 			this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
@@ -769,6 +770,7 @@ export class AgentSession {
 				sessionManager: this.sessionManager,
 				settingsManager: this.settingsManager,
 				getRetryPolicy: () => providerRetryPolicy(this.settingsManager),
+				getSessionId: () => this.sessionId,
 				isDisposed: () => this._disposed,
 				isDisposing: () => this._disposing,
 				isStreaming: () => this.isStreaming,
@@ -2421,6 +2423,10 @@ export class AgentSession {
 
 	bindExtensions(bindings: ExtensionBindings): Promise<void> {
 		return this._extensions.bindExtensions(bindings);
+	}
+
+	refreshModelMetadata(): void {
+		this._modelSelection.refreshModelMetadata();
 	}
 
 	private _refreshCurrentModelFromRegistry(
