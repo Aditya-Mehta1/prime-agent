@@ -262,7 +262,9 @@ export function resolveDiscardProbeTarget(
 		if (token === "-C") {
 			const dir = tokens[index + 1];
 			if (!dir) return UNRESOLVABLE_DISCARD_TARGET;
-			dashCDir = dir;
+			// Repeated -C paths are relative to the preceding one, so replay the
+			// whole sequence instead of keeping only the last directory.
+			dashCDir = dashCDir ? `${dashCDir} -C ${dir}` : dir;
 		} else if (token.startsWith("--git-dir") || token.startsWith("--work-tree") || token.startsWith("--prefix")) {
 			return UNRESOLVABLE_DISCARD_TARGET;
 		}
@@ -281,6 +283,17 @@ export function resolveDiscardProbeTarget(
 			}
 		}
 	}
+
+	// Inline env assignments directly before the git invocation (for example
+	// GIT_DIR=.../GIT_WORK_TREE=... git reset --hard) relocate the target
+	// repository; replay them in the probe, or refuse when they cannot be.
+	let envPrefix = "";
+	const lastSegment = prefix.split(/&&|\|\||;|\||\n/).pop() ?? "";
+	const assignmentTokens = lastSegment.trim().split(/\s+/).filter(Boolean);
+	for (const token of assignmentTokens) {
+		if (!/^[A-Za-z_][A-Za-z0-9_]*=[^\s$`;&|()<>"]+$/.test(token)) return UNRESOLVABLE_DISCARD_TARGET;
+	}
+	if (assignmentTokens.length > 0) envPrefix = `${assignmentTokens.join(" ")} `;
 
 	// Persistent cd relocations earlier in the command.
 	const cdArgs: string[] = [];
@@ -306,10 +319,11 @@ export function resolveDiscardProbeTarget(
 		if (sawCd && prefix.includes("(")) return UNRESOLVABLE_DISCARD_TARGET; // subshell/grouping: cd may not persist
 	}
 
-	if (!sawCd && dashCDir === undefined && !cleanRemovesIgnored) return null;
+	if (!sawCd && dashCDir === undefined && !cleanRemovesIgnored && !envPrefix) return null;
 	const ignored = cleanRemovesIgnored ? " --ignored=matching" : "";
+	const cdPrefix = sawCd ? `${cdArgs.map((arg) => (arg ? `cd ${arg}` : "cd")).join(" && ")} && ` : "";
 	return {
-		relocationPrefix: sawCd ? `${cdArgs.map((arg) => (arg ? `cd ${arg}` : "cd")).join(" && ")} && ` : undefined,
+		relocationPrefix: `${cdPrefix}${envPrefix}` || undefined,
 		gitStatusCommand: `${dashCDir ? `git -C ${dashCDir} ` : "git "}status --porcelain --untracked-files=all${ignored}`,
 	};
 }

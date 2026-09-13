@@ -60,6 +60,9 @@ describe("isDestructiveGitDiscardCommand", () => {
 		"git --git-dir=sub/.git reset --hard",
 		"git reset -q --hard",
 		"git reset --no-refresh --hard",
+		"git -C repo -C nested reset --hard",
+		"GIT_DIR=sub/.git git reset --hard",
+		"GIT_DIR=sub/.git GIT_WORK_TREE=sub git reset --hard",
 	])("matches %s", (command) => {
 		expect(isDestructiveGitDiscardCommand(command)).toBe(true);
 	});
@@ -423,6 +426,54 @@ describe("bash tool destructive-git dirty-tree guard", () => {
 		expect(error).toBeInstanceOf(Error);
 		expect((error as Error).message).toContain("fresh-untracked.txt");
 		expect(existsSync(join(testDir, "fresh-untracked.txt"))).toBe(true);
+	});
+
+	it("replays repeated git -C options against the chained target repository", async () => {
+		const nested = join(testDir, "repo", "nested");
+		mkdirSync(nested, { recursive: true });
+		initDirtyGitRepo(nested);
+		const bash = createBashTool(testDir);
+
+		const error = await bash.execute("guard-git-c-chain", { command: "git -C repo -C nested reset --hard" }).then(
+			() => undefined,
+			(err: Error) => err,
+		);
+
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("tracked.txt");
+		expect(readFileSync(join(nested, "tracked.txt"), "utf-8")).toBe("modified\n");
+	});
+
+	it("replays inline GIT_DIR/GIT_WORK_TREE assignments against the targeted repository", async () => {
+		const sub = join(testDir, "sub");
+		mkdirSync(sub);
+		initDirtyGitRepo(sub);
+		const bash = createBashTool(testDir);
+
+		const error = await bash
+			.execute("guard-git-dir", { command: "GIT_DIR=sub/.git GIT_WORK_TREE=sub git reset --hard" })
+			.then(
+				() => undefined,
+				(err: Error) => err,
+			);
+
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("tracked.txt");
+		expect(readFileSync(join(sub, "tracked.txt"), "utf-8")).toBe("modified\n");
+	});
+
+	it("conservatively refuses assignments it cannot replay safely", async () => {
+		const bash = createBashTool(testDir);
+
+		const error = await bash
+			.execute("guard-git-dir-subst", { command: "GIT_DIR=$(pwd)/sub/.git git reset --hard" })
+			.then(
+				() => undefined,
+				(err: Error) => err,
+			);
+
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("changes directory (or repository) first");
 	});
 
 	it("propagates aborts raised while probing", async () => {
