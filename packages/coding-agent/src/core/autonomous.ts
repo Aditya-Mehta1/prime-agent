@@ -70,10 +70,13 @@ export const DEFAULT_AUTONOMOUS_GATES: Required<AgentAutonomousGateConfig> = {
 
 /**
  * Default subagent keep-alive window: while subagents run, one continuation
- * per 30 minutes of continuous activity still fires so the parent can check
- * for hung or stopped children instead of sleeping until they finish.
+ * per 25 minutes of continuous activity still fires so the parent can check
+ * for hung or stopped children instead of sleeping until they finish. Kept
+ * strictly below the default wall-clock budget (30 minutes) so the valve
+ * fires before the run's timeout caps it; keep custom windows below any
+ * configured --timeout-ms for the same reason.
  */
-export const DEFAULT_AUTONOMOUS_SUBAGENT_KEEP_ALIVE_MS = 30 * 60 * 1000;
+export const DEFAULT_AUTONOMOUS_SUBAGENT_KEEP_ALIVE_MS = 25 * 60 * 1000;
 
 /**
  * Largest keep-alive window `setTimeout` accepts: Node clamps larger delays

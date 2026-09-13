@@ -240,8 +240,10 @@ longer burn continuation budget. The held continuation is delivered once the
 descendants settle, mirroring how goal continuations wait for subagent work.
 A slow keep-alive valve still fires one continuation per window of continuous
 subagent activity so the parent can inspect and unblock hung children (for
-example, stopped processes); the default window is 30 minutes and
-`--subagent-keep-alive-ms 0` disables it.
+example, stopped processes); the default window is 25 minutes and
+`--subagent-keep-alive-ms 0` disables it. Keep the window below any
+configured wall-clock budget so the valve fires before `--timeout-ms` caps
+the run.
 
 Autonomous mode supports limits for continuations, assistant turns, tokens, and wall-clock duration. Gate commands run before the session may finish; a failed gate returns its bounded output to the agent for another attempt. Prime Agent avoids rerunning the same failed gate when the workspace has not changed.
 

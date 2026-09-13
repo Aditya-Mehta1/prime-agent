@@ -2422,6 +2422,10 @@ export class AgentSession {
 		if (message.stopReason === "error" || message.stopReason === "aborted") {
 			return false;
 		}
+		if (autonomousLimitReason(this._autonomousState)) {
+			// The run is over: hold nothing so the hook can apply the limit.
+			return false;
+		}
 		if (!this._hasUnsettledRlmQuiescenceWork()) {
 			return false;
 		}
@@ -2466,8 +2470,12 @@ export class AgentSession {
 	 */
 	private async _resumeOwedAutonomousContinuation(): Promise<void> {
 		const snapshot = this._snapshotAutonomousRuntimeState();
+		const arrivalEpoch = this._sessionInputArrivalEpoch;
 		try {
-			const lastAssistantMessage = this._lastAssistantMessage;
+			// agent_end clears the live field, so fall back to the transcript;
+			// either way the session's last assistant turn decides the gate run.
+			const lastAssistantMessage =
+				this._lastAssistantMessage ?? this._findLastAssistantInMessages(this.agent.state.messages);
 			if (!lastAssistantMessage) {
 				if (autonomousLimitReason(this._autonomousState)) {
 					// The run is over; no continuation is owed anymore.
@@ -2483,11 +2491,24 @@ export class AgentSession {
 				cwd: this._cwd,
 				signal: this.agent.signal,
 			});
-			if (message) {
-				this._admitOwedAutonomousContinuation(message);
-			} else {
+			if (!message) {
 				this._clearAutonomousContinuationAwait();
+				return;
 			}
+			// Re-validate after the gate await: a new prompt, /autonomous off,
+			// or a goal takeover must not be bypassed by a stale continuation.
+			if (
+				this._disposed ||
+				this._disposing ||
+				!this._autonomousState.enabled ||
+				this._goalOwnsContinuationWakeup() ||
+				this._sessionInputArrivalEpoch !== arrivalEpoch
+			) {
+				this._restoreAutonomousRuntimeSnapshot(snapshot);
+				this._clearAutonomousContinuationAwait();
+				return;
+			}
+			this._admitOwedAutonomousContinuation(message);
 		} catch {
 			// Admission can race a new pause; roll back so the retry re-counts.
 			this._restoreAutonomousRuntimeSnapshot(snapshot);

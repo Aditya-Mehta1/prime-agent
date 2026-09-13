@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.js";
-import { type AutonomousRuntimeState, createAutonomousRuntimeState } from "../src/core/autonomous.js";
+import {
+	type AutonomousRuntimeState,
+	createAutonomousRuntimeState,
+	DEFAULT_AUTONOMOUS_LIMITS,
+	DEFAULT_AUTONOMOUS_SUBAGENT_KEEP_ALIVE_MS,
+} from "../src/core/autonomous.js";
 
 type FakeAssistantMessage = { role: "assistant"; stopReason: string };
 
@@ -10,7 +15,7 @@ type FakeSession = {
 	_autonomousSubagentKeepAliveTimer: ReturnType<typeof setTimeout> | undefined;
 	_autonomousContinuationResumeTask: Promise<void> | undefined;
 	_lastAssistantMessage: { role: "assistant"; stopReason: string } | undefined;
-	agent: { signal: AbortSignal | undefined };
+	agent: { signal: AbortSignal | undefined; state: { messages: unknown[] } };
 	_disposed: boolean;
 	_disposing: boolean;
 	_sessionInputAdmissionPauses: Set<symbol>;
@@ -64,7 +69,7 @@ function fakeSession(overrides: Partial<FakeSession> = {}): FakeSession {
 		_autonomousSubagentKeepAliveTimer: undefined,
 		_autonomousContinuationResumeTask: undefined,
 		_lastAssistantMessage: { role: "assistant", stopReason: "stop" },
-		agent: { signal: undefined },
+		agent: { signal: undefined, state: { messages: [] } },
 		_disposed: false,
 		_disposing: false,
 		_sessionInputAdmissionPauses: new Set(),
@@ -99,6 +104,7 @@ function fakeSession(overrides: Partial<FakeSession> = {}): FakeSession {
 		"_goalOwnsContinuationWakeup",
 		"_deliverAutonomousSubagentKeepAlive",
 		"_admitOwedAutonomousContinuation",
+		"_findLastAssistantInMessages",
 		"_armAutonomousSubagentKeepAlive",
 		"_disarmAutonomousSubagentKeepAlive",
 		"_clearAutonomousContinuationAwait",
@@ -380,6 +386,63 @@ describe("autonomous continuation vs active subagents", () => {
 		session._sessionInputAdmissionPauses.clear();
 		vi.advanceTimersByTime(1_000);
 		expect(session._admitSessionInput).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps the default keep-alive window under the default wall-clock budget", () => {
+		// A window at or above the timeout would be blocked by the wall-clock
+		// limit at the fire time, so the valve could never wake the parent.
+		expect(DEFAULT_AUTONOMOUS_SUBAGENT_KEEP_ALIVE_MS).toBeGreaterThan(0);
+		expect(DEFAULT_AUTONOMOUS_SUBAGENT_KEEP_ALIVE_MS).toBeLessThan(DEFAULT_AUTONOMOUS_LIMITS.timeoutMs);
+	});
+
+	it("does not hold the continuation once limits are reached", async () => {
+		const session = fakeSession({
+			_hasUnsettledRlmQuiescenceWork: () => true,
+			_autonomousState: createAutonomousRuntimeState({ enabled: true, maxContinuations: 1 }),
+		});
+		session._autonomousState.continuationsUsed = 1;
+		expect(holdForRlmWork.call(session, stoppedTurn)).toBe(false);
+		await expect(getContinuationMessages.call(session, context)).resolves.toEqual([]);
+		expect(session._autonomousContinuationAwaitsRlmWork).toBe(false);
+		expect(session._autonomousState.continuationsUsed).toBe(1);
+	});
+
+	it("drops a stale owed continuation when a prompt arrives during the gate evaluation", async () => {
+		const session = fakeSession({
+			_autonomousContinuationAwaitsRlmWork: true,
+			_cwd: "/tmp",
+			_autonomousState: createAutonomousRuntimeState({
+				enabled: true,
+				maxContinuations: 5,
+				gates: { commands: ["false"] },
+			}),
+		});
+		maybeResume.call(session);
+		// A user prompt lands while the gate command is still running.
+		session._sessionInputArrivalEpoch++;
+		await session._autonomousContinuationResumeTask;
+		expect(session._admitSessionInput).not.toHaveBeenCalled();
+		expect(session._autonomousContinuationAwaitsRlmWork).toBe(false);
+		expect(session._autonomousState.continuationsUsed).toBe(0);
+	});
+
+	it("evaluates gates from the transcript after agent_end clears the live last-assistant field", async () => {
+		const session = fakeSession({
+			_autonomousContinuationAwaitsRlmWork: true,
+			_cwd: "/tmp",
+			_lastAssistantMessage: undefined,
+			agent: { signal: undefined, state: { messages: [stoppedTurn] } },
+			_autonomousState: createAutonomousRuntimeState({
+				enabled: true,
+				maxContinuations: 5,
+				gates: { commands: ["true"] },
+			}),
+		});
+		maybeResume.call(session);
+		await session._autonomousContinuationResumeTask;
+		expect(session._admitSessionInput).not.toHaveBeenCalled();
+		expect(session._autonomousContinuationAwaitsRlmWork).toBe(false);
+		expect(session._autonomousState.continuationsUsed).toBe(0);
 	});
 
 	it("holds the threshold-compaction continuation while a child runs", async () => {
