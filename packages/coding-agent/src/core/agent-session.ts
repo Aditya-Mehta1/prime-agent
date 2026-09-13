@@ -1437,6 +1437,7 @@ export class AgentSession {
 	private async _getRequiredRequestAuth(model: Model<any>): Promise<{
 		apiKey: string;
 		headers?: Record<string, string>;
+		requestModel: Model<Api>;
 	}> {
 		const result = await this._modelRegistry.getApiKeyAndHeaders(model);
 		if (!result.ok) {
@@ -1446,7 +1447,7 @@ export class AgentSession {
 			throw new Error(result.error);
 		}
 		if (result.apiKey) {
-			return { apiKey: result.apiKey, headers: result.headers };
+			return { apiKey: result.apiKey, headers: result.headers, requestModel: result.requestModel ?? model };
 		}
 
 		const isOAuth = this._modelRegistry.isUsingOAuth(model);
@@ -6743,9 +6744,9 @@ export class AgentSession {
 				throw new Error(formatNoModelSelectedMessage());
 			}
 
-			const { apiKey, headers } = await this._getRequiredRequestAuth(this.model);
+			const { apiKey, headers, requestModel } = await this._getRequiredRequestAuth(this.model);
 			const result = await this._performCompaction({
-				model: this.model,
+				model: requestModel,
 				apiKey,
 				headers,
 				customInstructions,
@@ -6908,6 +6909,7 @@ export class AgentSession {
 					this.thinkingLevel,
 					summaryCall,
 					providerRetryPolicy(this.settingsManager),
+					this.sessionId,
 				));
 			}
 
@@ -7421,18 +7423,19 @@ export class AgentSession {
 		if (!model) {
 			return { shouldRefine: false, rationale: "No model selected." };
 		}
-		const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+		const { apiKey, headers, requestModel } = await this._getRequiredRequestAuth(model);
 		return reviewAutoRefine(
 			this.agent.state.messages,
 			this._loadMergedHarnessState(),
 			this._loadRefinementHistory(),
-			model,
+			requestModel,
 			apiKey,
 			context,
 			headers,
 			signal,
 			this.thinkingLevel,
 			providerRetryPolicy(this.settingsManager),
+			this.sessionId,
 		);
 	}
 
@@ -7667,8 +7670,7 @@ export class AgentSession {
 			throw new Error(formatNoModelSelectedMessage());
 		}
 
-		const model = this.model;
-		const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+		const { apiKey, headers, requestModel: model } = await this._getRequiredRequestAuth(this.model);
 		const globalHarnessStateDir = getGlobalHarnessStateDir();
 		const localHarnessStateDir = this._localHarnessStateDir();
 		const requestedScope = options.global ? "global" : "local";
@@ -7736,6 +7738,7 @@ export class AgentSession {
 			headers,
 			signal,
 			this.thinkingLevel,
+			this.sessionId,
 		);
 		if (this._disposed || signal.aborted) {
 			throw new Error("Refinement cancelled because the session was disposed.");
@@ -8141,7 +8144,7 @@ export class AgentSession {
 			}
 
 			const result = await this._performCompaction({
-				model: this.model,
+				model: authResult.requestModel ?? this.model,
 				apiKey: authResult.apiKey,
 				headers: authResult.headers,
 				customInstructions,
@@ -8336,6 +8339,19 @@ export class AgentSession {
 		this._extensionErrorUnsubscriber = this._extensionErrorListener
 			? runner.onError(this._extensionErrorListener)
 			: undefined;
+	}
+
+	refreshModelMetadata(): void {
+		if (this.model?.provider === "xai") {
+			this.agent.state.model = this._modelRegistry.getModelForCurrentAuth(this.model);
+			this.setThinkingLevel(this.thinkingLevel);
+			this._clampServiceTierForModel();
+		}
+		this._scopedModels = this._scopedModels.map((scoped) =>
+			scoped.model.provider === "xai"
+				? { ...scoped, model: this._modelRegistry.getModelForCurrentAuth(scoped.model) }
+				: scoped,
+		);
 	}
 
 	private _refreshCurrentModelFromRegistry(): void {
@@ -10769,14 +10785,14 @@ export class AgentSession {
 			let summaryDetails: unknown;
 			let summaryUsage: Usage | undefined;
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
-				const model = this.model!;
-				const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+				const { apiKey, headers, requestModel: model } = await this._getRequiredRequestAuth(this.model!);
 				const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
 				const result = await generateBranchSummary(entriesToSummarize, {
 					model,
 					apiKey,
 					headers,
 					signal: this._branchSummaryAbortController.signal,
+					sessionId: this.sessionId,
 					customInstructions,
 					replaceInstructions,
 					reserveTokens: branchSummarySettings.reserveTokens,
