@@ -541,10 +541,11 @@ export class DaemonAgentConnection implements AgentConnection {
 				undefined,
 				options,
 			);
-			if (this.latestSnapshotIsFresh && this.latestSnapshot === snapshot) {
-				return {
-					...snapshot,
-					state,
+			if (this.latestSnapshotIsFresh && this.latestSnapshot?.messages === snapshot.messages) {
+				const recap = this.latestSnapshot.state.recap;
+				this.latestSnapshot = {
+					...this.latestSnapshot,
+					state: recap !== snapshot.state.recap ? { ...state, recap } : state,
 					...(snapshot.sessionContext
 						? {
 								sessionContext: {
@@ -556,6 +557,8 @@ export class DaemonAgentConnection implements AgentConnection {
 							}
 						: {}),
 				};
+				this.latestSnapshotStateIsFresh = true;
+				return this.latestSnapshot;
 			}
 		}
 		// The session tree is intentionally not fetched here: it is large on long
@@ -599,6 +602,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			snapshotSequence === this.lastEventSequence &&
 			snapshotCursor?.generation === this.lastEventCursor?.generation &&
 			snapshotCursor?.sequence === this.lastEventCursor?.sequence;
+		this.latestSnapshotStateIsFresh = this.latestSnapshotIsFresh;
 		return this.latestSnapshot;
 	}
 

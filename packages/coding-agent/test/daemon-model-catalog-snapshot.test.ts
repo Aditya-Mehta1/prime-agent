@@ -54,6 +54,7 @@ async function createConnection(modelCatalog = true, deferSessionEvents = false)
 		setDuringStateRead: (callback: () => void) => {
 			duringStateRead = callback;
 		},
+		emitStatus: (recap: string) => listener?.({ type: "session_status", activeSessionId: "active", recap }),
 		emit: () =>
 			listener?.({
 				type: "session_event",
@@ -82,6 +83,11 @@ describe("model catalog refresh preserves the attached transcript", () => {
 				});
 				expect(request.mock.calls.map(([command]) => command.type)).not.toContain("get_messages");
 				expect(request.mock.calls.map(([command]) => command.type)).not.toContain("get_session_context");
+				request.mockClear();
+				expect(await connection.getInitialSnapshot()).toBe(snapshot);
+				expect(await connection.getState()).toBe(snapshot.state);
+				expect(await connection.getSessionContext()).toBe(snapshot.sessionContext);
+				expect(request).not.toHaveBeenCalled();
 			} finally {
 				await connection.dispose();
 			}
@@ -93,8 +99,30 @@ describe("model catalog refresh preserves the attached transcript", () => {
 		try {
 			await connection.getModelCatalog();
 			await connection.setThinkingLevel("medium");
-			expect((await connection.getInitialSnapshot()).messages).toBe(updatedMessages);
+			const snapshot = await connection.getInitialSnapshot();
+			expect(snapshot.messages).toBe(updatedMessages);
 			expect(request.mock.calls.map(([command]) => command.type)).toContain("get_messages");
+			request.mockClear();
+			expect(await connection.getInitialSnapshot()).toBe(snapshot);
+			expect(await connection.getState()).toBe(snapshot.state);
+			expect(await connection.getSessionContext()).toBe(snapshot.sessionContext);
+			expect(request).not.toHaveBeenCalled();
+		} finally {
+			await connection.dispose();
+		}
+	});
+
+	it("keeps a concurrent recap update without downloading the transcript", async () => {
+		const { connection, request, messages, emitStatus, setDuringStateRead } = await createConnection();
+		try {
+			await connection.getModelCatalog();
+			setDuringStateRead(() => emitStatus("Updated recap"));
+			request.mockClear();
+			const snapshot = await connection.getInitialSnapshot();
+			expect(snapshot.messages).toBe(messages);
+			expect(snapshot.state.recap).toBe("Updated recap");
+			expect(await connection.getInitialSnapshot()).toBe(snapshot);
+			expect(request.mock.calls.map(([command]) => command.type)).toEqual(["get_connection_state"]);
 		} finally {
 			await connection.dispose();
 		}
