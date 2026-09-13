@@ -249,6 +249,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	private childRosterSequence: number | undefined;
 	private latestSnapshot: AgentConnectionSnapshot | undefined;
 	private latestSnapshotIsFresh = false;
+	private latestSnapshotStateIsFresh = false;
 	private deferredSessionEvents: {
 		event: AgentSessionEvent;
 		sequence: number | undefined;
@@ -522,7 +523,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async getState(): Promise<AgentConnectionState> {
-		if (this.latestSnapshotIsFresh && this.latestSnapshot) {
+		if (this.latestSnapshotIsFresh && this.latestSnapshotStateIsFresh && this.latestSnapshot) {
 			return this.latestSnapshot.state;
 		}
 		return this.requestData<AgentConnectionState>({
@@ -533,7 +534,29 @@ export class DaemonAgentConnection implements AgentConnection {
 
 	async getInitialSnapshot(options?: { recoverable?: boolean }): Promise<AgentConnectionSnapshot> {
 		if (this.latestSnapshotIsFresh && this.latestSnapshot) {
-			return this.latestSnapshot;
+			if (this.latestSnapshotStateIsFresh) return this.latestSnapshot;
+			const snapshot = this.latestSnapshot;
+			const state = await this.requestData<AgentConnectionState>(
+				{ type: "get_connection_state", activeSessionId: this.activeSessionId },
+				undefined,
+				options,
+			);
+			if (this.latestSnapshotIsFresh && this.latestSnapshot === snapshot) {
+				return {
+					...snapshot,
+					state,
+					...(snapshot.sessionContext
+						? {
+								sessionContext: {
+									...snapshot.sessionContext,
+									thinkingLevel: state.thinkingLevel,
+									serviceTier: state.serviceTier,
+									model: state.model ? { provider: state.model.provider, modelId: state.model.id } : null,
+								},
+							}
+						: {}),
+				};
+			}
 		}
 		// The session tree is intentionally not fetched here: it is large on long
 		// sessions and only needed when the user opens the tree/branch selector.
@@ -780,7 +803,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async getSessionContext(): Promise<AgentConnectionSessionContext> {
-		if (this.latestSnapshotIsFresh && this.latestSnapshot?.sessionContext) {
+		if (this.latestSnapshotIsFresh && this.latestSnapshotStateIsFresh && this.latestSnapshot?.sessionContext) {
 			return this.latestSnapshot.sessionContext;
 		}
 		const data = await this.requestData<{ context: AgentConnectionSessionContext }>({
@@ -1831,7 +1854,10 @@ export class DaemonAgentConnection implements AgentConnection {
 			this.definitiveRequestErrors.add(error);
 			throw error;
 		}
-		if (invalidatesCachedSnapshot(command.type)) {
+		if (command.type === "get_model_catalog" || command.type === "get_available_models") {
+			// Catalog refresh can change model/auth settings, but does not change the transcript.
+			this.latestSnapshotStateIsFresh = false;
+		} else if (invalidatesCachedSnapshot(command.type)) {
 			this.latestSnapshotIsFresh = false;
 		}
 		return response.data as T;
@@ -2281,6 +2307,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		this.latestSnapshot.lastEventCursor = this.lastEventCursor;
 		this.childRosterSequence = Array.isArray(snapshot.children) ? snapshot.lastEventSequence : undefined;
 		this.latestSnapshotIsFresh = true;
+		this.latestSnapshotStateIsFresh = true;
 	}
 
 	private async completeSnapshotAssembly(
