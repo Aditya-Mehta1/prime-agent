@@ -156,7 +156,7 @@ export interface BashToolOptions {
 /** Bypass env var for the destructive-git dirty-tree guard. */
 export const BASH_DESTRUCTIVE_GIT_BYPASS_ENV = "PI_BASH_ALLOW_DESTRUCTIVE_GIT";
 
-const GIT_STATUS_PORCELAIN_COMMAND = "git status --porcelain";
+const GIT_STATUS_PORCELAIN_COMMAND = "git status --porcelain --untracked-files=all";
 
 /** How many dirty paths the refusal lists before eliding the rest. */
 const MAX_DIRTY_PATHS_LISTED = 10;
@@ -186,7 +186,10 @@ const DISCARD_RESTORE_PATTERN = new RegExp(
 	`\\bgit\\s+${GIT_GLOBAL_OPTIONS}restore\\s+(?:(?:--source|--worktree)(?:=\\S+)?\\s+|-s(?:\\s+\\S+|[^\\s]+)\\s+|-W\\s+|--\\s+)?(?:\\.\\/?|:\\/)(?=\\s|$|[;&|)])`,
 	"g",
 );
-const DISCARD_RESET_PATTERN = new RegExp(`\\bgit\\s+${GIT_GLOBAL_OPTIONS}reset\\s+--hard\\b`, "g");
+const DISCARD_RESET_PATTERN = new RegExp(
+	`\\bgit\\s+${GIT_GLOBAL_OPTIONS}reset\\s+(?:(?:-[^\\s;&|]+)\\s+)*--hard\\b`,
+	"g",
+);
 const DISCARD_CLEAN_PATTERN = new RegExp(`\\bgit\\s+${GIT_GLOBAL_OPTIONS}clean\\s+([^;&|]*)`, "g");
 
 function isForcedCleanSegment(args: string): boolean {
@@ -228,8 +231,12 @@ export function isDestructiveGitDiscardCommand(command: string): boolean {
 export interface DiscardProbeTarget {
 	/** Shell prefix relocating the probe, for example `cd sub && `. */
 	relocationPrefix?: string;
-	/** git status command honoring a `git -C` on the discard invocation. */
-	gitStatusCommand?: string;
+	/**
+	 * git status command for this discard: honors a `git -C` on the discard
+	 * invocation and includes ignored files when the discard deletes them
+	 * (git clean -x/-X).
+	 */
+	gitStatusCommand: string;
 }
 
 /** The probe cannot safely determine the repository the discard targets. */
@@ -241,20 +248,38 @@ export function resolveDiscardProbeTarget(
 ): DiscardProbeTarget | typeof UNRESOLVABLE_DISCARD_TARGET | null {
 	const prefix = command.slice(0, discardIndex);
 	const invocation = command.slice(discardIndex);
+	const tokens = invocation.split(/\s+/);
 
 	// git -C <dir> (or repository-relocating global options) on the discard invocation itself.
 	let dashCDir: string | undefined;
-	for (const [index, token] of invocation.split(/\s+/).entries()) {
+	let subcommandIndex = -1;
+	for (const [index, token] of tokens.entries()) {
 		if (index === 0) continue; // "git"
-		if (token === "reset" || token === "checkout" || token === "clean" || token === "restore") break;
+		if (token === "reset" || token === "checkout" || token === "clean" || token === "restore") {
+			subcommandIndex = index;
+			break;
+		}
 		if (token === "-C") {
-			const dir = invocation.split(/\s+/)[index + 1];
+			const dir = tokens[index + 1];
 			if (!dir) return UNRESOLVABLE_DISCARD_TARGET;
 			dashCDir = dir;
 		} else if (token.startsWith("--git-dir") || token.startsWith("--work-tree") || token.startsWith("--prefix")) {
 			return UNRESOLVABLE_DISCARD_TARGET;
 		}
 		// Other flags (for example -c key=value) do not relocate.
+	}
+
+	// git clean -x/-X also deletes ignored files, so its probe must include them.
+	let cleanRemovesIgnored = false;
+	if (subcommandIndex !== -1 && tokens[subcommandIndex] === "clean") {
+		for (const token of tokens.slice(subcommandIndex + 1)) {
+			if (token === "--") break; // everything after -- is a pathspec
+			if (token.startsWith("--")) continue;
+			if (token.startsWith("-") && /[xX]/.test(token.slice(1))) {
+				cleanRemovesIgnored = true;
+				break;
+			}
+		}
 	}
 
 	// Persistent cd relocations earlier in the command.
@@ -281,10 +306,11 @@ export function resolveDiscardProbeTarget(
 		if (sawCd && prefix.includes("(")) return UNRESOLVABLE_DISCARD_TARGET; // subshell/grouping: cd may not persist
 	}
 
-	if (!sawCd && dashCDir === undefined) return null;
+	if (!sawCd && dashCDir === undefined && !cleanRemovesIgnored) return null;
+	const ignored = cleanRemovesIgnored ? " --ignored=matching" : "";
 	return {
 		relocationPrefix: sawCd ? `${cdArgs.map((arg) => (arg ? `cd ${arg}` : "cd")).join(" && ")} && ` : undefined,
-		gitStatusCommand: dashCDir ? `git -C ${dashCDir} status --porcelain` : undefined,
+		gitStatusCommand: `${dashCDir ? `git -C ${dashCDir} ` : "git "}status --porcelain --untracked-files=all${ignored}`,
 	};
 }
 
@@ -293,9 +319,11 @@ function isTruthyEnvValue(value: string | undefined): boolean {
 }
 
 /**
- * Probe for uncommitted changes via `git status --porcelain` in the command's cwd.
- * Returns null when dirtiness cannot be determined (not a repo, git missing,
- * probe failure) so the guard fails open instead of blocking on a guess.
+ * Probe for at-risk files via `git status --porcelain --untracked-files=all`
+ * (plus `--ignored=matching` when the discard deletes ignored files) in the
+ * command's cwd. Returns null when dirtiness cannot be determined (not a
+ * repo, git missing, probe failure) so the guard fails open instead of
+ * blocking on a guess.
  */
 async function probeUncommittedChanges(
 	ops: BashOperations,
@@ -324,11 +352,12 @@ async function probeUncommittedChanges(
 		.map((line) => line.replace(/\r$/, ""));
 }
 
-function formatDirtyTreeRefusal(dirtyPaths: string[]): string {
+function formatDirtyTreeRefusal(dirtyPaths: string[], includesIgnoredFiles = false): string {
 	const listed = dirtyPaths.slice(0, MAX_DIRTY_PATHS_LISTED);
 	const elided = dirtyPaths.length - listed.length;
+	const noun = includesIgnoredFiles ? "uncommitted or ignored file(s)" : "uncommitted change(s)";
 	const lines = [
-		`Refusing to run this destructive git command: the working tree has ${dirtyPaths.length} uncommitted change(s).`,
+		`Refusing to run this destructive git command: the working tree has ${dirtyPaths.length} ${noun}.`,
 		...listed.map((line) => `  ${line}`),
 	];
 	if (elided > 0) lines.push(`  ... and ${elided} more`);
@@ -510,7 +539,8 @@ export function createBashToolDefinition(
 				// chains and git -C, refuse when the target cannot be resolved
 				// safely, and run the probe through the same spawn hook as the
 				// discard so hook-provided shell setup applies to both.
-				const probeContexts = new Map<string, BashSpawnContext>();
+				const probes: Array<{ context: BashSpawnContext; includesIgnoredFiles: boolean }> = [];
+				const seenProbes = new Set<string>();
 				for (const index of discardIndices) {
 					const target = resolveDiscardProbeTarget(spawnContext.command, index);
 					if (target === UNRESOLVABLE_DISCARD_TARGET) {
@@ -521,19 +551,25 @@ export function createBashToolDefinition(
 					const rawProbe = commandPrefix
 						? `${commandPrefix}\n${relocationPrefix}${gitStatus}`
 						: `${relocationPrefix}${gitStatus}`;
-					const probeContext = resolveSpawnContext(rawProbe, spawnContext.cwd, spawnHook);
-					probeContexts.set(`${probeContext.command}\u0000${probeContext.cwd}`, probeContext);
+					const context = resolveSpawnContext(rawProbe, spawnContext.cwd, spawnHook);
+					const key = `${context.command}\u0000${context.cwd}`;
+					if (seenProbes.has(key)) continue;
+					seenProbes.add(key);
+					probes.push({
+						context,
+						includesIgnoredFiles: gitStatus.includes("--ignored=matching"),
+					});
 				}
-				for (const probeContext of probeContexts.values()) {
+				for (const probe of probes) {
 					const dirtyPaths = await probeUncommittedChanges(
 						ops,
-						probeContext.command,
-						probeContext.cwd,
-						probeContext.env,
+						probe.context.command,
+						probe.context.cwd,
+						probe.context.env,
 						signal,
 					);
 					if (dirtyPaths && dirtyPaths.length > 0) {
-						throw new Error(formatDirtyTreeRefusal(dirtyPaths));
+						throw new Error(formatDirtyTreeRefusal(dirtyPaths, probe.includesIgnoredFiles));
 					}
 				}
 			}

@@ -58,6 +58,8 @@ describe("isDestructiveGitDiscardCommand", () => {
 		"git restore ./",
 		"git -C sub reset --hard",
 		"git --git-dir=sub/.git reset --hard",
+		"git reset -q --hard",
+		"git reset --no-refresh --hard",
 	])("matches %s", (command) => {
 		expect(isDestructiveGitDiscardCommand(command)).toBe(true);
 	});
@@ -205,7 +207,7 @@ describe("bash tool destructive-git dirty-tree guard", () => {
 		const operations: BashOperations = {
 			exec: async (command, _cwd, { onData }) => {
 				calls.push(command);
-				if (command === "git status --porcelain") {
+				if (command === "git status --porcelain --untracked-files=all") {
 					onData(Buffer.from("fatal: not a git repository\n", "utf8"));
 					return { exitCode: 128 };
 				}
@@ -215,7 +217,7 @@ describe("bash tool destructive-git dirty-tree guard", () => {
 		const bash = createBashTool(testDir, { operations });
 
 		await expect(bash.execute("guard-probe-fail", { command: "git checkout -- ." })).resolves.toBeDefined();
-		expect(calls).toEqual(["git status --porcelain", "git checkout -- ."]);
+		expect(calls).toEqual(["git status --porcelain --untracked-files=all", "git checkout -- ."]);
 	});
 
 	it("prepends the command prefix to the probe for shell-setup parity", async () => {
@@ -231,7 +233,7 @@ describe("bash tool destructive-git dirty-tree guard", () => {
 		await expect(bash.execute("guard-prefix", { command: "git checkout -- ." })).resolves.toBeDefined();
 
 		expect(calls).toEqual([
-			"export GUARD_TEST_VAR=1\ngit status --porcelain",
+			"export GUARD_TEST_VAR=1\ngit status --porcelain --untracked-files=all",
 			"export GUARD_TEST_VAR=1\ngit checkout -- .",
 		]);
 	});
@@ -319,7 +321,10 @@ describe("bash tool destructive-git dirty-tree guard", () => {
 
 		await bash.execute("guard-cd-chain", { command: "cd a && cd b && git checkout -- ." });
 
-		expect(calls).toEqual(["cd a && cd b && git status --porcelain", "cd a && cd b && git checkout -- ."]);
+		expect(calls).toEqual([
+			"cd a && cd b && git status --porcelain --untracked-files=all",
+			"cd a && cd b && git checkout -- .",
+		]);
 	});
 
 	it("replays git -C in the probe", async () => {
@@ -334,7 +339,7 @@ describe("bash tool destructive-git dirty-tree guard", () => {
 
 		await bash.execute("guard-git-c-probe", { command: "git -C sub reset --hard" });
 
-		expect(calls).toEqual(["git -C sub status --porcelain", "git -C sub reset --hard"]);
+		expect(calls).toEqual(["git -C sub status --porcelain --untracked-files=all", "git -C sub reset --hard"]);
 	});
 
 	it("runs the probe through the spawn hook like the discard itself", async () => {
@@ -352,13 +357,78 @@ describe("bash tool destructive-git dirty-tree guard", () => {
 
 		await bash.execute("guard-hook", { command: "git checkout -- ." });
 
-		expect(calls).toEqual(["source ~/.profile\ngit status --porcelain", "source ~/.profile\ngit checkout -- ."]);
+		expect(calls).toEqual([
+			"source ~/.profile\ngit status --porcelain --untracked-files=all",
+			"source ~/.profile\ngit checkout -- .",
+		]);
+	});
+
+	it("refuses git reset -q --hard on a dirty tree", async () => {
+		initDirtyGitRepo(testDir);
+		const bash = createBashTool(testDir);
+
+		await expect(bash.execute("guard-reset-q", { command: "git reset -q --hard" })).rejects.toThrow(
+			/Refusing to run this destructive git command/,
+		);
+	});
+
+	it("refuses git clean -fx when ignored files would be deleted, and lists them", async () => {
+		initDirtyGitRepo(testDir);
+		runGit(testDir, "add", "-A");
+		runGit(testDir, "commit", "-m", "second");
+		writeFileSync(join(testDir, ".gitignore"), "ignored.txt\n");
+		runGit(testDir, "add", ".gitignore");
+		runGit(testDir, "commit", "-m", "gitignore");
+		writeFileSync(join(testDir, "ignored.txt"), "generated\n");
+		const bash = createBashTool(testDir);
+
+		const error = await bash.execute("guard-clean-x", { command: "git clean -fx" }).then(
+			() => undefined,
+			(err: Error) => err,
+		);
+
+		expect(error).toBeInstanceOf(Error);
+		const message = (error as Error).message;
+		expect(message).toContain("uncommitted or ignored file(s)");
+		expect(message).toContain("ignored.txt");
+		expect(existsSync(join(testDir, "ignored.txt"))).toBe(true);
+	});
+
+	it("allows git clean -f when only ignored files exist", async () => {
+		initDirtyGitRepo(testDir);
+		runGit(testDir, "add", "-A");
+		runGit(testDir, "commit", "-m", "second");
+		writeFileSync(join(testDir, ".gitignore"), "ignored.txt\n");
+		runGit(testDir, "add", ".gitignore");
+		runGit(testDir, "commit", "-m", "gitignore");
+		writeFileSync(join(testDir, "ignored.txt"), "generated\n");
+		const bash = createBashTool(testDir);
+
+		await expect(bash.execute("guard-clean-f", { command: "git clean -f" })).resolves.toBeDefined();
+	});
+
+	it("detects untracked files even when status.showUntrackedFiles=no is configured", async () => {
+		initDirtyGitRepo(testDir);
+		runGit(testDir, "add", "-A");
+		runGit(testDir, "commit", "-m", "second");
+		writeFileSync(join(testDir, "fresh-untracked.txt"), "new\n");
+		runGit(testDir, "config", "status.showUntrackedFiles", "no");
+		const bash = createBashTool(testDir);
+
+		const error = await bash.execute("guard-untracked-config", { command: "git clean -fd" }).then(
+			() => undefined,
+			(err: Error) => err,
+		);
+
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("fresh-untracked.txt");
+		expect(existsSync(join(testDir, "fresh-untracked.txt"))).toBe(true);
 	});
 
 	it("propagates aborts raised while probing", async () => {
 		const operations: BashOperations = {
 			exec: async (command, _cwd, _options) => {
-				if (command === "git status --porcelain") throw new Error("aborted");
+				if (command === "git status --porcelain --untracked-files=all") throw new Error("aborted");
 				return { exitCode: 0 };
 			},
 		};
