@@ -14,6 +14,13 @@ export interface AgentAutonomousConfig {
 	timeoutMs?: number;
 	continuationPrompt?: string;
 	gates?: AgentAutonomousGateConfig;
+	/**
+	 * While subagents run, timer-driven continuations are held (child messages
+	 * and exit notices are the real wake-up signals). This window allows one
+	 * keep-alive continuation of continuous subagent activity so the parent
+	 * can still check for hung children. `0` disables the keep-alive valve.
+	 */
+	subagentKeepAliveMs?: number;
 }
 
 export interface AgentAutonomousGateConfig {
@@ -35,17 +42,19 @@ export interface AgentAutonomousStatus {
 	turnsUsed: number;
 	tokensUsed: number;
 	startedAt?: number;
-	limits: Required<Omit<AgentAutonomousConfig, "enabled" | "continuationPrompt" | "gates">>;
+	limits: Required<Omit<AgentAutonomousConfig, "enabled" | "continuationPrompt" | "gates" | "subagentKeepAliveMs">>;
 	gates: Required<AgentAutonomousGateConfig>;
 	gateAttempts: Record<string, number>;
 	lastGateFailure?: AgentAutonomousGateFailure;
+	/** Configured subagent keep-alive window; 0 disables the keep-alive valve. */
+	subagentKeepAliveMs?: number;
 }
 
 export const DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT =
 	"No human input is available in autonomous mode. Continue working until the host evaluator, verifier, or configured autonomous limits stop the run. If you were asking the user a question, make a reasonable assumption and verify it. If you believe you are blocked, prove it with host-observable evidence, preserve that evidence, and keep looking for safe progress while budget remains. Do not end the session yourself; the verifier/evaluator decides completion when configured gates pass.";
 
 export const DEFAULT_AUTONOMOUS_LIMITS: Required<
-	Omit<AgentAutonomousConfig, "enabled" | "continuationPrompt" | "gates">
+	Omit<AgentAutonomousConfig, "enabled" | "continuationPrompt" | "gates" | "subagentKeepAliveMs">
 > = {
 	maxContinuations: 3,
 	maxTurns: 12,
@@ -58,6 +67,13 @@ export const DEFAULT_AUTONOMOUS_GATES: Required<AgentAutonomousGateConfig> = {
 	maxRetries: 3,
 	timeoutMs: 5 * 60 * 1000,
 };
+
+/**
+ * Default subagent keep-alive window: while subagents run, one continuation
+ * per 30 minutes of continuous activity still fires so the parent can check
+ * for hung or stopped children instead of sleeping until they finish.
+ */
+export const DEFAULT_AUTONOMOUS_SUBAGENT_KEEP_ALIVE_MS = 30 * 60 * 1000;
 
 /**
  * JSON-safe sentinel meaning "no cap". Limit checks compare usage against the
@@ -79,12 +95,14 @@ export interface AutonomousRuntimeState {
 	turnsUsed: number;
 	tokensUsed: number;
 	startedAt?: number;
-	limits: Required<Omit<AgentAutonomousConfig, "enabled" | "continuationPrompt" | "gates">>;
+	limits: Required<Omit<AgentAutonomousConfig, "enabled" | "continuationPrompt" | "gates" | "subagentKeepAliveMs">>;
 	continuationPrompt: string;
 	gates: Required<AgentAutonomousGateConfig>;
 	gateAttempts: Record<string, number>;
 	lastGateFailure?: GateFailure;
 	lastGateFailureSnapshot?: GitWorktreeSnapshot;
+	/** Configured subagent keep-alive window; 0 disables the keep-alive valve. */
+	subagentKeepAliveMs: number;
 }
 
 export type AutonomousLimitReason = "maxContinuations" | "maxTurns" | "maxTokens" | "timeoutMs";
@@ -139,7 +157,19 @@ export function createAutonomousRuntimeState(
 		gateAttempts: {},
 		lastGateFailure: undefined,
 		lastGateFailureSnapshot: undefined,
+		subagentKeepAliveMs: normalizeSubagentKeepAliveMs(config?.subagentKeepAliveMs),
 	};
+}
+
+/**
+ * `undefined` (and invalid values) fall back to the default window; an
+ * explicit `0` disables the subagent keep-alive valve entirely.
+ */
+function normalizeSubagentKeepAliveMs(value: number | undefined): number {
+	if (value === 0) {
+		return 0;
+	}
+	return normalizeLimit(value, DEFAULT_AUTONOMOUS_SUBAGENT_KEEP_ALIVE_MS);
 }
 
 export function setAutonomousEnabled(
@@ -187,6 +217,9 @@ export function setAutonomousLimits(state: AutonomousRuntimeState, config?: Agen
 		state.gates.maxRetries = normalizeLimit(config.gates.maxRetries, state.gates.maxRetries);
 		state.gates.timeoutMs = normalizeLimit(config.gates.timeoutMs, state.gates.timeoutMs);
 	}
+	if (config.subagentKeepAliveMs !== undefined) {
+		state.subagentKeepAliveMs = normalizeSubagentKeepAliveMs(config.subagentKeepAliveMs);
+	}
 }
 
 export function autonomousStatus(state: AutonomousRuntimeState): AgentAutonomousStatus {
@@ -200,6 +233,7 @@ export function autonomousStatus(state: AutonomousRuntimeState): AgentAutonomous
 		gates: { ...state.gates, commands: [...state.gates.commands] },
 		gateAttempts: { ...state.gateAttempts },
 		lastGateFailure: state.lastGateFailure ? { ...state.lastGateFailure } : undefined,
+		subagentKeepAliveMs: state.subagentKeepAliveMs,
 	};
 }
 
@@ -254,6 +288,55 @@ export async function nextAutonomousContinuation(
 			},
 		],
 		timestamp: now,
+	};
+}
+
+/**
+ * Build the continuation message for a held autonomous continuation that is
+ * now being delivered (subagents settled, or the keep-alive window elapsed).
+ * Budget accounting is the caller's job so a failed admission can roll it
+ * back, mirroring how goal continuations account at delivery.
+ */
+export function createAutonomousContinuationMessage(
+	state: AutonomousRuntimeState,
+	timestamp = Date.now(),
+): UserMessage {
+	return {
+		role: "user",
+		content: [
+			{
+				type: "text",
+				text: `[autonomous-continuation]\n\n${state.continuationPrompt}`,
+			},
+		],
+		timestamp,
+	};
+}
+
+/**
+ * Keep-alive continuation delivered while subagents are still active: the
+ * parent gets a bounded chance to inspect and unblock hung children (for
+ * example, SIGTTIN-stopped processes) instead of sleeping until they finish.
+ */
+export function createAutonomousSubagentKeepAliveMessage(
+	state: AutonomousRuntimeState,
+	timestamp = Date.now(),
+): UserMessage {
+	const minutes = Math.max(1, Math.round(state.subagentKeepAliveMs / 60_000));
+	return {
+		role: "user",
+		content: [
+			{
+				type: "text",
+				text:
+					`[autonomous-continuation: subagent-keep-alive]\n\n` +
+					`Subagents have been running for at least ${minutes} minute${minutes === 1 ? "" : "s"} ` +
+					`without a reply or exit being delivered. Check their status (for example agent_observe, ` +
+					`rlm.list_subagents, or process inspection) and cancel or unblock any that are hung; ` +
+					`then continue working.`,
+			},
+		],
+		timestamp,
 	};
 }
 

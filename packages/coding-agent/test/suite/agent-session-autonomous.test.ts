@@ -781,3 +781,107 @@ describe("AgentSession autonomous mode", () => {
 		});
 	});
 });
+
+describe("AgentSession autonomous continuations vs subagents", () => {
+	const harnesses: Harness[] = [];
+	let childGate: { promise: Promise<void>; resolve: () => void } | undefined;
+
+	function createGate(): { promise: Promise<void>; resolve: () => void } {
+		let resolve!: () => void;
+		const promise = new Promise<void>((settle) => {
+			resolve = settle;
+		});
+		return { promise, resolve };
+	}
+
+	afterEach(() => {
+		childGate?.resolve();
+		childGate = undefined;
+		while (harnesses.length > 0) {
+			harnesses.pop()?.cleanup();
+		}
+	});
+
+	async function createGatedChildParent(options: {
+		keepAliveMs?: number;
+		maxContinuations?: number;
+	}): Promise<Harness> {
+		childGate = createGate();
+		const child = await createHarness({});
+		harnesses.push(child);
+		child.setResponses([
+			async () => {
+				await childGate!.promise;
+				return fauxAssistantMessage("child result");
+			},
+		]);
+		const parent = await createHarness({
+			rlmDepth: 0,
+			rlmMaxDepth: 1,
+			autonomous: {
+				enabled: true,
+				maxContinuations: options.maxContinuations ?? 1,
+				subagentKeepAliveMs: options.keepAliveMs,
+			},
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: child.session }),
+				deleteRlmSubagentRuntime: async () => {},
+			},
+		});
+		harnesses.push(parent);
+		return parent;
+	}
+
+	it("holds the timer continuation while a subagent runs and resumes it at settlement", async () => {
+		const parent = await createGatedChildParent({});
+		parent.setResponses([
+			fauxAssistantMessage("delegated to the child; waiting"),
+			fauxAssistantMessage("read the child exit notice"),
+			fauxAssistantMessage("parent resumed and continued"),
+		]);
+
+		await parent.session.runRlmChild("child task", { name: "worker" });
+		await expect.poll(() => parent.session.hasRunningRlmChildren()).toBe(true);
+
+		await parent.session.prompt("kick off");
+
+		// Held while the child runs: no continuation turn, budget untouched.
+		expect(getUserTexts(parent)).toEqual(["kick off"]);
+		expect(parent.session.getAutonomousStatus()).toMatchObject({ continuationsUsed: 0 });
+
+		childGate!.resolve();
+
+		// The exit notice delivers first; the owed continuation wakes the idle
+		// parent and is counted once.
+		await expect
+			.poll(() => getAssistantTexts(parent))
+			.toEqual(["delegated to the child; waiting", "read the child exit notice", "parent resumed and continued"]);
+		expect(getUserTexts(parent)).toEqual(["kick off", expect.stringContaining("[autonomous-continuation]")]);
+		expect(parent.session.getAutonomousStatus()).toMatchObject({ continuationsUsed: 1 });
+		expect(parent.session.hasRunningRlmChildren()).toBe(false);
+	});
+
+	it("fires one keep-alive continuation while a subagent stays active past the window", async () => {
+		const parent = await createGatedChildParent({ keepAliveMs: 25, maxContinuations: 2 });
+		parent.setResponses([
+			fauxAssistantMessage("delegated to the child; waiting"),
+			fauxAssistantMessage("checked on the still-running child"),
+		]);
+
+		await parent.session.runRlmChild("child task", { name: "worker" });
+		await expect.poll(() => parent.session.hasRunningRlmChildren()).toBe(true);
+
+		await parent.session.prompt("kick off");
+		expect(getUserTexts(parent)).toEqual(["kick off"]);
+		expect(parent.session.getAutonomousStatus()).toMatchObject({ continuationsUsed: 0 });
+
+		await expect
+			.poll(() => getAssistantTexts(parent), { timeout: 5_000 })
+			.toEqual(["delegated to the child; waiting", "checked on the still-running child"]);
+
+		const userTexts = getUserTexts(parent);
+		expect(userTexts[1]).toContain("[autonomous-continuation: subagent-keep-alive]");
+		expect(parent.session.getAutonomousStatus()).toMatchObject({ continuationsUsed: 1 });
+		expect(parent.session.hasRunningRlmChildren()).toBe(true);
+	});
+});

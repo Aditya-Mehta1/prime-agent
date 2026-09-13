@@ -85,8 +85,11 @@ import {
 	type AutonomousRuntimeState,
 	addAutonomousContinuation,
 	addAutonomousUsage,
+	autonomousLimitReason,
 	autonomousStatus,
+	createAutonomousContinuationMessage,
 	createAutonomousRuntimeState,
+	createAutonomousSubagentKeepAliveMessage,
 	isUnlimitedAutonomousLimit,
 	nextAutonomousContinuation,
 	refreshAutonomousQualityGates,
@@ -1041,7 +1044,7 @@ function parseGoalBudgetValue(value: string): number {
 const AUTONOMOUS_STATUS_NUMBER_FORMAT = new Intl.NumberFormat("en-US");
 
 const AUTONOMOUS_BUDGET_USAGE =
-	"Usage: /autonomous [status|off] or /autonomous on [--max-continuations <n|unlimited>] [--max-turns <n|unlimited>] [--max-tokens <n|unlimited>] [--timeout-ms <n|unlimited>] [--gate <command>] [--gate-retries <n>] [--gate-timeout-ms <n>]";
+	"Usage: /autonomous [status|off] or /autonomous on [--max-continuations <n|unlimited>] [--max-turns <n|unlimited>] [--max-tokens <n|unlimited>] [--timeout-ms <n|unlimited>] [--gate <command>] [--gate-retries <n>] [--gate-timeout-ms <n>] [--subagent-keep-alive-ms <n>]";
 
 // `/autonomous` budget flags mirror the `--autonomous-*` CLI options. The CLI
 // spelling (`--autonomous-max-continuations`) is accepted as an alias so the
@@ -1054,7 +1057,17 @@ const AUTONOMOUS_BUDGET_FLAGS: ReadonlySet<string> = new Set([
 	"gate",
 	"gate-retries",
 	"gate-timeout-ms",
+	"subagent-keep-alive-ms",
 ]);
+
+/** Keep-alive windows accept 0 (disable the valve) or a positive integer. */
+function parseSubagentKeepAliveMs(value: string): number {
+	const digits = value.replace(/[,_]/g, "");
+	if (digits === "0" || /^[1-9]\d*$/.test(digits)) {
+		return Number(digits);
+	}
+	throw new Error(`--subagent-keep-alive-ms must be 0 or a positive integer. ${AUTONOMOUS_BUDGET_USAGE}`);
+}
 
 function parseAutonomousBudgetInt(flag: string, value: string, allowUnlimited = false): number {
 	if (allowUnlimited && value.toLowerCase() === "unlimited") {
@@ -1120,6 +1133,9 @@ function parseAutonomousBudgetOptions(tokens: string[]): AgentAutonomousConfig {
 				break;
 			case "timeout-ms":
 				config.timeoutMs = parseAutonomousBudgetInt(flag, value, true);
+				break;
+			case "subagent-keep-alive-ms":
+				config.subagentKeepAliveMs = parseSubagentKeepAliveMs(value);
 				break;
 		}
 	}
@@ -1276,6 +1292,12 @@ export class AgentSession {
 	private _autonomousState: AutonomousRuntimeState;
 	private _autonomousContinuationSuppressionDepth = 0;
 	private _autonomousContinuationSuppressedMessages = new WeakSet<AgentMessage>();
+	// Held autonomous continuation owed while descendant work runs; mirrors
+	// _goalContinuationAwaitsRlmWork. Child replies and exit notices are the
+	// real wake-up signals, so timer-driven continuations pause instead of
+	// re-prompting a waiting parent (and pause without consuming budget).
+	private _autonomousContinuationAwaitsRlmWork = false;
+	private _autonomousSubagentKeepAliveTimer: ReturnType<typeof setTimeout> | undefined = undefined;
 
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
@@ -2231,7 +2253,12 @@ export class AgentSession {
 		const timeBudget = isUnlimitedAutonomousLimit(status.limits.timeoutMs)
 			? "unlimited"
 			: `${AUTONOMOUS_STATUS_NUMBER_FORMAT.format(Math.round(status.limits.timeoutMs / 1000))}s`;
-		return `[autonomous-status: ${state}]\n\nContinuations: ${formatCount(status.continuationsUsed)}/${formatCount(status.limits.maxContinuations)}. Turns: ${formatCount(status.turnsUsed)}/${formatCount(status.limits.maxTurns)}. Tokens: ${formatCount(status.tokensUsed)}/${formatCount(status.limits.maxTokens)}. Time: ${elapsedSeconds}s/${timeBudget}. Gates: ${gateSummary}.`;
+		const subagentKeepAliveMs = status.subagentKeepAliveMs ?? 0;
+		const keepAlive =
+			subagentKeepAliveMs > 0
+				? `${AUTONOMOUS_STATUS_NUMBER_FORMAT.format(Math.round(subagentKeepAliveMs / 60_000))}m`
+				: "off";
+		return `[autonomous-status: ${state}]\n\nContinuations: ${formatCount(status.continuationsUsed)}/${formatCount(status.limits.maxContinuations)}. Turns: ${formatCount(status.turnsUsed)}/${formatCount(status.limits.maxTurns)}. Tokens: ${formatCount(status.tokensUsed)}/${formatCount(status.limits.maxTokens)}. Time: ${elapsedSeconds}s/${timeBudget}. Gates: ${gateSummary}. Subagent keep-alive: ${keepAlive}.`;
 	}
 
 	private _emitAutonomousStatus(): void {
@@ -2265,6 +2292,7 @@ export class AgentSession {
 		} else if (command.kind === "off") {
 			setAutonomousEnabled(this._autonomousState, false);
 			this._clearQueuedAutonomousContinuations();
+			this._clearAutonomousContinuationAwait();
 		}
 		this._emitAutonomousStatus();
 		return true;
@@ -2359,6 +2387,138 @@ export class AgentSession {
 		} catch {
 			// Admission can race a new pause; roll back so the retry re-counts.
 			this._setGoalState(goalBeforeResume);
+		}
+	}
+
+	/**
+	 * Hold the timer-driven autonomous continuation while descendant work is
+	 * unsettled, mirroring the goal gate: delegating and ending the turn is
+	 * correct behavior, and child replies and exit notices are the real
+	 * wake-up signals. The owed continuation is delivered when descendants
+	 * settle without consuming the continuation budget while it waits. An
+	 * active goal holds its own continuation, so the held continuation is
+	 * not double-queued behind it.
+	 */
+	private _holdAutonomousContinuationForRlmWork(message: AssistantMessage): boolean {
+		if (!this._autonomousState.enabled) {
+			return false;
+		}
+		if (message.stopReason === "error" || message.stopReason === "aborted") {
+			return false;
+		}
+		if (!this._hasUnsettledRlmQuiescenceWork()) {
+			return false;
+		}
+		// An active goal's own continuation gate owns the wake-up discipline;
+		// hold this continuation without queueing a second one behind it.
+		if (this._goalState.status === "active" && this._goalState.objective) {
+			return true;
+		}
+		this._autonomousContinuationAwaitsRlmWork = true;
+		this._armAutonomousSubagentKeepAlive();
+		return true;
+	}
+
+	/** Deliver the owed continuation once descendant work settles. */
+	private _maybeResumeAutonomousContinuationAfterRlmWork(): void {
+		if (!this._autonomousContinuationAwaitsRlmWork) return;
+		if (this._disposed || this._disposing || this._hasUnsettledRlmQuiescenceWork()) return;
+		if (!this._autonomousState.enabled) {
+			this._clearAutonomousContinuationAwait();
+			return;
+		}
+		// Keep the deferral while admission is paused or the pump is suspended
+		// (post-abort); the pause release and resumeQueuedWork retry.
+		if (this._sessionInputAdmissionPauses.size > 0 || this._sessionInputPumpSuspended) return;
+		this._deliverOwedAutonomousContinuation({ keepAlive: false });
+	}
+
+	/**
+	 * Deliver an owed autonomous continuation, counting it at delivery like a
+	 * goal continuation. Returns false when admission raced a pause so callers
+	 * that own a retry window can re-arm it.
+	 */
+	private _deliverOwedAutonomousContinuation(options: { keepAlive: boolean }): boolean {
+		if (autonomousLimitReason(this._autonomousState)) {
+			// The run is over; no continuation is owed anymore.
+			this._clearAutonomousContinuationAwait();
+			return true;
+		}
+		const snapshot = this._snapshotAutonomousRuntimeState();
+		try {
+			const message = options.keepAlive
+				? createAutonomousSubagentKeepAliveMessage(this._autonomousState)
+				: createAutonomousContinuationMessage(this._autonomousState);
+			addAutonomousContinuation(this._autonomousState);
+			const normalized = normalizeMessageContent(message.content);
+			// No front: a settling child's terminal notice must be read first.
+			this._admitSessionInput(
+				this._createPreparedTurnAction("followUp", normalized.text, normalized.images, {
+					message,
+					resumeIfIdle: true,
+				}),
+			);
+			this._clearAutonomousContinuationAwait();
+			return true;
+		} catch {
+			// Admission can race a new pause; roll back so the retry re-counts.
+			this._restoreAutonomousRuntimeSnapshot(snapshot);
+			return false;
+		}
+	}
+
+	/** One keep-alive continuation per window of continuous subagent activity. */
+	private _armAutonomousSubagentKeepAlive(): void {
+		if (this._autonomousSubagentKeepAliveTimer !== undefined) return;
+		const keepAliveMs = this._autonomousState.subagentKeepAliveMs;
+		if (!keepAliveMs || keepAliveMs <= 0) return;
+		const timer = setTimeout(() => {
+			this._autonomousSubagentKeepAliveTimer = undefined;
+			this._fireAutonomousSubagentKeepAlive();
+		}, keepAliveMs);
+		// A pending keep-alive must not hold the event loop open on its own.
+		timer.unref();
+		this._autonomousSubagentKeepAliveTimer = timer;
+	}
+
+	private _disarmAutonomousSubagentKeepAlive(): void {
+		if (this._autonomousSubagentKeepAliveTimer === undefined) return;
+		clearTimeout(this._autonomousSubagentKeepAliveTimer);
+		this._autonomousSubagentKeepAliveTimer = undefined;
+	}
+
+	private _clearAutonomousContinuationAwait(): void {
+		this._autonomousContinuationAwaitsRlmWork = false;
+		this._disarmAutonomousSubagentKeepAlive();
+	}
+
+	/**
+	 * Safety valve for hung children: while subagents stay active past the
+	 * keep-alive window, wake the parent so it can inspect and unblock them
+	 * (a stopped SIGTTIN child never delivers its exit notice).
+	 */
+	private _fireAutonomousSubagentKeepAlive(): void {
+		if (!this._autonomousContinuationAwaitsRlmWork) return;
+		if (this._disposed || this._disposing) return;
+		if (!this._hasUnsettledRlmQuiescenceWork()) {
+			// Descendants settled while the keep-alive was pending; the normal
+			// resume path owns delivery.
+			this._maybeResumeAutonomousContinuationAfterRlmWork();
+			return;
+		}
+		if (!this._autonomousState.enabled) {
+			this._clearAutonomousContinuationAwait();
+			return;
+		}
+		// Keep the deferral while admission is paused or the pump is suspended
+		// (post-abort); the pause release and resumeQueuedWork retry.
+		if (this._sessionInputAdmissionPauses.size > 0 || this._sessionInputPumpSuspended) {
+			this._armAutonomousSubagentKeepAlive();
+			return;
+		}
+		if (!this._deliverOwedAutonomousContinuation({ keepAlive: true })) {
+			// Admission raced a pause; retry after another window.
+			this._armAutonomousSubagentKeepAlive();
 		}
 	}
 
@@ -3048,6 +3208,11 @@ export class AgentSession {
 		if (queuedMessage && this._postCompactionContinuationMessages.includes(queuedMessage)) {
 			return queuedMessage;
 		}
+		// Hold the post-compaction continuation while descendants are unsettled;
+		// the owed continuation is delivered when they settle.
+		if (this._holdAutonomousContinuationForRlmWork(message)) {
+			return undefined;
+		}
 		const snapshot = this._snapshotAutonomousRuntimeState();
 		const arrivalEpoch = this._sessionInputArrivalEpoch;
 		const autonomousMessage = await nextAutonomousContinuation(this._autonomousState, message, {
@@ -3600,6 +3765,12 @@ export class AgentSession {
 			this._autonomousContinuationSuppressionDepth > 0 ||
 			context.newMessages.some((message) => this._autonomousContinuationSuppressedMessages.has(message))
 		) {
+			return [];
+		}
+		// Delegating and ending the turn is correct behavior; hold the
+		// continuation until descendants settle instead of re-prompting a
+		// waiting parent, mirroring the goal gate above.
+		if (this._holdAutonomousContinuationForRlmWork(context.message)) {
 			return [];
 		}
 		const autonomousSnapshot = this._snapshotAutonomousRuntimeState();
@@ -4364,6 +4535,7 @@ export class AgentSession {
 				clearTimeout(timer);
 			}
 			this._scheduledAutoRefineTimers.clear();
+			this._disarmAutonomousSubagentKeepAlive();
 			this._serializedPlanInFlight = undefined;
 			this._serializedExplicitRefineOptions = undefined;
 			this._pendingRequestedRefine = undefined;
@@ -7053,6 +7225,7 @@ export class AgentSession {
 				this._notifySessionInputCheckpointChange();
 				this._flushDeferredRlmTerminalNotices();
 				this._maybeResumeGoalContinuationAfterRlmWork();
+				this._maybeResumeAutonomousContinuationAfterRlmWork();
 				this._scheduleSessionInputPump();
 			},
 		};
@@ -7170,6 +7343,7 @@ export class AgentSession {
 	resumeQueuedWork(): boolean {
 		this._resumeSessionInputAdmission();
 		this._maybeResumeGoalContinuationAfterRlmWork();
+		this._maybeResumeAutonomousContinuationAfterRlmWork();
 		this._scheduleSessionInputPump();
 		return this._hasSelectableSessionInput();
 	}
@@ -10125,6 +10299,7 @@ export class AgentSession {
 		this._unsettledRlmChildRuns.delete(run);
 		run.settlement.resolve();
 		this._maybeResumeGoalContinuationAfterRlmWork();
+		this._maybeResumeAutonomousContinuationAfterRlmWork();
 	}
 
 	private _cancelActiveRlmChildRuns(reason: string): void {
@@ -10454,6 +10629,7 @@ export class AgentSession {
 		run.deletionReservation.resolve();
 		this._unsettledRlmChildRuns.delete(run);
 		this._maybeResumeGoalContinuationAfterRlmWork();
+		this._maybeResumeAutonomousContinuationAfterRlmWork();
 	}
 
 	private _observeRlmRunDeletionCleanup(
@@ -11432,6 +11608,7 @@ export class AgentSession {
 					run.settlement.resolve();
 					this._unsettledRlmChildRuns.delete(run);
 					this._maybeResumeGoalContinuationAfterRlmWork();
+					this._maybeResumeAutonomousContinuationAfterRlmWork();
 				}
 			}
 		})().catch(() => undefined);
