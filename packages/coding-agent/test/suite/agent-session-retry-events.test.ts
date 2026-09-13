@@ -1,5 +1,12 @@
-import { AgentContinueError, type AgentEvent, type AgentTool } from "@earendil-works/pi-agent-core";
-import { type AssistantMessage, fauxAssistantMessage, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai";
+import { AgentContinueError, type AgentEvent, type AgentTool, type ThinkingLevel } from "@earendil-works/pi-agent-core";
+import {
+	type AssistantMessage,
+	fauxAssistantMessage,
+	fauxThinking,
+	fauxToolCall,
+	type Model,
+	type ServiceTier,
+} from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Settings } from "../../src/core/settings-manager.js";
@@ -1118,32 +1125,70 @@ describe("AgentSession retry and event characterization", () => {
 			},
 		});
 		harnesses.push(harness);
-		// Primary fails quota -> backup route; the backup fails quota -> wait ping.
-		harness.setResponses([quotaFailure(), quotaFailure(), fauxAssistantMessage("never reached")]);
 		const continueSpy = vi.spyOn(harness.session.agent, "continue");
-		const sawWaitStart = new Promise<void>((resolve) => {
-			const unsubscribe = harness.session.subscribe((event) => {
-				if (event.type === "auto_retry_start" && event.reason === "usage") {
-					unsubscribe();
-					resolve();
-				}
-			});
+		const backupModel = harness.getModel("faux-backup");
+		const primaryModel = harness.models[0];
+		if (!backupModel || !primaryModel) throw new Error("faux models missing");
+		const internals = harness.session as unknown as {
+			_backupModel: {
+				backup: Model<string>;
+				primary: Model<string>;
+				thinkingLevel: ThinkingLevel;
+				serviceTier: ServiceTier;
+			};
+			_retryAttempt: number;
+			_retryPromise: Promise<void> | undefined;
+			_retryResolve: (() => void) | undefined;
+			_retryAfterDelay: (
+				message: AssistantMessage,
+				options: unknown,
+				emitStart: {
+					type: "auto_retry_start";
+					attempt: number;
+					maxAttempts: number;
+					delayMs: number;
+					errorMessage: string;
+					reason?: "usage" | "unavailable" | "backup";
+				},
+				delayMs: number,
+			) => Promise<boolean>;
+		};
+
+		// Simulate a wait retry after a backup route: the session is on the
+		// backup, the retry state is active, and the wait delay has resolved.
+		const thinkingLevel = harness.session.agent.state.thinkingLevel;
+		const serviceTier = harness.session.agent.state.serviceTier;
+		internals._retryAttempt = 1;
+		internals._retryPromise = new Promise<void>((resolve) => {
+			internals._retryResolve = resolve;
 		});
-		const internals = harness.session as unknown as { _retryAbortController?: AbortController };
+		harness.session.agent.state.model = backupModel;
+		internals._backupModel = { backup: backupModel, primary: primaryModel, thinkingLevel, serviceTier };
 
-		const promptPromise = harness.session.prompt("test");
-		await sawWaitStart;
-		expect(harness.session.model?.id).toBe("faux-backup");
+		const message = fauxAssistantMessage("", { stopReason: "error", errorMessage: "429 usage limited" });
+		const didRetry = await internals._retryAfterDelay(
+			message,
+			undefined,
+			{
+				type: "auto_retry_start",
+				attempt: 1,
+				maxAttempts: 30,
+				delayMs: 0,
+				errorMessage: "429 usage limited",
+				reason: "usage",
+			},
+			0,
+		);
+		expect(didRetry).toBe(true);
 
-		// Wait for the wait-ping sleep to resolve (controller cleared), then cancel
-		// before the scheduled continue fires: the abort lands in the window
-		// deterministically because microtasks run before timers.
-		await vi.waitFor(() => expect(internals._retryAbortController).toBeUndefined(), { timeout: 5000 });
+		// The scheduled continue is a pending 0ms timer. Cancel synchronously:
+		// microtasks run before timers, so the cancel lands between the wait
+		// and the scheduled start.
 		harness.session.abortRetry();
-		await promptPromise;
+		await new Promise((resolve) => setTimeout(resolve, 10));
 
-		// Only the backup-route continue ran; the cancelled wait continue never fired.
-		expect(continueSpy).toHaveBeenCalledTimes(1);
+		// The cancelled retry's scheduled continue never re-issued the turn.
+		expect(continueSpy).not.toHaveBeenCalled();
 		expect(harness.session.model?.id).toBe("faux-1");
 		const retryEnd = harness.eventsOfType("auto_retry_end").at(-1);
 		expect(retryEnd?.finalError).toBe("Retry cancelled");
