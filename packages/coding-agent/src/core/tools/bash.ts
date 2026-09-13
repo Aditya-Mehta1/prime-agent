@@ -179,7 +179,7 @@ const MAX_DIRTY_PATHS_LISTED = 10;
 const GIT_GLOBAL_OPTIONS = "(?:-{1,2}[^\\s;&|]+(?:\\s+(?:\"[^\"]*\"|'[^']*'|[^\\s;&|]+))?\\s+)*";
 
 const DISCARD_CHECKOUT_PATTERN = new RegExp(
-	`\\bgit\\s+${GIT_GLOBAL_OPTIONS}checkout\\s+(?:(?:(?:-[fm]|--ours|--theirs|--conflict=\\S+)\\s+)*(?:--\\s+)?(?:\\.\\/?|:\\/)|HEAD\\s+--\\s+(?:\\.\\/?|:\\/))(?=\\s|$|[;&|)])`,
+	`\\bgit\\s+${GIT_GLOBAL_OPTIONS}checkout\\s+(?:(?:(?:-[fm]|--ours|--theirs|--conflict=\\S+)\\s+)*(?:--\\s+)?(?:\\.\\/?|:\\/)|[^\\s;&|()]+\\s+(?:--\\s+)?(?:\\.\\/?|:\\/))(?=\\s|$|[;&|)])`,
 	"g",
 );
 const DISCARD_RESTORE_PATTERN = new RegExp(
@@ -210,12 +210,40 @@ function isForcedCleanSegment(args: string): boolean {
  * Find every destructive git discard command in `command`, returning the
  * character index where each `git` token starts (empty when none match).
  */
+/**
+ * Replace characters inside single- or double-quoted spans with spaces so the
+ * discard matcher cannot match quoted data (for example `echo 'git reset --hard'`).
+ * Character positions stay identical to the original string, so match indices
+ * remain valid. Command substitution (`$(...)`, backticks) is left live because
+ * it executes.
+ */
+function maskQuotedSpans(command: string): string {
+	const chars = command.split("");
+	let quote: '"' | "'" | null = null;
+	for (let i = 0; i < chars.length; i++) {
+		const ch = chars[i];
+		if (quote === null) {
+			if (ch === '"' || ch === "'") quote = ch;
+		} else if (ch === "\\" && quote === '"') {
+			chars[i] = " ";
+			if (i + 1 < chars.length) chars[i + 1] = " ";
+			i++;
+		} else if (ch === quote) {
+			quote = null;
+		} else {
+			chars[i] = " ";
+		}
+	}
+	return chars.join("");
+}
+
 export function findDestructiveGitDiscardCommands(command: string): number[] {
+	const masked = maskQuotedSpans(command);
 	const indices: number[] = [];
 	for (const pattern of [DISCARD_CHECKOUT_PATTERN, DISCARD_RESTORE_PATTERN, DISCARD_RESET_PATTERN]) {
-		for (const match of command.matchAll(pattern)) indices.push(match.index);
+		for (const match of masked.matchAll(pattern)) indices.push(match.index);
 	}
-	for (const match of command.matchAll(DISCARD_CLEAN_PATTERN)) {
+	for (const match of masked.matchAll(DISCARD_CLEAN_PATTERN)) {
 		if (isForcedCleanSegment(match[1])) indices.push(match.index);
 	}
 	return indices.sort((a, b) => a - b);
@@ -362,6 +390,7 @@ async function probeUncommittedChanges(
 	cwd: string,
 	env: NodeJS.ProcessEnv,
 	signal: AbortSignal | undefined,
+	timeout: number | undefined,
 ): Promise<string[] | null> {
 	let output = "";
 	try {
@@ -370,6 +399,7 @@ async function probeUncommittedChanges(
 				output += data.toString("utf8");
 			},
 			signal,
+			timeout,
 			env,
 		});
 		if (result.exitCode !== 0) return null;
@@ -601,6 +631,7 @@ export function createBashToolDefinition(
 						probe.context.cwd,
 						probe.context.env,
 						signal,
+						timeout,
 					);
 					if (dirtyPaths && dirtyPaths.length > 0) {
 						throw new Error(formatDirtyTreeRefusal(dirtyPaths, probe.includesIgnoredFiles));

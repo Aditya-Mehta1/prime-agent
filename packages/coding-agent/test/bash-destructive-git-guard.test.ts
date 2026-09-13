@@ -67,6 +67,9 @@ describe("isDestructiveGitDiscardCommand", () => {
 		"git checkout --theirs -- .",
 		"git checkout -m .",
 		"git checkout --conflict=diff3 .",
+		"git checkout HEAD .",
+		"git checkout HEAD~1 -- .",
+		"git checkout origin/main .",
 		"git clean -f -- -n",
 	])("matches %s", (command) => {
 		expect(isDestructiveGitDiscardCommand(command)).toBe(true);
@@ -78,7 +81,11 @@ describe("isDestructiveGitDiscardCommand", () => {
 		"git checkout -b new-branch",
 		"git checkout main",
 		"git checkout -m main",
+		"git checkout -b newbranch .",
 		"git checkout -- single-file.txt",
+		"echo 'git reset --hard'",
+		'git commit -m "git reset --hard"',
+		'echo "git clean -fd"',
 		"git checkout ./nested",
 		"git restore --staged .",
 		"git restore --staged :/",
@@ -602,6 +609,32 @@ describe("bash tool destructive-git dirty-tree guard", () => {
 		await bash.execute("guard-hook-cwd", { command: "git checkout -- ." });
 
 		expect(calls.map((call) => call.cwd)).toEqual([`${testDir}/remapped`, `${testDir}/remapped`]);
+	});
+
+	it("executes harmless commands that merely quote a discard command", async () => {
+		initDirtyGitRepo(testDir);
+		const bash = createBashTool(testDir);
+
+		const result = await bash.execute("guard-quoted-echo", { command: "echo 'git reset --hard'" });
+		expect((result.content?.[0] as { text?: string } | undefined)?.text).toContain("git reset --hard");
+		expect(readModifiedTracked()).toBe("modified\n");
+	});
+
+	it("passes the tool timeout to the probe and fails open on probe timeouts", async () => {
+		const calls: Array<{ command: string; timeout?: number }> = [];
+		const operations: BashOperations = {
+			exec: async (command, _cwd, options) => {
+				calls.push({ command, timeout: options.timeout });
+				if (command.startsWith("git status")) throw new Error("timeout:5");
+				return { exitCode: 0 };
+			},
+		};
+		const bash = createBashTool(testDir, { operations });
+
+		const result = await bash.execute("guard-probe-timeout", { command: "git checkout -- .", timeout: 5 });
+
+		expect(result).toBeDefined();
+		expect(calls[0]).toEqual({ command: "git status --porcelain --untracked-files=all", timeout: 5 });
 	});
 
 	it("propagates aborts raised while probing", async () => {
