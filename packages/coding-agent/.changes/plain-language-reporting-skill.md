@@ -1,0 +1,1 @@
+- Added a built-in `plain` skill that restates the agent's last reply in plain human language on demand: no jargon, no commit hashes, human units like 6 hours instead of 21600 seconds, and none of the AI writing habits. Invoke it with `/skill:plain`, or just ask for a plain-language version of the last reply.

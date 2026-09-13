@@ -245,6 +245,15 @@ describe("builtin skills", () => {
 			expect(compact?.kind === "python" && compact.python.importName).toBe("compact");
 		});
 
+		it("loads the bundled plain skill as a markdown skill", () => {
+			const { skills } = loadSkillsFromDir({ dir: getBundledSkillsDir(), source: "builtin" });
+
+			const plain = skills.find((s) => s.name === "plain");
+			expect(plain).toBeDefined();
+			expect(plain?.kind).toBe("markdown");
+			expect(plain?.disableModelInvocation).toBe(false);
+		});
+
 		it("loads the bundled RLM heartbeat skill as a python skill", () => {
 			const { skills } = loadSkillsFromDir({ dir: getBundledSkillsDir(), source: "builtin" });
 
