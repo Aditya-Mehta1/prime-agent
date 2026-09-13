@@ -482,13 +482,19 @@ function harnessEntryLabel(entry: HarnessEntry): string {
 	return entry.provenance?.origin === "package" ? `package:${entry.id}` : `${entry.scope ?? "global"}:${entry.id}`;
 }
 
+/** Version digits are bounded so package-controlled values cannot bloat the digest. */
+function harnessVersionText(version: number): string {
+	const rendered = String(version);
+	return rendered.length > 12 ? rendered.slice(0, 12) : rendered;
+}
+
 /** Prompt-visible provenance for package overlays; renders no local filesystem paths. */
 function packageProvenanceText(entry: HarnessEntry, maxLength: number): string {
 	const provenance = entry.provenance;
 	if (provenance?.origin !== "package") {
 		return "";
 	}
-	const revision = provenance.revision ? ` rev=${provenance.revision}` : "";
+	const revision = provenance.revision ? ` rev=${compactText(provenance.revision, maxLength)}` : "";
 	return ` [read-only package; scope=${provenance.scope}; source=${compactText(provenance.source, maxLength)}${revision}; file=${compactText(provenance.file, maxLength)}]`;
 }
 
@@ -574,7 +580,10 @@ export function formatHarnessStateForPrompt(
 					? ` ref=${compactText(JSON.stringify(entry.reference), maxContentLength)}`
 					: "";
 			lines.push(
-				`- [${harnessEntryLabel(entry)}] ${entry.title} (${entry.path}, v${entry.version})${referenceText}${argumentsText}${packageProvenanceText(entry, maxContentLength)}: ${compactText(
+				`- [${harnessEntryLabel(entry)}] ${compactText(entry.title, maxContentLength)} (${compactText(
+					entry.path,
+					maxContentLength,
+				)}, v${harnessVersionText(entry.version)})${referenceText}${argumentsText}${packageProvenanceText(entry, maxContentLength)}: ${compactText(
 					entry.content,
 					maxContentLength,
 				)}`,
@@ -621,7 +630,7 @@ function overviewForPrompt(state: HarnessState): string {
 					? ` ref=${JSON.stringify(entry.reference).slice(0, 240)}`
 					: "";
 			lines.push(
-				`- [${harnessEntryLabel(entry)}] ${entry.title} (${entry.path}, v${entry.version})${referenceText}${argumentsText}${packageProvenanceText(entry, 240)}: ${content}`,
+				`- [${harnessEntryLabel(entry)}] ${compactText(entry.title, 240)} (${compactText(entry.path, 240)}, v${harnessVersionText(entry.version)})${referenceText}${argumentsText}${packageProvenanceText(entry, 240)}: ${content}`,
 			);
 		}
 		if (entries.length > 40) {

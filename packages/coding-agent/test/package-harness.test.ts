@@ -407,6 +407,39 @@ describe("package harness overlays in harness state", () => {
 		expect(digest.indexOf("[local:session_policy]")).toBeLessThan(digest.indexOf("[package:team_policy]"));
 	});
 
+	it("bounds package-controlled title, path, version, and revision in the digest", { timeout: 10_000 }, () => {
+		const packageState = harnessState([
+			packageEntry("memory", "bloat", {
+				title: "x".repeat(500),
+				path: "y".repeat(500),
+				version: 123456789012345,
+				provenance: {
+					origin: "package",
+					source: "local:example-package",
+					scope: "project",
+					file: "harness/memory/bloat.json",
+					revision: "z".repeat(300),
+					readOnly: true,
+				},
+			}),
+		]);
+
+		const digest = formatHarnessStateForPrompt(
+			mergeHarnessStates(createEmptyPackageHarnessState(), undefined, packageState),
+			{
+				maxContentLength: 40,
+			},
+		);
+
+		// Every package-controlled field is compacted before interpolation.
+		expect(digest).toContain(`[package:bloat] ${"x".repeat(37)}... (${"y".repeat(37)}..., v123456789012)`);
+		expect(digest).toContain(`rev=${"z".repeat(37)}...`);
+		expect(digest).not.toContain("x".repeat(60));
+		expect(digest).not.toContain("y".repeat(60));
+		expect(digest).not.toContain("z".repeat(60));
+		expect(digest).not.toContain("123456789012345");
+	});
+
 	it("guard update and delete of package entries but allow same-id overrides", { timeout: 10_000 }, () => {
 		const editableState = harnessState();
 		const packageState = harnessState([packageEntry("memory", "team_policy")]);

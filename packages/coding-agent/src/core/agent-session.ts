@@ -8508,7 +8508,8 @@ export class AgentSession {
 		return mergeHarnessStates(
 			loadHarnessState(getGlobalHarnessStateDir(), "global"),
 			localHarnessStateDir ? loadHarnessState(localHarnessStateDir, "local") : undefined,
-			this._resourceLoader.getHarness?.().state,
+			// Optional interface: a loader may omit getHarness or return no result.
+			this._resourceLoader.getHarness?.()?.state,
 		);
 	}
 
@@ -8684,7 +8685,7 @@ export class AgentSession {
 		}
 		const globalPlanningState = loadHarnessState(globalHarnessStateDir, "global");
 		const localPlanningState = localHarnessStateDir ? loadHarnessState(localHarnessStateDir, "local") : undefined;
-		const packagePlanningState = this._resourceLoader.getHarness?.().state;
+		const packagePlanningState = this._resourceLoader.getHarness?.()?.state;
 		const planningState =
 			requestedScope === "global"
 				? mergeHarnessStates(globalPlanningState, undefined, packagePlanningState)
@@ -8850,7 +8851,7 @@ export class AgentSession {
 				rollbackOf: plan.rollbackOf,
 				scope: targetScope,
 				baselineState: plan.baselineState,
-				packageState: this._resourceLoader.getHarness?.().state,
+				packageState: this._resourceLoader.getHarness?.()?.state,
 			});
 			result.harnessStatePath = saveHarnessState(targetHarnessStateDir, state);
 			if (targetScope === "global") {
