@@ -11625,7 +11625,13 @@ export class AgentSession {
 		this._unsettledRlmChildRuns.add(run);
 		const emitChildUpdate = () => {
 			const child = this._rlmChildSnapshotForRun(run);
-			const serialized = JSON.stringify(child);
+			// Dedup compares observable child state, not clock-derived fields:
+			// lastActivityAt advances on every streamed token delta and
+			// activityStaleMs is recomputed on each snapshot build, so including
+			// either would re-emit on every delta once answerPreview saturates its
+			// cap. Emitted snapshots still carry both fields fresh.
+			const { lastActivityAt: _lastActivityAt, activityStaleMs: _activityStaleMs, ...stable } = child;
+			const serialized = JSON.stringify(stable);
 			if (serialized === run.lastEmittedUpdate) return;
 			run.lastEmittedUpdate = serialized;
 			this._emit({ type: "rlm_child_update", child });

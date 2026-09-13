@@ -341,6 +341,79 @@ describe("rlm.progress.note child progress channel", () => {
 		}
 	});
 
+	it("does not churn child updates on streaming deltas once the preview saturates", async () => {
+		const held = heldAnswerStream();
+		session = makeSession(held.streamFn);
+		const handle = await session.runRlmChild("slow task", { name: "worker-a" });
+		const runs = (session as unknown as InspectableRlmSession)._activeRlmChildRuns;
+		await waitFor(() => runs.get(handle.rlm_child_id)?.session !== undefined);
+		const run = runs.get(handle.rlm_child_id)!;
+		const child = run.session!;
+		const childUpdates: { preview?: string; activityKind?: string; activityToolName?: string }[] = [];
+		session.subscribe((event) => {
+			if (event.type === "rlm_child_update" && event.child.id === handle.rlm_child_id) {
+				childUpdates.push({
+					preview: event.child.answerPreview,
+					activityKind: event.child.activity?.kind,
+					activityToolName: event.child.activity?.toolName,
+				});
+			}
+		});
+		const emitChild = (event: unknown) => (child as unknown as { _emit: (event: unknown) => void })._emit(event);
+
+		try {
+			// The agent turn starts asynchronously; wait for its activity signal so
+			// no tracked event can race the injected streaming deltas.
+			await waitFor(() => run.activity !== undefined);
+			// Streaming past the 160-character preview cap: like real token
+			// deltas, appending text past the cap leaves the capped preview
+			// unchanged, so only lastActivityAt still moves.
+			const saturatedText = "saturation".repeat(40);
+			const baseline = childUpdates.length;
+			emitChild({ type: "message_update", message: assistantMessage(saturatedText) });
+			await waitFor(() => childUpdates.length > baseline);
+			expect(childUpdates.at(-1)?.preview).toHaveLength(160);
+
+			// Saturated deltas must not re-emit (regression: the advancing
+			// lastActivityAt used to defeat the snapshot dedup on every delta).
+			const saturated = childUpdates.length;
+			const lastActivityBefore = run.lastActivityAt;
+			for (let index = 0; index < 3; index += 1) {
+				await new Promise((resolve) => setTimeout(resolve, 2));
+				emitChild({
+					type: "message_update",
+					message: assistantMessage(`${saturatedText}${"x".repeat(index + 1)}`),
+				});
+			}
+			expect(childUpdates.length).toBe(saturated);
+
+			// Staleness semantics survive: streaming still counts as activity.
+			expect(run.lastActivityAt).toBeGreaterThan(lastActivityBefore ?? 0);
+			const streamedSnapshot = session
+				.getRlmChildSnapshots()
+				.find((candidate) => candidate.id === handle.rlm_child_id);
+			expect(streamedSnapshot?.activityStaleMs).toBeUndefined();
+
+			// Real activity still emits: a changed preview, then a tool call.
+			const changed = childUpdates.length;
+			emitChild({ type: "message_update", message: assistantMessage(`changed ${saturatedText}`) });
+			await waitFor(() => childUpdates.length > changed);
+			expect(childUpdates.at(-1)?.preview).toContain("changed");
+
+			const beforeTool = childUpdates.length;
+			emitChild({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "ipython", args: {} });
+			await waitFor(() => childUpdates.length > beforeTool);
+			expect(childUpdates.at(-1)?.activityKind).toBe("executing");
+			expect(childUpdates.at(-1)?.activityToolName).toBe("ipython");
+		} finally {
+			held.complete("child answer");
+			await waitFor(
+				() => session!.getRlmChildSnapshots().every((candidate) => candidate.status !== "running"),
+				20_000,
+			);
+		}
+	});
+
 	it("carries live extras for externally restored retained children", async () => {
 		session = makeSession();
 		const childId = "restored-child";
