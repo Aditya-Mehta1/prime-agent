@@ -1002,6 +1002,7 @@ export class AgentSession {
 		getExtensions: () => this._extensionRunner,
 		getThinkingLevel: () => this.thinkingLevel,
 		getRetryPolicy: () => providerRetryPolicy(this.settingsManager),
+		getSessionId: () => this.sessionId,
 		getHarnessDigest: () => this._harnessDigest(),
 		rebuildContext: () => {
 			this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
@@ -1200,6 +1201,7 @@ export class AgentSession {
 				sessionManager: this.sessionManager,
 				settingsManager: this.settingsManager,
 				getRetryPolicy: () => providerRetryPolicy(this.settingsManager),
+				getSessionId: () => this.sessionId,
 				isDisposed: () => this._disposed,
 				isDisposing: () => this._disposing,
 				isStreaming: () => this.isStreaming,
@@ -1432,6 +1434,7 @@ export class AgentSession {
 	private async _getRequiredRequestAuth(model: Model<any>): Promise<{
 		apiKey: string;
 		headers?: Record<string, string>;
+		requestModel: Model<Api>;
 	}> {
 		const result = await this._modelRegistry.getApiKeyAndHeaders(model);
 		if (!result.ok) {
@@ -1441,7 +1444,7 @@ export class AgentSession {
 			throw new Error(result.error);
 		}
 		if (result.apiKey) {
-			return { apiKey: result.apiKey, headers: result.headers };
+			return { apiKey: result.apiKey, headers: result.headers, requestModel: result.requestModel ?? model };
 		}
 
 		const isOAuth = this._modelRegistry.isUsingOAuth(model);
@@ -6295,6 +6298,19 @@ export class AgentSession {
 			: undefined;
 	}
 
+	refreshModelMetadata(): void {
+		if (this.model?.provider === "xai") {
+			this.agent.state.model = this._modelRegistry.getModelForCurrentAuth(this.model);
+			this.setThinkingLevel(this.thinkingLevel);
+			this._clampServiceTierForModel();
+		}
+		this._scopedModels = this._scopedModels.map((scoped) =>
+			scoped.model.provider === "xai"
+				? { ...scoped, model: this._modelRegistry.getModelForCurrentAuth(scoped.model) }
+				: scoped,
+		);
+	}
+
 	private _refreshCurrentModelFromRegistry(): void {
 		const currentModel = this.model;
 		if (!currentModel) {
@@ -8727,14 +8743,14 @@ export class AgentSession {
 			let summaryDetails: unknown;
 			let summaryUsage: Usage | undefined;
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
-				const model = this.model!;
-				const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+				const { apiKey, headers, requestModel: model } = await this._getRequiredRequestAuth(this.model!);
 				const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
 				const result = await generateBranchSummary(entriesToSummarize, {
 					model,
 					apiKey,
 					headers,
 					signal: this._branchSummaryAbortController.signal,
+					sessionId: this.sessionId,
 					customInstructions,
 					replaceInstructions,
 					reserveTokens: branchSummarySettings.reserveTokens,
