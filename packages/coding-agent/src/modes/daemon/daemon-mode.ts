@@ -4830,8 +4830,10 @@ export class AgentDaemon {
 
 			case "get_rlm_children": {
 				const state = this.getSessionState(command.activeSessionId);
+				// Match the attach/snapshot path: merge passivated children so command
+				// consumers see the same authoritative roster the snapshot advertises.
 				return success(command.id, "get_rlm_children", {
-					children: state.runtime.session.getRlmChildSnapshots(),
+					children: await this.buildRlmChildSnapshotsWithPassiveRlmSubagents(state),
 					eventSequence: state.lastEventSequence,
 				});
 			}
@@ -6333,10 +6335,24 @@ export class AgentDaemon {
 			// runs, in which case the draft is no longer abandoned and must be kept.
 			queueMicrotask(() => {
 				if (this.sessions.has(state.activeSessionId) && this.isDiscardableDraft(state)) {
-					void this.closeSession(state, "killed");
+					this.discardAbandonedDraft(state);
 				}
 			});
 		}
+	}
+
+	/** Best-effort discard of an abandoned empty draft: teardown failures are logged, never fatal. */
+	private discardAbandonedDraft(state: ActiveSessionState): void {
+		// closeSession rethrows teardown failures; an unobserved rejection here
+		// would reach the daemon's unhandledRejection handler and exit the
+		// process, killing every other hosted session with it.
+		void this.closeSession(state, "killed").catch((error) => {
+			this.log(
+				`failed to discard abandoned empty draft ${state.activeSessionId}: ${
+					error instanceof Error ? (error.stack ?? error.message) : String(error)
+				}`,
+			);
+		});
 	}
 
 	private isDiscardableDraft(state: ActiveSessionState): boolean {
@@ -6344,6 +6360,12 @@ export class AgentDaemon {
 			return false;
 		}
 		if (state.clients.size > 0) {
+			return false;
+		}
+		// An attach increments pendingAttaches before its client joins state.clients.
+		// Count both, like the eviction snapshot, so a discard can't race an
+		// in-flight attach and kill the draft it is about to claim.
+		if (state.pendingAttaches > 0) {
 			return false;
 		}
 		if (state.runtime.metadata.kind === "subagent") {
@@ -6901,7 +6923,7 @@ export class AgentDaemon {
 				(eventType === "turn_end" || eventType === "compaction_end" || eventType === "bash_end") &&
 				this.isDiscardableDraft(state)
 			) {
-				void this.closeSession(state, "killed");
+				this.discardAbandonedDraft(state);
 			}
 			if (RECOVERY_CHECKPOINT_EVENTS.has(eventType)) {
 				this.recordWorkerRecoveryState(state, eventType);
