@@ -7,6 +7,7 @@ import type { SessionCommitLease } from "../input/commit-fence.js";
 import { collectEntriesForBranchSummary, generateBranchSummary } from "./branch-summary.js";
 
 export interface HistoryNavigationHost {
+	getSessionId?(): string;
 	sessionManager: SessionManager;
 	settingsManager: Pick<SettingsManager, "getBranchSummarySettings">;
 	getRetryPolicy(): ProviderRetryPolicy;
@@ -198,7 +199,7 @@ export class SessionHistoryNavigation {
 				const branchSummarySettings = this.host.settingsManager.getBranchSummarySettings();
 				const result = await generateBranchSummary(entriesToSummarize, {
 					model: requestModel ?? model,
-					sessionId: this.host.sessionManager.getSessionId(),
+					sessionId: this.host.getSessionId?.(),
 					apiKey,
 					headers,
 					signal: this._branchSummaryAbortController.signal,
