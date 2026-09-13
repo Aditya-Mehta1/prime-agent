@@ -743,6 +743,7 @@ export class AgentSession {
 		});
 
 		this._history = new SessionHistoryNavigation({
+			getSessionId: () => this.sessionId,
 			getRetryPolicy: () => providerRetryPolicy(this.settingsManager),
 			sessionManager: this.sessionManager,
 			settingsManager: this.settingsManager,
