@@ -1,0 +1,254 @@
+{
+ "data": {
+  "repository": {
+   "pullRequests": {
+    "totalCount": 6,
+    "pageInfo": {
+     "hasNextPage": false,
+     "endCursor": null
+    },
+    "nodes": [
+     {
+      "number": 2101,
+      "title": "fix(coding-agent): keep restored transcripts visible when render steps fail (ENG-4742)",
+      "author": {
+       "login": "xeophon"
+      },
+      "createdAt": "2026-08-20T10:00:00Z",
+      "updatedAt": "2026-09-12T10:00:00Z",
+      "isDraft": false,
+      "additions": 157,
+      "deletions": 12,
+      "changedFiles": 3,
+      "mergeStateStatus": "DIRTY",
+      "reviewDecision": "REVIEW_REQUIRED",
+      "reviewThreads": {
+       "totalCount": 1,
+       "nodes": [
+        {
+         "isResolved": false,
+         "comments": {
+          "nodes": [
+           {
+            "author": {
+             "login": "chatgpt-codex-connector[bot]"
+            }
+           }
+          ]
+         }
+        }
+       ]
+      },
+      "reviews": {
+       "nodes": [
+        {
+         "author": {
+          "login": "cursor"
+         },
+         "state": "COMMENTED",
+         "submittedAt": "2026-09-11T09:00:00Z"
+        }
+       ]
+      }
+     },
+     {
+      "number": 2115,
+      "title": "fix(coding-agent): bound heartbeat listing and skip client-owned launches",
+      "author": {
+       "login": "sethkarten"
+      },
+      "createdAt": "2026-08-15T09:00:00Z",
+      "updatedAt": "2026-09-10T08:00:00Z",
+      "isDraft": false,
+      "additions": 38,
+      "deletions": 2,
+      "changedFiles": 3,
+      "mergeStateStatus": "CLEAN",
+      "reviewDecision": "REVIEW_REQUIRED",
+      "reviewThreads": {
+       "totalCount": 0,
+       "nodes": []
+      },
+      "reviews": {
+       "nodes": []
+      }
+     },
+     {
+      "number": 2120,
+      "title": "fix(coding-agent): kernel pipe write errors under load",
+      "author": {
+       "login": "snimu"
+      },
+      "createdAt": "2026-09-10T08:00:00Z",
+      "updatedAt": "2026-09-12T18:00:00Z",
+      "isDraft": false,
+      "additions": 210,
+      "deletions": 45,
+      "changedFiles": 5,
+      "mergeStateStatus": "CLEAN",
+      "reviewDecision": "REVIEW_REQUIRED",
+      "reviewThreads": {
+       "totalCount": 2,
+       "nodes": [
+        {
+         "isResolved": false,
+         "comments": {
+          "nodes": [
+           {
+            "author": {
+             "login": "cursor[bot]"
+            }
+           }
+          ]
+         }
+        },
+        {
+         "isResolved": false,
+         "comments": {
+          "nodes": [
+           {
+            "author": {
+             "login": "macroscopeapp"
+            }
+           }
+          ]
+         }
+        }
+       ]
+      },
+      "reviews": {
+       "nodes": [
+        {
+         "author": {
+          "login": "kevinjosethomas"
+         },
+         "state": "COMMENTED",
+         "submittedAt": "2026-09-11T08:00:00Z"
+        }
+       ]
+      }
+     },
+     {
+      "number": 2125,
+      "title": "[RSI] Relevance-ranked harness digest + harness.search query API",
+      "author": {
+       "login": "sethkarten"
+      },
+      "createdAt": "2026-09-12T06:00:00Z",
+      "updatedAt": "2026-09-13T09:00:00Z",
+      "isDraft": false,
+      "additions": 293,
+      "deletions": 12,
+      "changedFiles": 8,
+      "mergeStateStatus": "BLOCKED",
+      "reviewDecision": "REVIEW_REQUIRED",
+      "reviewThreads": {
+       "totalCount": 0,
+       "nodes": []
+      },
+      "reviews": {
+       "nodes": [
+        {
+         "author": {
+          "login": "cursor"
+         },
+         "state": "PENDING",
+         "submittedAt": null
+        }
+       ]
+      }
+     },
+     {
+      "number": 2130,
+      "title": "WIP: agents view search",
+      "author": {
+       "login": "alexzhang13"
+      },
+      "createdAt": "2026-09-09T00:00:00Z",
+      "updatedAt": "2026-09-09T00:00:00Z",
+      "isDraft": true,
+      "additions": 50,
+      "deletions": 5,
+      "changedFiles": 2,
+      "mergeStateStatus": "CLEAN",
+      "reviewDecision": "PENDING",
+      "reviewThreads": {
+       "totalCount": 0,
+       "nodes": []
+      },
+      "reviews": {
+       "nodes": []
+      }
+     },
+     {
+      "number": 2131,
+      "title": "fix(coding-agent): prevent heartbeat catalog timeouts",
+      "author": {
+       "login": "xeophon"
+      },
+      "createdAt": "2026-07-30T10:00:00Z",
+      "updatedAt": "2026-09-01T10:00:00Z",
+      "isDraft": false,
+      "additions": 465,
+      "deletions": 245,
+      "changedFiles": 11,
+      "mergeStateStatus": "DIRTY",
+      "reviewDecision": "CHANGES_REQUESTED",
+      "reviewThreads": {
+       "totalCount": 3,
+       "nodes": [
+        {
+         "isResolved": false,
+         "comments": {
+          "nodes": [
+           {
+            "author": {
+             "login": "cursor[bot]"
+            }
+           }
+          ]
+         }
+        },
+        {
+         "isResolved": false,
+         "comments": {
+          "nodes": [
+           {
+            "author": {
+             "login": "cursor"
+            }
+           }
+          ]
+         }
+        },
+        {
+         "isResolved": false,
+         "comments": {
+          "nodes": [
+           {
+            "author": {
+             "login": "chatgpt-codex-connector"
+            }
+           }
+          ]
+         }
+        }
+       ]
+      },
+      "reviews": {
+       "nodes": [
+        {
+         "author": {
+          "login": "kevinjosethomas"
+         },
+         "state": "CHANGES_REQUESTED",
+         "submittedAt": "2026-08-15T10:00:00Z"
+        }
+       ]
+      }
+     }
+    ]
+   }
+  }
+ }
+}

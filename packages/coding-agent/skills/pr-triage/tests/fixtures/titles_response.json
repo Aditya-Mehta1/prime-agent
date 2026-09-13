@@ -1,0 +1,155 @@
+{
+ "data": {
+  "repository": {
+   "pullRequests": {
+    "totalCount": 14,
+    "pageInfo": {
+     "hasNextPage": false,
+     "endCursor": null
+    },
+    "nodes": [
+     {
+      "number": 2140,
+      "title": "fix(coding-agent): prevent heartbeat catalog timeouts",
+      "author": {
+       "login": "xeophon"
+      },
+      "updatedAt": "2026-09-13T08:00:00Z",
+      "changedFiles": 4,
+      "isDraft": false
+     },
+     {
+      "number": 2141,
+      "title": "fix(coding-agent): flaky browser smoke test",
+      "author": {
+       "login": "contributor0"
+      },
+      "updatedAt": "2026-09-13T08:00:00Z",
+      "changedFiles": 3,
+      "isDraft": false
+     },
+     {
+      "number": 2142,
+      "title": "fix(coding-agent): provider retry backoff",
+      "author": {
+       "login": "contributor1"
+      },
+      "updatedAt": "2026-09-13T08:00:00Z",
+      "changedFiles": 3,
+      "isDraft": false
+     },
+     {
+      "number": 2143,
+      "title": "fix(coding-agent): settings import merge order",
+      "author": {
+       "login": "contributor2"
+      },
+      "updatedAt": "2026-09-13T08:00:00Z",
+      "changedFiles": 3,
+      "isDraft": false
+     },
+     {
+      "number": 2144,
+      "title": "fix(coding-agent): tui resize overflow",
+      "author": {
+       "login": "contributor0"
+      },
+      "updatedAt": "2026-09-13T08:00:00Z",
+      "changedFiles": 3,
+      "isDraft": false
+     },
+     {
+      "number": 2145,
+      "title": "fix(coding-agent): refine diff quoting",
+      "author": {
+       "login": "contributor1"
+      },
+      "updatedAt": "2026-09-13T08:00:00Z",
+      "changedFiles": 3,
+      "isDraft": false
+     },
+     {
+      "number": 2146,
+      "title": "fix(coding-agent): agents view spinner",
+      "author": {
+       "login": "contributor2"
+      },
+      "updatedAt": "2026-09-13T08:00:00Z",
+      "changedFiles": 3,
+      "isDraft": false
+     },
+     {
+      "number": 2147,
+      "title": "fix(coding-agent): kernel venv rebuild hint",
+      "author": {
+       "login": "contributor0"
+      },
+      "updatedAt": "2026-09-13T08:00:00Z",
+      "changedFiles": 3,
+      "isDraft": false
+     },
+     {
+      "number": 2148,
+      "title": "fix(coding-agent): bash handle kill ordering",
+      "author": {
+       "login": "contributor1"
+      },
+      "updatedAt": "2026-09-13T08:00:00Z",
+      "changedFiles": 3,
+      "isDraft": false
+     },
+     {
+      "number": 2149,
+      "title": "fix(coding-agent): compact summary budget",
+      "author": {
+       "login": "contributor2"
+      },
+      "updatedAt": "2026-09-13T08:00:00Z",
+      "changedFiles": 3,
+      "isDraft": false
+     },
+     {
+      "number": 2150,
+      "title": "fix(coding-agent): mcp catalog refresh",
+      "author": {
+       "login": "contributor0"
+      },
+      "updatedAt": "2026-09-13T08:00:00Z",
+      "changedFiles": 3,
+      "isDraft": false
+     },
+     {
+      "number": 2151,
+      "title": "fix(coding-agent): spawn ledger replay guard",
+      "author": {
+       "login": "contributor1"
+      },
+      "updatedAt": "2026-09-13T08:00:00Z",
+      "changedFiles": 3,
+      "isDraft": false
+     },
+     {
+      "number": 2152,
+      "title": "fix(coding-agent): session identity retention",
+      "author": {
+       "login": "contributor2"
+      },
+      "updatedAt": "2026-09-13T08:00:00Z",
+      "changedFiles": 3,
+      "isDraft": false
+     },
+     {
+      "number": 2160,
+      "title": "feat(tui): list heartbeats in agents view",
+      "author": {
+       "login": "snimu"
+      },
+      "updatedAt": "2026-09-13T08:00:00Z",
+      "changedFiles": 2,
+      "isDraft": false
+     }
+    ]
+   }
+  }
+ }
+}

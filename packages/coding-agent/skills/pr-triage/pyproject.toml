@@ -1,0 +1,16 @@
+[project]
+name = "prime-agent-skill-pr-triage"
+version = "0.1.0"
+description = "PR queue triage skill for Prime Agent (GitHub PR digest and duplicate pre-flight via gh)."
+requires-python = ">=3.10"
+dependencies = ["prime-agent-runtime"]
+
+[project.scripts]
+pr_triage = "rlm.skill:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pr_triage"]

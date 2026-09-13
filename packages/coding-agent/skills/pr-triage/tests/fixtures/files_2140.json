@@ -1,0 +1,30 @@
+[
+ {
+  "filename": "packages/agent/src/daemon-supervisor.ts",
+  "additions": 10,
+  "deletions": 2,
+  "changes": 12,
+  "status": "modified"
+ },
+ {
+  "filename": "packages/agent/test/daemon-supervisor.test.ts",
+  "additions": 10,
+  "deletions": 2,
+  "changes": 12,
+  "status": "modified"
+ },
+ {
+  "filename": "packages/agent/src/daemon-launch.ts",
+  "additions": 10,
+  "deletions": 2,
+  "changes": 12,
+  "status": "modified"
+ },
+ {
+  "filename": "packages/agent/src/agent-session.ts",
+  "additions": 10,
+  "deletions": 2,
+  "changes": 12,
+  "status": "modified"
+ }
+]

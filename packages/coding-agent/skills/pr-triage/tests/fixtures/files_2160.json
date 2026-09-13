@@ -1,0 +1,16 @@
+[
+ {
+  "filename": "packages/tui/src/views/agents-view.ts",
+  "additions": 10,
+  "deletions": 2,
+  "changes": 12,
+  "status": "modified"
+ },
+ {
+  "filename": "packages/tui/test/agents-view.test.ts",
+  "additions": 10,
+  "deletions": 2,
+  "changes": 12,
+  "status": "modified"
+ }
+]

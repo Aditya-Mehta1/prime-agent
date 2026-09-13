@@ -1,0 +1,2 @@
+- Added a built-in `pr-triage` skill: it ranks a repository's open pull-request queue via `gh` (counts by merge state and review decision, age percentiles, CLEAN-first review-ready list with per-PR unresolved bot-thread counts and READY verdicts) and pre-flights planned changes against open PRs for duplicate work via changed-file overlap and title similarity.
+- Added a `check:python-skills` step to `npm run check` that compiles every bundled Python skill and runs its fixture tests, so `packages/coding-agent/skills/*/tests` run in CI.

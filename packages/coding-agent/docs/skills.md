@@ -51,6 +51,7 @@ Prime Agent ships with built-in skills that load by default:
 - `prime-intellect` - Prime Intellect products and workflows via the prime CLI: verifiers environments and the Environments Hub, evaluations (local and hosted), Hosted Training and prime-rl, sandboxes, tunnels, Prime Inference, GPU compute, and storage. Reference docs for each area load on demand from the skill's `references/` directory.
 - `skill-creator` - teaches the agent to create new skills: markdown skill layout, frontmatter rules, placement and precedence, and the full Python-backed skill contract (package layout, `run()` convention, optional CLI, kernel venv behavior) with a working template in `references/python-skills.md`.
 - `websearch` - a Python-backed Google search skill using the [Serper](https://serper.dev) API.
+- `pr-triage` - a Python-backed pull-request triage skill: ranks a repository's open PR queue via the `gh` CLI and pre-flights planned work against open PRs for duplicate work.
 
 Built-in skills behave like any other skill but have the lowest precedence: a user, project, package, or `--skill` skill with the same name overrides the built-in one.
 
@@ -105,6 +106,49 @@ To disable all built-in skills, set `enableBuiltinSkills` to `false` in `setting
   "skills": ["-prime-intellect/SKILL.md"]
 }
 ```
+
+### pr-triage
+
+Setup: none beyond the authenticated [GitHub CLI](https://cli.github.com) (`gh`)
+— no API keys. Inside a git checkout the repository is inferred from the origin
+remote; elsewhere pass `repo="OWNER/NAME"`.
+
+Queue digest — which PRs are actually ready for a human review:
+
+```python
+digest = await pr_triage(repo="PrimeIntellect-ai/prime-agent")
+print(digest)
+```
+
+The digest counts the queue by merge state and review decision, reports age
+percentiles and per-author depth, and lists CLEAN pull requests oldest-first
+with per-PR unresolved bot-thread counts (Cursor, Macroscope, Codex) and a
+READY verdict. Options: `include_drafts=True`, `stale_days=14`, `limit=100`
+(queues larger than the limit note the cut-off), `max_output` truncation.
+
+Duplicate pre-flight — does an open PR already cover this work? Run it before
+starting work on a change and before opening a PR:
+
+```python
+report = await pr_triage.check_overlaps(
+    repo="PrimeIntellect-ai/prime-agent",
+    title="Fix heartbeat listing",
+    files=["packages/agent/src/daemon-supervisor.ts", "packages/agent/test/daemon-supervisor.test.ts"],
+)
+print(report)
+```
+
+Open PRs are shortlisted by document-frequency-weighted title similarity
+(boilerplate prefixes count for almost nothing; one shared rare topic word
+shortlists a PR), then their changed files are fetched; PRs sharing files with
+the candidate (Jaccard >= 0.3, or the PR already touches most candidate files)
+are flagged with links. Pass `deep=True` to file-check every open PR instead of
+only screened ones.
+
+Notes: thread counts cap at the 50 most recent threads per PR, the file
+pre-flight at 300 files per PR, and `gh` is invoked through `asyncio.to_thread`
+so the kernel stays responsive. Both functions return setup guidance instead
+of raising when `gh` is missing, and error text when a `gh` call fails.
 
 ### Using Skills from Other Harnesses
 
