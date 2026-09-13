@@ -70,6 +70,8 @@ describe("isDestructiveGitDiscardCommand", () => {
 		"git checkout HEAD .",
 		"git checkout HEAD~1 -- .",
 		"git checkout origin/main .",
+		"git checkout -f main",
+		"git checkout --force main",
 		"git clean -f -- -n",
 	])("matches %s", (command) => {
 		expect(isDestructiveGitDiscardCommand(command)).toBe(true);
@@ -676,6 +678,26 @@ describe("bash tool destructive-git dirty-tree guard", () => {
 
 		expect(result).toBeDefined();
 		expect(calls[0]).toEqual({ command: "git status --porcelain --untracked-files=all", timeout: 5 });
+	});
+
+	it("refuses forced branch checkouts on a dirty tree", async () => {
+		initDirtyGitRepo(testDir);
+		const bash = createBashTool(testDir);
+
+		await expect(bash.execute("guard-checkout-f-branch", { command: "git checkout -f main" })).rejects.toThrow(
+			/Refusing to run this destructive git command/,
+		);
+		expect(readModifiedTracked()).toBe("modified\n");
+	});
+
+	it("guards discards executed through command substitution inside double quotes", async () => {
+		initDirtyGitRepo(testDir);
+		const bash = createBashTool(testDir);
+
+		await expect(bash.execute("guard-substitution-echo", { command: 'echo "$(git reset --hard)"' })).rejects.toThrow(
+			/Refusing to run this destructive git command/,
+		);
+		expect(readModifiedTracked()).toBe("modified\n");
 	});
 
 	it("propagates aborts raised while probing", async () => {

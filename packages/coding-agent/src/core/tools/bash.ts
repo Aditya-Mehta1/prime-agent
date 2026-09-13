@@ -179,7 +179,7 @@ const MAX_DIRTY_PATHS_LISTED = 10;
 const GIT_GLOBAL_OPTIONS = "(?:-{1,2}[^\\s;&|]+(?:\\s+(?:\"[^\"]*\"|'[^']*'|[^\\s;&|]+))?\\s+)*";
 
 const DISCARD_CHECKOUT_PATTERN = new RegExp(
-	`\\bgit\\s+${GIT_GLOBAL_OPTIONS}checkout\\s+(?:(?:(?:-[fm]|--ours|--theirs|--conflict=\\S+)\\s+)*(?:--\\s+)?(?:\\.\\/?|:\\/)|[^\\s;&|()]+\\s+(?:--\\s+)?(?:\\.\\/?|:\\/))(?=\\s|$|[;&|)])`,
+	`\\bgit\\s+${GIT_GLOBAL_OPTIONS}checkout\\s+(?:(?:(?:-[fm]|--ours|--theirs|--conflict=\\S+)\\s+)*(?:--\\s+)?(?:\\.\\/?|:\\/)|[^\\s;&|()]+\\s+(?:--\\s+)?(?:\\.\\/?|:\\/)|(?:-f|--force)\\s+[^\\s;&|()]+)(?=\\s|$|[;&|)])`,
 	"g",
 );
 const DISCARD_RESTORE_PATTERN = new RegExp(
@@ -224,12 +224,33 @@ function maskQuotedSpans(command: string): string {
 		const ch = chars[i];
 		if (quote === null) {
 			if (ch === '"' || ch === "'") quote = ch;
-		} else if (ch === "\\" && quote === '"') {
-			chars[i] = " ";
-			if (i + 1 < chars.length) chars[i + 1] = " ";
-			i++;
-		} else if (ch === quote) {
+		} else if (quote === "'") {
+			// No expansion happens inside single quotes; mask it all.
+			if (ch === "'") quote = null;
+			else chars[i] = " ";
+		} else if (ch === '"') {
 			quote = null;
+		} else if (ch === "\\" && i + 1 < chars.length) {
+			chars[i] = " ";
+			chars[i + 1] = " ";
+			i++;
+		} else if (ch === "$" && chars[i + 1] === "(") {
+			// Command substitution inside double quotes still executes; keep it live.
+			let depth = 0;
+			let j = i;
+			for (; j < chars.length; j++) {
+				if (chars[j] === "(") depth++;
+				else if (chars[j] === ")") {
+					depth--;
+					if (depth === 0) break;
+				}
+			}
+			i = j - 1;
+		} else if (ch === "`") {
+			// Backtick substitution inside double quotes still executes; keep it live.
+			let j = i + 1;
+			while (j < chars.length && chars[j] !== "`") j++;
+			i = j - 1;
 		} else {
 			chars[i] = " ";
 		}
