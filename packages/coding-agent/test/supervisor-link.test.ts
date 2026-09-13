@@ -37,6 +37,23 @@ function makeMockClient(failFirstRequest = false): MockClient {
 	return client as MockClient;
 }
 
+/** Bounded wait: a hung promise surfaces as a test failure, never a stuck run. */
+async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		const timeoutId = setTimeout(() => reject(new Error(`Timed out after ${ms}ms`)), ms);
+		promise.then(
+			(value) => {
+				clearTimeout(timeoutId);
+				resolve(value);
+			},
+			(error: unknown) => {
+				clearTimeout(timeoutId);
+				reject(error);
+			},
+		);
+	});
+}
+
 function makeLink(clients: MockClient[]) {
 	return new SupervisorLink({
 		socketPath: "/tmp/unused.sock",
@@ -162,6 +179,58 @@ describe("SupervisorLink", () => {
 		link.close();
 		expect(clients[0].closeCount).toBe(1);
 		await expect(pending).rejects.toThrow();
+	});
+
+	it("does not let a settled handshake clear a newer in-flight connect", async () => {
+		const clients: MockClient[] = [];
+		const connectWaiters: Array<{ resolve: () => void }> = [];
+		const helloWaiters: Array<{ resolve: (hello: unknown) => void; reject: (error: Error) => void }> = [];
+		const link = new SupervisorLink({
+			socketPath: "/tmp/unused.sock",
+			factory: () => {
+				const client = makeMockClient();
+				const index = clients.length;
+				// Handshakes advance only when the test resolves them, so the
+				// reconnect race is deterministic instead of timer-dependent.
+				client.connect = () =>
+					new Promise<void>((resolve) => {
+						connectWaiters[index] = { resolve };
+					});
+				client.waitForHello = () =>
+					new Promise((resolve, reject) => {
+						helloWaiters[index] = { resolve, reject };
+					});
+				const closeClient = client.close.bind(client);
+				client.close = () => {
+					// Socket death surfaces a pending handshake as a failure.
+					closeClient();
+					helloWaiters[index]?.reject(new Error("socket closed during handshake"));
+				};
+				clients.push(client);
+				return client;
+			},
+		});
+		// Handshake A is mid-flight when the shared socket dies (teardown).
+		const first = link.ensureConnected();
+		connectWaiters[0]?.resolve();
+		await withTimeout(new Promise((resolveTick) => setTimeout(resolveTick, 0)), 1000);
+		link.teardown();
+		// A later caller installs a newer in-flight handshake (B).
+		const second = link.ensureConnected();
+		// A settles and fails; it must not clear B's in-flight promise.
+		await withTimeout(expect(first).rejects.toThrow("socket closed during handshake"), 1000);
+		// A third caller must join B instead of opening a third connection.
+		const third = link.ensureConnected();
+		expect(clients).toHaveLength(2);
+		connectWaiters[1]?.resolve();
+		// B advances from connect() to waitForHello() on the next tick.
+		await withTimeout(new Promise((resolveTick) => setTimeout(resolveTick, 0)), 1000);
+		helloWaiters[1]?.resolve({});
+		const [clientSecond, clientThird] = await withTimeout(Promise.all([second, third]), 1000);
+		expect(clientSecond).toBe(clients[1]);
+		expect(clientThird).toBe(clients[1]);
+		expect(clients[0].closeCount).toBeGreaterThan(0);
+		link.close();
 	});
 
 	it("stops reconnecting after close()", async () => {

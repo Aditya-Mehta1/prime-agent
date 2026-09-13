@@ -42,8 +42,11 @@ export class SupervisorLink {
 
 	/**
 	 * Send one request over the persistent link. Never retries: daemon
-	 * commands like create or send_message are not idempotent, so the
-	 * link tears down on failure and the NEXT request reconnects. Call
+	 * commands like create or send_message are not idempotent, so a
+	 * failed request surfaces its error to the caller. Only
+	 * DaemonSocketClosedError tears the link down; the NEXT request
+	 * reconnects. Command-level failures (timeouts, rejections) leave
+	 * the shared connection serving other in-flight requests. Call
 	 * sites that need an establishment window use ensureConnected in
 	 * their own retry loop.
 	 */
@@ -103,10 +106,13 @@ export class SupervisorLink {
 			this.client = client;
 			return client;
 		})();
+		const connecting = this.connecting;
 		try {
-			return await this.connecting;
+			return await connecting;
 		} finally {
-			this.connecting = undefined;
+			// A teardown during the handshake lets a later caller install a
+			// newer in-flight promise; this awaiter must never clear that one.
+			if (this.connecting === connecting) this.connecting = undefined;
 		}
 	}
 
