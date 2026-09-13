@@ -304,6 +304,18 @@ function createUniqueSessionFileTarget(sessionDir: string): { sessionId: string;
 	throw new Error("Unable to create a unique session file");
 }
 
+// writeSync may return a short count without throwing; a torn line would
+// corrupt the forked JSONL on reopen, so loop until the whole buffer lands.
+function writeAllSync(descriptor: number, data: string, path: string): void {
+	const bytes = Buffer.from(data, "utf8");
+	let offset = 0;
+	while (offset < bytes.length) {
+		const written = writeSync(descriptor, bytes, offset, bytes.length - offset);
+		if (written <= 0) throw new Error(`Short write persisting ${path}`);
+		offset += written;
+	}
+}
+
 export function getSessionArtifactsRoot(sessionDir: string): string {
 	return join(dirname(sessionDir), "session-artifacts");
 }
@@ -2401,14 +2413,14 @@ export class SessionManager {
 			rlmDepth: resolveSessionRlmDepth(sourceHeader, sourcePath),
 			git: captureGitContext(targetCwd) ?? undefined,
 		};
-		// Write the whole fork through one descriptor: a single open/close for the
-		// fork instead of one appendFileSync (open+write+close) per source entry,
-		// which stalls the caller's thread with O(entries) syscalls on large
-		// sessions. createUniqueSessionFileTarget guarantees the target does not
-		// exist, so "w" creates it exactly like the first append used to.
+		// The whole fork flows through one descriptor: one openSync, one
+		// writeAllSync per line, one closeSync. writeAllSync loops past short
+		// counts so every JSONL line lands whole, and "w" creates the target
+		// fresh because createUniqueSessionFileTarget guarantees it does not
+		// exist yet.
 		const descriptor = openSync(newSessionFile, "w");
 		try {
-			writeSync(descriptor, `${JSON.stringify(newHeader)}\n`);
+			writeAllSync(descriptor, `${JSON.stringify(newHeader)}\n`, newSessionFile);
 
 			// Drop the source's git_state entries (re-linking children): they describe the source repo,
 			// so the fork would otherwise report the source's git instead of its own target context.
@@ -2425,7 +2437,7 @@ export class SessionManager {
 				if (entry.type === "session" || entry.type === "git_state") continue;
 				const parentId = liveParent(entry.parentId);
 				const out = parentId === entry.parentId ? entry : { ...entry, parentId };
-				writeSync(descriptor, `${JSON.stringify(out)}\n`);
+				writeAllSync(descriptor, `${JSON.stringify(out)}\n`, newSessionFile);
 			}
 		} finally {
 			closeSync(descriptor);

@@ -1,10 +1,10 @@
 /**
  * Benchmark: SessionManager append/fork hot paths.
  *
- * - _persist append cost at growing session sizes (the per-append
- *   has-assistant scan scales with entry count).
+ * - _persist append cost at growing session sizes (the flip-once
+ *   has-assistant cache keeps per-append cost flat as entries grow).
  * - forkFrom wall time for source sessions of growing entry counts
- *   (one appendFileSync per source entry today).
+ *   (the whole fork flows through one open descriptor).
  *
  * Run with:
  *
@@ -21,8 +21,8 @@ const MEASURED_APPENDS = 100;
 const FORK_RUNS = 3;
 
 // Session files are built without any assistant entry for the pre-assistant
-// scenario (the no-assistant guard then makes every append pay the full scan),
-// and with an early assistant entry for the steady-state scenario.
+// scenario (the guard then suppresses every append via the O(1) cache), and
+// with an early assistant entry for the steady-state scenario.
 
 function percentile(sorted: number[], p: number): number {
 	return sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))];
