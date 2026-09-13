@@ -16,7 +16,7 @@ from unittest.mock import Mock, patch
 from pydantic import ValidationError
 
 from cli import completed_report, main, validate_completion, workflow_source
-from controller import Canceled, Controller, cleanup, labels, side_complete
+from controller import Canceled, Controller, cleanup, labels
 from github import TITLE, GitHub
 from report import MARKER, METRICS, RUNTIME_METRICS, comparison, render
 from schema import (
@@ -27,10 +27,11 @@ from schema import (
     Request,
     Side,
     load_report,
+    side_complete,
     write_json,
 )
 from terminal import QUERIES, Display, Terminal
-from worker import environment, install, measure
+from worker import environment, install, measure, stop_agents
 
 SHA = "a" * 40
 HEAD = "b" * 40
@@ -63,7 +64,7 @@ class TerminalTests(unittest.TestCase):
 import os, sys, time, tty
 tty.setraw(0)
 time.sleep(float(sys.argv[1]))
-os.write(1, b'agents/resume\\r\\n> ')
+os.write(1, sys.argv[2].encode())
 while True:
     byte = os.read(0, 1)
     if byte == b'\\x7f':
@@ -80,9 +81,9 @@ while True:
             root = Path(directory)
             path = root / "fixture.py"
             path.write_text(script)
-            for delay in (0.05, 0.6):
+            for delay, label in ((0.05, "agents/resume\r\n> "), (0.6, ">\r\n← manage")):
                 terminal = Terminal(
-                    [sys.executable, str(path), str(delay)],
+                    [sys.executable, str(path), str(delay), label],
                     root,
                     os.environ.copy(),
                     root / f"transcript-{delay}",
@@ -590,6 +591,33 @@ class LifecycleTests(unittest.TestCase):
 
 
 class MeasurementTests(unittest.TestCase):
+    def test_cleanup_accepts_a_session_that_exits_between_list_and_stop(self):
+        stale = subprocess.CalledProcessError(
+            1, ["prime-agent", "stop", "session", "--json"], stderr="Error: Unknown active session: session\n"
+        )
+        with patch(
+            "worker.run_as",
+            side_effect=['{"sessions": [{"activeSessionId": "session"}]}', stale, '{"sessions": []}'],
+        ) as run:
+            stop_agents(Path("/fixture"))
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(run.call_args.args[1], ["prime-agent", "list", "--json"])
+
+    def test_cleanup_preserves_real_stop_failures(self):
+        for error, remaining in (
+            ("Error: Unknown active session: session\n", '{"sessions": [{"activeSessionId": "session"}]}'),
+            ("Error: connection closed\n", '{"sessions": []}'),
+            ("Error: Unknown active session: another\n", '{"sessions": []}'),
+        ):
+            with self.subTest(error=error, remaining=remaining):
+                failure = subprocess.CalledProcessError(1, ["prime-agent", "stop"], stderr=error)
+                with patch(
+                    "worker.run_as",
+                    side_effect=['{"sessions": [{"activeSessionId": "session"}]}', failure, remaining],
+                ):
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        stop_agents(Path("/fixture"))
+
     def test_disk_footprint_is_measured_after_interactive_first_use(self):
         order = []
         terminal = Mock()
@@ -638,6 +666,9 @@ class MeasurementTests(unittest.TestCase):
             home = root / "benchmark1"
             (home / ".prime/agent/kernel-venv/bin").mkdir(parents=True)
             (home / ".prime/agent/kernel-venv/bin/python").touch()
+            command = home / ".local/bin/prime-agent"
+            command.parent.mkdir(parents=True)
+            command.write_text("#!/usr/bin/env node\n")
             side = Side(sha=SHA)
 
             def run_as(_user, command, *_args, **_kwargs):

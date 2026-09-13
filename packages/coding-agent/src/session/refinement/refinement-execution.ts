@@ -50,8 +50,11 @@ export interface RefinementExecutionHost {
 	getModel(): Model<Api> | undefined;
 	getThinkingLevel(): ThinkingLevel;
 	getMessages(): AgentMessage[];
-	getRequiredRequestAuth(model: Model<Api>): Promise<{ apiKey: string; headers?: Record<string, string> }>;
+	getRequiredRequestAuth(
+		model: Model<Api>,
+	): Promise<{ apiKey: string; headers?: Record<string, string>; requestModel?: Model<Api> }>;
 	getRetryPolicy(): ProviderRetryPolicy;
+	getSessionId?(): string;
 	getExtensionRunner(): Pick<ExtensionRunner, "hasHandlers" | "emit">;
 	disconnect(): void;
 	reconnect(): void;
@@ -104,7 +107,7 @@ export class RefinementExecution {
 		}
 
 		const model = this._host.getModel()!;
-		const { apiKey, headers } = await this._host.getRequiredRequestAuth(model);
+		const { apiKey, headers, requestModel } = await this._host.getRequiredRequestAuth(model);
 		const globalHarnessStateDir = getGlobalHarnessStateDir();
 		const localHarnessStateDir = this._localHarnessStateDir();
 		const requestedScope = options.global ? "global" : "local";
@@ -166,12 +169,13 @@ export class RefinementExecution {
 			this._host.getMessages(),
 			planningState,
 			history,
-			model,
+			requestModel ?? model,
 			apiKey,
 			{ ...options, retry: this._host.getRetryPolicy() },
 			headers,
 			signal,
 			this._host.getThinkingLevel(),
+			this._host.getSessionId?.(),
 		);
 		if (this._host.isDisposed() || signal.aborted) {
 			throw new Error("Refinement cancelled because the session was disposed.");
@@ -319,18 +323,19 @@ export class RefinementExecution {
 		if (!model) {
 			return { shouldRefine: false, rationale: "No model selected." };
 		}
-		const { apiKey, headers } = await this._host.getRequiredRequestAuth(model);
+		const { apiKey, headers, requestModel } = await this._host.getRequiredRequestAuth(model);
 		return reviewAutoRefine(
 			this._host.getMessages(),
 			this._loadMergedHarnessState(),
 			this._loadRefinementHistory(),
-			model,
+			requestModel ?? model,
 			apiKey,
 			context,
 			headers,
 			signal,
 			this._host.getThinkingLevel(),
 			this._host.getRetryPolicy(),
+			this._host.getSessionId?.(),
 		);
 	}
 }
