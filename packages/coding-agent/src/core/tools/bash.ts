@@ -176,10 +176,10 @@ const MAX_DIRTY_PATHS_LISTED = 10;
  * `git --git-dir=dir/.git reset --hard`. Kept within one shell segment
  * (no ;&|) so it cannot swallow the rest of a chained command.
  */
-const GIT_GLOBAL_OPTIONS = "(?:-{1,2}[^\\s;&|]+(?:\\s+[^\\s;&|]+)?\\s+)*";
+const GIT_GLOBAL_OPTIONS = "(?:-{1,2}[^\\s;&|]+(?:\\s+(?:\"[^\"]*\"|'[^']*'|[^\\s;&|]+))?\\s+)*";
 
 const DISCARD_CHECKOUT_PATTERN = new RegExp(
-	`\\bgit\\s+${GIT_GLOBAL_OPTIONS}checkout\\s+(?:(?:--\\s+)?(?:\\.\\/?|:\\/)|HEAD\\s+--\\s+(?:\\.\\/?|:\\/))(?=\\s|$|[;&|)])`,
+	`\\bgit\\s+${GIT_GLOBAL_OPTIONS}checkout\\s+(?:(?:(?:-[fm]|--ours|--theirs|--conflict=\\S+)\\s+)*(?:--\\s+)?(?:\\.\\/?|:\\/)|HEAD\\s+--\\s+(?:\\.\\/?|:\\/))(?=\\s|$|[;&|)])`,
 	"g",
 );
 const DISCARD_RESTORE_PATTERN = new RegExp(
@@ -194,11 +194,14 @@ const DISCARD_CLEAN_PATTERN = new RegExp(`\\bgit\\s+${GIT_GLOBAL_OPTIONS}clean\\
 
 function isForcedCleanSegment(args: string): boolean {
 	const tokens = args.split(/\s+/).filter(Boolean);
-	const forces = tokens.filter((arg) =>
+	// Everything after -- is a pathspec, not options (git clean -f -- -n is forced).
+	const optionEnd = tokens.indexOf("--");
+	const optionTokens = optionEnd === -1 ? tokens : tokens.slice(0, optionEnd);
+	const forces = optionTokens.filter((arg) =>
 		arg.startsWith("--") ? arg.startsWith("--force") : arg.startsWith("-") && arg.includes("f"),
 	);
 	if (forces.length === 0) return false;
-	return !tokens.some(
+	return !optionTokens.some(
 		(arg) => arg === "--dry-run" || (arg.startsWith("-") && !arg.startsWith("--") && arg.includes("n")),
 	);
 }
@@ -261,7 +264,9 @@ export function resolveDiscardProbeTarget(
 		}
 		if (token === "-C") {
 			const dir = tokens[index + 1];
-			if (!dir) return UNRESOLVABLE_DISCARD_TARGET;
+			// A quoted or escaped path cannot be replayed as a single token; refuse
+			// rather than probe a truncated directory.
+			if (!dir || /["'\\]/.test(dir)) return UNRESOLVABLE_DISCARD_TARGET;
 			// Repeated -C paths are relative to the preceding one, so replay the
 			// whole sequence instead of keeping only the last directory.
 			dashCDir = dashCDir ? `${dashCDir} -C ${dir}` : dir;
@@ -310,9 +315,11 @@ export function resolveDiscardProbeTarget(
 			const cdMatch = /^cd\s*(.*)$/.exec(trimmed);
 			if (!cdMatch) continue;
 			const arg = cdMatch[1].trim();
-			// An arg we cannot replay safely (substitution, redirection, backgrounding)
-			// leaves the target repository unknown; refuse rather than probe blindly.
-			if (arg && /[$`;&|()<>]/.test(arg)) return UNRESOLVABLE_DISCARD_TARGET;
+			// An arg we cannot replay safely (substitution, redirection, backgrounding,
+			// or quotes split by segmenting) leaves the target repository unknown;
+			// refuse rather than probe blindly.
+			const balanced = (arg.match(/"/g)?.length ?? 0) % 2 === 0 && (arg.match(/'/g)?.length ?? 0) % 2 === 0;
+			if (!balanced || (arg && /[$`;&|()<>]/.test(arg))) return UNRESOLVABLE_DISCARD_TARGET;
 			sawCd = true;
 			cdArgs.push(arg);
 		}

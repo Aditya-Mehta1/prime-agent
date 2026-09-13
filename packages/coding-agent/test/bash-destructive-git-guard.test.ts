@@ -63,6 +63,11 @@ describe("isDestructiveGitDiscardCommand", () => {
 		"git -C repo -C nested reset --hard",
 		"GIT_DIR=sub/.git git reset --hard",
 		"GIT_DIR=sub/.git GIT_WORK_TREE=sub git reset --hard",
+		"git checkout -f -- .",
+		"git checkout --theirs -- .",
+		"git checkout -m .",
+		"git checkout --conflict=diff3 .",
+		"git clean -f -- -n",
 	])("matches %s", (command) => {
 		expect(isDestructiveGitDiscardCommand(command)).toBe(true);
 	});
@@ -72,12 +77,14 @@ describe("isDestructiveGitDiscardCommand", () => {
 		"git log --oneline",
 		"git checkout -b new-branch",
 		"git checkout main",
+		"git checkout -m main",
 		"git checkout -- single-file.txt",
 		"git checkout ./nested",
 		"git restore --staged .",
 		"git restore --staged :/",
 		"git restore single-file.txt",
 		"git clean -n",
+		"git clean -n -f .",
 		"git clean --dry-run",
 		"git clean -d",
 		"git reset",
@@ -474,6 +481,43 @@ describe("bash tool destructive-git dirty-tree guard", () => {
 
 		expect(error).toBeInstanceOf(Error);
 		expect((error as Error).message).toContain("changes directory (or repository) first");
+	});
+
+	it("refuses git checkout -f -- . on a dirty tree", async () => {
+		initDirtyGitRepo(testDir);
+		const bash = createBashTool(testDir);
+
+		await expect(bash.execute("guard-checkout-f", { command: "git checkout -f -- ." })).rejects.toThrow(
+			/Refusing to run this destructive git command/,
+		);
+		expect(readModifiedTracked()).toBe("modified\n");
+	});
+
+	it("refuses git clean -f -- -n, where -n is a pathspec, not a dry run", async () => {
+		initDirtyGitRepo(testDir);
+		writeFileSync(join(testDir, "-n"), "pathspec\n");
+		const bash = createBashTool(testDir);
+
+		await expect(bash.execute("guard-clean-pathspec", { command: "git clean -f -- -n" })).rejects.toThrow(
+			/Refusing to run this destructive git command/,
+		);
+		expect(existsSync(join(testDir, "-n"))).toBe(true);
+	});
+
+	it("conservatively refuses quoted git -C directories", async () => {
+		const sub = join(testDir, "dirty repo");
+		mkdirSync(sub);
+		initDirtyGitRepo(sub);
+		const bash = createBashTool(testDir);
+
+		const error = await bash.execute("guard-git-c-quoted", { command: 'git -C "dirty repo" reset --hard' }).then(
+			() => undefined,
+			(err: Error) => err,
+		);
+
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("changes directory (or repository) first");
+		expect(readFileSync(join(sub, "tracked.txt"), "utf-8")).toBe("modified\n");
 	});
 
 	it("propagates aborts raised while probing", async () => {
