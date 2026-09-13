@@ -88,6 +88,7 @@ import {
 	autonomousLimitReason,
 	autonomousStatus,
 	createAutonomousContinuationMessage,
+	createAutonomousGateFailureContinuationMessage,
 	createAutonomousRuntimeState,
 	createAutonomousSubagentKeepAliveMessage,
 	isUnlimitedAutonomousLimit,
@@ -96,6 +97,7 @@ import {
 	refreshAutonomousQualityGates,
 	setAutonomousEnabled,
 	setAutonomousLimits,
+	shouldAutonomouslyContinue,
 	UNLIMITED_AUTONOMOUS_LIMIT,
 } from "./autonomous.js";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.js";
@@ -1307,6 +1309,10 @@ export class AgentSession {
 	// In-flight gate evaluation for an owed continuation; holds the promise so
 	// settlement sites never double-fire the resume.
 	private _autonomousContinuationResumeTask: Promise<void> | undefined = undefined;
+	// Monotonic count of admitted RLM child terminal notices; differencing
+	// against the arrival epoch separates sibling notices (benign for the
+	// owed continuation) from user-driven admissions.
+	private _rlmTerminalNoticeAdmissionCount = 0;
 
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
@@ -2472,6 +2478,10 @@ export class AgentSession {
 	 */
 	private async _resumeOwedAutonomousContinuation(): Promise<void> {
 		const snapshot = this._snapshotAutonomousRuntimeState();
+		const beforeGates = {
+			arrivalEpoch: this._sessionInputArrivalEpoch,
+			noticeAdmissions: this._rlmTerminalNoticeAdmissionCount,
+		};
 		try {
 			// agent_end clears the live field, so fall back to the transcript;
 			// either way the session's last assistant turn decides the gate run.
@@ -2488,40 +2498,39 @@ export class AgentSession {
 				return;
 			}
 			// Configured quality gates decide whether the run is already done.
-			const beforeGates = {
-				continuationsUsed: this._autonomousState.continuationsUsed,
-				startedAt: this._autonomousState.startedAt,
-			};
-			const message = await nextAutonomousContinuation(this._autonomousState, lastAssistantMessage, {
+			// The decision runs before any accounting is written so a stale
+			// drop never spends a continuation or clobbers a user reset.
+			const decision = await shouldAutonomouslyContinue(this._autonomousState, lastAssistantMessage, {
 				cwd: this._cwd,
 				signal: this.agent.signal,
 			});
-			if (!message) {
+			if (!decision.shouldContinue) {
 				this._clearAutonomousContinuationAwait();
 				return;
 			}
 			// Re-validate after the gate await: mode-off, a goal takeover, or
-			// newly admitted user-driven work must not be bypassed by a stale
-			// continuation. Sibling terminal notices are excluded: this owed
-			// continuation is exactly the wake that reads them.
-			const userDrivenWake = this._actionStore
-				.unfinishedActions()
-				.some((action) => !this._isRlmTerminalNoticeAction(action));
+			// any user-driven admission (finished or queued) must not be
+			// bypassed by a stale continuation. Sibling terminal notices are
+			// the exception: this owed continuation is exactly the wake that
+			// reads them.
+			const admissions = this._sessionInputArrivalEpoch - beforeGates.arrivalEpoch;
+			const noticeAdmissions = this._rlmTerminalNoticeAdmissionCount - beforeGates.noticeAdmissions;
+			const userDrivenAdmissions = admissions > noticeAdmissions;
 			if (
 				this._disposed ||
 				this._disposing ||
 				!this._autonomousState.enabled ||
 				this._goalOwnsContinuationWakeup() ||
-				userDrivenWake
+				userDrivenAdmissions
 			) {
-				// Roll back only the increment for the un-delivered message, and
-				// only when the user has not reset the counters meanwhile.
-				if (this._autonomousState.startedAt === beforeGates.startedAt) {
-					this._autonomousState.continuationsUsed = beforeGates.continuationsUsed;
-				}
 				this._clearAutonomousContinuationAwait();
 				return;
 			}
+			addAutonomousContinuation(this._autonomousState);
+			const message =
+				(decision.reason === "gate_failed"
+					? createAutonomousGateFailureContinuationMessage(this._autonomousState)
+					: undefined) ?? createAutonomousContinuationMessage(this._autonomousState);
 			this._admitOwedAutonomousContinuation(message);
 		} catch {
 			// Admission can race a new pause; roll back so the retry re-counts.
@@ -5203,6 +5212,7 @@ export class AgentSession {
 		try {
 			const result = this._admitSessionInput(action, { wake: false });
 			if (!result.accepted) throw new Error("RLM child terminal notice was not admitted.");
+			this._rlmTerminalNoticeAdmissionCount++;
 		} catch (error) {
 			this._durableRlmTerminalNoticeActionIds.delete(action.id);
 			throw error;

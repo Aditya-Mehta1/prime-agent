@@ -323,6 +323,30 @@ export function createAutonomousContinuationMessage(
 }
 
 /**
+ * Build the gate-failure continuation message for a resume whose quality
+ * gates failed, mirroring the hook's gate-failure continuation text.
+ */
+export function createAutonomousGateFailureContinuationMessage(
+	state: AutonomousRuntimeState,
+	timestamp = Date.now(),
+): UserMessage | undefined {
+	const failure = state.lastGateFailure;
+	if (!failure) {
+		return undefined;
+	}
+	return {
+		role: "user",
+		content: [
+			{
+				type: "text",
+				text: buildAutonomousGateFailureContinuation(failure, state.gates.maxRetries, timestamp),
+			},
+		],
+		timestamp,
+	};
+}
+
+/**
  * Keep-alive continuation delivered while subagents are still active: the
  * parent gets a bounded chance to inspect and unblock hung children (for
  * example, SIGTTIN-stopped processes) instead of sleeping until they finish.

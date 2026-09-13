@@ -29,7 +29,7 @@ type FakeSession = {
 	_autonomousContinuationSuppressionDepth: number;
 	_autonomousContinuationSuppressedMessages: WeakSet<object>;
 	_hasUnsettledRlmQuiescenceWork: () => boolean;
-	_actionStore: { unfinishedActions: () => unknown[] };
+	_rlmTerminalNoticeAdmissionCount: number;
 	_admitSessionInput: ReturnType<typeof vi.fn>;
 	_createPreparedTurnAction: ReturnType<typeof vi.fn>;
 	_snapshotAutonomousRuntimeState: () => unknown;
@@ -84,7 +84,7 @@ function fakeSession(overrides: Partial<FakeSession> = {}): FakeSession {
 		_autonomousContinuationSuppressionDepth: 0,
 		_autonomousContinuationSuppressedMessages: new WeakSet(),
 		_hasUnsettledRlmQuiescenceWork: () => false,
-		_actionStore: { unfinishedActions: () => [] },
+		_rlmTerminalNoticeAdmissionCount: 0,
 		_admitSessionInput: vi.fn(),
 		_createPreparedTurnAction: vi.fn(
 			(schedule: string, _text: string, _images: unknown, options: Record<string, unknown>) => ({
@@ -106,8 +106,6 @@ function fakeSession(overrides: Partial<FakeSession> = {}): FakeSession {
 		"_goalOwnsContinuationWakeup",
 		"_deliverAutonomousSubagentKeepAlive",
 		"_admitOwedAutonomousContinuation",
-		"_isRlmTerminalNoticeAction",
-		"_isRlmTerminalNotice",
 		"_findLastAssistantInMessages",
 		"_armAutonomousSubagentKeepAlive",
 		"_disarmAutonomousSubagentKeepAlive",
@@ -122,35 +120,6 @@ function fakeSession(overrides: Partial<FakeSession> = {}): FakeSession {
 	session._snapshotAutonomousRuntimeState = () => snapshotRuntimeState.call(session);
 	session._restoreAutonomousRuntimeSnapshot = (snapshot: unknown) => restoreRuntimeSnapshot.call(session, snapshot);
 	return session;
-}
-
-function userPromptAction(): unknown {
-	return {
-		payload: {
-			kind: "turn",
-			records: [{ role: "primary", message: { role: "user", content: [], timestamp: 0 } }],
-		},
-	};
-}
-
-function terminalNoticeAction(): unknown {
-	return {
-		payload: {
-			kind: "turn",
-			records: [
-				{
-					role: "primary",
-					message: {
-						role: "custom",
-						customType: "rlm_child_terminal_notice",
-						content: "[child-exited: no-reply child:sibling]",
-						details: {},
-						timestamp: 0,
-					},
-				},
-			],
-		},
-	};
 }
 
 const stoppedTurn = { role: "assistant", stopReason: "stop" } as FakeAssistantMessage;
@@ -441,11 +410,9 @@ describe("autonomous continuation vs active subagents", () => {
 	});
 
 	it("drops a stale owed continuation when user-driven work arrives during the gate evaluation", async () => {
-		const queuedActions: unknown[] = [];
 		const session = fakeSession({
 			_autonomousContinuationAwaitsRlmWork: true,
 			_cwd: "/tmp",
-			_actionStore: { unfinishedActions: () => queuedActions },
 			_autonomousState: createAutonomousRuntimeState({
 				enabled: true,
 				maxContinuations: 5,
@@ -453,20 +420,20 @@ describe("autonomous continuation vs active subagents", () => {
 			}),
 		});
 		maybeResume.call(session);
-		// A user prompt lands while the gate command is still running.
-		queuedActions.push(userPromptAction());
+		// A user prompt is admitted (and may even finish) while the gate
+		// command is still running; the epoch sees it either way.
+		session._sessionInputArrivalEpoch++;
 		await session._autonomousContinuationResumeTask;
 		expect(session._admitSessionInput).not.toHaveBeenCalled();
 		expect(session._autonomousContinuationAwaitsRlmWork).toBe(false);
+		// Nothing was spent on the dropped continuation.
 		expect(session._autonomousState.continuationsUsed).toBe(0);
 	});
 
 	it("delivers past sibling terminal notices admitted during the gate evaluation", async () => {
-		const queuedActions: unknown[] = [];
 		const session = fakeSession({
 			_autonomousContinuationAwaitsRlmWork: true,
 			_cwd: "/tmp",
-			_actionStore: { unfinishedActions: () => queuedActions },
 			_autonomousState: createAutonomousRuntimeState({
 				enabled: true,
 				maxContinuations: 5,
@@ -475,8 +442,10 @@ describe("autonomous continuation vs active subagents", () => {
 		});
 		maybeResume.call(session);
 		// A second child exits while the gate command is still running: the
-		// owed continuation is the wake that reads its notice.
-		queuedActions.push(terminalNoticeAction());
+		// notice admission is not user-driven, and the owed continuation is
+		// the wake that reads it.
+		session._sessionInputArrivalEpoch++;
+		session._rlmTerminalNoticeAdmissionCount++;
 		await session._autonomousContinuationResumeTask;
 		expect(session._admitSessionInput).toHaveBeenCalledTimes(1);
 		expect(session._autonomousState.continuationsUsed).toBe(1);
@@ -484,11 +453,9 @@ describe("autonomous continuation vs active subagents", () => {
 	});
 
 	it("keeps a user-reset budget when dropping a stale owed continuation", async () => {
-		const queuedActions: unknown[] = [];
 		const session = fakeSession({
 			_autonomousContinuationAwaitsRlmWork: true,
 			_cwd: "/tmp",
-			_actionStore: { unfinishedActions: () => queuedActions },
 			_autonomousState: createAutonomousRuntimeState({
 				enabled: true,
 				maxContinuations: 5,
@@ -499,12 +466,12 @@ describe("autonomous continuation vs active subagents", () => {
 		// The user resets the run while the gate command is still running.
 		session._autonomousState.continuationsUsed = 0;
 		session._autonomousState.startedAt = (session._autonomousState.startedAt ?? 0) + 1;
-		queuedActions.push(userPromptAction());
+		session._sessionInputArrivalEpoch++;
 		await session._autonomousContinuationResumeTask;
 		expect(session._admitSessionInput).not.toHaveBeenCalled();
 		expect(session._autonomousContinuationAwaitsRlmWork).toBe(false);
-		// The reset counter is not overwritten by the rollback.
-		expect(session._autonomousState.continuationsUsed).toBe(1);
+		// The reset budget is untouched: no phantom continuation was spent.
+		expect(session._autonomousState.continuationsUsed).toBe(0);
 	});
 
 	it("evaluates gates from the transcript after agent_end clears the live last-assistant field", async () => {
