@@ -4832,9 +4832,12 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				// Match the attach/snapshot path: merge passivated children so command
 				// consumers see the same authoritative roster the snapshot advertises.
+				// Capture the sequence before the awaited walk so the response cannot
+				// claim freshness past the roster it returns.
+				const eventSequence = state.lastEventSequence;
 				return success(command.id, "get_rlm_children", {
 					children: await this.buildRlmChildSnapshotsWithPassiveRlmSubagents(state),
-					eventSequence: state.lastEventSequence,
+					eventSequence,
 				});
 			}
 

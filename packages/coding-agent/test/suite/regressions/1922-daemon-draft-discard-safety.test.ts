@@ -224,4 +224,25 @@ describe("#1922 get_rlm_children includes passivated children", () => {
 		});
 		expect(response.data?.eventSequence).toBe(parent.lastEventSequence);
 	});
+
+	it("pairs the roster with the sequence from before the passive walk, not after", async () => {
+		const { internals } = createDaemon();
+		const parent = makeEmptyTopLevelDraft("parent-sequence-race");
+		internals.sessions.set(parent.activeSessionId, parent);
+		(parent.runtime.session as { getRlmChildSnapshots(): unknown[] }).getRlmChildSnapshots = () => [];
+		// A child event lands while the awaited passive walk is in flight; the
+		// response must not claim that newer sequence for the older roster.
+		internals.listPassiveRlmSubagents = async () => {
+			parent.lastEventSequence = parent.lastEventSequence + 5;
+			return [];
+		};
+
+		const response = await internals.handleCommand(makeClient("client-1", parent.activeSessionId), {
+			type: "get_rlm_children",
+			activeSessionId: parent.activeSessionId,
+		});
+
+		expect(parent.lastEventSequence).toBe(5);
+		expect(response.data?.eventSequence).toBe(0);
+	});
 });
