@@ -71,6 +71,33 @@ describe("subagent default model setting", () => {
 		}
 	});
 
+	it("fails an unpinned spawn when the configured parent-model default is stale", { timeout: 30_000 }, async () => {
+		// A default naming the parent model must pass the same availability and
+		// authentication preflight as any other reference; the parent-model
+		// equality shortcut would start a child that fails its model request.
+		const harness = await createHarness({
+			provider,
+			models: [{ id: "parent-model" }, { id: "child-model" }],
+			settings: { subagentDefaultModel: `${provider}/parent-model` },
+		});
+		try {
+			expect(harness.session.modelRegistry.markProviderAuthStale(provider)).toBe(true);
+			expect(harness.session.modelRegistry.markProviderAuthStale(provider)).toBe(true);
+			expect(harness.session.modelRegistry.getProviderAuthStatus(provider)).toMatchObject({
+				source: "stale",
+				label: "expired",
+			});
+			harness.setResponses([fauxAssistantMessage("child answer")]);
+
+			await expect(harness.session.runRlmChild("do the work")).rejects.toThrow(
+				`Requested subagent model "${provider}/parent-model" is unavailable, unauthenticated, or expired`,
+			);
+			expect((await harness.session.listRlmSubagents()).subagents).toEqual([]);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
 	it("inherits the parent model when no default is configured", { timeout: 30_000 }, async () => {
 		const harness = await createHarness({
 			provider,

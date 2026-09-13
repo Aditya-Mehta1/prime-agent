@@ -11367,6 +11367,18 @@ export class AgentSession {
 
 		const normalizedReference = reference.toLowerCase();
 		if (`${parentModel.provider}/${parentModel.id}`.toLowerCase() === normalizedReference) {
+			// The parent model is in active use, so a catalog miss must not
+			// exclude it (e.g. an offline discovery refresh), but a stale or
+			// expired provider has to fail the spawn here instead of starting
+			// a child that fails its first model request.
+			const status = this._modelRegistry.getProviderAuthStatus(parentModel.provider);
+			if (status.source === "stale" || status.label === "expired") {
+				throw new Error(`Requested ${target} model "${reference}" is unavailable, unauthenticated, or expired`);
+			}
+			const auth = await this._modelRegistry.getApiKeyAndHeaders(parentModel);
+			if (!auth.ok) {
+				throw new Error(`Requested ${target} model "${reference}" failed authentication preflight`);
+			}
 			return { model: parentModel };
 		}
 		const model = (await this._authenticatedRlmModels()).find(
