@@ -313,7 +313,6 @@ describe("bash tool destructive-git dirty-tree guard", () => {
 		for (const command of [
 			"cd $(pwd)/sub && git reset --hard",
 			"git --git-dir=sub/.git reset --hard",
-			"(cd sub && git reset --hard)",
 			"cd sub || git reset --hard",
 			"pushd sub && git reset --hard",
 		]) {
@@ -578,19 +577,61 @@ describe("bash tool destructive-git dirty-tree guard", () => {
 		expect(readFileSync(join(sub, "tracked.txt"), "utf-8")).toBe("modified\n");
 	});
 
-	it("conservatively refuses cd inside grouping parentheses", async () => {
+	it("ignores cds in groups that close before the discard and probes the real directory", async () => {
+		initDirtyGitRepo(testDir);
+		const sub = join(testDir, "sub");
+		mkdirSync(sub);
+		initDirtyGitRepo(sub);
+		runGit(sub, "add", "-A");
+		runGit(sub, "commit", "-m", "second");
+		const bash = createBashTool(testDir);
+
+		const error = await bash
+			.execute("guard-closed-group", { command: "(echo hi; cd sub; echo done) && git reset --hard" })
+			.then(
+				() => undefined,
+				(err: Error) => err,
+			);
+
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("tracked.txt");
+		expect((error as Error).message).toContain("uncommitted change(s)");
+		expect(readModifiedTracked()).toBe("modified\n");
+		expect(readFileSync(join(sub, "tracked.txt"), "utf-8")).toBe("modified\n");
+	});
+
+	it("replays in-group cds when the discard runs inside the group", async () => {
 		const sub = join(testDir, "sub");
 		mkdirSync(sub);
 		initDirtyGitRepo(sub);
 		const bash = createBashTool(testDir);
 
-		const error = await bash.execute("guard-grouped-cd", { command: "(cd sub) && git reset --hard" }).then(
+		const error = await bash.execute("guard-open-group", { command: "(cd sub && git reset --hard)" }).then(
 			() => undefined,
 			(err: Error) => err,
 		);
 
 		expect(error).toBeInstanceOf(Error);
-		expect((error as Error).message).toContain("changes directory (or repository) first");
+		expect((error as Error).message).toContain("tracked.txt");
+		expect(readFileSync(join(sub, "tracked.txt"), "utf-8")).toBe("modified\n");
+	});
+
+	it("inherits persistent cds into open groups for the probe", async () => {
+		const nested = join(testDir, "sub", "nested");
+		mkdirSync(nested, { recursive: true });
+		initDirtyGitRepo(nested);
+		const bash = createBashTool(testDir);
+
+		const error = await bash
+			.execute("guard-inherited-group", { command: "cd sub && (cd nested; git reset --hard)" })
+			.then(
+				() => undefined,
+				(err: Error) => err,
+			);
+
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("tracked.txt");
+		expect(readFileSync(join(nested, "tracked.txt"), "utf-8")).toBe("modified\n");
 	});
 
 	it("applies cwd remapping hooks once to the probe", async () => {

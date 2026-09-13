@@ -334,9 +334,13 @@ export function resolveDiscardProbeTarget(
 	const assignments = leadingTokens.filter((token) => token.includes("="));
 	if (assignments.length > 0) envPrefix = `${assignments.join(" ")} `;
 
-	// Persistent cd relocations earlier in the command.
-	const cdArgs: string[] = [];
+	// cd relocations earlier in the command. cds inside grouping parentheses or
+	// command substitutions do not persist: they only matter when the discard
+	// itself runs inside the still-open group, tracked via paren depth.
+	const persistentCdArgs: string[] = [];
+	const groupedCdArgs: string[] = [];
 	let sawCd = false;
+	let parenDepth = 0;
 	if (/\b(cd|pushd)\b/.test(prefix) || prefix.includes("(")) {
 		for (const part of prefix.split(/(&&|\|\||;|\||\n)/)) {
 			if (part === "&&" || part === ";" || part === "\n") continue;
@@ -345,14 +349,25 @@ export function resolveDiscardProbeTarget(
 				continue;
 			}
 			const trimmed = part.trim();
-			const ungrouped = trimmed.replace(/^[(]+/, "");
-			if (ungrouped !== trimmed && /\b(cd|pushd)\b/.test(ungrouped)) {
-				// A cd inside grouping parentheses may not persist.
-				return UNRESOLVABLE_DISCARD_TARGET;
+			const opens = part.match(/\(/g)?.length ?? 0;
+			const closes = part.match(/\)/g)?.length ?? 0;
+			const insideGroup = parenDepth > 0 || opens > 0;
+			parenDepth = Math.max(0, parenDepth + opens - closes);
+			if (insideGroup) {
+				const groupCd = /^cd\s*(.*)$/.exec(trimmed.replace(/^[(\s]+/, "").replace(/[)\s]+$/, ""));
+				if (groupCd) {
+					const arg = groupCd[1].trim();
+					if (!arg || /[$`;&|()<>"]/.test(arg)) return UNRESOLVABLE_DISCARD_TARGET;
+					sawCd = true;
+					groupedCdArgs.push(arg);
+				} else if (/\b(cd|pushd)\b/.test(trimmed)) {
+					return UNRESOLVABLE_DISCARD_TARGET; // group content we cannot replay
+				}
+				continue;
 			}
-			if (ungrouped === "pushd" || ungrouped.startsWith("pushd ")) return UNRESOLVABLE_DISCARD_TARGET;
-			const cdMatch = /^cd\s*(.*)$/.exec(ungrouped);
-			if (!cdMatch) continue; // not a cd: cannot change cwd (grouping/substitution included)
+			if (trimmed === "pushd" || trimmed.startsWith("pushd ")) return UNRESOLVABLE_DISCARD_TARGET;
+			const cdMatch = /^cd\s*(.*)$/.exec(trimmed);
+			if (!cdMatch) continue; // not a cd: cannot change cwd
 			const arg = cdMatch[1].trim();
 			// An arg we cannot replay safely (substitution, redirection, backgrounding,
 			// or quotes split by segmenting) leaves the target repository unknown;
@@ -360,13 +375,17 @@ export function resolveDiscardProbeTarget(
 			const balanced = (arg.match(/"/g)?.length ?? 0) % 2 === 0 && (arg.match(/'/g)?.length ?? 0) % 2 === 0;
 			if (!balanced || (arg && /[$`;&|()<>]/.test(arg))) return UNRESOLVABLE_DISCARD_TARGET;
 			sawCd = true;
-			cdArgs.push(arg);
+			persistentCdArgs.push(arg);
 		}
 	}
+	// When the discard runs inside a still-open group, its directory is the
+	// persistent cd chain inherited by the group plus the group's own cds;
+	// otherwise only persistent cds apply.
+	const cdArgs = parenDepth > 0 ? [...persistentCdArgs, ...groupedCdArgs] : persistentCdArgs;
 
-	if (!sawCd && dashCDir === undefined && !cleanRemovesIgnored && !envPrefix) return null;
+	if (cdArgs.length === 0 && dashCDir === undefined && !cleanRemovesIgnored && !envPrefix) return null;
 	const ignored = cleanRemovesIgnored ? " --ignored=matching" : "";
-	const cdPrefix = sawCd ? `${cdArgs.map((arg) => (arg ? `cd ${arg}` : "cd")).join(" && ")} && ` : "";
+	const cdPrefix = cdArgs.length > 0 ? `${cdArgs.map((arg) => (arg ? `cd ${arg}` : "cd")).join(" && ")} && ` : "";
 	return {
 		relocationPrefix: `${cdPrefix}${envPrefix}` || undefined,
 		gitStatusCommand: `${dashCDir ? `git -C ${dashCDir} ` : "git "}status --porcelain --untracked-files=all${ignored}`,
