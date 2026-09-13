@@ -88,6 +88,7 @@ describe("isDestructiveGitDiscardCommand", () => {
 		"echo 'git reset --hard'",
 		'git commit -m "git reset --hard"',
 		'echo "git clean -fd"',
+		"echo preparing # git reset --hard",
 		"git checkout ./nested",
 		"git restore --staged .",
 		"git restore --staged :/",
@@ -589,7 +590,7 @@ describe("bash tool destructive-git dirty-tree guard", () => {
 		const bash = createBashTool(testDir);
 
 		const error = await bash
-			.execute("guard-closed-group", { command: "(echo hi; cd sub; echo done) && git reset --hard" })
+			.execute("guard-closed-group", { command: "(echo hi && cd sub && echo done) && git reset --hard" })
 			.then(
 				() => undefined,
 				(err: Error) => err,
@@ -625,7 +626,7 @@ describe("bash tool destructive-git dirty-tree guard", () => {
 		const bash = createBashTool(testDir);
 
 		const error = await bash
-			.execute("guard-inherited-group", { command: "cd sub && (cd nested; git reset --hard)" })
+			.execute("guard-inherited-group", { command: "cd sub && (cd nested && git reset --hard)" })
 			.then(
 				() => undefined,
 				(err: Error) => err,
@@ -698,6 +699,82 @@ describe("bash tool destructive-git dirty-tree guard", () => {
 			/Refusing to run this destructive git command/,
 		);
 		expect(readModifiedTracked()).toBe("modified\n");
+	});
+
+	it("conservatively refuses cds joined to the discard by ; or a newline", async () => {
+		const bash = createBashTool(testDir);
+
+		for (const command of ["cd /does/not/exist; git reset --hard", "cd sub\ngit reset --hard"]) {
+			const error = await bash.execute("guard-conditional-cd", { command }).then(
+				() => undefined,
+				(err: Error) => err,
+			);
+			expect(error).toBeInstanceOf(Error);
+			expect((error as Error).message).toContain("changes directory (or repository) first");
+		}
+	});
+
+	it("applies prefix cds once in the probe and probes the prefix directory", async () => {
+		const sub = join(testDir, "sub");
+		mkdirSync(sub);
+		initDirtyGitRepo(sub);
+		const bash = createBashTool(testDir, { commandPrefix: "cd sub" });
+
+		const error = await bash.execute("guard-prefix-cd", { command: "git reset --hard" }).then(
+			() => undefined,
+			(err: Error) => err,
+		);
+
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("tracked.txt");
+		expect(readFileSync(join(sub, "tracked.txt"), "utf-8")).toBe("modified\n");
+	});
+
+	it("records the prefix cd probe without duplication", async () => {
+		const calls: string[] = [];
+		const operations: BashOperations = {
+			exec: async (command, _cwd, _options) => {
+				calls.push(command);
+				return { exitCode: 0 };
+			},
+		};
+		const bash = createBashTool(testDir, { commandPrefix: "cd sub", operations });
+
+		await bash.execute("guard-prefix-cd-record", { command: "git checkout -- ." });
+
+		expect(calls).toEqual(["cd sub\ngit status --porcelain --untracked-files=all", "cd sub\ngit checkout -- ."]);
+	});
+
+	it("conservatively refuses relocating git -c config keys", async () => {
+		initDirtyGitRepo(testDir);
+		const bash = createBashTool(testDir);
+
+		const error = await bash
+			.execute("guard-c-core-worktree", { command: "git -c core.worktree=/other/tree reset --hard" })
+			.then(
+				() => undefined,
+				(err: Error) => err,
+			);
+
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("changes directory (or repository) first");
+	});
+
+	it("executes commands whose discard text sits in a comment", async () => {
+		initDirtyGitRepo(testDir);
+		const bash = createBashTool(testDir);
+
+		const result = await bash.execute("guard-comment", { command: "echo preparing # git reset --hard" });
+		expect((result.content?.[0] as { text?: string } | undefined)?.text).toContain("preparing");
+		expect(readModifiedTracked()).toBe("modified\n");
+	});
+
+	it("refuses destructive command prefixes instead of probing them", async () => {
+		const bash = createBashTool(testDir, { commandPrefix: "git clean -fd" });
+
+		await expect(bash.execute("guard-prefix-discard", { command: "echo hi" })).rejects.toThrow(
+			/changes directory \(or repository\) first/,
+		);
 	});
 
 	it("propagates aborts raised while probing", async () => {

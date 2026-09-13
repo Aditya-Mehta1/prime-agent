@@ -223,6 +223,12 @@ function maskQuotedSpans(command: string): string {
 	for (let i = 0; i < chars.length; i++) {
 		const ch = chars[i];
 		if (quote === null) {
+			// An unquoted # at a word boundary starts a comment; mask to end of line.
+			const prev = i > 0 ? chars[i - 1] : undefined;
+			if (ch === "#" && (i === 0 || prev === undefined || /[\s;&|(){}]/.test(prev))) {
+				for (let j = i; j < chars.length && chars[j] !== "\n"; j++) chars[j] = " ";
+				continue;
+			}
 			if (ch === '"' || ch === "'") quote = ch;
 		} else if (quote === "'") {
 			// No expansion happens inside single quotes; mask it all.
@@ -297,9 +303,13 @@ export const UNRESOLVABLE_DISCARD_TARGET = "unresolvable";
 export function resolveDiscardProbeTarget(
 	command: string,
 	discardIndex: number,
+	userCommandStart = 0,
 ): DiscardProbeTarget | typeof UNRESOLVABLE_DISCARD_TARGET | null {
 	const prefix = command.slice(0, discardIndex);
 	const invocation = command.slice(discardIndex);
+	// A discard inside the configured command prefix would be replayed by the
+	// probe itself; refuse instead of executing it during probing.
+	if (userCommandStart > 0 && discardIndex < userCommandStart) return UNRESOLVABLE_DISCARD_TARGET;
 	const tokens = invocation.split(/\s+/);
 
 	// git -C <dir> (or repository-relocating global options) on the discard invocation itself.
@@ -321,8 +331,12 @@ export function resolveDiscardProbeTarget(
 			dashCDir = dashCDir ? `${dashCDir} -C ${dir}` : dir;
 		} else if (token.startsWith("--git-dir") || token.startsWith("--work-tree") || token.startsWith("--prefix")) {
 			return UNRESOLVABLE_DISCARD_TARGET;
+		} else if (token === "-c") {
+			const config = tokens[index + 1];
+			// core.worktree/core.bare relocate the repository the discard targets.
+			if (config && /^core\.(worktree|bare)(=|$)/.test(config)) return UNRESOLVABLE_DISCARD_TARGET;
 		}
-		// Other flags (for example -c key=value) do not relocate.
+		// Other flags do not relocate.
 	}
 
 	// git clean -x/-X also deletes ignored files, so its probe must include them.
@@ -357,16 +371,32 @@ export function resolveDiscardProbeTarget(
 
 	// cd relocations earlier in the command. cds inside grouping parentheses or
 	// command substitutions do not persist: they only matter when the discard
-	// itself runs inside the still-open group, tracked via paren depth.
+	// itself runs inside the still-open group, tracked via paren depth. Segments
+	// before userCommandStart belong to the configured command prefix, which the
+	// probe already replays verbatim, so their cds are not re-applied.
 	const persistentCdArgs: string[] = [];
 	const groupedCdArgs: string[] = [];
 	let sawCd = false;
 	let parenDepth = 0;
+	let cdPendingSeparator = false;
 	if (/\b(cd|pushd)\b/.test(prefix) || prefix.includes("(")) {
+		let offset = 0;
 		for (const part of prefix.split(/(&&|\|\||;|\||\n)/)) {
-			if (part === "&&" || part === ";" || part === "\n") continue;
-			if (part === "||" || part === "|") {
-				if (sawCd) return UNRESOLVABLE_DISCARD_TARGET; // cd success no longer guaranteed
+			const start = offset;
+			offset += part.length;
+			if (start < userCommandStart) continue; // command-prefix region: replayed as-is
+			const separator = part === "&&" || part === "||" || part === ";" || part === "|" || part === "\n";
+			if (separator) {
+				if (cdPendingSeparator && (part === ";" || part === "\n")) {
+					// The discard's directory depends on the cd succeeding; refuse
+					// instead of probing only one of the two outcomes.
+					return UNRESOLVABLE_DISCARD_TARGET;
+				}
+				if (part === "||" || part === "|") {
+					if (sawCd) return UNRESOLVABLE_DISCARD_TARGET; // cd success no longer guaranteed
+					continue;
+				}
+				cdPendingSeparator = false;
 				continue;
 			}
 			const trimmed = part.trim();
@@ -378,8 +408,9 @@ export function resolveDiscardProbeTarget(
 				const groupCd = /^cd\s*(.*)$/.exec(trimmed.replace(/^[(\s]+/, "").replace(/[)\s]+$/, ""));
 				if (groupCd) {
 					const arg = groupCd[1].trim();
-					if (!arg || /[$`;&|()<>"]/.test(arg)) return UNRESOLVABLE_DISCARD_TARGET;
+					if (!arg || /[$`;&|()<>#"]/.test(arg)) return UNRESOLVABLE_DISCARD_TARGET;
 					sawCd = true;
+					cdPendingSeparator = true;
 					groupedCdArgs.push(arg);
 				} else if (/\b(cd|pushd)\b/.test(trimmed)) {
 					return UNRESOLVABLE_DISCARD_TARGET; // group content we cannot replay
@@ -388,14 +419,18 @@ export function resolveDiscardProbeTarget(
 			}
 			if (trimmed === "pushd" || trimmed.startsWith("pushd ")) return UNRESOLVABLE_DISCARD_TARGET;
 			const cdMatch = /^cd\s*(.*)$/.exec(trimmed);
-			if (!cdMatch) continue; // not a cd: cannot change cwd
+			if (!cdMatch) {
+				cdPendingSeparator = false;
+				continue; // not a cd: cannot change cwd
+			}
 			const arg = cdMatch[1].trim();
 			// An arg we cannot replay safely (substitution, redirection, backgrounding,
-			// or quotes split by segmenting) leaves the target repository unknown;
-			// refuse rather than probe blindly.
+			// comments, or quotes split by segmenting) leaves the target repository
+			// unknown; refuse rather than probe blindly.
 			const balanced = (arg.match(/"/g)?.length ?? 0) % 2 === 0 && (arg.match(/'/g)?.length ?? 0) % 2 === 0;
-			if (!balanced || (arg && /[$`;&|()<>]/.test(arg))) return UNRESOLVABLE_DISCARD_TARGET;
+			if (!balanced || (arg && /[$`;&|()<>#]/.test(arg))) return UNRESOLVABLE_DISCARD_TARGET;
 			sawCd = true;
+			cdPendingSeparator = true;
 			persistentCdArgs.push(arg);
 		}
 	}
@@ -630,7 +665,10 @@ export function createBashToolDefinition(
 			// bypass with allowDestructiveGit or the PI_BASH_ALLOW_DESTRUCTIVE_GIT
 			// env var. The pattern check is string-only and the probe runs only
 			// on a match, so clean runs pay nothing.
-			const discardIndices = findDestructiveGitDiscardCommands(spawnContext.command);
+			// Match and resolve the pre-hook command so probe construction stays
+			// aligned with the command prefix; the probe itself goes through the
+			// spawn hook like the guarded command does.
+			const discardIndices = findDestructiveGitDiscardCommands(resolvedCommand);
 			if (
 				discardIndices.length > 0 &&
 				allowDestructiveGit !== true &&
@@ -642,8 +680,9 @@ export function createBashToolDefinition(
 				// discard so hook-provided shell setup applies to both.
 				const probes: Array<{ context: BashSpawnContext; includesIgnoredFiles: boolean }> = [];
 				const seenProbes = new Set<string>();
+				const userCommandStart = commandPrefix ? commandPrefix.length + 1 : 0;
 				for (const index of discardIndices) {
-					const target = resolveDiscardProbeTarget(spawnContext.command, index);
+					const target = resolveDiscardProbeTarget(resolvedCommand, index, userCommandStart);
 					if (target === UNRESOLVABLE_DISCARD_TARGET) {
 						throw new Error(formatRelocationRefusal());
 					}
