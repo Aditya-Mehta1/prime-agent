@@ -106,7 +106,7 @@ def find_parent_session_file(sessions_dir: Path, ledger_text: str) -> Path | Non
         return None
     records, _malformed = scorer.parse_ledger(ledger_text)
     parents = {
-        os.path.basename(entry["parent"])
+        scorer._path_segments(entry["parent"])[-1]
         for entry in records
         if entry.get("op") == "spawn" and isinstance(entry.get("parent"), str)
     }
@@ -177,13 +177,18 @@ def first_stderr_error(stderr: str) -> str | None:
     return None
 
 
-def shutdown_agent_daemon(socket_path: Path) -> None:
+def shutdown_agent_daemon(socket_path: Path, retry_window_s: float = 0.0) -> None:
     """Stop the daemon the agent run leaves listening on the eval socket.
 
     The CLI spawns a detached daemon per --daemon-socket; without this,
     repeated evals accumulate orphan daemons and a timed-out run keeps
     its worker going. Client commands ride in a protocol envelope; the
     shutdown command closes the daemon's sessions before it exits.
+
+    A timed-out launch can die before the detached daemon finished
+    binding its socket; the daemon then comes up orphaned and never sees
+    the shutdown. With a retry window the teardown waits for the socket
+    to appear and still delivers the shutdown.
     """
     envelope = json.dumps(
         {
@@ -193,16 +198,22 @@ def shutdown_agent_daemon(socket_path: Path) -> None:
             "command": {"type": "shutdown"},
         }
     )
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(10)
-            client.connect(str(socket_path))
-            client.sendall(envelope.encode() + b"\n")
-            while client.recv(4096):
-                pass
-    except OSError:
-        # No daemon on the socket (launch failure or a stub agent): done.
-        pass
+    deadline = time.monotonic() + retry_window_s
+    while True:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(10)
+                client.connect(str(socket_path))
+                client.sendall(envelope.encode() + b"\n")
+                while client.recv(4096):
+                    pass
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                # No daemon on the socket (launch failure or a stub
+                # agent): done.
+                return
+            time.sleep(0.25)
 
 
 def agent_env(agent_home: Path, sessions_dir: str) -> dict:
@@ -222,7 +233,14 @@ def agent_env(agent_home: Path, sessions_dir: str) -> dict:
     deterministically.
     """
     env = {key: value for key, value in os.environ.items() if not key.startswith("PRIME_AGENT_INTERNAL_")}
-    for key in ("PRIME_AGENT_BASH_SHELL", "PRIME_AGENT_BASH_COMMAND_PREFIX"):
+    for key in (
+        "PRIME_AGENT_BASH_SHELL",
+        "PRIME_AGENT_BASH_COMMAND_PREFIX",
+        # Depth overrides from an embedding RLM session would start the
+        # eval parent at the wrong depth or block spawning shard children.
+        "RLM_DEPTH",
+        "RLM_MAX_DEPTH",
+    ):
         env.pop(key, None)
     source_agent_dir = Path(env.get("PRIME_AGENT_CODING_AGENT_DIR") or Path.home() / ".prime" / "agent")
     source_auth = source_agent_dir / "auth.json"
@@ -361,7 +379,9 @@ def main(argv: list[str] | None = None) -> int:
         exit_code = None
     finally:
         wall_time_s = time.monotonic() - started
-        shutdown_agent_daemon(workdir / "daemon.sock")
+        # A timed-out run may have died mid daemon-spawn: give the
+        # detached daemon time to bind before shutting it down.
+        shutdown_agent_daemon(workdir / "daemon.sock", retry_window_s=8.0 if timed_out else 0.0)
     (workdir / "agent.log").write_text(agent_log)
     # stderr is where launch and auth failures land; keep it with the result.
     (workdir / "agent.stderr").write_text(stderr_text)

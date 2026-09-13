@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import json
 import re
-from collections import defaultdict
 
 LEDGER_OPS = {"meta", "spawn", "rename", "delete"}
 NOTICE_CUSTOM_TYPES = {"rlm_child_terminal_notice", "rlm_child_failure"}
@@ -44,7 +43,7 @@ def score_fixture(fixture: dict, outcome: dict) -> dict:
     edges = replay_edges(records)
     answers = parse_answers(outcome.get("artifact_text", ""))
     coverage = score_coverage(fixture, answers)
-    delegation = score_delegation(fixture, edges, outcome.get("child_session_dirs", []))
+    delegation = score_delegation(fixture, edges, outcome.get("child_session_dirs", {}))
     dedup = score_dedup(fixture, records)
     receipts = score_receipts(edges, outcome.get("parent_transcript_text", ""))
     usage = outcome.get("usage") or {}
@@ -218,13 +217,18 @@ def score_delegation(fixture: dict, edges: dict[str, dict], child_session_dirs: 
     live_depth1 = [edge for edge in edges.values() if edge.get("depth") == 1 and edge.get("deleted") is None]
     worker_names = {edge.get("name") for edge in live_depth1 if edge.get("name") in required_workers}
     verified_workers = 0
+    claimed_sessions: set[tuple[str, str]] = set()
     for worker in required_workers:
-        if any(
-            _edge_has_session_dir(edge, child_session_dirs)
-            for edge in live_depth1
-            if edge.get("name") == worker
-        ):
-            verified_workers += 1
+        for edge in live_depth1:
+            if edge.get("name") != worker:
+                continue
+            session = _edge_session_dir_and_file(edge)
+            if session is None or session in claimed_sessions:
+                continue
+            if _session_dir_has_file(child_session_dirs, session):
+                claimed_sessions.add(session)
+                verified_workers += 1
+                break
     passed = worker_names == required_workers and verified_workers == len(required_workers)
     return {
         "delegation_evidence": passed,
@@ -235,21 +239,35 @@ def score_delegation(fixture: dict, edges: dict[str, dict], child_session_dirs: 
     }
 
 
-def _edge_has_session_dir(edge: dict, child_session_dirs: dict[str, list[str]]) -> bool:
-    """True when the edge's recorded child session file exists on disk.
+def _path_segments(path: str) -> list[str]:
+    """Split a recorded path on both separators, platform-independent.
+
+    The product writes ledger paths with the host separator; on Windows
+    they are backslash-joined, so splitting on "/" alone would reject
+    every valid child session there.
+    """
+    return [segment for segment in path.replace("\\", "/").split("/") if segment]
+
+
+def _edge_session_dir_and_file(edge: dict) -> tuple[str, str] | None:
+    """The edge's recorded (child session dir, session file) pair."""
+    child_file = edge.get("child")
+    if not isinstance(child_file, str):
+        return None
+    segments = _path_segments(child_file)
+    if len(segments) < 2:
+        return None
+    return segments[-2], segments[-1]
+
+
+def _session_dir_has_file(child_session_dirs: dict[str, list[str]], session: tuple[str, str]) -> bool:
+    """True when the recorded session file exists in the collected dirs.
 
     The ledger's child path points into the child's own sub-* dir; the
     runner collects the dir-to-files mapping, so a fabricated edge with
     no persisted session behind it cannot pass delegation.
     """
-    child_file = edge.get("child")
-    if not isinstance(child_file, str):
-        return False
-    segments = child_file.split("/")
-    if len(segments) < 2:
-        return False
-    child_dir = segments[-2]
-    session_file = segments[-1]
+    child_dir, session_file = session
     return session_file in child_session_dirs.get(child_dir, [])
 
 
@@ -264,8 +282,12 @@ def score_dedup(fixture: dict, records: list[dict]) -> dict:
     """
     n_shards = len(fixture.get("shards", []))
     shard_workers = {shard["worker"] for shard in fixture.get("shards", [])}
-    live_by_name: dict[str, set[str]] = defaultdict(set)
-    depth1_child_ids: set[str] = set()
+    # A child's shard assignment is its name at spawn and survives renames:
+    # renaming the first worker-events-01 child away must not free the name
+    # for a second spawn while the first child is still live. Deletes are
+    # the only legitimate way a shard's worker name becomes reusable.
+    spawn_name: dict[str, str] = {}
+    live_depth1_ids: set[str] = set()
     duplicates: list[dict] = []
     total_spawns = 0
     for record in records:
@@ -275,21 +297,13 @@ def score_dedup(fixture: dict, records: list[dict]) -> dict:
             continue
         if op == "spawn" and record.get("depth") == 1:
             total_spawns += 1
-            depth1_child_ids.add(child_id)
             name = record.get("name")
-            if name in shard_workers and live_by_name.get(name):
+            spawn_name[child_id] = name
+            if name in shard_workers and any(spawn_name.get(live_id) == name for live_id in live_depth1_ids):
                 duplicates.append({"name": name, "childId": child_id})
-            live_by_name[name].add(child_id)
-        elif op == "delete" and child_id in depth1_child_ids:
-            for child_ids in live_by_name.values():
-                child_ids.discard(child_id)
-        elif op == "rename" and child_id in depth1_child_ids:
-            # Rename bookkeeping applies only to the fan-out's own depth-1
-            # children; a renamed grandchild must not shadow a worker name.
-            for child_ids in live_by_name.values():
-                child_ids.discard(child_id)
-            if isinstance(record.get("name"), str):
-                live_by_name[record["name"]].add(child_id)
+            live_depth1_ids.add(child_id)
+        elif op == "delete":
+            live_depth1_ids.discard(child_id)
     budget = 2 * n_shards
     return {
         "dedup": not duplicates and total_spawns <= budget,
@@ -312,7 +326,11 @@ def score_receipts(edges: dict[str, dict], parent_transcript_text: str) -> dict:
     for entry in _transcript_records(parent_transcript_text):
         if entry.get("customType") == REPLY_CUSTOM_TYPE:
             details = entry.get("details") or {}
-            if details.get("fromRelationship") not in (None, "child"):
+            # Only an explicit child reply receipts a child: the daemon
+            # always stamps fromRelationship on delivered messages, so a
+            # record missing it (or claiming another relationship) with a
+            # matching session id is not the child's reply.
+            if details.get("fromRelationship") != "child":
                 continue
             sender = details.get("from") or {}
             session_id = sender.get("sessionId")
@@ -377,5 +395,8 @@ def _session_id_from_file(session_file: object) -> str | None:
     """The ledger child path is a <session-id>.jsonl file; extract the id."""
     if not isinstance(session_file, str):
         return None
-    name = session_file.rsplit("/", 1)[-1]
+    segments = _path_segments(session_file)
+    if not segments:
+        return None
+    name = segments[-1]
     return name[:-6] if name.endswith(".jsonl") else name

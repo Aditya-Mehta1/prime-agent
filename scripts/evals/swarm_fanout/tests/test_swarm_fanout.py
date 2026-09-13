@@ -21,7 +21,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 HARNESS = Path(__file__).resolve().parent.parent
@@ -428,6 +430,123 @@ class ScorerTests(unittest.TestCase):
         self.assertEqual(malformed, 2)
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["childId"], "sub-1")
+
+    def test_score_fixture_tolerates_missing_child_dirs_key(self):
+        # An outcome without child session dirs must score (delegation
+        # false), not crash the dict-based rubric.
+        outcome = passing_outcome(self.fixture)
+        del outcome["child_session_dirs"]
+        result = scorer.score_fixture(self.fixture, outcome)
+        self.assertFalse(result["delegation_evidence"])
+        self.assertFalse(result["resolved"])
+
+    def test_delegation_requires_distinct_session_claims(self):
+        # Two worker edges pointing at the same child session file is one
+        # child masquerading as a per-shard fan-out: each verified worker
+        # must claim its own session dir and file.
+        outcome = passing_outcome(self.fixture)
+        records = ledger_spawn_records(outcome["ledger_text"])
+        first = records[0]
+        shared_file = first["child"]
+        rewritten = []
+        for record in [json.loads(line) for line in outcome["ledger_text"].splitlines()]:
+            if record.get("op") == "spawn" and record["name"] != first["name"]:
+                record = {**record, "child": shared_file}
+            rewritten.append(json.dumps(record))
+        outcome["ledger_text"] = "\n".join(rewritten) + "\n"
+        result = scorer.score_fixture(self.fixture, outcome)
+        self.assertFalse(result["delegation_evidence"])
+        self.assertEqual(result["verified_shard_workers"], 1)
+
+    def test_renamed_worker_does_not_free_name_for_duplicate(self):
+        # Renaming the first worker-events-01 child away must not free the
+        # name for a second spawn while the first child is still live: the
+        # shard assignment is the spawn name, not the current name.
+        outcome = passing_outcome(self.fixture)
+        lines = outcome["ledger_text"].splitlines()
+        first = ledger_spawn_records(outcome["ledger_text"])[0]
+        duplicate = spawn_line("sub-secondspawn", first["name"], first["child"] + "2", first["parent"])
+        outcome["ledger_text"] = (
+            "\n".join(
+                lines + [rename_line(first["childId"], first["child"], "worker-renamed-away"), duplicate]
+            )
+            + "\n"
+        )
+        result = scorer.score_fixture(self.fixture, outcome)
+        self.assertFalse(result["dedup"])
+        self.assertEqual(len(result["duplicate_spawns"]), 1)
+        self.assertEqual(result["total_spawns"], 9)
+
+    def test_conflicting_duplicate_answers_block_coverage(self):
+        # A shard answered twice with conflicting values must fail even
+        # when one of the two is correct: duplicates are fabricated
+        # answers, not noise.
+        outcome = passing_outcome(self.fixture)
+        artifact = outcome["artifact_text"].rstrip()
+        first_shard = self.fixture["shards"][0]["file"]
+        outcome["artifact_text"] = (
+            artifact + "\n" + f"- {first_shard}: 999999\n" + f"- {first_shard}: 999999\n"
+        )
+        result = scorer.score_fixture(self.fixture, outcome)
+        self.assertFalse(result["coverage"])
+        self.assertIn(first_shard, result["wrong_answers"])
+        # Identical duplicate bullets that all match stay covered.
+        outcome["artifact_text"] = (
+            artifact + "\n" + f"- {first_shard}: {self.fixture['shards'][0]['expected']}\n"
+        )
+        result = scorer.score_fixture(self.fixture, outcome)
+        self.assertTrue(result["coverage"])
+
+    def test_edge_session_paths_use_platform_separators(self):
+        # The product writes ledger paths with the host separator; a
+        # Windows backslash-joined child path must verify delegation and
+        # receipts exactly like a POSIX one.
+        fixture = self.fixture
+        ledger_text, children = full_ledger(fixture, "\\tmp\\sessions\\parent-id.jsonl", "\\tmp\\artifacts")
+        backslash_children = []
+        lines = [json.loads(line) for line in ledger_text.splitlines()]
+        rewritten = []
+        for record in lines:
+            if record.get("op") == "spawn":
+                record = {**record, "child": record["child"].replace("/", "\\")}
+                backslash_children.append(record)
+            if record.get("op") == "meta":
+                record = {**record, "sessionsDir": record["sessionsDir"]}
+            rewritten.append(json.dumps(record))
+        outcome = {
+            "ledger_text": "\n".join(rewritten) + "\n",
+            "parent_transcript_text": full_transcript(children),
+            "child_session_dirs": child_dir_mapping(
+                [
+                    {
+                        "childId": child["childId"],
+                        "session": child["session"],
+                    }
+                    for child in children
+                ]
+            ),
+            "artifact_text": full_index(fixture),
+            "usage": {"tokens": 1, "turns": 1},
+            "wall_time_s": 1.0,
+        }
+        result = scorer.score_fixture(fixture, outcome)
+        self.assertTrue(result["delegation_evidence"])
+        self.assertTrue(result["receipts"])
+        self.assertTrue(result["resolved"])
+
+    def test_receipts_require_explicit_child_relationship(self):
+        # A reply record with the relationship field missing is not a
+        # receipt: the daemon always stamps it on delivered messages.
+        outcome = passing_outcome(self.fixture)
+        outcome["parent_transcript_text"] = (
+            "\n".join(
+                line.replace('"fromRelationship": "child",', "")
+                for line in outcome["parent_transcript_text"].splitlines()
+            )
+            + "\n"
+        )
+        result = scorer.score_fixture(self.fixture, outcome)
+        self.assertFalse(result["receipts"])
 
     def test_double_spawn_blocks_dedup(self):
         outcome = passing_outcome(self.fixture)
@@ -872,6 +991,47 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue((repo / "shards" / "events-01.jsonl").is_file())
         self.assertEqual(ref.read_text(), ref_before, "fixture commit leaked into the decoy repo")
         self.assertFalse((decoy / "shards").exists())
+
+    def test_agent_env_strips_embedding_overrides(self):
+        # RLM depth overrides from an embedding session must not leak into
+        # the eval agent: the eval parent must be an independent root.
+        env = dict(os.environ)
+        env.update({"RLM_DEPTH": "2", "RLM_MAX_DEPTH": "2", "PRIME_AGENT_INTERNAL_TOKEN": "x"})
+        workdir = Path(tempfile.mkdtemp(prefix="swarm-fanout-env-"))
+        try:
+            with unittest.mock.patch.dict(os.environ, env, clear=True):
+                result = runner.agent_env(workdir / "agent-home", str(workdir / "sessions"))
+            self.assertNotIn("RLM_DEPTH", result)
+            self.assertNotIn("RLM_MAX_DEPTH", result)
+            self.assertNotIn("PRIME_AGENT_INTERNAL_TOKEN", result)
+            self.assertEqual(result["PRIME_AGENT_SESSION_DIR"], str(workdir / "sessions"))
+            self.assertEqual(result["PRIME_AGENT_CODING_AGENT_DIR"], str(workdir / "agent-home"))
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    def test_shutdown_agent_daemon_waits_for_late_socket(self):
+        # A timed-out launch can die before the detached daemon binds; the
+        # retry window must still deliver the shutdown once it appears.
+        socket_dir = Path(tempfile.mkdtemp(prefix="swarm-fanout-late-"))
+        socket_path = socket_dir / "daemon.sock"
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        received = []
+
+        def serve() -> None:
+            time.sleep(1.0)
+            server.bind(str(socket_path))
+            server.listen(1)
+            connection, _ = server.accept()
+            received.append(connection.recv(1024).decode())
+            connection.close()
+
+        thread = threading.Thread(target=serve)
+        thread.start()
+        runner.shutdown_agent_daemon(socket_path, retry_window_s=5.0)
+        thread.join(timeout=10)
+        server.close()
+        self.assertEqual(len(received), 1)
+        self.assertEqual(json.loads(received[0])["command"]["type"], "shutdown")
 
     def test_shutdown_agent_daemon_sends_shutdown_command(self):
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
