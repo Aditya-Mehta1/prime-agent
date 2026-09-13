@@ -116,25 +116,28 @@ def find_parent_session_file(sessions_dir: Path, ledger_text: str) -> Path | Non
     return max(session_files, key=lambda path: path.stat().st_mtime)
 
 
-def collect_child_session_dirs(sessions_dir: Path, parent_session_file: Path | None) -> list[str]:
-    """sub-* child dirs under the parent's session artifact dir.
+def collect_child_session_dirs(sessions_dir: Path, parent_session_file: Path | None) -> dict[str, list[str]]:
+    """sub-* child dirs under the parent's session artifact dir, by name.
 
     Child sessions live next to their parent's artifacts
     (session-artifacts/<parent-id>/sub-<uuid8>/), each holding the
-    child's session JSONL; a dir counts only when that file exists.
+    child's session JSONL. The dir-to-files mapping lets the scorer
+    verify each ledger edge's recorded child file exists on disk, so a
+    dir unrelated to the ledger's children cannot stand in for one.
     """
     if parent_session_file is None:
-        return []
+        return {}
     artifacts_root = sessions_dir.parent / "session-artifacts"
     parent_artifacts = artifacts_root / parent_session_file.stem
     if not parent_artifacts.is_dir():
-        return []
-    child_dirs = []
+        return {}
+    child_dirs: dict[str, list[str]] = {}
     for child_dir in sorted(parent_artifacts.iterdir()):
         if not child_dir.is_dir() or not child_dir.name.startswith("sub-"):
             continue
-        if any(child_dir.glob("*.jsonl")):
-            child_dirs.append(child_dir.name)
+        session_files = sorted(path.name for path in child_dir.glob("*.jsonl"))
+        if session_files:
+            child_dirs[child_dir.name] = session_files
     return child_dirs
 
 
@@ -246,18 +249,37 @@ def init_fixture_repo(fixture_dir: Path, repo_dir: Path) -> None:
         repo_dir,
         ignore=shutil.ignore_patterns("fixture.json", "task.txt"),
     )
+    # Strip git location variables before initializing the temp repo: with
+    # GIT_DIR, GIT_INDEX_FILE, or GIT_WORK_TREE inherited from the caller,
+    # git add/commit would operate on the caller-selected repository instead
+    # of repo_dir. The environment is built fresh (not layered on
+    # os.environ) so a stripped variable cannot re-enter via the merge.
     git_env = {
-        "GIT_AUTHOR_NAME": "eval",
-        "GIT_AUTHOR_EMAIL": "eval@eval",
-        "GIT_COMMITTER_NAME": "eval",
-        "GIT_COMMITTER_EMAIL": "eval@eval",
+        key: value
+        for key, value in os.environ.items()
+        if key
+        not in {
+            "GIT_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_WORK_TREE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_COMMON_DIR",
+        }
     }
+    git_env.update(
+        {
+            "GIT_AUTHOR_NAME": "eval",
+            "GIT_AUTHOR_EMAIL": "eval@eval",
+            "GIT_COMMITTER_NAME": "eval",
+            "GIT_COMMITTER_EMAIL": "eval@eval",
+        }
+    )
     for command in (
         ["git", "init", "-q"],
         ["git", "add", "-A"],
         ["git", "-c", "commit.gpgsign=false", "commit", "-qm", "fixture"],
     ):
-        subprocess.run(command, cwd=repo_dir, check=True, env={**os.environ, **git_env})
+        subprocess.run(command, cwd=repo_dir, check=True, env=git_env)
 
 
 def collect_outcome(sessions_dir: Path, agent_home: Path, repo_dir: Path, agent_log: str) -> dict:

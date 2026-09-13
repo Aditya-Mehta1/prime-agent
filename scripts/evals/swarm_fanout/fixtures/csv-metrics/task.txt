@@ -17,7 +17,7 @@ How to run the fan-out:
 
 1. Spawn exactly one RLM subagent per shard from the Python kernel
    with await rlm.spawn('<task prompt>', name='worker-<shard stem>');
-   for shards/events-01.jsonl the child name is worker-events-01. The
+   for shards/metrics-01.csv the child name is worker-metrics-01. The
    child's task prompt must name the shard's file path and question
    and require the child to answer with only the number.
 2. Each child must send its answer back to you with

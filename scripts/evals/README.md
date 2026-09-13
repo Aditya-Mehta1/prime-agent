@@ -29,9 +29,11 @@ never from the agent's own claims.
 3. **Scorer** (`swarm_fanout/scorer.py`) applies the rubric:
    - **coverage**: every shard's answer in `combined-index.md` matches
      the machine-computed expected value;
-   - **delegation evidence**: at least one live depth-1 ledger edge per
-     shard with distinct worker names, plus one child session dir per
-     shard - a parent that answers everything itself fails here;
+   - **delegation evidence**: a live depth-1 ledger edge for every
+     shard's worker name, each edge backed by its real child session dir
+     (the edge's recorded child file must exist in the collected sub-*
+     dirs) - helper-named spawns do not substitute, and a parent that
+     answers everything itself fails here;
    - **dedup**: no shard's worker name is spawned twice while another
      child for that shard is live, and total depth-1 spawns stay within
      one retry per shard (2x the shard count);

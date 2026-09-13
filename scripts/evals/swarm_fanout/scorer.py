@@ -61,6 +61,7 @@ def score_fixture(fixture: dict, outcome: dict) -> dict:
         "live_depth1_edges": delegation["live_depth1_edges"],
         "distinct_worker_names": delegation["distinct_worker_names"],
         "child_session_dirs": delegation["child_session_dirs"],
+        "verified_shard_workers": delegation["verified_shard_workers"],
         "dedup": dedup["dedup"],
         "duplicate_spawns": dedup["duplicate_spawns"],
         "total_spawns": dedup["total_spawns"],
@@ -79,7 +80,12 @@ def parse_ledger(ledger_text: str) -> tuple[list[dict], int]:
 
     The product ledger fails closed on malformed lines; the scorer is a
     passive reader of a possibly torn artifact, so malformed lines are
-    skipped and counted in the result for diagnosis.
+    skipped and counted in the result for diagnosis. Each record's fields
+    are validated against the product schema (parseLedgerLine) before it
+    is replayed: a structurally invalid spawn line must not count as
+    delegation evidence. Records with a valid envelope but an unknown op
+    are skipped silently, the same forward-compat carve-out the product
+    reader makes.
     """
     records: list[dict] = []
     malformed = 0
@@ -92,11 +98,41 @@ def parse_ledger(ledger_text: str) -> tuple[list[dict], int]:
         except ValueError:
             malformed += 1
             continue
-        if isinstance(record, dict) and record.get("op") in LEDGER_OPS:
-            records.append(record)
-        else:
+        if not isinstance(record, dict) or record.get("op") not in LEDGER_OPS:
+            if isinstance(record, dict) and record.get("v") == 1 and isinstance(record.get("at"), str):
+                continue  # unknown op: forward-compat, not a defect
             malformed += 1
+            continue
+        if not _valid_ledger_record(record):
+            malformed += 1
+            continue
+        records.append(record)
     return records, malformed
+
+
+def _is_string(value: object) -> bool:
+    return isinstance(value, str)
+
+
+def _valid_ledger_record(record: dict) -> bool:
+    """Field-level validation, mirroring the product's parseLedgerLine."""
+    if record.get("v") != 1 or not _is_string(record.get("at")):
+        return False
+    op = record.get("op")
+    if op == "meta":
+        return _is_string(record.get("sessionsDir"))
+    if not (_is_string(record.get("childId")) and _is_string(record.get("child"))):
+        return False
+    if op == "spawn":
+        return (
+            _is_string(record.get("parent"))
+            and _is_string(record.get("name"))
+            and isinstance(record.get("depth"), int)
+            and not isinstance(record.get("depth"), bool)
+        )
+    if op == "rename":
+        return _is_string(record.get("name"))
+    return _is_string(record.get("reason"))
 
 
 def replay_edges(records: list[dict]) -> dict[str, dict]:
@@ -167,28 +203,54 @@ def score_coverage(fixture: dict, answers: dict[str, str]) -> dict:
     }
 
 
-def score_delegation(fixture: dict, edges: dict[str, dict], child_session_dirs: list[str]) -> dict:
+def score_delegation(fixture: dict, edges: dict[str, dict], child_session_dirs: dict[str, list[str]]) -> dict:
     """Spawn evidence must exist per shard: ledger edges plus child dirs.
 
+    Every shard's worker name must have a live depth-1 ledger edge, and
+    every such edge must be backed by its real child session dir: the
+    edge's recorded child file must exist in the collected sub-* dirs.
     A parent that answers every shard without spawning one child per
     shard fails delegation even though coverage may pass - the no-spawn
-    cheat is the blind-answer analog of swe-fix-loop's blind patch.
+    cheat is the blind-answer analog of swe-fix-loop's blind patch, and
+    helper-named children do not substitute for shard workers.
     """
-    n_shards = len(fixture.get("shards", []))
+    required_workers = {shard["worker"] for shard in fixture.get("shards", [])}
     live_depth1 = [edge for edge in edges.values() if edge.get("depth") == 1 and edge.get("deleted") is None]
-    distinct_child_ids = {edge["childId"] for edge in live_depth1}
-    distinct_names = {edge.get("name") for edge in live_depth1 if edge.get("name")}
-    passed = (
-        len(distinct_child_ids) >= n_shards
-        and len(distinct_names) >= n_shards
-        and len(child_session_dirs) >= n_shards
-    )
+    worker_names = {edge.get("name") for edge in live_depth1 if edge.get("name") in required_workers}
+    verified_workers = 0
+    for worker in required_workers:
+        if any(
+            _edge_has_session_dir(edge, child_session_dirs)
+            for edge in live_depth1
+            if edge.get("name") == worker
+        ):
+            verified_workers += 1
+    passed = worker_names == required_workers and verified_workers == len(required_workers)
     return {
         "delegation_evidence": passed,
-        "live_depth1_edges": len(distinct_child_ids),
-        "distinct_worker_names": len(distinct_names),
+        "live_depth1_edges": len({edge["childId"] for edge in live_depth1}),
+        "distinct_worker_names": len({edge.get("name") for edge in live_depth1 if edge.get("name")}),
         "child_session_dirs": len(child_session_dirs),
+        "verified_shard_workers": verified_workers,
     }
+
+
+def _edge_has_session_dir(edge: dict, child_session_dirs: dict[str, list[str]]) -> bool:
+    """True when the edge's recorded child session file exists on disk.
+
+    The ledger's child path points into the child's own sub-* dir; the
+    runner collects the dir-to-files mapping, so a fabricated edge with
+    no persisted session behind it cannot pass delegation.
+    """
+    child_file = edge.get("child")
+    if not isinstance(child_file, str):
+        return False
+    segments = child_file.split("/")
+    if len(segments) < 2:
+        return False
+    child_dir = segments[-2]
+    session_file = segments[-1]
+    return session_file in child_session_dirs.get(child_dir, [])
 
 
 def score_dedup(fixture: dict, records: list[dict]) -> dict:
@@ -203,6 +265,7 @@ def score_dedup(fixture: dict, records: list[dict]) -> dict:
     n_shards = len(fixture.get("shards", []))
     shard_workers = {shard["worker"] for shard in fixture.get("shards", [])}
     live_by_name: dict[str, set[str]] = defaultdict(set)
+    depth1_child_ids: set[str] = set()
     duplicates: list[dict] = []
     total_spawns = 0
     for record in records:
@@ -212,14 +275,17 @@ def score_dedup(fixture: dict, records: list[dict]) -> dict:
             continue
         if op == "spawn" and record.get("depth") == 1:
             total_spawns += 1
+            depth1_child_ids.add(child_id)
             name = record.get("name")
             if name in shard_workers and live_by_name.get(name):
                 duplicates.append({"name": name, "childId": child_id})
             live_by_name[name].add(child_id)
-        elif op == "delete":
+        elif op == "delete" and child_id in depth1_child_ids:
             for child_ids in live_by_name.values():
                 child_ids.discard(child_id)
-        elif op == "rename":
+        elif op == "rename" and child_id in depth1_child_ids:
+            # Rename bookkeeping applies only to the fan-out's own depth-1
+            # children; a renamed grandchild must not shadow a worker name.
             for child_ids in live_by_name.values():
                 child_ids.discard(child_id)
             if isinstance(record.get("name"), str):

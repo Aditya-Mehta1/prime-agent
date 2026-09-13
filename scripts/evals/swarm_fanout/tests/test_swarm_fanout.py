@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -222,12 +223,17 @@ def ledger_spawn_records(ledger_text: str) -> list[dict]:
     ]
 
 
+def child_dir_mapping(children: list[dict]) -> dict[str, list[str]]:
+    """The dir-to-session-files mapping the runner collects post-run."""
+    return {child["childId"]: [child["session"] + ".jsonl"] for child in children}
+
+
 def passing_outcome(fixture: dict) -> dict:
     ledger_text, children = full_ledger(fixture, "/tmp/sessions/parent-id.jsonl", "/tmp/artifacts")
     return {
         "ledger_text": ledger_text,
         "parent_transcript_text": full_transcript(children),
-        "child_session_dirs": [child["childId"] for child in children],
+        "child_session_dirs": child_dir_mapping(children),
         "artifact_text": full_index(fixture),
         "usage": {"tokens": 40_000, "turns": 12},
         "wall_time_s": 123.4,
@@ -253,6 +259,17 @@ class FixtureIntegrity(unittest.TestCase):
             task = (FIXTURES / name / "task.txt").read_text()
             for shard in manifest["shards"]:
                 self.assertIn(f"shards/{shard['file']}: {shard['question']}", task, name)
+
+    def test_task_txt_example_names_its_own_fixture(self):
+        # The worked example must reference this fixture's shards: the
+        # csv prompt naming events-* shards (or vice versa) would send a
+        # compliant model looking for files that do not exist.
+        for name, other_prefix in (("json-events", "metrics"), ("csv-metrics", "events-")):
+            manifest = fixture_manifest(name)
+            task = (FIXTURES / name / "task.txt").read_text()
+            first = manifest["shards"][0]
+            self.assertIn(f"for shards/{first['file']} the child name is {first['worker']}", task)
+            self.assertNotIn(f"{other_prefix}-01", task)
 
     def test_worker_names_and_artifact_are_wellformed(self):
         for name in ("json-events", "csv-metrics"):
@@ -286,7 +303,7 @@ class ScorerTests(unittest.TestCase):
         outcome = passing_outcome(self.fixture)
         outcome["ledger_text"] = ""
         outcome["parent_transcript_text"] = ""
-        outcome["child_session_dirs"] = []
+        outcome["child_session_dirs"] = {}
         result = scorer.score_fixture(self.fixture, outcome)
         self.assertTrue(result["coverage"])
         self.assertFalse(result["delegation_evidence"])
@@ -309,7 +326,7 @@ class ScorerTests(unittest.TestCase):
     def test_delegation_requires_child_session_dirs(self):
         # Ledger edges exist but the child session dirs were never written.
         outcome = passing_outcome(self.fixture)
-        outcome["child_session_dirs"] = []
+        outcome["child_session_dirs"] = {}
         result = scorer.score_fixture(self.fixture, outcome)
         self.assertFalse(result["delegation_evidence"])
         self.assertFalse(result["resolved"])
@@ -328,6 +345,90 @@ class ScorerTests(unittest.TestCase):
         self.assertFalse(result["delegation_evidence"])
         self.assertEqual(result["distinct_worker_names"], 1)
 
+    def test_delegation_requires_shard_worker_edges(self):
+        # Eight live depth-1 children named helper-N (none matching a
+        # shard's worker) with real session dirs still fail delegation:
+        # helper spawns cannot substitute for per-shard delegation.
+        outcome = passing_outcome(self.fixture)
+        records = [json.loads(line) for line in outcome["ledger_text"].splitlines()]
+        rewritten = []
+        for record in records:
+            if record.get("op") == "spawn":
+                record = {**record, "name": "helper-" + record["childId"][-4:]}
+            rewritten.append(json.dumps(record))
+        outcome["ledger_text"] = "\n".join(rewritten) + "\n"
+        result = scorer.score_fixture(self.fixture, outcome)
+        self.assertFalse(result["delegation_evidence"])
+        self.assertEqual(result["verified_shard_workers"], 0)
+
+    def test_delegation_requires_edge_backed_session_dirs(self):
+        # The collected dirs exist but belong to sessions the ledger edges
+        # never recorded, so no worker edge is backed by a real child
+        # session dir and delegation fails.
+        outcome = passing_outcome(self.fixture)
+        outcome["child_session_dirs"] = {
+            f"sub-unrelated{index:02d}": [f"session-{index:02d}.jsonl"] for index in range(8)
+        }
+        result = scorer.score_fixture(self.fixture, outcome)
+        self.assertFalse(result["delegation_evidence"])
+        self.assertEqual(result["verified_shard_workers"], 0)
+
+    def test_depth2_rename_does_not_flag_depth1_spawn(self):
+        # A grandchild renamed to a shard worker name must not shadow the
+        # parent's own depth-1 spawn of that worker: rename bookkeeping
+        # applies only to the fan-out's depth-1 children.
+        ledger = "\n".join(
+            [
+                spawn_line("sub-grand0000", "worker-tmp", "/tmp/g.jsonl", "/tmp/gp.jsonl", depth=2),
+                rename_line("sub-grand0000", "/tmp/g.jsonl", self.fixture["shards"][0]["worker"]),
+                spawn_line(
+                    "sub-kid000000",
+                    self.fixture["shards"][0]["worker"],
+                    "/tmp/artifacts/parent-id/sub-kid000000/c000000000001.jsonl",
+                    "/tmp/sessions/parent-id.jsonl",
+                ),
+            ]
+        )
+        records, _malformed = scorer.parse_ledger(ledger)
+        result = scorer.score_dedup(self.fixture, records)
+        self.assertTrue(result["dedup"])
+        self.assertEqual(result["total_spawns"], 1)
+
+    def test_parse_ledger_rejects_type_invalid_records(self):
+        # Records that fail the product ledger schema must not replay as
+        # delegation evidence: a spawn missing parent/child, or with a
+        # string depth, is malformed and skipped.
+        bad_spawn = json.dumps(
+            {
+                "v": 1,
+                "op": "spawn",
+                "at": "2026-09-12T00:00:00.000Z",
+                "childId": "sub-x",
+                "depth": 1,
+                "name": "worker-events-01",
+            }
+        )
+        bad_depth = json.dumps(
+            {
+                "v": 1,
+                "op": "spawn",
+                "at": "2026-09-12T00:00:00.000Z",
+                "childId": "sub-x",
+                "parent": "/tmp/p.jsonl",
+                "child": "/tmp/c.jsonl",
+                "depth": "1",
+                "name": "worker-events-01",
+            }
+        )
+        unknown_op = json.dumps({"v": 1, "op": "future", "at": "2026-09-12T00:00:00.000Z"})
+        good_spawn = spawn_line("sub-1", "worker-a", "/tmp/a.jsonl", "/tmp/p.jsonl")
+        records, malformed = scorer.parse_ledger(
+            "\n".join([bad_spawn, bad_depth, unknown_op, good_spawn]) + "\n"
+        )
+        self.assertEqual(malformed, 2)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["childId"], "sub-1")
+
     def test_double_spawn_blocks_dedup(self):
         outcome = passing_outcome(self.fixture)
         lines = outcome["ledger_text"].splitlines()
@@ -341,24 +442,26 @@ class ScorerTests(unittest.TestCase):
 
     def test_retry_after_delete_stays_within_dedup(self):
         # One child failed, was deleted, and a replacement with the same
-        # worker name was spawned; the replacement also replied. This is
-        # the retry the task prompt grants, and it resolves end to end.
+        # worker name was spawned in its own session dir; the replacement
+        # also replied. This is the retry the task prompt grants, and it
+        # resolves end to end.
         outcome = passing_outcome(self.fixture)
         lines = outcome["ledger_text"].splitlines()
         first = ledger_spawn_records(outcome["ledger_text"])[0]
-        replacement_file = first["child"].replace(".jsonl", "-retry.jsonl")
+        replacement_file = "/tmp/artifacts/parent-id/sub-retry00000/child-retry00000.jsonl"
         replacement = spawn_line("sub-retry00000", first["name"], replacement_file, first["parent"])
         outcome["ledger_text"] = (
             "\n".join(lines + [delete_line(first["childId"], first["child"]), replacement]) + "\n"
         )
+        outcome["child_session_dirs"]["sub-retry00000"] = ["child-retry00000.jsonl"]
         transcript = outcome["parent_transcript_text"].rstrip()
-        replacement_session = replacement_file.rsplit("/", 1)[-1][:-6]
         outcome["parent_transcript_text"] = (
-            transcript + "\n" + reply_line(replacement_session, first["name"]) + "\n"
+            transcript + "\n" + reply_line("child-retry00000", first["name"]) + "\n"
         )
         result = scorer.score_fixture(self.fixture, outcome)
         self.assertTrue(result["dedup"])
         self.assertTrue(result["receipts"])
+        self.assertTrue(result["delegation_evidence"])
         self.assertEqual(result["total_spawns"], 9)
         self.assertTrue(result["resolved"])
 
@@ -734,6 +837,41 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(result["resolved"])
         self.assertTrue(result["timed_out"])
         self.assertIsNone(result["exit_code"])
+
+    def test_init_fixture_repo_ignores_git_location_env(self):
+        # GIT_DIR / GIT_INDEX_FILE / GIT_WORK_TREE from the caller must not
+        # redirect the fixture init into another repository.
+        decoy = Path(tempfile.mkdtemp(prefix="swarm-fanout-gitenv-"))
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=decoy, check=True)
+        (decoy / "marker.txt").write_text("decoy\n")
+        subprocess.run(["git", "add", "marker.txt"], cwd=decoy, check=True)
+        subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-qm", "decoy"], cwd=decoy, check=True)
+        ref = decoy / ".git" / "refs" / "heads" / "main"
+        ref_before = ref.read_text()
+        fixture = fixture_manifest("json-events")
+        stub = write_stub_agent(fixture, mode="artifact-only")
+        argv = ["--fixture", str(FIXTURES / "json-events"), "--model", "test/fake", "--agent-bin", str(stub)]
+        git_env = {
+            "GIT_DIR": str(decoy / ".git"),
+            "GIT_WORK_TREE": str(decoy),
+            "GIT_INDEX_FILE": str(decoy / ".git" / "index"),
+        }
+        saved = {key: os.environ.get(key) for key in git_env}
+        try:
+            os.environ.update(git_env)
+            exit_code, result = self.run_runner(argv)
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        self.assertEqual(exit_code, 1)  # artifact-only stub: unresolved, but the repo must init
+        repo = Path(result["workdir"]) / "repo"
+        self.assertTrue((repo / ".git").is_dir(), "fixture repo was not initialized in the workdir")
+        self.assertTrue((repo / "shards" / "events-01.jsonl").is_file())
+        self.assertEqual(ref.read_text(), ref_before, "fixture commit leaked into the decoy repo")
+        self.assertFalse((decoy / "shards").exists())
 
     def test_shutdown_agent_daemon_sends_shutdown_command(self):
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
