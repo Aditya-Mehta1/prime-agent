@@ -197,16 +197,22 @@ import {
 	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
+import { findExactModelReferenceMatch } from "./model-resolver.js";
 import { throwIfPromptAdmissionCancelled } from "./prompt-admission.js";
 import { expandPromptTemplate, type PromptTemplate, parseCommandArgs } from "./prompt-templates.js";
 import {
 	isAgentLifecycleFailure,
 	isFauxProviderQueueExhausted,
 	isPermanentProviderFailureKind,
+	type ProviderWaitPolicy,
+	parseProviderResetMs,
 	providerRetryDelay,
 	providerRetryPolicy,
 	providerStreamFailureKind,
 	providerStreamFailureRetryAfterMs,
+	providerStreamFailureStatus,
+	providerWaitClass,
+	providerWaitDecision,
 } from "./provider-retry.js";
 import {
 	type AutoRefineReason,
@@ -387,12 +393,18 @@ export type AgentSessionEvent =
 			maxAttempts: number;
 			delayMs: number;
 			errorMessage: string;
+			/** Why the retry loop re-issues the turn; absent = ordinary quick retry. */
+			reason?: "usage" | "unavailable" | "backup";
+			/** Present when reason is "backup": "provider/model-id" of the backup. */
+			backupModel?: string;
 	  }
 	| {
 			type: "auto_retry_end";
 			success: boolean;
 			attempt: number;
 			finalError?: string;
+			/** "provider/model-id" restored after a backup-model retry succeeded. */
+			restoredModel?: string;
 	  }
 	| {
 			type: "auth_stale";
@@ -1296,6 +1308,11 @@ export class AgentSession {
 	private _retryPromise: Promise<void> | undefined = undefined;
 	private _retryResolve: (() => void) | undefined = undefined;
 	private _retryAuthFailureSources: AuthSourceToken[] = [];
+	/** Ongoing wait-for-recovery state: pings issued and when the wait started. */
+	private _providerWait: { attempts: number; startedAtMs: number } | undefined = undefined;
+	/** Set while turns are routed to the user-configured backup model. */
+	private _backupModel: { backup: Model<any>; primary: Model<any>; thinkingLevel: ThinkingLevel } | undefined =
+		undefined;
 	private _agentMessageClearEpoch = 0;
 	private _agentMessageOutcomes = new Map<string, AgentMessageOutcome>();
 	private _lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
@@ -3900,12 +3917,15 @@ export class AgentSession {
 				// Reset retry counter immediately on successful assistant response
 				// This prevents accumulation across multiple LLM calls within a turn
 				if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
+					const restoredModel = this._restorePrimaryModelAfterBackup();
 					this._emit({
 						type: "auto_retry_end",
 						success: true,
 						attempt: this._retryAttempt,
+						...(restoredModel ? { restoredModel } : {}),
 					});
 					this._retryAttempt = 0;
+					this._providerWait = undefined;
 					this._retryAuthFailureSources = [];
 				}
 				if (this._accountGoalUsageForAssistantMessage(assistantMsg)) {
@@ -11544,7 +11564,11 @@ export class AgentSession {
 	}
 
 	private _isStructuredPermanentProviderRetryExhausted(message: AssistantMessage): boolean {
-		return isPermanentProviderFailureKind(this._getProviderStreamFailureKind(message), this._retryAttempt);
+		return isPermanentProviderFailureKind(
+			this._getProviderStreamFailureKind(message),
+			this._retryAttempt,
+			providerStreamFailureStatus(message),
+		);
 	}
 
 	private _isConcreteProviderAuthFailure(message: AssistantMessage): boolean {
@@ -11618,6 +11642,7 @@ export class AgentSession {
 			return;
 		}
 		this._markProviderAuthStaleForRetryFailure(message);
+		this._restorePrimaryModelAfterBackup();
 		this._emit({
 			type: "auto_retry_end",
 			success: false,
@@ -11625,6 +11650,7 @@ export class AgentSession {
 			finalError: message.errorMessage,
 		});
 		this._retryAttempt = 0;
+		this._providerWait = undefined;
 		this._retryAuthFailureSources = [];
 	}
 
@@ -11649,9 +11675,34 @@ export class AgentSession {
 			});
 		}
 
+		const waitClass = providerWaitClass(providerStreamFailureKind(message), providerStreamFailureStatus(message));
+
+		// User-defined backup model (settings.providerBackupModel, default none):
+		// route the failed turn to the backup instead of waiting while the
+		// primary is quota-blocked or its provider is unavailable.
+		if (waitClass !== "permanent") {
+			const backupModel = this._resolveBackupModel();
+			if (backupModel && !modelsAreEqual(this.model, backupModel)) {
+				return this._handleBackupModelRetry(message, options, backupModel);
+			}
+		}
+
 		this._retryAttempt++;
 
+		const waitPolicy = this.settingsManager.getProviderWaitSettings();
+		// Quota/subscription exhaustion: wait for usage to come back with bounded
+		// exponential-backoff pings (and a scheduled resume when the provider
+		// reports a reset time) instead of the quick-retry loop.
+		if (waitClass === "quota" && waitPolicy.enabled) {
+			return this._handleProviderWait(message, options, waitPolicy, "usage");
+		}
+
 		if (this._retryAttempt > settings.maxRetries) {
+			// Quick retries exhausted on an unavailable provider: keep pinging
+			// with bounded exponential backoff instead of giving up.
+			if (waitClass === "transient" && waitPolicy.enabled) {
+				return this._handleProviderWait(message, options, waitPolicy, "unavailable");
+			}
 			this._markProviderAuthStaleForRetryFailure(message, options);
 			this._emit({
 				type: "auto_retry_end",
@@ -11685,20 +11736,42 @@ export class AgentSession {
 			return false;
 		}
 
-		const delayMs = delay.delayMs;
+		return this._retryAfterDelay(
+			message,
+			options,
+			{
+				type: "auto_retry_start",
+				attempt: this._retryAttempt,
+				maxAttempts: settings.maxRetries,
+				delayMs: delay.delayMs,
+				errorMessage: message.errorMessage || "Unknown error",
+			},
+			delay.delayMs,
+		);
+	}
+
+	/**
+	 * Shared retry tail: park the failed turn, surface the retry attempt, wait,
+	 * and re-issue the turn. Returns false when the retry was aborted instead.
+	 */
+	private async _retryAfterDelay(
+		message: AssistantMessage,
+		options:
+			| {
+					markAuthStaleOnFailure?: boolean;
+					authSourceTokens?: readonly AuthSourceToken[];
+			  }
+			| undefined,
+		emitStart: Extract<AgentSessionEvent, { type: "auto_retry_start" }>,
+		delayMs: number,
+	): Promise<boolean> {
 		// Park now: the retry re-issues the failed call and must reuse its Idempotency-Key.
 		// Payload hooks mutate the wire body after the hash point, so reuse is forfeited.
 		if (!this._extensionRunner.hasHandlers("before_provider_request")) {
 			this._semanticEdges.prepareTurnRetry();
 		}
 
-		this._emit({
-			type: "auto_retry_start",
-			attempt: this._retryAttempt,
-			maxAttempts: settings.maxRetries,
-			delayMs,
-			errorMessage: message.errorMessage || "Unknown error",
-		});
+		this._emit(emitStart);
 
 		const messages = this.agent.state.messages;
 		if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
@@ -11713,6 +11786,7 @@ export class AgentSession {
 			this._markProviderAuthStaleForRetryFailure(message, options);
 			this._retryAttempt = 0;
 			this._retryAbortController = undefined;
+			this._providerWait = undefined;
 			this._emit({
 				type: "auto_retry_end",
 				success: false,
@@ -11734,6 +11808,7 @@ export class AgentSession {
 				this._markProviderAuthStaleForRetryFailure(message, options);
 				const attempt = this._retryAttempt;
 				this._retryAttempt = 0;
+				this._providerWait = undefined;
 				this._retryAuthFailureSources = [];
 				this._emit({
 					type: "auto_retry_end",
@@ -11746,6 +11821,130 @@ export class AgentSession {
 		}, 0);
 
 		return true;
+	}
+
+	/**
+	 * Resolve the user-configured backup model reference against the available
+	 * models. Unknown or unauthenticated references resolve to undefined: the
+	 * wait loop runs instead, and never surprises the user with a switch.
+	 */
+	private _resolveBackupModel(): Model<any> | undefined {
+		const reference = this.settingsManager.getProviderBackupModel();
+		if (!reference) return undefined;
+		const backupModel = findExactModelReferenceMatch(reference, this._modelRegistry.getAvailable());
+		if (!backupModel || !this._modelRegistry.hasConfiguredAuth(backupModel)) {
+			return undefined;
+		}
+		return backupModel;
+	}
+
+	/** Route the failed turn to the backup model and retry immediately on it. */
+	private _handleBackupModelRetry(
+		message: AssistantMessage,
+		options:
+			| {
+					markAuthStaleOnFailure?: boolean;
+					authSourceTokens?: readonly AuthSourceToken[];
+			  }
+			| undefined,
+		backupModel: Model<any>,
+	): Promise<boolean> {
+		const previousModel = this.agent.state.model;
+		const previousThinkingLevel = this.agent.state.thinkingLevel;
+		this.agent.state.model = backupModel;
+		// Clamp per-request fields to what the backup supports; both are restored
+		// when the turn returns to the primary.
+		this.agent.state.thinkingLevel = clampThinkingLevel(backupModel, previousThinkingLevel) as ThinkingLevel;
+		this._clampServiceTierForModel();
+		// Session-log the switch so primary->backup->primary transitions stay debuggable.
+		this.sessionManager.appendModelChange(backupModel.provider, backupModel.id);
+		this._backupModel = { backup: backupModel, primary: previousModel, thinkingLevel: previousThinkingLevel };
+		this._retryAttempt++;
+		this._providerWait = undefined;
+
+		return this._retryAfterDelay(
+			message,
+			options,
+			{
+				type: "auto_retry_start",
+				attempt: this._retryAttempt,
+				maxAttempts: this.settingsManager.getRetrySettings().maxRetries,
+				delayMs: 0,
+				errorMessage: message.errorMessage || "Unknown error",
+				reason: "backup",
+				backupModel: `${backupModel.provider}/${backupModel.id}`,
+			},
+			0,
+		);
+	}
+
+	/**
+	 * One bounded wait-for-recovery ping: exponential backoff with jitter, a
+	 * scheduled resume when the provider reports a reset time, and hard abort
+	 * bounds so the wait can never hang.
+	 */
+	private async _handleProviderWait(
+		message: AssistantMessage,
+		options:
+			| {
+					markAuthStaleOnFailure?: boolean;
+					authSourceTokens?: readonly AuthSourceToken[];
+			  }
+			| undefined,
+		policy: ProviderWaitPolicy,
+		reason: "usage" | "unavailable",
+	): Promise<boolean> {
+		const wait = this._providerWait;
+		const startedAtMs = wait?.startedAtMs ?? Date.now();
+		const pingAttempt = (wait?.attempts ?? 0) + 1;
+		this._providerWait = { attempts: pingAttempt, startedAtMs };
+
+		const resetMs = providerStreamFailureRetryAfterMs(message) ?? parseProviderResetMs(message.errorMessage);
+		const decision = providerWaitDecision(pingAttempt, Date.now() - startedAtMs, resetMs, policy);
+		if (decision.kind === "abort") {
+			this._markProviderAuthStaleForRetryFailure(message, options);
+			this._emit({
+				type: "auto_retry_end",
+				success: false,
+				attempt: pingAttempt - 1,
+				finalError: `${decision.message}: ${message.errorMessage || "unknown error"}`,
+			});
+			this._retryAttempt = 0;
+			this._providerWait = undefined;
+			this._retryAuthFailureSources = [];
+			this._resolveRetry();
+			return false;
+		}
+
+		return this._retryAfterDelay(
+			message,
+			options,
+			{
+				type: "auto_retry_start",
+				attempt: pingAttempt,
+				maxAttempts: policy.maxAttempts,
+				delayMs: decision.delayMs,
+				errorMessage: message.errorMessage || "Unknown error",
+				reason,
+			},
+			decision.delayMs,
+		);
+	}
+
+	/**
+	 * Return to the primary model after a backup-model retry, unless the user
+	 * switched models meanwhile. Returns the restored "provider/model-id"
+	 * reference for the retry-end event.
+	 */
+	private _restorePrimaryModelAfterBackup(): string | undefined {
+		const backup = this._backupModel;
+		this._backupModel = undefined;
+		if (!backup || !modelsAreEqual(this.model, backup.backup)) return undefined;
+		this.agent.state.model = backup.primary;
+		this.agent.state.thinkingLevel = backup.thinkingLevel;
+		this._clampServiceTierForModel();
+		this.sessionManager.appendModelChange(backup.primary.provider, backup.primary.id);
+		return `${backup.primary.provider}/${backup.primary.id}`;
 	}
 
 	abortRetry(): void {
@@ -11763,6 +11962,7 @@ export class AgentSession {
 				finalError: "Retry cancelled",
 			});
 			this._retryAttempt = 0;
+			this._providerWait = undefined;
 		}
 		this._retryAuthFailureSources = [];
 		this._resolveRetry();

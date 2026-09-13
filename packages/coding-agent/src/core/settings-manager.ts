@@ -5,6 +5,7 @@ import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
 import { writeFileAtomicSync } from "../utils/atomic-file.js";
+import type { ProviderWaitPolicy } from "./provider-retry.js";
 
 const RECENT_MODELS_LIMIT = 20;
 export const DEFAULT_IDLE_EVICTION_MINUTES = 90;
@@ -28,9 +29,19 @@ export interface AutoRefineSettings {
 	cooldownMs?: number; // default: 20 minutes
 }
 
+export interface ProviderWaitSettings {
+	enabled?: boolean; // default: true - bounded wait for quota/unavailability recovery
+	baseDelayMs?: number; // default: 1000 (first ping delay)
+	maxDelayMs?: number; // default: 300000 (per-ping ceiling, 5m)
+	maxAttempts?: number; // default: 30 (abort bound: max pings)
+	maxWaitMs?: number; // default: 900000 (abort bound: max total wait, 15m)
+}
+
 export interface ProviderRetrySettings {
 	timeoutMs?: number; // SDK/provider request timeout in milliseconds
 	maxRetryDelayMs?: number; // default: 60000 (max server-requested retry delay before failing; 0 disables the cap)
+	/** Bounded wait-for-recovery loop for quota exhaustion and provider unavailability. */
+	waitForUsage?: ProviderWaitSettings;
 }
 
 export interface RetrySettings {
@@ -148,6 +159,12 @@ export interface Settings {
 	telemetry?: TelemetrySettings;
 	branchSummary?: BranchSummarySettings;
 	retry?: RetrySettings;
+	/**
+	 * User-defined backup model ("provider/model-id" or a bare model id) used
+	 * while the primary model is quota-blocked or its provider is unavailable.
+	 * Default: none - requests never silently switch models.
+	 */
+	providerBackupModel?: string;
 	shellPath?: string; // Custom shell path (e.g., for Cygwin users on Windows)
 	quietStartup?: boolean;
 	shellCommandPrefix?: string; // Prefix prepended to every bash command (e.g., "shopt -s expand_aliases" for alias support)
@@ -955,6 +972,24 @@ export class SettingsManager {
 			timeoutMs: this.settings.retry?.provider?.timeoutMs,
 			maxRetryDelayMs: this.settings.retry?.provider?.maxRetryDelayMs ?? 60000,
 		};
+	}
+
+	getProviderWaitSettings(): ProviderWaitPolicy {
+		const wait = this.settings.retry?.provider?.waitForUsage;
+		const bound = (value: number | undefined, fallback: number): number =>
+			typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : fallback;
+		return {
+			enabled: wait?.enabled ?? true,
+			baseDelayMs: bound(wait?.baseDelayMs, 1000),
+			maxDelayMs: bound(wait?.maxDelayMs, 300_000),
+			maxAttempts: bound(wait?.maxAttempts, 30),
+			maxWaitMs: bound(wait?.maxWaitMs, 900_000),
+		};
+	}
+
+	getProviderBackupModel(): string | undefined {
+		const reference = this.settings.providerBackupModel;
+		return reference?.trim() ? reference.trim() : undefined;
 	}
 
 	getShellPath(): string | undefined {

@@ -5610,8 +5610,19 @@ export class InteractiveMode {
 				this.stopWorkingLoader();
 				this.statusContainer.clear();
 				this.retryCountdown?.dispose();
-				const retryMessage = (seconds: number) =>
-					`Retrying (${event.attempt}/${event.maxAttempts}) in ${seconds}s... (${keyText("app.clear")} to cancel)`;
+				const cancelHint = `(${keyText("app.clear")} to cancel)`;
+				const retryMessage =
+					event.reason === "backup"
+						? () =>
+								`Primary model unavailable (${event.errorMessage}) — retrying on backup model ${event.backupModel ?? "unknown"}... ${cancelHint}`
+						: event.reason === "usage"
+							? (seconds: number) =>
+									`Waiting for provider usage to recover (${event.attempt}/${event.maxAttempts}), next check in ${seconds}s... ${cancelHint}`
+							: event.reason === "unavailable"
+								? (seconds: number) =>
+										`Waiting for provider to recover (${event.attempt}/${event.maxAttempts}), next check in ${seconds}s... ${cancelHint}`
+								: (seconds: number) =>
+										`Retrying (${event.attempt}/${event.maxAttempts}) in ${seconds}s... ${cancelHint}`;
 				this.retryLoader = new Loader(
 					this.ui,
 					(spinner) => theme.fg("muted", spinner),
@@ -5648,6 +5659,8 @@ export class InteractiveMode {
 				// Show error only on final failure (success shows normal response)
 				if (!event.success) {
 					this.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
+				} else if (event.restoredModel) {
+					this.showStatus(`Primary provider recovered — back on ${event.restoredModel}`);
 				}
 				this.ui.requestRender();
 				break;

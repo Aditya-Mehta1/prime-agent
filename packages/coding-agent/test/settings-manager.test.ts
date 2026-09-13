@@ -568,4 +568,62 @@ describe("SettingsManager", () => {
 			expect(manager.getTelemetryEnabled()).toBe(false);
 		});
 	});
+
+	describe("provider wait-for-recovery and backup model", () => {
+		it("returns the documented wait defaults when unset", () => {
+			const manager = SettingsManager.inMemory();
+
+			expect(manager.getProviderWaitSettings()).toEqual({
+				enabled: true,
+				baseDelayMs: 1000,
+				maxDelayMs: 300_000,
+				maxAttempts: 30,
+				maxWaitMs: 900_000,
+			});
+			expect(manager.getProviderBackupModel()).toBeUndefined();
+		});
+
+		it("returns configured wait bounds and normalizes invalid values", () => {
+			const manager = SettingsManager.inMemory({
+				retry: {
+					provider: {
+						waitForUsage: {
+							enabled: false,
+							baseDelayMs: 500,
+							maxDelayMs: 60_000,
+							maxAttempts: 10,
+							maxWaitMs: 120_000,
+						},
+					},
+				},
+			});
+
+			expect(manager.getProviderWaitSettings()).toEqual({
+				enabled: false,
+				baseDelayMs: 500,
+				maxDelayMs: 60_000,
+				maxAttempts: 10,
+				maxWaitMs: 120_000,
+			});
+		});
+
+		it("clamps non-finite wait bounds to the defaults", () => {
+			const manager = SettingsManager.inMemory({
+				retry: { provider: { waitForUsage: { baseDelayMs: Number.NaN, maxAttempts: -5 } } },
+			});
+
+			const wait = manager.getProviderWaitSettings();
+			expect(wait.baseDelayMs).toBe(1000);
+			expect(wait.maxAttempts).toBe(0);
+		});
+
+		it("returns the backup model reference trimmed", () => {
+			const manager = SettingsManager.inMemory({ providerBackupModel: "  anthropic/claude-opus-4-7  " });
+
+			expect(manager.getProviderBackupModel()).toBe("anthropic/claude-opus-4-7");
+
+			const unset = SettingsManager.inMemory({ providerBackupModel: "   " });
+			expect(unset.getProviderBackupModel()).toBeUndefined();
+		});
+	});
 });
