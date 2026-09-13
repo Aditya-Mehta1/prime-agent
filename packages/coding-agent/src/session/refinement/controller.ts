@@ -18,6 +18,7 @@ export interface SessionRefinementHost {
 	>;
 	settingsManager: Pick<SettingsManager, "getAutoRefineSettings">;
 	getRetryPolicy(): ProviderRetryPolicy;
+	getSessionId?(): string;
 	isDisposed(): boolean;
 	isDisposing(): boolean;
 	isStreaming(): boolean;
@@ -27,7 +28,9 @@ export interface SessionRefinementHost {
 	getModel(): Model<Api> | undefined;
 	getThinkingLevel(): ThinkingLevel;
 	getMessages(): AgentMessage[];
-	getRequiredRequestAuth(model: Model<Api>): Promise<{ apiKey: string; headers?: Record<string, string> }>;
+	getRequiredRequestAuth(
+		model: Model<Api>,
+	): Promise<{ apiKey: string; headers?: Record<string, string>; requestModel?: Model<Api> }>;
 	getExtensionRunner(): Pick<ExtensionRunner, "hasHandlers" | "emit">;
 	getEventQueue(): Promise<void>;
 	getCompactionOperation(): Promise<void> | undefined;

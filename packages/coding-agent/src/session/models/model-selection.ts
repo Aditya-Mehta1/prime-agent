@@ -43,6 +43,7 @@ export interface ModelSelectionHost {
 	supportsThinking(): boolean;
 	getRegistry(): Pick<
 		ModelRegistry,
+		| "getModelForCurrentAuth"
 		| "getExecutableModels"
 		| "getApiKeyAndHeaders"
 		| "isUsingOAuth"
@@ -146,6 +147,7 @@ export class SessionModelSelection {
 	async getRequiredRequestAuth(model: Model<Api>): Promise<{
 		apiKey: string;
 		headers?: Record<string, string>;
+		requestModel: Model<Api>;
 	}> {
 		const result = await this.host.getRegistry().getApiKeyAndHeaders(model);
 		if (!result.ok) {
@@ -155,7 +157,7 @@ export class SessionModelSelection {
 			throw new Error(result.error);
 		}
 		if (result.apiKey) {
-			return { apiKey: result.apiKey, headers: result.headers };
+			return { apiKey: result.apiKey, headers: result.headers, requestModel: result.requestModel ?? model };
 		}
 
 		const isOAuth = this.host.getRegistry().isUsingOAuth(model);
@@ -447,6 +449,19 @@ export class SessionModelSelection {
 
 	private _clampThinkingLevel(level: ThinkingLevel, _availableLevels: ThinkingLevel[]): ThinkingLevel {
 		return this.model ? (clampThinkingLevel(this.model, level) as ThinkingLevel) : "off";
+	}
+
+	refreshModelMetadata(): void {
+		if (this.model?.provider === "xai") {
+			this.host.getState().model = this.host.getRegistry().getModelForCurrentAuth(this.model);
+			this.host.setThinkingLevel(this.thinkingLevel);
+			this._clampServiceTierForModel();
+		}
+		this._scopedModels = this._scopedModels.map((scoped) =>
+			scoped.model.provider === "xai"
+				? { ...scoped, model: this.host.getRegistry().getModelForCurrentAuth(scoped.model) }
+				: scoped,
+		);
 	}
 
 	refreshCurrentModelFromRegistry(): void {
