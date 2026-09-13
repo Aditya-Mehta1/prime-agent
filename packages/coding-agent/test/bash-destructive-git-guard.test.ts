@@ -520,6 +520,90 @@ describe("bash tool destructive-git dirty-tree guard", () => {
 		expect(readFileSync(join(sub, "tracked.txt"), "utf-8")).toBe("modified\n");
 	});
 
+	it("conservatively refuses substituted git -C directories", async () => {
+		const sub = join(testDir, "sub");
+		mkdirSync(sub);
+		initDirtyGitRepo(sub);
+		const bash = createBashTool(testDir);
+
+		const error = await bash.execute("guard-git-c-var", { command: "repo=sub && git -C $repo reset --hard" }).then(
+			() => undefined,
+			(err: Error) => err,
+		);
+
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("changes directory (or repository) first");
+		expect(readFileSync(join(sub, "tracked.txt"), "utf-8")).toBe("modified\n");
+	});
+
+	it("guards path-qualified and sudo git discards without treating them as relocations", async () => {
+		initDirtyGitRepo(testDir);
+		const bash = createBashTool(testDir);
+
+		for (const command of ["/usr/bin/git reset --hard", "sudo git reset --hard"]) {
+			const error = await bash
+				.execute(`guard-wrapper-${command.startsWith("/") ? "path" : "sudo"}`, { command })
+				.then(
+					() => undefined,
+					(err: Error) => err,
+				);
+			expect(error).toBeInstanceOf(Error);
+			expect((error as Error).message).toMatch(/uncommitted change\(s\)/);
+		}
+		expect(readModifiedTracked()).toBe("modified\n");
+	});
+
+	it("probes cd relocations followed by unrelated grouped segments", async () => {
+		const sub = join(testDir, "sub");
+		mkdirSync(sub);
+		initDirtyGitRepo(sub);
+		const bash = createBashTool(testDir);
+
+		const error = await bash
+			.execute("guard-cd-then-group", { command: "cd sub && (echo hi) && git reset --hard" })
+			.then(
+				() => undefined,
+				(err: Error) => err,
+			);
+
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("tracked.txt");
+		expect(readFileSync(join(sub, "tracked.txt"), "utf-8")).toBe("modified\n");
+	});
+
+	it("conservatively refuses cd inside grouping parentheses", async () => {
+		const sub = join(testDir, "sub");
+		mkdirSync(sub);
+		initDirtyGitRepo(sub);
+		const bash = createBashTool(testDir);
+
+		const error = await bash.execute("guard-grouped-cd", { command: "(cd sub) && git reset --hard" }).then(
+			() => undefined,
+			(err: Error) => err,
+		);
+
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("changes directory (or repository) first");
+	});
+
+	it("applies cwd remapping hooks once to the probe", async () => {
+		const calls: Array<{ command: string; cwd: string }> = [];
+		const operations: BashOperations = {
+			exec: async (command, cwd, _options) => {
+				calls.push({ command, cwd });
+				return { exitCode: 0 };
+			},
+		};
+		const bash = createBashTool(testDir, {
+			operations,
+			spawnHook: (ctx) => ({ ...ctx, cwd: `${ctx.cwd}/remapped` }),
+		});
+
+		await bash.execute("guard-hook-cwd", { command: "git checkout -- ." });
+
+		expect(calls.map((call) => call.cwd)).toEqual([`${testDir}/remapped`, `${testDir}/remapped`]);
+	});
+
 	it("propagates aborts raised while probing", async () => {
 		const operations: BashOperations = {
 			exec: async (command, _cwd, _options) => {

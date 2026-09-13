@@ -264,9 +264,9 @@ export function resolveDiscardProbeTarget(
 		}
 		if (token === "-C") {
 			const dir = tokens[index + 1];
-			// A quoted or escaped path cannot be replayed as a single token; refuse
-			// rather than probe a truncated directory.
-			if (!dir || /["'\\]/.test(dir)) return UNRESOLVABLE_DISCARD_TARGET;
+			// A quoted, escaped, or substituted path cannot be replayed as a single
+			// token; refuse rather than probe a truncated or unset directory.
+			if (!dir || /["'\\$`]/.test(dir)) return UNRESOLVABLE_DISCARD_TARGET;
 			// Repeated -C paths are relative to the preceding one, so replay the
 			// whole sequence instead of keeping only the last directory.
 			dashCDir = dashCDir ? `${dashCDir} -C ${dir}` : dir;
@@ -294,11 +294,17 @@ export function resolveDiscardProbeTarget(
 	// repository; replay them in the probe, or refuse when they cannot be.
 	let envPrefix = "";
 	const lastSegment = prefix.split(/&&|\|\||;|\||\n/).pop() ?? "";
-	const assignmentTokens = lastSegment.trim().split(/\s+/).filter(Boolean);
-	for (const token of assignmentTokens) {
-		if (!/^[A-Za-z_][A-Za-z0-9_]*=[^\s$`;&|()<>"]+$/.test(token)) return UNRESOLVABLE_DISCARD_TARGET;
+	const leadingTokens = lastSegment.trim().split(/\s+/).filter(Boolean);
+	for (const token of leadingTokens) {
+		if (/^[A-Za-z_][A-Za-z0-9_]*=[^\s$`;&|()<>"]+$/.test(token)) continue; // replayable assignment
+		// Wrappers that cannot change directory or select another repository.
+		if (token === "sudo" || token === "env" || token === "command" || token === "builtin" || token.endsWith("/")) {
+			continue;
+		}
+		return UNRESOLVABLE_DISCARD_TARGET;
 	}
-	if (assignmentTokens.length > 0) envPrefix = `${assignmentTokens.join(" ")} `;
+	const assignments = leadingTokens.filter((token) => token.includes("="));
+	if (assignments.length > 0) envPrefix = `${assignments.join(" ")} `;
 
 	// Persistent cd relocations earlier in the command.
 	const cdArgs: string[] = [];
@@ -310,10 +316,15 @@ export function resolveDiscardProbeTarget(
 				if (sawCd) return UNRESOLVABLE_DISCARD_TARGET; // cd success no longer guaranteed
 				continue;
 			}
-			const trimmed = part.trim().replace(/^[(]+/, "");
-			if (trimmed === "pushd" || trimmed.startsWith("pushd ")) return UNRESOLVABLE_DISCARD_TARGET;
-			const cdMatch = /^cd\s*(.*)$/.exec(trimmed);
-			if (!cdMatch) continue;
+			const trimmed = part.trim();
+			const ungrouped = trimmed.replace(/^[(]+/, "");
+			if (ungrouped !== trimmed && /\b(cd|pushd)\b/.test(ungrouped)) {
+				// A cd inside grouping parentheses may not persist.
+				return UNRESOLVABLE_DISCARD_TARGET;
+			}
+			if (ungrouped === "pushd" || ungrouped.startsWith("pushd ")) return UNRESOLVABLE_DISCARD_TARGET;
+			const cdMatch = /^cd\s*(.*)$/.exec(ungrouped);
+			if (!cdMatch) continue; // not a cd: cannot change cwd (grouping/substitution included)
 			const arg = cdMatch[1].trim();
 			// An arg we cannot replay safely (substitution, redirection, backgrounding,
 			// or quotes split by segmenting) leaves the target repository unknown;
@@ -323,7 +334,6 @@ export function resolveDiscardProbeTarget(
 			sawCd = true;
 			cdArgs.push(arg);
 		}
-		if (sawCd && prefix.includes("(")) return UNRESOLVABLE_DISCARD_TARGET; // subshell/grouping: cd may not persist
 	}
 
 	if (!sawCd && dashCDir === undefined && !cleanRemovesIgnored && !envPrefix) return null;
@@ -572,7 +582,10 @@ export function createBashToolDefinition(
 					const rawProbe = commandPrefix
 						? `${commandPrefix}\n${relocationPrefix}${gitStatus}`
 						: `${relocationPrefix}${gitStatus}`;
-					const context = resolveSpawnContext(rawProbe, spawnContext.cwd, spawnHook);
+					// Resolve the probe from the original cwd so hook transforms (for
+					// example a sandbox cwd remap) apply once, not to the already
+					// remapped context of the guarded command.
+					const context = resolveSpawnContext(rawProbe, cwd, spawnHook);
 					const key = `${context.command}\u0000${context.cwd}`;
 					if (seenProbes.has(key)) continue;
 					seenProbes.add(key);
