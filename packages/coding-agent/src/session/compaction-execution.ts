@@ -31,6 +31,7 @@ export interface CompactionExecutionHost {
 	getExtensions(): Pick<ExtensionRunner, "hasHandlers" | "emit">;
 	getThinkingLevel(): ThinkingLevel;
 	getRetryPolicy(): ProviderRetryPolicy;
+	getSessionId?(): string;
 	getHarnessDigest(): string;
 	rebuildContext(): void;
 	syncKernelState(): Promise<void>;
@@ -126,6 +127,7 @@ export async function performSessionCompaction(
 				host.getThinkingLevel(),
 				summaryCall,
 				host.getRetryPolicy(),
+				host.getSessionId?.(),
 			));
 		}
 

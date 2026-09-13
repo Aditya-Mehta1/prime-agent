@@ -40,7 +40,9 @@ export interface SessionCompactionHost {
 	beginRefinementAbort(): { promise: Promise<unknown>; finish(): void } | undefined;
 	getModel(): Model<Api> | undefined;
 	isStreaming(): boolean;
-	getRequiredAuth(model: Model<Api>): Promise<{ apiKey: string; headers?: Record<string, string> }>;
+	getRequiredAuth(
+		model: Model<Api>,
+	): Promise<{ apiKey: string; headers?: Record<string, string>; requestModel?: Model<Api> }>;
 	getAuth(model: Model<Api>): ReturnType<ModelRegistry["getApiKeyAndHeaders"]>;
 	perform(options: CompactionExecutionOptions): Promise<CompactionResult>;
 	disconnect(): void;
@@ -257,9 +259,9 @@ export class SessionCompaction {
 				throw new Error(formatNoModelSelectedMessage());
 			}
 
-			const { apiKey, headers } = await this.host.getRequiredAuth(this.model);
+			const { apiKey, headers, requestModel } = await this.host.getRequiredAuth(this.model);
 			const result = await this.host.perform({
-				model: this.model,
+				model: requestModel ?? this.model,
 				apiKey,
 				headers,
 				customInstructions,
@@ -417,7 +419,7 @@ export class SessionCompaction {
 			}
 
 			const result = await this.host.perform({
-				model: this.model,
+				model: authResult.requestModel ?? this.model,
 				apiKey: authResult.apiKey,
 				headers: authResult.headers,
 				customInstructions,
