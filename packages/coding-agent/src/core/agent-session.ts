@@ -1311,8 +1311,14 @@ export class AgentSession {
 	/** Ongoing wait-for-recovery state: pings issued and when the wait started. */
 	private _providerWait: { attempts: number; startedAtMs: number } | undefined = undefined;
 	/** Set while turns are routed to the user-configured backup model. */
-	private _backupModel: { backup: Model<any>; primary: Model<any>; thinkingLevel: ThinkingLevel } | undefined =
-		undefined;
+	private _backupModel:
+		| {
+				backup: Model<any>;
+				primary: Model<any>;
+				thinkingLevel: ThinkingLevel;
+				serviceTier: ServiceTier;
+		  }
+		| undefined = undefined;
 	private _agentMessageClearEpoch = 0;
 	private _agentMessageOutcomes = new Map<string, AgentMessageOutcome>();
 	private _lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
@@ -11704,11 +11710,13 @@ export class AgentSession {
 				return this._handleProviderWait(message, options, waitPolicy, "unavailable");
 			}
 			this._markProviderAuthStaleForRetryFailure(message, options);
+			const restoredModel = this._restorePrimaryModelAfterBackup();
 			this._emit({
 				type: "auto_retry_end",
 				success: false,
 				attempt: this._retryAttempt - 1,
 				finalError: message.errorMessage,
+				...(restoredModel ? { restoredModel } : {}),
 			});
 			this._retryAttempt = 0;
 			this._retryAuthFailureSources = [];
@@ -11724,11 +11732,13 @@ export class AgentSession {
 		});
 		if (delay.kind === "exceeds-cap") {
 			this._markProviderAuthStaleForRetryFailure(message, options);
+			const restoredModel = this._restorePrimaryModelAfterBackup();
 			this._emit({
 				type: "auto_retry_end",
 				success: false,
 				attempt: this._retryAttempt - 1,
 				finalError: `Provider requested a ${Math.ceil(delay.retryAfterMs / 1000)}s wait before retrying (above retry.provider.maxRetryDelayMs=${maxRetryDelayMs}ms): ${message.errorMessage || "unknown error"}`,
+				...(restoredModel ? { restoredModel } : {}),
 			});
 			this._retryAttempt = 0;
 			this._retryAuthFailureSources = [];
@@ -11787,11 +11797,13 @@ export class AgentSession {
 			this._retryAttempt = 0;
 			this._retryAbortController = undefined;
 			this._providerWait = undefined;
+			const restoredModel = this._restorePrimaryModelAfterBackup();
 			this._emit({
 				type: "auto_retry_end",
 				success: false,
 				attempt,
 				finalError: "Retry cancelled",
+				...(restoredModel ? { restoredModel } : {}),
 			});
 			this._resolveRetry();
 			this._retryAuthFailureSources = [];
@@ -11851,14 +11863,20 @@ export class AgentSession {
 	): Promise<boolean> {
 		const previousModel = this.agent.state.model;
 		const previousThinkingLevel = this.agent.state.thinkingLevel;
+		const previousServiceTier = this.agent.state.serviceTier;
 		this.agent.state.model = backupModel;
-		// Clamp per-request fields to what the backup supports; both are restored
-		// when the turn returns to the primary.
+		// Clamp per-request fields to what the backup supports; all of them are
+		// restored when the turn returns to the primary.
 		this.agent.state.thinkingLevel = clampThinkingLevel(backupModel, previousThinkingLevel) as ThinkingLevel;
 		this._clampServiceTierForModel();
 		// Session-log the switch so primary->backup->primary transitions stay debuggable.
 		this.sessionManager.appendModelChange(backupModel.provider, backupModel.id);
-		this._backupModel = { backup: backupModel, primary: previousModel, thinkingLevel: previousThinkingLevel };
+		this._backupModel = {
+			backup: backupModel,
+			primary: previousModel,
+			thinkingLevel: previousThinkingLevel,
+			serviceTier: previousServiceTier,
+		};
 		this._retryAttempt++;
 		this._providerWait = undefined;
 
@@ -11903,11 +11921,13 @@ export class AgentSession {
 		const decision = providerWaitDecision(pingAttempt, Date.now() - startedAtMs, resetMs, policy);
 		if (decision.kind === "abort") {
 			this._markProviderAuthStaleForRetryFailure(message, options);
+			const restoredModel = this._restorePrimaryModelAfterBackup();
 			this._emit({
 				type: "auto_retry_end",
 				success: false,
 				attempt: pingAttempt - 1,
 				finalError: `${decision.message}: ${message.errorMessage || "unknown error"}`,
+				...(restoredModel ? { restoredModel } : {}),
 			});
 			this._retryAttempt = 0;
 			this._providerWait = undefined;
@@ -11942,7 +11962,9 @@ export class AgentSession {
 		if (!backup || !modelsAreEqual(this.model, backup.backup)) return undefined;
 		this.agent.state.model = backup.primary;
 		this.agent.state.thinkingLevel = backup.thinkingLevel;
-		this._clampServiceTierForModel();
+		// Restore the saved effective tier: reclamping from the current state
+		// would keep the tier the backup clamped it to.
+		this._clampServiceTierForModel(backup.serviceTier);
 		this.sessionManager.appendModelChange(backup.primary.provider, backup.primary.id);
 		return `${backup.primary.provider}/${backup.primary.id}`;
 	}
@@ -11955,11 +11977,13 @@ export class AgentSession {
 		if (this._retryAttempt > 0) {
 			this._autoCompactionAbortController?.abort();
 			this._cancelPostCompactionContinue();
+			const restoredModel = this._restorePrimaryModelAfterBackup();
 			this._emit({
 				type: "auto_retry_end",
 				success: false,
 				attempt: this._retryAttempt,
 				finalError: "Retry cancelled",
+				...(restoredModel ? { restoredModel } : {}),
 			});
 			this._retryAttempt = 0;
 			this._providerWait = undefined;

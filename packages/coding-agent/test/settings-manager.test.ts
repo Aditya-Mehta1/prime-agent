@@ -625,5 +625,16 @@ describe("SettingsManager", () => {
 			const unset = SettingsManager.inMemory({ providerBackupModel: "   " });
 			expect(unset.getProviderBackupModel()).toBeUndefined();
 		});
+
+		it("treats a non-string providerBackupModel value as unset instead of throwing", () => {
+			// Parsed settings are only cast; a corrupted value must not throw into the retry path.
+			const numeric = SettingsManager.inMemory({ providerBackupModel: 123 as unknown as string });
+			expect(numeric.getProviderBackupModel()).toBeUndefined();
+
+			const listed = SettingsManager.inMemory({
+				providerBackupModel: ["faux/faux-backup"] as unknown as string,
+			});
+			expect(listed.getProviderBackupModel()).toBeUndefined();
+		});
 	});
 });

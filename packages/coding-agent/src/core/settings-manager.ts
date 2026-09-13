@@ -988,8 +988,11 @@ export class SettingsManager {
 	}
 
 	getProviderBackupModel(): string | undefined {
+		// Parsed settings are only cast to Settings; a non-string JSON value
+		// (e.g. 123) must behave as unset, never throw into the retry path.
 		const reference = this.settings.providerBackupModel;
-		return reference?.trim() ? reference.trim() : undefined;
+		if (typeof reference !== "string") return undefined;
+		return reference.trim() ? reference.trim() : undefined;
 	}
 
 	getShellPath(): string | undefined {

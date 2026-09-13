@@ -972,4 +972,117 @@ describe("AgentSession retry and event characterization", () => {
 			[true, undefined],
 		]);
 	});
+
+	it("restores the primary model when a backup-model retry is cancelled mid-wait", async () => {
+		const harness = await createHarness({
+			models: [{ id: "faux-1" }, { id: "faux-backup" }],
+			settings: {
+				providerBackupModel: "faux/faux-backup",
+				retry: {
+					enabled: true,
+					maxRetries: 3,
+					baseDelayMs: 1,
+					provider: { waitForUsage: { baseDelayMs: 200, maxDelayMs: 200, maxAttempts: 3, maxWaitMs: 10_000 } },
+				},
+			},
+		});
+		harnesses.push(harness);
+		harness.setResponses([quotaFailure(), quotaFailure()]);
+		const sawWaitStart = new Promise<void>((resolve) => {
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type === "auto_retry_start" && event.reason === "usage") {
+					unsubscribe();
+					resolve();
+				}
+			});
+		});
+
+		const promptPromise = harness.session.prompt("test");
+		await sawWaitStart;
+		// Waiting happens on the backup after the primary routed to it.
+		expect(harness.session.model?.id).toBe("faux-backup");
+
+		harness.session.abortRetry();
+		await promptPromise;
+
+		expect(harness.session.model?.id).toBe("faux-1");
+		const retryEnd = harness.eventsOfType("auto_retry_end").at(-1);
+		expect(retryEnd?.finalError).toBe("Retry cancelled");
+		expect(retryEnd?.restoredModel).toBe("faux/faux-1");
+	});
+
+	it("restores the primary model when quick retries exhaust on the backup model", async () => {
+		const harness = await createHarness({
+			models: [{ id: "faux-1" }, { id: "faux-backup" }],
+			settings: {
+				providerBackupModel: "faux/faux-backup",
+				retry: {
+					enabled: true,
+					maxRetries: 2,
+					baseDelayMs: 1,
+					provider: { waitForUsage: { enabled: false } },
+				},
+			},
+		});
+		harnesses.push(harness);
+		harness.setResponses([quotaFailure(), quotaFailure(), quotaFailure()]);
+
+		await harness.session.prompt("test");
+
+		expect(harness.session.model?.id).toBe("faux-1");
+		const retryEnd = harness.eventsOfType("auto_retry_end").at(-1);
+		expect(retryEnd?.success).toBe(false);
+		expect(retryEnd?.restoredModel).toBe("faux/faux-1");
+	});
+
+	it("restores the primary model when the bounded wait aborts on the backup model", async () => {
+		const harness = await createHarness({
+			models: [{ id: "faux-1" }, { id: "faux-backup" }],
+			settings: {
+				providerBackupModel: "faux/faux-backup",
+				retry: {
+					enabled: true,
+					maxRetries: 3,
+					baseDelayMs: 1,
+					provider: { waitForUsage: { baseDelayMs: 1, maxDelayMs: 2, maxAttempts: 2, maxWaitMs: 10_000 } },
+				},
+			},
+		});
+		harnesses.push(harness);
+		harness.setResponses([quotaFailure(), quotaFailure(), quotaFailure(), quotaFailure()]);
+
+		await harness.session.prompt("test");
+
+		expect(harness.session.model?.id).toBe("faux-1");
+		const retryEnd = harness.eventsOfType("auto_retry_end").at(-1);
+		expect(retryEnd?.success).toBe(false);
+		expect(retryEnd?.finalError).toContain("maxAttempts");
+		expect(retryEnd?.restoredModel).toBe("faux/faux-1");
+	});
+
+	it("restores the saved service tier after a backup retry, not the backup-clamped one", async () => {
+		const harness = await createHarness({
+			models: [{ id: "faux-1" }, { id: "faux-backup" }],
+			settings: {
+				providerBackupModel: "faux/faux-backup",
+				retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 },
+			},
+		});
+		harnesses.push(harness);
+		const clampSpy = vi.spyOn(
+			harness.session as unknown as { _clampServiceTierForModel: (serviceTier?: string) => void },
+			"_clampServiceTierForModel",
+		);
+		const tierBeforeSwitch = harness.session.serviceTier;
+		harness.setResponses([quotaFailure(), fauxAssistantMessage("backup answer")]);
+
+		await harness.session.prompt("test");
+
+		// The restore clamp must pass the tier captured at switch time, not
+		// re-derive it from the (possibly clamped) current state.
+		const restoreCall = clampSpy.mock.calls.at(-1);
+		expect(restoreCall?.[0]).toBe(tierBeforeSwitch);
+		expect(harness.session.serviceTier).toBe(tierBeforeSwitch);
+		expect(harness.session.model?.id).toBe("faux-1");
+	});
 });
