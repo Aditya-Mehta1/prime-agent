@@ -478,24 +478,46 @@ class ScorerTests(unittest.TestCase):
         self.assertEqual(result["total_spawns"], 9)
 
     def test_conflicting_duplicate_answers_block_coverage(self):
-        # A shard answered twice with conflicting values must fail even
-        # when one of the two is correct: duplicates are fabricated
-        # answers, not noise.
+        # Order-independent: a wrong bullet must fail coverage whether it
+        # lands before or after the correct one. (Last-wins scoring would
+        # pass this when the correction lands last.)
         outcome = passing_outcome(self.fixture)
         artifact = outcome["artifact_text"].rstrip()
         first_shard = self.fixture["shards"][0]["file"]
+        expected = str(self.fixture["shards"][0]["expected"])
+        outcome["artifact_text"] = artifact + "\n" + f"- {first_shard}: 999999\n"
+        result = scorer.score_fixture(self.fixture, outcome)
+        self.assertFalse(result["coverage"])
+        # A correction after a wrong bullet still fails: the artifact
+        # carried a fabricated answer, and the scorer keeps every bullet.
         outcome["artifact_text"] = (
-            artifact + "\n" + f"- {first_shard}: 999999\n" + f"- {first_shard}: 999999\n"
+            artifact + "\n" + f"- {first_shard}: 999999\n" + f"- {first_shard}: {expected}\n"
         )
         result = scorer.score_fixture(self.fixture, outcome)
         self.assertFalse(result["coverage"])
-        self.assertIn(first_shard, result["wrong_answers"])
         # Identical duplicate bullets that all match stay covered.
-        outcome["artifact_text"] = (
-            artifact + "\n" + f"- {first_shard}: {self.fixture['shards'][0]['expected']}\n"
-        )
+        outcome["artifact_text"] = artifact + "\n" + f"- {first_shard}: {expected}\n"
         result = scorer.score_fixture(self.fixture, outcome)
         self.assertTrue(result["coverage"])
+
+    def test_replay_edges_keyed_by_child_id_and_path(self):
+        # Two spawns sharing a childId but naming different child
+        # sessions are two distinct edges (the product keys an edge by
+        # childId plus canonical child path); a delete names its own
+        # edge and must not tombstone the sibling.
+        ledger = "\n".join(
+            [
+                spawn_line("sub-1", "worker-a", "/tmp/a.jsonl", "/tmp/p.jsonl"),
+                spawn_line("sub-1", "worker-b", "/tmp/b.jsonl", "/tmp/p.jsonl"),
+                delete_line("sub-1", "/tmp/a.jsonl"),
+            ]
+        )
+        records, _malformed = scorer.parse_ledger(ledger)
+        edges = scorer.replay_edges(records)
+        self.assertEqual(len(edges), 2)
+        live = [edge for edge in edges.values() if edge["deleted"] is None]
+        self.assertEqual(len(live), 1)
+        self.assertEqual(live[0]["name"], "worker-b")
 
     def test_edge_session_paths_use_platform_separators(self):
         # The product writes ledger paths with the host separator; a
@@ -680,10 +702,11 @@ class ScorerTests(unittest.TestCase):
         records, malformed = scorer.parse_ledger(ledger)
         self.assertEqual(malformed, 0)
         edges = scorer.replay_edges(records)
-        self.assertEqual(set(edges), {"sub-1", "sub-2"})
-        self.assertEqual(edges["sub-2"]["name"], "worker-c")
-        self.assertIsNone(edges["sub-2"]["deleted"])
-        self.assertEqual(edges["sub-1"]["deleted"], "parent-teardown")
+        self.assertEqual(len(edges), 2)
+        by_child = {edge["childId"]: edge for edge in edges.values()}
+        self.assertEqual(by_child["sub-2"]["name"], "worker-c")
+        self.assertIsNone(by_child["sub-2"]["deleted"])
+        self.assertEqual(by_child["sub-1"]["deleted"], "parent-teardown")
 
     def test_parse_ledger_skips_malformed_lines(self):
         ledger = "{not json}\n" + spawn_line("sub-1", "worker-a", "/tmp/a.jsonl", "/tmp/p.jsonl") + "\n\n"

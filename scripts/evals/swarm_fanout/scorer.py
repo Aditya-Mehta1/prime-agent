@@ -26,6 +26,7 @@ single-agent baseline datapoint exists.
 from __future__ import annotations
 
 import json
+import os
 import re
 
 LEDGER_OPS = {"meta", "spawn", "rename", "delete"}
@@ -134,16 +135,25 @@ def _valid_ledger_record(record: dict) -> bool:
     return _is_string(record.get("reason"))
 
 
-def replay_edges(records: list[dict]) -> dict[str, dict]:
-    """Replay ledger records into edges, last-writer-wins per childId."""
-    edges: dict[str, dict] = {}
+def replay_edges(records: list[dict]) -> dict[tuple[str, str], dict]:
+    """Replay ledger records into edges, last-writer-wins per childId+child.
+
+    The product ledger keys an edge by (childId, canonical child session
+    path) - two records sharing a childId but naming different child
+    sessions are two distinct edges, and a rename or delete applies only
+    to the edge its own child path names. The scorer mirrors that key so
+    a shadowed child cannot slip out of delegation and receipt checks.
+    """
+    edges: dict[tuple[str, str], dict] = {}
     for record in records:
         op = record.get("op")
         child_id = record.get("childId")
-        if not isinstance(child_id, str):
+        child = record.get("child")
+        if not isinstance(child_id, str) or not isinstance(child, str):
             continue
+        key = (child_id, _canonical_session_path(child))
         if op == "spawn":
-            edges[child_id] = {
+            edges[key] = {
                 "childId": child_id,
                 "parent": record.get("parent"),
                 "child": record.get("child"),
@@ -152,48 +162,60 @@ def replay_edges(records: list[dict]) -> dict[str, dict]:
                 "deleted": None,
             }
         elif op == "rename":
-            edge = edges.get(child_id)
+            edge = edges.get(key)
             if edge is not None and isinstance(record.get("name"), str):
                 edge["name"] = record["name"]
         elif op == "delete":
-            edge = edges.get(child_id)
+            edge = edges.get(key)
             if edge is not None:
                 edge["deleted"] = record.get("reason")
     return edges
 
 
-def parse_answers(artifact_text: str) -> dict[str, str]:
-    """Map shard file name to answer from the combined-index bullets.
+def _canonical_session_path(session_path: str) -> str:
+    """Mirror the product's canonicalSessionPath for edge keys.
 
-    Later duplicates of the same shard line are ignored: coverage needs
-    one correct answer per shard, and a wrong duplicate of a correct line
-    is still a fabricated-answer smell worth surfacing via the extra-line
-    count only.
+    The path is real path'd when it exists, falling back to the parent's
+    real path joined with the file name, so a canonical and a plain
+    spelling of the same child session share one edge key.
     """
-    answers: dict[str, str] = {}
-    extra_lines = 0
+    resolved = os.path.abspath(session_path)
+    return os.path.realpath(resolved)
+
+
+def parse_answers(artifact_text: str) -> dict[str, list[str]]:
+    """Map shard file name to every answer given in the index bullets.
+
+    Duplicate bullets are kept, not overwritten: a shard answered twice
+    with conflicting values must not pass coverage just because one of
+    the two happens to be right. Coverage requires every occurrence to
+    match the expected answer.
+    """
+    answers: dict[str, list[str]] = {}
     for line in artifact_text.splitlines():
         match = ANSWER_LINE.match(line)
         if match is None:
             continue
         shard, answer = match.group(1), match.group(2)
-        if shard in answers:
-            extra_lines += 1
-        answers[shard] = answer
+        answers.setdefault(shard, []).append(answer)
     return answers
 
 
-def score_coverage(fixture: dict, answers: dict[str, str]) -> dict:
-    """Every shard's answer must match the machine-computed expected value."""
+def score_coverage(fixture: dict, answers: dict[str, list[str]]) -> dict:
+    """Every shard's answer must match the machine-computed expected value.
+
+    A shard listed more than once is covered only when every occurrence
+    matches: conflicting duplicates are fabricated answers, not noise.
+    """
     missing: list[str] = []
     wrong: dict[str, dict] = {}
     for shard in fixture.get("shards", []):
         file = shard["file"]
         expected = str(shard["expected"])
         found = answers.get(file)
-        if found is None:
+        if not found:
             missing.append(file)
-        elif found != expected:
+        elif any(value != expected for value in found):
             wrong[file] = {"expected": expected, "found": found}
     return {
         "coverage": not missing and not wrong,

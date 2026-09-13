@@ -105,11 +105,13 @@ def find_parent_session_file(sessions_dir: Path, ledger_text: str) -> Path | Non
     if not session_files:
         return None
     records, _malformed = scorer.parse_ledger(ledger_text)
-    parents = {
-        scorer._path_segments(entry["parent"])[-1]
-        for entry in records
-        if entry.get("op") == "spawn" and isinstance(entry.get("parent"), str)
-    }
+    parents = set()
+    for entry in records:
+        if entry.get("op") != "spawn" or not isinstance(entry.get("parent"), str):
+            continue
+        segments = scorer._path_segments(entry["parent"])
+        if segments:
+            parents.add(segments[-1])
     matching = [path for path in session_files if path.name in parents]
     if matching:
         return matching[0]
@@ -326,6 +328,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=int, default=1800, help="Agent run timeout in seconds")
     parser.add_argument("--agent-bin", default="prime-agent", help="Agent binary to invoke")
     args = parser.parse_args(argv)
+
+    if sys.platform == "win32":
+        # The eval contract (per-workdir Unix daemon socket plus an
+        # AF_UNIX shutdown client) has no Windows named-pipe support;
+        # refuse loudly instead of failing obscurely mid-run.
+        print(
+            "swarm-fanout eval requires a Unix-domain-socket platform; Windows named pipes are not supported",
+            file=sys.stderr,
+        )
+        return 1
 
     fixture_dir = Path(args.fixture).resolve()
     fixture = json.loads((fixture_dir / "fixture.json").read_text())
