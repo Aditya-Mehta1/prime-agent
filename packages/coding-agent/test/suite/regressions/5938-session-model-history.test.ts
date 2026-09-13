@@ -168,17 +168,22 @@ describe("session model and history ownership boundaries", () => {
 		const firstAuth = vi
 			.spyOn(registry, "getApiKeyAndHeaders")
 			.mockResolvedValue({ ok: true, apiKey: "first", headers: { team: "one" } });
-		const secondAuth = vi
-			.spyOn(second.session.modelRegistry, "getApiKeyAndHeaders")
-			.mockResolvedValue({ ok: true, apiKey: "second", headers: { team: "two" } });
+		const secondAuth = vi.spyOn(second.session.modelRegistry, "getApiKeyAndHeaders").mockResolvedValue({
+			ok: true,
+			apiKey: "second",
+			headers: { team: "two" },
+			requestModel: second.getModel(),
+		});
 		expect(await owner.getRequiredRequestAuth(first.getModel())).toEqual({
 			apiKey: "first",
 			headers: { team: "one" },
+			requestModel: first.getModel(),
 		});
 		registry = second.session.modelRegistry;
 		expect(await owner.getRequiredRequestAuth(first.getModel())).toEqual({
 			apiKey: "second",
 			headers: { team: "two" },
+			requestModel: second.getModel(),
 		});
 		secondAuth.mockResolvedValue({ ok: false, error: "credential refresh failed" });
 		await expect(owner.getRequiredRequestAuth(first.getModel())).rejects.toThrow("credential refresh failed");
