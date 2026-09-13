@@ -876,6 +876,10 @@ describe("AgentSession autonomous continuations vs subagents", () => {
 			enabled: true,
 			subagentKeepAliveMs: 250,
 		});
+		const statusMessages = harness.session.messages.filter(
+			(message) => message.role === "custom" && message.customType === "autonomous_status",
+		);
+		expect(getMessageText(statusMessages.at(-1))).toContain("Subagent keep-alive: 250ms.");
 	});
 
 	it("disarms a pending keep-alive when the valve is disabled mid-hold", async () => {

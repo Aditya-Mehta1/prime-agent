@@ -2265,7 +2265,9 @@ export class AgentSession {
 		const subagentKeepAliveMs = status.subagentKeepAliveMs ?? 0;
 		const keepAlive =
 			subagentKeepAliveMs > 0
-				? `${AUTONOMOUS_STATUS_NUMBER_FORMAT.format(Math.round(subagentKeepAliveMs / 60_000))}m`
+				? subagentKeepAliveMs >= 60_000
+					? `${AUTONOMOUS_STATUS_NUMBER_FORMAT.format(Math.round(subagentKeepAliveMs / 60_000))}m`
+					: `${AUTONOMOUS_STATUS_NUMBER_FORMAT.format(subagentKeepAliveMs)}ms`
 				: "off";
 		return `[autonomous-status: ${state}]\n\nContinuations: ${formatCount(status.continuationsUsed)}/${formatCount(status.limits.maxContinuations)}. Turns: ${formatCount(status.turnsUsed)}/${formatCount(status.limits.maxTurns)}. Tokens: ${formatCount(status.tokensUsed)}/${formatCount(status.limits.maxTokens)}. Time: ${elapsedSeconds}s/${timeBudget}. Gates: ${gateSummary}. Subagent keep-alive: ${keepAlive}.`;
 	}
@@ -2470,7 +2472,6 @@ export class AgentSession {
 	 */
 	private async _resumeOwedAutonomousContinuation(): Promise<void> {
 		const snapshot = this._snapshotAutonomousRuntimeState();
-		const arrivalEpoch = this._sessionInputArrivalEpoch;
 		try {
 			// agent_end clears the live field, so fall back to the transcript;
 			// either way the session's last assistant turn decides the gate run.
@@ -2487,6 +2488,10 @@ export class AgentSession {
 				return;
 			}
 			// Configured quality gates decide whether the run is already done.
+			const beforeGates = {
+				continuationsUsed: this._autonomousState.continuationsUsed,
+				startedAt: this._autonomousState.startedAt,
+			};
 			const message = await nextAutonomousContinuation(this._autonomousState, lastAssistantMessage, {
 				cwd: this._cwd,
 				signal: this.agent.signal,
@@ -2495,16 +2500,25 @@ export class AgentSession {
 				this._clearAutonomousContinuationAwait();
 				return;
 			}
-			// Re-validate after the gate await: a new prompt, /autonomous off,
-			// or a goal takeover must not be bypassed by a stale continuation.
+			// Re-validate after the gate await: mode-off, a goal takeover, or
+			// newly admitted user-driven work must not be bypassed by a stale
+			// continuation. Sibling terminal notices are excluded: this owed
+			// continuation is exactly the wake that reads them.
+			const userDrivenWake = this._actionStore
+				.unfinishedActions()
+				.some((action) => !this._isRlmTerminalNoticeAction(action));
 			if (
 				this._disposed ||
 				this._disposing ||
 				!this._autonomousState.enabled ||
 				this._goalOwnsContinuationWakeup() ||
-				this._sessionInputArrivalEpoch !== arrivalEpoch
+				userDrivenWake
 			) {
-				this._restoreAutonomousRuntimeSnapshot(snapshot);
+				// Roll back only the increment for the un-delivered message, and
+				// only when the user has not reset the counters meanwhile.
+				if (this._autonomousState.startedAt === beforeGates.startedAt) {
+					this._autonomousState.continuationsUsed = beforeGates.continuationsUsed;
+				}
 				this._clearAutonomousContinuationAwait();
 				return;
 			}
