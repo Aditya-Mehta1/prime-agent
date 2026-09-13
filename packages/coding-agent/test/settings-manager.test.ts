@@ -719,5 +719,16 @@ describe("SettingsManager", () => {
 			const blank = SettingsManager.create(projectDir, agentDir);
 			expect(blank.getSubagentDefaultModel()).toBeUndefined();
 		});
+
+		it("treats a non-string subagentDefaultModel value as unset instead of throwing", () => {
+			// Parsed settings are only cast; a corrupted value must not throw into the spawn path.
+			const numeric = SettingsManager.inMemory({ subagentDefaultModel: 123 as unknown as string });
+			expect(numeric.getSubagentDefaultModel()).toBeUndefined();
+
+			const listed = SettingsManager.inMemory({
+				subagentDefaultModel: ["faux/faux-child"] as unknown as string,
+			});
+			expect(listed.getSubagentDefaultModel()).toBeUndefined();
+		});
 	});
 });

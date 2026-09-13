@@ -765,8 +765,11 @@ export class SettingsManager {
 
 	/** Model selector applied when `rlm.spawn` does not pin a model; unset inherits the parent model. */
 	getSubagentDefaultModel(): string | undefined {
-		const model = this.settings.subagentDefaultModel?.trim();
-		return model ? model : undefined;
+		// Parsed settings are only cast to Settings; a non-string JSON value
+		// (e.g. 42) must behave as unset, never throw into the spawn path.
+		const reference = this.settings.subagentDefaultModel;
+		if (typeof reference !== "string") return undefined;
+		return reference.trim() ? reference.trim() : undefined;
 	}
 
 	setDefaultProvider(provider: string): void {
