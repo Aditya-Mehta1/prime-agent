@@ -304,7 +304,7 @@ class CheckOverlapsTests(unittest.TestCase):
     def test_flags_duplicate_with_shared_files(self):
         report, calls = self.run_overlaps()
         self.assertIn(f'# Duplicate pre-flight — "{self.CANDIDATE_TITLE}"', report)
-        self.assertIn("Checked 14 open pull requests in acme/widgets; file-overlap fetch on 2", report)
+        self.assertIn("Checked 14 of 14 open pull requests in acme/widgets; file-overlap fetch on 2", report)
         self.assertIn("## Likely duplicate work", report)
         self.assertIn(
             '- #2140 "fix(coding-agent): prevent heartbeat catalog timeouts" — '
@@ -323,7 +323,7 @@ class CheckOverlapsTests(unittest.TestCase):
         report, calls = self.run_overlaps(deep=True)
         fetched = self.file_fetch_numbers(calls)
         self.assertEqual(len(fetched), 14)
-        self.assertIn("file-overlap fetch on 14 (every open PR)", report)
+        self.assertIn("Checked 14 of 14 open pull requests in acme/widgets; file-overlap fetch on 14 (every open PR)", report)
         # Only the real overlap is flagged even when everything is checked.
         self.assertIn("Verdict: DUPLICATE RISK — read #2140", report)
         self.assertNotIn("#2141", report)
@@ -369,6 +369,132 @@ class ParseNodeTests(unittest.TestCase):
         self.assertEqual(pr_2131.unresolved_bots["codex"], 1)
         # The human CHANGES_REQUESTED review sets the last human touch.
         self.assertEqual(pr_2131.last_human_at, m._parse_ts("2026-08-15T10:00:00Z"))
+
+
+
+
+class TimeoutTests(unittest.TestCase):
+    def test_gh_timeout_becomes_error_text(self):
+        import subprocess as sp
+
+        def hanging_run(*args, **kwargs):
+            raise sp.TimeoutExpired(cmd=["gh"], timeout=m.GH_TIMEOUT_SECONDS)
+
+        with patch.object(sp, "run", side_effect=hanging_run):
+            out = run(m.run(repo=REPO))
+        self.assertIn(f"PR triage failed for {REPO}", out)
+        self.assertIn("timed out", out)
+
+    def test_gh_timeout_in_overlaps_becomes_error_text(self):
+        import subprocess as sp
+
+        def hanging_run(*args, **kwargs):
+            raise sp.TimeoutExpired(cmd=["gh"], timeout=m.GH_TIMEOUT_SECONDS)
+
+        with patch.object(sp, "run", side_effect=hanging_run):
+            out = run(m.check_overlaps("some title", ["a.ts"], repo=REPO))
+        self.assertIn(f"Duplicate pre-flight failed for {REPO}", out)
+        self.assertIn("timed out", out)
+
+
+class TruncationTests(unittest.TestCase):
+    def node(self, **overrides):
+        base = {
+            "number": 1,
+            "title": "fix(coding-agent): example",
+            "author": {"login": "someone"},
+            "createdAt": "2026-09-01T00:00:00Z",
+            "isDraft": False,
+            "additions": 10,
+            "deletions": 1,
+            "changedFiles": 2,
+            "mergeStateStatus": "CLEAN",
+            "reviewDecision": "REVIEW_REQUIRED",
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+            "reviews": {"nodes": []},
+        }
+        base.update(overrides)
+        return base
+
+    def test_truncated_thread_list_blocks_ready_verdict(self):
+        pr = m._pr_from_node(self.node(reviewThreads={"pageInfo": {"hasNextPage": True}, "nodes": []}))
+        self.assertTrue(pr.threads_truncated)
+        verdict, reasons = m._verdict(pr)
+        self.assertEqual(verdict, "ATTENTION")
+        self.assertIn("thread list truncated", reasons[0])
+
+    def test_unknown_bot_review_is_not_human_touch(self):
+        # github-actions[bot] and dependabot[bot] reviews must not reset the
+        # last-human timestamp; only human reviews do.
+        pr = m._pr_from_node(
+            self.node(
+                reviews={"nodes": [{"author": {"login": "github-actions[bot]"}, "state": "COMMENTED", "submittedAt": "2026-09-10T00:00:00Z"}]},
+            )
+        )
+        self.assertEqual(pr.last_human_at, pr.created_at)
+
+    def test_human_review_updates_last_human(self):
+        pr = m._pr_from_node(
+            self.node(reviews={"nodes": [{"author": {"login": "kevin"}, "state": "COMMENTED", "submittedAt": "2026-09-10T00:00:00Z"}]}),
+        )
+        self.assertEqual(pr.last_human_at, m._parse_ts("2026-09-10T00:00:00Z"))
+
+    def test_graphql_cap_reports_truncated_queue(self):
+        fixture = load_fixture("titles_response.json")
+        fixture["data"]["repository"]["pullRequests"]["pageInfo"]["hasNextPage"] = True
+        calls = []
+
+        async def fake_gh(*args, payload=None):
+            calls.append(args)
+            return json.dumps(fixture)
+
+        with patch.object(m, "gh", side_effect=fake_gh):
+            nodes, total, truncated = run(m._graphql_pages(m.TITLES_QUERY, REPO, 5))
+        self.assertTrue(truncated)
+        self.assertEqual(len(nodes), 14)
+        self.assertEqual(total, 14)
+
+    def test_graphql_complete_queue_not_truncated(self):
+        fixture = load_fixture("titles_response.json")
+
+        async def fake_gh(*args, payload=None):
+            return json.dumps(fixture)
+
+        with patch.object(m, "gh", side_effect=fake_gh):
+            _, _, truncated = run(m._graphql_pages(m.TITLES_QUERY, REPO, m.TITLES_FETCH_CAP))
+        self.assertFalse(truncated)
+
+    def test_file_fetch_cap_reports_truncation_and_note(self):
+        full_page = [{"filename": f"packages/x/f{i}.ts"} for i in range(m.FILES_PAGE_SIZE)]
+        pages = {p: json.dumps(full_page) for p in range(1, m.FILES_PAGE_CAP + 1)}
+        titles = load_fixture("titles_response.json")
+
+        async def fake_gh(*args, payload=None):
+            if args[1] == "graphql":
+                return json.dumps(titles)
+            number = int(args[1].rsplit("/", 2)[1])
+            if number == 2140:
+                page = int(args[1].split("&page=")[-1])
+                return pages.get(page, "[]")
+            name = {2160: "files_2160.json"}.get(number)
+            return json.dumps(load_fixture(name) if name else [])
+
+        with patch.object(m, "gh", side_effect=fake_gh):
+            files, truncated = run(m._fetch_pr_files(REPO, 2140))
+        self.assertTrue(truncated)
+        self.assertEqual(len(files), m.FILES_PAGE_SIZE * m.FILES_PAGE_CAP)
+
+        with patch.object(m, "gh", side_effect=fake_gh):
+            report = run(
+                m.check_overlaps(
+                    "fix(coding-agent): bound heartbeat listing and skip client-owned launches",
+                    ["packages/agent/src/daemon-supervisor.ts", "packages/agent/src/agent-session.ts"],
+                    repo=REPO,
+                )
+            )
+        self.assertIn("Coverage:", report)
+        self.assertIn(f"file lists capped at {m.FILES_PAGE_SIZE * m.FILES_PAGE_CAP} files on #2140", report)
+        self.assertIn("overlap on those PRs may be understated", report)
 
 
 if __name__ == "__main__":

@@ -63,7 +63,7 @@ QUEUE_QUERY = """query($owner: String!, $name: String!, $first: Int, $after: Str
         changedFiles
         mergeStateStatus
         reviewDecision
-        reviewThreads(first: 50) { nodes { isResolved comments(first: 1) { nodes { author { login } } } } }
+        reviewThreads(first: 50) { pageInfo { hasNextPage } nodes { isResolved comments(first: 1) { nodes { author { login } } } } }
         reviews(last: 30) { nodes { author { login } state submittedAt } }
       }
     }
@@ -85,15 +85,18 @@ GH_TIMEOUT_SECONDS = 60
 
 async def gh(*args: str, payload: dict[str, Any] | None = None) -> str:
     """Run one `gh` CLI call and return stdout; raise RuntimeError on failure."""
-    result = await asyncio.to_thread(
-        subprocess.run,
-        ["gh", *args],
-        input=json.dumps(payload) if payload is not None else None,
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=GH_TIMEOUT_SECONDS,
-    )
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["gh", *args],
+            input=json.dumps(payload) if payload is not None else None,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=GH_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"gh {' '.join(args[:2])} timed out after {GH_TIMEOUT_SECONDS}s") from e
     if result.returncode:
         detail = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(f"gh {' '.join(args[:2])} failed: {detail}")
@@ -118,6 +121,18 @@ def _bot_label(login: str | None) -> str | None:
         return None
     stripped = re.sub(r"\[bot\]$", "", login)
     return KNOWN_BOTS.get(stripped)
+
+
+def _is_bot(login: str | None) -> bool:
+    """True for any bot account: the review bots or any "[bot]"-suffixed actor.
+
+    Generic bot accounts (GitHub Actions, Dependabot, ...) report a
+    "[bot]"-suffixed login; the review bots are App actors whose logins appear
+    with and without the suffix, so KNOWN_BOTS covers them after stripping.
+    """
+    if not login:
+        return False
+    return _bot_label(login) is not None or login.endswith("[bot]")
 
 
 def _tokenize(text: str) -> set[str]:
@@ -210,6 +225,7 @@ class PR:
     review_decision: str
     unresolved_bots: Counter[str] = field(default_factory=Counter)
     last_human_at: datetime | None = None
+    threads_truncated: bool = False
 
     @property
     def unresolved(self) -> int:
@@ -240,14 +256,16 @@ def _pr_from_node(node: dict[str, Any]) -> PR:
         if review.get("state") == "PENDING" or not review.get("submittedAt"):
             continue
         author = review.get("author") or {}
-        if _bot_label(author.get("login")):
+        if _is_bot(author.get("login")):
             continue
         submitted = _parse_ts(review["submittedAt"])
         if submitted > last_human:
             last_human = submitted
 
     bots: Counter[str] = Counter()
-    for thread in node.get("reviewThreads", {}).get("nodes", []):
+    threads = node.get("reviewThreads", {})
+    threads_truncated = bool(threads.get("pageInfo", {}).get("hasNextPage"))
+    for thread in threads.get("nodes", []):
         if thread.get("isResolved"):
             continue
         comments = thread.get("comments", {}).get("nodes", [])
@@ -269,6 +287,7 @@ def _pr_from_node(node: dict[str, Any]) -> PR:
         review_decision=str(node.get("reviewDecision") or "PENDING"),
         unresolved_bots=bots,
         last_human_at=last_human,
+        threads_truncated=threads_truncated,
     )
 
 
@@ -279,16 +298,20 @@ def _split_repo(repo: str) -> tuple[str, str]:
     return owner, name
 
 
-async def _graphql_pages(query: str, repo: str, limit: int) -> tuple[list[dict[str, Any]], int]:
+async def _graphql_pages(
+    query: str, repo: str, limit: int
+) -> tuple[list[dict[str, Any]], int, bool]:
     """Paginate a GraphQL pullRequests query (QUEUE_QUERY or TITLES_QUERY).
 
-    Fetches until `limit` nodes or the queue ends. Returns the raw nodes plus
-    the queue's totalCount.
+    Fetches until `limit` nodes or the queue ends. Returns the raw nodes, the
+    queue's totalCount, and whether the queue still had more pages at the cap
+    (so callers can mark verdicts as covering only the fetched subset).
     """
     owner, name = _split_repo(repo)
     nodes: list[dict[str, Any]] = []
     total: int | None = None
     cursor: str | None = None
+    truncated = False
     while len(nodes) < limit:
         payload = {
             "query": query,
@@ -303,17 +326,24 @@ async def _graphql_pages(query: str, repo: str, limit: int) -> tuple[list[dict[s
         if not connection["pageInfo"]["hasNextPage"]:
             break
         cursor = connection["pageInfo"]["endCursor"]
-    return nodes, total or 0
+    else:
+        truncated = True
+    return nodes, total or 0, truncated
 
 
 async def _fetch_queue(repo: str, limit: int) -> tuple[list[PR], int]:
-    nodes, total = await _graphql_pages(QUEUE_QUERY, repo, limit)
+    nodes, total, _truncated = await _graphql_pages(QUEUE_QUERY, repo, limit)
     return [_pr_from_node(node) for node in nodes], total
 
 
-async def _fetch_pr_files(repo: str, number: int) -> list[str]:
-    """Fetch up to FILES_PAGE_CAP pages of a PR's changed-file paths via REST."""
+async def _fetch_pr_files(repo: str, number: int) -> tuple[list[str], bool]:
+    """Fetch a PR's changed-file paths via REST, up to FILES_PAGE_CAP pages.
+
+    Returns the paths and whether the PR has more files than the cap, so the
+    caller can mark the overlap check as truncated.
+    """
     filenames: list[str] = []
+    truncated = False
     for page in range(1, FILES_PAGE_CAP + 1):
         text = await gh("api", f"repos/{repo}/pulls/{number}/files?per_page={FILES_PAGE_SIZE}&page={page}")
         entries = json.loads(text)
@@ -322,7 +352,8 @@ async def _fetch_pr_files(repo: str, number: int) -> list[str]:
         filenames.extend(str(entry.get("filename") or "") for entry in entries if entry.get("filename"))
         if len(entries) < FILES_PAGE_SIZE:
             break
-    return filenames
+        truncated = page >= FILES_PAGE_CAP
+    return filenames, truncated
 
 
 def _format_bot_threads(bots: Counter[str]) -> str:
@@ -337,6 +368,10 @@ def _verdict(pr: PR) -> tuple[str, list[str]]:
         reasons.append(pr.merge_state.lower() if pr.merge_state != "UNKNOWN" else "merge state unknown")
     if pr.unresolved:
         reasons.append(f"{pr.unresolved} unresolved bot thread{'s' if pr.unresolved > 1 else ''}")
+    if pr.threads_truncated:
+        # Thread list truncated at the 50-fetch cap: cannot prove zero
+        # unresolved threads, so READY is withheld.
+        reasons.append("thread list truncated (50+ threads)")
     if pr.review_decision == "CHANGES_REQUESTED":
         reasons.append("changes requested")
     # READY per the merge-ready policy: CLEAN, no unresolved bot threads, no
@@ -524,7 +559,7 @@ async def check_overlaps(
         if not repo:
             return "Duplicate pre-flight needs a repository: pass repo=\"OWNER/NAME\", or run inside a checkout with an origin remote."
     try:
-        nodes, total = await _graphql_pages(TITLES_QUERY, repo, TITLES_FETCH_CAP)
+        nodes, total, queue_truncated = await _graphql_pages(TITLES_QUERY, repo, TITLES_FETCH_CAP)
         candidate_tokens = _tokenize(title)
         doc_freq: Counter[str] = Counter()
         pr_tokens: dict[int, set[str]] = {}
@@ -543,8 +578,11 @@ async def check_overlaps(
         scored.sort(key=lambda entry: (-entry[0], entry[1]))
         shortlist = scored if deep else scored[:MAX_SHORTLIST]
         flagged: list[dict[str, Any]] = []
+        truncated_files: list[int] = []
         for score, number, pr_title in shortlist:
-            pr_files = await _fetch_pr_files(repo, number)
+            pr_files, files_truncated = await _fetch_pr_files(repo, number)
+            if files_truncated:
+                truncated_files.append(number)
             shared, jaccard, candidate_share = _overlap_stats(files, pr_files)
             if not _is_overlapping(shared, jaccard, candidate_share):
                 continue
@@ -569,7 +607,17 @@ async def check_overlaps(
     flagged.sort(key=lambda entry: (-entry["shared"], -entry["jaccard"]))
     scope = "every open PR" if deep else f"up to {MAX_SHORTLIST} title-screened open PRs (pass deep=True to check every open PR)"
     lines = [f'# Duplicate pre-flight — "{title}" ({len(files)} files)', ""]
-    lines.append(f"Checked {total} open pull requests in {repo}; file-overlap fetch on {len(shortlist)} ({scope}).")
+    lines.append(f"Checked {len(nodes)} of {total} open pull requests in {repo}; file-overlap fetch on {len(shortlist)} ({scope}).")
+    coverage_note: list[str] = []
+    if queue_truncated:
+        coverage_note.append(
+            f"the queue was truncated at the {TITLES_FETCH_CAP}-PR cap ({total} open) — the verdict covers the fetched subset only"
+        )
+    if truncated_files:
+        ids = ", ".join(f"#{number}" for number in truncated_files[:10])
+        coverage_note.append(
+            f"file lists capped at {FILES_PAGE_SIZE * FILES_PAGE_CAP} files on {ids} — overlap on those PRs may be understated"
+        )
     lines.append("")
     if flagged:
         lines.append("## Likely duplicate work")
@@ -587,6 +635,9 @@ async def check_overlaps(
             lines.append("Verdict: CLEAR — no open PR overlaps the planned files above the thresholds.")
         else:
             lines.append("Verdict: CLEAR — no title-screened open PR overlaps the planned files.")
+    if coverage_note:
+        lines.append("")
+        lines.append("Coverage: " + "; ".join(coverage_note) + ".")
     return _truncate("\n".join(lines).rstrip() + "\n", max_output)
 
 

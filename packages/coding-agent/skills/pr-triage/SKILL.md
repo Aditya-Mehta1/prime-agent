@@ -45,9 +45,14 @@ thorough for high-stakes work).
 
 ## Notes
 
-- Thread-bot counts cap at the 50 most recent threads per PR and the file
-  pre-flight at 300 files per PR; queues larger than `limit` note the cut-off.
-- Staleness uses the latest non-bot review timestamp as a proxy for the last
-  human touch; PRs without human reviews fall back to their creation date.
+- Thread-bot counts cap at the 50 most recent threads per PR; when a PR has
+  more threads than that, its READY verdict is withheld and marked
+  "thread list truncated". The file pre-flight caps at 300 files per PR and
+  500 open PRs per queue; hit caps are reported as coverage notes so a CLEAR
+  verdict is never overstated.
+- Staleness uses the latest review by a human as a proxy for the last human
+  touch; reviews from ANY bot account (Cursor, Macroscope, Codex, GitHub
+  Actions, Dependabot, ...) are ignored, and PRs without human reviews fall
+  back to their creation date.
 - Both functions return setup guidance instead of raising when `gh` is
-  missing, and error text when a `gh` call fails.
+  missing, and error text when a `gh` call fails or times out.

@@ -145,10 +145,13 @@ the candidate (Jaccard >= 0.3, or the PR already touches most candidate files)
 are flagged with links. Pass `deep=True` to file-check every open PR instead of
 only screened ones.
 
-Notes: thread counts cap at the 50 most recent threads per PR, the file
-pre-flight at 300 files per PR, and `gh` is invoked through `asyncio.to_thread`
-so the kernel stays responsive. Both functions return setup guidance instead
-of raising when `gh` is missing, and error text when a `gh` call fails.
+Notes: thread counts cap at the 50 most recent threads per PR (truncated
+lists withhold the READY verdict), the file pre-flight at 300 files per PR
+and the title screen at 500 open PRs (hit caps are reported as coverage
+notes), and `gh` is invoked through `asyncio.to_thread` so the kernel stays
+responsive. Staleness ignores reviews from any bot account. Both functions
+return setup guidance instead of raising when `gh` is missing, and error
+text when a `gh` call fails or times out.
 
 ### Using Skills from Other Harnesses
 
