@@ -23,6 +23,12 @@ import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult
 const bashSchema = Type.Object({
 	command: Type.String({ description: "Bash command to execute" }),
 	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
+	allowDestructiveGit: Type.Optional(
+		Type.Boolean({
+			description:
+				"Skip the dirty-tree guard for destructive git discard commands. Only set when discarding uncommitted work is intentional.",
+		}),
+	),
 });
 
 export type BashToolInput = Static<typeof bashSchema>;
@@ -145,6 +151,98 @@ export interface BashToolOptions {
 	shellPath?: string;
 	/** Hook to adjust command, cwd, or env before execution */
 	spawnHook?: BashSpawnHook;
+}
+
+/** Bypass env var for the destructive-git dirty-tree guard. */
+export const BASH_DESTRUCTIVE_GIT_BYPASS_ENV = "PI_BASH_ALLOW_DESTRUCTIVE_GIT";
+
+const GIT_STATUS_PORCELAIN_COMMAND = "git status --porcelain";
+
+/** How many dirty paths the refusal lists before eliding the rest. */
+const MAX_DIRTY_PATHS_LISTED = 10;
+
+/**
+ * Detect git commands that discard uncommitted working-tree changes: the
+ * reflexive "clean the worktree" idiom (`git checkout -- .`, `git clean -fd`,
+ * `git reset --hard`) that has repeatedly destroyed in-progress agent work.
+ *
+ * Intentionally conservative: a false positive costs one `git status` probe
+ * and an explicit-bypass retry, while a false negative silently loses work.
+ * Matching is best-effort shell-text heuristics, not a parse.
+ */
+export function isDestructiveGitDiscardCommand(command: string): boolean {
+	// git checkout -- . | git checkout . | git checkout HEAD -- . | git restore .
+	if (/\bgit\s+checkout\s+(?:(?:--\s+)?\.|HEAD\s+--\s+\.)(?=\s|$|[;&|)])/.test(command)) return true;
+	if (/\bgit\s+restore\s+(?:(?:--source|--worktree)(?:=\S+)?\s+|-s\s+\S+\s+|-W\s+)?\.(?=\s|$|[;&|)])/.test(command)) {
+		return true;
+	}
+	// git reset --hard [ref]
+	if (/\bgit\s+reset\s+--hard\b/.test(command)) return true;
+	// git clean with a force flag, unless it is also a dry run
+	for (const match of command.matchAll(/\bgit\s+clean\s+([^;&|]*)/g)) {
+		const args = match[1].split(/\s+/).filter(Boolean);
+		const forces = args.filter((arg) =>
+			arg.startsWith("--") ? arg.startsWith("--force") : arg.startsWith("-") && arg.includes("f"),
+		);
+		if (forces.length === 0) continue;
+		const dryRun = args.some(
+			(arg) => arg === "--dry-run" || (arg.startsWith("-") && !arg.startsWith("--") && arg.includes("n")),
+		);
+		if (!dryRun) return true;
+	}
+	return false;
+}
+
+function isTruthyEnvValue(value: string | undefined): boolean {
+	return value !== undefined && value !== "" && value !== "0";
+}
+
+/**
+ * Probe for uncommitted changes via `git status --porcelain` in the command's cwd.
+ * Returns null when dirtiness cannot be determined (not a repo, git missing,
+ * probe failure) so the guard fails open instead of blocking on a guess.
+ */
+async function probeUncommittedChanges(
+	ops: BashOperations,
+	probeCommand: string,
+	cwd: string,
+	env: NodeJS.ProcessEnv,
+	signal: AbortSignal | undefined,
+): Promise<string[] | null> {
+	let output = "";
+	try {
+		const result = await ops.exec(probeCommand, cwd, {
+			onData: (data) => {
+				output += data.toString("utf8");
+			},
+			signal,
+			env,
+		});
+		if (result.exitCode !== 0) return null;
+	} catch (err) {
+		if (err instanceof Error && err.message === "aborted") throw err;
+		return null;
+	}
+	return output
+		.split("\n")
+		.filter((line) => line.trim().length > 0)
+		.map((line) => line.replace(/\r$/, ""));
+}
+
+function formatDirtyTreeRefusal(dirtyPaths: string[]): string {
+	const listed = dirtyPaths.slice(0, MAX_DIRTY_PATHS_LISTED);
+	const elided = dirtyPaths.length - listed.length;
+	const lines = [
+		`Refusing to run this destructive git command: the working tree has ${dirtyPaths.length} uncommitted change(s).`,
+		...listed.map((line) => `  ${line}`),
+	];
+	if (elided > 0) lines.push(`  ... and ${elided} more`);
+	lines.push("");
+	lines.push("Commit, stash, or stage your work first.");
+	lines.push(
+		`To discard these changes intentionally, retry with allowDestructiveGit: true, or set ${BASH_DESTRUCTIVE_GIT_BYPASS_ENV}=1.`,
+	);
+	return lines.join("\n");
 }
 
 const BASH_PREVIEW_LINES = 5;
@@ -279,18 +377,45 @@ export function createBashToolDefinition(
 	const definition: ToolDefinition<typeof bashSchema, BashToolDetails | undefined, BashRenderState> = {
 		name: "bash",
 		label: "bash",
-		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.`,
+		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds. Destructive git discard commands (git checkout -- ., git checkout ., git clean -f..., git reset --hard, git restore .) are refused while uncommitted changes exist; retry with allowDestructiveGit: true only when the discard is intentional.`,
 		promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
 		parameters: bashSchema,
 		async execute(
 			_toolCallId,
-			{ command, timeout }: { command: string; timeout?: number },
+			{
+				command,
+				timeout,
+				allowDestructiveGit,
+			}: { command: string; timeout?: number; allowDestructiveGit?: boolean },
 			signal?: AbortSignal,
 			onUpdate?,
 			_ctx?,
 		) {
 			const resolvedCommand = commandPrefix ? `${commandPrefix}\n${command}` : command;
 			const spawnContext = resolveSpawnContext(resolvedCommand, cwd, spawnHook);
+			// Dirty-tree guard: destructive git discard commands have repeatedly
+			// wiped uncommitted work, so refuse them while the tree is dirty
+			// (make it impossible, not discouraged). Zero cost otherwise: the
+			// pattern check is string-only and the probe only runs on a match.
+			if (
+				allowDestructiveGit !== true &&
+				!isTruthyEnvValue(spawnContext.env[BASH_DESTRUCTIVE_GIT_BYPASS_ENV]) &&
+				isDestructiveGitDiscardCommand(spawnContext.command)
+			) {
+				const probeCommand = commandPrefix
+					? `${commandPrefix}\n${GIT_STATUS_PORCELAIN_COMMAND}`
+					: GIT_STATUS_PORCELAIN_COMMAND;
+				const dirtyPaths = await probeUncommittedChanges(
+					ops,
+					probeCommand,
+					spawnContext.cwd,
+					spawnContext.env,
+					signal,
+				);
+				if (dirtyPaths && dirtyPaths.length > 0) {
+					throw new Error(formatDirtyTreeRefusal(dirtyPaths));
+				}
+			}
 			const output = new OutputAccumulator({ tempFilePrefix: "pi-bash" });
 			let updateTimer: NodeJS.Timeout | undefined;
 			let updateDirty = false;

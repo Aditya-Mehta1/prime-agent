@@ -1,0 +1,1 @@
+- Added a dirty-tree guard to the bash tool: destructive git discard commands (`git checkout -- .`, `git checkout .`, `git clean -f...`, `git reset --hard`, `git restore .`) are refused while uncommitted changes exist, listing the dirty paths and the explicit bypasses (`allowDestructiveGit: true` or `PI_BASH_ALLOW_DESTRUCTIVE_GIT=1`).
