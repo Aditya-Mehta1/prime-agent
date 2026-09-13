@@ -12,15 +12,17 @@ from unittest.mock import patch
 
 import ui
 from report import UI_METRICS, render
-from schema import UI_METRIC_KEYS, Config, Metric, Observation, ProcessMemory, Report, Side
+from schema import UI_METRIC_KEYS, Config, Metric, Observation, ProcessMemory, Report, Request, Side
 from ui import (
     expand_subagents,
+    expected_roster_inactive,
     fixture_spec,
     session_id,
     session_name,
     spawn_ledger_path,
     tail_marker,
     total_cpu,
+    ui_measure,
     wait_for_roster,
     write_fixtures,
 )
@@ -41,6 +43,21 @@ def small_fixture(**overrides):
     }
     constants.update(overrides)
     return [patch(f"ui.{name}", value) for name, value in constants.items()]
+
+
+def ui_request() -> Request:
+    """A minimal valid request for ui_measure entry checks."""
+    return Request(
+        repository="PrimeIntellect-ai/prime-agent",
+        source_repository="PrimeIntellect-ai/prime-agent",
+        sha="a" * 40,
+        harness_sha="a" * 40,
+        pr=42,
+        run_id=100,
+        attempt=1,
+        role="main",
+        config=Config.load(),
+    )
 
 
 class FixtureTests(unittest.TestCase):
@@ -162,14 +179,33 @@ class ProbeLogicTests(unittest.TestCase):
         ]
         terminal = FakeTerminal(frames)
         with patch("time.perf_counter", side_effect=[float(i) for i in range(200)]):
-            seconds = wait_for_roster(terminal, settle=3.0, timeout=90)
+            seconds = wait_for_roster(terminal, minimum=70, settle=3.0, timeout=90)
         self.assertGreaterEqual(seconds, 0.0)
         self.assertIn("70 inactive", terminal.display.text())
 
         with self.assertRaises(TimeoutError):
             wait_for_roster(
-                FakeTerminal(["agents   0 running, 1 idle, 1 inactive"] * 8), settle=3.0, timeout=0.05
+                FakeTerminal(["agents   0 running, 1 idle, 1 inactive"] * 8),
+                minimum=70,
+                settle=3.0,
+                timeout=0.05,
             )
+
+    def test_wait_for_roster_never_settles_below_the_expected_fixture_count(self):
+        # A splash stuck at an empty or partial roster must not count as hydrated,
+        # even when its count is unchanged for the whole settle window.
+        terminal = FakeTerminal(["agents   0 running, 1 idle, 5 inactive"] * 8)
+        with patch("time.perf_counter", side_effect=[float(i) for i in range(400)]):
+            with self.assertRaises(TimeoutError):
+                wait_for_roster(terminal, minimum=70, settle=3.0, timeout=90)
+
+    def test_expected_roster_inactive_counts_top_level_fixtures_minus_the_live_target(self):
+        self.assertEqual(expected_roster_inactive(), ui.LARGE_COUNT + ui.MEDIUM_COUNT)
+
+    def test_ui_trial_requires_a_successful_first_installation(self):
+        side = Side(sha="a" * 40)
+        with self.assertRaisesRegex(RuntimeError, "first installation"):
+            ui_measure(ui_request(), side, 0, results=Path("/unused"), homes=Path("/unused"), user="bench")
 
     def test_expand_subagents_requires_a_newly_expanded_row(self):
         # An ancestor already shows "▾", so only a growing count proves the selected row expanded;

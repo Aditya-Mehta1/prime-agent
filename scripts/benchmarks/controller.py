@@ -283,7 +283,7 @@ class Controller:
             ):
                 blocked: set[str] = set()
                 failures: dict[str, tuple[str, int]] = {}
-                if phase in ("measure", "runtime"):
+                if phase in ("measure", "runtime", "ui"):
                     for role in ready:
                         side = self.report.main if role == "main" else self.report.pr_head
                         if not any(

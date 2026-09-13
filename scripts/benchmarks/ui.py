@@ -418,15 +418,35 @@ def roster_inactive(display) -> int | None:  # type: ignore[no-untyped-def]
     return None
 
 
-def wait_for_roster(terminal: Terminal, *, settle: float = 3.0, timeout: float = 90) -> float:
-    """Wait until the agents-view roster stops growing; saved sessions stream in."""
+def expected_roster_inactive() -> int:
+    """Saved top-level fixture sessions a hydrated roster must list.
+
+    Large, medium, and the chain-root fixtures are top-level roster rows, but
+    the warm scenario holds the switch target live; nested fan-out and
+    subagent-chain files stay out of the top-level count either way.
+    """
+    top_level = LARGE_COUNT + MEDIUM_COUNT + 1
+    return top_level - 1
+
+
+def wait_for_roster(terminal: Terminal, *, minimum: int, settle: float = 3.0, timeout: float = 90) -> float:
+    """Wait until the roster lists `minimum` inactive sessions and stops growing.
+
+    Saved sessions stream in, but an empty or stalled roster must not count
+    as settled just because its count stopped moving.
+    """
     started = time.perf_counter()
     last_count: int | None = None
     last_change = time.perf_counter()
     while time.perf_counter() - started < timeout:
         terminal.settle(0.4)
         count = roster_inactive(terminal.display)
-        if count is not None and count == last_count and time.perf_counter() - last_change >= settle:
+        if (
+            count is not None
+            and count == last_count
+            and count >= minimum
+            and time.perf_counter() - last_change >= settle
+        ):
             return time.perf_counter() - started
         if count != last_count:
             last_count = count
@@ -438,6 +458,8 @@ def ui_measure(request: Request, side: Side, trial: int, *, results: Path, homes
     """One UI-interaction trial: fresh fixtures, a cold resume, then the warm navigation scenario."""
     from worker import clean_error, environment, record, stop_processes
 
+    if not any(s.value is not None and s.trial == 0 for s in side.metrics.get("install", [])):
+        raise RuntimeError("The first installation must succeed before interactive measurements")
     home = homes / user
     workspace = home / "workspace"
     agent_dir = home / ".prime/agent"
@@ -515,7 +537,7 @@ def ui_measure(request: Request, side: Side, trial: int, *, results: Path, homes
             metric = "agents_roster"
             cpu_start = cpu_total()
             bytes_start = terminal.bytes
-            roster_seconds = wait_for_roster(terminal)
+            roster_seconds = wait_for_roster(terminal, minimum=expected_roster_inactive())
             cpu = cpu_total() - cpu_start
             record(side, "agents_roster", trial, roster_seconds)  # type: ignore[arg-type]
             record(side, "agents_roster_cpu", trial, cpu)  # type: ignore[arg-type]

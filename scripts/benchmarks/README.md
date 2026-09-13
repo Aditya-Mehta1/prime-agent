@@ -158,8 +158,8 @@ Each trial stops all benchmark-user processes first, then measures:
   echoed marker. Measures the in-place session switch with a ~40 MB transcript.
 - **Open agents view from a session:** the left-arrow keystroke to the rendered agents-view splash.
 - **Full agents roster, many sessions:** after the agents-view splash is rendered, until the
-  roster's saved-session count stops growing. Saved sessions stream in, so this isolates catalog scanning, spawn-ledger
-  replay, and hydration across 200 session files.
+  roster lists the fixture's saved sessions and its count stops growing. Saved sessions stream in, so this isolates
+  catalog scanning, spawn-ledger replay, and hydration across 200 session files.
 - **Open another session from agents view:** typing the target's unique session-id prefix,
   right-arrow to open, until the target transcript renders and echoes. This is the full
   "session → agents view → another session" round trip with many sessions on disk.
@@ -177,7 +177,9 @@ Each trial stops all benchmark-user processes first, then measures:
 
 Readiness is never a spinner or a status line: a trial only counts when the target session's
 final transcript line is visible and the editor echoes a marker, so half-rendered states fail
-loudly instead of measuring fast. Raw results also record PTY bytes per interaction, a proxy for
+loudly instead of measuring fast. The roster wait likewise only settles once the fixture's saved
+sessions are listed, so a stalled or empty catalog scan fails the trial instead of recording a
+fast sample. Raw results also record PTY bytes per interaction, a proxy for
 how much the renderer redraws. UI trials default to 3 per revision (`ui_trials` in `config.json`)
 to bound sandbox cost; the scenario takes roughly 60–90 s per trial.
 
