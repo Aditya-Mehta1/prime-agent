@@ -44,6 +44,14 @@ describe("isDestructiveGitDiscardCommand", () => {
 		"git checkout main && git reset --hard",
 		"echo start\ngit clean -fd",
 		"npm test & git clean -fd &",
+		"git checkout :/",
+		"git checkout -- :/",
+		"git checkout HEAD -- :/",
+		"git restore :/",
+		"git restore -s@ .",
+		"git restore -s@ :/",
+		"git restore --source=HEAD :/",
+		"git restore -s HEAD~1 :/",
 	])("matches %s", (command) => {
 		expect(isDestructiveGitDiscardCommand(command)).toBe(true);
 	});
@@ -56,6 +64,7 @@ describe("isDestructiveGitDiscardCommand", () => {
 		"git checkout -- single-file.txt",
 		"git checkout ./nested",
 		"git restore --staged .",
+		"git restore --staged :/",
 		"git restore single-file.txt",
 		"git clean -n",
 		"git clean --dry-run",
@@ -219,6 +228,107 @@ describe("bash tool destructive-git dirty-tree guard", () => {
 			"export GUARD_TEST_VAR=1\ngit status --porcelain",
 			"export GUARD_TEST_VAR=1\ngit checkout -- .",
 		]);
+	});
+
+	it("follows cd relocations: refuses a discard in a dirty nested repository", async () => {
+		const sub = join(testDir, "sub");
+		mkdirSync(sub);
+		initDirtyGitRepo(sub);
+		const bash = createBashTool(testDir);
+
+		const error = await bash.execute("guard-cd-dirty", { command: "cd sub && git reset --hard" }).then(
+			() => undefined,
+			(err: Error) => err,
+		);
+
+		expect(error).toBeInstanceOf(Error);
+		const message = (error as Error).message;
+		expect(message).toMatch(/Refusing to run this destructive git command/);
+		expect(message).toContain("tracked.txt");
+		expect(readFileSync(join(sub, "tracked.txt"), "utf-8")).toBe("modified\n");
+	});
+
+	it("follows git -C relocations: refuses a discard in a dirty nested repository", async () => {
+		const sub = join(testDir, "sub");
+		mkdirSync(sub);
+		initDirtyGitRepo(sub);
+		const bash = createBashTool(testDir);
+
+		await expect(bash.execute("guard-git-c-dirty", { command: "git -C sub reset --hard" })).rejects.toThrow(
+			/tracked\.txt/,
+		);
+		expect(readFileSync(join(sub, "tracked.txt"), "utf-8")).toBe("modified\n");
+	});
+
+	it("allows a relocated discard when the target repository is clean", async () => {
+		const sub = join(testDir, "sub");
+		mkdirSync(sub);
+		initDirtyGitRepo(sub);
+		runGit(sub, "add", "-A");
+		runGit(sub, "commit", "-m", "second");
+		const bash = createBashTool(testDir);
+
+		await expect(bash.execute("guard-cd-clean", { command: "cd sub && git reset --hard" })).resolves.toBeDefined();
+	});
+
+	it("probes every discarded repository in multi-discard commands", async () => {
+		const sub = join(testDir, "sub");
+		mkdirSync(sub);
+		initDirtyGitRepo(sub);
+		const bash = createBashTool(testDir);
+
+		await expect(
+			bash.execute("guard-multi-discard", { command: "git checkout -- . && cd sub && git reset --hard" }),
+		).rejects.toThrow(/Refusing to run this destructive git command/);
+	});
+
+	it("conservatively refuses relocations it cannot replay safely", async () => {
+		const bash = createBashTool(testDir);
+
+		for (const command of [
+			"cd $(pwd)/sub && git reset --hard",
+			"git --git-dir=sub/.git reset --hard",
+			"(cd sub && git reset --hard)",
+			"cd sub || git reset --hard",
+			"pushd sub && git reset --hard",
+		]) {
+			const error = await bash.execute(`guard-unresolvable`, { command }).then(
+				() => undefined,
+				(err: Error) => err,
+			);
+			expect(error).toBeInstanceOf(Error);
+			expect((error as Error).message).toContain("changes directory (or repository) first");
+		}
+	});
+
+	it("replays cd chains in the probe", async () => {
+		const calls: string[] = [];
+		const operations: BashOperations = {
+			exec: async (command, _cwd, _options) => {
+				calls.push(command);
+				return { exitCode: 0 };
+			},
+		};
+		const bash = createBashTool(testDir, { operations });
+
+		await bash.execute("guard-cd-chain", { command: "cd a && cd b && git checkout -- ." });
+
+		expect(calls).toEqual(["cd a && cd b && git status --porcelain", "cd a && cd b && git checkout -- ."]);
+	});
+
+	it("replays git -C in the probe", async () => {
+		const calls: string[] = [];
+		const operations: BashOperations = {
+			exec: async (command, _cwd, _options) => {
+				calls.push(command);
+				return { exitCode: 0 };
+			},
+		};
+		const bash = createBashTool(testDir, { operations });
+
+		await bash.execute("guard-git-c-probe", { command: "git -C sub reset --hard" });
+
+		expect(calls).toEqual(["git -C sub status --porcelain", "git -C sub reset --hard"]);
 	});
 
 	it("propagates aborts raised while probing", async () => {

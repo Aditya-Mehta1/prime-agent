@@ -162,35 +162,133 @@ const GIT_STATUS_PORCELAIN_COMMAND = "git status --porcelain";
 const MAX_DIRTY_PATHS_LISTED = 10;
 
 /**
- * Detect git commands that discard uncommitted working-tree changes: the
- * reflexive "clean the worktree" idiom (`git checkout -- .`, `git clean -fd`,
- * `git reset --hard`) that has repeatedly destroyed in-progress agent work.
+ * Detection for git commands that discard uncommitted working-tree changes:
+ * the reflexive "clean the worktree" idiom (`git checkout -- .`, `git clean
+ * -fd`, `git reset --hard`) that has repeatedly destroyed in-progress agent
+ * work.
  *
  * Intentionally conservative: a false positive costs one `git status` probe
  * and an explicit-bypass retry, while a false negative silently loses work.
  * Matching is best-effort shell-text heuristics, not a parse.
  */
+
+/**
+ * Optional git global options between `git` and the subcommand, for example
+ * `git -C dir reset --hard`, `git -c key=value checkout -- .`, or
+ * `git --git-dir=dir/.git reset --hard`. Kept within one shell segment
+ * (no ;&|) so it cannot swallow the rest of a chained command.
+ */
+const GIT_GLOBAL_OPTIONS = "(?:-{1,2}[^\\s;&|]+(?:\\s+[^\\s;&|]+)?\\s+)*";
+
+const DISCARD_CHECKOUT_PATTERN = new RegExp(
+	`\\bgit\\s+${GIT_GLOBAL_OPTIONS}checkout\\s+(?:(?:--\\s+)?(?:\\.|:\\/)|HEAD\\s+--\\s+(?:\\.|:\\/))(?=\\s|$|[;&|)])`,
+	"g",
+);
+const DISCARD_RESTORE_PATTERN = new RegExp(
+	`\\bgit\\s+${GIT_GLOBAL_OPTIONS}restore\\s+(?:(?:--source|--worktree)(?:=\\S+)?\\s+|-s(?:\\s+\\S+|[^\\s]+)\\s+|-W\\s+)?(?:\\.|:\\/)(?=\\s|$|[;&|)])`,
+	"g",
+);
+const DISCARD_RESET_PATTERN = new RegExp(`\\bgit\\s+${GIT_GLOBAL_OPTIONS}reset\\s+--hard\\b`, "g");
+const DISCARD_CLEAN_PATTERN = new RegExp(`\\bgit\\s+${GIT_GLOBAL_OPTIONS}clean\\s+([^;&|]*)`, "g");
+
+function isForcedCleanSegment(args: string): boolean {
+	const tokens = args.split(/\s+/).filter(Boolean);
+	const forces = tokens.filter((arg) =>
+		arg.startsWith("--") ? arg.startsWith("--force") : arg.startsWith("-") && arg.includes("f"),
+	);
+	if (forces.length === 0) return false;
+	return !tokens.some(
+		(arg) => arg === "--dry-run" || (arg.startsWith("-") && !arg.startsWith("--") && arg.includes("n")),
+	);
+}
+
+/**
+ * Find every destructive git discard command in `command`, returning the
+ * character index where each `git` token starts (empty when none match).
+ */
+export function findDestructiveGitDiscardCommands(command: string): number[] {
+	const indices: number[] = [];
+	for (const pattern of [DISCARD_CHECKOUT_PATTERN, DISCARD_RESTORE_PATTERN, DISCARD_RESET_PATTERN]) {
+		for (const match of command.matchAll(pattern)) indices.push(match.index);
+	}
+	for (const match of command.matchAll(DISCARD_CLEAN_PATTERN)) {
+		if (isForcedCleanSegment(match[1])) indices.push(match.index);
+	}
+	return indices.sort((a, b) => a - b);
+}
+
 export function isDestructiveGitDiscardCommand(command: string): boolean {
-	// git checkout -- . | git checkout . | git checkout HEAD -- . | git restore .
-	if (/\bgit\s+checkout\s+(?:(?:--\s+)?\.|HEAD\s+--\s+\.)(?=\s|$|[;&|)])/.test(command)) return true;
-	if (/\bgit\s+restore\s+(?:(?:--source|--worktree)(?:=\S+)?\s+|-s\s+\S+\s+|-W\s+)?\.(?=\s|$|[;&|)])/.test(command)) {
-		return true;
+	return findDestructiveGitDiscardCommands(command).length > 0;
+}
+
+/**
+ * Where a discard command's probe must run: `cd` chains earlier in the command
+ * and `git -C <dir>` on the discard invocation itself both relocate the
+ * repository being discarded, so the probe follows them instead of assuming
+ * the tool cwd (Macroscope review: `cd project && git reset --hard` previously
+ * probed the wrong repository).
+ */
+export interface DiscardProbeTarget {
+	/** Shell prefix relocating the probe, for example `cd sub && `. */
+	relocationPrefix?: string;
+	/** git status command honoring a `git -C` on the discard invocation. */
+	gitStatusCommand?: string;
+}
+
+/** The probe cannot safely determine the repository the discard targets. */
+export const UNRESOLVABLE_DISCARD_TARGET = "unresolvable";
+
+export function resolveDiscardProbeTarget(
+	command: string,
+	discardIndex: number,
+): DiscardProbeTarget | typeof UNRESOLVABLE_DISCARD_TARGET | null {
+	const prefix = command.slice(0, discardIndex);
+	const invocation = command.slice(discardIndex);
+
+	// git -C <dir> (or repository-relocating global options) on the discard invocation itself.
+	let dashCDir: string | undefined;
+	for (const [index, token] of invocation.split(/\s+/).entries()) {
+		if (index === 0) continue; // "git"
+		if (token === "reset" || token === "checkout" || token === "clean" || token === "restore") break;
+		if (token === "-C") {
+			const dir = invocation.split(/\s+/)[index + 1];
+			if (!dir) return UNRESOLVABLE_DISCARD_TARGET;
+			dashCDir = dir;
+		} else if (token.startsWith("--git-dir") || token.startsWith("--work-tree") || token.startsWith("--prefix")) {
+			return UNRESOLVABLE_DISCARD_TARGET;
+		}
+		// Other flags (for example -c key=value) do not relocate.
 	}
-	// git reset --hard [ref]
-	if (/\bgit\s+reset\s+--hard\b/.test(command)) return true;
-	// git clean with a force flag, unless it is also a dry run
-	for (const match of command.matchAll(/\bgit\s+clean\s+([^;&|]*)/g)) {
-		const args = match[1].split(/\s+/).filter(Boolean);
-		const forces = args.filter((arg) =>
-			arg.startsWith("--") ? arg.startsWith("--force") : arg.startsWith("-") && arg.includes("f"),
-		);
-		if (forces.length === 0) continue;
-		const dryRun = args.some(
-			(arg) => arg === "--dry-run" || (arg.startsWith("-") && !arg.startsWith("--") && arg.includes("n")),
-		);
-		if (!dryRun) return true;
+
+	// Persistent cd relocations earlier in the command.
+	const cdArgs: string[] = [];
+	let sawCd = false;
+	if (/\b(cd|pushd)\b/.test(prefix) || prefix.includes("(")) {
+		for (const part of prefix.split(/(&&|\|\||;|\||\n)/)) {
+			if (part === "&&" || part === ";" || part === "\n") continue;
+			if (part === "||" || part === "|") {
+				if (sawCd) return UNRESOLVABLE_DISCARD_TARGET; // cd success no longer guaranteed
+				continue;
+			}
+			const trimmed = part.trim().replace(/^[(]+/, "");
+			if (trimmed === "pushd" || trimmed.startsWith("pushd ")) return UNRESOLVABLE_DISCARD_TARGET;
+			const cdMatch = /^cd\s*(.*)$/.exec(trimmed);
+			if (!cdMatch) continue;
+			const arg = cdMatch[1].trim();
+			// An arg we cannot replay safely (substitution, redirection, backgrounding)
+			// leaves the target repository unknown; refuse rather than probe blindly.
+			if (arg && /[$`;&|()<>]/.test(arg)) return UNRESOLVABLE_DISCARD_TARGET;
+			sawCd = true;
+			cdArgs.push(arg);
+		}
+		if (sawCd && prefix.includes("(")) return UNRESOLVABLE_DISCARD_TARGET; // subshell/grouping: cd may not persist
 	}
-	return false;
+
+	if (!sawCd && dashCDir === undefined) return null;
+	return {
+		relocationPrefix: sawCd ? `${cdArgs.map((arg) => (arg ? `cd ${arg}` : "cd")).join(" && ")} && ` : undefined,
+		gitStatusCommand: dashCDir ? `git -C ${dashCDir} status --porcelain` : undefined,
+	};
 }
 
 function isTruthyEnvValue(value: string | undefined): boolean {
@@ -243,6 +341,14 @@ function formatDirtyTreeRefusal(dirtyPaths: string[]): string {
 		`To discard these changes intentionally, retry with allowDestructiveGit: true, or set ${BASH_DESTRUCTIVE_GIT_BYPASS_ENV}=1.`,
 	);
 	return lines.join("\n");
+}
+
+function formatRelocationRefusal(): string {
+	return [
+		"Refusing to run this destructive git command: it changes directory (or repository) first, and the uncommitted changes of the repository it targets cannot be checked safely.",
+		"",
+		`Run the discard as its own command from the target directory, or retry with allowDestructiveGit: true, or set ${BASH_DESTRUCTIVE_GIT_BYPASS_ENV}=1.`,
+	].join("\n");
 }
 
 const BASH_PREVIEW_LINES = 5;
@@ -397,23 +503,40 @@ export function createBashToolDefinition(
 			// wiped uncommitted work, so refuse them while the tree is dirty
 			// (make it impossible, not discouraged). Zero cost otherwise: the
 			// pattern check is string-only and the probe only runs on a match.
+			const discardIndices = findDestructiveGitDiscardCommands(spawnContext.command);
 			if (
+				discardIndices.length > 0 &&
 				allowDestructiveGit !== true &&
-				!isTruthyEnvValue(spawnContext.env[BASH_DESTRUCTIVE_GIT_BYPASS_ENV]) &&
-				isDestructiveGitDiscardCommand(spawnContext.command)
+				!isTruthyEnvValue(spawnContext.env[BASH_DESTRUCTIVE_GIT_BYPASS_ENV])
 			) {
-				const probeCommand = commandPrefix
-					? `${commandPrefix}\n${GIT_STATUS_PORCELAIN_COMMAND}`
-					: GIT_STATUS_PORCELAIN_COMMAND;
-				const dirtyPaths = await probeUncommittedChanges(
-					ops,
-					probeCommand,
-					spawnContext.cwd,
-					spawnContext.env,
-					signal,
-				);
-				if (dirtyPaths && dirtyPaths.length > 0) {
-					throw new Error(formatDirtyTreeRefusal(dirtyPaths));
+				// Probe the repository each discard actually targets: follow cd
+				// chains and git -C, and refuse when the target cannot be
+				// resolved safely. Deduplicate identical probes.
+				const probeCommands = new Set<string>();
+				for (const index of discardIndices) {
+					const target = resolveDiscardProbeTarget(spawnContext.command, index);
+					if (target === UNRESOLVABLE_DISCARD_TARGET) {
+						throw new Error(formatRelocationRefusal());
+					}
+					const relocationPrefix = target?.relocationPrefix ?? "";
+					const gitStatus = target?.gitStatusCommand ?? GIT_STATUS_PORCELAIN_COMMAND;
+					probeCommands.add(
+						commandPrefix
+							? `${commandPrefix}\n${relocationPrefix}${gitStatus}`
+							: `${relocationPrefix}${gitStatus}`,
+					);
+				}
+				for (const probeCommand of probeCommands) {
+					const dirtyPaths = await probeUncommittedChanges(
+						ops,
+						probeCommand,
+						spawnContext.cwd,
+						spawnContext.env,
+						signal,
+					);
+					if (dirtyPaths && dirtyPaths.length > 0) {
+						throw new Error(formatDirtyTreeRefusal(dirtyPaths));
+					}
 				}
 			}
 			const output = new OutputAccumulator({ tempFilePrefix: "pi-bash" });
