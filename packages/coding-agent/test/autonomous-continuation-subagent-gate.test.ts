@@ -8,6 +8,9 @@ type FakeSession = {
 	_autonomousState: AutonomousRuntimeState;
 	_autonomousContinuationAwaitsRlmWork: boolean;
 	_autonomousSubagentKeepAliveTimer: ReturnType<typeof setTimeout> | undefined;
+	_autonomousContinuationResumeTask: Promise<void> | undefined;
+	_lastAssistantMessage: { role: "assistant"; stopReason: string } | undefined;
+	agent: { signal: AbortSignal | undefined };
 	_disposed: boolean;
 	_disposing: boolean;
 	_sessionInputAdmissionPauses: Set<symbol>;
@@ -59,6 +62,9 @@ function fakeSession(overrides: Partial<FakeSession> = {}): FakeSession {
 		_autonomousState: createAutonomousRuntimeState({ enabled: true, maxContinuations: 5 }),
 		_autonomousContinuationAwaitsRlmWork: false,
 		_autonomousSubagentKeepAliveTimer: undefined,
+		_autonomousContinuationResumeTask: undefined,
+		_lastAssistantMessage: { role: "assistant", stopReason: "stop" },
+		agent: { signal: undefined },
 		_disposed: false,
 		_disposing: false,
 		_sessionInputAdmissionPauses: new Set(),
@@ -89,7 +95,10 @@ function fakeSession(overrides: Partial<FakeSession> = {}): FakeSession {
 	const realMethods = [
 		"_holdAutonomousContinuationForRlmWork",
 		"_maybeResumeAutonomousContinuationAfterRlmWork",
-		"_deliverOwedAutonomousContinuation",
+		"_resumeOwedAutonomousContinuation",
+		"_goalOwnsContinuationWakeup",
+		"_deliverAutonomousSubagentKeepAlive",
+		"_admitOwedAutonomousContinuation",
 		"_armAutonomousSubagentKeepAlive",
 		"_disarmAutonomousSubagentKeepAlive",
 		"_clearAutonomousContinuationAwait",
@@ -138,10 +147,35 @@ describe("autonomous continuation vs active subagents", () => {
 		const session = fakeSession({
 			_hasUnsettledRlmQuiescenceWork: () => true,
 		});
+		session._autonomousContinuationAwaitsRlmWork = true;
 		session._goalState = { status: "active", objective: "ship it" };
 		expect(holdForRlmWork.call(session, stoppedTurn)).toBe(true);
+		// The goal's own continuation loop takes over the owed continuation.
 		expect(session._autonomousContinuationAwaitsRlmWork).toBe(false);
 		expect(vi.getTimerCount()).toBe(0);
+		expect(session._autonomousState.continuationsUsed).toBe(0);
+	});
+
+	it("drops a held continuation when a goal takes over at settlement", () => {
+		const session = fakeSession({ _autonomousContinuationAwaitsRlmWork: true });
+		session._goalState = { status: "active", objective: "ship it" };
+		maybeResume.call(session);
+		expect(session._admitSessionInput).not.toHaveBeenCalled();
+		expect(session._autonomousContinuationAwaitsRlmWork).toBe(false);
+		expect(session._autonomousState.continuationsUsed).toBe(0);
+	});
+
+	it("drops a pending keep-alive when a goal takes over while children stay active", () => {
+		vi.useFakeTimers();
+		const session = fakeSession({
+			_hasUnsettledRlmQuiescenceWork: () => true,
+			_autonomousState: createAutonomousRuntimeState({ enabled: true, subagentKeepAliveMs: 1_000 }),
+		});
+		expect(holdForRlmWork.call(session, stoppedTurn)).toBe(true);
+		session._goalState = { status: "active", objective: "ship it" };
+		vi.advanceTimersByTime(1_000);
+		expect(session._admitSessionInput).not.toHaveBeenCalled();
+		expect(session._autonomousContinuationAwaitsRlmWork).toBe(false);
 		expect(session._autonomousState.continuationsUsed).toBe(0);
 	});
 
@@ -162,10 +196,13 @@ describe("autonomous continuation vs active subagents", () => {
 		expect(session._autonomousContinuationAwaitsRlmWork).toBe(false);
 	});
 
-	it("resumes the held continuation exactly once, unqueued, idle-waking, and counted", () => {
+	it("resumes the held continuation exactly once, unqueued, idle-waking, and counted", async () => {
 		const session = fakeSession({ _autonomousContinuationAwaitsRlmWork: true });
 		maybeResume.call(session);
 		maybeResume.call(session);
+		await session._autonomousContinuationResumeTask;
+		maybeResume.call(session);
+		await session._autonomousContinuationResumeTask;
 		expect(session._admitSessionInput).toHaveBeenCalledTimes(1);
 		const [action] = session._admitSessionInput.mock.calls[0]!;
 		expect((action as { options: { resumeIfIdle: boolean } }).options.resumeIfIdle).toBe(true);
@@ -184,7 +221,7 @@ describe("autonomous continuation vs active subagents", () => {
 		expect(session._autonomousState.continuationsUsed).toBe(0);
 	});
 
-	it("keeps the deferral while admission is paused and retries after release", () => {
+	it("keeps the deferral while admission is paused and retries after release", async () => {
 		const session = fakeSession({ _autonomousContinuationAwaitsRlmWork: true });
 		session._sessionInputAdmissionPauses.add(Symbol("pause"));
 		maybeResume.call(session);
@@ -193,6 +230,7 @@ describe("autonomous continuation vs active subagents", () => {
 
 		session._sessionInputAdmissionPauses.clear();
 		maybeResume.call(session);
+		await session._autonomousContinuationResumeTask;
 		expect(session._admitSessionInput).toHaveBeenCalledTimes(1);
 		expect(session._autonomousContinuationAwaitsRlmWork).toBe(false);
 	});
@@ -207,7 +245,7 @@ describe("autonomous continuation vs active subagents", () => {
 		expect(session._autonomousContinuationAwaitsRlmWork).toBe(true);
 	});
 
-	it("keeps the deferral and rolls back the count when admission throws", () => {
+	it("keeps the deferral and rolls back the count when admission throws", async () => {
 		const session = fakeSession({
 			_autonomousContinuationAwaitsRlmWork: true,
 			_admitSessionInput: vi.fn(() => {
@@ -215,6 +253,7 @@ describe("autonomous continuation vs active subagents", () => {
 			}),
 		});
 		maybeResume.call(session);
+		await session._autonomousContinuationResumeTask;
 		expect(session._autonomousContinuationAwaitsRlmWork).toBe(true);
 		expect(session._autonomousState.continuationsUsed).toBe(0);
 	});
@@ -227,16 +266,54 @@ describe("autonomous continuation vs active subagents", () => {
 		expect(session._autonomousContinuationAwaitsRlmWork).toBe(false);
 	});
 
-	it("drops the held continuation when limits are already reached", () => {
+	it("drops the held continuation when limits are already reached", async () => {
 		const session = fakeSession({
 			_autonomousContinuationAwaitsRlmWork: true,
 			_autonomousState: createAutonomousRuntimeState({ enabled: true, maxContinuations: 1 }),
 		});
 		session._autonomousState.continuationsUsed = 1;
 		maybeResume.call(session);
+		await session._autonomousContinuationResumeTask;
 		expect(session._admitSessionInput).not.toHaveBeenCalled();
 		expect(session._autonomousContinuationAwaitsRlmWork).toBe(false);
 		expect(session._autonomousState.continuationsUsed).toBe(1);
+	});
+
+	it("skips the owed continuation when configured gates pass at settlement", async () => {
+		const session = fakeSession({
+			_autonomousContinuationAwaitsRlmWork: true,
+			_cwd: "/tmp",
+			_autonomousState: createAutonomousRuntimeState({
+				enabled: true,
+				maxContinuations: 5,
+				gates: { commands: ["true"] },
+			}),
+		});
+		maybeResume.call(session);
+		await session._autonomousContinuationResumeTask;
+		expect(session._admitSessionInput).not.toHaveBeenCalled();
+		expect(session._autonomousContinuationAwaitsRlmWork).toBe(false);
+		expect(session._autonomousState.continuationsUsed).toBe(0);
+	});
+
+	it("delivers a gate-failure continuation when configured gates fail at settlement", async () => {
+		const session = fakeSession({
+			_autonomousContinuationAwaitsRlmWork: true,
+			_cwd: "/tmp",
+			_autonomousState: createAutonomousRuntimeState({
+				enabled: true,
+				maxContinuations: 5,
+				gates: { commands: ["false"] },
+			}),
+		});
+		maybeResume.call(session);
+		await session._autonomousContinuationResumeTask;
+		expect(session._admitSessionInput).toHaveBeenCalledTimes(1);
+		const [action] = session._admitSessionInput.mock.calls[0]!;
+		const message = (action as { options: { message: { content: Array<{ text: string }> } } }).options.message;
+		expect(message.content[0]!.text).toContain("[autonomous-continuation: gate-failed]");
+		expect(session._autonomousState.continuationsUsed).toBe(1);
+		expect(session._autonomousContinuationAwaitsRlmWork).toBe(false);
 	});
 
 	it("fires one keep-alive continuation per window while children stay active", () => {
@@ -261,7 +338,7 @@ describe("autonomous continuation vs active subagents", () => {
 		expect(session._autonomousState.continuationsUsed).toBe(2);
 	});
 
-	it("delivers the plain owed continuation, not a keep-alive, when children settle first", () => {
+	it("delivers the plain owed continuation, not a keep-alive, when children settle first", async () => {
 		vi.useFakeTimers();
 		const session = fakeSession({
 			_hasUnsettledRlmQuiescenceWork: () => true,
@@ -270,6 +347,7 @@ describe("autonomous continuation vs active subagents", () => {
 		expect(holdForRlmWork.call(session, stoppedTurn)).toBe(true);
 		session._hasUnsettledRlmQuiescenceWork = () => false;
 		fireKeepAlive.call(session);
+		await session._autonomousContinuationResumeTask;
 		const [action] = session._admitSessionInput.mock.calls[0]!;
 		const message = (action as { options: { message: { content: Array<{ text: string }> } } }).options.message;
 		expect(message.content[0]!.text).toContain("[autonomous-continuation]");

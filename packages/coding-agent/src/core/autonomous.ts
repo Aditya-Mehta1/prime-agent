@@ -76,6 +76,12 @@ export const DEFAULT_AUTONOMOUS_GATES: Required<AgentAutonomousGateConfig> = {
 export const DEFAULT_AUTONOMOUS_SUBAGENT_KEEP_ALIVE_MS = 30 * 60 * 1000;
 
 /**
+ * Largest keep-alive window `setTimeout` accepts: Node clamps larger delays
+ * to 1 ms, which would turn a huge window into a keep-alive storm.
+ */
+export const MAX_SUBAGENT_KEEP_ALIVE_MS = 2_147_483_647;
+
+/**
  * JSON-safe sentinel meaning "no cap". Limit checks compare usage against the
  * configured value, so this stays finite and serializes to JSON while no
  * realistic run can ever reach it.
@@ -169,7 +175,7 @@ function normalizeSubagentKeepAliveMs(value: number | undefined): number {
 	if (value === 0) {
 		return 0;
 	}
-	return normalizeLimit(value, DEFAULT_AUTONOMOUS_SUBAGENT_KEEP_ALIVE_MS);
+	return Math.min(normalizeLimit(value, DEFAULT_AUTONOMOUS_SUBAGENT_KEEP_ALIVE_MS), MAX_SUBAGENT_KEEP_ALIVE_MS);
 }
 
 export function setAutonomousEnabled(

@@ -91,6 +91,7 @@ import {
 	createAutonomousRuntimeState,
 	createAutonomousSubagentKeepAliveMessage,
 	isUnlimitedAutonomousLimit,
+	MAX_SUBAGENT_KEEP_ALIVE_MS,
 	nextAutonomousContinuation,
 	refreshAutonomousQualityGates,
 	setAutonomousEnabled,
@@ -1064,9 +1065,14 @@ const AUTONOMOUS_BUDGET_FLAGS: ReadonlySet<string> = new Set([
 function parseSubagentKeepAliveMs(value: string): number {
 	const digits = value.replace(/[,_]/g, "");
 	if (digits === "0" || /^[1-9]\d*$/.test(digits)) {
-		return Number(digits);
+		const parsed = Number(digits);
+		if (parsed <= MAX_SUBAGENT_KEEP_ALIVE_MS) {
+			return parsed;
+		}
 	}
-	throw new Error(`--subagent-keep-alive-ms must be 0 or a positive integer. ${AUTONOMOUS_BUDGET_USAGE}`);
+	throw new Error(
+		`--subagent-keep-alive-ms must be 0 or a positive integer up to ${MAX_SUBAGENT_KEEP_ALIVE_MS}. ${AUTONOMOUS_BUDGET_USAGE}`,
+	);
 }
 
 function parseAutonomousBudgetInt(flag: string, value: string, allowUnlimited = false): number {
@@ -1298,6 +1304,9 @@ export class AgentSession {
 	// re-prompting a waiting parent (and pause without consuming budget).
 	private _autonomousContinuationAwaitsRlmWork = false;
 	private _autonomousSubagentKeepAliveTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+	// In-flight gate evaluation for an owed continuation; holds the promise so
+	// settlement sites never double-fire the resume.
+	private _autonomousContinuationResumeTask: Promise<void> | undefined = undefined;
 
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
@@ -2289,6 +2298,13 @@ export class AgentSession {
 		if (command.kind === "on") {
 			setAutonomousEnabled(this._autonomousState, true, { cwd: this._cwd });
 			setAutonomousLimits(this._autonomousState, command.config);
+			// Re-sync the keep-alive with the new window: a 0 setting must
+			// disarm an already-armed timer, and a shortened window must not
+			// keep the old one pending.
+			this._disarmAutonomousSubagentKeepAlive();
+			if (this._autonomousContinuationAwaitsRlmWork) {
+				this._armAutonomousSubagentKeepAlive();
+			}
 		} else if (command.kind === "off") {
 			setAutonomousEnabled(this._autonomousState, false);
 			this._clearQueuedAutonomousContinuations();
@@ -2410,8 +2426,9 @@ export class AgentSession {
 			return false;
 		}
 		// An active goal's own continuation gate owns the wake-up discipline;
-		// hold this continuation without queueing a second one behind it.
-		if (this._goalState.status === "active" && this._goalState.objective) {
+		// drop any owed continuation so both are never queued.
+		if (this._goalOwnsContinuationWakeup()) {
+			this._clearAutonomousContinuationAwait();
 			return true;
 		}
 		this._autonomousContinuationAwaitsRlmWork = true;
@@ -2419,46 +2436,91 @@ export class AgentSession {
 		return true;
 	}
 
+	/** True while an active goal's continuation loop owns the session wake-ups. */
+	private _goalOwnsContinuationWakeup(): boolean {
+		return this._goalState.status === "active" && !!this._goalState.objective;
+	}
+
 	/** Deliver the owed continuation once descendant work settles. */
 	private _maybeResumeAutonomousContinuationAfterRlmWork(): void {
 		if (!this._autonomousContinuationAwaitsRlmWork) return;
 		if (this._disposed || this._disposing || this._hasUnsettledRlmQuiescenceWork()) return;
-		if (!this._autonomousState.enabled) {
+		if (!this._autonomousState.enabled || this._goalOwnsContinuationWakeup()) {
 			this._clearAutonomousContinuationAwait();
 			return;
 		}
 		// Keep the deferral while admission is paused or the pump is suspended
 		// (post-abort); the pause release and resumeQueuedWork retry.
 		if (this._sessionInputAdmissionPauses.size > 0 || this._sessionInputPumpSuspended) return;
-		this._deliverOwedAutonomousContinuation({ keepAlive: false });
+		if (this._autonomousContinuationResumeTask) return;
+		this._autonomousContinuationResumeTask = this._resumeOwedAutonomousContinuation().finally(() => {
+			this._autonomousContinuationResumeTask = undefined;
+		});
 	}
 
 	/**
-	 * Deliver an owed autonomous continuation, counting it at delivery like a
-	 * goal continuation. Returns false when admission raced a pause so callers
-	 * that own a retry window can re-arm it.
+	 * Deliver the owed continuation, evaluating configured quality gates first
+	 * so a settlement never spends a turn when the gates already pass. Counted
+	 * at delivery like a goal continuation; a failed admission rolls the count
+	 * back and keeps the deferral for the pause-release retry.
 	 */
-	private _deliverOwedAutonomousContinuation(options: { keepAlive: boolean }): boolean {
+	private async _resumeOwedAutonomousContinuation(): Promise<void> {
+		const snapshot = this._snapshotAutonomousRuntimeState();
+		try {
+			const lastAssistantMessage = this._lastAssistantMessage;
+			if (!lastAssistantMessage) {
+				if (autonomousLimitReason(this._autonomousState)) {
+					// The run is over; no continuation is owed anymore.
+					this._clearAutonomousContinuationAwait();
+					return;
+				}
+				addAutonomousContinuation(this._autonomousState);
+				this._admitOwedAutonomousContinuation(createAutonomousContinuationMessage(this._autonomousState));
+				return;
+			}
+			// Configured quality gates decide whether the run is already done.
+			const message = await nextAutonomousContinuation(this._autonomousState, lastAssistantMessage, {
+				cwd: this._cwd,
+				signal: this.agent.signal,
+			});
+			if (message) {
+				this._admitOwedAutonomousContinuation(message);
+			} else {
+				this._clearAutonomousContinuationAwait();
+			}
+		} catch {
+			// Admission can race a new pause; roll back so the retry re-counts.
+			this._restoreAutonomousRuntimeSnapshot(snapshot);
+		}
+	}
+
+	/** Admit an already-built owed continuation behind pending notices. */
+	private _admitOwedAutonomousContinuation(message: UserMessage): void {
+		const normalized = normalizeMessageContent(message.content);
+		// No front: a settling child's terminal notice must be read first.
+		this._admitSessionInput(
+			this._createPreparedTurnAction("followUp", normalized.text, normalized.images, {
+				message,
+				resumeIfIdle: true,
+			}),
+		);
+		this._clearAutonomousContinuationAwait();
+	}
+
+	/**
+	 * Deliver the keep-alive continuation while subagents are still active.
+	 * Returns false when admission raced a pause so the window can re-arm.
+	 */
+	private _deliverAutonomousSubagentKeepAlive(): boolean {
 		if (autonomousLimitReason(this._autonomousState)) {
-			// The run is over; no continuation is owed anymore.
+			// The run is over; no keep-alive is owed anymore.
 			this._clearAutonomousContinuationAwait();
 			return true;
 		}
 		const snapshot = this._snapshotAutonomousRuntimeState();
 		try {
-			const message = options.keepAlive
-				? createAutonomousSubagentKeepAliveMessage(this._autonomousState)
-				: createAutonomousContinuationMessage(this._autonomousState);
 			addAutonomousContinuation(this._autonomousState);
-			const normalized = normalizeMessageContent(message.content);
-			// No front: a settling child's terminal notice must be read first.
-			this._admitSessionInput(
-				this._createPreparedTurnAction("followUp", normalized.text, normalized.images, {
-					message,
-					resumeIfIdle: true,
-				}),
-			);
-			this._clearAutonomousContinuationAwait();
+			this._admitOwedAutonomousContinuation(createAutonomousSubagentKeepAliveMessage(this._autonomousState));
 			return true;
 		} catch {
 			// Admission can race a new pause; roll back so the retry re-counts.
@@ -2506,7 +2568,7 @@ export class AgentSession {
 			this._maybeResumeAutonomousContinuationAfterRlmWork();
 			return;
 		}
-		if (!this._autonomousState.enabled) {
+		if (!this._autonomousState.enabled || this._goalOwnsContinuationWakeup()) {
 			this._clearAutonomousContinuationAwait();
 			return;
 		}
@@ -2516,7 +2578,7 @@ export class AgentSession {
 			this._armAutonomousSubagentKeepAlive();
 			return;
 		}
-		if (!this._deliverOwedAutonomousContinuation({ keepAlive: true })) {
+		if (!this._deliverAutonomousSubagentKeepAlive()) {
 			// Admission raced a pause; retry after another window.
 			this._armAutonomousSubagentKeepAlive();
 		}

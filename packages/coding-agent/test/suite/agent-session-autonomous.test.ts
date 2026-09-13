@@ -331,6 +331,8 @@ describe("AgentSession autonomous mode", () => {
 			"/autonomous on --max-continuations",
 			"/autonomous on --speed 10",
 			"/autonomous on --gate-retries unlimited",
+			"/autonomous on --subagent-keep-alive-ms 3000000000",
+			"/autonomous on --subagent-keep-alive-ms -5",
 			"/autonomous off --max-continuations 2",
 		]) {
 			await harness.session.prompt(input);
@@ -343,6 +345,8 @@ describe("AgentSession autonomous mode", () => {
 			expect.stringContaining("Missing value for --max-continuations"),
 			expect.stringContaining("Unknown autonomous budget flag: --speed"),
 			expect.stringContaining("--gate-retries must be a positive integer."),
+			expect.stringContaining("--subagent-keep-alive-ms must be 0 or a positive integer up to 2147483647"),
+			expect.stringContaining("--subagent-keep-alive-ms must be 0 or a positive integer up to 2147483647"),
 			expect.stringContaining("Unexpected autonomous argument: --max-continuations"),
 		]);
 
@@ -859,6 +863,39 @@ describe("AgentSession autonomous continuations vs subagents", () => {
 		expect(getUserTexts(parent)).toEqual(["kick off", expect.stringContaining("[autonomous-continuation]")]);
 		expect(parent.session.getAutonomousStatus()).toMatchObject({ continuationsUsed: 1 });
 		expect(parent.session.hasRunningRlmChildren()).toBe(false);
+	});
+
+	it("accepts a bounded keep-alive window flag and reports it in the status", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+
+		await harness.session.prompt("/autonomous on --subagent-keep-alive-ms 250");
+
+		expect(harness.getPendingResponseCount()).toBe(0);
+		expect(harness.session.getAutonomousStatus()).toMatchObject({
+			enabled: true,
+			subagentKeepAliveMs: 250,
+		});
+	});
+
+	it("disarms a pending keep-alive when the valve is disabled mid-hold", async () => {
+		const parent = await createGatedChildParent({ keepAliveMs: 25, maxContinuations: 2 });
+		parent.setResponses([fauxAssistantMessage("delegated to the child; waiting")]);
+
+		await parent.session.runRlmChild("child task", { name: "worker" });
+		await expect.poll(() => parent.session.hasRunningRlmChildren()).toBe(true);
+
+		await parent.session.prompt("kick off");
+		expect(getUserTexts(parent)).toEqual(["kick off"]);
+
+		await parent.session.prompt("/autonomous on --subagent-keep-alive-ms 0");
+
+		// The previously armed 25 ms window is gone; no keep-alive turn fires.
+		await new Promise((resolve) => setTimeout(resolve, 150));
+		expect(getAssistantTexts(parent)).toEqual(["delegated to the child; waiting"]);
+		expect(getUserTexts(parent)).toEqual(["kick off"]);
+		expect(parent.session.getAutonomousStatus()).toMatchObject({ continuationsUsed: 0 });
+		expect(parent.session.hasRunningRlmChildren()).toBe(true);
 	});
 
 	it("fires one keep-alive continuation while a subagent stays active past the window", async () => {
