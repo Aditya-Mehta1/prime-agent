@@ -52,6 +52,12 @@ describe("isDestructiveGitDiscardCommand", () => {
 		"git restore -s@ :/",
 		"git restore --source=HEAD :/",
 		"git restore -s HEAD~1 :/",
+		"git restore -- .",
+		"git checkout -- ./",
+		"git checkout ./",
+		"git restore ./",
+		"git -C sub reset --hard",
+		"git --git-dir=sub/.git reset --hard",
 	])("matches %s", (command) => {
 		expect(isDestructiveGitDiscardCommand(command)).toBe(true);
 	});
@@ -329,6 +335,24 @@ describe("bash tool destructive-git dirty-tree guard", () => {
 		await bash.execute("guard-git-c-probe", { command: "git -C sub reset --hard" });
 
 		expect(calls).toEqual(["git -C sub status --porcelain", "git -C sub reset --hard"]);
+	});
+
+	it("runs the probe through the spawn hook like the discard itself", async () => {
+		const calls: string[] = [];
+		const operations: BashOperations = {
+			exec: async (command, _cwd, _options) => {
+				calls.push(command);
+				return { exitCode: 0 };
+			},
+		};
+		const bash = createBashTool(testDir, {
+			operations,
+			spawnHook: (ctx) => ({ ...ctx, command: `source ~/.profile\n${ctx.command}` }),
+		});
+
+		await bash.execute("guard-hook", { command: "git checkout -- ." });
+
+		expect(calls).toEqual(["source ~/.profile\ngit status --porcelain", "source ~/.profile\ngit checkout -- ."]);
 	});
 
 	it("propagates aborts raised while probing", async () => {
