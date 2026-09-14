@@ -98,9 +98,7 @@ describe("verifyReleaseChecksums", () => {
 	});
 
 	test("rejects a cryptographically valid signature from the wrong signer", () => {
-		expect(() => verifyReleaseChecksums(checksums, bundle)).toThrow(
-			new RegExp(`not by ${PINNED_RELEASE_SIGNER.repositoryUri.replace(/[.]/g, "\\.")}`),
-		);
+		expect(() => verifyReleaseChecksums(checksums, bundle)).toThrow(`not by ${PINNED_RELEASE_SIGNER.repositoryUri}`);
 	});
 
 	test("rejects the right workflow on a ref outside the allowed pattern", () => {

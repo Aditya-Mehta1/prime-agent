@@ -86,6 +86,27 @@ function stageChangedFiles() {
 	run(`git add -- ${paths.map(shellQuote).join(" ")}`);
 }
 
+/**
+ * Creates the release branch before any file is touched, so an aborted or repeated run never
+ * leaves the original branch holding a half-consumed release. Fails if the branch already exists
+ * locally or on the remote: a second release of the same version is a new decision, not a retry.
+ */
+function createReleaseBranch(version) {
+	const branch = `release/v${version}`;
+	const local = run(`git branch --list ${branch}`, { silent: true });
+	if (local && local.trim()) {
+		console.error(`Error: branch ${branch} already exists locally. Delete it or pick another version.`);
+		process.exit(1);
+	}
+	const remote = run(`git ls-remote --heads origin ${branch}`, { silent: true });
+	if (remote && remote.trim()) {
+		console.error(`Error: branch ${branch} already exists on origin. A release for v${version} was already prepared.`);
+		process.exit(1);
+	}
+	run(`git checkout -b ${branch}`);
+	return branch;
+}
+
 function bumpOrSetVersion(target) {
 	const currentVersion = getVersion();
 
@@ -252,16 +273,22 @@ if (status && status.trim()) {
 }
 console.log("  Working directory clean\n");
 
+// Predict the version and create the branch BEFORE anything is mutated.
+const plannedVersion = previewVersion(RELEASE_TARGET);
+const releaseBranch = createReleaseBranch(plannedVersion);
+
 const version = bumpOrSetVersion(RELEASE_TARGET);
 console.log(`  New version: ${version}\n`);
+if (version !== plannedVersion) {
+	console.error(`Error: expected the bump to produce ${plannedVersion} but got ${version}.`);
+	process.exit(1);
+}
 
 console.log("Updating CHANGELOG.md files...");
 updateChangelogsForRelease(version);
 console.log();
 
-const releaseBranch = `release/v${version}`;
 console.log(`Committing on ${releaseBranch}...`);
-run(`git checkout -b ${releaseBranch}`);
 stageChangedFiles();
 run(`git commit -m "Release v${version}"`);
 console.log();

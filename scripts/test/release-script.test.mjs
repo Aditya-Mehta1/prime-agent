@@ -31,3 +31,20 @@ test("the release script opens the pull request but cannot approve or merge it",
 	assert.equal(/gh pr review/.test(script), false);
 	assert.equal(/--admin/.test(script), false);
 });
+
+test("the release script creates the release branch before mutating anything", () => {
+	const branch = script.indexOf("createReleaseBranch(plannedVersion)");
+	const bump = script.indexOf("bumpOrSetVersion(RELEASE_TARGET)");
+	// The first call to updateChangelogsForRelease is the dry run, which exits before anything is
+	// mutated; the real call is the last one.
+	const changelog = script.lastIndexOf("updateChangelogsForRelease(version)");
+	assert.ok(script.indexOf("process.exit(0)") < branch, "the dry run must exit before the branch is created");
+	assert.ok(branch > 0 && bump > 0 && changelog > 0);
+	assert.ok(branch < bump, "branch must be created before the version bump");
+	assert.ok(branch < changelog, "branch must be created before changelogs are rewritten");
+});
+
+test("the release script refuses an existing release branch", () => {
+	assert.match(script, /git branch --list \$\{branch\}/);
+	assert.match(script, /git ls-remote --heads origin \$\{branch\}/);
+});
