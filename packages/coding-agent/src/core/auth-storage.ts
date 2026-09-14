@@ -20,16 +20,7 @@ import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { getAgentDir } from "../config.js";
 import { realpathIfPresentSync, writeFileAtomicSync } from "../utils/atomic-file.js";
-import {
-	clearPrimeCliCredentials,
-	getPrimeCliConfigPath,
-	loadPrimeCliConfig,
-	PRIME_INFERENCE_PROVIDER_ID,
-	type PrimeCliConfig,
-	type PrimeTeam,
-	savePrimeCliApiKey,
-	savePrimeCliTeamSelection,
-} from "./prime-inference-auth.js";
+import { getPrimeCliConfigPath, PRIME_INFERENCE_PROVIDER_ID, type PrimeTeam } from "./prime-inference-auth.js";
 import { resolveConfigValue, resolveConfigValueUncached } from "./resolve-config-value.js";
 import type { TelemetryErrorOperation } from "./telemetry-error-classification.js";
 import { captureTelemetryError, reportTelemetryError, type TelemetryErrorContext } from "./telemetry-errors.js";
@@ -102,6 +93,7 @@ type AuthSourceCandidate = {
 type AuthApiKeyResult = {
 	apiKey?: string;
 	sourceToken?: AuthSourceToken;
+	credentialType?: AuthCredential["type"];
 };
 
 export interface AuthStorageBackend {
@@ -412,22 +404,6 @@ export class AuthStorage {
 		};
 	}
 
-	private getPrimeCliAuthCandidate(provider: string): AuthSourceCandidate | undefined {
-		const apiKey = this.getPrimeCliApiKey(provider);
-		if (!apiKey) {
-			return undefined;
-		}
-		return {
-			label: "Prime CLI",
-			...this.createAuthSourceCandidate({
-				configured: false,
-				source: "prime_cli",
-				identityMaterial: provider,
-				valueMaterial: apiKey,
-			}),
-		};
-	}
-
 	private getStoredAuthCandidate(
 		provider: string,
 		options?: { resolveCommandValue?: boolean; resolvedCommandValue?: string },
@@ -525,7 +501,6 @@ export class AuthStorage {
 				? [
 						this.getRuntimeAuthCandidate(provider),
 						this.getEnvironmentAuthCandidate(provider),
-						this.getPrimeCliAuthCandidate(provider),
 						this.getStoredAuthCandidate(provider),
 						fallbackCandidate,
 					]
@@ -661,7 +636,11 @@ export class AuthStorage {
 		if (!content) {
 			return {};
 		}
-		return JSON.parse(content) as AuthStorageData;
+		const data: unknown = JSON.parse(content);
+		if (typeof data !== "object" || data === null || Array.isArray(data)) {
+			throw new Error("Invalid auth storage: expected a JSON object");
+		}
+		return data as AuthStorageData;
 	}
 
 	/**
@@ -733,18 +712,196 @@ export class AuthStorage {
 	 * load or write failure instead of recording it, so callers can refuse to
 	 * proceed while the credential may still exist on disk. Disk-authoritative
 	 * and idempotent — in-memory state is only updated after the write succeeds.
+	 * Returns whether a credential was actually removed from disk.
 	 */
-	removeVerified(provider: string): void {
-		this.storage.withLock((current) => {
+	removeVerified(provider: string): boolean {
+		const removed = this.storage.withLock((current) => {
 			const currentData = this.parseStorageData(current);
-			if (!(provider in currentData)) return { result: undefined };
+			if (!(provider in currentData)) return { result: false };
 			const merged: AuthStorageData = { ...currentData };
 			delete merged[provider];
-			return { result: undefined, next: JSON.stringify(merged, null, 2) };
+			return { result: true, next: JSON.stringify(merged, null, 2) };
 		});
-		delete this.data[provider];
-		// Post-success only: a failed removal must not make a stale-marked credential selectable again.
-		this.clearStaleAuthSource(provider, "stored");
+		if (removed) {
+			delete this.data[provider];
+			// Post-success only: a failed removal must not make a stale-marked credential selectable again.
+			this.clearStaleAuthSource(provider, "stored");
+		}
+		return removed;
+	}
+
+	/**
+	 * Disk-authoritative conditional move for staged MCP logins: move
+	 * `stagedProvider`'s credential to `provider` ONLY when no credential
+	 * exists at `provider` ON DISK, reading and writing under the backend's
+	 * own file lock. An ordinary login in another process — invisible to this
+	 * instance's cache — can never be clobbered by a race between the get and
+	 * the set. Returns "occupied" when the destination already holds a
+	 * credential, "nothing" when the staged slot is empty, or the exact
+	 * credential that moved (for exact-own rollback).
+	 */
+	moveStagedCredential(
+		stagedProvider: string,
+		provider: string,
+	): { status: "occupied" } | { status: "nothing" } | { status: "moved"; credential: AuthCredential } {
+		type MoveOutcome =
+			| { status: "occupied" }
+			| { status: "nothing" }
+			| { status: "moved"; credential: AuthCredential };
+		const outcome = this.storage.withLock<MoveOutcome>((current) => {
+			const currentData = this.parseStorageData(current);
+			if (provider in currentData) {
+				return { result: { status: "occupied" } };
+			}
+			const staged = currentData[stagedProvider];
+			if (!staged) {
+				return { result: { status: "nothing" } };
+			}
+			const merged: AuthStorageData = { ...currentData, [provider]: staged };
+			delete merged[stagedProvider];
+			return {
+				result: { status: "moved", credential: staged },
+				next: JSON.stringify(merged, null, 2),
+			};
+		});
+		// Post-success only: refresh the cache from disk under the same lock
+		// discipline so no stale entry survives the move.
+		if (outcome.status === "moved") {
+			this.reload();
+		}
+		return outcome;
+	}
+
+	/**
+	 * Disk-authoritative conditional restore: write `credential` to
+	 * `provider` ONLY when the slot is empty ON DISK. A credential written by
+	 * anyone else is never overwritten.
+	 */
+	restoreCredentialIfAbsent(provider: string, credential: AuthCredential): boolean {
+		const restored = this.storage.withLock((current) => {
+			const currentData = this.parseStorageData(current);
+			if (provider in currentData) {
+				return { result: false };
+			}
+			const merged: AuthStorageData = { ...currentData, [provider]: credential };
+			return { result: true, next: JSON.stringify(merged, null, 2) };
+		});
+		if (restored) {
+			this.data[provider] = credential;
+			this.clearStaleAuthSource(provider, "stored");
+		}
+		return restored;
+	}
+
+	/**
+	 * Disk-authoritative conditional removal: remove `provider`'s credential
+	 * ONLY when the ON-DISK value is exactly `expected` (full-object
+	 * comparison, not token equality) — a credential written by anyone else is
+	 * never deleted. The in-memory cache drops the key only after the write
+	 * succeeds.
+	 */
+	removeIfCredentialMatches(provider: string, expected: AuthCredential): boolean {
+		const removed = this.storage.withLock((current) => {
+			const currentData = this.parseStorageData(current);
+			const currentCredential = currentData[provider];
+			if (currentCredential === undefined) {
+				return { result: false };
+			}
+			if (JSON.stringify(currentCredential) !== JSON.stringify(expected)) {
+				return { result: false };
+			}
+			const merged: AuthStorageData = { ...currentData };
+			delete merged[provider];
+			return { result: true, next: JSON.stringify(merged, null, 2) };
+		});
+		if (removed) {
+			delete this.data[provider];
+			this.clearStaleAuthSource(provider, "stored");
+		}
+		return removed;
+	}
+
+	/**
+	 * Disk-authoritative credential read under the backend's own file lock —
+	 * a cross-instance writer is always visible, unlike the cached `get()`.
+	 * Used to capture the full identity a guarded login's compare-and-swap
+	 * expects to replace (legacy/credential-only accounts included).
+	 */
+	getVerified(provider: string): AuthCredential | undefined {
+		return this.storage.withLock((current) => {
+			const currentData = this.parseStorageData(current);
+			return { result: currentData[provider] };
+		});
+	}
+
+	/**
+	 * Atomic full-identity compare-and-swap move for guarded MCP logins:
+	 * move `stagedProvider`'s credential to `provider` ONLY when the on-disk
+	 * value at `provider` is exactly `expectedOld` — the comparison INCLUDES
+	 * absence (both present, or both absent) — read and written under the
+	 * backend's own file lock. A changed OR deleted grant refuses ("occupied"):
+	 * a logged-out account is never reactivated and a newer writer is never
+	 * clobbered. Returns the exact credential that moved (for full-identity
+	 * rollback).
+	 */
+	replaceStagedCredential(
+		stagedProvider: string,
+		provider: string,
+		expectedOld: AuthCredential | undefined,
+	): { status: "occupied" } | { status: "nothing" } | { status: "replaced"; credential: AuthCredential } {
+		type ReplaceOutcome =
+			| { status: "occupied" }
+			| { status: "nothing" }
+			| { status: "replaced"; credential: AuthCredential };
+		const outcome = this.storage.withLock<ReplaceOutcome>((current) => {
+			const currentData = this.parseStorageData(current);
+			const existing = currentData[provider];
+			// FULL-IDENTITY comparison INCLUDING absence: the on-disk value must
+			// be exactly `expectedOld` (both present, or both absent). A
+			// changed OR deleted grant refuses — never reactivate a logged-out
+			// account, never clobber a newer writer.
+			if (JSON.stringify(existing) !== JSON.stringify(expectedOld)) {
+				return { result: { status: "occupied" as const } };
+			}
+			const staged = currentData[stagedProvider];
+			if (!staged) {
+				return { result: { status: "nothing" as const } };
+			}
+			const merged: AuthStorageData = { ...currentData, [provider]: staged };
+			delete merged[stagedProvider];
+			return {
+				result: { status: "replaced" as const, credential: staged },
+				next: JSON.stringify(merged, null, 2),
+			};
+		});
+		// Post-success only: refresh the cache under the same lock discipline.
+		if (outcome.status === "replaced") {
+			this.reload();
+		}
+		return outcome;
+	}
+
+	/**
+	 * Atomic full-identity compare-and-swap write: set `provider` to `next`
+	 * ONLY when the on-disk value is exactly `expected`. Used to roll back a
+	 * guarded replacement (restoring the PREVIOUS credential) and to undo
+	 * only this attempt's own write — a newer writer is never clobbered.
+	 */
+	replaceCredentialIfMatches(provider: string, expected: AuthCredential, next: AuthCredential): boolean {
+		const replaced = this.storage.withLock((current) => {
+			const currentData = this.parseStorageData(current);
+			const existing = currentData[provider];
+			if (existing === undefined || JSON.stringify(existing) !== JSON.stringify(expected)) {
+				return { result: false };
+			}
+			const merged: AuthStorageData = { ...currentData, [provider]: next };
+			return { result: true, next: JSON.stringify(merged, null, 2) };
+		});
+		if (replaced) {
+			this.data[provider] = next;
+			this.clearStaleAuthSource(provider, "stored");
+		}
+		return replaced;
 	}
 
 	/**
@@ -811,14 +968,9 @@ export class AuthStorage {
 	 * Logout from a provider.
 	 */
 	logout(provider: string): void {
-		if (provider === PRIME_INFERENCE_PROVIDER_ID && this.isPrimeCliConfigEnabled()) {
-			try {
-				clearPrimeCliCredentials(this.getEnabledPrimeCliConfigPath());
-				this.clearStaleAuthSource(provider, "prime_cli");
-			} catch (error) {
-				this.recordError(error, "logout", provider);
-				throw error;
-			}
+		if (provider === PRIME_INFERENCE_PROVIDER_ID) {
+			this.removeVerified(provider);
+			return;
 		}
 		this.remove(provider);
 	}
@@ -877,7 +1029,7 @@ export class AuthStorage {
 	 * Get API key for a provider.
 	 * Priority:
 	 * 1. Runtime override (CLI --api-key)
-	 * 2. Prime Inference: environment variable, Prime CLI config, auth.json
+	 * 2. Prime Inference: environment variable, auth.json
 	 * 3. Other providers: auth.json, environment variable
 	 * 4. Fallback resolver (models.json custom providers)
 	 */
@@ -909,17 +1061,6 @@ export class AuthStorage {
 			};
 		}
 
-		if (providerId === PRIME_INFERENCE_PROVIDER_ID) {
-			const primeCliCandidate = this.getPrimeCliAuthCandidate(providerId);
-			const primeCliKey = this.getPrimeCliApiKey(providerId);
-			if (primeCliKey && primeCliCandidate && !this.isAuthSourceStale(providerId, primeCliCandidate)) {
-				return {
-					apiKey: primeCliKey,
-					sourceToken: this.getAuthSourceTokenForCandidate(providerId, primeCliCandidate),
-				};
-			}
-		}
-
 		const cred = this.data[providerId];
 
 		if (cred?.type === "api_key") {
@@ -940,7 +1081,7 @@ export class AuthStorage {
 											storedCandidate)
 									: storedCandidate,
 							);
-				return { apiKey, sourceToken };
+				return { apiKey, sourceToken, credentialType: "api_key" };
 			}
 		}
 
@@ -961,6 +1102,7 @@ export class AuthStorage {
 							const refreshedCandidate = this.getStoredAuthCandidate(providerId);
 							return {
 								apiKey: result.apiKey,
+								credentialType: "oauth",
 								sourceToken: refreshedCandidate
 									? this.getAuthSourceTokenForCandidate(providerId, refreshedCandidate)
 									: undefined,
@@ -976,6 +1118,7 @@ export class AuthStorage {
 							const updatedCandidate = this.getStoredAuthCandidate(providerId);
 							return {
 								apiKey: provider.getApiKey(updatedCred),
+								credentialType: "oauth",
 								sourceToken: updatedCandidate
 									? this.getAuthSourceTokenForCandidate(providerId, updatedCandidate)
 									: undefined,
@@ -988,6 +1131,7 @@ export class AuthStorage {
 				} else {
 					return {
 						apiKey: provider.getApiKey(cred),
+						credentialType: "oauth",
 						sourceToken: this.getAuthSourceTokenForCandidate(providerId, storedCandidate),
 					};
 				}
@@ -1030,114 +1174,60 @@ export class AuthStorage {
 		return getOAuthProviders();
 	}
 
-	setPrimeInferenceTeamSelection(team: PrimeTeam | null): void {
-		if (this.isPrimeCliConfigEnabled()) {
-			try {
-				savePrimeCliTeamSelection(team, this.getEnabledPrimeCliConfigPath());
-			} catch (error) {
-				this.recordError(error, "save", PRIME_INFERENCE_PROVIDER_ID);
-				throw error;
-			}
-			return;
+	private updatePrimeInferenceCredential(
+		update: (credential: AuthCredential | undefined) => ApiKeyCredential | undefined,
+	): void {
+		try {
+			const data = this.storage.withLock((current) => {
+				const data = this.parseStorageData(current);
+				const credential = update(data[PRIME_INFERENCE_PROVIDER_ID]);
+				if (!credential) return { result: data };
+				data[PRIME_INFERENCE_PROVIDER_ID] = credential;
+				return { result: data, next: JSON.stringify(data, null, 2) };
+			});
+			this.data = data;
+			this.loadError = null;
+		} catch (error) {
+			this.recordError(error, "save", PRIME_INFERENCE_PROVIDER_ID);
+			throw error;
 		}
-
-		const credential = this.data[PRIME_INFERENCE_PROVIDER_ID];
-		if (credential?.type !== "api_key") {
-			return;
-		}
-		this.set(PRIME_INFERENCE_PROVIDER_ID, {
-			...credential,
-			primeTeam: team ? this.toPrimeTeamCredential(team) : null,
-		});
 	}
 
-	setPrimeInferenceApiKey(apiKey: string): void {
-		if (this.isPrimeCliConfigEnabled()) {
-			try {
-				const configPath = this.getEnabledPrimeCliConfigPath();
-				const config = loadPrimeCliConfig(configPath);
-				const existingCredential = this.data[PRIME_INFERENCE_PROVIDER_ID];
-				const legacyPrimeTeam = existingCredential?.type === "api_key" ? existingCredential.primeTeam : undefined;
-				if (config.apiKey !== apiKey) {
-					savePrimeCliApiKey(apiKey, configPath);
-				} else if (!config.teamIdFromEnv && (legacyPrimeTeam === null || (!config.teamId && legacyPrimeTeam))) {
-					savePrimeCliTeamSelection(legacyPrimeTeam, configPath);
-				}
-				this.clearStaleAuthSource(PRIME_INFERENCE_PROVIDER_ID, "prime_cli");
-			} catch (error) {
-				this.recordError(error, "save", PRIME_INFERENCE_PROVIDER_ID);
-				throw error;
-			}
-			if (this.data[PRIME_INFERENCE_PROVIDER_ID]) {
-				this.remove(PRIME_INFERENCE_PROVIDER_ID);
-			}
-			return;
-		}
+	setPrimeInferenceTeamSelection(team: PrimeTeam | null, expectedApiKey?: string): void {
+		this.updatePrimeInferenceCredential((credential) =>
+			credential?.type === "api_key" && (expectedApiKey === undefined || credential.key === expectedApiKey)
+				? { ...credential, primeTeam: team ? this.toPrimeTeamCredential(team) : null }
+				: undefined,
+		);
+	}
 
-		const existingCredential = this.data[PRIME_INFERENCE_PROVIDER_ID];
-		const existingPrimeTeam = existingCredential?.type === "api_key" ? existingCredential.primeTeam : undefined;
-		this.set(PRIME_INFERENCE_PROVIDER_ID, {
+	setPrimeInferenceApiKey(apiKey: string, team?: PrimeTeam | null): void {
+		this.updatePrimeInferenceCredential((existing) => ({
 			type: "api_key",
 			key: apiKey,
-			...(existingPrimeTeam !== undefined ? { primeTeam: existingPrimeTeam } : {}),
-		});
+			primeTeam:
+				team !== undefined
+					? team
+						? this.toPrimeTeamCredential(team)
+						: null
+					: existing?.type === "api_key" && existing.key === apiKey
+						? (existing.primeTeam ?? null)
+						: null,
+		}));
+		this.clearStaleAuthSource(PRIME_INFERENCE_PROVIDER_ID, "stored");
 	}
 
 	getPrimeInferenceTeamSelection(): PrimeTeamCredential | null | undefined {
-		let config: PrimeCliConfig | undefined;
-		if (this.isPrimeCliConfigEnabled()) {
-			config = this.getPrimeCliConfig(PRIME_INFERENCE_PROVIDER_ID);
-			if (config?.teamIdFromEnv) {
-				return undefined;
-			}
-		}
-
-		const credential = this.data[PRIME_INFERENCE_PROVIDER_ID];
+		if (process.env.PRIME_TEAM_ID?.trim()) return undefined;
 		const authSource = this.getAuthStatus(PRIME_INFERENCE_PROVIDER_ID).source;
-		if (authSource === "runtime" || authSource === "environment") {
-			return undefined;
-		}
-		// A stale CLI key must not erase the selected team used to validate cached model access.
-		if (authSource === "prime_cli" || (authSource === "stale" && config?.apiKey)) {
-			if (credential?.type === "api_key" && credential.primeTeam === null) {
-				return null;
-			}
-			if (config?.teamId) {
-				return this.toPrimeTeamCredential({
-					teamId: config.teamId,
-					name: config.teamName ?? "Prime CLI team",
-					...(config.teamRole ? { role: config.teamRole } : {}),
-				});
-			}
-			if (credential?.type === "api_key" && credential.primeTeam) {
-				return credential.primeTeam;
-			}
-			return null;
-		}
-		if (credential?.type === "api_key" && credential.primeTeam !== undefined) {
-			return credential.primeTeam;
-		}
-		if (!config?.apiKey && config?.teamId) {
-			return this.toPrimeTeamCredential({
-				teamId: config.teamId,
-				name: config.teamName ?? "Prime CLI team",
-				...(config.teamRole ? { role: config.teamRole } : {}),
-			});
-		}
-		return undefined;
+		if (authSource === "runtime" || authSource === "environment") return undefined;
+		const credential = this.data[PRIME_INFERENCE_PROVIDER_ID];
+		return credential?.type === "api_key" ? credential.primeTeam : undefined;
 	}
 
 	getProviderHeaders(providerId: string): Record<string, string> | undefined {
-		if (providerId !== PRIME_INFERENCE_PROVIDER_ID) {
-			return undefined;
-		}
-
-		const primeCliConfig = this.getPrimeCliConfig(providerId);
-		if (primeCliConfig?.teamIdFromEnv) {
-			return primeCliConfig.teamId ? { "X-Prime-Team-ID": primeCliConfig.teamId } : undefined;
-		}
-
-		const teamId = this.getPrimeInferenceTeamSelection()?.teamId;
+		if (providerId !== PRIME_INFERENCE_PROVIDER_ID) return undefined;
+		const teamId = process.env.PRIME_TEAM_ID?.trim() || this.getPrimeInferenceTeamSelection()?.teamId;
 		return teamId ? { "X-Prime-Team-ID": teamId } : undefined;
 	}
 
@@ -1163,28 +1253,6 @@ export class AuthStorage {
 			credential.createdAt = team.createdAt;
 		}
 		return credential;
-	}
-
-	private getPrimeCliConfig(providerId: string): PrimeCliConfig | undefined {
-		if (providerId !== PRIME_INFERENCE_PROVIDER_ID) {
-			return undefined;
-		}
-		if (!this.isPrimeCliConfigEnabled()) {
-			return undefined;
-		}
-		return loadPrimeCliConfig(this.options.primeCliConfigPath);
-	}
-
-	private getPrimeCliApiKey(providerId: string): string | undefined {
-		return this.getPrimeCliConfig(providerId)?.apiKey;
-	}
-
-	private getEnabledPrimeCliConfigPath(): string {
-		const configPath = this.getPrimeCliConfigPath();
-		if (!configPath) {
-			throw new Error("Prime CLI config is not enabled");
-		}
-		return configPath;
 	}
 
 	private isPrimeCliConfigEnabled(): boolean {

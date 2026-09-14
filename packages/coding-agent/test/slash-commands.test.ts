@@ -57,10 +57,15 @@ describe("built-in slash commands", () => {
 		expect(builtinSlashCommandTakesArgument("side")).toBe(true);
 	});
 
-	test("describes /mcp as the MCP Connections menu entry point", () => {
+	test("describes /mcp and /plugins as the external-services entry points", () => {
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "mcp")).toMatchObject({
-			description: "Open MCP Connections or manage MCP integrations",
+			description: "Browse external services or manage MCP integrations",
 			argumentHint: "[add|list|get|remove|login|logout]",
+			takesArgument: true,
+		});
+		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "plugins")).toMatchObject({
+			description: "Browse and connect external services",
+			argumentHint: "[search]",
 			takesArgument: true,
 		});
 	});
@@ -74,7 +79,6 @@ describe("built-in slash commands", () => {
 
 	test("marks argument commands as taking a free-form argument", () => {
 		for (const [name, argumentHint] of [
-			["model", "[search]"],
 			["export", "[path]"],
 			["import", "<path.jsonl>"],
 			["name", "[name]"],
@@ -89,6 +93,7 @@ describe("built-in slash commands", () => {
 		});
 		expect(builtinSlashCommandTakesArgument("goal")).toBe(true);
 		expect(builtinSlashCommandTakesArgument("effort")).toBe(false);
+		expect(builtinSlashCommandTakesArgument("model")).toBe(false);
 		expect(builtinSlashCommandTakesArgument("thinking")).toBe(false);
 		expect(builtinSlashCommandTakesArgument("heartbeat")).toBe(true);
 		expect(builtinSlashCommandTakesArgument("mcp")).toBe(true);

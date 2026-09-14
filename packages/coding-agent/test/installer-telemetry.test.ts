@@ -108,6 +108,9 @@ esac
 		TMPDIR: tempDir,
 		PRIME_AGENT_CODING_AGENT_DIR: agentDir,
 		PRIME_AGENT_DOWNLOAD_BASE_URL: "https://downloads.invalid",
+		// main defaults installs to the compiled (native) archive flow; these tests
+		// cover the Node install flow the telemetry helpers instrument.
+		PRIME_AGENT_INSTALL_METHOD: "node",
 		PRIME_AGENT_INSTALLER_PLAIN: "1",
 		PRIME_AGENT_TELEMETRY_ENDPOINT: "https://telemetry.invalid/api/v1/agent-analytics/events",
 		TEST_BATCHES: batchesPath,

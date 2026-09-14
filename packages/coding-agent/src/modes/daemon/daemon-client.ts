@@ -36,6 +36,8 @@ export type DaemonClientProgressListener = (message: DaemonRequestProgress) => v
 
 export interface DaemonClientRequestOptions {
 	onProgress?: DaemonClientProgressListener;
+	/** Runs synchronously before the reader dispatches any records following this response. */
+	onResponse?: (response: DaemonResponse) => void;
 	/**
 	 * False opts out of reconnect parking: a close rejects so the caller's own retry loop stays live.
 	 * Any caller that owns its own bounded retry MUST pass false; a parked request waits for a hello
@@ -403,7 +405,14 @@ export class DaemonClient {
 
 		return new Promise((resolve, reject) => {
 			const pending: PendingDaemonRequest = {
-				resolve,
+				resolve: (response) => {
+					try {
+						options.onResponse?.(response);
+						resolve(response);
+					} catch (error) {
+						reject(error);
+					}
+				},
 				reject,
 				timeoutMs,
 				commandType: command.type,
@@ -739,6 +748,7 @@ function isDaemonSavedSessionAgentStatus(value: unknown): boolean {
 		typeof candidate.basedOnMessageCount === "number" &&
 		(candidate.taskState === undefined ||
 			candidate.taskState === "needs_input" ||
-			candidate.taskState === "completed")
+			candidate.taskState === "completed" ||
+			candidate.taskState === "error")
 	);
 }

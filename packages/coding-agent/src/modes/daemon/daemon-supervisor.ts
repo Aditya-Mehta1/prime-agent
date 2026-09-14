@@ -194,6 +194,14 @@ const SUPERVISOR_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
 ];
 const PEER_TRANSPORT_GRANT_TTL_MS = 10_000;
 const WORKER_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+// The daemon client's default request budget is 30s and each ready-worker heartbeat
+// forward gets 5s, so waiting longer than this on in-flight launches would only
+// surface as a client transport timeout instead of a bounded per-worker state error.
+export const HEARTBEAT_LIST_LAUNCH_WAIT_MS = 15_000;
+// Session-scoped listing must fail inside the client's request budget too; the
+// worker request default (24h) would turn a stuck worker into a client transport
+// timeout instead of a daemon-side failure.
+export const HEARTBEAT_LIST_FORWARD_TIMEOUT_MS = 25_000;
 const INPUT_PAUSE_CLEANUP_TIMEOUT_MS = 5_000;
 const UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS = 80_000;
 const UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS = 90_000;
@@ -202,6 +210,14 @@ const UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS = 90_000;
 // an abandoned prepare leaves the daemon permanently fenced with workers stopped.
 const UPDATE_RESTART_PREPARE_DEADLINE_MS = 100_000;
 const WORKER_RETRY_DELAYS_MS = [250, 1000, 5000] as const;
+/**
+ * Upper bound on relay payloads deferred per client and session while a
+ * snapshot stream is active. Deferral spans one stream (seconds), so overflow
+ * means a pathologically slow client; the supervisor then falls back to a
+ * catch-up snapshot instead of buffering without limit.
+ */
+const MAX_DEFERRED_SESSION_PAYLOADS = 256;
+const MAX_DEFERRED_SESSION_BYTES = 8 * 1024 * 1024;
 const DEFERRED_RECOVERY_RECHECK_MS = 5000;
 // ~2.5 minutes of probing: each round is one 5s defer recheck plus a ~11s three-delay probe pass.
 const MAX_DEFERRED_RECOVERY_ROUNDS = 10;
@@ -714,6 +730,13 @@ export class DaemonSupervisor {
 	private readonly workers = new Map<string, ResidentWorker>();
 	private workerStopCounts?: Map<ResidentWorker, number>;
 	private readonly openingWorkers = new Map<string, Promise<ResidentWorker>>();
+	/**
+	 * Openings that can register catalog-visible workers (`ownerClientId === undefined`).
+	 * Client-owned launches stay in `openingWorkers` for create dedupe but can never
+	 * join the public heartbeat catalog (`isVisibleWorker`), so catalog listing
+	 * never waits on them.
+	 */
+	private readonly catalogOpeningWorkers = new Map<string, Promise<ResidentWorker>>();
 	/** Public admission ids are scoped to the socket that registered them. */
 	private readonly promptAdmissions = new Map<DaemonSocketClient, Map<string, SupervisorPromptAdmission>>();
 	private readonly sessionInputPauses = new Map<string, SupervisorSessionInputPause>();
@@ -938,7 +961,7 @@ export class DaemonSupervisor {
 				pendingCancelRoots.add(canonicalSessionPath(context.sessionFile));
 			}
 		}
-		const infos = await this.rlmSpawnLedger().family();
+		const infos = await this.rlmSpawnLedger().family(SESSION_SCHEDULED_JOBS_FILENAME);
 		const infoByPath = new Map(infos.map((info) => [canonicalSessionPath(info.path), info] as const));
 		const storeBySessionId = new Map<string, AgentCronJobStore>();
 		const infoBySessionId = new Map<string, SessionInfo>();
@@ -1477,6 +1500,8 @@ export class DaemonSupervisor {
 				return;
 			}
 			cleaned = true;
+			clearTimeout(client.catchupRetryTimer);
+			client.catchupRetryTimer = undefined;
 			client.detachInput();
 			this.sessionInputPauseEpochs.set(client, (this.sessionInputPauseEpochs.get(client) ?? 0) + 1);
 			const ownerClientId = this.protocolClientId(client);
@@ -2074,6 +2099,7 @@ export class DaemonSupervisor {
 					this.write(client, success(command.id, command.type, attached.result));
 					this.detachClient(client, command.activeSessionId);
 					releaseSnapshotReservation();
+					this.releaseDeferredSessionPayloads(client, targetActiveSessionId, true);
 					return undefined;
 				} catch (error) {
 					releaseTranscript?.();
@@ -2081,6 +2107,7 @@ export class DaemonSupervisor {
 						this.detachClient(client, targetActiveSessionId);
 					}
 					releaseSnapshotReservation();
+					this.releaseDeferredSessionPayloads(client, targetActiveSessionId, targetWasAttached);
 					throw error;
 				}
 			}
@@ -2287,10 +2314,39 @@ export class DaemonSupervisor {
 			case "heartbeats_list": {
 				if (command.activeSessionId) {
 					const match = await this.findWorkerForClient(client, command.activeSessionId);
-					return this.forwardToWorker(match.worker, command);
+					// The forward may first join an in-flight recovery whose budget far exceeds
+					// the client's request timeout, so bound the whole operation: a stuck or
+					// still-recovering worker fails daemon-side inside the caller's budget
+					// instead of surfacing as a client transport timeout.
+					const forward = this.forwardToWorker(match.worker, command, HEARTBEAT_LIST_FORWARD_TIMEOUT_MS);
+					const forwardDeadline = unrefDelay(HEARTBEAT_LIST_FORWARD_TIMEOUT_MS).then(() => {
+						throw new Error(
+							`Timed out waiting for session worker to list heartbeats within ${HEARTBEAT_LIST_FORWARD_TIMEOUT_MS}ms`,
+						);
+					});
+					return Promise.race([forward, forwardDeadline]).catch((error: unknown) =>
+						failure(command.id, command.type, error, serializeDaemonError(error)),
+					);
+				}
+				const openings = [...this.catalogOpeningWorkers.values()];
+				const selectedWorkers = new Set(this.workers.values());
+				for (const opening of openings) {
+					opening.then(
+						(worker) => selectedWorkers.add(worker),
+						() => undefined,
+					);
+				}
+				// Slow launches must not outrun the caller's request budget: after
+				// HEARTBEAT_LIST_LAUNCH_WAIT_MS the catalog proceeds with whatever
+				// registered, and workers that are still starting surface through the
+				// per-worker state error below instead of being omitted.
+				await Promise.race([Promise.allSettled(openings), unrefDelay(HEARTBEAT_LIST_LAUNCH_WAIT_MS)]);
+				for (const worker of this.workers.values()) {
+					selectedWorkers.add(worker);
 				}
 				const workers = [...this.workers.values()].filter(
-					(worker) => this.isLiveWorker(worker) && worker.descriptor.lifecycle !== "failed",
+					(worker) =>
+						selectedWorkers.has(worker) && this.isLiveWorker(worker) && worker.descriptor.lifecycle !== "failed",
 				);
 				const heartbeats = new Map<string, AgentConnectionHeartbeat>();
 				const snapshots: Array<{ heartbeats?: AgentConnectionHeartbeat[]; response?: DaemonResponse }> =
@@ -2905,11 +2961,17 @@ export class DaemonSupervisor {
 			});
 		})();
 		this.openingWorkers.set(key, opening);
+		if (ownerClientId === undefined) {
+			this.catalogOpeningWorkers.set(key, opening);
+		}
 		try {
 			return await opening;
 		} finally {
 			if (this.openingWorkers.get(key) === opening) {
 				this.openingWorkers.delete(key);
+			}
+			if (this.catalogOpeningWorkers.get(key) === opening) {
+				this.catalogOpeningWorkers.delete(key);
 			}
 		}
 	}
@@ -5358,24 +5420,31 @@ export class DaemonSupervisor {
 		releaseSnapshotReservation = this.reserveSnapshotStream(client, result.activeSessionId),
 	): Promise<void> {
 		const stream = result.snapshotStream;
-		const releaseTranscript = retainedTranscriptRelease ?? transcript.retain();
-		if (!stream || client.socket.destroyed) {
+		const signal = client.snapshotTransferAbortControllers?.get(result.activeSessionId)?.signal;
+		if (!stream || client.socket.destroyed || signal?.aborted) {
 			releaseSnapshotReservation();
-			releaseTranscript();
+			retainedTranscriptRelease?.();
+			this.releaseDeferredSessionPayloads(client, result.activeSessionId, false);
 			return;
 		}
+		const releaseTranscript = retainedTranscriptRelease ?? transcript.retain();
 		const { messages: _messages, ...snapshotHeader } = result.snapshot;
+		let snapshotDelivered = false;
 		try {
 			if (
-				!(await this.writeSnapshotRecord(client, {
-					type: "session_snapshot_begin",
-					activeSessionId: result.activeSessionId,
-					snapshotId: stream.id,
-					snapshot: snapshotHeader,
-					messageCount: stream.messageCount,
-					targetChunkBytes: stream.targetChunkBytes,
-					purpose,
-				}))
+				!(await this.writeSnapshotRecord(
+					client,
+					{
+						type: "session_snapshot_begin",
+						activeSessionId: result.activeSessionId,
+						snapshotId: stream.id,
+						snapshot: snapshotHeader,
+						messageCount: stream.messageCount,
+						targetChunkBytes: stream.targetChunkBytes,
+						purpose,
+					},
+					signal,
+				))
 			) {
 				return;
 			}
@@ -5383,8 +5452,9 @@ export class DaemonSupervisor {
 			while (true) {
 				let chunk: Buffer | undefined;
 				try {
-					chunk = await transcript.waitForChunk(chunkCount);
+					chunk = await transcript.waitForChunk(chunkCount, signal);
 				} catch (error) {
+					if (signal?.aborted) return;
 					const streamError = error instanceof Error ? error : new Error(String(error));
 					this.failWorkerSnapshotCache(worker, result.activeSessionId, streamError, false, stream.id);
 					throw streamError;
@@ -5392,29 +5462,39 @@ export class DaemonSupervisor {
 				if (!chunk) {
 					break;
 				}
-				if (!(await this.writeSnapshotBuffer(client, chunk))) {
+				if (!(await this.writeSnapshotBuffer(client, chunk, signal))) {
 					return;
 				}
 				chunkCount++;
 			}
-			await this.writeSnapshotRecord(client, {
-				type: "session_snapshot_end",
-				activeSessionId: result.activeSessionId,
-				snapshotId: stream.id,
-				chunkCount,
-				lastEventSequence: result.lastEventSequence,
-				lastEventCursor: result.lastEventCursor,
-			});
+			snapshotDelivered = await this.writeSnapshotRecord(
+				client,
+				{
+					type: "session_snapshot_end",
+					activeSessionId: result.activeSessionId,
+					snapshotId: stream.id,
+					chunkCount,
+					lastEventSequence: result.lastEventSequence,
+					lastEventCursor: result.lastEventCursor,
+				},
+				signal,
+			);
 		} catch (error) {
+			if (signal?.aborted) return;
 			const streamError = error instanceof Error ? error : new Error(String(error));
 			if (!client.socket.destroyed) {
 				try {
-					const delivered = await this.writeSnapshotRecord(client, {
-						type: "session_snapshot_failed",
-						activeSessionId: result.activeSessionId,
-						snapshotId: stream.id,
-						error: streamError.message,
-					});
+					const delivered = await this.writeSnapshotRecord(
+						client,
+						{
+							type: "session_snapshot_failed",
+							activeSessionId: result.activeSessionId,
+							snapshotId: stream.id,
+							error: streamError.message,
+						},
+						signal,
+					);
+					if (signal?.aborted) return;
 					if (!delivered && !client.socket.destroyed) {
 						client.socket.destroy(streamError);
 					}
@@ -5424,12 +5504,25 @@ export class DaemonSupervisor {
 			}
 			throw streamError;
 		} finally {
+			if (
+				!snapshotDelivered &&
+				client.attachedActiveSessionIds.has(result.activeSessionId) &&
+				client.deferredSessionPayloads?.get(result.activeSessionId)?.payloads.length
+			) {
+				this.queueCatchup(client, result.activeSessionId, "resync");
+			}
 			releaseSnapshotReservation();
 			releaseTranscript();
+			this.releaseDeferredSessionPayloads(client, result.activeSessionId, snapshotDelivered);
 		}
 	}
 
 	private reserveSnapshotStream(client: DaemonSocketClient, activeSessionId: string): () => void {
+		if (!client.snapshotActiveSessionIds?.has(activeSessionId)) {
+			client.deferredSessionPayloadsDropped?.delete(activeSessionId);
+			client.snapshotTransferAbortControllers ??= new Map();
+			client.snapshotTransferAbortControllers.set(activeSessionId, new AbortController());
+		}
 		client.snapshotStreaming = true;
 		client.snapshotActiveSessionIds ??= new Set();
 		client.snapshotActiveSessionIds.add(activeSessionId);
@@ -5450,11 +5543,9 @@ export class DaemonSupervisor {
 			} else {
 				client.snapshotActiveSessionCounts?.delete(activeSessionId);
 				client.snapshotActiveSessionIds?.delete(activeSessionId);
+				client.snapshotTransferAbortControllers?.delete(activeSessionId);
 			}
 			client.snapshotStreaming = (client.snapshotActiveSessionIds?.size ?? 0) > 0;
-			if (!client.snapshotStreaming) {
-				client.backpressured = false;
-			}
 			if (!client.snapshotStreaming && client.catchupActiveSessionIds?.size) {
 				void this.catchUpClient(client).catch((error) =>
 					this.log(`Failed to catch up client ${client.id}: ${String(error)}`),
@@ -5463,17 +5554,26 @@ export class DaemonSupervisor {
 		};
 	}
 
-	private writeSnapshotRecord(client: DaemonSocketClient, message: DaemonOutbound): Promise<boolean> {
-		return this.writeSnapshotBuffer(client, Buffer.from(serializeJsonLine(message)));
+	private writeSnapshotRecord(
+		client: DaemonSocketClient,
+		message: DaemonOutbound,
+		signal?: AbortSignal,
+	): Promise<boolean> {
+		return this.writeSnapshotBuffer(client, Buffer.from(serializeJsonLine(message)), signal);
 	}
 
-	private async writeSnapshotBuffer(client: DaemonSocketClient, buffer: Uint8Array): Promise<boolean> {
-		if (client.socket.destroyed) {
+	private async writeSnapshotBuffer(
+		client: DaemonSocketClient,
+		buffer: Uint8Array,
+		signal?: AbortSignal,
+	): Promise<boolean> {
+		if (client.socket.destroyed || signal?.aborted) {
 			return false;
 		}
 		if (this.writeSerialized(client, buffer)) {
 			return true;
 		}
+		if (signal?.aborted) return false;
 		return new Promise<boolean>((resolveDrain) => {
 			let settled = false;
 			const finish = (value: boolean) => {
@@ -5484,6 +5584,7 @@ export class DaemonSupervisor {
 				client.socket.off("drain", onDrain);
 				client.socket.off("close", onClose);
 				client.socket.off("error", onClose);
+				signal?.removeEventListener("abort", onClose);
 				resolveDrain(value);
 			};
 			const onDrain = () => finish(true);
@@ -5491,6 +5592,7 @@ export class DaemonSupervisor {
 			client.socket.once("drain", onDrain);
 			client.socket.once("close", onClose);
 			client.socket.once("error", onClose);
+			signal?.addEventListener("abort", onClose, { once: true });
 		});
 	}
 
@@ -5504,6 +5606,7 @@ export class DaemonSupervisor {
 			}
 			client.catchupActiveSessionIds?.delete(resolvedId);
 			client.catchupPurposes?.delete(resolvedId);
+			client.deferredSessionPayloadsDropped?.delete(resolvedId);
 			this.write(client, { type: "session_detached", activeSessionId: resolvedId });
 			void this.syncWorkerExtensionUi(resolvedId);
 			void this.evictEmptySessionOnLastDetach(resolvedId);
@@ -5912,10 +6015,38 @@ export class DaemonSupervisor {
 			if (outboundType === "extension_ui_request" && !client.supportsExtensionUi) {
 				continue;
 			}
-			if (client.snapshotActiveSessionIds?.has(activeSessionId)) {
-				this.queueCatchup(client, activeSessionId, outboundType === "session_replaced" ? "replacement" : "resync");
+			// Snapshots cannot recover extension requests, so never defer or drop them.
+			if (outboundType === "extension_ui_request") {
+				this.writeSerialized(client, publicPayload);
 				continue;
 			}
+			if (outboundType === "session_closed") {
+				client.snapshotTransferAbortControllers?.get(activeSessionId)?.abort();
+				this.discardDeferredSessionPayloads(client, activeSessionId);
+				client.catchupActiveSessionIds?.delete(activeSessionId);
+				client.catchupPurposes?.delete(activeSessionId);
+				this.writeSerialized(client, publicPayload);
+				continue;
+			}
+			if (client.snapshotActiveSessionIds?.has(activeSessionId)) {
+				// A replacement swaps the session wholesale; buffered payloads from
+				// the old session must never replay, so fall back to a replacement
+				// catch-up snapshot.
+				if (outboundType === "session_replaced") {
+					this.discardDeferredSessionPayloads(client, activeSessionId);
+					client.deferredSessionPayloadsDropped ??= new Set();
+					client.deferredSessionPayloadsDropped.add(activeSessionId);
+					this.queueCatchup(client, activeSessionId, "replacement");
+					continue;
+				}
+				if (this.deferSessionPayload(client, activeSessionId, publicPayload)) {
+					continue;
+				}
+				// The deferral buffer overflowed: fall back to a full resync.
+				this.queueCatchup(client, activeSessionId, "resync");
+				continue;
+			}
+			if (client.deferredSessionPayloadsDropped?.has(activeSessionId)) continue;
 			if (client.backpressured === true) {
 				this.queueCatchup(client, activeSessionId, outboundType === "session_replaced" ? "replacement" : "resync");
 				continue;
@@ -5986,18 +6117,94 @@ export class DaemonSupervisor {
 		}
 	}
 
+	/** Hold relayed payloads until the snapshot finishes; false requests a catch-up. */
+	private deferSessionPayload(client: DaemonSocketClient, activeSessionId: string, payload: Buffer): boolean {
+		if (client.deferredSessionPayloadsDropped?.has(activeSessionId)) {
+			return false;
+		}
+		const deferred = client.deferredSessionPayloads?.get(activeSessionId) ?? { payloads: [], bytes: 0 };
+		if (
+			deferred.payloads.length >= MAX_DEFERRED_SESSION_PAYLOADS ||
+			deferred.bytes + payload.byteLength > MAX_DEFERRED_SESSION_BYTES
+		) {
+			// A catch-up snapshot supersedes the buffered payloads.
+			client.deferredSessionPayloadsDropped ??= new Set();
+			client.deferredSessionPayloadsDropped.add(activeSessionId);
+			this.discardDeferredSessionPayloads(client, activeSessionId);
+			return false;
+		}
+		deferred.payloads.push(payload);
+		deferred.bytes += payload.byteLength;
+		client.deferredSessionPayloads ??= new Map();
+		client.deferredSessionPayloads.set(activeSessionId, deferred);
+		return true;
+	}
+
+	/** Replay payloads deferred during a completed snapshot stream, in order. */
+	private flushDeferredSessionPayloads(client: DaemonSocketClient, activeSessionId: string): void {
+		const payloads = client.deferredSessionPayloads?.get(activeSessionId)?.payloads;
+		if (!payloads || payloads.length === 0) {
+			return;
+		}
+		client.deferredSessionPayloads?.delete(activeSessionId);
+		if (!client.attachedActiveSessionIds.has(activeSessionId)) return;
+		for (const payload of payloads) {
+			if (client.socket.destroyed) {
+				return;
+			}
+			if (client.backpressured || !this.writeSerialized(client, payload)) {
+				this.queueCatchup(client, activeSessionId, "resync");
+				return;
+			}
+		}
+	}
+
+	private discardDeferredSessionPayloads(client: DaemonSocketClient, activeSessionId: string): void {
+		client.deferredSessionPayloads?.delete(activeSessionId);
+	}
+
+	/**
+	 * Flush or discard the payloads withheld during a snapshot stream. Only the
+	 * last active stream for the session owns them; an overlapping stream
+	 * replays them after it completes.
+	 */
+	private releaseDeferredSessionPayloads(
+		client: DaemonSocketClient,
+		activeSessionId: string,
+		delivered: boolean,
+	): void {
+		if (client.snapshotActiveSessionIds?.has(activeSessionId)) {
+			return;
+		}
+		if (delivered) {
+			this.flushDeferredSessionPayloads(client, activeSessionId);
+		} else {
+			this.discardDeferredSessionPayloads(client, activeSessionId);
+		}
+	}
+
 	private catchUpClient(client: DaemonSocketClient): Promise<void> {
 		if (client.catchupPromise) {
 			return client.catchupPromise;
 		}
-		if (client.snapshotStreaming || client.backpressured) {
+		if (client.snapshotStreaming || client.backpressured || client.catchupRetryTimer) {
 			return Promise.resolve();
 		}
-		const catchup = this.drainClientCatchupQueue(client).finally(() => {
-			if (client.catchupPromise === catchup) {
-				client.catchupPromise = undefined;
-			}
-		});
+		const catchup = this.drainClientCatchupQueue(client)
+			.catch((error) => {
+				this.log(`Failed to catch up client ${client.id}: ${String(error)}`);
+				if (client.socket.destroyed || !client.catchupActiveSessionIds?.size) return;
+				client.catchupRetryTimer = setTimeout(() => {
+					client.catchupRetryTimer = undefined;
+					void this.catchUpClient(client);
+				}, 250);
+				client.catchupRetryTimer.unref();
+			})
+			.finally(() => {
+				if (client.catchupPromise === catchup) {
+					client.catchupPromise = undefined;
+				}
+			});
 		client.catchupPromise = catchup;
 		return catchup;
 	}
@@ -6023,9 +6230,12 @@ export class DaemonSupervisor {
 		}));
 		client.catchupActiveSessionIds?.clear();
 		client.catchupPurposes?.clear();
+		let retryError: Error | undefined;
 		for (let index = 0; index < pending.length; index++) {
 			const { activeSessionId, purpose } = pending[index]!;
 			let releaseTranscript: (() => void) | undefined;
+			const releaseSnapshotReservation = this.reserveSnapshotStream(client, activeSessionId);
+			const snapshotSignal = client.snapshotTransferAbortControllers?.get(activeSessionId)?.signal;
 			try {
 				const attached = await this.attachClient(client, {
 					type: "attach",
@@ -6061,6 +6271,7 @@ export class DaemonSupervisor {
 						transcript,
 						purpose,
 						releaseTranscript,
+						releaseSnapshotReservation,
 					);
 					releaseTranscript = undefined;
 					continue;
@@ -6086,7 +6297,10 @@ export class DaemonSupervisor {
 								snapshot: attached.result.snapshot,
 								meta,
 							};
-				if (!this.write(client, catchup)) {
+				const accepted = this.write(client, catchup);
+				releaseSnapshotReservation();
+				this.releaseDeferredSessionPayloads(client, activeSessionId, true);
+				if (!accepted) {
 					for (const remaining of pending.slice(index + 1)) {
 						this.queueCatchup(client, remaining.activeSessionId, remaining.purpose);
 					}
@@ -6094,9 +6308,20 @@ export class DaemonSupervisor {
 				}
 			} catch (error) {
 				releaseTranscript?.();
-				this.log(`Failed to catch up client ${client.id} for ${activeSessionId}: ${String(error)}`);
+				if (client.attachedActiveSessionIds.has(activeSessionId) && !snapshotSignal?.aborted) {
+					this.queueCatchup(client, activeSessionId, purpose);
+				}
+				client.deferredSessionPayloadsDropped ??= new Set();
+				client.deferredSessionPayloadsDropped.add(activeSessionId);
+				this.discardDeferredSessionPayloads(client, activeSessionId);
+				retryError ??= error instanceof Error ? error : new Error(String(error));
+			} finally {
+				releaseSnapshotReservation();
+				this.releaseDeferredSessionPayloads(client, activeSessionId, false);
 			}
 		}
+		// Retry failed sessions only after the rest of the batch has had a chance to recover.
+		if (retryError) throw retryError;
 	}
 
 	private async prepareUpdateRestart(): Promise<DaemonUpdateRestartManifest> {
@@ -6887,6 +7112,7 @@ export class DaemonSupervisor {
 		}
 		this.workers.clear();
 		this.openingWorkers.clear();
+		this.catalogOpeningWorkers.clear();
 		await this.runCleanupStep("daemon catalog", () => this.catalog.stop());
 		await this.runCleanupStep("daemon server", () => serverClosed);
 		await this.runCleanupStep("daemon socket", () => this.cleanupSocket());

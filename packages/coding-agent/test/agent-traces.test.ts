@@ -116,7 +116,7 @@ function writeLedgerOutboxEntry(agentDir: string, ledgerFile: string, uploadedBy
 }
 
 async function advanceTimersUntil(condition: () => boolean): Promise<void> {
-	for (let step = 0; step < 200 && !condition(); step += 1) {
+	for (let step = 0; step < 1_000 && !condition(); step += 1) {
 		await stat(new URL(import.meta.url));
 		if (!condition() && vi.getTimerCount() > 0) {
 			await vi.advanceTimersToNextTimerAsync();
@@ -149,36 +149,61 @@ describe("agent trace upload", () => {
 		delete process.env.PRIME_API_BASE_URL;
 	});
 
-	afterEach(() => {
+	// Fire-and-forget trace uploads can still be writing under ENV_AGENT_DIR
+	// when the test body returns, so cleanup flushes them and retries removal.
+	async function flushAsyncWork(): Promise<void> {
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		await new Promise<void>((resolve) => setImmediate(resolve));
+	}
+
+	async function rmTempDirSafely(dir: string): Promise<void> {
+		await flushAsyncWork();
+		for (let attempt = 1; attempt <= 3; attempt++) {
+			try {
+				rmSync(dir, { recursive: true, force: true });
+				return;
+			} catch (error) {
+				if (attempt === 3) throw error;
+				await new Promise<void>((resolve) => setTimeout(resolve, 10 * attempt));
+			}
+		}
+	}
+
+	afterEach(async () => {
 		vi.restoreAllMocks();
 		vi.useRealTimers();
-		if (originalAgentDir === undefined) {
-			delete process.env[ENV_AGENT_DIR];
-		} else {
-			process.env[ENV_AGENT_DIR] = originalAgentDir;
-		}
-		if (originalTraceApiKey === undefined) {
-			delete process.env.PRIME_AGENT_TRACES_API_KEY;
-		} else {
-			process.env.PRIME_AGENT_TRACES_API_KEY = originalTraceApiKey;
-		}
-		if (originalPrimeApiKey === undefined) {
-			delete process.env.PRIME_API_KEY;
-		} else {
-			process.env.PRIME_API_KEY = originalPrimeApiKey;
-		}
-		if (originalTraceBaseUrl === undefined) {
-			delete process.env.PRIME_AGENT_TRACES_BASE_URL;
-		} else {
-			process.env.PRIME_AGENT_TRACES_BASE_URL = originalTraceBaseUrl;
-		}
-		if (originalPrimeBaseUrl === undefined) {
-			delete process.env.PRIME_API_BASE_URL;
-		} else {
-			process.env.PRIME_API_BASE_URL = originalPrimeBaseUrl;
-		}
-		if (tempDir && existsSync(tempDir)) {
-			rmSync(tempDir, { recursive: true, force: true });
+		try {
+			// Flush straggler uploads and remove the temp dir while ENV_AGENT_DIR
+			// still points at it, so late writes land inside the dir being removed.
+			if (tempDir && existsSync(tempDir)) {
+				await rmTempDirSafely(tempDir);
+			}
+		} finally {
+			if (originalAgentDir === undefined) {
+				delete process.env[ENV_AGENT_DIR];
+			} else {
+				process.env[ENV_AGENT_DIR] = originalAgentDir;
+			}
+			if (originalTraceApiKey === undefined) {
+				delete process.env.PRIME_AGENT_TRACES_API_KEY;
+			} else {
+				process.env.PRIME_AGENT_TRACES_API_KEY = originalTraceApiKey;
+			}
+			if (originalPrimeApiKey === undefined) {
+				delete process.env.PRIME_API_KEY;
+			} else {
+				process.env.PRIME_API_KEY = originalPrimeApiKey;
+			}
+			if (originalTraceBaseUrl === undefined) {
+				delete process.env.PRIME_AGENT_TRACES_BASE_URL;
+			} else {
+				process.env.PRIME_AGENT_TRACES_BASE_URL = originalTraceBaseUrl;
+			}
+			if (originalPrimeBaseUrl === undefined) {
+				delete process.env.PRIME_API_BASE_URL;
+			} else {
+				process.env.PRIME_API_BASE_URL = originalPrimeBaseUrl;
+			}
 		}
 	});
 
@@ -318,11 +343,13 @@ describe("agent trace upload", () => {
 		const calls: FetchCall[] = [];
 		const result = await uploadAgentTraceFile({
 			sessionFile: sessionManager.getSessionFile(),
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
+			authStorage: AuthStorage.inMemory(
+				{
+					[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
+				},
+				{ primeCliConfigPath: configPath, usePrimeCliConfig: true },
+			),
 			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			configPath,
 			fetchFn: createFetchRecorder(calls),
 			reloadConfig: false,
 		});
@@ -410,6 +437,17 @@ describe("agent trace upload", () => {
 		sessionManager.appendMessage(createAssistantMessage("hi"));
 		await advanceTimersUntil(() => calls.length === 1);
 		expect(calls[0].url).toBe("https://api.example.test/api/v1/agent-traces/sessions/listener-session");
+		const sessionFile = sessionManager.getSessionFile()!;
+		const signature = await stat(sessionFile);
+		await advanceTimersUntil(() => readOutboxEntry(tempDir, sessionFile)?.size === signature.size);
+		// The request starts before the upload cursor and completion log are written.
+		await advanceTimersUntil(() => {
+			const logPath = getAgentTracesLogPath();
+			return (
+				existsSync(logPath) &&
+				readFileSync(logPath, "utf8").includes(`uploaded session uploaded-session (123 bytes) [${sessionFile}]`)
+			);
+		});
 	});
 
 	it("coalesces new content that persists during an in-flight upload into one follow-up upload", async () => {
@@ -490,6 +528,16 @@ describe("agent trace upload", () => {
 		sessionManager.appendMessage(createAssistantMessage("hi"));
 		expect(Number(setTimeoutSpy.mock.calls.at(-1)?.[1])).toBe(1_000);
 		await advanceTimersUntil(() => calls.length === 1);
+
+		// The request starts before the upload cursor and completion log are written.
+		const sessionFile = sessionManager.getSessionFile() as string;
+		await advanceTimersUntil(() => {
+			const logPath = getAgentTracesLogPath();
+			return (
+				existsSync(logPath) &&
+				readFileSync(logPath, "utf8").includes(`uploaded session uploaded-session (123 bytes) [${sessionFile}]`)
+			);
+		});
 
 		setTimeoutSpy.mockClear();
 		sessionManager.appendMessage(createUserMessage("next"));
@@ -710,6 +758,15 @@ describe("agent trace upload", () => {
 		// The rate-limited cycle re-arms itself; the retry succeeds without any caller waiting.
 		await advanceTimersUntil(() => calls.length === 1);
 		expect(attempts).toBe(2);
+		// Receiving the request is not completion: wait for the durable cursor before teardown.
+		const sessionFile = sessionManager.getSessionFile()!;
+		const signature = await stat(sessionFile);
+		await advanceTimersUntil(() => readOutboxEntry(tempDir, sessionFile)?.size === signature.size);
+		expect(readOutboxEntry(tempDir, sessionFile)).toEqual({
+			sessionFile,
+			size: signature.size,
+			mtimeMs: signature.mtimeMs,
+		});
 	});
 
 	it.each([503])("honors Retry-After when retrying HTTP %i", async (status) => {
@@ -1428,6 +1485,15 @@ describe("agent trace upload", () => {
 
 		await advanceTimersUntil(() => calls.length === 1);
 		expect(attempts).toBe(2);
+		// The request starts before the upload cursor and completion log are written.
+		const sessionFile = sessionManager.getSessionFile() as string;
+		await advanceTimersUntil(() => {
+			const logPath = getAgentTracesLogPath();
+			return (
+				existsSync(logPath) &&
+				readFileSync(logPath, "utf8").includes(`uploaded session uploaded-session (123 bytes) [${sessionFile}]`)
+			);
+		});
 	});
 
 	it("retries the intent marker on the next persist after a failed write", async () => {
@@ -1544,26 +1610,50 @@ describe("agent trace upload", () => {
 		expect(calls).toHaveLength(0);
 	});
 
-	it("prefers the prime-inference credential over the prime-cli config key", async () => {
+	it.each([false, true])("does not fall back to CLI credentials for trace upload (stale: %s)", async (stale) => {
+		const session = writeSession(tempDir, join(tempDir, "sessions"), "cli-fallback-session");
+		const calls: FetchCall[] = [];
+		const configPath = join(tempDir, "prime-config.json");
+		writeFileSync(configPath, JSON.stringify({ api_key: "cli-key", base_url: "https://api.primeintellect.ai" }));
+		const authStorage = AuthStorage.inMemory({}, { primeCliConfigPath: configPath });
+		if (stale) {
+			authStorage.setPrimeInferenceApiKey("agent-key");
+			expect(authStorage.markAuthStale(PRIME_INFERENCE_PROVIDER_ID)).toBe(true);
+			writeFileSync(configPath, JSON.stringify({ api_key: "changed-cli-key" }));
+		}
+		const result = await uploadAgentTraceFile({
+			sessionFile: session.getSessionFile(),
+			authStorage,
+			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
+			fetchFn: createFetchRecorder(calls),
+			reloadConfig: false,
+		});
+		expect(result).toEqual({ status: "missing_credentials" });
+		expect(calls).toHaveLength(0);
+	});
+
+	it("uses Agent inference credentials at production despite local CLI credentials and URLs", async () => {
 		const session = writeSession(tempDir, join(tempDir, "sessions"), "credential-order-session");
 		const calls: FetchCall[] = [];
 		const configPath = join(tempDir, "prime-config.json");
-		writeFileSync(configPath, JSON.stringify({ api_key: "cli-fallback-key" }));
+		writeFileSync(configPath, JSON.stringify({ api_key: "cli-fallback-key", base_url: "http://localhost:8000" }));
 
 		const result = await uploadAgentTraceFile({
 			sessionFile: session.getSessionFile(),
-			authStorage: AuthStorage.inMemory({
-				[PRIME_INFERENCE_PROVIDER_ID]: { type: "api_key", key: "inference-key" },
-			}),
+			authStorage: AuthStorage.inMemory(
+				{
+					[PRIME_INFERENCE_PROVIDER_ID]: { type: "api_key", key: "inference-key" },
+				},
+				{ primeCliConfigPath: configPath, usePrimeCliConfig: true },
+			),
 			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			configPath,
 			fetchFn: createFetchRecorder(calls),
 			reloadConfig: false,
 		});
 
 		expect(result.status).toBe("uploaded");
 		expect(calls).toHaveLength(1);
+		expect(calls[0]?.url).toBe("https://api.primeintellect.ai/api/v1/agent-traces/sessions/credential-order-session");
 		expect(calls[0]?.init.headers).toMatchObject({ Authorization: "Bearer inference-key" });
 	});
 });

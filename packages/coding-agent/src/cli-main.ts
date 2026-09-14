@@ -6,6 +6,7 @@ import {
 	isOwnedSessionWorkerProcess,
 	maybeRunOwnedSessionWorkerFrontend,
 } from "./cli/owned-session-worker.js";
+import { runRuntimeBootstrap } from "./cli/runtime-bootstrap.js";
 import { APP_NAME } from "./config.js";
 import {
 	flushTelemetryErrorReporting,
@@ -28,6 +29,17 @@ export async function runCli(): Promise<void> {
 	installOwnedSessionWorkerOwnerWatch();
 
 	const args = process.argv.slice(2);
+	if (args.length === 1 && args[0] === "--prime-agent-bootstrap") {
+		try {
+			await runRuntimeBootstrap();
+		} catch (error) {
+			console.error(error instanceof Error ? error.message : String(error));
+			process.exitCode = 1;
+		} finally {
+			closeOwnedSessionWorkerOwnerWatch();
+		}
+		return;
+	}
 	const handledByOwnedWorker = await maybeRunOwnedSessionWorkerFrontend(args);
 	if (!handledByOwnedWorker) {
 		if (!isOwnedSessionWorkerProcess()) {

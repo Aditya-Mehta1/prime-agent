@@ -33,6 +33,8 @@ export interface CreateAgentSessionServicesOptions {
 	authStorage?: AuthStorage;
 	settingsManager?: SettingsManager;
 	modelRegistry?: ModelRegistry;
+	/** Pre-built MCP manager (tests inject stub probes and stores). */
+	mcpManager?: McpManager;
 	extensionFlagValues?: Map<string, boolean | string>;
 	resourceLoaderOptions?: Omit<DefaultResourceLoaderOptions, "cwd" | "agentDir" | "settingsManager">;
 	/**
@@ -154,19 +156,26 @@ export async function createAgentSessionServices(
 		telemetryDisabled: options.telemetryDisabled,
 	};
 	const authStorage =
-		options.authStorage ?? AuthStorage.create(join(agentDir, "auth.json"), { telemetryErrorContext });
+		options.authStorage ??
+		AuthStorage.create(options.agentDir === undefined ? undefined : join(agentDir, "auth.json"), {
+			telemetryErrorContext,
+			usePrimeCliConfig: options.agentDir === undefined,
+		});
 	authStorage.setTelemetryErrorContext(telemetryErrorContext);
 	const modelRegistry = options.modelRegistry ?? ModelRegistry.create(authStorage, join(agentDir, "models.json"));
 
 	// MCP integrations: registers OAuth providers and gates the built-in
 	// integration skills by whether the user is logged in (enable-by-login).
-	const mcpManager = new McpManager({
-		authStorage,
-		getUserServers: () => settingsManager.getGlobalMcpServers(),
-		telemetryErrorContext,
-	});
+	const mcpManager =
+		options.mcpManager ??
+		new McpManager({
+			authStorage,
+			getUserServers: () => settingsManager.getGlobalMcpServers(),
+			getCatalogSources: () => settingsManager.getMcpCatalogSources(),
+			telemetryErrorContext,
+		});
 	// refresh() resets the OAuth registry to built-ins; re-add user MCP providers too.
-	modelRegistry.setOnOAuthProvidersReset(() => mcpManager.registerUserProviders());
+	modelRegistry.setOnOAuthProvidersReset(() => mcpManager.registerAllProviders());
 
 	const userExtensionFactories = options.resourceLoaderOptions?.extensionFactories ?? [];
 	// The built-in Herdr reporter defers to Herdr's own file-based integration

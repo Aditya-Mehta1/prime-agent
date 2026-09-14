@@ -85,13 +85,19 @@ import {
 	type AutonomousRuntimeState,
 	addAutonomousContinuation,
 	addAutonomousUsage,
+	autonomousLimitReason,
 	autonomousStatus,
+	createAutonomousContinuationMessage,
+	createAutonomousGateFailureContinuationMessage,
 	createAutonomousRuntimeState,
+	createAutonomousSubagentKeepAliveMessage,
 	isUnlimitedAutonomousLimit,
+	MAX_SUBAGENT_KEEP_ALIVE_MS,
 	nextAutonomousContinuation,
 	refreshAutonomousQualityGates,
 	setAutonomousEnabled,
 	setAutonomousLimits,
+	shouldAutonomouslyContinue,
 	UNLIMITED_AUTONOMOUS_LIMIT,
 } from "./autonomous.js";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.js";
@@ -153,6 +159,7 @@ import {
 	GOAL_CONTEXT_PREVIEW_LABEL,
 	GOAL_SKILL_NAME,
 	GOAL_STATE_CUSTOM_TYPE,
+	type GoalContextDetails,
 	type GoalHostResponse,
 	type GoalState,
 	type GoalStatus,
@@ -197,16 +204,22 @@ import {
 	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
+import { findExactModelReferenceMatch } from "./model-resolver.js";
 import { throwIfPromptAdmissionCancelled } from "./prompt-admission.js";
 import { expandPromptTemplate, type PromptTemplate, parseCommandArgs } from "./prompt-templates.js";
 import {
 	isAgentLifecycleFailure,
 	isFauxProviderQueueExhausted,
 	isPermanentProviderFailureKind,
+	type ProviderWaitPolicy,
+	parseProviderResetMs,
 	providerRetryDelay,
 	providerRetryPolicy,
 	providerStreamFailureKind,
 	providerStreamFailureRetryAfterMs,
+	providerStreamFailureStatus,
+	providerWaitClass,
+	providerWaitDecision,
 } from "./provider-retry.js";
 import {
 	type AutoRefineReason,
@@ -218,7 +231,9 @@ import {
 	getGlobalHarnessStateDir,
 	getLocalHarnessStateDir,
 	getRefinementHistory,
+	type HarnessQueryTerms,
 	type HarnessState,
+	harnessQueryTerms,
 	inferRefinementResultScope,
 	loadGlobalRefinementHistory,
 	loadHarnessState,
@@ -237,16 +252,22 @@ import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.j
 import {
 	type CreateRlmSubagentRuntimeOptions,
 	createAsyncBashCompletionHostHandler,
+	createAsyncBashConsumedHostHandler,
 	createDefaultRlmSubagentSessionName,
+	createRlmCollectHostHandler,
 	createRlmCreateSessionHostHandler,
 	createRlmDeleteSubagentHostHandler,
 	createRlmFindModelsHostHandler,
 	createRlmListSubagentsHostHandler,
 	createRlmRunHostHandler,
 	findRlmModelMatches,
+	findUniqueRlmShortFormModelMatch,
+	formatRlmModelUnavailableError,
 	normalizeRequestedRlmSubagentModel,
 	normalizeRequestedRlmSubagentSessionName,
 	normalizeRequestedRlmSubagentThinkingLevel,
+	type RlmCollectResult,
+	type RlmCollectResultEntry,
 	type RlmCreateSessionResult,
 	type RlmDeleteSubagentResult,
 	type RlmFindModelsResult,
@@ -298,9 +319,13 @@ import type { SessionStats } from "./session-stats.js";
 import type { SettingsManager } from "./settings-manager.js";
 import { getPythonSkillRuntimeInfo, type Skill } from "./skills.js";
 import {
+	BUILTIN_SLASH_COMMANDS,
+	findSlashCommandSuggestion,
+	isBuiltinSlashCommandName,
 	parseRefineCommandOptions,
 	parseSessionSlashCommand,
 	parseSlashCommand,
+	SESSION_SLASH_COMMAND_NAMES,
 	type SessionSlashCommand,
 	type SlashCommandInfo,
 } from "./slash-commands.js";
@@ -388,12 +413,18 @@ export type AgentSessionEvent =
 			maxAttempts: number;
 			delayMs: number;
 			errorMessage: string;
+			/** Why the retry loop re-issues the turn; absent = ordinary quick retry. */
+			reason?: "usage" | "unavailable" | "backup";
+			/** Present when reason is "backup": "provider/model-id" of the backup. */
+			backupModel?: string;
 	  }
 	| {
 			type: "auto_retry_end";
 			success: boolean;
 			attempt: number;
 			finalError?: string;
+			/** "provider/model-id" restored after a backup-model retry succeeded. */
+			restoredModel?: string;
 	  }
 	| {
 			type: "auth_stale";
@@ -1043,7 +1074,7 @@ function parseGoalBudgetValue(value: string): number {
 const AUTONOMOUS_STATUS_NUMBER_FORMAT = new Intl.NumberFormat("en-US");
 
 const AUTONOMOUS_BUDGET_USAGE =
-	"Usage: /autonomous [status|off] or /autonomous on [--max-continuations <n|unlimited>] [--max-turns <n|unlimited>] [--max-tokens <n|unlimited>] [--timeout-ms <n|unlimited>] [--gate <command>] [--gate-retries <n>] [--gate-timeout-ms <n>]";
+	"Usage: /autonomous [status|off] or /autonomous on [--max-continuations <n|unlimited>] [--max-turns <n|unlimited>] [--max-tokens <n|unlimited>] [--timeout-ms <n|unlimited>] [--gate <command>] [--gate-retries <n>] [--gate-timeout-ms <n>] [--subagent-keep-alive-ms <n>]";
 
 // `/autonomous` budget flags mirror the `--autonomous-*` CLI options. The CLI
 // spelling (`--autonomous-max-continuations`) is accepted as an alias so the
@@ -1056,7 +1087,22 @@ const AUTONOMOUS_BUDGET_FLAGS: ReadonlySet<string> = new Set([
 	"gate",
 	"gate-retries",
 	"gate-timeout-ms",
+	"subagent-keep-alive-ms",
 ]);
+
+/** Keep-alive windows accept 0 (disable the valve) or a positive integer. */
+function parseSubagentKeepAliveMs(value: string): number {
+	const digits = value.replace(/[,_]/g, "");
+	if (digits === "0" || /^[1-9]\d*$/.test(digits)) {
+		const parsed = Number(digits);
+		if (parsed <= MAX_SUBAGENT_KEEP_ALIVE_MS) {
+			return parsed;
+		}
+	}
+	throw new Error(
+		`--subagent-keep-alive-ms must be 0 or a positive integer up to ${MAX_SUBAGENT_KEEP_ALIVE_MS}. ${AUTONOMOUS_BUDGET_USAGE}`,
+	);
+}
 
 function parseAutonomousBudgetInt(flag: string, value: string, allowUnlimited = false): number {
 	if (allowUnlimited && value.toLowerCase() === "unlimited") {
@@ -1122,6 +1168,9 @@ function parseAutonomousBudgetOptions(tokens: string[]): AgentAutonomousConfig {
 				break;
 			case "timeout-ms":
 				config.timeoutMs = parseAutonomousBudgetInt(flag, value, true);
+				break;
+			case "subagent-keep-alive-ms":
+				config.subagentKeepAliveMs = parseSubagentKeepAliveMs(value);
 				break;
 		}
 	}
@@ -1280,6 +1329,19 @@ export class AgentSession {
 	private _autonomousState: AutonomousRuntimeState;
 	private _autonomousContinuationSuppressionDepth = 0;
 	private _autonomousContinuationSuppressedMessages = new WeakSet<AgentMessage>();
+	// Held autonomous continuation owed while descendant work runs; mirrors
+	// _goalContinuationAwaitsRlmWork. Child replies and exit notices are the
+	// real wake-up signals, so timer-driven continuations pause instead of
+	// re-prompting a waiting parent (and pause without consuming budget).
+	private _autonomousContinuationAwaitsRlmWork = false;
+	private _autonomousSubagentKeepAliveTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+	// In-flight gate evaluation for an owed continuation; holds the promise so
+	// settlement sites never double-fire the resume.
+	private _autonomousContinuationResumeTask: Promise<void> | undefined = undefined;
+	// Monotonic count of admitted RLM child terminal notices; differencing
+	// against the arrival epoch separates sibling notices (benign for the
+	// owed continuation) from user-driven admissions.
+	private _rlmTerminalNoticeAdmissionCount = 0;
 
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
@@ -1300,6 +1362,17 @@ export class AgentSession {
 	private _retryPromise: Promise<void> | undefined = undefined;
 	private _retryResolve: (() => void) | undefined = undefined;
 	private _retryAuthFailureSources: AuthSourceToken[] = [];
+	/** Ongoing wait-for-recovery state: pings issued and when the wait started. */
+	private _providerWait: { attempts: number; startedAtMs: number } | undefined = undefined;
+	/** Set while turns are routed to the user-configured backup model. */
+	private _backupModel:
+		| {
+				backup: Model<any>;
+				primary: Model<any>;
+				thinkingLevel: ThinkingLevel;
+				serviceTier: ServiceTier;
+		  }
+		| undefined = undefined;
 	private _agentMessageClearEpoch = 0;
 	private _agentMessageOutcomes = new Map<string, AgentMessageOutcome>();
 	private _lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
@@ -1492,6 +1565,7 @@ export class AgentSession {
 		this._subagentRuntimeHost = config.subagentRuntimeHost;
 		this._autonomousState = createAutonomousRuntimeState(config.autonomous, {
 			cwd: this._cwd,
+			defaultLimits: this.settingsManager.getAutonomousLimits(),
 		});
 		this._goalState = this._loadPersistedGoalState();
 		// Seed initial goal from CLI --goal flag, but only for top-level sessions
@@ -1642,6 +1716,7 @@ export class AgentSession {
 	private async _getRequiredRequestAuth(model: Model<any>): Promise<{
 		apiKey: string;
 		headers?: Record<string, string>;
+		requestModel: Model<Api>;
 	}> {
 		const result = await this._modelRegistry.getApiKeyAndHeaders(model);
 		if (!result.ok) {
@@ -1651,7 +1726,7 @@ export class AgentSession {
 			throw new Error(result.error);
 		}
 		if (result.apiKey) {
-			return { apiKey: result.apiKey, headers: result.headers };
+			return { apiKey: result.apiKey, headers: result.headers, requestModel: result.requestModel ?? model };
 		}
 
 		const isOAuth = this._modelRegistry.isUsingOAuth(model);
@@ -1881,8 +1956,25 @@ export class AgentSession {
 		return true;
 	}
 
-	private _reloadGoalStateFromBranch(): void {
-		this._goalState = this._loadPersistedGoalState();
+	private _reloadGoalStateFromBranch(options: { monotonicTokens?: boolean } = {}): void {
+		const previous = this._goalState;
+		const reloaded = this._loadPersistedGoalState();
+		if (options.monotonicTokens && reloaded.goalId !== undefined && reloaded.goalId === previous.goalId) {
+			// A context rebuild continues the same timeline, but the rebuilt branch's
+			// last persisted goal entry can lag the in-memory state (queue/flush
+			// races; child-usage attribution landing late). Neither the accounting
+			// counters nor an already-fired gate (budget limit, pause, completion)
+			// for the same logical goal may regress across the cold boundary. Tree
+			// navigation keeps faithful branch semantics by calling without the flag.
+			this._goalState = {
+				...previous,
+				tokensUsed: Math.max(previous.tokensUsed, reloaded.tokensUsed),
+				continuationsUsed: Math.max(previous.continuationsUsed, reloaded.continuationsUsed),
+				timeUsedSeconds: Math.max(previous.timeUsedSeconds, reloaded.timeUsedSeconds),
+			};
+		} else {
+			this._goalState = reloaded;
+		}
 		this._goalAccountingStartedAt = this._goalState.status === "active" ? Date.now() : undefined;
 		this._emitGoalUpdate();
 	}
@@ -2234,7 +2326,14 @@ export class AgentSession {
 		const timeBudget = isUnlimitedAutonomousLimit(status.limits.timeoutMs)
 			? "unlimited"
 			: `${AUTONOMOUS_STATUS_NUMBER_FORMAT.format(Math.round(status.limits.timeoutMs / 1000))}s`;
-		return `[autonomous-status: ${state}]\n\nContinuations: ${formatCount(status.continuationsUsed)}/${formatCount(status.limits.maxContinuations)}. Turns: ${formatCount(status.turnsUsed)}/${formatCount(status.limits.maxTurns)}. Tokens: ${formatCount(status.tokensUsed)}/${formatCount(status.limits.maxTokens)}. Time: ${elapsedSeconds}s/${timeBudget}. Gates: ${gateSummary}.`;
+		const subagentKeepAliveMs = status.subagentKeepAliveMs ?? 0;
+		const keepAlive =
+			subagentKeepAliveMs > 0
+				? subagentKeepAliveMs >= 60_000
+					? `${AUTONOMOUS_STATUS_NUMBER_FORMAT.format(Math.round(subagentKeepAliveMs / 60_000))}m`
+					: `${AUTONOMOUS_STATUS_NUMBER_FORMAT.format(subagentKeepAliveMs)}ms`
+				: "off";
+		return `[autonomous-status: ${state}]\n\nContinuations: ${formatCount(status.continuationsUsed)}/${formatCount(status.limits.maxContinuations)}. Turns: ${formatCount(status.turnsUsed)}/${formatCount(status.limits.maxTurns)}. Tokens: ${formatCount(status.tokensUsed)}/${formatCount(status.limits.maxTokens)}. Time: ${elapsedSeconds}s/${timeBudget}. Gates: ${gateSummary}. Subagent keep-alive: ${keepAlive}.`;
 	}
 
 	private _emitAutonomousStatus(): void {
@@ -2265,9 +2364,17 @@ export class AgentSession {
 		if (command.kind === "on") {
 			setAutonomousEnabled(this._autonomousState, true, { cwd: this._cwd });
 			setAutonomousLimits(this._autonomousState, command.config);
+			// Re-sync the keep-alive with the new window: a 0 setting must
+			// disarm an already-armed timer, and a shortened window must not
+			// keep the old one pending.
+			this._disarmAutonomousSubagentKeepAlive();
+			if (this._autonomousContinuationAwaitsRlmWork) {
+				this._armAutonomousSubagentKeepAlive();
+			}
 		} else if (command.kind === "off") {
 			setAutonomousEnabled(this._autonomousState, false);
 			this._clearQueuedAutonomousContinuations();
+			this._clearAutonomousContinuationAwait();
 		}
 		this._emitAutonomousStatus();
 		return true;
@@ -2363,6 +2470,254 @@ export class AgentSession {
 			// Admission can race a new pause; roll back so the retry re-counts.
 			this._setGoalState(goalBeforeResume);
 		}
+	}
+
+	/**
+	 * Hold the timer-driven autonomous continuation while descendant work is
+	 * unsettled, mirroring the goal gate: delegating and ending the turn is
+	 * correct behavior, and child replies and exit notices are the real
+	 * wake-up signals. The owed continuation is delivered when descendants
+	 * settle without consuming the continuation budget while it waits. An
+	 * active goal holds its own continuation, so the held continuation is
+	 * not double-queued behind it.
+	 */
+	private _holdAutonomousContinuationForRlmWork(message: AssistantMessage): boolean {
+		if (!this._autonomousState.enabled) {
+			return false;
+		}
+		if (message.stopReason === "error" || message.stopReason === "aborted") {
+			return false;
+		}
+		if (autonomousLimitReason(this._autonomousState)) {
+			// The run is over: hold nothing so the hook can apply the limit.
+			return false;
+		}
+		if (!this._hasUnsettledRlmQuiescenceWork()) {
+			return false;
+		}
+		// An active goal's own continuation gate owns the wake-up discipline;
+		// drop any owed continuation so both are never queued.
+		if (this._goalOwnsContinuationWakeup()) {
+			this._clearAutonomousContinuationAwait();
+			return true;
+		}
+		this._autonomousContinuationAwaitsRlmWork = true;
+		this._armAutonomousSubagentKeepAlive();
+		return true;
+	}
+
+	/** True while an active goal's continuation loop owns the session wake-ups. */
+	private _goalOwnsContinuationWakeup(): boolean {
+		return this._goalState.status === "active" && !!this._goalState.objective;
+	}
+
+	/** Deliver the owed continuation once descendant work settles. */
+	private _maybeResumeAutonomousContinuationAfterRlmWork(): void {
+		if (!this._autonomousContinuationAwaitsRlmWork) return;
+		if (this._disposed || this._disposing || this._hasUnsettledRlmQuiescenceWork()) return;
+		if (!this._autonomousState.enabled || this._goalOwnsContinuationWakeup()) {
+			this._clearAutonomousContinuationAwait();
+			return;
+		}
+		// Keep the deferral while admission is paused or the pump is suspended
+		// (post-abort); the pause release and resumeQueuedWork retry.
+		if (this._sessionInputAdmissionPauses.size > 0 || this._sessionInputPumpSuspended) return;
+		if (this._autonomousContinuationResumeTask) return;
+		this._autonomousContinuationResumeTask = this._resumeOwedAutonomousContinuation().finally(() => {
+			this._autonomousContinuationResumeTask = undefined;
+		});
+	}
+
+	/**
+	 * Deliver the owed continuation, evaluating configured quality gates first
+	 * so a settlement never spends a turn when the gates already pass. Counted
+	 * at delivery like a goal continuation; a failed admission rolls the count
+	 * back and keeps the deferral for the pause-release retry.
+	 */
+	private async _resumeOwedAutonomousContinuation(): Promise<void> {
+		const snapshot = this._snapshotAutonomousRuntimeState();
+		const beforeGates = {
+			arrivalEpoch: this._sessionInputArrivalEpoch,
+			noticeAdmissions: this._rlmTerminalNoticeAdmissionCount,
+		};
+		try {
+			// agent_end clears the live field, so fall back to the transcript;
+			// either way the session's last assistant turn decides the gate run.
+			const lastAssistantMessage =
+				this._lastAssistantMessage ?? this._findLastAssistantInMessages(this.agent.state.messages);
+			if (!lastAssistantMessage) {
+				if (autonomousLimitReason(this._autonomousState)) {
+					// The run is over; no continuation is owed anymore.
+					this._clearAutonomousContinuationAwait();
+					return;
+				}
+				addAutonomousContinuation(this._autonomousState);
+				this._admitOwedAutonomousContinuation(createAutonomousContinuationMessage(this._autonomousState));
+				return;
+			}
+			// Configured quality gates decide whether the run is already done.
+			// The decision runs before any accounting is written so a stale
+			// drop never spends a continuation or clobbers a user reset.
+			const decision = await shouldAutonomouslyContinue(this._autonomousState, lastAssistantMessage, {
+				cwd: this._cwd,
+				signal: this.agent.signal,
+			});
+			if (!decision.shouldContinue) {
+				this._clearAutonomousContinuationAwait();
+				return;
+			}
+			// Re-validate after the gate await: mode-off, a goal takeover, or
+			// any user-driven admission (finished or queued) must not be
+			// bypassed by a stale continuation. Sibling terminal notices are
+			// the exception: this owed continuation is exactly the wake that
+			// reads them.
+			const admissions = this._sessionInputArrivalEpoch - beforeGates.arrivalEpoch;
+			const noticeAdmissions = this._rlmTerminalNoticeAdmissionCount - beforeGates.noticeAdmissions;
+			const userDrivenAdmissions = admissions > noticeAdmissions;
+			if (
+				this._disposed ||
+				this._disposing ||
+				!this._autonomousState.enabled ||
+				this._goalOwnsContinuationWakeup() ||
+				userDrivenAdmissions
+			) {
+				this._clearAutonomousContinuationAwait();
+				return;
+			}
+			addAutonomousContinuation(this._autonomousState);
+			const message =
+				(decision.reason === "gate_failed"
+					? createAutonomousGateFailureContinuationMessage(this._autonomousState)
+					: undefined) ?? createAutonomousContinuationMessage(this._autonomousState);
+			this._admitOwedAutonomousContinuation(message);
+		} catch {
+			// Admission can race a new pause; roll back so the retry re-counts.
+			this._restoreAutonomousRuntimeSnapshot(snapshot);
+		}
+	}
+
+	/** Admit an already-built owed continuation behind pending notices. */
+	private _admitOwedAutonomousContinuation(message: UserMessage): void {
+		const normalized = normalizeMessageContent(message.content);
+		// No front: a settling child's terminal notice must be read first.
+		this._admitSessionInput(
+			this._createPreparedTurnAction("followUp", normalized.text, normalized.images, {
+				message,
+				resumeIfIdle: true,
+			}),
+		);
+		this._clearAutonomousContinuationAwait();
+	}
+
+	/**
+	 * Deliver the keep-alive continuation while subagents are still active.
+	 * Returns false when admission raced a pause so the window can re-arm.
+	 */
+	private _deliverAutonomousSubagentKeepAlive(): boolean {
+		if (autonomousLimitReason(this._autonomousState)) {
+			// The run is over; no keep-alive is owed anymore.
+			this._clearAutonomousContinuationAwait();
+			return true;
+		}
+		const snapshot = this._snapshotAutonomousRuntimeState();
+		try {
+			addAutonomousContinuation(this._autonomousState);
+			this._admitOwedAutonomousContinuation(createAutonomousSubagentKeepAliveMessage(this._autonomousState));
+			return true;
+		} catch {
+			// Admission can race a new pause; roll back so the retry re-counts.
+			this._restoreAutonomousRuntimeSnapshot(snapshot);
+			return false;
+		}
+	}
+
+	/** One keep-alive continuation per window of continuous subagent activity. */
+	private _armAutonomousSubagentKeepAlive(): void {
+		if (this._autonomousSubagentKeepAliveTimer !== undefined) return;
+		const keepAliveMs = this._autonomousState.subagentKeepAliveMs;
+		if (!keepAliveMs || keepAliveMs <= 0) return;
+		const timer = setTimeout(() => {
+			this._autonomousSubagentKeepAliveTimer = undefined;
+			this._fireAutonomousSubagentKeepAlive();
+		}, keepAliveMs);
+		// A pending keep-alive must not hold the event loop open on its own.
+		timer.unref();
+		this._autonomousSubagentKeepAliveTimer = timer;
+	}
+
+	private _disarmAutonomousSubagentKeepAlive(): void {
+		if (this._autonomousSubagentKeepAliveTimer === undefined) return;
+		clearTimeout(this._autonomousSubagentKeepAliveTimer);
+		this._autonomousSubagentKeepAliveTimer = undefined;
+	}
+
+	private _clearAutonomousContinuationAwait(): void {
+		this._autonomousContinuationAwaitsRlmWork = false;
+		this._disarmAutonomousSubagentKeepAlive();
+	}
+
+	/**
+	 * Safety valve for hung children: while subagents stay active past the
+	 * keep-alive window, wake the parent so it can inspect and unblock them
+	 * (a stopped SIGTTIN child never delivers its exit notice).
+	 */
+	private _fireAutonomousSubagentKeepAlive(): void {
+		if (!this._autonomousContinuationAwaitsRlmWork) return;
+		if (this._disposed || this._disposing) return;
+		if (!this._hasUnsettledRlmQuiescenceWork()) {
+			// Descendants settled while the keep-alive was pending; the normal
+			// resume path owns delivery.
+			this._maybeResumeAutonomousContinuationAfterRlmWork();
+			return;
+		}
+		if (!this._autonomousState.enabled || this._goalOwnsContinuationWakeup()) {
+			this._clearAutonomousContinuationAwait();
+			return;
+		}
+		// Keep the deferral while admission is paused or the pump is suspended
+		// (post-abort); the pause release and resumeQueuedWork retry.
+		if (this._sessionInputAdmissionPauses.size > 0 || this._sessionInputPumpSuspended) {
+			this._armAutonomousSubagentKeepAlive();
+			return;
+		}
+		if (!this._deliverAutonomousSubagentKeepAlive()) {
+			// Admission raced a pause; retry after another window.
+			this._armAutonomousSubagentKeepAlive();
+		}
+	}
+
+	/**
+	 * Queued goal continuations snapshot goal accounting at queue time, but
+	 * delivery can lag arbitrarily (a threshold compaction, admission pauses,
+	 * other queued work) while usage keeps accruing. A continuation's whole
+	 * purpose is "here is the current goal state — keep working", so stale
+	 * numbers misreport the budget and can mislead the model into stopping
+	 * early or ignoring limits. Refresh the frozen content in place at
+	 * delivery, preserving the message identity every queue/dedup marker
+	 * (post-compaction continuation tracking, threshold dedup) matches on.
+	 * Budget-limit steers are excluded: they are created immediately after the
+	 * accounting event they report, and `objective_updated` carries the
+	 * objective snapshot that was the event.
+	 */
+	private _refreshGoalContextMessageAtDelivery(message: AgentMessage): void {
+		if (message.role !== "custom" || message.customType !== GOAL_CONTEXT_CUSTOM_TYPE) return;
+		const custom = message as CustomMessage<GoalContextDetails | undefined>;
+		const details = custom.details;
+		if (details?.kind !== "continuation" || details.goalId === undefined) return;
+		if (
+			this._goalState.status !== "active" ||
+			this._goalState.goalId !== details.goalId ||
+			!this._goalState.objective
+		) {
+			return;
+		}
+		const images = Array.isArray(custom.content)
+			? custom.content.filter((block): block is ImageContent => block.type === "image")
+			: undefined;
+		const fresh = createGoalContextMessage(this._goalState, "continuation", images);
+		custom.content = fresh.content;
+		custom.details = fresh.details;
+		custom.timestamp = fresh.timestamp;
 	}
 
 	private _runOrQueueGoalContext(kind: "continuation" | "objective_updated", images?: ImageContent[]): void {
@@ -3051,6 +3406,11 @@ export class AgentSession {
 		if (queuedMessage && this._postCompactionContinuationMessages.includes(queuedMessage)) {
 			return queuedMessage;
 		}
+		// Hold the post-compaction continuation while descendants are unsettled;
+		// the owed continuation is delivered when they settle.
+		if (this._holdAutonomousContinuationForRlmWork(message)) {
+			return undefined;
+		}
 		const snapshot = this._snapshotAutonomousRuntimeState();
 		const arrivalEpoch = this._sessionInputArrivalEpoch;
 		const autonomousMessage = await nextAutonomousContinuation(this._autonomousState, message, {
@@ -3605,6 +3965,12 @@ export class AgentSession {
 		) {
 			return [];
 		}
+		// Delegating and ending the turn is correct behavior; hold the
+		// continuation until descendants settle instead of re-prompting a
+		// waiting parent, mirroring the goal gate above.
+		if (this._holdAutonomousContinuationForRlmWork(context.message)) {
+			return [];
+		}
 		const autonomousSnapshot = this._snapshotAutonomousRuntimeState();
 		const autonomousMessage = await nextAutonomousContinuation(this._autonomousState, context.message, {
 			cwd: this._cwd,
@@ -3903,12 +4269,15 @@ export class AgentSession {
 				// Reset retry counter immediately on successful assistant response
 				// This prevents accumulation across multiple LLM calls within a turn
 				if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
+					const restoredModel = this._restorePrimaryModelAfterBackup();
 					this._emit({
 						type: "auto_retry_end",
 						success: true,
 						attempt: this._retryAttempt,
+						...(restoredModel ? { restoredModel } : {}),
 					});
 					this._retryAttempt = 0;
+					this._providerWait = undefined;
 					this._retryAuthFailureSources = [];
 				}
 				if (this._accountGoalUsageForAssistantMessage(assistantMsg)) {
@@ -4367,6 +4736,7 @@ export class AgentSession {
 				clearTimeout(timer);
 			}
 			this._scheduledAutoRefineTimers.clear();
+			this._disarmAutonomousSubagentKeepAlive();
 			this._serializedPlanInFlight = undefined;
 			this._serializedExplicitRefineOptions = undefined;
 			this._pendingRequestedRefine = undefined;
@@ -4672,12 +5042,47 @@ export class AgentSession {
 		images: ImageContent[] | undefined,
 		policy: SubmissionNormalizationPolicy,
 	): NormalizedSubmission {
+		if (policy.expandPromptTemplates) this._throwIfUnknownSlashCommand(text);
 		let expandedText = text;
 		if (policy.expandSkills) expandedText = this._expandSkillCommand(expandedText);
 		if (policy.expandPromptTemplates) {
 			expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 		}
 		return { kind: "prompt", text: expandedText, images };
+	}
+
+	/**
+	 * Reject slash-command typos before they burn a model round trip and
+	 * pollute the transcript. Only fires when a registered command name is
+	 * close enough to be the intended one; anything else passes through so
+	 * genuine prompts that merely start with "/" keep working.
+	 */
+	private _throwIfUnknownSlashCommand(text: string): void {
+		const parsed = parseSlashCommand(text);
+		if (!parsed) return;
+		// No registered command name is anywhere near this long; oversized
+		// /-prefixed inputs are prompts, and fuzzy-matching them would be
+		// quadratic work on the event loop.
+		if (parsed.name.length > 64) return;
+		if (isBuiltinSlashCommandName(parsed.name)) return;
+		if (this.promptTemplates.some((template) => template.name === parsed.name)) return;
+		if (
+			parsed.name.startsWith("skill:") &&
+			this.resourceLoader.getSkills().skills.some((skill) => skill.name === parsed.name.slice("skill:".length))
+		) {
+			return;
+		}
+		const skills = this.resourceLoader.getSkills().skills.map((skill) => skill.name);
+		const candidates = [
+			...BUILTIN_SLASH_COMMANDS.flatMap((command) => [command.name, ...(command.aliases ?? [])]),
+			...SESSION_SLASH_COMMAND_NAMES,
+			...this.promptTemplates.map((template) => template.name),
+			...this._extensionRunner.getRegisteredCommands().map((command) => command.invocationName),
+			...skills.map((skill) => `skill:${skill}`),
+		];
+		const suggestion = findSlashCommandSuggestion(parsed.name, candidates);
+		if (!suggestion) return;
+		throw new Error(`Unknown command: /${parsed.name}. Did you mean /${suggestion}?`);
 	}
 
 	private _normalizeSubmission(
@@ -4937,6 +5342,7 @@ export class AgentSession {
 		try {
 			const result = this._admitSessionInput(action, { wake: false });
 			if (!result.accepted) throw new Error("RLM child terminal notice was not admitted.");
+			this._rlmTerminalNoticeAdmissionCount++;
 		} catch (error) {
 			this._durableRlmTerminalNoticeActionIds.delete(action.id);
 			throw error;
@@ -5027,6 +5433,37 @@ export class AgentSession {
 			actions,
 		);
 		for (const id of ids) this._durableRlmTerminalNoticeActionIds.delete(id);
+	}
+
+	/**
+	 * The kernel read the command's result before the notice reached the model, so
+	 * the notice has nothing left to report: drop it while it is still queued.
+	 * Delivered notices are no longer clearable, which makes this a no-op.
+	 */
+	private _withdrawAsyncBashCompletionNotice(details: { pid: number; command: string }): void {
+		// One read withdraws one notice: pid reuse can queue an identical key twice,
+		// and the read belongs to the older handle, which is the earlier notice.
+		const notice = this._actionStore
+			.clearableActions()
+			.find((action) => this._isAsyncBashCompletionActionFor(action, details));
+		if (!notice) return;
+		this._cancelSessionActions(
+			(action) => action === notice,
+			new Error("Background command completion notice withdrawn: the kernel read the result first."),
+		);
+		this._emitQueueUpdate();
+	}
+
+	private _isAsyncBashCompletionActionFor(
+		action: QueuedSessionAction,
+		details: { pid: number; command: string },
+	): boolean {
+		if (action.payload.kind !== "turn") return false;
+		const message = primaryDeliveryRecord(action).message;
+		if (message.role !== "custom" || message.customType !== ASYNC_BASH_COMPLETION_CUSTOM_TYPE) return false;
+		// pids are reused across handles, so the command has to match too.
+		const completion = message.details as AsyncBashCompletionDetails | undefined;
+		return completion?.pid === details.pid && completion.command === details.command;
 	}
 
 	private async _promptInjectedMessage(
@@ -5316,7 +5753,7 @@ export class AgentSession {
 
 		const command = this._extensionRunner.getCommand(commandName);
 		if (!command) return undefined;
-		const context = this._extensionRunner.createCommandContext();
+		const context = this._extensionRunner.createCommandContext(command.sourceInfo.path);
 		return Promise.resolve()
 			.then(() => command.handler(args, context))
 
@@ -6182,6 +6619,12 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Busy inputs: compaction, retry, bash, plus (for "pump") disposal,
+	 * suspension, queued-work pauses, and branch-summary mutation. Waiters
+	 * parked on this predicate rely on every clear site notifying the
+	 * session-input checkpoint waiters.
+	 */
 	private _isBusyForSessionInput(point: "preflight" | "pump"): boolean {
 		const externalBusy = this.isCompacting || this.isRetrying || this.isBashRunning;
 		if (point === "pump") {
@@ -6326,6 +6769,11 @@ export class AgentSession {
 					);
 					const firstPrimaryIndex = turns[0].payload.records.indexOf(primaryDeliveryRecord(turns[0]));
 					turns[0].payload.records.splice(firstPrimaryIndex, 0, ...contextRecords);
+					for (const action of turns) {
+						// Queued continuations must report goal accounting as of delivery,
+						// not as of queue time (see refresh rationale).
+						this._refreshGoalContextMessageAtDelivery(primaryDeliveryRecord(action).message);
+					}
 					const preparedMessages: AgentMessage[] = turns.flatMap((action) =>
 						action.payload.records.map((record) => record.message),
 					);
@@ -7029,6 +7477,7 @@ export class AgentSession {
 				this._notifySessionInputCheckpointChange();
 				this._flushDeferredRlmTerminalNotices();
 				this._maybeResumeGoalContinuationAfterRlmWork();
+				this._maybeResumeAutonomousContinuationAfterRlmWork();
 				this._scheduleSessionInputPump();
 			},
 		};
@@ -7146,6 +7595,7 @@ export class AgentSession {
 	resumeQueuedWork(): boolean {
 		this._resumeSessionInputAdmission();
 		this._maybeResumeGoalContinuationAfterRlmWork();
+		this._maybeResumeAutonomousContinuationAfterRlmWork();
 		this._scheduleSessionInputPump();
 		return this._hasSelectableSessionInput();
 	}
@@ -7171,7 +7621,10 @@ export class AgentSession {
 	private async _waitForIdleOrSettlement(settlement?: PostCompactionContinuationSettlement): Promise<void> {
 		while (settlement === undefined || this._postCompactionContinuationSettlement === settlement) {
 			if (this._actionStore.queuedActions().length > 0) {
-				if (this._sessionInputPumpSuspended || this._queuedWorkPauses.size > 0) {
+				// Park while the pump would refuse scheduling or selection: rescheduling
+				// a blocked pump completes on already-resolved promises, so looping here
+				// would spin on the microtask queue and starve the IO that ends the busy state.
+				if (this._isBusyForSessionInput("pump")) {
 					let wake = () => {};
 					const changed = new Promise<void>((resolve) => {
 						wake = resolve;
@@ -7727,9 +8180,9 @@ export class AgentSession {
 				throw new Error(formatNoModelSelectedMessage());
 			}
 
-			const { apiKey, headers } = await this._getRequiredRequestAuth(this.model);
+			const { apiKey, headers, requestModel } = await this._getRequiredRequestAuth(this.model);
 			const result = await this._performCompaction({
-				model: this.model,
+				model: requestModel,
 				apiKey,
 				headers,
 				customInstructions,
@@ -7892,6 +8345,7 @@ export class AgentSession {
 					this.thinkingLevel,
 					summaryCall,
 					providerRetryPolicy(this.settingsManager),
+					this.sessionId,
 				));
 			}
 
@@ -8394,26 +8848,63 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Refinement passes (review and planning) run with their own prompts, so
+	 * issuing them on the session model evicts the provider's prefix-cache entry
+	 * for the session and forces a full context re-read on the next session
+	 * request. Route them to the configured auxiliary model when it is set and
+	 * usable; fall back to the session model otherwise.
+	 */
+	private async _resolveRefinementModel(): Promise<
+		{ model: Model<Api>; apiKey: string; headers?: Record<string, string> } | undefined
+	> {
+		const sessionModel = this.model;
+		if (!sessionModel) {
+			return undefined;
+		}
+		const selector = this.settingsManager.getAuxiliaryModel()?.trim().toLowerCase();
+		if (!selector || `${sessionModel.provider}/${sessionModel.id}`.toLowerCase() === selector) {
+			const { apiKey, headers, requestModel } = await this._getRequiredRequestAuth(sessionModel);
+			return { model: requestModel, apiKey, headers };
+		}
+		try {
+			const model = (await this._authenticatedRlmModels()).find(
+				(candidate) => `${candidate.provider}/${candidate.id}`.toLowerCase() === selector,
+			);
+			if (!model) {
+				throw new Error(`model "${selector}" is unavailable, unauthenticated, or expired`);
+			}
+			const { apiKey, headers, requestModel } = await this._getRequiredRequestAuth(model);
+			return { model: requestModel, apiKey, headers };
+		} catch {
+			// Error details from the auth stack can embed credential material, so only
+			// the selector is logged (CodeQL js/clear-text-logging).
+			console.warn(`Warning: auxiliaryModel "${selector}" unusable for refinement; using the session model.`);
+			const { apiKey, headers, requestModel } = await this._getRequiredRequestAuth(sessionModel);
+			return { model: requestModel, apiKey, headers };
+		}
+	}
+
 	private async _reviewAutoRefine(context: AutoRefineReviewRequest, signal?: AbortSignal): Promise<AutoRefineReview> {
 		if (this._autoRefineReviewer) {
 			return this._autoRefineReviewer(context, signal);
 		}
-		const model = this.model;
-		if (!model) {
+		const refinementModel = await this._resolveRefinementModel();
+		if (!refinementModel) {
 			return { shouldRefine: false, rationale: "No model selected." };
 		}
-		const { apiKey, headers } = await this._getRequiredRequestAuth(model);
 		return reviewAutoRefine(
 			this.agent.state.messages,
 			this._loadMergedHarnessState(),
 			this._loadRefinementHistory(),
-			model,
-			apiKey,
+			refinementModel.model,
+			refinementModel.apiKey,
 			context,
-			headers,
+			refinementModel.headers,
 			signal,
 			this.thinkingLevel,
 			providerRetryPolicy(this.settingsManager),
+			this.sessionId,
 		);
 	}
 
@@ -8427,7 +8918,47 @@ export class AgentSession {
 			includeIpythonExamples: hasIpython,
 			includeShellExamples: tools.includes("bash"),
 			includeRefineExamples: hasIpython && hasRefineSkill,
+			queryTerms: this._buildHarnessDigestQueryTerms(),
 		});
+	}
+
+	/**
+	 * Relevance signal for the harness digest: terms from the active goal
+	 * objective (strongest) and the last few user/assistant messages,
+	 * newest first. Term overlap is cheap and capped so scoring stays trivial.
+	 */
+	private _buildHarnessDigestQueryTerms(): HarnessQueryTerms {
+		const terms = new Map<string, number>();
+		const addText = (text: string | undefined, weight: number) => {
+			if (!text) return;
+			for (const raw of harnessQueryTerms(text)) {
+				if (terms.size >= 48 && !terms.has(raw)) return;
+				if (!terms.has(raw)) terms.set(raw, weight);
+			}
+		};
+		addText(this._goalState.objective, 3);
+		const recent = this.agent.state.messages
+			.filter(
+				(message): message is UserMessage | AssistantMessage =>
+					message.role === "user" || message.role === "assistant",
+			)
+			.slice(-4)
+			.reverse();
+		let recencyWeight = 2;
+		for (const message of recent) {
+			const text =
+				message.role === "assistant"
+					? readAssistantText(message)
+					: typeof message.content === "string"
+						? message.content
+						: message.content
+								.filter((block): block is TextContent => block.type === "text")
+								.map((block) => block.text)
+								.join(" ");
+			addText(text, recencyWeight);
+			recencyWeight = Math.max(1, recencyWeight - 0.5);
+		}
+		return terms;
 	}
 
 	/** Cold-boundary digest delivery: empty contexts defer to the first committed turn (untouched sessions must stay empty); non-empty contexts append only when the newest in-context digest mismatches disk. */
@@ -8648,8 +9179,10 @@ export class AgentSession {
 			throw new Error(formatNoModelSelectedMessage());
 		}
 
-		const model = this.model;
-		const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+		const refinementModel = await this._resolveRefinementModel();
+		if (!refinementModel) {
+			throw new Error(formatNoModelSelectedMessage());
+		}
 		const globalHarnessStateDir = getGlobalHarnessStateDir();
 		const localHarnessStateDir = this._localHarnessStateDir();
 		const requestedScope = options.global ? "global" : "local";
@@ -8711,12 +9244,13 @@ export class AgentSession {
 			this.agent.state.messages,
 			planningState,
 			history,
-			model,
-			apiKey,
+			refinementModel.model,
+			refinementModel.apiKey,
 			{ ...options, retry: providerRetryPolicy(this.settingsManager) },
-			headers,
+			refinementModel.headers,
 			signal,
 			this.thinkingLevel,
+			this.sessionId,
 		);
 		if (this._disposed || signal.aborted) {
 			throw new Error("Refinement cancelled because the session was disposed.");
@@ -9122,7 +9656,7 @@ export class AgentSession {
 			}
 
 			const result = await this._performCompaction({
-				model: this.model,
+				model: authResult.requestModel ?? this.model,
 				apiKey: authResult.apiKey,
 				headers: authResult.headers,
 				customInstructions,
@@ -9317,6 +9851,19 @@ export class AgentSession {
 		this._extensionErrorUnsubscriber = this._extensionErrorListener
 			? runner.onError(this._extensionErrorListener)
 			: undefined;
+	}
+
+	refreshModelMetadata(): void {
+		if (this.model?.provider === "xai") {
+			this.agent.state.model = this._modelRegistry.getModelForCurrentAuth(this.model);
+			this.setThinkingLevel(this.thinkingLevel);
+			this._clampServiceTierForModel();
+		}
+		this._scopedModels = this._scopedModels.map((scoped) =>
+			scoped.model.provider === "xai"
+				? { ...scoped, model: this._modelRegistry.getModelForCurrentAuth(scoped.model) }
+				: scoped,
+		);
 	}
 
 	private _refreshCurrentModelFromRegistry(): void {
@@ -9607,6 +10154,7 @@ export class AgentSession {
 			extensionsResult.runtime.getExecEnv = this._execEnvProvider;
 		}
 
+		const previousRunner: ExtensionRunner | undefined = this._extensionRunner;
 		this._extensionRunner = new ExtensionRunner(
 			extensionsResult.extensions,
 			extensionsResult.runtime,
@@ -9614,6 +10162,14 @@ export class AgentSession {
 			this.sessionManager,
 			this._modelRegistry,
 		);
+		// Retire only when the extension world restarts (reload); runtime-only rebuilds adopt the timer host instead, so session_start timers survive and unload still cancels them.
+		if (previousRunner) {
+			if (previousRunner.builtFromSameExtensions(extensionsResult.extensions)) {
+				this._extensionRunner.adoptHostTimers(previousRunner);
+			} else {
+				previousRunner.retire();
+			}
+		}
 		if (this._extensionRunnerRef) {
 			this._extensionRunnerRef.current = this._extensionRunner;
 		}
@@ -9718,8 +10274,14 @@ export class AgentSession {
 					}
 				}
 			}),
+			"bash.consumed": createAsyncBashConsumedHostHandler((details) => {
+				this._withdrawAsyncBashCompletionNotice(details);
+			}),
 			"rlm.find_models": createRlmFindModelsHostHandler((query, limit) => this.findRlmModels(query, limit)),
 			"rlm.list_subagents": createRlmListSubagentsHostHandler(() => this.listRlmSubagents()),
+			"rlm.collect": createRlmCollectHostHandler((targets, timeoutMs) =>
+				this.collectRlmChildren(targets, timeoutMs),
+			),
 			"rlm.delete_subagent": createRlmDeleteSubagentHostHandler((target) => this.deleteRlmSubagent(target)),
 			"model.info": async () => ({
 				id: this.model?.id ?? null,
@@ -10083,6 +10645,7 @@ export class AgentSession {
 		this._unsettledRlmChildRuns.delete(run);
 		run.settlement.resolve();
 		this._maybeResumeGoalContinuationAfterRlmWork();
+		this._maybeResumeAutonomousContinuationAfterRlmWork();
 	}
 
 	private _cancelActiveRlmChildRuns(reason: string): void {
@@ -10211,6 +10774,105 @@ export class AgentSession {
 			});
 		}
 		return { subagents };
+	}
+
+	/**
+	 * Typed fan-in for direct RLM children: wait (bounded) for the selected
+	 * runs to settle and return result envelopes. Never steers the parent and
+	 * never rejects on timeout — a timeout returns the current snapshots so
+	 * the caller can end its turn, poll, or retry. `targets` are child ids or
+	 * session names; an empty list means every direct child that is not being
+	 * deleted.
+	 */
+	async collectRlmChildren(targets: string[], timeoutMs: number): Promise<RlmCollectResult> {
+		const candidates = new Map<string, RlmChildRun>();
+		for (const run of this._activeRlmChildRuns.values()) {
+			candidates.set(run.id, run);
+		}
+		// Terminal cleanup moves settled runs out of _activeRlmChildRuns while their
+		// envelope stays retained in _rlmChildSessions until deleted; collect must see
+		// both or a completed child can no longer be re-collected.
+		for (const [childId, retained] of this._rlmChildSessions) {
+			if (retained.run && !candidates.has(childId)) {
+				candidates.set(childId, retained.run);
+			}
+		}
+		const runs = new Map<string, RlmChildRun>();
+		if (targets.length === 0) {
+			for (const [childId, run] of candidates) {
+				if (!run.detachedDeletion && !this._deletingRlmChildren.has(run.id)) {
+					runs.set(childId, run);
+				}
+			}
+		} else {
+			for (const target of targets) {
+				const matches = [...candidates.values()].filter(
+					(run) =>
+						!run.detachedDeletion &&
+						!this._deletingRlmChildren.has(run.id) &&
+						this._rlmChildRunMatchesTarget(run, target),
+				);
+				if (matches.length === 0) {
+					throw new Error(`No direct RLM child matches "${target}" in the current parent session`);
+				}
+				if (matches.length > 1) {
+					throw new Error(`RLM child selector "${target}" is ambiguous in the current parent session`);
+				}
+				runs.set(matches[0].id, matches[0]);
+			}
+		}
+		if (timeoutMs > 0) {
+			const deadline = Date.now() + timeoutMs;
+			await Promise.all(
+				[...runs.values()].map((run) => {
+					if (run.settled) return undefined;
+					const remainingMs = deadline - Date.now();
+					if (remainingMs <= 0) return undefined;
+					let timer: NodeJS.Timeout | undefined;
+					const timeout = new Promise<void>((resolve) => {
+						timer = setTimeout(resolve, remainingMs);
+						timer.unref?.();
+					});
+					return Promise.race([
+						// A settled failure is terminal state, not a collect error.
+						run.settlement.promise.then(
+							() => undefined,
+							() => undefined,
+						),
+						timeout,
+					]).finally(() => {
+						clearTimeout(timer);
+					});
+				}),
+			);
+		}
+		return { results: [...runs.values()].map((run) => this._rlmCollectEntryForRun(run)) };
+	}
+
+	private _rlmChildRunMatchesTarget(run: RlmChildRun, target: string): boolean {
+		const session = run.session ?? this._rlmChildSessions.get(run.id)?.session;
+		return (
+			run.id === target ||
+			run.sessionName === target ||
+			session?.sessionId === target ||
+			session?.sessionName === target
+		);
+	}
+
+	private _rlmCollectEntryForRun(run: RlmChildRun): RlmCollectResultEntry {
+		const snapshot = this._rlmChildSnapshotForRun(run);
+		return {
+			rlm_child_id: snapshot.id,
+			session_name: snapshot.sessionName,
+			session_dir: snapshot.sessionDir,
+			status: snapshot.status,
+			settled: run.settled,
+			answer_preview: snapshot.answerPreview,
+			error: snapshot.error,
+			duration_ms: snapshot.durationMs,
+			tool_use_count: snapshot.toolUseCount,
+			replied_since_task: snapshot.repliedSinceTask,
+		};
 	}
 
 	private _rlmSubagentMatchesTarget(entry: RlmSubagentRegistryEntry, target: string): boolean {
@@ -10412,6 +11074,7 @@ export class AgentSession {
 		run.deletionReservation.resolve();
 		this._unsettledRlmChildRuns.delete(run);
 		this._maybeResumeGoalContinuationAfterRlmWork();
+		this._maybeResumeAutonomousContinuationAfterRlmWork();
 	}
 
 	private _observeRlmRunDeletionCleanup(
@@ -10910,13 +11573,31 @@ export class AgentSession {
 
 		const normalizedReference = reference.toLowerCase();
 		if (`${parentModel.provider}/${parentModel.id}`.toLowerCase() === normalizedReference) {
+			// The parent model is in active use, so a catalog miss must not
+			// exclude it (e.g. an offline discovery refresh), but a stale or
+			// expired provider has to fail the spawn here instead of starting
+			// a child that fails its first model request.
+			const status = this._modelRegistry.getProviderAuthStatus(parentModel.provider);
+			if (status.source === "stale" || status.label === "expired") {
+				throw new Error(`Requested ${target} model "${reference}" is unavailable, unauthenticated, or expired`);
+			}
+			const auth = await this._modelRegistry.getApiKeyAndHeaders(parentModel);
+			if (!auth.ok) {
+				throw new Error(`Requested ${target} model "${reference}" failed authentication preflight`);
+			}
 			return { model: parentModel };
 		}
-		const model = (await this._authenticatedRlmModels()).find(
-			(candidate) => `${candidate.provider}/${candidate.id}`.toLowerCase() === normalizedReference,
-		);
+		const candidates = await this._authenticatedRlmModels();
+		// The parent model can be missing from the authenticated catalog (offline
+		// discovery or expired credentials) while staying selectable, so it backs
+		// the short-form lookup when the catalog has no match. Several catalog
+		// matches still leave the reference unresolved.
+		const model =
+			candidates.find(
+				(candidate) => `${candidate.provider}/${candidate.id}`.toLowerCase() === normalizedReference,
+			) ?? findUniqueRlmShortFormModelMatch(reference, candidates, parentModel);
 		if (!model) {
-			throw new Error(`Requested ${target} model "${reference}" is unavailable, unauthenticated, or expired`);
+			throw new Error(formatRlmModelUnavailableError(reference, target, candidates));
 		}
 
 		const auth = await this._modelRegistry.getApiKeyAndHeaders(model);
@@ -10958,7 +11639,12 @@ export class AgentSession {
 		let modelSelection: RlmSubagentModelSelection;
 		try {
 			if (requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(requestedSessionName, true);
-			modelSelection = await this._resolveRlmSubagentModel(requestedModel);
+			// An unpinned spawn model resolves against the persisted subagent
+			// default; an unavailable default fails the spawn instead of silently
+			// inheriting the parent model.
+			modelSelection = await this._resolveRlmSubagentModel(
+				requestedModel ?? this.settingsManager.getSubagentDefaultModel(),
+			);
 		} finally {
 			if (requestedSessionName) this._pendingRlmSubagentSessionNames.delete(requestedSessionName);
 		}
@@ -11390,6 +12076,7 @@ export class AgentSession {
 					run.settlement.resolve();
 					this._unsettledRlmChildRuns.delete(run);
 					this._maybeResumeGoalContinuationAfterRlmWork();
+					this._maybeResumeAutonomousContinuationAfterRlmWork();
 				}
 			}
 		})().catch(() => undefined);
@@ -11502,7 +12189,11 @@ export class AgentSession {
 	}
 
 	private _isStructuredPermanentProviderRetryExhausted(message: AssistantMessage): boolean {
-		return isPermanentProviderFailureKind(this._getProviderStreamFailureKind(message), this._retryAttempt);
+		return isPermanentProviderFailureKind(
+			this._getProviderStreamFailureKind(message),
+			this._retryAttempt,
+			providerStreamFailureStatus(message),
+		);
 	}
 
 	private _isConcreteProviderAuthFailure(message: AssistantMessage): boolean {
@@ -11583,6 +12274,7 @@ export class AgentSession {
 			return;
 		}
 		this._markProviderAuthStaleForRetryFailure(message);
+		this._restorePrimaryModelAfterBackup();
 		this._emit({
 			type: "auto_retry_end",
 			success: false,
@@ -11590,6 +12282,7 @@ export class AgentSession {
 			finalError: message.errorMessage,
 		});
 		this._retryAttempt = 0;
+		this._providerWait = undefined;
 		this._retryAuthFailureSources = [];
 	}
 
@@ -11614,15 +12307,42 @@ export class AgentSession {
 			});
 		}
 
+		const waitClass = providerWaitClass(providerStreamFailureKind(message), providerStreamFailureStatus(message));
+
+		// User-defined backup model (settings.providerBackupModel, default none):
+		// route the failed turn to the backup instead of waiting while the
+		// primary is quota-blocked or its provider is unavailable.
+		if (waitClass !== "permanent") {
+			const backupModel = this._resolveBackupModel();
+			if (backupModel && !modelsAreEqual(this.model, backupModel)) {
+				return this._handleBackupModelRetry(message, options, backupModel);
+			}
+		}
+
 		this._retryAttempt++;
 
+		const waitPolicy = this.settingsManager.getProviderWaitSettings();
+		// Quota/subscription exhaustion: wait for usage to come back with bounded
+		// exponential-backoff pings (and a scheduled resume when the provider
+		// reports a reset time) instead of the quick-retry loop.
+		if (waitClass === "quota" && waitPolicy.enabled) {
+			return this._handleProviderWait(message, options, waitPolicy, "usage");
+		}
+
 		if (this._retryAttempt > settings.maxRetries) {
+			// Quick retries exhausted on an unavailable provider: keep pinging
+			// with bounded exponential backoff instead of giving up.
+			if (waitClass === "transient" && waitPolicy.enabled) {
+				return this._handleProviderWait(message, options, waitPolicy, "unavailable");
+			}
 			this._markProviderAuthStaleForRetryFailure(message, options);
+			const restoredModel = this._restorePrimaryModelAfterBackup();
 			this._emit({
 				type: "auto_retry_end",
 				success: false,
 				attempt: this._retryAttempt - 1,
 				finalError: message.errorMessage,
+				...(restoredModel ? { restoredModel } : {}),
 			});
 			this._retryAttempt = 0;
 			this._retryAuthFailureSources = [];
@@ -11638,11 +12358,13 @@ export class AgentSession {
 		});
 		if (delay.kind === "exceeds-cap") {
 			this._markProviderAuthStaleForRetryFailure(message, options);
+			const restoredModel = this._restorePrimaryModelAfterBackup();
 			this._emit({
 				type: "auto_retry_end",
 				success: false,
 				attempt: this._retryAttempt - 1,
 				finalError: `Provider requested a ${Math.ceil(delay.retryAfterMs / 1000)}s wait before retrying (above retry.provider.maxRetryDelayMs=${maxRetryDelayMs}ms): ${message.errorMessage || "unknown error"}`,
+				...(restoredModel ? { restoredModel } : {}),
 			});
 			this._retryAttempt = 0;
 			this._retryAuthFailureSources = [];
@@ -11650,20 +12372,42 @@ export class AgentSession {
 			return false;
 		}
 
-		const delayMs = delay.delayMs;
+		return this._retryAfterDelay(
+			message,
+			options,
+			{
+				type: "auto_retry_start",
+				attempt: this._retryAttempt,
+				maxAttempts: settings.maxRetries,
+				delayMs: delay.delayMs,
+				errorMessage: message.errorMessage || "Unknown error",
+			},
+			delay.delayMs,
+		);
+	}
+
+	/**
+	 * Shared retry tail: park the failed turn, surface the retry attempt, wait,
+	 * and re-issue the turn. Returns false when the retry was aborted instead.
+	 */
+	private async _retryAfterDelay(
+		message: AssistantMessage,
+		options:
+			| {
+					markAuthStaleOnFailure?: boolean;
+					authSourceTokens?: readonly AuthSourceToken[];
+			  }
+			| undefined,
+		emitStart: Extract<AgentSessionEvent, { type: "auto_retry_start" }>,
+		delayMs: number,
+	): Promise<boolean> {
 		// Park now: the retry re-issues the failed call and must reuse its Idempotency-Key.
 		// Payload hooks mutate the wire body after the hash point, so reuse is forfeited.
 		if (!this._extensionRunner.hasHandlers("before_provider_request")) {
 			this._semanticEdges.prepareTurnRetry();
 		}
 
-		this._emit({
-			type: "auto_retry_start",
-			attempt: this._retryAttempt,
-			maxAttempts: settings.maxRetries,
-			delayMs,
-			errorMessage: message.errorMessage || "Unknown error",
-		});
+		this._emit(emitStart);
 
 		const messages = this.agent.state.messages;
 		if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
@@ -11678,11 +12422,14 @@ export class AgentSession {
 			this._markProviderAuthStaleForRetryFailure(message, options);
 			this._retryAttempt = 0;
 			this._retryAbortController = undefined;
+			this._providerWait = undefined;
+			const restoredModel = this._restorePrimaryModelAfterBackup();
 			this._emit({
 				type: "auto_retry_end",
 				success: false,
 				attempt,
 				finalError: "Retry cancelled",
+				...(restoredModel ? { restoredModel } : {}),
 			});
 			this._resolveRetry();
 			this._retryAuthFailureSources = [];
@@ -11692,25 +12439,165 @@ export class AgentSession {
 
 		const retryGeneration = this._retryGeneration;
 		setTimeout(() => {
+			// A retry aborted between the sleep and this scheduled start must not
+			// re-issue the turn (e.g. onto a quota-blocked primary after a restore).
+			if (this._retryGeneration !== retryGeneration || !this.isRetrying) return;
 			this.agent.continue().catch((error: unknown) => {
 				// A continue that never starts must still resolve the retry (else isRetrying
 				// sticks forever) — unless a newer retry owns the state by now.
 				if (this._retryGeneration !== retryGeneration || !this.isRetrying) return;
 				this._markProviderAuthStaleForRetryFailure(message, options);
+				const restoredModel = this._restorePrimaryModelAfterBackup();
 				const attempt = this._retryAttempt;
 				this._retryAttempt = 0;
+				this._providerWait = undefined;
 				this._retryAuthFailureSources = [];
 				this._emit({
 					type: "auto_retry_end",
 					success: false,
 					attempt,
 					finalError: error instanceof Error ? error.message : String(error),
+					...(restoredModel ? { restoredModel } : {}),
 				});
 				this._resolveRetry();
 			});
 		}, 0);
 
 		return true;
+	}
+
+	/**
+	 * Resolve the user-configured backup model reference against the available
+	 * models. Unknown or unauthenticated references resolve to undefined: the
+	 * wait loop runs instead, and never surprises the user with a switch.
+	 */
+	private _resolveBackupModel(): Model<any> | undefined {
+		const reference = this.settingsManager.getProviderBackupModel();
+		if (!reference) return undefined;
+		const backupModel = findExactModelReferenceMatch(reference, this._modelRegistry.getAvailable());
+		if (!backupModel || !this._modelRegistry.hasConfiguredAuth(backupModel)) {
+			return undefined;
+		}
+		return backupModel;
+	}
+
+	/** Route the failed turn to the backup model and retry immediately on it. */
+	private _handleBackupModelRetry(
+		message: AssistantMessage,
+		options:
+			| {
+					markAuthStaleOnFailure?: boolean;
+					authSourceTokens?: readonly AuthSourceToken[];
+			  }
+			| undefined,
+		backupModel: Model<any>,
+	): Promise<boolean> {
+		const previousModel = this.agent.state.model;
+		const previousThinkingLevel = this.agent.state.thinkingLevel;
+		const previousServiceTier = this.agent.state.serviceTier;
+		this.agent.state.model = backupModel;
+		// Clamp per-request fields to what the backup supports; all of them are
+		// restored when the turn returns to the primary.
+		this.agent.state.thinkingLevel = clampThinkingLevel(backupModel, previousThinkingLevel) as ThinkingLevel;
+		this._clampServiceTierForModel();
+		// Session-log the switch so primary->backup->primary transitions stay debuggable.
+		this.sessionManager.appendModelChange(backupModel.provider, backupModel.id);
+		this._backupModel = {
+			backup: backupModel,
+			primary: previousModel,
+			thinkingLevel: previousThinkingLevel,
+			serviceTier: previousServiceTier,
+		};
+		this._retryAttempt++;
+		this._providerWait = undefined;
+
+		return this._retryAfterDelay(
+			message,
+			options,
+			{
+				type: "auto_retry_start",
+				attempt: this._retryAttempt,
+				maxAttempts: this.settingsManager.getRetrySettings().maxRetries,
+				delayMs: 0,
+				errorMessage: message.errorMessage || "Unknown error",
+				reason: "backup",
+				backupModel: `${backupModel.provider}/${backupModel.id}`,
+			},
+			0,
+		);
+	}
+
+	/**
+	 * One bounded wait-for-recovery ping: exponential backoff with jitter, a
+	 * scheduled resume when the provider reports a reset time, and hard abort
+	 * bounds so the wait can never hang.
+	 */
+	private async _handleProviderWait(
+		message: AssistantMessage,
+		options:
+			| {
+					markAuthStaleOnFailure?: boolean;
+					authSourceTokens?: readonly AuthSourceToken[];
+			  }
+			| undefined,
+		policy: ProviderWaitPolicy,
+		reason: "usage" | "unavailable",
+	): Promise<boolean> {
+		const wait = this._providerWait;
+		const startedAtMs = wait?.startedAtMs ?? Date.now();
+		const pingAttempt = (wait?.attempts ?? 0) + 1;
+		this._providerWait = { attempts: pingAttempt, startedAtMs };
+
+		const resetMs = providerStreamFailureRetryAfterMs(message) ?? parseProviderResetMs(message.errorMessage);
+		const decision = providerWaitDecision(pingAttempt, Date.now() - startedAtMs, resetMs, policy);
+		if (decision.kind === "abort") {
+			this._markProviderAuthStaleForRetryFailure(message, options);
+			const restoredModel = this._restorePrimaryModelAfterBackup();
+			this._emit({
+				type: "auto_retry_end",
+				success: false,
+				attempt: pingAttempt - 1,
+				finalError: `${decision.message}: ${message.errorMessage || "unknown error"}`,
+				...(restoredModel ? { restoredModel } : {}),
+			});
+			this._retryAttempt = 0;
+			this._providerWait = undefined;
+			this._retryAuthFailureSources = [];
+			this._resolveRetry();
+			return false;
+		}
+
+		return this._retryAfterDelay(
+			message,
+			options,
+			{
+				type: "auto_retry_start",
+				attempt: pingAttempt,
+				maxAttempts: policy.maxAttempts,
+				delayMs: decision.delayMs,
+				errorMessage: message.errorMessage || "Unknown error",
+				reason,
+			},
+			decision.delayMs,
+		);
+	}
+
+	/**
+	 * Return to the primary model after a backup-model retry, unless the user
+	 * switched models meanwhile. Returns the restored "provider/model-id"
+	 * reference for the retry-end event.
+	 */
+	private _restorePrimaryModelAfterBackup(): string | undefined {
+		const backup = this._backupModel;
+		this._backupModel = undefined;
+		if (!backup || !modelsAreEqual(this.model, backup.backup)) return undefined;
+		this.agent.state.model = backup.primary;
+		this.agent.state.thinkingLevel = backup.thinkingLevel;
+		// Restore the saved effective tier: reclamping from the current state
+		// would keep the tier the backup clamped it to.
+		this._clampServiceTierForModel(backup.serviceTier);
+		this.sessionManager.appendModelChange(backup.primary.provider, backup.primary.id);
+		return `${backup.primary.provider}/${backup.primary.id}`;
 	}
 
 	abortRetry(): void {
@@ -11721,13 +12608,16 @@ export class AgentSession {
 		if (this._retryAttempt > 0) {
 			this._autoCompactionAbortController?.abort();
 			this._cancelPostCompactionContinue();
+			const restoredModel = this._restorePrimaryModelAfterBackup();
 			this._emit({
 				type: "auto_retry_end",
 				success: false,
 				attempt: this._retryAttempt,
 				finalError: "Retry cancelled",
+				...(restoredModel ? { restoredModel } : {}),
 			});
 			this._retryAttempt = 0;
+			this._providerWait = undefined;
 		}
 		this._retryAuthFailureSources = [];
 		this._resolveRetry();
@@ -12223,14 +13113,14 @@ export class AgentSession {
 			let summaryDetails: unknown;
 			let summaryUsage: Usage | undefined;
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
-				const model = this.model!;
-				const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+				const { apiKey, headers, requestModel: model } = await this._getRequiredRequestAuth(this.model!);
 				const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
 				const result = await generateBranchSummary(entriesToSummarize, {
 					model,
 					apiKey,
 					headers,
 					signal: this._branchSummaryAbortController.signal,
+					sessionId: this.sessionId,
 					customInstructions,
 					replaceInstructions,
 					reserveTokens: branchSummarySettings.reserveTokens,
@@ -12301,8 +13191,11 @@ export class AgentSession {
 			this._mergeUnpersistedOutcomes(this.agent.state.messages);
 			this._restoreLateIpythonSentAgentMessages();
 			// Context rebuild = cold boundary: refresh the digest like resume.
+			// Summary navigation continues the same timeline (compaction), so the
+			// same goal's accounting must never regress; a plain branch move is
+			// time travel and keeps faithful branch semantics.
 			this._ensureHarnessDigestContext();
-			this._reloadGoalStateFromBranch();
+			this._reloadGoalStateFromBranch({ monotonicTokens: Boolean(summaryText) });
 			this._reloadRlmMaxDepthFromBranch();
 			this._invalidateQueuedPromptPreparation();
 
@@ -12612,9 +13505,10 @@ export class AgentSession {
 	// =========================================================================
 
 	createReplacedSessionContext(): ReplacedSessionContext {
+		// The initiating extension is not in scope here; label timers with the context kind instead.
 		const context = Object.defineProperties(
 			{},
-			Object.getOwnPropertyDescriptors(this._extensionRunner.createCommandContext()),
+			Object.getOwnPropertyDescriptors(this._extensionRunner.createCommandContext("<session-replacement>")),
 		) as ReplacedSessionContext;
 		context.sendMessage = (message, options) => this.sendCustomMessage(message, options);
 		context.sendUserMessage = (content, options) => this.sendUserMessage(content, options);

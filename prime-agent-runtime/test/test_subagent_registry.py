@@ -198,6 +198,33 @@ class RlmSubagentRegistryTest(unittest.TestCase):
             {"target": "sub-a1b2c3d4"},
         )
 
+    def test_deletes_subagent_by_spawn_handle(self) -> None:
+        handle = rlm_module.RLMSpawnHandle(
+            rlm_child_id="sub-a1b2c3d4",
+            name="api-reviewer",
+            session_dir=Path("/tmp/parent/sub-a1b2c3d4"),
+            model="deepseek/deepseek-v4-flash",
+        )
+        deleted_payload = {
+            "rlm_child_id": handle.rlm_child_id,
+            "active_session_id": None,
+            "session_id": None,
+            "session_name": handle.name,
+            "session_dir": str(handle.session_dir),
+            "status": "completed",
+        }
+        host_request = AsyncMock(return_value={"subagent": deleted_payload})
+
+        with patch.object(rlm_module, "host_request", host_request):
+            deleted = asyncio.run(rlm_module.rlm.delete_subagent(handle))
+
+        self.assertEqual(deleted.rlm_child_id, handle.rlm_child_id)
+        self.assertEqual(deleted.session_name, handle.name)
+        host_request.assert_awaited_once_with(
+            "rlm.delete_subagent",
+            {"target": "sub-a1b2c3d4"},
+        )
+
     def test_rejects_invalid_delete_response_and_target(self) -> None:
         host_request = AsyncMock(return_value={"subagent": {"status": "completed"}})
 
@@ -207,7 +234,7 @@ class RlmSubagentRegistryTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "target must not be empty"):
             asyncio.run(rlm_module.delete_subagent("   "))
-        with self.assertRaisesRegex(TypeError, "target must be str or RLMSubagent"):
+        with self.assertRaisesRegex(TypeError, "target must be RLMSpawnHandle, RLMSubagent, or str"):
             asyncio.run(rlm_module.delete_subagent(123))
 
     def test_rejects_invalid_registry_payload(self) -> None:
@@ -239,3 +266,117 @@ class RlmSubagentRegistryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class RlmCollectTest(unittest.TestCase):
+    def test_collect_all_children_returns_typed_results(self) -> None:
+        host_request = AsyncMock(
+            return_value={
+                "results": [
+                    {
+                        "rlm_child_id": "sub-a1b2c3d4",
+                        "session_name": "worker-a",
+                        "session_dir": "/tmp/parent/sub-a1b2c3d4",
+                        "status": "done",
+                        "settled": True,
+                        "answer_preview": "task finished cleanly",
+                        "error": None,
+                        "duration_ms": 4321,
+                        "tool_use_count": 3,
+                        "replied_since_task": False,
+                    },
+                    {
+                        "rlm_child_id": "sub-b2c3d4e5",
+                        "session_name": "worker-b",
+                        "session_dir": "/tmp/parent/sub-b2c3d4e5",
+                        "status": "running",
+                        "settled": False,
+                        "answer_preview": None,
+                        "error": None,
+                        "duration_ms": None,
+                        "tool_use_count": None,
+                        "replied_since_task": None,
+                    },
+                ]
+            }
+        )
+
+        with patch.object(rlm_module, "host_request", host_request):
+            results = asyncio.run(rlm_module.rlm.collect())
+
+        self.assertEqual(len(results), 2)
+        done = results[0]
+        self.assertEqual(done.rlm_child_id, "sub-a1b2c3d4")
+        self.assertEqual(done.session_name, "worker-a")
+        self.assertEqual(done.session_dir, Path("/tmp/parent/sub-a1b2c3d4"))
+        self.assertEqual(done.status, "done")
+        self.assertTrue(done.settled)
+        self.assertEqual(done.answer_preview, "task finished cleanly")
+        self.assertIsNone(done.error)
+        self.assertEqual(done.duration_ms, 4321)
+        self.assertEqual(done.tool_use_count, 3)
+        self.assertFalse(done.replied_since_task)
+        running = results[1]
+        self.assertEqual(running.status, "running")
+        self.assertFalse(running.settled)
+        self.assertIsNone(running.answer_preview)
+        host_request.assert_awaited_once_with("rlm.collect", {"targets": [], "timeout_ms": 0})
+
+    def test_collect_normalizes_spawn_handles_and_names(self) -> None:
+        host_request = AsyncMock(return_value={"results": []})
+        handle = rlm_module.RLMSpawnHandle(
+            rlm_child_id="sub-h1",
+            name="worker-h",
+            session_dir=Path("/tmp/parent/sub-h1"),
+            model="anthropic/claude-sonnet-4-5",
+        )
+
+        with patch.object(rlm_module, "host_request", host_request):
+            results = asyncio.run(rlm_module.rlm.collect([handle, "worker-b"], timeout_ms=250))
+
+        self.assertEqual(results, [])
+        host_request.assert_awaited_once_with(
+            "rlm.collect", {"targets": ["sub-h1", "worker-b"], "timeout_ms": 250}
+        )
+
+    def test_collect_accepts_single_spawn_handle_and_subagent_row(self) -> None:
+        handle = rlm_module.RLMSpawnHandle(
+            rlm_child_id="sub-h1",
+            name="worker-h",
+            session_dir=Path("/tmp/parent/sub-h1"),
+            model="anthropic/claude-sonnet-4-5",
+        )
+        subagent = rlm_module.RLMSubagent(
+            rlm_child_id="sub-r1",
+            active_session_id=None,
+            session_id="session-child",
+            session_name="worker-r",
+            session_dir=Path("/tmp/parent/sub-r1"),
+            status="running",
+        )
+
+        for target, expected_selector in ((handle, "sub-h1"), (subagent, "sub-r1")):
+            host_request = AsyncMock(return_value={"results": []})
+            with patch.object(rlm_module, "host_request", host_request):
+                results = asyncio.run(rlm_module.rlm.collect(target))
+
+            self.assertEqual(results, [])
+            host_request.assert_awaited_once_with(
+                "rlm.collect", {"targets": [expected_selector], "timeout_ms": 0}
+            )
+
+    def test_collect_validates_arguments(self) -> None:
+        with self.assertRaisesRegex(TypeError, "timeout_ms"):
+            asyncio.run(rlm_module.rlm.collect(timeout_ms=-1))
+        with self.assertRaisesRegex(TypeError, "timeout_ms"):
+            asyncio.run(rlm_module.rlm.collect(timeout_ms="soon"))
+        with self.assertRaisesRegex(TypeError, "targets must be"):
+            asyncio.run(rlm_module.rlm.collect(42))
+        with self.assertRaisesRegex(TypeError, "collect target"):
+            asyncio.run(rlm_module.rlm.collect(["ok", ""]))
+
+    def test_collect_rejects_invalid_payloads(self) -> None:
+        host_request = AsyncMock(return_value={"results": [{"rlm_child_id": "sub-x", "status": "nonsense"}]})
+
+        with patch.object(rlm_module, "host_request", host_request):
+            with self.assertRaisesRegex(RuntimeError, "invalid status"):
+                asyncio.run(rlm_module.rlm.collect())

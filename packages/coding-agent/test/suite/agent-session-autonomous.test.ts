@@ -249,6 +249,62 @@ describe("AgentSession autonomous mode", () => {
 		});
 	});
 
+	it("seeds autonomous limits from persisted settings when no run-level limits are set", async () => {
+		const harness = await createHarness({
+			settings: {
+				autonomous: { maxContinuations: 100, maxTurns: "unlimited", maxTokens: 1_000_000 },
+			},
+		});
+		harnesses.push(harness);
+
+		expect(harness.session.getAutonomousStatus().limits).toEqual({
+			maxContinuations: 100,
+			maxTurns: UNLIMITED_AUTONOMOUS_LIMIT,
+			maxTokens: 1_000_000,
+			timeoutMs: 30 * 60 * 1000,
+		});
+	});
+
+	it("keeps explicit run-level autonomous limits ahead of persisted settings", async () => {
+		const harness = await createHarness({
+			settings: { autonomous: { maxContinuations: 100, maxTokens: 1_000_000 } },
+			autonomous: { enabled: true, maxContinuations: 2, maxTokens: 20_000 },
+		});
+		harnesses.push(harness);
+
+		expect(harness.session.getAutonomousStatus()).toMatchObject({
+			enabled: true,
+			limits: { maxContinuations: 2, maxTokens: 20_000 },
+		});
+	});
+
+	it("drops invalid persisted autonomous limits back to the built-in defaults", async () => {
+		const harness = await createHarness({
+			settings: { autonomous: { maxContinuations: -3, maxTurns: 0.5, maxTokens: 0.5 } },
+		});
+		harnesses.push(harness);
+
+		expect(harness.session.getAutonomousStatus().limits).toMatchObject({
+			maxContinuations: 3,
+			maxTurns: 12,
+			maxTokens: 80_000,
+		});
+	});
+
+	it("keeps settings-derived limits when enabling autonomous mode without budget flags", async () => {
+		const harness = await createHarness({
+			settings: { autonomous: { maxContinuations: 100 } },
+		});
+		harnesses.push(harness);
+
+		await harness.session.prompt("/autonomous on");
+
+		expect(harness.session.getAutonomousStatus()).toMatchObject({
+			enabled: true,
+			limits: { maxContinuations: 100 },
+		});
+	});
+
 	it("keeps defaults when no budget flags are named and appends repeated gates", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -331,6 +387,8 @@ describe("AgentSession autonomous mode", () => {
 			"/autonomous on --max-continuations",
 			"/autonomous on --speed 10",
 			"/autonomous on --gate-retries unlimited",
+			"/autonomous on --subagent-keep-alive-ms 3000000000",
+			"/autonomous on --subagent-keep-alive-ms -5",
 			"/autonomous off --max-continuations 2",
 		]) {
 			await harness.session.prompt(input);
@@ -343,6 +401,8 @@ describe("AgentSession autonomous mode", () => {
 			expect.stringContaining("Missing value for --max-continuations"),
 			expect.stringContaining("Unknown autonomous budget flag: --speed"),
 			expect.stringContaining("--gate-retries must be a positive integer."),
+			expect.stringContaining("--subagent-keep-alive-ms must be 0 or a positive integer up to 2147483647"),
+			expect.stringContaining("--subagent-keep-alive-ms must be 0 or a positive integer up to 2147483647"),
 			expect.stringContaining("Unexpected autonomous argument: --max-continuations"),
 		]);
 
@@ -779,5 +839,146 @@ describe("AgentSession autonomous mode", () => {
 			shouldContinue: true,
 			reason: "missing_terminal_evidence",
 		});
+	});
+});
+
+describe("AgentSession autonomous continuations vs subagents", () => {
+	const harnesses: Harness[] = [];
+	let childGate: { promise: Promise<void>; resolve: () => void } | undefined;
+
+	function createGate(): { promise: Promise<void>; resolve: () => void } {
+		let resolve!: () => void;
+		const promise = new Promise<void>((settle) => {
+			resolve = settle;
+		});
+		return { promise, resolve };
+	}
+
+	afterEach(() => {
+		childGate?.resolve();
+		childGate = undefined;
+		while (harnesses.length > 0) {
+			harnesses.pop()?.cleanup();
+		}
+	});
+
+	async function createGatedChildParent(options: {
+		keepAliveMs?: number;
+		maxContinuations?: number;
+	}): Promise<Harness> {
+		childGate = createGate();
+		const child = await createHarness({});
+		harnesses.push(child);
+		child.setResponses([
+			async () => {
+				await childGate!.promise;
+				return fauxAssistantMessage("child result");
+			},
+		]);
+		const parent = await createHarness({
+			rlmDepth: 0,
+			rlmMaxDepth: 1,
+			autonomous: {
+				enabled: true,
+				maxContinuations: options.maxContinuations ?? 1,
+				subagentKeepAliveMs: options.keepAliveMs,
+			},
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: child.session }),
+				deleteRlmSubagentRuntime: async () => {},
+			},
+		});
+		harnesses.push(parent);
+		return parent;
+	}
+
+	it("holds the timer continuation while a subagent runs and resumes it at settlement", async () => {
+		const parent = await createGatedChildParent({});
+		parent.setResponses([
+			fauxAssistantMessage("delegated to the child; waiting"),
+			fauxAssistantMessage("read the child exit notice"),
+			fauxAssistantMessage("parent resumed and continued"),
+		]);
+
+		await parent.session.runRlmChild("child task", { name: "worker" });
+		await expect.poll(() => parent.session.hasRunningRlmChildren()).toBe(true);
+
+		await parent.session.prompt("kick off");
+
+		// Held while the child runs: no continuation turn, budget untouched.
+		expect(getUserTexts(parent)).toEqual(["kick off"]);
+		expect(parent.session.getAutonomousStatus()).toMatchObject({ continuationsUsed: 0 });
+
+		childGate!.resolve();
+
+		// The exit notice delivers first; the owed continuation wakes the idle
+		// parent and is counted once.
+		await expect
+			.poll(() => getAssistantTexts(parent))
+			.toEqual(["delegated to the child; waiting", "read the child exit notice", "parent resumed and continued"]);
+		expect(getUserTexts(parent)).toEqual(["kick off", expect.stringContaining("[autonomous-continuation]")]);
+		expect(parent.session.getAutonomousStatus()).toMatchObject({ continuationsUsed: 1 });
+		expect(parent.session.hasRunningRlmChildren()).toBe(false);
+	});
+
+	it("accepts a bounded keep-alive window flag and reports it in the status", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+
+		await harness.session.prompt("/autonomous on --subagent-keep-alive-ms 250");
+
+		expect(harness.getPendingResponseCount()).toBe(0);
+		expect(harness.session.getAutonomousStatus()).toMatchObject({
+			enabled: true,
+			subagentKeepAliveMs: 250,
+		});
+		const statusMessages = harness.session.messages.filter(
+			(message) => message.role === "custom" && message.customType === "autonomous_status",
+		);
+		expect(getMessageText(statusMessages.at(-1))).toContain("Subagent keep-alive: 250ms.");
+	});
+
+	it("disarms a pending keep-alive when the valve is disabled mid-hold", async () => {
+		const parent = await createGatedChildParent({ keepAliveMs: 25, maxContinuations: 2 });
+		parent.setResponses([fauxAssistantMessage("delegated to the child; waiting")]);
+
+		await parent.session.runRlmChild("child task", { name: "worker" });
+		await expect.poll(() => parent.session.hasRunningRlmChildren()).toBe(true);
+
+		await parent.session.prompt("kick off");
+		expect(getUserTexts(parent)).toEqual(["kick off"]);
+
+		await parent.session.prompt("/autonomous on --subagent-keep-alive-ms 0");
+
+		// The previously armed 25 ms window is gone; no keep-alive turn fires.
+		await new Promise((resolve) => setTimeout(resolve, 150));
+		expect(getAssistantTexts(parent)).toEqual(["delegated to the child; waiting"]);
+		expect(getUserTexts(parent)).toEqual(["kick off"]);
+		expect(parent.session.getAutonomousStatus()).toMatchObject({ continuationsUsed: 0 });
+		expect(parent.session.hasRunningRlmChildren()).toBe(true);
+	});
+
+	it("fires one keep-alive continuation while a subagent stays active past the window", async () => {
+		const parent = await createGatedChildParent({ keepAliveMs: 25, maxContinuations: 2 });
+		parent.setResponses([
+			fauxAssistantMessage("delegated to the child; waiting"),
+			fauxAssistantMessage("checked on the still-running child"),
+		]);
+
+		await parent.session.runRlmChild("child task", { name: "worker" });
+		await expect.poll(() => parent.session.hasRunningRlmChildren()).toBe(true);
+
+		await parent.session.prompt("kick off");
+		expect(getUserTexts(parent)).toEqual(["kick off"]);
+		expect(parent.session.getAutonomousStatus()).toMatchObject({ continuationsUsed: 0 });
+
+		await expect
+			.poll(() => getAssistantTexts(parent), { timeout: 5_000 })
+			.toEqual(["delegated to the child; waiting", "checked on the still-running child"]);
+
+		const userTexts = getUserTexts(parent);
+		expect(userTexts[1]).toContain("[autonomous-continuation: subagent-keep-alive]");
+		expect(parent.session.getAutonomousStatus()).toMatchObject({ continuationsUsed: 1 });
+		expect(parent.session.hasRunningRlmChildren()).toBe(true);
 	});
 });

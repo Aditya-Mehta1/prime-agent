@@ -2,12 +2,12 @@ import * as path from "node:path";
 import { getProviders, type OAuthProviderId, type OAuthSelectPrompt } from "@earendil-works/pi-ai";
 import type { OverlayHandle, TUI } from "@earendil-works/pi-tui";
 import { getAuthPath, getDocsPath } from "../../config.js";
+import type { McpRemoveAccountResult } from "../../core/mcp/connection-store.js";
 import type { ModelRegistry } from "../../core/model-registry.js";
 import {
 	checkPrimeAgentTracesAccess,
 	checkPrimeInferenceAccess,
 	fetchPrimeTeams,
-	loadPrimeCliConfig,
 	loginPrimeAgentTraces,
 	loginPrimeInference,
 	PRIME_AGENT_TRACES_PROVIDER_ID,
@@ -17,6 +17,7 @@ import {
 	type PrimeInferenceLoginCallbacks,
 	type PrimeTeam,
 	resolvePrimeAgentTracesBaseUrl,
+	resolvePrimeInferenceAuthConfig,
 } from "../../core/prime-inference-auth.js";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "../../core/provider-display-names.js";
 import type { TelemetryAcquisitionMethod, TelemetryValidationScope } from "../../core/telemetry-journeys.js";
@@ -113,6 +114,24 @@ export interface ProviderAuthFlowsHost {
 	onAuthObservation?(observation: AuthFlowObservation): void;
 	onAuthError?(error: unknown, providerId: string, operation: "login" | "logout" | "discover"): void;
 	runWithAuthTelemetry?(run: () => Promise<AuthenticationResult>): Promise<AuthenticationResult>;
+	/**
+	 * OWNS the MCP account login for the generic /login service options and
+	 * the config menu: the host runs the ONE guarded connect operation
+	 * (claim under the store lock, staged OAuth, guarded finalize). There
+	 * is NO raw-dialog fallback for MCP ids — an unresolvable provider
+	 * reports an explicit configuration-required outcome; only the guarded
+	 * operation's private staging dialog exists.
+	 */
+	onMcpAccountLogin?(providerId: string): Promise<AuthenticationResult>;
+	/**
+	 * OWNS the entire MCP account logout for the generic /logout route: the
+	 * host must perform verified credential deletion AND pending-attempt
+	 * cancellation under ONE connection-store critical section (store->auth)
+	 * BEFORE the route reports anything. Called INSTEAD of
+	 * authStorage.logout for MCP credential ids; non-MCP logouts are
+	 * unaffected.
+	 */
+	onMcpAccountLogout?(providerId: string): Promise<McpRemoveAccountResult> | McpRemoveAccountResult;
 }
 
 export interface AuthFlowObservation {
@@ -240,6 +259,15 @@ export class ProviderAuthFlows {
 	loginProvider(providerOption: AuthSelectorProvider): Promise<AuthenticationResult> {
 		const kind = providerOption.category === "service" ? "service" : "provider";
 		if (providerOption.authType === "oauth") {
+			// MCP account logins are DELEGATED to the host's guarded connect
+			// operation BEFORE any dialog writes the final credential: a
+			// concurrent logout can cancel the attempt and a late callback
+			// can never reactivate or clobber the account.
+			if (providerOption.id.startsWith("mcp:")) {
+				if (this.host.onMcpAccountLogin) return this.host.onMcpAccountLogin(providerOption.id);
+				this.host.showError("MCP account login requires the guarded host connection flow.");
+				return Promise.resolve({ status: "failed" });
+			}
 			return this.showLoginDialog(providerOption.id, providerOption.name, kind);
 		}
 		if (providerOption.id === PRIME_INFERENCE_PROVIDER_ID) {
@@ -280,7 +308,36 @@ export class ProviderAuthFlows {
 					close();
 
 					try {
-						this.host.modelRegistry.authStorage.logout(providerOption.id);
+						// MCP logouts are DELEGATED whole before this route touches
+						// auth: a plain authStorage.logout would race a concurrent
+						// finalize that could re-create the credential after it.
+						if (providerOption.id.startsWith("mcp:") && this.host.onMcpAccountLogout) {
+							const outcome = await this.host.onMcpAccountLogout(providerOption.id);
+							if (outcome === "refused") {
+								// State-neutral: the attempt is no longer current
+								// — no "Logged out" claim, and no Connected
+								// claim from mere token presence.
+								this.host.showStatus(
+									`This login attempt is no longer current; manage the account from /plugins.`,
+								);
+								resolve(providerOption.id);
+								return;
+							}
+							if (outcome === "failed") {
+								throw new Error(
+									`Logout failed: the change could not be saved; try logging out ${providerOption.name} again.`,
+								);
+							}
+							if (outcome === "logged-out") {
+								this.host.showStatus(
+									`Logged out of ${providerOption.name}, but the change could not be saved. It may still appear in the list; try again to finish cleanup.`,
+								);
+								resolve(providerOption.id);
+								return;
+							}
+						} else {
+							this.host.modelRegistry.authStorage.logout(providerOption.id);
+						}
 						this.host.modelRegistry.refresh();
 						await this.host.onAuthChanged?.();
 						const message =
@@ -368,17 +425,6 @@ export class ProviderAuthFlows {
 				authType: credential.type,
 				category: isSerper || isMcp ? "service" : "provider",
 			});
-		}
-
-		if (!options.some((option) => option.id === PRIME_INFERENCE_PROVIDER_ID)) {
-			const primeInferenceStatus = authStorage.getAuthStatus(PRIME_INFERENCE_PROVIDER_ID);
-			if (primeInferenceStatus.source === "prime_cli") {
-				options.push({
-					id: PRIME_INFERENCE_PROVIDER_ID,
-					name: PRIME_INFERENCE_PROVIDER_NAME,
-					authType: "api_key",
-				});
-			}
 		}
 
 		return options.sort((a, b) => a.name.localeCompare(b.name));
@@ -504,24 +550,7 @@ export class ProviderAuthFlows {
 	}
 
 	private getPrimeInferenceDefaultTeamStatus(): string {
-		const configPath = this.host.modelRegistry.authStorage.getPrimeCliConfigPath();
-		if (configPath) {
-			let config: ReturnType<typeof loadPrimeCliConfig>;
-			try {
-				config = loadPrimeCliConfig(configPath);
-			} catch {
-				return "Using personal account.";
-			}
-			if (config.teamIdFromEnv) {
-				return "Using team from PRIME_TEAM_ID.";
-			}
-			if (config.teamName) {
-				return `Using team "${config.teamName}".`;
-			}
-			if (config.teamId) {
-				return "Using Prime CLI team.";
-			}
-		}
+		if (process.env.PRIME_TEAM_ID?.trim()) return "Using team from PRIME_TEAM_ID.";
 		const storedTeam = this.host.modelRegistry.authStorage.getPrimeInferenceTeamSelection();
 		if (storedTeam) {
 			return `Using team "${storedTeam.name}".`;
@@ -534,27 +563,28 @@ export class ProviderAuthFlows {
 
 	private async selectPrimeInferenceTeam(apiKey: string, dialog: LoginDialogComponent): Promise<string | undefined> {
 		try {
-			const config = loadPrimeCliConfig(this.host.modelRegistry.authStorage.getPrimeCliConfigPath());
-			if (config.teamIdFromEnv) {
+			if (process.env.PRIME_TEAM_ID?.trim()) {
 				this.host.modelRegistry.authStorage.reload();
 				return "Using team from PRIME_TEAM_ID.";
 			}
 
 			dialog.showProgress("Loading Prime teams...");
-			const teams = await fetchPrimeTeams(apiKey, config.baseUrl, { signal: dialog.signal });
+			const teams = await fetchPrimeTeams(apiKey, resolvePrimeInferenceAuthConfig().baseUrl, {
+				signal: dialog.signal,
+			});
 			if (dialog.signal.aborted) {
 				return this.getPrimeInferenceDefaultTeamStatus();
 			}
 			if (teams.length === 0) {
-				this.host.modelRegistry.authStorage.setPrimeInferenceTeamSelection(null);
+				this.host.modelRegistry.authStorage.setPrimeInferenceTeamSelection(null, apiKey);
 				return "Using personal account.";
 			}
 
 			const storedTeam = this.host.modelRegistry.authStorage.getPrimeInferenceTeamSelection();
-			const currentTeamId = storedTeam === null ? undefined : (storedTeam?.teamId ?? config.teamId);
+			const currentTeamId = storedTeam === null ? undefined : storedTeam?.teamId;
 			const selectedTeam = await this.showPrimeTeamSelector(teams, currentTeamId);
 			if (selectedTeam !== undefined) {
-				this.host.modelRegistry.authStorage.setPrimeInferenceTeamSelection(selectedTeam);
+				this.host.modelRegistry.authStorage.setPrimeInferenceTeamSelection(selectedTeam, apiKey);
 			}
 			return selectedTeam
 				? `Using team "${selectedTeam.name}".`
@@ -573,8 +603,9 @@ export class ProviderAuthFlows {
 		dialog: LoginDialogComponent,
 		closeDialog: () => void,
 		method: TelemetryAcquisitionMethod,
+		primeTeam?: PrimeTeam | null,
 	): Promise<AuthenticationResult> {
-		this.host.modelRegistry.authStorage.setPrimeInferenceApiKey(apiKey);
+		this.host.modelRegistry.authStorage.setPrimeInferenceApiKey(apiKey, primeTeam);
 		this.observeAuth({
 			providerId: PRIME_INFERENCE_PROVIDER_ID,
 			stage: "credential_discovery",
@@ -591,7 +622,6 @@ export class ProviderAuthFlows {
 			"api_key",
 			teamStatus,
 			"provider",
-			this.host.modelRegistry.authStorage.getPrimeCliConfigPath() ?? getAuthPath(),
 		);
 	}
 
@@ -696,11 +726,13 @@ export class ProviderAuthFlows {
 				},
 				signal: browserAbort.signal,
 			};
+			const primeCliLoginOptions = {
+				configPath: this.host.modelRegistry.authStorage.getPrimeCliConfigPath(),
+				usePrimeCliConfig: this.host.modelRegistry.authStorage.getPrimeCliConfigPath() !== undefined,
+			};
 			const browserLogin = traces
-				? loginPrimeAgentTraces(callbacks)
-				: loginPrimeInference(callbacks, {
-						configPath: this.host.modelRegistry.authStorage.getPrimeCliConfigPath(),
-					});
+				? loginPrimeAgentTraces(callbacks, primeCliLoginOptions)
+				: loginPrimeInference(callbacks, primeCliLoginOptions);
 			// When the browser challenge cannot start or breaks down, keep the dialog
 			// open and fall back to plain API key entry instead of failing outright.
 			const browserLoginOrFallback = browserLogin.catch((error: unknown) => {
@@ -735,9 +767,7 @@ export class ProviderAuthFlows {
 			if (result.source === "manual") {
 				browserAbort.abort();
 				dialog.showProgress(traces ? "Checking Prime Agent trace access..." : "Checking Prime Inference access...");
-				const baseUrl = traces
-					? resolvePrimeAgentTracesBaseUrl()
-					: loadPrimeCliConfig(this.host.modelRegistry.authStorage.getPrimeCliConfigPath()).baseUrl;
+				const baseUrl = traces ? resolvePrimeAgentTracesBaseUrl() : resolvePrimeInferenceAuthConfig().baseUrl;
 				const validationStartedAt = performance.now();
 				const access = await (traces ? checkPrimeAgentTracesAccess : checkPrimeInferenceAccess)(
 					result.apiKey,
@@ -775,7 +805,13 @@ export class ProviderAuthFlows {
 						: "existing_configuration";
 			return traces
 				? await this.completePrimeAgentTracesLogin(result.apiKey, closeDialog, method)
-				: await this.completePrimeInferenceLogin(result.apiKey, dialog, closeDialog, method);
+				: await this.completePrimeInferenceLogin(
+						result.apiKey,
+						dialog,
+						closeDialog,
+						method,
+						"primeTeam" in result ? result.primeTeam : undefined,
+					);
 		} catch (error: unknown) {
 			closeDialog();
 			const errorMsg = error instanceof Error ? error.message : String(error);

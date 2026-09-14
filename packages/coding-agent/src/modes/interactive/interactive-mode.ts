@@ -14,6 +14,7 @@ import {
 	type ToolCall,
 } from "@earendil-works/pi-ai";
 import { BUILTIN_MCP_CATALOG } from "@earendil-works/pi-ai/mcp";
+import { registerOAuthProvider, unregisterOAuthProvider } from "@earendil-works/pi-ai/oauth";
 import type {
 	AutocompleteItem,
 	AutocompleteProvider,
@@ -47,7 +48,11 @@ import {
 	launchDaemonUpdateRestartCoordinator,
 	resolveDaemonUpdateRestartSocketPath,
 } from "../../cli/daemon-update-restart.js";
-import { type CliSubprocessLaunchSpec, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
+import {
+	type CliSubprocessLaunchSpec,
+	createCliSubprocessLaunchSpec,
+	createUpdatedCliSubprocessLaunchSpec,
+} from "../../cli/subprocess-launch.js";
 import {
 	APP_NAME,
 	APP_TITLE,
@@ -75,12 +80,14 @@ import {
 	uploadAllAgentTraces,
 } from "../../core/agent-traces.js";
 import { isNoModelsAvailableMessage } from "../../core/auth-guidance.js";
+import type { AuthCredential } from "../../core/auth-storage.js";
 import {
 	type AgentCronJob,
 	type AgentHeartbeatManagementAction,
 	DEFAULT_HEARTBEAT_DELIVERY_MODE,
 	parseHeartbeatCommand,
 } from "../../core/cron-jobs.js";
+import { DEFAULT_THINKING_LEVEL } from "../../core/defaults.js";
 import type {
 	AutocompleteProviderFactory,
 	ContextUsage,
@@ -96,7 +103,28 @@ import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/
 import { emptyGoalState, formatGoalUsage, GOAL_CONTEXT_PREVIEW_LABEL, type GoalState } from "../../core/goals.js";
 import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.js";
+import {
+	logoutMcpAccount,
+	type McpConnectionRecord,
+	McpConnectionStore,
+	type McpRemoveAccountResult,
+} from "../../core/mcp/connection-store.js";
 import { runMcpManagementCommand } from "../../core/mcp/mcp-command.js";
+import {
+	accountStateFor,
+	buildPluginViews,
+	createConfiguredMcpProvider,
+	type McpPluginView,
+	type McpServiceDescriptor,
+	mcpCredentialKey,
+	mcpLoginEligibility,
+	nextMcpConnectionId,
+	reservedMcpOwnership,
+	resolveMcpOAuthIdentity,
+	resolveServiceCatalogWithDiagnostics,
+	verifyMcpConnection,
+} from "../../core/mcp/service-catalog.js";
+
 import {
 	ASYNC_BASH_COMPLETION_PREVIEW_LABEL,
 	bashOutputToText,
@@ -151,7 +179,7 @@ import {
 	type TelemetryUiInputAttempt,
 } from "../../core/telemetry-journeys.js";
 import { type TruncationResult, truncateTail } from "../../core/tools/truncate.js";
-import { PRIME_BUTTERFLY_LOGO } from "../../themes/prime-logo.js";
+import { PRIME_COMPACT_BUTTERFLY_LOGO } from "../../themes/prime-logo.js";
 import { getChangelogPath, parseChangelog } from "../../utils/changelog.js";
 import { spawnHidden, spawnSyncHidden } from "../../utils/child-process.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
@@ -210,7 +238,7 @@ import {
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.js";
 import { ConfigurationMenuComponent, type ConfigurationMenuTab } from "./components/configuration-menu.js";
 import { formatContextTree } from "./components/context-tree-format.js";
-import { isCompactAgentMessageNeighbor } from "./components/conversation-components.js";
+import { createConversationSpacing, createShellCompletionComponent } from "./components/conversation-components.js";
 import { CountdownTimer } from "./components/countdown-timer.js";
 import { CustomEditor } from "./components/custom-editor.js";
 import { CustomMessageComponent } from "./components/custom-message.js";
@@ -221,20 +249,30 @@ import { type FileChangeSummary, formatTotalChangeSummary, mergeTurnFileChanges 
 import { ExtensionEditorComponent } from "./components/extension-editor.js";
 import { ExtensionInputComponent } from "./components/extension-input.js";
 import { ExtensionSelectorComponent } from "./components/extension-selector.js";
-import { FEATURE_HINT_ANIMATION_INTERVAL_MS, FeatureHintComponent } from "./components/feature-hint.js";
 import { FooterComponent } from "./components/footer.js";
 import { HeartbeatManagerComponent } from "./components/heartbeat-manager.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./components/injected-prompt-message.js";
-import { formatKeyText, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.js";
+import {
+	formatConversationDetailStatus,
+	formatKeyText,
+	keyHint,
+	keyText,
+	rawKeyHint,
+} from "./components/keybinding-hints.js";
 import { createMermaidMarkdownTransform } from "./components/mermaid.js";
 import type { AuthSelectorProvider } from "./components/oauth-selector.js";
 import { PrimeOnboardingSplashComponent } from "./components/prime-onboarding-splash.js";
+import { PromptContextLine } from "./components/prompt-context-line.js";
 import { styleArgumentTokens } from "./components/prompt-highlight.js";
 import {
 	MalformedRefinementOutcomeMessageComponent,
 	RefinementOutcomeMessageComponent,
 } from "./components/refinement-outcome-message.js";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.js";
+import {
+	ServiceCatalogPickerComponent,
+	type ServiceCatalogPickerOptions,
+} from "./components/service-catalog-picker.js";
 import { SettingsSelectorComponent } from "./components/settings-selector.js";
 import { SideQuestionComponent } from "./components/side-question.js";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.js";
@@ -245,8 +283,8 @@ import {
 } from "./components/slash-command-message.js";
 import { SlashCommandResultMessageComponent } from "./components/slash-command-result-message.js";
 import {
-	countDirectSubagentStatuses,
 	countRosterSubagentStatuses,
+	countSubtreeSubagentStatuses,
 	SubagentSummaryLine,
 } from "./components/subagent-summary-line.js";
 import { ThinkingSelectorComponent } from "./components/thinking-selector.js";
@@ -258,7 +296,6 @@ import {
 import { TreeSelectorComponent } from "./components/tree-selector.js";
 import { UserMessageComponent } from "./components/user-message.js";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.js";
-import { FeatureHintDeck } from "./feature-hints.js";
 import { scopeHeartbeatsToSession } from "./heartbeat-scope.js";
 import {
 	collectMarkedImages,
@@ -313,20 +350,6 @@ interface PendingToolCallRenderInput {
 const HEARTBEAT_LEGACY_PROMPT_MIN_TOLERANCE_MS = 15_000;
 const HEARTBEAT_LEGACY_PROMPT_MAX_TOLERANCE_MS = 120_000;
 const MODEL_CATALOG_REFRESH_TTL_MS = 60_000;
-const FEATURE_HINT_DELAY_MS = 5_000;
-
-export const START_HINTS = [
-	'Try "refactor @<filepath>"',
-	'Try "fix bugs in @<filepath>"',
-	'Try "add tests for @<filepath>"',
-	'Try "explain how @<filepath> works"',
-	'Try "improve performance in @<filepath>"',
-] as const;
-
-export function getRandomStartHint(random = Math.random): (typeof START_HINTS)[number] {
-	return START_HINTS[Math.floor(random() * START_HINTS.length)] ?? START_HINTS[0];
-}
-
 function isLabeledQueuedPreview(message: string): boolean {
 	return (
 		message.startsWith(`${HEARTBEAT_PROMPT_PREVIEW_LABEL}: `) ||
@@ -356,19 +379,6 @@ export function styleQueuedMessagePreview(
 
 function isExpandable(obj: unknown): obj is Expandable {
 	return typeof obj === "object" && obj !== null && "setExpanded" in obj && typeof obj.setExpanded === "function";
-}
-
-interface AgentMessagesExpandable {
-	setAgentMessagesExpanded(expanded: boolean): void;
-}
-
-function hasAgentMessagesExpansion(obj: unknown): obj is AgentMessagesExpandable {
-	return (
-		typeof obj === "object" &&
-		obj !== null &&
-		"setAgentMessagesExpanded" in obj &&
-		typeof (obj as AgentMessagesExpandable).setAgentMessagesExpanded === "function"
-	);
 }
 
 interface EditDiffsExpandable {
@@ -464,25 +474,22 @@ export interface BrandSplashMetadataLine {
 export interface BrandSplashHeaderOptions {
 	logo?: string;
 	topPadding?: boolean;
+	getModelId?: () => string | undefined;
 	getExtraMetadata?: () => readonly BrandSplashMetadataLine[];
-	getHideStartHint?: () => boolean;
-	getStartHint?: () => string;
 }
 
 export class BrandSplashHeader implements Component {
 	private readonly logoRaw: string[];
 	private readonly logoCanvasWidth: number;
-	private readonly gutter = 4;
-	private readonly labelWidth = 9;
+	private readonly gutter = 3;
 
 	constructor(
 		private readonly version: string,
-		private readonly getModelId: () => string | undefined,
-		private readonly getCwd: () => string,
+		private readonly getCwd: () => string | undefined,
 		private readonly verboseInstructions?: string,
 		private readonly options: BrandSplashHeaderOptions = {},
 	) {
-		this.logoRaw = (options.logo ?? PRIME_BUTTERFLY_LOGO).split("\n");
+		this.logoRaw = (options.logo ?? PRIME_COMPACT_BUTTERFLY_LOGO).split("\n");
 		this.logoCanvasWidth = this.logoRaw.reduce((max, line) => Math.max(max, visibleWidth(line)), 0);
 	}
 
@@ -494,41 +501,50 @@ export class BrandSplashHeader implements Component {
 		const safeWidth = Math.max(1, width);
 		const paddingX = safeWidth > 1 ? 1 : 0;
 		const contentWidth = Math.max(1, safeWidth - paddingX * 2);
-		const metaWidth = contentWidth - this.logoCanvasWidth - this.gutter;
-		const showMeta = metaWidth >= this.labelWidth + 8;
-		const valueWidth = Math.max(1, metaWidth - this.labelWidth);
-		const labelled = (label: string, value: string) => {
-			const displayValue =
-				label === "cwd" ? truncatePathMiddle(value, valueWidth) : truncateToWidth(value, valueWidth);
-			return theme.fg("dim", label.padEnd(this.labelWidth)) + theme.fg("muted", displayValue);
-		};
+		const showLogo = this.logoCanvasWidth > 0 && contentWidth - this.logoCanvasWidth - this.gutter >= 24;
+		const metaWidth = showLogo ? contentWidth - this.logoCanvasWidth - this.gutter : contentWidth;
 		const extraMetadata = this.options.getExtraMetadata?.() ?? [];
-		const hideStartHint = this.options.getHideStartHint?.() ?? false;
-		const startHint = this.options.getStartHint?.() ?? "type to search sessions";
-		const metaLines = showMeta
-			? [
-					labelled("version", `v${this.version}`),
-					labelled("model", this.getModelId() ?? "—"),
-					labelled("cwd", formatSplashCwd(this.getCwd())),
-					...extraMetadata.map((line) => labelled(line.label, line.value)),
-					...(hideStartHint ? [] : ["", theme.fg("dim", startHint)]),
-				]
-			: [];
-		const metaStart = Math.max(0, Math.floor((this.logoRaw.length - metaLines.length) / 2));
+		const version = theme.fg("muted", `v${this.version}`);
+		const titleText = "prime agent";
+		const title = theme.fg("text", titleText);
+		const modelLabel = "model ";
+		const cwdLabel = "cwd ";
+		const cwd = this.getCwd();
+		const metaLines = [
+			...(visibleWidth(`${titleText} v${this.version}`) <= metaWidth ? [`${title} ${version}`] : [title, version]),
+			...(this.options.getModelId
+				? [
+						`${theme.fg("dim", modelLabel)}${theme.fg(
+							"muted",
+							truncateToWidth(
+								this.options.getModelId() ?? "—",
+								Math.max(1, metaWidth - visibleWidth(modelLabel)),
+							),
+						)}`,
+					]
+				: []),
+			...extraMetadata.map(({ label, value }) => `${theme.fg("dim", `${label} `)}${theme.fg("muted", value)}`),
+			...(cwd === undefined
+				? []
+				: [
+						`${theme.fg("dim", cwdLabel)}${theme.fg("muted", truncatePathMiddle(formatSplashCwd(cwd), Math.max(1, metaWidth - visibleWidth(cwdLabel))))}`,
+					]),
+		];
 		const lines = this.options.topPadding ? [""] : [];
-		lines.push(
-			...this.logoRaw.map((line, index) => {
-				const colored = theme.fg("text", line);
-				const meta = index >= metaStart && index < metaStart + metaLines.length ? metaLines[index - metaStart] : "";
-				const padding = showMeta
-					? " ".repeat(Math.max(0, this.logoCanvasWidth - visibleWidth(line) + this.gutter))
-					: "";
-				const content = truncateToWidth(colored + padding + meta, contentWidth, "");
-				return (
-					" ".repeat(paddingX) + content + " ".repeat(Math.max(0, safeWidth - paddingX - visibleWidth(content)))
-				);
-			}),
-		);
+		const rowCount = Math.max(showLogo ? this.logoRaw.length : 0, metaLines.length);
+		const metaStartIndex = showLogo ? Math.floor((rowCount - metaLines.length) / 2) : 0;
+		for (let index = 0; index < rowCount; index++) {
+			const logoLine = showLogo ? (this.logoRaw[index] ?? "") : "";
+			const logo = showLogo
+				? theme.fg("text", logoLine) + " ".repeat(this.logoCanvasWidth - visibleWidth(logoLine) + this.gutter)
+				: "";
+			const metaIndex = index - metaStartIndex;
+			const metaLine = metaIndex >= 0 && metaIndex < metaLines.length ? metaLines[metaIndex] : "";
+			const content = truncateToWidth(logo + metaLine, contentWidth);
+			lines.push(
+				" ".repeat(paddingX) + content + " ".repeat(Math.max(0, safeWidth - paddingX - visibleWidth(content))),
+			);
+		}
 
 		if (this.verboseInstructions) {
 			lines.push(" ".repeat(safeWidth));
@@ -607,6 +623,9 @@ const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
 // evicted past the cap to keep a long session bounded.
 const MAX_PASTED_IMAGE_BYTES = 64 * 1024 * 1024;
 const INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT = 400;
+// Coalesce at most this many heartbeats_changed refreshes into one refresh
+// promise; sustained churn must not hold rebindCurrentSession in a drain loop.
+const HEARTBEAT_REFRESH_DRAIN_LIMIT = 25;
 
 function initialRenderMessages(messages: AgentMessage[]): AgentMessage[] {
 	if (messages.length <= INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT) {
@@ -936,6 +955,25 @@ export function formatAgentDepthLabel(depth: number | undefined, hasChildren: bo
 	return `depth ${depth}`;
 }
 
+/**
+ * Map a fixed verification category to user-readable wording. The persisted
+ * record keeps only the category; this layer adds the friendly explanation.
+ */
+const MCP_VERIFICATION_ISSUES: Record<string, string> = {
+	"http-unauthorized": "the endpoint rejected the stored credentials (reconnect)",
+	"verification-timeout": "the endpoint did not respond in time",
+	"network-unreachable": "the endpoint could not be reached",
+	"server-rejected-handshake": "the server rejected the MCP handshake",
+	"http-error": "the endpoint returned an HTTP error",
+	"invalid-response": "the endpoint returned an invalid MCP response",
+	"verification-failed": "the handshake could not be completed",
+	"credential-changed": "the stored credentials changed during verification",
+};
+
+function formatMcpVerificationIssue(category: string | undefined): string {
+	return MCP_VERIFICATION_ISSUES[category ?? ""] ?? "the endpoint did not complete an MCP handshake";
+}
+
 export class InteractiveMode {
 	private static readonly EXIT_HINT_DURATION_MS = 2000;
 	private static readonly ESCAPE_REPEAT_WINDOW_MS = 500;
@@ -951,7 +989,6 @@ export class InteractiveMode {
 	private statusContainer: Container;
 	private queuedMessagesContainer: Container;
 	private sideQuestionContainer: Container;
-	private featureHintContainer: Container;
 	private defaultEditor: CustomEditor;
 	private editor: EditorComponent;
 	private readonly promptStashStore: ClientPromptStashStore | undefined;
@@ -974,7 +1011,6 @@ export class InteractiveMode {
 	// Stored so the same manager can be injected into custom editors, selectors, and extension UI.
 	private keybindings: KeybindingsManager;
 	private version: string;
-	private readonly startHint = getRandomStartHint();
 	private isInitialized = false;
 	private journeyTelemetry?: TelemetryJourneys;
 	private installationReady?: Promise<void>;
@@ -988,6 +1024,7 @@ export class InteractiveMode {
 	private onboardingTelemetry?: TelemetryOnboardingAttempt;
 	private onboardingExitOutcome: "failed" | "canceled" = "canceled";
 	private onboardingValidationObserved = false;
+	private initializationPromise: Promise<void> | undefined;
 	private onInputCallback?: (text: string | undefined) => void;
 	private submittedInputBehavior: "steer" | "followUp" = "steer";
 	private latestEditorPromptStash: PromptStash | undefined;
@@ -998,6 +1035,7 @@ export class InteractiveMode {
 	private readonly retainedSubmissionGenerations = new WeakMap<PromptStash, number>();
 	private admitPendingStartupPrompts: (() => Promise<StartupPromptBarrierOutcome>) | undefined;
 	private agentsViewRequest: InteractiveModeRunResult["type"] | undefined;
+	private isReturningToAgentsView = false;
 	private loadingAnimation: Loader | undefined = undefined;
 	private workingMessage: string | undefined = undefined;
 	private workingVisible = true;
@@ -1006,14 +1044,6 @@ export class InteractiveMode {
 	// Start of the in-flight run; survives loader teardown so the elapsed display doesn't reset on re-entry.
 	private turnStartedAt: number | undefined = undefined;
 	private workingTimer: NodeJS.Timeout | undefined = undefined;
-	private readonly featureHintDeck = new FeatureHintDeck();
-	private currentFeatureHint: string | undefined;
-	private featureHintEligibleAt = 0;
-	private featureHintTimer: NodeJS.Timeout | undefined;
-	private featureHintAnimationTimer: NodeJS.Timeout | undefined;
-	private featureHintComponent: FeatureHintComponent | undefined;
-	private featureHintRunPending = false;
-	private featureHintSuppressedByQueue = false;
 	private pulseTimer: NodeJS.Timeout | undefined = undefined;
 	private pulseFrame = 0;
 	private readonly activityTracker = new AgentActivityTracker();
@@ -1022,8 +1052,6 @@ export class InteractiveMode {
 	private contextUsageTokenBaseline = 0;
 	// Refresh ordering: a stale failure must never clobber a newer success.
 	private contextUsageRefresh = { generation: 0, lastSuccessGeneration: 0 };
-	private readonly defaultHiddenThinkingLabel = "Thinking...";
-	private hiddenThinkingLabel = this.defaultHiddenThinkingLabel;
 
 	private ctrlCExitHintExpiresAt = 0;
 	private ctrlCExitHintTimer: ReturnType<typeof setTimeout> | undefined = undefined;
@@ -1062,6 +1090,9 @@ export class InteractiveMode {
 
 	// Serializes session event handling; see subscribeToAgent
 	private sessionEventQueue: Promise<void> = Promise.resolve();
+	// The in-flight initial transcript render, if any. Session resync/replacement
+	// renders await it so they never interleave with a half-built transcript.
+	private initialRenderPromise: Promise<void> | undefined = undefined;
 	private sessionEventGeneration = 0;
 	private fastModeToggleQueue: Promise<void> = Promise.resolve();
 
@@ -1081,10 +1112,9 @@ export class InteractiveMode {
 	private rosterBar: { summaries(): SessionSummary[]; dispose(): Promise<void> } | undefined;
 
 	private toolOutputExpanded = false;
-	private agentMessagesExpanded = false;
 	private editDiffsExpanded = false;
 
-	private hideThinkingBlock = false;
+	private hideThinkingBlock = true;
 	private readonly mermaidMarkdownTransform = createMermaidMarkdownTransform({
 		getMode: () => this.settingsManager.getMermaidRenderingMode(),
 		theme,
@@ -1097,6 +1127,9 @@ export class InteractiveMode {
 	private connectionModelsFetchedAt = 0;
 	private connectionModelsRefreshVersion = 0;
 	private connectionModelsRefreshInFlight: { version: number; promise: Promise<AgentConnectionModel[]> } | undefined;
+	private closeConfigurationMenu: (() => void) | undefined;
+	private closeServiceCatalogPicker: (() => void) | undefined;
+	private configurationModelSelection: Promise<void> | undefined;
 	private connectionState: AgentConnectionState | undefined;
 	private connectionResourceSnapshot: AgentConnectionResourceSnapshot | undefined;
 	private heartbeatCatalog: AgentConnectionHeartbeat[] = [];
@@ -1116,6 +1149,9 @@ export class InteractiveMode {
 	private nextImageMarkerId = 1;
 
 	private unsubscribe?: () => void;
+	private mcpConnectionStore?: McpConnectionStore;
+	/** MCP changes made while streaming/compacting; activated at the next safe boundary. */
+	private pendingPostRunActivation: { message: string; successMessage: string } | undefined;
 	private signalCleanupHandlers: Array<() => void> = [];
 
 	private autoCompactionLoader: Loader | undefined = undefined;
@@ -1223,7 +1259,6 @@ export class InteractiveMode {
 		});
 		this.queuedMessagesContainer = new Container();
 		this.sideQuestionContainer = new Container();
-		this.featureHintContainer = new Container();
 		this.widgetContainerAbove = new Container();
 		this.widgetContainerBelow = new Container();
 		this.recapContainer = new Container();
@@ -1235,8 +1270,6 @@ export class InteractiveMode {
 			paddingX: editorPaddingX,
 			autocompleteMaxVisible,
 			isArgumentCommand: builtinSlashCommandTakesArgument,
-			placeholder: this.startHint,
-			placeholderColor: (text) => theme.fg("dim", text),
 		});
 		this.editor = this.defaultEditor;
 		this.mainContainer = new Container();
@@ -1253,6 +1286,7 @@ export class InteractiveMode {
 			() => this.getTrayLocationLabel(),
 			() => this.getTrayContextLabel(),
 			() => this.getTrayOverrideLabel(),
+			() => this.isInlinePickerOpen(),
 		);
 		this.subagentSummaryLine.setOpenable(this.options.returnToAgentsView === true);
 		this.subagentSummaryLine.onOpen = () => void this.openScopedAgentsView();
@@ -1262,8 +1296,6 @@ export class InteractiveMode {
 		this.footer = new FooterComponent(this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(this.settingsManager.getCompactionEnabled());
 		this.setGoalAnnouncementBaseline(emptyGoalState());
-
-		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
 
 		setRegisteredThemes(this.uiServices.getThemes());
 		initTheme(this.settingsManager.getTheme(), true);
@@ -1477,7 +1509,7 @@ export class InteractiveMode {
 			aliases: command.aliases,
 			description: command.description,
 			argumentHint: command.argumentHint,
-			takesArgument: command.takesArgument,
+			takesArgument: command.takesArgument === true,
 		}));
 
 		const modelCommand = slashCommands.find((command) => command.name === "model");
@@ -1573,18 +1605,15 @@ export class InteractiveMode {
 		// fd powers autocomplete, and rg is available for shell commands.
 		const [fdPath, rgResult] = await Promise.all([ensureTool("fd"), ensureToolWithStatus("rg")]);
 		this.fdPath = fdPath;
-		if (rgResult.status === "unavailable") {
-			this.showWarning(formatMissingRipgrepMessage(rgResult));
-		}
 
 		this.ui.addChild(this.headerContainer);
 
-		// Brand splash: side-panel layout with structured runtime metadata on the right.
+		// Compact butterfly beside runtime metadata.
 		// The model/cwd are read through live getters, so they fill in once the
 		// connection state loads (rebindCurrentSession below). Onboarding, when
 		// required, renders as a full-screen overlay on top of this header.
 		if (this.options.verbose || !this.settingsManager.getQuietStartup()) {
-			// Verbose: include the full keybinding cheatsheet under the brand mark.
+			// Verbose: include the full keybinding cheatsheet below the header.
 			const hint = (keybinding: AppKeybinding, description: string) => keyHint(keybinding, description);
 			const verboseInstructions = this.options.verbose
 				? [
@@ -1596,10 +1625,7 @@ export class InteractiveMode {
 						keyHint("tui.editor.deleteToLineEnd", "to delete to end"),
 						rawKeyHint("/effort", "to set thinking level"),
 						hint("app.model.select", "to select model"),
-						hint("app.tools.expand", "to expand tools"),
-						hint("app.messages.expand", "to expand agent messages"),
-						hint("app.edits.expand", "to expand edit diffs"),
-						hint("app.thinking.toggle", "to expand thinking"),
+						hint("app.tools.expand", "to cycle conversation detail"),
 						hint("app.subagents.focus", "to inspect subagents"),
 						hint("app.editor.external", "for external editor"),
 						hint("app.prompt.stash", "to stash prompt"),
@@ -1610,17 +1636,10 @@ export class InteractiveMode {
 						rawKeyHint("drop files", "to attach"),
 					].join("\n")
 				: undefined;
-			this.builtInHeader = new BrandSplashHeader(
-				this.version,
-				() => this.getCurrentModelId(),
-				() => this.getCurrentCwd(),
-				verboseInstructions,
-				{
-					topPadding: true,
-					getHideStartHint: () => !this.isNewChat(),
-					getStartHint: () => this.startHint,
-				},
-			);
+			this.builtInHeader = new BrandSplashHeader(this.version, () => this.getCurrentCwd(), verboseInstructions, {
+				topPadding: true,
+				getModelId: () => this.getCurrentModelId(),
+			});
 			this.headerContainer.addChild(this.builtInHeader);
 			this.headerContainer.addChild(new Spacer(1));
 		} else {
@@ -1630,12 +1649,13 @@ export class InteractiveMode {
 		}
 
 		this.mainContainer.addChild(this.mainViewContainer);
-		this.renderWidgets(); // Initialize with default spacer
+		this.renderWidgets();
 		this.mainContainer.addChild(this.widgetContainerAbove);
 		this.renderRecap();
 		for (const container of this.getPromptContextContainers()) {
 			this.mainContainer.addChild(container);
 		}
+		this.mainContainer.addChild(this.recapContainer);
 		this.mainContainer.addChild(this.editorContainer);
 		this.mainContainer.addChild(this.subagentSummaryLine);
 		this.mainContainer.addChild(this.widgetContainerBelow);
@@ -1662,6 +1682,9 @@ export class InteractiveMode {
 		await this.rebindCurrentSession();
 
 		await this.renderInitialMessages();
+		if (rgResult.status === "unavailable") {
+			this.showWarning(formatMissingRipgrepMessage(rgResult));
+		}
 
 		onThemeChange(() => {
 			this.ui.invalidate();
@@ -1701,7 +1724,8 @@ export class InteractiveMode {
 	}
 
 	async run(): Promise<InteractiveModeRunResult> {
-		await this.init();
+		this.initializationPromise = this.init();
+		await this.initializationPromise;
 		this.restorePromptStashOnOpen();
 
 		// Global, environment-scoped notices (app update, extension updates, tmux setup)
@@ -1875,14 +1899,16 @@ export class InteractiveMode {
 			}
 		};
 
-		await this.runStartupOnboarding();
-		showDeferredStartupNotifications();
-		showModelFallbackWarning();
-		void this.maybeWarnAboutAnthropicSubscriptionAuth();
-		void deliverStartupPrompts().then(
-			() => settleStartupPrompts("admitted"),
-			() => settleStartupPrompts("admitted"),
-		);
+		if (!this.isShuttingDown && !this.isReturningToAgentsView) {
+			await this.runStartupOnboarding();
+			showDeferredStartupNotifications();
+			showModelFallbackWarning();
+			void this.maybeWarnAboutAnthropicSubscriptionAuth();
+			void deliverStartupPrompts().then(
+				() => settleStartupPrompts("admitted"),
+				() => settleStartupPrompts("admitted"),
+			);
+		}
 
 		// Enter/Alt+Enter submit directly through AgentConnection. Wait for the
 		// lifecycle signal exactly once; a returned editor value has already been
@@ -1972,10 +1998,15 @@ export class InteractiveMode {
 		const showPrimeCliSplash = this.shouldRunPrimeCliOnboardingSplash();
 		let outcome: TelemetryOnboardingOutcome = "aborted";
 		try {
-			this.markOnboardingShown();
-			await this.settingsManager.flush();
 			await this.runOnboardingFlow(showPrimeCliSplash);
 			outcome = isOnboardingModelReady(this.getOnboardingState()) ? "success" : "aborted";
+			if (outcome === "success") {
+				// Only a completed onboarding counts as seen: an escaped splash or a
+				// failed login leaves the flag unset so the next launch retries, and
+				// shouldRunOnboarding already skips users who configured a model.
+				this.markOnboardingShown();
+				await this.settingsManager.flush();
+			}
 			return true;
 		} catch (error) {
 			outcome = "error";
@@ -2024,11 +2055,8 @@ export class InteractiveMode {
 	}
 
 	private async showOnboardingModelSelection(splash: OnboardingSplashHandle): Promise<void> {
-		try {
-			await this.showConfigurationMenu("models");
-		} finally {
-			splash.dismiss();
-		}
+		splash.dismiss();
+		await this.showConfigurationMenu("models");
 	}
 
 	private async runOnboardingFlow(showPrimeCliSplash = this.shouldRunPrimeCliOnboardingSplash()): Promise<void> {
@@ -2761,7 +2789,6 @@ export class InteractiveMode {
 
 		const extensionRunner = localSessionHost.getExtensionRunner();
 		this.setupExtensionShortcuts(extensionRunner);
-		this.showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true });
 	}
 
 	private applyRuntimeSettings(): void {
@@ -2769,7 +2796,6 @@ export class InteractiveMode {
 			this.connectionState?.autoCompactionEnabled ?? this.settingsManager.getCompactionEnabled(),
 		);
 		this.footerDataProvider.setCwd(this.getCurrentCwd());
-		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
 		this.ui.setShowHardwareCursor(this.settingsManager.getShowHardwareCursor());
 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
 		const editorPaddingX = this.settingsManager.getEditorPaddingX();
@@ -2811,15 +2837,24 @@ export class InteractiveMode {
 		}
 		const connection = this.agentConnection;
 		const refresh = (async () => {
-			do {
+			// Bound the drain loop: sustained heartbeats_changed churn must not
+			// starve an awaiting rebind (and its transcript render) indefinitely.
+			for (let drain = 0; drain <= HEARTBEAT_REFRESH_DRAIN_LIMIT; drain++) {
 				this.heartbeatRefreshRequested = false;
 				const heartbeats = await connection.listHeartbeats();
-				if (this.agentConnection !== connection) return;
+				if (this.isShuttingDown || this.isReturningToAgentsView || this.agentConnection !== connection) return;
 				this.applyHeartbeatCatalog(heartbeats);
-			} while (this.heartbeatRefreshRequested);
+				if (!this.heartbeatRefreshRequested) return;
+			}
 		})().finally(() => {
 			if (this.heartbeatRefreshPromise === refresh) {
 				this.heartbeatRefreshPromise = undefined;
+				// The drain bound was hit with a newer heartbeats_changed
+				// pending: schedule the follow-up refresh so the catalog
+				// converges instead of staying stale until the next event.
+				if (this.heartbeatRefreshRequested) {
+					void this.refreshHeartbeatCatalog().catch(() => undefined);
+				}
 			}
 		});
 		this.heartbeatRefreshPromise = refresh;
@@ -2929,6 +2964,7 @@ export class InteractiveMode {
 			}
 			case "agent_end":
 				this.patchConnectionState({ isStreaming: false, activeToolNames: [] });
+				void this.maybeRunQueuedMcpActivation();
 				break;
 			case "session_action_update":
 				this.patchConnectionState({ sessionActions: event.actions });
@@ -2939,6 +2975,7 @@ export class InteractiveMode {
 				break;
 			case "compaction_end":
 				this.patchConnectionState({ isCompacting: false });
+				void this.maybeRunQueuedMcpActivation();
 				break;
 			case "session_info_changed":
 				this.patchConnectionState({ sessionName: event.name });
@@ -3072,17 +3109,31 @@ export class InteractiveMode {
 			await this.bindCurrentSessionExtensions();
 		} else {
 			setRegisteredThemes(this.uiServices.getThemes());
-			await this.refreshConnectionCatalog();
+			// Best-effort: the catalog enriches the composer (commands, models,
+			// resources). A transient control-plane failure must not abort the
+			// rebind and leave the transcript unrendered.
+			try {
+				await this.refreshConnectionCatalog();
+			} catch {
+				// Keep the previous catalog; reconnects re-fetch it.
+			}
 			this.setupAutocompleteProvider();
-			this.showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true });
 		}
 		this.subscribeToAgent();
 		await this.subscribeToRosterBar();
 		// A session_action_update in the unsubscribed gap above is lost; re-sync the queue post-subscription.
-		this.patchConnectionState({ sessionActions: (await this.agentConnection.getState()).sessionActions });
+		// Best-effort: a transient control-plane failure must not abort the
+		// rebind and leave the transcript unrendered.
+		try {
+			this.patchConnectionState({ sessionActions: (await this.agentConnection.getState()).sessionActions });
+		} catch {
+			// Keep the attached snapshot's session actions; the next connection
+			// state update re-syncs them.
+		}
 		this.refreshQueueSelectionFromState();
 		this.updatePendingMessagesDisplay();
-		await this.refreshHeartbeatCatalog().catch(() => undefined);
+		// Optional tray metadata must not delay opening or leaving a chat.
+		void this.refreshHeartbeatCatalog().catch(() => undefined);
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
 		this.updateTerminalTitle();
@@ -3106,7 +3157,6 @@ export class InteractiveMode {
 	}
 
 	private resetCurrentSessionRenderState(options?: { clearPromptStash?: boolean }): void {
-		this.endFeatureHintRun();
 		this.chatContainer.clear();
 		this.shortcutGuideContainer.clear();
 		this.pendingMessagesContainer.clear();
@@ -3116,7 +3166,6 @@ export class InteractiveMode {
 		// The selection and its stashed draft belong to the previous session;
 		// every editor draft is cleared below, so discard rather than restore.
 		this.queueSelection.reset();
-		this.featureHintSuppressedByQueue = false;
 		if (options?.clearPromptStash) {
 			this.promptStash = undefined;
 			if (this.promptStashState) this.promptStashState.queuedStashes = undefined;
@@ -3195,6 +3244,7 @@ export class InteractiveMode {
 		await this.renderSessionContext(this.getSessionContextFromConnectionSnapshot(snapshot), {
 			clearChat: true,
 			updateFooter: true,
+			limitTranscript: true,
 		});
 		await this.restoreStreamingMessageFromSnapshot(snapshot.streamingMessage);
 		this.updatePendingMessagesDisplay();
@@ -3282,19 +3332,20 @@ export class InteractiveMode {
 				return componentAfterLoad;
 			}
 
+			const spacing = createConversationSpacing(this.chatContainer.children);
 			const component = new ToolExecutionComponent(
 				latestToolCall.name,
 				latestToolCall.id,
 				latestToolCall.arguments,
 				{
 					showImages: this.settingsManager.getShowImages(),
+					shouldAddLeadingSpace: () => spacing.shouldAddLeadingSpace(true),
 				},
 				toolDefinition,
 				this.ui,
 				this.getCurrentCwd(),
 			);
 			component.setExpanded(this.toolOutputExpanded);
-			component.setAgentMessagesExpanded(this.agentMessagesExpanded);
 			component.setEditDiffsExpanded(this.editDiffsExpanded);
 			if (this.startedToolCalls.has(latestToolCall.id)) {
 				component.markExecutionStarted();
@@ -3362,7 +3413,8 @@ export class InteractiveMode {
 		if (shortcuts.size === 0) return;
 
 		const localSessionHost = this.getLocalSessionHost();
-		const createContext = (): ExtensionContext => ({
+		const createContext = (ownerPath: string): ExtensionContext => ({
+			...extensionRunner.createTimerBindings(ownerPath),
 			ui: this.createExtensionUIContext(),
 			hasUI: true,
 			cwd: this.getCurrentCwd(),
@@ -3394,7 +3446,7 @@ export class InteractiveMode {
 		this.defaultEditor.onExtensionShortcut = (data: string) => {
 			for (const [shortcutStr, shortcut] of shortcuts) {
 				if (matchesKey(data, shortcutStr as KeyId)) {
-					Promise.resolve(shortcut.handler(createContext())).catch((err) => {
+					Promise.resolve(shortcut.handler(createContext(shortcut.extensionPath))).catch((err) => {
 						this.showError(`Shortcut handler error: ${err instanceof Error ? err.message : String(err)}`);
 					});
 					return true;
@@ -3500,11 +3552,9 @@ export class InteractiveMode {
 		this.loadingAnimation = this.createWorkingLoader();
 		this.statusContainer.addChild(this.loadingAnimation);
 		this.startWorkingTimer();
-		this.startFeatureHintPresentation();
 	}
 
 	private stopWorkingLoader(): void {
-		this.clearFeatureHintPresentation();
 		if (this.workingTimer) {
 			clearInterval(this.workingTimer);
 			this.workingTimer = undefined;
@@ -3517,114 +3567,12 @@ export class InteractiveMode {
 		this.statusContainer.clear();
 	}
 
-	private startFeatureHintPresentation(): void {
-		this.clearFeatureHintPresentation();
-		if (this.shouldSuppressFeatureHint()) {
-			return;
-		}
-		if (this.featureHintEligibleAt === 0) {
-			this.featureHintEligibleAt = Date.now() + FEATURE_HINT_DELAY_MS;
-		}
-		const delay = Math.max(0, this.featureHintEligibleAt - Date.now());
-		if (delay === 0) {
-			this.showFeatureHint();
-			return;
-		}
-		this.featureHintTimer = setTimeout(() => {
-			this.featureHintTimer = undefined;
-			this.showFeatureHint();
-		}, delay);
-		this.featureHintTimer.unref?.();
-	}
-
-	private showFeatureHint(): void {
-		if (
-			this.shouldSuppressFeatureHint() ||
-			!this.loadingAnimation ||
-			!this.shouldShowWorkingLoader() ||
-			!this.statusContainer.children.includes(this.loadingAnimation)
-		) {
-			return;
-		}
-		if (!this.currentFeatureHint) {
-			const hint = this.featureHintDeck.next({
-				getKeybinding: (action) => {
-					const key = keyText(action);
-					return key ? this.capitalizeKey(key) : undefined;
-				},
-				isResidentSession: this.options.returnToAgentsView === true,
-			});
-			this.currentFeatureHint = hint?.text;
-		}
-		if (!this.currentFeatureHint) {
-			return;
-		}
-		this.featureHintComponent = new FeatureHintComponent(this.currentFeatureHint);
-		this.featureHintContainer.addChild(this.featureHintComponent);
-		this.renderRecap();
-		this.featureHintAnimationTimer = setInterval(() => {
-			this.featureHintComponent?.advance();
-			this.ui.requestRender();
-		}, FEATURE_HINT_ANIMATION_INTERVAL_MS);
-		this.featureHintAnimationTimer.unref?.();
-		this.ui.requestRender();
-	}
-
-	private clearFeatureHintPresentation(): void {
-		if (this.featureHintTimer) {
-			clearTimeout(this.featureHintTimer);
-			this.featureHintTimer = undefined;
-		}
-		if (this.featureHintAnimationTimer) {
-			clearInterval(this.featureHintAnimationTimer);
-			this.featureHintAnimationTimer = undefined;
-		}
-		if (this.featureHintComponent) {
-			this.featureHintContainer.removeChild(this.featureHintComponent);
-			this.featureHintComponent = undefined;
-			this.renderRecap();
-		}
-	}
-
-	private resumeFeatureHintPresentation(): void {
-		if (
-			!this.shouldSuppressFeatureHint() &&
-			this.loadingAnimation &&
-			this.shouldShowWorkingLoader() &&
-			this.statusContainer.children.includes(this.loadingAnimation)
-		) {
-			this.startFeatureHintPresentation();
-		}
-	}
-
-	private shouldSuppressFeatureHint(): boolean {
-		const { steering, followUp } = this.getAllQueuedMessages();
-		return steering.length > 0 || followUp.length > 0;
-	}
-
-	private endFeatureHintRun(): void {
-		this.clearFeatureHintPresentation();
-		this.currentFeatureHint = undefined;
-		this.featureHintEligibleAt = 0;
-		this.featureHintRunPending = false;
-	}
-
-	private prepareFeatureHintRun(message: AgentMessage): void {
-		if (!this.featureHintRunPending) return;
-		if (message.role === "assistant") {
-			this.featureHintRunPending = false;
-			return;
-		}
-		if (!startsAgentRun(message)) return;
-
-		this.endFeatureHintRun();
-		if (this.shouldShowWorkingLoader()) {
-			this.startFeatureHintPresentation();
-		}
-	}
-
 	private updateWorkingPulse(): void {
-		const active = this.isAgentStreaming();
+		const active =
+			this.isAgentStreaming() ||
+			this.chatContainer.children.some(
+				(component) => component instanceof ToolExecutionComponent && component.hasRunningBackgroundShell(),
+			);
 		if (!active) {
 			this.stopWorkingPulse();
 			return;
@@ -3636,6 +3584,7 @@ export class InteractiveMode {
 	}
 
 	private tickWorkingPulse(): void {
+		this.updateWorkingPulse();
 		this.pulseFrame += 1;
 		setWorkingPulseFrame(this.pulseFrame);
 		this.ui.requestRender();
@@ -3767,17 +3716,8 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	private setHiddenThinkingLabel(label?: string): void {
-		this.hiddenThinkingLabel = label ?? this.defaultHiddenThinkingLabel;
-		for (const child of this.chatContainer.children) {
-			if (child instanceof AssistantMessageComponent) {
-				child.setHiddenThinkingLabel(this.hiddenThinkingLabel);
-			}
-		}
-		if (this.streamingComponent) {
-			this.streamingComponent.setHiddenThinkingLabel(this.hiddenThinkingLabel);
-		}
-		this.ui.requestRender();
+	private setHiddenThinkingLabel(_label?: string): void {
+		// Retain the extension/daemon UI hook; conversation thinking no longer has a heading.
 	}
 
 	private setExtensionWidget(
@@ -3833,6 +3773,8 @@ export class InteractiveMode {
 	}
 
 	private resetExtensionUI(): void {
+		this.closeConfigurationMenu?.();
+		this.closeServiceCatalogPicker?.();
 		this.cancelActiveConnectionExtensionUiRequests();
 		this.closeHeartbeatManager();
 		if (this.extensionSelector) {
@@ -3862,49 +3804,43 @@ export class InteractiveMode {
 		if (this.loadingAnimation) {
 			this.updateWorkingLoaderMessage();
 		}
-		this.setHiddenThinkingLabel();
 	}
 
 	private static readonly MAX_WIDGET_LINES = 10;
 
 	private renderWidgets(): void {
 		if (!this.widgetContainerAbove || !this.widgetContainerBelow) return;
-		this.renderWidgetContainer(this.widgetContainerAbove, this.extensionWidgetsAbove, true, true);
-		this.renderWidgetContainer(this.widgetContainerBelow, this.extensionWidgetsBelow, false, false);
+		this.renderWidgetContainer(this.widgetContainerAbove, this.extensionWidgetsAbove, true);
+		this.renderWidgetContainer(this.widgetContainerBelow, this.extensionWidgetsBelow, false);
 		this.ui.requestRender();
 	}
 
 	private renderRecap(): void {
 		if (!this.recapContainer) return;
 		this.recapContainer.clear();
-		const recap = this.sessionRecap?.trim();
 		const showChanges = !this.isAgentStreaming() && this.agentRunFileChanges.size > 0;
 		if (showChanges) {
 			this.recapContainer.addChild(
 				new TruncatedText(formatTotalChangeSummary([...this.agentRunFileChanges.values()]), 1, 0),
 			);
 		}
-		if (recap) {
-			this.recapContainer.addChild(new TruncatedText(theme.fg("dim", `Recap: ${recap}`), 1, 0));
-		}
-		if ((recap || showChanges) && !this.featureHintComponent) {
-			this.recapContainer.addChild(new Spacer(1));
-		}
+		this.recapContainer.addChild(
+			new PromptContextLine(
+				() => this.sessionRecap,
+				(maxWidth) => this.getPromptContextLabel(maxWidth),
+			),
+		);
 		this.ui.requestRender();
 	}
 
 	private renderWidgetContainer(
 		container: Container,
 		widgets: Map<string, Component & { dispose?(): void }>,
-		spacerWhenEmpty: boolean,
 		leadingSpacer: boolean,
 	): void {
 		container.clear();
 
 		if (widgets.size === 0) {
-			if (spacerWhenEmpty) {
-				container.addChild(new Spacer(1));
-			}
 			return;
 		}
 
@@ -4436,10 +4372,9 @@ export class InteractiveMode {
 			void this.handleDebugCommand();
 		};
 		this.defaultEditor.onAction("app.model.select", () => this.showModelSelector());
+		this.defaultEditor.onAction("app.model.cycleForward", () => this.handleModelCycle("forward"));
+		this.defaultEditor.onAction("app.model.cycleBackward", () => this.handleModelCycle("backward"));
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
-		this.defaultEditor.onAction("app.messages.expand", () => this.toggleAgentMessageExpansion());
-		this.defaultEditor.onAction("app.edits.expand", () => this.toggleEditDiffExpansion());
-		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
 		this.defaultEditor.onAction("app.subagents.focus", () => this.focusSubagentSummary());
 		this.defaultEditor.onAction("app.heartbeats.open", () => {
 			void this.showHeartbeatManager();
@@ -4768,6 +4703,7 @@ export class InteractiveMode {
 			this.sideQuestionComponent.addTurn(event);
 		} else {
 			this.sideQuestionComponent = new SideQuestionComponent(event, this.settingsManager.getEditorPaddingX());
+			this.sideQuestionComponent.setExpanded(this.toolOutputExpanded);
 			this.sideQuestionContainer.addChild(new Spacer(1));
 			this.sideQuestionContainer.addChild(this.sideQuestionComponent);
 		}
@@ -4964,12 +4900,22 @@ export class InteractiveMode {
 					await this.handleSideQuestion(commandArgs);
 					return;
 				}
-				if (commandName === "settings" && !commandArgs) {
+				if (commandName === "settings") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /settings");
+						return;
+					}
 					await this.showSettingsSelector();
 					this.editor.setText("");
 					return;
 				}
-				if (commandName === "scoped-models" && !commandArgs) {
+				if (commandName === "scoped-models") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /scoped-models");
+						return;
+					}
 					this.editor.setText("");
 					await this.showModelsSelector();
 					return;
@@ -5009,12 +4955,22 @@ export class InteractiveMode {
 					this.editor.setText("");
 					return;
 				}
-				if (commandName === "share" && !commandArgs) {
+				if (commandName === "share") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /share");
+						return;
+					}
 					await this.handleShareCommand();
 					this.editor.setText("");
 					return;
 				}
-				if (commandName === "copy" && !commandArgs) {
+				if (commandName === "copy") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /copy");
+						return;
+					}
 					await this.handleCopyCommand();
 					this.editor.setText("");
 					return;
@@ -5029,13 +4985,23 @@ export class InteractiveMode {
 					await this.handleRlmMaxDepthCommand(commandArgs);
 					return;
 				}
-				if (commandName === "session" && !commandArgs) {
+				if (commandName === "session") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /session");
+						return;
+					}
 					this.echoLocalCommand(text);
 					await this.handleSessionCommand();
 					this.editor.setText("");
 					return;
 				}
-				if (commandName === "system-prompt" && !commandArgs) {
+				if (commandName === "system-prompt") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /system-prompt");
+						return;
+					}
 					this.echoLocalCommand(text);
 					await this.handleSystemPromptCommand();
 					this.editor.setText("");
@@ -5046,13 +5012,23 @@ export class InteractiveMode {
 					this.editor.setText("");
 					return;
 				}
-				if (commandName === "context" && !commandArgs) {
+				if (commandName === "context") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /context");
+						return;
+					}
 					this.echoLocalCommand(text);
 					await this.handleContextCommand();
 					this.editor.setText("");
 					return;
 				}
-				if (commandName === "logs" && !commandArgs) {
+				if (commandName === "logs") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /logs");
+						return;
+					}
 					this.echoLocalCommand(text);
 					this.handleLogsCommand();
 					this.editor.setText("");
@@ -5064,44 +5040,84 @@ export class InteractiveMode {
 					return;
 				}
 				if (commandName === "heartbeats") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /heartbeats");
+						return;
+					}
 					this.editor.setText("");
 					await this.showHeartbeatManager();
 					return;
 				}
-				if (commandName === "changelog" && !commandArgs) {
+				if (commandName === "changelog") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /changelog");
+						return;
+					}
 					this.echoLocalCommand(text);
 					this.handleChangelogCommand();
 					this.editor.setText("");
 					return;
 				}
-				if (commandName === "hotkeys" && !commandArgs) {
+				if (commandName === "hotkeys") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /hotkeys");
+						return;
+					}
 					this.echoLocalCommand(text);
 					this.handleHotkeysCommand();
 					this.editor.setText("");
 					return;
 				}
-				if (commandName === "fork" && !commandArgs) {
+				if (commandName === "fork") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /fork");
+						return;
+					}
 					this.editor.setText("");
 					await this.showUserMessageSelector();
 					return;
 				}
-				if (commandName === "clone" && !commandArgs) {
+				if (commandName === "clone") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /clone");
+						return;
+					}
 					this.editor.setText("");
 					await this.handleCloneCommand();
 					return;
 				}
-				if (commandName === "tree" && !commandArgs) {
+				if (commandName === "tree") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /tree");
+						return;
+					}
 					this.editor.setText("");
 					restorePromptStashAfterSubmit = false;
 					await this.showTreeSelector();
 					return;
 				}
-				if (commandName === "login" && !commandArgs) {
+				if (commandName === "login") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /login");
+						return;
+					}
 					this.editor.setText("");
 					await this.showConfigurationMenu("providers");
 					return;
 				}
-				if (commandName === "logout" && !commandArgs) {
+				if (commandName === "logout") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /logout");
+						return;
+					}
 					this.editor.setText("");
 					await this.showLogoutSelector();
 					return;
@@ -5109,6 +5125,11 @@ export class InteractiveMode {
 				if (commandName === "mcp") {
 					this.editor.setText("");
 					await this.handleMcpCommand(commandArgs);
+					return;
+				}
+				if (commandName === "plugins") {
+					this.editor.setText("");
+					await this.handlePluginsCommand(commandArgs);
 					return;
 				}
 				if (slashCommand?.name === "clear") {
@@ -5139,7 +5160,12 @@ export class InteractiveMode {
 					await this.handleResumeCommand(commandArgs);
 					return;
 				}
-				if (commandName === "reload" && !commandArgs) {
+				if (commandName === "reload") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /reload");
+						return;
+					}
 					this.editor.setText("");
 					await this.handleReloadCommand();
 					return;
@@ -5168,7 +5194,12 @@ export class InteractiveMode {
 					this.setFullscreenMode(enable);
 					return;
 				}
-				if (commandName === "debug" && !commandArgs) {
+				if (commandName === "debug") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /debug");
+						return;
+					}
 					await this.handleDebugCommand();
 					this.editor.setText("");
 					return;
@@ -5316,6 +5347,7 @@ export class InteractiveMode {
 				if (
 					submissionOutcome === "lifecycle-cancelled" ||
 					this.isShuttingDown ||
+					this.isReturningToAgentsView ||
 					this.agentsViewRequest ||
 					this.promptStashSessionId !== submissionSessionId
 				) {
@@ -5343,6 +5375,7 @@ export class InteractiveMode {
 					const rejectedDraft = submittedDraft ?? { text };
 					const canRestore =
 						!this.isShuttingDown &&
+						!this.isReturningToAgentsView &&
 						!this.agentsViewRequest &&
 						submissionGeneration === this.inputSubmissionGeneration &&
 						this.editor.getText().length === 0;
@@ -5366,7 +5399,7 @@ export class InteractiveMode {
 				this.updatePendingMessagesDisplay();
 				this.ui.requestRender();
 			} finally {
-				if (this.isShuttingDown || this.agentsViewRequest) {
+				if (this.isShuttingDown || this.isReturningToAgentsView || this.agentsViewRequest) {
 					submissionOutcome = "lifecycle-cancelled";
 				}
 				if (
@@ -5415,6 +5448,10 @@ export class InteractiveMode {
 					const generation = ++this.sessionEventGeneration;
 					const run = this.sessionEventQueue.then(async () => {
 						if (generation !== this.sessionEventGeneration) return;
+						// Let an in-flight initial render finish before clearing the
+						// chat for the new session.
+						await this.initialRenderPromise?.catch(() => undefined);
+						if (generation !== this.sessionEventGeneration) return;
 						this.resetSideQuestion();
 						this.resetExtensionUI();
 						this.applyConnectionStateSnapshot(event.state);
@@ -5430,6 +5467,10 @@ export class InteractiveMode {
 					const run = this.sessionEventQueue.then(async () => {
 						if (generation !== this.sessionEventGeneration) return false;
 						await this.refreshCommandCatalogForCurrentSession?.();
+						if (generation !== this.sessionEventGeneration) return false;
+						// Never rebuild the transcript while an initial render is
+						// mid-flight; queue behind it instead.
+						await this.initialRenderPromise?.catch(() => undefined);
 						if (generation !== this.sessionEventGeneration) return false;
 						await this.renderResyncedSession(event.snapshot);
 						return true;
@@ -5648,9 +5689,6 @@ export class InteractiveMode {
 		this.observeCancellationIdle();
 		// A new user message resets the activity tracker to 0, so the in-flight baseline must
 		// reset with it. (agent_start on auto-retry does not reset the tracker.)
-		if (event.type === "message_start") {
-			this.prepareFeatureHintRun(event.message);
-		}
 		if (event.type === "message_start" && (event.message.role === "user" || isAgentSessionMessage(event.message))) {
 			this.contextUsageTokenBaseline = 0;
 			this.clearShortcutGuide();
@@ -5662,7 +5700,6 @@ export class InteractiveMode {
 
 		switch (event.type) {
 			case "agent_start":
-				this.featureHintRunPending = this.getRetryAttempt() === 0;
 				this.resetPendingToolState();
 				this.renderRecap();
 				if (this.settingsManager.getShowTerminalProgress()) {
@@ -5728,6 +5765,7 @@ export class InteractiveMode {
 				const component = new BashExecutionComponent(event.command, this.ui, event.excludeFromContext, {
 					suppressLeadingSpace: this.chatContainer.children.at(-1) instanceof AgentMessageComponent,
 				});
+				component.setExpanded(this.toolOutputExpanded);
 				if (ownSideBash && this.sideQuestionComponent) {
 					// Same component as the main thread, mounted inside the pane.
 					this.sideQuestionComponent.addBash(component);
@@ -6002,8 +6040,19 @@ export class InteractiveMode {
 				this.stopWorkingLoader();
 				this.statusContainer.clear();
 				this.retryCountdown?.dispose();
-				const retryMessage = (seconds: number) =>
-					`Retrying (${event.attempt}/${event.maxAttempts}) in ${seconds}s... (${keyText("app.clear")} to cancel)`;
+				const cancelHint = `(${keyText("app.clear")} to cancel)`;
+				const retryMessage =
+					event.reason === "backup"
+						? () =>
+								`Primary model unavailable (${event.errorMessage}) — retrying on backup model ${event.backupModel ?? "unknown"}... ${cancelHint}`
+						: event.reason === "usage"
+							? (seconds: number) =>
+									`Waiting for provider usage to recover (${event.attempt}/${event.maxAttempts}), next check in ${seconds}s... ${cancelHint}`
+							: event.reason === "unavailable"
+								? (seconds: number) =>
+										`Waiting for provider to recover (${event.attempt}/${event.maxAttempts}), next check in ${seconds}s... ${cancelHint}`
+								: (seconds: number) =>
+										`Retrying (${event.attempt}/${event.maxAttempts}) in ${seconds}s... ${cancelHint}`;
 				this.retryLoader = new Loader(
 					this.ui,
 					(spinner) => theme.fg("muted", spinner),
@@ -6040,6 +6089,8 @@ export class InteractiveMode {
 				// Show error only on final failure (success shows normal response)
 				if (!event.success) {
 					this.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
+				} else if (event.restoredModel) {
+					this.showStatus(`Primary provider recovered — back on ${event.restoredModel}`);
 				}
 				this.ui.requestRender();
 				break;
@@ -6074,12 +6125,9 @@ export class InteractiveMode {
 			undefined,
 			this.hideThinkingBlock,
 			this.getMarkdownThemeWithSettings(),
-			this.hiddenThinkingLabel,
 			{
 				expanded: this.toolOutputExpanded,
-				precededByToolActivity:
-					this.chatContainer.children.at(-1) instanceof ToolExecutionComponent ||
-					this.chatContainer.children.at(-1) instanceof AgentMessageComponent,
+				precededByToolActivity: createConversationSpacing(this.chatContainer.children).precededByToolActivity,
 				mermaidTransform: this.mermaidMarkdownTransform,
 				cwd: this.getCurrentCwd(),
 			},
@@ -6284,7 +6332,7 @@ export class InteractiveMode {
 						sessionId: this.connectionState?.sessionId,
 						sessionFile: this.connectionState?.sessionFile,
 					})
-				: countDirectSubagentStatuses(this.subagentSnapshots.values(), this.rlmNodeId),
+				: countSubtreeSubagentStatuses(this.subagentSnapshots.values(), this.rlmNodeId),
 		);
 		if (!this.subagentSummaryLine.isSelectable() && this.subagentSummaryLine.focused) this.focusEditor();
 	}
@@ -6313,7 +6361,8 @@ export class InteractiveMode {
 	}
 
 	private focusSubagentSummary(): boolean {
-		if (!this.subagentSummaryLine.isSelectable() || this.getTrayOverrideLabel()) return false;
+		if (this.isInlinePickerOpen() || !this.subagentSummaryLine.isSelectable() || this.getTrayOverrideLabel())
+			return false;
 		this.ui.setFocus(this.subagentSummaryLine);
 		this.ui.requestRender();
 		return true;
@@ -6322,7 +6371,9 @@ export class InteractiveMode {
 	private async openScopedAgentsView(): Promise<void> {
 		if (!this.options.returnToAgentsView) {
 			this.focusEditor();
-			this.showStatus("The agents view needs the daemon; start without --no-daemon to browse sessions");
+			this.showStatus(
+				"The agents view needs a daemon-hosted session; start normally (without --no-session) to browse sessions",
+			);
 			return;
 		}
 		await this.returnToAgentsView("scoped_agents_view");
@@ -6333,24 +6384,23 @@ export class InteractiveMode {
 			this.toggleToolOutputExpansion();
 			return;
 		}
-		if (this.keybindings.matches(data, "app.messages.expand")) {
-			this.toggleAgentMessageExpansion();
-			return;
-		}
-		// A raw "\n" is a newline for the editor, not ctrl+j.
-		if (data !== "\n" && this.keybindings.matches(data, "app.edits.expand")) {
-			this.toggleEditDiffExpansion();
-			return;
-		}
-		if (this.keybindings.matches(data, "app.thinking.toggle")) {
-			this.toggleThinkingBlockVisibility();
-			return;
-		}
 		this.focusEditor();
 		this.editor.handleInput(data);
 	}
 
+	// Pickers mount either as overlays (model/provider/MCP menu) or in place of
+	// the editor (thinking, settings, and scoped-model selectors); the tray stays
+	// hidden while either surface is up. Autocomplete keeps focus in the editor.
+	private isInlinePickerOpen(): boolean {
+		const editorAutocomplete =
+			this.editor instanceof CustomEditor && this.editor.focused && this.editor.isShowingAutocomplete();
+		if (this.ui.hasOverlay() && !editorAutocomplete) return true;
+		const editorChild = this.editorContainer.children[0];
+		return editorChild !== undefined && editorChild !== this.editor;
+	}
+
 	private getTrayOverrideLabel(): string | undefined {
+		if (this.isInlinePickerOpen()) return undefined;
 		if (this.isCtrlCExitHintVisible()) {
 			const clearKey = keyText("app.clear");
 			return clearKey ? `Press ${clearKey} again to exit` : "Press again to exit";
@@ -6363,61 +6413,64 @@ export class InteractiveMode {
 	}
 
 	private getTrayLocationLabel(): string | undefined {
-		const modelLabel = this.getModelTrayLabel();
+		if (this.isInlinePickerOpen()) return undefined;
+		const sessionDepth = this.options.sessionDepth;
 		const hasChildren = this.options.sessionHasChildren === true || (this.subagentSnapshots?.size ?? 0) > 0;
-		const depthLabel = formatAgentDepthLabel(this.options.sessionDepth, hasChildren);
-		const shortcutsHint = this.getShortcutsTrayHint();
+		// Depth is subagent-session context: a root session (depth 0) never shows
+		// a depth label, even while its children run.
+		const depthLabel = sessionDepth ? formatAgentDepthLabel(sessionDepth, hasChildren) : undefined;
 		const agentsHint = this.getAgentsViewTrayHint();
-		return [agentsHint, depthLabel, modelLabel, shortcutsHint]
-			.filter((label): label is string => label !== undefined)
-			.join("  ");
-	}
-
-	private getShortcutsTrayHint(): string | undefined {
-		if (!this.isNewChat() || this.editor.getText().length > 0) {
-			return undefined;
-		}
-		return keyText("app.shortcuts") ? keyHint("app.shortcuts", "for shortcuts") : "/hotkeys for shortcuts";
+		return [agentsHint, depthLabel].filter((label): label is string => label !== undefined).join("  ");
 	}
 
 	private isNewChat(): boolean {
 		return (this.connectionState?.messageCount ?? 0) === 0 && this.connectionState?.isStreaming !== true;
 	}
 
-	private getModelTrayLabel(): string {
+	private getPromptContextLabel(maxWidth: number): string | undefined {
+		if (maxWidth < 1) return undefined;
+		return theme.fg(
+			"dim",
+			truncateToWidth(formatConversationDetailStatus(this.toolOutputExpanded, this.editDiffsExpanded), maxWidth, ""),
+		);
+	}
+
+	private getModelContextLabel(maxWidth = Number.MAX_SAFE_INTEGER): string | undefined {
+		if (maxWidth < 1) return undefined;
 		const model = this.getCurrentModel();
-		if (!model) {
-			return "—";
-		}
-		const parts = [model.name];
-		if (model.reasoning) {
-			const level = this.connectionState?.thinkingLevel ?? "off";
-			if (level !== "off") {
-				parts.push(level);
+		const parts: string[] = [];
+		if (model) {
+			const providerPrefix = `${model.provider}/`;
+			const modelId = model.id.startsWith(providerPrefix) ? model.id.slice(providerPrefix.length) : model.id;
+			const effort = model.reasoning ? this.connectionState?.thinkingLevel : undefined;
+			parts.push(effort ? `${modelId}:${effort.toLowerCase()}` : modelId);
+			if (this.connectionState?.serviceTier === "priority") {
+				parts.push("fast");
 			}
 		}
-		if (this.connectionState?.serviceTier === "priority") {
-			parts.push("fast");
+		const usage = this.getConnectionContextUsage();
+		if (usage && typeof usage.tokens === "number" && typeof usage.percent === "number") {
+			parts.push(`${formatTokenCount(usage.tokens)} (${Math.round(usage.percent)}%)`);
 		}
-		return parts.join(" • ");
+		if (parts.length === 0) return undefined;
+		return theme.fg("dim", truncateToWidth(parts.join(" · "), maxWidth, ""));
 	}
 
 	private getAgentsViewTrayHint(): string | undefined {
 		if (!this.options.returnToAgentsView) {
 			return undefined;
 		}
-		return keyHint("app.agents.back", "agents/resume");
+		return keyHint("app.agents.back", "manage");
 	}
 
 	private getTrayContextLabel(): string | undefined {
+		if (this.isInlinePickerOpen()) return undefined;
 		const goalLabel = this.getTrayGoalLabel();
 		const heartbeatLabel = this.getTrayHeartbeatLabel();
-		const usage = this.getConnectionContextUsage();
-		const contextLabel =
-			usage && typeof usage.tokens === "number" && typeof usage.percent === "number"
-				? `${formatTokenCount(usage.tokens)} (${Math.round(usage.percent)}%)`
-				: undefined;
-		return [goalLabel, heartbeatLabel, contextLabel].filter((label) => label !== undefined).join(" · ") || undefined;
+		return (
+			[goalLabel, heartbeatLabel, this.getModelContextLabel()].filter((label) => label !== undefined).join(" · ") ||
+			undefined
+		);
 	}
 
 	private getTrayHeartbeatLabel(): string | undefined {
@@ -6605,9 +6658,11 @@ export class InteractiveMode {
 		}
 		if (isAgentSessionMessage(message)) {
 			return new AgentMessageComponent(message, this.getMarkdownThemeWithSettings(), {
-				suppressLeadingSpace: isCompactAgentMessageNeighbor(this.chatContainer.children.at(-1)),
+				shouldAddLeadingSpace: createConversationSpacing(this.chatContainer.children).shouldAddLeadingSpace,
 			});
 		}
+		const shellCompletion = createShellCompletionComponent(message, this.chatContainer.children);
+		if (shellCompletion) return shellCompletion;
 		if (isInjectedPromptMessage(message)) {
 			return new InjectedPromptMessageComponent(message, this.getMarkdownThemeWithSettings());
 		}
@@ -6626,6 +6681,7 @@ export class InteractiveMode {
 				const component = new BashExecutionComponent(message.command, this.ui, message.excludeFromContext, {
 					suppressLeadingSpace: this.chatContainer.children.at(-1) instanceof AgentMessageComponent,
 				});
+				component.setExpanded(this.toolOutputExpanded);
 				if (message.output) {
 					component.appendOutput(message.output);
 				}
@@ -6642,7 +6698,7 @@ export class InteractiveMode {
 				if (message.display) {
 					const component = this.createDisplayedCustomMessageComponent(message);
 					if (isExpandable(component)) {
-						component.setExpanded(this.expansionStateFor(component));
+						component.setExpanded(this.toolOutputExpanded);
 					}
 					if (hasEditDiffsExpansion(component)) {
 						component.setEditDiffsExpanded(this.editDiffsExpanded);
@@ -6723,12 +6779,9 @@ export class InteractiveMode {
 					message,
 					this.hideThinkingBlock,
 					this.getMarkdownThemeWithSettings(),
-					this.hiddenThinkingLabel,
 					{
 						expanded: this.toolOutputExpanded,
-						precededByToolActivity:
-							this.chatContainer.children.at(-1) instanceof ToolExecutionComponent ||
-							this.chatContainer.children.at(-1) instanceof AgentMessageComponent,
+						precededByToolActivity: createConversationSpacing(this.chatContainer.children).precededByToolActivity,
 						mermaidTransform: this.mermaidMarkdownTransform,
 						cwd: this.getCurrentCwd(),
 					},
@@ -6799,10 +6852,25 @@ export class InteractiveMode {
 				}
 			}
 		}
-		await this.preloadToolDefinitions(toolNames);
+		// Tool definitions only enrich rendering: components fall back to
+		// cached or missing definitions. A transient control-plane failure here
+		// must not abort the render (a resync render aborts into an empty chat).
+		let toolDefinitionWarning: string | undefined;
+		try {
+			await this.preloadToolDefinitions(toolNames);
+		} catch (error) {
+			toolDefinitionWarning = `Could not load tool definitions: ${
+				error instanceof Error ? error.message : String(error)
+			}`;
+		}
 
 		if (options.clearChat) {
 			this.chatContainer.clear();
+		}
+
+		// Shown after clearChat so rebuild/resync renders keep the warning.
+		if (toolDefinitionWarning) {
+			this.showWarning(toolDefinitionWarning);
 		}
 
 		if (options.updateFooter) {
@@ -6833,63 +6901,85 @@ export class InteractiveMode {
 		}
 
 		for (const message of messagesToRender) {
-			// Assistant messages need special handling for tool calls
-			if (message.role === "assistant") {
-				this.addMessageToChat(message);
-				// Render tool call components
-				for (const content of message.content) {
-					if (content.type === "toolCall") {
-						const component = new ToolExecutionComponent(
-							content.name,
-							content.id,
-							content.arguments,
-							{
-								showImages: this.settingsManager.getShowImages(),
-								includeImageDimensions: false,
-							},
-							this.getCachedToolDefinition(content.name),
-							this.ui,
-							this.getCurrentCwd(),
-						);
-						component.setExpanded(this.toolOutputExpanded);
-						component.setAgentMessagesExpanded(this.agentMessagesExpanded);
-						component.setEditDiffsExpanded(this.editDiffsExpanded);
-						selectLatestToolExpandHint(this.chatContainer.children, component);
-						this.chatContainer.addChild(component);
-						this.registerIpythonToolComponent(content.name, content.id, component);
+			// One unrenderable message must not abort the whole transcript:
+			// the chat container may already be cleared for this render.
+			try {
+				// Assistant messages need special handling for tool calls
+				if (message.role === "assistant") {
+					this.addMessageToChat(message);
+					// Render tool call components
+					for (const content of message.content) {
+						if (content.type === "toolCall") {
+							const spacing = createConversationSpacing(this.chatContainer.children);
+							const component = new ToolExecutionComponent(
+								content.name,
+								content.id,
+								content.arguments,
+								{
+									showImages: this.settingsManager.getShowImages(),
+									includeImageDimensions: false,
+									shouldAddLeadingSpace: () => spacing.shouldAddLeadingSpace(true),
+								},
+								this.getCachedToolDefinition(content.name),
+								this.ui,
+								this.getCurrentCwd(),
+							);
+							component.setExpanded(this.toolOutputExpanded);
+							component.setEditDiffsExpanded(this.editDiffsExpanded);
+							selectLatestToolExpandHint(this.chatContainer.children, component);
+							this.chatContainer.addChild(component);
+							this.registerIpythonToolComponent(content.name, content.id, component);
 
-						if (message.stopReason === "aborted" || message.stopReason === "error") {
-							let errorMessage: string;
-							if (message.stopReason === "aborted") {
-								const retryAttempt = this.getRetryAttempt();
-								errorMessage =
-									retryAttempt > 0
-										? `Aborted after ${retryAttempt} retry attempt${retryAttempt > 1 ? "s" : ""}`
-										: message.errorMessage && message.errorMessage !== "Request was aborted"
-											? message.errorMessage
-											: "Operation aborted";
+							if (message.stopReason === "aborted" || message.stopReason === "error") {
+								let errorMessage: string;
+								if (message.stopReason === "aborted") {
+									const retryAttempt = this.getRetryAttempt();
+									errorMessage =
+										retryAttempt > 0
+											? `Aborted after ${retryAttempt} retry attempt${retryAttempt > 1 ? "s" : ""}`
+											: message.errorMessage && message.errorMessage !== "Request was aborted"
+												? message.errorMessage
+												: "Operation aborted";
+								} else {
+									errorMessage = message.errorMessage || "Error";
+								}
+								component.updateResult({ content: [{ type: "text", text: errorMessage }], isError: true });
 							} else {
-								errorMessage = message.errorMessage || "Error";
+								renderedPendingTools.set(content.id, component);
 							}
-							component.updateResult({ content: [{ type: "text", text: errorMessage }], isError: true });
-						} else {
-							renderedPendingTools.set(content.id, component);
 						}
 					}
+				} else if (message.role === "toolResult") {
+					// Match tool results to pending tool components
+					const component = renderedPendingTools.get(message.toolCallId);
+					if (component) {
+						// Delete first: a throwing updateResult must not leave the
+						// completed result reported as still pending.
+						renderedPendingTools.delete(message.toolCallId);
+						component.updateResult(message);
+					}
+				} else {
+					// All other messages use standard rendering
+					this.addMessageToChat(message, renderOptions);
 				}
-			} else if (message.role === "toolResult") {
-				// Match tool results to pending tool components
-				const component = renderedPendingTools.get(message.toolCallId);
-				if (component) {
-					component.updateResult(message);
-					renderedPendingTools.delete(message.toolCallId);
-				}
-			} else {
-				// All other messages use standard rendering
-				this.addMessageToChat(message, renderOptions);
+			} catch (error) {
+				// Render an inline placeholder instead of losing the transcript.
+				this.chatContainer.addChild(
+					new Text(
+						theme.fg(
+							"warning",
+							`Failed to render a ${message.role} message: ${
+								error instanceof Error ? error.message : String(error)
+							}`,
+						),
+						1,
+						0,
+					),
+				);
 			}
 		}
 
+		this.updateWorkingPulse();
 		for (const [toolCallId, component] of renderedPendingTools) {
 			component.setIncludeImageDimensions(true);
 			this.pendingTools.set(toolCallId, component);
@@ -6898,26 +6988,46 @@ export class InteractiveMode {
 	}
 
 	async renderInitialMessages(): Promise<void> {
-		const snapshot = await this.agentConnection.getInitialSnapshot();
-		const context = this.getSessionContextFromConnectionSnapshot(snapshot);
-		const state = snapshot.state;
-		const streamingMessage = snapshot.streamingMessage;
-		this.rlmNodeId = snapshot.parent?.childId;
-		this.seedSubagentSummary(snapshot.children);
-		this.applyConnectionStateSnapshot(state);
-		this.restoreTurnStartFromMessages(context.messages);
-		await this.renderSessionContext(context, {
-			updateFooter: true,
-			populateHistory: true,
-			limitTranscript: true,
-		});
-		await this.restoreStreamingMessageFromSnapshot(streamingMessage);
+		// Serialize with any in-flight initial render: resync/replacement handlers
+		// re-enter this method, and two concurrent transcript builds race the
+		// chat container.
+		const previousRender = this.initialRenderPromise;
+		const render = (async () => {
+			await previousRender?.catch(() => undefined);
+			const snapshot = await this.agentConnection.getInitialSnapshot();
+			const context = this.getSessionContextFromConnectionSnapshot(snapshot);
+			const state = snapshot.state;
+			const streamingMessage = snapshot.streamingMessage;
+			this.rlmNodeId = snapshot.parent?.childId;
+			this.seedSubagentSummary(snapshot.children);
+			this.applyConnectionStateSnapshot(state);
+			this.restoreTurnStartFromMessages(context.messages);
+			await this.renderSessionContext(context, {
+				clearChat: true,
+				updateFooter: true,
+				populateHistory: true,
+				limitTranscript: true,
+			});
+			await this.restoreStreamingMessageFromSnapshot(streamingMessage);
+			this.showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true });
 
-		// Show compaction info if session was compacted
-		const compactionCount = state.compactionCount;
-		if (compactionCount > 0) {
-			const times = compactionCount === 1 ? "1 time" : `${compactionCount} times`;
-			this.showStatus(`Session compacted ${times}`);
+			// Show compaction info if session was compacted
+			const compactionCount = state.compactionCount;
+			if (compactionCount > 0) {
+				const times = compactionCount === 1 ? "1 time" : `${compactionCount} times`;
+				this.showStatus(`Session compacted ${times}`);
+			}
+		})();
+		this.initialRenderPromise = render;
+		try {
+			await render;
+		} finally {
+			if (this.initialRenderPromise === render) {
+				this.initialRenderPromise = undefined;
+				// Release deferred events even if the last queued render failed. Do not
+				// await listener delivery: session-replaced handlers share that queue.
+				void this.agentConnection.flushBufferedSessionEvents?.();
+			}
 		}
 	}
 
@@ -6961,7 +7071,7 @@ export class InteractiveMode {
 
 	private async rebuildChatFromMessages(): Promise<void> {
 		const context = await this.agentConnection.getSessionContext();
-		await this.renderSessionContext(context, { clearChat: true });
+		await this.renderSessionContext(context, { clearChat: true, limitTranscript: true });
 	}
 
 	private handleEscape(): void {
@@ -7212,17 +7322,22 @@ export class InteractiveMode {
 
 	private async requestAgentsView(): Promise<void> {
 		if (!this.options.returnToAgentsView) {
-			this.showStatus("The agents view needs the daemon; start without --no-daemon to browse sessions");
+			this.showStatus(
+				"The agents view needs a daemon-hosted session; start normally (without --no-session) to browse sessions",
+			);
 			return;
 		}
 		await this.returnToAgentsView();
 	}
 
 	private async returnToAgentsView(request: InteractiveModeRunResult["type"] = "agents_view"): Promise<void> {
-		if (this.isShuttingDown || this.agentsViewRequest) return;
-		this.stashDraftForAgentsView();
-		this.agentsViewRequest = request;
+		if (this.isShuttingDown || this.isReturningToAgentsView) return;
+		this.isReturningToAgentsView = true;
+		// Keep startup's connection alive without blocking an explicit shutdown.
+		await this.initializationPromise?.catch(() => undefined);
+		if (this.isShuttingDown) return;
 		this.isShuttingDown = true;
+		this.stashDraftForAgentsView();
 		this.unregisterSignalHandlers();
 
 		await this.teardownSessionUi({ preserveAltScreen: true });
@@ -7232,6 +7347,7 @@ export class InteractiveMode {
 				await this.agentConnection.dispose();
 			} finally {
 				await this.options.onShutdown?.();
+				this.agentsViewRequest = request;
 				this.onInputCallback?.(undefined);
 				handoffComplete = true;
 			}
@@ -7593,11 +7709,11 @@ export class InteractiveMode {
 	}
 
 	private getPromptContextContainers(): Container[] {
-		return [this.recapContainer, this.featureHintContainer, this.queuedMessagesContainer, this.sideQuestionContainer];
+		return [this.queuedMessagesContainer, this.sideQuestionContainer];
 	}
 
 	private getPromptDockComponents(): Component[] {
-		return [this.editorContainer, this.subagentSummaryLine, this.footerSlot];
+		return [this.recapContainer, this.editorContainer, this.subagentSummaryLine, this.footerSlot];
 	}
 
 	/** Enter or leave fullscreen rendering without touching the persisted setting. */
@@ -7638,27 +7754,19 @@ export class InteractiveMode {
 	}
 
 	private toggleToolOutputExpansion(): void {
-		this.setToolsExpanded(!this.toolOutputExpanded);
-	}
-
-	private toggleAgentMessageExpansion(): void {
-		this.agentMessagesExpanded = !this.agentMessagesExpanded;
-		this.applyChatExpansion();
-	}
-
-	private toggleEditDiffExpansion(): void {
-		this.editDiffsExpanded = !this.editDiffsExpanded;
-		this.applyChatExpansion();
+		this.setChatDetail(this.toolOutputExpanded ? "overview" : this.editDiffsExpanded ? "all" : "details");
 	}
 
 	private setToolsExpanded(expanded: boolean): void {
-		this.toolOutputExpanded = expanded;
-		this.applyChatExpansion();
+		this.setChatDetail(expanded ? "all" : "overview");
 	}
 
-	/** Expansion state for a chat component: agent messages toggle separately from tools. */
-	private expansionStateFor(component: unknown): boolean {
-		return component instanceof AgentMessageComponent ? this.agentMessagesExpanded : this.toolOutputExpanded;
+	/** Presentation only: never rewrite messages, settings, or the session trace. */
+	private setChatDetail(detail: "overview" | "details" | "all"): void {
+		this.toolOutputExpanded = detail === "all";
+		this.editDiffsExpanded = detail !== "overview";
+		this.hideThinkingBlock = detail === "overview";
+		this.applyChatExpansion();
 	}
 
 	private applyChatExpansion(): void {
@@ -7666,12 +7774,17 @@ export class InteractiveMode {
 		if (isExpandable(activeHeader)) {
 			activeHeader.setExpanded(this.toolOutputExpanded);
 		}
-		for (const child of this.chatContainer.children) {
-			if (isExpandable(child)) {
-				child.setExpanded(this.expansionStateFor(child));
+		for (const child of new Set([
+			...this.chatContainer.children,
+			...this.pendingBashComponents,
+			this.activeBashComponent,
+			this.sideQuestionComponent,
+		])) {
+			if (child instanceof AssistantMessageComponent) {
+				child.setHideThinkingBlock(this.hideThinkingBlock);
 			}
-			if (hasAgentMessagesExpansion(child)) {
-				child.setAgentMessagesExpanded(this.agentMessagesExpanded);
+			if (isExpandable(child)) {
+				child.setExpanded(this.toolOutputExpanded);
 			}
 			if (hasEditDiffsExpansion(child)) {
 				child.setEditDiffsExpanded(this.editDiffsExpanded);
@@ -7686,27 +7799,6 @@ export class InteractiveMode {
 		} else {
 			this.ui.requestRenderPreservingViewport();
 		}
-	}
-
-	private toggleThinkingBlockVisibility(): void {
-		this.hideThinkingBlock = !this.hideThinkingBlock;
-		this.settingsManager.setHideThinkingBlock(this.hideThinkingBlock);
-
-		void (async () => {
-			// Rebuild chat from session messages
-			await this.rebuildChatFromMessages();
-
-			// If streaming, re-add the streaming component with updated visibility and re-render
-			if (this.streamingComponent && this.streamingMessage) {
-				this.streamingComponent.setHideThinkingBlock(this.hideThinkingBlock);
-				this.streamingComponent.updateContent(this.streamingMessage);
-				this.chatContainer.addChild(this.streamingComponent);
-			}
-
-			this.showStatus(`Thinking blocks: ${this.hideThinkingBlock ? "hidden" : "visible"}`);
-		})().catch((error) => {
-			this.showError(error instanceof Error ? error.message : String(error));
-		});
 	}
 
 	private openExternalEditor(): void {
@@ -7832,13 +7924,6 @@ export class InteractiveMode {
 			const hintText = theme.fg("dim", `╰─ ${dequeueHint} to browse and edit queued messages`);
 			this.queuedMessagesContainer.addChild(new TruncatedText(hintText, 1, 0));
 		}
-		if (hasQueuedMessages && !this.featureHintSuppressedByQueue) {
-			this.featureHintSuppressedByQueue = true;
-			this.clearFeatureHintPresentation();
-		} else if (!hasQueuedMessages && this.featureHintSuppressedByQueue) {
-			this.featureHintSuppressedByQueue = false;
-			this.resumeFeatureHintPresentation();
-		}
 	}
 
 	private flushPendingBashComponents(): void {
@@ -7896,7 +7981,6 @@ export class InteractiveMode {
 					availableThinkingLevels: state.availableThinkingLevels,
 					currentTheme: this.settingsManager.getTheme() || "prime",
 					availableThemes: getAvailableThemes(),
-					hideThinkingBlock: this.hideThinkingBlock,
 					mermaidRenderingMode: this.settingsManager.getMermaidRenderingMode(),
 					treeFilterMode: this.settingsManager.getTreeFilterMode(),
 					showHardwareCursor: this.settingsManager.getShowHardwareCursor(),
@@ -7984,18 +8068,6 @@ export class InteractiveMode {
 							this.ui.invalidate();
 							this.ui.requestRender();
 						}
-					},
-					onHideThinkingBlockChange: (hidden) => {
-						this.hideThinkingBlock = hidden;
-						this.settingsManager.setHideThinkingBlock(hidden);
-						for (const child of this.chatContainer.children) {
-							if (child instanceof AssistantMessageComponent) {
-								child.setHideThinkingBlock(hidden);
-							}
-						}
-						void this.rebuildChatFromMessages().catch((error) => {
-							this.showError(error instanceof Error ? error.message : String(error));
-						});
 					},
 					onMermaidRenderingModeChange: (mode) => {
 						this.settingsManager.setMermaidRenderingMode(mode);
@@ -8108,8 +8180,16 @@ export class InteractiveMode {
 			return;
 		}
 		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		this.applyModelSwitchUiState(state, model);
+	}
+
+	/** Patch model-derived connection state and refresh the UI that reads it. */
+	private applyModelSwitchUiState(
+		state: Pick<AgentConnectionState, "model" | "serviceTier" | "availableThinkingLevels">,
+		fallbackModel: AgentConnectionModel,
+	): void {
 		this.patchConnectionState({
-			model: state.model ?? model,
+			model: state.model ?? fallbackModel,
 			serviceTier: state.serviceTier,
 			availableThinkingLevels: state.availableThinkingLevels,
 		});
@@ -8254,8 +8334,26 @@ export class InteractiveMode {
 	}
 
 	private async refreshConnectionModelsAfterAuthChange(): Promise<void> {
+		const connection = this.agentConnection;
+		const sessionId = this.connectionState?.sessionId;
 		this.invalidateConnectionModels();
 		await this.getConnectionAvailableModels();
+		const state = await connection.getState();
+		if (
+			this.agentConnection !== connection ||
+			this.connectionState?.sessionId !== sessionId ||
+			(sessionId !== undefined && state.sessionId !== sessionId)
+		) {
+			return;
+		}
+		this.patchConnectionState({
+			model: state.model,
+			scopedModels: state.scopedModels,
+			serviceTier: state.serviceTier,
+			availableThinkingLevels: state.availableThinkingLevels,
+		});
+		this.subagentSummaryLine.invalidate();
+		this.setupAutocompleteProvider();
 	}
 
 	private async getModelCandidates(): Promise<AgentConnectionModel[]> {
@@ -8451,9 +8549,9 @@ export class InteractiveMode {
 		});
 	}
 
-	private applyThinkingLevel(level: ThinkingLevel, existingFeature?: TelemetryFeatureAttempt): void {
+	private applyThinkingLevel(level: ThinkingLevel, existingFeature?: TelemetryFeatureAttempt): Promise<boolean> {
 		const feature = existingFeature ?? this.journeyTelemetry?.beginFeature("effort", level);
-		void this.agentConnection
+		return this.agentConnection
 			.setThinkingLevel(level)
 			.then(() => {
 				feature?.finish("completed", level);
@@ -8461,9 +8559,37 @@ export class InteractiveMode {
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
 				this.showStatus(`Thinking level: ${level}`);
+				return true;
 			})
 			.catch((error) => {
 				feature?.finish("failed", level);
+				this.showError(error instanceof Error ? error.message : String(error));
+				return false;
+			});
+	}
+
+	private handleModelCycle(direction: "forward" | "backward"): void {
+		const connection = this.agentConnection;
+		const sessionId = this.connectionState?.sessionId;
+		void connection
+			.cycleModel(direction)
+			.then(async (result) => {
+				if (!result) {
+					this.showStatus("No other models available to cycle");
+					return;
+				}
+				const state = await connection.getState();
+				if (
+					this.agentConnection !== connection ||
+					this.connectionState?.sessionId !== sessionId ||
+					(sessionId !== undefined && state.sessionId !== sessionId)
+				) {
+					return;
+				}
+				this.applyModelSwitchUiState(state, result.model);
+				this.showStatus(`Model: ${result.model.provider}/${result.model.id}`);
+			})
+			.catch((error) => {
 				this.showError(error instanceof Error ? error.message : String(error));
 			});
 	}
@@ -8512,6 +8638,9 @@ export class InteractiveMode {
 	}
 
 	private showConfigurationMenu(initialTab: ConfigurationMenuTab, initialModelSearch?: string): Promise<void> {
+		if (this.configurationModelSelection) return this.configurationModelSelection;
+		this.closeConfigurationMenu?.();
+		this.closeServiceCatalogPicker?.();
 		const modelCatalog = this.getCachedModelCandidates();
 		const loginMenuFeature = initialTab !== "models" ? this.journeyTelemetry?.beginFeature("login") : undefined;
 		const authFlows = this.createAuthFlows(loginMenuFeature);
@@ -8526,35 +8655,24 @@ export class InteractiveMode {
 		}
 
 		return new Promise((resolve) => {
-			let handle: OverlayHandle | undefined;
 			let settled = false;
-			let hidden = false;
-			let removed = false;
+			let busy = false;
 			let menu: ConfigurationMenuComponent;
-			const hide = () => {
-				if (removed) return;
-				removed = true;
-				hidden = true;
-				handle?.hide();
+			const restoreEditor = () => {
+				if (!this.editorContainer.children.includes(menu)) return;
+				this.editorContainer.clear();
+				this.editorContainer.addChild(this.editor);
+				this.ui.setFocus(this.editor);
 				this.ui.requestRender();
 			};
-			const conceal = () => {
-				if (hidden || removed) return;
-				hidden = true;
-				handle?.setHidden(true);
-				this.ui.requestRender();
-			};
-			const show = () => {
-				if (!hidden || removed || settled) return;
-				hidden = false;
-				handle?.setHidden(false);
-				handle?.focus();
-				this.ui.requestRender();
+			const focus = () => {
+				if (!settled && this.editorContainer.children.includes(menu)) this.ui.setFocus(menu);
 			};
 			const finish = () => {
 				if (settled) return;
 				settled = true;
-				hide();
+				restoreEditor();
+				if (this.closeConfigurationMenu === finish) this.closeConfigurationMenu = undefined;
 				feature?.finish("canceled");
 				loginMenuFeature?.finish("canceled");
 				if (reenteredOnboarding) {
@@ -8587,27 +8705,25 @@ export class InteractiveMode {
 					});
 			};
 			const authenticate = (provider: AuthSelectorProvider, tab: "providers" | "mcp-connections") => {
-				if (settled) return;
+				if (settled || busy) return;
+				busy = true;
 				void authFlows
 					.loginProvider(provider)
 					.then(async (authResult) => {
 						if (settled) return;
-						handle?.focus();
+						focus();
 						menu.refreshAuthentication();
 						if (authResult.status !== "success") return;
 
 						if (tab === "mcp-connections") {
 							if (!authResult.providerId.startsWith("mcp:")) return;
-							if (this.isAgentStreaming() || this.isAgentCompacting()) {
-								this.showStatus("Connected. Run /reload (after the current turn) to activate the integration.");
-								return;
-							}
+							// The guarded operation already verified and scheduled activation.
 							finish();
-							await this.handleReloadCommand();
 							return;
 						}
 
 						await this.prepareForModelSelectionAfterLogin(authResult);
+						if (settled) return;
 						menu.updateModels(
 							this.getCurrentModel(),
 							this.getCachedModelCandidates(),
@@ -8617,8 +8733,11 @@ export class InteractiveMode {
 						refreshModels(true);
 					})
 					.catch((error) => {
-						handle?.focus();
-						this.showError(error instanceof Error ? error.message : String(error));
+						focus();
+						if (!settled) this.showError(error instanceof Error ? error.message : String(error));
+					})
+					.finally(() => {
+						busy = false;
 					});
 			};
 
@@ -8634,45 +8753,69 @@ export class InteractiveMode {
 				configuredProviders: this.connectionConfiguredProviders,
 				recentModels: this.settingsManager.getRecentModels(),
 				initialModelSearch,
-				getRows: () => this.ui.terminal.rows,
+				thinkingLevel: this.getCurrentModel()?.reasoning
+					? this.connectionState?.thinkingLevel
+					: (this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL),
+				getRows: () => Math.max(1, Math.min(20, this.ui.terminal.rows - 3)),
 				requestRender: () => this.ui.requestRender(),
 				onSelectProvider: (provider) => authenticate(provider, "providers"),
 				onSelectMcpConnection: (provider) => authenticate(provider, "mcp-connections"),
-				onSelectModel: (model) => {
+				onSelectModel: (model, thinkingLevel) => {
 					feature ??= this.journeyTelemetry?.beginFeature("model");
+					if (settled || busy) return;
+					busy = true;
 					void (async () => {
 						let completed = false;
+						let selectionInFlight: Promise<void> | undefined;
 						try {
 							const ready = await this.ensureModelProviderConfigured(model, authFlows, providerOptions, feature);
-							handle?.focus();
+							if (settled) return;
+							focus();
 							menu.refreshAuthentication();
 							menu.updateModels(
 								this.getCurrentModel(),
 								this.getCachedModelCandidates(),
 								this.connectionConfiguredProviders,
 							);
-							if (!ready || settled) {
+							if (!ready) {
 								feature?.finish("canceled");
 								feature = undefined;
 								return;
 							}
-							conceal();
-							await this.completeModelSelection(model);
-							feature?.finish("completed");
-							completed = true;
+							menu.setBusy(true);
+							const selection = (async () => {
+								await this.completeModelSelection(model);
+								if (settled) return false;
+								return thinkingLevel === undefined || (await this.applyThinkingLevel(thinkingLevel));
+							})();
+							selectionInFlight = selection.then(
+								() => {},
+								() => {},
+							);
+							this.configurationModelSelection = selectionInFlight;
+							completed = await selection;
+							if (completed) feature?.finish("completed");
 						} catch (error) {
 							feature?.finish("failed");
 							feature = undefined;
-							show();
-							this.showError(error instanceof Error ? error.message : String(error));
+							focus();
+							if (!settled) this.showError(error instanceof Error ? error.message : String(error));
 						} finally {
+							busy = false;
+							if (this.configurationModelSelection === selectionInFlight)
+								this.configurationModelSelection = undefined;
+							menu.setBusy(false);
 							if (completed) finish();
 						}
 					})();
 				},
 				onCancel: finish,
 			});
-			handle = this.showFullPaneOverlay(menu, 96);
+			this.closeConfigurationMenu = finish;
+			this.editorContainer.clear();
+			this.editorContainer.addChild(menu);
+			focus();
+			this.ui.requestRender();
 			refreshModels(initialModelSearch !== undefined);
 		});
 	}
@@ -9197,7 +9340,34 @@ export class InteractiveMode {
 			onLoginCompleted: () => {
 				void this.maybeWarnAboutAnthropicSubscriptionAuth();
 			},
+			onMcpAccountLogout: (providerId) => this.logoutMcpAccount(providerId),
+			onMcpAccountLogin: async (providerId) => {
+				const name = providerId.slice("mcp:".length);
+				const { resolved, result } = await this.connectMcpAccountByName(name);
+				if (!resolved) {
+					this.showStatus(`No endpoint configured for ${name}; add it with /mcp add or connect from /plugins.`);
+				}
+				return result;
+			},
 		});
+	}
+
+	/**
+	 * The ENTIRE MCP account logout, owned by ONE connection-store critical
+	 * section (store->auth ordering): verified credential deletion AND
+	 * pending-attempt cancellation happen under the store's file lock BEFORE
+	 * the generic /logout route reports anything. The route delegates here
+	 * instead of calling authStorage.logout first — a plain logout could be
+	 * defeated by a concurrent finalize re-creating the credential after it.
+	 *
+	 * Id resolution is exact-first: a local service id may itself contain
+	 * "--", so a staged key maps back ONLY through its actually recorded
+	 * attempt nonce.
+	 */
+	private async logoutMcpAccount(providerId: string): Promise<McpRemoveAccountResult> {
+		// The shared exported one-op handler: same code the reviewer's route
+		// tests drive, no copied literals.
+		return logoutMcpAccount(providerId, this.getMcpConnectionStore(), this.modelRegistry.authStorage);
 	}
 
 	private async prepareForModelSelectionAfterLogin(authResult: AuthenticationResult): Promise<boolean> {
@@ -9243,7 +9413,7 @@ export class InteractiveMode {
 		const argv = parseCommandArgs((args ?? "").trim());
 		const [sub, server] = argv;
 		if (!sub) {
-			await this.showConfigurationMenu("mcp-connections");
+			await this.showServiceCatalogPicker();
 			return;
 		}
 
@@ -9254,8 +9424,13 @@ export class InteractiveMode {
 				this.showError("Usage: /mcp login <name> (e.g. /mcp login linear)");
 				return;
 			}
-			const result = await this.createAuthFlows().runMcpLogin(server);
-			if (result.status === "success") await this.reloadAfterMcpChange(`Connected ${server}.`);
+			// /mcp login routes through the ONE guarded connect operation (claim
+			// -> staged OAuth -> guarded finalize): the raw dialog that wrote the
+			// final credential directly is gone.
+			const { resolved } = await this.connectMcpAccountByName(server);
+			if (!resolved) {
+				this.showError(`No endpoint configured for ${server}; add it with /mcp add or connect from /plugins.`);
+			}
 			return;
 		}
 
@@ -9268,13 +9443,46 @@ export class InteractiveMode {
 				this.showStatus(`${server} is not connected.`);
 				return;
 			}
-			authStorage.logout(`mcp:${server}`);
+			// Credential AND record removal in one store-locked step (the same
+			// lock ordering finalize uses): no orphan credential can survive.
+			const loggedOut = await this.getMcpConnectionStore().removeAccount({
+				connectionId: server,
+				authCleanup: (connectionId) => {
+					// Disk-authoritative logout: remove() swallows persistence
+					// errors, so a failed auth-file write could report the logout
+					// done while the credential survives. removeVerified throws
+					// instead (the honest "failed" path) and returns whether a
+					// credential was actually removed from disk.
+					return authStorage.removeVerified(mcpCredentialKey(connectionId));
+				},
+			});
+			// Honest outcomes: removed/credential-only changed durable state,
+			// missing is a no-op, logged-out keeps the durable logout but says
+			// the record save failed, and failed is state-neutral (the cleanup
+			// may or may not have run — it never claims a specific state).
+			if (loggedOut === "failed") {
+				this.showWarning(`The change could not be saved; try logging out ${server} again.`);
+				return;
+			}
+			if (loggedOut === "logged-out") {
+				this.showWarning(
+					`Logged out ${server}, but the change could not be saved. It may still appear in the list; try again to finish cleanup.`,
+				);
+				return;
+			}
+			if (loggedOut === "missing") {
+				this.showStatus(`${server} is no longer connected.`);
+				return;
+			}
 			await this.reloadAfterMcpChange(`Disconnected ${server}.`);
 			return;
 		}
 
 		try {
 			const result = await runMcpManagementCommand(argv, this.settingsManager, this.modelRegistry.authStorage);
+			if (result.changed && result.serverChange?.verb === "removed") {
+				await this.removeMcpConnectionRecord(result.serverChange.name);
+			}
 			if (result.changed && result.serverChange) {
 				const { name, transport, verb, usesOAuth } = result.serverChange;
 				const hasMcpProviderRefresh = this.uiServices.refreshMcpProviders !== undefined;
@@ -9301,9 +9509,918 @@ export class InteractiveMode {
 		}
 	}
 
+	private getMcpConnectionStore(): McpConnectionStore {
+		this.mcpConnectionStore ??= McpConnectionStore.open(path.join(getAgentDir(), "mcp-connections.json"));
+		return this.mcpConnectionStore;
+	}
+
+	private async removeMcpConnectionRecord(connectionId: string): Promise<void> {
+		const store = this.getMcpConnectionStore();
+		store.remove(connectionId);
+		await store.flush().catch(() => undefined);
+	}
+
+	/**
+	 * External-service cards for the /plugins picker. Uses the SAME resolver the
+	 * host uses (built-in catalog + declared local sources from settings) and
+	 * re-reads the shared connection records from disk, so the UI never renders
+	 * a stale in-process cache.
+	 */
+	private buildServiceCatalogViews(): {
+		services: readonly McpServiceDescriptor[];
+		views: McpPluginView[];
+		diagnostics: string[];
+	} {
+		// Fresh records first: the resolver pins vanished-source services from them.
+		this.getMcpConnectionStore().load();
+		const resolution = resolveServiceCatalogWithDiagnostics(
+			this.settingsManager.getMcpCatalogSources(),
+			this.getMcpConnectionStore().records(),
+		);
+		const views = buildPluginViews({
+			services: resolution.descriptors,
+			userServers: this.settingsManager.getGlobalMcpServers(),
+			authStorage: this.modelRegistry.authStorage,
+			connectionStore: this.getMcpConnectionStore(),
+		});
+		return { services: resolution.descriptors, views, diagnostics: resolution.diagnostics };
+	}
+
+	/**
+	 * Catalog resolution WITHOUT reloading the store: mid-flow admission
+	 * keeps this process's pending (unflushed) record writes visible — a
+	 * load() here would wipe in-memory state a queued op still owns. The
+	 * authoritative cross-process gate stays the claim/reserve/finalize ops
+	 * under the store's file lock.
+	 */
+	private resolveCurrentServiceCatalog(): readonly McpServiceDescriptor[] {
+		return resolveServiceCatalogWithDiagnostics(
+			this.settingsManager.getMcpCatalogSources(),
+			this.getMcpConnectionStore().records(),
+		).descriptors;
+	}
+
+	private getMcpLoginEligibility(
+		connectionId: string,
+		catalogServiceId = connectionId,
+		addAccount = false,
+		locked?: { record: McpConnectionRecord },
+		explicitLogin = false,
+		precomputedService?: McpServiceDescriptor,
+	): ReturnType<typeof mcpLoginEligibility> {
+		const services = precomputedService ? [precomputedService] : this.resolveCurrentServiceCatalog();
+		const record = locked ? locked.record : this.getMcpConnectionStore().get(connectionId);
+		const service = services.find((entry) => entry.serviceId === (record?.serviceId ?? catalogServiceId));
+		const userServers = this.settingsManager.getGlobalMcpServers() ?? {};
+		return mcpLoginEligibility({
+			connectionId,
+			service,
+			record,
+			addAccount,
+			explicitLogin,
+			userConfig: userServers[connectionId],
+			reservedConfig: service ? userServers[service.serviceId] : undefined,
+			credential: this.modelRegistry.authStorage.getVerified(mcpCredentialKey(connectionId)),
+		});
+	}
+
+	private async handlePluginsCommand(args: string | undefined): Promise<void> {
+		await this.showServiceCatalogPicker((args ?? "").trim() || undefined);
+	}
+
+	private selectServiceCatalogRow(
+		views: readonly McpPluginView[],
+		options: Omit<ServiceCatalogPickerOptions, "getRows"> = {},
+	): Promise<McpPluginView | undefined> {
+		this.closeConfigurationMenu?.();
+		this.closeServiceCatalogPicker?.();
+		return new Promise((resolve) => {
+			this.showSelector((done) => {
+				let settled = false;
+				const finish = (selection?: McpPluginView) => {
+					if (settled) return;
+					settled = true;
+					const ownsEditor = this.editorContainer.children.includes(picker);
+					if (ownsEditor) done();
+					if (this.closeServiceCatalogPicker === close) this.closeServiceCatalogPicker = undefined;
+					this.ui.requestRender();
+					// A stale selection settles as cancellation without replacing the
+					// next picker or starting an operation from its old row.
+					resolve(ownsEditor ? selection : undefined);
+				};
+				const close = () => finish();
+				const picker = new ServiceCatalogPickerComponent(views, finish, close, {
+					...options,
+					getRows: () => Math.max(1, Math.min(20, this.ui.terminal.rows - 3)),
+				});
+				this.closeServiceCatalogPicker = close;
+				return { component: picker, focus: picker };
+			});
+		});
+	}
+
+	private async showServiceCatalogPicker(initialSearch?: string): Promise<void> {
+		const { services, views, diagnostics } = this.buildServiceCatalogViews();
+		// Wiring problems (a declared local source that vanished, duplicate ids,
+		// truncation) are visible, never silent.
+		if (diagnostics.length > 0) {
+			this.showWarning(`Service catalog notice: ${diagnostics[0]}`);
+		}
+		// Connect targets keyed by serviceId; user-declared servers resolve from settings.
+		const userServers = this.settingsManager.getGlobalMcpServers() ?? {};
+		const targets = new Map<
+			string,
+			{
+				url?: string;
+				usesOAuth: boolean;
+				bearerTokenEnvVar?: string;
+				managedBySettings: boolean;
+				transport?: "stdio";
+				name?: string;
+			}
+		>();
+		for (const service of services) {
+			if (
+				service.transport.type === "http" &&
+				service.transport.url &&
+				(service.legacyBuiltin || !userServers[service.serviceId])
+			) {
+				targets.set(service.serviceId, {
+					url: service.transport.url,
+					usesOAuth: service.authStrategy === "oauth" || service.authStrategy === "unknown",
+					managedBySettings: false,
+				});
+			}
+		}
+		for (const [name, config] of Object.entries(userServers)) {
+			if (services.some((entry) => entry.serviceId === name && entry.legacyBuiltin)) continue;
+			if (config.type === "http") {
+				targets.set(name, {
+					url: config.url,
+					usesOAuth: config.oauth === true,
+					...(config.bearerTokenEnvVar ? { bearerTokenEnvVar: config.bearerTokenEnvVar } : {}),
+					managedBySettings: true,
+				});
+			} else if (config.type === "stdio") {
+				targets.set(name, {
+					usesOAuth: false,
+					managedBySettings: true,
+					transport: "stdio",
+					name,
+				});
+			}
+		}
+
+		// Freeze the displayed intent: guidance must never become a mutation
+		// when settings change while the picker is open.
+		const settingsActions = new Map<
+			string,
+			"disable local server" | "settings guidance" | "verify" | "manage saved account"
+		>();
+		for (const [name, config] of Object.entries(userServers)) {
+			if (views.find((view) => view.serviceId === name)?.source !== "user") continue;
+			if (config.type === "stdio") {
+				settingsActions.set(name, config.enabled === false ? "settings guidance" : "disable local server");
+			} else if (!config.oauth) {
+				const hasSavedAccount =
+					this.getMcpConnectionStore().get(name) !== undefined ||
+					this.modelRegistry.authStorage.getVerified(mcpCredentialKey(name)) !== undefined;
+				const pending =
+					config.enabled !== false &&
+					views.find((view) => view.serviceId === name)?.connectionStatus === "pending";
+				settingsActions.set(
+					name,
+					hasSavedAccount ? "manage saved account" : pending ? "verify" : "settings guidance",
+				);
+			}
+		}
+		const service = await this.selectServiceCatalogRow(views, {
+			initialSearch,
+			getRowPresentation: (view) => {
+				const action = settingsActions.get(view.serviceId);
+				return action ? { action } : undefined;
+			},
+		});
+		if (!service) return;
+		try {
+			const settingsAction = settingsActions.get(service.serviceId);
+			if (settingsAction === "settings guidance") {
+				this.showStatus(
+					service.setupHint ??
+						`${service.label} is configured through settings; manage it with /mcp or your settings file.`,
+				);
+				return;
+			}
+			if (settingsAction === "disable local server" || settingsAction === "verify") {
+				await this.connectServiceFromPicker(service, targets.get(service.serviceId));
+				return;
+			}
+			// Every configured id is off-limits for new account ids.
+			const knownIds = new Set<string>([...services.map((entry) => entry.serviceId), ...Object.keys(userServers)]);
+			if (settingsAction === "manage saved account" || service.connectionIds.length > 0) {
+				const accountService =
+					settingsAction === "manage saved account" ? { ...service, connectionIds: [service.serviceId] } : service;
+				await this.showAccountPickerForService(accountService, targets.get(service.serviceId), { knownIds });
+				return;
+			}
+			await this.connectServiceFromPicker(service, targets.get(service.serviceId), { knownIds });
+		} catch {
+			this.showError("MCP connection action did not complete. Try again.");
+		}
+	}
+
+	/**
+	 * Account management for a service with at least one existing account: the
+	 * same picker lists the accounts (each row reconnects or disconnects THAT
+	 * connection id) plus an "Add another account" row that allocates a new id
+	 * and runs a fresh login — a second account never overwrites the first.
+	 */
+	private async showAccountPickerForService(
+		service: McpPluginView,
+		target: { url?: string; usesOAuth: boolean; bearerTokenEnvVar?: string; managedBySettings: boolean } | undefined,
+		options: { knownIds: Set<string> },
+	): Promise<void> {
+		const catalogServiceId = service.serviceId;
+		const settingsOnly = service.source === "user" && !service.usesOAuth;
+		const definition = this.buildServiceCatalogViews().services.find((entry) => entry.serviceId === catalogServiceId);
+		const ownership = reservedMcpOwnership(
+			definition,
+			this.settingsManager.getGlobalMcpServers()?.[catalogServiceId],
+		);
+		const accountCards: McpPluginView[] = [];
+		const accountTargets = new Map<string, typeof target>();
+		for (const connectionId of service.connectionIds) {
+			// Centralized per-account state: credential binding, expiry, and the
+			// record combine through the SAME computation as the plugin aggregate
+			// and the inventory — the picker never trusts a raw record.status.
+			const admission = this.getMcpLoginEligibility(connectionId, catalogServiceId);
+			const accountTarget = target && admission.endpoint ? { ...target, url: admission.endpoint } : target;
+			accountTargets.set(connectionId, accountTarget);
+			const state = settingsOnly
+				? { status: service.connectionStatus, setupHint: service.setupHint, toolCount: service.toolCount }
+				: accountStateFor({
+						connectionId,
+						endpoint: accountTarget?.url ?? "",
+						authStorage: this.modelRegistry.authStorage,
+						connectionStore: this.getMcpConnectionStore(),
+						usesOAuth: service.usesOAuth,
+					});
+			const blocked = ownership.status !== "canonical" || service.connectionStatus === "disabled";
+			const status = blocked ? service.connectionStatus : state.status;
+			const loginPending = "loginPending" in state && state.loginPending === true;
+			const repairHint =
+				admission.repair && admission.endpoint
+					? `Saved endpoint: ${new URL(admission.endpoint).origin}${new URL(admission.endpoint).pathname}`
+					: undefined;
+			accountCards.push({
+				...service,
+				serviceId: connectionId,
+				label: `${service.label} · ${connectionId}`,
+				connectionIds: [connectionId],
+				connectionStatus: status,
+				connectable:
+					!blocked && !loginPending && admission.allowed && (status === "error" || status === "not_connected"),
+				loginPending,
+				setupHint: blocked
+					? service.setupHint
+					: !admission.allowed
+						? admission.setupHint
+						: [repairHint, state.setupHint].filter(Boolean).join(" · ") || undefined,
+				...(state.toolCount !== undefined ? { toolCount: state.toolCount } : {}),
+			});
+			// Explicit per-account remove action, state-independent.
+			accountCards.push({
+				...service,
+				serviceId: connectionId,
+				label: settingsOnly ? `Remove saved data for ${connectionId}` : `Remove ${connectionId}`,
+				connectionIds: [connectionId],
+				connectionStatus: status,
+				connectable: false,
+				removeAction: true,
+			});
+		}
+		if (
+			service.usesOAuth &&
+			target?.usesOAuth &&
+			!service.loginPending &&
+			this.getMcpLoginEligibility(catalogServiceId, catalogServiceId, true, undefined, false, definition).allowed
+		) {
+			accountCards.push({
+				...service,
+				label: "Add another account",
+				connectionIds: [],
+				connectionStatus: "not_connected",
+				connectable: true,
+				setupHint: undefined,
+			});
+		}
+		const card = await this.selectServiceCatalogRow(accountCards, {
+			title: `Accounts — ${service.label}`,
+			mode: "accounts",
+			getRowPresentation: (row) =>
+				settingsOnly
+					? row.removeAction
+						? {
+								action: "remove saved data",
+								status: "Remove saved data",
+								detail: "Remove saved account data. Keeps server settings and environment token.",
+							}
+						: { action: row.connectionStatus === "pending" ? "verify" : "settings guidance" }
+					: undefined,
+		});
+		if (!card) return;
+		try {
+			if (settingsOnly && !card.removeAction && card.connectionStatus !== "pending") {
+				this.showStatus(
+					card.setupHint ??
+						`${service.label} is configured through settings; manage it with /mcp or your settings file.`,
+				);
+				return;
+			}
+			if (card.connectionIds.length === 0) {
+				await this.connectServiceFromPicker(card, target, {
+					catalogServiceId,
+					addAccount: true,
+					knownIds: options.knownIds,
+				});
+				return;
+			}
+			await this.connectServiceFromPicker(card, accountTargets.get(card.serviceId), { catalogServiceId });
+		} catch {
+			this.showError("MCP connection action did not complete. Try again.");
+		}
+	}
+
+	/**
+	 * Route a user-facing MCP login by NAME (/mcp login, the generic /login
+	 * service options, the config menu) through the ONE guarded connect
+	 * operation: the account is claimed under the store's file lock first,
+	 * the OAuth credential stages, and the guarded finalize commits it — a
+	 * concurrent logout can cancel us and a late callback can never
+	 * reactivate or clobber the account. Resolution and authentication outcomes
+	 * are separate; a cancelled login never reports success.
+	 */
+	private async connectMcpAccountByName(name: string): Promise<{ resolved: boolean; result: AuthenticationResult }> {
+		const { services } = this.buildServiceCatalogViews();
+		const record = this.getMcpConnectionStore().get(name);
+		const service =
+			services.find((entry) => entry.serviceId === (record?.serviceId ?? name)) ??
+			services.find((entry) => entry.aliases.includes(name));
+		const connectionId = record ? name : (service?.serviceId ?? name);
+		const config = this.settingsManager.getGlobalMcpServers()?.[connectionId];
+		const credential = this.modelRegistry.authStorage.getVerified(mcpCredentialKey(connectionId));
+		if (!service && !record && !config && !credential) return { resolved: false, result: { status: "failed" } };
+		const admission =
+			service || config || record
+				? this.getMcpLoginEligibility(connectionId, service?.serviceId ?? connectionId, false, undefined, true)
+				: { allowed: true, endpoint: undefined as string | undefined };
+		const endpoint =
+			admission.endpoint ?? (config?.type === "http" ? config.url : undefined) ?? record?.endpoint ?? "";
+		if (!admission.allowed || !endpoint) {
+			this.showStatus(admission.setupHint ?? "This service cannot be connected automatically.");
+			return { resolved: true, result: { status: "failed" } };
+		}
+		const result = await this.guardedMcpLogin(
+			{
+				serviceId: connectionId,
+				label: record?.label ?? service?.label ?? connectionId,
+				connectionStatus: record?.status ?? "not_connected",
+				connectionIds: record ? [connectionId] : [],
+				connectable: true,
+				usesOAuth: true,
+				source: service ? "catalog" : "user",
+			},
+			{
+				url: endpoint,
+				usesOAuth: true,
+				managedBySettings: config !== undefined && !service?.legacyBuiltin,
+			},
+			{
+				catalogServiceId: record?.serviceId ?? service?.serviceId ?? connectionId,
+				explicitLogin: true,
+			},
+		);
+		return { resolved: true, result };
+	}
+
+	private async connectServiceFromPicker(
+		service: McpPluginView,
+		target:
+			| {
+					url?: string;
+					usesOAuth: boolean;
+					bearerTokenEnvVar?: string;
+					managedBySettings: boolean;
+					transport?: "stdio";
+					name?: string;
+			  }
+			| undefined,
+		options: {
+			catalogServiceId?: string;
+			addAccount?: boolean;
+			knownIds?: ReadonlySet<string>;
+		} = {},
+	): Promise<boolean> {
+		if (target?.transport === "stdio" && target.name) {
+			const serverName = target.name;
+			const config = this.settingsManager.getGlobalMcpServers()?.[serverName];
+			if (!config) {
+				this.showStatus(`${service.label} is no longer present in settings.`);
+				return false;
+			}
+			if (config.type !== "stdio" || config.enabled === false) {
+				this.showStatus(
+					`${service.label} is disabled. Re-enable or remove it with /mcp, or edit your settings file.`,
+				);
+				return false;
+			}
+			this.settingsManager.setGlobalMcpServer(serverName, { ...config, enabled: false }, true);
+			await this.settingsManager.flush();
+			this.uiServices.refreshMcpProviders?.();
+			await this.reloadAfterMcpChange(
+				`Disabled local server ${service.label}. Manage it with /mcp or your settings file.`,
+			);
+			return false;
+		}
+		// Explicit per-account remove: credential AND record removal in ONE
+		// store-locked step (the same lock ordering finalize uses), then reload.
+		if (service.removeAction === true) {
+			const removed = await this.getMcpConnectionStore().removeAccount({
+				connectionId: service.serviceId,
+				authCleanup: (connectionId) => {
+					// Disk-authoritative logout: remove() swallows persistence
+					// errors, so a failed auth-file write could report the logout
+					// done while the credential survives. removeVerified throws
+					// instead (the honest "failed" path) and returns whether a
+					// credential was actually removed from disk.
+					return this.modelRegistry.authStorage.removeVerified(mcpCredentialKey(connectionId));
+				},
+			});
+			// Honest outcomes: removed/credential-only removed the account (the
+			// credential-only case still had a credential to log out), missing is
+			// a no-op, logged-out keeps the durable logout but says the record
+			// save failed, and failed is state-neutral (the cleanup may or may
+			// not have run — it never claims a specific state).
+			if (removed === "failed") {
+				this.showWarning(`The change could not be saved; try removing account ${service.serviceId} again.`);
+				return false;
+			}
+			if (removed === "logged-out") {
+				this.showWarning(
+					`Logged out account ${service.serviceId}, but the change could not be saved. It may still appear in the list; try again to finish cleanup.`,
+				);
+				return false;
+			}
+			if (removed === "missing") {
+				this.showStatus(`Account ${service.serviceId} is no longer present.`);
+				return false;
+			}
+			await this.reloadAfterMcpChange(`Removed account ${service.serviceId}.`);
+			return false;
+		}
+		if (service.loginPending || this.getMcpConnectionStore().get(service.serviceId)?.attemptId !== undefined) {
+			this.showStatus("Login in progress. Finish it or remove the account to cancel.");
+			return false;
+		}
+		const currentServices = this.resolveCurrentServiceCatalog();
+		const catalog = currentServices.find(
+			(entry) => entry.serviceId === (options.catalogServiceId ?? service.serviceId),
+		);
+		const ownership = reservedMcpOwnership(
+			catalog,
+			this.settingsManager.getGlobalMcpServers()?.[catalog?.serviceId ?? service.serviceId],
+		);
+		if (ownership.status !== "canonical" || service.connectionStatus === "disabled") {
+			this.showStatus(ownership.setupHint ?? service.setupHint ?? "Disabled in settings.");
+			return false;
+		}
+		if (service.connectionStatus === "connected") {
+			if (target?.managedBySettings && !service.usesOAuth) {
+				this.showStatus(
+					`${service.label} is configured through settings; manage it with /mcp remove ${service.serviceId}.`,
+				);
+				return false;
+			}
+			const disconnected = await this.getMcpConnectionStore().removeAccount({
+				connectionId: service.serviceId,
+				authCleanup: (connectionId) => {
+					// Disk-authoritative logout: remove() swallows persistence
+					// errors, so a failed auth-file write could report the logout
+					// done while the credential survives. removeVerified throws
+					// instead (the honest "failed" path) and returns whether a
+					// credential was actually removed from disk.
+					return this.modelRegistry.authStorage.removeVerified(mcpCredentialKey(connectionId));
+				},
+			});
+			// Honest outcomes: removed/credential-only disconnected the account,
+			// missing is a no-op, logged-out keeps the durable logout but says the
+			// record save failed, and failed is state-neutral (the cleanup may or
+			// may not have run — it never claims a specific state).
+			if (disconnected === "failed") {
+				this.showWarning(`The change could not be saved; try disconnecting ${service.label} again.`);
+				return false;
+			}
+			if (disconnected === "logged-out") {
+				this.showWarning(
+					`Logged out ${service.label}, but the change could not be saved. It may still appear in the list; try again to finish cleanup.`,
+				);
+				return false;
+			}
+			if (disconnected === "missing") {
+				this.showStatus(`${service.label} is no longer connected.`);
+				return false;
+			}
+			await this.reloadAfterMcpChange(`Disconnected ${service.label}.`);
+			return false;
+		}
+		// Pending accounts retry verification explicitly — no login needed, the
+		// grant already exists; "retry from /plugins" must actually work.
+		if (service.connectionStatus === "pending" && target?.url) {
+			let retried: McpConnectionRecord | undefined;
+			try {
+				retried = await verifyMcpConnection({
+					authStorage: this.modelRegistry.authStorage,
+					connectionStore: this.getMcpConnectionStore(),
+					connectionId: service.serviceId,
+					serviceId: options.catalogServiceId ?? service.serviceId,
+					label: service.label,
+					endpoint: target.url,
+					usesOAuth: target.usesOAuth,
+					...(target.bearerTokenEnvVar ? { bearerTokenEnvVar: target.bearerTokenEnvVar } : {}),
+				});
+			} catch {
+				retried = undefined;
+			}
+			const retriedMessage =
+				retried?.status === "connected"
+					? `Connected ${service.label}${
+							retried.toolCount !== undefined ? ` (${retried.toolCount} tools verified)` : ""
+						}.`
+					: retried
+						? `Verification did not complete: ${formatMcpVerificationIssue(retried.lastError)}. The connection is saved; retry from /plugins.`
+						: "The verification result could not be saved. The connection is saved; retry from /plugins.";
+			await this.reloadAfterMcpChange(retriedMessage);
+			return false;
+		}
+
+		// Actual connects route through the ONE guarded OAuth operation —
+		// separate from the picker's disconnect/verify actions above, so LOGIN
+		// intent (from any route) never dispatches a disconnect by record
+		// status.
+		return (await this.guardedMcpLogin(service, target, options)).status === "success";
+	}
+
+	/**
+	 * The ONE guarded MCP OAuth login operation (initial connect, reconnect,
+	 * add account, /mcp login, the generic /login service options, the config
+	 * menu): claim/reserve under the store's file lock, staged OAuth, guarded
+	 * finalize, verification. Never dispatches on the record's status — the
+	 * picker's disconnect/verify actions live in connectServiceFromPicker.
+	 * Reports success only after the finalize committed.
+	 */
+	private async guardedMcpLogin(
+		service: McpPluginView,
+		target:
+			| {
+					url?: string;
+					usesOAuth: boolean;
+					bearerTokenEnvVar?: string;
+					managedBySettings: boolean;
+					transport?: "stdio";
+					name?: string;
+			  }
+			| undefined,
+		options: {
+			catalogServiceId?: string;
+			addAccount?: boolean;
+			knownIds?: ReadonlySet<string>;
+			explicitLogin?: boolean;
+		} = {},
+	): Promise<AuthenticationResult> {
+		if (!service.connectable || !target) {
+			this.showStatus(service.setupHint ?? `${service.label} cannot be connected automatically in this build.`);
+			return { status: "failed" };
+		}
+		const currentServices = this.resolveCurrentServiceCatalog();
+		const definition = currentServices.find(
+			(entry) => entry.serviceId === (options.catalogServiceId ?? service.serviceId),
+		);
+		const userConfig = this.settingsManager.getGlobalMcpServers()?.[service.serviceId];
+		const admission =
+			definition || userConfig
+				? this.getMcpLoginEligibility(
+						service.serviceId,
+						options.catalogServiceId ?? service.serviceId,
+						options.addAccount === true,
+						undefined,
+						options.explicitLogin === true,
+					)
+				: { allowed: true, endpoint: target.url };
+		const targetUrl = admission.endpoint;
+		if (!admission.allowed || !targetUrl || target.url !== targetUrl || !target.usesOAuth) {
+			this.showStatus(admission.setupHint ?? "The connection target changed. Open the catalog again to review it.");
+			return { status: "failed" };
+		}
+		// EVERY user-facing MCP login is guarded (initial connect, reconnect,
+		// add account): the account is claimed under the store's file lock first
+		// — a durable pending reservation for a fresh id, a nonce claim on an
+		// existing record — so a concurrent logout can cancel us and a late
+		// OAuth callback can never reactivate or clobber the account.
+		let connectionId = service.serviceId;
+		let attemptId: string | undefined;
+		let stagedServerId: string | undefined;
+		// The full on-disk identity a guarded REPLACE expects to swap out —
+		// captured for EVERY login, even without a record: legacy
+		// credential-only accounts can hold a grant with no record, and a
+		// reconnect must replace it without clearing it first.
+		let expectedOldCredential: AuthCredential | undefined;
+		if (options.addAccount === true) {
+			const store = this.getMcpConnectionStore();
+			const taken = (id: string): boolean =>
+				store.get(id) !== undefined ||
+				this.modelRegistry.authStorage.get(mcpCredentialKey(id)) !== undefined ||
+				(options.knownIds?.has(id) ?? false) ||
+				this.settingsManager.getGlobalMcpServers()?.[id] !== undefined;
+			const usedIds = new Set<string>();
+			for (let attempt = 0; attempt < 20; attempt++) {
+				const candidate = nextMcpConnectionId(service.serviceId, (id) => taken(id) || usedIds.has(id));
+				const now = Date.now();
+				const nonce = randomUUID();
+				// Durable, commit-gated reservation: the pending marker (with the
+				// opaque attempt nonce) only counts once the record write commits.
+				const won = await store.reserveConnectionId({
+					connectionId: candidate,
+					serviceId: options.catalogServiceId ?? service.serviceId,
+					endpoint: targetUrl,
+					label: `${service.label} (${candidate})`,
+					status: "pending",
+					createdAt: now,
+					updatedAt: now,
+					attemptId: nonce,
+				});
+				if (won) {
+					connectionId = candidate;
+					attemptId = nonce;
+					break;
+				}
+				usedIds.add(candidate);
+			}
+			if (attemptId === undefined) {
+				this.showStatus(`Could not allocate a free account id for ${service.label}.`);
+				return { status: "failed" };
+			}
+		} else {
+			const store = this.getMcpConnectionStore();
+			const nonce = randomUUID();
+			// Disk-authoritative identity capture (never the per-instance cache):
+			// an intentional replacement CASes against exactly this value, and a
+			// newer external writer refuses instead of being clobbered.
+			expectedOldCredential = this.modelRegistry.authStorage.getVerified(mcpCredentialKey(connectionId));
+			const existing = store.get(connectionId);
+			if (existing === undefined) {
+				const now = Date.now();
+				const won = await store.reserveConnectionId({
+					connectionId,
+					serviceId: options.catalogServiceId ?? service.serviceId,
+					endpoint: targetUrl,
+					label: service.label,
+					status: "pending",
+					createdAt: now,
+					updatedAt: now,
+					attemptId: nonce,
+				});
+				if (!won) {
+					this.showStatus(`${service.label} is already being connected from another client.`);
+					return { status: "failed" };
+				}
+			} else {
+				const claimed = await store.claimConnectionId({
+					connectionId,
+					attemptId: nonce,
+					isStillCurrent: (record) => {
+						const current = this.getMcpLoginEligibility(
+							connectionId,
+							options.catalogServiceId ?? service.serviceId,
+							false,
+							{ record },
+							options.explicitLogin === true,
+						);
+						return current.allowed && current.endpoint === targetUrl;
+					},
+				});
+				if (!claimed) {
+					this.showStatus(`${service.label} is already being connected from another client.`);
+					return { status: "failed" };
+				}
+			}
+			attemptId = nonce;
+		}
+		// The OAuth credential ALWAYS stages under a per-attempt key; the real
+		// account key is only written by the guarded finalize below.
+		stagedServerId = `${connectionId}--${attemptId}`;
+		const releaseAttempt = async (): Promise<boolean> => {
+			let discarded = false;
+			try {
+				this.modelRegistry.authStorage.removeVerified(mcpCredentialKey(stagedServerId));
+				discarded = true;
+			} catch {
+				// Keep recovery data if staged credential deletion fails.
+			}
+			unregisterOAuthProvider(mcpCredentialKey(stagedServerId));
+			if (discarded)
+				this.showStatus(
+					`The login result was discarded. Account settings for ${connectionId} were kept; reconnect or remove the account from /plugins.`,
+				);
+			// Never delete a shell on cancellation: an external auth writer can
+			// change the account key at any moment, outside the store lock.
+			const released = await this.getMcpConnectionStore().releaseClaim({ connectionId, attemptId });
+			if (!released || !discarded) {
+				this.showWarning(
+					`Could not confirm login cleanup for ${connectionId}. Account settings and any remaining credentials were kept; retry from /plugins or remove the account.`,
+				);
+			}
+			return released && discarded;
+		};
+		const loginLabel = connectionId === service.serviceId ? service.label : `${service.label} (${connectionId})`;
+		// ONE login-time client identity, shared by the staged login and the
+		// post-finalize real-id registration: the engine pins the client
+		// identity on the stored credential and refuses drift at refresh, so
+		// both registrations must resolve the exact same config. Settings
+		// identity applies to user-owned servers; reserved builtins never take
+		// a user-configured client identity.
+		const parentConfig = this.settingsManager.getGlobalMcpServers()?.[options.catalogServiceId ?? service.serviceId];
+		const loginIdentity = definition?.legacyBuiltin ? {} : resolveMcpOAuthIdentity(parentConfig);
+		let result: AuthenticationResult;
+		try {
+			registerOAuthProvider(
+				createConfiguredMcpProvider({
+					server: stagedServerId,
+					label: loginLabel,
+					url: targetUrl,
+					identity: loginIdentity,
+					reviewedScopes: definition?.reviewedScopes,
+					clientRegistration: definition?.clientRegistration,
+				}),
+			);
+			result = await this.createAuthFlows().runMcpLogin(stagedServerId, loginLabel);
+		} catch {
+			result = { status: "failed" };
+		}
+		if (result.status !== "success") {
+			const cleaned = await releaseAttempt();
+			if (cleaned)
+				this.showStatus(
+					`Login did not complete. Account settings for ${connectionId} were kept; reconnect or remove the account from /plugins.`,
+				);
+			return cleaned ? result : { status: "failed" };
+		}
+		{
+			const stagedKey = mcpCredentialKey(stagedServerId);
+			const realKey = mcpCredentialKey(connectionId);
+			// Guarded commit: the staged credential moves to the REAL account key
+			// under the store's file lock, only while our claim is still ours.
+			// A FRESH account (no existing grant) moves set-if-absent — a
+			// bystander credential is never clobbered. A REPLACEMENT (reconnect,
+			// or a legacy grant with no record) CASes against the captured full
+			// identity; a newer external credential refuses. When the record
+			// write fails, the compensate runs under the SAME lock and RESTORES
+			// the previous credential (never delete-only, never clobbering a
+			// newer writer); a failed rollback surfaces recovery-required with
+			// the credential RETAINED.
+			let movedCredential: AuthCredential | undefined;
+			let replacedPrevious: AuthCredential | undefined;
+			const finalization = await this.getMcpConnectionStore().finalizeAttempt({
+				connectionId,
+				attemptId,
+				commit: (record) => {
+					// Atomic, disk-authoritative move under the AUTH backend's
+					// own file lock: the store's lock cannot cover an ordinary
+					// login in another process, so the conditional move reads
+					// CURRENT on-disk data.
+					const move =
+						expectedOldCredential === undefined
+							? this.modelRegistry.authStorage.moveStagedCredential(stagedKey, realKey)
+							: this.modelRegistry.authStorage.replaceStagedCredential(
+									stagedKey,
+									realKey,
+									expectedOldCredential,
+								);
+					if (move.status === "occupied") {
+						// A newer external credential - or a deleted old grant -
+						// owns the account key: fail CLOSED and preserve the
+						// account shell in the cleanup.
+						throw new Error("account key occupied by a newer login");
+					}
+					if (move.status === "nothing") throw new Error("staged login credential is missing");
+					if (move.status === "replaced") {
+						movedCredential = move.credential;
+						replacedPrevious = expectedOldCredential;
+					} else if (move.status === "moved") {
+						movedCredential = move.credential;
+					}
+					// Pending-verification: the commit CONSUMES the nonce and
+					// clears the previous verification state — an old Connected
+					// status never carries onto a newly replaced grant.
+					const {
+						attemptId: _consumedNonce,
+						verifiedAt: _oldVerifiedAt,
+						toolCount: _oldToolCount,
+						lastError: _oldLastError,
+						...pendingRecord
+					} = record;
+					return { ...pendingRecord, status: "pending", updatedAt: Date.now() };
+				},
+				compensate: () => {
+					if (!movedCredential) {
+						// Never moved: nothing of ours to undo.
+						return { status: "failed" };
+					}
+					if (replacedPrevious !== undefined) {
+						// RESTORE the previous credential (never delete-only) via
+						// a full-identity CAS: a newer writer is never clobbered.
+						this.modelRegistry.authStorage.replaceCredentialIfMatches(realKey, movedCredential, replacedPrevious);
+						return { status: "failed" };
+					}
+					// Fresh-account rollback: restore ours to the staged slot only
+					// when it is empty, then delete it from the real slot only
+					// when it is still exactly ours — a credential written by
+					// anyone else is never deleted.
+					this.modelRegistry.authStorage.restoreCredentialIfAbsent(stagedKey, movedCredential);
+					this.modelRegistry.authStorage.removeIfCredentialMatches(realKey, movedCredential);
+				},
+			});
+			if (finalization === "recovery-required") {
+				// Explicit recovery state: the commit or its rollback failed and
+				// partial state may remain. RETAIN the credential wherever it
+				// lives (staged key or real key) — never discard recovery data —
+				// and tell the user exactly that.
+				this.showWarning(
+					`The login for account ${connectionId} could not be committed. The credential is retained and can be recovered; retry from /plugins or remove the placeholder account.`,
+				);
+				return { status: "failed" };
+			}
+			if (finalization !== "committed") {
+				this.showStatus(
+					`The account ${connectionId} was logged out or replaced during login, or the change could not be saved; login was not committed.`,
+				);
+				await releaseAttempt();
+				return { status: "failed" };
+			}
+			// Committed: the real id now owns the credential — register its
+			// provider and drop the staged registration.
+			registerOAuthProvider(
+				createConfiguredMcpProvider({
+					server: connectionId,
+					label: `${service.label} (${connectionId})`,
+					url: targetUrl,
+					identity: loginIdentity,
+					reviewedScopes: definition?.reviewedScopes,
+					clientRegistration: definition?.clientRegistration,
+				}),
+			);
+			unregisterOAuthProvider(mcpCredentialKey(stagedServerId));
+		}
+		// A stored token is not "Connected": verify with a real MCP handshake. The
+		// record's serviceId stays the catalog id; the connectionId is the account.
+		let verification: McpConnectionRecord | undefined;
+		try {
+			verification = await verifyMcpConnection({
+				authStorage: this.modelRegistry.authStorage,
+				connectionStore: this.getMcpConnectionStore(),
+				connectionId,
+				serviceId: options.catalogServiceId ?? service.serviceId,
+				label: loginLabel,
+				endpoint: targetUrl,
+				usesOAuth: target.usesOAuth,
+				...(target.bearerTokenEnvVar ? { bearerTokenEnvVar: target.bearerTokenEnvVar } : {}),
+			});
+		} catch {
+			verification = undefined;
+		}
+		const accountPrefix = options.addAccount === true ? `Added account ${connectionId}. ` : "";
+		const message =
+			verification?.status === "connected"
+				? `${accountPrefix}Connected ${loginLabel}${
+						verification.toolCount !== undefined ? ` (${verification.toolCount} tools verified)` : ""
+					}.`
+				: verification
+					? `${accountPrefix}Login succeeded for ${loginLabel}, but connection verification did not complete: ${formatMcpVerificationIssue(
+							verification.lastError,
+						)}. The connection is saved; retry from /plugins.`
+					: `${accountPrefix}Login succeeded for ${loginLabel}, but the verification result could not be saved. The connection is saved; retry from /plugins.`;
+		await this.reloadAfterMcpChange(message);
+		return {
+			status: "success",
+			providerId: mcpCredentialKey(connectionId),
+			providerName: loginLabel,
+			authType: "oauth",
+			kind: "service",
+		};
+	}
+
 	private async reloadAfterMcpChange(message: string, successMessage = message): Promise<void> {
 		if (this.isAgentStreaming() || this.isAgentCompacting()) {
-			this.showStatus(`${message} The change was saved. Run /reload after the current turn to activate it.`);
+			this.queueMcpActivationForNextBoundary(message, successMessage);
 			return;
 		}
 		const reloaded = await this.handleReloadCommand();
@@ -9311,6 +10428,28 @@ export class InteractiveMode {
 			this.showStatus(successMessage);
 		} else {
 			this.showWarning(`${message} The change remains saved, but it is not active in this session.`);
+		}
+	}
+
+	/**
+	 * Defer an MCP change's activation to the next safe boundary (agent run end and
+	 * compaction end both check); the user never has to run /reload manually.
+	 */
+	private queueMcpActivationForNextBoundary(message: string, successMessage = message): void {
+		this.pendingPostRunActivation = { message, successMessage };
+		this.showStatus(`${message} It will activate automatically when the current turn finishes.`);
+	}
+
+	private async maybeRunQueuedMcpActivation(): Promise<void> {
+		if (!this.pendingPostRunActivation) return;
+		if (this.isAgentStreaming() || this.isAgentCompacting()) return;
+		const pending = this.pendingPostRunActivation;
+		this.pendingPostRunActivation = undefined;
+		const reloaded = await this.handleReloadCommand();
+		if (reloaded) {
+			this.showStatus(pending.successMessage);
+		} else {
+			this.showWarning(`${pending.message} The change remains saved, but it is not active in this session.`);
 		}
 	}
 
@@ -9358,15 +10497,12 @@ export class InteractiveMode {
 					[SELF_UPDATE_INTERACTIVE_CHILD_ENV]: "1",
 				}
 			: process.env;
-		const updateResult = spawnSync(
-			process.execPath,
-			[...process.execArgv, entrypoint, "update", ...updateChildArgs],
-			{
-				stdio: "inherit",
-				cwd: updateCwd,
-				env: updateEnv,
-			},
-		);
+		const updateLaunch = createCliSubprocessLaunchSpec(["update", ...updateChildArgs]);
+		const updateResult = spawnSync(updateLaunch.command, updateLaunch.args, {
+			stdio: "inherit",
+			cwd: updateCwd,
+			env: updateEnv,
+		});
 		const updateExitCode = updateResult.status ?? (updateResult.signal ? 1 : 0);
 		const selfUpdateNotAttempted =
 			includesSelf && !updateResult.error && updateExitCode === SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE;
@@ -9418,7 +10554,7 @@ export class InteractiveMode {
 					);
 				}
 			}
-			const relaunch = createCliSubprocessLaunchSpec(relaunchArgs);
+			const relaunch = createUpdatedCliSubprocessLaunchSpec(relaunchArgs);
 			installation?.stage("relaunch", "started");
 			await this.installationReady;
 			await installation?.flush();
@@ -9531,6 +10667,7 @@ export class InteractiveMode {
 
 		try {
 			await this.agentConnection.reload();
+			this.pendingPostRunActivation = undefined;
 			this.toolDefinitionCache.clear();
 			this.keybindings.reload();
 			const activeHeader = this.customHeader ?? this.builtInHeader;
@@ -9538,7 +10675,6 @@ export class InteractiveMode {
 				activeHeader.setExpanded(this.toolOutputExpanded);
 			}
 			setRegisteredThemes(this.uiServices.getThemes());
-			this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
 			const themeName = this.settingsManager.getTheme();
 			const themeResult = themeName ? setTheme(themeName, true) : { success: true };
 			if (!themeResult.success) {
@@ -9854,13 +10990,13 @@ export class InteractiveMode {
 		const stats = await this.agentConnection.getSessionStats();
 		const sessionName = this.getCurrentSessionName();
 
-		let info = `${theme.bold("Session Info")}\n\n`;
+		let info = `Session Info\n\n`;
 		if (sessionName) {
 			info += `${theme.fg("dim", "Name:")} ${sessionName}\n`;
 		}
 		info += `${theme.fg("dim", "File:")} ${stats.sessionFile ?? "In-memory"}\n`;
 		info += `${theme.fg("dim", "ID:")} ${stats.sessionId}\n\n`;
-		info += `${theme.bold("Messages")}\n`;
+		info += `Messages\n`;
 		info += `${theme.fg("dim", "User:")} ${stats.userMessages}\n`;
 		info += `${theme.fg("dim", "Assistant:")} ${stats.assistantMessages}\n`;
 		info += `${theme.fg("dim", "Tool Calls:")} ${stats.toolCalls}\n`;
@@ -9875,7 +11011,7 @@ export class InteractiveMode {
 
 	private handleLogsCommand(): void {
 		const logsDir = getLogsDir();
-		let info = `${theme.bold("Logs")}\n\n`;
+		let info = `Logs\n\n`;
 		info += `${theme.fg("dim", "Directory:")} ${logsDir}\n\n`;
 
 		let files: string[] = [];
@@ -9908,7 +11044,7 @@ export class InteractiveMode {
 
 	private async handleSystemPromptCommand(): Promise<void> {
 		const prompt = await this.agentConnection.getSystemPrompt();
-		const header = `${theme.bold("System Prompt")} ${theme.fg("dim", `(${prompt.length} chars)`)}`;
+		const header = `System Prompt ${theme.fg("dim", `(${prompt.length} chars)`)}`;
 
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Text(header, 1, 0));
@@ -9980,7 +11116,7 @@ export class InteractiveMode {
 
 	private formatTracePreview(result: Extract<AgentTracePreviewResult, { status: "ready" }>): string {
 		const lines = [
-			theme.bold("Trace Preview"),
+			"Trace Preview",
 			theme.fg("dim", "Nothing has been uploaded by this command."),
 			"",
 			`${theme.fg("dim", "File:")} ${result.sessionFile}`,
@@ -9999,7 +11135,7 @@ export class InteractiveMode {
 		if (result.gitCommit) {
 			lines.push(`${theme.fg("dim", "Git commit:")} ${result.gitCommit}`);
 		}
-		lines.push("", theme.bold("Raw JSONL payload preview"));
+		lines.push("", "Raw JSONL payload preview");
 		if (result.contentPreview) {
 			lines.push(result.contentPreview);
 			if (result.truncated) {
@@ -10041,7 +11177,7 @@ export class InteractiveMode {
 			const credential = await getPrimeAgentTraceCredential(this.modelRegistry.authStorage);
 			const state = await this.agentConnection.getState();
 			const info = [
-				theme.bold("Trace Sharing"),
+				"Trace Sharing",
 				"",
 				`${theme.fg("dim", "Automatic uploads:")} ${this.settingsManager.getAgentTracesEnabled() ? "Enabled" : "Disabled"}`,
 				`${theme.fg("dim", "Credential:")} ${credential?.label ?? "Not configured"}`,
@@ -10355,7 +11491,7 @@ export class InteractiveMode {
 		const next = job.nextRunAt ? new Date(job.nextRunAt).toLocaleString() : "-";
 		const last = job.lastRunAt ? new Date(job.lastRunAt).toLocaleString() : "-";
 		const lines = [
-			theme.bold("Heartbeat"),
+			"Heartbeat",
 			"",
 			`${theme.fg("dim", "Status:")} ${job.status}`,
 			`${theme.fg("dim", "Every:")} ${job.schedule.expression}`,
@@ -10387,7 +11523,7 @@ export class InteractiveMode {
 
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new DynamicBorder());
-		this.chatContainer.addChild(new Text(theme.bold(theme.fg("accent", "What's New")), 1, 0));
+		this.chatContainer.addChild(new Text(theme.fg("accent", "What's New"), 1, 0));
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Markdown(changelogMarkdown, 1, 1, this.getMarkdownThemeWithSettings()));
 		this.chatContainer.addChild(new DynamicBorder());
@@ -10421,9 +11557,6 @@ export class InteractiveMode {
 		const shortcutsKey = this.getAppKeyDisplay("app.shortcuts");
 		const selectModel = this.getAppKeyDisplay("app.model.select");
 		const expandTools = this.getAppKeyDisplay("app.tools.expand");
-		const expandMessages = this.getAppKeyDisplay("app.messages.expand");
-		const expandEdits = this.getAppKeyDisplay("app.edits.expand");
-		const toggleThinking = this.getAppKeyDisplay("app.thinking.toggle");
 		const externalEditor = this.getAppKeyDisplay("app.editor.external");
 		const promptStash = this.getAppKeyDisplay("app.prompt.stash");
 		const pasteImage = this.getAppKeyDisplay("app.clipboard.pasteImage");
@@ -10435,8 +11568,8 @@ export class InteractiveMode {
 \`${clearInput}\` interrupt · press twice to rewind or clear the prompt
 
 **Controls**
-\`${selectModel}\` select model · \`/effort\` set reasoning · \`${expandTools}\` tool output
-\`${expandMessages}\` agent messages · \`${expandEdits}\` edit diffs · \`${toggleThinking}\` thinking blocks · \`${promptStash}\` stash prompt · \`${externalEditor}\` edit in \`$EDITOR\`
+\`${selectModel}\` select model · \`/effort\` set reasoning · \`${expandTools}\` overview → thinking + diffs → all output
+\`${promptStash}\` stash prompt · \`${externalEditor}\` edit in \`$EDITOR\`
 \`${pasteImage}\` paste image
 
 **Help**
@@ -10474,9 +11607,6 @@ ${shortcutsKey ? `\`${shortcutsKey}\` quick shortcuts · ` : ""}\`/hotkeys\` ful
 		const exit = this.getAppKeyDisplay("app.exit");
 		const selectModel = this.getAppKeyDisplay("app.model.select");
 		const expandTools = this.getAppKeyDisplay("app.tools.expand");
-		const expandMessages = this.getAppKeyDisplay("app.messages.expand");
-		const expandEdits = this.getAppKeyDisplay("app.edits.expand");
-		const toggleThinking = this.getAppKeyDisplay("app.thinking.toggle");
 		const focusSubagents = this.getAppKeyDisplay("app.subagents.focus");
 		const manageHeartbeats = this.getAppKeyDisplay("app.heartbeats.open");
 		const externalEditor = this.getAppKeyDisplay("app.editor.external");
@@ -10523,10 +11653,7 @@ ${shortcutsKey ? `\`${shortcutsKey}\` quick shortcuts · ` : ""}\`/hotkeys\` ful
 | \`${clear}\` | Interrupt current operation (first) / exit (second) |
 ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shortcutsKey ? `| \`${shortcutsKey}\` | Show quick shortcuts |\n` : ""}| \`${exit}\` | Exit (when editor is empty) |
 | \`${selectModel}\` | Open model selector |
-| \`${expandTools}\` | Toggle tool output expansion |
-| \`${expandMessages}\` | Toggle agent message expansion |
-| \`${expandEdits}\` | Toggle edit diff expansion |
-| \`${toggleThinking}\` | Toggle thinking block visibility |
+| \`${expandTools}\` | Cycle overview → thinking + diffs → all output |
 | \`${focusSubagents}\` | Focus the subagent summary / open the scoped agents view |
 | \`${manageHeartbeats}\` | Manage heartbeats |
 | \`${externalEditor}\` | Edit message in external editor |
@@ -10697,6 +11824,8 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 		this.pendingCancellation?.finish("unavailable");
 		this.pendingCancellation = undefined;
 		this.journeyTelemetry?.dispose();
+		this.closeConfigurationMenu?.();
+		this.closeServiceCatalogPicker?.();
 		this.unregisterSignalHandlers();
 		this.clearCtrlCExitHint({ render: false });
 		this.clearEscapeRepeat();
@@ -10705,7 +11834,6 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 		}
 		this.stopWorkingLoader();
 		this.discardRefineLoader();
-		this.endFeatureHintRun();
 		this.stopWorkingPulse();
 		this.stopGoalTrayTimer();
 		this.closeHeartbeatManager();
