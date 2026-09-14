@@ -30,7 +30,16 @@
 - If you create or modify a test file, you MUST run that test file and iterate until it passes.
 - When writing tests, run them, identify issues in either the test or implementation, and iterate until fixed.
 - For `packages/coding-agent/test/suite/`, use `test/suite/harness.ts` plus the faux provider. Do not use real provider APIs, real API keys, or paid tokens.
-- Put issue-specific regressions under `packages/coding-agent/test/suite/regressions/` and name them `<issue-number>-<short-slug>.test.ts`.
+- Before adding, keeping, or deleting a test, apply `## Testing Policy`.
+
+## Testing Policy
+
+- A test must fail when the code it covers is broken. Stub or revert that code; if the test still passes, delete the test.
+- Test these only: process boundaries (daemon RPC, ACP), on-disk formats (session files, settings), concurrency and ordering, crash/restart/resume, and load (many sessions, many subagents). Anything else needs a stated reason in the PR.
+- A change may not add more lines of test than of source. A test-only change must delete at least as many test lines as it adds.
+- Banned in test files: `as unknown as` casts, assertions on mock return values, assertions on rendered text or copy, sleeps, hardcoded ports or socket paths, `.skip` and `.todo`.
+- Regressions go in the existing suite file for the module that broke, issue number in the test name. Never a new file per issue.
+- One test file per source module. Repeated blocks become one `it.each` table. Deleting code deletes its tests. A flaky test is made deterministic or deleted, never retried.
 
 ## Daemon Protocol Changes
 
