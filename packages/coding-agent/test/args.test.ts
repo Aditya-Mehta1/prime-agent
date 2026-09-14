@@ -771,25 +771,19 @@ describe("value flags require values", () => {
 		});
 	});
 
-	test.each([
-		"--provider",
-		"--api-key",
-		"--cwd",
-		"--fork",
-		"--session-dir",
-		"--models",
-		"--daemon-socket",
-		"--system-prompt",
-	])("%s followed by a short option reports a missing value", (flag) => {
-		const result = parseArgs([flag, "-x"]);
+	test.each(["--provider", "--api-key", "--cwd", "--fork", "--session-dir", "--models", "--daemon-socket"])(
+		"%s followed by a short option reports a missing value",
+		(flag) => {
+			const result = parseArgs([flag, "-x"]);
 
-		expect(result.diagnostics).toContainEqual({
-			type: "error",
-			message: `${flag} requires a value`,
-		});
-	});
+			expect(result.diagnostics).toContainEqual({
+				type: "error",
+				message: `${flag} requires a value`,
+			});
+		},
+	);
 
-	test("free-text value flags keep accepting dash-prefixed values", () => {
+	test("free-form value flags keep accepting dash-prefixed values", () => {
 		const goal = parseArgs(["--goal", "-p"]);
 		expect(goal.goal).toBe("-p");
 		expect(goal.print).toBeUndefined();
@@ -798,5 +792,13 @@ describe("value flags require values", () => {
 		const gate = parseArgs(["--autonomous-gate", "-x npm test"]);
 		expect(gate.autonomousGates).toEqual(["-x npm test"]);
 		expect(gate.diagnostics.some((d) => d.type === "error")).toBe(false);
+
+		const prompt = parseArgs(["--system-prompt", "- Respond only with JSON"]);
+		expect(prompt.systemPrompt).toBe("- Respond only with JSON");
+		expect(prompt.diagnostics.some((d) => d.type === "error")).toBe(false);
+
+		const appended = parseArgs(["--append-system-prompt", "- Be terse"]);
+		expect(appended.appendSystemPrompt).toEqual(["- Be terse"]);
+		expect(appended.diagnostics.some((d) => d.type === "error")).toBe(false);
 	});
 });
