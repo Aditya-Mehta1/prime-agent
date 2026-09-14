@@ -254,6 +254,24 @@ describe("client-owned PostHog errors", () => {
 		await client.flush();
 		expect(batches[1].events.map((event) => event.name)).toEqual(["agent error"]);
 	});
+	it("never holds an occurrence error through a final flush", async () => {
+		let now = Date.now();
+		let discoveries = 0;
+		const { client, batches } = setup(support, accepted, {
+			now: () => now,
+			discover: () => (++discoveries === 1 ? Response.json(support) : new Response(null, { status: 503 })),
+		});
+		client.capture(source.name, source.properties);
+		await client.flush();
+		expect(batches[0].events.map((event) => event.name)).toEqual(["agent error", "$exception"]);
+		now += 60_001;
+		client.capture(source.name, source.properties);
+		await client.flush();
+		expect(batches).toHaveLength(1);
+		// Shutdown has no later flush to wait for: send what the collector takes.
+		await client.flush({ final: true });
+		expect(batches[1].events.map((event) => event.name)).toEqual(["agent error"]);
+	});
 	it("keeps every error pair within batch count and byte limits", async () => {
 		const { client, batches } = setup();
 		for (let i = 0; i < 21; i++) client.capture(source.name, source.properties);

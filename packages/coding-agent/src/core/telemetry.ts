@@ -100,7 +100,8 @@ export interface TelemetryBatch {
 
 export interface TelemetrySink {
 	capture(name: TelemetryEventName, properties: TelemetryProperties): void;
-	flush(options?: { timeoutMs?: number }): Promise<void>;
+	/** `final` marks a last-chance flush: nothing may be held back for a later one. */
+	flush(options?: { timeoutMs?: number; final?: boolean }): Promise<void>;
 }
 
 interface TelemetryState {
@@ -539,16 +540,17 @@ export class TelemetryClient implements TelemetrySink {
 		})();
 	}
 
-	async flush(options: { timeoutMs?: number } = {}): Promise<void> {
+	async flush(options: { timeoutMs?: number; final?: boolean } = {}): Promise<void> {
 		if (this.flushTimer) clearTimeout(this.flushTimer);
 		this.flushTimer = undefined;
 		if (!this.enabled()) return;
 		const timeoutMs = Math.max(1, options.timeoutMs ?? this.requestTimeoutMs);
 		if (this.flushInFlight) {
+			const inFlight = this.flushInFlight;
 			let timer: ReturnType<typeof setTimeout> | undefined;
 			try {
 				await Promise.race([
-					this.flushInFlight,
+					inFlight,
 					new Promise<void>((resolve) => {
 						timer = setTimeout(() => {
 							for (const controller of this.requests) controller.abort();
@@ -560,10 +562,13 @@ export class TelemetryClient implements TelemetrySink {
 			} finally {
 				if (timer) clearTimeout(timer);
 			}
-			return;
+			// A last-chance flush cannot settle for whatever the in-flight pass
+			// decided to hold back; drain again below with the final rules once
+			// that pass has finished (a pass still running keeps ownership).
+			if (!options.final || this.flushInFlight === inFlight) return;
 		}
 		this.discover();
-		this.flushInFlight = this.drainQueue(timeoutMs);
+		this.flushInFlight = this.drainQueue(timeoutMs, options.final === true);
 		try {
 			await this.flushInFlight;
 		} finally {
@@ -573,7 +578,7 @@ export class TelemetryClient implements TelemetrySink {
 		}
 	}
 
-	private async drainQueue(timeoutMs: number): Promise<void> {
+	private async drainQueue(timeoutMs: number, final = false): Promise<void> {
 		const generation = this.queueGeneration;
 		const deadline = performance.now() + timeoutMs;
 		if (this.discovery) {
@@ -617,6 +622,7 @@ export class TelemetryClient implements TelemetrySink {
 				// does. Past the wait window the analytics event still ships, so a
 				// collector that never answers cannot hoard errors forever.
 				if (
+					!final &&
 					(this.discovery || !this.capabilitiesSettled) &&
 					entry.event.name === "agent error" &&
 					entry.event.properties.error_event_kind === "occurrence" &&
@@ -788,7 +794,7 @@ export async function flushTelemetry(
 			if (sink instanceof TelemetryClient) sink.clearPending();
 			return;
 		}
-		await sink?.flush({ timeoutMs });
+		await sink?.flush({ timeoutMs, final: true });
 	} catch {
 		/* Controlled shutdown is bounded and must preserve its original result. */
 	}
@@ -1542,7 +1548,7 @@ export function installAgentTelemetry(session: AgentSession, options: InstallAge
 		});
 		telemetry.dispose();
 		try {
-			await sink.flush({ timeoutMs: 1_500 });
+			await sink.flush({ timeoutMs: 1_500, final: true });
 		} catch {
 			/* Shutdown remains best-effort. */
 		}
