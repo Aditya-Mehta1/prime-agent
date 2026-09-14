@@ -57,6 +57,12 @@ export type AgentTraceUploadResult =
 	| { status: "too_large"; size: number; maxBytes: number }
 	| { status: "failed"; statusCode?: number; message: string; retryAfterMs?: number };
 
+export interface AgentTraceUploadDelay {
+	/** Retry backoff after a failed attempt, or the batch gate holding the platform rate limit. */
+	reason: "retry-backoff" | "rate-limit";
+	delayMs: number;
+}
+
 export interface AgentTraceUploadOptions {
 	sessionFile: string | undefined;
 	authStorage: AuthStorage;
@@ -69,10 +75,18 @@ export interface AgentTraceUploadOptions {
 	reloadConfig?: boolean;
 	requestTimeoutMs?: number;
 	signal?: AbortSignal;
+	/** Reports every wait the upload arms before its next request. */
+	onUploadDelay?: (delay: AgentTraceUploadDelay) => void;
 }
 
 export interface AgentTraceSessionUploadOptions extends Omit<AgentTraceUploadOptions, "sessionFile"> {
 	sessionManager: SessionManager;
+}
+
+export interface AgentTraceUploadSchedule {
+	delayMs: number;
+	/** True when the armed timer keeps the process alive; the scheduler always arms unref'd timers. */
+	holdsProcessOpen: boolean;
 }
 
 export interface AgentTraceUploadInstallOptions {
@@ -84,6 +98,18 @@ export interface AgentTraceUploadInstallOptions {
 	requestTimeoutMs?: number;
 	/** The session's semantic-edge ledger; registered with the outbox as its own delivery kind. */
 	semanticEdgesLedgerPath?: string;
+	/** Reports the timer the scheduler arms for its next automatic upload. */
+	onUploadScheduled?: (schedule: AgentTraceUploadSchedule) => void;
+	/** Reports each scheduled cycle once it settles, after any follow-up cycle is armed. */
+	onUploadSettled?: (outcome: AgentTraceUploadCycleOutcome) => void;
+}
+
+/** A scheduled cycle either finishes an upload or folds into the upload already in flight. */
+export type AgentTraceUploadCycleOutcome = AgentTraceUploadResult | { status: "coalesced" };
+
+export interface AgentTraceUploadInstallation {
+	/** Resolves once the startup catch-up and any in-flight automatic upload have finished writing. */
+	whenIdle: () => Promise<void>;
 }
 
 export type AgentTracePreviewResult =
@@ -410,14 +436,18 @@ function retryAfterDelay(response: Response, capMs: number = TRACE_UPLOAD_RATE_L
 
 type BeforeTraceUploadRequest = () => Promise<void>;
 
-async function fetchWithRetry(
-	fetchFn: typeof fetch,
-	url: string,
-	init: RequestInit,
-	timeoutMs: number,
-	signal?: AbortSignal,
-	beforeRequest?: BeforeTraceUploadRequest,
-): Promise<Response> {
+interface TraceUploadRequest {
+	fetchFn: typeof fetch;
+	url: string;
+	init: RequestInit;
+	timeoutMs: number;
+	signal?: AbortSignal;
+	beforeRequest?: BeforeTraceUploadRequest;
+	onUploadDelay?: (delay: AgentTraceUploadDelay) => void;
+}
+
+async function fetchWithRetry(request: TraceUploadRequest): Promise<Response> {
+	const { fetchFn, url, init, timeoutMs, signal, beforeRequest, onUploadDelay } = request;
 	for (let attempt = 0; ; attempt += 1) {
 		let retryDelayMs: number | undefined;
 		try {
@@ -442,7 +472,11 @@ async function fetchWithRetry(
 			}
 		}
 
-		await delay(retryDelayMs ?? traceUploadRetryDelay(attempt), signal);
+		const backoffMs = retryDelayMs ?? traceUploadRetryDelay(attempt);
+		if (!signal?.aborted) {
+			onUploadDelay?.({ reason: "retry-backoff", delayMs: backoffMs });
+		}
+		await delay(backoffMs, signal);
 		if (signal?.aborted) {
 			throw signal.reason ?? new Error("Trace upload cancelled");
 		}
@@ -550,13 +584,17 @@ export async function findAgentTraceFiles(sessionDir: string = getSessionsDir())
 	return [...files].sort();
 }
 
-function createTraceUploadAllRequestGate(signal?: AbortSignal): BeforeTraceUploadRequest {
+function createTraceUploadAllRequestGate(
+	signal?: AbortSignal,
+	onUploadDelay?: (delay: AgentTraceUploadDelay) => void,
+): BeforeTraceUploadRequest {
 	let nextRequestAt = 0;
 	let queue = Promise.resolve();
 	return () => {
 		const slot = queue.then(async () => {
 			const waitMs = Math.max(0, nextRequestAt - Date.now());
 			if (waitMs > 0) {
+				onUploadDelay?.({ reason: "rate-limit", delayMs: waitMs });
 				await delay(waitMs, signal);
 			}
 			if (!signal?.aborted) {
@@ -575,7 +613,7 @@ export async function uploadAllAgentTraces(options: AgentTraceUploadAllOptions):
 	const results: Array<UploadResultItem | undefined> = new Array(sessionFiles.length);
 	let cursor = 0;
 	let completed = 0;
-	const beforeRequest = createTraceUploadAllRequestGate(uploadOptions.signal);
+	const beforeRequest = createTraceUploadAllRequestGate(uploadOptions.signal, uploadOptions.onUploadDelay);
 	onProgress?.({ completed, total: sessionFiles.length });
 
 	const worker = async () => {
@@ -1014,18 +1052,15 @@ async function performAgentTraceUpload(
 
 	let response: Response;
 	try {
-		response = await fetchWithRetry(
+		response = await fetchWithRetry({
 			fetchFn,
 			url,
-			{
-				method: "PUT",
-				headers,
-				body,
-			},
-			options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
-			options.signal,
+			init: { method: "PUT", headers, body },
+			timeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+			signal: options.signal,
 			beforeRequest,
-		);
+			onUploadDelay: options.onUploadDelay,
+		});
 	} catch (error) {
 		return { status: "failed", message: describeError(error) };
 	}
@@ -1065,7 +1100,7 @@ export function uploadAgentTraceSession(options: AgentTraceSessionUploadOptions)
 class AgentTraceUploadController {
 	private timeout: NodeJS.Timeout | undefined;
 	private pending = false;
-	private inFlight: Promise<void> | undefined;
+	private inFlight: Promise<AgentTraceUploadResult> | undefined;
 	private lastUploadStartedAt: number | undefined;
 	private notBeforeAt = 0;
 
@@ -1101,6 +1136,10 @@ class AgentTraceUploadController {
 		this.arm();
 	};
 
+	whenIdle(): Promise<void> {
+		return this.inFlight === undefined ? Promise.resolve() : this.inFlight.then(() => undefined);
+	}
+
 	private arm(): void {
 		if (this.timeout) {
 			clearTimeout(this.timeout);
@@ -1108,41 +1147,39 @@ class AgentTraceUploadController {
 		const elapsed = this.lastUploadStartedAt === undefined ? undefined : Date.now() - this.lastUploadStartedAt;
 		const throttleDelay = elapsed === undefined ? 0 : Math.max(0, TRACE_UPLOAD_MIN_INTERVAL_MS - elapsed);
 		const notBeforeDelay = Math.max(0, this.notBeforeAt - Date.now());
-		this.timeout = setTimeout(
-			() => {
-				this.timeout = undefined;
-				void this.runScheduledUpload();
-			},
-			Math.max(TRACE_UPLOAD_DEBOUNCE_MS, throttleDelay, notBeforeDelay),
-		);
+		const delayMs = Math.max(TRACE_UPLOAD_DEBOUNCE_MS, throttleDelay, notBeforeDelay);
+		this.timeout = setTimeout(() => {
+			this.timeout = undefined;
+			void this.runScheduledUpload();
+		}, delayMs);
 		this.timeout.unref();
+		this.options.onUploadScheduled?.({ delayMs, holdsProcessOpen: this.timeout.hasRef() });
 	}
 
 	private async runScheduledUpload(): Promise<void> {
 		if (this.inFlight) {
+			this.options.onUploadSettled?.({ status: "coalesced" });
 			return;
 		}
 		this.pending = false;
 		this.lastUploadStartedAt = Date.now();
-		this.inFlight = uploadAgentTraceSession({
+		const upload = uploadAgentTraceSession({
 			...this.options,
 			sessionManager: this.sessionManager,
-		}).then(
-			(result) => {
-				if (result.status === "failed" && isRescheduledUploadFailure(result.statusCode)) {
-					this.pending = true;
-					if (result.retryAfterMs !== undefined) {
-						this.notBeforeAt = Date.now() + result.retryAfterMs;
-					}
-				}
-			},
-			() => undefined,
-		);
-		await this.inFlight;
+		}).catch((error: unknown): AgentTraceUploadResult => ({ status: "failed", message: describeError(error) }));
+		this.inFlight = upload;
+		const result = await upload;
+		if (result.status === "failed" && isRescheduledUploadFailure(result.statusCode)) {
+			this.pending = true;
+			if (result.retryAfterMs !== undefined) {
+				this.notBeforeAt = Date.now() + result.retryAfterMs;
+			}
+		}
 		this.inFlight = undefined;
 		if (this.pending) {
 			this.arm();
 		}
+		this.options.onUploadSettled?.(result);
 	}
 }
 
@@ -1151,20 +1188,32 @@ function isRescheduledUploadFailure(statusCode: number | undefined): boolean {
 }
 
 const traceUploadControllers = new WeakMap<SessionManager, AgentTraceUploadController>();
-let catchUpTriggered = false;
+let startupCatchUp: Promise<void> | undefined;
 
-export function installAgentTraceUpload(sessionManager: SessionManager, options: AgentTraceUploadInstallOptions): void {
-	if (!catchUpTriggered) {
-		catchUpTriggered = true;
-		void catchUpAgentTraceUploads(options).catch(() => undefined);
+export function installAgentTraceUpload(
+	sessionManager: SessionManager,
+	options: AgentTraceUploadInstallOptions,
+): AgentTraceUploadInstallation {
+	if (!startupCatchUp) {
+		startupCatchUp = catchUpAgentTraceUploads(options).then(
+			() => undefined,
+			() => undefined,
+		);
 	}
+	const pendingCatchUp = startupCatchUp;
 	let controller = traceUploadControllers.get(sessionManager);
 	if (controller) {
 		controller.update(options);
-		return;
+	} else {
+		controller = new AgentTraceUploadController(sessionManager, options);
+		traceUploadControllers.set(sessionManager, controller);
+		sessionManager.onPersist(controller.schedule);
 	}
-
-	controller = new AgentTraceUploadController(sessionManager, options);
-	traceUploadControllers.set(sessionManager, controller);
-	sessionManager.onPersist(controller.schedule);
+	const installed = controller;
+	return {
+		whenIdle: async () => {
+			await pendingCatchUp;
+			await installed.whenIdle();
+		},
+	};
 }
