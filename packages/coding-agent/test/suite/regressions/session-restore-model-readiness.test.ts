@@ -101,7 +101,7 @@ describe("session model restore waits for catalog readiness", () => {
 		expect(restored.fallbackMessage).toBeUndefined();
 	});
 
-	test("restoreModelFromSession keeps today's fallback when the bounded wait expires", async () => {
+	test("restoreModelFromSession falls back to the current model when the bounded wait expires", async () => {
 		stubDelayedCatalogFetch(150);
 		const registry = ModelRegistry.create(primeAuthStorage(), join(tempDirs[0]!, "models.json"));
 		const currentModel = registry.find(SAVED_PROVIDER, FALLBACK_MODEL_ID);

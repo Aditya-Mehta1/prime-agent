@@ -592,11 +592,12 @@ export async function findInitialModel(options: {
  * Find a saved session model, giving in-flight catalog/auth refreshes a
  * bounded window to settle before the lookup is allowed to fail.
  *
- * The fast path is exactly the old synchronous restore lookup
- * (find + hasConfiguredAuth). Only when that fails do we refresh the
- * registry, wait for the refreshes this call kicked off to settle (bounded by
- * readinessTimeoutMs), and retry the lookup once. A model that still cannot
- * be restored after that keeps today's fallback behavior.
+ * The fast path is a synchronous registry lookup (find +
+ * hasConfiguredAuth). Only when that fails do we refresh the registry,
+ * wait for the refreshes this call kicked off to settle (bounded by
+ * readinessTimeoutMs), and retry the lookup once. A model that still
+ * cannot be found after that returns undefined, leaving the caller to
+ * fall back to another model.
  */
 export async function findSessionModelWithReadinessWait(
 	modelRegistry: ModelRegistry,
