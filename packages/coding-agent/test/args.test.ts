@@ -610,6 +610,19 @@ describe("parseArgs", () => {
 			expect(result.unknownFlags.size).toBe(0);
 		});
 
+		test("value flags do not consume the end-of-options delimiter as a value", () => {
+			const prompt = parseArgs(["--system-prompt", "--", "--model", "foo"]);
+			expect(prompt.systemPrompt).toBeUndefined();
+			expect(prompt.model).toBeUndefined();
+			expect(prompt.messages).toEqual(["--model", "foo"]);
+			expect(prompt.diagnostics).toEqual([{ type: "error", message: "--system-prompt requires a value" }]);
+
+			const appended = parseArgs(["--append-system-prompt", "--", "Run the suite"]);
+			expect(appended.appendSystemPrompt).toBeUndefined();
+			expect(appended.messages).toEqual(["Run the suite"]);
+			expect(appended.diagnostics).toEqual([{ type: "error", message: "--append-system-prompt requires a value" }]);
+		});
+
 		test("parses --goal as a string", () => {
 			const result = parseArgs(["--goal", "Write a paper"]);
 			expect(result.goal).toBe("Write a paper");

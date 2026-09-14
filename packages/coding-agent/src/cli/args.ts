@@ -375,10 +375,16 @@ function hasRequiredOptionValue(args: string[], index: number, flag: string, res
 	// Prompt values are arbitrary text, even long-option-looking text such as
 	// YAML frontmatter ("---"); free-form value flags accept dash-prefixed
 	// text; every other value flag treats an option-looking token as a missing
-	// value so it still parses as a flag.
+	// value so it still parses as a flag. The standalone "--" delimiter is
+	// never a value; the main loop consumes it so the remaining tokens stay
+	// positional.
 	const valueMayStartWithDash = FREEFORM_VALUE_FLAGS.has(flag);
 	const valueIsArbitraryPromptText = PROMPT_VALUE_FLAGS.has(flag);
-	if (next === undefined || (!valueIsArbitraryPromptText && next.startsWith(valueMayStartWithDash ? "--" : "-"))) {
+	if (
+		next === undefined ||
+		next === "--" ||
+		(!valueIsArbitraryPromptText && next.startsWith(valueMayStartWithDash ? "--" : "-"))
+	) {
 		result.diagnostics.push({ type: "error", message: `${flag} requires a value` });
 		return false;
 	}
