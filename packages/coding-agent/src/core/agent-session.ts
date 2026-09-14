@@ -258,6 +258,8 @@ import {
 	createRlmListSubagentsHostHandler,
 	createRlmRunHostHandler,
 	findRlmModelMatches,
+	findUniqueRlmShortFormModelMatch,
+	formatRlmModelUnavailableError,
 	normalizeRequestedRlmSubagentModel,
 	normalizeRequestedRlmSubagentSessionName,
 	normalizeRequestedRlmSubagentThinkingLevel,
@@ -11407,11 +11409,13 @@ export class AgentSession {
 		if (`${parentModel.provider}/${parentModel.id}`.toLowerCase() === normalizedReference) {
 			return { model: parentModel };
 		}
-		const model = (await this._authenticatedRlmModels()).find(
-			(candidate) => `${candidate.provider}/${candidate.id}`.toLowerCase() === normalizedReference,
-		);
+		const candidates = await this._authenticatedRlmModels();
+		const model =
+			candidates.find(
+				(candidate) => `${candidate.provider}/${candidate.id}`.toLowerCase() === normalizedReference,
+			) ?? findUniqueRlmShortFormModelMatch(reference, candidates);
 		if (!model) {
-			throw new Error(`Requested ${target} model "${reference}" is unavailable, unauthenticated, or expired`);
+			throw new Error(formatRlmModelUnavailableError(reference, target, candidates));
 		}
 
 		const auth = await this._modelRegistry.getApiKeyAndHeaders(model);

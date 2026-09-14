@@ -1,0 +1,1 @@
+- Fixed vague subagent and top-level session model validation errors: unambiguous bare model ids (like "z-ai/glm-5.3") now resolve to their full selector ("prime-inference/z-ai/glm-5.3"), and unresolved references state the expected "provider/model-id" form with close matches instead of only "unavailable, unauthenticated, or expired".

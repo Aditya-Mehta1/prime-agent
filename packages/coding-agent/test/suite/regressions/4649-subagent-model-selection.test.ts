@@ -1,10 +1,15 @@
-import { fauxAssistantMessage } from "@earendil-works/pi-ai";
+import { type Api, fauxAssistantMessage, type Model } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import type { HostRequestHandlers } from "../../../src/core/kernel/index.js";
+import { findUniqueRlmShortFormModelMatch, formatRlmModelUnavailableError } from "../../../src/core/rlm-runtime.js";
 import { SessionManager } from "../../../src/core/session-manager.js";
 import { createHarness } from "../harness.js";
 
 const provider = "faux-eng-4649";
+
+function catalogModel(provider: string, id: string): Model<Api> {
+	return { id, name: id, provider } as Model<Api>;
+}
 
 function openAICodexToken(accountId: string): string {
 	const payload = Buffer.from(
@@ -456,5 +461,85 @@ describe("ENG-4649 subagent model selection", () => {
 		} finally {
 			harness.cleanup();
 		}
+	});
+
+	it("resolves an unambiguous bare model id to its full selector", async () => {
+		const harness = await createHarness({
+			provider,
+			models: [{ id: "parent-model" }, { id: "z-ai/glm-5.3" }],
+		});
+		try {
+			harness.setResponses([fauxAssistantMessage("short form child answer")]);
+
+			const result = await harness.session.runRlmChild("use the reported short form", {
+				model: "z-ai/glm-5.3",
+			});
+
+			expect(result.model).toBe(`${provider}/z-ai/glm-5.3`);
+			await vi.waitFor(async () => {
+				const childEntry = (await harness.session.listRlmSubagents()).subagents[0];
+				expect(childEntry?.status).toBe("completed");
+				expect(harness.session.getRlmChildSession(childEntry!.rlm_child_id)?.model?.id).toBe("z-ai/glm-5.3");
+			});
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("does not auto-resolve an ambiguous bare id and hints the full selectors", async () => {
+		const harness = await createHarness({
+			provider,
+			models: [{ id: "parent-model" }, { id: "glm-5.3" }, { id: "z-ai/glm-5.3" }],
+		});
+		try {
+			await expect(harness.session.runRlmChild("ambiguous bare id", { model: "glm-5.3" })).rejects.toThrow(
+				`close matches: "${provider}/glm-5.3", "${provider}/z-ai/glm-5.3"`,
+			);
+			expect((await harness.session.listRlmSubagents()).subagents).toEqual([]);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("hints the expected selector form when a requested model is unavailable", async () => {
+		const harness = await createHarness({
+			provider,
+			models: [{ id: "parent-model" }, { id: "z-ai/glm-5.3" }],
+		});
+		try {
+			await expect(harness.session.runRlmChild("unknown short form", { model: "glm-5.4" })).rejects.toThrow(
+				'selectors use the form "provider/model-id" (e.g. "prime-inference/z-ai/glm-5.3")',
+			);
+			expect((await harness.session.listRlmSubagents()).subagents).toEqual([]);
+		} finally {
+			harness.cleanup();
+		}
+	});
+});
+
+describe("rlm model selector resolution", () => {
+	const primeModel = catalogModel("prime-inference", "z-ai/glm-5.3");
+
+	it("resolves an unambiguous short form to its full selector", () => {
+		expect(findUniqueRlmShortFormModelMatch("z-ai/glm-5.3", [primeModel])).toBe(primeModel);
+		expect(findUniqueRlmShortFormModelMatch("glm-5.3", [primeModel])).toBe(primeModel);
+	});
+
+	it("stays unresolved when a short form matches zero or several models", () => {
+		const otherModel = catalogModel("other-provider", "glm-5.3");
+		expect(findUniqueRlmShortFormModelMatch("glm-5.3", [primeModel, otherModel])).toBeUndefined();
+		expect(findUniqueRlmShortFormModelMatch("glm-5.4", [primeModel, otherModel])).toBeUndefined();
+	});
+
+	it("hints the expected selector form when no model resolves", () => {
+		expect(formatRlmModelUnavailableError("glm-5.4", "subagent", [primeModel])).toBe(
+			'Requested subagent model "glm-5.4" is unavailable, unauthenticated, or expired; selectors use the form "provider/model-id" (e.g. "prime-inference/z-ai/glm-5.3")',
+		);
+	});
+
+	it("lists close matches alongside the form hint", () => {
+		expect(formatRlmModelUnavailableError("glm-5", "top-level session", [primeModel])).toBe(
+			'Requested top-level session model "glm-5" is unavailable, unauthenticated, or expired; selectors use the form "provider/model-id" (e.g. "prime-inference/z-ai/glm-5.3"); close matches: "prime-inference/z-ai/glm-5.3"',
+		);
 	});
 });
