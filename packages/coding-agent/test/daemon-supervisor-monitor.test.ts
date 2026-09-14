@@ -1236,9 +1236,13 @@ describe("daemon worker supervisor monitoring", () => {
 			return result ?? false;
 		});
 		// Drive the fake clock until the expected number of probes have run;
-		// one advance alone does not flush the availability check chain.
+		// one advance alone does not flush the availability check chain. The
+		// chain interleaves fake timers with real registry-lock I/O, so a fixed
+		// step budget runs out of real time on slow runners — budget by wall
+		// clock (performance.now is not faked) and keep stepping instead.
 		const advanceUntilProbes = async (expected: number) => {
-			for (let step = 0; probeCount < expected && step < 200; step++) {
+			const deadline = performance.now() + 10_000;
+			while (probeCount < expected && performance.now() < deadline) {
 				await vi.advanceTimersByTimeAsync(100);
 			}
 			expect(probeCount).toBe(expected);
