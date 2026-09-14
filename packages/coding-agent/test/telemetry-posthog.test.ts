@@ -218,6 +218,42 @@ describe("client-owned PostHog errors", () => {
 		expect(batches[0].events.map((event) => event.name)).toEqual(["agent error", "$exception"]);
 		expect(batches[1].events.map((event) => event.name)).toEqual(["agent error"]);
 	});
+	it("holds an occurrence error until a failed capability probe is answered", async () => {
+		let now = Date.now();
+		let discoveries = 0;
+		const { client, batches } = setup(support, accepted, {
+			now: () => now,
+			discover: () => (++discoveries === 1 ? new Response(null, { status: 503 }) : Response.json(support)),
+		});
+		client.capture(source.name, source.properties);
+		await client.flush();
+		// A transport failure leaves support unknown, so retiring the analytics
+		// event now would lose its pair for good.
+		expect(batches).toHaveLength(0);
+		now += 60_001;
+		await client.flush();
+		expect(batches[0].events.map((event) => event.name)).toEqual(["agent error", "$exception"]);
+	});
+	it("ships an occurrence error unpaired once the capability wait lapses", async () => {
+		let now = Date.now();
+		let discoveries = 0;
+		const { client, batches } = setup(support, accepted, {
+			now: () => now,
+			discover: () => (++discoveries === 1 ? Response.json(support) : new Response(null, { status: 503 })),
+		});
+		client.capture(source.name, source.properties);
+		await client.flush();
+		expect(batches[0].events.map((event) => event.name)).toEqual(["agent error", "$exception"]);
+		// A refresh that never lands leaves the richer payloads unconfirmed.
+		now += 60_001;
+		client.capture(source.name, source.properties);
+		await client.flush();
+		expect(batches).toHaveLength(1);
+		// A collector that never answers must not hoard errors forever.
+		now += 5 * 60_000 + 1;
+		await client.flush();
+		expect(batches[1].events.map((event) => event.name)).toEqual(["agent error"]);
+	});
 	it("keeps every error pair within batch count and byte limits", async () => {
 		const { client, batches } = setup();
 		for (let i = 0; i < 21; i++) client.capture(source.name, source.properties);

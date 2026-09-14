@@ -64,6 +64,7 @@ prime_agent_telemetry_target_version=
 prime_agent_telemetry_stage=started
 prime_agent_telemetry_reason=unknown
 prime_agent_telemetry_outcome=
+prime_agent_telemetry_retry_start=0
 
 # Standalone published installers cannot import the installed telemetry client.
 # Buffer only approved fields after consent, then share one bounded upload at exit.
@@ -337,10 +338,20 @@ prime_agent_install_node() {
 			exit "$check_status"
 		fi
 
+		# The bootstrap may have installed the Node the telemetry helper needs.
+		# Only an attempt that never started gets a fresh begin: re-recording
+		# the requirements stage for an attempt that already started would
+		# duplicate it, and a helper that failed on the old Node must not
+		# outlive the upgrade (opt-outs still latch inside begin).
+		prime_agent_telemetry_retry_start=0
+		if [ -z "$prime_agent_telemetry_state" ]; then
+			prime_agent_telemetry_retry_start=1
+			prime_agent_telemetry_disabled=0
+		fi
 		prime_agent_telemetry_begin
-		# The bootstrap installed Node, so this attempt can actually record the
-		# requirements stage; the pre-bootstrap record was a no-op.
-		prime_agent_telemetry_record requirements started
+		if [ "$prime_agent_telemetry_retry_start" = 1 ] && [ -n "$prime_agent_telemetry_state" ]; then
+			prime_agent_telemetry_record requirements started
+		fi
 		start_preflight_checks
 		if finish_preflight_checks; then
 			check_status=0
