@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { registerOAuthProvider, unregisterOAuthProvider } from "@earendil-works/pi-ai/oauth";
 import type { Component, OverlayHandle, TUI } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
@@ -507,6 +508,36 @@ describe("ProviderAuthFlows", () => {
 		await expect(
 			new ProviderAuthFlows(host).loginProvider({ id: "openai", name: "OpenAI", authType: "api_key" }),
 		).resolves.toMatchObject({ status: "success" });
+	});
+
+	it("reports a failed OAuth login once, from the UI scope only", async () => {
+		vi.stubEnv("DO_NOT_TRACK", "0");
+		vi.stubEnv("PI_OFFLINE", "0");
+		vi.stubEnv("PRIME_AGENT_TELEMETRY", "");
+		const reports: TelemetryProperties[] = [];
+		const authStorage = AuthStorage.create(authJsonPath, {
+			usePrimeCliConfig: false,
+			telemetryErrorContext: {
+				agentDir: tempDir,
+				settingsManager: SettingsManager.inMemory(),
+				sink: { capture: (_name, properties) => reports.push(properties), flush: async () => {} },
+			},
+		});
+		const failure = new Error("Provider denied the login");
+		registerOAuthProvider({
+			id: "faux-oauth",
+			name: "Faux",
+			login: async () => {
+				throw failure;
+			},
+		} as never);
+		onTestFinished(() => unregisterOAuthProvider("faux-oauth"));
+
+		await expect(authStorage.login("faux-oauth" as never, {} as never)).rejects.toThrow(failure);
+
+		// The login UI reports this failure inside the authentication scope, so a
+		// storage-level report would upload the same failure under a second scope.
+		expect(reports).toEqual([]);
 	});
 
 	it("wraps source and host error observations in the same UI authentication scope", async () => {

@@ -777,13 +777,11 @@ export class AuthStorage {
 			throw new Error(`Unknown OAuth provider: ${providerId}`);
 		}
 
-		try {
-			const credentials = await provider.login(callbacks);
-			this.set(providerId, { type: "oauth", ...credentials });
-		} catch (error) {
-			this.recordError(error, "login", providerId);
-			throw error;
-		}
+		// The login UI owns failure reporting: it runs inside the authentication
+		// telemetry scope, so reporting here as well would upload the same
+		// failure twice under two different scopes.
+		const credentials = await provider.login(callbacks);
+		this.set(providerId, { type: "oauth", ...credentials });
 	}
 
 	/**
