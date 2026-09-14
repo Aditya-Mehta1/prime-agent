@@ -10,13 +10,14 @@ and anything that is *not* an approved version-bump pull request stops and waits
 
 ## The normal release
 
-1. **Open a release pull request.** Bump the version with `npm run release:patch` or
-   `npm run release:minor` (no major releases by policy: patch for fixes and features, minor for
-   breaking changes) and finalize the changelogs. Versions move in lockstep for the root package and
-   the published packages.
-2. **Get it reviewed and merged.** This is the approval gate. The release workflow later confirms
-   that the merge commit belongs to a merged pull request with at least one approving review from a
-   human; bot approvals do not count.
+1. **Prepare the release.** Run `npm run release:patch` or `npm run release:minor` (no major
+   releases by policy: patch for fixes and features, minor for breaking changes). The script bumps
+   the version in lockstep across the published packages, folds the `.changes/*.md` fragments into
+   the changelogs, commits on a `release/vX.Y.Z` branch and pushes that branch. It does not push
+   `main`, does not create the tag, and does not publish anything.
+2. **Open a pull request from that branch, get it reviewed, and merge it.** This is the approval
+   gate. The release workflow later confirms that the merge commit belongs to a merged pull request
+   with at least one approving review from a human; bot approvals do not count.
 3. **CI takes over.** The `Release Prime Agent` workflow runs on the merge:
 
    | Job | What it does | Secrets |

@@ -12,10 +12,15 @@
  * 2. Bump version via npm run version:xxx or set an explicit version
  * 3. Update CHANGELOG.md files: aggregate .changes/*.md fragments into a
  *    [version] - date section, git rm the consumed fragments
- * 4. Commit and tag
+ * 4. Commit on a release/vX.Y.Z branch and push that branch
  *
- * Publishing is NOT part of this script. CI publishes the release artifacts from main
- * (R2 archives and npm packages), so no publish credential is ever present on a laptop.
+ * This script PREPARES a release; it does not perform one. It never pushes main and never
+ * creates the tag. A release is a reviewed pull request: open one from the pushed branch, get it
+ * approved, merge it, and CI builds, signs, publishes and tags the result. See
+ * packages/coding-agent/docs/releasing.md.
+ *
+ * Publishing is NOT part of this script. CI publishes the release artifacts (R2 archives and npm
+ * packages), so no publish credential is ever present on a laptop.
  */
 
 import { execSync } from "child_process";
@@ -210,18 +215,22 @@ console.log("Updating CHANGELOG.md files...");
 updateChangelogsForRelease(version);
 console.log();
 
-console.log("Committing and tagging...");
+const releaseBranch = `release/v${version}`;
+console.log(`Committing on ${releaseBranch}...`);
+run(`git checkout -b ${releaseBranch}`);
 stageChangedFiles();
 run(`git commit -m "Release v${version}"`);
-run(`git tag v${version}`);
 console.log();
 
 // npm publishing is a CI-only job (OIDC trusted publishing, --provenance). Never publish from a
 // laptop: a release shell runs a full install, build and check with a registry credential in
 // ~/.npmrc, which is exactly the shape a malicious postinstall exploits.
-console.log("Pushing to remote...");
-run("git push origin main");
-run(`git push origin v${version}`);
+console.log("Pushing the release branch...");
+run(`git push -u origin ${releaseBranch}`);
 console.log();
 
-console.log(`=== Released v${version} ===`);
+// The tag is created by the release workflow after the artifacts are published, so a tag never
+// exists for a release that failed or was never reviewed.
+console.log(`=== Prepared v${version} on ${releaseBranch} ===`);
+console.log("Next: open a pull request for this branch, have it reviewed, and merge it.");
+console.log("CI then builds, signs, publishes and tags the release.");
