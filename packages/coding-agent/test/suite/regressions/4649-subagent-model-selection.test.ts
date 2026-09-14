@@ -530,6 +530,24 @@ describe("ENG-4649 subagent model selection", () => {
 		}
 	});
 
+	it("does not auto-resolve an ambiguous bare id that also matches the parent", async () => {
+		const harness = await createHarness({
+			provider,
+			models: [{ id: "z-ai/glm-5.3" }, { id: "glm-5.3" }, { id: "other/glm-5.3" }],
+		});
+		try {
+			// The parent is the first model, "z-ai/glm-5.3", whose selector ends with
+			// "/glm-5.3"; two other authenticated models share that short form, so the
+			// reference must stay unresolved instead of silently selecting the parent.
+			await expect(harness.session.runRlmChild("ambiguous parent short form", { model: "glm-5.3" })).rejects.toThrow(
+				`close matches: "${provider}/glm-5.3", "${provider}/other/glm-5.3", "${provider}/z-ai/glm-5.3"`,
+			);
+			expect((await harness.session.listRlmSubagents()).subagents).toEqual([]);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
 	it("hints the expected selector form when a requested model is unavailable", async () => {
 		const harness = await createHarness({
 			provider,
@@ -558,6 +576,15 @@ describe("rlm model selector resolution", () => {
 		const otherModel = catalogModel("other-provider", "glm-5.3");
 		expect(findUniqueRlmShortFormModelMatch("glm-5.3", [primeModel, otherModel])).toBeUndefined();
 		expect(findUniqueRlmShortFormModelMatch("glm-5.4", [primeModel, otherModel])).toBeUndefined();
+	});
+
+	it("uses the fallback model only when the catalog has no short-form match", () => {
+		const parentModel = catalogModel("prime-inference", "z-ai/glm-5.3");
+		const siblingModel = catalogModel("other-provider", "z-ai/glm-5.3");
+		expect(findUniqueRlmShortFormModelMatch("glm-5.3", [], parentModel)).toBe(parentModel);
+		expect(findUniqueRlmShortFormModelMatch("glm-5.4", [], parentModel)).toBeUndefined();
+		expect(findUniqueRlmShortFormModelMatch("glm-5.3", [siblingModel], parentModel)).toBe(siblingModel);
+		expect(findUniqueRlmShortFormModelMatch("glm-5.3", [primeModel, siblingModel], parentModel)).toBeUndefined();
 	});
 
 	it("hints the expected selector form when no model resolves", () => {

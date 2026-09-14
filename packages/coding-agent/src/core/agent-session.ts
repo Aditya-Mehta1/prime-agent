@@ -11411,14 +11411,13 @@ export class AgentSession {
 		}
 		const candidates = await this._authenticatedRlmModels();
 		// The parent model can be missing from the authenticated catalog (offline
-		// discovery or expired credentials) while staying selectable, so it is its
-		// own last-resort short-form candidate before rejecting the reference.
+		// discovery or expired credentials) while staying selectable, so it backs
+		// the short-form lookup when the catalog has no match. Several catalog
+		// matches still leave the reference unresolved.
 		const model =
 			candidates.find(
 				(candidate) => `${candidate.provider}/${candidate.id}`.toLowerCase() === normalizedReference,
-			) ??
-			findUniqueRlmShortFormModelMatch(reference, candidates) ??
-			findUniqueRlmShortFormModelMatch(reference, [parentModel]);
+			) ?? findUniqueRlmShortFormModelMatch(reference, candidates, parentModel);
 		if (!model) {
 			throw new Error(formatRlmModelUnavailableError(reference, target, candidates));
 		}

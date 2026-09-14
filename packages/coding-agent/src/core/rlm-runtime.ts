@@ -226,12 +226,21 @@ function findRlmShortFormModelMatches(reference: string, models: Model<Api>[]): 
 }
 
 /**
- * The single model a short-form reference resolves to, or undefined when the
- * reference matches zero or several models and must not be auto-resolved.
+ * The single model a short-form reference resolves to: its unique match among
+ * models, or the fallback model when no model matches. Stays undefined when
+ * several models match, so an ambiguous reference is never auto-resolved.
  */
-export function findUniqueRlmShortFormModelMatch(reference: string, models: Model<Api>[]): Model<Api> | undefined {
+export function findUniqueRlmShortFormModelMatch(
+	reference: string,
+	models: Model<Api>[],
+	fallback?: Model<Api>,
+): Model<Api> | undefined {
 	const matches = findRlmShortFormModelMatches(reference, models);
-	return matches.length === 1 ? matches[0] : undefined;
+	if (matches.length === 1) return matches[0];
+	if (matches.length === 0 && fallback && findRlmShortFormModelMatches(reference, [fallback]).length === 1) {
+		return fallback;
+	}
+	return undefined;
 }
 
 /**
