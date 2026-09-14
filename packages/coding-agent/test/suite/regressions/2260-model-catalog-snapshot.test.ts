@@ -151,4 +151,51 @@ describe("model catalog refresh preserves the attached transcript", () => {
 			await connection.dispose();
 		}
 	});
+
+	it("keeps state stale when a catalog refresh lands during the state re-read", async () => {
+		const { connection, request, messages, refreshedState, setDuringStateRead } = await createConnection();
+		try {
+			await connection.getModelCatalog();
+			setDuringStateRead(() => void connection.getAvailableModels());
+			const snapshot = await connection.getInitialSnapshot();
+			expect(snapshot.messages).toBe(messages);
+			// The concurrent catalog refresh must preserve the invalidation: getState()
+			// re-reads state instead of trusting the merged snapshot's state.
+			expect(await connection.getState()).toBe(refreshedState);
+			expect(request.mock.calls.filter(([command]) => command.type === "get_connection_state")).toHaveLength(2);
+			setDuringStateRead(undefined);
+			const merged = await connection.getInitialSnapshot();
+			expect(merged.state).toBe(refreshedState);
+			expect(await connection.getInitialSnapshot()).toBe(merged);
+			expect(await connection.getState()).toBe(merged.state);
+			expect(request.mock.calls.filter(([command]) => command.type === "get_connection_state")).toHaveLength(3);
+			expect(request.mock.calls.filter(([command]) => command.type === "get_messages")).toHaveLength(0);
+			expect(request.mock.calls.filter(([command]) => command.type === "get_session_context")).toHaveLength(0);
+		} finally {
+			await connection.dispose();
+		}
+	});
+
+	it("keeps state stale when a catalog refresh lands during a full snapshot reload", async () => {
+		const { connection, request, updatedMessages, refreshedState, setDuringStateRead } = await createConnection();
+		try {
+			await connection.getModelCatalog();
+			await connection.setThinkingLevel("medium");
+			setDuringStateRead(() => void connection.getAvailableModels());
+			const snapshot = await connection.getInitialSnapshot();
+			expect(snapshot.messages).toBe(updatedMessages);
+			// The concurrent catalog refresh must preserve the invalidation even
+			// though the transcript cursor guard passed: getState() re-reads state.
+			expect(await connection.getState()).toBe(refreshedState);
+			expect(request.mock.calls.filter(([command]) => command.type === "get_connection_state")).toHaveLength(2);
+			setDuringStateRead(undefined);
+			const merged = await connection.getInitialSnapshot();
+			expect(merged.messages).toBe(updatedMessages);
+			expect(await connection.getInitialSnapshot()).toBe(merged);
+			expect(request.mock.calls.filter(([command]) => command.type === "get_messages")).toHaveLength(1);
+			expect(request.mock.calls.filter(([command]) => command.type === "get_session_context")).toHaveLength(1);
+		} finally {
+			await connection.dispose();
+		}
+	});
 });

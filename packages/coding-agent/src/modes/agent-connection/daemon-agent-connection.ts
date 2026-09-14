@@ -250,6 +250,9 @@ export class DaemonAgentConnection implements AgentConnection {
 	private latestSnapshot: AgentConnectionSnapshot | undefined;
 	private latestSnapshotIsFresh = false;
 	private latestSnapshotStateIsFresh = false;
+	// Bumped whenever a catalog refresh invalidates state freshness so snapshot
+	// reads already in flight cannot mark stale state fresh again.
+	private stateFreshnessGeneration = 0;
 	private deferredSessionEvents: {
 		event: AgentSessionEvent;
 		sequence: number | undefined;
@@ -536,6 +539,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (this.latestSnapshotIsFresh && this.latestSnapshot) {
 			if (this.latestSnapshotStateIsFresh) return this.latestSnapshot;
 			const snapshot = this.latestSnapshot;
+			const stateFreshnessGeneration = this.stateFreshnessGeneration;
 			const state = await this.requestData<AgentConnectionState>(
 				{ type: "get_connection_state", activeSessionId: this.activeSessionId },
 				undefined,
@@ -557,7 +561,7 @@ export class DaemonAgentConnection implements AgentConnection {
 							}
 						: {}),
 				};
-				this.latestSnapshotStateIsFresh = true;
+				this.latestSnapshotStateIsFresh = stateFreshnessGeneration === this.stateFreshnessGeneration;
 				return this.latestSnapshot;
 			}
 		}
@@ -566,6 +570,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		// getSessionTree() fetches it lazily via get_session_tree on first use.
 		const snapshotCursor = this.lastEventCursor;
 		const snapshotSequence = this.lastEventSequence;
+		const stateFreshnessGeneration = this.stateFreshnessGeneration;
 		const [state, messagesData, sessionContextData] = await Promise.all([
 			this.requestData<AgentConnectionState>(
 				{ type: "get_connection_state", activeSessionId: this.activeSessionId },
@@ -602,7 +607,8 @@ export class DaemonAgentConnection implements AgentConnection {
 			snapshotSequence === this.lastEventSequence &&
 			snapshotCursor?.generation === this.lastEventCursor?.generation &&
 			snapshotCursor?.sequence === this.lastEventCursor?.sequence;
-		this.latestSnapshotStateIsFresh = this.latestSnapshotIsFresh;
+		this.latestSnapshotStateIsFresh =
+			this.latestSnapshotIsFresh && stateFreshnessGeneration === this.stateFreshnessGeneration;
 		return this.latestSnapshot;
 	}
 
@@ -1860,6 +1866,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 		if (command.type === "get_model_catalog" || command.type === "get_available_models") {
 			// Catalog refresh can change model/auth settings, but does not change the transcript.
+			this.stateFreshnessGeneration++;
 			this.latestSnapshotStateIsFresh = false;
 		} else if (invalidatesCachedSnapshot(command.type)) {
 			this.latestSnapshotIsFresh = false;
