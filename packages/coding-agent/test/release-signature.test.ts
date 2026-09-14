@@ -114,7 +114,7 @@ describe("verifyReleaseChecksums", () => {
 	test("rejects the right repository signed by the wrong workflow file", () => {
 		expect(() =>
 			verifyReleaseChecksums(checksums, bundle, {
-				identity: fixturePolicy({ workflowPath: ".github/workflows/release.yml" }),
+				identity: fixturePolicy({ workflowPath: ".github/workflows/build-binaries.yml" }),
 			}),
 		).toThrow(/not by /);
 	});

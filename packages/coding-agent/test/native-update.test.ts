@@ -8,7 +8,7 @@ import { ReleaseSignatureError } from "../src/utils/release-signature.js";
 import { getLatestPiRelease } from "../src/utils/version-check.js";
 
 const SIGNER_IDENTITY =
-	"https://github.com/PrimeIntellect-ai/prime-agent/.github/workflows/release.yml@refs/heads/main";
+	"https://github.com/PrimeIntellect-ai/prime-agent/.github/workflows/build-binaries.yml@refs/heads/main";
 
 // The real verifier is exercised end to end in release-signature.test.ts and, against the production
 // pinning, in native-update-signature.test.ts. Here it is stubbed so these tests can concentrate on

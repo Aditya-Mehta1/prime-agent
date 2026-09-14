@@ -17,7 +17,7 @@ export const RELEASE_SIGNER_REPOSITORY = "PrimeIntellect-ai/prime-agent";
 export const RELEASE_SIGNER_REPOSITORY_URI = `https://github.com/${RELEASE_SIGNER_REPOSITORY}`;
 
 /** The only workflow file allowed to produce a release signature. */
-export const RELEASE_SIGNER_WORKFLOW_PATH = ".github/workflows/release.yml";
+export const RELEASE_SIGNER_WORKFLOW_PATH = ".github/workflows/build-binaries.yml";
 
 /** The OIDC issuer that must have minted the signing certificate. */
 export const RELEASE_SIGNER_OIDC_ISSUER = "https://token.actions.githubusercontent.com";

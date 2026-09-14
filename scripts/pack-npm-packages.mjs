@@ -15,7 +15,13 @@
  *
  * Options:
  *   --binary-dir <dir>   Directory holding darwin-arm64/, darwin-x64/, linux-arm64/, linux-x64/
- *                        (the output of the standalone binary build). Required.
+ *                        (the output of the standalone binary build). Required unless --archives
+ *                        is given.
+ *   --archives <dir>     Directory holding the assembled release archives
+ *                        prime-agent-<version>-<platform>.tar.gz. Each archive is checked against
+ *                        the receipts file when one is given, then extracted into a temporary
+ *                        binary directory. This is what CI uses: the privileged job never needs the
+ *                        raw build tree, only the artifacts it is about to publish.
  *   --version <x.y.z>    Release version. Defaults to PRIME_AGENT_VERSION, then the coding-agent
  *                        package.json version.
  *   --out-dir <dir>      Staging root. Default: release/npm
@@ -44,12 +50,14 @@ import {
 	cpSync,
 	existsSync,
 	mkdirSync,
+	mkdtempSync,
 	readFileSync,
 	readdirSync,
 	rmSync,
 	statSync,
 	writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { binaryAssets, setBinaryVersion, validateBinaryAssets } from "../packages/coding-agent/scripts/copy-binary-assets.mjs";
@@ -289,6 +297,7 @@ export function buildPackagePlan({ version, scope, frontDoor, sourcePackages, bi
 function parseArgs(args) {
 	const parsed = {
 		binaryDir: undefined,
+		archivesDir: undefined,
 		version: process.env.PRIME_AGENT_VERSION,
 		outDir: DEFAULTS.outDir,
 		scope: DEFAULTS.scope,
@@ -304,6 +313,11 @@ function parseArgs(args) {
 			case "--binary-dir":
 				if (!value) throw new Error("--binary-dir requires a value");
 				parsed.binaryDir = resolve(root, value);
+				i += 1;
+				break;
+			case "--archives":
+				if (!value) throw new Error("--archives requires a value");
+				parsed.archivesDir = resolve(root, value);
 				i += 1;
 				break;
 			case "--version":
@@ -348,12 +362,13 @@ function parseArgs(args) {
 				throw new Error(`Unknown argument: ${arg}`);
 		}
 	}
-	if (!parsed.binaryDir) throw new Error("--binary-dir is required");
+	if (!parsed.binaryDir && !parsed.archivesDir) throw new Error("--binary-dir or --archives is required");
+	if (parsed.binaryDir && parsed.archivesDir) throw new Error("--binary-dir and --archives are mutually exclusive");
 	return parsed;
 }
 
 function printHelp() {
-	console.log(`Usage: node scripts/pack-npm-packages.mjs --binary-dir <dir> [--version x.y.z] [--out-dir dir]
+	console.log(`Usage: node scripts/pack-npm-packages.mjs (--binary-dir <dir> | --archives <dir>) [--version x.y.z] [--out-dir dir]
        [--scope @primeintellect] [--front-door prime-agent] [--receipts file] [--skip-pack]
 
 Stages registry-ready packages under <out-dir> and writes <out-dir>/manifest.json with the publish order.
@@ -379,6 +394,39 @@ function prepareOutputDir(outDir) {
 }
 
 /** Read executable receipts for every platform, cross-checking an R2 manifest when one is given. */
+/**
+ * Materialise a binary directory from the assembled release archives.
+ *
+ * CI publishes from the artifact set it just verified, not from a build tree. Every archive is
+ * hashed and compared against the receipts file before it is unpacked, so a tampered archive cannot
+ * reach the registry even if it reached the artifact store.
+ */
+function extractBinariesFromArchives(archivesDir, version, receiptsFile) {
+	const declared = receiptsFile ? readJson(receiptsFile).binaries || [] : [];
+	const staging = mkdtempSync(join(tmpdir(), "prime-agent-npm-binaries-"));
+	for (const platform of Object.keys(PLATFORMS)) {
+		const file = `prime-agent-${version}-${platform}.tar.gz`;
+		const archive = join(archivesDir, file);
+		if (!existsSync(archive)) throw new Error(`Missing release archive: ${archive}`);
+		const declaredReceipt = declared.find((entry) => entry.platform === platform);
+		if (declaredReceipt) {
+			if (declaredReceipt.file !== file) {
+				throw new Error(`Receipt for ${platform} names ${declaredReceipt.file}, not ${file}`);
+			}
+			const archiveSha256 = sha256File(archive);
+			if (declaredReceipt.sha256 !== archiveSha256) {
+				throw new Error(
+					`Archive mismatch for ${platform}: ${receiptsFile} records ${declaredReceipt.sha256}, ${file} hashes ${archiveSha256}`,
+				);
+			}
+		}
+		const target = join(staging, platform);
+		mkdirSync(target, { recursive: true });
+		run("tar", ["-xzf", archive, "-C", target], root);
+	}
+	return staging;
+}
+
 function collectBinaries(binaryDir, receiptsFile) {
 	const declared = receiptsFile ? readJson(receiptsFile).binaries || [] : [];
 	const binaries = [];
@@ -483,6 +531,7 @@ function main() {
 		]),
 	);
 	const version = normalizeVersion(args.version || sourcePackages.get("coding-agent").version);
+	if (args.archivesDir) args.binaryDir = extractBinariesFromArchives(args.archivesDir, version, args.receipts);
 	const binaries = collectBinaries(args.binaryDir, args.receipts);
 	const plan = buildPackagePlan({
 		version,

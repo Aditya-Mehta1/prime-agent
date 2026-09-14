@@ -1070,21 +1070,31 @@ jobs:
       - name: Build the npm package set
         run: |
           set -euo pipefail
+          # --archives re-hashes every release archive against latest.json before unpacking it, so
+          # the registry artifacts and the R2 artifacts assert the same bytes.
           node scripts/pack-npm-packages.mjs \
             --version "$PRODUCTION_VERSION" \
-            --artifacts release-artifacts/production \
+            --archives release-artifacts/production \
+            --receipts release-artifacts/production/latest.json \
             --out-dir npm-packages
 
       - name: Publish every package with provenance
         run: |
           set -euo pipefail
-          published=0
-          for package_dir in npm-packages/*/; do
-            test -f "${package_dir}package.json" || continue
-            npm publish "$package_dir" --provenance --access public --ignore-scripts
-            published=$((published + 1))
+          # manifest.json records the dependency-safe publish order: platform binaries, then
+          # libraries, then the front door and its mirror last.
+          mapfile -t tarballs < <(node -e '
+            const manifest = require("./npm-packages/manifest.json");
+            for (const name of manifest.publishOrder) {
+              const entry = manifest.packages.find((candidate) => candidate.name === name);
+              if (!entry || !entry.tarball) throw new Error(`No tarball staged for ${name}`);
+              console.log(entry.tarball);
+            }
+          ')
+          test "${#tarballs[@]}" -gt 0
+          for tarball in "${tarballs[@]}"; do
+            npm publish "npm-packages/artifacts/${tarball}" --provenance --access public --ignore-scripts
           done
-          test "$published" -gt 0
 
   tap-bump:
     name: Bump the Homebrew tap formula

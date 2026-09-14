@@ -117,7 +117,7 @@ own lockfile hash, registry signatures, and provenance (`npm audit signatures`).
    (`prime-agent-ai`, `prime-agent-core`, `prime-agent-tui`, `prime-agent-<platform>`) so nobody can
    squat the strings the installer and README already teach.
 3. Configure a trusted publisher per package: repository `PrimeIntellect-ai/prime-agent`, workflow
-   `.github/workflows/release.yml`, environment `release-npm`. Trusted publishing is configured per
+   `.github/workflows/build-binaries.yml`, environment `release-npm`. Trusted publishing is configured per
    package and **the package must already exist**, which is why step 2 comes first.
 4. After the trusted publishers exist, delete any classic automation tokens; the publish job must
    hold no npm credential.

@@ -43,7 +43,7 @@ vi.mock("../src/utils/release-signature.js", async (importOriginal) => {
 			return {
 				digest,
 				signerIdentity:
-					"https://github.com/PrimeIntellect-ai/prime-agent/.github/workflows/release.yml@refs/heads/main",
+					"https://github.com/PrimeIntellect-ai/prime-agent/.github/workflows/build-binaries.yml@refs/heads/main",
 				signerRef: "refs/heads/main",
 			};
 		},
