@@ -749,4 +749,54 @@ describe("value flags require values", () => {
 		expect(result.fork).toBe("abc");
 		expect(result.diagnostics.some((d) => d.type === "error")).toBe(false);
 	});
+
+	test("--model followed by a short option is not consumed as its value", () => {
+		const result = parseArgs(["--model", "-t", "ipython"]);
+
+		expect(result.model).toBeUndefined();
+		expect(result.tools).toEqual(["ipython"]);
+		expect(result.diagnostics).toContainEqual({
+			type: "error",
+			message: "--model requires a value",
+		});
+	});
+
+	test("value flags followed by a short option report missing values", () => {
+		const result = parseArgs(["--thinking", "-x"]);
+
+		expect(result.thinking).toBeUndefined();
+		expect(result.diagnostics).toContainEqual({
+			type: "error",
+			message: "--thinking requires a value",
+		});
+	});
+
+	test.each([
+		"--provider",
+		"--api-key",
+		"--cwd",
+		"--fork",
+		"--session-dir",
+		"--models",
+		"--daemon-socket",
+		"--system-prompt",
+	])("%s followed by a short option reports a missing value", (flag) => {
+		const result = parseArgs([flag, "-x"]);
+
+		expect(result.diagnostics).toContainEqual({
+			type: "error",
+			message: `${flag} requires a value`,
+		});
+	});
+
+	test("free-text value flags keep accepting dash-prefixed values", () => {
+		const goal = parseArgs(["--goal", "-p"]);
+		expect(goal.goal).toBe("-p");
+		expect(goal.print).toBeUndefined();
+		expect(goal.diagnostics.some((d) => d.type === "error")).toBe(false);
+
+		const gate = parseArgs(["--autonomous-gate", "-x npm test"]);
+		expect(gate.autonomousGates).toEqual(["-x npm test"]);
+		expect(gate.diagnostics.some((d) => d.type === "error")).toBe(false);
+	});
 });

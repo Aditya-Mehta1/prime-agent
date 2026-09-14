@@ -368,7 +368,11 @@ export function parseArgs(args: string[]): Args {
 
 function hasRequiredOptionValue(args: string[], index: number, flag: string, result: Args): boolean {
 	const next = args[index + 1];
-	if (next === undefined || next.startsWith("--")) {
+	// --goal and --autonomous-gate take free-form text (an objective, a shell
+	// command) that may legitimately start with a dash; every other value flag
+	// treats an option-looking token as a missing value so it still parses as a flag.
+	const valueMayStartWithDash = flag === "--goal" || flag === "--autonomous-gate";
+	if (next === undefined || next.startsWith(valueMayStartWithDash ? "--" : "-")) {
 		result.diagnostics.push({ type: "error", message: `${flag} requires a value` });
 		return false;
 	}
