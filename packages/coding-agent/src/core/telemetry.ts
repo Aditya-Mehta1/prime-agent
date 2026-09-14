@@ -545,7 +545,11 @@ export class TelemetryClient implements TelemetrySink {
 		this.flushTimer = undefined;
 		if (!this.enabled()) return;
 		const timeoutMs = Math.max(1, options.timeoutMs ?? this.requestTimeoutMs);
-		if (this.flushInFlight) {
+		// Wait out whichever pass owns the drain. A non-final caller is finished
+		// once that pass settles; a last-chance caller cannot settle for what the
+		// pass held back, so it drains again — but only after ownership is free,
+		// so two passes never write the queue at the same time.
+		while (this.flushInFlight) {
 			const inFlight = this.flushInFlight;
 			let timer: ReturnType<typeof setTimeout> | undefined;
 			try {
@@ -562,10 +566,9 @@ export class TelemetryClient implements TelemetrySink {
 			} finally {
 				if (timer) clearTimeout(timer);
 			}
-			// A last-chance flush cannot settle for whatever the in-flight pass
-			// decided to hold back; drain again below with the final rules once
-			// that pass has finished (a pass still running keeps ownership).
-			if (!options.final || this.flushInFlight === inFlight) return;
+			if (!options.final) return;
+			// The pass timed out instead of finishing: it still owns the drain.
+			if (this.flushInFlight === inFlight) return;
 		}
 		this.discover();
 		this.flushInFlight = this.drainQueue(timeoutMs, options.final === true);
@@ -787,6 +790,9 @@ export interface CaptureTelemetryEventOptions {
 export async function flushTelemetry(
 	options: Pick<CaptureTelemetryEventOptions, "agentDir" | "settingsManager" | "sink">,
 	timeoutMs = 1_500,
+	// Only callers that park or discard the queue afterwards (exit, relaunch,
+	// clearPending) are last-chance; mid-session flushes keep the hold-back.
+	{ final = false }: { final?: boolean } = {},
 ): Promise<void> {
 	try {
 		const sink = options.sink ?? telemetryClients.get(options.settingsManager)?.get(options.agentDir);
@@ -794,7 +800,7 @@ export async function flushTelemetry(
 			if (sink instanceof TelemetryClient) sink.clearPending();
 			return;
 		}
-		await sink?.flush({ timeoutMs, final: true });
+		await sink?.flush({ timeoutMs, final });
 	} catch {
 		/* Controlled shutdown is bounded and must preserve its original result. */
 	}

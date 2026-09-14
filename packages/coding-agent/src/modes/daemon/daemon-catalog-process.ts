@@ -157,7 +157,8 @@ export async function runDaemonCatalogProcess(): Promise<never> {
 					operation: "startup",
 					stage: "startup",
 				});
-				await flushTelemetry({ agentDir, settingsManager });
+				// The catalog process rethrows and exits right after this report.
+				await flushTelemetry({ agentDir, settingsManager }, undefined, { final: true });
 			}
 		} catch {
 			// Startup reporting must preserve the original failure.

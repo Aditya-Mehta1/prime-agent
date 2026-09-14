@@ -272,6 +272,16 @@ describe("client-owned PostHog errors", () => {
 		await client.flush({ final: true });
 		expect(batches[1].events.map((event) => event.name)).toEqual(["agent error"]);
 	});
+	it("never drains twice for concurrent final flushes", async () => {
+		const { client, batches } = setup();
+		client.capture(source.name, source.properties);
+		const first = client.flush({ final: true });
+		const second = client.flush({ final: true });
+		await Promise.all([first, second]);
+		// Overlapping drains would post the same queued events twice.
+		expect(batches).toHaveLength(1);
+		expect(batches[0].events.map((event) => event.name)).toEqual(["agent error", "$exception"]);
+	});
 	it("keeps every error pair within batch count and byte limits", async () => {
 		const { client, batches } = setup();
 		for (let i = 0; i < 21; i++) client.capture(source.name, source.properties);

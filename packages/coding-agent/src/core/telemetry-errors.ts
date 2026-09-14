@@ -154,7 +154,8 @@ export async function flushTelemetryErrorReporting(): Promise<void> {
 	try {
 		const context = scopedContext.getStore() ?? activeContext;
 		if (!context || context.telemetryDisabled) return;
-		await flushTelemetry(context);
+		// Startup failure reporting runs as the process gives up: last chance.
+		await flushTelemetry(context, undefined, { final: true });
 	} catch {
 		/* Error reporting cannot replace the original startup failure. */
 	}

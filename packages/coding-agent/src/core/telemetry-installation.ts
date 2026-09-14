@@ -182,7 +182,8 @@ export class TelemetryInstallationAttempt {
 
 	async flush(): Promise<void> {
 		try {
-			if (this.enabled()) await flushTelemetry(this.options);
+			// The pending queue is cleared below, so nothing may be held back.
+			if (this.enabled()) await flushTelemetry(this.options, undefined, { final: true });
 		} finally {
 			clearPendingTelemetry(this.options);
 		}
@@ -296,7 +297,8 @@ export async function observeInstalledRuntimeReady(options: {
 			});
 			captured = true;
 		}
-		if (captured) await flushTelemetry({ ...options, sink: deliverySink });
+		// The delivery sink is cleared in the finally below: last chance.
+		if (captured) await flushTelemetry({ ...options, sink: deliverySink }, undefined, { final: true });
 	} catch {
 		// Installation analytics are never a startup dependency.
 	} finally {
