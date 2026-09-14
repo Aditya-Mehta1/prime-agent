@@ -2135,6 +2135,8 @@ export class AgentDaemon {
 			}
 			await session.followUp(runnableJob.prompt, undefined, {
 				resumeIfIdle: true,
+				// A scheduled prompt is machine-triggered, so it must not outrank live human input.
+				priority: "background",
 			});
 			return;
 		}
@@ -2167,6 +2169,8 @@ export class AgentDaemon {
 			await session.promptUntilAccepted(current.prompt, {
 				streamingBehavior: "followUp",
 				source: "rpc",
+				// A scheduled prompt is machine-triggered, so it must not outrank live human input.
+				priority: "background",
 				admissionCommitted,
 			});
 		} catch (error) {
