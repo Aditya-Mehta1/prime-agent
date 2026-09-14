@@ -62,8 +62,10 @@ export interface Args {
 
 const REMOVED_BUILTIN_TOOL_NAMES = new Set(["read", "write", "grep", "find", "ls"]);
 const BUILTIN_TOOL_NAMES = ["ipython"];
-/** Value flags whose free-form text (an objective, a gate command, a prompt) may legitimately start with a dash. */
-const FREEFORM_VALUE_FLAGS = new Set(["--goal", "--autonomous-gate", "--system-prompt", "--append-system-prompt"]);
+/** Value flags whose free-form text (an objective, a gate command) may legitimately start with a dash. */
+const FREEFORM_VALUE_FLAGS = new Set(["--goal", "--autonomous-gate"]);
+/** Prompt value flags whose text may start with a long-option-looking token, e.g. YAML frontmatter ("---"). */
+const PROMPT_VALUE_FLAGS = new Set(["--system-prompt", "--append-system-prompt"]);
 
 export const INTERNAL_RUNTIME_COMMAND_MARKER = "\0prime-agent-runtime-command";
 
@@ -370,10 +372,13 @@ export function parseArgs(args: string[]): Args {
 
 function hasRequiredOptionValue(args: string[], index: number, flag: string, result: Args): boolean {
 	const next = args[index + 1];
-	// Free-form value flags accept dash-prefixed text; every other value flag
-	// treats an option-looking token as a missing value so it still parses as a flag.
+	// Prompt values are arbitrary text, even long-option-looking text such as
+	// YAML frontmatter ("---"); free-form value flags accept dash-prefixed
+	// text; every other value flag treats an option-looking token as a missing
+	// value so it still parses as a flag.
 	const valueMayStartWithDash = FREEFORM_VALUE_FLAGS.has(flag);
-	if (next === undefined || next.startsWith(valueMayStartWithDash ? "--" : "-")) {
+	const valueIsArbitraryPromptText = PROMPT_VALUE_FLAGS.has(flag);
+	if (next === undefined || (!valueIsArbitraryPromptText && next.startsWith(valueMayStartWithDash ? "--" : "-"))) {
 		result.diagnostics.push({ type: "error", message: `${flag} requires a value` });
 		return false;
 	}

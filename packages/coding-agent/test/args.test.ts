@@ -801,4 +801,26 @@ describe("value flags require values", () => {
 		expect(appended.appendSystemPrompt).toEqual(["- Be terse"]);
 		expect(appended.diagnostics.some((d) => d.type === "error")).toBe(false);
 	});
+
+	test("prompt value flags keep accepting YAML frontmatter", () => {
+		const frontmatter = "---\nname: strict\n---\nYou output only JSON.";
+
+		const prompt = parseArgs(["--system-prompt", frontmatter]);
+		expect(prompt.systemPrompt).toBe(frontmatter);
+		expect(prompt.diagnostics.some((d) => d.type === "error")).toBe(false);
+
+		const appended = parseArgs(["--append-system-prompt", frontmatter]);
+		expect(appended.appendSystemPrompt).toEqual([frontmatter]);
+		expect(appended.diagnostics.some((d) => d.type === "error")).toBe(false);
+	});
+
+	test("goal and gate flags still reject long-option-looking values", () => {
+		const goal = parseArgs(["--goal", "--verbose"]);
+		expect(goal.goal).toBeUndefined();
+		expect(goal.diagnostics).toContainEqual({ type: "error", message: "--goal requires a value" });
+
+		const gate = parseArgs(["--autonomous-gate", "---run"]);
+		expect(gate.autonomousGates).toBeUndefined();
+		expect(gate.diagnostics).toContainEqual({ type: "error", message: "--autonomous-gate requires a value" });
+	});
 });
