@@ -1,13 +1,18 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { stat } from "node:fs/promises";
+import { rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR, getAgentTracesLogPath } from "../src/config.js";
 import {
+	type AgentTraceUploadCycleOutcome,
+	type AgentTraceUploadDelay,
+	type AgentTraceUploadInstallation,
+	type AgentTraceUploadInstallOptions,
+	type AgentTraceUploadSchedule,
 	catchUpAgentTraceUploads,
 	findAgentTraceFiles,
 	installAgentTraceUpload,
@@ -15,14 +20,58 @@ import {
 	uploadAgentTraceFile,
 	uploadAllAgentTraces,
 } from "../src/core/agent-traces.js";
-import { AuthStorage } from "../src/core/auth-storage.js";
+import { AuthStorage, type AuthStorageOptions } from "../src/core/auth-storage.js";
 import { PRIME_AGENT_TRACES_PROVIDER_ID, PRIME_INFERENCE_PROVIDER_ID } from "../src/core/prime-inference-auth.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 
+const TRACE_BASE_URL = "https://api.example.test";
+const UPLOAD_DEBOUNCE_MS = 1_000;
+const UPLOAD_MIN_INTERVAL_MS = 60_000;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const BATCH_REQUEST_INTERVAL_MS = 12_100;
+const MANAGED_ENV_VARS = [
+	ENV_AGENT_DIR,
+	"PRIME_AGENT_TRACES_API_KEY",
+	"PRIME_API_KEY",
+	"PRIME_AGENT_TRACES_BASE_URL",
+	"PRIME_API_BASE_URL",
+];
+
 interface FetchCall {
 	url: string;
 	init: RequestInit;
+}
+
+/** Hands each value to whoever awaits it next, so tests await source events instead of pumping timers. */
+interface SignalQueue<T> {
+	push: (value: T) => void;
+	next: () => Promise<T>;
+	buffered: () => number;
+}
+
+function createSignalQueue<T>(): SignalQueue<T> {
+	const values: T[] = [];
+	const waiters: Array<(value: T) => void> = [];
+	return {
+		push: (value: T) => {
+			const waiter = waiters.shift();
+			if (waiter) {
+				waiter(value);
+				return;
+			}
+			values.push(value);
+		},
+		next: () => {
+			if (values.length > 0) {
+				return Promise.resolve(values.shift() as T);
+			}
+			return new Promise<T>((resolve) => {
+				waiters.push(resolve);
+			});
+		},
+		buffered: () => values.length,
+	};
 }
 
 function createAssistantMessage(text: string): AssistantMessage {
@@ -46,11 +95,7 @@ function createAssistantMessage(text: string): AssistantMessage {
 }
 
 function createUserMessage(text: string) {
-	return {
-		role: "user" as const,
-		content: text,
-		timestamp: Date.now(),
-	};
+	return { role: "user" as const, content: text, timestamp: Date.now() };
 }
 
 function createFetchRecorder(calls: FetchCall[]): typeof fetch {
@@ -68,12 +113,40 @@ function createFetchRecorder(calls: FetchCall[]): typeof fetch {
 	};
 }
 
+function traceAuthStorage(options?: AuthStorageOptions): AuthStorage {
+	return AuthStorage.inMemory({ [PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" } }, options);
+}
+
+/** The option bag every direct upload, batch upload and catch-up in this file shares. */
+function traceOptions(fetchFn: typeof fetch, enabled = true) {
+	return {
+		authStorage: traceAuthStorage(),
+		settingsManager: SettingsManager.inMemory({ agentTraces: { enabled } }),
+		baseUrl: TRACE_BASE_URL,
+		fetchFn,
+		reloadConfig: false,
+	};
+}
+
+function installOptions(fetchFn: typeof fetch, enabled = true): AgentTraceUploadInstallOptions {
+	const { authStorage, settingsManager, baseUrl } = traceOptions(fetchFn, enabled);
+	return { authStorage, settingsManager, baseUrl, fetchFn };
+}
+
 function writeSession(cwd: string, sessionDir: string, id: string, parentSession?: string): SessionManager {
 	const sessionManager = SessionManager.create(cwd, sessionDir);
 	sessionManager.newSession({ id, parentSession });
 	sessionManager.appendMessage(createUserMessage(`user ${id}`));
 	sessionManager.appendMessage(createAssistantMessage(`assistant ${id}`));
 	return sessionManager;
+}
+
+function sessionFileOf(sessionManager: SessionManager): string {
+	const sessionFile = sessionManager.getSessionFile();
+	if (!sessionFile) {
+		throw new Error("session manager has no session file");
+	}
+	return sessionFile;
 }
 
 /** Mirrors the outbox on-disk format: one JSON entry per session file, named by path hash. */
@@ -115,179 +188,207 @@ function writeLedgerOutboxEntry(agentDir: string, ledgerFile: string, uploadedBy
 	);
 }
 
-async function advanceTimersUntil(condition: () => boolean): Promise<void> {
-	for (let step = 0; step < 1_000 && !condition(); step += 1) {
-		await stat(new URL(import.meta.url));
-		if (!condition() && vi.getTimerCount() > 0) {
-			await vi.advanceTimersToNextTimerAsync();
-		}
-	}
-	if (!condition()) {
-		throw new Error("Timed out advancing fake timers to the expected condition");
-	}
+type TransportStep =
+	| { kind: "network-error"; code: string }
+	| { kind: "response"; status: number; retryAfterSeconds?: number };
+
+function netError(code: string): TransportStep {
+	return { kind: "network-error", code };
 }
+
+function httpResponse(status: number, retryAfterSeconds?: number): TransportStep {
+	return { kind: "response", status, retryAfterSeconds };
+}
+
+/** Replays one step per attempt; the last step repeats for every further attempt. */
+function createStepTransport(steps: TransportStep[]): { fetchFn: typeof fetch; startTimes: number[] } {
+	const startTimes: number[] = [];
+	let attempts = 0;
+	const fetchFn: typeof fetch = async () => {
+		attempts += 1;
+		startTimes.push(Date.now());
+		const step = steps[Math.min(attempts, steps.length) - 1];
+		if (!step) {
+			throw new Error("transport has no steps");
+		}
+		if (step.kind === "network-error") {
+			throw new TypeError("fetch failed", { cause: { code: step.code } });
+		}
+		const headers: Record<string, string> =
+			step.retryAfterSeconds === undefined ? {} : { "retry-after": String(step.retryAfterSeconds) };
+		const body = step.status === 200 ? { bytes_stored: 42 } : { detail: "unavailable" };
+		return new Response(JSON.stringify(body), { status: step.status, headers });
+	};
+	return { fetchFn, startTimes };
+}
+
+/** The fake-clock instant each attempt must start at, given the backoff waits between them. */
+function cumulativeStarts(delaysMs: number[]): number[] {
+	const starts = [0];
+	for (const delayMs of delaysMs) {
+		starts.push(starts[starts.length - 1] + delayMs);
+	}
+	return starts;
+}
+
+interface RetryCase {
+	name: string;
+	steps: TransportStep[];
+	expectedAttempts: number;
+	/** Backoff waits the upload arms between attempts, with jitter pinned to its floor. */
+	expectedDelaysMs: number[];
+	expectedResult: Record<string, unknown>;
+}
+
+const retryCases: RetryCase[] = [
+	{
+		name: "retries a transient connection failure, then succeeds",
+		steps: [netError("ECONNRESET"), httpResponse(200)],
+		expectedAttempts: 2,
+		expectedDelaysMs: [400],
+		expectedResult: { status: "uploaded", bytesStored: 42 },
+	},
+	{
+		name: "stops retrying connection failures at the retry bound",
+		steps: [netError("ECONNRESET")],
+		expectedAttempts: 4,
+		expectedDelaysMs: [400, 800, 1_600],
+		expectedResult: { status: "failed", message: "fetch failed (ECONNRESET)" },
+	},
+	{
+		name: "does not retry a permanent DNS failure",
+		steps: [netError("ENOTFOUND")],
+		expectedAttempts: 1,
+		expectedDelaysMs: [],
+		expectedResult: { status: "failed", message: "fetch failed (ENOTFOUND)" },
+	},
+	{
+		name: "retries transient HTTP responses, then succeeds",
+		steps: [httpResponse(503), httpResponse(503), httpResponse(200)],
+		expectedAttempts: 3,
+		expectedDelaysMs: [400, 800],
+		expectedResult: { status: "uploaded", bytesStored: 42 },
+	},
+	{
+		name: "does not retry a permanent HTTP response",
+		steps: [httpResponse(400)],
+		expectedAttempts: 1,
+		expectedDelaysMs: [],
+		expectedResult: { status: "failed", statusCode: 400 },
+	},
+	{
+		name: "returns a rate-limited response instead of sleeping in-request",
+		steps: [httpResponse(429)],
+		expectedAttempts: 1,
+		expectedDelaysMs: [],
+		expectedResult: { status: "failed", statusCode: 429 },
+	},
+	{
+		name: "honors Retry-After on a retried 503",
+		steps: [httpResponse(503, 17), httpResponse(200)],
+		expectedAttempts: 2,
+		expectedDelaysMs: [17_000],
+		expectedResult: { status: "uploaded", bytesStored: 42 },
+	},
+	{
+		name: "caps Retry-After at the platform rate-limit window",
+		steps: [httpResponse(503, 3_600), httpResponse(200)],
+		expectedAttempts: 2,
+		expectedDelaysMs: [60_000],
+		expectedResult: { status: "uploaded", bytesStored: 42 },
+	},
+];
 
 describe("agent trace upload", () => {
 	let tempDir: string;
-	let originalTraceApiKey: string | undefined;
-	let originalPrimeApiKey: string | undefined;
-	let originalTraceBaseUrl: string | undefined;
-	let originalPrimeBaseUrl: string | undefined;
-	let originalAgentDir: string | undefined;
+	let installations: AgentTraceUploadInstallation[];
+	let savedEnv: Array<[string, string | undefined]>;
+
+	function install(sessionManager: SessionManager, options: AgentTraceUploadInstallOptions): void {
+		installations.push(installAgentTraceUpload(sessionManager, options));
+	}
+
+	function liveSession(id: string): SessionManager {
+		const cwd = join(tempDir, "project");
+		mkdirSync(cwd, { recursive: true });
+		const sessionManager = SessionManager.create(cwd, join(tempDir, "sessions"));
+		sessionManager.newSession({ id });
+		return sessionManager;
+	}
+
+	function installWithSignals(
+		sessionManager: SessionManager,
+		fetchFn: typeof fetch,
+	): { scheduled: SignalQueue<AgentTraceUploadSchedule>; settled: SignalQueue<AgentTraceUploadCycleOutcome> } {
+		const scheduled = createSignalQueue<AgentTraceUploadSchedule>();
+		const settled = createSignalQueue<AgentTraceUploadCycleOutcome>();
+		install(sessionManager, {
+			...installOptions(fetchFn),
+			onUploadScheduled: scheduled.push,
+			onUploadSettled: settled.push,
+		});
+		return { scheduled, settled };
+	}
 
 	beforeEach(() => {
-		tempDir = mkdtempSync(join(tmpdir(), "agent-traces-test-"));
-		originalAgentDir = process.env[ENV_AGENT_DIR];
-		process.env[ENV_AGENT_DIR] = tempDir;
-		originalTraceApiKey = process.env.PRIME_AGENT_TRACES_API_KEY;
-		originalPrimeApiKey = process.env.PRIME_API_KEY;
-		originalTraceBaseUrl = process.env.PRIME_AGENT_TRACES_BASE_URL;
-		originalPrimeBaseUrl = process.env.PRIME_API_BASE_URL;
-		delete process.env.PRIME_AGENT_TRACES_API_KEY;
-		delete process.env.PRIME_API_KEY;
-		delete process.env.PRIME_AGENT_TRACES_BASE_URL;
-		delete process.env.PRIME_API_BASE_URL;
-	});
-
-	// Fire-and-forget trace uploads can still be writing under ENV_AGENT_DIR
-	// when the test body returns, so cleanup flushes them and retries removal.
-	async function flushAsyncWork(): Promise<void> {
-		await new Promise<void>((resolve) => setImmediate(resolve));
-		await new Promise<void>((resolve) => setImmediate(resolve));
-	}
-
-	async function rmTempDirSafely(dir: string): Promise<void> {
-		await flushAsyncWork();
-		for (let attempt = 1; attempt <= 3; attempt++) {
-			try {
-				rmSync(dir, { recursive: true, force: true });
-				return;
-			} catch (error) {
-				if (attempt === 3) throw error;
-				await new Promise<void>((resolve) => setTimeout(resolve, 10 * attempt));
-			}
+		savedEnv = MANAGED_ENV_VARS.map((name) => [name, process.env[name]]);
+		for (const name of MANAGED_ENV_VARS) {
+			delete process.env[name];
 		}
-	}
+		tempDir = mkdtempSync(join(tmpdir(), "agent-traces-test-"));
+		installations = [];
+		process.env[ENV_AGENT_DIR] = tempDir;
+	});
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
 		vi.useRealTimers();
-		try {
-			// Flush straggler uploads and remove the temp dir while ENV_AGENT_DIR
-			// still points at it, so late writes land inside the dir being removed.
-			if (tempDir && existsSync(tempDir)) {
-				await rmTempDirSafely(tempDir);
-			}
-		} finally {
-			if (originalAgentDir === undefined) {
-				delete process.env[ENV_AGENT_DIR];
+		for (const [name, value] of savedEnv) {
+			if (value === undefined) {
+				delete process.env[name];
 			} else {
-				process.env[ENV_AGENT_DIR] = originalAgentDir;
-			}
-			if (originalTraceApiKey === undefined) {
-				delete process.env.PRIME_AGENT_TRACES_API_KEY;
-			} else {
-				process.env.PRIME_AGENT_TRACES_API_KEY = originalTraceApiKey;
-			}
-			if (originalPrimeApiKey === undefined) {
-				delete process.env.PRIME_API_KEY;
-			} else {
-				process.env.PRIME_API_KEY = originalPrimeApiKey;
-			}
-			if (originalTraceBaseUrl === undefined) {
-				delete process.env.PRIME_AGENT_TRACES_BASE_URL;
-			} else {
-				process.env.PRIME_AGENT_TRACES_BASE_URL = originalTraceBaseUrl;
-			}
-			if (originalPrimeBaseUrl === undefined) {
-				delete process.env.PRIME_API_BASE_URL;
-			} else {
-				process.env.PRIME_API_BASE_URL = originalPrimeBaseUrl;
+				process.env[name] = value;
 			}
 		}
+		// Every writer this test started must finish before the directory it writes into disappears.
+		await Promise.all(installations.map((installation) => installation.whenIdle()));
+		await rm(tempDir, { recursive: true, force: true });
 	});
 
-	it("does not upload when trace sharing is disabled", async () => {
-		const sessionManager = writeSession(tempDir, join(tempDir, "sessions"), "disabled-session");
+	it.each([
+		{ name: "skips the upload while trace sharing is disabled", requireEnabled: true, status: "disabled", sent: 0 },
+		{ name: "uploads one-shot without enabling sharing", requireEnabled: false, status: "uploaded", sent: 1 },
+	])("$name", async ({ requireEnabled, status, sent }) => {
+		const session = writeSession(tempDir, join(tempDir, "sessions"), "opt-in-session");
 		const calls: FetchCall[] = [];
 		const result = await uploadAgentTraceFile({
-			sessionFile: sessionManager.getSessionFile(),
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: false } }),
-			baseUrl: "https://api.example.test",
-			fetchFn: createFetchRecorder(calls),
-			reloadConfig: false,
+			...traceOptions(createFetchRecorder(calls), false),
+			sessionFile: sessionFileOf(session),
+			requireEnabled,
 		});
+
+		expect(result.status).toBe(status);
+		expect(calls).toHaveLength(sent);
+	});
+
+	it.each([
+		{ name: "before reading the session body", enabledChecks: 2 },
+		{ name: "before sending the upload request", enabledChecks: 3 },
+	])("stops the upload when sharing is turned off $name", async ({ enabledChecks }) => {
+		const session = writeSession(tempDir, join(tempDir, "sessions"), "disabled-mid-upload-session");
+		const calls: FetchCall[] = [];
+		const options = traceOptions(createFetchRecorder(calls));
+		const enabledSpy = vi.spyOn(options.settingsManager, "getAgentTracesEnabled");
+		for (let check = 1; check < enabledChecks; check += 1) {
+			enabledSpy.mockReturnValueOnce(true);
+		}
+		enabledSpy.mockReturnValue(false);
+
+		const result = await uploadAgentTraceFile({ ...options, sessionFile: sessionFileOf(session) });
 
 		expect(result).toEqual({ status: "disabled" });
 		expect(calls).toHaveLength(0);
-	});
-
-	it("allows an explicit one-shot upload without enabling automatic sharing", async () => {
-		const sessionManager = writeSession(tempDir, join(tempDir, "sessions"), "one-shot-session");
-		const calls: FetchCall[] = [];
-		const result = await uploadAgentTraceFile({
-			sessionFile: sessionManager.getSessionFile(),
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: false } }),
-			requireEnabled: false,
-			baseUrl: "https://api.example.test",
-			fetchFn: createFetchRecorder(calls),
-			reloadConfig: false,
-		});
-
-		expect(result.status).toBe("uploaded");
-		expect(calls).toHaveLength(1);
-	});
-
-	it("stops before reading the session body when trace sharing is disabled after upload starts", async () => {
-		const sessionManager = writeSession(tempDir, join(tempDir, "sessions"), "disabled-before-read-session");
-		const settingsManager = SettingsManager.inMemory({ agentTraces: { enabled: true } });
-		const enabledSpy = vi.spyOn(settingsManager, "getAgentTracesEnabled");
-		enabledSpy.mockReturnValueOnce(true).mockReturnValue(false);
-
-		const calls: FetchCall[] = [];
-		const result = await uploadAgentTraceFile({
-			sessionFile: sessionManager.getSessionFile(),
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager,
-			baseUrl: "https://api.example.test",
-			fetchFn: createFetchRecorder(calls),
-			reloadConfig: false,
-		});
-
-		expect(result).toEqual({ status: "disabled" });
-		expect(calls).toHaveLength(0);
-		expect(enabledSpy).toHaveBeenCalledTimes(2);
-	});
-
-	it("rechecks trace sharing before sending the upload request", async () => {
-		const sessionManager = writeSession(tempDir, join(tempDir, "sessions"), "disabled-before-fetch-session");
-		const settingsManager = SettingsManager.inMemory({ agentTraces: { enabled: true } });
-		const enabledSpy = vi.spyOn(settingsManager, "getAgentTracesEnabled");
-		enabledSpy.mockReturnValueOnce(true).mockReturnValueOnce(true).mockReturnValue(false);
-
-		const calls: FetchCall[] = [];
-		const result = await uploadAgentTraceFile({
-			sessionFile: sessionManager.getSessionFile(),
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager,
-			baseUrl: "https://api.example.test",
-			fetchFn: createFetchRecorder(calls),
-			reloadConfig: false,
-		});
-
-		expect(result).toEqual({ status: "disabled" });
-		expect(calls).toHaveLength(0);
-		expect(enabledSpy).toHaveBeenCalledTimes(3);
+		expect(enabledSpy).toHaveBeenCalledTimes(enabledChecks);
 	});
 
 	it("uploads raw session JSONL with trace headers", async () => {
@@ -295,20 +396,13 @@ describe("agent trace upload", () => {
 		const sessionDir = join(tempDir, "sessions");
 		mkdirSync(cwd, { recursive: true });
 		const parent = writeSession(cwd, sessionDir, "parent-session");
-		const child = writeSession(cwd, sessionDir, "child-session", parent.getSessionFile());
-		const childSessionFile = child.getSessionFile();
-		expect(childSessionFile).toBeDefined();
+		const child = writeSession(cwd, sessionDir, "child-session", sessionFileOf(parent));
+		const childSessionFile = sessionFileOf(child);
 
 		const calls: FetchCall[] = [];
 		const result = await uploadAgentTraceFile({
+			...traceOptions(createFetchRecorder(calls)),
 			sessionFile: childSessionFile,
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn: createFetchRecorder(calls),
-			reloadConfig: false,
 		});
 
 		expect(result).toEqual({
@@ -320,9 +414,9 @@ describe("agent trace upload", () => {
 		});
 		expect(calls).toHaveLength(1);
 		const call = calls[0];
-		expect(call.url).toBe("https://api.example.test/api/v1/agent-traces/sessions/child-session");
+		expect(call.url).toBe(`${TRACE_BASE_URL}/api/v1/agent-traces/sessions/child-session`);
 		expect(call.init.method).toBe("PUT");
-		expect(call.init.body).toBe(readFileSync(childSessionFile!, "utf8"));
+		expect(call.init.body).toBe(readFileSync(childSessionFile, "utf8"));
 
 		const headers = new Headers(call.init.headers);
 		expect(headers.get("authorization")).toBe("Bearer trace-key");
@@ -334,643 +428,81 @@ describe("agent trace upload", () => {
 		expect(headers.get("content-length")).toBeNull();
 	});
 
-	it("uses the production trace API unless a trace-specific base URL is configured", async () => {
-		const sessionManager = writeSession(tempDir, join(tempDir, "sessions"), "prod-session");
+	it.each([
+		{ name: "ignores the prime-cli base URL and its environment override", traceBaseUrl: undefined },
+		{
+			name: "uses PRIME_AGENT_TRACES_BASE_URL when it is configured",
+			traceBaseUrl: "https://trace-api.example/api/v1",
+		},
+	])("$name", async ({ traceBaseUrl }) => {
+		const session = writeSession(tempDir, join(tempDir, "sessions"), "base-url-session");
 		const configPath = join(tempDir, "prime-config.json");
 		writeFileSync(configPath, JSON.stringify({ base_url: "https://dev-api.example/api/v1" }));
 		process.env.PRIME_API_BASE_URL = "https://wrong-api.example";
+		if (traceBaseUrl) {
+			process.env.PRIME_AGENT_TRACES_BASE_URL = traceBaseUrl;
+		}
 
 		const calls: FetchCall[] = [];
+		const { baseUrl: _ignoredBaseUrl, ...options } = traceOptions(createFetchRecorder(calls));
 		const result = await uploadAgentTraceFile({
-			sessionFile: sessionManager.getSessionFile(),
+			...options,
+			authStorage: traceAuthStorage({ primeCliConfigPath: configPath, usePrimeCliConfig: true }),
+			sessionFile: sessionFileOf(session),
+		});
+
+		expect(result.status).toBe("uploaded");
+		expect(calls).toHaveLength(1);
+		expect(calls[0].url).toBe(
+			`${traceBaseUrl ?? "https://api.primeintellect.ai/api/v1"}/agent-traces/sessions/base-url-session`,
+		);
+	});
+
+	it.each([{ stale: false }, { stale: true }])(
+		"never falls back to the prime-cli credential (stale agent auth: $stale)",
+		async ({ stale }) => {
+			const session = writeSession(tempDir, join(tempDir, "sessions"), "cli-fallback-session");
+			const configPath = join(tempDir, "prime-config.json");
+			writeFileSync(configPath, JSON.stringify({ api_key: "cli-key", base_url: "https://api.primeintellect.ai" }));
+			const authStorage = AuthStorage.inMemory({}, { primeCliConfigPath: configPath });
+			if (stale) {
+				authStorage.setPrimeInferenceApiKey("agent-key");
+				expect(authStorage.markAuthStale(PRIME_INFERENCE_PROVIDER_ID)).toBe(true);
+				writeFileSync(configPath, JSON.stringify({ api_key: "changed-cli-key" }));
+			}
+
+			const calls: FetchCall[] = [];
+			const result = await uploadAgentTraceFile({
+				...traceOptions(createFetchRecorder(calls)),
+				authStorage,
+				sessionFile: sessionFileOf(session),
+			});
+
+			expect(result).toEqual({ status: "missing_credentials" });
+			expect(calls).toHaveLength(0);
+		},
+	);
+
+	it("uses the agent inference credential at production despite local prime-cli credentials and URLs", async () => {
+		const session = writeSession(tempDir, join(tempDir, "sessions"), "credential-order-session");
+		const configPath = join(tempDir, "prime-config.json");
+		writeFileSync(configPath, JSON.stringify({ api_key: "cli-fallback-key", base_url: "http://localhost:8000" }));
+
+		const calls: FetchCall[] = [];
+		const { baseUrl: _ignoredBaseUrl, ...options } = traceOptions(createFetchRecorder(calls));
+		const result = await uploadAgentTraceFile({
+			...options,
 			authStorage: AuthStorage.inMemory(
-				{
-					[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-				},
+				{ [PRIME_INFERENCE_PROVIDER_ID]: { type: "api_key", key: "inference-key" } },
 				{ primeCliConfigPath: configPath, usePrimeCliConfig: true },
 			),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			fetchFn: createFetchRecorder(calls),
-			reloadConfig: false,
+			sessionFile: sessionFileOf(session),
 		});
 
 		expect(result.status).toBe("uploaded");
 		expect(calls).toHaveLength(1);
-		expect(calls[0].url).toBe("https://api.primeintellect.ai/api/v1/agent-traces/sessions/prod-session");
-	});
-
-	it("uses PRIME_AGENT_TRACES_BASE_URL for trace API overrides", async () => {
-		const sessionManager = writeSession(tempDir, join(tempDir, "sessions"), "override-session");
-		process.env.PRIME_AGENT_TRACES_BASE_URL = "https://trace-api.example/api/v1";
-
-		const calls: FetchCall[] = [];
-		const result = await uploadAgentTraceFile({
-			sessionFile: sessionManager.getSessionFile(),
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			fetchFn: createFetchRecorder(calls),
-			reloadConfig: false,
-		});
-
-		expect(result.status).toBe("uploaded");
-		expect(calls).toHaveLength(1);
-		expect(calls[0].url).toBe("https://trace-api.example/api/v1/agent-traces/sessions/override-session");
-	});
-
-	it("runs a startup catch-up on the first trace-upload install", async () => {
-		const cwd = join(tempDir, "project");
-		const sessionDir = join(tempDir, "sessions");
-		mkdirSync(cwd, { recursive: true });
-		const missed = writeSession(cwd, sessionDir, "missed-session");
-		const missedFile = missed.getSessionFile();
-		expect(missedFile).toBeDefined();
-		writeOutboxEntry(tempDir, missedFile as string);
-
-		const live = SessionManager.create(cwd, sessionDir);
-		live.newSession({ id: "live-session" });
-		const calls: FetchCall[] = [];
-		installAgentTraceUpload(live, {
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn: createFetchRecorder(calls),
-		});
-
-		await vi.waitFor(() => expect(calls).toHaveLength(1));
-		expect(calls[0].url).toBe("https://api.example.test/api/v1/agent-traces/sessions/missed-session");
-		expect(calls[0].init.body).toBe(readFileSync(missedFile as string, "utf8"));
-		const stats = await stat(missedFile as string);
-		await vi.waitFor(() =>
-			expect(readOutboxEntry(tempDir, missedFile as string)).toEqual({
-				sessionFile: missedFile,
-				size: stats.size,
-				mtimeMs: stats.mtimeMs,
-			}),
-		);
-	});
-
-	it("schedules upload only after the session file is persisted", async () => {
-		vi.useFakeTimers();
-		const cwd = join(tempDir, "project");
-		const sessionDir = join(tempDir, "sessions");
-		mkdirSync(cwd, { recursive: true });
-		const sessionManager = SessionManager.create(cwd, sessionDir);
-		sessionManager.newSession({ id: "listener-session" });
-
-		const calls: FetchCall[] = [];
-		installAgentTraceUpload(sessionManager, {
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn: createFetchRecorder(calls),
-		});
-
-		sessionManager.appendMessage(createUserMessage("hello"));
-		expect(vi.getTimerCount()).toBe(0);
-
-		sessionManager.appendMessage(createAssistantMessage("hi"));
-		await advanceTimersUntil(() => calls.length === 1);
-		expect(calls[0].url).toBe("https://api.example.test/api/v1/agent-traces/sessions/listener-session");
-		const sessionFile = sessionManager.getSessionFile()!;
-		const signature = await stat(sessionFile);
-		await advanceTimersUntil(() => readOutboxEntry(tempDir, sessionFile)?.size === signature.size);
-		// The request starts before the upload cursor and completion log are written.
-		await advanceTimersUntil(() => {
-			const logPath = getAgentTracesLogPath();
-			return (
-				existsSync(logPath) &&
-				readFileSync(logPath, "utf8").includes(`uploaded session uploaded-session (123 bytes) [${sessionFile}]`)
-			);
-		});
-	});
-
-	it("coalesces new content that persists during an in-flight upload into one follow-up upload", async () => {
-		vi.useFakeTimers();
-		const cwd = join(tempDir, "project");
-		const sessionDir = join(tempDir, "sessions");
-		mkdirSync(cwd, { recursive: true });
-		const sessionManager = SessionManager.create(cwd, sessionDir);
-		sessionManager.newSession({ id: "concurrent-upload-session" });
-
-		let releaseFetch: () => void = () => {};
-		const fetchReleased = new Promise<void>((resolve) => {
-			releaseFetch = resolve;
-		});
-		const calls: FetchCall[] = [];
-		const fetchFn: typeof fetch = async (input, init) => {
-			calls.push({ url: String(input), init: init ?? {} });
-			if (calls.length === 1) {
-				await fetchReleased;
-			}
-			return new Response(JSON.stringify({ bytes_stored: 123 }), {
-				status: 200,
-				headers: { "content-type": "application/json" },
-			});
-		};
-
-		installAgentTraceUpload(sessionManager, {
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn,
-		});
-
-		sessionManager.appendMessage(createUserMessage("hello"));
-		sessionManager.appendMessage(createAssistantMessage("hi"));
-		await advanceTimersUntil(() => calls.length === 1);
-
-		// New content lands while the first upload is still in flight.
-		sessionManager.appendMessage(createUserMessage("more"));
-		sessionManager.appendMessage(createAssistantMessage("content"));
-		await advanceTimersUntil(() => vi.getTimerCount() > 0);
-		await vi.advanceTimersToNextTimerAsync();
-		expect(calls).toHaveLength(1);
-
-		releaseFetch();
-		await advanceTimersUntil(() => calls.length === 2);
-		const finalBody = readFileSync(sessionManager.getSessionFile() as string, "utf8");
-		expect(calls[1].init.body).toBe(finalBody);
-		// Drain the follow-up upload's completion so its chain cannot leak into later fake-timer tests.
-		await advanceTimersUntil(
-			() =>
-				readOutboxEntry(tempDir, sessionManager.getSessionFile() as string)?.size === Buffer.byteLength(finalBody),
-		);
-	});
-
-	it("schedules automatic uploads at most once per minute and only after new entries persist", async () => {
-		vi.useFakeTimers();
-		const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
-		const cwd = join(tempDir, "project");
-		const sessionDir = join(tempDir, "sessions");
-		mkdirSync(cwd, { recursive: true });
-		const sessionManager = SessionManager.create(cwd, sessionDir);
-		sessionManager.newSession({ id: "throttled-session" });
-
-		const calls: FetchCall[] = [];
-		installAgentTraceUpload(sessionManager, {
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn: createFetchRecorder(calls),
-		});
-
-		sessionManager.appendMessage(createUserMessage("hello"));
-		sessionManager.appendMessage(createAssistantMessage("hi"));
-		expect(Number(setTimeoutSpy.mock.calls.at(-1)?.[1])).toBe(1_000);
-		await advanceTimersUntil(() => calls.length === 1);
-
-		// The request starts before the upload cursor and completion log are written.
-		const sessionFile = sessionManager.getSessionFile() as string;
-		await advanceTimersUntil(() => {
-			const logPath = getAgentTracesLogPath();
-			return (
-				existsSync(logPath) &&
-				readFileSync(logPath, "utf8").includes(`uploaded session uploaded-session (123 bytes) [${sessionFile}]`)
-			);
-		});
-
-		setTimeoutSpy.mockClear();
-		sessionManager.appendMessage(createUserMessage("next"));
-		expect(Number(setTimeoutSpy.mock.calls.at(-1)?.[1])).toBe(60_000);
-	});
-
-	it("surfaces the underlying fetch cause and logs the failure", async () => {
-		const session = writeSession(tempDir, join(tempDir, "sessions"), "failing-session");
-		const sessionFile = session.getSessionFile();
-
-		const failingFetch: typeof fetch = async () => {
-			const error = new TypeError("fetch failed");
-			(error as { cause?: unknown }).cause = { code: "ENOTFOUND", message: "getaddrinfo ENOTFOUND host" };
-			throw error;
-		};
-
-		const result = await uploadAgentTraceFile({
-			sessionFile,
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn: failingFetch,
-			reloadConfig: false,
-		});
-
-		expect(result.status).toBe("failed");
-		if (result.status === "failed") {
-			expect(result.message).toBe("fetch failed (ENOTFOUND)");
-		}
-
-		const logContents = readFileSync(getAgentTracesLogPath(), "utf8");
-		expect(logContents).toContain("upload failed");
-		expect(logContents).toContain("fetch failed (ENOTFOUND)");
-		expect(logContents).toContain(sessionFile ?? "");
-	});
-
-	it("retries once on a transient connection failure, then succeeds", async () => {
-		const session = writeSession(tempDir, join(tempDir, "sessions"), "retry-session");
-		const calls: FetchCall[] = [];
-		let attempts = 0;
-		const flakyFetch: typeof fetch = async (input, init) => {
-			attempts += 1;
-			if (attempts === 1) {
-				const error = new TypeError("fetch failed");
-				(error as { cause?: unknown }).cause = { code: "ECONNRESET" };
-				throw error;
-			}
-			return createFetchRecorder(calls)(input, init);
-		};
-
-		const result = await uploadAgentTraceFile({
-			sessionFile: session.getSessionFile(),
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn: flakyFetch,
-			reloadConfig: false,
-		});
-
-		expect(attempts).toBe(2);
-		expect(result.status).toBe("uploaded");
-		expect(calls).toHaveLength(1);
-	});
-
-	it("uses bounded exponential backoff with jitter for transient failures", async () => {
-		const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0);
-		const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
-		const session = writeSession(tempDir, join(tempDir, "sessions"), "bounded-retry-session");
-		let attempts = 0;
-		const failingFetch: typeof fetch = async () => {
-			attempts += 1;
-			const error = new TypeError("fetch failed");
-			(error as { cause?: unknown }).cause = { code: "ECONNRESET" };
-			throw error;
-		};
-
-		const result = await uploadAgentTraceFile({
-			sessionFile: session.getSessionFile(),
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn: failingFetch,
-			reloadConfig: false,
-		});
-		expect(attempts).toBe(4);
-		expect(result.status).toBe("failed");
-		const retryDelays = timeoutSpy.mock.calls.map((call) => Number(call[1])).filter((delay) => delay < 15_000);
-		expect(retryDelays).toEqual([400, 800, 1_600]);
-		randomSpy.mockRestore();
-	});
-
-	it("retries request timeouts within the retry bound", async () => {
-		vi.useFakeTimers();
-		const session = writeSession(tempDir, join(tempDir, "sessions"), "timeout-retry-session");
-		let markFirstAttemptStarted: () => void = () => {};
-		const firstAttemptStarted = new Promise<void>((resolve) => {
-			markFirstAttemptStarted = resolve;
-		});
-		let attempts = 0;
-		const timeoutFetch: typeof fetch = async (_input, init) => {
-			attempts += 1;
-			if (attempts === 1) {
-				markFirstAttemptStarted();
-			}
-			return await new Promise<Response>((_resolve, reject) => {
-				const signal = init?.signal;
-				signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
-			});
-		};
-
-		const upload = uploadAgentTraceFile({
-			sessionFile: session.getSessionFile(),
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn: timeoutFetch,
-			requestTimeoutMs: 100,
-			reloadConfig: false,
-		});
-
-		await firstAttemptStarted;
-		await vi.runAllTimersAsync();
-		const result = await upload;
-		expect(attempts).toBe(4);
-		expect(result).toEqual({ status: "failed", message: "Trace upload timed out after 100ms" });
-	});
-
-	it("retries transient HTTP responses but not permanent HTTP responses", async () => {
-		const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0.5);
-		const session = writeSession(tempDir, join(tempDir, "sessions"), "http-retry-session");
-		let attempts = 0;
-		const fetchFn: typeof fetch = async () => {
-			attempts += 1;
-			if (attempts < 3) {
-				return new Response(JSON.stringify({ detail: "temporarily unavailable" }), { status: 503 });
-			}
-			return new Response(JSON.stringify({ bytes_stored: 42 }), { status: 200 });
-		};
-
-		const result = await uploadAgentTraceFile({
-			sessionFile: session.getSessionFile(),
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn,
-			reloadConfig: false,
-		});
-		expect(attempts).toBe(3);
-		expect(result.status).toBe("uploaded");
-		randomSpy.mockRestore();
-	});
-
-	it("returns a rate-limited upload immediately instead of sleeping in-request", async () => {
-		const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
-		const session = writeSession(tempDir, join(tempDir, "sessions"), "rate-limit-session");
-		let attempts = 0;
-		const fetchFn: typeof fetch = async () => {
-			attempts += 1;
-			return new Response(JSON.stringify({ detail: "Too Many Requests" }), { status: 429 });
-		};
-
-		const result = await uploadAgentTraceFile({
-			sessionFile: session.getSessionFile(),
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn,
-			reloadConfig: false,
-		});
-
-		expect(attempts).toBe(1);
-		expect(result).toMatchObject({ status: "failed", statusCode: 429 });
-		expect(timeoutSpy.mock.calls.map((call) => Number(call[1]))).not.toContain(60_000);
-	});
-
-	it("reschedules a rate-limited automatic upload without blocking and retries on the next cycle", async () => {
-		vi.useFakeTimers();
-		const cwd = join(tempDir, "project");
-		const sessionDir = join(tempDir, "sessions");
-		mkdirSync(cwd, { recursive: true });
-		const sessionManager = SessionManager.create(cwd, sessionDir);
-		sessionManager.newSession({ id: "rate-limit-reschedule-session" });
-
-		let attempts = 0;
-		const calls: FetchCall[] = [];
-		const fetchFn: typeof fetch = async (input, init) => {
-			attempts += 1;
-			if (attempts === 1) {
-				return new Response(JSON.stringify({ detail: "Too Many Requests" }), { status: 429 });
-			}
-			return createFetchRecorder(calls)(input, init);
-		};
-
-		installAgentTraceUpload(sessionManager, {
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn,
-		});
-
-		sessionManager.appendMessage(createUserMessage("hello"));
-		sessionManager.appendMessage(createAssistantMessage("hi"));
-		await advanceTimersUntil(() => attempts === 1);
-		// The rate-limited cycle re-arms itself; the retry succeeds without any caller waiting.
-		await advanceTimersUntil(() => calls.length === 1);
-		expect(attempts).toBe(2);
-		// Receiving the request is not completion: wait for the durable cursor before teardown.
-		const sessionFile = sessionManager.getSessionFile()!;
-		const signature = await stat(sessionFile);
-		await advanceTimersUntil(() => readOutboxEntry(tempDir, sessionFile)?.size === signature.size);
-		expect(readOutboxEntry(tempDir, sessionFile)).toEqual({
-			sessionFile,
-			size: signature.size,
-			mtimeMs: signature.mtimeMs,
-		});
-	});
-
-	it.each([503])("honors Retry-After when retrying HTTP %i", async (status) => {
-		vi.useFakeTimers();
-		const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
-		const session = writeSession(tempDir, join(tempDir, "sessions"), `retry-after-session-${status}`);
-		let markFirstAttemptStarted: () => void = () => {};
-		const firstAttemptStarted = new Promise<void>((resolve) => {
-			markFirstAttemptStarted = resolve;
-		});
-		let attempts = 0;
-		const fetchFn: typeof fetch = async () => {
-			attempts += 1;
-			if (attempts === 1) {
-				markFirstAttemptStarted();
-				return new Response(null, { status, headers: { "retry-after": "17" } });
-			}
-			return new Response(JSON.stringify({ bytes_stored: 42 }), { status: 200 });
-		};
-
-		const upload = uploadAgentTraceFile({
-			sessionFile: session.getSessionFile(),
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn,
-			reloadConfig: false,
-		});
-
-		await firstAttemptStarted;
-		await vi.runAllTimersAsync();
-		const result = await upload;
-		expect(attempts).toBe(2);
-		expect(result.status).toBe("uploaded");
-		expect(timeoutSpy.mock.calls.map((call) => Number(call[1]))).toContain(17_000);
-	});
-
-	it("caps Retry-After at the platform rate-limit window", async () => {
-		vi.useFakeTimers();
-		const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
-		const session = writeSession(tempDir, join(tempDir, "sessions"), "bounded-retry-after-session");
-		let markFirstAttemptStarted: () => void = () => {};
-		const firstAttemptStarted = new Promise<void>((resolve) => {
-			markFirstAttemptStarted = resolve;
-		});
-		let attempts = 0;
-		const fetchFn: typeof fetch = async () => {
-			attempts += 1;
-			if (attempts === 1) {
-				markFirstAttemptStarted();
-				return new Response(null, { status: 503, headers: { "retry-after": "3600" } });
-			}
-			return new Response(JSON.stringify({ bytes_stored: 42 }), { status: 200 });
-		};
-
-		const upload = uploadAgentTraceFile({
-			sessionFile: session.getSessionFile(),
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn,
-			reloadConfig: false,
-		});
-
-		await firstAttemptStarted;
-		await vi.runAllTimersAsync();
-		const result = await upload;
-		expect(attempts).toBe(2);
-		expect(result.status).toBe("uploaded");
-		expect(timeoutSpy.mock.calls.map((call) => Number(call[1]))).toContain(60_000);
-		expect(timeoutSpy.mock.calls.map((call) => Number(call[1]))).not.toContain(3_600_000);
-	});
-
-	it("surfaces the cancellation reason when aborted during the retry backoff", async () => {
-		const session = writeSession(tempDir, join(tempDir, "sessions"), "aborted-retry-session");
-		const controller = new AbortController();
-		const abortReason = new Error("upload cancelled");
-		let attempts = 0;
-		const flakyFetch: typeof fetch = async () => {
-			attempts += 1;
-			controller.abort(abortReason);
-			const error = new TypeError("fetch failed");
-			(error as { cause?: unknown }).cause = { code: "ECONNRESET" };
-			throw error;
-		};
-
-		const result = await uploadAgentTraceFile({
-			sessionFile: session.getSessionFile(),
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn: flakyFetch,
-			signal: controller.signal,
-			reloadConfig: false,
-		});
-
-		expect(attempts).toBe(1);
-		expect(result.status).toBe("failed");
-		if (result.status === "failed") {
-			expect(result.message).toBe("upload cancelled");
-		}
-	});
-
-	it("does not back off when an HTTP response cleanup aborts the upload", async () => {
-		vi.useFakeTimers();
-		const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
-		const session = writeSession(tempDir, join(tempDir, "sessions"), "aborted-http-retry-session");
-		const controller = new AbortController();
-		const abortReason = new Error("upload cancelled during cleanup");
-		let attempts = 0;
-		const fetchFn: typeof fetch = async () => {
-			attempts += 1;
-			return {
-				status: 503,
-				headers: new Headers(),
-				body: {
-					cancel: async () => {
-						controller.abort(abortReason);
-					},
-				},
-			} as unknown as Response;
-		};
-
-		const upload = uploadAgentTraceFile({
-			sessionFile: session.getSessionFile(),
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn,
-			signal: controller.signal,
-			reloadConfig: false,
-		});
-
-		await vi.runAllTimersAsync();
-		const result = await upload;
-		expect(attempts).toBe(1);
-		expect(result).toEqual({ status: "failed", message: "upload cancelled during cleanup" });
-		const retryDelays = timeoutSpy.mock.calls.map((call) => Number(call[1])).filter((delay) => delay < 15_000);
-		expect(retryDelays).toEqual([]);
-	});
-
-	it("does not retry a permanent DNS failure", async () => {
-		const session = writeSession(tempDir, join(tempDir, "sessions"), "dns-failure-session");
-		let attempts = 0;
-		const dnsFailFetch: typeof fetch = async () => {
-			attempts += 1;
-			const error = new TypeError("fetch failed");
-			(error as { cause?: unknown }).cause = { code: "ENOTFOUND", message: "getaddrinfo ENOTFOUND host" };
-			throw error;
-		};
-
-		const result = await uploadAgentTraceFile({
-			sessionFile: session.getSessionFile(),
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn: dnsFailFetch,
-			reloadConfig: false,
-		});
-
-		expect(attempts).toBe(1);
-		expect(result.status).toBe("failed");
-		if (result.status === "failed") {
-			expect(result.message).toBe("fetch failed (ENOTFOUND)");
-		}
-	});
-
-	it("does not retry on an HTTP error response", async () => {
-		const session = writeSession(tempDir, join(tempDir, "sessions"), "http-error-session");
-		let attempts = 0;
-		const erroringFetch: typeof fetch = async () => {
-			attempts += 1;
-			return new Response(JSON.stringify({ detail: "bad request" }), {
-				status: 400,
-				headers: { "content-type": "application/json" },
-			});
-		};
-
-		const result = await uploadAgentTraceFile({
-			sessionFile: session.getSessionFile(),
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn: erroringFetch,
-			reloadConfig: false,
-		});
-
-		expect(attempts).toBe(1);
-		expect(result.status).toBe("failed");
-		if (result.status === "failed") {
-			expect(result.statusCode).toBe(400);
-		}
+		expect(calls[0].url).toBe("https://api.primeintellect.ai/api/v1/agent-traces/sessions/credential-order-session");
+		expect(calls[0].init.headers).toMatchObject({ Authorization: "Bearer inference-key" });
 	});
 
 	it("previews the current trace without requiring sharing or credentials", async () => {
@@ -978,11 +510,11 @@ describe("agent trace upload", () => {
 		const sessionDir = join(tempDir, "sessions");
 		mkdirSync(cwd, { recursive: true });
 		const parent = writeSession(cwd, sessionDir, "preview-parent");
-		const child = writeSession(cwd, sessionDir, "preview-child", parent.getSessionFile());
+		const child = writeSession(cwd, sessionDir, "preview-child", sessionFileOf(parent));
 
 		const result = await previewAgentTraceFile({
-			sessionFile: child.getSessionFile(),
-			baseUrl: "https://api.example.test",
+			sessionFile: sessionFileOf(child),
+			baseUrl: TRACE_BASE_URL,
 			maxContentChars: 256,
 		});
 
@@ -994,12 +526,148 @@ describe("agent trace upload", () => {
 				parentSessionId: "preview-parent",
 				cwd,
 				uploadable: true,
-				endpoint: "https://api.example.test/api/v1/agent-traces/sessions/preview-child",
+				endpoint: `${TRACE_BASE_URL}/api/v1/agent-traces/sessions/preview-child`,
 				truncated: true,
 			});
 			expect(result.contentPreview).toContain("middle of trace omitted");
 			expect(result.contentPreview).toContain("preview-child");
 		}
+	});
+
+	it.each(retryCases)("$name", async ({ steps, expectedAttempts, expectedDelaysMs, expectedResult }) => {
+		vi.useFakeTimers();
+		vi.spyOn(Math, "random").mockReturnValue(0);
+		const session = writeSession(tempDir, join(tempDir, "sessions"), "retry-session");
+		const transport = createStepTransport(steps);
+		const delays = createSignalQueue<AgentTraceUploadDelay>();
+
+		const upload = uploadAgentTraceFile({
+			...traceOptions(transport.fetchFn),
+			sessionFile: sessionFileOf(session),
+			onUploadDelay: delays.push,
+		});
+
+		const observedDelaysMs: number[] = [];
+		for (let retry = 0; retry < expectedDelaysMs.length; retry += 1) {
+			const armed = await delays.next();
+			expect(armed.reason).toBe("retry-backoff");
+			observedDelaysMs.push(armed.delayMs);
+			await vi.advanceTimersByTimeAsync(armed.delayMs);
+		}
+		const result = await upload;
+
+		expect(observedDelaysMs).toEqual(expectedDelaysMs);
+		expect(delays.buffered()).toBe(0);
+		// Every attempt starts only after its whole backoff has elapsed on the controlled clock.
+		const [firstStart = 0] = transport.startTimes;
+		expect(transport.startTimes.map((start) => start - firstStart)).toEqual(cumulativeStarts(expectedDelaysMs));
+		expect(transport.startTimes).toHaveLength(expectedAttempts);
+		expect(result).toMatchObject(expectedResult);
+	});
+
+	it("retries a request that outlives its deadline, then fails", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(Math, "random").mockReturnValue(0);
+		const session = writeSession(tempDir, join(tempDir, "sessions"), "timeout-retry-session");
+		const requestStarted = createSignalQueue<void>();
+		const delays = createSignalQueue<AgentTraceUploadDelay>();
+		const startTimes: number[] = [];
+		const stalledFetch: typeof fetch = async (_input, init) => {
+			startTimes.push(Date.now());
+			return await new Promise<Response>((_resolve, reject) => {
+				const signal = init?.signal;
+				signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+				requestStarted.push(undefined);
+			});
+		};
+
+		const upload = uploadAgentTraceFile({
+			...traceOptions(stalledFetch),
+			sessionFile: sessionFileOf(session),
+			requestTimeoutMs: 100,
+			onUploadDelay: delays.push,
+		});
+
+		for (const expectedDelayMs of [400, 800, 1_600]) {
+			await requestStarted.next();
+			await vi.advanceTimersByTimeAsync(100);
+			expect((await delays.next()).delayMs).toBe(expectedDelayMs);
+			await vi.advanceTimersByTimeAsync(expectedDelayMs);
+		}
+		await requestStarted.next();
+		await vi.advanceTimersByTimeAsync(100);
+		const result = await upload;
+
+		// Each attempt waits out the 100ms deadline plus its own backoff before the next one starts.
+		const [firstStart = 0] = startTimes;
+		expect(startTimes.map((start) => start - firstStart)).toEqual([0, 500, 1_400, 3_100]);
+		expect(result).toEqual({ status: "failed", message: "Trace upload timed out after 100ms" });
+	});
+
+	it("surfaces the cancellation reason when the caller aborts during a retry", async () => {
+		const session = writeSession(tempDir, join(tempDir, "sessions"), "aborted-retry-session");
+		const controller = new AbortController();
+		const delays = createSignalQueue<AgentTraceUploadDelay>();
+		let attempts = 0;
+		const abortingFetch: typeof fetch = async () => {
+			attempts += 1;
+			controller.abort(new Error("upload cancelled"));
+			throw new TypeError("fetch failed", { cause: { code: "ECONNRESET" } });
+		};
+
+		const result = await uploadAgentTraceFile({
+			...traceOptions(abortingFetch),
+			sessionFile: sessionFileOf(session),
+			signal: controller.signal,
+			onUploadDelay: delays.push,
+		});
+
+		expect(attempts).toBe(1);
+		expect(result).toEqual({ status: "failed", message: "upload cancelled" });
+		expect(delays.buffered()).toBe(0);
+	});
+
+	it("does not arm a backoff when draining an HTTP response aborts the upload", async () => {
+		const session = writeSession(tempDir, join(tempDir, "sessions"), "aborted-http-retry-session");
+		const controller = new AbortController();
+		const delays = createSignalQueue<AgentTraceUploadDelay>();
+		let attempts = 0;
+		const cancellingFetch: typeof fetch = async () => {
+			attempts += 1;
+			const body = new ReadableStream<Uint8Array>({
+				cancel: () => {
+					controller.abort(new Error("upload cancelled during cleanup"));
+				},
+			});
+			return new Response(body, { status: 503 });
+		};
+
+		const result = await uploadAgentTraceFile({
+			...traceOptions(cancellingFetch),
+			sessionFile: sessionFileOf(session),
+			signal: controller.signal,
+			onUploadDelay: delays.push,
+		});
+
+		expect(attempts).toBe(1);
+		expect(result).toEqual({ status: "failed", message: "upload cancelled during cleanup" });
+		expect(delays.buffered()).toBe(0);
+	});
+
+	it("logs the failing upload with the underlying network cause", async () => {
+		const session = writeSession(tempDir, join(tempDir, "sessions"), "failing-session");
+		const sessionFile = sessionFileOf(session);
+		const failingFetch: typeof fetch = async () => {
+			throw new TypeError("fetch failed", { cause: { code: "ENOTFOUND", message: "getaddrinfo ENOTFOUND host" } });
+		};
+
+		const result = await uploadAgentTraceFile({ ...traceOptions(failingFetch), sessionFile });
+
+		expect(result).toEqual({ status: "failed", message: "fetch failed (ENOTFOUND)" });
+		const logContents = readFileSync(getAgentTracesLogPath(), "utf8");
+		expect(logContents).toContain("upload failed");
+		expect(logContents).toContain("fetch failed (ENOTFOUND)");
+		expect(logContents).toContain(sessionFile);
 	});
 
 	it("discovers and uploads saved parent and subagent traces", async () => {
@@ -1008,53 +676,43 @@ describe("agent trace upload", () => {
 		mkdirSync(cwd, { recursive: true });
 		const parent = writeSession(cwd, sessionDir, "all-parent");
 		const childDir = join(tempDir, "session-artifacts", "all-parent", "sub-12345678");
-		const child = writeSession(cwd, childDir, "all-child", parent.getSessionFile());
-		const grandchildDir = join(childDir, "sub-87654321");
-		const grandchild = writeSession(cwd, grandchildDir, "all-grandchild", child.getSessionFile());
+		const child = writeSession(cwd, childDir, "all-child", sessionFileOf(parent));
+		const grandchild = writeSession(cwd, join(childDir, "sub-87654321"), "all-grandchild", sessionFileOf(child));
 		writeFileSync(join(childDir, "not-a-session.jsonl"), '{"type":"diagnostic"}\n');
 
 		const discovered = await findAgentTraceFiles(sessionDir);
-		expect(discovered).toEqual([child.getSessionFile(), grandchild.getSessionFile(), parent.getSessionFile()].sort());
+		expect(discovered).toEqual([sessionFileOf(child), sessionFileOf(grandchild), sessionFileOf(parent)].sort());
 
 		vi.useFakeTimers();
 		const calls: FetchCall[] = [];
-		let resolveFirstCompletion: () => void = () => {};
-		const firstCompletion = new Promise<void>((resolve) => {
-			resolveFirstCompletion = resolve;
-		});
+		const delays = createSignalQueue<AgentTraceUploadDelay>();
 		const progress: Array<{ completed: number; total: number }> = [];
 		const upload = uploadAllAgentTraces({
+			...traceOptions(createFetchRecorder(calls), false),
 			sessionDir,
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: false } }),
 			requireEnabled: false,
-			baseUrl: "https://api.example.test",
-			fetchFn: createFetchRecorder(calls),
-			reloadConfig: false,
-			concurrency: 0.5,
+			concurrency: 1,
+			onUploadDelay: delays.push,
 			onProgress: ({ completed, total }) => {
 				progress.push({ completed, total });
-				if (completed === 1) {
-					resolveFirstCompletion();
-				}
 			},
 		});
-		await firstCompletion;
-		await advanceTimersUntil(() => calls.length === 3);
+		for (let request = 1; request < 3; request += 1) {
+			const gate = await delays.next();
+			expect(gate.reason).toBe("rate-limit");
+			await vi.advanceTimersByTimeAsync(gate.delayMs);
+		}
 		const result = await upload;
 
 		expect(result).toMatchObject({ total: 3, uploaded: 3, failed: 0, skipped: 0, bytesStored: 369 });
 		expect(calls.map((call) => call.url).sort()).toEqual(
 			[
-				"https://api.example.test/api/v1/agent-traces/sessions/all-child",
-				"https://api.example.test/api/v1/agent-traces/sessions/all-grandchild",
-				"https://api.example.test/api/v1/agent-traces/sessions/all-parent",
+				`${TRACE_BASE_URL}/api/v1/agent-traces/sessions/all-child`,
+				`${TRACE_BASE_URL}/api/v1/agent-traces/sessions/all-grandchild`,
+				`${TRACE_BASE_URL}/api/v1/agent-traces/sessions/all-parent`,
 			].sort(),
 		);
-		const grandchildCall = calls.find((call) => call.url.endsWith("/all-grandchild"));
-		const grandchildHeaders = new Headers(grandchildCall?.init.headers);
+		const grandchildHeaders = new Headers(calls.find((call) => call.url.endsWith("/all-grandchild"))?.init.headers);
 		expect(grandchildHeaders.get("x-trace-id")).toBe("all-parent");
 		expect(grandchildHeaders.get("x-parent-session")).toBe("all-child");
 		expect(progress[0]).toEqual({ completed: 0, total: 3 });
@@ -1068,40 +726,33 @@ describe("agent trace upload", () => {
 		}
 
 		vi.useFakeTimers();
-		let markFirstRequestStarted: () => void = () => {};
-		const firstRequestStarted = new Promise<void>((resolve) => {
-			markFirstRequestStarted = resolve;
-		});
+		const delays = createSignalQueue<AgentTraceUploadDelay>();
 		const requestStarts: number[] = [];
-		const fetchFn: typeof fetch = async () => {
+		const pacedFetch: typeof fetch = async () => {
 			requestStarts.push(Date.now());
-			if (requestStarts.length === 1) {
-				markFirstRequestStarted();
-			}
 			return new Response(JSON.stringify({ bytes_stored: 1 }), { status: 200 });
 		};
 
 		const upload = uploadAllAgentTraces({
+			...traceOptions(pacedFetch, false),
 			sessionDir,
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: false } }),
 			requireEnabled: false,
-			baseUrl: "https://api.example.test",
-			fetchFn,
-			reloadConfig: false,
+			onUploadDelay: delays.push,
 		});
 
-		await firstRequestStarted;
-		await advanceTimersUntil(() => requestStarts.length === 6);
+		for (let request = 1; request < 6; request += 1) {
+			const gate = await delays.next();
+			expect(gate.delayMs).toBe(BATCH_REQUEST_INTERVAL_MS);
+			await vi.advanceTimersByTimeAsync(gate.delayMs);
+		}
 		const result = await upload;
+
 		expect(result).toMatchObject({ total: 6, uploaded: 6, failed: 0, skipped: 0 });
 		expect(requestStarts).toHaveLength(6);
 		for (let index = 1; index < requestStarts.length; index += 1) {
-			expect(requestStarts[index]! - requestStarts[index - 1]!).toBeGreaterThanOrEqual(12_000);
+			expect(requestStarts[index] - requestStarts[index - 1]).toBeGreaterThanOrEqual(12_000);
 		}
-		expect(requestStarts[5]! - requestStarts[0]!).toBeGreaterThanOrEqual(60_000);
+		expect(requestStarts[5] - requestStarts[0]).toBeGreaterThanOrEqual(60_000);
 	});
 
 	it("stops scheduling batch uploads after cancellation", async () => {
@@ -1113,15 +764,9 @@ describe("agent trace upload", () => {
 		const calls: FetchCall[] = [];
 
 		const result = await uploadAllAgentTraces({
+			...traceOptions(createFetchRecorder(calls), false),
 			sessionDir,
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: false } }),
 			requireEnabled: false,
-			baseUrl: "https://api.example.test",
-			fetchFn: createFetchRecorder(calls),
-			reloadConfig: false,
 			concurrency: 1,
 			signal: controller.signal,
 			onProgress: ({ completed }) => {
@@ -1142,41 +787,28 @@ describe("agent trace upload", () => {
 		writeSession(tempDir, sessionDir, "abort-in-flight-b");
 		writeSession(tempDir, sessionDir, "abort-in-flight-c");
 		const controller = new AbortController();
-		const abortReason = new Error("cancel in-flight batch");
 		vi.useFakeTimers();
-		let markFirstRequestStarted: () => void = () => {};
-		const firstRequestStarted = new Promise<void>((resolve) => {
-			markFirstRequestStarted = resolve;
-		});
+		const delays = createSignalQueue<AgentTraceUploadDelay>();
 		let attempts = 0;
-		const fetchFn: typeof fetch = async (_input, init) => {
+		const stalledFetch: typeof fetch = async (_input, init) => {
 			attempts += 1;
-			if (attempts === 1) {
-				markFirstRequestStarted();
-			}
 			return await new Promise<Response>((_resolve, reject) => {
 				init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
 				if (attempts === 2) {
-					queueMicrotask(() => controller.abort(abortReason));
+					queueMicrotask(() => controller.abort(new Error("cancel in-flight batch")));
 				}
 			});
 		};
 
 		const upload = uploadAllAgentTraces({
+			...traceOptions(stalledFetch, false),
 			sessionDir,
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: false } }),
 			requireEnabled: false,
-			baseUrl: "https://api.example.test",
-			fetchFn,
-			reloadConfig: false,
 			concurrency: 2,
 			signal: controller.signal,
+			onUploadDelay: delays.push,
 		});
-		await firstRequestStarted;
-		await advanceTimersUntil(() => attempts === 2);
+		await vi.advanceTimersByTimeAsync((await delays.next()).delayMs);
 		const result = await upload;
 
 		expect(attempts).toBe(2);
@@ -1184,31 +816,45 @@ describe("agent trace upload", () => {
 		expect(result.results).toHaveLength(0);
 	});
 
-	it("durably records upload intent on disk before any upload happens", async () => {
-		vi.useFakeTimers();
+	// Runs before any other install: the startup catch-up fires once per process.
+	it("runs a startup catch-up on the first trace-upload install", async () => {
 		const cwd = join(tempDir, "project");
 		const sessionDir = join(tempDir, "sessions");
 		mkdirSync(cwd, { recursive: true });
-		const sessionManager = SessionManager.create(cwd, sessionDir);
-		sessionManager.newSession({ id: "unflushed-session" });
+		const missedFile = sessionFileOf(writeSession(cwd, sessionDir, "missed-session"));
+		writeOutboxEntry(tempDir, missedFile);
 
 		const calls: FetchCall[] = [];
-		installAgentTraceUpload(sessionManager, {
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn: createFetchRecorder(calls),
+		const installation = installAgentTraceUpload(
+			liveSession("live-session"),
+			installOptions(createFetchRecorder(calls)),
+		);
+		installations.push(installation);
+		await installation.whenIdle();
+
+		expect(calls).toHaveLength(1);
+		expect(calls[0].url).toBe(`${TRACE_BASE_URL}/api/v1/agent-traces/sessions/missed-session`);
+		expect(calls[0].init.body).toBe(readFileSync(missedFile, "utf8"));
+		const stats = await stat(missedFile);
+		expect(readOutboxEntry(tempDir, missedFile)).toEqual({
+			sessionFile: missedFile,
+			size: stats.size,
+			mtimeMs: stats.mtimeMs,
 		});
+	});
+
+	it("durably records upload intent on disk before any upload happens", async () => {
+		vi.useFakeTimers();
+		const sessionManager = liveSession("unflushed-session");
+		const calls: FetchCall[] = [];
+		install(sessionManager, installOptions(createFetchRecorder(calls)));
 
 		sessionManager.appendMessage(createUserMessage("hello"));
 		sessionManager.appendMessage(createAssistantMessage("hi"));
-		const sessionFile = sessionManager.getSessionFile();
-		expect(sessionFile).toBeDefined();
 
 		// Synchronously durable: the intent marker is on disk the moment the persist returns.
-		expect(readOutboxEntry(tempDir, sessionFile as string)).toEqual({ sessionFile });
+		const sessionFile = sessionFileOf(sessionManager);
+		expect(readOutboxEntry(tempDir, sessionFile)).toEqual({ sessionFile });
 		expect(calls).toHaveLength(0);
 	});
 
@@ -1216,21 +862,11 @@ describe("agent trace upload", () => {
 		const cwd = join(tempDir, "project");
 		const sessionDir = join(tempDir, "sessions");
 		mkdirSync(cwd, { recursive: true });
-		const missed = writeSession(cwd, sessionDir, "crash-lost-session");
-		const missedFile = missed.getSessionFile() as string;
+		const missedFile = sessionFileOf(writeSession(cwd, sessionDir, "crash-lost-session"));
 		writeOutboxEntry(tempDir, missedFile);
 
 		const calls: FetchCall[] = [];
-		const options = {
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn: createFetchRecorder(calls),
-			reloadConfig: false,
-		};
-
+		const options = traceOptions(createFetchRecorder(calls));
 		const first = await catchUpAgentTraceUploads(options);
 		expect(first.results.map(({ result }) => result.status)).toEqual(["uploaded"]);
 		expect(calls).toHaveLength(1);
@@ -1243,10 +879,8 @@ describe("agent trace upload", () => {
 		});
 
 		// Unchanged content: subsequent cycles and restarts never re-POST.
-		const second = await catchUpAgentTraceUploads(options);
-		expect(second.results).toEqual([]);
-		const automatic = await uploadAgentTraceFile({ ...options, sessionFile: missedFile });
-		expect(automatic).toEqual({ status: "unchanged" });
+		expect((await catchUpAgentTraceUploads(options)).results).toEqual([]);
+		expect(await uploadAgentTraceFile({ ...options, sessionFile: missedFile })).toEqual({ status: "unchanged" });
 		expect(calls).toHaveLength(1);
 	});
 
@@ -1254,8 +888,7 @@ describe("agent trace upload", () => {
 		const cwd = join(tempDir, "project");
 		const sessionDir = join(tempDir, "sessions");
 		mkdirSync(cwd, { recursive: true });
-		const kept = writeSession(cwd, sessionDir, "kept-session");
-		const keptFile = kept.getSessionFile() as string;
+		const keptFile = sessionFileOf(writeSession(cwd, sessionDir, "kept-session"));
 		const keptStats = await stat(keptFile);
 		const keptSignature = { size: keptStats.size, mtimeMs: keptStats.mtimeMs };
 		const deletedFile = join(sessionDir, "deleted-session.jsonl");
@@ -1263,15 +896,7 @@ describe("agent trace upload", () => {
 		writeOutboxEntry(tempDir, keptFile, keptSignature);
 
 		const calls: FetchCall[] = [];
-		const result = await catchUpAgentTraceUploads({
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn: createFetchRecorder(calls),
-			reloadConfig: false,
-		});
+		const result = await catchUpAgentTraceUploads(traceOptions(createFetchRecorder(calls)));
 
 		expect(result).toEqual({ pruned: 1, semanticEdgeLedgersPending: 0, results: [] });
 		expect(calls).toHaveLength(0);
@@ -1279,23 +904,66 @@ describe("agent trace upload", () => {
 		expect(readOutboxEntry(tempDir, keptFile)).toEqual({ sessionFile: keptFile, ...keptSignature });
 	});
 
-	it("registers the semantic-edge ledger with a kind-tagged durable intent at persist", async () => {
-		vi.useFakeTimers();
+	it("a corrupt outbox entry costs only itself; other cursors survive", async () => {
 		const cwd = join(tempDir, "project");
 		const sessionDir = join(tempDir, "sessions");
 		mkdirSync(cwd, { recursive: true });
-		const sessionManager = SessionManager.create(cwd, sessionDir);
-		sessionManager.newSession({ id: "ledger-intent-session" });
-		const ledgerPath = join(tempDir, "artifacts", "semantic-edges.jsonl");
+		const keptFile = sessionFileOf(writeSession(cwd, sessionDir, "kept-cursor-session"));
+		const keptStats = await stat(keptFile);
+		writeOutboxEntry(tempDir, keptFile, { size: keptStats.size, mtimeMs: keptStats.mtimeMs });
+		writeFileSync(join(tempDir, "agent-traces-outbox", "deadbeef.json"), "not json");
 
 		const calls: FetchCall[] = [];
-		installAgentTraceUpload(sessionManager, {
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn: createFetchRecorder(calls),
+		const options = traceOptions(createFetchRecorder(calls));
+		const result = await catchUpAgentTraceUploads(options);
+
+		expect(result).toEqual({ pruned: 1, semanticEdgeLedgersPending: 0, results: [] });
+		expect(existsSync(join(tempDir, "agent-traces-outbox", "deadbeef.json"))).toBe(false);
+		expect(await uploadAgentTraceFile({ ...options, sessionFile: keptFile })).toEqual({ status: "unchanged" });
+		expect(calls).toHaveLength(0);
+	});
+
+	it("returns a retryable failure when the upload cursor cannot be persisted", async () => {
+		const session = writeSession(tempDir, join(tempDir, "sessions"), "cursor-persist-failure");
+		writeFileSync(join(tempDir, "agent-traces-outbox"), "not a directory");
+
+		const calls: FetchCall[] = [];
+		const result = await uploadAgentTraceFile({
+			...traceOptions(createFetchRecorder(calls)),
+			sessionFile: sessionFileOf(session),
+		});
+
+		expect(calls).toHaveLength(1);
+		expect(result.status).toBe("failed");
+		if (result.status === "failed") {
+			expect(result.message).toContain("cursor");
+		}
+	});
+
+	it("retries the intent marker on the next persist after a failed write", async () => {
+		vi.useFakeTimers();
+		const sessionManager = liveSession("marker-retry-session");
+		const blocker = join(tempDir, "agent-traces-outbox");
+		writeFileSync(blocker, "not a directory");
+		install(sessionManager, installOptions(createFetchRecorder([])));
+
+		sessionManager.appendMessage(createUserMessage("hello"));
+		sessionManager.appendMessage(createAssistantMessage("hi"));
+		const sessionFile = sessionFileOf(sessionManager);
+		expect(readOutboxEntry(tempDir, sessionFile)).toBeUndefined();
+
+		rmSync(blocker);
+		sessionManager.appendMessage(createUserMessage("again"));
+		expect(readOutboxEntry(tempDir, sessionFile)).toEqual({ sessionFile });
+	});
+
+	it("registers the semantic-edge ledger with a kind-tagged durable intent at persist", async () => {
+		vi.useFakeTimers();
+		const sessionManager = liveSession("ledger-intent-session");
+		const ledgerPath = join(tempDir, "artifacts", "semantic-edges.jsonl");
+		const calls: FetchCall[] = [];
+		install(sessionManager, {
+			...installOptions(createFetchRecorder(calls)),
 			semanticEdgesLedgerPath: ledgerPath,
 		});
 		sessionManager.appendMessage(createUserMessage("hello"));
@@ -1307,16 +975,19 @@ describe("agent trace upload", () => {
 
 		// A re-install with a DIFFERENT ledger path registers the new ledger at the next persist.
 		const movedLedgerPath = join(tempDir, "artifacts-moved", "semantic-edges.jsonl");
-		installAgentTraceUpload(sessionManager, {
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn: createFetchRecorder(calls),
+		install(sessionManager, {
+			...installOptions(createFetchRecorder(calls)),
 			semanticEdgesLedgerPath: movedLedgerPath,
 		});
 		sessionManager.appendMessage(createAssistantMessage("after re-install"));
+		expect(readOutboxEntry(tempDir, movedLedgerPath)).toEqual({
+			sessionFile: movedLedgerPath,
+			kind: "semantic-edges",
+		});
+
+		// A concurrent catch-up pruned the entry (missing ledger file at scan time).
+		rmSync(outboxEntryPath(tempDir, movedLedgerPath));
+		sessionManager.appendMessage(createUserMessage("still here"));
 		expect(readOutboxEntry(tempDir, movedLedgerPath)).toEqual({
 			sessionFile: movedLedgerPath,
 			kind: "semantic-edges",
@@ -1326,20 +997,10 @@ describe("agent trace upload", () => {
 
 	it("creates no outbox intent while trace sharing is disabled", async () => {
 		vi.useFakeTimers();
-		const cwd = join(tempDir, "project");
-		const sessionDir = join(tempDir, "sessions");
-		mkdirSync(cwd, { recursive: true });
-		const sessionManager = SessionManager.create(cwd, sessionDir);
-		sessionManager.newSession({ id: "opted-out-session" });
+		const sessionManager = liveSession("opted-out-session");
 		const ledgerPath = join(tempDir, "artifacts", "semantic-edges.jsonl");
-
-		installAgentTraceUpload(sessionManager, {
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: false } }),
-			baseUrl: "https://api.example.test",
-			fetchFn: createFetchRecorder([]),
+		install(sessionManager, {
+			...installOptions(createFetchRecorder([]), false),
 			semanticEdgesLedgerPath: ledgerPath,
 		});
 		sessionManager.appendMessage(createUserMessage("private"));
@@ -1347,36 +1008,8 @@ describe("agent trace upload", () => {
 
 		// Neither kind leaves a durable entry: enabling sharing later must not
 		// retroactively collect sessions recorded while sharing was off.
-		expect(readOutboxEntry(tempDir, sessionManager.getSessionFile() as string)).toBeUndefined();
+		expect(readOutboxEntry(tempDir, sessionFileOf(sessionManager))).toBeUndefined();
 		expect(readOutboxEntry(tempDir, ledgerPath)).toBeUndefined();
-	});
-
-	it("re-registers the ledger at the next persist after its entry is pruned", async () => {
-		vi.useFakeTimers();
-		const cwd = join(tempDir, "project");
-		const sessionDir = join(tempDir, "sessions");
-		mkdirSync(cwd, { recursive: true });
-		const sessionManager = SessionManager.create(cwd, sessionDir);
-		sessionManager.newSession({ id: "pruned-ledger-session" });
-		const ledgerPath = join(tempDir, "artifacts", "semantic-edges.jsonl");
-
-		installAgentTraceUpload(sessionManager, {
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn: createFetchRecorder([]),
-			semanticEdgesLedgerPath: ledgerPath,
-		});
-		sessionManager.appendMessage(createUserMessage("hello"));
-		sessionManager.appendMessage(createAssistantMessage("hi"));
-		expect(readOutboxEntry(tempDir, ledgerPath)).toEqual({ sessionFile: ledgerPath, kind: "semantic-edges" });
-
-		// A concurrent catch-up pruned the entry (missing ledger file at scan time).
-		rmSync(outboxEntryPath(tempDir, ledgerPath));
-		sessionManager.appendMessage(createUserMessage("still here"));
-		expect(readOutboxEntry(tempDir, ledgerPath)).toEqual({ sessionFile: ledgerPath, kind: "semantic-edges" });
 	});
 
 	it("counts appended ledger bytes as pending, stays quiet at the cursor, and prunes deleted ledgers", async () => {
@@ -1389,19 +1022,14 @@ describe("agent trace upload", () => {
 		writeLedgerOutboxEntry(tempDir, deletedLedger);
 
 		const calls: FetchCall[] = [];
-		const options = {
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn: createFetchRecorder(calls),
-			reloadConfig: false,
-		};
+		const options = traceOptions(createFetchRecorder(calls));
 
 		// Catch-up after a kill: the never-delivered ledger is pending; the deleted one is pruned.
-		const first = await catchUpAgentTraceUploads(options);
-		expect(first).toEqual({ pruned: 1, semanticEdgeLedgersPending: 1, results: [] });
+		expect(await catchUpAgentTraceUploads(options)).toEqual({
+			pruned: 1,
+			semanticEdgeLedgersPending: 1,
+			results: [],
+		});
 		expect(existsSync(outboxEntryPath(tempDir, deletedLedger))).toBe(false);
 		// The cursor stays untouched: the first real sender must deliver the whole backlog.
 		expect(readOutboxEntry(tempDir, ledgerFile)).toEqual({ sessionFile: ledgerFile, kind: "semantic-edges" });
@@ -1409,251 +1037,151 @@ describe("agent trace upload", () => {
 		// A cursor at the file size means unchanged: never re-counted, never resent.
 		const { size } = await stat(ledgerFile);
 		writeLedgerOutboxEntry(tempDir, ledgerFile, size);
-		const second = await catchUpAgentTraceUploads(options);
-		expect(second).toEqual({ pruned: 0, semanticEdgeLedgersPending: 0, results: [] });
+		expect(await catchUpAgentTraceUploads(options)).toEqual({
+			pruned: 0,
+			semanticEdgeLedgersPending: 0,
+			results: [],
+		});
 
 		// Appended bytes beyond the cursor become pending again.
 		writeFileSync(ledgerFile, `${JSON.stringify({ type: "request_started", request_id: "r", session_id: "s" })}\n`, {
 			flag: "a",
 		});
-		const third = await catchUpAgentTraceUploads(options);
-		expect(third).toEqual({ pruned: 0, semanticEdgeLedgersPending: 1, results: [] });
+		expect(await catchUpAgentTraceUploads(options)).toEqual({
+			pruned: 0,
+			semanticEdgeLedgersPending: 1,
+			results: [],
+		});
 		expect(calls).toHaveLength(0);
 	});
 
-	it("arms upload timers that never hold the process open", async () => {
-		const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
-		const cwd = join(tempDir, "project");
-		const sessionDir = join(tempDir, "sessions");
-		mkdirSync(cwd, { recursive: true });
-		const sessionManager = SessionManager.create(cwd, sessionDir);
-		sessionManager.newSession({ id: "unref-session" });
-
+	it("arms a debounced upload once the session file is persisted, without holding the process open", async () => {
+		vi.useFakeTimers();
+		const sessionManager = liveSession("listener-session");
 		const calls: FetchCall[] = [];
-		installAgentTraceUpload(sessionManager, {
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn: createFetchRecorder(calls),
-		});
+		const { scheduled, settled } = installWithSignals(sessionManager, createFetchRecorder(calls));
+
+		sessionManager.appendMessage(createUserMessage("hello"));
+		expect(scheduled.buffered()).toBe(0);
+
+		sessionManager.appendMessage(createAssistantMessage("hi"));
+		const armed = await scheduled.next();
+		expect(armed).toEqual({ delayMs: UPLOAD_DEBOUNCE_MS, holdsProcessOpen: false });
+
+		await vi.advanceTimersByTimeAsync(armed.delayMs);
+		expect((await settled.next()).status).toBe("uploaded");
+		expect(calls).toHaveLength(1);
+		expect(calls[0].url).toBe(`${TRACE_BASE_URL}/api/v1/agent-traces/sessions/listener-session`);
+
+		// Sending the request is not completion: the cursor and the log land before the cycle settles.
+		const sessionFile = sessionFileOf(sessionManager);
+		const { size, mtimeMs } = await stat(sessionFile);
+		expect(readOutboxEntry(tempDir, sessionFile)).toEqual({ sessionFile, size, mtimeMs });
+		expect(readFileSync(getAgentTracesLogPath(), "utf8")).toContain(
+			`uploaded session uploaded-session (123 bytes) [${sessionFile}]`,
+		);
+	});
+
+	it("throttles automatic uploads to at most one per minute", async () => {
+		vi.useFakeTimers();
+		const sessionManager = liveSession("throttled-session");
+		const calls: FetchCall[] = [];
+		const { scheduled, settled } = installWithSignals(sessionManager, createFetchRecorder(calls));
 
 		sessionManager.appendMessage(createUserMessage("hello"));
 		sessionManager.appendMessage(createAssistantMessage("hi"));
-		const timer = setTimeoutSpy.mock.results.at(-1)?.value as NodeJS.Timeout;
-		expect(timer.hasRef()).toBe(false);
+		expect((await scheduled.next()).delayMs).toBe(UPLOAD_DEBOUNCE_MS);
+		await vi.advanceTimersByTimeAsync(UPLOAD_DEBOUNCE_MS);
+		expect((await settled.next()).status).toBe("uploaded");
+
+		// The next persist lands inside the minute window, so its upload waits for the window to close.
+		sessionManager.appendMessage(createUserMessage("next"));
+		expect((await scheduled.next()).delayMs).toBe(UPLOAD_MIN_INTERVAL_MS);
+		expect(calls).toHaveLength(1);
 	});
 
-	it("honors an advertised Retry-After on the next scheduled cycle without blocking", async () => {
+	it.each([
+		{ name: "the advertised Retry-After window", retryAfterSeconds: 300, expectedDelayMs: 300_000 },
+		{ name: "the maximum timer delay", retryAfterSeconds: 2_592_000, expectedDelayMs: MAX_TIMER_DELAY_MS },
+	])("reschedules a rate-limited automatic upload at $name", async ({ retryAfterSeconds, expectedDelayMs }) => {
 		vi.useFakeTimers();
-		const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
-		const cwd = join(tempDir, "project");
-		const sessionDir = join(tempDir, "sessions");
-		mkdirSync(cwd, { recursive: true });
-		const sessionManager = SessionManager.create(cwd, sessionDir);
-		sessionManager.newSession({ id: "retry-after-reschedule-session" });
-
-		let attempts = 0;
+		const sessionManager = liveSession("rate-limited-session");
 		const calls: FetchCall[] = [];
-		const fetchFn: typeof fetch = async (input, init) => {
+		let attempts = 0;
+		const rateLimitedFetch: typeof fetch = async (input, init) => {
 			attempts += 1;
 			if (attempts === 1) {
-				return new Response(null, { status: 429, headers: { "retry-after": "300" } });
+				return new Response(null, { status: 429, headers: { "retry-after": String(retryAfterSeconds) } });
 			}
 			return createFetchRecorder(calls)(input, init);
 		};
-
-		installAgentTraceUpload(sessionManager, {
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn,
-		});
+		const { scheduled, settled } = installWithSignals(sessionManager, rateLimitedFetch);
 
 		sessionManager.appendMessage(createUserMessage("hello"));
 		sessionManager.appendMessage(createAssistantMessage("hi"));
-		await advanceTimersUntil(() => attempts === 1);
-		await advanceTimersUntil(() => vi.getTimerCount() > 0);
-		expect(Number(setTimeoutSpy.mock.calls.at(-1)?.[1])).toBe(300_000);
+		await vi.advanceTimersByTimeAsync((await scheduled.next()).delayMs);
+		expect(await settled.next()).toMatchObject({ status: "failed", statusCode: 429 });
+		expect((await scheduled.next()).delayMs).toBe(expectedDelayMs);
 
 		// A fresh persist must not re-arm inside the advertised window.
 		sessionManager.appendMessage(createUserMessage("more"));
-		expect(Number(setTimeoutSpy.mock.calls.at(-1)?.[1])).toBeGreaterThanOrEqual(299_000);
+		expect((await scheduled.next()).delayMs).toBe(expectedDelayMs);
+		expect(calls).toHaveLength(0);
 
-		await advanceTimersUntil(() => calls.length === 1);
+		await vi.advanceTimersByTimeAsync(expectedDelayMs);
+		expect((await settled.next()).status).toBe("uploaded");
 		expect(attempts).toBe(2);
-		// The request starts before the upload cursor and completion log are written.
-		const sessionFile = sessionManager.getSessionFile() as string;
-		await advanceTimersUntil(() => {
-			const logPath = getAgentTracesLogPath();
-			return (
-				existsSync(logPath) &&
-				readFileSync(logPath, "utf8").includes(`uploaded session uploaded-session (123 bytes) [${sessionFile}]`)
-			);
-		});
+		expect(calls).toHaveLength(1);
+		const sessionFile = sessionFileOf(sessionManager);
+		const { size, mtimeMs } = await stat(sessionFile);
+		expect(readOutboxEntry(tempDir, sessionFile)).toEqual({ sessionFile, size, mtimeMs });
 	});
 
-	it("retries the intent marker on the next persist after a failed write", async () => {
+	it("coalesces new content that persists during an in-flight upload into one follow-up upload", async () => {
 		vi.useFakeTimers();
-		const cwd = join(tempDir, "project");
-		const sessionDir = join(tempDir, "sessions");
-		mkdirSync(cwd, { recursive: true });
-		const sessionManager = SessionManager.create(cwd, sessionDir);
-		sessionManager.newSession({ id: "marker-retry-session" });
-		const blocker = join(tempDir, "agent-traces-outbox");
-		writeFileSync(blocker, "not a directory");
-
-		const calls: FetchCall[] = [];
-		installAgentTraceUpload(sessionManager, {
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn: createFetchRecorder(calls),
+		const sessionManager = liveSession("concurrent-upload-session");
+		let releaseFirstUpload: () => void = () => {};
+		const firstUploadReleased = new Promise<void>((resolve) => {
+			releaseFirstUpload = resolve;
 		});
+		const requestStarted = createSignalQueue<void>();
+		const calls: FetchCall[] = [];
+		const blockingFetch: typeof fetch = async (input, init) => {
+			calls.push({ url: String(input), init: init ?? {} });
+			requestStarted.push(undefined);
+			if (calls.length === 1) {
+				await firstUploadReleased;
+			}
+			return new Response(JSON.stringify({ bytes_stored: 123 }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		};
+		const { scheduled, settled } = installWithSignals(sessionManager, blockingFetch);
 
 		sessionManager.appendMessage(createUserMessage("hello"));
 		sessionManager.appendMessage(createAssistantMessage("hi"));
-		const sessionFile = sessionManager.getSessionFile() as string;
-		expect(readOutboxEntry(tempDir, sessionFile)).toBeUndefined();
+		await vi.advanceTimersByTimeAsync((await scheduled.next()).delayMs);
+		await requestStarted.next();
 
-		rmSync(blocker);
-		sessionManager.appendMessage(createUserMessage("again"));
-		expect(readOutboxEntry(tempDir, sessionFile)).toEqual({ sessionFile });
-	});
-
-	it("caps an absurd Retry-After at the max timer delay instead of retrying immediately", async () => {
-		vi.useFakeTimers();
-		const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
-		const cwd = join(tempDir, "project");
-		const sessionDir = join(tempDir, "sessions");
-		mkdirSync(cwd, { recursive: true });
-		const sessionManager = SessionManager.create(cwd, sessionDir);
-		sessionManager.newSession({ id: "absurd-retry-after-session" });
-
-		let attempts = 0;
-		const fetchFn: typeof fetch = async () => {
-			attempts += 1;
-			// 30 days, far beyond Node's ~24.8-day timer maximum.
-			return new Response(null, { status: 429, headers: { "retry-after": "2592000" } });
-		};
-
-		installAgentTraceUpload(sessionManager, {
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn,
-		});
-
-		sessionManager.appendMessage(createUserMessage("hello"));
-		sessionManager.appendMessage(createAssistantMessage("hi"));
-		await advanceTimersUntil(() => attempts === 1);
-		await advanceTimersUntil(() => vi.getTimerCount() > 0);
-		expect(Number(setTimeoutSpy.mock.calls.at(-1)?.[1])).toBe(2_147_483_647);
-	});
-
-	it("returns a retryable failure when the upload cursor cannot be persisted", async () => {
-		const session = writeSession(tempDir, join(tempDir, "sessions"), "cursor-persist-failure");
-		writeFileSync(join(tempDir, "agent-traces-outbox"), "not a directory");
-
-		const calls: FetchCall[] = [];
-		const result = await uploadAgentTraceFile({
-			sessionFile: session.getSessionFile(),
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn: createFetchRecorder(calls),
-			reloadConfig: false,
-		});
-
+		// New content lands while the first upload is still in flight.
+		sessionManager.appendMessage(createUserMessage("more"));
+		sessionManager.appendMessage(createAssistantMessage("content"));
+		await vi.advanceTimersByTimeAsync((await scheduled.next()).delayMs);
+		// The cycle that fires mid-flight folds into the running upload instead of sending again.
+		expect((await settled.next()).status).toBe("coalesced");
 		expect(calls).toHaveLength(1);
-		expect(result.status).toBe("failed");
-		if (result.status === "failed") {
-			expect(result.message).toContain("cursor");
-		}
-	});
 
-	it("a corrupt outbox entry costs only itself; other cursors survive", async () => {
-		const cwd = join(tempDir, "project");
-		const sessionDir = join(tempDir, "sessions");
-		mkdirSync(cwd, { recursive: true });
-		const kept = writeSession(cwd, sessionDir, "kept-cursor-session");
-		const keptFile = kept.getSessionFile() as string;
-		const keptStats = await stat(keptFile);
-		writeOutboxEntry(tempDir, keptFile, { size: keptStats.size, mtimeMs: keptStats.mtimeMs });
-		writeFileSync(join(tempDir, "agent-traces-outbox", "deadbeef.json"), "not json");
+		releaseFirstUpload();
+		expect((await settled.next()).status).toBe("uploaded");
 
-		const calls: FetchCall[] = [];
-		const options = {
-			authStorage: AuthStorage.inMemory({
-				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-			}),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			baseUrl: "https://api.example.test",
-			fetchFn: createFetchRecorder(calls),
-			reloadConfig: false,
-		};
-
-		const result = await catchUpAgentTraceUploads(options);
-		expect(result).toEqual({ pruned: 1, semanticEdgeLedgersPending: 0, results: [] });
-		expect(calls).toHaveLength(0);
-		expect(existsSync(join(tempDir, "agent-traces-outbox", "deadbeef.json"))).toBe(false);
-		expect(await uploadAgentTraceFile({ ...options, sessionFile: keptFile })).toEqual({ status: "unchanged" });
-		expect(calls).toHaveLength(0);
-	});
-
-	it.each([false, true])("does not fall back to CLI credentials for trace upload (stale: %s)", async (stale) => {
-		const session = writeSession(tempDir, join(tempDir, "sessions"), "cli-fallback-session");
-		const calls: FetchCall[] = [];
-		const configPath = join(tempDir, "prime-config.json");
-		writeFileSync(configPath, JSON.stringify({ api_key: "cli-key", base_url: "https://api.primeintellect.ai" }));
-		const authStorage = AuthStorage.inMemory({}, { primeCliConfigPath: configPath });
-		if (stale) {
-			authStorage.setPrimeInferenceApiKey("agent-key");
-			expect(authStorage.markAuthStale(PRIME_INFERENCE_PROVIDER_ID)).toBe(true);
-			writeFileSync(configPath, JSON.stringify({ api_key: "changed-cli-key" }));
-		}
-		const result = await uploadAgentTraceFile({
-			sessionFile: session.getSessionFile(),
-			authStorage,
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			fetchFn: createFetchRecorder(calls),
-			reloadConfig: false,
-		});
-		expect(result).toEqual({ status: "missing_credentials" });
-		expect(calls).toHaveLength(0);
-	});
-
-	it("uses Agent inference credentials at production despite local CLI credentials and URLs", async () => {
-		const session = writeSession(tempDir, join(tempDir, "sessions"), "credential-order-session");
-		const calls: FetchCall[] = [];
-		const configPath = join(tempDir, "prime-config.json");
-		writeFileSync(configPath, JSON.stringify({ api_key: "cli-fallback-key", base_url: "http://localhost:8000" }));
-
-		const result = await uploadAgentTraceFile({
-			sessionFile: session.getSessionFile(),
-			authStorage: AuthStorage.inMemory(
-				{
-					[PRIME_INFERENCE_PROVIDER_ID]: { type: "api_key", key: "inference-key" },
-				},
-				{ primeCliConfigPath: configPath, usePrimeCliConfig: true },
-			),
-			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-			fetchFn: createFetchRecorder(calls),
-			reloadConfig: false,
-		});
-
-		expect(result.status).toBe("uploaded");
-		expect(calls).toHaveLength(1);
-		expect(calls[0]?.url).toBe("https://api.primeintellect.ai/api/v1/agent-traces/sessions/credential-order-session");
-		expect(calls[0]?.init.headers).toMatchObject({ Authorization: "Bearer inference-key" });
+		// The coalesced follow-up sends the whole file exactly once.
+		await vi.advanceTimersByTimeAsync((await scheduled.next()).delayMs);
+		await requestStarted.next();
+		expect((await settled.next()).status).toBe("uploaded");
+		expect(calls).toHaveLength(2);
+		const finalBody = readFileSync(sessionFileOf(sessionManager), "utf8");
+		expect(calls[1].init.body).toBe(finalBody);
+		expect(readOutboxEntry(tempDir, sessionFileOf(sessionManager))?.size).toBe(Buffer.byteLength(finalBody));
 	});
 });
