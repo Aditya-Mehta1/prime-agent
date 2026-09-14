@@ -512,10 +512,10 @@ jobs:
           mkdir -p signatures
           (cd artifacts && sha256sum --check SHA256SUMS)
           cosign sign-blob --yes \
-            --bundle signatures/SHA256SUMS.sigstore \
+            --bundle signatures/SHA256SUMS.sigstore.json \
             artifacts/SHA256SUMS
           cosign verify-blob \
-            --bundle signatures/SHA256SUMS.sigstore \
+            --bundle signatures/SHA256SUMS.sigstore.json \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/build-binaries.yml@${GITHUB_REF}" \
             artifacts/SHA256SUMS
@@ -702,7 +702,6 @@ jobs:
             case "$1" in
               *.tar.gz|*.tgz) echo application/gzip ;;
               *.json) echo application/json ;;
-              *.sigstore) echo application/json ;;
               *.sh) echo text/x-shellscript ;;
               *) echo text/plain ;;
             esac
@@ -823,7 +822,7 @@ jobs:
           base="${R2_PUBLIC_BASE_URL%/}/releases/v${PRODUCTION_VERSION}"
           mkdir -p download
           cd download
-          for name in SHA256SUMS SHA256SUMS.sigstore install.sh "prime-agent-${PRODUCTION_VERSION}-linux-x64.tar.gz"; do
+          for name in SHA256SUMS SHA256SUMS.sigstore.json install.sh "prime-agent-${PRODUCTION_VERSION}-linux-x64.tar.gz"; do
             curl --proto '=https' --proto-redir '=https' -fsSL --retry 5 --retry-delay 5 \
               -o "$name" "${base}/${name}"
           done
@@ -834,7 +833,7 @@ jobs:
         run: |
           set -euo pipefail
           cosign verify-blob \
-            --bundle SHA256SUMS.sigstore \
+            --bundle SHA256SUMS.sigstore.json \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/build-binaries.yml@refs/heads/${DEFAULT_BRANCH}" \
             SHA256SUMS
