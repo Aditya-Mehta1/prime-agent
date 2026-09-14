@@ -199,7 +199,11 @@ Create provider file exporting:
    npm run release:minor    # API breaking changes
    ```
 
-The script handles: version bump, folding `.changes/` fragments into the release section, commit, tag, and publish.
+The script handles: version bump, folding `.changes/` fragments into the release section, commit, and tag.
+
+It does **not** publish. Releases are published by CI from `main` (R2 archives and npm packages), so no
+publish credential is ever present on a developer machine. See `scripts/npm-release-contract.md` for the
+npm packages, their publish order, and the CLI the release workflow calls.
 
 ## **CRITICAL** Git Rules for Parallel Agents **CRITICAL**
 
