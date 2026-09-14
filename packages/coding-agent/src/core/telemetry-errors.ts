@@ -51,7 +51,6 @@ export interface TelemetryErrorDetails {
 
 export type CaptureTelemetryErrorOptions = TelemetryErrorContext & TelemetryErrorDetails;
 type ErrorReport = Record<string, string | number | boolean | null>;
-type ErrorReporter = (properties: ErrorReport) => void;
 
 const DEDUPLICATION_WINDOW_MS = 1_000;
 const MAX_COUNTER = 1_000_000;
@@ -59,7 +58,6 @@ const seenErrors = new WeakMap<object, { id: string; scope: string; capturedAt: 
 const watchedSettings = new WeakMap<SettingsManager, Set<TelemetryErrorRecoveryTracker>>();
 const scopedContext = new AsyncLocalStorage<TelemetryErrorContext>();
 let activeContext: TelemetryErrorContext | undefined;
-let customReporter: ErrorReporter | undefined;
 let reporting = false;
 
 function counter(value: number | undefined, maximum = MAX_COUNTER): number | null {
@@ -162,15 +160,6 @@ export async function flushTelemetryErrorReporting(): Promise<void> {
 	}
 }
 
-/** Receives sanitized properties only; intended for hosts that own their telemetry transport. */
-export function registerTelemetryErrorReporter(reporter: ErrorReporter): () => void {
-	const previous = customReporter;
-	customReporter = reporter;
-	return () => {
-		if (customReporter === reporter) customReporter = previous;
-	};
-}
-
 export function captureTelemetryError(options: CaptureTelemetryErrorOptions): string | undefined {
 	if (reporting) return undefined;
 	try {
@@ -203,17 +192,9 @@ export function reportTelemetryError(details: TelemetryErrorDetails): string | u
 		if (!context) return undefined;
 		if (context.telemetryDisabled || !isTelemetryEnabled(context.settingsManager)) return undefined;
 		const scopedDetails = { ...details, clientSessionId: details.clientSessionId ?? context.clientSessionId };
-		if (!customReporter) return captureTelemetryError({ ...context, ...scopedDetails });
-		reporting = true;
-		const prepared = makeReport(scopedDetails);
-		const report = prepared ? trackReport(context, prepared, scopedDetails.provider) : undefined;
-		if (!report) return undefined;
-		customReporter(report);
-		return report.error_id as string;
+		return captureTelemetryError({ ...context, ...scopedDetails });
 	} catch {
 		return undefined;
-	} finally {
-		reporting = false;
 	}
 }
 

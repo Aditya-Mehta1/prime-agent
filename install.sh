@@ -338,6 +338,9 @@ prime_agent_install_node() {
 		fi
 
 		prime_agent_telemetry_begin
+		# The bootstrap installed Node, so this attempt can actually record the
+		# requirements stage; the pre-bootstrap record was a no-op.
+		prime_agent_telemetry_record requirements started
 		start_preflight_checks
 		if finish_preflight_checks; then
 			check_status=0

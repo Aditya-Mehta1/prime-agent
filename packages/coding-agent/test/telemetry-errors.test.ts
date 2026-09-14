@@ -183,6 +183,32 @@ describe("application error reporting", () => {
 		expect(tracker.finishRun({ sessionId: SESSION_ID, runId: RUN_ID, outcome: "success" })).toEqual([]);
 	});
 
+	it("preserves shared group counts when pruning drops only some pending errors", () => {
+		let now = 0;
+		const tracker = getTelemetryErrorRecoveryTracker({}, "prune-shared-counts", {
+			isEnabled: () => settings.getTelemetryEnabled(),
+			now: () => now,
+			retentionMs: 60_000,
+		});
+		const failure = (id: string) =>
+			tracker.recordFailure({
+				error_id: id,
+				session_id: SESSION_ID,
+				component: "provider",
+				operation: "request",
+				error_type: "http",
+				error_subtype: "server_error",
+			});
+		expect(failure("expired")?.consecutive_failure_count).toBe(1);
+		now = 50_000;
+		expect(failure("retained")?.consecutive_failure_count).toBe(2);
+		now = 100_000;
+		// Only "expired" (at=0s) ages out of the 60s window at this tick;
+		// "retained" (at=50s) keeps the group's history alive, so the next
+		// failure counts as the third, not as a fresh first occurrence.
+		expect(failure("renewed")?.consecutive_failure_count).toBe(3);
+	});
+
 	it("does not throw or recursively report a sink failure", () => {
 		const broken = {
 			capture() {

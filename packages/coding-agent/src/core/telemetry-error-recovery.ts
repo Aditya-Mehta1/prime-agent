@@ -71,23 +71,32 @@ export class TelemetryErrorRecoveryTracker {
 
 	private prune(): void {
 		const oldest = this.now() - this.retentionMs;
+		const prunedGroups = new Set<string>();
 		for (const [id, error] of this.pending) {
 			if (error.at < oldest) {
 				this.pending.delete(id);
-				this.counts.delete(error.group);
+				prunedGroups.add(error.group);
 			}
 		}
 		while (this.pending.size > this.maximum) {
 			const first = this.pending.entries().next().value;
 			if (!first) break;
 			this.pending.delete(first[0]);
-			this.counts.delete(first[1].group);
+			prunedGroups.add(first[1].group);
 		}
+		// Counts describe the group's failure history, not any single pending
+		// record; reset them only once the group's last pending error is gone.
+		for (const group of prunedGroups) this.dropGroupCounts(group);
 		while (this.counts.size > this.maximum) {
 			const first = this.counts.keys().next().value;
 			if (first === undefined) break;
 			this.counts.delete(first);
 		}
+	}
+
+	private dropGroupCounts(group: string): void {
+		if (this.pending.size !== 0 && [...this.pending.values()].some((error) => error.group === group)) return;
+		this.counts.delete(group);
 	}
 
 	recordFailure(
@@ -166,8 +175,7 @@ export class TelemetryErrorRecoveryTracker {
 			if (!error || !this.matches(error, scope, true)) continue;
 			updates.push({ ...error.properties, error_event_kind: "recovery_update", recovery_outcome: "success" });
 			this.pending.delete(id);
-			if (![...this.pending.values()].some((remaining) => remaining.group === error.group))
-				this.counts.delete(error.group);
+			this.dropGroupCounts(error.group);
 		}
 		return updates;
 	}
@@ -223,7 +231,7 @@ export class TelemetryErrorRecoveryTracker {
 			updates.push({ ...error.properties });
 			if (scope.outcome === "success") {
 				this.pending.delete(id);
-				this.counts.delete(error.group);
+				this.dropGroupCounts(error.group);
 			}
 		}
 		return updates;

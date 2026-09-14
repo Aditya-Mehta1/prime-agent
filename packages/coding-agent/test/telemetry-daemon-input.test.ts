@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SettingsManager } from "../src/core/settings-manager.js";
-import { initializeTelemetryErrorReporting, registerTelemetryErrorReporter } from "../src/core/telemetry-errors.js";
+import * as telemetry from "../src/core/telemetry.js";
+import { initializeTelemetryErrorReporting } from "../src/core/telemetry-errors.js";
 import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
 import {
@@ -169,8 +170,7 @@ describe("optional daemon input telemetry", () => {
 		"uses the target session consent for non-HTTP command failures (disabled=%s)",
 		async (disabled) => {
 			const { daemon, state } = worker(disabled);
-			const reporter = vi.fn();
-			cleanups.push(registerTelemetryErrorReporter(reporter));
+			const capture = vi.spyOn(telemetry, "captureTelemetryEvent");
 			cleanups.push(
 				initializeTelemetryErrorReporting({
 					agentDir: "/tmp/unrelated-context",
@@ -180,10 +180,16 @@ describe("optional daemon input telemetry", () => {
 			await expect(daemon.handleCommand({}, { type: "abort", activeSessionId: "active" })).rejects.toThrow(
 				"worker operation failed",
 			);
-			expect(reporter).toHaveBeenCalledTimes(disabled ? 0 : 1);
+			expect(capture).toHaveBeenCalledTimes(disabled ? 0 : 1);
+			if (!disabled) {
+				expect(capture.mock.calls[0]?.[0]).toMatchObject({
+					name: "agent error",
+					properties: { component: "daemon", operation: "request" },
+				});
+			}
 			Object.assign(state.runtime.runtimeConfig, { telemetryDisabled: true });
 			await expect(daemon.handleCommand({}, { type: "abort", activeSessionId: "active" })).rejects.toThrow();
-			expect(reporter).toHaveBeenCalledTimes(disabled ? 0 : 1);
+			expect(capture).toHaveBeenCalledTimes(disabled ? 0 : 1);
 		},
 	);
 });
