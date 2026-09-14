@@ -57,7 +57,7 @@ describe("attach-image skill over the kernel host bridge", () => {
 		expect(blocks).toEqual([{ type: "image", data: PNG_BASE64, mimeType: "image/png" }]);
 	});
 
-	it("compresses large attached images before storing them in the tool result", { retry: 1 }, async () => {
+	it("compresses large attached images before storing them in the tool result", async () => {
 		const imagePath = join(tempDir, "large.png");
 
 		provisioner = new IpythonKernelProvisioner(tempDir, {
@@ -82,7 +82,7 @@ print(await attach_image(${JSON.stringify(imagePath)}))
 		expect(result.attachments?.[0]?.data.length).toBeLessThanOrEqual(350_000);
 	});
 
-	it("reports when compressed animated images are flattened to their first frame", { retry: 1 }, async () => {
+	it("reports when compressed animated images are flattened to their first frame", async () => {
 		const imagePath = join(tempDir, "animated.gif");
 
 		provisioner = new IpythonKernelProvisioner(tempDir, {
