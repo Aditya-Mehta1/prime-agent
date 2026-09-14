@@ -12,7 +12,7 @@
  * 2. Bump version via npm run version:xxx or set an explicit version
  * 3. Update CHANGELOG.md files: aggregate .changes/*.md fragments into a
  *    [version] - date section, git rm the consumed fragments
- * 4. Commit on a release/vX.Y.Z branch and push that branch
+ * 4. Commit on a release/vX.Y.Z branch, push it, and open the release pull request
  *
  * This script PREPARES a release; it does not perform one. It never pushes main and never
  * creates the tag. A release is a reviewed pull request: open one from the pushed branch, get it
@@ -25,16 +25,18 @@
 
 import { execSync } from "child_process";
 import { readFileSync, writeFileSync, readdirSync, existsSync } from "fs";
+import { tmpdir } from "os";
 import { dirname, join } from "path";
 import { buildReleaseSection } from "./lib/changelog-fragments.mjs";
 
 const DRY_RUN = process.argv.includes("--dry-run");
+const NO_PR = process.argv.includes("--no-pr");
 const RELEASE_TARGET = process.argv.slice(2).find((arg) => !arg.startsWith("--"));
 const BUMP_TYPES = new Set(["major", "minor", "patch"]);
 const SEMVER_RE = /^\d+\.\d+\.\d+$/;
 
 if (!RELEASE_TARGET || (!BUMP_TYPES.has(RELEASE_TARGET) && !SEMVER_RE.test(RELEASE_TARGET))) {
-	console.error("Usage: node scripts/release.mjs <major|minor|patch|x.y.z> [--dry-run]");
+	console.error("Usage: node scripts/release.mjs <major|minor|patch|x.y.z> [--dry-run] [--no-pr]");
 	process.exit(1);
 }
 
@@ -137,6 +139,48 @@ function fragmentSortKey(path) {
 	return Number.isFinite(epoch) ? epoch : Infinity;
 }
 
+/** Reads the notes this release just wrote into the coding-agent changelog, for the pull request body. */
+function releaseNotes(version) {
+	const changelog = join("packages", "coding-agent", "CHANGELOG.md");
+	if (!existsSync(changelog)) return "";
+	const lines = readFileSync(changelog, "utf-8").split("\n");
+	const start = lines.findIndex((line) => line.startsWith(`## [${version}]`));
+	if (start === -1) return "";
+	const rest = lines.slice(start + 1);
+	const end = rest.findIndex((line) => line.startsWith("## ["));
+	return (end === -1 ? rest : rest.slice(0, end)).join("\n").trim();
+}
+
+/**
+ * Opens the release pull request. Failing here is not fatal: the branch is already pushed, so the
+ * pull request can be opened by hand.
+ */
+function openReleasePullRequest(version, branch) {
+	console.log("Opening the release pull request...");
+	const notes = releaseNotes(version);
+	const body = [
+		`release v${version}.`,
+		"",
+		notes || "see the changelogs in this branch for the included changes.",
+		"",
+		"merging this publishes the release: ci builds, signs and verifies the artifacts, then tags `v" +
+			version +
+			"`.",
+	].join("\n");
+	const bodyFile = join(tmpdir(), `prime-agent-release-${version}.md`);
+	writeFileSync(bodyFile, `${body}\n`);
+	try {
+		const url = run(
+			`gh pr create --base main --head ${branch} --title "release v${version}" --body-file ${bodyFile}`,
+			{ silent: true },
+		);
+		return url.trim().split("\n").at(-1);
+	} catch {
+		console.warn(`  Could not open the pull request automatically; open it for ${branch} by hand.`);
+		return undefined;
+	}
+}
+
 function updateChangelogsForRelease(version) {
 	const date = new Date().toISOString().split("T")[0];
 	const changelogs = getChangelogs();
@@ -229,8 +273,18 @@ console.log("Pushing the release branch...");
 run(`git push -u origin ${releaseBranch}`);
 console.log();
 
+// Opening the pull request is the last thing this script does. It cannot approve or merge it:
+// the release workflow publishes unattended only for a merge commit whose pull request carries a
+// human approval, so a release always passes through someone else's review.
+const pullRequestUrl = NO_PR ? undefined : openReleasePullRequest(version, releaseBranch);
+
 // The tag is created by the release workflow after the artifacts are published, so a tag never
 // exists for a release that failed or was never reviewed.
 console.log(`=== Prepared v${version} on ${releaseBranch} ===`);
-console.log("Next: open a pull request for this branch, have it reviewed, and merge it.");
-console.log("CI then builds, signs, publishes and tags the release.");
+if (pullRequestUrl) {
+	console.log(`Release pull request: ${pullRequestUrl}`);
+	console.log("Next: have it reviewed and merged. CI then builds, signs, publishes and tags the release.");
+} else {
+	console.log(`Next: open a pull request for ${releaseBranch}, have it reviewed, and merge it.`);
+	console.log("CI then builds, signs, publishes and tags the release.");
+}

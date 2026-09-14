@@ -24,3 +24,10 @@ test("the release script pushes a release branch instead", () => {
 	assert.match(script, /release\/v\$\{version\}/);
 	assert.match(script, /git push -u origin \$\{releaseBranch\}/);
 });
+
+test("the release script opens the pull request but cannot approve or merge it", () => {
+	assert.match(script, /gh pr create --base main --head \$\{branch\}/);
+	assert.equal(/gh pr merge/.test(script), false);
+	assert.equal(/gh pr review/.test(script), false);
+	assert.equal(/--admin/.test(script), false);
+});
