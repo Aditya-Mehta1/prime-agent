@@ -1,12 +1,14 @@
 import { execFileSync } from "node:child_process";
 import { accessSync, constants, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
-import { APP_NAME, type SelfUpdateCommand } from "../config.js";
+import { APP_NAME, isHomebrewManagedPath, type SelfUpdateCommand } from "../config.js";
 import {
 	getNativeInstallationTarget,
 	readNativeInstallation,
 	readNativeRollbackInstallation,
 } from "../utils/native-installation.js";
+import { getPiUserAgent } from "../utils/pi-user-agent.js";
+import { fetchVerifiedReleaseArtifactDigest, ReleaseSignatureError } from "../utils/release-signature.js";
 import {
 	getLatestPiRelease,
 	isBaseVersionDowngrade,
@@ -32,6 +34,33 @@ export interface NativeUpdatePlan {
 	targetVersion: string;
 	/** Set when the channel's current release has a lower base version than the installed one; nothing is planned. */
 	refusedDowngradeTo?: string;
+	/** Set when PRIME_AGENT_DOWNLOAD_BASE_URL moved the origin away from the recorded install source. */
+	overriddenBaseUrl?: string;
+	/** Certificate identity that signed the SHA256SUMS this plan trusts. Absent for rollbacks. */
+	verifiedSignerIdentity?: string;
+}
+
+/**
+ * Read the development origin override.
+ *
+ * The override may move WHERE bytes come from; it can never change WHAT is accepted. The cosign
+ * signature over SHA256SUMS is still required, and the pinned signer identity is compiled in, so an
+ * attacker-controlled origin cannot serve an installable artifact. The override must be an absolute
+ * https URL; the previous code accepted any string and quietly replaced the recorded
+ * `.install-source`, which made the redirection invisible to the user.
+ */
+function readDownloadBaseUrlOverride(): string | undefined {
+	const raw = process.env.PRIME_AGENT_DOWNLOAD_BASE_URL?.trim();
+	if (!raw) return undefined;
+	let parsed: URL;
+	try {
+		parsed = new URL(raw);
+	} catch {
+		throw new Error(`PRIME_AGENT_DOWNLOAD_BASE_URL is not a valid URL: ${raw}`);
+	}
+	if (parsed.protocol !== "https:")
+		throw new Error(`PRIME_AGENT_DOWNLOAD_BASE_URL must use https, got ${parsed.protocol}//.`);
+	return raw.replace(/\/+$/, "");
 }
 
 export async function getNativeUpdatePlan(options: {
@@ -40,6 +69,11 @@ export async function getNativeUpdatePlan(options: {
 	channel?: UpdateChannel;
 	executable?: string;
 }): Promise<NativeUpdatePlan> {
+	// A Homebrew keg is Homebrew's to replace. Check before anything else so that a brew copy can
+	// never be talked into rewriting itself, even if it otherwise looks installer-shaped.
+	const executablePath = options.executable ?? process.execPath;
+	if (isHomebrewManagedPath(executablePath))
+		throw new Error(`This ${APP_NAME} copy is managed by Homebrew. Update it with: brew upgrade ${APP_NAME}`);
 	const current = getNativeInstallationTarget(options.executable);
 	if (!current)
 		throw new Error(
@@ -60,8 +94,10 @@ export async function getNativeUpdatePlan(options: {
 	accessSync(join(installation.root, "bin"), constants.W_OK);
 	let version: string;
 	let checksum: string | undefined;
+	let signerIdentity: string | undefined;
 	let previousTarget: string | undefined;
-	const baseUrl = process.env.PRIME_AGENT_DOWNLOAD_BASE_URL?.trim() || installation.baseUrl;
+	const overriddenBaseUrl = readDownloadBaseUrlOverride();
+	const baseUrl = overriddenBaseUrl ?? installation.baseUrl;
 	if (options.rollback) {
 		const previous = readNativeRollbackInstallation(installation.root);
 		if (!previous || previous.executable === current.executable)
@@ -101,7 +137,22 @@ export async function getNativeUpdatePlan(options: {
 		const artifact = release.binaries?.find((entry) => entry.platform === current.platform);
 		if (!artifact) throw new Error(`No verified compiled archive is available for ${current.platform}.`);
 		version = release.version;
-		checksum = artifact.sha256;
+		// The manifest and the archive come from the same origin, so the manifest digest proves
+		// nothing on its own. Take the digest from a cosign-signed SHA256SUMS instead, and treat any
+		// disagreement between the two as tampering. Verification is mandatory on every origin,
+		// including one supplied through PRIME_AGENT_DOWNLOAD_BASE_URL.
+		const verification = await fetchVerifiedReleaseArtifactDigest({
+			baseUrl,
+			version,
+			file: artifact.file,
+			userAgent: getPiUserAgent(current.version),
+		});
+		if (verification.digest !== artifact.sha256)
+			throw new ReleaseSignatureError(
+				`The signed SHA256SUMS for ${version} does not match the release manifest for ${artifact.file}. The installed version was kept.`,
+			);
+		checksum = verification.digest;
+		signerIdentity = verification.signerIdentity;
 	}
 	const environment = {
 		PRIME_AGENT_INSTALL_METHOD: "binary",
@@ -117,6 +168,8 @@ export async function getNativeUpdatePlan(options: {
 	};
 	return {
 		targetVersion: version,
+		...(overriddenBaseUrl ? { overriddenBaseUrl } : {}),
+		...(signerIdentity ? { verifiedSignerIdentity: signerIdentity } : {}),
 		command: {
 			command: "/usr/bin/env",
 			args: [
