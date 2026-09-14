@@ -29,6 +29,7 @@ import {
 	CombinedAutocompleteProvider,
 	type Component,
 	Container,
+	isFocusable,
 	Loader,
 	type LoaderIndicatorOptions,
 	Markdown,
@@ -166,7 +167,7 @@ import { resizeImage } from "../../utils/image-resize.js";
 import { getCwdRelativePath } from "../../utils/paths.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import { ensureTool, ensureToolWithStatus, formatMissingRipgrepMessage } from "../../utils/tools-manager.js";
-import { checkForNewPiVersion } from "../../utils/version-check.js";
+import { checkForNewPiVersion, resolveUpdateChannel } from "../../utils/version-check.js";
 import type {
 	AgentConnection,
 	AgentConnectionExtensionUiRequest,
@@ -1083,6 +1084,7 @@ export class InteractiveMode {
 	private connectionModelsRefreshVersion = 0;
 	private connectionModelsRefreshInFlight: { version: number; promise: Promise<AgentConnectionModel[]> } | undefined;
 	private closeConfigurationMenu: (() => void) | undefined;
+	private inlineAuthPanelClosers: (() => void)[] = [];
 	private configurationModelSelection: Promise<void> | undefined;
 	private connectionState: AgentConnectionState | undefined;
 	private connectionResourceSnapshot: AgentConnectionResourceSnapshot | undefined;
@@ -1736,7 +1738,9 @@ export class InteractiveMode {
 		// `returnToAgentsView`, which is also set for direct daemon attaches that never
 		// rendered the agents view and still want the in-session fallback.)
 		const ownsGlobalStartupNotices = !this.options.agentsViewOwnsStartupNotices;
-		const newVersionPromise = ownsGlobalStartupNotices ? checkForNewPiVersion(this.version) : undefined;
+		const newVersionPromise = ownsGlobalStartupNotices
+			? checkForNewPiVersion(this.version, this.settingsManager.getUpdateChannel())
+			: undefined;
 		const packageUpdatesPromise = ownsGlobalStartupNotices
 			? checkForPackageUpdates({
 					cwd: this.getCurrentCwd(),
@@ -2085,7 +2089,9 @@ export class InteractiveMode {
 		}
 
 		splash.showProgress("Signing in to Prime Intellect...");
-		const authResult = await this.createAuthFlows().runPrimeInferenceLogin();
+		// The splash covers the whole screen, so the login panel must render as an
+		// overlay above it instead of inline behind it.
+		const authResult = await this.createAuthFlows({ overlay: true }).runPrimeInferenceLogin();
 		if (authResult.status !== "success") {
 			this.onboardingExitOutcome = authResult.status === "failed" ? "failed" : "canceled";
 			splash.dismiss();
@@ -3775,6 +3781,12 @@ export class InteractiveMode {
 	}
 
 	private resetExtensionUI(): void {
+		// Close inline auth panels before the configuration menu so a restored
+		// menu is still torn down by the closeConfigurationMenu call below.
+		// Innermost panels close first, ending at the pre-login content.
+		for (const close of this.inlineAuthPanelClosers.splice(0).reverse()) {
+			close();
+		}
 		this.closeConfigurationMenu?.();
 		this.cancelActiveConnectionExtensionUiRequests();
 		this.closeHeartbeatManager();
@@ -5165,6 +5177,37 @@ export class InteractiveMode {
 					}
 					this.editor.setText("");
 					await this.handleReloadCommand();
+					return;
+				}
+				if (commandName === "nightly") {
+					this.editor.setText("");
+					const nightlyArg = commandArgs?.trim().toLowerCase();
+					if (nightlyArg === "status") {
+						const channel = resolveUpdateChannel(this.version, this.settingsManager.getUpdateChannel());
+						const source = this.settingsManager.getUpdateChannel()
+							? "set in settings"
+							: "inferred from the running version";
+						this.showStatus(`Updates follow the ${channel} channel (${source}). v${this.version} installed.`);
+						return;
+					}
+					if (nightlyArg === "off" || nightlyArg === "stable") {
+						this.settingsManager.setUpdateChannel("stable");
+						this.showStatus(
+							"Updates now follow the stable channel. Run /update to install the latest stable release.",
+						);
+						return;
+					}
+					if (nightlyArg && nightlyArg !== "on") {
+						this.showError("Usage: /nightly [on|off|status]");
+						return;
+					}
+					if (this.isAgentCompacting() || this.isAgentStreaming() || this.isBashRunning()) {
+						this.showWarning("Wait for the current work to finish before updating.");
+						return;
+					}
+					// The update command owns the nightly warning, the channel switch, and the
+					// busy-session confirmation, so declining either leaves settings untouched.
+					await this.handleUpdateCommand("--self --nightly");
 					return;
 				}
 				if (commandName === "update") {
@@ -8643,7 +8686,7 @@ export class InteractiveMode {
 		this.closeConfigurationMenu?.();
 		const modelCatalog = this.getCachedModelCandidates();
 		const loginMenuFeature = initialTab !== "models" ? this.journeyTelemetry?.beginFeature("login") : undefined;
-		const authFlows = this.createAuthFlows(loginMenuFeature);
+		const authFlows = this.createAuthFlows({ initialLoginFeature: loginMenuFeature });
 		const providerOptions = authFlows.getLoginProviderOptions();
 		let feature = initialTab === "models" ? this.journeyTelemetry?.beginFeature("model") : undefined;
 		const reenteredOnboarding =
@@ -8733,7 +8776,6 @@ export class InteractiveMode {
 							this.getCachedModelCandidates(),
 							this.connectionConfiguredProviders,
 						);
-						menu.setActiveTab("models");
 						refreshModels(true);
 					})
 					.catch((error) => {
@@ -9250,14 +9292,30 @@ export class InteractiveMode {
 		});
 	}
 
-	private createAuthFlows(initialLoginFeature?: TelemetryFeatureAttempt): ProviderAuthFlows {
-		let pendingLoginFeature = initialLoginFeature;
+	private createAuthFlows(
+		options: { overlay?: boolean; initialLoginFeature?: TelemetryFeatureAttempt } = {},
+	): ProviderAuthFlows {
+		let pendingLoginFeature = options.initialLoginFeature;
 		let currentAuthentication: TelemetryAuthenticationAttempt | undefined;
+		const showAuthPanel = options.overlay
+			? (component: Component) => {
+					const handle = this.showFullPaneOverlay(component, {
+						maxContentWidth: 88,
+						suspendFullscreenMouse: true,
+					});
+					return () => {
+						handle.hide();
+						this.ui.requestRender();
+					};
+				}
+			: (component: Component) => this.showInlineAuthPanel(component);
 		return new ProviderAuthFlows({
 			ui: this.ui,
 			modelRegistry: this.modelRegistry,
 			showStatus: (message) => this.showStatus(message),
-			showError: (message) => this.showError(message, false),
+			showError: (message) => this.showError(message),
+			showAuthPanel,
+			getAuthPanelRows: () => Math.max(1, Math.min(20, this.ui.terminal.rows - 3)),
 			onAuthenticationStarted: (providerId, method) => {
 				const feature = pendingLoginFeature ?? this.journeyTelemetry?.beginFeature("login");
 				pendingLoginFeature = undefined;
@@ -9345,6 +9403,40 @@ export class InteractiveMode {
 				void this.maybeWarnAboutAnthropicSubscriptionAuth();
 			},
 		});
+	}
+
+	/**
+	 * Mount a provider-auth panel inline in place of the prompt area, matching
+	 * the inline pickers. Returns a callback that unmounts the panel and
+	 * restores the previous content and focus. Closers are tracked in a stack
+	 * because in-flow selectors mount on top of the login dialog;
+	 * resetExtensionUI tears the whole stack down on session resets. Each
+	 * closer runs once, so a reset cannot stomp a picker opened afterwards.
+	 */
+	private showInlineAuthPanel(component: Component): () => void {
+		const previousChildren = [...this.editorContainer.children];
+		const previousFocus = previousChildren.find((child) => isFocusable(child) && child.focused) ?? this.editor;
+		this.editorContainer.clear();
+		this.editorContainer.addChild(component);
+		this.ui.setFocus(component);
+		this.ui.requestRender();
+		let closed = false;
+		const close = () => {
+			if (closed) return;
+			closed = true;
+			const index = this.inlineAuthPanelClosers.indexOf(close);
+			if (index !== -1) {
+				this.inlineAuthPanelClosers.splice(index, 1);
+			}
+			this.editorContainer.clear();
+			for (const child of previousChildren) {
+				this.editorContainer.addChild(child);
+			}
+			this.ui.setFocus(previousFocus);
+			this.ui.requestRender();
+		};
+		this.inlineAuthPanelClosers.push(close);
+		return close;
 	}
 
 	private async prepareForModelSelectionAfterLogin(authResult: AuthenticationResult): Promise<boolean> {
@@ -9615,6 +9707,10 @@ export class InteractiveMode {
 			this.applyFullscreen(true);
 		}
 		this.ui.requestRender(true);
+
+		// The updater ran in a child process and may have persisted settings, for example the
+		// update channel, without installing anything. Pick those up before reporting.
+		await this.settingsManager.reload().catch(() => undefined);
 
 		if (selfUpdateNotAttempted) {
 			this.showStatus(`Update did not change ${APP_NAME}. Reloading resources...`);
