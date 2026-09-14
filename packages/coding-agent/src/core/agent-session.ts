@@ -175,6 +175,9 @@ import { type RestoreResult, snapshotPathIn } from "./kernel/state-snapshot.js";
 import type { AcpMcpServerConfig } from "./mcp/acp-mcp-types.js";
 import type { McpManager } from "./mcp/mcp-manager.js";
 import {
+	AGENT_MESSAGE_DELIVERY_FAILED_CUSTOM_TYPE,
+	AGENT_MESSAGE_DELIVERY_FAILED_PREVIEW_LABEL,
+	type AgentMessageDeliveryFailedDetails,
 	ASYNC_BASH_COMPLETION_CUSTOM_TYPE,
 	ASYNC_BASH_COMPLETION_PREVIEW_LABEL,
 	type AsyncBashCompletionDetails,
@@ -183,6 +186,7 @@ import {
 	type CompactionOutcomeReason,
 	type CustomMessage,
 	convertToLlm,
+	createAgentMessageDeliveryFailedMessage,
 	createAsyncBashCompletionMessage,
 	createCompactionOutcomeMessage,
 	createHarnessDigestMessage,
@@ -352,6 +356,16 @@ export type { SessionStats } from "./session-stats.js";
 export { type ParsedSkillBlock, parseSkillBlock } from "./skill-blocks.js";
 
 export type RlmChildAgentStatus = "queued" | "running" | "done" | "error" | "cancelled";
+
+/** One accepted-but-undelivered agent message still queued in a target session. */
+export interface QueuedAgentMessageDeliverySummary {
+	id: string;
+	senderActiveSessionId?: string;
+	senderSessionId?: string;
+	senderSessionName?: string;
+	senderClientId?: string;
+	delivery: "steer" | "followUp";
+}
 
 export interface RlmChildAgentActivity {
 	kind: "waiting" | "writing" | "executing";
@@ -894,6 +908,8 @@ function injectedMessagePreviewLabel(message: CustomMessage): string | undefined
 			return ASYNC_BASH_COMPLETION_PREVIEW_LABEL;
 		case GOAL_CONTEXT_CUSTOM_TYPE:
 			return GOAL_CONTEXT_PREVIEW_LABEL;
+		case AGENT_MESSAGE_DELIVERY_FAILED_CUSTOM_TYPE:
+			return AGENT_MESSAGE_DELIVERY_FAILED_PREVIEW_LABEL;
 		default:
 			return undefined;
 	}
@@ -5300,6 +5316,37 @@ export class AgentSession {
 		});
 	}
 
+	/**
+	 * Daemon-originated notice: queued agent messages sent by this session were
+	 * dropped before delivery (target closed, cleared, or paused). Steered into
+	 * the conversation like other runtime notices; wakes an idle session.
+	 */
+	async promptAgentMessageDeliveryFailureNotice(details: AgentMessageDeliveryFailedDetails): Promise<void> {
+		const message = createAgentMessageDeliveryFailedMessage(details);
+		const disposeSignal = this._sessionActionCommitDisposeAbortController.signal;
+		while (true) {
+			let admissionCommitted = false;
+			try {
+				await this._promptInjectedMessage(message.content, message, {
+					streamingBehavior: "steer",
+					queueIfBusy: true,
+					returnAfterAccepted: true,
+					resumeIfIdle: true,
+					suppressAutonomousContinuation: true,
+					admissionCommitted: () => {
+						admissionCommitted = true;
+					},
+				});
+				return;
+			} catch (error) {
+				if (admissionCommitted || !(error instanceof SessionInputAdmissionPausedError)) throw error;
+				while (this._sessionInputAdmissionPauses.size > 0 && !disposeSignal.aborted) {
+					await this._waitForSessionActivityChange(disposeSignal);
+				}
+			}
+		}
+	}
+
 	private _isRlmTerminalNotice(message: CustomMessage): boolean {
 		return (
 			message.customType === RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE ||
@@ -7069,6 +7116,30 @@ export class AgentSession {
 		for (const action of this._actionStore.clearableActions()) {
 			if (action.payload.kind === "turn") action.payload.prepared = undefined;
 		}
+	}
+
+	/**
+	 * Agent messages still queued for delivery: accepted by this session but not
+	 * yet dispatched into its conversation. Callers dropping the queue use this
+	 * to notify senders that their messages were never delivered.
+	 */
+	queuedAgentMessages(): QueuedAgentMessageDeliverySummary[] {
+		const summaries: QueuedAgentMessageDeliverySummary[] = [];
+		for (const action of this._actionStore.queuedActions()) {
+			if (action.payload.kind !== "turn") continue;
+			const message = primaryDeliveryRecord(action).message;
+			if (!isAgentSessionMessage(message)) continue;
+			const sender = message.details.from ?? {};
+			summaries.push({
+				id: message.details.id,
+				...(sender.activeSessionId ? { senderActiveSessionId: sender.activeSessionId } : {}),
+				...(sender.sessionId ? { senderSessionId: sender.sessionId } : {}),
+				...(sender.sessionName ? { senderSessionName: sender.sessionName } : {}),
+				...(sender.clientId ? { senderClientId: sender.clientId } : {}),
+				delivery: action.delivery === "next_turn_boundary" ? "steer" : "followUp",
+			});
+		}
+		return summaries;
 	}
 
 	clearQueuedAgentMessages(): { steering: string[]; followUp: string[] } {
