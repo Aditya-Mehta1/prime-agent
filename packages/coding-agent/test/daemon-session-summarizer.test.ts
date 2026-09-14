@@ -345,8 +345,14 @@ describe("daemon session summarizer", () => {
 			return [userMessage("write a session marker and verify the file content"), assistantError(errorMessage)];
 		}
 
-		// A journal-backed state: getLatestAgentStatus returns what appends recorded.
-		function erroredState(options: { messages: AgentMessage[]; isSessionActive?: boolean }): {
+		// A journal-backed state: getLatestAgentStatus returns what appends recorded,
+		// falling back to a verdict that predates this run (e.g. written before a
+		// daemon restart).
+		function erroredState(options: {
+			messages: AgentMessage[];
+			isSessionActive?: boolean;
+			persistedStatus?: AgentStatus;
+		}): {
 			state: ActiveSessionState;
 			appended: AgentStatus[];
 		} {
@@ -365,7 +371,7 @@ describe("daemon session summarizer", () => {
 							appendAgentStatus: (status: AgentStatus) => {
 								appended.push(status);
 							},
-							getLatestAgentStatus: () => appended.at(-1),
+							getLatestAgentStatus: () => appended.at(-1) ?? options.persistedStatus,
 							getLeafId: () => null,
 						},
 					},
@@ -415,6 +421,43 @@ describe("daemon session summarizer", () => {
 			await internal.summarize(state);
 			await internal.summarize(state);
 
+			expect(appended).toHaveLength(1);
+		});
+
+		test("a restart-seeded completed verdict for an errored transcript is repaired by the sweep", async () => {
+			// Pre-fix code fabricated a completed verdict for the errored transcript
+			// and the journal kept it; a daemon restart seeds it back before the
+			// first sweep. The unchanged-content fast path must not skip the repair.
+			const persisted: AgentStatus = {
+				summary: "Writing session marker and verifying file content",
+				taskState: "completed",
+				basedOnMessageCount: 2,
+			};
+			const { state, appended } = erroredState({
+				messages: erroredTranscript(providerError),
+				persistedStatus: persisted,
+			});
+			const generate = vi.fn(async () => ({ summary: "unreached", taskState: "completed" as const }));
+			const summarizer = new DaemonSessionSummarizer(() => [state], undefined, generate);
+			// Daemon-mode bind() restores the persisted verdict on restart.
+			summarizer.seed(state);
+			const internal = summarizer as unknown as { summarize(state: ActiveSessionState): Promise<void> };
+
+			await internal.summarize(state);
+
+			expect(generate).not.toHaveBeenCalled();
+			expect(state.summaryState).toEqual({
+				summary: `Model request failed: ${providerError}`,
+				taskState: "error",
+				basedOnMessageCount: 2,
+			});
+			expect(appended).toEqual([
+				{ summary: `Model request failed: ${providerError}`, taskState: "error", basedOnMessageCount: 2 },
+			]);
+
+			// Repaired once: later sweeps append nothing more.
+			await internal.summarize(state);
+			await internal.summarize(state);
 			expect(appended).toHaveLength(1);
 		});
 
