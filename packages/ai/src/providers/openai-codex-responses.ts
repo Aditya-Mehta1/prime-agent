@@ -142,50 +142,69 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 
 			if (transport !== "sse" && !websocketDisabledForSession) {
 				let websocketStarted = false;
-				try {
-					await processWebSocketStream(
-						resolveCodexWebSocketUrl(model.baseUrl),
-						body,
-						websocketHeaders,
-						output,
-						stream,
-						model,
-						() => {
-							websocketStarted = true;
-						},
-						options,
-					);
+				// previous_response_id state is scoped to the server-side WebSocket
+				// connection, so a cached continuation can reference a response the
+				// server no longer knows (daemon restart, reconnect, state expiry).
+				// Recover once by dropping the session's cached connection entry and
+				// retrying with the full request body; a second failure surfaces
+				// below exactly as before.
+				let chainResetRetried = false;
+				for (;;) {
+					try {
+						await processWebSocketStream(
+							resolveCodexWebSocketUrl(model.baseUrl),
+							body,
+							websocketHeaders,
+							output,
+							stream,
+							model,
+							() => {
+								websocketStarted = true;
+							},
+							options,
+						);
 
-					if (options?.signal?.aborted) {
-						throw new Error("Request was aborted");
+						if (options?.signal?.aborted) {
+							throw new Error("Request was aborted");
+						}
+						stream.push({
+							type: "done",
+							reason: output.stopReason as "stop" | "length" | "toolUse",
+							message: output,
+						});
+						stream.end();
+						return;
+					} catch (error) {
+						const aborted = options?.signal?.aborted;
+						// Only reset the chain while nothing was streamed yet: after the
+						// first event the retry would duplicate "start"/content events.
+						if (!aborted && !websocketStarted && !chainResetRetried && isStaleCodexContinuationError(error)) {
+							chainResetRetried = true;
+							if (options?.sessionId) {
+								invalidateSessionWebSocketContinuation(options.sessionId);
+							}
+							continue;
+						}
+						if (aborted || isCodexNonTransportError(error)) {
+							throw error;
+						}
+						appendAssistantMessageDiagnostic(
+							output,
+							createAssistantMessageDiagnostic("provider_transport_failure", error, {
+								configuredTransport: transport,
+								fallbackTransport: websocketStarted ? undefined : "sse",
+								eventsEmitted: websocketStarted,
+								phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
+								requestBytes: new TextEncoder().encode(bodyJson).byteLength,
+							}),
+						);
+						recordWebSocketFailure(options?.sessionId, error);
+						if (websocketStarted) {
+							throw error;
+						}
+						recordWebSocketSseFallback(options?.sessionId);
+						break;
 					}
-					stream.push({
-						type: "done",
-						reason: output.stopReason as "stop" | "length" | "toolUse",
-						message: output,
-					});
-					stream.end();
-					return;
-				} catch (error) {
-					const aborted = options?.signal?.aborted;
-					if (aborted || isCodexNonTransportError(error)) {
-						throw error;
-					}
-					appendAssistantMessageDiagnostic(
-						output,
-						createAssistantMessageDiagnostic("provider_transport_failure", error, {
-							configuredTransport: transport,
-							fallbackTransport: websocketStarted ? undefined : "sse",
-							eventsEmitted: websocketStarted,
-							phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
-							requestBytes: new TextEncoder().encode(bodyJson).byteLength,
-						}),
-					);
-					recordWebSocketFailure(options?.sessionId, error);
-					if (websocketStarted) {
-						throw error;
-					}
-					recordWebSocketSseFallback(options?.sessionId);
 				}
 			}
 
@@ -425,6 +444,17 @@ function isCodexNonTransportError(error: unknown): boolean {
 	return error instanceof CodexApiError || error instanceof CodexProtocolError;
 }
 
+const STALE_CONTINUATION_ERROR_CODE = "previous_response_not_found";
+
+/**
+ * The server lost the connection-scoped response state that a cached WebSocket
+ * continuation chained on (daemon restart, reconnect, state expiry), so every
+ * request carrying the cached previous_response_id is rejected.
+ */
+function isStaleCodexContinuationError(error: unknown): boolean {
+	return error instanceof CodexApiError && error.code?.toLowerCase() === STALE_CONTINUATION_ERROR_CODE;
+}
+
 async function* mapCodexEvents(events: AsyncIterable<Record<string, unknown>>): AsyncGenerator<ResponseStreamEvent> {
 	for await (const event of events) {
 		const type = typeof event.type === "string" ? event.type : undefined;
@@ -545,6 +575,8 @@ interface CachedWebSocketContinuationState {
 	lastRequestBody: RequestBody;
 	lastResponseId: string;
 	lastResponseItems: ResponseInput;
+	/** Connection whose server-side response state this chain is anchored to. */
+	connection: WebSocketLike;
 }
 
 interface CachedWebSocketConnection {
@@ -625,6 +657,18 @@ export function closeOpenAICodexWebSocketSessions(sessionId?: string): void {
 		closeEntry(entry);
 	}
 	websocketSessionCache.clear();
+}
+
+/**
+ * Drop a session's cached WebSocket connection entry (socket plus continuation,
+ * including its lastResponseId) so the next request resends the full context.
+ */
+function invalidateSessionWebSocketContinuation(sessionId: string): void {
+	const entry = websocketSessionCache.get(sessionId);
+	if (!entry) return;
+	if (entry.idleTimer) clearTimeout(entry.idleTimer);
+	closeWebSocketSilently(entry.socket, 1000, "chain_reset");
+	websocketSessionCache.delete(sessionId);
 }
 
 registerSessionResourceCleanup(closeOpenAICodexWebSocketSessions);
@@ -1051,6 +1095,14 @@ function buildCachedWebSocketRequestBody(entry: CachedWebSocketConnection, body:
 		return body;
 	}
 
+	// previous_response_id state is scoped to the server-side connection:
+	// never chain a continuation that was anchored on a different connection.
+	// A fresh connection always starts from the full request body.
+	if (continuation.connection !== entry.socket) {
+		entry.continuation = undefined;
+		return body;
+	}
+
 	const delta = getCachedWebSocketInputDelta(body, continuation);
 	if (!delta || !continuation.lastResponseId) {
 		entry.continuation = undefined;
@@ -1144,6 +1196,7 @@ async function processWebSocketStream(
 				lastRequestBody: fullBody,
 				lastResponseId: output.responseId,
 				lastResponseItems: responseItems,
+				connection: entry.socket,
 			};
 		}
 	} catch (error) {
