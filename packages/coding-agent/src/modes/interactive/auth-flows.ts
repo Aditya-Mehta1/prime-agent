@@ -1,13 +1,12 @@
 import * as path from "node:path";
 import { getProviders, type OAuthProviderId, type OAuthSelectPrompt } from "@earendil-works/pi-ai";
-import type { OverlayHandle, TUI } from "@earendil-works/pi-tui";
+import type { Component, TUI } from "@earendil-works/pi-tui";
 import { getAuthPath, getDocsPath } from "../../config.js";
 import type { ModelRegistry } from "../../core/model-registry.js";
 import {
 	checkPrimeAgentTracesAccess,
 	checkPrimeInferenceAccess,
 	fetchPrimeTeams,
-	loadPrimeCliConfig,
 	loginPrimeAgentTraces,
 	loginPrimeInference,
 	PRIME_AGENT_TRACES_PROVIDER_ID,
@@ -16,10 +15,10 @@ import {
 	PRIME_INFERENCE_PROVIDER_NAME,
 	type PrimeTeam,
 	resolvePrimeAgentTracesBaseUrl,
+	resolvePrimeInferenceAuthConfig,
 } from "../../core/prime-inference-auth.js";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "../../core/provider-display-names.js";
 import { SERPER_CREDENTIAL_ID, SERPER_CREDENTIAL_NAME } from "../../core/websearch-credential.js";
-import { showFullPaneOverlay } from "./components/centered-overlay.js";
 import { ExtensionSelectorComponent } from "./components/extension-selector.js";
 import { LoginDialogComponent } from "./components/login-dialog.js";
 import {
@@ -97,6 +96,14 @@ export interface ProviderAuthFlowsHost {
 	readonly modelRegistry: ModelRegistry;
 	showStatus(message: string): void;
 	showError(message: string): void;
+	/**
+	 * Mount a provider-auth panel (login dialog or in-flow selector) in place of
+	 * the prompt area. Returns a callback that unmounts the panel and restores
+	 * the previous content and focus.
+	 */
+	showAuthPanel(component: Component): () => void;
+	/** Terminal rows available to auth panels; selectors size their lists to it. */
+	getAuthPanelRows(): number;
 	/** Models currently visible to the host; used to detect providers configured via external credentials. */
 	getAvailableModels(): Promise<ReadonlyArray<{ provider: string }>>;
 	/** Invoked after stored credentials change so the host can refresh dependent UI. */
@@ -146,27 +153,23 @@ export class ProviderAuthFlows {
 		}
 
 		return new Promise((resolve) => {
-			let handle: OverlayHandle | undefined;
-			const close = () => {
-				handle?.hide();
-				this.host.ui.requestRender();
-			};
+			let close: (() => void) | undefined;
 			const selector = new OAuthSelectorComponent(
 				"login",
 				this.host.modelRegistry.authStorage,
 				providerOptions,
 				async (providerOption: AuthSelectorProvider) => {
-					close();
+					close?.();
 					resolve(await this.loginProvider(providerOption));
 				},
 				() => {
-					close();
+					close?.();
 					resolve({ status: "cancelled" });
 				},
 				(providerId) => this.host.modelRegistry.getProviderAuthStatus(providerId),
-				{ getRows: () => this.host.ui.terminal.rows, initialCategory },
+				{ getRows: () => this.host.getAuthPanelRows(), initialCategory, inline: true },
 			);
-			handle = showFullPaneOverlay(this.host.ui, selector, 78);
+			close = this.host.showAuthPanel(selector);
 		});
 	}
 
@@ -194,17 +197,13 @@ export class ProviderAuthFlows {
 		}
 
 		return new Promise((resolve) => {
-			let handle: OverlayHandle | undefined;
-			const close = () => {
-				handle?.hide();
-				this.host.ui.requestRender();
-			};
+			let close: (() => void) | undefined;
 			const selector = new OAuthSelectorComponent(
 				"logout",
 				this.host.modelRegistry.authStorage,
 				providerOptions,
 				async (providerOption: AuthSelectorProvider) => {
-					close();
+					close?.();
 
 					try {
 						this.host.modelRegistry.authStorage.logout(providerOption.id);
@@ -222,13 +221,13 @@ export class ProviderAuthFlows {
 					}
 				},
 				() => {
-					close();
+					close?.();
 					resolve(null);
 				},
 				undefined,
-				{ getRows: () => this.host.ui.terminal.rows },
+				{ getRows: () => this.host.getAuthPanelRows(), inline: true },
 			);
-			handle = showFullPaneOverlay(this.host.ui, selector, 78);
+			close = this.host.showAuthPanel(selector);
 		});
 	}
 
@@ -293,17 +292,6 @@ export class ProviderAuthFlows {
 			});
 		}
 
-		if (!options.some((option) => option.id === PRIME_INFERENCE_PROVIDER_ID)) {
-			const primeInferenceStatus = authStorage.getAuthStatus(PRIME_INFERENCE_PROVIDER_ID);
-			if (primeInferenceStatus.source === "prime_cli") {
-				options.push({
-					id: PRIME_INFERENCE_PROVIDER_ID,
-					name: PRIME_INFERENCE_PROVIDER_NAME,
-					authType: "api_key",
-				});
-			}
-		}
-
 		return options.sort((a, b) => a.name.localeCompare(b.name));
 	}
 
@@ -354,11 +342,7 @@ export class ProviderAuthFlows {
 
 	private async showBedrockSetupDialog(providerId: string, providerName: string): Promise<AuthenticationResult> {
 		const dialog = new LoginDialogComponent(this.host.ui, providerId, () => {}, providerName, "Amazon Bedrock setup");
-		const handle = showFullPaneOverlay(this.host.ui, dialog, 88);
-		const closeDialog = () => {
-			handle.hide();
-			this.host.ui.requestRender();
-		};
+		const closeDialog = this.host.showAuthPanel(dialog);
 
 		try {
 			await dialog.showContinueInfo([
@@ -389,47 +373,26 @@ export class ProviderAuthFlows {
 		currentTeamId: string | undefined,
 	): Promise<PrimeTeam | null | undefined> {
 		return new Promise((resolve) => {
-			let handle: OverlayHandle | undefined;
-			const close = () => {
-				handle?.hide();
-				this.host.ui.requestRender();
-			};
+			let close: (() => void) | undefined;
 			const selector = new PrimeTeamSelectorComponent(
 				teams,
 				currentTeamId,
 				(team) => {
-					close();
+					close?.();
 					resolve(team);
 				},
 				() => {
-					close();
+					close?.();
 					resolve(undefined);
 				},
-				{ getRows: () => this.host.ui.terminal.rows },
+				{ getRows: () => this.host.getAuthPanelRows() },
 			);
-			handle = showFullPaneOverlay(this.host.ui, selector, 78);
+			close = this.host.showAuthPanel(selector);
 		});
 	}
 
 	private getPrimeInferenceDefaultTeamStatus(): string {
-		const configPath = this.host.modelRegistry.authStorage.getPrimeCliConfigPath();
-		if (configPath) {
-			let config: ReturnType<typeof loadPrimeCliConfig>;
-			try {
-				config = loadPrimeCliConfig(configPath);
-			} catch {
-				return "Using personal account.";
-			}
-			if (config.teamIdFromEnv) {
-				return "Using team from PRIME_TEAM_ID.";
-			}
-			if (config.teamName) {
-				return `Using team "${config.teamName}".`;
-			}
-			if (config.teamId) {
-				return "Using Prime CLI team.";
-			}
-		}
+		if (process.env.PRIME_TEAM_ID?.trim()) return "Using team from PRIME_TEAM_ID.";
 		const storedTeam = this.host.modelRegistry.authStorage.getPrimeInferenceTeamSelection();
 		if (storedTeam) {
 			return `Using team "${storedTeam.name}".`;
@@ -442,27 +405,28 @@ export class ProviderAuthFlows {
 
 	private async selectPrimeInferenceTeam(apiKey: string, dialog: LoginDialogComponent): Promise<string | undefined> {
 		try {
-			const config = loadPrimeCliConfig(this.host.modelRegistry.authStorage.getPrimeCliConfigPath());
-			if (config.teamIdFromEnv) {
+			if (process.env.PRIME_TEAM_ID?.trim()) {
 				this.host.modelRegistry.authStorage.reload();
 				return "Using team from PRIME_TEAM_ID.";
 			}
 
 			dialog.showProgress("Loading Prime teams...");
-			const teams = await fetchPrimeTeams(apiKey, config.baseUrl, { signal: dialog.signal });
+			const teams = await fetchPrimeTeams(apiKey, resolvePrimeInferenceAuthConfig().baseUrl, {
+				signal: dialog.signal,
+			});
 			if (dialog.signal.aborted) {
 				return this.getPrimeInferenceDefaultTeamStatus();
 			}
 			if (teams.length === 0) {
-				this.host.modelRegistry.authStorage.setPrimeInferenceTeamSelection(null);
+				this.host.modelRegistry.authStorage.setPrimeInferenceTeamSelection(null, apiKey);
 				return "Using personal account.";
 			}
 
 			const storedTeam = this.host.modelRegistry.authStorage.getPrimeInferenceTeamSelection();
-			const currentTeamId = storedTeam === null ? undefined : (storedTeam?.teamId ?? config.teamId);
+			const currentTeamId = storedTeam === null ? undefined : storedTeam?.teamId;
 			const selectedTeam = await this.showPrimeTeamSelector(teams, currentTeamId);
 			if (selectedTeam !== undefined) {
-				this.host.modelRegistry.authStorage.setPrimeInferenceTeamSelection(selectedTeam);
+				this.host.modelRegistry.authStorage.setPrimeInferenceTeamSelection(selectedTeam, apiKey);
 			}
 			return selectedTeam
 				? `Using team "${selectedTeam.name}".`
@@ -479,8 +443,9 @@ export class ProviderAuthFlows {
 		apiKey: string,
 		dialog: LoginDialogComponent,
 		closeDialog: () => void,
+		primeTeam?: PrimeTeam | null,
 	): Promise<AuthenticationResult> {
-		this.host.modelRegistry.authStorage.setPrimeInferenceApiKey(apiKey);
+		this.host.modelRegistry.authStorage.setPrimeInferenceApiKey(apiKey, primeTeam);
 		const teamStatus = await this.selectPrimeInferenceTeam(apiKey, dialog);
 
 		closeDialog();
@@ -490,7 +455,6 @@ export class ProviderAuthFlows {
 			"api_key",
 			teamStatus,
 			"provider",
-			this.host.modelRegistry.authStorage.getPrimeCliConfigPath() ?? getAuthPath(),
 		);
 	}
 
@@ -516,15 +480,7 @@ export class ProviderAuthFlows {
 			PRIME_INFERENCE_PROVIDER_NAME,
 		);
 
-		const handle = showFullPaneOverlay(this.host.ui, dialog, {
-			maxContentWidth: 88,
-			suspendFullscreenMouse: true,
-		});
-
-		const closeDialog = () => {
-			handle.hide();
-			this.host.ui.requestRender();
-		};
+		const closeDialog = this.host.showAuthPanel(dialog);
 
 		// The browser challenge gets its own controller so a manually pasted key
 		// can stop the polling without tearing down the dialog.
@@ -564,6 +520,7 @@ export class ProviderAuthFlows {
 				},
 				{
 					configPath: this.host.modelRegistry.authStorage.getPrimeCliConfigPath(),
+					usePrimeCliConfig: this.host.modelRegistry.authStorage.getPrimeCliConfigPath() !== undefined,
 				},
 			);
 			// When the browser challenge cannot start or breaks down, keep the dialog
@@ -599,8 +556,9 @@ export class ProviderAuthFlows {
 			if (result.source === "manual") {
 				browserAbort.abort();
 				dialog.showProgress("Checking Prime Inference access...");
-				const config = loadPrimeCliConfig(this.host.modelRegistry.authStorage.getPrimeCliConfigPath());
-				const access = await checkPrimeInferenceAccess(result.apiKey, config.baseUrl, { signal: dialog.signal });
+				const access = await checkPrimeInferenceAccess(result.apiKey, resolvePrimeInferenceAuthConfig().baseUrl, {
+					signal: dialog.signal,
+				});
 				if (dialog.signal.aborted) {
 					closeDialog();
 					return { status: "cancelled" };
@@ -611,7 +569,12 @@ export class ProviderAuthFlows {
 				}
 			}
 
-			return await this.completePrimeInferenceLogin(result.apiKey, dialog, closeDialog);
+			return await this.completePrimeInferenceLogin(
+				result.apiKey,
+				dialog,
+				closeDialog,
+				"primeTeam" in result ? result.primeTeam : undefined,
+			);
 		} catch (error: unknown) {
 			closeDialog();
 			const errorMsg = error instanceof Error ? error.message : String(error);
@@ -633,15 +596,7 @@ export class ProviderAuthFlows {
 			PRIME_AGENT_TRACES_PROVIDER_NAME,
 		);
 
-		const handle = showFullPaneOverlay(this.host.ui, dialog, {
-			maxContentWidth: 88,
-			suspendFullscreenMouse: true,
-		});
-
-		const closeDialog = () => {
-			handle.hide();
-			this.host.ui.requestRender();
-		};
+		const closeDialog = this.host.showAuthPanel(dialog);
 
 		const browserAbort = new AbortController();
 		const onDialogAbort = () => browserAbort.abort();
@@ -666,16 +621,22 @@ export class ProviderAuthFlows {
 		};
 
 		try {
-			const browserLogin = loginPrimeAgentTraces({
-				onAuth: (info) => {
-					dialog.showAuth(info.url, info.instructions);
-					armManualInput("Complete the sign-in in your browser, or paste a Prime API key below:");
+			const browserLogin = loginPrimeAgentTraces(
+				{
+					onAuth: (info) => {
+						dialog.showAuth(info.url, info.instructions);
+						armManualInput("Complete the sign-in in your browser, or paste a Prime API key below:");
+					},
+					onProgress: (message) => {
+						dialog.showProgress(message);
+					},
+					signal: browserAbort.signal,
 				},
-				onProgress: (message) => {
-					dialog.showProgress(message);
+				{
+					configPath: this.host.modelRegistry.authStorage.getPrimeCliConfigPath(),
+					usePrimeCliConfig: this.host.modelRegistry.authStorage.getPrimeCliConfigPath() !== undefined,
 				},
-				signal: browserAbort.signal,
-			});
+			);
 			const browserLoginOrFallback = browserLogin.catch((error: unknown) => {
 				if (browserAbort.signal.aborted) {
 					throw error;
@@ -736,12 +697,7 @@ export class ProviderAuthFlows {
 	): Promise<AuthenticationResult> {
 		const dialog = new LoginDialogComponent(this.host.ui, providerId, (_success, _message) => {}, providerName);
 
-		const handle = showFullPaneOverlay(this.host.ui, dialog, 88);
-
-		const closeDialog = () => {
-			handle.hide();
-			this.host.ui.requestRender();
-		};
+		const closeDialog = this.host.showAuthPanel(dialog);
 
 		try {
 			const apiKey = (await dialog.showPrompt("Enter API key:")).trim();
@@ -764,31 +720,24 @@ export class ProviderAuthFlows {
 		}
 	}
 
-	private showOAuthLoginSelect(dialogHandle: OverlayHandle, prompt: OAuthSelectPrompt): Promise<string | undefined> {
+	private showOAuthLoginSelect(prompt: OAuthSelectPrompt): Promise<string | undefined> {
 		return new Promise((resolve) => {
-			dialogHandle.setHidden(true);
-			let selectorHandle: OverlayHandle | undefined;
-			const restoreDialog = () => {
-				selectorHandle?.hide();
-				dialogHandle.setHidden(false);
-				dialogHandle.focus();
-				this.host.ui.requestRender();
-			};
+			let close: (() => void) | undefined;
 			const labels = prompt.options.map((option) => option.label);
 			const selector = new ExtensionSelectorComponent(
 				prompt.message,
 				labels,
 				(optionLabel) => {
-					restoreDialog();
+					close?.();
 					resolve(prompt.options.find((option) => option.label === optionLabel)?.id);
 				},
 				() => {
-					restoreDialog();
+					close?.();
 					resolve(undefined);
 				},
-				{ getRows: () => this.host.ui.terminal.rows },
+				{ getRows: () => this.host.getAuthPanelRows(), inline: true },
 			);
-			selectorHandle = showFullPaneOverlay(this.host.ui, selector, 76);
+			close = this.host.showAuthPanel(selector);
 		});
 	}
 
@@ -805,10 +754,7 @@ export class ProviderAuthFlows {
 
 		const dialog = new LoginDialogComponent(this.host.ui, providerId, (_success, _message) => {}, providerName);
 
-		const dialogHandle = showFullPaneOverlay(this.host.ui, dialog, {
-			maxContentWidth: 88,
-			suspendFullscreenMouse: true,
-		});
+		const closeDialog = this.host.showAuthPanel(dialog);
 
 		let manualCodeResolve: ((code: string) => void) | undefined;
 		let manualCodeReject: ((err: Error) => void) | undefined;
@@ -816,11 +762,6 @@ export class ProviderAuthFlows {
 			manualCodeResolve = resolve;
 			manualCodeReject = reject;
 		});
-
-		const closeDialog = () => {
-			dialogHandle.hide();
-			this.host.ui.requestRender();
-		};
 
 		try {
 			await this.host.modelRegistry.authStorage.login(providerId as OAuthProviderId, {
@@ -855,7 +796,7 @@ export class ProviderAuthFlows {
 					dialog.showProgress(message);
 				},
 
-				onSelect: (prompt: OAuthSelectPrompt) => this.showOAuthLoginSelect(dialogHandle, prompt),
+				onSelect: (prompt: OAuthSelectPrompt) => this.showOAuthLoginSelect(prompt),
 
 				onManualCodeInput: () => manualCodePromise,
 

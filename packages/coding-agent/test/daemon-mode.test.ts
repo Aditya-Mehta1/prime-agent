@@ -17,6 +17,15 @@ import {
 import fsPromises from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import { createServer, type Server, type Socket } from "node:net";
+
+/** Close a fake supervisor and destroy lingering worker connections (persistent supervisor links keep sockets open). */
+function closeFakeSupervisor(server: Server, sockets: Set<Socket>): Promise<void> {
+	return new Promise<void>((resolveClose) => {
+		server.close(() => resolveClose());
+		for (const socket of sockets) socket.destroy();
+	});
+}
+
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
@@ -29,7 +38,11 @@ import {
 	DEFAULT_AGENT_MESSAGE_MAX_CHARS,
 	sessionNameReservationKey,
 } from "../src/core/agent-messages.js";
-import type { AgentObserveController } from "../src/core/agent-observe.js";
+import {
+	AGENT_OBSERVE_PREVIEW_MAX_CHARS,
+	type AgentObserveController,
+	type AgentObserveListResult,
+} from "../src/core/agent-observe.js";
 import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.js";
 import { installAgentTraceUpload } from "../src/core/agent-traces.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
@@ -886,8 +899,9 @@ describe("daemon mode helpers", () => {
 			target: { activeSessionId: subagentState.activeSessionId, runtimeKind: "subagent" },
 		});
 		expect(acceptAgentMessagePrompt).toHaveBeenCalledOnce();
-		expect(acceptAgentMessagePrompt.mock.calls[0]?.[0]).toContain(`To: ${defaultSubagentName}, active child`);
-		expect(acceptAgentMessagePrompt.mock.calls[0]?.[0]).toContain("report current progress");
+		expect(acceptAgentMessagePrompt.mock.calls[0]?.[0]).toBe(
+			"[agent-message from sibling:Parent]\n\nreport current progress",
+		);
 	});
 
 	it("closes a hosted child through the release hook and persists cancellation", async () => {
@@ -1047,10 +1061,10 @@ describe("daemon mode helpers", () => {
 
 			expect((await internals.listPassiveRlmSubagents()).map(({ entry }) => entry.childId)).toContain("child-1");
 			expect((await internals.findPassiveRlmSubagent("real-worker"))?.entry.childId).toBe("child-1");
-			const roster = await internals.createAgentMessageController(() => parentState).roster?.();
-			const passiveRosterEntry = roster?.entries.find((entry) => entry.name === "real-worker");
-			expect(passiveRosterEntry).toMatchObject({ relationship: "child", status: "inactive" });
-			expect(passiveRosterEntry).not.toHaveProperty("repliedSinceTask");
+			const family = await internals.createAgentMessageController(() => parentState).family?.();
+			const passiveMember = family?.find((member) => member.entry.name === "real-worker");
+			expect(passiveMember).toMatchObject({ relationship: "child", entry: { status: "inactive" } });
+			expect(passiveMember?.entry).not.toHaveProperty("repliedSinceTask");
 			const listed = await internals.buildSessionListWithPassiveRlmSubagents(
 				[parentState],
 				await SessionManager.listAll(undefined, sessionDir),
@@ -1159,9 +1173,12 @@ describe("daemon mode helpers", () => {
 			expect((await internals.listPassiveRlmSubagents()).map(({ entry }) => entry)).toContainEqual(
 				expect.objectContaining({ childId: fixture.childId, status: "running" }),
 			);
-			await expect(internals.createAgentMessageController(() => parentState).roster?.()).resolves.toMatchObject({
-				entries: [expect.objectContaining({ relationship: "child", name: "renamed-worker" })],
-			});
+			await expect(internals.createAgentMessageController(() => parentState).family?.()).resolves.toEqual([
+				expect.objectContaining({
+					relationship: "child",
+					entry: expect.objectContaining({ name: "renamed-worker" }),
+				}),
+			]);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -1859,7 +1876,10 @@ describe("daemon mode helpers", () => {
 			const tempDir = mkdtempSync(join(tmpdir(), "pa-root-session-"));
 			const socketPath = join(tempDir, "supervisor.sock");
 			const commands: Array<Record<string, unknown>> = [];
+			const sockets = new Set<Socket>();
 			const server: Server = createServer((socket) => {
+				sockets.add(socket);
+				socket.on("close", () => sockets.delete(socket));
 				socket.on("error", () => undefined);
 				socket.write(
 					`${JSON.stringify({
@@ -2014,7 +2034,7 @@ describe("daemon mode helpers", () => {
 				vi.unstubAllEnvs();
 				if (previousSupervisorSocket === undefined) delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
 				else process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSupervisorSocket;
-				await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+				await closeFakeSupervisor(server, sockets);
 				rmSync(tempDir, { recursive: true, force: true });
 			}
 		},
@@ -2024,7 +2044,10 @@ describe("daemon mode helpers", () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "pa-root-timeout-"));
 		const socketPath = join(tempDir, "supervisor.sock");
 		const commands: Array<Record<string, unknown>> = [];
+		const sockets = new Set<Socket>();
 		const server = createServer((socket) => {
+			sockets.add(socket);
+			socket.on("close", () => sockets.delete(socket));
 			socket.on("error", () => {});
 			socket.write(
 				`${JSON.stringify({
@@ -2090,7 +2113,7 @@ describe("daemon mode helpers", () => {
 			requestSpy.mockRestore();
 			if (previousSocket === undefined) delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
 			else process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSocket;
-			await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+			await closeFakeSupervisor(server, sockets);
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
@@ -2153,15 +2176,18 @@ describe("daemon mode helpers", () => {
 		);
 		const listAll = vi.spyOn(SessionManager, "listAll").mockResolvedValue([]);
 		try {
-			const handlers = createAgentMessageHostHandlers(internals.createAgentMessageController(() => source));
-			const roster = await handlers["agent_message.list_agents"]!({});
-			expect(roster.current).toMatchObject({ name: "Source", id: "session-source", depth: 0 });
-			expect(roster.entries).toContainEqual({
+			const controller = internals.createAgentMessageController(() => source);
+			const handlers = createAgentMessageHostHandlers({ ...controller, family: async () => controller.family!() });
+			await expect(controller.family!()).resolves.toContainEqual({
 				relationship: "sibling",
-				name: "Remote",
-				id: "session-remote",
-				depth: 0,
-				status: "idle",
+				entry: {
+					id: "session-remote",
+					name: "Remote",
+					depth: 0,
+					status: "idle",
+					cwd: "/tmp/remote",
+					activeSessionId: remoteSelector,
+				},
 			});
 			await expect(
 				handlers["agent_message.send"]!({
@@ -2268,7 +2294,10 @@ describe("daemon mode helpers", () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "pa-msg-"));
 		const socketPath = join(tempDir, "d.sock");
 		let connectionCount = 0;
+		const sockets = new Set<Socket>();
 		const server: Server = createServer((socket) => {
+			sockets.add(socket);
+			socket.on("close", () => sockets.delete(socket));
 			connectionCount++;
 			socket.on("error", () => undefined);
 			socket.write(
@@ -2334,7 +2363,7 @@ describe("daemon mode helpers", () => {
 			} else {
 				process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSupervisorSocket;
 			}
-			await new Promise<void>((resolve) => server.close(() => resolve()));
+			await closeFakeSupervisor(server, sockets);
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
@@ -2343,7 +2372,10 @@ describe("daemon mode helpers", () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "pa-msg-disconnect-"));
 		const socketPath = join(tempDir, "d.sock");
 		let requestCount = 0;
+		const sockets = new Set<Socket>();
 		const server: Server = createServer((socket) => {
+			sockets.add(socket);
+			socket.on("close", () => sockets.delete(socket));
 			socket.on("error", () => undefined);
 			socket.write(
 				`${JSON.stringify({
@@ -2413,7 +2445,7 @@ describe("daemon mode helpers", () => {
 			} else {
 				process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSupervisorSocket;
 			}
-			await new Promise<void>((resolve) => server.close(() => resolve()));
+			await closeFakeSupervisor(server, sockets);
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
@@ -2426,7 +2458,10 @@ describe("daemon mode helpers", () => {
 		const responseGate = new Promise<void>((resolve) => {
 			releaseResponse = resolve;
 		});
+		const sockets = new Set<Socket>();
 		const server = createServer((socket) => {
+			sockets.add(socket);
+			socket.on("close", () => sockets.delete(socket));
 			socket.write(
 				`${JSON.stringify({
 					type: "daemon_hello",
@@ -2494,7 +2529,7 @@ describe("daemon mode helpers", () => {
 		} finally {
 			if (previousSocketPath === undefined) delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
 			else process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSocketPath;
-			await new Promise<void>((resolve) => server.close(() => resolve()));
+			await closeFakeSupervisor(server, sockets);
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
@@ -2503,7 +2538,10 @@ describe("daemon mode helpers", () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "pa-ambiguous-"));
 		const socketPath = join(tempDir, "s");
 		let requestCount = 0;
+		const sockets = new Set<Socket>();
 		const server = createServer((socket) => {
+			sockets.add(socket);
+			socket.on("close", () => sockets.delete(socket));
 			socket.write(
 				`${JSON.stringify({
 					type: "daemon_hello",
@@ -2552,7 +2590,7 @@ describe("daemon mode helpers", () => {
 		} finally {
 			if (previousSocketPath === undefined) delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
 			else process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSocketPath;
-			await new Promise<void>((resolve) => server.close(() => resolve()));
+			await closeFakeSupervisor(server, sockets);
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
@@ -3092,6 +3130,99 @@ describe("daemon mode helpers", () => {
 		expect((await internals.createAgentObserveListResult(targetState)).current.status).toBe("compacting");
 	});
 
+	it("lists inactive family members in the agent-observe roster", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const currentState = makeState("current");
+		currentState.runtime = {
+			...currentState.runtime,
+			cwd: "/tmp",
+			diagnostics: [],
+			modelFallbackMessage: undefined,
+			session: {
+				sessionId: "session-current",
+				sessionName: "Current",
+				sessionFile: "/tmp/current.jsonl",
+				sessionManager: { getCwd: () => "/tmp" },
+				isStreaming: false,
+				isCompacting: false,
+				isSessionActive: false,
+				unfinishedActionCount: 0,
+				getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
+				messages: [],
+				state: { pendingToolCalls: new Set(), streamingMessage: undefined },
+				hasRunningRlmChildren: () => false,
+			},
+		} as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			createAgentFamilyCatalog: ReturnType<typeof vi.fn>;
+			createAgentObserveListResult(current: ActiveSessionState): Promise<AgentObserveListResult>;
+		};
+		internals.sessions.set(currentState.activeSessionId, currentState);
+		internals.createAgentFamilyCatalog = vi.fn(async () => [
+			{ id: "session-current", name: "Current", depth: 0, status: "running", sessionPath: "/tmp/current.jsonl" },
+			{
+				id: "session-archived",
+				name: "archivist",
+				depth: 0,
+				status: "inactive",
+				sessionPath: "/tmp/archivist.jsonl",
+				cwd: "/tmp/archivist",
+				messageCount: 3,
+				firstMessage: "x".repeat(1000),
+			},
+			{
+				id: "session-remote",
+				name: "peer",
+				depth: 0,
+				status: "running",
+				sessionPath: "/tmp/peer.jsonl",
+				cwd: "/tmp/peer",
+				activeSessionId: "remote-active",
+			},
+		]);
+
+		const listed = await internals.createAgentObserveListResult(currentState);
+		expect(listed.agents).toEqual([
+			{
+				relationship: "sibling",
+				sessionId: "session-archived",
+				sessionName: "archivist",
+				runtimeKind: "top-level",
+				cwd: "/tmp/archivist",
+				status: "inactive",
+				isCurrent: false,
+				isStreaming: false,
+				isCompacting: false,
+				attachedClients: 0,
+				messageCount: 3,
+				queuedCount: 0,
+				isSessionActive: false,
+				firstMessage: "x".repeat(AGENT_OBSERVE_PREVIEW_MAX_CHARS),
+			},
+			{
+				activeSessionId: "remote-active",
+				relationship: "sibling",
+				sessionId: "session-remote",
+				sessionName: "peer",
+				runtimeKind: "top-level",
+				cwd: "/tmp/peer",
+				status: "running",
+				isCurrent: false,
+				isStreaming: false,
+				isCompacting: false,
+				attachedClients: 0,
+				queuedCount: 0,
+				isSessionActive: true,
+			},
+		]);
+	});
+
 	it("canonicalizes symlinked family paths before comparison", () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-family-paths-"));
 		try {
@@ -3324,11 +3455,12 @@ describe("daemon mode helpers", () => {
 		const messaging = internals.createAgentMessageController(() => child);
 		const observe = internals.createAgentObserveController(() => child);
 
-		expect((await observe.listAgents()).agents.map((agent) => agent.activeSessionId)).toEqual([
-			"root",
-			"child",
-			"sibling",
-			"grandchild",
+		const observed = await observe.listAgents();
+		expect(observed.current.activeSessionId).toBe("child");
+		expect(observed.agents.map((agent) => [agent.relationship, agent.activeSessionId])).toEqual([
+			["parent", "root"],
+			["sibling", "sibling"],
+			["child", "grandchild"],
 		]);
 		await expect(observe.getAgent("cousin")).rejects.toThrow(
 			"Agent reach is limited to parent, siblings, and children",
@@ -3918,45 +4050,70 @@ describe("daemon mode helpers", () => {
 		expect(client.attachedActiveSessionIds).not.toContain(state.activeSessionId);
 	});
 
-	it("drops a backpressure catch-up when the client detaches during snapshot creation", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: vi.fn(),
-		});
-		const state = makeState("active");
-		const write = vi.fn(() => true);
-		const client = makeClient("client-1", state.activeSessionId);
-		client.socket = { destroyed: false, write } as unknown as Socket;
-		client.catchupActiveSessionIds = new Set([state.activeSessionId]);
-		state.clients.add(client);
-		let releaseSnapshot!: () => void;
-		const snapshotGate = new Promise<void>((resolve) => {
-			releaseSnapshot = resolve;
-		});
-		const result = {
-			activeSessionId: state.activeSessionId,
-			snapshot: { summary: {}, state: {}, messages: [], lastEventSequence: 0 },
-			lastEventSequence: 0,
-		} as unknown as DaemonAttachResult;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			createAttachResult: ReturnType<typeof vi.fn>;
-			drainBackpressuredClientCatchups(client: DaemonSocketClient): Promise<void>;
-		};
-		internals.sessions.set(state.activeSessionId, state);
-		internals.createAttachResult = vi.fn(async () => {
-			await snapshotGate;
-			return result;
-		});
+	it.each(["inline-detached", "chunked-detached", "chunked-failed"])(
+		"releases a catch-up reservation: %s",
+		async (outcome) => {
+			const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+				defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+				createRuntime: vi.fn(),
+			});
+			const state = makeState("active");
+			const write = vi.fn(() => true);
+			const client = makeClient("client-1", state.activeSessionId);
+			client.socket = { destroyed: false, write } as unknown as Socket;
+			if (outcome.startsWith("chunked")) {
+				client.transport = "private-framed";
+				client.capabilities = new Set(["chunked_snapshot"]);
+			}
+			client.catchupActiveSessionIds = new Set([state.activeSessionId]);
+			state.clients.add(client);
+			let releaseSnapshot!: () => void;
+			const snapshotGate = new Promise<void>((resolve) => {
+				releaseSnapshot = resolve;
+			});
+			const result = {
+				activeSessionId: state.activeSessionId,
+				snapshot: { summary: {}, state: {}, messages: [], lastEventSequence: 0 },
+				lastEventSequence: 0,
+			} as unknown as DaemonAttachResult;
+			const internals = daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				createAttachResult: ReturnType<typeof vi.fn>;
+				drainBackpressuredClientCatchups(client: DaemonSocketClient): Promise<void>;
+				broadcastToSession(state: ActiveSessionState, message: DaemonOutbound): void;
+			};
+			internals.sessions.set(state.activeSessionId, state);
+			internals.createAttachResult = vi.fn(async () => {
+				await snapshotGate;
+				if (outcome === "chunked-failed") throw new Error("snapshot preparation failed");
+				return result;
+			});
 
-		const catchup = internals.drainBackpressuredClientCatchups(client);
-		await vi.waitFor(() => expect(internals.createAttachResult).toHaveBeenCalledOnce());
-		state.clients.delete(client);
-		client.attachedActiveSessionIds.delete(state.activeSessionId);
-		releaseSnapshot();
-		await catchup;
-		expect(write).not.toHaveBeenCalled();
-	});
+			const catchup = internals.drainBackpressuredClientCatchups(client);
+			await vi.waitFor(() => expect(internals.createAttachResult).toHaveBeenCalledOnce());
+			expect(client.snapshotStreaming).toBe(true);
+			if (outcome.endsWith("detached")) {
+				state.clients.delete(client);
+				client.attachedActiveSessionIds.delete(state.activeSessionId);
+			}
+			releaseSnapshot();
+			await catchup;
+			clearTimeout(client.catchupRetryTimer);
+			if (outcome === "chunked-failed") {
+				internals.broadcastToSession(state, {
+					type: "session_event",
+					activeSessionId: state.activeSessionId,
+					event: { type: "session_info_changed", name: "during retry" },
+				});
+				expect(client.deferredSessionFramesDropped?.has(state.activeSessionId)).toBe(true);
+			}
+			expect(write).not.toHaveBeenCalled();
+			expect(client.snapshotStreaming).not.toBe(true);
+			expect(client.snapshotActiveSessionCounts?.size ?? 0).toBe(0);
+			expect(client.snapshotTransferAbortControllers?.size ?? 0).toBe(0);
+			expect(client.catchupActiveSessionIds?.has(state.activeSessionId)).toBe(outcome === "chunked-failed");
+		},
+	);
 
 	it("marks a chunked attach as snapshotting before deferred streaming", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-snapshot-order-"));
@@ -4331,9 +4488,10 @@ describe("daemon mode helpers", () => {
 					const controller = options.sessionOptions?.agentMessageController;
 					const result = await controller?.listAgents();
 					expect(result?.current?.activeSessionId).toBeTruthy();
-					await expect(controller?.roster?.()).resolves.toMatchObject({
-						current: { id: session.sessionId },
-					});
+					// The catalog must resolve around the binding session, which is the selection
+					// origin and therefore never one of its own family members.
+					const family = await controller?.family?.();
+					expect(family?.some((member) => member.entry.id === session.sessionId)).toBe(false);
 					listedAgentsDuringBind++;
 				});
 				return {
@@ -5044,25 +5202,25 @@ describe("daemon mode helpers", () => {
 				}
 			).createAgentObserveController(() => parentState);
 			const observedAgents = await observeController.listAgents();
-			expect(observedAgents.agents).toContainEqual(
-				expect.objectContaining({
-					activeSessionId: expect.any(String),
-					sessionName: "renamed-worker",
-					runtimeKind: "subagent",
-					status: "idle",
-					messageCount: 1,
-					rlmChildId: fixture.childId,
-				}),
-			);
+			const observedChild = observedAgents.agents.find((agent) => agent.sessionName === "renamed-worker");
+			expect(observedChild).toMatchObject({
+				relationship: "child",
+				runtimeKind: "subagent",
+				status: "inactive",
+				isSessionActive: false,
+				messageCount: 1,
+				rlmChildId: fixture.childId,
+			});
+			expect(observedChild).not.toHaveProperty("activeSessionId");
 			expect(fixture.createRuntime).toHaveBeenCalledOnce();
 
 			const messageController = internals.createAgentMessageController(() => parentState);
-			await expect(messageController.roster?.()).resolves.toMatchObject({
-				current: { id: parentState.runtime.session.sessionId, depth: 0 },
-				entries: [
-					expect.objectContaining({ relationship: "child", name: "renamed-worker", depth: 1, status: "inactive" }),
-				],
-			});
+			await expect(messageController.family?.()).resolves.toEqual([
+				expect.objectContaining({
+					relationship: "child",
+					entry: expect.objectContaining({ name: "renamed-worker", depth: 1, status: "inactive" }),
+				}),
+			]);
 			await expect(
 				messageController.assertSessionNameAvailable?.({
 					name: "renamed-worker",
@@ -8727,7 +8885,10 @@ describe("daemon mode helpers", () => {
 
 		await fixture.runCronJob(makeCronJob({ id: "cron-1", source: "cron", activeSessionId: fixture.activeSessionId }));
 
-		expect(fixture.followUp).toHaveBeenCalledWith("heartbeat prompt", undefined, { resumeIfIdle: true });
+		expect(fixture.followUp).toHaveBeenCalledWith("heartbeat prompt", undefined, {
+			resumeIfIdle: true,
+			priority: "background",
+		});
 		expect(fixture.prompt).not.toHaveBeenCalled();
 		expect(fixture.promptHeartbeat).not.toHaveBeenCalled();
 	});
