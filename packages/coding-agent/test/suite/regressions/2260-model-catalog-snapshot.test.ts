@@ -1,10 +1,10 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { getModel } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
-import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
-import type { AgentConnectionState } from "../src/modes/agent-connection/types.js";
-import type { DaemonClientMessageListener, DaemonTransportClient } from "../src/modes/daemon/daemon-client.js";
-import type { DaemonCommand } from "../src/modes/daemon/daemon-protocol.js";
+import { DaemonAgentConnection } from "../../../src/modes/agent-connection/daemon-agent-connection.js";
+import type { AgentConnectionState } from "../../../src/modes/agent-connection/types.js";
+import type { DaemonClientMessageListener, DaemonTransportClient } from "../../../src/modes/daemon/daemon-client.js";
+import type { DaemonCommand } from "../../../src/modes/daemon/daemon-protocol.js";
 
 async function createConnection(modelCatalog = true, deferSessionEvents = false) {
 	const messages: AgentMessage[] = [{ role: "user", content: "saved transcript", timestamp: 1 }];
@@ -51,7 +51,7 @@ async function createConnection(modelCatalog = true, deferSessionEvents = false)
 		messages,
 		updatedMessages,
 		refreshedState,
-		setDuringStateRead: (callback: () => void) => {
+		setDuringStateRead: (callback: (() => void) | undefined) => {
 			duringStateRead = callback;
 		},
 		emitStatus: (recap: string) => listener?.({ type: "session_status", activeSessionId: "active", recap }),
