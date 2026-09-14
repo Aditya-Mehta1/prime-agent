@@ -9,6 +9,7 @@ import {
 	acquireDaemonShutdownAdmission,
 	acquireDaemonSupervisorOwnership,
 	assertDaemonSupervisorOwnerCurrent,
+	isDaemonShutdownAdmissionActive,
 	persistDaemonStartupFenceFromOwner,
 } from "../src/modes/daemon/daemon-supervisor-ownership.js";
 import * as childProcessModule from "../src/utils/child-process.js";
@@ -254,6 +255,66 @@ describe("daemon supervisor ownership registry", () => {
 		await expect(pending).rejects.toMatchObject({ code: "daemon_shutdown_in_progress" });
 		await releasing;
 		expect(existsSync(admissionPath)).toBe(false);
+	});
+
+	it("re-arms a shutdown admission whose lease elapsed while the holder blocked its event loop", async () => {
+		const paths = createPaths();
+		mkdirSync(paths.registryDir, { recursive: true, mode: 0o700 });
+		process.env[registryDirEnv] = paths.registryDir;
+		const admission = await acquireDaemonShutdownAdmission();
+		const admissionPath = join(paths.registryDir, "shutdown-admission.json");
+		const record = readJson(admissionPath);
+		const elapsed = new Date(Date.now() - 1000).toISOString();
+		writeFileSync(admissionPath, `${JSON.stringify({ ...record, expiresAt: elapsed }, null, 2)}\n`);
+
+		await admission.assertOrRenew();
+
+		const renewed = readJson(admissionPath);
+		expect(renewed.token).toBe(record.token);
+		expect(Date.parse(renewed.expiresAt as string)).toBeGreaterThan(Date.now());
+		await admission.release();
+		expect(existsSync(admissionPath)).toBe(false);
+	});
+
+	it("keeps a live holder's elapsed admission on disk when another process only probes it", async () => {
+		const paths = createPaths();
+		mkdirSync(paths.registryDir, { recursive: true, mode: 0o700 });
+		process.env[registryDirEnv] = paths.registryDir;
+		const admission = await acquireDaemonShutdownAdmission();
+		const admissionPath = join(paths.registryDir, "shutdown-admission.json");
+		const record = readJson(admissionPath);
+		const elapsed = new Date(Date.now() - 1000).toISOString();
+		writeFileSync(admissionPath, `${JSON.stringify({ ...record, expiresAt: elapsed }, null, 2)}\n`);
+
+		expect(await isDaemonShutdownAdmissionActive()).toBe(false);
+		expect(existsSync(admissionPath)).toBe(true);
+		expect(readJson(admissionPath).token).toBe(record.token);
+
+		await admission.assertOrRenew();
+		expect(await isDaemonShutdownAdmissionActive()).toBe(true);
+		await admission.release();
+	});
+
+	it("keeps a shutdown admission after a renew that could not read the record", async () => {
+		const paths = createPaths();
+		mkdirSync(paths.registryDir, { recursive: true, mode: 0o700 });
+		process.env[registryDirEnv] = paths.registryDir;
+		const admission = await acquireDaemonShutdownAdmission();
+		const admissionPath = join(paths.registryDir, "shutdown-admission.json");
+		const bytes = readFileSync(admissionPath, "utf8");
+		writeFileSync(admissionPath, "{ truncated");
+
+		const readFailure = await admission
+			.assertOrRenew()
+			.then(() => undefined)
+			.catch((error: unknown) => error as Error & { code?: string });
+		if (!readFailure) throw new Error("assertOrRenew resolved despite an unreadable record");
+		expect(readFailure.code).toBeUndefined();
+
+		writeFileSync(admissionPath, bytes);
+		await admission.assertOrRenew();
+		expect(readJson(admissionPath).token).toBe((JSON.parse(bytes) as OwnerRecord).token);
+		await admission.release();
 	});
 
 	it("disambiguates never-acquired from lost-on-disk ownership errors", async () => {
