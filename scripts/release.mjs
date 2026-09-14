@@ -13,7 +13,9 @@
  * 3. Update CHANGELOG.md files: aggregate .changes/*.md fragments into a
  *    [version] - date section, git rm the consumed fragments
  * 4. Commit and tag
- * 5. Publish to npm
+ *
+ * Publishing is NOT part of this script. CI publishes the release artifacts from main
+ * (R2 archives and npm packages), so no publish credential is ever present on a laptop.
  */
 
 import { execSync } from "child_process";
@@ -214,10 +216,9 @@ run(`git commit -m "Release v${version}"`);
 run(`git tag v${version}`);
 console.log();
 
-console.log("Publishing to npm...");
-run("npm run publish");
-console.log();
-
+// npm publishing is a CI-only job (OIDC trusted publishing, --provenance). Never publish from a
+// laptop: a release shell runs a full install, build and check with a registry credential in
+// ~/.npmrc, which is exactly the shape a malicious postinstall exploits.
 console.log("Pushing to remote...");
 run("git push origin main");
 run(`git push origin v${version}`);
