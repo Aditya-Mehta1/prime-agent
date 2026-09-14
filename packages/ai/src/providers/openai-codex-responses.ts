@@ -142,12 +142,10 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 
 			if (transport !== "sse" && !websocketDisabledForSession) {
 				let websocketStarted = false;
-				// previous_response_id state is scoped to the server-side WebSocket
-				// connection, so a cached continuation can reference a response the
-				// server no longer knows (daemon restart, reconnect, state expiry).
-				// Recover once by dropping the session's cached connection entry and
-				// retrying with the full request body; a second failure surfaces
-				// below exactly as before.
+				// Retry a stale previous_response_id once on a fresh connection: the
+				// failed attempt's error cleanup already dropped the cached connection
+				// entry, so the retry resends the full request body. Any further
+				// failure takes the shared error handling below.
 				let chainResetRetried = false;
 				for (;;) {
 					try {
@@ -180,9 +178,6 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 						// first event the retry would duplicate "start"/content events.
 						if (!aborted && !websocketStarted && !chainResetRetried && isStaleCodexContinuationError(error)) {
 							chainResetRetried = true;
-							if (options?.sessionId) {
-								invalidateSessionWebSocketContinuation(options.sessionId);
-							}
 							continue;
 						}
 						if (aborted || isCodexNonTransportError(error)) {
@@ -447,9 +442,8 @@ function isCodexNonTransportError(error: unknown): boolean {
 const STALE_CONTINUATION_ERROR_CODE = "previous_response_not_found";
 
 /**
- * The server lost the connection-scoped response state that a cached WebSocket
- * continuation chained on (daemon restart, reconnect, state expiry), so every
- * request carrying the cached previous_response_id is rejected.
+ * Codex API error for a previous_response_id the server does not recognize;
+ * the request must be resent in full instead of chained.
  */
 function isStaleCodexContinuationError(error: unknown): boolean {
 	return error instanceof CodexApiError && error.code?.toLowerCase() === STALE_CONTINUATION_ERROR_CODE;
@@ -657,18 +651,6 @@ export function closeOpenAICodexWebSocketSessions(sessionId?: string): void {
 		closeEntry(entry);
 	}
 	websocketSessionCache.clear();
-}
-
-/**
- * Drop a session's cached WebSocket connection entry (socket plus continuation,
- * including its lastResponseId) so the next request resends the full context.
- */
-function invalidateSessionWebSocketContinuation(sessionId: string): void {
-	const entry = websocketSessionCache.get(sessionId);
-	if (!entry) return;
-	if (entry.idleTimer) clearTimeout(entry.idleTimer);
-	closeWebSocketSilently(entry.socket, 1000, "chain_reset");
-	websocketSessionCache.delete(sessionId);
 }
 
 registerSessionResourceCleanup(closeOpenAICodexWebSocketSessions);
@@ -1095,9 +1077,8 @@ function buildCachedWebSocketRequestBody(entry: CachedWebSocketConnection, body:
 		return body;
 	}
 
-	// previous_response_id state is scoped to the server-side connection:
-	// never chain a continuation that was anchored on a different connection.
-	// A fresh connection always starts from the full request body.
+	// Continuations are anchored to the connection that produced the response;
+	// a different socket cannot resolve their previous_response_id.
 	if (continuation.connection !== entry.socket) {
 		entry.continuation = undefined;
 		return body;
