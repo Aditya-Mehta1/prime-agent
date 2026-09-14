@@ -162,6 +162,11 @@ describe("rlm.progress.note child progress channel", () => {
 		await expect(handler({ message: "x".repeat(RLM_PROGRESS_NOTE_MAX_LENGTH + 1) })).rejects.toThrow(
 			`at most ${RLM_PROGRESS_NOTE_MAX_LENGTH}`,
 		);
+		// The bound counts UTF-16 code units, so 512 astral characters (1024
+		// units) cross it; the Python-side cap measures the same way.
+		await expect(handler({ message: "🎉".repeat(RLM_PROGRESS_NOTE_MAX_LENGTH) })).rejects.toThrow(
+			`at most ${RLM_PROGRESS_NOTE_MAX_LENGTH}`,
+		);
 		await expect(handler({ message: "  working on it  " })).resolves.toEqual({ accepted: true });
 
 		let received = "";
@@ -338,6 +343,54 @@ describe("rlm.progress.note child progress channel", () => {
 				() => session!.getRlmChildSnapshots().every((candidate) => candidate.status !== "running"),
 				20_000,
 			);
+		}
+	});
+
+	it("seeds the staleness clock at admission for never-active children", async () => {
+		const held = heldAnswerStream();
+		session = makeSession(held.streamFn);
+		const handle = await session.runRlmChild("slow task", { name: "worker-a" });
+		const runs = (session as unknown as InspectableRlmSession)._activeRlmChildRuns;
+		const run = runs.get(handle.rlm_child_id)!;
+
+		try {
+			// Admission seeds the clock before any tracked event: a child hung
+			// before its first activity still crosses the staleness threshold
+			// once running. Previously the timestamp only appeared with the
+			// first child event, so a never-active child was never stale.
+			expect(run.lastActivityAt).toBeGreaterThan(0);
+		} finally {
+			held.complete("child answer");
+			await waitFor(() => {
+				const snapshot = session!.getRlmChildSnapshots().find((candidate) => candidate.id === handle.rlm_child_id);
+				return snapshot?.status !== "running" && snapshot?.status !== "queued";
+			}, 20_000);
+		}
+	});
+
+	it("caps the kernel roster label while snapshots keep the full prompt", async () => {
+		const held = heldAnswerStream();
+		session = makeSession(held.streamFn);
+		// rlmChildLabel collapses whitespace only; the collapsed label still
+		// far exceeds the roster's hard cap.
+		const longPrompt = "refactor the frobnicator ".repeat(40);
+		const handle = await session.runRlmChild(longPrompt, { name: "worker-a" });
+
+		try {
+			const snapshot = session.getRlmChildSnapshots().find((candidate) => candidate.id === handle.rlm_child_id);
+			expect(snapshot?.label.length).toBeGreaterThan(200);
+			const roster = await session.listRlmSubagents();
+			const entry = roster.subagents.find((candidate) => candidate.rlm_child_id === handle.rlm_child_id);
+			// The kernel roster entry is bounded like the other wire extras; the
+			// snapshot keeps the full label for the TUI.
+			expect(entry?.label).toHaveLength(200);
+			expect(entry?.label).toBe(snapshot?.label.slice(0, 200));
+		} finally {
+			held.complete("child answer");
+			await waitFor(() => {
+				const snapshot = session!.getRlmChildSnapshots().find((candidate) => candidate.id === handle.rlm_child_id);
+				return snapshot?.status !== "running" && snapshot?.status !== "queued";
+			}, 20_000);
 		}
 	});
 

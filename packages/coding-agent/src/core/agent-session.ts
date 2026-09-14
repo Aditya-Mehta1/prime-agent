@@ -378,7 +378,7 @@ export interface RlmChildAgentSnapshot {
 	repliedSinceTask?: boolean;
 	/** Latest child progress note (`rlm.progress.note`), newest wins. */
 	progressNote?: string;
-	/** Wall-clock ms of the last tracked child activity (model, tool, or note events). */
+	/** Wall-clock ms of the last tracked child activity (seeded at admission, then model/tool/note events). */
 	lastActivityAt?: number;
 	/** Set when a running child has had no tracked activity for the staleness threshold. */
 	activityStaleMs?: number;
@@ -990,7 +990,11 @@ interface RlmChildRun {
 	activity?: RlmChildAgentActivity;
 	/** Bounded ring of the child's latest progress notes (newest last). */
 	progressNotes: string[];
-	/** Wall-clock ms of the last tracked child activity; drives snapshot staleness. */
+	/**
+	 * Wall-clock ms of the last tracked child activity; drives snapshot staleness.
+	 * Seeded at admission so a child that never emits a tracked event still
+	 * crosses the staleness threshold once running.
+	 */
 	lastActivityAt?: number;
 	error?: string;
 	abort: () => void;
@@ -1042,6 +1046,8 @@ const RLM_CHILD_PROGRESS_NOTE_RING_MAX = 5;
 const RLM_CHILD_STALE_ACTIVITY_THRESHOLD_MS = 10 * 60_000;
 /** Hard cap for answer previews carried into kernel roster entries. */
 const RLM_REGISTRY_ANSWER_PREVIEW_MAX_LENGTH = 200;
+/** Hard cap for labels carried into kernel roster entries (snapshots keep the full prompt). */
+const RLM_REGISTRY_LABEL_MAX_LENGTH = 200;
 
 function noopRlmChildAbort(): void {}
 function noopRlmChildEventUnsubscribe(): void {}
@@ -10774,7 +10780,7 @@ export class AgentSession {
 			answer_preview: snapshot.answerPreview?.slice(0, RLM_REGISTRY_ANSWER_PREVIEW_MAX_LENGTH),
 			replied_since_task: snapshot.repliedSinceTask,
 			progress_note: snapshot.progressNote,
-			label: snapshot.label,
+			label: snapshot.label.slice(0, RLM_REGISTRY_LABEL_MAX_LENGTH),
 			last_activity_at: snapshot.lastActivityAt,
 			activity_stale_ms: snapshot.activityStaleMs,
 		};
@@ -11833,6 +11839,9 @@ export class AgentSession {
 			status: "queued",
 			toolUseCount: 0,
 			progressNotes: [],
+			// Seed the staleness clock at admission: a child hung before its
+			// first tracked event still crosses the threshold once running.
+			lastActivityAt: startedAt,
 			settled: false,
 			abort: noopRlmChildAbort,
 			publication: createAgentMessageDeferred(),

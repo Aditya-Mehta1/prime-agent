@@ -297,6 +297,23 @@ class RlmProgressNoteTest(unittest.TestCase):
             result = asyncio.run(rlm_module.rlm.progress_note("x" * 512))
         self.assertTrue(result.accepted)
 
+    def test_progress_note_measures_utf16_length_at_the_boundary(self) -> None:
+        # 512 astral characters are 1024 UTF-16 code units under the host's
+        # message.length measure, so they must fail validation before the call.
+        with self.assertRaisesRegex(ValueError, "at most 512"):
+            asyncio.run(rlm_module.rlm.progress_note("🎉" * 512))
+        # A BMP character plus one astral character crosses the same bound.
+        with self.assertRaisesRegex(ValueError, "at most 512"):
+            asyncio.run(rlm_module.rlm.progress_note("a" * 511 + "🎉"))
+
+        # 256 astral characters are exactly 512 UTF-16 code units: accepted.
+        host_request = AsyncMock(return_value={"accepted": True})
+        with patch.object(rlm_module, "host_request", host_request):
+            result = asyncio.run(rlm_module.rlm.progress_note("🎉" * 256))
+
+        self.assertTrue(result.accepted)
+        host_request.assert_awaited_once_with("rlm.progress.note", {"message": "🎉" * 256})
+
     def test_progress_note_rejects_invalid_payloads(self) -> None:
         host_request = AsyncMock(return_value={"retry_after_ms": 1000})
         with patch.object(rlm_module, "host_request", host_request):
@@ -351,7 +368,7 @@ class RlmSubagentExtrasTest(unittest.TestCase):
         self.assertEqual(entry.last_activity_at, 1757700000000)
         self.assertIsNone(entry.activity_stale_ms)
 
-    def test_accepts_legacy_entries_without_extras(self) -> None:
+    def test_accepts_entries_missing_optional_extras(self) -> None:
         host_request = AsyncMock(
             return_value={
                 "subagents": [

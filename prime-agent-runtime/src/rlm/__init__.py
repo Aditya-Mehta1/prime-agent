@@ -430,18 +430,22 @@ RLM_PROGRESS_NOTE_MAX_LENGTH = 512
 async def progress_note(message: str) -> RLMProgressNoteResult:
     """Report brief in-flight progress to the parent orchestrator.
 
-    The note (at most 512 characters, about one per 10 seconds) reaches the
+    The note (at most 512 UTF-16 code units, about one per 10 seconds) reaches the
     parent's child snapshots and roster entries without steering the parent
     or requiring an explicit reply. A throttled note returns
     ``accepted=False`` with a ``retry_after_ms`` hint instead of raising.
     """
     if not isinstance(message, str):
         raise TypeError(f"message must be str, got {type(message).__name__}")
-    if not message.strip():
+    stripped = message.strip()
+    if not stripped:
         raise ValueError("message must not be empty")
-    if len(message.strip()) > RLM_PROGRESS_NOTE_MAX_LENGTH:
+    # The host measures message.length in UTF-16 code units, so 512 astral
+    # characters are 1024 units there and would fail its check after Python
+    # accepted them. Measure the stripped message the same way.
+    if len(stripped.encode("utf-16-le")) // 2 > RLM_PROGRESS_NOTE_MAX_LENGTH:
         raise ValueError(f"message must be at most {RLM_PROGRESS_NOTE_MAX_LENGTH} characters")
-    payload = await host_request("rlm.progress.note", {"message": message.strip()})
+    payload = await host_request("rlm.progress.note", {"message": stripped})
     accepted = payload.get("accepted")
     if not isinstance(accepted, bool):
         raise RuntimeError("rlm.progress.note returned an invalid accepted flag")

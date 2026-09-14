@@ -59,8 +59,9 @@ export interface RlmSubagentRegistryEntry {
 	replied_since_task?: boolean;
 	/** Latest child progress note (`rlm.progress.note`), newest wins. */
 	progress_note?: string;
-	/** One-line task label derived from the persisted prompt. */
+	/** One-line task label, hard-capped for the kernel roster. */
 	label?: string;
+	/** Wall-clock ms of the last tracked child activity; seeded at admission. */
 	last_activity_at?: number;
 	/** Set when a running child has had no tracked activity for the staleness threshold. */
 	activity_stale_ms?: number;
