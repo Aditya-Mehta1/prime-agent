@@ -15,6 +15,7 @@ interface Step {
 }
 interface Job {
 	needs?: string | string[];
+	environment?: { name?: string } | string;
 	if?: string;
 	"continue-on-error"?: boolean;
 	"runs-on"?: string;
@@ -50,16 +51,23 @@ function requiresSuccess(job: Job): void {
 describe("release workflow signature gates", () => {
 	it("requires successful build and both native final validation jobs before publication", () => {
 		const validation = release.jobs["validate-macos"]!;
-		expect(validation.needs).toEqual(expect.arrayContaining(["release-context", "build"]));
+		expect(validation.needs).toEqual(expect.arrayContaining(["context", "build"]));
 		expect(validation["runs-on"]).toBe(`\${{ matrix.runner }}`);
 		expect(validation.strategy?.matrix.include).toEqual([
 			{ platform: "darwin-arm64", runner: "macos-15" },
 			{ platform: "darwin-x64", runner: "macos-15-intel" },
 		]);
-		const publish = release.jobs.publish!;
-		expect(publish.needs).toEqual(expect.arrayContaining(["build", "validate-macos"]));
-		expect(publish.if).toBe("github.event_name != 'pull_request'");
+		// Publication is a chain: everything the release publishes has to pass
+		// through assemble (receipts) and github-release (recorded digests) first.
+		const assemble = release.jobs.assemble!;
+		expect(assemble.needs).toEqual(expect.arrayContaining(["build", "validate-macos"]));
+		const githubRelease = release.jobs["github-release"]!;
+		expect(githubRelease.needs).toEqual(expect.arrayContaining(["assemble", "sign"]));
+		const publish = release.jobs["publish-r2"]!;
+		expect(publish.needs).toEqual(expect.arrayContaining(["github-release"]));
+		expect(publish.if).toContain("github.event_name != 'pull_request'");
 		requiresSuccess(validation);
+		requiresSuccess(assemble);
 		requiresSuccess(publish);
 	});
 
@@ -74,18 +82,38 @@ describe("release workflow signature gates", () => {
 		expect(validation.steps.indexOf(verify)).toBeLessThan(
 			validation.steps.indexOf(step(validation, "Upload native validation receipts")),
 		);
-		const publish = release.jobs.publish!;
-		const gate = step(publish, "Match native validation to publication artifacts");
+		const assemble = release.jobs.assemble!;
+		const gate = step(assemble, "Match native validation to publication artifacts");
 		expect(gate.if).toBeUndefined();
 		expect(gate.run).toContain(
 			"verify-macos-validation-receipts.mjs release-artifacts/production macos-validation production",
 		);
 		expect(gate.run).toContain("verify-macos-validation-receipts.mjs release-artifacts/beta macos-validation beta");
-		const writes = publish.steps.filter((entry) =>
-			/aws s3 cp|gh release (?:upload|create|edit)|gh api --method/.test(entry.run ?? ""),
-		);
-		expect(writes.length).toBeGreaterThan(0);
-		for (const write of writes) expect(publish.steps.indexOf(gate)).toBeLessThan(publish.steps.indexOf(write));
+		// The receipt gate runs before anything leaves this job, and every job that
+		// writes to R2, npm, the tap or a GitHub release runs after assemble.
+		const publishers = [
+			"publish-r2",
+			"publish-beta-r2",
+			"github-release",
+			"github-release-beta",
+			"finalize-release",
+			"tap-bump",
+		];
+		for (const entry of Object.values(release.jobs)) {
+			const writes = (entry.steps ?? []).filter((candidate) =>
+				/aws s3 cp|gh release (?:upload|create|edit)|gh api --method/.test(candidate.run ?? ""),
+			);
+			if (writes.length === 0) continue;
+			expect(publishers).toContain(Object.keys(release.jobs).find((name) => release.jobs[name] === entry));
+		}
+		for (const name of publishers) {
+			const job = release.jobs[name]!;
+			const needs = typeof job.needs === "string" ? [job.needs] : (job.needs ?? []);
+			expect(needs.length).toBeGreaterThan(0);
+		}
+		const uploads = assemble.steps.filter((entry) => entry.uses?.startsWith("actions/upload-artifact@"));
+		expect(uploads.length).toBeGreaterThan(0);
+		for (const upload of uploads) expect(assemble.steps.indexOf(gate)).toBeLessThan(assemble.steps.indexOf(upload));
 	});
 
 	it.each([{ channels: ["production"] }, { channels: ["beta"] }, { channels: ["production", "beta"] }])(
@@ -161,7 +189,7 @@ ${step(validation, "Verify and exercise exact final Mac archives").run}`,
 		expect(upload.with?.path).toContain("binaries.json");
 		expect(build.steps.indexOf(test)).toBeLessThan(build.steps.indexOf(upload));
 		requiresSuccess(build);
-		expect(release.jobs.standalone!.with?.build_ref).toBe(`\${{ needs.release-context.outputs.build_ref }}`);
+		expect(release.jobs.standalone!.with?.build_ref).toBe(`\${{ needs.context.outputs.build_ref }}`);
 	});
 
 	it.skipIf(process.platform === "win32")(
@@ -171,7 +199,7 @@ ${step(validation, "Verify and exercise exact final Mac archives").run}`,
 			const directory = mkdtempSync(join(tmpdir(), "prime-release-context-"));
 			try {
 				const output = join(directory, "output");
-				const context = step(release.jobs["release-context"]!, "Resolve release context");
+				const context = step(release.jobs.context!, "Resolve release context");
 				const result = spawnSync("bash", ["-e", "-o", "pipefail", "-c", context.run!], {
 					cwd: repository,
 					env: {
@@ -206,7 +234,10 @@ ${step(validation, "Verify and exercise exact final Mac archives").run}`,
 					expect(pack.run).toContain(`--channel ${channel}`);
 					expect(pack.run).toContain("--binary-dir packages/coding-agent/binaries");
 				}
-				expect(release.jobs.publish!.if).toBe("github.event_name != 'pull_request'");
+				expect(release.jobs["publish-r2"]!.if).toContain("github.event_name != 'pull_request'");
+				expect(release.jobs["publish-r2"]!.environment).toEqual({
+					name: `\${{ needs.context.outputs.publish_environment }}`,
+				});
 			} finally {
 				rmSync(directory, { recursive: true, force: true });
 			}

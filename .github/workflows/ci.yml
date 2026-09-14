@@ -66,6 +66,12 @@ jobs:
       - name: Check
         run: npm run check
 
+      - name: Check the release pipeline invariants
+        run: node scripts/check-release-workflow.mjs
+
+      - name: Test the release scripts
+        run: node --test "scripts/test/*.test.mjs"
+
   test:
     name: Test (${{ matrix.name }})
     needs: trust
