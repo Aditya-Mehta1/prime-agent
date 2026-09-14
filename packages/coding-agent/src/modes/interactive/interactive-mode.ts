@@ -7873,7 +7873,7 @@ export class InteractiveMode {
 				operation: "unknown",
 			});
 		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(theme.fg("error", `Error: ${errorMessage}`), 1, 0));
+		this.chatContainer.addChild(new Text(theme.fg("error", `⚠ Error: ${errorMessage}`), 1, 0));
 		this.ui.requestRender();
 	}
 
