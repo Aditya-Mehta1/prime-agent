@@ -20,8 +20,16 @@ import { createServer } from "node:http2";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { deflateSync } from "node:zlib";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
+
+// Every deadline inside a test or hook must stay strictly below the surrounding vitest budget,
+// otherwise the slower standalone runners kill the test before its own diagnostic can report.
+const RUN_TIMEOUT = 60000;
+const CONNECT_TIMEOUT = 5000;
+const GRACEFUL_EXIT_TIMEOUT = 3000;
+const TEARDOWN_TIMEOUT = 10000;
+vi.setConfig({ testTimeout: 120000, hookTimeout: 60000 });
 
 const archive = process.env.PRIME_AGENT_TEST_ARCHIVE;
 const uv = process.env.PRIME_AGENT_TEST_UV;
@@ -34,7 +42,37 @@ let cwd = "";
 let socket = "";
 let environment: NodeJS.ProcessEnv;
 
-async function run(args: string[], extraEnv: NodeJS.ProcessEnv = {}, timeout = 30000, input?: string) {
+function hasExited(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return false;
+	} catch {
+		return true;
+	}
+}
+
+/** SIGKILL cannot be blocked, so the supervisor exit is reached without waiting on a graceful shutdown. */
+async function terminateSupervisor(pid: number): Promise<void> {
+	const escalateAt = Date.now() + GRACEFUL_EXIT_TIMEOUT;
+	await expect
+		.poll(
+			() => {
+				if (hasExited(pid)) return true;
+				if (Date.now() >= escalateAt) {
+					try {
+						process.kill(pid, "SIGKILL");
+					} catch {
+						/* Exited between the check and the signal. */
+					}
+				}
+				return false;
+			},
+			{ timeout: TEARDOWN_TIMEOUT },
+		)
+		.toBe(true);
+}
+
+async function run(args: string[], extraEnv: NodeJS.ProcessEnv = {}, timeout = RUN_TIMEOUT, input?: string) {
 	const child = spawn(binary, args, { cwd, env: { ...environment, ...extraEnv }, stdio: ["pipe", "pipe", "pipe"] });
 	children.add(child);
 	let stdout = "";
@@ -166,32 +204,23 @@ describe.skipIf(!archive)("extracted standalone archive", () => {
 	afterEach(async () => {
 		for (const child of children) child.kill("SIGTERM");
 		const client = new DaemonClient(socket);
+		let supervisorPid: number | undefined;
+		let shutdownError: unknown;
 		try {
-			await client.connect(1000);
-			const hello = await client.waitForHello();
+			await client.connect(CONNECT_TIMEOUT);
+			supervisorPid = (await client.waitForHello()).supervisorPid;
 			await client.request({ type: "shutdown", force: true });
-			if (hello.supervisorPid) {
-				await expect
-					.poll(
-						() => {
-							try {
-								process.kill(hello.supervisorPid!, 0);
-								return false;
-							} catch {
-								return true;
-							}
-						},
-						{ timeout: 10000 },
-					)
-					.toBe(true);
-			}
 		} catch (error) {
-			if (existsSync(socket)) throw error;
+			if (existsSync(socket)) shutdownError = error;
 		} finally {
 			client.close();
 		}
+		// The supervisor is terminated even when the shutdown request failed, so an unresponsive
+		// daemon reports its own error instead of leaking a process into the next test.
+		if (supervisorPid !== undefined) await terminateSupervisor(supervisorPid);
 		for (const child of children) if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
 		children.clear();
+		if (shutdownError) throw shutdownError;
 	});
 	afterAll(() => {
 		if (root) rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
@@ -314,7 +343,7 @@ writeFileSync(join(process.cwd(), "hot-runtime.json"), JSON.stringify({ value, e
 		]
 			.map((command) => `${JSON.stringify(command)}\n`)
 			.join("");
-		const result = await run([...sessionArgs(), "--no-tools", "--mode", "rpc"], {}, 30000, input);
+		const result = await run([...sessionArgs(), "--no-tools", "--mode", "rpc"], {}, RUN_TIMEOUT, input);
 		expect(result.code, result.stderr).toBe(0);
 		const frames = result.stdout
 			.trim()
