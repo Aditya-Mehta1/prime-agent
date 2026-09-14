@@ -195,6 +195,35 @@ describe("ENG-4649 subagent model selection", () => {
 		}
 	});
 
+	it("resolves the parent model as its own short form when the catalog lacks it", async () => {
+		const codexProvider = "openai-codex";
+		const harness = await createHarness({ provider: codexProvider, models: [{ id: "parent-model" }] });
+		const fetchModels = vi.fn().mockRejectedValue(new Error("offline"));
+		vi.stubGlobal("fetch", fetchModels);
+		try {
+			harness.authStorage.setRuntimeApiKey(codexProvider, openAICodexToken("account-1"));
+			await expect(harness.session.findRlmModels("parent", 8)).resolves.toEqual({ models: [] });
+			harness.setResponses([fauxAssistantMessage("short form parent answer")]);
+
+			const result = await harness.session.runRlmChild("keep the parent model by short form", {
+				model: "parent-model",
+			});
+
+			expect(result.model).toBe(`${codexProvider}/parent-model`);
+			await vi.waitFor(
+				async () => {
+					const childEntry = (await harness.session.listRlmSubagents()).subagents[0];
+					expect(childEntry?.status).toBe("completed");
+					expect(harness.session.getRlmChildSession(childEntry!.rlm_child_id)?.model?.id).toBe("parent-model");
+				},
+				{ timeout: 5_000 },
+			);
+		} finally {
+			vi.unstubAllGlobals();
+			harness.cleanup();
+		}
+	});
+
 	it("does not start a child after its parent is disposed during preflight", async () => {
 		const harness = await createHarness({
 			provider,

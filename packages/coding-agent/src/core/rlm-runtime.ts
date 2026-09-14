@@ -217,10 +217,9 @@ export function findRlmModelMatches(query: string, models: Model<Api>[], limit: 
 
 /**
  * Models whose full selector ends with the reference, so a bare model id like
- * "z-ai/glm-5.3" also matches "prime-inference/z-ai/glm-5.3". Callers try an
- * exact full-selector match first; this is the short-form fallback.
+ * "z-ai/glm-5.3" also matches "prime-inference/z-ai/glm-5.3".
  */
-export function findRlmShortFormModelMatches(reference: string, models: Model<Api>[]): Model<Api>[] {
+function findRlmShortFormModelMatches(reference: string, models: Model<Api>[]): Model<Api>[] {
 	const normalized = reference.trim().toLowerCase();
 	if (!normalized) return [];
 	return models.filter((model) => `${model.provider}/${model.id}`.toLowerCase().endsWith(`/${normalized}`));
@@ -236,9 +235,9 @@ export function findUniqueRlmShortFormModelMatch(reference: string, models: Mode
 }
 
 /**
- * Rejection message for an unresolved model reference. Keeps the historical
- * "unavailable, unauthenticated, or expired" reason, then states the expected
- * selector form and close matches so the user can retry with a full selector.
+ * Rejection message for an unresolved model reference: states that the model is
+ * unavailable, unauthenticated, or expired, then the expected selector form and
+ * close matches so the user can retry with a full selector.
  */
 export function formatRlmModelUnavailableError(reference: string, target: string, models: Model<Api>[]): string {
 	const base = `Requested ${target} model "${reference}" is unavailable, unauthenticated, or expired`;
