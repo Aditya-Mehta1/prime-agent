@@ -314,6 +314,16 @@ class RlmProgressNoteTest(unittest.TestCase):
         self.assertTrue(result.accepted)
         host_request.assert_awaited_once_with("rlm.progress.note", {"message": "🎉" * 256})
 
+        # Lone surrogates are valid Python strings that json.dumps escapes and
+        # the host accepts, so each must count as one UTF-16 code unit, not raise.
+        host_request = AsyncMock(return_value={"accepted": True})
+        with patch.object(rlm_module, "host_request", host_request):
+            result = asyncio.run(rlm_module.rlm.progress_note("\ud800"))
+        self.assertTrue(result.accepted)
+        host_request.assert_awaited_once_with("rlm.progress.note", {"message": "\ud800"})
+        with self.assertRaisesRegex(ValueError, "at most 512"):
+            asyncio.run(rlm_module.rlm.progress_note("\ud800" * 513))
+
     def test_progress_note_rejects_invalid_payloads(self) -> None:
         host_request = AsyncMock(return_value={"retry_after_ms": 1000})
         with patch.object(rlm_module, "host_request", host_request):

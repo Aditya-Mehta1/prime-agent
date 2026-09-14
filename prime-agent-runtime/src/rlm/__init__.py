@@ -442,8 +442,9 @@ async def progress_note(message: str) -> RLMProgressNoteResult:
         raise ValueError("message must not be empty")
     # The host measures message.length in UTF-16 code units, so 512 astral
     # characters are 1024 units there and would fail its check after Python
-    # accepted them. Measure the stripped message the same way.
-    if len(stripped.encode("utf-16-le")) // 2 > RLM_PROGRESS_NOTE_MAX_LENGTH:
+    # accepted them. Measure the stripped message the same way; surrogatepass
+    # counts a lone surrogate as one unit, matching the host's length.
+    if len(stripped.encode("utf-16-le", "surrogatepass")) // 2 > RLM_PROGRESS_NOTE_MAX_LENGTH:
         raise ValueError(f"message must be at most {RLM_PROGRESS_NOTE_MAX_LENGTH} characters")
     payload = await host_request("rlm.progress.note", {"message": stripped})
     accepted = payload.get("accepted")
