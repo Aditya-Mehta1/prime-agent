@@ -229,7 +229,10 @@ describe("issue #4491 provider stale after repeated 401", () => {
 
 	it("marks captured auth failures stale when the final retryable error is not auth", async () => {
 		const harness = await createHarness({
-			settings: { retry: { enabled: true, maxRetries: 2, baseDelayMs: 1 } },
+			// Wait-for-usage is disabled so quick-retry exhaustion stays terminal here.
+			settings: {
+				retry: { enabled: true, maxRetries: 2, baseDelayMs: 1, provider: { waitForUsage: { enabled: false } } },
+			},
 		});
 		harnesses.push(harness);
 		harness.setResponses([provider401Message(), provider500Message(), provider500Message()]);
