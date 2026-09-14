@@ -4,7 +4,20 @@ import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getNativeUpdatePlan } from "../src/cli/native-update.js";
 import { NATIVE_RELEASE_ASSETS } from "../src/utils/native-installation.js";
+import { ReleaseSignatureError } from "../src/utils/release-signature.js";
 import { getLatestPiRelease } from "../src/utils/version-check.js";
+
+const SIGNER_IDENTITY =
+	"https://github.com/PrimeIntellect-ai/prime-agent/.github/workflows/release.yml@refs/heads/main";
+
+// The real verifier is exercised end to end in release-signature.test.ts and, against the production
+// pinning, in native-update-signature.test.ts. Here it is stubbed so these tests can concentrate on
+// how the update plan reacts to its result.
+const verifiedDigest = vi.hoisted(() => vi.fn());
+vi.mock("../src/utils/release-signature.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../src/utils/release-signature.js")>()),
+	fetchVerifiedReleaseArtifactDigest: verifiedDigest,
+}));
 
 const artifact = {
 	platform: "linux-x64",
@@ -52,6 +65,7 @@ describe("native release metadata isolation", () => {
 	afterEach(() => {
 		vi.unstubAllGlobals();
 		vi.unstubAllEnvs();
+		verifiedDigest.mockReset();
 		rmSync(root, { recursive: true, force: true });
 	});
 
@@ -84,16 +98,87 @@ describe("native release metadata isolation", () => {
 		},
 	);
 
-	it("uses the verified platform checksum when the entire native list is valid", async () => {
+	it("uses the signature-verified platform checksum when the entire native list is valid", async () => {
 		vi.stubGlobal(
 			"fetch",
 			vi.fn(async () => Response.json({ version: "1.2.4", binaries: [artifact] })),
 		);
+		verifiedDigest.mockResolvedValue({
+			digest: artifact.sha256,
+			signerIdentity: SIGNER_IDENTITY,
+			signerRef: "refs/heads/main",
+		});
 
 		const plan = await getNativeUpdatePlan({ force: false, rollback: false, executable });
 
+		expect(verifiedDigest).toHaveBeenCalledWith(
+			expect.objectContaining({ baseUrl, version: "1.2.4", file: artifact.file }),
+		);
 		expect(plan.targetVersion).toBe("1.2.4");
+		expect(plan.verifiedSignerIdentity).toBe(SIGNER_IDENTITY);
 		expect(plan.command?.args).toContain(`PRIME_AGENT_EXPECTED_SHA256=${artifact.sha256}`);
 		expect(plan.command?.args).toContain("PRIME_AGENT_INSTALL_METHOD=binary");
 	});
+
+	it("refuses the update when the signed SHA256SUMS disagrees with the release manifest", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => Response.json({ version: "1.2.4", binaries: [artifact] })),
+		);
+		verifiedDigest.mockResolvedValue({
+			digest: "c".repeat(64),
+			signerIdentity: SIGNER_IDENTITY,
+			signerRef: "refs/heads/main",
+		});
+
+		await expect(getNativeUpdatePlan({ force: false, rollback: false, executable })).rejects.toThrow(
+			/does not match the release manifest/,
+		);
+		expect(readlinkSync(join(root, "bin", "prime-agent"))).toBe(target);
+	});
+
+	it("lets a verification failure abort the update instead of degrading to a warning", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => Response.json({ version: "1.2.4", binaries: [artifact] })),
+		);
+		verifiedDigest.mockRejectedValue(new ReleaseSignatureError("no signature was published"));
+
+		await expect(getNativeUpdatePlan({ force: false, rollback: false, executable })).rejects.toThrow(
+			ReleaseSignatureError,
+		);
+		expect(readlinkSync(join(root, "bin", "prime-agent"))).toBe(target);
+	});
+
+	it("records the origin override instead of applying it silently", async () => {
+		vi.stubEnv("PRIME_AGENT_DOWNLOAD_BASE_URL", "https://mirror.example/");
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => Response.json({ version: "1.2.4", binaries: [artifact] })),
+		);
+		verifiedDigest.mockResolvedValue({
+			digest: artifact.sha256,
+			signerIdentity: SIGNER_IDENTITY,
+			signerRef: "refs/heads/main",
+		});
+
+		const plan = await getNativeUpdatePlan({ force: false, rollback: false, executable });
+
+		// The override moves the origin, and verification still runs against that origin.
+		expect(plan.overriddenBaseUrl).toBe("https://mirror.example");
+		expect(verifiedDigest).toHaveBeenCalledWith(expect.objectContaining({ baseUrl: "https://mirror.example" }));
+		expect(plan.command?.args).toContain("PRIME_AGENT_DOWNLOAD_BASE_URL=https://mirror.example");
+	});
+
+	it.each(["http://mirror.example", "not a url"])(
+		"refuses an origin override that is not an https URL: %s",
+		async (override) => {
+			vi.stubEnv("PRIME_AGENT_DOWNLOAD_BASE_URL", override);
+
+			await expect(getNativeUpdatePlan({ force: false, rollback: false, executable })).rejects.toThrow(
+				/PRIME_AGENT_DOWNLOAD_BASE_URL/,
+			);
+			expect(verifiedDigest).not.toHaveBeenCalled();
+		},
+	);
 });

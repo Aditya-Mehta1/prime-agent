@@ -22,6 +22,34 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { getNativeUpdatePlan } from "../src/cli/native-update.js";
 import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
 
+/**
+ * This fixture publishes a real release feed but cannot mint a real cosign signature for it - only
+ * the release workflow's OIDC identity can. Replace ONLY the signature step: the digest is still
+ * read from the feed's own `SHA256SUMS` with the production parser, so everything downstream
+ * (manifest cross-check, PRIME_AGENT_EXPECTED_SHA256, install.sh) is exercised unchanged.
+ *
+ * The signature step itself is covered by release-signature.test.ts (real Sigstore fixtures) and by
+ * native-update-signature.test.ts (production pinning, fail-closed).
+ */
+vi.mock("../src/utils/release-signature.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../src/utils/release-signature.js")>();
+	return {
+		...actual,
+		fetchVerifiedReleaseArtifactDigest: async (options: { baseUrl: string; version: string; file: string }) => {
+			const response = await fetch(`${options.baseUrl}/releases/v${options.version}/SHA256SUMS`);
+			if (!response.ok) throw new actual.ReleaseSignatureError("no SHA256SUMS in the fixture feed");
+			const digest = actual.parseChecksums(new Uint8Array(await response.arrayBuffer())).get(options.file);
+			if (!digest) throw new actual.ReleaseSignatureError(`fixture feed does not cover ${options.file}`);
+			return {
+				digest,
+				signerIdentity:
+					"https://github.com/PrimeIntellect-ai/prime-agent/.github/workflows/release.yml@refs/heads/main",
+				signerRef: "refs/heads/main",
+			};
+		},
+	};
+});
+
 const installer = resolve(__dirname, "../../../install.sh");
 const assets = [
 	"package.json",
