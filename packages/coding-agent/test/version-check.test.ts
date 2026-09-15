@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { DownloadOriginError } from "../src/utils/download-url.js";
 import {
 	checkForNewPiVersion,
 	comparePackageVersions,
@@ -147,6 +148,7 @@ describe("version checks", () => {
 			"https://mirror.example/#frag",
 		]) {
 			process.env.PRIME_AGENT_DOWNLOAD_BASE_URL = value;
+			await expect(getLatestPiRelease("1.2.3"), value).rejects.toThrow(DownloadOriginError);
 			await expect(getLatestPiRelease("1.2.3"), value).rejects.toThrow(/PRIME_AGENT_DOWNLOAD_BASE_URL/);
 		}
 		expect(fetchMock).not.toHaveBeenCalled();

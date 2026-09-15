@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -207,6 +207,71 @@ describe("npm package plan", () => {
 				}
 			}
 		}
+	});
+});
+
+describe("argument hygiene", () => {
+	it.each([
+		["--scope", "@x/../../.."],
+		["--scope", "@Scope"],
+		["--scope", "@x/y"],
+		["--scope", "primeintellect"],
+		["--front-door", "../.."],
+		["--front-door", "@primeintellect/prime-agent"],
+		["--front-door", "prime.agent"],
+		["--front-door", "Prime-Agent"],
+	])("refuses a %s of %s before writing anything", (flag, value) => {
+		const { outDir, result } = stage([flag, value]);
+		expect(result.status, result.stderr).not.toBe(0);
+		expect(result.stderr).toMatch(new RegExp(`${flag.replace(/-/g, "\\-")}`));
+		expect(existsSync(outDir)).toBe(false);
+		// Nothing may have escaped above the output directory either.
+		expect(existsSync(join(dirname(outDir), "bin"))).toBe(false);
+		expect(existsSync(join(dirname(outDir), "package.json"))).toBe(false);
+	});
+
+	it("removes the archive extraction directory even when staging fails", () => {
+		const archives = mkdtempSync(join(root, "archives-"));
+		for (const platform of platforms) {
+			const dir = join(root, "arch-src", platform);
+			writeBinaryFixture(dir, platform);
+			spawnSync("tar", ["-czf", join(archives, `prime-agent-${version}-${platform}.tar.gz`), "-C", dir, "."]);
+		}
+		const before = new Set(readdirSync(tmpdir()).filter((name) => name.startsWith("prime-agent-npm-binaries-")));
+		const outDir = join(root, "out-fail");
+		// An invalid front door makes staging fail after extraction would have happened; extraction
+		// runs first only when the arguments parse, so use a receipts mismatch to fail late instead.
+		const receipts = join(root, "bad-receipts.json");
+		writeFileSync(
+			receipts,
+			JSON.stringify({
+				version,
+				binaries: platforms.map((platform) => ({
+					platform,
+					file: `prime-agent-${version}-${platform}.tar.gz`,
+					sha256: "0".repeat(64),
+					executableSha256: "0".repeat(64),
+				})),
+			}),
+		);
+		const result = pack([
+			"--archives",
+			archives,
+			"--receipts",
+			receipts,
+			"--packages-dir",
+			packagesDir,
+			"--version",
+			version,
+			"--out-dir",
+			outDir,
+			"--skip-pack",
+		]);
+		expect(result.status).not.toBe(0);
+		const after = readdirSync(tmpdir()).filter(
+			(name) => name.startsWith("prime-agent-npm-binaries-") && !before.has(name),
+		);
+		expect(after).toEqual([]);
 	});
 });
 

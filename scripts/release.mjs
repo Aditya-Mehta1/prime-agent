@@ -24,7 +24,7 @@
  */
 
 import { execSync } from "child_process";
-import { readFileSync, writeFileSync, readdirSync, existsSync } from "fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
 import { buildReleaseSection } from "./lib/changelog-fragments.mjs";
@@ -202,8 +202,11 @@ function openReleasePullRequest(version, branch) {
 			version +
 			"`.",
 	].join("\n");
-	const bodyFile = join(tmpdir(), `prime-agent-release-${version}.md`);
-	writeFileSync(bodyFile, `${body}\n`);
+	// A private, freshly created directory: a predictable path in the shared temp directory could be
+	// pre-planted as a symlink and make this write clobber an arbitrary file.
+	const bodyDir = mkdtempSync(join(tmpdir(), "prime-agent-release-"));
+	const bodyFile = join(bodyDir, "pull-request.md");
+	writeFileSync(bodyFile, `${body}\n`, { flag: "wx" });
 	// ignoreError: a missing or unauthenticated gh must not abort a run whose branch is already
 	// pushed; the caller prints the manual recovery instead.
 	const url = run(

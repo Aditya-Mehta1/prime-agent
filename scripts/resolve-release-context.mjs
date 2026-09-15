@@ -80,6 +80,20 @@ export function evaluateReviews(reviews, headSha) {
  * of the head commit and no human requesting changes.
  */
 export function findApprovingPullRequest(deps, repository, sha, defaultBranch) {
+	// Any failure to consult GitHub is a reason NOT to publish unattended, never a reason to abort
+	// the run: the fail-safe answer is "not approved", which routes production to release-manual and
+	// still lets the beta artifacts publish.
+	try {
+		return findApprovingPullRequestUnsafe(deps, repository, sha, defaultBranch);
+	} catch (error) {
+		return {
+			approved: false,
+			reason: `Could not verify pull request approval for ${sha}: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
+}
+
+function findApprovingPullRequestUnsafe(deps, repository, sha, defaultBranch) {
 	const pulls = deps.ghJson(["api", "-H", "Accept: application/vnd.github+json", `repos/${repository}/commits/${sha}/pulls`]);
 	if (!Array.isArray(pulls)) {
 		return { approved: false, reason: `Could not list pull requests for ${sha}.` };

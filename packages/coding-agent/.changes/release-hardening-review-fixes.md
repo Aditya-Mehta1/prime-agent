@@ -18,3 +18,4 @@ the signer described in the file instead of the production release signer, write
 `binaries-test-signer/` rather than the release output, and marks every signer line `prime-agent
 update` prints with `(test signer override)`. Release builds always compile the override as `null`;
 there is no runtime input (environment, file or flag) that can set it.
+- Changed `prime-agent update` to refuse an invalid `PRIME_AGENT_DOWNLOAD_BASE_URL` instead of silently falling back to the npm registry package.

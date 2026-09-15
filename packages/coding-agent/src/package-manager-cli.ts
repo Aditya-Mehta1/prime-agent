@@ -80,6 +80,7 @@ import {
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 } from "./modes/daemon/daemon-worker-protocol.js";
 import { shouldUseWindowsShell } from "./utils/child-process.js";
+import { DownloadOriginError } from "./utils/download-url.js";
 import {
 	getLatestPiRelease,
 	isBaseVersionDowngrade,
@@ -579,7 +580,10 @@ async function getSelfUpdatePlan(force: boolean, rollback = false, channel?: Upd
 		) {
 			return { installSpec, packageName, shouldRun: true, targetVersion: latestRelease?.version };
 		}
-	} catch {
+	} catch (error) {
+		// A misconfigured download origin is the user's explicit choice of where updates come from.
+		// Never answer it by quietly installing from somewhere else.
+		if (error instanceof DownloadOriginError) throw error;
 		if (effectiveChannel === "nightly") return nightlyReleaseUnavailablePlan();
 		return { installSpec: PACKAGE_NAME, packageName: PACKAGE_NAME, shouldRun: true };
 	}

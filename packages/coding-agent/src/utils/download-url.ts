@@ -15,20 +15,33 @@
  * host and shown in the update UI), and any scheme other than https. Trailing slashes are dropped so
  * paths are always joined with exactly one `/`. `label` names the setting in error messages.
  */
+/**
+ * A download origin was configured but is unusable. Callers must surface this to the user; it is a
+ * configuration error, never a reason to silently fall back to another update source.
+ */
+export class DownloadOriginError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "DownloadOriginError";
+	}
+}
+
 export function parseDownloadBaseUrl(raw: string, label = "The download base URL"): string {
 	const trimmed = raw.trim();
 	let parsed: URL;
 	try {
 		parsed = new URL(trimmed);
 	} catch {
-		throw new Error(`${label} is not a valid URL: ${raw}`);
+		throw new DownloadOriginError(`${label} is not a valid URL: ${raw}`);
 	}
-	if (parsed.protocol !== "https:") throw new Error(`${label} must use https, got ${parsed.protocol}//.`);
-	if (parsed.username || parsed.password) throw new Error(`${label} must not contain credentials.`);
+	if (parsed.protocol !== "https:")
+		throw new DownloadOriginError(`${label} must use https, got ${parsed.protocol}//.`);
+	if (parsed.username || parsed.password) throw new DownloadOriginError(`${label} must not contain credentials.`);
 	// `new URL("https://x?").search` and `new URL("https://x#").hash` are both "", so check the raw text too.
-	if (parsed.search || trimmed.includes("?")) throw new Error(`${label} must not contain a query string.`);
-	if (parsed.hash || trimmed.includes("#")) throw new Error(`${label} must not contain a fragment.`);
-	if (!parsed.hostname) throw new Error(`${label} must name a host.`);
+	if (parsed.search || trimmed.includes("?"))
+		throw new DownloadOriginError(`${label} must not contain a query string.`);
+	if (parsed.hash || trimmed.includes("#")) throw new DownloadOriginError(`${label} must not contain a fragment.`);
+	if (!parsed.hostname) throw new DownloadOriginError(`${label} must name a host.`);
 	const pathname = parsed.pathname.replace(/\/+$/, "");
 	return `${parsed.origin}${pathname}`;
 }

@@ -278,6 +278,24 @@ test("findApprovingPullRequest tolerates paginated (--slurp) review pages and a 
 	assert.equal(findApprovingPullRequest(deps, "o/r", SHA, "main").approved, false);
 });
 
+test("a GitHub API failure routes production to the manual environment instead of aborting", () => {
+	const deps = makeDeps({ pulls: [mergedPull(7)] });
+	deps.ghJson = () => {
+		throw new Error("gh: HTTP 502 Bad Gateway");
+	};
+	const verdict = findApprovingPullRequest(deps, "o/r", SHA, "main");
+	assert.equal(verdict.approved, false);
+	assert.match(verdict.reason, /Could not verify pull request approval/);
+	assert.match(verdict.reason, /502/);
+
+	// Through the whole context: the run continues, beta still publishes, production waits.
+	const { outputs } = resolveReleaseContext(pushEnv(), deps);
+	assert.equal(outputs.publish_production, "true");
+	assert.equal(outputs.requires_approval, "true");
+	assert.equal(outputs.publish_environment, MANUAL_ENVIRONMENT);
+	assert.equal(outputs.publish_beta, "true");
+});
+
 test("direct push with no pull request needs a reviewer", () => {
 	const deps = makeDeps({ pulls: [] });
 	const { outputs } = resolveReleaseContext(pushEnv(), deps);

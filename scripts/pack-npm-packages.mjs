@@ -73,6 +73,15 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const shimSource = join(root, "scripts", "lib", "npm-bin-shim.cjs");
 const stagingMarker = ".prime-agent-npm-staging";
 
+/**
+ * Both values are interpolated into staging paths under --out-dir, so they are restricted to the
+ * subset of npm names that can never contain a path separator, `.`, or `..`: a scope is `@` plus
+ * one lowercase URL-safe segment, an unscoped name is one such segment. `@x/../../..` and `../..`
+ * are npm-invalid anyway; refusing them here keeps the packer from writing outside its output tree.
+ */
+export const NPM_SCOPE = /^@[a-z0-9](?:[a-z0-9_-]{0,213})$/;
+export const NPM_UNSCOPED_NAME = /^[a-z0-9](?:[a-z0-9_-]{0,213})$/;
+
 export const PLATFORMS = {
 	"darwin-arm64": { os: "darwin", cpu: "arm64" },
 	"darwin-x64": { os: "darwin", cpu: "x64" },
@@ -333,12 +342,13 @@ function parseArgs(args) {
 				i += 1;
 				break;
 			case "--scope":
-				if (!value || !value.startsWith("@")) throw new Error("--scope must look like @scope");
+				if (!value || !NPM_SCOPE.test(value)) throw new Error("--scope must look like @scope (lowercase, no slashes or dots)");
 				parsed.scope = value;
 				i += 1;
 				break;
 			case "--front-door":
-				if (!value) throw new Error("--front-door requires a value");
+				if (!value || !NPM_UNSCOPED_NAME.test(value))
+					throw new Error("--front-door must be a plain unscoped npm package name");
 				parsed.frontDoor = value;
 				i += 1;
 				break;
@@ -604,7 +614,20 @@ function main() {
 		]),
 	);
 	const version = normalizeVersion(args.version || sourcePackages.get("coding-agent").version);
-	if (args.archivesDir) args.binaryDir = extractBinariesFromArchives(args.archivesDir, version, args.receipts);
+	let extracted;
+	if (args.archivesDir) {
+		extracted = extractBinariesFromArchives(args.archivesDir, version, args.receipts);
+		args.binaryDir = extracted;
+	}
+	try {
+		stagePackages(args, version, sourcePackages);
+	} finally {
+		// The extraction directory only exists for this run; never leave four payloads in $TMPDIR.
+		if (extracted) rmSync(extracted, { recursive: true, force: true });
+	}
+}
+
+function stagePackages(args, version, sourcePackages) {
 	const binaries = collectBinaries(args.binaryDir, version, args.receipts);
 	const plan = buildPackagePlan({
 		version,

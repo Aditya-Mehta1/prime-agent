@@ -60,3 +60,9 @@ test("a failed gh pr create does not abort after the branch was pushed", () => {
 	const opts = script.slice(call, call + 200);
 	assert.match(opts, /ignoreError: true/);
 });
+
+test("the release script writes the pull request body in a private temp directory", () => {
+	assert.match(script, /mkdtempSync\(join\(tmpdir\(\), "prime-agent-release-"\)\)/);
+	assert.match(script, /flag: "wx"/);
+	assert.equal(/join\(tmpdir\(\), `prime-agent-release-\$\{version\}\.md`\)/.test(script), false);
+});
