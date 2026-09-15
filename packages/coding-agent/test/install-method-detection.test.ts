@@ -1,7 +1,7 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { dirname, join } from "node:path";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { getNativeUpdatePlan } from "../src/cli/native-update.js";
 import {
 	detectInstallMethod,
@@ -9,7 +9,9 @@ import {
 	getSelfUpdateUnavailableInstruction,
 	getUpdateInstruction,
 	isHomebrewManagedPath,
+	resolveExecutablePath,
 } from "../src/config.js";
+import { NATIVE_RELEASE_ASSETS } from "../src/utils/native-installation.js";
 
 /**
  * Install-source detection for COMPILED copies.
@@ -50,6 +52,37 @@ function createHomebrewBinaryInstall(): { keg: string; executable: string; link:
 	process.env.PI_PACKAGE_DIR = binDir;
 	setExecPath(executable);
 	return { keg, executable, link };
+}
+
+/**
+ * The dangerous shape: a keg whose contents are ALSO a valid self-updater installation (the same
+ * layout install.sh produces), reached only through the `<prefix>/bin` symlink. Judged by the
+ * invoked path alone it is installer-owned; judged by what the path resolves to it is Homebrew's.
+ */
+function createInstallerShapedHomebrewKeg(): { keg: string; link: string; target: string } {
+	const prefix = realpathSync(mkdtempSync(join(tmpdir(), "pi-brew-managed-")));
+	tempDir = prefix;
+	const keg = join(prefix, "Cellar", "prime-agent", "1.2.3");
+	const checksum = "a".repeat(64);
+	const releaseName = `1.2.3-linux-x64-${checksum}`;
+	const releaseDir = join(keg, "releases", releaseName);
+	mkdirSync(releaseDir, { recursive: true });
+	mkdirSync(join(keg, "bin"));
+	writeFileSync(join(keg, ".managed"), "prime-agent-native-v1\n");
+	for (const asset of NATIVE_RELEASE_ASSETS) {
+		mkdirSync(dirname(join(releaseDir, asset)), { recursive: true });
+		writeFileSync(join(releaseDir, asset), "fixture\n");
+	}
+	writeFileSync(join(releaseDir, ".archive-sha256"), checksum);
+	writeFileSync(join(releaseDir, ".install-source"), "https://releases.example");
+	writeFileSync(join(releaseDir, "package.json"), JSON.stringify({ version: "1.2.3" }));
+	writeFileSync(join(releaseDir, "prime-agent"), "#!/bin/sh\n", { mode: 0o755 });
+	const target = `../releases/${releaseName}/prime-agent`;
+	symlinkSync(target, join(keg, "bin", "prime-agent"));
+	mkdirSync(join(prefix, "bin"), { recursive: true });
+	const link = join(prefix, "bin", "prime-agent");
+	symlinkSync(join(keg, "bin", "prime-agent"), link);
+	return { keg, link, target };
 }
 
 /** An npm per-platform package: the same compiled binary, under a global node_modules tree. */
@@ -112,6 +145,44 @@ describe("detectInstallMethod for compiled copies", () => {
 		await expect(getNativeUpdatePlan({ force: true, rollback: false, executable })).rejects.toThrow(
 			"managed by Homebrew. Update it with: brew upgrade prime-agent",
 		);
+	});
+
+	test("resolveExecutablePath follows the prefix symlink into the keg and tolerates unresolvable paths", () => {
+		const { link, executable } = createHomebrewBinaryInstall();
+
+		expect(resolveExecutablePath(link)).toBe(realpathSync(executable));
+		expect(resolveExecutablePath("/nonexistent/prime-agent")).toBe("/nonexistent/prime-agent");
+		expect(resolveExecutablePath("")).toBe("");
+	});
+
+	test("the self-updater refuses a brew keg reached through the <prefix>/bin symlink, even an installer-shaped one", async () => {
+		const { keg, link, target } = createInstallerShapedHomebrewKeg();
+		vi.stubEnv("PRIME_AGENT_DOWNLOAD_BASE_URL", "");
+		const fetchMock = vi.fn();
+		vi.stubGlobal("fetch", fetchMock);
+		try {
+			// The invoked path is not keg-shaped; only its resolution is.
+			expect(isHomebrewManagedPath(link)).toBe(false);
+			expect(isHomebrewManagedPath(resolveExecutablePath(link))).toBe(true);
+
+			for (const rollback of [false, true]) {
+				await expect(getNativeUpdatePlan({ force: true, rollback, executable: link })).rejects.toThrow(
+					"managed by Homebrew. Update it with: brew upgrade prime-agent",
+				);
+			}
+			// Nothing was planned, fetched or rewritten.
+			expect(fetchMock).not.toHaveBeenCalled();
+			expect(readlinkSync(join(keg, "bin", "prime-agent"))).toBe(target);
+
+			// The same keg reported through process.execPath is Homebrew's for the instruction text too.
+			delete process.env.PI_PACKAGE_DIR;
+			setExecPath(link);
+			expect(detectInstallMethod()).toBe("homebrew");
+			expect(getUpdateInstruction("prime-agent")).toBe("Update with: brew upgrade prime-agent");
+		} finally {
+			vi.unstubAllGlobals();
+			vi.unstubAllEnvs();
+		}
 	});
 
 	test("an npm-installed compiled binary reports npm and gets an npm instruction", () => {

@@ -4,11 +4,11 @@ import { type ObjectIdentifierValuePair, TrustedRoot } from "@sigstore/protobuf-
 import { type TrustMaterial, toSignedEntity, toTrustMaterial, Verifier } from "@sigstore/verify";
 import { parseDownloadBaseUrl } from "./download-url.js";
 import {
+	ACTIVE_RELEASE_SIGNER,
 	buildExpectedSignerIdentity,
 	FULCIO_OID_BUILD_SIGNER_URI,
 	FULCIO_OID_RUNNER_ENVIRONMENT,
 	FULCIO_OID_SOURCE_REPOSITORY_URI,
-	PINNED_RELEASE_SIGNER,
 	type PinnedSignerIdentity,
 	parseSignerIdentity,
 	RELEASE_CHECKSUMS_ASSET,
@@ -107,8 +107,10 @@ export interface VerifiedReleaseChecksums {
 
 export interface VerifyReleaseChecksumsOptions {
 	/**
-	 * Identity to pin. Defaults to the production release signer. Overriding it is an in-process
-	 * test seam only - it is not reachable from the environment, a config file or the network.
+	 * Identity to pin. Defaults to {@link ACTIVE_RELEASE_SIGNER}: the production release signer,
+	 * or the signer a TEST-ONLY binary had compiled in with `--test-signer-json`. Overriding it here
+	 * is an in-process test seam only - it is not reachable from the environment, a config file or
+	 * the network.
 	 */
 	identity?: PinnedSignerIdentity;
 	/** Alternate Sigstore trusted root, for tests. Defaults to the embedded public-good root. */
@@ -127,7 +129,7 @@ export function verifyReleaseChecksums(
 	bundle: unknown,
 	options: VerifyReleaseChecksumsOptions = {},
 ): VerifiedReleaseChecksums {
-	const identity = options.identity ?? PINNED_RELEASE_SIGNER;
+	const identity = options.identity ?? ACTIVE_RELEASE_SIGNER;
 	if (bundle === undefined || bundle === null)
 		throw new ReleaseSignatureError(`No ${RELEASE_SIGNATURE_BUNDLE_ASSET} signature was published for this release.`);
 
@@ -216,6 +218,15 @@ export interface FetchVerifiedDigestOptions {
 
 const DEFAULT_SIGNATURE_TIMEOUT_MS = 30000;
 
+/**
+ * Hard size caps for the two control files. A real `SHA256SUMS` is a few hundred bytes and a cosign
+ * bundle a few kilobytes, so these are generous - but they are hard: a download origin (including
+ * one supplied through PRIME_AGENT_DOWNLOAD_BASE_URL) must not be able to make the updater buffer an
+ * unbounded body into memory before verification has even started.
+ */
+export const MAX_RELEASE_CHECKSUMS_BYTES = 1024 * 1024;
+export const MAX_RELEASE_SIGNATURE_BUNDLE_BYTES = 4 * 1024 * 1024;
+
 const RELEASE_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 const RELEASE_ASSET_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
@@ -243,9 +254,16 @@ export function releaseAssetUrl(baseUrl: string, version: string, asset: string)
 	return base.href;
 }
 
+/**
+ * Download a control file of at most `maxBytes`.
+ *
+ * The cap is enforced twice: a declared `Content-Length` above it is refused before a single body
+ * byte is read, and the body is then streamed with a running count so a chunked or lying response
+ * is cut off the moment it exceeds the cap. The body is never buffered whole before the check.
+ */
 async function download(
 	url: string,
-	options: { timeoutMs: number; userAgent?: string; fetchImpl: typeof fetch },
+	options: { timeoutMs: number; userAgent?: string; fetchImpl: typeof fetch; maxBytes: number },
 ): Promise<Uint8Array> {
 	let response: Response;
 	try {
@@ -257,7 +275,35 @@ async function download(
 		throw new ReleaseSignatureError(`Could not download ${url}.`, error);
 	}
 	if (!response.ok) throw new ReleaseSignatureError(`Could not download ${url} (HTTP ${response.status}).`);
-	return new Uint8Array(await response.arrayBuffer());
+	const tooLarge = () =>
+		new ReleaseSignatureError(`Refusing to download ${url}: the response exceeds ${options.maxBytes} bytes.`);
+	const declaredLength = response.headers.get("content-length");
+	if (declaredLength !== null) {
+		if (!/^\d+$/.test(declaredLength.trim()))
+			throw new ReleaseSignatureError(`Could not download ${url}: malformed Content-Length header.`);
+		if (Number(declaredLength.trim()) > options.maxBytes) throw tooLarge();
+	}
+	if (!response.body) return new Uint8Array(0);
+	const reader = response.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let received = 0;
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			if (!value) continue;
+			received += value.byteLength;
+			if (received > options.maxBytes) {
+				await reader.cancel().catch(() => undefined);
+				throw tooLarge();
+			}
+			chunks.push(value);
+		}
+	} catch (error) {
+		if (error instanceof ReleaseSignatureError) throw error;
+		throw new ReleaseSignatureError(`Could not download ${url}.`, error);
+	}
+	return Buffer.concat(chunks, received);
 }
 
 /**
@@ -276,13 +322,13 @@ export async function fetchVerifiedReleaseArtifactDigest(
 		userAgent: options.userAgent,
 		fetchImpl: options.fetchImpl ?? fetch,
 	};
-	const checksums = await download(
-		releaseAssetUrl(options.baseUrl, options.version, RELEASE_CHECKSUMS_ASSET),
-		download_,
-	);
+	const checksums = await download(releaseAssetUrl(options.baseUrl, options.version, RELEASE_CHECKSUMS_ASSET), {
+		...download_,
+		maxBytes: MAX_RELEASE_CHECKSUMS_BYTES,
+	});
 	const bundleBytes = await download(
 		releaseAssetUrl(options.baseUrl, options.version, RELEASE_SIGNATURE_BUNDLE_ASSET),
-		download_,
+		{ ...download_, maxBytes: MAX_RELEASE_SIGNATURE_BUNDLE_BYTES },
 	);
 
 	let bundle: unknown;

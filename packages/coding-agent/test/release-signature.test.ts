@@ -6,15 +6,20 @@ import { crypto as sigstoreCrypto } from "@sigstore/core";
 import { describe, expect, test } from "vitest";
 import {
 	fetchVerifiedReleaseArtifactDigest,
+	MAX_RELEASE_CHECKSUMS_BYTES,
+	MAX_RELEASE_SIGNATURE_BUNDLE_BYTES,
 	parseChecksums,
 	ReleaseSignatureError,
 	verifyReleaseChecksums,
 } from "../src/utils/release-signature.js";
 import {
+	ACTIVE_RELEASE_SIGNER,
 	buildExpectedSignerIdentity,
 	PINNED_RELEASE_SIGNER,
 	type PinnedSignerIdentity,
+	parseSignerOverride,
 	RELEASE_SIGNER_OIDC_ISSUER,
+	RELEASE_SIGNER_TEST_OVERRIDE,
 } from "../src/utils/release-trust.js";
 
 const fixtures = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "release-signature");
@@ -260,6 +265,217 @@ describe("fetchVerifiedReleaseArtifactDigest", () => {
 				identity: fixturePolicy(),
 			}),
 		).rejects.toThrow(/does not cover/);
+	});
+});
+
+describe("control file size caps", () => {
+	const OTHER_ORIGIN = "https://downloads.example.dev";
+	const base = `${OTHER_ORIGIN}/releases/v0.94.2`;
+	const bundleBytes = Buffer.from(JSON.stringify(bundle), "utf8");
+
+	/** A body that keeps producing chunks until it is cancelled, recording how far it got. */
+	function endlessBody(chunkSize: number) {
+		const state = { pulled: 0, cancelled: false };
+		const stream = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				state.pulled += 1;
+				controller.enqueue(new Uint8Array(chunkSize).fill(0x61));
+			},
+			cancel() {
+				state.cancelled = true;
+			},
+		});
+		return { stream, state };
+	}
+
+	function fetchWith(responses: Record<string, () => Response>): { fetchImpl: typeof fetch; requested: string[] } {
+		const requested: string[] = [];
+		const fetchImpl = (async (input: string | URL) => {
+			const url = String(input);
+			requested.push(url);
+			const respond = responses[url];
+			return respond ? respond() : new Response(null, { status: 404 });
+		}) as unknown as typeof fetch;
+		return { fetchImpl, requested };
+	}
+
+	const verify = (fetchImpl: typeof fetch) =>
+		fetchVerifiedReleaseArtifactDigest({
+			baseUrl: OTHER_ORIGIN,
+			version: "0.94.2",
+			file: ARTIFACT,
+			fetchImpl,
+			identity: fixturePolicy(),
+		});
+
+	test("the caps are generous for real control files but finite", () => {
+		expect(checksums.byteLength).toBeLessThan(MAX_RELEASE_CHECKSUMS_BYTES);
+		expect(bundleBytes.byteLength).toBeLessThan(MAX_RELEASE_SIGNATURE_BUNDLE_BYTES);
+		expect(MAX_RELEASE_CHECKSUMS_BYTES).toBe(1024 * 1024);
+		expect(MAX_RELEASE_SIGNATURE_BUNDLE_BYTES).toBe(4 * 1024 * 1024);
+	});
+
+	test("normal sizes pass, including bodies delivered in many small chunks", async () => {
+		const chunked = (bytes: Buffer) =>
+			new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						for (let offset = 0; offset < bytes.length; offset += 7)
+							controller.enqueue(bytes.subarray(offset, offset + 7));
+						controller.close();
+					},
+				}),
+				{ status: 200 },
+			);
+		const { fetchImpl } = fetchWith({
+			[`${base}/SHA256SUMS`]: () => chunked(checksums),
+			[`${base}/SHA256SUMS.sigstore.json`]: () => chunked(bundleBytes),
+		});
+
+		const result = await verify(fetchImpl);
+
+		expect(result.digest).toMatch(/^[a-f0-9]{64}$/);
+	});
+
+	test("refuses a SHA256SUMS whose declared Content-Length exceeds the cap without reading the body", async () => {
+		const { stream, state } = endlessBody(1024);
+		const { fetchImpl } = fetchWith({
+			[`${base}/SHA256SUMS`]: () =>
+				new Response(stream, {
+					status: 200,
+					headers: { "content-length": String(MAX_RELEASE_CHECKSUMS_BYTES + 1) },
+				}),
+		});
+
+		await expect(verify(fetchImpl)).rejects.toThrow(/exceeds 1048576 bytes/);
+		await expect(verify(fetchImpl)).rejects.toThrow(ReleaseSignatureError);
+		// A ReadableStream primes one chunk on construction; the updater itself pulled nothing.
+		expect(state.pulled).toBeLessThanOrEqual(1);
+	});
+
+	test("refuses a bundle whose declared Content-Length exceeds the cap", async () => {
+		const { fetchImpl } = fetchWith({
+			[`${base}/SHA256SUMS`]: () => new Response(checksums, { status: 200 }),
+			[`${base}/SHA256SUMS.sigstore.json`]: () =>
+				new Response(bundleBytes, {
+					status: 200,
+					headers: { "content-length": String(MAX_RELEASE_SIGNATURE_BUNDLE_BYTES + 1) },
+				}),
+		});
+
+		await expect(verify(fetchImpl)).rejects.toThrow(/exceeds 4194304 bytes/);
+	});
+
+	test("a Content-Length exactly at the cap is accepted", async () => {
+		const { fetchImpl } = fetchWith({
+			[`${base}/SHA256SUMS`]: () =>
+				new Response(checksums, {
+					status: 200,
+					headers: { "content-length": String(MAX_RELEASE_CHECKSUMS_BYTES) },
+				}),
+			[`${base}/SHA256SUMS.sigstore.json`]: () => new Response(bundleBytes, { status: 200 }),
+		});
+
+		await expect(verify(fetchImpl)).resolves.toMatchObject({ digest: expect.stringMatching(/^[a-f0-9]{64}$/) });
+	});
+
+	test("refuses a malformed Content-Length instead of guessing", async () => {
+		const { fetchImpl } = fetchWith({
+			[`${base}/SHA256SUMS`]: () => new Response(checksums, { status: 200, headers: { "content-length": "lots" } }),
+		});
+
+		await expect(verify(fetchImpl)).rejects.toThrow(/malformed Content-Length/);
+	});
+
+	test("aborts a chunked SHA256SUMS body the moment it passes the cap", async () => {
+		const chunk = 64 * 1024;
+		const { stream, state } = endlessBody(chunk);
+		const { fetchImpl } = fetchWith({ [`${base}/SHA256SUMS`]: () => new Response(stream, { status: 200 }) });
+
+		await expect(verify(fetchImpl)).rejects.toThrow(/exceeds 1048576 bytes/);
+		// One chunk past the cap and not a byte more; the body was cancelled, never buffered whole.
+		expect(state.pulled).toBeLessThanOrEqual(MAX_RELEASE_CHECKSUMS_BYTES / chunk + 2);
+		expect(state.cancelled).toBe(true);
+	});
+
+	test("aborts a chunked bundle body the moment it passes the cap", async () => {
+		const chunk = 256 * 1024;
+		const { stream, state } = endlessBody(chunk);
+		const { fetchImpl, requested } = fetchWith({
+			[`${base}/SHA256SUMS`]: () => new Response(checksums, { status: 200 }),
+			[`${base}/SHA256SUMS.sigstore.json`]: () => new Response(stream, { status: 200 }),
+		});
+
+		await expect(verify(fetchImpl)).rejects.toThrow(/exceeds 4194304 bytes/);
+		expect(state.pulled).toBeLessThanOrEqual(MAX_RELEASE_SIGNATURE_BUNDLE_BYTES / chunk + 2);
+		expect(state.cancelled).toBe(true);
+		expect(requested).toHaveLength(2);
+	});
+
+	test("a lying Content-Length below the cap does not let an oversized body through", async () => {
+		const { stream, state } = endlessBody(128 * 1024);
+		const { fetchImpl } = fetchWith({
+			[`${base}/SHA256SUMS`]: () => new Response(stream, { status: 200, headers: { "content-length": "100" } }),
+		});
+
+		await expect(verify(fetchImpl)).rejects.toThrow(/exceeds 1048576 bytes/);
+		expect(state.cancelled).toBe(true);
+	});
+});
+
+describe("compiled signer override document", () => {
+	const VALID = {
+		repositoryUri: "https://github.com/example/prime-agent",
+		workflowRepositoryUri: "https://github.com/example/prime-agent",
+		workflowPath: ".github/workflows/standalone-binaries.yml",
+		oidcIssuer: "https://token.actions.githubusercontent.com",
+		runnerEnvironment: "github-hosted",
+		refPattern: "^refs/pull/\\d+/merge$",
+	};
+
+	test("under Node no override is compiled in and the production signer is active", () => {
+		expect(RELEASE_SIGNER_TEST_OVERRIDE).toBeUndefined();
+		expect(ACTIVE_RELEASE_SIGNER).toBe(PINNED_RELEASE_SIGNER);
+	});
+
+	test("parses a complete document and compiles its ref pattern", () => {
+		const parsed = parseSignerOverride(JSON.stringify(VALID));
+
+		expect(parsed).toMatchObject({ ...VALID, refPattern: expect.any(RegExp) });
+		expect(parsed.refPattern.source).toBe(new RegExp(VALID.refPattern).source);
+		expect(parsed.refPattern.test("refs/pull/12/merge")).toBe(true);
+		expect(parsed.refPattern.test("refs/heads/main")).toBe(false);
+	});
+
+	test.each([
+		["not JSON", "nope", /not valid JSON/],
+		["an array", "[]", /JSON object/],
+		["a missing field", JSON.stringify({ ...VALID, oidcIssuer: undefined }), /oidcIssuer must be a non-empty string/],
+		["an empty field", JSON.stringify({ ...VALID, workflowPath: "" }), /workflowPath must be a non-empty string/],
+		["a non-string field", JSON.stringify({ ...VALID, refPattern: 7 }), /refPattern must be a non-empty string/],
+		["an unknown field", JSON.stringify({ ...VALID, extra: "x" }), /unknown field "extra"/],
+		["an http repository", JSON.stringify({ ...VALID, repositoryUri: "http://github.com/x/y" }), /bare https URL/],
+		["a non-URL issuer", JSON.stringify({ ...VALID, oidcIssuer: "token.actions" }), /not a valid URL/],
+		[
+			"credentials in a URL",
+			JSON.stringify({ ...VALID, workflowRepositoryUri: "https://a:b@github.com/x/y" }),
+			/bare https URL/,
+		],
+		[
+			"a workflow path without .yml",
+			JSON.stringify({ ...VALID, workflowPath: ".github/workflows/x" }),
+			/workflowPath/,
+		],
+		["an absolute workflow path", JSON.stringify({ ...VALID, workflowPath: "/w/x.yml" }), /workflowPath/],
+		[
+			"an unknown runner environment",
+			JSON.stringify({ ...VALID, runnerEnvironment: "anywhere" }),
+			/runnerEnvironment/,
+		],
+		["an unanchored ref pattern", JSON.stringify({ ...VALID, refPattern: "refs/heads/main" }), /anchored/],
+		["a non-compiling ref pattern", JSON.stringify({ ...VALID, refPattern: "^refs/(heads$" }), /does not compile/],
+	])("refuses %s", (_label, json, message) => {
+		expect(() => parseSignerOverride(json)).toThrow(message);
 	});
 });
 

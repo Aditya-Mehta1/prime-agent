@@ -1,4 +1,13 @@
-import { mkdirSync, mkdtempSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	mkdirSync,
+	mkdtempSync,
+	readlinkSync,
+	realpathSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -222,21 +231,115 @@ describe("native release metadata isolation", () => {
 	});
 
 	it.each([
-		["query string", "https://releases.example/?x=1"],
-		["fragment", "https://releases.example/#x"],
-		["credentials", "https://user:pass@releases.example"],
-		["http scheme", "http://releases.example"],
-	])("refuses a recorded install source with a %s instead of appending to it", async (_label, source) => {
+		["query string", "https://releases.example/?x=1", /query string/],
+		["fragment", "https://releases.example/#x", /fragment/],
+		["credentials", "https://user:pass@releases.example", /credentials/],
+		["http scheme", "http://releases.example", /must use https/],
+	])("refuses a recorded install source with a %s instead of appending to it", async (_label, source, message) => {
 		vi.stubEnv("PRIME_AGENT_DOWNLOAD_BASE_URL", "");
 		writeFileSync(join(root, "releases", `1.2.3-linux-x64-${"a".repeat(64)}`, ".install-source"), source);
 		const fetchMock = vi.fn();
 		vi.stubGlobal("fetch", fetchMock);
 
 		await expect(getNativeUpdatePlan({ force: false, rollback: false, executable })).rejects.toThrow(
-			/install source/,
+			/^The recorded install source \(\.install-source\)/,
 		);
+		await expect(getNativeUpdatePlan({ force: false, rollback: false, executable })).rejects.toThrow(message);
 		expect(fetchMock).not.toHaveBeenCalled();
 		expect(verifiedDigest).not.toHaveBeenCalled();
+	});
+
+	it("does not report an override that names the recorded origin", async () => {
+		// The recorded source is `https://releases.example`; the same origin, differently spelled.
+		vi.stubEnv("PRIME_AGENT_DOWNLOAD_BASE_URL", "https://Releases.example/");
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => Response.json({ version: "1.2.4", binaries: [artifact] })),
+		);
+		verifiedDigest.mockResolvedValue({
+			digest: artifact.sha256,
+			signerIdentity: SIGNER_IDENTITY,
+			signerRef: "refs/heads/main",
+		});
+
+		const plan = await getNativeUpdatePlan({ force: false, rollback: false, executable });
+
+		expect(plan.overriddenBaseUrl).toBeUndefined();
+		expect(describeNativeUpdatePlan(plan).warnings).toEqual([]);
+		expect(plan.command?.args).toContain("PRIME_AGENT_DOWNLOAD_BASE_URL=https://releases.example");
+	});
+
+	describe("rollback with a legacy install source", () => {
+		const legacySource = "http://legacy.example/prime-agent";
+		let previousTarget: string;
+
+		/** Retain a valid previous release and record the legacy http origin in both releases. */
+		function retainPreviousRelease(): void {
+			const activeDir = join(root, "releases", `1.2.3-linux-x64-${"a".repeat(64)}`);
+			writeFileSync(join(activeDir, ".install-source"), legacySource);
+			writeFileSync(join(activeDir, "install.sh"), "#!/bin/sh\n# prime-agent-native-recovery-v1\n");
+			const checksum = "c".repeat(64);
+			const releaseName = `1.2.2-linux-x64-${checksum}`;
+			const previousDir = join(root, "releases", releaseName);
+			for (const asset of NATIVE_RELEASE_ASSETS) {
+				mkdirSync(dirname(join(previousDir, asset)), { recursive: true });
+				writeFileSync(join(previousDir, asset), "fixture\n");
+			}
+			writeFileSync(join(previousDir, ".archive-sha256"), checksum);
+			writeFileSync(join(previousDir, ".install-source"), legacySource);
+			writeFileSync(join(previousDir, "package.json"), JSON.stringify({ version: "1.2.2" }));
+			writeFileSync(join(previousDir, "prime-agent"), "#!/bin/sh\nprintf '1.2.2\\n'\n");
+			chmodSync(join(previousDir, "prime-agent"), 0o755);
+			previousTarget = `../releases/${releaseName}/prime-agent`;
+			symlinkSync(previousTarget, join(root, "bin", "previous"));
+		}
+
+		it("plans the rollback: nothing is downloaded, so the recorded origin is not validated", async () => {
+			vi.stubEnv("PRIME_AGENT_DOWNLOAD_BASE_URL", "");
+			retainPreviousRelease();
+			const fetchMock = vi.fn();
+			vi.stubGlobal("fetch", fetchMock);
+
+			const plan = await getNativeUpdatePlan({ force: false, rollback: true, executable });
+
+			expect(plan.targetVersion).toBe("1.2.2");
+			expect(plan.verifiedSignerIdentity).toBeUndefined();
+			expect(plan.overriddenBaseUrl).toBeUndefined();
+			expect(plan.command?.args).toContain("--rollback");
+			expect(plan.command?.args).toContain(`PRIME_AGENT_EXPECTED_PREVIOUS=${previousTarget}`);
+			// Handed through exactly as recorded; the installer's rollback never reads it.
+			expect(plan.command?.args).toContain(`PRIME_AGENT_DOWNLOAD_BASE_URL=${legacySource}`);
+			expect(fetchMock).not.toHaveBeenCalled();
+			expect(verifiedDigest).not.toHaveBeenCalled();
+			expect(describeNativeUpdatePlan(plan)).toEqual({
+				notes: ["Restoring the retained release v1.2.2; no download or signature check is involved."],
+				warnings: [],
+			});
+		});
+
+		it("still refuses to download from the same legacy origin", async () => {
+			vi.stubEnv("PRIME_AGENT_DOWNLOAD_BASE_URL", "");
+			retainPreviousRelease();
+			const fetchMock = vi.fn();
+			vi.stubGlobal("fetch", fetchMock);
+
+			await expect(getNativeUpdatePlan({ force: true, rollback: false, executable })).rejects.toThrow(
+				"The recorded install source (.install-source) must use https, got http://.",
+			);
+			expect(fetchMock).not.toHaveBeenCalled();
+			expect(verifiedDigest).not.toHaveBeenCalled();
+			expect(readlinkSync(join(root, "bin", "prime-agent"))).toBe(target);
+		});
+
+		it("reports an override on a rollback plan only when it names a different origin", async () => {
+			retainPreviousRelease();
+			vi.stubEnv("PRIME_AGENT_DOWNLOAD_BASE_URL", "https://mirror.example");
+
+			const plan = await getNativeUpdatePlan({ force: false, rollback: true, executable });
+
+			expect(plan.overriddenBaseUrl).toBe("https://mirror.example");
+			expect(plan.command?.args).toContain("PRIME_AGENT_DOWNLOAD_BASE_URL=https://mirror.example");
+		});
 	});
 
 	describe("user-facing provenance lines", () => {

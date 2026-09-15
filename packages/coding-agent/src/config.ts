@@ -94,8 +94,13 @@ export function detectInstallMethod(): InstallMethod {
 	if (isBunBinary) {
 		// A compiled binary can also be delivered by a package manager (the per-platform npm
 		// packages install the same executable under node_modules). Those copies belong to the
-		// package manager too, not to the self-updater.
-		return classifyPackageManagerPath(`${getPackageDir()}\0${process.execPath || ""}`) ?? "bun-binary";
+		// package manager too, not to the self-updater. Classify the RESOLVED executable as well as
+		// the invoked path: a `bin` symlink into a package tree must not look like a loose binary.
+		return (
+			classifyPackageManagerPath(
+				`${getPackageDir()}\0${process.execPath || ""}\0${resolveExecutablePath(process.execPath || "")}`,
+			) ?? "bun-binary"
+		);
 	}
 
 	const resolvedPath = `${__dirname}\0${process.execPath || ""}`.toLowerCase().replace(/\\/g, "/");
@@ -139,17 +144,31 @@ export function isHomebrewManagedPath(rawPath: string): boolean {
 	return /(?:^|\/)cellar\/[^/]+\/[^/]+(?:\/|$)/.test(path);
 }
 
+/**
+ * Resolve an executable path through every symlink to the file that actually runs. Install-method
+ * decisions (Homebrew, package manager, self-updater) must be made on THIS path, never on the path
+ * as invoked: Homebrew and npm both expose a `bin` symlink whose own location says nothing about who
+ * owns the target. Returns the input unchanged when it cannot be resolved, so callers still see a
+ * non-empty path to match against.
+ */
+export function resolveExecutablePath(executablePath: string): string {
+	if (!executablePath) return executablePath;
+	try {
+		return realpathSync(executablePath);
+	} catch {
+		return executablePath;
+	}
+}
+
 function isHomebrewInstall(): boolean {
 	// Homebrew symlinks `<prefix>/bin/prime-agent` at the keg, so the executable as invoked may not
 	// look like a keg path until it is resolved. Check both, plus the package dir for npm layouts.
-	const candidates = [getPackageDir(), process.execPath || "", __dirname];
-	if (process.execPath) {
-		try {
-			candidates.push(realpathSync(process.execPath));
-		} catch {
-			// An unreadable execPath simply contributes no evidence.
-		}
-	}
+	const candidates = [
+		getPackageDir(),
+		process.execPath || "",
+		resolveExecutablePath(process.execPath || ""),
+		__dirname,
+	];
 	return candidates.some((candidate) => candidate && isHomebrewManagedPath(candidate));
 }
 
