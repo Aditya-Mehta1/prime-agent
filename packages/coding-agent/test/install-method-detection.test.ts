@@ -44,6 +44,8 @@ function createHomebrewBinaryInstall(): { keg: string; executable: string; link:
 	const keg = join(prefix, "Cellar", "prime-agent", "0.9.5");
 	const binDir = join(keg, "bin");
 	mkdirSync(binDir, { recursive: true });
+	// brew writes an INSTALL_RECEIPT.json into every keg; it is what marks a Cellar as Homebrew's.
+	writeFileSync(join(keg, "INSTALL_RECEIPT.json"), "{}\n");
 	const executable = join(binDir, "prime-agent");
 	writeFileSync(executable, "#!/bin/sh\n");
 	mkdirSync(join(prefix, "bin"), { recursive: true });
@@ -68,6 +70,7 @@ function createInstallerShapedHomebrewKeg(): { keg: string; link: string; target
 	const releaseDir = join(keg, "releases", releaseName);
 	mkdirSync(releaseDir, { recursive: true });
 	mkdirSync(join(keg, "bin"));
+	writeFileSync(join(keg, "INSTALL_RECEIPT.json"), "{}\n");
 	writeFileSync(join(keg, ".managed"), "prime-agent-native-v1\n");
 	for (const asset of NATIVE_RELEASE_ASSETS) {
 		mkdirSync(dirname(join(releaseDir, asset)), { recursive: true });
@@ -100,7 +103,7 @@ function createNpmBinaryInstall(): { executable: string } {
 }
 
 describe("isHomebrewManagedPath", () => {
-	test("matches a keg, whatever the prefix or the layout inside it", () => {
+	test("matches a keg under any default Homebrew prefix, whatever the layout inside it", () => {
 		expect(isHomebrewManagedPath("/opt/homebrew/Cellar/prime-agent/0.9.5/bin/prime-agent")).toBe(true);
 		expect(isHomebrewManagedPath("/usr/local/Cellar/prime-agent/0.9.5/bin/prime-agent")).toBe(true);
 		expect(
@@ -108,12 +111,45 @@ describe("isHomebrewManagedPath", () => {
 				"/home/linuxbrew/.linuxbrew/Cellar/prime-agent/0.9.5/libexec/lib/node_modules/prime-agent",
 			),
 		).toBe(true);
-		expect(isHomebrewManagedPath("C:\\brew\\Cellar\\prime-agent\\0.9.5\\bin")).toBe(true);
+		// Homebrew does not exist on Windows; a Cellar-shaped path there is somebody else's directory.
+		expect(isHomebrewManagedPath("C:\\brew\\Cellar\\prime-agent\\0.9.5\\bin")).toBe(false);
 	});
 
 	test("does not match paths that merely contain the word cellar", () => {
 		expect(isHomebrewManagedPath("/Users/kevin/wine-cellar/prime-agent")).toBe(false);
 		expect(isHomebrewManagedPath("/Users/kevin/.local/share/prime-agent/releases/0.9.5/prime-agent")).toBe(false);
+	});
+
+	test("a user directory named Cellar is not Homebrew unless brew left its receipt there", () => {
+		const home = mkdtempSync(join(tmpdir(), "pi-not-brew-"));
+		tempDir = home;
+		const keg = join(home, "Cellar", "project", "1.0");
+		mkdirSync(join(keg, "bin"), { recursive: true });
+		const executable = join(keg, "bin", "prime-agent");
+		writeFileSync(executable, "#!/bin/sh\n");
+		expect(isHomebrewManagedPath(executable)).toBe(false);
+
+		writeFileSync(join(keg, "INSTALL_RECEIPT.json"), "{}\n");
+		expect(isHomebrewManagedPath(executable)).toBe(true);
+	});
+
+	test("HOMEBREW_PREFIX and HOMEBREW_CELLAR make a non-default prefix count without a receipt", () => {
+		const previousPrefix = process.env.HOMEBREW_PREFIX;
+		const previousCellar = process.env.HOMEBREW_CELLAR;
+		try {
+			process.env.HOMEBREW_PREFIX = "/srv/brew";
+			delete process.env.HOMEBREW_CELLAR;
+			expect(isHomebrewManagedPath("/srv/brew/Cellar/prime-agent/0.9.5/bin/prime-agent")).toBe(true);
+			expect(isHomebrewManagedPath("/srv/other/Cellar/prime-agent/0.9.5/bin/prime-agent")).toBe(false);
+			delete process.env.HOMEBREW_PREFIX;
+			process.env.HOMEBREW_CELLAR = "/srv/other/Cellar";
+			expect(isHomebrewManagedPath("/srv/other/Cellar/prime-agent/0.9.5/bin/prime-agent")).toBe(true);
+		} finally {
+			if (previousPrefix === undefined) delete process.env.HOMEBREW_PREFIX;
+			else process.env.HOMEBREW_PREFIX = previousPrefix;
+			if (previousCellar === undefined) delete process.env.HOMEBREW_CELLAR;
+			else process.env.HOMEBREW_CELLAR = previousCellar;
+		}
 	});
 });
 

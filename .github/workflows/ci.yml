@@ -167,6 +167,11 @@ jobs:
     needs: trust
     if: needs.trust.outputs.allowed == 'true'
     uses: ./.github/workflows/standalone-binaries.yml
+    # The reusable workflow signs a test-only build with keyless cosign for the end-to-end updater
+    # test; that needs an OIDC token and nothing else. No secrets are passed.
+    permissions:
+      contents: read
+      id-token: write
 
   build-check-test:
     name: build-check-test

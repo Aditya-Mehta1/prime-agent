@@ -483,7 +483,9 @@ export function readReceipts(receiptsFile, version) {
  */
 function extractBinariesFromArchives(archivesDir, version, receiptsFile) {
 	const receipts = receiptsFile ? readReceipts(receiptsFile, version) : undefined;
-	const staging = mkdtempSync(join(tmpdir(), "prime-agent-npm-binaries-"));
+	// Verify every archive BEFORE creating the staging directory, so a missing archive or a receipt
+	// mismatch never leaves a half-populated temp directory behind.
+	const archives = new Map();
 	for (const platform of Object.keys(PLATFORMS)) {
 		const file = `prime-agent-${version}-${platform}.tar.gz`;
 		const archive = join(archivesDir, file);
@@ -498,9 +500,18 @@ function extractBinariesFromArchives(archivesDir, version, receiptsFile) {
 				);
 			}
 		}
-		const target = join(staging, platform);
-		mkdirSync(target, { recursive: true });
-		run("tar", ["-xzf", archive, "-C", target], root);
+		archives.set(platform, archive);
+	}
+	const staging = mkdtempSync(join(tmpdir(), "prime-agent-npm-binaries-"));
+	try {
+		for (const [platform, archive] of archives) {
+			const target = join(staging, platform);
+			mkdirSync(target, { recursive: true });
+			run("tar", ["-xzf", archive, "-C", target], root);
+		}
+	} catch (error) {
+		rmSync(staging, { recursive: true, force: true });
+		throw error;
 	}
 	return staging;
 }

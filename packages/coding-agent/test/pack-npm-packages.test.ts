@@ -223,7 +223,7 @@ describe("argument hygiene", () => {
 	])("refuses a %s of %s before writing anything", (flag, value) => {
 		const { outDir, result } = stage([flag, value]);
 		expect(result.status, result.stderr).not.toBe(0);
-		expect(result.stderr).toMatch(new RegExp(`${flag.replace(/-/g, "\\-")}`));
+		expect(result.stderr).toContain(flag);
 		expect(existsSync(outDir)).toBe(false);
 		// Nothing may have escaped above the output directory either.
 		expect(existsSync(join(dirname(outDir), "bin"))).toBe(false);

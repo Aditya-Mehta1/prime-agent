@@ -134,14 +134,35 @@ function classifyPackageManagerPath(rawPath: string): InstallMethod | undefined 
 	return undefined;
 }
 
+/** Homebrew's documented default prefixes (macOS Apple silicon, macOS Intel, Linuxbrew). */
+const HOMEBREW_DEFAULT_PREFIXES = ["/opt/homebrew", "/usr/local", "/home/linuxbrew/.linuxbrew"];
+
 /**
- * Whether a path sits inside a Homebrew keg. Matches the `<prefix>/Cellar/<formula>/<version>/...`
- * shape, which covers both the old npm-inside-libexec layout and a formula that installs the
- * compiled binary directly into `<keg>/bin`.
+ * Whether a path sits inside a Homebrew keg: `<prefix>/Cellar/<formula>/<version>/...`. The shape
+ * alone is not enough - a user directory named `Cellar` must not make the self-updater refuse to
+ * work - so the Cellar has to belong to Homebrew: either it sits under a known prefix (the defaults
+ * or `HOMEBREW_PREFIX`/`HOMEBREW_CELLAR` from the environment), or the keg carries the
+ * `INSTALL_RECEIPT.json` that `brew` writes into every keg it installs.
  */
 export function isHomebrewManagedPath(rawPath: string): boolean {
-	const path = rawPath.toLowerCase().replace(/\\/g, "/");
-	return /(?:^|\/)cellar\/[^/]+\/[^/]+(?:\/|$)/.test(path);
+	const normalized = rawPath.replace(/\\/g, "/");
+	const match = /^(.*?)\/cellar\/([^/]+)\/([^/]+)(?:\/|$)/i.exec(normalized);
+	if (!match) return false;
+	const [, prefix, formula, version] = match;
+	if (!formula || !version || formula === "." || formula === "..") return false;
+	const cellar = `${prefix}/Cellar`;
+	const knownPrefixes = new Set(HOMEBREW_DEFAULT_PREFIXES.map((entry) => entry.toLowerCase()));
+	const knownCellars = new Set<string>();
+	const envPrefix = process.env.HOMEBREW_PREFIX?.replace(/\\/g, "/").replace(/\/+$/, "");
+	const envCellar = process.env.HOMEBREW_CELLAR?.replace(/\\/g, "/").replace(/\/+$/, "");
+	if (envPrefix) knownPrefixes.add(envPrefix.toLowerCase());
+	if (envCellar) knownCellars.add(envCellar.toLowerCase());
+	if (knownPrefixes.has(prefix.toLowerCase()) || knownCellars.has(cellar.toLowerCase())) return true;
+	try {
+		return statSync(join(cellar, formula, version, "INSTALL_RECEIPT.json")).isFile();
+	} catch {
+		return false;
+	}
 }
 
 /**
