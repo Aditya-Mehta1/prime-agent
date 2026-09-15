@@ -137,9 +137,25 @@ describe.runIf(process.platform !== "win32")("daemon state root scoping", () => 
 		expect(belongsToStateRoot(join(aliasDir, "nested", "worker-command.sock"))).toBe(true);
 	});
 
+	it("claims a supervisor in a directory literally named '..runtime'", () => {
+		const { root, base } = createRoot();
+		const aliasDir = join(base, "agent-alias");
+		symlinkSync(root.agentDir, aliasDir);
+		const belongsToStateRoot = createDaemonStateRootMatcher(root);
+		expect(belongsToStateRoot(join(root.agentDir, "..runtime", "daemon.sock"))).toBe(true);
+		expect(belongsToStateRoot(join(aliasDir, "..runtime", "daemon.sock"))).toBe(true);
+	});
+
 	it("does not mistake an agent dir with a shared name prefix for our own", () => {
 		const { root, base } = createRoot();
 		expect(createDaemonStateRootMatcher(root)(join(`${base}/agent-other`, "daemon.sock"))).toBe(false);
+	});
+
+	it("still disowns a listener that traverses out of our agent dir", () => {
+		const { root, base } = createRoot();
+		const belongsToStateRoot = createDaemonStateRootMatcher(root);
+		expect(belongsToStateRoot(join(base, "outside.sock"))).toBe(false);
+		expect(belongsToStateRoot(join(base, "..", "outside.sock"))).toBe(false);
 	});
 
 	it("still disowns a listener whose symlink alias points outside our root", () => {

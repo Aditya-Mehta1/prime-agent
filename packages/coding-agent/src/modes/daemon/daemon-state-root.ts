@@ -1,4 +1,4 @@
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { getAgentDir } from "../../config.js";
 import { defaultDaemonSocketDir, defaultDaemonSocketPath, normalizeSocketPath } from "./daemon-socket.js";
 import {
@@ -96,11 +96,13 @@ export function createDaemonStateRootMatcher(
  * rather than a prefix comparison so a sibling whose name merely starts with the
  * parent's name (`/tmp/agent-other` against `/tmp/agent`) is not mistaken for a
  * child, and so an absolute result on a different volume is rejected outright.
+ * Traversal is recognized only as a complete `..` path segment, so a directory
+ * literally named `..runtime` still counts as a child.
  */
 function isInside(directory: string, parent: string): boolean {
 	if (directory === parent) return true;
 	const offset = relative(parent, directory);
-	return offset.length > 0 && !offset.startsWith("..") && !isAbsolute(offset);
+	return offset.length > 0 && offset !== ".." && !offset.startsWith(`..${sep}`) && !isAbsolute(offset);
 }
 
 /**
