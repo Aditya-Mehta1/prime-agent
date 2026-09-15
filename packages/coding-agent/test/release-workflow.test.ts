@@ -13,23 +13,25 @@ interface Step {
 	uses?: string;
 	if?: string;
 	"continue-on-error"?: boolean;
+	env?: Record<string, string>;
 	with?: Record<string, string>;
 }
 interface Matrix {
-	platform?: string[];
-	channel?: string[];
-	include: { platform: string; runner: string }[];
+	include: { channel?: string; platform: string; runner: string }[];
 }
 interface Job {
 	needs?: string | string[];
 	if?: string;
 	"continue-on-error"?: boolean;
 	"runs-on"?: string;
-	strategy?: { matrix: Matrix };
+	strategy?: { "fail-fast"?: boolean; matrix: Matrix | string };
+	outputs?: Record<string, string>;
 	steps: Step[];
+	uses?: string;
 	with?: Record<string, string>;
 }
 interface Workflow {
+	concurrency?: { "cancel-in-progress"?: boolean | string; group?: string; queue?: string };
 	jobs: Record<string, Job>;
 	on: Record<string, unknown>;
 }
@@ -43,11 +45,25 @@ const releasePlatforms = spawnSync(process.execPath, [join(repository, "scripts/
 	.split("\n");
 const release: Workflow = parse(readFileSync(join(repository, ".github/workflows/build-binaries.yml"), "utf8"));
 const standalone: Workflow = parse(readFileSync(join(repository, ".github/workflows/standalone-binaries.yml"), "utf8"));
+const ci: Workflow = parse(readFileSync(join(repository, ".github/workflows/ci.yml"), "utf8"));
+const matrixResolver = join(repository, "scripts/release-macos-validation-matrix.mjs");
 
 function step(job: Job, name: string): Step {
 	const found = job.steps.find((entry) => entry.name === name);
 	expect(found, `Missing workflow step: ${name}`).toBeDefined();
 	return found!;
+}
+
+function matrix(job: Job): Matrix {
+	const value = job.strategy?.matrix;
+	expect(value).toBeTypeOf("object");
+	return value as Matrix;
+}
+
+function resolveValidationMatrix(publishProduction: boolean, publishBeta: boolean) {
+	return spawnSync(process.execPath, [matrixResolver, String(publishProduction), String(publishBeta)], {
+		encoding: "utf8",
+	});
 }
 
 function requiresSuccess(job: Job): void {
@@ -61,25 +77,54 @@ function requiresSuccess(job: Job): void {
 }
 
 describe("release workflow signature gates", () => {
-	it("requires successful build and both native final validation jobs before publication", () => {
+	it("cancels only superseded pull request release runs", () => {
+		expect(release.concurrency?.group).toBe(
+			`\${{ github.event_name == 'pull_request' && format('release-validation-pr-{0}', github.event.pull_request.number) || 'release-prime-agent' }}`,
+		);
+		expect(release.concurrency?.["cancel-in-progress"]).toBe(`\${{ github.event_name == 'pull_request' }}`);
+		expect(release.concurrency?.queue).toBe("max");
+	});
+
+	it("keeps every external release action pinned to a full commit", () => {
+		for (const workflow of [release, standalone]) {
+			for (const job of Object.values(workflow.jobs)) {
+				for (const action of job.steps ?? []) {
+					if (action.uses && !action.uses.startsWith("./")) expect(action.uses).toMatch(/@[0-9a-f]{40}$/);
+				}
+			}
+		}
+	});
+
+	it("makes Release Prime Agent the only CI owner of standalone validation", () => {
+		expect(release.on).toHaveProperty("pull_request");
+		expect(release.on).toHaveProperty("push");
+		expect(ci.jobs.standalone).toBeUndefined();
+		for (const job of Object.values(ci.jobs)) {
+			expect(job.uses ?? "").not.toContain("standalone-binaries.yml");
+		}
+		expect(release.jobs.standalone?.uses).toBe("./.github/workflows/standalone-binaries.yml");
+		expect(release.jobs.build?.needs).toEqual(expect.arrayContaining(["release-context", "standalone"]));
+
+		const aggregate = ci.jobs["build-check-test"]!;
+		expect(aggregate.needs).toEqual(["trust", "build-check", "test"]);
+		const verify = step(aggregate, "Verify CI results");
+		expect(verify.run).not.toContain("STANDALONE");
+		expect(verify.env).not.toHaveProperty("STANDALONE_RESULT");
+	});
+	it("requires successful build and dynamic native final validation before publication", () => {
+		const context = release.jobs["release-context"]!;
+		expect(context.outputs?.macos_validation_matrix).toBe(`\${{ steps.context.outputs.macos_validation_matrix }}`);
 		const validation = release.jobs["validate-macos"]!;
 		expect(validation.needs).toEqual(expect.arrayContaining(["release-context", "build"]));
 		expect(validation["runs-on"]).toBe(`\${{ matrix.runner }}`);
-		const matrix = validation.strategy?.matrix;
-		expect(matrix?.platform).toEqual(["darwin-arm64", "darwin-x64"]);
-		expect(matrix?.channel).toEqual(["production", "beta"]);
-		expect(matrix?.include).toEqual([
-			{ platform: "darwin-arm64", runner: "macos-15" },
-			{ platform: "darwin-x64", runner: "macos-15-intel" },
-		]);
-		expect(
-			matrix!.platform!.flatMap((platform) => matrix!.channel!.map((channel) => ({ platform, channel }))),
-		).toEqual([
-			{ platform: "darwin-arm64", channel: "production" },
-			{ platform: "darwin-arm64", channel: "beta" },
-			{ platform: "darwin-x64", channel: "production" },
-			{ platform: "darwin-x64", channel: "beta" },
-		]);
+		expect(validation.strategy?.["fail-fast"]).toBe(false);
+		expect(validation.strategy?.matrix).toBe(
+			`\${{ fromJSON(needs.release-context.outputs.macos_validation_matrix) }}`,
+		);
+		expect(validation.if).toBeUndefined();
+		expect(validation.steps.some((entry) => entry.id === "gate")).toBe(false);
+		for (const entry of validation.steps) expect(entry.if ?? "").not.toContain("steps.gate");
+
 		const publish = release.jobs.publish!;
 		expect(publish.needs).toEqual(expect.arrayContaining(["build", "validate-macos"]));
 		expect(publish.if).toBe("github.event_name != 'pull_request'");
@@ -88,42 +133,45 @@ describe("release workflow signature gates", () => {
 	});
 
 	it.each([
-		{ channel: "production", publishProduction: true, publishBeta: false, skip: false },
-		{ channel: "beta", publishProduction: true, publishBeta: false, skip: true },
-		{ channel: "production", publishProduction: false, publishBeta: true, skip: true },
-		{ channel: "beta", publishProduction: false, publishBeta: true, skip: false },
-		{ channel: "production", publishProduction: true, publishBeta: true, skip: false },
-		{ channel: "beta", publishProduction: true, publishBeta: true, skip: false },
-	])("gates the $channel matrix lane when skip=$skip", ({ channel, publishProduction, publishBeta, skip }) => {
-		const validation = release.jobs["validate-macos"]!;
-		expect(validation.if).toBe(
-			"needs.release-context.outputs.publish_production == 'true' || needs.release-context.outputs.publish_beta == 'true'",
-		);
-		const gate = step(validation, "Check channel is enabled");
-		expect(gate.id).toBe("gate");
-		expect(validation.steps[0]).toBe(gate);
-		for (const entry of validation.steps.slice(1)) {
-			expect(entry.if, entry.name).toBe("steps.gate.outputs.skip != 'true'");
-		}
+		{
+			name: "pull request dual channel",
+			publishProduction: true,
+			publishBeta: true,
+			include: [
+				{ channel: "production", platform: "darwin-arm64", runner: "macos-15" },
+				{ channel: "production", platform: "darwin-x64", runner: "macos-15-intel" },
+				{ channel: "beta", platform: "darwin-arm64", runner: "macos-15" },
+				{ channel: "beta", platform: "darwin-x64", runner: "macos-15-intel" },
+			],
+		},
+		{
+			name: "ordinary beta-only release",
+			publishProduction: false,
+			publishBeta: true,
+			include: [
+				{ channel: "beta", platform: "darwin-arm64", runner: "macos-15" },
+				{ channel: "beta", platform: "darwin-x64", runner: "macos-15-intel" },
+			],
+		},
+		{
+			name: "production-only release",
+			publishProduction: true,
+			publishBeta: false,
+			include: [
+				{ channel: "production", platform: "darwin-arm64", runner: "macos-15" },
+				{ channel: "production", platform: "darwin-x64", runner: "macos-15-intel" },
+			],
+		},
+	])("resolves exactly the enabled macOS entries for $name", ({ publishProduction, publishBeta, include }) => {
+		const result = resolveValidationMatrix(publishProduction, publishBeta);
+		expect(result.status, result.stderr).toBe(0);
+		expect(JSON.parse(result.stdout)).toEqual({ include });
+	});
 
-		const directory = mkdtempSync(join(tmpdir(), "prime-release-gate-"));
-		try {
-			const output = join(directory, "output");
-			const result = spawnSync("bash", ["-e", "-o", "pipefail", "-c", gate.run!], {
-				env: {
-					...process.env,
-					CHANNEL: channel,
-					PUBLISH_PRODUCTION: String(publishProduction),
-					PUBLISH_BETA: String(publishBeta),
-					GITHUB_OUTPUT: output,
-				},
-				encoding: "utf8",
-			});
-			expect(result.status, result.stderr).toBe(0);
-			expect(readFileSync(output, "utf8").trim()).toBe(`skip=${skip}`);
-		} finally {
-			rmSync(directory, { recursive: true, force: true });
-		}
+	it("fails closed when no release channel is enabled", () => {
+		const result = resolveValidationMatrix(false, false);
+		expect(result.status).not.toBe(0);
+		expect(result.stderr).toContain("At least one release channel must be enabled");
 	});
 
 	it("tests final channel archives before uploading receipts, then checks receipts before external writes", () => {
@@ -149,6 +197,33 @@ describe("release workflow signature gates", () => {
 		);
 		expect(writes.length).toBeGreaterThan(0);
 		for (const write of writes) expect(publish.steps.indexOf(gate)).toBeLessThan(publish.steps.indexOf(write));
+	});
+
+	it("keeps exact channel artifact and unique receipt paths through publisher validation", () => {
+		const validation = release.jobs["validate-macos"]!;
+		const channelDownload = step(validation, "Download exact final channel artifacts");
+		expect(channelDownload.with).toMatchObject({
+			name: `prime-agent-\${{ matrix.channel }}`,
+			path: `\${{ runner.temp }}/final-artifacts/prime-agent-\${{ matrix.channel }}`,
+		});
+		const identityDownload = step(validation, "Download tested executable identity");
+		expect(identityDownload.with).toMatchObject({
+			name: `standalone-\${{ matrix.platform }}`,
+			path: `\${{ runner.temp }}/standalone-reference`,
+		});
+		const upload = step(validation, "Upload native validation receipt");
+		expect(upload.with).toMatchObject({
+			name: `macos-validation-\${{ matrix.channel }}-\${{ matrix.platform }}`,
+			path: `\${{ runner.temp }}/macos-validation/\${{ matrix.channel }}-\${{ matrix.platform }}.json`,
+			"if-no-files-found": "error",
+		});
+
+		const publisherDownload = step(release.jobs.publish!, "Download native validation receipts");
+		expect(publisherDownload.with).toMatchObject({
+			pattern: "macos-validation-*",
+			path: "macos-validation",
+			"merge-multiple": true,
+		});
 	});
 
 	it.each([{ channel: "production" }, { channel: "beta" }])(
@@ -204,7 +279,7 @@ ${step(validation, "Verify and exercise exact final Mac archive").run}`,
 
 	it("retains every standalone target and only uploads tested executable identities", () => {
 		const build = standalone.jobs.build!;
-		expect(build.strategy?.matrix.include.map((entry) => entry.platform)).toEqual(releasePlatforms);
+		expect(matrix(build).include.map((entry) => entry.platform)).toEqual(releasePlatforms);
 		// Each target must be compiled explicitly; the host default cannot produce a cross-build.
 		expect(step(build, "Compile standalone application").run).toContain(`--platform \${{ matrix.platform }}`);
 		const test = step(build, "Test extracted application without JavaScript runtimes on PATH");
@@ -231,7 +306,7 @@ ${step(validation, "Verify and exercise exact final Mac archive").run}`,
 		const upload = build.steps.find((entry) => entry.uses?.startsWith("actions/upload-artifact@"))!;
 		expect(build.steps.indexOf(musl)).toBeLessThan(build.steps.indexOf(upload));
 		// A container smoke test only proves execution when the runner matches the target architecture.
-		for (const entry of build.strategy!.matrix.include) {
+		for (const entry of matrix(build).include) {
 			if (!entry.platform.startsWith("linux-")) continue;
 			expect(entry.runner.endsWith("-arm"), entry.platform).toBe(entry.platform.includes("arm64"));
 		}
@@ -278,6 +353,14 @@ ${step(validation, "Verify and exercise exact final Mac archive").run}`,
 					build_ref: "abcdef0123456789",
 				});
 				expect(values.beta_version).toBe(`${values.production_version}-beta.5.1.abcdef0`);
+				expect(JSON.parse(values.macos_validation_matrix)).toEqual({
+					include: [
+						{ channel: "production", platform: "darwin-arm64", runner: "macos-15" },
+						{ channel: "production", platform: "darwin-x64", runner: "macos-15-intel" },
+						{ channel: "beta", platform: "darwin-arm64", runner: "macos-15" },
+						{ channel: "beta", platform: "darwin-x64", runner: "macos-15-intel" },
+					],
+				});
 				for (const [name, channel] of [
 					["Pack production release", "stable"],
 					["Pack beta release", "beta"],
