@@ -383,7 +383,12 @@ export interface RlmChildAgentSnapshot {
 	progressNote?: string;
 	/** Wall-clock ms of the last tracked child activity (seeded at admission, then model/tool/note events). */
 	lastActivityAt?: number;
-	/** Set when a running child has had no tracked activity for the staleness threshold. */
+	/**
+	 * Active time in ms since the last tracked activity, once past the staleness
+	 * threshold, for a running child that is not executing a tool call.
+	 * Measured against the monotonic clock, so a host sleep that freezes the
+	 * session does not flag every running child stale on wake.
+	 */
 	activityStaleMs?: number;
 	error?: string;
 }
@@ -1016,11 +1021,17 @@ interface RlmChildRun {
 	/** Bounded ring of the child's latest progress notes (newest last). */
 	progressNotes: string[];
 	/**
-	 * Wall-clock ms of the last tracked child activity; drives snapshot staleness.
+	 * Wall-clock ms of the last tracked child activity; carried into snapshots.
 	 * Seeded at admission so a child that never emits a tracked event still
 	 * crosses the staleness threshold once running.
 	 */
 	lastActivityAt?: number;
+	/**
+	 * Monotonic counterpart of lastActivityAt (performance.now()), written by
+	 * the same events. Staleness measures this so wall-clock jumps (a host
+	 * sleep freezing the whole session) do not inflate it.
+	 */
+	lastActivityMonotonicAt?: number;
 	error?: string;
 	abort: () => void;
 	publication: AgentMessageDeferred;
@@ -1259,13 +1270,39 @@ export function rlmChildLabel(prompt: string): string {
 }
 
 /**
+ * Record a tracked child activity on both clocks: lastActivityAt stays
+ * wall-clock ms for snapshots, and its monotonic twin bounds staleness so a
+ * host sleep cannot inflate it.
+ */
+function touchRlmChildActivity(run: RlmChildRun): void {
+	run.lastActivityAt = Date.now();
+	run.lastActivityMonotonicAt = performance.now();
+}
+
+/**
  * Lazily computed staleness for a running child: how long since the last
  * tracked activity, once past the threshold. Computed at snapshot build time
  * only — no background timers update it.
+ *
+ * A tool call in flight (activity "executing") is legitimately quiet for its
+ * whole duration — a minutes-long bash() run emits no events while it works —
+ * so an executing child never reports stale. Staleness measures active time:
+ * the wall clock alone would mark every running child stale after a laptop
+ * sleep, so the smaller of the wall and monotonic clock deltas bounds it to
+ * time the host was actually awake.
  */
-function rlmActivityStaleMs(status: RlmChildAgentStatus, lastActivityAt: number | undefined): number | undefined {
+function rlmActivityStaleMs(
+	status: RlmChildAgentStatus,
+	activity: RlmChildAgentActivity | undefined,
+	lastActivityAt: number | undefined,
+	lastActivityMonotonicAt: number | undefined,
+): number | undefined {
 	if (status !== "running" || lastActivityAt === undefined) return undefined;
-	const staleMs = Date.now() - lastActivityAt;
+	if (activity?.kind === "executing") return undefined;
+	const wallStaleMs = Date.now() - lastActivityAt;
+	const monotonicStaleMs =
+		lastActivityMonotonicAt === undefined ? wallStaleMs : performance.now() - lastActivityMonotonicAt;
+	const staleMs = Math.min(wallStaleMs, monotonicStaleMs);
 	return staleMs >= RLM_CHILD_STALE_ACTIVITY_THRESHOLD_MS ? staleMs : undefined;
 }
 
@@ -11422,7 +11459,7 @@ export class AgentSession {
 			repliedSinceTask: child?._repliedToParentSinceTask,
 			progressNote: run.progressNotes.at(-1),
 			lastActivityAt: run.lastActivityAt,
-			activityStaleMs: rlmActivityStaleMs(run.status, run.lastActivityAt),
+			activityStaleMs: rlmActivityStaleMs(run.status, run.activity, run.lastActivityAt, run.lastActivityMonotonicAt),
 			error: run.error,
 		};
 	}
@@ -11889,6 +11926,7 @@ export class AgentSession {
 		};
 		let runningToolCount = 0;
 		let childSession: AgentSession | undefined;
+		const startedMonotonicAt = performance.now();
 		const run: RlmChildRun = {
 			id: childNodeId,
 			prompt,
@@ -11901,6 +11939,7 @@ export class AgentSession {
 			// Seed the staleness clock at admission: a child hung before its
 			// first tracked event still crosses the threshold once running.
 			lastActivityAt: startedAt,
+			lastActivityMonotonicAt: startedMonotonicAt,
 			settled: false,
 			abort: noopRlmChildAbort,
 			publication: createAgentMessageDeferred(),
@@ -12011,19 +12050,19 @@ export class AgentSession {
 					}
 					if (event.type === "agent_start") {
 						run.activity = { kind: "waiting" };
-						run.lastActivityAt = Date.now();
+						touchRlmChildActivity(run);
 						emitChildUpdate();
 					} else if (event.type === "agent_end") {
 						flushPendingChildUsageAttribution();
 						run.activity = undefined;
-						run.lastActivityAt = Date.now();
+						touchRlmChildActivity(run);
 						emitChildUpdate();
 					} else if (event.type === "rlm_progress_note") {
 						run.progressNotes.push(event.message);
 						if (run.progressNotes.length > RLM_CHILD_PROGRESS_NOTE_RING_MAX) {
 							run.progressNotes.shift();
 						}
-						run.lastActivityAt = Date.now();
+						touchRlmChildActivity(run);
 						emitChildUpdate();
 					} else if (event.type === "message_end" && event.message.role === "assistant") {
 						const assistant = event.message as AssistantMessage;
@@ -12055,14 +12094,14 @@ export class AgentSession {
 						}
 						const text = compactRlmText(readAssistantText(assistant));
 						if (text) run.answerPreview = text;
-						run.lastActivityAt = Date.now();
+						touchRlmChildActivity(run);
 						emitChildUpdate();
 					} else if (event.type === "message_start" || event.type === "message_update") {
 						if (event.message.role === "assistant") {
 							const text = compactRlmText(readAssistantText(event.message as AssistantMessage));
 							if (text) run.answerPreview = text;
 							run.activity = { kind: "writing" };
-							run.lastActivityAt = Date.now();
+							touchRlmChildActivity(run);
 							emitChildUpdate();
 						}
 					} else if (event.type === "tool_execution_start") {
@@ -12070,12 +12109,12 @@ export class AgentSession {
 						run.toolUseCount += 1;
 						runningToolCount += 1;
 						run.activity = { kind: "executing", toolName: event.toolName };
-						run.lastActivityAt = Date.now();
+						touchRlmChildActivity(run);
 						emitChildUpdate();
 					} else if (event.type === "tool_execution_end") {
 						runningToolCount = Math.max(0, runningToolCount - 1);
 						if (runningToolCount === 0) run.activity = { kind: "waiting" };
-						run.lastActivityAt = Date.now();
+						touchRlmChildActivity(run);
 						emitChildUpdate();
 					} else if (event.type === "session_info_changed" || event.type === "recap_update") {
 						emitChildUpdate();

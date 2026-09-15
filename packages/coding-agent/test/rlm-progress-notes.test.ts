@@ -25,6 +25,7 @@ const model = getModel("anthropic", "claude-sonnet-4-5")!;
 interface InspectableRlmRun {
 	progressNotes: string[];
 	lastActivityAt?: number;
+	lastActivityMonotonicAt?: number;
 	status: string;
 	activity?: { kind: string };
 	session?: AgentSession;
@@ -323,8 +324,10 @@ describe("rlm.progress.note child progress channel", () => {
 			// The agent turn starts asynchronously; wait for its activity signal
 			// so no tracked event can overwrite the simulated staleness below.
 			await waitFor(() => run.activity !== undefined);
-			// Simulate a child silent past the threshold.
+			// Simulate a child silent for the threshold of active time: age
+			// both clocks together, as real elapsed time would.
 			run.lastActivityAt = Date.now() - 11 * 60_000;
+			run.lastActivityMonotonicAt = performance.now() - 11 * 60_000;
 			const staleSnapshot = session.getRlmChildSnapshots().find((candidate) => candidate.id === handle.rlm_child_id);
 			expect(staleSnapshot?.status).toBe("running");
 			expect(staleSnapshot?.activityStaleMs).toBeGreaterThanOrEqual(10 * 60_000);
@@ -337,6 +340,100 @@ describe("rlm.progress.note child progress channel", () => {
 			run.lastActivityAt = Date.now();
 			const freshSnapshot = session.getRlmChildSnapshots().find((candidate) => candidate.id === handle.rlm_child_id);
 			expect(freshSnapshot?.activityStaleMs).toBeUndefined();
+		} finally {
+			held.complete("child answer");
+			await waitFor(
+				() => session!.getRlmChildSnapshots().every((candidate) => candidate.status !== "running"),
+				20_000,
+			);
+		}
+	});
+
+	it("never marks a tool call in flight stale, even past the threshold", async () => {
+		const held = heldAnswerStream();
+		session = makeSession(held.streamFn);
+		const handle = await session.runRlmChild("slow task", { name: "worker-a" });
+		const runs = (session as unknown as InspectableRlmSession)._activeRlmChildRuns;
+		await waitFor(() => runs.get(handle.rlm_child_id)?.session !== undefined, 20_000);
+		const run = runs.get(handle.rlm_child_id)!;
+		const child = run.session!;
+
+		try {
+			// The agent turn starts asynchronously; wait for its activity signal
+			// so no tracked event can overwrite the injected tool execution.
+			await waitFor(() => run.activity !== undefined, 20_000);
+			const emitChild = (event: unknown) => (child as unknown as { _emit: (event: unknown) => void })._emit(event);
+			emitChild({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "bash", args: {} });
+
+			// A long bash() call streams no child events for its whole
+			// duration; age both clocks 11 minutes into that silence. The
+			// child is busy executing, not stale (regression: staleness used
+			// to ignore activity and flag exactly this case).
+			run.lastActivityAt = Date.now() - 11 * 60_000;
+			run.lastActivityMonotonicAt = performance.now() - 11 * 60_000;
+			const executingSnapshot = session
+				.getRlmChildSnapshots()
+				.find((candidate) => candidate.id === handle.rlm_child_id);
+			expect(executingSnapshot?.status).toBe("running");
+			expect(executingSnapshot?.activity).toEqual({ kind: "executing", toolName: "bash" });
+			expect(executingSnapshot?.activityStaleMs).toBeUndefined();
+
+			const roster = await session.listRlmSubagents();
+			const entry = roster.subagents.find((candidate) => candidate.rlm_child_id === handle.rlm_child_id);
+			expect(entry?.activity).toEqual({ kind: "executing", tool_name: "bash" });
+			expect(entry?.activity_stale_ms).toBeUndefined();
+
+			// The suppression is executing-only: once the tool ends and the
+			// child goes quiet again for the threshold, staleness returns.
+			emitChild({ type: "tool_execution_end", toolCallId: "tool-1", args: {}, output: "" });
+			run.lastActivityAt = Date.now() - 11 * 60_000;
+			run.lastActivityMonotonicAt = performance.now() - 11 * 60_000;
+			const waitingSnapshot = session
+				.getRlmChildSnapshots()
+				.find((candidate) => candidate.id === handle.rlm_child_id);
+			expect(waitingSnapshot?.activity?.kind).toBe("waiting");
+			expect(waitingSnapshot?.activityStaleMs).toBeGreaterThanOrEqual(10 * 60_000);
+		} finally {
+			held.complete("child answer");
+			await waitFor(
+				() => session!.getRlmChildSnapshots().every((candidate) => candidate.status !== "running"),
+				20_000,
+			);
+		}
+	});
+
+	it("does not flag a running child stale after a host-sleep wall-clock jump", async () => {
+		const held = heldAnswerStream();
+		session = makeSession(held.streamFn);
+		const handle = await session.runRlmChild("slow task", { name: "worker-a" });
+		const runs = (session as unknown as InspectableRlmSession)._activeRlmChildRuns;
+		await waitFor(() => runs.get(handle.rlm_child_id)?.session !== undefined, 20_000);
+		const run = runs.get(handle.rlm_child_id)!;
+
+		try {
+			// The agent turn starts asynchronously; wait for its activity signal
+			// so no tracked event can overwrite the simulated wake below.
+			await waitFor(() => run.activity !== undefined, 20_000);
+			// Simulate waking from a six-hour laptop sleep: the wall clock
+			// jumped, but the monotonic clock only advanced while the host
+			// was awake (regression: wall-clock staleness marked every
+			// running child stale on wake).
+			run.lastActivityAt = Date.now() - 6 * 60 * 60_000;
+			run.lastActivityMonotonicAt = performance.now() - 30_000;
+			const wokeSnapshot = session.getRlmChildSnapshots().find((candidate) => candidate.id === handle.rlm_child_id);
+			expect(wokeSnapshot?.status).toBe("running");
+			expect(wokeSnapshot?.activityStaleMs).toBeUndefined();
+
+			const roster = await session.listRlmSubagents();
+			const entry = roster.subagents.find((candidate) => candidate.rlm_child_id === handle.rlm_child_id);
+			expect(entry?.activity_stale_ms).toBeUndefined();
+
+			// Staleness still measures genuinely idle active time: a child
+			// silent for the threshold while the host is awake stays stale
+			// even with the stale wall-clock reading still in place.
+			run.lastActivityMonotonicAt = performance.now() - 11 * 60_000;
+			const idleSnapshot = session.getRlmChildSnapshots().find((candidate) => candidate.id === handle.rlm_child_id);
+			expect(idleSnapshot?.activityStaleMs).toBeGreaterThanOrEqual(10 * 60_000);
 		} finally {
 			held.complete("child answer");
 			await waitFor(
@@ -359,6 +456,7 @@ describe("rlm.progress.note child progress channel", () => {
 			// once running. Previously the timestamp only appeared with the
 			// first child event, so a never-active child was never stale.
 			expect(run.lastActivityAt).toBeGreaterThan(0);
+			expect(run.lastActivityMonotonicAt).toBeGreaterThan(0);
 		} finally {
 			held.complete("child answer");
 			await waitFor(() => {
