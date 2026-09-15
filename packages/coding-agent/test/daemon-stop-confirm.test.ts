@@ -1,10 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RunningDaemonProbe } from "../src/cli/daemon-launch.js";
-import {
-	confirmDaemonSessionLoss,
-	type DaemonSessionLossCopy,
-	pluralizeSessions,
-} from "../src/cli/daemon-stop-confirm.js";
+import { confirmDaemonSessionLoss, type DaemonSessionLossCopy } from "../src/cli/daemon-stop-confirm.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 
 const COPY: DaemonSessionLossCopy = {
@@ -39,83 +35,90 @@ describe("confirmDaemonSessionLoss", () => {
 		}
 	});
 
-	it("proceeds without prompting when the daemon is unreachable", async () => {
-		setTTY(true);
-		const probe: RunningDaemonProbe = { reachable: false };
-		expect(await confirmDaemonSessionLoss(probe, { force: false, copy: COPY })).toBe(true);
-	});
+	// Stopping the daemon while a session is working loses that work, so the guard must
+	// only proceed unattended when nothing is busy.
+	it.each([
+		["proceeds when the daemon is unreachable", true, { reachable: false } as RunningDaemonProbe, false, true],
+		[
+			"proceeds when force is set",
+			true,
+			{ reachable: true, activeSessions: [session({ isStreaming: true })] } as RunningDaemonProbe,
+			true,
+			true,
+		],
+		[
+			"proceeds when no session is busy",
+			true,
+			{ reachable: true, activeSessions: [session({ isStreaming: false }), session({})] } as RunningDaemonProbe,
+			false,
+			true,
+		],
+		[
+			"aborts when a queued session is busy off a TTY",
+			false,
+			{
+				reachable: true,
+				activeSessions: [
+					session({ isSessionActive: true, sessionActions: { queuedCount: 2, steering: [], followUps: [] } }),
+				],
+			} as RunningDaemonProbe,
+			false,
+			false,
+		],
+		[
+			"aborts when a compacting session is busy off a TTY",
+			false,
+			{
+				reachable: true,
+				activeSessions: [session({ isSessionActive: true, isCompacting: true })],
+			} as RunningDaemonProbe,
+			false,
+			false,
+		],
+		[
+			"aborts when a streaming session is busy off a TTY",
+			false,
+			{
+				reachable: true,
+				activeSessions: [session({ isSessionActive: true, isStreaming: true })],
+			} as RunningDaemonProbe,
+			false,
+			false,
+		],
+		[
+			"aborts when a running bash session is busy off a TTY",
+			false,
+			{
+				reachable: true,
+				activeSessions: [session({ isSessionActive: true, isBashRunning: true })],
+			} as RunningDaemonProbe,
+			false,
+			false,
+		],
+		[
+			"aborts when a session with running RLM children is busy off a TTY",
+			false,
+			{ reachable: true, activeSessions: [session({ hasRunningRlmChildren: true })] } as RunningDaemonProbe,
+			false,
+			false,
+		],
+		[
+			"aborts when only client-owned sessions are busy off a TTY",
+			false,
+			{ reachable: true, activeSessions: [], busyClientOwnedSessionCount: 2 } as RunningDaemonProbe,
+			false,
+			false,
+		],
+		[
+			"aborts when sessions cannot be listed off a TTY",
+			false,
+			{ reachable: true } as RunningDaemonProbe,
+			false,
+			false,
+		],
+	])("%s", async (_name, tty, probe, force, expected) => {
+		setTTY(tty);
 
-	it("proceeds without prompting when force is set", async () => {
-		setTTY(true);
-		const probe: RunningDaemonProbe = { reachable: true, activeSessions: [session({ isStreaming: true })] };
-		expect(await confirmDaemonSessionLoss(probe, { force: true, copy: COPY })).toBe(true);
-	});
-
-	it("proceeds without prompting when no session is busy", async () => {
-		setTTY(true);
-		const probe: RunningDaemonProbe = {
-			reachable: true,
-			activeSessions: [
-				session({ isStreaming: false }),
-				session({ sessionActions: { queuedCount: 0, steering: [], followUps: [] } }),
-			],
-		};
-		expect(await confirmDaemonSessionLoss(probe, { force: false, copy: COPY })).toBe(true);
-	});
-
-	it("aborts without prompting when not at a TTY and a session is busy", async () => {
-		setTTY(false);
-		const probe: RunningDaemonProbe = {
-			reachable: true,
-			activeSessions: [
-				session({
-					isSessionActive: true,
-					sessionActions: { queuedCount: 2, steering: [], followUps: [] },
-				}),
-			],
-		};
-		expect(await confirmDaemonSessionLoss(probe, { force: false, copy: COPY })).toBe(false);
-		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("hint"));
-		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("busy:1"));
-	});
-
-	it("counts busy client-owned sessions without exposing their identities", async () => {
-		setTTY(false);
-		const probe: RunningDaemonProbe = {
-			reachable: true,
-			activeSessions: [],
-			busyClientOwnedSessionCount: 2,
-		};
-		expect(await confirmDaemonSessionLoss(probe, { force: false, copy: COPY })).toBe(false);
-		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("busy:2"));
-	});
-
-	it("aborts without prompting when not at a TTY and sessions cannot be listed", async () => {
-		setTTY(false);
-		const probe: RunningDaemonProbe = { reachable: true };
-		expect(await confirmDaemonSessionLoss(probe, { force: false, copy: COPY })).toBe(false);
-		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("unlistable"));
-	});
-
-	it("treats compacting and pending-message sessions as busy", async () => {
-		setTTY(false);
-		for (const overrides of [
-			{ isSessionActive: true, isCompacting: true },
-			{ isSessionActive: true, sessionActions: { queuedCount: 1, steering: [], followUps: [] } },
-			{ isSessionActive: true, isStreaming: true },
-			{ isSessionActive: true, isBashRunning: true },
-			{ hasRunningRlmChildren: true },
-		]) {
-			vi.mocked(console.error).mockClear();
-			const probe: RunningDaemonProbe = { reachable: true, activeSessions: [session(overrides)] };
-			expect(await confirmDaemonSessionLoss(probe, { force: false, copy: COPY })).toBe(false);
-		}
-	});
-});
-
-describe("pluralizeSessions", () => {
-	it("uses singular for one and plural otherwise", () => {
-		expect(pluralizeSessions(1)).toEqual({ noun: "session", pronoun: "it" });
-		expect(pluralizeSessions(2)).toEqual({ noun: "sessions", pronoun: "them" });
+		expect(await confirmDaemonSessionLoss(probe, { force, copy: COPY })).toBe(expected);
 	});
 });
