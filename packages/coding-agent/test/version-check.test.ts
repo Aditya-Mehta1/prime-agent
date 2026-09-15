@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { NATIVE_PLATFORMS } from "../src/utils/native-installation.js";
 import {
 	checkForNewPiVersion,
 	comparePackageVersions,
@@ -159,5 +160,99 @@ describe("update channel preference", () => {
 			vi.fn(async () => Response.json({ version: "v1.2.5-beta.1.1.abcdef0" })),
 		);
 		await expect(checkForNewPiVersion("1.2.4", "nightly")).resolves.toBe("1.2.5-beta.1.1.abcdef0");
+	});
+});
+
+describe("manifest binary schema compatibility", () => {
+	const artifact = (platform: string, sha256 = "a".repeat(64)) => ({
+		platform,
+		file: `prime-agent-1.2.4-${platform}.tar.gz`,
+		sha256,
+	});
+
+	function stubManifest(fields: Record<string, unknown>): void {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () =>
+				Response.json({
+					version: "v1.2.4",
+					package: "prime-agent",
+					tarball: "releases/v1.2.4/prime-agent-1.2.4.tgz",
+					...fields,
+				}),
+			),
+		);
+	}
+
+	it("prefers binariesV2, keeps every supported platform, and skips future platforms", async () => {
+		stubManifest({
+			binaries: [artifact("darwin-arm64", "b".repeat(64))],
+			binariesV2: [
+				...NATIVE_PLATFORMS.map((platform, index) => artifact(platform, index.toString(16).padStart(64, "0"))),
+				artifact("future-riscv128", "f".repeat(64)),
+			],
+		});
+
+		const release = await getLatestPiRelease("1.2.3");
+		expect(release?.binaries?.map(({ platform }) => platform)).toEqual(NATIVE_PLATFORMS);
+		expect(release?.binaries?.map(({ platform }) => platform)).toEqual(
+			expect.arrayContaining([
+				"linux-arm64-musl",
+				"linux-x64-baseline",
+				"linux-x64-musl",
+				"linux-x64-musl-baseline",
+			]),
+		);
+	});
+
+	it("falls back to binaries when binariesV2 is absent", async () => {
+		stubManifest({ binaries: [artifact("darwin-arm64")] });
+
+		await expect(getLatestPiRelease("1.2.3")).resolves.toMatchObject({
+			binaries: [artifact("darwin-arm64")],
+		});
+	});
+
+	it("rejects the selected list when an entry is structurally malformed", async () => {
+		stubManifest({
+			binaries: [artifact("darwin-arm64")],
+			binariesV2: [artifact("linux-x64"), null],
+		});
+
+		const release = await getLatestPiRelease("1.2.3");
+		expect(release?.version).toBe("1.2.4");
+		expect(release?.binaries).toBeUndefined();
+	});
+
+	it("rejects the selected list when a supported platform entry is malformed", async () => {
+		stubManifest({
+			binaries: [artifact("darwin-arm64")],
+			binariesV2: [artifact("linux-x64"), artifact("linux-x64-musl", "not-hex")],
+		});
+
+		const release = await getLatestPiRelease("1.2.3");
+		expect(release?.version).toBe("1.2.4");
+		expect(release?.binaries).toBeUndefined();
+	});
+
+	it("rejects the selected list when a supported platform is duplicated", async () => {
+		stubManifest({
+			binaries: [artifact("darwin-arm64")],
+			binariesV2: [artifact("linux-x64"), artifact("linux-x64", "b".repeat(64))],
+		});
+
+		const release = await getLatestPiRelease("1.2.3");
+		expect(release?.version).toBe("1.2.4");
+		expect(release?.binaries).toBeUndefined();
+	});
+
+	it("preserves npm release info when the selected list contains only future platforms", async () => {
+		stubManifest({ binariesV2: [artifact("future-riscv128", "b".repeat(64))] });
+
+		await expect(getLatestPiRelease("1.2.3")).resolves.toEqual({
+			version: "1.2.4",
+			packageName: "prime-agent",
+			installSpec: `${defaultPrimeAgentDownloadBaseUrl}/releases/v1.2.4/prime-agent-1.2.4.tgz`,
+		});
 	});
 });
