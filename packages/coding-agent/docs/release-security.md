@@ -51,8 +51,19 @@ them, and upload them. R2 credentials are declared at **step** level, so they ar
 other step in the same job. Build jobs, which do run repository and dependency code, hold no
 credentials at all - including `pack-npm`, which builds the registry packages and hands tarballs to
 `publish-npm` by artifact. `scripts/check-release-workflow.mjs` enforces this in CI: it derives which
-jobs are credential-bearing and fails if any of them checks out code, installs packages, or invokes
-anything under the repository.
+jobs are credential-bearing (any environment, any write permission, or any secret other than exactly
+`GITHUB_TOKEN`) and fails if any of them checks out code, installs packages, invokes anything under
+the repository, or runs shell constructs whose target it cannot prove (`sh -c`, `eval`, command
+substitution, `xargs`, piping into an interpreter).
+
+The `standalone` build jobs hold `id-token: write` but no secrets. They use it to sign a **test-only**
+build so the CI end-to-end test can exercise `prime-agent update` against an actual signed archive.
+That test binary is compiled with a build-time signer override naming the standalone job's own
+certificate identity, is marked `(test signer override)` in its output, never leaves the runner's
+temporary directory, and cannot reach the release artifact. The release binary has no runtime or
+build-time path to change its pinned identity; the checker asserts the override flag appears only in
+that one test step. A standalone job's certificate names `standalone-binaries.yml`, never the release
+workflow, so nothing it signs can satisfy the release binary's pin.
 
 ### Dependency install scripts do not run on release machines
 
