@@ -506,7 +506,7 @@ cosign() {
 
 function runStepScript(script: string, shims: string, env: Record<string, string>): SpawnSyncReturns<string> {
 	return spawnSync("bash", ["-e", "-o", "pipefail", "-c", `${shims}\n${script}`], {
-		cwd: mkdtempSync(join(tmpdir(), "prime-release-step-")),
+		cwd: env.GITHUB_WORKSPACE ?? mkdtempSync(join(tmpdir(), "prime-release-step-")),
 		env: { ...process.env, ...env },
 		encoding: "utf8",
 	});
@@ -1073,12 +1073,19 @@ describe("tap-bump reruns safely and never touches the tap's default branch", ()
 		expect(bump.run).not.toMatch(/git push origin "\$branch"/);
 		expect(bump.run).not.toMatch(/push[^\n]*--force(?!-with-lease)/);
 		expect(bump.run).toContain('test "$default_branch" != "$branch"');
-		expect(bump.run).toContain('gh pr edit "$existing" --repo "$TAP_REPO"');
+		// The pull request is edited by its head branch, a value the checker can prove is not an option.
+		expect(bump.run).toContain('gh pr edit "$branch" --repo "$TAP_REPO"');
+		expect(bump.run).not.toContain('gh pr edit "$existing"');
 		expect(bump.run).toContain('gh pr create --repo "$TAP_REPO" --head "$branch" --base "$default_branch"');
 		// The job never changes directory: the checker only allows `cd` into downloaded artifacts.
 		expect(bump.run).not.toMatch(/(^|[;&|(]\s*|\n\s*)(cd|pushd|popd)\b/);
-		// The formula is rewritten with sed alone: no interpreter, no heredoc, in a job that holds the tap token.
-		expect(bump.run).not.toMatch(/<<|\bpython3?\b|\bnode\b|\bperl\b|\bruby\b/);
+		// The formula is rewritten with bash parameter expansion alone: no sed (whose e/w/r commands run
+		// programs and write files), no awk, no interpreter, no heredoc, in a job that holds the tap token.
+		expect(bump.run).not.toMatch(/<<|\bsed\b|\bawk\b|\bpython3?\b|\bnode\b|\bperl\b|\bruby\b/);
+		// The step never spells its token, and the clone target lives under the runner's temp directory.
+		expect(bump.run).not.toContain("GH_TOKEN");
+		expect(bump.run).toContain('workdir="$RUNNER_TEMP/tap"');
+		expect(bump.run).toContain('gh repo clone "https://github.com/$' + '{TAP_REPO}" "$workdir" -- --depth 1');
 		expect(bump.run).toContain('[[ "$PRODUCTION_VERSION" =~ $version_pattern ]]');
 		expect(bump.run).toContain('[[ "$digest" =~ ^[0-9a-f]{64}$ ]]');
 	});
@@ -1104,7 +1111,6 @@ describe("tap-bump reruns safely and never touches the tap's default branch", ()
 			version?: string;
 		}) => `
 log="$GITHUB_WORKSPACE/calls.log"
-mktemp() { mkdir -p "$GITHUB_WORKSPACE/tap"; echo "$GITHUB_WORKSPACE/tap"; }
 gh() {
   echo "gh $*" >> "$log"
   case "$1 $2" in
@@ -1137,6 +1143,7 @@ git() {
 			writeFileSync(join(workspace, "formula.rb"), formula);
 			const result = runStepScript(bump.run!, shims(options), {
 				GITHUB_WORKSPACE: workspace,
+				RUNNER_TEMP: workspace,
 				GH_TOKEN: "token",
 				PRODUCTION_VERSION: options.version ?? "1.2.3",
 				TAP_REPO: "o/tap",
@@ -1179,13 +1186,14 @@ git() {
 			expect(push).toContain(
 				`push origin refs/heads/${BRANCH}:refs/heads/${BRANCH} --force-with-lease=refs/heads/${BRANCH}:${OTHER_REF}`,
 			);
-			expect(calls.some((call) => call.startsWith("gh pr edit 7 --repo o/tap --title prime-agent 1.2.3"))).toBe(
-				true,
-			);
+			expect(
+				calls.some((call) => call.startsWith(`gh pr edit ${BRANCH} --repo o/tap --title prime-agent 1.2.3`)),
+			).toBe(true);
+			expect(result.stdout).toContain("Refreshed pull request #7");
 			expect(calls.some((call) => call.startsWith("gh pr create"))).toBe(false);
 		});
 
-		it("refuses a version that is not a version before anything reaches sed", () => {
+		it("refuses a version that is not a version before anything reaches the formula", () => {
 			for (const version of ["1.2.3;rm -rf /", "1.2.3/e whoami", "1.2.3&", "v1.2.3", "", "1.2.3 4"]) {
 				const { result, calls, edited } = run({ version });
 				expect(result.status, version).toBe(1);
