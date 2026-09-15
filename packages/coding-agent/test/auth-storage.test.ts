@@ -1,10 +1,14 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { type AssistantMessage, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { registerOAuthProvider } from "@earendil-works/pi-ai/oauth";
 import lockfile from "proper-lockfile";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.js";
 import { AuthStorage, FileAuthStorageBackend } from "../src/core/auth-storage.js";
+import { InProcessAgentConnection } from "../src/modes/agent-connection/in-process-agent-connection.js";
+import { createHarness, type Harness, type HarnessOptions } from "./suite/harness.js";
 
 const initialWriteFault = vi.hoisted(() => ({ count: -1 }));
 const renameFault = vi.hoisted(() => ({ error: undefined as Error | undefined }));
@@ -753,5 +757,217 @@ describe("AuthStorage", () => {
 			authStorage.removeRuntimeApiKey("anthropic");
 			await expect(authStorage.getApiKey("anthropic")).resolves.toBe("stored-key");
 		});
+	});
+});
+
+
+function structuredFailureMessage(kind: string, status: number, errorMessage: string): AssistantMessage {
+	return {
+		...fauxAssistantMessage("", { stopReason: "error", errorMessage }),
+		diagnostics: [{ type: "provider_stream_failure", timestamp: Date.now(), details: { kind, status } }],
+	};
+}
+
+const provider401Message = () => structuredFailureMessage("auth", 401, "401 Unauthorized: invalid API key");
+const provider500Message = () => structuredFailureMessage("server_error", 500, "500 Internal Server Error");
+const unstructured401Message = () =>
+	fauxAssistantMessage("", { stopReason: "error", errorMessage: "401 status code (no body)" });
+
+interface StaleAuthCase {
+	name: string;
+	settings: HarnessOptions["settings"];
+	responses: () => AssistantMessage[];
+	calls: number;
+	retryAttempts: number[];
+	stale: boolean;
+}
+
+const staleAuthCases: StaleAuthCase[] = [
+	{
+		name: "structured 401 retries once, then marks the current auth stale",
+		settings: { retry: { enabled: true, maxRetries: 2, baseDelayMs: 1 } },
+		responses: () => [provider401Message(), provider401Message(), provider401Message()],
+		calls: 2,
+		retryAttempts: [1],
+		stale: true,
+	},
+	{
+		name: "unstructured 401 error text does not mark auth stale",
+		settings: { retry: { enabled: true, maxRetries: 0, baseDelayMs: 1 } },
+		responses: () => [unstructured401Message()],
+		calls: 1,
+		retryAttempts: [],
+		stale: false,
+	},
+	{
+		name: "structured permission (403) failures do not mark auth stale",
+		settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
+		responses: () => [
+			structuredFailureMessage("permission", 403, "403 model access denied by organization policy"),
+			fauxAssistantMessage("unused"),
+		],
+		calls: 1,
+		retryAttempts: [],
+		stale: false,
+	},
+	{
+		// Wait-for-usage is disabled so quick-retry exhaustion stays terminal here.
+		name: "a captured auth failure stays stale when the final retryable error is not auth",
+		settings: {
+			retry: { enabled: true, maxRetries: 2, baseDelayMs: 1, provider: { waitForUsage: { enabled: false } } },
+		},
+		responses: () => [provider401Message(), provider500Message(), provider500Message()],
+		calls: 3,
+		retryAttempts: [1, 2],
+		stale: true,
+	},
+	{
+		name: "concrete auth failures are marked stale when retry is disabled",
+		settings: { retry: { enabled: false } },
+		responses: () => [provider401Message()],
+		calls: 1,
+		retryAttempts: [],
+		stale: true,
+	},
+];
+
+describe("issue #4491 provider auth stale after repeated 401", () => {
+	const harnesses: Harness[] = [];
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		while (harnesses.length > 0) {
+			harnesses.pop()?.cleanup();
+		}
+	});
+
+	/** The harness configures two auth sources; mark both so the provider is fully locked out. */
+	function lockOutProvider(harness: Harness, provider: string): void {
+		const registry = harness.session.modelRegistry;
+		for (let i = 0; i < 2 && registry.getProviderAuthStatus(provider).source !== "stale"; i++) {
+			expect(registry.markProviderAuthStale(provider)).toBe(true);
+		}
+		expect(registry.getProviderAuthStatus(provider)).toMatchObject({ configured: false, source: "stale" });
+	}
+
+	test.each(staleAuthCases)("$name", async ({ settings, responses, calls, retryAttempts, stale }) => {
+		const harness = await createHarness({ settings });
+		harnesses.push(harness);
+		harness.setResponses(responses());
+
+		await harness.session.prompt("hello");
+
+		const provider = harness.getModel().provider;
+		expect(harness.faux.state.callCount).toBe(calls);
+		expect(harness.eventsOfType("auto_retry_start").map((event) => event.attempt)).toEqual(retryAttempts);
+		expect(harness.eventsOfType("auth_stale")).toHaveLength(stale ? 1 : 0);
+		expect(harness.authStorage.hasAuth(provider)).toBe(!stale);
+		if (stale) {
+			expect(harness.authStorage.getAuthStatus(provider)).toEqual({
+				configured: false,
+				source: "stale",
+				label: "expired",
+			});
+			await expect(harness.authStorage.getApiKey(provider)).resolves.toBeUndefined();
+		}
+	});
+
+	test("emits stale auth source tokens for daemon clients after a structured 401", async () => {
+		const harness = await createHarness({
+			provider: "prime-inference",
+			settings: { retry: { enabled: true, maxRetries: 0, baseDelayMs: 1 } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([provider401Message()]);
+
+		await harness.session.prompt("hello");
+
+		const authStaleEvents = harness.eventsOfType("auth_stale");
+		expect(authStaleEvents).toHaveLength(1);
+		expect(authStaleEvents[0]?.provider).toBe("prime-inference");
+		expect(authStaleEvents[0]?.sourceTokens).toMatchObject([{ provider: "prime-inference", source: "runtime" }]);
+		expect(harness.authStorage.getAuthStatus("prime-inference")).toEqual({
+			configured: false,
+			source: "stale",
+			label: "expired",
+		});
+	});
+
+	test("marks captured auth failures stale when retry backoff is cancelled", async () => {
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 100 } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([provider401Message(), provider401Message()]);
+		const sawRetryStart = new Promise<void>((resolve) => {
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type === "auto_retry_start") {
+					unsubscribe();
+					resolve();
+				}
+			});
+		});
+
+		const promptPromise = harness.session.prompt("hello");
+		await sawRetryStart;
+		harness.session.abortRetry();
+		await promptPromise;
+
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(harness.eventsOfType("auth_stale")).toHaveLength(1);
+		expect(harness.eventsOfType("auto_retry_end").map((event) => event.finalError)).toContain("Retry cancelled");
+		await expect(harness.authStorage.getApiKey(harness.getModel().provider)).resolves.toBeUndefined();
+	});
+
+	test("marks each failed auth source stale when credentials change during retry backoff", async () => {
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 5 } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([provider401Message(), provider401Message()]);
+		let changedCredentials = false;
+		harness.session.subscribe((event) => {
+			if (event.type === "auto_retry_start" && !changedCredentials) {
+				changedCredentials = true;
+				harness.authStorage.setRuntimeApiKey(harness.getModel().provider, "fresh-key");
+			}
+		});
+
+		await harness.session.prompt("hello");
+
+		expect(changedCredentials).toBe(true);
+		expect(harness.faux.state.callCount).toBe(2);
+		expect(harness.authStorage.getAuthStatus(harness.getModel().provider)).toEqual({
+			configured: false,
+			source: "stale",
+			label: "expired",
+		});
+		await expect(harness.authStorage.getApiKey(harness.getModel().provider)).resolves.toBeUndefined();
+	});
+
+	test("only a resolvable explicit model selection clears a stale-auth lockout", async () => {
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 0, baseDelayMs: 1 } },
+		});
+		harnesses.push(harness);
+		const provider = harness.getModel().provider;
+		lockOutProvider(harness, provider);
+		const runtime = {
+			session: harness.session,
+			setRebindSession() {},
+			setBeforeSessionInvalidate() {},
+		} as unknown as AgentSessionRuntime;
+		const connection = new InProcessAgentConnection(runtime);
+
+		// A mistyped model id must not unlock the provider it failed to switch to.
+		await expect(connection.setModel(provider, "not-a-model")).rejects.toThrow("Model not found");
+		expect(harness.authStorage.hasAuth(provider)).toBe(false);
+		expect(harness.session.modelRegistry.getProviderAuthStatus(provider)).toMatchObject({ source: "stale" });
+
+		const model = harness.getModel();
+		await connection.setModel(model.provider, model.id);
+
+		expect(harness.authStorage.hasAuth(provider)).toBe(true);
+		expect(harness.session.modelRegistry.getProviderAuthStatus(provider).source).not.toBe("stale");
 	});
 });

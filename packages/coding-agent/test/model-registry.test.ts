@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Api, Context, Model, OpenAICompletionsCompat } from "@earendil-works/pi-ai";
@@ -1095,5 +1095,67 @@ describe("ModelRegistry", () => {
 				source: "models_json_command",
 			});
 		});
+	});
+});
+
+
+describe("issue #702 codex model discovery client version", () => {
+	const originalFetch = globalThis.fetch;
+	let codexTempDir: string;
+
+	beforeEach(() => {
+		codexTempDir = mkdtempSync(join(tmpdir(), "codex-client-version-"));
+	});
+
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+		rmSync(codexTempDir, { recursive: true, force: true });
+	});
+
+	function codexAccessToken(accountId: string): string {
+		const payload = Buffer.from(
+			JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: accountId } }),
+		).toString("base64url");
+		return `header.${payload}.signature`;
+	}
+
+	test("sends a Codex CLI client version on the discovery request instead of the package version", async () => {
+		const authPath = join(codexTempDir, "auth.json");
+		writeFileSync(
+			authPath,
+			JSON.stringify({
+				"openai-codex": {
+					type: "oauth",
+					access: codexAccessToken("account-123"),
+					refresh: "refresh-token",
+					expires: Date.now() + 60 * 60 * 1000,
+					accountId: "account-123",
+				},
+			}),
+		);
+		const registry = ModelRegistry.create(AuthStorage.create(authPath), join(codexTempDir, "models.json"));
+		const codexModels = registry.getAvailable().filter((model) => model.provider === "openai-codex");
+		expect(codexModels.length).toBeGreaterThan(0);
+		const requestedUrls: string[] = [];
+		globalThis.fetch = (async (input: Parameters<typeof globalThis.fetch>[0]) => {
+			requestedUrls.push(input instanceof Request ? input.url : input.toString());
+			return new Response(JSON.stringify({ models: codexModels.map((model) => ({ slug: model.id })) }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		}) as typeof globalThis.fetch;
+
+		const executable = await registry.getExecutableModels();
+
+		const discoveryUrl = requestedUrls.find((url) => url.includes("/codex/models"));
+		expect(discoveryUrl).toBeDefined();
+		const clientVersion = new URL(discoveryUrl ?? "").searchParams.get("client_version");
+		// Prime Agent's own version is 0.x well below this floor, so comparing against VERSION
+		// would pass today and break silently once the package version reaches the pinned constant.
+		expect(clientVersion).toMatch(/^\d+\.\d+\.\d+$/);
+		const [major, minor] = (clientVersion ?? "0.0.0").split(".").map(Number);
+		// 0.153.x is the floor at which ChatGPT discovery lists GPT-6 Astra (discussion #2062).
+		expect((major ?? 0) > 0 || (minor ?? 0) >= 153).toBe(true);
+		expect(executable.some((model) => model.provider === "openai-codex")).toBe(true);
 	});
 });

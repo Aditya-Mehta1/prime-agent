@@ -15,6 +15,7 @@ import type { ExtensionFactory } from "../../src/core/extensions/types.js";
 import { convertToLlm } from "../../src/core/messages.js";
 import { getLocalHarnessStateDir, loadHarnessState, saveHarnessState } from "../../src/core/refinement/index.js";
 import { SessionManager } from "../../src/core/session-manager.js";
+import { assistantMsg, userMsg } from "../utilities.js";
 import { createHarness, getMessageText, type Harness, type HarnessOptions } from "./harness.js";
 import { createDeferred } from "./scheduling.js";
 
@@ -1159,5 +1160,61 @@ describe("AgentSession compaction", () => {
 				"the compact skill is disabled in this session",
 			);
 		});
+	});
+});
+
+describe("AgentSession compaction regressions", () => {
+	const harnesses: Harness[] = [];
+
+	afterEach(() => {
+		while (harnesses.length > 0) {
+			harnesses.pop()?.cleanup();
+		}
+	});
+
+	it("ENG-6011: retries a token-rate-limit rejection without compacting", async () => {
+		const harness = await createHarness({
+			models: [{ id: "litellm-fixture", contextWindow: 262144, maxTokens: 8192 }],
+			settings: {
+				autoRefine: { enabled: false },
+				compaction: { enabled: true, reserveTokens: 8192, keepRecentTokens: 50 },
+				retry: { enabled: true, maxRetries: 1, baseDelayMs: 1 },
+			},
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("Earlier findings recorded.")]);
+		await harness.session.prompt("Earlier context. ".repeat(100));
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "429 rate limit: too many tokens" }),
+			fauxAssistantMessage("Recovered after rate limit."),
+		]);
+
+		await harness.session.prompt("Continue the task.");
+
+		expect(harness.eventsOfType("compaction_start")).toEqual([]);
+		expect(harness.eventsOfType("auto_retry_start")).toHaveLength(1);
+		expect(getMessageText(harness.session.messages.at(-1))).toBe("Recovered after rate limit.");
+		expect(harness.faux.state.callCount).toBe(3);
+	});
+
+	it("#3688: clears branch summary state when session_before_tree cancels navigation", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_tree", () => ({ cancel: true }));
+				},
+			],
+		});
+		harnesses.push(harness);
+		const targetId = harness.sessionManager.appendMessage(userMsg("first"));
+		harness.sessionManager.appendMessage(assistantMsg("reply"));
+		const currentLeafId = harness.sessionManager.appendMessage(userMsg("second"));
+		expect(harness.sessionManager.getLeafId()).toBe(currentLeafId);
+
+		const result = await harness.session.navigateTree(targetId, { summarize: false });
+
+		expect(result).toEqual({ cancelled: true });
+		expect(harness.session.isCompacting).toBe(false);
+		expect(harness.sessionManager.getLeafId()).toBe(currentLeafId);
 	});
 });

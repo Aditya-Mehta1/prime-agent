@@ -1900,7 +1900,7 @@ prime_agent_native_probe() (
 	# macOS does not ship timeout; keep the deadline independent of Node and Python.
 	native_probe_pid=
 	case "${PRIME_AGENT_PROBE_TIMEOUT_SECONDS:-}" in
-		'' | *[!0-9]* | 0 | 0*) native_probe_timeout=10 ;;
+		'' | *[!0-9]* | 0) native_probe_timeout=10 ;;
 		*) native_probe_timeout=$PRIME_AGENT_PROBE_TIMEOUT_SECONDS ;;
 	esac
 	trap '
@@ -1914,8 +1914,7 @@ prime_agent_native_probe() (
 	trap 'exit 129' HUP
 	"$@" &
 	native_probe_pid=$!
-	# date +%s truncates to whole seconds, so add one to avoid killing a probe early.
-	native_probe_deadline=$(($(date +%s) + native_probe_timeout + 1))
+	native_probe_deadline=$(($(date +%s) + native_probe_timeout))
 	while kill -0 "$native_probe_pid" 2>/dev/null; do
 		if [ "$(date +%s)" -ge "$native_probe_deadline" ]; then
 			printf 'error: executable probe timed out after %s seconds.\n' "$native_probe_timeout" >&2
