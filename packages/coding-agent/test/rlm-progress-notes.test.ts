@@ -434,6 +434,16 @@ describe("rlm.progress.note child progress channel", () => {
 			run.lastActivityMonotonicAt = performance.now() - 11 * 60_000;
 			const idleSnapshot = session.getRlmChildSnapshots().find((candidate) => candidate.id === handle.rlm_child_id);
 			expect(idleSnapshot?.activityStaleMs).toBeGreaterThanOrEqual(10 * 60_000);
+			// The monotonic delta is fractional, but staleness stays integer ms:
+			// the kernel roster parser rejects non-int activity_stale_ms
+			// (regression: performance.now() deltas used to leak floats onto
+			// the wire and break rlm.list_subagents() for a stale child).
+			expect(Number.isInteger(idleSnapshot?.activityStaleMs)).toBe(true);
+
+			const idleRoster = await session.listRlmSubagents();
+			const idleEntry = idleRoster.subagents.find((candidate) => candidate.rlm_child_id === handle.rlm_child_id);
+			expect(Number.isInteger(idleEntry?.activity_stale_ms)).toBe(true);
+			expect(idleEntry?.activity_stale_ms).toBeGreaterThanOrEqual(10 * 60_000);
 		} finally {
 			held.complete("child answer");
 			await waitFor(

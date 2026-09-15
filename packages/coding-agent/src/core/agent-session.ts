@@ -1302,7 +1302,9 @@ function rlmActivityStaleMs(
 	const wallStaleMs = Date.now() - lastActivityAt;
 	const monotonicStaleMs =
 		lastActivityMonotonicAt === undefined ? wallStaleMs : performance.now() - lastActivityMonotonicAt;
-	const staleMs = Math.min(wallStaleMs, monotonicStaleMs);
+	// Integer ms like every other roster wire field: performance.now() deltas
+	// are fractional, and the kernel parser rejects non-int activity_stale_ms.
+	const staleMs = Math.floor(Math.min(wallStaleMs, monotonicStaleMs));
 	return staleMs >= RLM_CHILD_STALE_ACTIVITY_THRESHOLD_MS ? staleMs : undefined;
 }
 
