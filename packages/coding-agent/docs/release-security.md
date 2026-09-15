@@ -56,9 +56,17 @@ jobs are credential-bearing (any environment, any write permission, or any secre
 the repository, changes directory anywhere but a downloaded-artifact directory, sets a
 `working-directory`, edits `PATH` or interpreter startup variables, or runs shell constructs whose
 target it cannot prove (`sh -c`, `eval`, command substitution, `xargs`, piping into an interpreter).
-It also holds an allowlist for R2 writes: only the publishing jobs may call `aws`, every upload
-destination must be a literal key under the immutable `releases/v<version>/` prefix, and the four
-channel pointers may be written only by the last step of `finalize-release`.
+It also holds a per-job command allowlist for those jobs (coreutils, `jq`, `tar`, `curl` with
+`--proto '=https'`, `gh`, plus `aws`/`cosign`/`npm`/`git` only where that job needs them; no
+interpreter of any kind), pins every `aws` call to `--endpoint-url "$R2_ENDPOINT_URL"`, and holds an
+allowlist for R2 writes: every upload destination must be a literal key under the immutable
+`releases/v<version>/` prefix, sources must be normalised paths inside a downloaded artifact
+directory, and the four channel pointers may be written only by the last step of `finalize-release`.
+
+Beta builds are signed the same way. The `sign` job also signs the beta `SHA256SUMS` with the same
+identity (`build-binaries.yml` on the default branch, which the updater's pin accepts), and the beta
+job verifies that bundle before uploading it next to the checksums, so a compiled nightly install
+updates through exactly the same verification as a stable one.
 
 The `standalone` build jobs hold `id-token: write` but no secrets. They use it to sign a **test-only**
 build so the CI end-to-end test can exercise `prime-agent update` against an actual signed archive.
