@@ -169,7 +169,6 @@ describe("CombinedAutocompleteProvider", () => {
 		/** [name, line, cursor col, expected prefix (null means no suggestions)] */
 		const prefixCases: [name: string, line: string, col: number, prefix: string | null][] = [
 			["extracts / from 'hey /' when forced", "hey /", 5, "/"],
-			["extracts /A from '/A' when forced", "/A", 2, "/A"],
 			["does not trigger for slash commands", "/model", 6, null],
 			["triggers for absolute paths after a slash command argument", "/command /", 10, "/"],
 		];

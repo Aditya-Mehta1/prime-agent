@@ -115,14 +115,44 @@ describe("ExtensionRunner", () => {
 	const OVERRIDE = "built-in shortcut for app.clipboard.pasteImage";
 	it.each([
 		{ name: "built-in reserved default", key: "ctrl+c", overrides: {}, allowed: false, warning: CONFLICT },
-		{ name: "reserved default freed by a rebind", key: "ctrl+l", overrides: { "app.model.select": "ctrl+n" }, allowed: true, warning: null },
+		{
+			name: "reserved default freed by a rebind",
+			key: "ctrl+l",
+			overrides: { "app.model.select": "ctrl+n" },
+			allowed: true,
+			warning: null,
+		},
 		{ name: "non-reserved built-in key", key: pasteImageKey, overrides: {}, allowed: true, warning: OVERRIDE },
-		{ name: "rebound reserved action", key: "ctrl+x", overrides: { "app.interrupt": "ctrl+x" }, allowed: false, warning: CONFLICT },
-		{ name: "key shared with a reserved default", key: "ctrl+o", overrides: { "app.clipboard.pasteImage": "ctrl+o" }, allowed: false, warning: CONFLICT },
+		{
+			name: "rebound reserved action",
+			key: "ctrl+x",
+			overrides: { "app.interrupt": "ctrl+x" },
+			allowed: false,
+			warning: CONFLICT,
+		},
+		{
+			name: "key shared with a reserved default",
+			key: "ctrl+o",
+			overrides: { "app.clipboard.pasteImage": "ctrl+o" },
+			allowed: false,
+			warning: CONFLICT,
+		},
 		{ name: "model cycle forward", key: "alt+m", overrides: {}, allowed: false, warning: CONFLICT },
 		{ name: "model cycle backward", key: "shift+alt+m", overrides: {}, allowed: false, warning: CONFLICT },
-		{ name: "reserved action with several keys", key: "ctrl+y", overrides: { "app.clear": ["ctrl+x", "ctrl+y"] }, allowed: false, warning: CONFLICT },
-		{ name: "non-reserved action with several keys", key: "ctrl+y", overrides: { "app.clipboard.pasteImage": ["ctrl+x", "ctrl+y"] }, allowed: true, warning: OVERRIDE },
+		{
+			name: "reserved action with several keys",
+			key: "ctrl+y",
+			overrides: { "app.clear": ["ctrl+x", "ctrl+y"] },
+			allowed: false,
+			warning: CONFLICT,
+		},
+		{
+			name: "non-reserved action with several keys",
+			key: "ctrl+y",
+			overrides: { "app.clipboard.pasteImage": ["ctrl+x", "ctrl+y"] },
+			allowed: true,
+			warning: OVERRIDE,
+		},
 	])("shortcut on $name: allowed=$allowed", async ({ key, overrides, allowed, warning }) => {
 		writeExt("shortcut.ts", shortcutExt(key));
 		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -233,7 +263,10 @@ describe("ExtensionRunner", () => {
 	});
 
 	it("reports handler exceptions to error listeners instead of throwing", async () => {
-		writeExt("throws.ts", `export default function(pi) { pi.on("context", async () => { throw new Error("Handler error!"); }); }`);
+		writeExt(
+			"throws.ts",
+			`export default function(pi) { pi.on("context", async () => { throw new Error("Handler error!"); }); }`,
+		);
 
 		const { runner } = await loadRunner();
 		const errors: Array<{ extensionPath: string; event: string; error: string }> = [];
@@ -391,7 +424,9 @@ describe("ExtensionRunner", () => {
 		const globals = globalThis as unknown as { __inputSources?: string[]; __inputReachedSecond?: boolean };
 
 		async function runnerWith(...extensions: string[]) {
-			extensions.forEach((code, index) => writeExt(`input-${index}.ts`, code));
+			extensions.forEach((code, index) => {
+				writeExt(`input-${index}.ts`, code);
+			});
 			const { runner } = await loadRunner();
 			return runner;
 		}

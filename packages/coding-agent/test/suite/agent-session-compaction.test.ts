@@ -326,7 +326,12 @@ describe("AgentSession compaction", () => {
 		expect(text.indexOf("# Continual Harness State")).toBeLessThan(text.indexOf("[compaction-summary]"));
 
 		// Update-merge path: the second compaction head carries the digest too.
-		harness.setResponses([fauxAssistantMessage("merged summary"), fauxAssistantMessage("merged turn summary")]);
+		harness.setResponses([
+			fauxAssistantMessage("three response"),
+			fauxAssistantMessage("merged summary"),
+			fauxAssistantMessage("merged turn summary"),
+		]);
+		await harness.session.prompt("three");
 		await harness.session.compact();
 		expect((harness.session.messages[0] as { harnessDigest?: string }).harnessDigest).toContain(
 			"[local:compaction_test_memory] Compaction test memory",
