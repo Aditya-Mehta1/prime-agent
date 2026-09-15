@@ -832,7 +832,10 @@ jobs:
               echo "unchanged ${key}"
               continue
             fi
-            aws s3 cp "$file" "s3://${R2_BUCKET}/${key}" \
+            # The destination is spelled out in full: the release checker only
+            # allows releases/v<version>/<name> here, with <name> the basename of
+            # the artifacts/* loop variable, so no other key can be written.
+            aws s3 cp "$file" "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/${name}" \
               --endpoint-url "$R2_ENDPOINT_URL" \
               --content-type "$(content_type "$name")" \
               --cache-control 'public, max-age=31536000, immutable' \
@@ -1070,27 +1073,32 @@ jobs:
           set -euo pipefail
           test -n "$R2_BUCKET"
           test -n "$R2_ENDPOINT_URL"
-          publish_pointer() {
-            local file="$1" key="$2" type="$3"
-            local expected
+          # Every destination below is spelled out in full. The release checker
+          # allows exactly these four keys, in this step only, and refuses any
+          # key built from a variable, so nothing else in the workflow can move
+          # a channel pointer.
+          verify_pointer() {
+            local file="$1" key="$2" expected actual
             expected=$(sha256sum "$file" | cut -d' ' -f1)
-            aws s3 cp "$file" "s3://${R2_BUCKET}/${key}" \
-              --endpoint-url "$R2_ENDPOINT_URL" \
-              --content-type "$type" \
-              --cache-control no-cache \
-              --quiet
             aws s3 cp "s3://${R2_BUCKET}/${key}" /tmp/pointer.bin --endpoint-url "$R2_ENDPOINT_URL" --quiet
-            local actual
             actual=$(sha256sum /tmp/pointer.bin | cut -d' ' -f1)
             rm -f /tmp/pointer.bin
             test "$actual" = "$expected"
             echo "pointer ${key}"
           }
 
-          publish_pointer artifacts/latest.json latest.json application/json
-          publish_pointer artifacts/stable stable text/plain
-          publish_pointer artifacts/install.sh install.sh text/x-shellscript
-          publish_pointer artifacts/install-beta.sh install-beta.sh text/x-shellscript
+          aws s3 cp artifacts/latest.json "s3://${R2_BUCKET}/latest.json" \
+            --endpoint-url "$R2_ENDPOINT_URL" --content-type application/json --cache-control no-cache --quiet
+          verify_pointer artifacts/latest.json latest.json
+          aws s3 cp artifacts/stable "s3://${R2_BUCKET}/stable" \
+            --endpoint-url "$R2_ENDPOINT_URL" --content-type text/plain --cache-control no-cache --quiet
+          verify_pointer artifacts/stable stable
+          aws s3 cp artifacts/install.sh "s3://${R2_BUCKET}/install.sh" \
+            --endpoint-url "$R2_ENDPOINT_URL" --content-type text/x-shellscript --cache-control no-cache --quiet
+          verify_pointer artifacts/install.sh install.sh
+          aws s3 cp artifacts/install-beta.sh "s3://${R2_BUCKET}/install-beta.sh" \
+            --endpoint-url "$R2_ENDPOINT_URL" --content-type text/x-shellscript --cache-control no-cache --quiet
+          verify_pointer artifacts/install-beta.sh install-beta.sh
 
   publish-beta-r2:
     name: Publish beta to R2
@@ -1162,7 +1170,10 @@ jobs:
               *.json) type=application/json ;;
               *) type=text/plain ;;
             esac
-            aws s3 cp "$file" "s3://${R2_BUCKET}/${key}" \
+            # Spelled out in full for the release checker: only releases/v<beta
+            # version>/<name> may be written here, <name> being the basename of
+            # the artifacts/* loop variable.
+            aws s3 cp "$file" "s3://${R2_BUCKET}/releases/v${BETA_VERSION}/${name}" \
               --endpoint-url "$R2_ENDPOINT_URL" \
               --content-type "$type" \
               --cache-control 'public, max-age=31536000, immutable' \
@@ -1408,18 +1419,28 @@ jobs:
           name: release-final-production
           path: artifacts
 
-      - name: Open a formula bump pull request
+      - name: Open or refresh the formula bump pull request
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           set -euo pipefail
           test -n "$GH_TOKEN"
+          test -n "$TAP_REPO"
           branch="prime-agent-${PRODUCTION_VERSION}"
           workdir=$(mktemp -d)
           gh repo clone "$TAP_REPO" "$workdir" -- --depth 1
-          cd "$workdir"
-          git switch -c "$branch"
-          formula=Formula/prime-agent.rb
+          # The clone's HEAD is the tap's default branch. Nothing below may push
+          # to it: the only push names the bump branch on both sides of the refspec.
+          default_branch=$(git -C "$workdir" symbolic-ref --short HEAD)
+          test -n "$default_branch"
+          test "$default_branch" != "$branch"
+          # A rerun finds the branch a previous run pushed. The push below is
+          # leased on exactly the commit seen here, so a concurrent writer makes
+          # the push fail instead of being overwritten; an empty lease means the
+          # branch must not exist yet.
+          lease=$(git -C "$workdir" ls-remote --heads origin "refs/heads/${branch}" | cut -f1)
+          git -C "$workdir" switch -c "$branch"
+          formula="$workdir/Formula/prime-agent.rb"
           test -f "$formula"
           for platform in darwin-arm64 darwin-x64 linux-arm64 linux-x64; do
             digest=$(grep -E "  prime-agent-${PRODUCTION_VERSION}-${platform}\.tar\.gz$" \
@@ -1441,9 +1462,22 @@ jobs:
           body = re.sub(r'/releases/v[0-9][^/"]*/', f'/releases/v{version}/', body)
           open(path, "w").write(body)
           PY
-          git -c user.name='prime-agent-release' -c user.email='release@primeintellect.ai' \
+          if git -C "$workdir" diff --quiet; then
+            echo "Formula already describes prime-agent ${PRODUCTION_VERSION}; nothing to push."
+            exit 0
+          fi
+          git -C "$workdir" -c user.name='prime-agent-release' -c user.email='release@primeintellect.ai' \
             commit -am "prime-agent ${PRODUCTION_VERSION}"
-          git push origin "$branch"
-          gh pr create --repo "$TAP_REPO" --head "$branch" \
-            --title "prime-agent ${PRODUCTION_VERSION}" \
-            --body "Automated formula bump for prime-agent v${PRODUCTION_VERSION}."
+          git -C "$workdir" push origin "refs/heads/${branch}:refs/heads/${branch}" \
+            --force-with-lease="refs/heads/${branch}:${lease}"
+          title="prime-agent ${PRODUCTION_VERSION}"
+          body="Automated formula bump for prime-agent v${PRODUCTION_VERSION}."
+          existing=$(gh pr list --repo "$TAP_REPO" --head "$branch" --base "$default_branch" --state open \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --repo "$TAP_REPO" --title "$title" --body "$body"
+            echo "Refreshed pull request #${existing} on ${TAP_REPO} from ${branch}."
+          else
+            gh pr create --repo "$TAP_REPO" --head "$branch" --base "$default_branch" \
+              --title "$title" --body "$body"
+          fi

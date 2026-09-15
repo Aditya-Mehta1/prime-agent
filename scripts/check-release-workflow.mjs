@@ -19,6 +19,7 @@
  */
 
 import { readFileSync } from "node:fs";
+import { posix } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { parse } from "yaml";
@@ -36,6 +37,44 @@ export const CREDENTIAL_JOBS = ["publish-r2", "finalize-release", "publish-beta-
 const ORDERED_JOBS = ["github-release", "publish-r2", "verify", "finalize-release"];
 /** The only job allowed to move a production channel pointer. */
 const POINTER_JOB = "finalize-release";
+/** The production channel pointers, in the order finalize-release writes them. */
+export const PRODUCTION_POINTERS = ["latest.json", "stable", "install.sh", "install-beta.sh"];
+/**
+ * The only jobs that may invoke the aws CLI at all, and the only R2 keys each may write to.
+ *
+ * Every `aws s3 cp` destination in these jobs must be spelled out in the workflow file:
+ * `s3://${R2_BUCKET}/releases/v${<prefix>}/<literal>` or `.../${name}` where `name` is the
+ * basename of the `for file in artifacts/*` loop variable, or - in the job's LAST step only - one
+ * of the listed pointer keys. Any other variable, command substitution, bucket or prefix is an
+ * error, so `key=stable; aws s3 cp x "s3://$B/$key"` can never sneak a pointer write past the
+ * publication order. `aws s3 mv|sync|rm`, `--recursive` and every writing `s3api` call are errors.
+ */
+export const R2_WRITERS = {
+	"publish-r2": { prefix: "PRODUCTION_VERSION", pointers: [] },
+	"publish-beta-r2": { prefix: "BETA_VERSION", pointers: ["beta", "beta.json"] },
+	[POINTER_JOB]: { prefix: null, pointers: PRODUCTION_POINTERS },
+};
+/** Options an `aws s3 cp` in a publish job may carry, with the number of values each consumes. */
+const AWS_CP_OPTIONS = { "--endpoint-url": 1, "--content-type": 1, "--cache-control": 1, "--quiet": 0, "--no-progress": 0, "--only-show-errors": 0 };
+/** `aws s3api` operations that only read. */
+const AWS_S3API_READS = /^(head-object|head-bucket|get-object|list-objects|list-objects-v2)$/;
+/** Variables the R2 destinations are built from; a publish step may not reassign them. */
+const R2_PROTECTED_VARIABLES = /^(R2_BUCKET|R2_ENDPOINT_URL|PRODUCTION_VERSION|BETA_VERSION)$/;
+/** How the R2 destination variables must reach a publish job. */
+const R2_ENV_SOURCES = {
+	R2_BUCKET: /^\$\{\{\s*secrets\.(NIGHTLY_)?R2_BUCKET\s*\}\}$/,
+	R2_ENDPOINT_URL: /^\$\{\{\s*secrets\.(NIGHTLY_)?R2_ENDPOINT_URL\s*\}\}$/,
+	PRODUCTION_VERSION: /^\$\{\{\s*needs\.context\.outputs\.production_version\s*\}\}$/,
+	BETA_VERSION: /^\$\{\{\s*needs\.context\.outputs\.beta_version\s*\}\}$/,
+};
+/** A literal object name: no expansion, no slash, no leading dot. */
+const LITERAL_OBJECT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+/** Builtins that change the working directory; in a credential-bearing job only `cd`/`pushd` into a downloaded artifact directory is allowed. */
+const DIRECTORY_COMMANDS = /^(cd|pushd|popd|chdir)$/;
+/** Commands that assign the names given as their arguments. */
+const ASSIGNING_COMMANDS = /^(read|local|declare|typeset|export|readonly|mapfile|readarray|let|unset|getopts|printf)$/;
+/** The only `shell:` a credential-bearing step may declare: the checker reads bash. */
+const PLAIN_SHELL = /^(bash|sh)$/;
 
 /**
  * The only place a binary may be compiled with a test signer override, and the only step that may
@@ -58,6 +97,10 @@ const INTERPRETERS = /^(node|nodejs|bash|sh|zsh|dash|ksh|ash|fish|python|python3
 const SOURCE_COMMANDS = /^(source|\.)$/;
 /** Commands whose effect the static checker cannot follow; forbidden outright in credential-bearing jobs. */
 const OPAQUE_EXECUTORS = /^(eval|xargs|parallel)$/;
+/** Builtins that change how later command names resolve or run code the checker cannot see (`trap 'node x' EXIT`). */
+const RESOLUTION_BUILTINS = /^(alias|unalias|shopt|enable|hash|trap)$/;
+/** Environment variables that make a shell or interpreter load code before the `run` block starts. */
+const STARTUP_ENV = /^(BASH_ENV|ENV|PATH|LD_PRELOAD|LD_LIBRARY_PATH|DYLD_INSERT_LIBRARIES|NODE_OPTIONS|NODE_PATH|PYTHONSTARTUP|PYTHONPATH|PERL5OPT|RUBYOPT|SHELLOPTS|BASHOPTS)$/;
 /** Words that may precede the command without being it. */
 const SHELL_KEYWORDS = /^(if|then|else|elif|fi|do|done|while|until|for|in|case|esac|!|\{|\}|\[\[|\]\]|function)$/;
 /** Wrappers that run their argument list as a command after their own options. */
@@ -108,6 +151,7 @@ export function splitWords(line) {
 	let redirections = [];
 	let piped = false;
 	let nextPiped = false;
+	let pendingOpens = 0;
 	let text = "";
 	let expansion = false;
 	let inWord = false;
@@ -125,7 +169,12 @@ export function splitWords(line) {
 	};
 	const endCommand = () => {
 		endWord();
-		if (words.length > 0 || substitutions.length > 0 || redirections.length > 0) commands.push({ words, substitutions, redirections, piped });
+		if (words.length > 0 || substitutions.length > 0 || redirections.length > 0) {
+			// `opens` counts the `(` that preceded this command, `closes` the `)` that followed it,
+			// so a caller can scope a `cd` inside `( ... )` to the subshell.
+			commands.push({ words, substitutions, redirections, piped, opens: pendingOpens, closes: 0 });
+			pendingOpens = 0;
+		}
 		words = [];
 		substitutions = [];
 		redirections = [];
@@ -381,6 +430,8 @@ export function splitWords(line) {
 			while (i < source.length && ";|&".includes(source[i])) operator += source[i++];
 			nextPiped = operator === "|" || operator === "|&";
 			endCommand();
+			if (operator[0] === "(") pendingOpens += 1;
+			else if (operator[0] === ")" && commands.length > 0) commands[commands.length - 1].closes += 1;
 			continue;
 		}
 		if (!inWord && (ch === "<" || ch === ">" || (/[0-9]/.test(ch) && REDIRECTION.test(source.slice(i))))) {
@@ -450,9 +501,9 @@ export function* shellCommands(script) {
 
 function asCommand(input) {
 	if (Array.isArray(input)) {
-		return { words: input.map((text) => ({ text: String(text), expansion: /[$`]/.test(String(text)) })), substitutions: [], redirections: [], piped: false };
+		return { words: input.map((text) => ({ text: String(text), expansion: /[$`]/.test(String(text)) })), substitutions: [], redirections: [], piped: false, opens: 0, closes: 0 };
 	}
-	return { redirections: [], piped: false, ...input };
+	return { redirections: [], piped: false, opens: 0, closes: 0, ...input };
 }
 
 /** The index of the word that names the command, after assignments, keywords and wrappers; -1 when there is none. */
@@ -503,16 +554,89 @@ function commandWordOf(command) {
 }
 
 /**
+ * Resolves a relative, literal word against the working directory the step has `cd`-ed into.
+ * Returns null for words that are not paths a program would open: options, expansions, absolute
+ * paths, assignments and URLs.
+ */
+function resolveAgainst(cwd, word) {
+	const text = word.text;
+	if (!cwd || !text || word.expansion || text.startsWith("-") || text.startsWith("/") || text.includes("://") || ASSIGNMENT.test(text) || SHELL_KEYWORDS.test(text)) return null;
+	return posix.normalize(posix.join(cwd, text));
+}
+
+/** The relative directories `actions/download-artifact` fills in this job; the only places a credential-bearing step may `cd` into. */
+export function artifactDirectoriesOf(job) {
+	const directories = [];
+	for (const step of job.steps ?? []) {
+		if (!step.uses?.startsWith("actions/download-artifact@")) continue;
+		const path = step.with?.path;
+		if (typeof path !== "string" || !LITERAL_DIRECTORY.test(path)) continue;
+		directories.push(posix.normalize(path));
+	}
+	return directories;
+}
+const LITERAL_DIRECTORY = /^[A-Za-z0-9_][A-Za-z0-9_./-]*$/;
+
+/** True when `directory` (already resolved against the workspace root) is a downloaded artifact directory or lies inside one. */
+export function isArtifactDirectory(directory, artifactDirectories) {
+	if (typeof directory !== "string" || directory.includes("$") || directory.includes("{") || directory.startsWith("/") || directory.startsWith("-")) return false;
+	const normalized = posix.normalize(directory).replace(/\/$/, "");
+	if (normalized === "" || normalized === "." || normalized.startsWith("..")) return false;
+	return artifactDirectories.some((entry) => normalized === entry || normalized.startsWith(`${entry}/`));
+}
+
+/**
+ * Walks one credential-bearing `run` block in order, tracking the working directory. Returns the
+ * reasons the block would run repository code or move to a directory the checker does not allow.
+ *
+ * `cd` and `pushd` may only target a downloaded artifact directory, spelled literally; `popd`,
+ * `chdir`, `cd` with no target, `cd -`, `cd ..` and any target with an expansion are errors.
+ * Inside `( ... )` the directory change is scoped to the subshell.
+ */
+export function credentialStepReasons(run, { artifactDirectories = [], workingDirectory = "" } = {}) {
+	const reasons = [];
+	let cwd = workingDirectory && isArtifactDirectory(workingDirectory, artifactDirectories) ? posix.normalize(workingDirectory).replace(/\/$/, "") : "";
+	const stack = [];
+	for (const command of shellCommands(run)) {
+		for (let n = 0; n < (command.opens ?? 0); n += 1) stack.push(cwd);
+		reasons.push(...repositoryCodeReasons(command, cwd));
+		const index = commandIndex(command.words);
+		if (index !== -1) {
+			const name = command.words[index].text;
+			if (DIRECTORY_COMMANDS.test(name)) {
+				const args = command.words.slice(index + 1).filter((word) => !(/^-[LPe@]+$/.test(word.text) && !word.expansion));
+				const target = args[0];
+				const spelled = command.words.slice(index).map((word) => word.text).join(" ");
+				if (name === "popd" || name === "chdir") {
+					reasons.push(`changes directory in a way the checker cannot follow: ${spelled}`);
+				} else if (!target || args.length > 1 || target.expansion || target.text === "-" || target.text === "--") {
+					reasons.push(`changes directory to a target the checker cannot resolve: ${spelled}`);
+				} else {
+					const resolved = posix.normalize(posix.join(cwd, target.text)).replace(/\/$/, "");
+					if (!isArtifactDirectory(resolved, artifactDirectories)) {
+						reasons.push(`changes directory outside the downloaded artifacts (${artifactDirectories.join(", ") || "none"}): ${spelled}`);
+					}
+					// Follow the change either way, so what runs next is resolved against where it really runs.
+					cwd = resolved === "." ? "" : resolved;
+				}
+			}
+		}
+		for (let n = 0; n < (command.closes ?? 0); n += 1) if (stack.length > 0) cwd = stack.pop();
+	}
+	return reasons;
+}
+
+/**
  * Returns the reasons a simple command would execute or read repository code, or would run
  * something the checker cannot see. `input` is a command from {@link shellCommands} (or a plain
  * array of words for convenience).
  */
-export function repositoryCodeReasons(input) {
+export function repositoryCodeReasons(input, cwd = "") {
 	const { words, substitutions, redirections, piped } = asCommand(input);
 	const reasons = [];
 	for (const substitution of substitutions) {
 		for (const inner of shellCommands(substitution)) {
-			for (const reason of repositoryCodeReasons(inner)) reasons.push(`inside a command substitution: ${reason}`);
+			for (const reason of repositoryCodeReasons(inner, cwd)) reasons.push(`inside a command substitution: ${reason}`);
 			for (const word of inner.words) {
 				if (word.text.includes("://")) continue;
 				if (SCRIPT_EXTENSION.test(word.text) || /^\.{1,2}\//.test(word.text)) {
@@ -522,19 +646,36 @@ export function repositoryCodeReasons(input) {
 			}
 		}
 	}
-	for (const word of words) {
+	const commandAt = commandIndex(words);
+	for (const [position, word] of words.entries()) {
 		if (word.text.includes("://")) continue; // a URL, e.g. the cosign certificate identity
 		if (CHECKOUT_PATH.test(word.text) || WORKSPACE_PATH.test(word.text)) {
 			reasons.push(`references the checkout: ${word.text}`);
+		} else if (cwd && !(position === commandAt && !word.text.includes("/"))) {
+			// A bare command name is looked up on PATH, never in the working directory.
+			// The step has `cd`-ed somewhere: a bare name resolves against that directory.
+			const resolved = resolveAgainst(cwd, word);
+			if (resolved !== null && CHECKOUT_PATH.test(resolved)) {
+				reasons.push(`references the checkout: ${word.text} resolves to ${resolved} from working directory ${cwd}`);
+			}
 		}
+		if (/^(export\s+)?PATH=/.test(word.text)) reasons.push(`modifies PATH, so a bare command name may resolve to the checkout: ${word.text}`);
 	}
 	for (const redirection of redirections) {
 		if (redirection.text.includes("://")) continue;
 		if (CHECKOUT_PATH.test(redirection.text) || WORKSPACE_PATH.test(redirection.text)) {
 			reasons.push(`redirects the checkout: ${redirection.operator}${redirection.text}`);
+		} else if (cwd) {
+			const resolved = resolveAgainst(cwd, redirection);
+			if (resolved !== null && CHECKOUT_PATH.test(resolved)) {
+				reasons.push(`redirects the checkout: ${redirection.operator}${redirection.text} resolves to ${resolved} from working directory ${cwd}`);
+			}
 		}
 	}
 	const index = commandIndex(words, reasons);
+	if (index !== -1 && words[index].text === "export" && words.slice(index + 1).some((word) => /^PATH(=|$)/.test(word.text))) {
+		reasons.push("modifies PATH, so a bare command name may resolve to the checkout: export PATH");
+	}
 	if (index === -1) return reasons;
 	const commandWord = words[index];
 	const command = commandWord.text;
@@ -547,6 +688,9 @@ export function repositoryCodeReasons(input) {
 	}
 	if (OPAQUE_EXECUTORS.test(command)) {
 		reasons.push(`${command} runs a command the checker cannot see`);
+	}
+	if (RESOLUTION_BUILTINS.test(command)) {
+		reasons.push(`${command} changes how commands resolve or run, which the checker cannot follow`);
 	}
 	if (PACKAGE_MANAGERS.test(command)) {
 		const sub = args[0]?.text ?? "";
@@ -588,6 +732,162 @@ export function repositoryCodeReasons(input) {
 		}
 	}
 	return reasons;
+}
+
+/** The shell variables a simple command assigns: `X=1 cmd`, `for X in`, `read X`, `local X=`, `export X`, `printf -v X`. */
+function assignedNames(command) {
+	const names = [];
+	const words = command.words;
+	let index = 0;
+	while (index < words.length && (ASSIGNMENT.test(words[index].text) || SHELL_KEYWORDS.test(words[index].text))) {
+		if (ASSIGNMENT.test(words[index].text)) names.push(words[index].text.match(/^[A-Za-z_][A-Za-z0-9_]*/)[0]);
+		if (/^(for|select)$/.test(words[index].text) && words[index + 1]) names.push(words[index + 1].text);
+		index += 1;
+	}
+	const commandAt = commandIndex(words);
+	if (commandAt !== -1 && ASSIGNING_COMMANDS.test(words[commandAt].text)) {
+		for (const arg of words.slice(commandAt + 1)) {
+			if (arg.text.startsWith("-")) continue;
+			const name = arg.text.match(/^[A-Za-z_][A-Za-z0-9_]*/);
+			if (name) names.push(name[0]);
+		}
+	}
+	return names;
+}
+
+/**
+ * Walks one `run` block for aws CLI invocations and checks every one against {@link R2_WRITERS}.
+ * Returns `{ reasons, pointers }`: the violations, and the pointer keys the block writes.
+ *
+ * The walk is stateful: `for file in <artifact dir>/*` binds `file`, and exactly
+ * `name=$(basename "$file")` then binds `name`; any other assignment to either name unbinds it,
+ * and a destination ending in `${name}` is only allowed while `name` is bound.
+ */
+export function r2StepReasons(jobId, run, { last = false, artifactDirectories = [] } = {}) {
+	const writer = R2_WRITERS[jobId];
+	const reasons = [];
+	const pointers = [];
+	const bound = { file: false, name: false };
+	const spell = (command, index) => command.words.slice(index).map((word) => word.text).join(" ");
+	const inspect = (command, context) => {
+		for (const substitution of command.substitutions) {
+			for (const inner of shellCommands(substitution)) inspect(inner, "inside a command substitution: ");
+		}
+		const assigned = assignedNames(command);
+		for (const variable of assigned) {
+			if (writer && R2_PROTECTED_VARIABLES.test(variable)) {
+				reasons.push(`${context}reassigns ${variable}, which every R2 destination is built from: ${spell(command, 0)}`);
+			}
+		}
+		// `do`, `then`, `else` and `{` may precede the statement on the same line.
+		let first = 0;
+		while (first < command.words.length && /^(do|then|else|\{)$/.test(command.words[first].text)) first += 1;
+		const statement = command.words.slice(first);
+		const texts = statement.map((word) => word.text);
+		if (texts.length === 4 && texts[0] === "for" && texts[1] === "file" && texts[2] === "in" && !statement[3].expansion && texts[3].endsWith("/*") && artifactDirectories.includes(posix.normalize(texts[3].slice(0, -2)))) {
+			bound.file = true;
+			bound.name = false;
+		} else if (texts.length === 1 && texts[0] === 'name=$(basename "$file")') {
+			bound.name = bound.file;
+		} else {
+			if (assigned.includes("file")) bound.file = false;
+			if (assigned.includes("file") || assigned.includes("name")) bound.name = false;
+		}
+		const index = commandIndex(command.words);
+		if (index === -1) return;
+		const commandWord = command.words[index];
+		if (posix.basename(commandWord.text) !== "aws") return;
+		const spelled = spell(command, index);
+		if (!writer) {
+			reasons.push(`${context}invokes the aws CLI; only ${Object.keys(R2_WRITERS).join(", ")} may talk to R2: ${spelled}`);
+			return;
+		}
+		if (commandWord.text !== "aws" || commandWord.expansion) {
+			reasons.push(`${context}invokes aws through a path or expansion: ${spelled}`);
+			return;
+		}
+		const args = command.words.slice(index + 1);
+		const [service, operation] = args;
+		if (!service || !operation || service.expansion || operation.expansion) {
+			reasons.push(`${context}aws must name a literal service and operation: ${spelled}`);
+			return;
+		}
+		if (service.text === "s3api") {
+			if (AWS_S3API_READS.test(operation.text)) return;
+			reasons.push(`${context}aws s3api ${operation.text} writes outside the 'aws s3 cp' allowlist: ${spelled}`);
+			return;
+		}
+		if (service.text !== "s3") {
+			reasons.push(`${context}aws ${service.text} is not an R2 object operation: ${spelled}`);
+			return;
+		}
+		if (operation.text === "ls") return;
+		if (operation.text !== "cp") {
+			reasons.push(`${context}aws s3 ${operation.text} is not allowed; only 'aws s3 cp' with a spelled-out destination may write: ${spelled}`);
+			return;
+		}
+		const positionals = [];
+		for (let i = 2; i < args.length; i += 1) {
+			const arg = args[i];
+			if (arg.text.startsWith("-")) {
+				const values = AWS_CP_OPTIONS[arg.text];
+				if (values === undefined || arg.expansion) {
+					reasons.push(`${context}aws s3 cp carries an option the checker does not allow: ${arg.text} (${spelled})`);
+					return;
+				}
+				i += values;
+				continue;
+			}
+			positionals.push(arg);
+		}
+		if (positionals.length !== 2) {
+			reasons.push(`${context}aws s3 cp must name exactly one source and one destination: ${spelled}`);
+			return;
+		}
+		const [source, destination] = positionals;
+		if (!destination.text.startsWith("s3://")) {
+			if (!source.text.startsWith("s3://")) reasons.push(`${context}aws s3 cp copies between local paths: ${spelled}`);
+			return; // a download; where it lands is checked like any other path
+		}
+		const sourceIsLoopFile = source.text === "$file" || source.text === "${file}";
+		const sourceIsArtifact = !source.expansion && !/[*?[]/.test(source.text) && artifactDirectories.some((directory) => source.text.startsWith(`${directory}/`));
+		if (!(sourceIsLoopFile ? bound.file : sourceIsArtifact)) {
+			reasons.push(`${context}aws s3 cp uploads something other than a downloaded artifact: ${source.text} (${spelled})`);
+		}
+		const bucketMatch = destination.text.match(/^s3:\/\/\$\{R2_BUCKET\}\/(.*)$/);
+		if (!bucketMatch) {
+			reasons.push(`${context}aws s3 cp destination must be spelled s3://\${R2_BUCKET}/<key>: ${destination.text}`);
+			return;
+		}
+		const key = bucketMatch[1];
+		if (writer.prefix) {
+			const prefix = `releases/v\${${writer.prefix}}/`;
+			if (key.startsWith(prefix)) {
+				const object = key.slice(prefix.length);
+				if (LITERAL_OBJECT_NAME.test(object)) return;
+				if (object === "${name}") {
+					if (bound.name) return;
+					reasons.push(`${context}aws s3 cp destination uses \${name} where it is not the basename of the 'for file in artifacts/*' loop variable: ${destination.text}`);
+					return;
+				}
+				reasons.push(`${context}aws s3 cp object name must be a literal or \${name}, never another expansion: ${destination.text}`);
+				return;
+			}
+		}
+		if (writer.pointers.includes(key)) {
+			pointers.push(key);
+			if (!last) reasons.push(`${context}must advance the channel pointers in its last step; '${key}' is written earlier (${spelled})`);
+			return;
+		}
+		if (PRODUCTION_POINTERS.includes(key)) {
+			if (jobId === "publish-beta-r2") reasons.push(`${context}the beta channel must never write a production pointer (${spelled})`);
+			else reasons.push(`${context}only '${POINTER_JOB}' may write a production pointer; '${jobId}' does (${spelled})`);
+			return;
+		}
+		reasons.push(`${context}aws s3 cp destination is outside the allowlist for '${jobId}' (${writer.prefix ? `releases/v\${${writer.prefix}}/<literal|\${name}>` : "no prefix"}${writer.pointers.length ? `, last step: ${writer.pointers.join(", ")}` : ""}): ${destination.text}`);
+	};
+	for (const command of shellCommands(run)) inspect(command, "");
+	return { reasons, pointers };
 }
 
 /** True when an expression references any secret other than exactly `secrets.GITHUB_TOKEN`. */
@@ -643,8 +943,33 @@ export function checkWorkflows(read = (path) => readFileSync(path, "utf8")) {
 		}
 		if (!isCredentialBearing(job)) continue;
 		const allowed = ALLOWED_ACTIONS[jobId] ?? [];
+		const artifactDirectories = artifactDirectoriesOf(job);
+		// A default working directory or shell would change what every `run` line means.
+		for (const [scope, defaults] of [["the workflow", release.defaults], [`job '${jobId}'`, job.defaults]]) {
+			const directory = defaults?.run?.["working-directory"];
+			if (directory !== undefined && !isArtifactDirectory(String(directory), artifactDirectories)) {
+				fail(`${RELEASE_WORKFLOW}: credential-bearing job '${jobId}' must not run in a working directory other than a downloaded artifact directory (${scope} defaults to ${directory}).`);
+			}
+			const shell = defaults?.run?.shell;
+			if (shell !== undefined && !PLAIN_SHELL.test(String(shell))) {
+				fail(`${RELEASE_WORKFLOW}: credential-bearing job '${jobId}' must run bash; ${scope} defaults to shell '${shell}', which the checker cannot read.`);
+			}
+		}
+		for (const name of Object.keys(job.env ?? {})) {
+			if (STARTUP_ENV.test(name)) fail(`${RELEASE_WORKFLOW}: credential-bearing job '${jobId}' sets ${name}, which loads code before any command runs.`);
+		}
 		for (const step of job.steps ?? []) {
 			const label = step.name ?? step.uses ?? "(unnamed step)";
+			for (const name of Object.keys(step.env ?? {})) {
+				if (STARTUP_ENV.test(name)) fail(`${RELEASE_WORKFLOW}: credential-bearing job '${jobId}' sets ${name}, which loads code before any command runs (${label}).`);
+			}
+			const workingDirectory = step["working-directory"] ?? job.defaults?.run?.["working-directory"] ?? release.defaults?.run?.["working-directory"];
+			if (step["working-directory"] !== undefined && !isArtifactDirectory(String(step["working-directory"]), artifactDirectories)) {
+				fail(`${RELEASE_WORKFLOW}: credential-bearing job '${jobId}' must not run in a working directory other than a downloaded artifact directory (${artifactDirectories.join(", ") || "none"}): working-directory: ${step["working-directory"]} (${label}).`);
+			}
+			if (step.shell !== undefined && !PLAIN_SHELL.test(String(step.shell))) {
+				fail(`${RELEASE_WORKFLOW}: credential-bearing job '${jobId}' must run bash; shell '${step.shell}' is code the checker cannot read (${label}).`);
+			}
 			if (step.uses) {
 				for (const pattern of FORBIDDEN_ACTIONS) {
 					if (pattern.test(step.uses) && !allowed.some((entry) => entry.test(step.uses))) {
@@ -655,9 +980,12 @@ export function checkWorkflows(read = (path) => readFileSync(path, "utf8")) {
 					fail(`${RELEASE_WORKFLOW}: credential-bearing job '${jobId}' must not run a local action (${step.uses}).`);
 				}
 			}
-			const run = step.run ?? "";
-			for (const command of shellCommands(run)) {
-				for (const reason of repositoryCodeReasons(command)) {
+			const run = String(step.run ?? "");
+			const options = { artifactDirectories, workingDirectory: workingDirectory === undefined ? "" : String(workingDirectory) };
+			for (const reason of credentialStepReasons(run, options)) {
+				if (reason.includes("changes directory")) {
+					fail(`${RELEASE_WORKFLOW}: credential-bearing job '${jobId}' ${reason} (${label}).`);
+				} else {
 					fail(`${RELEASE_WORKFLOW}: credential-bearing job '${jobId}' must not run repository code: ${reason} (${label}).`);
 				}
 			}
@@ -690,32 +1018,40 @@ export function checkWorkflows(read = (path) => readFileSync(path, "utf8")) {
 			fail(`${RELEASE_WORKFLOW}: job '${later}' must need '${earlier}'; nothing may become public before verification.`);
 		}
 	}
-	const POINTER_WRITE = /aws s3 cp[^\n]*\b(stable|latest\.json|install\.sh|install-beta\.sh)\b|s3:\/\/\$\{R2_BUCKET\}\/(stable|latest\.json|install\.sh|install-beta\.sh)\b|publish_pointer\s/;
+	// Every aws invocation in the workflow is checked against the R2 allowlist; the pointer keys each
+	// step writes fall out of that walk and drive the ordering checks below.
+	const pointerSteps = new Map();
+	for (const [jobId, job] of Object.entries(release.jobs)) {
+		const artifactDirectories = artifactDirectoriesOf(job);
+		const steps = job.steps ?? [];
+		if (R2_WRITERS[jobId]) {
+			const environments = [["job", job.env ?? {}], ...steps.map((step) => [`step '${step.name ?? "(unnamed)"}'`, step.env ?? {}])];
+			for (const [scope, env] of environments) {
+				for (const [name, source] of Object.entries(R2_ENV_SOURCES)) {
+					if (env[name] !== undefined && !source.test(String(env[name]))) {
+						fail(`${RELEASE_WORKFLOW}: job '${jobId}' ${scope} sets ${name} to '${env[name]}'; the R2 destinations may only be built from the ${name.endsWith("VERSION") ? "context output" : "secret"}.`);
+					}
+				}
+			}
+		}
+		steps.forEach((step, index) => {
+			const label = step.name ?? step.uses ?? "(unnamed step)";
+			const { reasons, pointers } = r2StepReasons(jobId, String(step.run ?? ""), { last: index === steps.length - 1, artifactDirectories });
+			for (const reason of reasons) fail(`${RELEASE_WORKFLOW}: job '${jobId}' ${reason} (${label}).`);
+			if (pointers.length > 0) pointerSteps.set(`${jobId}\u0000${index}`, pointers);
+		});
+	}
 	if (release.jobs[POINTER_JOB]) {
 		const steps = release.jobs[POINTER_JOB].steps ?? [];
-		const pointerIndex = steps.findIndex((step) => POINTER_WRITE.test(String(step.run ?? "")));
-		if (pointerIndex === -1) {
-			fail(`${RELEASE_WORKFLOW}: job '${POINTER_JOB}' must advance the production channel pointers.`);
-		} else if (pointerIndex !== steps.length - 1) {
-			fail(`${RELEASE_WORKFLOW}: job '${POINTER_JOB}' must advance the channel pointers in its last step.`);
+		const pointerIndex = steps.findIndex((_, index) => pointerSteps.has(`${POINTER_JOB}\u0000${index}`));
+		const written = pointerSteps.get(`${POINTER_JOB}\u0000${steps.length - 1}`) ?? [];
+		const missing = PRODUCTION_POINTERS.filter((pointer) => !written.includes(pointer));
+		if (missing.length > 0) {
+			fail(`${RELEASE_WORKFLOW}: job '${POINTER_JOB}' must advance the production channel pointers in its last step (missing: ${missing.join(", ")}).`);
 		}
 		const publishIndex = steps.findIndex((step) => /gh release edit .*--draft=false/.test(String(step.run ?? "")));
-		if (publishIndex === -1 || publishIndex > pointerIndex) {
+		if (publishIndex === -1 || (pointerIndex !== -1 && publishIndex > pointerIndex)) {
 			fail(`${RELEASE_WORKFLOW}: job '${POINTER_JOB}' must publish the GitHub release before it moves the channel pointers.`);
-		}
-	}
-
-	for (const [jobId, job] of Object.entries(release.jobs)) {
-		if (jobId === POINTER_JOB) continue;
-		for (const step of job.steps ?? []) {
-			const run = String(step.run ?? "");
-			if (!POINTER_WRITE.test(run)) continue;
-			const written = run.match(POINTER_WRITE)[0];
-			if (jobId === "publish-beta-r2") {
-				fail(`${RELEASE_WORKFLOW}: the beta channel must never write a production pointer (${written.trim()}).`);
-			} else {
-				fail(`${RELEASE_WORKFLOW}: only '${POINTER_JOB}' may write a production pointer; '${jobId}' does (${written.trim()}).`);
-			}
 		}
 	}
 
@@ -778,7 +1114,7 @@ export function checkWorkflows(read = (path) => readFileSync(path, "utf8")) {
 		}
 	}
 	const caller = release.jobs.standalone;
-	if (!caller?.uses?.endsWith(STANDALONE_WORKFLOW.replace(/^\.github/, ".github"))) {
+	if (caller?.uses !== `./${STANDALONE_WORKFLOW}`) {
 		fail(`${RELEASE_WORKFLOW}: expected job 'standalone' to call ${STANDALONE_WORKFLOW}.`);
 	} else {
 		for (const [scope, value] of Object.entries(caller.permissions ?? {})) {
