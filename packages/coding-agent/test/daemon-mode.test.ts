@@ -16,8 +16,10 @@ import { syncBuiltinESMExports } from "node:module";
 import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
+import { PassThrough } from "node:stream";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
 import { AGENT_FAMILY_REACH_ERROR, type AgentSessionMessageController } from "../src/core/agent-messages.js";
 import type { AgentObserveController } from "../src/core/agent-observe.js";
@@ -42,9 +44,24 @@ import {
 	markClientSnapshotStreaming,
 	setDaemonClientSessionCapabilities,
 } from "../src/modes/daemon/daemon-mode.js";
-import type { DaemonAttachResult, DaemonCommand, DaemonOutbound } from "../src/modes/daemon/daemon-protocol.js";
+import {
+	DAEMON_PROTOCOL_INFO,
+	type DaemonAttachResult,
+	type DaemonCommand,
+	type DaemonOutbound,
+} from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
+import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
+import { type DaemonWorkerFrameHeader, isDaemonWorkerFrameHeader } from "../src/modes/daemon/daemon-worker-protocol.js";
 import { RlmSpawnLedger } from "../src/modes/daemon/rlm-ledger.js";
+import {
+	createSnapshotTranscriptChunks,
+	SnapshotTranscriptCache,
+	type SnapshotTranscriptChunkSource,
+} from "../src/modes/daemon/snapshot-transcript-cache.js";
+
+import { type PrivateFrame, PrivateFrameDecoder } from "../src/modes/session-worker/private-framing.js";
+import { seedSupervisorRoster } from "./fixtures/roster-seed.js";
 
 describe("daemon mode helpers", () => {
 	it("persists a real child completion for passive discovery, roster, and listing", async () => {
@@ -3412,3 +3429,712 @@ function makeClient(id: string, activeSessionId: string, supportsExtensionUi = f
 		capabilities: new Set(supportsExtensionUi ? ["extension_ui"] : []),
 	};
 }
+
+/**
+ * Snapshot transfer coverage folded in from the ENG-4677 / ENG-4602 / ENG-4601 regression files:
+ * catch-up drain gating and coalescing, snapshot generation replacement, and scoped snapshot
+ * failures that must never drop a sibling session or its stream.
+ */
+describe("daemon snapshot transfers", () => {
+	const snapshotSessionId = "active-snapshot";
+	const siblingSessionId = "active-snapshot-sibling";
+	const snapshotRoots: string[] = [];
+
+	interface SnapshotWorkerHarness {
+		descriptor: { workerId: string; rootActiveSessionId: string; lifecycle: "ready"; pid: number };
+		client?: { close: ReturnType<typeof vi.fn>; request: ReturnType<typeof vi.fn> };
+		summaries: Map<string, SessionSummary>;
+		snapshotCache: Map<string, DaemonAttachResult>;
+		transcriptCaches: Map<string, SnapshotTranscriptCache>;
+		snapshotGenerations: Map<string, Map<string, unknown>>;
+		snapshotLoads: Map<string, Promise<DaemonAttachResult>>;
+		intentionalStop: boolean;
+		stopRevision: number;
+	}
+
+	type CatchupDrain = (client: DaemonSocketClient) => Promise<void>;
+
+	afterEach(() => {
+		for (const root of snapshotRoots.splice(0)) {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	function snapshotRoot(): string {
+		const directory = mkdtempSync(join(tmpdir(), "daemon-snapshot-"));
+		snapshotRoots.push(directory);
+		return directory;
+	}
+
+	function snapshotSummary(activeSessionId: string, messageCount: number): SessionSummary {
+		return {
+			id: activeSessionId,
+			activeSessionId,
+			lifecycle: "live",
+			activity: "idle",
+			isSessionActive: false,
+			sessionId: `session-${activeSessionId}`,
+			cwd: "/tmp",
+			isStreaming: false,
+			isCompacting: false,
+			attachedClients: 0,
+			messageCount,
+			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+		};
+	}
+
+	function snapshotResult(
+		snapshotId: string,
+		messageCount: number,
+		lastEventSequence: number,
+		activeSessionId = snapshotSessionId,
+	): DaemonAttachResult {
+		return {
+			protocol: DAEMON_PROTOCOL_INFO,
+			activeSessionId,
+			snapshot: {
+				activeSessionId,
+				summary: snapshotSummary(activeSessionId, messageCount),
+				state: {
+					activeSessionId,
+					sessionId: `session-${activeSessionId}`,
+				} as DaemonAttachResult["snapshot"]["state"],
+				messages: [],
+				lastEventSequence,
+			},
+			replay: { status: "complete", toSequence: lastEventSequence },
+			lastEventSequence,
+			snapshotStream: { id: snapshotId, messageCount, targetChunkBytes: 1 },
+			client: { id: "supervisor", capabilities: ["chunked_snapshot"] },
+		};
+	}
+
+	function snapshotWorker(result: DaemonAttachResult, transcript?: SnapshotTranscriptCache): SnapshotWorkerHarness {
+		const close = vi.fn();
+		const request = vi.fn(async () => {
+			throw new Error("unexpected snapshot reload");
+		});
+		return {
+			descriptor: {
+				workerId: "worker-snapshot",
+				rootActiveSessionId: snapshotSessionId,
+				lifecycle: "ready",
+				pid: 4677,
+			},
+			client: { close, request },
+			summaries: new Map([[snapshotSessionId, result.snapshot.summary]]),
+			snapshotCache: transcript ? new Map([[snapshotSessionId, result]]) : new Map(),
+			transcriptCaches: transcript ? new Map([[snapshotSessionId, transcript]]) : new Map(),
+			snapshotGenerations: new Map(),
+			snapshotLoads: new Map(),
+			intentionalStop: false,
+			stopRevision: 0,
+		};
+	}
+
+	function snapshotFrame(
+		message: DaemonOutbound,
+		purpose: "attach" | "replacement" | "catchup" = "replacement",
+	): PrivateFrame<DaemonWorkerFrameHeader> {
+		return {
+			header: {
+				kind: "outbound",
+				outboundType: message.type,
+				...("activeSessionId" in message ? { activeSessionId: message.activeSessionId } : {}),
+				...("snapshotId" in message && typeof message.snapshotId === "string"
+					? { snapshotId: message.snapshotId }
+					: {}),
+				payloadEncoding: "jsonl",
+				snapshotPurpose: purpose,
+			},
+			payload: Buffer.from(JSON.stringify(message)),
+		};
+	}
+
+	function snapshotClient(id: string): { client: DaemonSocketClient; socket: PassThrough } {
+		const socket = new PassThrough();
+		socket.on("error", () => {});
+		return {
+			socket,
+			client: {
+				id,
+				socket: socket as unknown as Socket,
+				transport: "private-framed",
+				attachedActiveSessionIds: new Set([snapshotSessionId]),
+				catchupActiveSessionIds: new Set<string>(),
+				detachInput: () => {},
+				supportsExtensionUi: false,
+				capabilities: new Set(["chunked_snapshot"]),
+			} as DaemonSocketClient,
+		};
+	}
+
+	function makeSupervisor(root: string): DaemonSupervisor {
+		return new DaemonSupervisor(join(root, "supervisor.sock"), {
+			defaultSessionConfig: { agentDir: root, cwd: root },
+			descriptorDir: join(root, "state"),
+		});
+	}
+
+	function makeWorkerDaemon(root: string): AgentDaemon {
+		return new AgentDaemon(join(root, "worker.sock"), {
+			defaultSessionConfig: { agentDir: root, cwd: root },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+	}
+
+	/** Both catch-up channels (supervisor -> public client, worker -> supervisor link) share one contract. */
+	function catchupChannel(channel: "supervisor" | "worker", root: string, drain: CatchupDrain) {
+		if (channel === "supervisor") {
+			const internals = makeSupervisor(root) as unknown as {
+				drainClientCatchups: CatchupDrain;
+				queueCatchup(client: DaemonSocketClient, activeSessionId: string, purpose?: "replacement" | "resync"): void;
+				catchUpClient(client: DaemonSocketClient): Promise<void>;
+			};
+			internals.drainClientCatchups = drain;
+			return {
+				queue: (client: DaemonSocketClient, purpose?: "replacement" | "resync") =>
+					internals.queueCatchup(client, snapshotSessionId, purpose),
+				catchUp: (client: DaemonSocketClient) => internals.catchUpClient(client),
+			};
+		}
+		const internals = makeWorkerDaemon(root) as unknown as {
+			drainBackpressuredClientCatchups: CatchupDrain;
+			queueClientCatchup(
+				client: DaemonSocketClient,
+				activeSessionId: string,
+				purpose?: "replacement" | "resync",
+			): void;
+			catchUpBackpressuredClient(client: DaemonSocketClient): Promise<void>;
+		};
+		internals.drainBackpressuredClientCatchups = drain;
+		return {
+			queue: (client: DaemonSocketClient, purpose?: "replacement" | "resync") =>
+				internals.queueClientCatchup(client, snapshotSessionId, purpose),
+			catchUp: (client: DaemonSocketClient) => internals.catchUpBackpressuredClient(client),
+		};
+	}
+
+	it.each(["supervisor", "worker"] as const)(
+		"ENG-4677: waits for the %s socket to drain before continuing catch-up",
+		async (channel) => {
+			const drain = vi.fn(async (target: DaemonSocketClient) => {
+				target.catchupActiveSessionIds?.clear();
+			});
+			const { client, socket } = snapshotClient(`${channel}-backpressure`);
+			client.backpressured = true;
+			const { queue, catchUp } = catchupChannel(channel, snapshotRoot(), drain);
+			queue(client);
+
+			await catchUp(client);
+			expect(drain).not.toHaveBeenCalled();
+			expect(client.catchupActiveSessionIds).toContain(snapshotSessionId);
+
+			client.backpressured = false;
+			await catchUp(client);
+			expect(drain).toHaveBeenCalledOnce();
+			socket.destroy();
+		},
+	);
+
+	it.each(["supervisor", "worker"] as const)(
+		"ENG-4677: coalesces concurrent %s catch-up triggers into one drain",
+		async (channel) => {
+			let releaseFirstDrain!: () => void;
+			const firstDrainBlocked = new Promise<void>((resolve) => {
+				releaseFirstDrain = resolve;
+			});
+			const drain = vi.fn(async (target: DaemonSocketClient) => {
+				target.catchupActiveSessionIds?.clear();
+				target.catchupPurposes?.clear();
+				if (drain.mock.calls.length === 1) {
+					await firstDrainBlocked;
+				}
+			});
+			const { client, socket } = snapshotClient(`${channel}-coalesced`);
+			const { queue, catchUp } = catchupChannel(channel, snapshotRoot(), drain);
+			queue(client);
+
+			const first = catchUp(client);
+			expect(catchUp(client)).toBe(first);
+			expect(drain).toHaveBeenCalledOnce();
+
+			// A trigger that lands while the first drain is in flight must run exactly one follow-up drain.
+			queue(client, "replacement");
+			releaseFirstDrain();
+			await first;
+			for (let attempt = 0; attempt < 10 && drain.mock.calls.length < 2; attempt++) {
+				await new Promise<void>((resolve) => setImmediate(resolve));
+			}
+
+			expect(drain).toHaveBeenCalledTimes(2);
+			expect(client.catchupActiveSessionIds?.size).toBe(0);
+			socket.destroy();
+		},
+	);
+
+	it("ENG-4677: lets a retained snapshot finish while a newer generation becomes current", async () => {
+		const root = snapshotRoot();
+		const supervisor = makeSupervisor(root);
+		const firstSnapshotId = "snapshot-generation-a";
+		const replacementSnapshotId = "snapshot-generation-b";
+		const firstMessages: AgentMessage[] = [
+			{ role: "user", content: "first", timestamp: 1 },
+			{ role: "user", content: "second", timestamp: 2 },
+		];
+		const firstResult = snapshotResult(firstSnapshotId, firstMessages.length, 1);
+		const firstTranscript = new SnapshotTranscriptCache({
+			activeSessionId: snapshotSessionId,
+			snapshotId: firstSnapshotId,
+			messages: firstMessages,
+			cacheRoot: root,
+			targetChunkBytes: 1,
+		});
+		const worker = snapshotWorker(firstResult, firstTranscript);
+		const { client, socket } = snapshotClient("slow-client");
+		const written: DaemonOutbound[] = [];
+		let releaseFirstChunk!: (accepted: boolean) => void;
+		const firstChunkBlocked = new Promise<boolean>((resolve) => {
+			releaseFirstChunk = resolve;
+		});
+		let firstChunkStarted!: () => void;
+		const firstChunkReached = new Promise<void>((resolve) => {
+			firstChunkStarted = resolve;
+		});
+		const writeSnapshotBuffer = vi.fn((_client: DaemonSocketClient, buffer: Uint8Array) => {
+			const message = JSON.parse(Buffer.from(buffer).toString("utf8")) as DaemonOutbound;
+			written.push(message);
+			if (
+				message.type === "session_snapshot_chunk" &&
+				message.snapshotId === firstSnapshotId &&
+				message.index === 0
+			) {
+				firstChunkStarted();
+				return firstChunkBlocked;
+			}
+			return Promise.resolve(true);
+		});
+		const internals = supervisor as unknown as {
+			clients: Set<DaemonSocketClient>;
+			workers: Map<string, SnapshotWorkerHarness>;
+			writeSnapshotBuffer: typeof writeSnapshotBuffer;
+			syncWorkerExtensionUi: ReturnType<typeof vi.fn>;
+			streamSnapshot(
+				client: DaemonSocketClient,
+				worker: SnapshotWorkerHarness,
+				result: DaemonAttachResult,
+				transcript: SnapshotTranscriptCache,
+				purpose: "attach" | "replacement" | "resync",
+			): Promise<void>;
+			handleWorkerFrame(worker: SnapshotWorkerHarness, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
+			queueCatchup(client: DaemonSocketClient, activeSessionId: string, purpose: "replacement" | "resync"): void;
+			catchUpClient(client: DaemonSocketClient): Promise<void>;
+		};
+		internals.writeSnapshotBuffer = writeSnapshotBuffer;
+		internals.syncWorkerExtensionUi = vi.fn(async () => {});
+
+		const firstStream = internals.streamSnapshot(client, worker, firstResult, firstTranscript, "attach");
+		await firstChunkReached;
+
+		const { messages: _messages, ...replacementSnapshot } = snapshotResult(replacementSnapshotId, 1, 2).snapshot;
+		for (const message of [
+			{
+				type: "session_snapshot_begin",
+				activeSessionId: snapshotSessionId,
+				snapshotId: replacementSnapshotId,
+				snapshot: replacementSnapshot,
+				messageCount: 1,
+				targetChunkBytes: 1,
+			},
+			// A chunk from the retired generation must not land in the current transcript.
+			{
+				type: "session_snapshot_chunk",
+				activeSessionId: snapshotSessionId,
+				snapshotId: firstSnapshotId,
+				index: 2,
+				messages: [{ role: "user", content: "stale", timestamp: 3 }],
+			},
+			{
+				type: "session_snapshot_chunk",
+				activeSessionId: snapshotSessionId,
+				snapshotId: replacementSnapshotId,
+				index: 0,
+				messages: [{ role: "user", content: "replacement", timestamp: 4 }],
+			},
+			{
+				type: "session_snapshot_end",
+				activeSessionId: snapshotSessionId,
+				snapshotId: replacementSnapshotId,
+				chunkCount: 1,
+				lastEventSequence: 2,
+			},
+		] satisfies DaemonOutbound[]) {
+			internals.handleWorkerFrame(worker, snapshotFrame(message));
+		}
+
+		expect(worker.transcriptCaches.get(snapshotSessionId)).toMatchObject({
+			snapshotId: replacementSnapshotId,
+			chunkCount: 1,
+			complete: true,
+		});
+
+		releaseFirstChunk(true);
+		await firstStream;
+
+		expect(written.filter((message) => message.type === "session_snapshot_failed")).toHaveLength(0);
+		expect(
+			written.filter(
+				(message) => message.type === "session_snapshot_chunk" && message.snapshotId === firstSnapshotId,
+			),
+		).toHaveLength(2);
+
+		internals.clients.add(client);
+		internals.workers.set(worker.descriptor.workerId, worker);
+		seedSupervisorRoster(supervisor, worker);
+		internals.queueCatchup(client, snapshotSessionId, "replacement");
+		await internals.catchUpClient(client);
+
+		expect(
+			written.some(
+				(message) =>
+					message.type === "session_snapshot_begin" &&
+					message.snapshotId === replacementSnapshotId &&
+					message.purpose === "replacement",
+			),
+		).toBe(true);
+		expect(worker.transcriptCaches.get(snapshotSessionId)?.snapshotId).toBe(replacementSnapshotId);
+		socket.destroy();
+	});
+
+	it("ENG-4677: does not let a stale attach response replace a newer completed generation", async () => {
+		const root = snapshotRoot();
+		const supervisor = makeSupervisor(root);
+		const firstSnapshotId = "snapshot-stale-a";
+		const replacementSnapshotId = "snapshot-stale-b";
+		const firstResult = snapshotResult(firstSnapshotId, 1, 1);
+		const worker = snapshotWorker(firstResult);
+		let resolveAttach!: (response: { success: true; data: DaemonAttachResult }) => void;
+		worker.client = {
+			close: vi.fn(),
+			request: vi.fn(
+				() =>
+					new Promise<{ success: true; data: DaemonAttachResult }>((resolve) => {
+						resolveAttach = resolve;
+					}),
+			),
+		};
+		const { client, socket } = snapshotClient("stale-attach");
+		const internals = supervisor as unknown as {
+			workers: Map<string, SnapshotWorkerHarness>;
+			attachClient(
+				client: DaemonSocketClient,
+				command: { type: "attach"; activeSessionId: string; capabilities: ["chunked_snapshot"] },
+			): Promise<{
+				result: DaemonAttachResult;
+				transcript?: SnapshotTranscriptCache;
+				releaseTranscript?: () => void;
+			}>;
+			handleWorkerFrame(worker: SnapshotWorkerHarness, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
+		};
+		internals.workers.set(worker.descriptor.workerId, worker);
+		seedSupervisorRoster(supervisor, worker);
+		const attaching = internals.attachClient(client, {
+			type: "attach",
+			activeSessionId: snapshotSessionId,
+			capabilities: ["chunked_snapshot"],
+		});
+		await Promise.resolve();
+
+		for (const result of [firstResult, snapshotResult(replacementSnapshotId, 1, 2)]) {
+			const { messages: _messages, ...snapshot } = result.snapshot;
+			const snapshotId = result.snapshotStream!.id;
+			for (const message of [
+				{
+					type: "session_snapshot_begin",
+					activeSessionId: snapshotSessionId,
+					snapshotId,
+					snapshot,
+					messageCount: 1,
+					targetChunkBytes: 1,
+				},
+				{
+					type: "session_snapshot_chunk",
+					activeSessionId: snapshotSessionId,
+					snapshotId,
+					index: 0,
+					messages: [{ role: "user", content: snapshotId, timestamp: result.lastEventSequence }],
+				},
+				{
+					type: "session_snapshot_end",
+					activeSessionId: snapshotSessionId,
+					snapshotId,
+					chunkCount: 1,
+					lastEventSequence: result.lastEventSequence,
+				},
+			] satisfies DaemonOutbound[]) {
+				internals.handleWorkerFrame(worker, snapshotFrame(message));
+			}
+		}
+		resolveAttach({ success: true, data: firstResult });
+
+		const attached = await attaching;
+		expect(attached.result.snapshotStream?.id).toBe(replacementSnapshotId);
+		expect(attached.transcript).toMatchObject({ snapshotId: replacementSnapshotId, complete: true });
+		expect(worker.transcriptCaches.get(snapshotSessionId)?.snapshotId).toBe(replacementSnapshotId);
+		attached.releaseTranscript?.();
+		socket.destroy();
+	});
+
+	/** A snapshot that fails mid-transfer is scoped to its own session on both transfer channels. */
+	it.each(["worker channel", "public client"] as const)(
+		"ENG-4602: fails one snapshot on the %s without dropping another session",
+		async (channel) => {
+			const root = snapshotRoot();
+			const snapshotId = "snapshot-scoped-failure";
+			const result = snapshotResult(snapshotId, 1, 1);
+			const transcript = new SnapshotTranscriptCache({
+				activeSessionId: snapshotSessionId,
+				snapshotId,
+				messages: [{ role: "user", content: "message", timestamp: 1 }],
+				cacheRoot: root,
+			});
+			const streamError = new Error("chunk read failed");
+			transcript.readChunk = vi.fn(() => {
+				throw streamError;
+			});
+			const markFailed = vi.spyOn(transcript, "markFailed");
+			const dispose = vi.spyOn(transcript, "dispose");
+			const { client, socket } = snapshotClient("scoped-failure");
+			client.attachedActiveSessionIds.add(siblingSessionId);
+			const written: Buffer[] = [];
+			socket.on("data", (chunk: Buffer) => written.push(Buffer.from(chunk)));
+			const worker = snapshotWorker(result, transcript);
+
+			let stream: Promise<void>;
+			let decode: () => DaemonOutbound[];
+			if (channel === "worker channel") {
+				const internals = makeWorkerDaemon(root) as unknown as {
+					streamWorkerSnapshot(
+						client: DaemonSocketClient,
+						result: DaemonAttachResult,
+						transcript: SnapshotTranscriptCache,
+					): Promise<void>;
+				};
+				stream = internals.streamWorkerSnapshot(client, result, transcript);
+				decode = () =>
+					new PrivateFrameDecoder(isDaemonWorkerFrameHeader)
+						.push(Buffer.concat(written))
+						.map((frame) => JSON.parse(frame.payload.toString("utf8")) as DaemonOutbound);
+			} else {
+				const supervisor = makeSupervisor(root);
+				const internals = supervisor as unknown as {
+					clients: Set<DaemonSocketClient>;
+					streamSnapshot(
+						client: DaemonSocketClient,
+						worker: SnapshotWorkerHarness,
+						result: DaemonAttachResult,
+						transcript: SnapshotTranscriptCache,
+					): Promise<void>;
+				};
+				const sibling = snapshotClient("sibling");
+				internals.clients.add(client);
+				internals.clients.add(sibling.client);
+				stream = internals.streamSnapshot(client, worker, result, transcript);
+				decode = () =>
+					Buffer.concat(written)
+						.toString("utf8")
+						.trim()
+						.split("\n")
+						.map((line) => JSON.parse(line) as DaemonOutbound);
+			}
+
+			await expect(stream).rejects.toBe(streamError);
+
+			const records = decode();
+			expect(records.map((record) => record.type)).toEqual(["session_snapshot_begin", "session_snapshot_failed"]);
+			expect(records[1]).toMatchObject({
+				type: "session_snapshot_failed",
+				activeSessionId: snapshotSessionId,
+				snapshotId,
+				error: streamError.message,
+			});
+			expect(socket.destroyed).toBe(false);
+			expect(client.attachedActiveSessionIds).toContain(siblingSessionId);
+			expect(client.snapshotStreaming).toBe(false);
+			expect(transcript.complete).toBe(false);
+			expect(markFailed.mock.invocationCallOrder[0]).toBeLessThan(dispose.mock.invocationCallOrder[0]!);
+			expect(worker.client?.close).not.toHaveBeenCalled();
+			socket.destroy();
+		},
+	);
+
+	it("ENG-4602: keeps a multi-session worker connected after a scoped snapshot failure frame", () => {
+		const root = snapshotRoot();
+		const supervisor = makeSupervisor(root);
+		const snapshotId = "snapshot-failure-frame";
+		const transcript = new SnapshotTranscriptCache({
+			activeSessionId: snapshotSessionId,
+			snapshotId,
+			cacheRoot: root,
+		});
+		const worker = snapshotWorker(snapshotResult(snapshotId, 1, 1), transcript);
+		worker.summaries.set(siblingSessionId, snapshotSummary(siblingSessionId, 1));
+		const internals = supervisor as unknown as {
+			handleWorkerFrame(worker: SnapshotWorkerHarness, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
+		};
+
+		internals.handleWorkerFrame(
+			worker,
+			snapshotFrame({
+				type: "session_snapshot_failed",
+				activeSessionId: snapshotSessionId,
+				snapshotId,
+				error: "snapshot encoder failed",
+			}),
+		);
+
+		expect(worker.client?.close).not.toHaveBeenCalled();
+		expect(worker.descriptor.lifecycle).toBe("ready");
+		expect(worker.summaries.has(siblingSessionId)).toBe(true);
+		expect(worker.snapshotCache.has(snapshotSessionId)).toBe(false);
+		expect(worker.transcriptCaches.has(snapshotSessionId)).toBe(false);
+		expect(worker.snapshotGenerations.has(snapshotSessionId)).toBe(false);
+	});
+
+	it("ENG-4601: preserves legacy JSONL bytes from a stable message-array snapshot", () => {
+		const transcript: AgentMessage[] = [{ role: "user", content: 'line1\n"quoted"\\tail', timestamp: 1 }];
+		const chunks = createSnapshotTranscriptChunks({
+			activeSessionId: 'active-"\\',
+			snapshotId: "snapshot-\n",
+			messages: transcript,
+		});
+		transcript.push({ role: "user", content: "late", timestamp: 2 });
+
+		expect([...chunks].map((chunk) => chunk.toString("utf8"))).toEqual([
+			'{"type":"session_snapshot_chunk","activeSessionId":"active-\\"\\\\","snapshotId":"snapshot-\\n","index":0,"messages":[{"role":"user","content":"line1\\n\\"quoted\\"\\\\tail","timestamp":1}]}\n',
+		]);
+		expect([
+			...createSnapshotTranscriptChunks({
+				activeSessionId: snapshotSessionId,
+				snapshotId: "snapshot-empty",
+				messages: [],
+			}),
+		]).toEqual([]);
+	});
+
+	it("ENG-4601: terminates an aborted worker snapshot without interrupting a sibling stream", async () => {
+		const root = snapshotRoot();
+		const snapshotId = "snapshot-aborted";
+		const siblingSnapshotId = "snapshot-aborted-sibling";
+		const { client, socket } = snapshotClient("worker-detach");
+		client.attachedActiveSessionIds.add(siblingSessionId);
+		const state = {
+			activeSessionId: snapshotSessionId,
+			clients: new Set([client]),
+			extensionUiRequests: new Map(),
+			runtime: { metadata: { kind: "subagent" } },
+		} as unknown as ActiveSessionState;
+		const written: DaemonOutbound[] = [];
+		const produced: number[] = [];
+		const signal = markClientSnapshotStreaming(client, snapshotSessionId);
+		const siblingSignal = markClientSnapshotStreaming(client, siblingSessionId);
+		const messages: AgentMessage[] = [
+			{ role: "user", content: "first", timestamp: 1 },
+			{ role: "user", content: "second", timestamp: 2 },
+		];
+		const encoded = createSnapshotTranscriptChunks({
+			activeSessionId: snapshotSessionId,
+			snapshotId,
+			messages,
+			targetChunkBytes: 1,
+			signal,
+		});
+		const transcript: SnapshotTranscriptChunkSource = {
+			*[Symbol.iterator]() {
+				let index = 0;
+				for (const chunk of encoded) {
+					produced.push(index++);
+					yield chunk;
+				}
+			},
+		};
+		const internals = makeWorkerDaemon(root) as unknown as {
+			writeSerialized(client: DaemonSocketClient, buffer: string | Buffer, message?: DaemonOutbound): boolean;
+			streamWorkerSnapshot(
+				client: DaemonSocketClient,
+				result: DaemonAttachResult,
+				transcript: SnapshotTranscriptChunkSource,
+				purpose: "attach",
+				signal: AbortSignal,
+				snapshotAlreadyMarked: boolean,
+			): Promise<void>;
+			detachClientFromSession(client: DaemonSocketClient, state: ActiveSessionState): void;
+		};
+		// Only the aborted session's writes stay backpressured; the sibling stream keeps draining.
+		internals.writeSerialized = (_client, _buffer, message) => {
+			if (message) written.push(message);
+			return message?.type !== "session_snapshot_chunk" || message.activeSessionId === siblingSessionId;
+		};
+
+		const stream = internals.streamWorkerSnapshot(
+			client,
+			snapshotResult(snapshotId, 2, 1),
+			transcript,
+			"attach",
+			signal,
+			true,
+		);
+		const siblingStream = internals.streamWorkerSnapshot(
+			client,
+			snapshotResult(siblingSnapshotId, 2, 1, siblingSessionId),
+			createSnapshotTranscriptChunks({
+				activeSessionId: siblingSessionId,
+				snapshotId: siblingSnapshotId,
+				messages,
+				targetChunkBytes: 1,
+				signal: siblingSignal,
+			}),
+			"attach",
+			siblingSignal,
+			true,
+		);
+		for (let attempt = 0; attempt < 10 && socket.listenerCount("drain") === 0; attempt++) {
+			await Promise.resolve();
+		}
+		expect(produced).toEqual([0]);
+
+		internals.detachClientFromSession(client, state);
+		await Promise.all([stream, siblingStream]);
+
+		expect(produced).toEqual([0]);
+		expect(
+			written.some(
+				(message) => message.type === "session_snapshot_end" && message.activeSessionId === snapshotSessionId,
+			),
+		).toBe(false);
+		expect(written).toContainEqual({
+			type: "session_snapshot_failed",
+			activeSessionId: snapshotSessionId,
+			snapshotId,
+			error: `Snapshot ${snapshotId} was aborted`,
+		});
+		expect(written).toContainEqual(
+			expect.objectContaining({
+				type: "session_snapshot_end",
+				activeSessionId: siblingSessionId,
+				snapshotId: siblingSnapshotId,
+			}),
+		);
+		expect(state.clients.has(client)).toBe(false);
+		expect(client.attachedActiveSessionIds.has(snapshotSessionId)).toBe(false);
+		expect(client.attachedActiveSessionIds.has(siblingSessionId)).toBe(true);
+		expect(client.snapshotStreaming).toBe(false);
+		expect(client.snapshotActiveSessionIds?.size).toBe(0);
+		expect(client.snapshotTransferAbortControllers?.size).toBe(0);
+		expect(socket.listenerCount("drain")).toBe(0);
+		expect(socket.destroyed).toBe(false);
+		socket.destroy();
+	});
+});
