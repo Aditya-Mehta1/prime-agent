@@ -22,14 +22,16 @@ import { basename, dirname, join, resolve } from "node:path";
 import { deflateSync } from "node:zlib";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
+import { terminateSupervisor } from "./supervisor-teardown.js";
 
-// Every deadline inside a test or hook must stay strictly below the surrounding vitest budget,
-// otherwise the slower standalone runners kill the test before its own diagnostic can report.
+// Extracting and exercising a standalone archive is slower than an ordinary unit test, so this file
+// raises the test budget above the shared default; the hook budget comes from vitest.config.ts.
+// Every deadline inside a test or hook stays strictly below the surrounding budget, otherwise the
+// slower standalone runners kill the test before its own diagnostic can report.
 const RUN_TIMEOUT = 60000;
 const CONNECT_TIMEOUT = 5000;
-const GRACEFUL_EXIT_TIMEOUT = 3000;
-const TEARDOWN_TIMEOUT = 10000;
-vi.setConfig({ testTimeout: 120000, hookTimeout: 60000 });
+const SHUTDOWN_TIMEOUT = 15000;
+vi.setConfig({ testTimeout: 120000 });
 
 const archive = process.env.PRIME_AGENT_TEST_ARCHIVE;
 const uv = process.env.PRIME_AGENT_TEST_UV;
@@ -41,36 +43,6 @@ let home = "";
 let cwd = "";
 let socket = "";
 let environment: NodeJS.ProcessEnv;
-
-function hasExited(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return false;
-	} catch {
-		return true;
-	}
-}
-
-/** SIGKILL cannot be blocked, so the supervisor exit is reached without waiting on a graceful shutdown. */
-async function terminateSupervisor(pid: number): Promise<void> {
-	const escalateAt = Date.now() + GRACEFUL_EXIT_TIMEOUT;
-	await expect
-		.poll(
-			() => {
-				if (hasExited(pid)) return true;
-				if (Date.now() >= escalateAt) {
-					try {
-						process.kill(pid, "SIGKILL");
-					} catch {
-						/* Exited between the check and the signal. */
-					}
-				}
-				return false;
-			},
-			{ timeout: TEARDOWN_TIMEOUT },
-		)
-		.toBe(true);
-}
 
 async function run(args: string[], extraEnv: NodeJS.ProcessEnv = {}, timeout = RUN_TIMEOUT, input?: string) {
 	const child = spawn(binary, args, { cwd, env: { ...environment, ...extraEnv }, stdio: ["pipe", "pipe", "pipe"] });
@@ -209,7 +181,7 @@ describe.skipIf(!archive)("extracted standalone archive", () => {
 		try {
 			await client.connect(CONNECT_TIMEOUT);
 			supervisorPid = (await client.waitForHello()).supervisorPid;
-			await client.request({ type: "shutdown", force: true });
+			await client.request({ type: "shutdown", force: true }, SHUTDOWN_TIMEOUT);
 		} catch (error) {
 			if (existsSync(socket)) shutdownError = error;
 		} finally {
@@ -223,6 +195,8 @@ describe.skipIf(!archive)("extracted standalone archive", () => {
 		if (shutdownError) throw shutdownError;
 	});
 	afterAll(() => {
+		// The retry budget removes an extracted tree whose files a just-killed child may still hold;
+		// ten attempts spaced 100ms apart stay far below the hook budget even when every one is used.
 		if (root) rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 	});
 
