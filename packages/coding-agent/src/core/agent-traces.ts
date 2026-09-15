@@ -1135,6 +1135,11 @@ class AgentTraceUploadController {
 		// depends on wall-clock time. Bounded because a retry re-arms.
 		for (let drain = 0; drain < MAX_IDLE_DRAIN_CYCLES; drain += 1) {
 			if (this.timeout !== undefined) {
+				if (!this.isUploadDue()) {
+					// Backoff outlives this drain; the durable outbox replays it on the
+					// next catch-up rather than overrunning the server's Retry-After.
+					return;
+				}
 				clearTimeout(this.timeout);
 				this.timeout = undefined;
 				await this.runScheduledUpload();
@@ -1164,7 +1169,22 @@ class AgentTraceUploadController {
 		this.options.onUploadScheduled?.({ delayMs });
 	}
 
+	/** True when neither the server's Retry-After nor the throttle window blocks an upload. */
+	private isUploadDue(): boolean {
+		const now = Date.now();
+		if (now < this.notBeforeAt) {
+			return false;
+		}
+		return this.lastUploadStartedAt === undefined || now - this.lastUploadStartedAt >= TRACE_UPLOAD_MIN_INTERVAL_MS;
+	}
+
 	private async runScheduledUpload(): Promise<void> {
+		if (!this.isUploadDue()) {
+			// A flush must not overrun Retry-After or the throttle window; re-arm instead.
+			this.pending = true;
+			this.arm();
+			return;
+		}
 		if (this.inFlight) {
 			// Keep the work pending so the in-flight upload's settle path re-arms:
 			// the coalesce notice always has a guaranteed follow-up behind it.
