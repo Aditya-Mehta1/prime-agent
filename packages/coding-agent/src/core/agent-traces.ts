@@ -1134,6 +1134,12 @@ class AgentTraceUploadController {
 		// Flush the armed timer instead of waiting for it, so draining never
 		// depends on wall-clock time. Bounded because a retry re-arms.
 		for (let drain = 0; drain < MAX_IDLE_DRAIN_CYCLES; drain += 1) {
+			// An active writer is always awaited first, so a drain never returns while a
+			// request is still in flight.
+			if (this.inFlight !== undefined) {
+				await this.inFlight;
+				continue;
+			}
 			if (this.timeout !== undefined) {
 				if (!this.isUploadDue()) {
 					// Backoff outlives this drain; the durable outbox replays it on the
@@ -1143,10 +1149,6 @@ class AgentTraceUploadController {
 				clearTimeout(this.timeout);
 				this.timeout = undefined;
 				await this.runScheduledUpload();
-				continue;
-			}
-			if (this.inFlight !== undefined) {
-				await this.inFlight;
 				continue;
 			}
 			return;
