@@ -19,7 +19,7 @@ commit to put code on a user's machine.
 | Signing | Sigstore | keyless cosign, identity bound to this repository, workflow file and ref |
 | GitHub release | GitHub | asset digests recorded by GitHub, release drafted before anything is public |
 | R2 | Cloudflare | objects verified against GitHub's digests, immutable prefixes, read-back |
-| Install | the user | `SHA256SUMS` plus its signature; GitHub is a second origin |
+| Install | the user | `SHA256SUMS`; its cosign signature when `cosign` is on `PATH` (fail closed on mismatch, required with `PRIME_AGENT_REQUIRE_SIGNATURE=1`); otherwise TLS and the same-origin checksum only |
 | Update | the running binary | signature verification is mandatory and fails closed |
 
 The key idea is that **no single origin can assert its own integrity**. R2 serves the artifact, but
@@ -82,8 +82,13 @@ workflow, so nothing it signs can satisfy the release binary's pin.
 
 ### Dependency install scripts do not run on release machines
 
-Release and build jobs use `npm ci --ignore-scripts`, with a single explicit `npm rebuild esbuild`.
-A compromised transitive dependency cannot execute during a release build.
+Release and build jobs use `npm ci --ignore-scripts`, so a compromised dependency's `postinstall`
+does not run on the machine that produces the binaries. One exception is deliberate and checked:
+`npm rebuild esbuild` runs esbuild's own install script, because the bundler cannot work without its
+platform binary. That means a compromised **esbuild** (a direct, SHA-pinned dependency in the
+lockfile) could still execute on a build runner. Build runners hold no credentials, and every artifact
+they produce is verified downstream, so the blast radius is the build output itself - which is why
+the checker allows `npm rebuild` for exactly that one package and nothing else.
 
 ### Nightly cannot reach stable
 
@@ -132,6 +137,16 @@ cannot relax or replace verification.
 
 This matters because the updater, not the installer, is how most users receive most releases.
 
+### The installer verifies when it can, and says so when it cannot
+
+`install.sh` downloads `SHA256SUMS.sigstore.json` next to `SHA256SUMS` and refuses to continue if the
+bundle is missing. When `cosign` is on `PATH` it verifies the bundle against the release workflow's
+identity and fails closed on any mismatch. A POSIX shell script cannot verify a Sigstore bundle by
+itself, so **without cosign a fresh `curl | sh` install rests on TLS and the same-origin checksum**,
+and the installer prints exactly that. Set `PRIME_AGENT_REQUIRE_SIGNATURE=1` to make a missing
+`cosign` a hard failure. From the first `prime-agent update` onward the compiled binary verifies every
+release itself, with no fallback.
+
 ### Installations know who owns them
 
 A Homebrew or npm installation is detected before the compiled-binary path, so those copies are
@@ -141,9 +156,9 @@ directed to `brew upgrade` or their package manager instead of overwriting a man
 
 | Attacker | Before | After |
 |---|---|---|
-| Holds the R2 credential | replace artifact, checksums, manifest and installer | cannot match GitHub's digests, cannot forge the signature; existing installs refuse the update |
+| Holds the R2 credential | replace artifact, checksums, manifest and installer | cannot match GitHub's digests, cannot forge the signature; existing installs and cosign-equipped fresh installs refuse it. A fresh install on a machine without cosign remains exposed until its first update |
 | Has repository write access | push a `v*` tag and ship a release unattended | a pushed tag does nothing; publishing needs an approved version-bump pull request or a reviewer |
-| Compromises a build dependency | execute during the release build beside credentials | install scripts do not run, and build jobs hold no credentials |
+| Compromises a build dependency | execute during the release build beside credentials | install scripts do not run (except esbuild's, see above), and build jobs hold no credentials |
 | Steals a nightly credential | overwrite the stable channel | limited to the beta prefix |
 | Compromises an npm token | publish a malicious package | there is no token; publishing is OIDC with provenance |
 

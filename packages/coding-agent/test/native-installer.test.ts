@@ -81,6 +81,9 @@ let certificate: string;
 const originalDispatcher = getGlobalDispatcher();
 let fixtureDispatcher: Agent;
 
+/** Placeholder bundle bytes: present in the feed, never verified because cosign is off PATH. */
+const FIXTURE_BUNDLE = '{"fixture":"not a real sigstore bundle"}\n';
+
 function publish(
 	version: string,
 	options: { broken?: boolean; missing?: boolean; link?: boolean; installer?: string } = {},
@@ -106,6 +109,10 @@ function publish(
 	const digest = createHash("sha256").update(bytes).digest("hex");
 	feed.set(`/releases/v${version}/${filename}`, bytes);
 	feed.set(`/releases/v${version}/SHA256SUMS`, Buffer.from(`${digest}  ${filename}\n`));
+	// The fixture cannot mint a real cosign bundle (only the release workflow's OIDC identity can).
+	// The installer refuses an inventory whose bundle is MISSING, and verifies the bundle only when
+	// cosign is on PATH; these tests keep cosign off PATH except where they install a fake one.
+	feed.set(`/releases/v${version}/SHA256SUMS.sigstore.json`, Buffer.from(FIXTURE_BUNDLE));
 	feed.set(
 		version.includes("-beta") ? "/beta.json" : "/latest.json",
 		Buffer.from(
@@ -124,6 +131,7 @@ function publishNodePackage(version: string) {
 	const digest = createHash("sha256").update(bytes).digest("hex");
 	feed.set(`/releases/v${version}/${filename}`, bytes);
 	feed.set(`/releases/v${version}/SHA256SUMS`, Buffer.from(`${digest}  ${filename}\n`));
+	feed.set(`/releases/v${version}/SHA256SUMS.sigstore.json`, Buffer.from(FIXTURE_BUNDLE));
 }
 
 async function install(version: string, extra: NodeJS.ProcessEnv = {}, entrypoint = installer) {
@@ -1078,6 +1086,65 @@ exec /bin/${operation} "$@"
 		expect(result.code).not.toBe(0);
 		expect(result.output).toContain("installation is locked");
 		expect(readFileSync(join(lock, "pid"), "utf8")).toBe(`${process.pid}\n`);
+	});
+
+	describe("release inventory signature", () => {
+		function fakeCosign(mode: "pass" | "fail"): string {
+			const dir = mkdtempSync(join(root, "cosign-"));
+			const record = join(dir, "args.txt");
+			writeFileSync(
+				join(dir, "cosign"),
+				`#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(record)}\n${mode === "pass" ? "exit 0" : "echo 'Error: none of the expected identities matched' >&2; exit 1"}\n`,
+				{ mode: 0o755 },
+			);
+			return dir;
+		}
+
+		it("verifies the inventory with cosign when it is available, pinning the release workflow identity", async () => {
+			publish("1.0.0");
+			const shim = fakeCosign("pass");
+			const result = await install("1.0.0", { PATH: `${shim}:/usr/bin:/bin` });
+			expect(result.code, result.output).toBe(0);
+			expect(result.output).not.toContain("cosign was not found");
+			const args = readFileSync(join(shim, "args.txt"), "utf8").split("\n");
+			expect(args[0]).toBe("verify-blob");
+			expect(args).toContain("--certificate-oidc-issuer");
+			expect(args).toContain("https://token.actions.githubusercontent.com");
+			expect(args).toContain("--certificate-identity-regexp");
+			const identity = args[args.indexOf("--certificate-identity-regexp") + 1];
+			expect(identity).toContain("PrimeIntellect-ai/prime-agent");
+			expect(identity).toContain("build-binaries");
+			expect(identity).toContain("refs/(heads/main|tags/v");
+			expect(args.at(-2)).toMatch(/SHA256SUMS$/);
+		});
+
+		it("refuses to install when cosign rejects the inventory signature", async () => {
+			publish("1.0.0");
+			const shim = fakeCosign("fail");
+			const result = await install("1.0.0", { PATH: `${shim}:/usr/bin:/bin` });
+			expect(result.code).not.toBe(0);
+			expect(result.output).toContain("not signed by the Prime Agent release workflow");
+			expect(existsSync(join(home, "data/prime-agent/bin/prime-agent"))).toBe(false);
+		});
+
+		it("refuses to install when the signature bundle is missing from the release", async () => {
+			publish("1.0.0");
+			feed.delete("/releases/v1.0.0/SHA256SUMS.sigstore.json");
+			const result = await install("1.0.0");
+			expect(result.code).not.toBe(0);
+			expect(result.output).toContain("release signature (SHA256SUMS.sigstore.json) could not be downloaded");
+		});
+
+		it("without cosign it says so, and refuses when a signature is required", async () => {
+			publish("1.0.0");
+			const relaxed = await install("1.0.0");
+			expect(relaxed.code, relaxed.output).toBe(0);
+			expect(relaxed.output).toContain("cosign was not found, so the release signature was not verified");
+
+			const strict = await install("1.0.0", { PRIME_AGENT_REQUIRE_SIGNATURE: "1" });
+			expect(strict.code).not.toBe(0);
+			expect(strict.output).toContain("cosign is required to verify the release signature");
+		});
 	});
 
 	it("releases its installation lock after a terminal hangup", async () => {
