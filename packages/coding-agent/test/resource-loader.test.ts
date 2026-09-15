@@ -711,3 +711,93 @@ export default function(pi: ExtensionAPI) {
 		});
 	});
 });
+
+
+describe("settings reload regressions", () => {
+	let tempDir: string;
+	let agentDir: string;
+
+	beforeEach(() => {
+		tempDir = join(tmpdir(), `rl-settings-reload-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		agentDir = join(tempDir, "agent");
+		mkdirSync(join(agentDir, "prompts"), { recursive: true });
+	});
+
+	afterEach(() => {
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	function inMemoryLoaderSettings() {
+		return SettingsManager.inMemory({
+			defaultThinkingLevel: "high",
+			images: { autoResize: false },
+			compaction: { enabled: false },
+		});
+	}
+
+	it("#2753: applies updated top-level prompt settings on reload after startup", async () => {
+		writeFileSync(join(agentDir, "prompts", "test.md"), "Echo test prompt\n");
+		const settingsManager = SettingsManager.create(tempDir, agentDir);
+		const loader = new DefaultResourceLoader({
+			cwd: tempDir,
+			agentDir,
+			settingsManager,
+			noExtensions: true,
+			noSkills: true,
+			noThemes: true,
+		});
+		await loader.reload();
+		expect(loader.getPrompts().prompts.map((prompt) => prompt.name)).toContain("test");
+
+		writeFileSync(join(agentDir, "settings.json"), `${JSON.stringify({ prompts: ["-prompts/test.md"] }, null, 2)}\n`);
+		await loader.reload();
+
+		expect(settingsManager.getGlobalSettings().prompts).toEqual(["-prompts/test.md"]);
+		expect(loader.getPrompts().prompts.map((prompt) => prompt.name)).not.toContain("test");
+	});
+
+	it.each([
+		{
+			name: "a direct settings reload",
+			reload: async (settingsManager: SettingsManager) => {
+				await settingsManager.reload();
+			},
+		},
+		{
+			name: "a resource loader reload",
+			reload: async (settingsManager: SettingsManager, cwd: string, dir: string) => {
+				await new DefaultResourceLoader({
+					cwd,
+					agentDir: dir,
+					settingsManager,
+					noExtensions: true,
+					noSkills: true,
+					noPromptTemplates: true,
+					noThemes: true,
+					noContextFiles: true,
+				}).reload();
+			},
+		},
+		{
+			name: "an unrelated setter, flush, and reload",
+			reload: async (settingsManager: SettingsManager) => {
+				settingsManager.setTheme("dark");
+				await settingsManager.flush();
+				await settingsManager.reload();
+			},
+		},
+	])("#3616: in-memory settings survive $name", async ({ reload }) => {
+		const settingsManager = inMemoryLoaderSettings();
+
+		await reload(settingsManager, tempDir, agentDir);
+
+		expect(settingsManager.getDefaultThinkingLevel()).toBe("high");
+		expect(settingsManager.getImageAutoResize()).toBe(false);
+		expect(settingsManager.getCompactionEnabled()).toBe(false);
+		expect(settingsManager.getGlobalSettings()).toMatchObject({
+			defaultThinkingLevel: "high",
+			images: { autoResize: false },
+			compaction: { enabled: false },
+		});
+	});
+});

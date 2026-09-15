@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { AgentContinueError, type AgentTool } from "@earendil-works/pi-agent-core";
-import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxToolCall, type ToolResultMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -12,8 +12,11 @@ import {
 	createAgentSessionMessagePrompt,
 } from "../../src/core/agent-messages.js";
 import { type AgentCronJob, shouldDeferHeartbeatCronJob } from "../../src/core/cron-jobs.js";
+import type { HostRequestHandlers, KernelSentAgentMessage } from "../../src/core/kernel/index.js";
 import {
+	ASYNC_BASH_COMPLETION_CUSTOM_TYPE,
 	createSessionSlashCommandMessage,
+	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
 	isRefinementOutcomeMessage,
 	REFINEMENT_OUTCOME_CUSTOM_TYPE,
 } from "../../src/core/messages.js";
@@ -3683,5 +3686,538 @@ describe("AgentSession scheduler scenarios", () => {
 
 		expect(scheduleCount).toBeLessThan(200);
 		expect(getAssistantTexts(harness)).toEqual(["first done", "second done"]);
+	});
+});
+
+
+type LateSentAgentMessageHost = {
+	_recordLateIpythonSentAgentMessage: (toolCallId: string, message: KernelSentAgentMessage) => void;
+	_agentEventQueue: Promise<void>;
+	_lateIpythonSentAgentMessages: Map<string, KernelSentAgentMessage[]>;
+	_restoreLateIpythonSentAgentMessages: () => void;
+};
+
+type KernelHostSession = {
+	_createKernelHostHandlers(): HostRequestHandlers;
+};
+
+type StateRestoreHost = {
+	_onIpythonStateRestored(result: { restored: string[]; failed: string[]; path: string }): void;
+};
+
+const HEARTBEAT_MARKED_PROMPT = "[heartbeat: every 5m run#0]\n\ncheck progress";
+
+const shellCompletion = { pid: 42, command: "npm test", exitCode: 0 };
+
+function kernelHandlers(harness: Harness): HostRequestHandlers {
+	return (harness.session as unknown as KernelHostSession)._createKernelHostHandlers();
+}
+
+function completeShell(harness: Harness): Promise<unknown> {
+	return kernelHandlers(harness)["bash.completed"]!(shellCompletion) as Promise<unknown>;
+}
+
+function readShellResult(harness: Harness, command = shellCompletion.command): Promise<unknown> {
+	return kernelHandlers(harness)["bash.consumed"]!({ pid: shellCompletion.pid, command }) as Promise<unknown>;
+}
+
+function shellMessages(harness: Harness): unknown[] {
+	return harness.session.messages.filter(
+		(message) => message.role === "custom" && message.customType === ASYNC_BASH_COMPLETION_CUSTOM_TYPE,
+	);
+}
+
+describe("AgentSession queue regressions", () => {
+	const harnesses: Harness[] = [];
+
+	afterEach(() => {
+		while (harnesses.length > 0) {
+			harnesses.pop()?.cleanup();
+		}
+	});
+
+	it("ENG-4531: persists sent agent messages that arrive after their Python cell completes", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const toolResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "ipython_4531",
+			toolName: "ipython",
+			content: [{ type: "text", text: "" }],
+			details: { status: "ok" },
+			isError: false,
+			timestamp: Date.now(),
+		};
+		harness.session.sessionManager.appendMessage(
+			fauxAssistantMessage(fauxToolCall("ipython", { code: "background_send" }), { stopReason: "toolUse" }),
+		);
+		harness.session.sessionManager.appendMessage(toolResult);
+		harness.session.agent.state.messages.push(toolResult);
+		const lateMessage = {
+			id: "agentmsg_late_4531",
+			message: "Background review finished.",
+			deliveryStatus: "delivered" as const,
+			target: { activeSessionId: "worker-active", sessionId: "worker-session", sessionName: "Worker" },
+		};
+		const events: string[] = [];
+		const unsubscribe = harness.session.subscribe((event) => events.push(event.type));
+		const host = harness.session as unknown as LateSentAgentMessageHost;
+
+		host._recordLateIpythonSentAgentMessage(toolResult.toolCallId, lateMessage);
+		await host._agentEventQueue;
+		unsubscribe();
+
+		expect(toolResult.details).toMatchObject({ sentAgentMessages: [lateMessage] });
+		expect(
+			harness.session.sessionManager
+				.getEntries()
+				.some((entry) => entry.type === "custom" && entry.customType === "ipython_sent_agent_message"),
+		).toBe(true);
+		expect(events).toContain("ipython_sent_agent_message");
+		expect(
+			harness.session
+				.buildSessionContext()
+				.messages.find(
+					(message): message is ToolResultMessage =>
+						message.role === "toolResult" && message.toolCallId === toolResult.toolCallId,
+				)?.details,
+		).toMatchObject({ sentAgentMessages: [lateMessage] });
+
+		// A rebuilt transcript re-attaches the receipt; receipts for abandoned branches are dropped.
+		toolResult.details = { status: "ok" };
+		host._restoreLateIpythonSentAgentMessages();
+		expect(toolResult.details).toMatchObject({ sentAgentMessages: [lateMessage] });
+		host._lateIpythonSentAgentMessages.set("ipython_other_branch", [
+			{
+				id: "agentmsg_other_branch",
+				message: "Stale branch receipt.",
+				deliveryStatus: "delivered",
+				target: { activeSessionId: "other", sessionId: "other-session" },
+			},
+		]);
+		host._restoreLateIpythonSentAgentMessages();
+		expect(host._lateIpythonSentAgentMessages.has("ipython_other_branch")).toBe(false);
+	});
+
+	it("ENG-4531: preserves the custom message when direct delivery races with active work", async () => {
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = await createWaitingHarness();
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("Original turn complete."),
+			fauxAssistantMessage("Agent message handled."),
+		]);
+		await waitForToolStart;
+		const payload: AgentSessionMessagePayload = {
+			id: "agentmsg_4531",
+			source: AGENT_MESSAGE_SOURCE,
+			message: "Queue behind the active turn.",
+			target: { activeSessionId: "worker-active", sessionId: "worker-session" },
+		};
+
+		await harness.session.acceptAgentMessagePrompt(createAgentSessionMessagePrompt(payload), {
+			customMessage: createAgentSessionMessage(payload),
+			streamingBehavior: "followUp",
+			queueIfBusy: true,
+		});
+
+		const queued = harness.session.getSessionActionRecoverySnapshot().actions[0];
+		expect(queued?.payload.kind === "turn" ? queued.payload.customMessage : undefined).toMatchObject({
+			customType: "agent_message",
+			details: { message: "Queue behind the active turn." },
+		});
+		releaseToolExecution();
+		await promptPromise;
+		await harness.session.agent.waitForIdle();
+		expect(
+			harness.session.messages.some(
+				(message) => message.role === "custom" && message.customType === "agent_message",
+			),
+		).toBe(true);
+	});
+
+	it("ENG-4482: orders a heartbeat after an earlier prompt with a slow input handler", async () => {
+		const inputReached = createDeferred();
+		const inputGate = createDeferred();
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", async (event) => {
+						if (event.text !== "ordinary first") return;
+						inputReached.resolve();
+						await inputGate.promise;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		const providerOrder: string[] = [];
+		harness.setResponses([
+			(context) => {
+				providerOrder.push(getMessageText(context.messages.at(-1)));
+				return fauxAssistantMessage("first done");
+			},
+			(context) => {
+				providerOrder.push(getMessageText(context.messages.at(-1)));
+				return fauxAssistantMessage("heartbeat done");
+			},
+		]);
+
+		const ordinary = harness.session.prompt("ordinary first");
+		await inputReached.promise;
+		const heartbeat = harness.session.promptHeartbeat(heartbeatJob());
+		inputGate.resolve();
+		await Promise.all([ordinary, heartbeat]);
+		await harness.session.waitForIdle();
+
+		expect(providerOrder).toEqual(["ordinary first", HEARTBEAT_MARKED_PROMPT]);
+	});
+
+	it("ENG-4482: waits for a queued-work pause before admitting a streaming heartbeat", async () => {
+		const started = createDeferred();
+		const turnGate = createDeferred();
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([
+			async () => {
+				started.resolve();
+				await turnGate.promise;
+				return fauxAssistantMessage("original done");
+			},
+			fauxAssistantMessage("heartbeat done"),
+		]);
+
+		const originalTurn = harness.session.prompt("start");
+		await started.promise;
+		const pause = harness.session.acquireQueuedWorkPause();
+		const heartbeat = harness.session.promptHeartbeat(heartbeatJob(), { streamingBehavior: "followUp" });
+		await Promise.resolve();
+		expect(harness.session.getSessionActionRecoverySnapshot().actions).toHaveLength(0);
+
+		pause.release();
+		await heartbeat;
+		expect(harness.session.getSessionActionRecoverySnapshot().actions).toHaveLength(1);
+		turnGate.resolve();
+		await originalTurn;
+		await harness.session.waitForIdle();
+		expect(harness.session.getSessionActionRecoverySnapshot().actions).toHaveLength(0);
+	});
+
+	it("ENG-4482: preserves next-turn context order across queued heartbeat admission", async () => {
+		const started = createDeferred();
+		const turnGate = createDeferred();
+		const harness = await createHarness();
+		harnesses.push(harness);
+		let deliveredOrder: string[] = [];
+		harness.setResponses([
+			async () => {
+				started.resolve();
+				await turnGate.promise;
+				return fauxAssistantMessage("original turn complete");
+			},
+			(context) => {
+				deliveredOrder = context.messages
+					.map(getMessageText)
+					.filter((text) => ["context A", "context B", HEARTBEAT_MARKED_PROMPT].includes(text));
+				return fauxAssistantMessage("heartbeat handled");
+			},
+		]);
+
+		const originalTurn = harness.session.prompt("start");
+		await started.promise;
+		expect(harness.session.isStreaming).toBe(true);
+		expect(harness.session.unfinishedActionCount).toBe(1);
+		expect(harness.session.hasPendingSessionWork).toBe(false);
+		expect(shouldDeferHeartbeatCronJob(heartbeatJob(), harness.session)).toBe(false);
+		await harness.session.sendCustomMessage(
+			{ customType: "next-turn", content: "context A", display: true, details: {} },
+			{ deliverAs: "nextTurn" },
+		);
+		await harness.session.promptHeartbeat(heartbeatJob(), { streamingBehavior: "followUp" });
+		await harness.session.sendCustomMessage(
+			{ customType: "next-turn", content: "context B", display: true, details: {} },
+			{ deliverAs: "nextTurn" },
+		);
+		turnGate.resolve();
+		await originalTurn;
+		await harness.session.waitForIdle();
+
+		expect(deliveredOrder).toEqual(["context A", "context B", HEARTBEAT_MARKED_PROMPT]);
+	});
+
+	it.each([
+		{
+			behavior: "followUp" as const,
+			queued: (harness: Harness) => harness.session.clearQueue(),
+			expected: { steering: [], followUp: [HEARTBEAT_MARKED_PROMPT] },
+		},
+		{
+			behavior: "steer" as const,
+			queued: (harness: Harness) => {
+				expect(harness.session.removeQueuedFollowUp("heartbeat:heartbeat-test")).toBe(true);
+				return { steering: [], followUp: [] };
+			},
+			expected: { steering: [], followUp: [] },
+		},
+	])("ENG-4482: removes a queued $behavior heartbeat prompt by queue key", async ({ behavior, queued, expected }) => {
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = await createWaitingHarness();
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("original turn complete"),
+		]);
+		await waitForToolStart;
+		await harness.session.promptHeartbeat(heartbeatJob(), { streamingBehavior: behavior });
+
+		expect(harness.session.queuedActionCount).toBe(1);
+		expect(queued(harness)).toEqual(expected);
+		expect(harness.session.queuedActionCount).toBe(0);
+
+		releaseToolExecution();
+		await promptPromise;
+		await harness.session.waitForIdle();
+		expect(getUserTexts(harness)).toEqual(["start"]);
+	});
+
+	it("ENG-4530: retries only undelivered input after partial scheduler delivery", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		await harness.session.sendCustomMessage(
+			{
+				customType: IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
+				content: "restore context",
+				display: true,
+				details: { restored: true },
+			},
+			{ deliverAs: "nextTurn" },
+		);
+		withStreaming(harness, true);
+		await harness.session.prompt("queued prompt", { streamingBehavior: "followUp" });
+		withStreaming(harness, false);
+		vi.spyOn(harness.session.agent, "prompt").mockImplementationOnce(async (messages) => {
+			const batch = Array.isArray(messages) ? messages : [messages];
+			harness.session.agent.state.messages.push(batch[0]);
+			harness.session.acquireQueuedWorkPause();
+			throw new Error("partial delivery failed");
+		});
+
+		harness.session.resumeQueuedWork();
+		await harness.session.waitForSessionInputIdle();
+
+		const [queued] = harness.session.getSessionActionRecoverySnapshot().actions;
+		expect(queued?.payload).toMatchObject({ text: "queued prompt" });
+		expect(
+			queued?.payload.kind === "turn" ? queued.payload.records.filter((record) => record.role === "prefix") : [],
+		).toEqual([]);
+		expect(conversationMessages(harness.session)).toEqual([
+			expect.objectContaining({ customType: IPYTHON_STATE_RESTORED_CUSTOM_TYPE }),
+		]);
+	});
+
+	it("ENG-4530: queues restore context as a prefix record on the next queued turn", async () => {
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = await createWaitingHarness();
+		harnesses.push(harness);
+		let providerSawRestoreContext = false;
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("original turn complete"),
+			(context) => {
+				providerSawRestoreContext = context.messages.some((message) =>
+					getMessageText(message).includes("These names are available again: alpha, beta."),
+				);
+				return fauxAssistantMessage("queued turn complete");
+			},
+		]);
+		await waitForToolStart;
+		(harness.session as unknown as StateRestoreHost)._onIpythonStateRestored({
+			restored: ["alpha", "beta"],
+			failed: [],
+			path: "/tmp/kernel-state.dill",
+		});
+		await harness.session.prompt("stop the heartbeat", { streamingBehavior: "followUp" });
+
+		const [queued] = harness.session.getSessionActionRecoverySnapshot().actions;
+		const prefixMessages =
+			queued?.payload.kind === "turn"
+				? queued.payload.records.filter((record) => record.role === "prefix").map((record) => record.message)
+				: [];
+		expect(prefixMessages).toHaveLength(1);
+		expect(prefixMessages[0]).toMatchObject({
+			role: "custom",
+			customType: IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
+			display: true,
+			details: { restored: true },
+		});
+
+		releaseToolExecution();
+		await promptPromise;
+		await harness.session.waitForIdle();
+
+		expect(providerSawRestoreContext).toBe(true);
+		expect(getUserTexts(harness)).toEqual(["start", "stop the heartbeat"]);
+	});
+
+	it("#2068: consumes shell steering at the next tool boundary without waiting for idle", async () => {
+		const started = createDeferred();
+		const release = createDeferred();
+		const order: string[] = [];
+		let consumed = { streaming: false, completedRuns: -1, text: "" };
+		const tool: AgentTool = {
+			name: "hold",
+			label: "Hold",
+			description: "Hold the current tool until released",
+			parameters: Type.Object({}),
+			execute: async () => {
+				order.push("tool-start");
+				started.resolve();
+				await release.promise;
+				order.push("tool-end");
+				return { content: [{ type: "text", text: "released" }], details: {} };
+			},
+		};
+		const harness = await createHarness({ tools: [tool] });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("hold", {}), { stopReason: "toolUse" }),
+			(context) => {
+				consumed = {
+					streaming: harness.session.isStreaming,
+					completedRuns: harness.eventsOfType("agent_end").length,
+					text: getMessageText(context.messages.at(-1)),
+				};
+				order.push("shell-consumed");
+				return fauxAssistantMessage("Inspected the shell result.");
+			},
+		]);
+		const original = harness.session.prompt("Continue working.");
+		try {
+			await started.promise;
+			await expect(completeShell(harness)).resolves.toEqual({});
+			order.push("shell-queued");
+			expect(order).toEqual(["tool-start", "shell-queued"]);
+			expect(harness.session.getFollowUpMessages()).toEqual([]);
+			expect(harness.session.getSteeringMessages()).toHaveLength(1);
+			expect(harness.session.getSessionActionRecoverySnapshot().actions).toContainEqual(
+				expect.objectContaining({ delivery: "next_turn_boundary" }),
+			);
+		} finally {
+			release.resolve();
+			await original;
+		}
+		await harness.session.waitForIdle();
+
+		expect(order).toEqual(["tool-start", "shell-queued", "tool-end", "shell-consumed"]);
+		expect(consumed).toMatchObject({ streaming: true, completedRuns: 1 });
+		expect(consumed.text).toBe('[bash-done pid:42 exit:0]\n\nCommand: "npm test"');
+		expect(shellMessages(harness)).toHaveLength(1);
+		expect(harness.eventsOfType("agent_start")).toHaveLength(2);
+		expect(harness.eventsOfType("agent_end")).toHaveLength(2);
+	});
+
+	it("#2068: withdraws a queued shell notice once the kernel reads the result", async () => {
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = await createWaitingHarness();
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("Finished the original work."),
+		]);
+		await waitForToolStart;
+		await completeShell(harness);
+		expect(harness.session.getSteeringMessages()).toHaveLength(1);
+		// pids are reused across handles, so another command must not withdraw this notice.
+		await readShellResult(harness, "other command");
+		expect(harness.session.getSteeringMessages()).toHaveLength(1);
+		// pid reuse can queue an identical key twice; one read withdraws one notice.
+		await completeShell(harness);
+		expect(harness.session.getSteeringMessages()).toHaveLength(2);
+		await readShellResult(harness);
+		expect(harness.session.getSteeringMessages()).toHaveLength(1);
+		await readShellResult(harness);
+		expect(harness.session.getSteeringMessages()).toEqual([]);
+
+		releaseToolExecution();
+		await promptPromise;
+		await harness.session.waitForIdle();
+		expect(shellMessages(harness)).toEqual([]);
+		expect(harness.eventsOfType("agent_start")).toHaveLength(1);
+	});
+
+	it("#2023: keeps extension-origin queued slash-command text out of command dispatch", async () => {
+		let extensionApi: ExtensionAPI | undefined;
+		const commandRuns: string[] = [];
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = await createWaitingHarness({
+			extensionFactories: [
+				(pi) => {
+					extensionApi = pi;
+					pi.registerCommand("testcmd", {
+						description: "Test command",
+						handler: async (args) => {
+							commandRuns.push(args);
+						},
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("first turn complete"),
+			fauxAssistantMessage("queued follow-up handled by model"),
+		]);
+		await waitForToolStart;
+
+		extensionApi?.sendUserMessage("/testcmd queued", { deliverAs: "followUp" });
+		releaseToolExecution();
+		await promptPromise;
+		await harness.session.waitForIdle();
+
+		expect(commandRuns).toEqual([]);
+		expect(getUserTexts(harness)).toEqual(["start", "/testcmd queued"]);
+		expect(getAssistantTexts(harness)).toContain("queued follow-up handled by model");
+	});
+
+	it.each([
+		{ kind: "steering", queue: (harness: Harness) => harness.session.steer("stop heartbeat", undefined, { resumeIfIdle: true }) },
+		{
+			kind: "follow-up",
+			queue: (harness: Harness) => harness.session.followUp("continue after end", undefined, { resumeIfIdle: true }),
+		},
+	])("ENG-4653: starts a new turn for $kind queued from agent_end", async ({ kind, queue }) => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("first turn complete"), fauxAssistantMessage("second turn")]);
+		let queued = false;
+		const unsubscribe = harness.session.agent.subscribe(async (event) => {
+			if (event.type !== "agent_end" || queued) return;
+			queued = true;
+			await queue(harness);
+		});
+
+		await harness.session.prompt("start");
+		await vi.waitFor(() => expect(harness.faux.state.callCount).toBe(2));
+		await harness.session.agent.waitForIdle();
+		await vi.waitFor(() => expect(harness.session.queuedActionCount).toBe(0));
+		unsubscribe();
+
+		expect(getUserTexts(harness)).toEqual([
+			"start",
+			kind === "steering" ? "stop heartbeat" : "continue after end",
+		]);
+		expect(harness.eventsOfType("agent_start")).toHaveLength(2);
+		expect(harness.eventsOfType("agent_end")).toHaveLength(2);
+	});
+
+	it("ENG-4653: starts a turn for an explicit steering message accepted while idle", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("idle steering handled")]);
+
+		await harness.session.steer("recover stale routing", undefined, { resumeIfIdle: true });
+		await vi.waitFor(() => expect(harness.faux.state.callCount).toBe(1));
+		await harness.session.agent.waitForIdle();
+		await vi.waitFor(() => expect(harness.session.queuedActionCount).toBe(0));
+
+		expect(getUserTexts(harness)).toEqual(["recover stale routing"]);
+		expect(harness.eventsOfType("agent_start")).toHaveLength(1);
 	});
 });

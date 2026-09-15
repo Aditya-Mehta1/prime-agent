@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { parseNewSessionCommand } from "../src/core/new-session-command.js";
+import { expandPromptTemplate, type PromptTemplate, substituteArgs } from "../src/core/prompt-templates.js";
 import {
 	BUILTIN_SLASH_COMMANDS,
 	builtinSlashCommandTakesArgument,
@@ -12,6 +13,7 @@ import {
 	resolveSlashCommand,
 	SESSION_SLASH_COMMAND_NAMES,
 } from "../src/core/slash-commands.js";
+import { createSyntheticSourceInfo } from "../src/core/source-info.js";
 
 describe("built-in slash commands", () => {
 	test("exposes heartbeat without exposing a cron slash command", () => {
@@ -262,5 +264,49 @@ describe("session slash commands", () => {
 		expect(parseSessionSlashCommand(" /compact")).toBeUndefined();
 		expect(parseSessionSlashCommand("/compaction")).toBeUndefined();
 		expect(parseSessionSlashCommand("/settings")).toBeUndefined();
+	});
+});
+
+
+describe("ENG-6014 literal prompt arguments", () => {
+	const explainTemplate: PromptTemplate = {
+		name: "explain",
+		description: "Explain the argument",
+		content: "Explain: $ARGUMENTS",
+		sourceInfo: createSyntheticSourceInfo("/tmp/explain.md", { source: "test" }),
+		filePath: "/tmp/explain.md",
+	};
+
+	test.each(["$$", "$&", "$`", "$'", "$1", "$10", "$ARGUMENTS", "$@", `\${@:2}`, `\${@:1:2}`])(
+		"preserves %s in every placeholder form",
+		(literal) => {
+			const args = [literal, "tail"];
+			expect(substituteArgs("Before $1 after", args)).toBe(`Before ${literal} after`);
+			expect(substituteArgs("Before $ARGUMENTS after", args)).toBe(`Before ${literal} tail after`);
+			expect(substituteArgs("Before $@ after", args)).toBe(`Before ${literal} tail after`);
+			expect(substituteArgs(`Before \${@:1} after`, args)).toBe(`Before ${literal} tail after`);
+			expect(substituteArgs(`Before \${@:2:1} after`, ["head", literal, "tail"])).toBe(`Before ${literal} after`);
+		},
+	);
+
+	test("does not expand placeholders formed across insertion boundaries", () => {
+		expect(substituteArgs("$1ARGUMENTS|$1@|$1{@:2}", ["$", "tail"])).toBe(`$ARGUMENTS|$@|\${@:2}`);
+	});
+
+	test("expands mixed and repeated template placeholders without expanding inserted arguments", () => {
+		expect(substituteArgs(`$1|$2|\${@:2:1}|$@|$ARGUMENTS|$1`, ["$@", `\${@:1}`, "$ARGUMENTS"])).toBe(
+			`$@|\${@:1}|\${@:1}|$@ \${@:1} $ARGUMENTS|$@ \${@:1} $ARGUMENTS|$@`,
+		);
+	});
+
+	test.each([
+		{ input: "$$", expected: "Explain: $$" },
+		{ input: "$&", expected: "Explain: $&" },
+		{ input: "$@ tail", expected: "Explain: $@ tail" },
+		{ input: '"$`"', expected: "Explain: $`" },
+		{ input: '"$\'"', expected: "Explain: $'" },
+		{ input: "ordinary text", expected: "Explain: ordinary text" },
+	])("preserves $input through an expanded prompt template", ({ input, expected }) => {
+		expect(expandPromptTemplate(`/explain ${input}`, [explainTemplate])).toBe(expected);
 	});
 });
