@@ -4,7 +4,17 @@ import { test } from "node:test";
 
 import { parse } from "yaml";
 
-import { CREDENTIAL_JOBS, checkWorkflows, isCredentialBearing, repositoryCodeReasons, shellCommands } from "../check-release-workflow.mjs";
+import {
+	CREDENTIAL_JOBS,
+	TEST_SIGNER_FLAG,
+	TEST_SIGNER_STEP,
+	checkWorkflows,
+	isCredentialBearing,
+	referencesSecret,
+	repositoryCodeReasons,
+	shellCommands,
+	splitWords,
+} from "../check-release-workflow.mjs";
 
 const RELEASE = ".github/workflows/build-binaries.yml";
 const STANDALONE = ".github/workflows/standalone-binaries.yml";
@@ -61,6 +71,79 @@ test("every job that publishes holds its credential in a protected environment",
 	for (const jobId of ["build", "assemble", "validate-macos", "pack-npm", "context", "verify"]) {
 		assert.equal(isCredentialBearing(release.jobs[jobId]), false, `${jobId} holds no credential`);
 	}
+});
+
+test("GITHUB_TOKEN never masks another secret in the same job (finding A)", () => {
+	// A job that reads R2_SECRET_ACCESS_KEY is credential-bearing no matter what else it references.
+	const both = {
+		permissions: { contents: "read" },
+		steps: [
+			{
+				name: "Upload",
+				env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}", AWS_SECRET_ACCESS_KEY: "${{ secrets.R2_SECRET_ACCESS_KEY }}" },
+				run: "aws s3 cp x s3://y",
+			},
+		],
+	};
+	assert.equal(isCredentialBearing(both), true);
+	// The same two references in ONE value.
+	assert.equal(
+		isCredentialBearing({ permissions: {}, env: { TOKENS: "${{ secrets.GITHUB_TOKEN }} ${{ secrets.R2_SECRET_ACCESS_KEY }}" }, steps: [] }),
+		true,
+	);
+	// Only GITHUB_TOKEN, in any number of places, is not a credential.
+	assert.equal(
+		isCredentialBearing({
+			permissions: { contents: "read" },
+			env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" },
+			steps: [{ env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }, run: "gh api x" }],
+		}),
+		false,
+	);
+	// Secrets reach a job through more than `env:`.
+	for (const job of [
+		{ permissions: {}, steps: [{ uses: "some/action@0000000000000000000000000000000000000000", with: { token: "${{ secrets.NPM_TOKEN }}" } }] },
+		{ permissions: {}, steps: [{ run: 'echo "${{ secrets.R2_BUCKET }}"' }] },
+		{ permissions: {}, steps: [{ run: "echo ${{ toJSON(secrets) }}" }] },
+		{ permissions: {}, steps: [{ run: "echo ${{ secrets['R2_BUCKET'] }}" }] },
+		{ permissions: {}, steps: [{ run: "echo ${{ secrets.GITHUB_TOKEN_BACKUP }}" }] },
+		{ permissions: {}, if: "secrets.DEPLOY_KEY != ''", steps: [] },
+		{ permissions: {}, steps: [{ if: "secrets.DEPLOY_KEY != ''", run: "true" }] },
+	]) {
+		assert.equal(isCredentialBearing(job), true, JSON.stringify(job));
+	}
+	assert.equal(referencesSecret("${{ secrets.GITHUB_TOKEN }}"), false);
+	assert.equal(referencesSecret("${{ secrets.GITHUB_TOKEN }} ${{ secrets.OTHER }}"), true);
+	assert.equal(referencesSecret("${{ secrets.OTHER }} ${{ secrets.GITHUB_TOKEN }}"), true);
+	assert.equal(referencesSecret("${{ secrets.GITHUB_TOKEN2 }}"), true);
+	assert.equal(referencesSecret("${{ secrets.GITHUB_TOKENX }}"), true);
+});
+
+test("a job with both GITHUB_TOKEN and an R2 secret is classified credential-bearing and its checkout is flagged (finding A)", () => {
+	// Take `build` - an unprivileged job that legitimately checks out - and give it an R2 secret next
+	// to GITHUB_TOKEN in a step env. Before the fix GITHUB_TOKEN's presence exempted the whole value.
+	const broken = mutate(RELEASE, (text) =>
+		appendStep(
+			text,
+			"build",
+			"      - name: Upload with both tokens\n        env:\n          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}\n        run: aws s3 cp x s3://y\n",
+		),
+	);
+	const release = parse(broken);
+	assert.equal(isCredentialBearing(release.jobs.build), true);
+	const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+	assert.ok(
+		problems.some((problem) => problem.includes("'build'") && problem.includes("actions/checkout")),
+		problems.join("\n"),
+	);
+	// The same secret pair as ONE job-level env value is rejected as a job-level secret too.
+	const jobLevel = mutate(RELEASE, (text) =>
+		text.replace(
+			"    env:\n      PRODUCTION_VERSION: ${{ needs.context.outputs.production_version }}\n    steps:\n      # No checkout, no dependency install",
+			"    env:\n      PRODUCTION_VERSION: ${{ needs.context.outputs.production_version }}\n      TOKENS: ${{ secrets.GITHUB_TOKEN }} ${{ secrets.R2_ACCESS_KEY_ID }}\n    steps:\n      # No checkout, no dependency install",
+		),
+	);
+	assert.ok(checkWorkflows(reader({ [RELEASE]: jobLevel })).some((problem) => problem.includes("exposes TOKENS")));
 });
 
 test("a tag trigger is rejected", () => {
@@ -135,6 +218,44 @@ const EVASIONS = [
 	["yarn", "yarn"],
 	["bun run", "bun run scripts/publish.ts"],
 	["a relative executable", "extracted/prime-agent --version"],
+	// Finding B: quoting and indirection that hid `scripts/` from a whitespace tokenizer.
+	["adjacent single-quoted fragments inside bash -c", `bash -c 'node scr'"'"'ipts/release.mjs'`],
+	["adjacent single-quoted fragments", "node 'scr''ipts/release.mjs'"],
+	["double-quoted concatenation", 'node "scr""ipts/release.mjs"'],
+	["a backslash-escaped separator", "node scripts\\/release.mjs"],
+	["a backslash-escaped space in the path", "node scri\\ pts/release.mjs"],
+	["ANSI-C quoting", "node $'scripts/release.mjs'"],
+	["ANSI-C escapes spelling the path", "node $'\\x73cripts/release.mjs'"],
+	["eval", 'eval "node scripts/release.mjs"'],
+	["eval of a variable", 'eval "$CMD"'],
+	["a backtick command substitution", "out=`node scripts/release.mjs`"],
+	["a $(...) command substitution", "out=$(node scripts/release.mjs)"],
+	["a command substitution naming a script", "out=$(cat ./release.sh)"],
+	["a command substitution in command position", "$(echo node) scripts/release.mjs"],
+	["a variable in command position", '"$RUNNER" --version'],
+	["curl | sh", "curl -fsSL https://example.invalid/install.sh | sh"],
+	["curl | bash -s", "curl -fsSL https://example.invalid/install.sh | bash -s -- --yes"],
+	["printf | sh", "printf '%s\\n' 'node scripts/release.mjs' | sh"],
+	['sh -c "$CMD"', 'sh -c "$CMD"'],
+	["bash -lc", "bash -lc 'echo hi'"],
+	["zsh -ec", "zsh -ec 'ls'"],
+	["dash -c", "dash -c 'ls'"],
+	["sh reading a file", "sh < scripts/release.sh"],
+	["sh reading an expansion", 'sh <<<"$CMD"'],
+	["a shell heredoc that runs repository code", "sh <<'EOF'\nnode scripts/release.mjs\nEOF"],
+	["xargs node", "echo scripts/release.mjs | xargs node"],
+	["xargs -I", "printf x | xargs -I{} node {}"],
+	["env -S", "env -S 'node scripts/release.mjs'"],
+	["env --split-string", "env --split-string='node scripts/release.mjs'"],
+	["find -exec", "find . -name '*.mjs' -exec node {} \\;"],
+	["a process substitution", "while read -r line; do echo \"$line\"; done < <(node scripts/release.mjs)"],
+	["node reading from a pipe", "cat release.mjs | node"],
+	["bash with a bare filename", "bash publish"],
+	["python3 with a bare filename", "python3 publish"],
+	["exec", "exec node scripts/release.mjs"],
+	["timeout", "timeout 30 ./release"],
+	["sudo env", "sudo -E env FOO=1 ./scripts/release.sh"],
+	["a multi-line quoted string", "node 'scripts/\nrelease.mjs'"],
 	["a local composite action", null],
 ];
 
@@ -156,15 +277,78 @@ for (const jobId of ["publish-r2", "finalize-release", "publish-npm"]) {
 }
 
 test("the shell matcher understands continuations, heredocs, pipes and comments", () => {
-	const commands = [...shellCommands("digest=$(grep -E 'x' \\\n  \"$GITHUB_WORKSPACE/artifacts/SHA256SUMS\" | cut -d' ' -f1)\npython3 - \"$formula\" <<'PY'\nimport scripts/evil\nPY\n# node scripts/comment.mjs\necho ok # node scripts/comment.mjs\n")];
-	assert.deepEqual(commands, [
-		["digest=$"],
-		["grep", "-E", "'x'", '"$GITHUB_WORKSPACE/artifacts/SHA256SUMS"'],
-		["cut", "-d'", "'", "-f1"],
-		["python3", "-", '"$formula"', "<<'PY'"],
-		["echo", "ok"],
-	]);
-	for (const tokens of commands) assert.deepEqual(repositoryCodeReasons(tokens), [], tokens.join(" "));
+	const commands = [
+		...shellCommands(
+			"digest=$(grep -E 'x' \\\n  \"$GITHUB_WORKSPACE/artifacts/SHA256SUMS\" | cut -d' ' -f1)\npython3 - \"$formula\" <<'PY'\nimport scripts/evil\nPY\n# node scripts/comment.mjs\necho ok # node scripts/comment.mjs\n",
+		),
+	];
+	assert.deepEqual(
+		commands.map((command) => command.words.map((word) => word.text)),
+		[["digest=$(grep -E 'x'    \"$GITHUB_WORKSPACE/artifacts/SHA256SUMS\" | cut -d' ' -f1)"], ["python3", "-", "$formula"], ["echo", "ok"]],
+	);
+	assert.deepEqual(commands[0].substitutions, ["grep -E 'x'    \"$GITHUB_WORKSPACE/artifacts/SHA256SUMS\" | cut -d' ' -f1"]);
+	for (const command of commands) assert.deepEqual(repositoryCodeReasons(command), [], command.words.map((word) => word.text).join(" "));
+});
+
+test("word splitting resolves adjacent quoted fragments the way a POSIX shell does (finding B)", () => {
+	const words = (line) => splitWords(line).commands.map((command) => command.words.map((word) => word.text));
+	assert.deepEqual(words(`bash -c 'node scr'"'"'ipts/release.mjs'`), [["bash", "-c", "node scr'ipts/release.mjs"]]);
+	assert.deepEqual(words(`node 'scr''ipts/x.mjs'`), [["node", "scripts/x.mjs"]]);
+	assert.deepEqual(words(`node "scr""ipts/x.mjs"`), [["node", "scripts/x.mjs"]]);
+	assert.deepEqual(words(`node scr\\ipts/x.mjs`), [["node", "scripts/x.mjs"]]);
+	assert.deepEqual(words(`node scri\\ pts/x.mjs`), [["node", "scri pts/x.mjs"]]);
+	assert.deepEqual(words(`node $'scripts/x.mjs'`), [["node", "scripts/x.mjs"]]);
+	assert.deepEqual(words(`node $'\\x73cripts/\\146.mjs'`), [["node", "scripts/f.mjs"]]);
+	assert.deepEqual(words(`echo "a \\"b\\" \\$c" 'd $e' f\\ g`), [["echo", 'a "b" $c', "d $e", "f g"]]);
+	// Separators, comments and redirections.
+	assert.deepEqual(words("a; b && c || d | e & f"), [["a"], ["b"], ["c"], ["d"], ["e"], ["f"]]);
+	assert.deepEqual(words("a # b c"), [["a"]]);
+	assert.deepEqual(words("a '#' b"), [["a", "#", "b"]]);
+	assert.deepEqual(words('a > out 2>&1 <<<"x" >>log'), [["a"]]);
+	assert.deepEqual(words("names+=(\"$name\") x"), [['names+=("$name")', "x"]]);
+	assert.deepEqual(words("case \"$1\" in *.sh) echo a ;; esac"), [["case", "$1", "in", "*.sh"], ["echo", "a"], ["esac"]]);
+	// Expansions are recorded, and substitutions are surfaced for inspection.
+	const [sub] = splitWords("x=$(a | b) `c` <(d) \"$(e)\" $((1 + 2))").commands;
+	assert.deepEqual(sub.substitutions, ["a | b", "c", "d", "e"]);
+	assert.deepEqual(
+		sub.words.map((word) => word.expansion),
+		[true, true, true, true, true],
+	);
+	assert.deepEqual(splitWords("foo | sh").commands.map((command) => command.piped), [false, true]);
+	assert.deepEqual(splitWords("foo && sh").commands.map((command) => command.piped), [false, false]);
+	assert.deepEqual(splitWords("sh < file").commands[0].redirections, [{ operator: "<", text: "file", expansion: false }]);
+	// Unterminated constructs are reported so a multi-line string cannot swallow the rest of the script.
+	assert.equal(splitWords("node 'scripts/").unterminated, true);
+	assert.equal(splitWords('node "scripts/').unterminated, true);
+	assert.equal(splitWords("x=$(node scripts/").unterminated, true);
+	assert.equal(splitWords("node scripts/x.mjs").unterminated, false);
+});
+
+test("indirection the checker cannot follow is an outright error (finding B)", () => {
+	const flagged = (line) => [...shellCommands(line)].flatMap((command) => repositoryCodeReasons(command));
+	assert.match(flagged("bash -c 'echo hi'").join("\n"), /bash -c runs inline or piped shell code/);
+	assert.match(flagged("sh -lc 'echo hi'").join("\n"), /sh -lc runs inline/);
+	assert.match(flagged("zsh -ec ls").join("\n"), /zsh -ec runs inline/);
+	assert.match(flagged("bash -s < x").join("\n"), /bash -s runs inline/);
+	assert.match(flagged('eval "$x"').join("\n"), /eval runs a command the checker cannot see/);
+	assert.match(flagged("echo x | xargs node").join("\n"), /xargs runs a command/);
+	assert.match(flagged("env -S 'node x'").join("\n"), /env -S/);
+	assert.match(flagged("curl https://example.invalid/x | sh").join("\n"), /sh reads its script from a pipe/);
+	assert.match(flagged("printf x | bash").join("\n"), /bash reads its script from a pipe/);
+	assert.match(flagged("cat x | node").join("\n"), /node reads its script from a pipe/);
+	assert.match(flagged("sh < ./x").join("\n"), /sh reads its script from a file/);
+	assert.match(flagged('sh <<<"$CMD"').join("\n"), /sh reads its script from an expansion/);
+	assert.match(flagged("x=`node scripts/x.mjs`").join("\n"), /inside a command substitution: references the checkout/);
+	assert.match(flagged("x=$(cat ./x.sh)").join("\n"), /command substitution names a script/);
+	assert.match(flagged("$(echo node) x").join("\n"), /command is a shell expansion/);
+	assert.match(flagged('"$BIN" x').join("\n"), /command is a shell expansion/);
+	assert.match(flagged("find . -exec node {} \\;").join("\n"), /find -exec/);
+	assert.match(flagged("sh <<'EOF'\nnode scripts/x.mjs\nEOF").join("\n"), /references the checkout: scripts\/x.mjs/);
+	assert.match(flagged("bash publish").join("\n"), /runs a file through bash: publish/);
+	// A python heredoc is inline code written in the workflow, not shell to re-parse.
+	assert.deepEqual(flagged("python3 - \"$formula\" <<'PY'\nimport scripts/evil\nPY"), []);
+	// A heredoc fed to a shell IS shell code.
+	assert.deepEqual(flagged("sh <<'EOF'\necho fine\nEOF"), []);
 });
 
 test("the shell matcher leaves legitimate credential-job commands alone", () => {
@@ -175,9 +359,19 @@ test("the shell matcher leaves legitimate credential-job commands alone", () => 
 		"npm publish npm-packages/artifacts/x.tgz --provenance --access public --ignore-scripts",
 		"jq -r '.publishOrder[]' npm-packages/manifest.json",
 		"python3 - \"$formula\" \"$platform\"",
-		"bash -c 'echo hi'",
 		"node -e 'console.log(1)'",
 		"sha256sum --check SHA256SUMS",
+		"command -v uv",
+		"count=$((count + 1))",
+		"names=()",
+		'while IFS= read -r name; do names+=("$name"); done < <(jq -r \'.publishOrder[]\' npm-packages/manifest.json)',
+		'test "$(jq -r .isDraft /tmp/release.json)" = true',
+		'echo "Draft ${TAG} targets ${BUILD_REF}; $(jq length /tmp/current-assets.json) assets unchanged."',
+		'if [[ "$BUILD_REF" =~ ^[0-9a-f]{40}$ ]]; then echo ok; fi',
+		'case "$name" in *.tar.gz) echo archive ;; esac',
+		'local_digest="sha256:$(sha256sum "artifacts/$name" | cut -d\' \' -f1)"',
+		"printf 'Automated beta build from `%s` (`%s`).\\n' \"$DEFAULT_BRANCH\" \"$BUILD_REF\" > /tmp/beta-release-notes.md",
+		"gh release create \"$TAG\" --draft --notes-file /tmp/notes.md artifacts/*",
 		"test -f artifacts/install.sh",
 		"grep -E 'x' \"$GITHUB_WORKSPACE/artifacts/SHA256SUMS\"",
 		"/usr/bin/env true",
@@ -266,4 +460,75 @@ test("an unpinned action is rejected", () => {
 	);
 	const problems = checkWorkflows(reader({ [STANDALONE]: broken }));
 	assert.ok(problems.some((problem) => problem.includes("without a full commit SHA")));
+});
+
+test("the test signer override may be compiled in exactly one standalone step and never uploaded (finding C)", () => {
+	const RELEASE_TRUST = "packages/coding-agent/src/utils/release-trust.ts";
+	assert.equal(TEST_SIGNER_STEP.workflow, STANDALONE);
+	const standalone = parse(readFileSync(STANDALONE, "utf8"));
+	const compile = standalone.jobs[TEST_SIGNER_STEP.job].steps.find((step) => step.name === TEST_SIGNER_STEP.step);
+	assert.ok(compile.run.includes(TEST_SIGNER_FLAG), "the designated step compiles with the flag");
+
+	// The flag anywhere else - the release compile, another job, an env value - is rejected.
+	let broken = mutate(STANDALONE, (text) => text.replace("run: npm run build:binary", `run: npm run build:binary -- ${TEST_SIGNER_FLAG} signer.json`));
+	let problems = checkWorkflows(reader({ [STANDALONE]: broken }));
+	assert.ok(problems.some((problem) => problem.includes(TEST_SIGNER_FLAG) && problem.includes("'Compile standalone application'")), problems.join("\n"));
+	broken = mutate(RELEASE, (text) => appendStep(text, "build", runStep("Sneak a test signer in", `node packages/coding-agent/scripts/build-binary.mjs ${TEST_SIGNER_FLAG} x.json`)));
+	problems = checkWorkflows(reader({ [RELEASE]: broken }));
+	assert.ok(problems.some((problem) => problem.includes(TEST_SIGNER_FLAG) && problem.includes("'build'")), problems.join("\n"));
+	// So is defining the identifier by hand.
+	broken = mutate(RELEASE, (text) => appendStep(text, "build", runStep("Define it directly", "bun build --define __PRIME_AGENT_RELEASE_SIGNER_OVERRIDE__='\"{}\"' x")));
+	problems = checkWorkflows(reader({ [RELEASE]: broken }));
+	assert.ok(problems.some((problem) => problem.includes("__PRIME_AGENT_RELEASE_SIGNER_OVERRIDE__")), problems.join("\n"));
+	// Renaming the designated step turns its own flag into a violation.
+	broken = mutate(STANDALONE, (text) => text.replace(`name: ${TEST_SIGNER_STEP.step}`, "name: Compile another binary"));
+	problems = checkWorkflows(reader({ [STANDALONE]: broken }));
+	assert.ok(problems.some((problem) => problem.includes(TEST_SIGNER_FLAG)), problems.join("\n"));
+
+	// The uploaded artifact must not reach into the test-signer directories or a whole tree.
+	for (const extra of ["${{ runner.temp }}/test-release/current/*.tar.gz", "${{ runner.temp }}/**", "${{ runner.temp }}/", "source/packages/coding-agent/binaries-test-signer/"]) {
+		broken = mutate(STANDALONE, (text) => text.replace("            ${{ runner.temp }}/standalone/binaries.json\n", `            \${{ runner.temp }}/standalone/binaries.json\n            ${extra}\n`));
+		problems = checkWorkflows(reader({ [STANDALONE]: broken }));
+		assert.ok(problems.some((problem) => /test-signer|directory tree/.test(problem)), `${extra}:\n${problems.join("\n")}`);
+	}
+	// The test build must stay under $RUNNER_TEMP/test-release.
+	broken = mutate(STANDALONE, (text) => text.replace(`"$RUNNER_TEMP/test-release/next" 99.0.0`, `"$RUNNER_TEMP/standalone" 99.0.0`));
+	problems = checkWorkflows(reader({ [STANDALONE]: broken }));
+	assert.ok(problems.some((problem) => problem.includes("under $RUNNER_TEMP/test-release")), problems.join("\n"));
+	broken = mutate(STANDALONE, (text) => text.replace(`${TEST_SIGNER_FLAG} "$RUNNER_TEMP/test-release/signer.json"`, `${TEST_SIGNER_FLAG} signer.json`));
+	problems = checkWorkflows(reader({ [STANDALONE]: broken }));
+	assert.ok(problems.some((problem) => problem.includes("signer JSON from under $RUNNER_TEMP/test-release")), problems.join("\n"));
+	// ...and be compiled only after the release archive has been assembled.
+	broken = mutate(STANDALONE, (text) => {
+		const start = text.indexOf("      - name: Assemble native archive\n");
+		const end = text.indexOf("      - name: Resolve the signer identity of this job\n");
+		const assemble = text.slice(start, end);
+		const anchor = "      - name: Remove the build paths from the test machine\n";
+		return `${text.slice(0, start)}${text.slice(end).replace(anchor, `${assemble}${anchor}`)}`;
+	});
+	problems = checkWorkflows(reader({ [STANDALONE]: broken }));
+	assert.ok(problems.some((problem) => problem.includes("must be assembled before")), problems.join("\n"));
+
+	// The standalone job may hold id-token:write ONLY because the updater pins a different workflow path.
+	const trust = readFileSync(RELEASE_TRUST, "utf8");
+	broken = trust.replace('RELEASE_SIGNER_WORKFLOW_PATH = ".github/workflows/build-binaries.yml"', 'RELEASE_SIGNER_WORKFLOW_PATH = ".github/workflows/standalone-binaries.yml"');
+	assert.notEqual(broken, trust);
+	problems = checkWorkflows(reader({ [RELEASE_TRUST]: broken }));
+	assert.ok(problems.some((problem) => problem.includes("RELEASE_SIGNER_WORKFLOW_PATH must pin")), problems.join("\n"));
+	// ...and nothing else may be granted next to repository code, in the called or the calling job.
+	broken = mutate(STANDALONE, (text) => text.replace("      contents: read\n      id-token: write\n", "      contents: write\n      id-token: write\n"));
+	problems = checkWorkflows(reader({ [STANDALONE]: broken }));
+	assert.ok(problems.some((problem) => problem.includes("holds 'contents: write'")), problems.join("\n"));
+	broken = mutate(STANDALONE, (text) => text.replace("      contents: read\n      id-token: write\n", "      contents: read\n      id-token: write\n      attestations: write\n"));
+	problems = checkWorkflows(reader({ [STANDALONE]: broken }));
+	assert.ok(problems.some((problem) => problem.includes("holds 'attestations: write'")), problems.join("\n"));
+	broken = mutate(STANDALONE, (text) => text.replace("    env:\n      # A pull request from a fork", "    environment: release-r2\n    env:\n      # A pull request from a fork"));
+	problems = checkWorkflows(reader({ [STANDALONE]: broken }));
+	assert.ok(problems.some((problem) => problem.includes("must not run in an environment")), problems.join("\n"));
+	broken = mutate(STANDALONE, (text) => text.replace("      TARGET_PLATFORM: ${{ matrix.platform }}\n", "      TARGET_PLATFORM: ${{ matrix.platform }}\n      R2: ${{ secrets.R2_BUCKET }}\n"));
+	problems = checkWorkflows(reader({ [STANDALONE]: broken }));
+	assert.ok(problems.some((problem) => problem.includes("references a secret")), problems.join("\n"));
+	broken = mutate(RELEASE, (text) => text.replace("    permissions:\n      contents: read\n      id-token: write\n    uses: ./.github/workflows/standalone-binaries.yml", "    permissions:\n      contents: write\n      id-token: write\n    uses: ./.github/workflows/standalone-binaries.yml"));
+	problems = checkWorkflows(reader({ [RELEASE]: broken }));
+	assert.ok(problems.some((problem) => problem.includes("passes 'contents: write'")), problems.join("\n"));
 });

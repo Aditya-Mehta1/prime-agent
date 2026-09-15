@@ -137,8 +137,14 @@ jobs:
   standalone:
     name: Standalone binaries
     needs: context
+    # id-token:write is passed through so the called workflow can cosign a
+    # TEST-ONLY SHA256SUMS for its end-to-end updater test. The identity it
+    # mints is standalone-binaries.yml@<ref> - the called workflow path - which
+    # the updater's pin (build-binaries.yml on main / v* tags) rejects, so it is
+    # not a release credential. See the header of standalone-binaries.yml.
     permissions:
       contents: read
+      id-token: write
     uses: ./.github/workflows/standalone-binaries.yml
     with:
       build_ref: ${{ needs.context.outputs.build_ref }}
@@ -369,7 +375,10 @@ jobs:
               "$RUNNER_TEMP/macos-validation/$channel-$TARGET_PLATFORM.json"
             export PRIME_AGENT_TEST_ARCHIVE=$(find "$artifacts" -maxdepth 1 -name "*-$TARGET_PLATFORM.tar.gz")
             test -n "$PRIME_AGENT_TEST_ARCHIVE"
-            (cd packages/coding-agent && npx tsx ../../node_modules/vitest/dist/cli.js --run test/compiled-artifact.test.ts test/native-installer.test.ts)
+            # The final binary pins the production signer and nothing here can sign
+            # as it, so the signed end-to-end updater test (native-installer.test.ts)
+            # runs in the standalone job against a test-signer build instead.
+            (cd packages/coding-agent && npx tsx ../../node_modules/vitest/dist/cli.js --run test/compiled-artifact.test.ts)
           done
 
       - name: Upload native validation receipts
