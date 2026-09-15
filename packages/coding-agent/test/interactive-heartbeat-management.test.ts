@@ -8,7 +8,11 @@ import type {
 	AgentConnectionRlmChildAgentSnapshot,
 } from "../src/modes/agent-connection/types.js";
 import type { HeartbeatManagerComponent } from "../src/modes/interactive/components/heartbeat-manager.js";
-import { HEARTBEAT_REFRESH_FETCH_TIMEOUT_MS, InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
+import {
+	HEARTBEAT_REFRESH_FETCH_TIMEOUT_MS,
+	HEARTBEAT_REFRESH_RETRY_DELAY_MS,
+	InteractiveMode,
+} from "../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
 interface HeartbeatManagementHarness {
@@ -258,6 +262,9 @@ interface HeartbeatManagerOpenHarness {
 	heartbeatCatalog: AgentConnectionHeartbeat[];
 	heartbeatRefreshPromise: Promise<void> | undefined;
 	heartbeatRefreshRequested: boolean;
+	heartbeatManagerFetchRetryTimer: ReturnType<typeof setTimeout> | undefined;
+	heartbeatManagerRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+	heartbeatManagerRefreshAt: number | undefined;
 	connectionState: { activeSessionId: string; sessionId: string };
 	subagentSnapshots: Map<string, AgentConnectionRlmChildAgentSnapshot>;
 	agentConnection: { listHeartbeats(): Promise<AgentConnectionHeartbeat[]> };
@@ -305,7 +312,11 @@ describe("interactive heartbeat manager open (stale-while-revalidate)", () => {
 
 	const overlayHandle = { focus: vi.fn(), hide: vi.fn() };
 
-	function makeOpenHarness(options?: { listHeartbeats?: () => Promise<AgentConnectionHeartbeat[]> }): {
+	function makeOpenHarness(options?: {
+		listHeartbeats?: () => Promise<AgentConnectionHeartbeat[]>;
+		/** Keep the real nextRunAt poll scheduling instead of a mock. */
+		realSchedule?: boolean;
+	}): {
 		harness: HeartbeatManagerOpenHarness;
 		requestRender: ReturnType<typeof vi.fn>;
 	} {
@@ -316,6 +327,9 @@ describe("interactive heartbeat manager open (stale-while-revalidate)", () => {
 		harness.heartbeatCatalog = [{ job: heartbeat() }];
 		harness.heartbeatRefreshPromise = undefined;
 		harness.heartbeatRefreshRequested = false;
+		harness.heartbeatManagerFetchRetryTimer = undefined;
+		harness.heartbeatManagerRefreshTimer = undefined;
+		harness.heartbeatManagerRefreshAt = undefined;
 		harness.connectionState = { activeSessionId: "active-1", sessionId: "session-1" };
 		harness.subagentSnapshots = new Map([
 			[
@@ -339,7 +353,15 @@ describe("interactive heartbeat manager open (stale-while-revalidate)", () => {
 			terminal: { rows: 24 },
 			showOverlay: vi.fn(() => overlayHandle),
 		};
-		harness.scheduleHeartbeatManagerRefresh = vi.fn();
+		if (options?.realSchedule) {
+			harness.scheduleHeartbeatManagerRefresh = (
+				InteractiveMode.prototype as unknown as {
+					scheduleHeartbeatManagerRefresh(this: HeartbeatManagerOpenHarness): void;
+				}
+			).scheduleHeartbeatManagerRefresh;
+		} else {
+			harness.scheduleHeartbeatManagerRefresh = vi.fn();
+		}
 		harness.updateSubagentSummaryLine = vi.fn();
 		return { harness, requestRender };
 	}
@@ -453,6 +475,162 @@ describe("interactive heartbeat manager open (stale-while-revalidate)", () => {
 			await vi.advanceTimersByTimeAsync(10);
 			expect(listHeartbeats).toHaveBeenCalledTimes(2);
 			expect(harness.heartbeatCatalog).toEqual(fresh);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("retries a timed-out initial fetch on a short cadence so the open view converges", {
+		timeout: 10_000,
+	}, async () => {
+		vi.useFakeTimers();
+		try {
+			// No heartbeats_changed event arrives and the empty catalog has no
+			// nextRunAt for the poll to schedule from: only the retry chain can
+			// guarantee the open view a next retrieval.
+			const fresh: AgentConnectionHeartbeat[] = [{ job: heartbeat() }];
+			const listHeartbeats = vi.fn(() => Promise.resolve(fresh));
+			listHeartbeats.mockImplementationOnce(() => new Promise<AgentConnectionHeartbeat[]>(() => {}));
+			const { harness } = makeOpenHarness({ listHeartbeats });
+			harness.heartbeatCatalog = [];
+
+			harness.showHeartbeatManager();
+			expect(renderedManager(harness.heartbeatManager!)).toContain("No running or paused heartbeats");
+
+			// The deadline expires quietly: the stale catalog stays, but the
+			// view must not be left without a next scheduled retrieval.
+			await vi.advanceTimersByTimeAsync(HEARTBEAT_REFRESH_FETCH_TIMEOUT_MS + 10);
+			expect(listHeartbeats).toHaveBeenCalledTimes(1);
+			expect(harness.heartbeatManagerFetchRetryTimer).toBeDefined();
+			expect(harness.heartbeatCatalog).toEqual([]);
+
+			// The bounded retry fires and converges the open view.
+			await vi.advanceTimersByTimeAsync(HEARTBEAT_REFRESH_RETRY_DELAY_MS + 10);
+			expect(listHeartbeats).toHaveBeenCalledTimes(2);
+			expect(harness.heartbeatCatalog).toEqual(fresh);
+			expect(renderedManager(harness.heartbeatManager!)).toContain("1 heartbeat.");
+			expect(harness.updateSubagentSummaryLine).toHaveBeenCalled();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("applies the late result to the open view after the fetch deadline expired", { timeout: 10_000 }, async () => {
+		vi.useFakeTimers();
+		try {
+			let resolveFetch: (heartbeats: AgentConnectionHeartbeat[]) => void = () => {};
+			const listHeartbeats = vi.fn(
+				() =>
+					new Promise<AgentConnectionHeartbeat[]>((resolve) => {
+						resolveFetch = resolve;
+					}),
+			);
+			const { harness } = makeOpenHarness({ listHeartbeats });
+
+			harness.showHeartbeatManager();
+			const refresh = harness.heartbeatRefreshPromise;
+			expect(refresh).toBeDefined();
+
+			await vi.advanceTimersByTimeAsync(HEARTBEAT_REFRESH_FETCH_TIMEOUT_MS + 10);
+			await expect(refresh).resolves.toBeUndefined();
+			// The deadline kept the stale catalog...
+			expect(harness.heartbeatCatalog).toEqual([{ job: heartbeat() }]);
+			expect(harness.updateSubagentSummaryLine).not.toHaveBeenCalled();
+
+			// ...but the retained fetch must still land in the open view.
+			const fresh: AgentConnectionHeartbeat[] = [
+				{ job: heartbeat() },
+				{
+					job: heartbeat({
+						id: "heartbeat-2",
+						activeSessionId: "active-2",
+						sessionId: "session-2",
+						sessionFile: "/tmp/session-2.jsonl",
+						status: "paused",
+						nextRunAt: undefined,
+					}),
+				},
+			];
+			resolveFetch(fresh);
+			await vi.advanceTimersByTimeAsync(10);
+			await Promise.resolve();
+
+			expect(listHeartbeats).toHaveBeenCalledTimes(1);
+			expect(harness.heartbeatCatalog).toEqual(fresh);
+			expect(harness.updateSubagentSummaryLine).toHaveBeenCalled();
+			expect(renderedManager(harness.heartbeatManager!)).toContain("2 heartbeats · 1 paused");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("opens with a visible failure state when the initial fetch rejects, then recovers on the retry", {
+		timeout: 10_000,
+	}, async () => {
+		vi.useFakeTimers();
+		try {
+			const fresh: AgentConnectionHeartbeat[] = [{ job: heartbeat() }];
+			const listHeartbeats = vi.fn(() => Promise.resolve(fresh));
+			listHeartbeats.mockImplementationOnce(() => Promise.reject(new Error("worker recovering")));
+			const { harness } = makeOpenHarness({ listHeartbeats });
+
+			harness.showHeartbeatManager();
+			// The manager must still open without waiting for the fetch.
+			expect(harness.heartbeatManagerHandle).toBe(overlayHandle);
+			await vi.advanceTimersByTimeAsync(10);
+
+			// The rejection surfaces in the view instead of a silent stale catalog.
+			const rendered = renderedManager(harness.heartbeatManager!);
+			expect(rendered).toContain("Heartbeat refresh failed: worker recovering");
+			expect(rendered).toContain("1 heartbeat.");
+			// A failed fetch still leaves the open view a next scheduled retrieval.
+			expect(harness.heartbeatManagerFetchRetryTimer).toBeDefined();
+
+			// The retry recovers: fresh data lands and the failure notice clears.
+			await vi.advanceTimersByTimeAsync(HEARTBEAT_REFRESH_RETRY_DELAY_MS + 10);
+			expect(listHeartbeats).toHaveBeenCalledTimes(2);
+			expect(harness.heartbeatCatalog).toEqual(fresh);
+			const recovered = renderedManager(harness.heartbeatManager!);
+			expect(recovered).not.toContain("Heartbeat refresh failed");
+			expect(recovered).toContain("1 heartbeat.");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("keeps a next retrieval scheduled after a timed-out poll", { timeout: 10_000 }, async () => {
+		vi.useFakeTimers();
+		try {
+			// Overdue heartbeat: the nextRunAt poll falls back to the 5s cadence.
+			vi.setSystemTime(new Date("2026-01-01T00:10:00.000Z"));
+			const listHeartbeats = vi.fn(() => new Promise<AgentConnectionHeartbeat[]>(() => {}));
+			const { harness } = makeOpenHarness({ listHeartbeats, realSchedule: true });
+
+			harness.showHeartbeatManager();
+			expect(listHeartbeats).toHaveBeenCalledTimes(1);
+
+			// The overdue poll fires and joins the in-flight initial fetch.
+			await vi.advanceTimersByTimeAsync(5_250);
+			expect(listHeartbeats).toHaveBeenCalledTimes(1);
+
+			// That fetch times out: the poll is spent and nothing applied, yet
+			// the retry chain keeps a next retrieval armed and the follow-up
+			// refresh issued. The view must never go quiet from here.
+			await vi.advanceTimersByTimeAsync(4_760);
+			expect(listHeartbeats).toHaveBeenCalledTimes(2);
+			expect(harness.heartbeatManagerFetchRetryTimer).toBeDefined();
+
+			await vi.advanceTimersByTimeAsync(10_010);
+			expect(listHeartbeats).toHaveBeenCalledTimes(3);
+			await vi.advanceTimersByTimeAsync(10_010);
+			expect(listHeartbeats).toHaveBeenCalledTimes(4);
+			await vi.advanceTimersByTimeAsync(10_010);
+			expect(listHeartbeats).toHaveBeenCalledTimes(5);
+
+			// All those fetches timed out: the view kept its stale catalog and
+			// still never lacked a next scheduled retrieval.
+			expect(harness.heartbeatCatalog).toEqual([{ job: heartbeat() }]);
+			expect(harness.updateSubagentSummaryLine).not.toHaveBeenCalled();
 		} finally {
 			vi.useRealTimers();
 		}
