@@ -8,7 +8,12 @@ import {
 	readNativeRollbackInstallation,
 } from "../utils/native-installation.js";
 import { getPiUserAgent } from "../utils/pi-user-agent.js";
-import { fetchVerifiedReleaseArtifactDigest, ReleaseSignatureError } from "../utils/release-signature.js";
+import {
+	fetchVerifiedReleaseArtifactDigest,
+	parseDownloadBaseUrl,
+	ReleaseSignatureError,
+} from "../utils/release-signature.js";
+import { parseSignerIdentity } from "../utils/release-trust.js";
 import {
 	getLatestPiRelease,
 	isBaseVersionDowngrade,
@@ -34,7 +39,10 @@ export interface NativeUpdatePlan {
 	targetVersion: string;
 	/** Set when the channel's current release has a lower base version than the installed one; nothing is planned. */
 	refusedDowngradeTo?: string;
-	/** Set when PRIME_AGENT_DOWNLOAD_BASE_URL moved the origin away from the recorded install source. */
+	/**
+	 * Set whenever PRIME_AGENT_DOWNLOAD_BASE_URL is in effect: the canonical origin the plan downloads
+	 * from instead of the recorded install source. Surfaced to the user by {@link describeNativeUpdatePlan}.
+	 */
 	overriddenBaseUrl?: string;
 	/** Certificate identity that signed the SHA256SUMS this plan trusts. Absent for rollbacks. */
 	verifiedSignerIdentity?: string;
@@ -45,22 +53,50 @@ export interface NativeUpdatePlan {
  *
  * The override may move WHERE bytes come from; it can never change WHAT is accepted. The cosign
  * signature over SHA256SUMS is still required, and the pinned signer identity is compiled in, so an
- * attacker-controlled origin cannot serve an installable artifact. The override must be an absolute
- * https URL; the previous code accepted any string and quietly replaced the recorded
+ * attacker-controlled origin cannot serve an installable artifact. The override must be a bare
+ * absolute https URL (no credentials, query string or fragment - paths such as `/latest.json` are
+ * appended to it, so those would silently change what is requested); it is canonicalised without a
+ * trailing slash. The previous code accepted any string and quietly replaced the recorded
  * `.install-source`, which made the redirection invisible to the user.
  */
 function readDownloadBaseUrlOverride(): string | undefined {
 	const raw = process.env.PRIME_AGENT_DOWNLOAD_BASE_URL?.trim();
 	if (!raw) return undefined;
-	let parsed: URL;
-	try {
-		parsed = new URL(raw);
-	} catch {
-		throw new Error(`PRIME_AGENT_DOWNLOAD_BASE_URL is not a valid URL: ${raw}`);
+	return parseDownloadBaseUrl(raw, "PRIME_AGENT_DOWNLOAD_BASE_URL");
+}
+
+/** Human-readable breakdown of a verified signer identity SAN, for the update output. */
+function formatSignerIdentity(identity: string): string {
+	const parsed = parseSignerIdentity(identity);
+	const match = parsed ? /^https:\/\/github\.com\/([^/]+\/[^/]+)\/(.+)$/.exec(parsed.workflowUri) : undefined;
+	if (!parsed || !match) return identity;
+	return `repository ${match[1]}, workflow ${match[2]}, ref ${parsed.ref}`;
+}
+
+/**
+ * Plain log lines that tell the user what the plan trusts before the installer runs: the signer
+ * identity the release checksums were verified against, and - when PRIME_AGENT_DOWNLOAD_BASE_URL is
+ * in effect - a warning naming the origin the bytes will actually come from. Nothing here is
+ * conditional on verification having passed: a plan without `verifiedSignerIdentity` is a rollback
+ * to the retained release and says so.
+ */
+export function describeNativeUpdatePlan(plan: NativeUpdatePlan): { notes: string[]; warnings: string[] } {
+	if (!plan.command) return { notes: [], warnings: [] };
+	const notes: string[] = [];
+	const warnings: string[] = [];
+	if (plan.verifiedSignerIdentity) {
+		notes.push(
+			`Release v${plan.targetVersion} checksums verified: signed by ${formatSignerIdentity(plan.verifiedSignerIdentity)} (${plan.verifiedSignerIdentity}).`,
+		);
+	} else {
+		notes.push(`Restoring the retained release v${plan.targetVersion}; no download or signature check is involved.`);
 	}
-	if (parsed.protocol !== "https:")
-		throw new Error(`PRIME_AGENT_DOWNLOAD_BASE_URL must use https, got ${parsed.protocol}//.`);
-	return raw.replace(/\/+$/, "");
+	if (plan.overriddenBaseUrl) {
+		warnings.push(
+			`Warning: PRIME_AGENT_DOWNLOAD_BASE_URL overrides the recorded download origin. Release files will be fetched from ${plan.overriddenBaseUrl}. The signature requirement is unchanged.`,
+		);
+	}
+	return { notes, warnings };
 }
 
 export async function getNativeUpdatePlan(options: {
@@ -97,7 +133,10 @@ export async function getNativeUpdatePlan(options: {
 	let signerIdentity: string | undefined;
 	let previousTarget: string | undefined;
 	const overriddenBaseUrl = readDownloadBaseUrlOverride();
-	const baseUrl = overriddenBaseUrl ?? installation.baseUrl;
+	// The recorded install source is appended to as well, so hold it to the same shape. A damaged or
+	// tampered `.install-source` refuses the update rather than producing a malformed request.
+	const baseUrl =
+		overriddenBaseUrl ?? parseDownloadBaseUrl(installation.baseUrl, "The recorded install source (.install-source)");
 	if (options.rollback) {
 		const previous = readNativeRollbackInstallation(installation.root);
 		if (!previous || previous.executable === current.executable)
