@@ -64,7 +64,9 @@ describe("AuthStorage", () => {
 	}
 
 	function toShPath(value: string): string {
-		return value.replace(/\\/g, "/").replace(/"/g, '\\"');
+		// Single pass: backslashes become separators and quotes are escaped, so no
+		// escape sequence can be produced and then re-escaped by a later pass.
+		return value.replace(/[\\"]/g, (ch) => (ch === "\\" ? "/" : '\\"'));
 	}
 
 	describe("API key resolution", () => {
@@ -759,7 +761,6 @@ describe("AuthStorage", () => {
 		});
 	});
 });
-
 
 function structuredFailureMessage(kind: string, status: number, errorMessage: string): AssistantMessage {
 	return {

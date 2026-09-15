@@ -58,7 +58,9 @@ describe("ModelRegistry", () => {
 	}
 
 	function toShPath(value: string): string {
-		return value.replace(/\\/g, "/").replace(/"/g, '\\"');
+		// Single pass: backslashes become separators and quotes are escaped, so no
+		// escape sequence can be produced and then re-escaped by a later pass.
+		return value.replace(/[\\"]/g, (ch) => (ch === "\\" ? "/" : '\\"'));
 	}
 
 	function overrideConfig(baseUrl: string, headers?: Record<string, string>) {
@@ -1097,7 +1099,6 @@ describe("ModelRegistry", () => {
 		});
 	});
 });
-
 
 describe("issue #702 codex model discovery client version", () => {
 	const originalFetch = globalThis.fetch;
