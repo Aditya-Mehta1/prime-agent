@@ -24,16 +24,16 @@ describe("substituteArgs", () => {
 		["$1 $2", ["line1\nline2", "tab\tthere"], "line1\nline2 tab\tthere"],
 		["$ARGUMENTS", ["日本語", "🎉", "café"], "日本語 🎉 café"],
 		["$ARGUMENTS", ["a", "", "c"], "a  c"],
-		["${@:2}", ["a", "b", "c", "d"], "b c d"],
-		["${@:0}", ["a", "b", "c"], "a b c"],
-		["${@:2:2}", ["a", "b", "c", "d"], "b c"],
-		["${@:2:0}", ["a", "b", "c"], ""],
-		["${@:2:99}", ["a", "b", "c"], "b c"],
-		["${@:99}", ["a", "b"], ""],
-		["${@:2}", [], ""],
-		["prefix${@:2}suffix", ["a", "b", "c"], "prefixb csuffix"],
-		["$1: ${@:2} vs $@", ["cmd", "arg1", "arg2"], "cmd: arg1 arg2 vs cmd arg1 arg2"],
-		["${@:1:1} and ${@:2}", ["a", "b", "c"], "a and b c"],
+		[`\${@:2}`, ["a", "b", "c", "d"], "b c d"],
+		[`\${@:0}`, ["a", "b", "c"], "a b c"],
+		[`\${@:2:2}`, ["a", "b", "c", "d"], "b c"],
+		[`\${@:2:0}`, ["a", "b", "c"], ""],
+		[`\${@:2:99}`, ["a", "b", "c"], "b c"],
+		[`\${@:99}`, ["a", "b"], ""],
+		[`\${@:2}`, [], ""],
+		[`prefix\${@:2}suffix`, ["a", "b", "c"], "prefixb csuffix"],
+		[`$1: \${@:2} vs $@`, ["cmd", "arg1", "arg2"], "cmd: arg1 arg2 vs cmd arg1 arg2"],
+		[`\${@:1:1} and \${@:2}`, ["a", "b", "c"], "a and b c"],
 	])("substitutes %j", (template, args, expected) => {
 		expect(substituteArgs(template, args)).toBe(expected);
 	});
@@ -42,8 +42,8 @@ describe("substituteArgs", () => {
 	test("does not recursively substitute patterns in argument values", () => {
 		expect(substituteArgs("$ARGUMENTS", ["$1", "$ARGUMENTS"])).toBe("$1 $ARGUMENTS");
 		expect(substituteArgs("$@", ["$100", "$1"])).toBe("$100 $1");
-		expect(substituteArgs("${@:1}", ["${@:2}", "test"])).toBe("${@:2} test");
-		expect(substituteArgs("${@:2}", ["a", "${@:3}", "c"])).toBe("${@:3} c");
+		expect(substituteArgs(`\${@:1}`, [`\${@:2}`, "test"])).toBe(`\${@:2} test`);
+		expect(substituteArgs(`\${@:2}`, ["a", `\${@:3}`, "c"])).toBe(`\${@:3} c`);
 	});
 });
 
