@@ -53,8 +53,12 @@ credentials at all - including `pack-npm`, which builds the registry packages an
 `publish-npm` by artifact. `scripts/check-release-workflow.mjs` enforces this in CI: it derives which
 jobs are credential-bearing (any environment, any write permission, or any secret other than exactly
 `GITHUB_TOKEN`) and fails if any of them checks out code, installs packages, invokes anything under
-the repository, or runs shell constructs whose target it cannot prove (`sh -c`, `eval`, command
-substitution, `xargs`, piping into an interpreter).
+the repository, changes directory anywhere but a downloaded-artifact directory, sets a
+`working-directory`, edits `PATH` or interpreter startup variables, or runs shell constructs whose
+target it cannot prove (`sh -c`, `eval`, command substitution, `xargs`, piping into an interpreter).
+It also holds an allowlist for R2 writes: only the publishing jobs may call `aws`, every upload
+destination must be a literal key under the immutable `releases/v<version>/` prefix, and the four
+channel pointers may be written only by the last step of `finalize-release`.
 
 The `standalone` build jobs hold `id-token: write` but no secrets. They use it to sign a **test-only**
 build so the CI end-to-end test can exercise `prime-agent update` against an actual signed archive.
