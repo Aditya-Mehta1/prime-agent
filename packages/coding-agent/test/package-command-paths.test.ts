@@ -271,6 +271,8 @@ describe("package commands", () => {
 		const selfPackageDir = join(globalPrefix, "lib", "node_modules", "@earendil-works", "pi-coding-agent");
 		const fakeNpmPath = join(tempDir, "fake-npm.cjs");
 		const recordPath = join(tempDir, "self-update.json");
+		// The manifest may only name tarballs on the origin it was fetched from.
+		process.env.PRIME_AGENT_DOWNLOAD_BASE_URL = "https://downloads.example.test/prime-agent";
 		const tarballUrl = "https://downloads.example.test/prime-agent/prime-agent-current.tgz";
 		mkdirSync(selfPackageDir, { recursive: true });
 		mkdirSync(join(projectDir, ".prime", "agent"), { recursive: true });

@@ -1,5 +1,5 @@
+import { parseDownloadBaseUrl } from "./download-url.js";
 import { getPiUserAgent } from "./pi-user-agent.js";
-import { parseDownloadBaseUrl } from "./release-signature.js";
 
 const DEFAULT_PRIME_AGENT_DOWNLOAD_BASE_URL = "https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev";
 const STABLE_VERSION_MANIFEST_PATH = "latest.json";
