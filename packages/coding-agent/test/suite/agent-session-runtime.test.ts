@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai";
@@ -21,6 +21,7 @@ import {
 	readSemanticEdgeLedger,
 	SEMANTIC_EDGES_LEDGER_FILENAME,
 } from "../../src/core/semantic-edges.js";
+import { SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../../src/core/session-lease.js";
 import { SessionManager } from "../../src/core/session-manager.js";
 import { SettingsManager } from "../../src/core/settings-manager.js";
 import type {
@@ -52,6 +53,7 @@ describe("AgentSessionRuntime characterization", () => {
 		while (cleanups.length > 0) {
 			await cleanups.pop()?.();
 		}
+		vi.unstubAllEnvs();
 	});
 
 	async function createRuntimeForTest(
@@ -1001,6 +1003,44 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(runtime.session.thinkingLevel).toBe("off");
 	});
 
+	it("runs beforeSessionInvalidate after session_shutdown and before rebindSession", async () => {
+		const phases: string[] = [];
+		const { runtime } = await createRuntimeForTest((pi: ExtensionAPI) => {
+			pi.on("session_shutdown", () => {
+				phases.push("session_shutdown");
+			});
+		});
+		const oldSession = runtime.session;
+		runtime.setBeforeSessionInvalidate(() => {
+			phases.push("beforeSessionInvalidate");
+			expect(oldSession.extensionRunner.createContext().cwd).toBe(oldSession.sessionManager.getCwd());
+		});
+		runtime.setRebindSession(async () => {
+			phases.push("rebindSession");
+		});
+
+		await runtime.newSession();
+
+		expect(phases).toEqual(["session_shutdown", "beforeSessionInvalidate", "rebindSession"]);
+		expect(() => oldSession.extensionRunner.createContext().cwd).toThrow("stale after session replacement or reload");
+		runtime.setBeforeSessionInvalidate(undefined);
+		runtime.setRebindSession(undefined);
+	});
+
+	it("releases a replacement lease when current-session teardown fails", async () => {
+		vi.stubEnv(SESSION_LEASES_ENABLED_ENV, "1");
+		vi.stubEnv(SESSION_LEASE_OWNER_ID_ENV, "runtime-events");
+		const { runtime } = await createRuntimeForTest(() => {});
+		runtime.setBeforeSessionInvalidate(() => {
+			throw new Error("teardown failed");
+		});
+
+		await expect(runtime.newSession()).rejects.toThrow("teardown failed");
+		runtime.setBeforeSessionInvalidate(undefined);
+		const leaseRoot = join(runtime.services.agentDir, "session-leases");
+		expect(readdirSync(leaseRoot).filter((entry) => entry.endsWith(".lock"))).toHaveLength(1);
+	});
+
 	/**
 	 * Session replacement rebinding folded in from the regression #2860 file: the runtime rebinds
 	 * extensions before `withSession` runs, the callback targets the replacement session, and stale
@@ -1031,9 +1071,7 @@ describe("AgentSessionRuntime characterization", () => {
 		}
 
 		function conversation(runtime: AgentSessionRuntime): string[] {
-			return conversationMessages(runtime.session).map(
-				(message) => `${message.role}:${getMessageText(message)}`,
-			);
+			return conversationMessages(runtime.session).map((message) => `${message.role}:${getMessageText(message)}`);
 		}
 
 		it("rebinds before withSession, targets the replacement session, and invalidates stale pi/ctx", async () => {
@@ -1160,7 +1198,6 @@ describe("AgentSessionRuntime characterization", () => {
 		});
 	});
 });
-
 
 describe("ENG-4620 fast mode settings", () => {
 	let harness: Harness | undefined;
