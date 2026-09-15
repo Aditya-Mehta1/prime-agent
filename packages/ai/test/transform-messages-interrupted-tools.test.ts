@@ -186,7 +186,9 @@ describe("cross-model session migration", () => {
 		]);
 
 		const migrated = result.find((message) => message.role === "assistant") as AssistantMessage;
-		expect((migrated.content.find((block) => block.type === "toolCall") as ToolCall).thoughtSignature).toBeUndefined();
+		expect(
+			(migrated.content.find((block) => block.type === "toolCall") as ToolCall).thoughtSignature,
+		).toBeUndefined();
 	});
 
 	it("adds synthetic results for trailing orphaned tool calls across the migration", () => {

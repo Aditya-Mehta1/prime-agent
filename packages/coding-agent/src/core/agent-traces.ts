@@ -1086,6 +1086,9 @@ export function uploadAgentTraceSession(options: AgentTraceSessionUploadOptions)
 	});
 }
 
+/** Bounds whenIdle() drain loops so a retry that re-arms cannot spin forever. */
+const MAX_IDLE_DRAIN_CYCLES = 4;
+
 class AgentTraceUploadController {
 	private timeout: NodeJS.Timeout | undefined;
 	private pending = false;
@@ -1125,8 +1128,24 @@ class AgentTraceUploadController {
 		this.arm();
 	};
 
-	whenIdle(): Promise<void> {
-		return this.inFlight === undefined ? Promise.resolve() : this.inFlight.then(() => undefined);
+	async whenIdle(): Promise<void> {
+		// A debounced upload is still work in progress: waiting only on `inFlight`
+		// lets a caller tear down during the delay and drop the scheduled upload.
+		// Flush the armed timer instead of waiting for it, so draining never
+		// depends on wall-clock time. Bounded because a retry re-arms.
+		for (let drain = 0; drain < MAX_IDLE_DRAIN_CYCLES; drain += 1) {
+			if (this.timeout !== undefined) {
+				clearTimeout(this.timeout);
+				this.timeout = undefined;
+				await this.runScheduledUpload();
+				continue;
+			}
+			if (this.inFlight !== undefined) {
+				await this.inFlight;
+				continue;
+			}
+			return;
+		}
 	}
 
 	private arm(): void {
@@ -1147,6 +1166,9 @@ class AgentTraceUploadController {
 
 	private async runScheduledUpload(): Promise<void> {
 		if (this.inFlight) {
+			// Keep the work pending so the in-flight upload's settle path re-arms:
+			// the coalesce notice always has a guaranteed follow-up behind it.
+			this.pending = true;
 			this.options.onUploadSettled?.({ status: "coalesced" });
 			return;
 		}

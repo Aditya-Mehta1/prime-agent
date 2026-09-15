@@ -292,7 +292,9 @@ describe("SessionManager agent status", () => {
 			// Status never reaches the model.
 			const context = buildSessionContext(session.getEntries(), session.getLeafId());
 			expect(context.messages).toHaveLength(2);
-			expect(context.messages.every((message) => message.role === "user" || message.role === "assistant")).toBe(true);
+			expect(context.messages.every((message) => message.role === "user" || message.role === "assistant")).toBe(
+				true,
+			);
 
 			// Branch A off m1, then branch B off m2 with a later status in the file.
 			session.branch(m1);
@@ -317,14 +319,57 @@ describe("SessionManager.hasUserContent", () => {
 		s.appendThinkingLevelChange("off");
 	};
 	const cases: Array<{ name: string; setup: (session: SessionManager) => void; expected: boolean }> = [
-		{ name: "creation defaults only", setup: (s) => { defaults(s); s.appendServiceTierChange("default"); }, expected: false },
+		{
+			name: "creation defaults only",
+			setup: (s) => {
+				defaults(s);
+				s.appendServiceTierChange("default");
+			},
+			expected: false,
+		},
 		{ name: "no model available at creation", setup: (s) => s.appendThinkingLevelChange("off"), expected: false },
-		{ name: "model changed after creation", setup: (s) => { defaults(s); s.appendModelChange("openai", "gpt-5"); }, expected: true },
-		{ name: "thinking level changed after creation", setup: (s) => { defaults(s); s.appendThinkingLevelChange("high"); }, expected: true },
-		{ name: "thinking level changed on a no-model session", setup: (s) => { s.appendThinkingLevelChange("off"); s.appendThinkingLevelChange("high"); }, expected: true },
-		{ name: "Fast mode enabled after creation", setup: (s) => { defaults(s); s.appendServiceTierChange("default"); s.appendServiceTierChange("priority"); }, expected: true },
+		{
+			name: "model changed after creation",
+			setup: (s) => {
+				defaults(s);
+				s.appendModelChange("openai", "gpt-5");
+			},
+			expected: true,
+		},
+		{
+			name: "thinking level changed after creation",
+			setup: (s) => {
+				defaults(s);
+				s.appendThinkingLevelChange("high");
+			},
+			expected: true,
+		},
+		{
+			name: "thinking level changed on a no-model session",
+			setup: (s) => {
+				s.appendThinkingLevelChange("off");
+				s.appendThinkingLevelChange("high");
+			},
+			expected: true,
+		},
+		{
+			name: "Fast mode enabled after creation",
+			setup: (s) => {
+				defaults(s);
+				s.appendServiceTierChange("default");
+				s.appendServiceTierChange("priority");
+			},
+			expected: true,
+		},
 		{ name: "a message was sent", setup: (s) => s.appendMessage(userMsg("hello")), expected: true },
-		{ name: "the session was named", setup: (s) => { defaults(s); s.appendSessionInfo("my draft"); }, expected: true },
+		{
+			name: "the session was named",
+			setup: (s) => {
+				defaults(s);
+				s.appendSessionInfo("my draft");
+			},
+			expected: true,
+		},
 	];
 
 	it.each(cases)("is $expected for: $name", ({ setup, expected }) => {

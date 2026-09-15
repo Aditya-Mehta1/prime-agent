@@ -162,11 +162,17 @@ describe("openai-completions reasoning replay", () => {
 			content: [{ type: "thinking", thinking: "internal reasoning" }] as AssistantMessage["content"],
 			expected: [{ type: "text", text: "internal reasoning" }],
 		},
-	])("serializes $name as assistant text parts when the provider requires thinking-as-text", ({ content, expected }) => {
-		const messages = convertMessages(buildModel(), buildContext(content), { ...compat, requiresThinkingAsText: true });
+	])(
+		"serializes $name as assistant text parts when the provider requires thinking-as-text",
+		({ content, expected }) => {
+			const messages = convertMessages(buildModel(), buildContext(content), {
+				...compat,
+				requiresThinkingAsText: true,
+			});
 
-		expect(messages[1]).toEqual({ role: "assistant", content: expected });
-	});
+			expect(messages[1]).toEqual({ role: "assistant", content: expected });
+		},
+	);
 
 	it("replays signed thinking alongside a tool call", () => {
 		const messages = convertMessages(

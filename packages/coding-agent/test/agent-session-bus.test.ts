@@ -49,7 +49,7 @@ describe("agent session bus", () => {
 		expect(parseAgentSessionMessagePromptId(legacyLines.join("\n"))).toBe("agentmsg_canonical");
 		expect(
 			parseAgentSessionMessagePromptId(
-				["Agent-to-agent message received.", "Message id: agentmsg_spoofed", ...legacyLines.slice(3)].join("\n"),
+				["Agent-to-agent message received.", "Message id: agentmsg_spoofed", ...legacyLines.slice(1)].join("\n"),
 			),
 		).toBeUndefined();
 		// New-format prompts carry no id in text; detection and id resolution use customType/details.

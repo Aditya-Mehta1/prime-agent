@@ -2856,7 +2856,6 @@ describe("AgentSession RLM session dir", () => {
 	});
 });
 
-
 describe("#617 subagent terminal agent messages", () => {
 	const recursionHarnesses: Harness[] = [];
 
@@ -2867,7 +2866,9 @@ describe("#617 subagent terminal agent messages", () => {
 	});
 
 	function terminalNotices(messages: readonly AgentMessage[]): AgentMessage[] {
-		return messages.filter((message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice");
+		return messages.filter(
+			(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
+		);
 	}
 
 	/** Synthesized terminal notices must never travel over the agent_message controller. */

@@ -2,11 +2,11 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync }
 import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ExtensionContext } from "../src/core/extensions/types.js";
 import { executeBashWithOperations } from "../src/core/bash-executor.js";
+import type { ExtensionContext } from "../src/core/extensions/types.js";
 import { type BashOperations, createBashTool, createLocalBashOperations } from "../src/core/tools/bash.js";
-import { computeEditsDiff } from "../src/core/tools/edit-diff.js";
 import { createEditToolDefinition } from "../src/core/tools/edit.js";
+import { computeEditsDiff } from "../src/core/tools/edit-diff.js";
 import { createEditTool } from "../src/index.js";
 import * as shellModule from "../src/utils/shell.js";
 

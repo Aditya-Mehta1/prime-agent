@@ -251,10 +251,7 @@ const emptyUsage = {
 };
 
 describe("google-shared convertMessages — Gemini 3 tool call signatures", () => {
-	function toolCallContext(
-		source: { api: string; provider: string; id: string },
-		thoughtSignature?: string,
-	): Context {
+	function toolCallContext(source: { api: string; provider: string; id: string }, thoughtSignature?: string): Context {
 		return {
 			messages: [
 				{ role: "user", content: "Hi", timestamp: 1 },

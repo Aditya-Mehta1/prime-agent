@@ -207,8 +207,16 @@ describe("kernel bootstrap", () => {
 
 	it.each([
 		{ name: "a sibling skill directory", packageName: undefined, dependency: "attach-image" },
-		{ name: "a sibling whose package and directory names differ", packageName: "prime-agent-skill-attach-image", dependency: "prime-agent-skill-attach-image" },
-		{ name: "a dependency declared with extras and a version bound", packageName: undefined, dependency: "attach-image[httpx]>4.0.0" },
+		{
+			name: "a sibling whose package and directory names differ",
+			packageName: "prime-agent-skill-attach-image",
+			dependency: "prime-agent-skill-attach-image",
+		},
+		{
+			name: "a dependency declared with extras and a version bound",
+			packageName: undefined,
+			dependency: "attach-image[httpx]>4.0.0",
+		},
 	])("installs $name as an editable package", async ({ packageName, dependency }) => {
 		const logPath = installFakeUv();
 		const venv = join(tempDir, "kernel-venv");
@@ -253,7 +261,6 @@ dependencies = ["httpx"]
 		expect(version.pythonSkills[0].pyprojectHash).toBe(pyprojectHash(pythonSkill.pyprojectPath));
 	});
 
-
 	it("continues when a Python skill editable install fails and retries it next startup", async () => {
 		const logPath = installFakeUv();
 		const venv = join(tempDir, "kernel-venv");
@@ -289,7 +296,6 @@ dependencies = ["httpx"]
 			retryLog.split("\n").filter((line) => line.includes(`--editable ${brokenSkill.packagePath}`)),
 		).toHaveLength(2);
 	});
-
 
 	it("shares concurrent bootstrap work in one process", async () => {
 		const logPath = installFakeUv();

@@ -131,21 +131,39 @@ describe("Prime Inference auth", () => {
 	});
 
 	it.each([
-		["inference", loginPrimeInference, { inference: { write: true } }, { apiKey: "prime-cli-key", source: "prime-cli", primeTeam: null }],
-		["agent traces", loginPrimeAgentTraces, { agent_traces: { write: true } }, { apiKey: "prime-cli-key", source: "prime-cli" }],
-	] as const)("imports a valid Prime CLI key for %s against the production API", async (_label, login, scope, expected) => {
-		writeFileSync(configPath, JSON.stringify({ api_key: "prime-cli-key", base_url: "https://api.primeintellect.ai/api/v1" }));
-		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-			expect(getUrl(input)).toBe("https://api.primeintellect.ai/api/v1/user/whoami");
-			expect(getAuthorization(init)).toBe("Bearer prime-cli-key");
-			return jsonResponse({ data: { scope } });
-		});
-		const onAuth = vi.fn();
+		[
+			"inference",
+			loginPrimeInference,
+			{ inference: { write: true } },
+			{ apiKey: "prime-cli-key", source: "prime-cli", primeTeam: null },
+		],
+		[
+			"agent traces",
+			loginPrimeAgentTraces,
+			{ agent_traces: { write: true } },
+			{ apiKey: "prime-cli-key", source: "prime-cli" },
+		],
+	] as const)(
+		"imports a valid Prime CLI key for %s against the production API",
+		async (_label, login, scope, expected) => {
+			writeFileSync(
+				configPath,
+				JSON.stringify({ api_key: "prime-cli-key", base_url: "https://api.primeintellect.ai/api/v1" }),
+			);
+			const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				expect(getUrl(input)).toBe("https://api.primeintellect.ai/api/v1/user/whoami");
+				expect(getAuthorization(init)).toBe("Bearer prime-cli-key");
+				return jsonResponse({ data: { scope } });
+			});
+			const onAuth = vi.fn();
 
-		await expect(login({ onAuth }, { configPath, fetchFn: fetchMock, requestTimeoutMs: 1000 })).resolves.toEqual(expected);
-		expect(onAuth).not.toHaveBeenCalled();
-		expect(fetchMock).toHaveBeenCalledOnce();
-	});
+			await expect(login({ onAuth }, { configPath, fetchFn: fetchMock, requestTimeoutMs: 1000 })).resolves.toEqual(
+				expected,
+			);
+			expect(onAuth).not.toHaveBeenCalled();
+			expect(fetchMock).toHaveBeenCalledOnce();
+		},
+	);
 
 	it.each([
 		["inference", checkPrimeInferenceAccess, { inference: { read: true, write: true } }],
@@ -158,14 +176,31 @@ describe("Prime Inference auth", () => {
 			return jsonResponse({ data: { scope } });
 		});
 
-		await expect(check("prime-key", "https://prime-api.example", { fetchFn: fetchMock })).resolves.toEqual({ ok: true });
+		await expect(check("prime-key", "https://prime-api.example", { fetchFn: fetchMock })).resolves.toEqual({
+			ok: true,
+		});
 		expect(fetchMock).toHaveBeenCalledOnce();
 	});
 
 	it.each([
-		["PRIME_AGENT_INFERENCE_API_BASE_URL", "https://custom.example/api/v1/", loginPrimeInference, "https://custom.example"],
-		["PRIME_AGENT_INFERENCE_FRONTEND_URL", "https://custom.example/", loginPrimeInference, "https://api.primeintellect.ai"],
-		["PRIME_AGENT_TRACES_BASE_URL", "https://custom.example/api/v1/", loginPrimeAgentTraces, "https://custom.example"],
+		[
+			"PRIME_AGENT_INFERENCE_API_BASE_URL",
+			"https://custom.example/api/v1/",
+			loginPrimeInference,
+			"https://custom.example",
+		],
+		[
+			"PRIME_AGENT_INFERENCE_FRONTEND_URL",
+			"https://custom.example/",
+			loginPrimeInference,
+			"https://api.primeintellect.ai",
+		],
+		[
+			"PRIME_AGENT_TRACES_BASE_URL",
+			"https://custom.example/api/v1/",
+			loginPrimeAgentTraces,
+			"https://custom.example",
+		],
 	] as const)("does not import CLI credentials with %s", async (env, value, login, baseUrl) => {
 		vi.stubEnv(env, value);
 		writeFileSync(configPath, JSON.stringify({ api_key: "prime-cli-key" }));
@@ -296,7 +331,10 @@ describe("Prime Inference auth", () => {
 		});
 		const onAuth = vi.fn();
 
-		const result = await login({ onAuth }, { configPath, fetchFn: fetchMock, pollIntervalMs: 0, requestTimeoutMs: 1000 });
+		const result = await login(
+			{ onAuth },
+			{ configPath, fetchFn: fetchMock, pollIntervalMs: 0, requestTimeoutMs: 1000 },
+		);
 
 		expect(result).toEqual({ apiKey: options.key, source: "browser" });
 		expect(onAuth).toHaveBeenCalledWith({ url: options.authUrl, instructions: "Code: challenge-code" });

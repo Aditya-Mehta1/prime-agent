@@ -1827,7 +1827,6 @@ describe("daemon supervisor resident workers", () => {
 	});
 });
 
-
 describe("issue #879 stable daemon process identity across timezone changes", () => {
 	it("pins the portable process query to UTC across caller timezone changes", () => {
 		const calls: Array<{ command: string; args: string[]; env: NodeJS.ProcessEnv | undefined }> = [];

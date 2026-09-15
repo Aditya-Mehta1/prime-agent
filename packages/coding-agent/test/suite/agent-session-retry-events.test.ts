@@ -1196,7 +1196,6 @@ describe("AgentSession retry and event characterization", () => {
 	});
 });
 
-
 describe("AgentSession retry regressions", () => {
 	const harnesses: Harness[] = [];
 

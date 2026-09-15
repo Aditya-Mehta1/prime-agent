@@ -656,7 +656,10 @@ describe("agent trace upload", () => {
 
 		const calls: FetchCall[] = [];
 		const options = traceOptions(createFetchRecorder(calls));
-		const installation = installAgentTraceUpload(liveSession("live-session"), installOptions(createFetchRecorder(calls)));
+		const installation = installAgentTraceUpload(
+			liveSession("live-session"),
+			installOptions(createFetchRecorder(calls)),
+		);
 		installations.push(installation);
 		await installation.whenIdle();
 

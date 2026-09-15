@@ -778,7 +778,6 @@ describe("ACP mode preserves prime-agent features", () => {
 	}, 30_000);
 });
 
-
 /** ACP `session/new` against an arbitrary cwd, which `connectAcp` pins to the harness temp dir. */
 async function newAcpSessionAt(harness: Harness, cwd: string) {
 	const connection = new InProcessAgentConnection(runtimeHostFor(harness.session));
@@ -801,7 +800,9 @@ function acpMcpHttpServer(name: string) {
 }
 
 function acpMcpProvisioner(result: ExecuteResult): IpythonKernelProvisioner {
-	return { ensure: vi.fn(async () => ({ execute: vi.fn(async (_code: string) => result) })) } as unknown as IpythonKernelProvisioner;
+	return {
+		ensure: vi.fn(async () => ({ execute: vi.fn(async (_code: string) => result) })),
+	} as unknown as IpythonKernelProvisioner;
 }
 
 function requireAcpMcpTool(tool: ToolDefinition | undefined): ToolDefinition {

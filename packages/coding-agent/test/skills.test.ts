@@ -74,7 +74,10 @@ describe("skills", () => {
 	});
 
 	it("reads disable-model-invocation, defaulting to false", () => {
-		const [disabled] = loadSkillsFromDir({ dir: join(fixturesDir, "disable-model-invocation"), source: "test" }).skills;
+		const [disabled] = loadSkillsFromDir({
+			dir: join(fixturesDir, "disable-model-invocation"),
+			source: "test",
+		}).skills;
 		const [enabled] = loadSkillsFromDir({ dir: join(fixturesDir, "valid-skill"), source: "test" }).skills;
 
 		expect(disabled.disableModelInvocation).toBe(true);
@@ -118,7 +121,10 @@ describe("skills", () => {
 	});
 
 	it("degrades a Python skill to markdown when its package files are missing", () => {
-		const { skills, diagnostics } = loadSkillsFromDir({ dir: join(fixturesDir, "python-package-missing"), source: "test" });
+		const { skills, diagnostics } = loadSkillsFromDir({
+			dir: join(fixturesDir, "python-package-missing"),
+			source: "test",
+		});
 
 		expect(skills).toHaveLength(1);
 		expect(skills[0].kind).toBe("markdown");

@@ -2,6 +2,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.js";
 import {
 	type AgentCronJob,
 	AgentCronJobStore,
@@ -14,7 +15,6 @@ import {
 	SESSION_SCHEDULED_JOBS_FILENAME,
 	shouldDeferHeartbeatCronJob,
 } from "../src/core/cron-jobs.js";
-import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.js";
 import type { ActiveSessionState } from "../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
 import { createHarness, type Harness } from "./suite/harness.js";
@@ -1522,7 +1522,12 @@ describe("AgentCronScheduler session resurrection guard (ENG-4519)", () => {
 		sessionId: (harness: Harness) => string;
 		sessionFile: (harness: Harness) => string;
 		persistStates?: readonly ("active" | "archived")[];
-	}): Promise<{ harness: Harness; internals: CronDaemonInternals; createRuntime: ReturnType<typeof vi.fn>; jobId: string }> {
+	}): Promise<{
+		harness: Harness;
+		internals: CronDaemonInternals;
+		createRuntime: ReturnType<typeof vi.fn>;
+		jobId: string;
+	}> {
 		const harness = await createHarness({ persistSession: true });
 		harnesses.push(harness);
 		for (const status of options.persistStates ?? []) {

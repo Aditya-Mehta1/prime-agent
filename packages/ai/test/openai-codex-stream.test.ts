@@ -1533,7 +1533,10 @@ describe("openai-responses shared conversions", () => {
 			const item = { type: "function_call", id: "fc_test", call_id: "call_test", name: "edit" };
 			yield { type: "response.output_item.added", item: { ...item, arguments: "" } } as ResponseStreamEvent;
 			yield { type: "response.function_call_arguments.delta", delta: '{"path":"README.md"' } as ResponseStreamEvent;
-			yield { type: "response.function_call_arguments.delta", delta: ',"content":"updated"}' } as ResponseStreamEvent;
+			yield {
+				type: "response.function_call_arguments.delta",
+				delta: ',"content":"updated"}',
+			} as ResponseStreamEvent;
 			yield { type: "response.function_call_arguments.done", arguments: argumentsJson } as ResponseStreamEvent;
 			yield {
 				type: "response.output_item.done",

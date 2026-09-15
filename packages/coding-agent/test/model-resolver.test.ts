@@ -34,7 +34,8 @@ const qwenExacto = model({ id: "qwen/qwen3-coder:exacto", provider: "openrouter"
 const gpt4oExtended = model({ id: "openai/gpt-4o:extended", provider: "openrouter", reasoning: false });
 const allModels = [sonnet, gpt4o, qwenExacto, gpt4oExtended];
 
-const primeInference = (id: string) => model({ id, provider: "prime-inference", baseUrl: "https://api.pinference.ai/api/v1" });
+const primeInference = (id: string) =>
+	model({ id, provider: "prime-inference", baseUrl: "https://api.pinference.ai/api/v1" });
 const zaiDirect = model({ id: "glm-5", provider: "zai", baseUrl: "https://open.bigmodel.cn/api/paas/v4" });
 const zaiGateway = model({ id: "zai/glm-5", provider: "vercel-ai-gateway", baseUrl: "https://ai-gateway.vercel.sh" });
 
@@ -43,7 +44,11 @@ const cliRegistry = (models: AnyModel[]): CliRegistry => ({ getAll: () => models
 describe("resolveModelScopeFromModels", () => {
 	test("resolves scope patterns, thinking suffixes, and provider-qualified ids", () => {
 		const daemonOnly = primeInference("daemon-only-model");
-		const hfGlm = model({ id: "zai-org/GLM-5.2", provider: "huggingface", baseUrl: "https://router.huggingface.co/v1" });
+		const hfGlm = model({
+			id: "zai-org/GLM-5.2",
+			provider: "huggingface",
+			baseUrl: "https://router.huggingface.co/v1",
+		});
 		const primeGlm = primeInference("z-ai/glm-5.2");
 		const models = [...allModels, daemonOnly, hfGlm, primeGlm];
 
@@ -75,17 +80,51 @@ describe("resolveModelScopeFromModels", () => {
 });
 
 describe("resolveCliModel", () => {
-	test.each<[string, { provider?: string; pattern: string; models?: AnyModel[] }, { provider: string; id: string; thinking?: string }]>([
+	test.each<
+		[
+			string,
+			{ provider?: string; pattern: string; models?: AnyModel[] },
+			{ provider: string; id: string; thinking?: string },
+		]
+	>([
 		["provider/id without --provider", { pattern: "openai/gpt-4o" }, { provider: "openai", id: "gpt-4o" }],
-		["a fuzzy pattern inside an explicit provider", { provider: "openai", pattern: "4o" }, { provider: "openai", id: "gpt-4o" }],
-		["a provider-prefixed fuzzy pattern", { pattern: "openrouter/qwen" }, { provider: "openrouter", id: "qwen/qwen3-coder:exacto" }],
-		["a <pattern>:<thinking> suffix", { pattern: "sonnet:high" }, { provider: "anthropic", id: "claude-sonnet-4-5", thinking: "high" }],
+		[
+			"a fuzzy pattern inside an explicit provider",
+			{ provider: "openai", pattern: "4o" },
+			{ provider: "openai", id: "gpt-4o" },
+		],
+		[
+			"a provider-prefixed fuzzy pattern",
+			{ pattern: "openrouter/qwen" },
+			{ provider: "openrouter", id: "qwen/qwen3-coder:exacto" },
+		],
+		[
+			"a <pattern>:<thinking> suffix",
+			{ pattern: "sonnet:high" },
+			{ provider: "anthropic", id: "claude-sonnet-4-5", thinking: "high" },
+		],
 		// An exact id match beats provider inference, and an invalid :suffix stays part of the id.
-		["an exact OpenRouter-style id", { pattern: "openai/gpt-4o:extended" }, { provider: "openrouter", id: "openai/gpt-4o:extended" }],
-		["a raw id with a non-thinking suffix", { provider: "openai", pattern: "gpt-4o:extended" }, { provider: "openai", id: "gpt-4o:extended" }],
-		["a custom id without double prefixing", { provider: "openrouter", pattern: "openrouter/openai/ghost-model" }, { provider: "openrouter", id: "openai/ghost-model" }],
+		[
+			"an exact OpenRouter-style id",
+			{ pattern: "openai/gpt-4o:extended" },
+			{ provider: "openrouter", id: "openai/gpt-4o:extended" },
+		],
+		[
+			"a raw id with a non-thinking suffix",
+			{ provider: "openai", pattern: "gpt-4o:extended" },
+			{ provider: "openai", id: "gpt-4o:extended" },
+		],
+		[
+			"a custom id without double prefixing",
+			{ provider: "openrouter", pattern: "openrouter/openai/ghost-model" },
+			{ provider: "openrouter", id: "openai/ghost-model" },
+		],
 		// A provider/model split beats a gateway model whose id happens to match.
-		["provider split over a gateway id", { pattern: "zai/glm-5", models: [...allModels, zaiDirect, zaiGateway] }, { provider: "zai", id: "glm-5" }],
+		[
+			"provider split over a gateway id",
+			{ pattern: "zai/glm-5", models: [...allModels, zaiDirect, zaiGateway] },
+			{ provider: "zai", id: "glm-5" },
+		],
 	])("resolves %s", (_label, { provider, pattern, models }, expected) => {
 		const result = resolveCliModel({
 			cliProvider: provider,
@@ -119,7 +158,11 @@ describe("resolveCliModel", () => {
 		// catalog that only loads after refreshAvailableModels().
 		const registry = cliRegistry([...getModels("prime-inference"), ...getPrivatePrimeInferenceModels()]);
 
-		const priv = resolveCliModel({ cliProvider: "prime-inference", cliModel: "internal/glm-5.3-fast", modelRegistry: registry });
+		const priv = resolveCliModel({
+			cliProvider: "prime-inference",
+			cliModel: "internal/glm-5.3-fast",
+			modelRegistry: registry,
+		});
 		expect(priv.error).toBeUndefined();
 		expect(priv.model?.id).toBe("internal/glm-5.3-fast");
 		expect(priv.model?.provider).toBe("prime-inference");
@@ -173,9 +216,23 @@ describe("default model selection", () => {
 	});
 
 	test.each<[string, AnyModel[], string]>([
-		["prefers the Prime Inference default", [sonnet, primeInference("z-ai/glm-5.2"), primeInference("z-ai/glm-5.3")], "z-ai/glm-5.3"],
+		[
+			"prefers the Prime Inference default",
+			[sonnet, primeInference("z-ai/glm-5.2"), primeInference("z-ai/glm-5.3")],
+			"z-ai/glm-5.3",
+		],
 		["falls back to another provider default", [sonnet], "claude-sonnet-4-5"],
-		["selects the ai-gateway default", [model({ id: "anthropic/claude-opus-4-6", provider: "vercel-ai-gateway", baseUrl: "https://ai-gateway.vercel.sh" })], "anthropic/claude-opus-4-6"],
+		[
+			"selects the ai-gateway default",
+			[
+				model({
+					id: "anthropic/claude-opus-4-6",
+					provider: "vercel-ai-gateway",
+					baseUrl: "https://ai-gateway.vercel.sh",
+				}),
+			],
+			"anthropic/claude-opus-4-6",
+		],
 	])("findInitialModel %s", async (_label, available, expectedId) => {
 		const registry = { refreshAvailableModels: async () => available } as unknown as InitialRegistry;
 
@@ -208,12 +265,20 @@ describe("default model selection", () => {
 	test.each<[string, { provider: string; modelId: string; snapshot: AnyModel[] }, string]>([
 		[
 			"rebuilds a saved default missing from the snapshot when the provider is authed",
-			{ provider: "prime-inference", modelId: "anthropic/claude-opus-4.6", snapshot: [primeInference("openai/gpt-5.5")] },
+			{
+				provider: "prime-inference",
+				modelId: "anthropic/claude-opus-4.6",
+				snapshot: [primeInference("openai/gpt-5.5")],
+			},
 			"anthropic/claude-opus-4.6",
 		],
 		[
 			"does not rebuild a saved default for an unauthed provider",
-			{ provider: "anthropic", modelId: "claude-ghost-9", snapshot: [...allModels, primeInference("openai/gpt-5.5")] },
+			{
+				provider: "anthropic",
+				modelId: "claude-ghost-9",
+				snapshot: [...allModels, primeInference("openai/gpt-5.5")],
+			},
 			"openai/gpt-5.5",
 		],
 	])("findInitialModel %s", async (_label, saved, expectedId) => {

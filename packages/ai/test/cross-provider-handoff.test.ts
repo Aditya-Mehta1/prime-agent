@@ -3,8 +3,6 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { getModel } from "../src/models.js";
 import { completeSimple, getEnvApiKey } from "../src/stream.js";
 import type { Api, Message, Model, Tool, ToolResultMessage } from "../src/types.js";
-import { hasAzureOpenAICredentials } from "./azure-utils.js";
-import { hasCloudflareAiGatewayCredentials, hasCloudflareWorkersAICredentials } from "./cloudflare-utils.js";
 import { resolveApiKey } from "./oauth.js";
 
 const testToolSchema = Type.Object({ value: Type.Number({ description: "A number to double" }) });
@@ -19,7 +17,6 @@ interface ProviderModelPair {
 	model: string;
 	label: string;
 	apiOverride?: Api;
-	upstreamApiKeyEnv?: string;
 }
 
 // One pair per wire format that has to survive a handoff: anthropic, google, openai-completions,
@@ -44,12 +41,6 @@ function resolveProviderModel(pair: ProviderModelPair): Model<Api> | undefined {
 }
 
 function hasApiKey(pair: ProviderModelPair): boolean {
-	if (pair.provider === "azure-openai-responses") return hasAzureOpenAICredentials();
-	if (pair.provider === "cloudflare-workers-ai") return hasCloudflareWorkersAICredentials();
-	if (pair.provider === "cloudflare-ai-gateway") {
-		if (!hasCloudflareAiGatewayCredentials()) return false;
-		return pair.upstreamApiKeyEnv ? !!process.env[pair.upstreamApiKeyEnv] : true;
-	}
 	return !!getEnvApiKey(pair.provider);
 }
 
@@ -118,39 +109,35 @@ describe.skipIf(!PROVIDER_MODEL_PAIRS.some(hasApiKey))("Cross-Provider Handoff",
 		}
 	}, 300000);
 
-	it(
-		"accepts a history assembled from every other provider without a wire-format error",
-		async () => {
-			if (contexts.size < 2) return;
-			const failures: string[] = [];
+	it("accepts a history assembled from every other provider without a wire-format error", async () => {
+		if (contexts.size < 2) return;
+		const failures: string[] = [];
 
-			for (const targetPair of PROVIDER_MODEL_PAIRS) {
-				const model = resolveProviderModel(targetPair);
-				const apiKey = hasApiKey(targetPair) ? await getApiKey(targetPair.provider) : undefined;
-				if (!model || !apiKey) continue;
+		for (const targetPair of PROVIDER_MODEL_PAIRS) {
+			const model = resolveProviderModel(targetPair);
+			const apiKey = hasApiKey(targetPair) ? await getApiKey(targetPair.provider) : undefined;
+			if (!model || !apiKey) continue;
 
-				const foreign = [...contexts.entries()]
-					.filter(([label]) => label !== targetPair.label)
-					.flatMap(([, messages]) => messages);
-				if (foreign.length === 0) continue;
+			const foreign = [...contexts.entries()]
+				.filter(([label]) => label !== targetPair.label)
+				.flatMap(([, messages]) => messages);
+			if (foreign.length === 0) continue;
 
-				const response = await completeSimple(
-					model,
-					{
-						systemPrompt: "You are a helpful assistant.",
-						messages: [
-							...foreign,
-							{ role: "user", content: "Say 'Hello, handoff successful!'", timestamp: Date.now() },
-						],
-						tools: [testTool],
-					},
-					{ apiKey, reasoning: model.reasoning === true ? "high" : undefined },
-				);
-				if (response.stopReason === "error") failures.push(`${targetPair.label}: ${response.errorMessage}`);
-			}
+			const response = await completeSimple(
+				model,
+				{
+					systemPrompt: "You are a helpful assistant.",
+					messages: [
+						...foreign,
+						{ role: "user", content: "Say 'Hello, handoff successful!'", timestamp: Date.now() },
+					],
+					tools: [testTool],
+				},
+				{ apiKey, reasoning: model.reasoning === true ? "high" : undefined },
+			);
+			if (response.stopReason === "error") failures.push(`${targetPair.label}: ${response.errorMessage}`);
+		}
 
-			expect(failures).toEqual([]);
-		},
-		600000,
-	);
+		expect(failures).toEqual([]);
+	}, 600000);
 });

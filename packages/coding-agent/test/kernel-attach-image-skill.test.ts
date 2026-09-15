@@ -344,6 +344,11 @@ print(json.dumps({"agents": agents, "agent": agent, "recent": recent}, sort_keys
 			"agent_observe.get",
 			"agent_observe.recent",
 		]);
-		expect(requests[2].payload).toMatchObject({ type: "agent_observe.recent", target: "beta", limit: 3, max_chars: 120 });
+		expect(requests[2].payload).toMatchObject({
+			type: "agent_observe.recent",
+			target: "beta",
+			limit: 3,
+			max_chars: 120,
+		});
 	});
 });

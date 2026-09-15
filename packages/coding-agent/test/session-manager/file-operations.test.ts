@@ -68,14 +68,17 @@ describe("loadEntriesFromFile", () => {
 		["a file without a session header", `${MESSAGE}\n`, []],
 		["malformed JSON", "not json\n", []],
 		["a valid session file", `${HEADER}\n${MESSAGE}\n`, ["session", "message"]],
-		["a file with a malformed line between valid ones", `${HEADER}\nnot valid json\n${MESSAGE}\n`, ["session", "message"]],
+		[
+			"a file with a malformed line between valid ones",
+			`${HEADER}\nnot valid json\n${MESSAGE}\n`,
+			["session", "message"],
+		],
 	])("loads %s", (_label, content, expectedTypes) => {
 		const file = join(tempDir, "session.jsonl");
 		if (content !== undefined) writeFileSync(file, content);
 
 		expect(loadEntriesFromFile(file).map((entry) => entry.type)).toEqual(expectedTypes);
 	});
-
 
 	it("yields while parsing a multi-megabyte session below the streaming threshold", async () => {
 		const file = join(tempDir, "buffered.jsonl");
@@ -180,7 +183,10 @@ describe("session tree metadata", () => {
 	function writeLegacySession(relativePath: string, header: Record<string, unknown>): string {
 		const file = join(tempDir, relativePath);
 		mkdirSync(join(file, ".."), { recursive: true });
-		writeFileSync(file, `${JSON.stringify({ type: "session", timestamp: "2025-01-01T00:00:00Z", cwd: tempDir, ...header })}\n`);
+		writeFileSync(
+			file,
+			`${JSON.stringify({ type: "session", timestamp: "2025-01-01T00:00:00Z", cwd: tempDir, ...header })}\n`,
+		);
 		return file;
 	}
 
@@ -286,7 +292,11 @@ describe("session tree metadata", () => {
 			() => {
 				writeLegacySession("grandparent.jsonl", { id: "grandparent", rlmDepth: 4 });
 				writeLegacySession("parent.jsonl", { id: "parent", parentSession: "grandparent.jsonl" });
-				return { header: { parentSession: "../parent.jsonl" }, file: join(tempDir, "sub-1234abcd", "child.jsonl"), expected: 5 };
+				return {
+					header: { parentSession: "../parent.jsonl" },
+					file: join(tempDir, "sub-1234abcd", "child.jsonl"),
+					expected: 5,
+				};
 			},
 		],
 		[
@@ -384,7 +394,10 @@ describe("findMostRecentSession", () => {
 				return { dir: tempDir, expected: null };
 			},
 		],
-		["returns the single valid session file", () => ({ dir: tempDir, expected: writeSession("session.jsonl", "abc") })],
+		[
+			"returns the single valid session file",
+			() => ({ dir: tempDir, expected: writeSession("session.jsonl", "abc") }),
+		],
 		[
 			"returns the most recently modified session",
 			() => {
@@ -829,7 +842,13 @@ describe("migrateSessionEntries", () => {
 				timestamp: "2025-01-01T00:00:01Z",
 				message: { role: "user", content: "hi", timestamp: 1 },
 			},
-			{ type: "message", id: "def67890", parentId: "abc12345", timestamp: "2025-01-01T00:00:02Z", message: assistant },
+			{
+				type: "message",
+				id: "def67890",
+				parentId: "abc12345",
+				timestamp: "2025-01-01T00:00:02Z",
+				message: assistant,
+			},
 		] as unknown as FileEntry[];
 
 		migrateSessionEntries(entries);

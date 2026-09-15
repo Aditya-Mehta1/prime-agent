@@ -1042,9 +1042,8 @@ describe("AgentSessionRuntime characterization", () => {
 	});
 
 	/**
-	 * Session replacement rebinding folded in from the regression #2860 file: the runtime rebinds
-	 * extensions before `withSession` runs, the callback targets the replacement session, and stale
-	 * pi/ctx handles from the replaced session stop working.
+	 * The runtime rebinds extensions before `withSession` runs, the callback targets the replacement
+	 * session, and stale pi/ctx handles from the replaced session stop working.
 	 */
 	describe("regression #2860: replaced session callbacks", () => {
 		/** Re-create the production rebind wiring so command contexts can replace the live session. */

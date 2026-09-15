@@ -64,13 +64,33 @@ async function streamOnce() {
 
 describe("azure-openai-responses base URL normalization", () => {
 	it.each([
-		["cognitive services root", "https://res.cognitiveservices.azure.com", "https://res.cognitiveservices.azure.com/openai/v1"],
+		[
+			"cognitive services root",
+			"https://res.cognitiveservices.azure.com",
+			"https://res.cognitiveservices.azure.com/openai/v1",
+		],
 		["azure openai root", "https://res.openai.azure.com", "https://res.openai.azure.com/openai/v1"],
-		["/openai path", "https://res.cognitiveservices.azure.com/openai", "https://res.cognitiveservices.azure.com/openai/v1"],
-		["/openai/v1 path", "https://res.cognitiveservices.azure.com/openai/v1", "https://res.cognitiveservices.azure.com/openai/v1"],
+		[
+			"/openai path",
+			"https://res.cognitiveservices.azure.com/openai",
+			"https://res.cognitiveservices.azure.com/openai/v1",
+		],
+		[
+			"/openai/v1 path",
+			"https://res.cognitiveservices.azure.com/openai/v1",
+			"https://res.cognitiveservices.azure.com/openai/v1",
+		],
 		["non-azure proxy path", "https://my-proxy.example.com/v1", "https://my-proxy.example.com/v1"],
-		["azure query params", "https://res.openai.azure.com/openai?api-version=2024-12-01", "https://res.openai.azure.com/openai/v1"],
-		["non-azure query params", "https://my-proxy.example.com/v1?custom=true", "https://my-proxy.example.com/v1?custom=true"],
+		[
+			"azure query params",
+			"https://res.openai.azure.com/openai?api-version=2024-12-01",
+			"https://res.openai.azure.com/openai/v1",
+		],
+		[
+			"non-azure query params",
+			"https://my-proxy.example.com/v1?custom=true",
+			"https://my-proxy.example.com/v1?custom=true",
+		],
 	])("normalizes %s", async (_name, baseUrl, expected) => {
 		process.env.AZURE_OPENAI_BASE_URL = baseUrl;
 

@@ -30,7 +30,11 @@ async function captureRequest(
 	model: Model<"openai-responses">,
 	options: Parameters<typeof streamOpenAIResponses>[2] = {},
 ): Promise<{ payload: unknown; sessionId: string | null; clientRequestId: string | null }> {
-	const captured = { payload: undefined as unknown, sessionId: null as string | null, clientRequestId: null as string | null };
+	const captured = {
+		payload: undefined as unknown,
+		sessionId: null as string | null,
+		clientRequestId: null as string | null,
+	};
 	vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
 		captured.sessionId = getHeader(init?.headers, "session_id");
 		captured.clientRequestId = getHeader(init?.headers, "x-client-request-id");
@@ -68,10 +72,20 @@ const REASONING_DEFAULTS: Array<{
 		model: () => getModel("github-copilot", "gpt-5-mini"),
 	},
 	...(["gpt-5.1", "gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.5"] as const).map(
-		(modelId) => ({ provider: "openai" as const, modelId, effort: "none" as const, model: () => getModel("openai", modelId) }),
+		(modelId) => ({
+			provider: "openai" as const,
+			modelId,
+			effort: "none" as const,
+			model: () => getModel("openai", modelId),
+		}),
 	),
 	...(["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5-pro", "gpt-5.2-pro", "gpt-5.4-pro", "gpt-5.5-pro"] as const).map(
-		(modelId) => ({ provider: "openai" as const, modelId, effort: "absent" as const, model: () => getModel("openai", modelId) }),
+		(modelId) => ({
+			provider: "openai" as const,
+			modelId,
+			effort: "absent" as const,
+			model: () => getModel("openai", modelId),
+		}),
 	),
 ];
 

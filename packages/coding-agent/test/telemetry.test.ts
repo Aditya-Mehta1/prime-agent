@@ -229,7 +229,12 @@ describe("agent telemetry aggregation", () => {
 		fakeSession.emit({
 			type: "message_update",
 			message: assistant,
-			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "private streamed text", partial: assistant },
+			assistantMessageEvent: {
+				type: "text_delta",
+				contentIndex: 0,
+				delta: "private streamed text",
+				partial: assistant,
+			},
 		});
 		timestamp = 1_050;
 		fakeSession.emit({

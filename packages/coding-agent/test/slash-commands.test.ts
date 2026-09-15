@@ -129,7 +129,6 @@ describe("session slash commands", () => {
 	});
 });
 
-
 describe("ENG-6014 literal prompt arguments", () => {
 	const explainTemplate: PromptTemplate = {
 		name: "explain",

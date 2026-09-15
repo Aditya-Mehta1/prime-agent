@@ -135,7 +135,13 @@ describe("faux provider", () => {
 			cacheHit: false,
 			cacheWrite: true,
 		},
-		{ name: "does not cache without a sessionId", first: undefined, second: undefined, cacheHit: false, cacheWrite: false },
+		{
+			name: "does not cache without a sessionId",
+			first: undefined,
+			second: undefined,
+			cacheHit: false,
+			cacheWrite: false,
+		},
 		{
 			name: "does not cache when cacheRetention is none",
 			first: { sessionId: "session-1", cacheRetention: "none" } as ProviderStreamOptions,

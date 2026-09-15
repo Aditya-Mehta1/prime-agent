@@ -49,43 +49,81 @@ describe("extensions discovery", () => {
 		write(path.join(dir, "package.json"), JSON.stringify({ name: "my-package", pi: { extensions } }));
 
 	it.each([
-		{ name: "direct .ts files", setup: () => { write("foo.ts"); write("bar.ts"); }, expected: ["bar.ts", "foo.ts"] },
+		{
+			name: "direct .ts files",
+			setup: () => {
+				write("foo.ts");
+				write("bar.ts");
+			},
+			expected: ["bar.ts", "foo.ts"],
+		},
 		{ name: "direct .js files", setup: () => write("foo.js"), expected: ["foo.js"] },
-		{ name: "subdirectory index.ts", setup: () => write("my-extension/index.ts"), expected: ["my-extension/index.ts"] },
-		{ name: "subdirectory index.js", setup: () => write("my-extension/index.js"), expected: ["my-extension/index.js"] },
+		{
+			name: "subdirectory index.ts",
+			setup: () => write("my-extension/index.ts"),
+			expected: ["my-extension/index.ts"],
+		},
+		{
+			name: "subdirectory index.js",
+			setup: () => write("my-extension/index.js"),
+			expected: ["my-extension/index.js"],
+		},
 		{
 			name: "index.ts wins over index.js",
-			setup: () => { write("my-extension/index.ts"); write("my-extension/index.js"); },
+			setup: () => {
+				write("my-extension/index.ts");
+				write("my-extension/index.js");
+			},
 			expected: ["my-extension/index.ts"],
 		},
 		{
 			name: "package.json pi field",
-			setup: () => { write("my-package/src/main.ts"); manifest("my-package", ["./src/main.ts"]); },
+			setup: () => {
+				write("my-package/src/main.ts");
+				manifest("my-package", ["./src/main.ts"]);
+			},
 			expected: ["my-package/src/main.ts"],
 		},
 		{
 			name: "package.json declaring several extensions",
-			setup: () => { write("my-package/ext1.ts"); write("my-package/ext2.ts"); manifest("my-package", ["./ext1.ts", "./ext2.ts"]); },
+			setup: () => {
+				write("my-package/ext1.ts");
+				write("my-package/ext2.ts");
+				manifest("my-package", ["./ext1.ts", "./ext2.ts"]);
+			},
 			expected: ["my-package/ext1.ts", "my-package/ext2.ts"],
 		},
 		{
 			name: "package.json pi field wins over index.ts",
-			setup: () => { write("my-package/index.ts"); write("my-package/custom.ts"); manifest("my-package", ["./custom.ts"]); },
+			setup: () => {
+				write("my-package/index.ts");
+				write("my-package/custom.ts");
+				manifest("my-package", ["./custom.ts"]);
+			},
 			expected: ["my-package/custom.ts"],
 		},
 		{
 			name: "package.json without pi field falls back to index.ts",
-			setup: () => { write("my-package/index.ts"); write("my-package/package.json", JSON.stringify({ name: "my-package", version: "1.0.0" })); },
+			setup: () => {
+				write("my-package/index.ts");
+				write("my-package/package.json", JSON.stringify({ name: "my-package", version: "1.0.0" }));
+			},
 			expected: ["my-package/index.ts"],
 		},
 		{
 			name: "package.json paths that do not exist are skipped",
-			setup: () => { write("my-package/exists.ts"); manifest("my-package", ["./exists.ts", "./missing.ts"]); },
+			setup: () => {
+				write("my-package/exists.ts");
+				manifest("my-package", ["./exists.ts", "./missing.ts"]);
+			},
 			expected: ["my-package/exists.ts"],
 		},
 		{
 			name: "subdirectory without index or manifest",
-			setup: () => { write("not-an-extension/helper.ts"); write("not-an-extension/utils.ts"); },
+			setup: () => {
+				write("not-an-extension/helper.ts");
+				write("not-an-extension/utils.ts");
+			},
 			expected: [],
 		},
 		{ name: "no recursion beyond one level", setup: () => write("container/nested/index.ts"), expected: [] },
@@ -111,7 +149,12 @@ describe("extensions discovery", () => {
 	});
 
 	it.each([
-		{ name: "code that fails to load", file: "invalid.ts", code: "this is not valid typescript export", error: undefined },
+		{
+			name: "code that fails to load",
+			file: "invalid.ts",
+			code: "this is not valid typescript export",
+			error: undefined,
+		},
 		{
 			name: "a factory that throws",
 			file: "throws.ts",

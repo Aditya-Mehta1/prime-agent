@@ -27,8 +27,18 @@ describe("ENG-4722 resume selector matching", () => {
 	});
 
 	it.each([
-		{ name: "an exact normalized id beats prefix and suffix matches", saved: ["abcd", "abcd1", "1abcd"], selector: "AB-CD", resolved: "abcd" },
-		{ name: "the normalized suffix shown by the session list resolves", saved: [SAVED_ID], selector: "aaaaaaaaaaaa", resolved: SAVED_ID },
+		{
+			name: "an exact normalized id beats prefix and suffix matches",
+			saved: ["abcd", "abcd1", "1abcd"],
+			selector: "AB-CD",
+			resolved: "abcd",
+		},
+		{
+			name: "the normalized suffix shown by the session list resolves",
+			saved: [SAVED_ID],
+			selector: "aaaaaaaaaaaa",
+			resolved: SAVED_ID,
+		},
 		{
 			name: "an ambiguous prefix is rejected",
 			saved: ["11111111-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "11111111-bbbb-bbbb-bbbb-bbbbbbbbbbbb"],
@@ -39,7 +49,11 @@ describe("ENG-4722 resume selector matching", () => {
 			name: "a mistyped id is rejected with the closest saved id",
 			saved: [SAVED_ID],
 			selector: `${SAVED_ID.slice(0, -1)}b`,
-			error: { name: SessionSelectorNotFoundError.name, selector: `${SAVED_ID.slice(0, -1)}b`, suggestion: SAVED_ID },
+			error: {
+				name: SessionSelectorNotFoundError.name,
+				selector: `${SAVED_ID.slice(0, -1)}b`,
+				suggestion: SAVED_ID,
+			},
 		},
 	])("$name", async ({ saved, selector, resolved, error }) => {
 		harness = await createHarness();

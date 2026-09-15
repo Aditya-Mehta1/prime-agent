@@ -46,7 +46,12 @@ function createDaemonInternals(
 	const daemon = new AgentDaemon(`${harness.tempDir}/daemon.sock`, {
 		defaultSessionConfig: { cwd: harness.tempDir, agentDir: harness.tempDir },
 		...(options.worker
-			? { worker: { authenticationToken: "test-token", restoreActiveSessionId: options.worker.restoreActiveSessionId } }
+			? {
+					worker: {
+						authenticationToken: "test-token",
+						restoreActiveSessionId: options.worker.restoreActiveSessionId,
+					},
+				}
 			: {}),
 		createRuntime: async () => {
 			throw new Error("unexpected runtime creation");
@@ -93,7 +98,10 @@ function attachDaemon(harness: Harness): {
 	const client = createWriteClient(writes, ["active-1"]);
 	return {
 		send: (command) =>
-			internals.handleLine(client, JSON.stringify({ activeSessionId: "active-1", expandPromptTemplates: false, ...command })),
+			internals.handleLine(
+				client,
+				JSON.stringify({ activeSessionId: "active-1", expandPromptTemplates: false, ...command }),
+			),
 		responses: () =>
 			writes
 				.join("")
