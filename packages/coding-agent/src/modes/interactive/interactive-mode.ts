@@ -1096,6 +1096,11 @@ export class InteractiveMode {
 	// Last catalog fetch failure surfaced in the open manager view; cleared by
 	// the next successful apply and on manager open.
 	private heartbeatCatalogFetchError: string | undefined;
+	// Monotonic issue-order sequence for catalog writes (fetches and heartbeat
+	// management actions). A fetch write sequenced behind an already-applied
+	// newer one is dropped, so a late/older snapshot cannot revert newer state.
+	private heartbeatCatalogSeq = 0;
+	private heartbeatCatalogAppliedSeq = 0;
 
 	// Registry of images pasted this session, keyed by the `[image #N]` marker
 	// shown to the user. Insertion-ordered; the bytes persist (bounded by
@@ -2691,6 +2696,7 @@ export class InteractiveMode {
 			// starve an awaiting rebind (and its transcript render) indefinitely.
 			for (let drain = 0; drain <= HEARTBEAT_REFRESH_DRAIN_LIMIT; drain++) {
 				this.heartbeatRefreshRequested = false;
+				const fetchSeq = ++this.heartbeatCatalogSeq;
 				const fetch = connection.listHeartbeats();
 				const heartbeats = await fetchHeartbeatsWithinDeadline(fetch);
 				if (this.isShuttingDown || this.isReturningToAgentsView || this.agentConnection !== connection) return;
@@ -2701,11 +2707,11 @@ export class InteractiveMode {
 					// always has a next scheduled retrieval even if it never does.
 					// A change event that arrived mid-fetch still re-triggers a
 					// refresh through the follow-up scheduling below.
-					this.retainHeartbeatCatalogFetch(fetch, connection);
+					this.retainHeartbeatCatalogFetch(fetch, connection, fetchSeq);
 					this.armHeartbeatManagerFetchRetry();
 					return;
 				}
-				this.applyHeartbeatCatalog(heartbeats);
+				this.applyHeartbeatCatalog(heartbeats, fetchSeq);
 				if (!this.heartbeatRefreshRequested) return;
 			}
 		})().finally(() => {
@@ -2723,7 +2729,13 @@ export class InteractiveMode {
 		return refresh;
 	}
 
-	private applyHeartbeatCatalog(heartbeats: AgentConnectionHeartbeat[]): void {
+	private applyHeartbeatCatalog(heartbeats: AgentConnectionHeartbeat[], seq?: number): void {
+		// A sequenced fetch write that lost the race to a newer catalog write
+		// (a later fetch or a management action) must not revert it.
+		if (seq !== undefined) {
+			if (seq < this.heartbeatCatalogAppliedSeq) return;
+			this.heartbeatCatalogAppliedSeq = seq;
+		}
 		this.heartbeatCatalog = heartbeats;
 		this.heartbeatCatalogFetchError = undefined;
 		this.scheduleHeartbeatManagerRefresh();
@@ -10063,18 +10075,23 @@ export class InteractiveMode {
 		this.heartbeatManagerRefreshAt = undefined;
 	}
 
-	private retainHeartbeatCatalogFetch(fetch: Promise<AgentConnectionHeartbeat[]>, connection: AgentConnection): void {
+	private retainHeartbeatCatalogFetch(
+		fetch: Promise<AgentConnectionHeartbeat[]>,
+		connection: AgentConnection,
+		seq: number,
+	): void {
 		// The deadline expired while this fetch was still in flight: apply the
 		// late result when it lands so the open view converges even without a
 		// further heartbeats_changed event. Bounded by the same context guards
-		// as the drain loop; a late failure is swallowed (the retry chain owns
-		// recovery from it).
+		// as the drain loop and by the write sequence, so a superseded result
+		// cannot revert newer catalog state; a late failure is swallowed (the
+		// retry chain owns recovery from it).
 		void fetch
 			.then((heartbeats) => {
 				if (this.isShuttingDown || this.isReturningToAgentsView || this.agentConnection !== connection) {
 					return;
 				}
-				this.applyHeartbeatCatalog(heartbeats);
+				this.applyHeartbeatCatalog(heartbeats, seq);
 			})
 			.catch(() => undefined);
 	}
@@ -10112,6 +10129,10 @@ export class InteractiveMode {
 		heartbeat: AgentConnectionHeartbeat,
 		action: AgentHeartbeatManagementAction,
 	): Promise<void> {
+		// Sequence the action by issue order so an older in-flight fetch
+		// cannot later revert its result; the action itself is authoritative
+		// and always applies.
+		const actionSeq = ++this.heartbeatCatalogSeq;
 		const updated = await this.agentConnection.manageHeartbeat(
 			heartbeat.job.activeSessionId,
 			heartbeat.job.id,
@@ -10120,6 +10141,7 @@ export class InteractiveMode {
 		if (updated.source === "heartbeat" && updated.activeSessionId === this.connectionState?.activeSessionId) {
 			this.patchConnectionState({ heartbeat: action === "stop" ? null : updated });
 		}
+		this.heartbeatCatalogAppliedSeq = Math.max(this.heartbeatCatalogAppliedSeq, actionSeq);
 		const remaining = this.heartbeatCatalog.filter((entry) => entry.job.id !== updated.id);
 		this.applyHeartbeatCatalog(
 			updated.status === "active" || updated.status === "paused"

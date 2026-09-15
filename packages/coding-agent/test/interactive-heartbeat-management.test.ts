@@ -265,9 +265,18 @@ interface HeartbeatManagerOpenHarness {
 	heartbeatManagerFetchRetryTimer: ReturnType<typeof setTimeout> | undefined;
 	heartbeatManagerRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 	heartbeatManagerRefreshAt: number | undefined;
+	heartbeatCatalogSeq: number;
+	heartbeatCatalogAppliedSeq: number;
 	connectionState: { activeSessionId: string; sessionId: string };
 	subagentSnapshots: Map<string, AgentConnectionRlmChildAgentSnapshot>;
-	agentConnection: { listHeartbeats(): Promise<AgentConnectionHeartbeat[]> };
+	agentConnection: {
+		listHeartbeats(): Promise<AgentConnectionHeartbeat[]>;
+		manageHeartbeat?(
+			activeSessionId: string,
+			jobId: string,
+			action: AgentHeartbeatManagementAction,
+		): Promise<AgentCronJob>;
+	};
 	isShuttingDown: boolean;
 	isReturningToAgentsView: boolean;
 	ui: {
@@ -275,10 +284,12 @@ interface HeartbeatManagerOpenHarness {
 		terminal: { rows: number };
 		showOverlay(): { focus(): void; hide(): void };
 	};
+	patchConnectionState(patch: { heartbeat: AgentCronJob | null }): void;
 	scheduleHeartbeatManagerRefresh(): void;
 	updateSubagentSummaryLine(): void;
 	refreshHeartbeatCatalog(): Promise<void>;
 	showHeartbeatManager(): void;
+	manageHeartbeat(heartbeat: AgentConnectionHeartbeat, action: AgentHeartbeatManagementAction): Promise<void>;
 }
 
 interface HeartbeatCommandHarness {
@@ -330,6 +341,10 @@ describe("interactive heartbeat manager open (stale-while-revalidate)", () => {
 		harness.heartbeatManagerFetchRetryTimer = undefined;
 		harness.heartbeatManagerRefreshTimer = undefined;
 		harness.heartbeatManagerRefreshAt = undefined;
+		// Prototype-only harnesses skip the constructor, so sequence fields
+		// must be seeded explicitly.
+		harness.heartbeatCatalogSeq = 0;
+		harness.heartbeatCatalogAppliedSeq = 0;
 		harness.connectionState = { activeSessionId: "active-1", sessionId: "session-1" };
 		harness.subagentSnapshots = new Map([
 			[
@@ -353,6 +368,7 @@ describe("interactive heartbeat manager open (stale-while-revalidate)", () => {
 			terminal: { rows: 24 },
 			showOverlay: vi.fn(() => overlayHandle),
 		};
+		harness.patchConnectionState = vi.fn();
 		if (options?.realSchedule) {
 			harness.scheduleHeartbeatManagerRefresh = (
 				InteractiveMode.prototype as unknown as {
@@ -631,6 +647,82 @@ describe("interactive heartbeat manager open (stale-while-revalidate)", () => {
 			// still never lacked a next scheduled retrieval.
 			expect(harness.heartbeatCatalog).toEqual([{ job: heartbeat() }]);
 			expect(harness.updateSubagentSummaryLine).not.toHaveBeenCalled();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("does not overwrite a newer catalog with a late timed-out fetch result", { timeout: 10_000 }, async () => {
+		vi.useFakeTimers();
+		try {
+			const resolvers: Array<(heartbeats: AgentConnectionHeartbeat[]) => void> = [];
+			const listHeartbeats = vi.fn(
+				() =>
+					new Promise<AgentConnectionHeartbeat[]>((resolve) => {
+						resolvers.push(resolve);
+					}),
+			);
+			const { harness } = makeOpenHarness({ listHeartbeats });
+
+			harness.showHeartbeatManager();
+			// The initial fetch times out and is retained.
+			await vi.advanceTimersByTimeAsync(HEARTBEAT_REFRESH_FETCH_TIMEOUT_MS + 10);
+
+			// The retry fetch lands first with fresh data.
+			await vi.advanceTimersByTimeAsync(HEARTBEAT_REFRESH_RETRY_DELAY_MS + 10);
+			expect(resolvers.length).toBe(2);
+			const fresh: AgentConnectionHeartbeat[] = [{ job: heartbeat({ id: "heartbeat-9" }) }];
+			resolvers[1]?.(fresh);
+			await vi.advanceTimersByTimeAsync(10);
+			await Promise.resolve();
+			expect(harness.heartbeatCatalog).toEqual(fresh);
+
+			// The older timed-out fetch resolves last: it must not overwrite.
+			const stale: AgentConnectionHeartbeat[] = [{ job: heartbeat() }, { job: heartbeat({ id: "heartbeat-8" }) }];
+			resolvers[0]?.(stale);
+			await vi.advanceTimersByTimeAsync(10);
+			await Promise.resolve();
+
+			expect(harness.heartbeatCatalog).toEqual(fresh);
+			expect(harness.updateSubagentSummaryLine).toHaveBeenCalledTimes(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("does not let a late timed-out fetch revert a local heartbeat action", { timeout: 10_000 }, async () => {
+		vi.useFakeTimers();
+		try {
+			const resolvers: Array<(heartbeats: AgentConnectionHeartbeat[]) => void> = [];
+			const listHeartbeats = vi.fn(
+				() =>
+					new Promise<AgentConnectionHeartbeat[]>((resolve) => {
+						resolvers.push(resolve);
+					}),
+			);
+			const current = heartbeat();
+			const paused = { ...current, status: "paused" as const, nextRunAt: undefined };
+			const { harness } = makeOpenHarness({ listHeartbeats });
+			harness.agentConnection = {
+				listHeartbeats,
+				manageHeartbeat: vi.fn(async () => paused),
+			};
+
+			harness.showHeartbeatManager();
+			// The user pauses while the initial fetch is still in flight.
+			await harness.manageHeartbeat({ job: current }, "pause");
+			expect(harness.heartbeatCatalog).toEqual([{ job: paused }]);
+
+			// The initial fetch times out and is retained.
+			await vi.advanceTimersByTimeAsync(HEARTBEAT_REFRESH_FETCH_TIMEOUT_MS + 10);
+
+			// The pre-pause snapshot lands late: it must not revert the pause.
+			resolvers[0]?.([{ job: current }]);
+			await vi.advanceTimersByTimeAsync(10);
+			await Promise.resolve();
+
+			expect(harness.heartbeatCatalog).toEqual([{ job: paused }]);
+			expect(renderedManager(harness.heartbeatManager!)).toContain("1 paused");
 		} finally {
 			vi.useRealTimers();
 		}
