@@ -26,6 +26,12 @@
  * job must declare `environment:` unless it is one of the three jobs whose
  * credential the checker proves inert without one (ENVIRONMENT_EXEMPT_JOBS), and
  * every job holding contents:write must sit in the publication order.
+ *
+ * Every allowlisted tool is read through an option table (review round 7): an
+ * option the table does not name is an error, a word that begins with an
+ * expansion may stand only where the table proves it is a value (or where the
+ * variable's value provably begins with a literal), and every variable a step
+ * expands must be on ALLOWED_VARIABLES and bound in that step.
  */
 
 import { readdirSync, readFileSync } from "node:fs";
@@ -134,6 +140,275 @@ const ASSIGNING_COMMANDS = /^(read|local|declare|typeset|export|readonly|mapfile
 const PLAIN_SHELL = /^(bash|sh)$/;
 
 /**
+ * The shell variables a credential-bearing step may expand in an argument or a redirection target
+ * (review round 7, finding 3). An allowlist over names: a variable the checker does not know is an
+ * error until it is named here, and every name must be bound in the step - declared in the job's
+ * or step's `env:`, set by the runner ({@link GITHUB_DEFAULT_ENV}) or assigned earlier in the block
+ * by an assignment, `for`, `read`, `local`, `declare` or `export` - because an unbound name would
+ * take whatever the environment holds. The step's own credentials (`GH_TOKEN`,
+ * `AWS_SECRET_ACCESS_KEY`, ...) are deliberately absent: the tools read them from the
+ * environment, and a step that spelled one could write it into a file the job uploads.
+ */
+export const ALLOWED_VARIABLES = [
+	// Bound from the context job's outputs or the workflow's env.
+	"PRODUCTION_VERSION", "BETA_VERSION", "BUILD_REF", "DEFAULT_BRANCH", "TAP_REPO", "R2_BUCKET", "R2_ENDPOINT_URL",
+	// Bound in the publish and finalize steps.
+	"file", "name", "digest", "local_digest", "existing_digest", "readback_digest", "count", "pointer", "prefix", "key", "head_status", "type", "expected", "actual",
+	// Bound in the release steps.
+	"TAG", "tag", "ref", "sha", "tagged", "release_id", "missing", "failed", "asset_id", "latest_main_sha",
+	// Bound in the npm publish step.
+	"names", "tarball", "path",
+	// Bound in the tap bump step.
+	"branch", "workdir", "default_branch", "lease", "formula", "version_pattern", "platform", "rewritten", "previous", "digests", "line", "rest", "title", "body", "existing",
+	// Bound in the sign step.
+	"archive",
+];
+/** Variables the runner sets in every job; never an option, never attacker-chosen. */
+export const GITHUB_DEFAULT_ENV = ["GITHUB_REPOSITORY", "GITHUB_OUTPUT", "GITHUB_WORKSPACE", "GITHUB_REF", "GITHUB_REF_NAME", "GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_SERVER_URL", "GITHUB_API_URL", "RUNNER_TEMP", "RUNNER_OS", "RUNNER_ARCH"];
+/** `$GITHUB_ENV` and `$GITHUB_PATH` set the environment and PATH of every later step: writing to them is code loading by another name. */
+const STEP_STATE_FILES = /GITHUB_(ENV|PATH)\b/;
+/**
+ * Commands whose options cannot write a file or run a program, so an argument that turns out to be
+ * an option is at worst a wrong answer: an expanded word may stand in any argument position of
+ * these. Every other command - the publishing tools, the writing coreutils (`cp --target-directory`,
+ * `sort -o`, `tee -a`, `rm -r`), `set` (`set +e`, `set -a`), the assigning builtins - gets an
+ * expanded word only in the value slot of a known option, after a literal `--`, or when the
+ * variable's value provably begins with a literal that is not `-` (review round 7, finding 3).
+ */
+const EXPANSION_SAFE_COMMANDS = /^(basename|cat|cmp|cut|date|diff|dirname|echo|false|grep|head|ls|pwd|sha256sum|sleep|tail|test|tr|true|uniq|wc|\[|:|exit|return|continue|break|shift|wait)$/;
+/**
+ * Coreutils that can create, move or delete files (`sort -o`, `mktemp` included): the options each
+ * may carry, literal and value-less, and whether its positionals are files it writes (`targets`:
+ * the last one for cp/mv, all of them for rm/mkdir/tee/..., none for sort/mktemp). None may write
+ * into a downloaded artifact directory.
+ */
+const WRITING_COREUTILS = {
+	cp: { options: /^-[rRpaf]+$/, targets: "last" },
+	mv: { options: /^-f$/, targets: "last" },
+	rm: { options: /^-[rf]+$/, targets: "all" },
+	mkdir: { options: /^-p$/, targets: "all" },
+	rmdir: { options: /^-p$/, targets: "all" },
+	chmod: { options: /^-R$/, targets: "all" },
+	tee: { options: /^-a$/, targets: "all" },
+	touch: { options: /^$/, targets: "all" },
+	sort: { options: /^-[urn]+$/, targets: "none" },
+	mktemp: { options: /^(-d|--directory)$/, targets: "none" },
+};
+/** Tools whose whole argument list is parsed against a table: an option not in the table is an error. */
+const TOOL_OPTIONS = {
+	jq: { "-r": 0, "--raw-output": 0, "-e": 0, "--exit-status": 0, "-c": 0, "--compact-output": 0, "-s": 0, "--slurp": 0, "-n": 0, "--null-input": 0, "-S": 0, "--sort-keys": 0, "-j": 0, "--join-output": 0, "-a": 0, "--ascii-output": 0, "--tab": 0, "--indent": 1, "--arg": 2, "--argjson": 2, "--args": 0, "--jsonargs": 0 },
+	cosign: {
+		"sign-blob": { "--yes": 0, "-y": 0, "--bundle": 1 },
+		"verify-blob": { "--bundle": 1, "--certificate-identity": 1, "--certificate-oidc-issuer": 1 },
+	},
+	syft: { scan: { "-o": 1, "--output": 1, "-q": 0, "--quiet": 0 } },
+	tar: { "-x": 0, "--extract": 0, "-t": 0, "--list": 0, "-z": 0, "--gzip": 0, "-j": 0, "-J": 0, "-v": 0, "--verbose": 0, "-f": 1, "--file": 1, "-C": 1, "--directory": 1, "--strip-components": 1 },
+	curl: { "--proto": 1, "-f": 0, "--fail": 0, "-s": 0, "--silent": 0, "-S": 0, "--show-error": 0, "-L": 0, "--location": 0, "--retry": 1, "--retry-delay": 1, "--max-time": 1, "-m": 1, "--connect-timeout": 1, "-o": 1, "--output": 1, "-I": 0, "--head": 0 },
+	"gh api": { "--jq": 1, "-q": 1, "--paginate": 0, "--method": 1, "-X": 1, "-f": 1, "--raw-field": 1, "-F": 1, "--field": 1, "--input": 1, "--silent": 0, "--slurp": 0 },
+	"gh pr": {
+		list: { "--repo": 1, "-R": 1, "--head": 1, "-H": 1, "--base": 1, "-B": 1, "--state": 1, "-s": 1, "--json": 1, "--jq": 1, "-q": 1, "--limit": 1, "-L": 1, "--author": 1, "-A": 1, "--label": 1, "-l": 1, "--search": 1, "-S": 1 },
+		create: { "--repo": 1, "-R": 1, "--head": 1, "-H": 1, "--base": 1, "-B": 1, "--title": 1, "-t": 1, "--body": 1, "-b": 1, "--body-file": 1, "-F": 1, "--draft": 0, "-d": 0, "--label": 1, "-l": 1, "--reviewer": 1, "-r": 1, "--assignee": 1, "-a": 1 },
+		edit: { "--repo": 1, "-R": 1, "--title": 1, "-t": 1, "--body": 1, "-b": 1, "--body-file": 1, "-F": 1, "--base": 1, "-B": 1, "--add-label": 1, "--remove-label": 1 },
+		view: { "--repo": 1, "-R": 1, "--json": 1, "--jq": 1, "-q": 1, "--comments": 0, "-c": 0 },
+	},
+};
+/** `git` subcommands a credential-bearing job may run and the options each takes (`-c` is `switch --create`, never a config). */
+const GIT_COMMAND_OPTIONS = {
+	"symbolic-ref": { "--short": 0, "-q": 0, "--quiet": 0 },
+	"ls-remote": { "--heads": 0, "-h": 0, "--tags": 0, "-t": 0, "--refs": 0, "-q": 0, "--quiet": 0, "--exit-code": 0 },
+	switch: { "-c": 1, "--create": 1, "--detach": 0, "-q": 0, "--quiet": 0 },
+	diff: { "--quiet": 0, "--exit-code": 0, "--stat": 0, "--name-only": 0, "--cached": 0, "--staged": 0 },
+	commit: { "-a": 0, "--all": 0, "-m": 1, "--message": 1, "-q": 0, "--quiet": 0 },
+	push: { "--force-with-lease": 0, "--atomic": 0, "-q": 0, "--quiet": 0, "--porcelain": 0, "--dry-run": 0, "-n": 0 },
+	status: { "--porcelain": 0, "-s": 0, "--short": 0, "-b": 0, "--branch": 0 },
+	"rev-parse": { "--verify": 0, "--short": 0, "--abbrev-ref": 0, "-q": 0, "--quiet": 0, "--is-inside-work-tree": 0, "--show-toplevel": 0 },
+};
+/** The one `npm` line a credential-bearing job may run, besides `npm --version`: the tarball is the only free word. */
+const NPM_PUBLISH_OPTIONS = ["--provenance", "--access", "public", "--ignore-scripts"];
+/** pflag spellings of `true`; any other value after `--draft=` or `--latest=` is read as its opposite or an error, both of which publish or fail. */
+const PFLAG_TRUE = /^(1|t|T|TRUE|true|True)$/;
+
+/**
+ * Parses an argument list against a table of known options (`{ "--name": valueCount }`). A long
+ * option may attach its value with `=`; a one-value short option may attach it (`-XPOST`); zero-
+ * value short options may cluster (`-fsSL`), with a one-value letter last (`-xzf FILE`). A literal
+ * `--` ends option parsing. Parsing begins at `start` (the words before it are the subcommand).
+ * Returns the options seen, the indices of the words consumed as values, the positional indices,
+ * the words the table does not know, and the index of the first word after `--` (-1 when there is
+ * none). An option whose name is built from an expansion is unknown.
+ */
+export function parseOptions(args, table, start = 0) {
+	const options = [];
+	const values = new Set();
+	const positionals = [];
+	const unknown = [];
+	let rest = -1;
+	for (let index = start; index < args.length; index += 1) {
+		const arg = args[index];
+		const text = arg.text;
+		if (rest !== -1 || !text.startsWith("-") || text === "-") {
+			positionals.push(index);
+			continue;
+		}
+		if (text === "--" && !arg.expansion) {
+			rest = index + 1;
+			continue;
+		}
+		const [name, ...attachedParts] = text.split("=");
+		if (arg.expansion && /[$`]/.test(name)) {
+			unknown.push(arg);
+			continue;
+		}
+		const attached = attachedParts.length > 0 ? attachedParts.join("=") : null;
+		if (name.startsWith("--")) {
+			const count = table[name];
+			if (count === undefined) {
+				unknown.push(arg);
+				continue;
+			}
+			if (attached !== null) options.push({ name, value: { text: attached, expansion: arg.expansion }, index, attached: true });
+			else {
+				options.push({ name, value: count === 1 ? args[index + 1] : undefined, index, attached: false });
+				for (let n = 1; n <= count; n += 1) values.add(index + n);
+				index += count;
+			}
+			continue;
+		}
+		// Short options: `-X POST`, `-XPOST`, `-fsSL`, `-xzf FILE`, `-d=false`.
+		const letters = name.slice(1);
+		let consumedNext = 0;
+		let known = true;
+		for (let position = 0; position < letters.length; position += 1) {
+			const short = `-${letters[position]}`;
+			const count = table[short];
+			if (count === undefined) {
+				known = false;
+				break;
+			}
+			if (count === 0) {
+				options.push({ name: short, value: attached !== null && position === letters.length - 1 ? { text: attached, expansion: arg.expansion } : undefined, index, attached: attached !== null && position === letters.length - 1 });
+				continue;
+			}
+			// A letter that takes a value: the rest of the cluster (or the next word) is that value.
+			const remainder = letters.slice(position + 1);
+			if (remainder.length > 0 || attached !== null) {
+				const value = remainder.length > 0 ? `${remainder}${attached !== null ? `=${attached}` : ""}` : attached;
+				options.push({ name: short, value: { text: value, expansion: arg.expansion }, index, attached: true });
+			} else {
+				options.push({ name: short, value: args[index + 1], index, attached: false });
+				consumedNext = count;
+			}
+			break;
+		}
+		if (!known) {
+			unknown.push(arg);
+			continue;
+		}
+		for (let n = 1; n <= consumedNext; n += 1) values.add(index + n);
+		index += consumedNext;
+	}
+	return { options, values, positionals, unknown, rest };
+}
+
+/**
+ * The variable names a word references, and the reasons it expands something the checker cannot
+ * follow: an indirect expansion (`${!x}`), a transformation (`${x@P}` runs prompt expansion, which
+ * runs commands), an assignment inside `$(( ))`. Command substitutions are skipped here: their
+ * commands are inspected on their own.
+ */
+export function variableReferences(text) {
+	const names = [];
+	const reasons = [];
+	const source = String(text);
+	const skipParens = (start, depth) => {
+		let j = start;
+		let open = depth;
+		while (j < source.length && open > 0) {
+			if (source[j] === "(") open += 1;
+			else if (source[j] === ")") open -= 1;
+			j += 1;
+		}
+		return j;
+	};
+	let i = 0;
+	while (i < source.length) {
+		const ch = source[i];
+		if (ch === "`") {
+			const close = source.indexOf("`", i + 1);
+			i = close === -1 ? source.length : close + 1;
+			continue;
+		}
+		if (ch !== "$") {
+			i += 1;
+			continue;
+		}
+		const next = source[i + 1];
+		if (next === "(") {
+			if (source[i + 2] === "(") {
+				const end = skipParens(i + 3, 2);
+				const body = source.slice(i + 3, Math.max(i + 3, end - 2));
+				if (/(^|[^=!<>])=(?!=)|\+\+|--/.test(body)) reasons.push(`assigns a variable inside an arithmetic expansion: $((${body}))`);
+				for (const match of body.matchAll(/[A-Za-z_][A-Za-z0-9_]*/g)) names.push(match[0]);
+				i = end;
+			} else i = skipParens(i + 2, 1);
+			continue;
+		}
+		if (next === "{") {
+			let depth = 1;
+			let j = i + 2;
+			while (j < source.length && depth > 0) {
+				if (source[j] === "{") depth += 1;
+				else if (source[j] === "}") depth -= 1;
+				j += 1;
+			}
+			const body = source.slice(i + 2, depth === 0 ? j - 1 : j);
+			i = j;
+			if (body.startsWith("!")) {
+				reasons.push(`\${${body}} is an indirect expansion: the variable it names cannot be known statically`);
+				continue;
+			}
+			const match = body.match(/^#?([A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*#?$!0-])/);
+			if (!match) {
+				reasons.push(`\${${body}} is an expansion the checker cannot read`);
+				continue;
+			}
+			if (/^[A-Za-z_]/.test(match[1])) names.push(match[1]);
+			const remainder = body.slice(match[0].length);
+			if (/^(\[[^\]]*\])?@/.test(remainder)) {
+				reasons.push(`\${${body}} applies a transformation (@P expands a prompt string, which runs commands)`);
+				continue;
+			}
+			const inner = variableReferences(remainder);
+			names.push(...inner.names);
+			reasons.push(...inner.reasons);
+			continue;
+		}
+		const match = source.slice(i + 1).match(/^([A-Za-z_][A-Za-z0-9_]*|[0-9]|[@*#?$!0-])/);
+		if (match) {
+			if (/^[A-Za-z_]/.test(match[1])) names.push(match[1]);
+			i += 1 + match[1].length;
+			continue;
+		}
+		i += 1;
+	}
+	return { names, reasons };
+}
+
+/** The variable a word begins with (`$x`, `${x:-y}`), or null when it begins with a literal or a command substitution. */
+function leadingVariable(text) {
+	const match = String(text).match(/^\$(?:\{#?([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_]*))/);
+	return match ? (match[1] ?? match[2]) : null;
+}
+
+/** True when the word's value provably begins with something that is not `-`: a literal, or a variable known to (see {@link EXPANSION_SAFE_COMMANDS}). */
+function beginsSafely(text, prefixed) {
+	if (text === "" || text.startsWith("-") || text.startsWith("`") || text.startsWith("$(")) return false;
+	if (!text.startsWith("$")) return true;
+	const name = leadingVariable(text);
+	return name !== null && prefixed.has(name);
+}
+
+/**
  * The only place a binary may be compiled with a test signer override, and the only step that may
  * do it: the standalone job's end-to-end updater test against an archive this very job signs.
  * The test binary never leaves $RUNNER_TEMP; the uploaded `standalone-<platform>` artifact must
@@ -195,9 +470,11 @@ export const ALLOWED_COMMANDS = {
 	"finalize-release": ["aws"],
 	sign: ["cosign", "syft"],
 	"publish-npm": ["npm"],
-	"tap-bump": ["git", "sed"],
+	// No sed: its `e`, `w`, `r`, `W`, `R` commands and `s///e` flag run programs and write files. The
+	// formula bump is written with parameter expansion (review round 7, finding 1).
+	"tap-bump": ["git"],
 };
-/** `gh` subcommands a credential-bearing job may use; `gh extension`, `gh alias --shell` and friends run code. */
+/** `gh` subcommands a credential-bearing job may use; `gh extension`, `gh alias --shell`, `gh config`, `gh run download -D` and friends run code or move files. */
 const GH_SUBCOMMANDS = /^(api|release|pr|repo)$/;
 /**
  * `gh release` subcommands a credential-bearing job may use and the options each takes, with the
@@ -214,10 +491,44 @@ const GH_RELEASE_OPTIONS = {
 };
 /** `gh` options whose value is a file the command reads and sends; the file must be a downloaded artifact or a literal under /tmp. */
 const GH_FILE_OPTIONS = /^(--notes-file|-F|--body-file|--input)$/;
-/** `gh api --method|-X`, `-f`, `-F`, `--field`, `--raw-field`, `--input` turn a read into a write. */
-const GH_API_WRITE_OPTIONS = /^(--method|-X|-f|--raw-field|-F|--field|--input)(=|$)/;
-/** `gh release create|edit` words that publish: the release becomes visible and the tag is created. */
-const GH_RELEASE_PUBLISHES = /^(--draft=false|--draft=no|--draft=0|--latest|--latest=true|--latest=yes|--latest=1)$/;
+/** `gh api --method|-X`, `-f`, `-F`, `--field`, `--raw-field`, `--input` turn a read into a write; attached spellings (`-XPOST`, `--method=POST`) are read through {@link parseOptions}. */
+const GH_API_WRITE_OPTIONS = /^(--method|-X|-f|--raw-field|-F|--field|--input)$/;
+/**
+ * True when a `gh api` argument list writes, or carries anything the checker cannot read (an
+ * unknown option, an option built from an expansion): only a plainly spelled read is a read.
+ */
+export function ghApiWrites(args) {
+	const parsed = parseOptions(args, TOOL_OPTIONS["gh api"], 1);
+	return parsed.unknown.length > 0 || parsed.options.some((option) => GH_API_WRITE_OPTIONS.test(option.name));
+}
+/**
+ * Reads the draft flags of a `gh release create|edit` argument list with the option table, so an
+ * option VALUE spelled `--draft` (`--title --draft`) does not count and every spelling of a
+ * publishing flag does (review round 7b, finding A). Returns `{ draft, publishes, unknown }`:
+ * `draft` when a real `--draft`/`-d` flag is present and not set false, `publishes` when
+ * `--draft=<anything but a pflag true>`, `--latest` or `--latest=<pflag true>` appears, `unknown`
+ * when an option is not in the table (the checker then cannot tell flags from assets).
+ */
+export function ghReleaseDraftFlags(args) {
+	const operation = args[1] && !args[1].expansion ? args[1].text : "";
+	const table = GH_RELEASE_OPTIONS[operation];
+	if (!table) return { draft: false, publishes: true, unknown: true };
+	const parsed = parseOptions(args, table, 2);
+	let draft = false;
+	let publishes = false;
+	for (const option of parsed.options) {
+		if (option.name === "--draft" || option.name === "-d") {
+			if (option.value === undefined) draft = true;
+			else if (!option.value.expansion && PFLAG_TRUE.test(option.value.text)) draft = true;
+			else {
+				draft = false;
+				publishes = true;
+			}
+		}
+		if (option.name === "--latest" && (option.value === undefined || option.value.expansion || PFLAG_TRUE.test(option.value.text))) publishes = true;
+	}
+	return { draft, publishes, unknown: parsed.unknown.length > 0 };
+}
 /** A file the job itself wrote under /tmp, spelled literally. */
 const TMP_FILE = /^\/tmp\/[A-Za-z0-9][A-Za-z0-9._-]*$/;
 /**
@@ -288,11 +599,22 @@ const LIFECYCLE_SUBCOMMANDS = {
 };
 /** Package managers that always install and run code with no lifecycle switch the checker trusts. */
 const ALWAYS_LIFECYCLE = /^(bunx|uvx|pip|pip3)$/;
+/**
+ * Tools that run another command after their own options - `corepack npm ci`, `npx --yes npm ci`,
+ * `volta run npm ci`, `nvm exec 20 npm ci`, `fnm exec --using=20 npm ci`, `asdf exec npm ci`,
+ * `mise x node@20 -- npm ci`, `pnpm dlx`, `yarn dlx`. The child is held to the lifecycle rules as
+ * if it had been written directly (review round 7b, finding D). corepack's own subcommands only
+ * download a package manager; a version manager with no recognisable child is refused outright.
+ */
+const PACKAGE_EXECUTORS = /^(corepack|npx|volta|nvm|fnm|asdf|mise)$/;
+const COREPACK_SUBCOMMANDS = /^(enable|disable|prepare|hydrate|up|use|install|pack|cache|--version|-v|--help|-h)$/;
 export const REBUILD_ALLOWLIST = { command: ["npm", "rebuild", "esbuild"], jobs: { [RELEASE_WORKFLOW]: ["build", "validate-macos", "pack-npm"], [STANDALONE_WORKFLOW]: ["build"] } };
 /** `if:` conditions that run a job or step after an upstream failure or cancellation. Nothing in the release may use one. */
 const STATUS_FUNCTIONS = /\b(always|failure|cancelled|success)\s*\(/;
 /** Every job that calls the standalone workflow must hold exactly these permissions and pass nothing else. */
 const STANDALONE_CALLER_PERMISSIONS = { contents: "read", "id-token": "write" };
+/** The one job in the release workflow that may call a reusable workflow. */
+const STANDALONE_CALLER_JOB = "standalone";
 const STANDALONE_CALLER_INPUTS = ["build_ref"];
 /**
  * The immutable-upload guard. `aws s3api head-object` fails for many reasons (a revoked token, a
@@ -398,6 +720,7 @@ export function splitWords(line, { patternPosition = false } = {}) {
 	let inWord = false;
 	let quoted = false;
 	let definesFunction = false;
+	let nul = false;
 	let unterminated = false;
 	// True while the next words are `case` patterns (`a|b)`), i.e. right after `case X in` or `;;`
 	// and until the `)` that ends the pattern list. Patterns are data, not commands.
@@ -409,13 +732,14 @@ export function splitWords(line, { patternPosition = false } = {}) {
 		if (inWord) {
 			// `esac` in pattern position closes the case statement.
 			if (pattern && words.length === 0 && text === "esac" && !quoted) pattern = false;
-			words.push({ text, expansion, quoted, definesFunction });
+			words.push({ text, expansion, quoted, definesFunction, nul });
 		}
 		text = "";
 		expansion = false;
 		inWord = false;
 		quoted = false;
 		definesFunction = false;
+		nul = false;
 	};
 	const endCommand = () => {
 		endWord();
@@ -613,25 +937,55 @@ export function splitWords(line, { patternPosition = false } = {}) {
 						i += 1;
 						break;
 					}
+					// Every numeric form bash decodes is decoded here, at bash's own digit limits:
+					// `\x2d` (1-2 hex), `\055` (1-3 octal), `\u002d` (1-4 hex), `\U0000002d` (1-8 hex)
+					// and `\cX` (control-X) all spell `-` or a control character without writing it,
+					// so `$'\U0000002d-checkpoint-action=exec=id'` is the option it decodes to (review
+					// round 7, finding 2). A NUL ends the string, as it does in bash; the word is marked.
+					let decoded = null;
+					let consumed = 2;
 					if (next in ANSI_C_ESCAPES) {
-						text += ANSI_C_ESCAPES[next];
-						i += 2;
-					} else if (next === "x" && /^[0-9a-fA-F]{1,2}/.test(source.slice(i + 2))) {
+						decoded = ANSI_C_ESCAPES[next];
+					} else if (next === "x" && /^[0-9a-fA-F]/.test(source.slice(i + 2))) {
 						const hex = source.slice(i + 2).match(/^[0-9a-fA-F]{1,2}/)[0];
-						text += String.fromCharCode(parseInt(hex, 16));
-						i += 2 + hex.length;
-					} else if (/^[0-7]/.test(next) && /^[0-7]{1,3}/.test(source.slice(i + 1))) {
+						decoded = String.fromCodePoint(parseInt(hex, 16));
+						consumed = 2 + hex.length;
+					} else if (/^[0-7]/.test(next)) {
 						const octal = source.slice(i + 1).match(/^[0-7]{1,3}/)[0];
-						text += String.fromCharCode(parseInt(octal, 8));
-						i += 1 + octal.length;
-					} else if (next === "u" && /^[0-9a-fA-F]{1,4}/.test(source.slice(i + 2))) {
+						decoded = String.fromCodePoint(parseInt(octal, 8));
+						consumed = 1 + octal.length;
+					} else if (next === "u" && /^[0-9a-fA-F]/.test(source.slice(i + 2))) {
 						const hex = source.slice(i + 2).match(/^[0-9a-fA-F]{1,4}/)[0];
-						text += String.fromCharCode(parseInt(hex, 16));
-						i += 2 + hex.length;
-					} else {
+						decoded = String.fromCodePoint(parseInt(hex, 16));
+						consumed = 2 + hex.length;
+					} else if (next === "U" && /^[0-9a-fA-F]/.test(source.slice(i + 2))) {
+						const hex = source.slice(i + 2).match(/^[0-9a-fA-F]{1,8}/)[0];
+						const codePoint = parseInt(hex, 16);
+						decoded = codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : "\ufffd";
+						consumed = 2 + hex.length;
+					} else if (next === "c" && i + 2 < source.length) {
+						const control = source[i + 2];
+						decoded = control === "?" ? "\x7f" : String.fromCharCode(control.toUpperCase().charCodeAt(0) & 0x1f);
+						consumed = 3;
+					}
+					if (decoded === null) {
 						text += `\\${next}`;
 						i += 2;
+						continue;
 					}
+					i += consumed;
+					if (decoded === "\0") {
+						// bash stores C strings: the rest of this $'...' is dropped. Adjacent fragments still join.
+						nul = true;
+						const close = source.indexOf("'", i);
+						if (close === -1) {
+							unterminated = true;
+							i = source.length;
+						} else i = close + 1;
+						closed = close !== -1;
+						break;
+					}
+					text += decoded;
 					continue;
 				}
 				if (c === "'") {
@@ -909,15 +1263,28 @@ export function isArtifactDirectory(directory, artifactDirectories) {
  * `chdir`, `cd` with no target, `cd -`, `cd ..` and any target with an expansion are errors.
  * Inside `( ... )` the directory change is scoped to the subshell.
  */
-export function credentialStepReasons(run, { artifactDirectories = [], workingDirectory = "", jobId = null } = {}) {
+export function credentialStepReasons(run, { artifactDirectories = [], workingDirectory = "", jobId = null, env } = {}) {
 	const reasons = [];
 	let cwd = workingDirectory && isArtifactDirectory(workingDirectory, artifactDirectories) ? posix.normalize(workingDirectory).replace(/\/$/, "") : "";
 	const stack = [];
 	const functions = new Set();
+	// The variables the step starts with: the runner's, plus the job's and step's `env:`. An env
+	// value that is a literal not beginning with `-` can never be an option; an expression
+	// (`${{ needs.* }}`, `${{ secrets.* }}`) is data the checker cannot see. Without `env` (unit
+	// tests) every allowlisted name counts as bound, and none as prefixed.
+	const state = { bound: new Set(GITHUB_DEFAULT_ENV), prefixed: new Set(GITHUB_DEFAULT_ENV), functions };
+	if (env === undefined) for (const name of ALLOWED_VARIABLES) state.bound.add(name);
+	else {
+		for (const [name, value] of Object.entries(env)) {
+			state.bound.add(name);
+			if (typeof value === "string" && value !== "" && !value.includes("${{") && !value.startsWith("-") && !value.startsWith("$")) state.prefixed.add(name);
+		}
+	}
 	for (const command of shellCommands(run)) {
 		for (let n = 0; n < (command.opens ?? 0); n += 1) stack.push(cwd);
 		for (const reason of repositoryCodeReasons(command, cwd)) reasons.push(`must not run repository code: ${reason}`);
 		reasons.push(...commandAllowlistReasons(command, { jobId, functions, artifactDirectories }));
+		reasons.push(...expansionReasons(command, state, { artifactDirectories }));
 		const index = commandIndex(command.words);
 		if (index !== -1) {
 			const name = command.words[index].text;
@@ -1002,6 +1369,10 @@ export function repositoryCodeReasons(input, cwd = "") {
 	for (const name of new Set(assignedHere)) {
 		if (STARTUP_ENV.test(name) && name !== "PATH") reasons.push(`sets ${name}, which loads code before the command runs or changes how a name resolves: ${spelledAll}`);
 	}
+	// `read PATH`, `printf -v PATH`, `printf -vPATH`, `mapfile PATH`: an assigning builtin naming PATH.
+	if (assignedHere.includes("PATH") && commandAt !== -1 && ASSIGNING_COMMANDS.test(words[commandAt].text)) {
+		reasons.push(`modifies PATH, so a bare command name may resolve to the checkout: ${spelledAll}`);
+	}
 	for (const word of words) {
 		// Any assignment word the walk above did not attribute (`env NODE_OPTIONS=--import=x node ...` behind an unknown option).
 		const name = ASSIGNMENT.test(word.text) ? word.text.match(/^[A-Za-z_][A-Za-z0-9_]*/)[0] : null;
@@ -1033,7 +1404,7 @@ export function repositoryCodeReasons(input, cwd = "") {
 	}
 	if (PACKAGE_MANAGERS.test(command)) {
 		const sub = args[0]?.text ?? "";
-		if (command !== "npm" || !/^(publish|--version|-v|view|config)$/.test(sub)) {
+		if (command !== "npm" || !/^(publish|--version|-v)$/.test(sub)) {
 			reasons.push(`runs a package manager: ${command} ${sub}`.trim());
 		} else if (sub === "publish" && !ignoreScriptsEnabled(args)) {
 			reasons.push(`npm publish runs the package's publish lifecycle scripts without --ignore-scripts: ${words.map((word) => word.text).join(" ")}`);
@@ -1125,15 +1496,6 @@ function globToRegExp(pattern) {
 	return new RegExp(`${source}$`);
 }
 
-/** The `case` patterns (as glob strings) a `run` block matches against. */
-export function casePatternsOf(run) {
-	const patterns = [];
-	for (const command of shellCommands(run)) {
-		if (command.casePattern) for (const word of command.words) patterns.push(word.text);
-	}
-	return patterns;
-}
-
 /**
  * The `case` patterns (as glob strings) whose body leaves the loop or the step - `continue`, `break`,
  * `exit`, `return` - i.e. the names an upload loop skips.
@@ -1157,7 +1519,8 @@ export function caseSkipPatternsOf(run) {
 		if (command.casePattern) {
 			if (inBody) flush();
 			inBody = false;
-			group.push(...command.words.map((word) => word.text));
+			// A pattern built from an expansion can match anything: it is recorded as the match-all glob.
+			group.push(...command.words.map((word) => (word.expansion ? "*" : word.text)));
 		} else if (group.length > 0) {
 			inBody = true;
 			body.push(command);
@@ -1167,7 +1530,7 @@ export function caseSkipPatternsOf(run) {
 	return skipped;
 }
 
-/** True when a `case` pattern in `run` whose body skips the item would match `name`. */
+/** True when a `case` pattern in `run` whose body skips the item would (or, if built from an expansion, could) match `name`. */
 export function casePatternMatches(run, name) {
 	return caseSkipPatternsOf(run).some((pattern) => globToRegExp(pattern).test(name));
 }
@@ -1194,6 +1557,8 @@ export function commandAllowlistReasons(input, { jobId = null, functions = new S
 	const words = command.words;
 	const spelled = words.map((word) => word.text).join(" ");
 	for (const word of words) {
+		// A control character (from `$'\cM'`, `$'\x1b'`, `$'\n'`) has no place in an argument; only a tab (`IFS=$'\t'`) is data.
+		if (/[\x00-\x08\x0a-\x1f\x7f]/.test(word.text)) reasons.push(`a word contains a control character the checker cannot read as an argument: ${JSON.stringify(word.text)} (${spelled})`);
 		if (word.text.includes("://")) continue;
 		if (CONFIGURATION_PATH.test(word.text)) reasons.push(`names a configuration or credential file the allowlisted tools read: ${word.text} (${spelled})`);
 		// `artifacts/../../etc/passwd` in ANY position - a cp source, `test -f`, `sha256sum`, a `for`
@@ -1204,7 +1569,15 @@ export function commandAllowlistReasons(input, { jobId = null, functions = new S
 		if (CONFIGURATION_PATH.test(redirection.text)) reasons.push(`redirects to a configuration or credential file the allowlisted tools read: ${redirection.operator}${redirection.text} (${spelled})`);
 		if (!redirection.text.includes("://") && hasDotSegment(redirection.text)) reasons.push(`redirects a path with a . or .. segment: ${redirection.operator}${redirection.text} (${spelled})`);
 	}
-	if (command.casePattern || command.heredoc) return reasons; // data, not commands
+	if (command.casePattern) {
+		// A pattern built from an expansion matches whatever the variable holds - `"$skip") continue`
+		// could name the signature bundle - so every pattern must be a literal glob (review round 7, finding 4).
+		for (const word of words) {
+			if (word.expansion) reasons.push(`a case pattern built from an expansion could match any name, including one the loop must not skip: ${word.text} (${spelled})`);
+		}
+		return reasons;
+	}
+	if (command.heredoc) return reasons; // data, not commands
 	if (command.background) {
 		// A backgrounded command's exit status is never seen by `set -e`, and `coproc`/`&` let a
 		// command outlive the checks that follow it (review round 6, finding 7).
@@ -1259,18 +1632,25 @@ export function commandAllowlistReasons(input, { jobId = null, functions = new S
 		return reasons;
 	}
 	const args = words.slice(index + 1);
+	const dashArtifacts = [...new Set(artifactDirectories)];
+	// Every option name must be literal, whatever the tool: `--${x}`, `-$flag` (review round 7, finding 3).
+	for (const arg of args) {
+		if (optionNameExpands(arg)) reasons.push(`${name} option ${arg.text} is built from an expansion, so the checker cannot tell what it does: ${spelled}`);
+	}
+	const { reasons: optionReasons } = toolArguments(name, args, { artifactDirectories });
+	for (const reason of optionReasons) reasons.push(`${reason}: ${spelled}`);
 	if (name === "gh") {
 		const sub = args[0];
 		// A file gh reads and sends (release notes, a PR body, an API body) must be a downloaded
 		// artifact spelled plainly, or a literal file under /tmp the job wrote itself (review round 6, finding 3).
 		const fileArgument = (value, option) => {
 			if (!value || value.expansion || !(isArtifactPath(value.text, artifactDirectories) || TMP_FILE.test(value.text))) {
-				reasons.push(`gh ${option} must name a downloaded artifact (${[...new Set(artifactDirectories)].join(", ") || "none"}) or a literal /tmp file, never ${value?.text ?? "nothing"}: ${spelled}`);
+				reasons.push(`gh ${option} must name a downloaded artifact (${dashArtifacts.join(", ") || "none"}) or a literal /tmp file, never ${value?.text ?? "nothing"}: ${spelled}`);
 			}
 		};
 		const apiField = sub?.text === "api" ? /^(-F|--field)$/ : /^--field$/; // `-F` is --notes-file for gh release
 		for (const [position, arg] of args.entries()) {
-			if (arg.expansion && arg.text.startsWith("-")) continue; // optionNameExpands is reported below for every subcommand
+			if (arg.expansion && arg.text.startsWith("-")) continue; // optionNameExpands is reported above
 			if (GH_FILE_OPTIONS.test(arg.text) && !apiField.test(arg.text)) fileArgument(args[position + 1], arg.text);
 			const attached = arg.text.match(/^(--notes-file|--body-file|--input)=(.*)$/);
 			if (attached) fileArgument({ text: attached[2], expansion: arg.expansion }, attached[1]);
@@ -1279,11 +1659,8 @@ export function commandAllowlistReasons(input, { jobId = null, functions = new S
 			const at = field?.text.indexOf("=@") ?? -1;
 			if (field && at !== -1) fileArgument({ text: field.text.slice(at + 2), expansion: field.expansion }, `${arg.text.split("=")[0]} key=@file`);
 		}
-		for (const arg of args) {
-			if (optionNameExpands(arg)) reasons.push(`gh option ${arg.text} is built from an expansion, so the checker cannot tell what it does: ${spelled}`);
-		}
 		if (!sub || sub.expansion || !GH_SUBCOMMANDS.test(sub.text)) {
-			reasons.push(`gh may only run ${GH_SUBCOMMANDS.source.slice(2, -2).replaceAll("|", ", ")} here; other subcommands (extension, alias, auth, config, ...) run code or move the token: ${spelled}`);
+			reasons.push(`gh may only run ${GH_SUBCOMMANDS.source.slice(2, -2).replaceAll("|", ", ")} here; other subcommands (extension, alias, auth, config, run, ...) run code or move the token: ${spelled}`);
 		} else if (sub.text === "release") {
 			// Every option must be known so the checker can tell the release assets from option
 			// values; every asset must be a downloaded artifact or `<artifact dir>/*`.
@@ -1292,26 +1669,13 @@ export function commandAllowlistReasons(input, { jobId = null, functions = new S
 			if (!options) {
 				reasons.push(`gh release may only ${Object.keys(GH_RELEASE_OPTIONS).join(", ")} here; ${operation?.text ?? "nothing"} deletes, downloads or is not a literal: ${spelled}`);
 			} else {
-				const positionals = [];
-				for (let position = 2; position < args.length; position += 1) {
-					const arg = args[position];
-					if (arg.text.startsWith("-") && arg.text !== "-") {
-						const [option] = arg.text.split("=");
-						const values = options[option];
-						if (values === undefined || arg.expansion) {
-							reasons.push(`gh release ${operation.text} carries an option the checker does not know, so it cannot tell which words are the assets: ${arg.text} (${spelled})`);
-							continue;
-						}
-						if (!arg.text.includes("=")) position += values;
-						continue;
-					}
-					positionals.push(arg);
-				}
+				const parsed = parseOptions(args, options, 2);
+				const positionals = parsed.positionals.map((position) => args[position]);
 				const assets = positionals.slice(1); // the first positional is the tag
 				for (const asset of assets) {
 					const glob = asset.text.endsWith("/*") && !asset.expansion && artifactDirectories.includes(asset.text.slice(0, -2)) && posix.normalize(asset.text.slice(0, -2)) === asset.text.slice(0, -2);
 					if (!glob && !(!asset.expansion && isArtifactPath(asset.text, artifactDirectories))) {
-						reasons.push(`gh release ${operation.text} may only attach downloaded artifacts (${[...new Set(artifactDirectories)].map((directory) => `${directory}/*`).join(", ") || "none"}), never ${asset.text}: ${spelled}`);
+						reasons.push(`gh release ${operation.text} may only attach downloaded artifacts (${dashArtifacts.map((directory) => `${directory}/*`).join(", ") || "none"}), never ${asset.text}: ${spelled}`);
 					}
 				}
 				if (/^(view|list)$/.test(operation.text) && assets.length > 0) reasons.push(`gh release ${operation.text} takes no file: ${spelled}`);
@@ -1348,30 +1712,281 @@ export function commandAllowlistReasons(input, { jobId = null, functions = new S
 			}
 		}
 		const sub = args[position];
-		if (!sub || sub.expansion || !GIT_SUBCOMMANDS.test(sub.text)) {
-			reasons.push(`git may only run ${GIT_SUBCOMMANDS.source.slice(2, -2).replaceAll("|", ", ")} here: ${spelled}`);
+		if (!sub || sub.expansion || !GIT_COMMAND_OPTIONS[sub.text]) {
+			reasons.push(`git may only run ${Object.keys(GIT_COMMAND_OPTIONS).join(", ")} here: ${spelled}`);
 		}
 		for (const arg of args.slice(position + 1)) {
-			if (optionNameExpands(arg) || GIT_FORBIDDEN_OPTIONS.test(arg.text)) {
-				reasons.push(`git option ${arg.text} names a program or another configuration to use: ${spelled}`);
-			}
+			// Sharper than "not in the table" for the options that name a program or another configuration.
+			if (GIT_FORBIDDEN_OPTIONS.test(arg.text) || /^--config/.test(arg.text)) reasons.push(`git option ${arg.text} names a program or another configuration to use: ${spelled}`);
 		}
 	}
 	if (name === "tar") {
+		if (args[0] && !args[0].text.startsWith("-")) reasons.push(`tar old-style option words (${args[0].text}) are not read by the checker; spell options with a dash: ${spelled}`);
 		for (const arg of args) {
-			if (optionNameExpands(arg) || TAR_FORBIDDEN_OPTIONS.test(arg.text)) reasons.push(`tar option ${arg.text} runs a program or reads a list the checker cannot see: ${spelled}`);
+			if (TAR_FORBIDDEN_OPTIONS.test(arg.text)) reasons.push(`tar option ${arg.text} runs a program or reads a list the checker cannot see: ${spelled}`);
+		}
+		const parsed = parseOptions(args, TOOL_OPTIONS.tar);
+		for (const option of parsed.options) {
+			if ((option.name === "-C" || option.name === "--directory") && !(option.value && !option.value.expansion && (isArtifactDirectory(option.value.text, artifactDirectories) || TMP_FILE.test(option.value.text)))) {
+				reasons.push(`tar may extract only into a downloaded artifact directory or a literal /tmp path, never ${option.value?.text ?? "nothing"}: ${spelled}`);
+			}
 		}
 	}
 	if (name === "curl") {
 		let https = false;
-		for (const [position, arg] of args.entries()) {
-			if (arg.text === "--proto" && !arg.expansion && args[position + 1]?.text === "=https" && !args[position + 1].expansion) https = true;
-			if (optionNameExpands(arg) || CURL_FORBIDDEN_OPTIONS.test(arg.text)) reasons.push(`curl option ${arg.text} reads a config, weakens TLS or lets the server pick the output name: ${spelled}`);
-			if (/^https?:\/\//i.test(arg.text) && !/^https:\/\//.test(arg.text)) reasons.push(`curl must fetch https:// URLs only: ${spelled}`);
+		const parsed = parseOptions(args, TOOL_OPTIONS.curl);
+		for (const option of parsed.options) {
+			if (option.name === "--proto" && option.value && !option.value.expansion && option.value.text === "=https") https = true;
+			if ((option.name === "-o" || option.name === "--output") && !(option.value && !option.value.expansion && (isArtifactPath(option.value.text, artifactDirectories) || TMP_FILE.test(option.value.text)))) {
+				reasons.push(`curl may write only to a downloaded artifact path or a literal /tmp file, never ${option.value?.text ?? "nothing"}: ${spelled}`);
+			}
+		}
+		for (const arg of args) {
+			// Sharper than "not in the table" for the options that read a config or weaken TLS.
+			if (CURL_FORBIDDEN_OPTIONS.test(arg.text)) reasons.push(`curl option ${arg.text} reads a config, weakens TLS or lets the server pick the output name: ${spelled}`);
+		}
+		const urls = parsed.positionals.map((position) => args[position]);
+		if (urls.length === 0) reasons.push(`curl names no URL: ${spelled}`);
+		for (const url of urls) {
+			if (url.expansion || !/^https:\/\//.test(url.text)) reasons.push(`curl must fetch https:// URLs only, spelled literally, never ${url.text}: ${spelled}`);
 		}
 		if (!https) reasons.push(`curl must pin --proto '=https' in ${describe}: ${spelled}`);
 	}
+	if (name === "jq") {
+		const parsed = parseOptions(args, TOOL_OPTIONS.jq);
+		const program = parsed.positionals.map((position) => args[position])[0];
+		if (!program || program.expansion) reasons.push(`jq must run a literal program written in the workflow file, never ${program?.text ?? "nothing"}: ${spelled}`);
+	}
+	if (name === "npm") {
+		// Exactly `npm publish <tarball> --provenance --access public --ignore-scripts` (any order of
+		// the options), or `npm --version`: no config, no registry, no script shell, no other subcommand.
+		const texts = args.map((arg) => arg.text);
+		const isVersion = texts.length === 1 && /^(--version|-v)$/.test(texts[0]);
+		const rest = texts.slice(1);
+		const tarball = args[1];
+		const isPublish = texts[0] === "publish" && tarball && !tarball.text.startsWith("-") && texts.length === 2 + NPM_PUBLISH_OPTIONS.length && (() => {
+			const expected = [...NPM_PUBLISH_OPTIONS].sort().join(" ");
+			const after = rest.slice(1);
+			// `--access public` must stay adjacent: the value is a positional otherwise.
+			const access = after.indexOf("--access");
+			return after[access + 1] === "public" && [...after].sort().join(" ") === expected;
+		})();
+		if (!isVersion && !isPublish) {
+			reasons.push(`npm may only run 'npm publish <tarball> ${NPM_PUBLISH_OPTIONS.join(" ")}' or 'npm --version' here: ${spelled}`);
+		}
+	}
+	if (WRITING_COREUTILS[name]) {
+		// None of these takes an option with a value; every option must be literal and listed.
+		const parsed = parseOptions(args, {});
+		const tool = WRITING_COREUTILS[name];
+		for (const arg of parsed.unknown) {
+			if (!tool.options.test(arg.text)) reasons.push(`${name} option ${arg.text} is not one the checker allows here (${tool.options.source}): ${spelled}`);
+		}
+		// A downloaded artifact directory is read, verified and uploaded; nothing may be created,
+		// renamed or deleted in it, or the uploaded set is no longer what verify saw (review round 7).
+		const positionals = parsed.positionals.map((position) => args[position]);
+		const targets = tool.targets === "last" ? positionals.slice(-1) : tool.targets === "all" ? positionals : [];
+		for (const target of targets) {
+			if (!target.expansion && touchesArtifacts(target.text, artifactDirectories)) reasons.push(`${name} writes into a downloaded artifact directory (${dashArtifacts.join(", ")}), which the job uploads as verified: ${spelled}`);
+			if (writesOutsideScratch(target.text)) reasons.push(`${name} writes outside /tmp: a profile, a binary on PATH or a tool's configuration could be replaced: ${spelled}`);
+		}
+	}
 	return reasons;
+}
+
+/** True when a path is a downloaded artifact directory, or lies inside one. */
+function touchesArtifacts(text, artifactDirectories) {
+	return isArtifactPath(text, artifactDirectories) || isArtifactDirectory(text, artifactDirectories);
+}
+/** True when a literal absolute path is outside the scratch locations a credential-bearing step may write (`/tmp/...`, `/dev/...`). */
+function writesOutsideScratch(text) {
+	return text.startsWith("/") && !/^\/(tmp|dev)\//.test(text);
+}
+
+/**
+ * Parses the arguments of an allowlisted tool against its option table(s) (see {@link TOOL_OPTIONS},
+ * {@link GIT_COMMAND_OPTIONS}, {@link GH_RELEASE_OPTIONS}, {@link AWS_OPTIONS}). Returns the indices of the
+ * words that are option values, the index after a literal `--`, and the reasons an option or
+ * subcommand is not allowed. {@link expansionReasons} uses the value slots; {@link commandAllowlistReasons}
+ * reports the reasons.
+ */
+export function toolArguments(name, args, { artifactDirectories = [] } = {}) {
+	const reasons = [];
+	const result = (parsed, tool) => {
+		for (const arg of parsed.unknown) reasons.push(`${tool} carries an option the checker does not know, so it cannot tell which words are values and which are files: ${arg.text}`);
+		return { values: parsed.values, rest: parsed.rest, positionals: parsed.positionals, reasons };
+	};
+	const none = () => ({ values: new Set(), rest: -1, positionals: args.map((_, position) => position), reasons });
+	const literal = (word) => word && !word.expansion ? word.text : null;
+	switch (name) {
+		case "jq":
+		case "tar":
+		case "curl":
+			return result(parseOptions(args, TOOL_OPTIONS[name]), name);
+		case "cosign":
+		case "syft": {
+			const table = TOOL_OPTIONS[name][literal(args[0])];
+			if (!table) {
+				reasons.push(`${name} may only run ${Object.keys(TOOL_OPTIONS[name]).join(", ")} here, never ${args[0]?.text ?? "nothing"}`);
+				return none();
+			}
+			return result(parseOptions(args, table, 1), `${name} ${args[0].text}`);
+		}
+		case "gh": {
+			const sub = literal(args[0]);
+			if (sub === "api") return result(parseOptions(args, TOOL_OPTIONS["gh api"], 1), "gh api");
+			if (sub === "release") {
+				const table = GH_RELEASE_OPTIONS[literal(args[1])];
+				return table ? result(parseOptions(args, table, 2), `gh release ${args[1].text}`) : none(); // the subcommand error is reported by the caller
+			}
+			if (sub === "pr") {
+				const table = TOOL_OPTIONS["gh pr"][literal(args[1])];
+				if (!table) {
+					reasons.push(`gh pr may only ${Object.keys(TOOL_OPTIONS["gh pr"]).join(", ")} here, never ${args[1]?.text ?? "nothing"}`);
+					return none();
+				}
+				return result(parseOptions(args, table, 2), `gh pr ${args[1].text}`);
+			}
+			if (sub === "repo") return result(parseOptions(args, {}, 2), "gh repo clone");
+			return none();
+		}
+		case "git": {
+			const values = new Set();
+			let position = 0;
+			while (position < args.length && args[position].text.startsWith("-")) {
+				if (/^-[Cc]$/.test(args[position].text) && !args[position].expansion) values.add(position + 1);
+				position += 2;
+			}
+			const table = GIT_COMMAND_OPTIONS[literal(args[position])];
+			if (!table) return { values, rest: -1, positionals: [], reasons }; // the subcommand error is reported by the caller
+			const parsed = parseOptions(args, table, position + 1);
+			for (const value of parsed.values) values.add(value);
+			return { ...result(parsed, `git ${args[position].text}`), values };
+		}
+		case "aws": {
+			const service = literal(args[0]);
+			const operation = literal(args[1]);
+			const table = service && operation ? AWS_OPTIONS[service === "s3api" ? "s3api" : `${service} ${operation}`] : undefined;
+			if (!table) return none(); // reported by r2StepReasons
+			const parsed = parseOptions(args, table, 2);
+			return { values: parsed.values, rest: parsed.rest, positionals: parsed.positionals, reasons }; // unknown options are reported by r2StepReasons
+		}
+		case "npm":
+			return { ...none(), values: new Set(args.flatMap((arg, position) => (arg.text === "--access" && !arg.expansion ? [position + 1] : []))) };
+		case "printf": {
+			// After a literal format string every argument is data: printf stops reading options there.
+			if (args[0] && !args[0].expansion && !args[0].text.startsWith("-")) return { values: new Set(args.map((_, position) => position).slice(1)), rest: -1, positionals: [0], reasons };
+			return none();
+		}
+		default: {
+			// No option table: nothing is a value slot, but a literal `--` still ends the options.
+			const parsed = parseOptions(args, {});
+			return { values: new Set(), rest: parsed.rest, positionals: parsed.positionals, reasons };
+		}
+	}
+}
+
+/**
+ * Returns the reasons a simple command in a credential-bearing job expands something the checker
+ * cannot pin down (review round 7, finding 3). `state` is `{ bound, prefixed, functions }`, the
+ * variables the step has bound so far, those whose value provably begins with a literal that is
+ * not `-`, and the functions it has defined; the walk in {@link credentialStepReasons} feeds it.
+ *   - Every variable an argument or redirection target expands must be on {@link ALLOWED_VARIABLES}
+ *     (or set by the runner) and bound earlier in the step; `${!x}`, `${x@P}` and an assignment
+ *     inside `$(( ))` are refused outright.
+ *   - A word that begins with an expansion is an option if the value begins with `-`, so in the
+ *     argument list of anything but an {@link EXPANSION_SAFE_COMMANDS} command or a shell function
+ *     it must be the value slot of a known option, follow a literal `--`, or begin with a variable
+ *     whose value provably does not begin with `-` (a `for` over `<artifact dir>/*`, an assignment
+ *     from a literal, a runner variable).
+ *   - The assigning builtins (`export`, `local`, `read`, `printf -v`, ...) must name the variable literally.
+ *   - Nothing may be written to `$GITHUB_ENV`, `$GITHUB_PATH` or into a downloaded artifact directory.
+ * The command's own assignments are then bound for what follows.
+ */
+export function expansionReasons(input, state, { artifactDirectories = [] } = {}) {
+	const command = asCommand(input);
+	const reasons = [];
+	const spelled = command.words.map((word) => word.text).join(" ");
+	for (const substitution of command.substitutions) {
+		for (const inner of shellCommands(substitution)) {
+			for (const reason of expansionReasons(inner, state, { artifactDirectories })) reasons.push(`inside a command substitution: ${reason}`);
+		}
+	}
+	const check = (text, where) => {
+		const { names, reasons: inner } = variableReferences(text);
+		for (const reason of inner) reasons.push(`${reason} (${where})`);
+		for (const name of new Set(names)) {
+			if (!ALLOWED_VARIABLES.includes(name) && !GITHUB_DEFAULT_ENV.includes(name)) {
+				reasons.push(`expands $${name}, which is not on the variable allowlist for credential-bearing jobs (${where})`);
+			} else if (!state.bound.has(name)) {
+				reasons.push(`expands $${name} before this step binds it, so its value would come from the environment (${where})`);
+			}
+		}
+	};
+	for (const word of command.words) {
+		if (word.expansion) check(word.text, spelled);
+		if (word.nul) reasons.push(`a word contains a NUL character, which truncates it in ways the checker does not follow: ${spelled}`);
+	}
+	for (const redirection of command.redirections) {
+		const target = `${redirection.operator}${redirection.text} (${spelled})`;
+		if (redirection.expansion) check(redirection.text, target);
+		if (STEP_STATE_FILES.test(redirection.text)) reasons.push(`writes to a file that sets the environment or PATH of every later step: ${target}`);
+		if (/^[0-9]*(>>|>\||>|&>>|&>|<>)$/.test(redirection.operator)) {
+			if (!redirection.expansion && touchesArtifacts(redirection.text, artifactDirectories)) reasons.push(`writes into a downloaded artifact directory, which the job uploads as verified: ${target}`);
+			if (writesOutsideScratch(redirection.text)) reasons.push(`writes outside /tmp: a profile, a binary on PATH or a tool's configuration could be replaced: ${target}`);
+		}
+	}
+	if (command.casePattern || command.heredoc) return reasons; // data; bound nothing
+	const index = commandIndex(command.words);
+	if (index !== -1) {
+		const name = command.words[index].text;
+		const args = command.words.slice(index + 1);
+		const leadsWithExpansion = (arg) => arg.expansion && /^[$`]/.test(arg.text);
+		if (name === "printf") {
+			// `printf -v NAME` assigns; the name must be literal. Everything after a literal format is data.
+			for (const [position, arg] of args.entries()) {
+				const target = arg.text === "-v" && !arg.expansion ? args[position + 1] : /^-v./.test(arg.text) && !arg.expansion ? null : undefined;
+				if (target !== undefined && (target === null ? false : !target || leadsWithExpansion(target))) reasons.push(`printf -v names what it assigns through an expansion, so the checker cannot tell which variable is set: ${spelled}`);
+			}
+		}
+		if (ASSIGNING_COMMANDS.test(name) && name !== "printf") {
+			for (const arg of args) {
+				if (leadsWithExpansion(arg)) reasons.push(`${name} names what it assigns through an expansion, so the checker cannot tell which variable is set: ${spelled}`);
+			}
+		} else if (!EXPANSION_SAFE_COMMANDS.test(name) && !state.functions.has(name) && !DIRECTORY_COMMANDS.test(name) && !command.words[index].expansion) {
+			const { values, rest } = toolArguments(name, args, { artifactDirectories });
+			for (const [position, arg] of args.entries()) {
+				if (!leadsWithExpansion(arg) || values.has(position) || (rest !== -1 && position >= rest)) continue;
+				if (beginsSafely(arg.text, state.prefixed)) continue;
+				reasons.push(`${name} receives ${arg.text} where an option could stand; an expanded word must be the value of a known option, follow a literal --, or begin with a variable whose value provably does not begin with '-': ${spelled}`);
+			}
+		}
+	}
+	bindVariables(command, state);
+	return reasons;
+}
+
+/** Binds what a command assigns into `state.bound`, and tracks which of those values provably begin with a literal that is not `-`. */
+function bindVariables(command, state) {
+	const words = command.words;
+	const assignedHere = assignedNames(command);
+	for (const name of assignedHere) {
+		state.bound.add(name);
+		state.prefixed.delete(name);
+	}
+	const prefixedValue = (text) => beginsSafely(text, state.prefixed) && !text.startsWith("(");
+	// `X=value` words, wherever assignedNames found them.
+	for (const word of words) {
+		const match = word.text.match(/^([A-Za-z_][A-Za-z0-9_]*)(\[[^\]]*\])?\+?=(.*)$/s);
+		if (match && assignedHere.includes(match[1]) && !match[2] && prefixedValue(match[3])) state.prefixed.add(match[1]);
+	}
+	// `for X in a b c`: prefixed when every item is.
+	const texts = words.map((word) => word.text);
+	const at = texts.findIndex((text) => /^(for|select)$/.test(text));
+	if (at !== -1 && texts[at + 2] === "in" && words[at + 1]) {
+		const items = words.slice(at + 3).filter((word) => !/^(do|;)$/.test(word.text));
+		if (items.length > 0 && items.every((item) => prefixedValue(item.text))) state.prefixed.add(words[at + 1].text);
+	}
 }
 
 /**
@@ -1424,9 +2039,35 @@ export function lifecycleReasons(input, location = {}) {
 	}
 	for (const reason of wrapperReasons) reasons.push(`${reason} (${spelledAll})`);
 	const name = posix.basename(commandWord.text);
-	if (!PACKAGE_MANAGERS.test(name)) return reasons;
 	const args = command.words.slice(index + 1);
 	const spelled = command.words.slice(index).map((word) => word.text).join(" ");
+	const isDlx = /^(pnpm|yarn)$/.test(name) && args[0]?.text === "dlx" && !args[0].expansion;
+	if (PACKAGE_EXECUTORS.test(name) || isDlx) {
+		// The child command: the first word after a literal `--`, else the first word that names a
+		// package manager (`npm`, `npm@10` under corepack) or an interpreter. Its arguments are the rest.
+		if (name === "corepack" && args[0] && !args[0].expansion && COREPACK_SUBCOMMANDS.test(args[0].text)) return reasons; // downloads a package manager, runs nothing
+		const dash = args.findIndex((arg) => arg.text === "--" && !arg.expansion);
+		const childName = (arg) => (PACKAGE_MANAGERS.test(arg.text.replace(/@.*$/, "")) ? arg.text.replace(/@.*$/, "") : arg.text); // `npm@10`, `pnpm@9.1.0`
+		let childAt = dash !== -1 ? dash + 1 : args.findIndex((arg, position) => position >= (isDlx ? 1 : 0) && !arg.expansion && (PACKAGE_MANAGERS.test(childName(arg)) || (INTERPRETERS.test(arg.text) && dash === -1)));
+		if (dash !== -1 && childAt >= args.length) childAt = -1;
+		if (args.slice(0, childAt === -1 ? args.length : childAt).some((arg) => arg.expansion)) {
+			reasons.push(`${name} carries an expansion before its child command, so the checker cannot tell what runs: ${spelled}`);
+		}
+		if (childAt !== -1) {
+			const child = args[childAt];
+			const childCommand = { ...command, words: [{ ...child, text: childName(child) }, ...args.slice(childAt + 1)], substitutions: [] };
+			for (const reason of lifecycleReasons(childCommand, location)) reasons.push(`through ${name}: ${reason}`);
+			if (PACKAGE_MANAGERS.test(childName(child)) && name !== "corepack") {
+				reasons.push(`${name} runs a package manager (${childName(child)}); run it directly so its flags are the ones the checker reads: ${spelled}`);
+			}
+		} else if (name === "corepack") {
+			if (!args[0] || args[0].expansion || !COREPACK_SUBCOMMANDS.test(args[0].text)) reasons.push(`corepack may only ${COREPACK_SUBCOMMANDS.source.slice(2, -2).replaceAll("|", ", ")} here; ${args[0]?.text ?? "nothing"} is not a corepack subcommand the checker knows: ${spelled}`);
+		} else if (name !== "npx" && !isDlx) {
+			reasons.push(`${name} runs a child command the checker could not find, so it cannot apply the package-manager rules: ${spelled}`);
+		}
+		if (name !== "npx" && !isDlx) return reasons;
+	}
+	if (!PACKAGE_MANAGERS.test(name)) return reasons;
 	if (commandWord.text !== name) {
 		reasons.push(`invokes ${name} through a path or expansion: ${spelled}`);
 		return reasons;
@@ -1565,7 +2206,12 @@ function assignedNames(command) {
 	}
 	if (commandAt !== -1 && ASSIGNING_COMMANDS.test(words[commandAt].text)) {
 		for (const arg of words.slice(commandAt + 1)) {
-			if (arg.text.startsWith("-")) continue;
+			if (arg.text.startsWith("-")) {
+				// `printf -vNAME` attaches the variable to the option.
+				const attached = words[commandAt].text === "printf" ? arg.text.match(/^-v([A-Za-z_][A-Za-z0-9_]*)/) : null;
+				if (attached && !arg.expansion) names.push(attached[1]);
+				continue;
+			}
 			const name = arg.text.match(/^[A-Za-z_][A-Za-z0-9_]*/);
 			if (name) names.push(name[0]);
 		}
@@ -1746,9 +2392,13 @@ export function r2StepReasons(jobId, run, { last = false, artifactDirectories = 
  */
 export function headObjectGuardReasons(run) {
 	const reasons = [];
-	const commands = [...shellCommands(run)];
-	const spell = (command) => command.words.map((word) => word.text).join(" ");
+	const commands = [...shellCommands(run)].filter((command) => !command.casePattern && !command.heredoc);
+	const spell = (command) => (command ? command.words.map((word) => word.text).join(" ") : "");
 	const guard = HEAD_OBJECT_GUARD;
+	// The guard lines as the parser reads them: `if [ ... ]` / `then`, and `elif [ ... ]` / `grep ...` / `then`.
+	const existsSequence = splitWords(guard.exists).commands.map(spell);
+	const absentSequence = splitWords(guard.absent).commands.map(spell);
+	const matches = (start, sequence) => sequence.every((expected, offset) => spell(commands[start + offset]) === expected);
 	let count = 0;
 	commands.forEach((command, position) => {
 		const index = commandIndex(command.words);
@@ -1764,47 +2414,71 @@ export function headObjectGuardReasons(run) {
 		if (stderr.length !== 1 || stderr[0].operator !== "2>" || stderr[0].text !== guard.errorFile) {
 			reasons.push(`must keep the stderr of aws s3api head-object in ${guard.errorFile} so an explicit 404 can be told from any other error: ${spelled}`);
 		}
-		if (spell(commands[position - 1] ?? { words: [] }) !== guard.reset) {
+		if (spell(commands[position - 1]) !== guard.reset) {
 			reasons.push(`must reset '${guard.reset}' immediately before aws s3api head-object: ${spelled}`);
 		}
-		if (spell(commands[position + 1] ?? { words: [] }) !== guard.capture) {
+		if (spell(commands[position + 1]) !== guard.capture) {
 			reasons.push(`must capture the exit status with '|| ${guard.capture}' immediately after aws s3api head-object: ${spelled}`);
 		}
+		// The guard is a structure attached to THIS call, read from the parsed commands: the `if` must
+		// follow the capture, its one `elif` must be the exact 404 test, and its `else` must end in
+		// `exit 1`. Nothing elsewhere in the step - an unrelated `if false` block, a second `else` -
+		// can stand in for a branch (review round 7, finding 5).
+		if (!matches(position + 2, existsSequence)) {
+			reasons.push(`must test the head-object status with exactly '${guard.exists}' immediately after capturing it (found '${spell(commands[position + 2])}'): ${spelled}`);
+			return;
+		}
+		let depth = 0;
+		let absentSeen = false;
+		let elseSeen = false;
+		let closed = false;
+		const elseBody = [];
+		for (let cursor = position + 2 + existsSequence.length; cursor < commands.length; cursor += 1) {
+			const first = commands[cursor].words[0]?.text ?? "";
+			if (depth === 0) {
+				if (first === "elif") {
+					if (!absentSeen && !elseSeen && matches(cursor, absentSequence)) {
+						absentSeen = true;
+						cursor += absentSequence.length - 1;
+						continue;
+					}
+					if (!absentSeen) reasons.push(`must accept only an explicit 404 as "absent", spelled exactly: ${guard.absent} (found '${spell(commands[cursor])}')`);
+					else reasons.push(`must not add another branch to the head-object guard: ${spell(commands[cursor])}`);
+					return;
+				}
+				if (first === "else") {
+					if (elseSeen) {
+						reasons.push(`must not add another branch to the head-object guard: ${spell(commands[cursor])}`);
+						return;
+					}
+					elseSeen = true;
+					continue;
+				}
+				if (first === "fi") {
+					closed = true;
+					break;
+				}
+			}
+			if (/^(if|for|while|until|case)$/.test(first)) depth += 1;
+			else if (/^(fi|done|esac)$/.test(first) && depth > 0) depth -= 1;
+			else if (elseSeen && depth === 0 && !/^(then|do|\{|\})$/.test(first)) elseBody.push(commands[cursor]);
+		}
+		if (!closed) reasons.push(`must close the head-object guard with 'fi': ${spelled}`);
+		if (!absentSeen) reasons.push(`must accept only an explicit 404 as "absent", spelled exactly: ${guard.absent} (found no such branch for ${spelled})`);
+		const exits = elseBody.length > 0 && spell(elseBody[elseBody.length - 1]) === "exit 1";
+		const leaves = elseBody.some((command) => {
+			const at = commandIndex(command.words);
+			return at !== -1 && /^(continue|break|return)$/.test(command.words[at].text);
+		});
+		if (!elseSeen || !exits || leaves) reasons.push("must end the head-object guard with an 'else' branch that exits 1 for every other error");
 	});
 	if (count === 0) return reasons;
-	if (spell(commands[0] ?? { words: [] }) !== "set -euo pipefail") reasons.push("must start with 'set -euo pipefail' when it calls aws s3api head-object");
+	if (spell(commands[0]) !== "set -euo pipefail") reasons.push("must start with 'set -euo pipefail' when it calls aws s3api head-object");
 	for (const command of commands) {
 		const spelled = spell(command);
 		if (assignedNames(command).includes("head_status") && spelled !== guard.reset && spelled !== guard.capture) {
 			reasons.push(`assigns head_status outside the head-object guard: ${spelled}`);
 		}
-	}
-	const lines = String(run).split("\n").map((line) => line.trim());
-	const exists = lines.filter((line) => line === guard.exists).length;
-	const absent = lines.map((line, index) => (line === guard.absent ? index : -1)).filter((index) => index !== -1);
-	if (exists !== count) reasons.push(`must test the head-object status with exactly '${guard.exists}' once per head-object call (found ${exists} for ${count})`);
-	if (absent.length !== count) reasons.push(`must accept only an explicit 404 as "absent", spelled exactly: ${guard.absent} (found ${absent.length} for ${count})`);
-	for (const start of absent) {
-		let depth = 0;
-		let sawElse = false;
-		let sawExit = false;
-		let closed = false;
-		for (let index = start + 1; index < lines.length && !closed; index += 1) {
-			const line = lines[index];
-			if (/^(if|while|until|for|case)\b/.test(line) && !/\b(fi|done|esac)$/.test(line)) depth += 1;
-			else if (/^(fi|done|esac)$/.test(line)) {
-				if (depth > 0) depth -= 1;
-				else closed = true;
-			} else if (depth === 0) {
-				if (line.startsWith("elif")) {
-					reasons.push(`must not add another branch to the head-object guard: ${line}`);
-					break;
-				}
-				if (line === "else") sawElse = true;
-				else if (sawElse && line === "exit 1") sawExit = true;
-			}
-		}
-		if (!sawElse || !sawExit) reasons.push("must end the head-object guard with an 'else' branch that exits 1 for every other error");
 	}
 	return reasons;
 }
@@ -1880,7 +2554,17 @@ function credentialsOf(job) {
  */
 export function credentialJobReasons(jobId, job, jobs = {}) {
 	const reasons = [];
-	if (job.uses !== undefined) return reasons; // a reusable-workflow call; its callers are checked separately
+	if (job.uses !== undefined) {
+		// A reusable-workflow call is a job like any other: its permissions and secrets are checked
+		// below, and the only workflow it may call is the standalone build, from the job named for
+		// it - whose caller contract (exactly contents:read + id-token:write, no secrets, no
+		// environment) is proved in checkWorkflows (review round 7b, finding C).
+		if (jobId !== STANDALONE_CALLER_JOB || job.uses !== `./${STANDALONE_WORKFLOW}`) {
+			reasons.push(`job '${jobId}' calls a reusable workflow (${job.uses}); only '${STANDALONE_CALLER_JOB}' may, and only ./${STANDALONE_WORKFLOW}: a called workflow runs code the checker does not see.`);
+		} else if (JSON.stringify(permissionEntries(job.permissions).sort()) === JSON.stringify(Object.entries(STANDALONE_CALLER_PERMISSIONS).sort()) && !("secrets" in job) && job.environment === undefined && !expressionsOf(job).some(referencesSecret)) {
+			return reasons; // the proven standalone caller
+		}
+	}
 	if (holdsWrite(job, "contents") && !CONTENTS_WRITE_JOBS.includes(jobId) && !needsOf(job).includes(VERIFY_JOB)) {
 		reasons.push(`job '${jobId}' holds contents:write - it could publish a release or push a tag - without being one of ${CONTENTS_WRITE_JOBS.join(", ")} or needing '${VERIFY_JOB}'.`);
 	}
@@ -1915,14 +2599,20 @@ export function credentialJobReasons(jobId, job, jobs = {}) {
 				const spelled = texts.join(" ");
 				if (texts[0] === "git") reasons.push(`job '${jobId}' may run without an environment only while it never runs git: ${spelled} (${label}).`);
 				if (texts[0] !== "gh") continue;
-				if (texts[1] === "api" && texts.slice(2).some((text) => GH_API_WRITE_OPTIONS.test(text))) {
+				const args = command.words.slice(index + 1);
+				// `-XPOST`, `--method=POST`, `-f k=v`, `--input=f`: every spelling is read through the option table (review round 7b, finding B).
+				if (texts[1] === "api" && ghApiWrites(args)) {
 					reasons.push(`job '${jobId}' may run without an environment only while gh api never writes: ${spelled} (${label}).`);
 				}
 				if (texts[1] === "release" && /^(create|edit)$/.test(texts[2] ?? "")) {
-					if (!texts.slice(3).some((text) => text === "--draft" || text === "-d" || text === "--draft=true")) {
+					const flags = ghReleaseDraftFlags(args);
+					if (flags.unknown) {
+						reasons.push(`job '${jobId}' may run without an environment only while every gh release option is one the checker knows, so it can tell a --draft flag from a value: ${spelled} (${label}).`);
+					}
+					if (!flags.draft) {
 						reasons.push(`job '${jobId}' may run without an environment only while every release it creates or edits stays a draft: ${spelled} (${label}).`);
 					}
-					if (texts.slice(3).some((text) => GH_RELEASE_PUBLISHES.test(text))) {
+					if (flags.publishes) {
 						reasons.push(`job '${jobId}' may run without an environment only while it never publishes a release: ${spelled} (${label}).`);
 					}
 				}

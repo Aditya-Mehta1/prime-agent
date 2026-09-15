@@ -1524,11 +1524,11 @@ jobs:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           set -euo pipefail
-          test -n "$GH_TOKEN"
           test -n "$TAP_REPO"
           branch="prime-agent-${PRODUCTION_VERSION}"
-          workdir=$(mktemp -d)
-          gh repo clone "$TAP_REPO" "$workdir" -- --depth 1
+          workdir="$RUNNER_TEMP/tap"
+          mkdir "$workdir"
+          gh repo clone "https://github.com/${TAP_REPO}" "$workdir" -- --depth 1
           # The clone's HEAD is the tap's default branch. Nothing below may push
           # to it: the only push names the bump branch on both sides of the refspec.
           default_branch=$(git -C "$workdir" symbolic-ref --short HEAD)
@@ -1542,29 +1542,54 @@ jobs:
           git -C "$workdir" switch -c "$branch"
           formula="$workdir/Formula/prime-agent.rb"
           test -f "$formula"
-          # The formula is edited with sed alone: this job holds the tap token, so no
-          # interpreter may read a script here, not even a heredoc. Every value that
-          # reaches a sed expression is validated first; the version and digests are
-          # confined to characters sed treats literally in a replacement.
           version_pattern='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
           [[ "$PRODUCTION_VERSION" =~ $version_pattern ]] \
             || { echo "PRODUCTION_VERSION is not a version: $PRODUCTION_VERSION" >&2; exit 1; }
-          rewrite() {
-            sed -E "$1" "$formula" > "$formula.tmp"
-            mv "$formula.tmp" "$formula"
+          # The formula is rewritten line by line with bash parameter expansion
+          # alone: no stream editor (its e, w and r commands run programs and
+          # write files), no interpreter and no heredoc in a job that holds the
+          # tap token. Every value that reaches the formula is validated first.
+          # The release checker allows no other tool here.
+          digest_for() {
+            local platform="$1" digest
+            digest=$(grep -E "  prime-agent-${PRODUCTION_VERSION}-${platform}\.tar\.gz$" artifacts/SHA256SUMS | cut -d' ' -f1)
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || { echo "No digest for ${platform} in SHA256SUMS" >&2; return 1; }
+            printf '%s\n' "$digest"
           }
-          for platform in darwin-arm64 darwin-x64 linux-arm64 linux-x64; do
-            digest=$(grep -E "  prime-agent-${PRODUCTION_VERSION}-${platform}\.tar\.gz$" \
-              "$GITHUB_WORKSPACE/artifacts/SHA256SUMS" | cut -d' ' -f1)
-            [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || { echo "No digest for ${platform} in SHA256SUMS" >&2; exit 1; }
+          rewritten="$RUNNER_TEMP/prime-agent.rb"
+          : > "$rewritten"
+          previous=""
+          digests=0
+          while IFS= read -r line || [ -n "$line" ]; do
             # The line after the `# <platform>` comment carries that platform's sha256.
-            rewrite "/# ${platform}\$/{n;s/(sha256 \")[0-9a-f]{64}(\")/\\1${digest}\\2/;}"
-            grep -qE "# ${platform}" "$formula" || { echo "Formula has no # ${platform} entry" >&2; exit 1; }
-          done
-          rewrite "s/^([[:space:]]*version \")[^\"]+(\")/\\1${PRODUCTION_VERSION}\\2/"
-          rewrite "s|/releases/v[0-9][^/\"]*/|/releases/v${PRODUCTION_VERSION}/|g"
-          grep -qE "^[[:space:]]*version \"${PRODUCTION_VERSION//./\\.}\"" "$formula" \
+            for platform in darwin-arm64 darwin-x64 linux-arm64 linux-x64; do
+              if [[ "$previous" == *"# ${platform}" ]] && [[ "$line" == *'sha256 "'*'"'* ]]; then
+                digest=$(digest_for "$platform")
+                rest="${line#*sha256 \"}"
+                rest="${rest#*\"}"
+                line="${line%%sha256 \"*}sha256 \"${digest}\"${rest}"
+                digests=$((digests + 1))
+              fi
+            done
+            if [[ "$line" == *'version "'*'"'* ]]; then
+              rest="${line#*version \"}"
+              rest="${rest#*\"}"
+              line="${line%%version \"*}version \"${PRODUCTION_VERSION}\"${rest}"
+            fi
+            if [[ "$line" == *'/releases/v'[0-9]*'/'* ]]; then
+              rest="${line#*/releases/v}"
+              rest="${rest#*/}"
+              line="${line%%/releases/v*}/releases/v${PRODUCTION_VERSION}/${rest}"
+            fi
+            printf '%s\n' "$line" >> "$rewritten"
+            previous="$line"
+          done < "$formula"
+          test "$digests" -eq 4 || { echo "Formula carries $digests of the 4 platform sha256 entries" >&2; exit 1; }
+          grep -qE "^[[:space:]]*version \"${PRODUCTION_VERSION//./\\.}\"" "$rewritten" \
             || { echo "Formula version was not rewritten" >&2; exit 1; }
+          test "$(grep -c '/releases/v' "$rewritten")" = "$(grep -cF "/releases/v${PRODUCTION_VERSION}/" "$rewritten")" \
+            || { echo "Formula still names another release prefix" >&2; exit 1; }
+          mv "$rewritten" "$formula"
           if git -C "$workdir" diff --quiet; then
             echo "Formula already describes prime-agent ${PRODUCTION_VERSION}; nothing to push."
             exit 0
@@ -1578,7 +1603,8 @@ jobs:
           existing=$(gh pr list --repo "$TAP_REPO" --head "$branch" --base "$default_branch" --state open \
             --json number --jq '.[0].number // empty')
           if [ -n "$existing" ]; then
-            gh pr edit "$existing" --repo "$TAP_REPO" --title "$title" --body "$body"
+            # The bump branch names the pull request: gh pr edit accepts a head branch.
+            gh pr edit "$branch" --repo "$TAP_REPO" --title "$title" --body "$body"
             echo "Refreshed pull request #${existing} on ${TAP_REPO} from ${branch}."
           else
             gh pr create --repo "$TAP_REPO" --head "$branch" --base "$default_branch" \
