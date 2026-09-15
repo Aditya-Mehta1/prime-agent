@@ -554,6 +554,74 @@ describe("release ordering: nothing is public before verification", () => {
 		for (const job of [githubRelease, publish, verify, finalize]) requiresSuccess(job);
 	});
 
+	it("signs the beta SHA256SUMS and publishes the bundle next to it, verified against the pinned identity (round 5, finding 4)", () => {
+		const sign = release.jobs.sign!;
+		// sign runs for the beta as well as production; it holds only id-token/attestations, no secret.
+		expect(sign.if).toContain("needs.context.outputs.publish_beta == 'true'");
+		expect(sign.if).toContain("needs.context.outputs.publish_production == 'true'");
+		expect(sign.environment).toBeUndefined();
+		expect(sign.permissions).toEqual({ attestations: "write", contents: "read", "id-token": "write" });
+		expect(JSON.stringify(sign)).not.toMatch(/secrets\./);
+		const betaDownload = sign.steps.find(
+			(entry) => entry.uses?.startsWith("actions/download-artifact@") && entry.with?.name === "release-final-beta",
+		)!;
+		expect(betaDownload.with).toEqual({ name: "release-final-beta", path: "beta-artifacts" });
+		expect(betaDownload.if).toBe("env.PUBLISH_BETA == 'true'");
+		const betaSign = step(sign, "Sign the beta SHA256SUMS with a keyless cosign signature");
+		expect(betaSign.if).toBe("env.PUBLISH_BETA == 'true'");
+		expect(betaSign.run).toContain("(cd beta-artifacts && sha256sum --check SHA256SUMS)");
+		expect(betaSign.run).toMatch(
+			/cosign sign-blob --yes \\\n\s*--bundle beta-signatures\/SHA256SUMS\.sigstore\.json \\\n\s*beta-artifacts\/SHA256SUMS/,
+		);
+		// The same identity as the production signature: this workflow file at the ref that ran.
+		expect(betaSign.run).toContain(
+			`--certificate-identity "https://github.com/\${GITHUB_REPOSITORY}/.github/workflows/build-binaries.yml@\${GITHUB_REF}"`,
+		);
+		expect(step(sign, "Attest beta build provenance").if).toBe("env.PUBLISH_BETA == 'true'");
+		const betaUpload = step(sign, "Upload beta signatures");
+		expect(betaUpload.if).toBe("env.PUBLISH_BETA == 'true'");
+		expect(betaUpload.with).toEqual({
+			name: "release-beta-signatures",
+			path: "beta-signatures/SHA256SUMS.sigstore.json",
+			"if-no-files-found": "error",
+		});
+		// Production steps are gated on production so a beta-only run does not fail on missing artifacts.
+		for (const name of [
+			"Sign SHA256SUMS with a keyless cosign signature",
+			"Generate an SBOM per archive",
+			"Attest build provenance",
+			"Upload signatures",
+		]) {
+			expect(step(sign, name).if, name).toBe("env.PUBLISH_PRODUCTION == 'true'");
+		}
+
+		const beta = release.jobs["publish-beta-r2"]!;
+		expect(beta.needs).toEqual(expect.arrayContaining(["assemble", "sign"]));
+		expect(beta.steps.some((entry) => entry.uses?.startsWith("actions/checkout@"))).toBe(false);
+		const bundleDownload = step(beta, "Download beta signatures");
+		expect(bundleDownload.with).toEqual({ name: "release-beta-signatures", path: "artifacts" });
+		expect(step(beta, "Download assembled beta artifacts").with?.path).toBe("artifacts");
+		expect(step(beta, "Refuse anything that is not a beta artifact").run).toContain(
+			"test -s artifacts/SHA256SUMS.sigstore.json",
+		);
+		const verify = step(beta, "Verify the beta signature bundle against the pinned release identity");
+		expect(verify.env).toBeUndefined(); // no credential in the env of the verifying step
+		expect(verify.run).toContain("--bundle artifacts/SHA256SUMS.sigstore.json");
+		expect(verify.run).toContain("--certificate-oidc-issuer https://token.actions.githubusercontent.com");
+		expect(verify.run).toContain(
+			`--certificate-identity "https://github.com/\${GITHUB_REPOSITORY}/.github/workflows/build-binaries.yml@refs/heads/\${DEFAULT_BRANCH}"`,
+		);
+		expect(verify.run).toMatch(/\n\s*artifacts\/SHA256SUMS\s*$/);
+		expect(beta.env?.DEFAULT_BRANCH).toBe(`\${{ github.event.repository.default_branch }}`);
+		const names = beta.steps.map((entry) => entry.name);
+		expect(names.indexOf(verify.name!)).toBeLessThan(names.indexOf("Upload immutable beta objects"));
+		// The upload loop publishes everything in artifacts/ except the two pointers: the bundle rides along.
+		const upload = step(beta, "Upload immutable beta objects");
+		expect(upload.run).toContain("for file in artifacts/*; do");
+		expect(upload.run).toContain("beta|beta.json) continue ;;");
+		expect(upload.run).not.toMatch(/sigstore/);
+	});
+
 	it("publish-r2 writes only the immutable prefix and never a channel pointer", () => {
 		const names = publish.steps.map((entry) => entry.name);
 		expect(names).not.toContain("Advance the production channel pointers");
@@ -867,11 +935,18 @@ aws() {
   esac
 }
 `;
-		const run = (jobId: string, stepName: string, head: Parameters<typeof shim>[0], existing?: string) => {
+		const run = (
+			jobId: string,
+			stepName: string,
+			head: Parameters<typeof shim>[0],
+			existing?: string,
+			extraFiles: Record<string, string> = {},
+		) => {
 			const workspace = mkdtempSync(join(tmpdir(), "prime-head-object-"));
 			mkdirSync(join(workspace, "artifacts"));
 			mkdirSync(join(workspace, "stash"));
 			writeFileSync(join(workspace, "artifacts", DIGEST_FILE), "release bytes");
+			for (const [name, body] of Object.entries(extraFiles)) writeFileSync(join(workspace, "artifacts", name), body);
 			if (existing !== undefined) writeFileSync(join(workspace, "stash", DIGEST_FILE), existing);
 			const result = spawnSync(
 				"bash",
@@ -939,6 +1014,29 @@ aws() {
 						expect(result.status, JSON.stringify(head)).toBe(1);
 						expect(uploads, JSON.stringify(head)).toEqual([]);
 					}
+				});
+
+				it("uploads SHA256SUMS.sigstore.json next to SHA256SUMS and never a pointer (round 5, finding 4)", () => {
+					const { result, uploads } = run(jobId, stepName, { exit: 254, stderr: NOT_FOUND }, undefined, {
+						SHA256SUMS: "sums",
+						"SHA256SUMS.sigstore.json": '{"bundle":true}',
+						...(jobId === "publish-r2"
+							? { stable: "1.2.3", "latest.json": "{}" }
+							: { beta: "1.2.3", "beta.json": "{}" }),
+					});
+					expect(result.status, result.stderr).toBe(0);
+					const version = "1.2.3";
+					const names = uploads.map((call) => call.match(/ s3:\/\/bucket\/(\S+)/)![1]);
+					expect(names.sort()).toEqual(
+						[
+							`releases/v${version}/${DIGEST_FILE}`,
+							`releases/v${version}/SHA256SUMS`,
+							`releases/v${version}/SHA256SUMS.sigstore.json`,
+						].sort(),
+					);
+					const bundle = uploads.find((call) => call.includes("SHA256SUMS.sigstore.json"))!;
+					expect(bundle).toContain("--content-type application/json");
+					expect(bundle).toContain("--endpoint-url https://r2.invalid");
 				});
 
 				it("never uploads over an existing object", () => {

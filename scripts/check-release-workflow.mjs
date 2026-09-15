@@ -15,7 +15,12 @@
  * through any interpreter, not just `node scripts/...`. Because the checker
  * reads shell statically, constructs whose effect it cannot prove (`sh -c`,
  * `eval`, `xargs`, `env -S`, piping into a shell, a command substitution that
- * names a script) are forbidden outright in those jobs.
+ * names a script) are forbidden outright in those jobs, and every command such
+ * a job runs must be on an explicit allowlist (ALLOWED_COMMANDS): coreutils,
+ * jq, gh, cosign, tar, curl and the one tool the job exists to run. No
+ * interpreter, no wrapper, no path. Every aws call must go to the R2 endpoint
+ * the secret names, and only plainly spelled downloaded-artifact paths may be
+ * uploaded.
  */
 
 import { readdirSync, readFileSync } from "node:fs";
@@ -55,19 +60,42 @@ export const R2_WRITERS = {
 	"publish-beta-r2": { prefix: "BETA_VERSION", pointers: ["beta", "beta.json"] },
 	[POINTER_JOB]: { prefix: null, pointers: PRODUCTION_POINTERS },
 };
-/** Options an `aws s3 cp` in a publish job may carry, with the number of values each consumes. */
-const AWS_CP_OPTIONS = { "--endpoint-url": 1, "--content-type": 1, "--cache-control": 1, "--quiet": 0, "--no-progress": 0, "--only-show-errors": 0 };
+/**
+ * Options an aws invocation in a publish job may carry, per operation, with the number of values
+ * each consumes. Every invocation must carry `--endpoint-url "$R2_ENDPOINT_URL"` - the variable
+ * bound from the secret at step level - exactly once; `--region` may only say `auto` (or
+ * `"$AWS_DEFAULT_REGION"`, which the step env pins to `auto`). Anything else (`--profile`,
+ * `--no-verify-ssl`, `--ca-bundle`, `--endpoint-url=<value>`, another region or endpoint) is an
+ * error (review round 5, finding 2).
+ */
+const AWS_OPTIONS = {
+	"s3 cp": { "--endpoint-url": 1, "--region": 1, "--content-type": 1, "--cache-control": 1, "--quiet": 0, "--no-progress": 0, "--only-show-errors": 0 },
+	"s3 ls": { "--endpoint-url": 1, "--region": 1 },
+	s3api: { "--endpoint-url": 1, "--region": 1, "--bucket": 1, "--key": 1, "--prefix": 1 },
+};
+const AWS_ENDPOINT_VALUE = /^\$\{?R2_ENDPOINT_URL\}?$/;
+const AWS_REGION_VALUE = /^(auto|\$\{?AWS_DEFAULT_REGION\}?)$/;
 /** `aws s3api` operations that only read. */
 const AWS_S3API_READS = /^(head-object|head-bucket|get-object|list-objects|list-objects-v2)$/;
 /** Variables the R2 destinations are built from; a publish step may not reassign them. */
-const R2_PROTECTED_VARIABLES = /^(R2_BUCKET|R2_ENDPOINT_URL|PRODUCTION_VERSION|BETA_VERSION)$/;
+const R2_PROTECTED_VARIABLES = /^(R2_BUCKET|R2_ENDPOINT_URL|PRODUCTION_VERSION|BETA_VERSION|AWS_DEFAULT_REGION)$/;
 /** How the R2 destination variables must reach a publish job. */
 const R2_ENV_SOURCES = {
 	R2_BUCKET: /^\$\{\{\s*secrets\.(NIGHTLY_)?R2_BUCKET\s*\}\}$/,
 	R2_ENDPOINT_URL: /^\$\{\{\s*secrets\.(NIGHTLY_)?R2_ENDPOINT_URL\s*\}\}$/,
 	PRODUCTION_VERSION: /^\$\{\{\s*needs\.context\.outputs\.production_version\s*\}\}$/,
 	BETA_VERSION: /^\$\{\{\s*needs\.context\.outputs\.beta_version\s*\}\}$/,
+	AWS_DEFAULT_REGION: /^auto$/,
 };
+/** A relative path under a downloaded artifact directory, spelled plainly: no `.`/`..`/empty segment, no `~`, no leading `/`, no glob. */
+export function isArtifactPath(text, artifactDirectories) {
+	if (typeof text !== "string" || text === "" || text.startsWith("/") || text.startsWith("~") || /[*?[$`{}]/.test(text)) return false;
+	const segments = text.split("/");
+	if (segments.length < 2 || segments.some((segment) => segment === "" || segment === "." || segment === "..")) return false;
+	const normalized = posix.normalize(text);
+	if (normalized !== text) return false;
+	return artifactDirectories.some((directory) => normalized.startsWith(`${directory}/`) && normalized.length > directory.length + 1);
+}
 /** A literal object name: no expansion, no slash, no leading dot. */
 const LITERAL_OBJECT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 /** Builtins that change the working directory; in a credential-bearing job only `cd`/`pushd` into a downloaded artifact directory is allowed. */
@@ -99,16 +127,80 @@ export const ALLOWED_ACTIONS = {
 	"*": [/^actions\/download-artifact@/, /^actions\/upload-artifact@/],
 	"publish-npm": [/^actions\/setup-node@/],
 	sign: [/^sigstore\/cosign-installer@/, /^anchore\/sbom-action\/download-syft@/, /^actions\/attest-build-provenance@/],
+	"publish-beta-r2": [/^sigstore\/cosign-installer@/],
 };
+
+/**
+ * The beta signature contract (review round 5, finding 4). A compiled beta install verifies
+ * `SHA256SUMS.sigstore.json` next to `SHA256SUMS` with the identity the updater pins - this
+ * workflow file at the default branch - so the sign job must run for the beta too, publish-beta-r2
+ * must download the bundle into the directory it uploads from, verify it against that identity
+ * before the credential is used, and never skip it in the upload loop.
+ */
+export const BETA_SIGNATURES = {
+	artifact: "release-beta-signatures",
+	artifactsArtifact: "release-final-beta",
+	bundle: "SHA256SUMS.sigstore.json",
+	signJob: "sign",
+	publishJob: "publish-beta-r2",
+	uploadStep: "Upload immutable beta objects",
+	identity: 'https://github.com/${GITHUB_REPOSITORY}/.github/workflows/build-binaries.yml@refs/heads/${DEFAULT_BRANCH}',
+	issuer: "https://token.actions.githubusercontent.com",
+	defaultBranch: "${{ github.event.repository.default_branch }}",
+};
+
+/**
+ * The only commands a credential-bearing job may run (review round 5, finding 1). An allowlist over
+ * bare command names looked up on PATH: no interpreter of any kind (not even `node -e` with code
+ * written in the workflow file - `node -e "require('./scr'+'ipts/x')"` reads the checkout without
+ * ever spelling `scripts/`), no wrapper (`env`, `sudo`, `timeout`, `exec`, ...), no path. `*`
+ * applies to every credential-bearing job; the per-job entries name the one tool that job exists
+ * to run. Shell functions defined in the same `run` block may be called; defining one whose name is
+ * on the allowlist (shadowing `aws`, `test`, ...) is an error.
+ */
+const COREUTILS = ["basename", "cat", "chmod", "cmp", "cp", "cut", "date", "diff", "dirname", "echo", "false", "head", "ls", "mkdir", "mktemp", "mv", "printf", "pwd", "rm", "rmdir", "sha256sum", "sleep", "sort", "tail", "tee", "test", "touch", "tr", "true", "uniq", "wc"];
+const SHELL_BUILTINS = ["set", "exit", "return", "continue", "break", "shift", "local", "read", "unset", "export", "declare", "readonly", ":", "[", "wait"];
+export const ALLOWED_COMMANDS = {
+	"*": [...COREUTILS, ...SHELL_BUILTINS, "grep", "jq", "tar", "curl", "gh"],
+	"publish-r2": ["aws"],
+	"publish-beta-r2": ["aws", "cosign"],
+	"finalize-release": ["aws"],
+	sign: ["cosign", "syft"],
+	"publish-npm": ["npm"],
+	"tap-bump": ["git", "sed"],
+};
+/** `gh` subcommands a credential-bearing job may use; `gh extension`, `gh alias --shell` and friends run code. */
+const GH_SUBCOMMANDS = /^(api|release|pr|repo)$/;
+/** After `gh repo clone <repo> <dir> --`, only a shallow-clone depth may be handed to git. */
+const GH_CLONE_GIT_OPTIONS = /^--depth$/;
+/** `git` global options a credential-bearing job may use: `-C <dir>` and the two identity keys `-c user.name=`/`-c user.email=`. */
+const GIT_CONFIG_KEYS = /^user\.(name|email)=/;
+const GIT_SUBCOMMANDS = /^(symbolic-ref|ls-remote|switch|diff|commit|push|status|rev-parse)$/;
+/** git options that name a program to run (locally for a local remote, or as the remote helper) or another config. */
+const GIT_FORBIDDEN_OPTIONS = /^(--upload-pack|--receive-pack|--exec|--ext-diff|--config|--config-env|--exec-path|--git-dir|--work-tree|--namespace|-u|--no-verify|--template|--recurse-submodules|--hooks?-path)(=|$)/;
+/** tar options that run a program. */
+const TAR_FORBIDDEN_OPTIONS = /^(--to-command|--use-compress-program|-I|--checkpoint-action|--rmt-command|--rsh-command|--info-script|--new-volume-script|-F|--files-from|-T|--occurrence)(=|$)/;
+/** curl in a credential-bearing job must pin `--proto '=https'` and may not read a config file, disable TLS checks or name an http:// URL. */
+const CURL_FORBIDDEN_OPTIONS = /^(-K|--config|-k|--insecure|--proto-default|--proto-redir|--cacert|--capath|--ssl-no-revoke|--netrc|-n|--netrc-file|--netrc-optional|-x|--proxy|--preproxy|--noproxy|--unix-socket|--abstract-unix-socket|--resolve|--connect-to|--doh-url|-O|--remote-name|-J|--remote-header-name|--output-dir)(=|$)/;
+/**
+ * Environment variables that redirect where a credential is sent or which configuration a tool
+ * loads: an aws endpoint or profile override, a gh host, git's every knob (`GIT_SSH_COMMAND`,
+ * `GIT_EXTERNAL_DIFF`, `GIT_CONFIG_*`), npm config, the TLS trust roots, `HOME`. None may be set in a
+ * credential-bearing job, in `env:` or in the shell (review round 5, finding 2).
+ */
+const CREDENTIAL_ENV = /^(AWS_ENDPOINT_URL(_[A-Z0-9_]+)?|AWS_PROFILE|AWS_REGION|AWS_CONFIG_FILE|AWS_SHARED_CREDENTIALS_FILE|AWS_CA_BUNDLE|AWS_DATA_PATH|AWS_IGNORE_CONFIGURED_ENDPOINT_URLS|AWS_USE_FIPS_ENDPOINT|AWS_USE_DUALSTACK_ENDPOINT|AWS_STS_REGIONAL_ENDPOINTS|AWS_SDK_LOAD_CONFIG|AWS_EC2_METADATA_SERVICE_ENDPOINT|AWS_CONTAINER_CREDENTIALS_FULL_URI|AWS_CONTAINER_CREDENTIALS_RELATIVE_URI|AWS_WEB_IDENTITY_TOKEN_FILE|AWS_ROLE_ARN|GH_HOST|GH_CONFIG_DIR|GH_PATH|GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN|GH_BROWSER|GH_EDITOR|GH_PAGER|GIT_[A-Z0-9_]+|NPM_CONFIG_[A-Z0-9_]+|npm_config_[A-Za-z0-9_]+|NODE_EXTRA_CA_CERTS|NODE_TLS_REJECT_UNAUTHORIZED|SSL_CERT_FILE|SSL_CERT_DIR|REQUESTS_CA_BUNDLE|CURL_HOME|CURL_CA_BUNDLE|XDG_CONFIG_HOME|HOME|COSIGN_[A-Z0-9_]+|SIGSTORE_[A-Z0-9_]+|TUF_ROOT|HTTPS?_PROXY|https?_proxy|ALL_PROXY|all_proxy|NO_PROXY|no_proxy)$/;
+/** File paths a credential-bearing step may never name: the dotfiles the allowlisted tools read their configuration and credentials from. */
+const CONFIGURATION_PATH = /^~(\/|$)|^[A-Za-z_][A-Za-z0-9_]*=~(\/|$)|(^|[\/"'=:])\$\{?HOME\}?(\/|$)|(^|\/)\.(aws|npmrc|gitconfig|git-credentials|config\/gh|config\/git|config\/npm|bashrc|bash_profile|profile|zshrc|curlrc|netrc|sigstore|docker)(\/|$)/;
 
 const PACKAGE_MANAGERS = /^(npm|npx|yarn|pnpm|bun|bunx|corepack|uv|uvx|pip|pip3)$/;
 const SHELLS = /^(bash|sh|zsh|dash|ksh|ash|fish)$/;
 const INTERPRETERS = /^(node|nodejs|bash|sh|zsh|dash|ksh|ash|fish|python|python3|perl|ruby|tsx|ts-node|deno)$/;
 /**
- * The only options an interpreter may carry in a credential-bearing job: the flag that introduces
- * inline code written in the workflow file, and version/help. Everything else (`--import`,
- * `--require`, `-r`, `--loader`, `--experimental-loader`, `--env-file`, `--run`, `-m`, `-I`, ...)
- * loads code the checker cannot see and is refused before the file-argument scan.
+ * The inline-code flags of each interpreter, and version/help. {@link repositoryCodeReasons} uses
+ * them to say precisely what an interpreter line would do (`--import`, `--require`, `-r`,
+ * `--loader`, `--env-file`, `--run`, `-m`, `-I`, ... load code the checker cannot see). In a
+ * credential-bearing job no interpreter may run at all, inline code included - see
+ * {@link ALLOWED_COMMANDS} (review round 5, finding 1) - so these only sharpen the diagnostic.
  */
 const INLINE_CODE_FLAGS = {
 	node: /^(-e|--eval|-p|--print)$/,
@@ -205,7 +297,7 @@ const ANSI_C_ESCAPES = { n: "\n", t: "\t", r: "\r", a: "\x07", b: "\b", f: "\f",
  * word is `{ text, expansion }` - `expansion` is true when the word contains something the shell
  * would expand (`$var`, `$(...)`, backticks), so its value cannot be known statically.
  */
-export function splitWords(line) {
+export function splitWords(line, { patternPosition = false } = {}) {
 	const commands = [];
 	let words = [];
 	let substitutions = [];
@@ -217,29 +309,50 @@ export function splitWords(line) {
 	let expansion = false;
 	let inWord = false;
 	let quoted = false;
+	let definesFunction = false;
 	let unterminated = false;
+	// True while the next words are `case` patterns (`a|b)`), i.e. right after `case X in` or `;;`
+	// and until the `)` that ends the pattern list. Patterns are data, not commands.
+	let pattern = patternPosition;
 	const source = String(line);
 	let i = 0;
 
 	const endWord = () => {
-		if (inWord) words.push({ text, expansion, quoted });
+		if (inWord) {
+			// `esac` in pattern position closes the case statement.
+			if (pattern && words.length === 0 && text === "esac" && !quoted) pattern = false;
+			words.push({ text, expansion, quoted, definesFunction });
+		}
 		text = "";
 		expansion = false;
 		inWord = false;
 		quoted = false;
+		definesFunction = false;
 	};
 	const endCommand = () => {
 		endWord();
+		if (words.length >= 3 && words[0].text === "case" && words[words.length - 1].text === "in" && !words[0].quoted) pattern = true;
 		if (words.length > 0 || substitutions.length > 0 || redirections.length > 0) {
 			// `opens` counts the `(` that preceded this command, `closes` the `)` that followed it,
 			// so a caller can scope a `cd` inside `( ... )` to the subshell.
-			commands.push({ words, substitutions, redirections, piped, opens: pendingOpens, closes: 0 });
+			commands.push({ words, substitutions, redirections, piped, opens: pendingOpens, closes: 0, casePattern: false });
 			pendingOpens = 0;
 		}
 		words = [];
 		substitutions = [];
 		redirections = [];
 		piped = nextPiped;
+		nextPiped = false;
+	};
+	/** Ends a `case` pattern segment (`a|`, `b)`): the words are patterns and never a command. */
+	const endPattern = () => {
+		endWord();
+		if (words.length > 0 || substitutions.length > 0) {
+			commands.push({ words, substitutions, redirections, piped: false, opens: 0, closes: 0, casePattern: true });
+		}
+		words = [];
+		substitutions = [];
+		redirections = [];
 		nextPiped = false;
 	};
 	/** Scans a `$(`/`<(`/`>(` or `$((` body from `start` (just past the opener); returns [inner, end index after the closer]. */
@@ -483,16 +596,35 @@ export function splitWords(line) {
 			i = end;
 			continue;
 		}
+		if (ch === "(" && inWord && !quoted && !expansion && !pattern && words.length === 0 && source[i + 1] === ")" && /^[A-Za-z_][A-Za-z0-9_-]*$/.test(text)) {
+			// A function definition: `name() {`. The word names the function, not a command to run.
+			definesFunction = true;
+			i += 2;
+			endCommand();
+			continue;
+		}
 		if (ch === ";" || ch === "|" || ch === "&" || ch === "(" || ch === ")") {
 			// `&&`, `||`, `;;`, `|&` are all command separators too. A single `|` (or `|&`) feeds
 			// the next command's stdin, which matters when that command is a shell.
 			let operator = ch;
 			i += 1;
 			while (i < source.length && ";|&".includes(source[i])) operator += source[i++];
+			if (pattern && (operator === "|" || operator === "(" || operator === ")")) {
+				// Inside a pattern list: `(a|b)` or `a|b)`. `)` ends it; what follows is the body.
+				endPattern();
+				if (operator === ")") pattern = false;
+				continue;
+			}
 			nextPiped = operator === "|" || operator === "|&";
+			// `case X in PATTERN)` on one line: the `)` closes the pattern, not a subshell.
+			const caseHead = words.length >= 3 && words[0].text === "case" && words[2].text === "in" && !words[0].quoted;
 			endCommand();
-			if (operator[0] === "(") pendingOpens += 1;
-			else if (operator[0] === ")" && commands.length > 0) commands[commands.length - 1].closes += 1;
+			if (/^;;&?$|^;&$/.test(operator)) pattern = true;
+			else if (operator[0] === "(") pendingOpens += 1;
+			else if (operator[0] === ")") {
+				if (caseHead) pattern = false;
+				else if (commands.length > 0) commands[commands.length - 1].closes += 1;
+			}
 			continue;
 		}
 		if (!inWord && (ch === "<" || ch === ">" || (/[0-9]/.test(ch) && REDIRECTION.test(source.slice(i))))) {
@@ -516,7 +648,7 @@ export function splitWords(line) {
 		i += 1;
 	}
 	endCommand();
-	return { commands, unterminated };
+	return { commands, unterminated, patternPosition: pattern };
 }
 
 /**
@@ -534,11 +666,14 @@ export function* shellCommands(script) {
 	let heredoc = null; // { delimiter, stripTabs }
 	let heredocBody = [];
 	let carried = "";
+	let patternPosition = false; // inside a `case`, between `in`/`;;` and the next `)`
 	const finishHeredoc = function* () {
 		const body = heredocBody.join("\n");
 		heredocBody = [];
 		heredoc = heredocs.shift() ?? null;
-		yield* shellCommands(body);
+		// The body is data for whatever reads it; it is inspected, and marked so the command
+		// allowlist does not read prose as commands (an interpreter reading it is an error anyway).
+		for (const command of shellCommands(body)) yield { ...command, heredoc: true };
 	};
 	for (const rawLine of joinContinuations(script)) {
 		if (heredoc !== null) {
@@ -548,13 +683,15 @@ export function* shellCommands(script) {
 			continue;
 		}
 		const line = carried ? `${carried}\n${rawLine}` : rawLine;
-		const { commands, unterminated } = splitWords(line);
+		const parsed = splitWords(line, { patternPosition });
+		const { commands, unterminated } = parsed;
 		if (unterminated) {
 			// A quote or substitution spans lines; keep reading until it closes.
 			carried = line;
 			continue;
 		}
 		carried = "";
+		patternPosition = parsed.patternPosition;
 		for (const command of commands) {
 			for (const entry of command.redirections) {
 				const operator = entry.operator.replace(/^[0-9]+/, "");
@@ -574,9 +711,9 @@ export function* shellCommands(script) {
 
 function asCommand(input) {
 	if (Array.isArray(input)) {
-		return { words: input.map((text) => ({ text: String(text), expansion: /[$`]/.test(String(text)) })), substitutions: [], redirections: [], piped: false, opens: 0, closes: 0 };
+		return { words: input.map((text) => ({ text: String(text), expansion: /[$`]/.test(String(text)), quoted: false, definesFunction: false })), substitutions: [], redirections: [], piped: false, opens: 0, closes: 0, casePattern: false, heredoc: false };
 	}
-	return { redirections: [], piped: false, opens: 0, closes: 0, ...input };
+	return { redirections: [], piped: false, opens: 0, closes: 0, casePattern: false, heredoc: false, ...input };
 }
 
 /** The index of the word that names the command, after assignments, keywords and wrappers; -1 when there is none. */
@@ -666,13 +803,15 @@ export function isArtifactDirectory(directory, artifactDirectories) {
  * `chdir`, `cd` with no target, `cd -`, `cd ..` and any target with an expansion are errors.
  * Inside `( ... )` the directory change is scoped to the subshell.
  */
-export function credentialStepReasons(run, { artifactDirectories = [], workingDirectory = "" } = {}) {
+export function credentialStepReasons(run, { artifactDirectories = [], workingDirectory = "", jobId = null } = {}) {
 	const reasons = [];
 	let cwd = workingDirectory && isArtifactDirectory(workingDirectory, artifactDirectories) ? posix.normalize(workingDirectory).replace(/\/$/, "") : "";
 	const stack = [];
+	const functions = new Set();
 	for (const command of shellCommands(run)) {
 		for (let n = 0; n < (command.opens ?? 0); n += 1) stack.push(cwd);
-		reasons.push(...repositoryCodeReasons(command, cwd));
+		for (const reason of repositoryCodeReasons(command, cwd)) reasons.push(`must not run repository code: ${reason}`);
+		reasons.push(...commandAllowlistReasons(command, { jobId, functions }));
 		const index = commandIndex(command.words);
 		if (index !== -1) {
 			const name = command.words[index].text;
@@ -790,10 +929,11 @@ export function repositoryCodeReasons(input, cwd = "") {
 		reasons.push("find -exec runs a command the checker cannot see");
 	}
 	if (INTERPRETERS.test(command)) {
-		// An interpreter may only run inline code that is written here, in the workflow file, after
-		// the one flag that introduces it (`node -e`, `python3 -c`). Everything else - a pipe, a
-		// file, stdin, a heredoc, a here-string, an expansion, a preload option, a shell `-c`
-		// string - is code the checker cannot see.
+		// The command allowlist refuses every interpreter in a credential-bearing job. This walk
+		// still says precisely what the line would do: anything but inline code written here after
+		// the flag that introduces it (`node -e`, `python3 -c`) - a pipe, a file, stdin, a heredoc, a
+		// here-string, an expansion, a preload option, a shell `-c` string - is code the checker
+		// cannot see.
 		if (piped) reasons.push(`${command} reads its script from a pipe the checker cannot see`);
 		for (const redirection of redirections) {
 			const operator = redirection.operator.replace(/^[0-9]+/, "");
@@ -840,6 +980,211 @@ export function repositoryCodeReasons(input, cwd = "") {
 			reasons.push(`runs a file through ${command}: ${arg.text}`);
 			break;
 		}
+	}
+	return reasons;
+}
+
+/** True when a word that looks like an option has an expansion in its name part (`"--$FLAG"`, `--${x}=1`), so the checker cannot know which option it is. */
+function optionNameExpands(word) {
+	return word.text.startsWith("-") && word.expansion && /[$`]/.test(word.text.split("=")[0]);
+}
+
+/** A glob from a `case` pattern as a regular expression (`*`, `?`, `[...]`; everything else literal). */
+function globToRegExp(pattern) {
+	let source = "^";
+	for (let i = 0; i < pattern.length; i += 1) {
+		const ch = pattern[i];
+		if (ch === "*") source += ".*";
+		else if (ch === "?") source += ".";
+		else if (ch === "[") {
+			const close = pattern.indexOf("]", i + 1);
+			if (close === -1) source += "\\[";
+			else {
+				source += `[${pattern.slice(i + 1, close).replace(/^!/, "^").replace(/\\/g, "\\\\")}]`;
+				i = close;
+			}
+		} else source += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	}
+	return new RegExp(`${source}$`);
+}
+
+/** The `case` patterns (as glob strings) a `run` block matches against. */
+export function casePatternsOf(run) {
+	const patterns = [];
+	for (const command of shellCommands(run)) {
+		if (command.casePattern) for (const word of command.words) patterns.push(word.text);
+	}
+	return patterns;
+}
+
+/**
+ * The `case` patterns (as glob strings) whose body leaves the loop or the step - `continue`, `break`,
+ * `exit`, `return` - i.e. the names an upload loop skips.
+ */
+export function caseSkipPatternsOf(run) {
+	const skipped = [];
+	let group = [];
+	let body = [];
+	const flush = () => {
+		if (group.length > 0 && body.some((command) => {
+			const index = commandIndex(command.words);
+			return index !== -1 && /^(continue|break|exit|return)$/.test(command.words[index].text);
+		})) {
+			skipped.push(...group);
+		}
+		group = [];
+		body = [];
+	};
+	let inBody = false;
+	for (const command of shellCommands(run)) {
+		if (command.casePattern) {
+			if (inBody) flush();
+			inBody = false;
+			group.push(...command.words.map((word) => word.text));
+		} else if (group.length > 0) {
+			inBody = true;
+			body.push(command);
+		}
+	}
+	flush();
+	return skipped;
+}
+
+/** True when a `case` pattern in `run` whose body skips the item would match `name`. */
+export function casePatternMatches(run, name) {
+	return caseSkipPatternsOf(run).some((pattern) => globToRegExp(pattern).test(name));
+}
+
+/**
+ * Returns the reasons a simple command in a credential-bearing job runs something outside
+ * {@link ALLOWED_COMMANDS} (review round 5, finding 1), sets an environment variable that redirects
+ * a credential or a tool's configuration ({@link CREDENTIAL_ENV}), names a configuration dotfile, or
+ * uses an allowlisted tool in a way that runs code (`gh extension`, `git --upload-pack`,
+ * `tar --to-command`, `curl` without `--proto '=https'`).
+ *
+ * `functions` is the set of shell functions the block has defined so far (a definition adds to it;
+ * a call to a defined function is allowed). `jobId` selects the per-job allowlist; without one only
+ * the `*` set applies.
+ */
+export function commandAllowlistReasons(input, { jobId = null, functions = new Set() } = {}) {
+	const command = asCommand(input);
+	const reasons = [];
+	for (const substitution of command.substitutions) {
+		for (const inner of shellCommands(substitution)) {
+			for (const reason of commandAllowlistReasons(inner, { jobId, functions })) reasons.push(`inside a command substitution: ${reason}`);
+		}
+	}
+	const words = command.words;
+	const spelled = words.map((word) => word.text).join(" ");
+	for (const word of words) {
+		if (word.text.includes("://")) continue;
+		if (CONFIGURATION_PATH.test(word.text)) reasons.push(`names a configuration or credential file the allowlisted tools read: ${word.text} (${spelled})`);
+	}
+	for (const redirection of command.redirections) {
+		if (CONFIGURATION_PATH.test(redirection.text)) reasons.push(`redirects to a configuration or credential file the allowlisted tools read: ${redirection.operator}${redirection.text} (${spelled})`);
+	}
+	if (command.casePattern || command.heredoc) return reasons; // data, not commands
+	const assigned = new Set(assignedNames(command));
+	for (const word of words) {
+		if (ASSIGNMENT.test(word.text)) assigned.add(word.text.match(/^[A-Za-z_][A-Za-z0-9_]*/)[0]);
+	}
+	for (const name of assigned) {
+		if (CREDENTIAL_ENV.test(name)) reasons.push(`sets ${name}, which redirects where a credential is sent or which configuration a tool loads: ${spelled}`);
+	}
+	let start = 0;
+	while (start < words.length && (ASSIGNMENT.test(words[start].text) || SHELL_KEYWORDS.test(words[start].text))) {
+		if (/^(for|case|\[\[|\[|select)$/.test(words[start].text)) return reasons;
+		start += 1;
+	}
+	if (start >= words.length) return reasons;
+	const index = commandIndex(words);
+	if (index === -1) return reasons; // `command -v x`
+	const allowed = new Set([...ALLOWED_COMMANDS["*"], ...(ALLOWED_COMMANDS[jobId] ?? [])]);
+	const describe = `credential-bearing job${jobId ? ` '${jobId}'` : "s"}`;
+	for (let position = start; position < index; position += 1) {
+		reasons.push(`runs ${words[position].text}, a wrapper that hands its arguments to another command; ${describe} may run only the allowlisted commands directly: ${spelled}`);
+	}
+	const word = words[index];
+	const name = word.text;
+	if (word.definesFunction || words[index - 1]?.text === "function") {
+		// A function may not take the name of anything that is a command anywhere in the release.
+		const everyAllowed = new Set(Object.values(ALLOWED_COMMANDS).flat());
+		if (everyAllowed.has(name) || DIRECTORY_COMMANDS.test(name) || INTERPRETERS.test(name) || PACKAGE_MANAGERS.test(name) || COMMAND_PREFIXES.test(name) || SHELL_KEYWORDS.test(name) || OPAQUE_EXECUTORS.test(name) || RESOLUTION_BUILTINS.test(name) || SOURCE_COMMANDS.test(name)) {
+			reasons.push(`defines a shell function named ${name}, which would shadow that command for the rest of the step: ${spelled}`);
+		} else {
+			functions.add(name);
+		}
+		return reasons;
+	}
+	if (word.expansion) return reasons; // already an error in repositoryCodeReasons
+	if (name.includes("/")) {
+		reasons.push(`runs ${name} through a path; ${describe} may run only bare allowlisted names looked up on PATH: ${spelled}`);
+		return reasons;
+	}
+	if (functions.has(name) || DIRECTORY_COMMANDS.test(name)) return reasons; // cd/pushd are checked by credentialStepReasons
+	if (!allowed.has(name)) {
+		reasons.push(`runs ${name}, which is not on the command allowlist for ${describe} (${[...allowed].sort().join(", ")}): ${spelled}`);
+		return reasons;
+	}
+	const args = words.slice(index + 1);
+	if (name === "gh") {
+		const sub = args[0];
+		if (!sub || sub.expansion || !GH_SUBCOMMANDS.test(sub.text)) {
+			reasons.push(`gh may only run ${GH_SUBCOMMANDS.source.slice(2, -2).replaceAll("|", ", ")} here; other subcommands (extension, alias, auth, config, ...) run code or move the token: ${spelled}`);
+		} else if (sub.text === "repo") {
+			if (args[1]?.text !== "clone" || args[1].expansion) reasons.push(`gh repo may only clone here: ${spelled}`);
+			const dash = args.findIndex((arg) => arg.text === "--" && !arg.expansion);
+			if (dash !== -1) {
+				const gitArgs = args.slice(dash + 1);
+				for (let position = 0; position < gitArgs.length; position += 1) {
+					const arg = gitArgs[position];
+					if (!GH_CLONE_GIT_OPTIONS.test(arg.text) || arg.expansion) {
+						reasons.push(`gh repo clone may hand git only --depth <n>; ${arg.text} could configure the clone to run code: ${spelled}`);
+						break;
+					}
+					if (!/^[0-9]+$/.test(gitArgs[position + 1]?.text ?? "")) {
+						reasons.push(`gh repo clone -- --depth needs a literal number: ${spelled}`);
+						break;
+					}
+					position += 1;
+				}
+			}
+		}
+	}
+	if (name === "git") {
+		let position = 0;
+		while (position < args.length && args[position].text.startsWith("-")) {
+			const option = args[position];
+			if (option.text === "-C" && !option.expansion && args[position + 1]) position += 2;
+			else if (option.text === "-c" && !option.expansion && args[position + 1] && !args[position + 1].expansion && GIT_CONFIG_KEYS.test(args[position + 1].text)) position += 2;
+			else {
+				reasons.push(`git may carry only -C <dir> and -c user.name=/-c user.email= before its subcommand; ${option.text} could change what git runs: ${spelled}`);
+				return reasons;
+			}
+		}
+		const sub = args[position];
+		if (!sub || sub.expansion || !GIT_SUBCOMMANDS.test(sub.text)) {
+			reasons.push(`git may only run ${GIT_SUBCOMMANDS.source.slice(2, -2).replaceAll("|", ", ")} here: ${spelled}`);
+		}
+		for (const arg of args.slice(position + 1)) {
+			if (optionNameExpands(arg) || GIT_FORBIDDEN_OPTIONS.test(arg.text)) {
+				reasons.push(`git option ${arg.text} names a program or another configuration to use: ${spelled}`);
+			}
+		}
+	}
+	if (name === "tar") {
+		for (const arg of args) {
+			if (optionNameExpands(arg) || TAR_FORBIDDEN_OPTIONS.test(arg.text)) reasons.push(`tar option ${arg.text} runs a program or reads a list the checker cannot see: ${spelled}`);
+		}
+	}
+	if (name === "curl") {
+		let https = false;
+		for (const [position, arg] of args.entries()) {
+			if (arg.text === "--proto" && !arg.expansion && args[position + 1]?.text === "=https" && !args[position + 1].expansion) https = true;
+			if (optionNameExpands(arg) || CURL_FORBIDDEN_OPTIONS.test(arg.text)) reasons.push(`curl option ${arg.text} reads a config, weakens TLS or lets the server pick the output name: ${spelled}`);
+			if (/^https?:\/\//i.test(arg.text) && !/^https:\/\//.test(arg.text)) reasons.push(`curl must fetch https:// URLs only: ${spelled}`);
+		}
+		if (!https) reasons.push(`curl must pin --proto '=https' in ${describe}: ${spelled}`);
 	}
 	return reasons;
 }
@@ -978,7 +1323,7 @@ export function r2StepReasons(jobId, run, { last = false, artifactDirectories = 
 		while (first < command.words.length && /^(do|then|else|\{)$/.test(command.words[first].text)) first += 1;
 		const statement = command.words.slice(first);
 		const texts = statement.map((word) => word.text);
-		if (texts.length === 4 && texts[0] === "for" && texts[1] === "file" && texts[2] === "in" && !statement[3].expansion && texts[3].endsWith("/*") && artifactDirectories.includes(posix.normalize(texts[3].slice(0, -2)))) {
+		if (texts.length === 4 && texts[0] === "for" && texts[1] === "file" && texts[2] === "in" && !statement[3].expansion && texts[3].endsWith("/*") && isArtifactDirectory(texts[3].slice(0, -2), artifactDirectories) && !texts[3].split("/").some((segment) => segment === "." || segment === ".." || segment === "") && posix.normalize(texts[3].slice(0, -2)) === texts[3].slice(0, -2) && artifactDirectories.includes(texts[3].slice(0, -2))) {
 			bound.file = true;
 			bound.name = false;
 		} else if (texts.length === 1 && texts[0] === 'name=$(basename "$file")') {
@@ -1006,6 +1351,39 @@ export function r2StepReasons(jobId, run, { last = false, artifactDirectories = 
 			reasons.push(`${context}aws must name a literal service and operation: ${spelled}`);
 			return;
 		}
+		// Options first: every operation must go to the R2 endpoint the secret names, and nothing may
+		// point the CLI at another profile, region, endpoint or trust store.
+		const operationKey = service.text === "s3api" ? "s3api" : `${service.text} ${operation.text}`;
+		const allowedOptions = AWS_OPTIONS[operationKey];
+		const positionals = [];
+		let endpoints = 0;
+		for (let i = 2; i < args.length; i += 1) {
+			const arg = args[i];
+			if (arg.text.startsWith("-")) {
+				const values = allowedOptions?.[arg.text];
+				if (values === undefined || arg.expansion) {
+					reasons.push(`${context}aws ${operationKey} carries an option the checker does not allow: ${arg.text} (${spelled})`);
+					continue;
+				}
+				const value = args[i + 1];
+				if (arg.text === "--endpoint-url") {
+					endpoints += 1;
+					if (!value || !value.expansion || !AWS_ENDPOINT_VALUE.test(value.text)) {
+						reasons.push(`${context}aws --endpoint-url must be exactly "$R2_ENDPOINT_URL", the secret bound at step level, never ${value?.text ?? "nothing"} (${spelled})`);
+					}
+				} else if (arg.text === "--region") {
+					if (!value || AWS_REGION_VALUE.test(value.text) === false) {
+						reasons.push(`${context}aws --region may only be auto: ${value?.text ?? "nothing"} (${spelled})`);
+					}
+				}
+				i += values;
+				continue;
+			}
+			positionals.push(arg);
+		}
+		if (allowedOptions && endpoints !== 1) {
+			reasons.push(`${context}aws must carry --endpoint-url "$R2_ENDPOINT_URL" exactly once (found ${endpoints}): ${spelled}`);
+		}
 		if (service.text === "s3api") {
 			if (AWS_S3API_READS.test(operation.text)) return;
 			reasons.push(`${context}aws s3api ${operation.text} writes outside the 'aws s3 cp' allowlist: ${spelled}`);
@@ -1020,20 +1398,6 @@ export function r2StepReasons(jobId, run, { last = false, artifactDirectories = 
 			reasons.push(`${context}aws s3 ${operation.text} is not allowed; only 'aws s3 cp' with a spelled-out destination may write: ${spelled}`);
 			return;
 		}
-		const positionals = [];
-		for (let i = 2; i < args.length; i += 1) {
-			const arg = args[i];
-			if (arg.text.startsWith("-")) {
-				const values = AWS_CP_OPTIONS[arg.text];
-				if (values === undefined || arg.expansion) {
-					reasons.push(`${context}aws s3 cp carries an option the checker does not allow: ${arg.text} (${spelled})`);
-					return;
-				}
-				i += values;
-				continue;
-			}
-			positionals.push(arg);
-		}
 		if (positionals.length !== 2) {
 			reasons.push(`${context}aws s3 cp must name exactly one source and one destination: ${spelled}`);
 			return;
@@ -1043,8 +1407,10 @@ export function r2StepReasons(jobId, run, { last = false, artifactDirectories = 
 			if (!source.text.startsWith("s3://")) reasons.push(`${context}aws s3 cp copies between local paths: ${spelled}`);
 			return; // a download; where it lands is checked like any other path
 		}
+		// The source must be a downloaded artifact, spelled plainly: `artifacts/../x`, `./artifacts/x`,
+		// `/artifacts/x` and `~/artifacts/x` are not (review round 5, finding 3).
 		const sourceIsLoopFile = source.text === "$file" || source.text === "${file}";
-		const sourceIsArtifact = !source.expansion && !/[*?[]/.test(source.text) && artifactDirectories.some((directory) => source.text.startsWith(`${directory}/`));
+		const sourceIsArtifact = !source.expansion && isArtifactPath(source.text, artifactDirectories);
 		if (!(sourceIsLoopFile ? bound.file : sourceIsArtifact)) {
 			reasons.push(`${context}aws s3 cp uploads something other than a downloaded artifact: ${source.text} (${spelled})`);
 		}
@@ -1273,11 +1639,13 @@ export function checkWorkflows(read = (path) => readFileSync(path, "utf8"), list
 		}
 		for (const name of Object.keys(job.env ?? {})) {
 			if (STARTUP_ENV.test(name)) fail(`${RELEASE_WORKFLOW}: credential-bearing job '${jobId}' sets ${name}, which loads code before any command runs.`);
+			if (CREDENTIAL_ENV.test(name)) fail(`${RELEASE_WORKFLOW}: credential-bearing job '${jobId}' sets ${name}, which redirects where a credential is sent or which configuration a tool loads.`);
 		}
 		for (const step of job.steps ?? []) {
 			const label = step.name ?? step.uses ?? "(unnamed step)";
 			for (const name of Object.keys(step.env ?? {})) {
 				if (STARTUP_ENV.test(name)) fail(`${RELEASE_WORKFLOW}: credential-bearing job '${jobId}' sets ${name}, which loads code before any command runs (${label}).`);
+				if (CREDENTIAL_ENV.test(name)) fail(`${RELEASE_WORKFLOW}: credential-bearing job '${jobId}' sets ${name}, which redirects where a credential is sent or which configuration a tool loads (${label}).`);
 			}
 			const workingDirectory = step["working-directory"] ?? job.defaults?.run?.["working-directory"] ?? release.defaults?.run?.["working-directory"];
 			if (step["working-directory"] !== undefined && !isArtifactDirectory(String(step["working-directory"]), artifactDirectories)) {
@@ -1297,13 +1665,9 @@ export function checkWorkflows(read = (path) => readFileSync(path, "utf8"), list
 				}
 			}
 			const run = String(step.run ?? "");
-			const options = { artifactDirectories, workingDirectory: workingDirectory === undefined ? "" : String(workingDirectory) };
+			const options = { artifactDirectories, workingDirectory: workingDirectory === undefined ? "" : String(workingDirectory), jobId };
 			for (const reason of credentialStepReasons(run, options)) {
-				if (reason.includes("changes directory")) {
-					fail(`${RELEASE_WORKFLOW}: credential-bearing job '${jobId}' ${reason} (${label}).`);
-				} else {
-					fail(`${RELEASE_WORKFLOW}: credential-bearing job '${jobId}' must not run repository code: ${reason} (${label}).`);
-				}
+				fail(`${RELEASE_WORKFLOW}: credential-bearing job '${jobId}' ${reason} (${label}).`);
 			}
 		}
 	}
@@ -1345,7 +1709,7 @@ export function checkWorkflows(read = (path) => readFileSync(path, "utf8"), list
 			for (const [scope, env] of environments) {
 				for (const [name, source] of Object.entries(R2_ENV_SOURCES)) {
 					if (env[name] !== undefined && !source.test(String(env[name]))) {
-						fail(`${RELEASE_WORKFLOW}: job '${jobId}' ${scope} sets ${name} to '${env[name]}'; the R2 destinations may only be built from the ${name.endsWith("VERSION") ? "context output" : "secret"}.`);
+						fail(`${RELEASE_WORKFLOW}: job '${jobId}' ${scope} sets ${name} to '${env[name]}'; ${name === "AWS_DEFAULT_REGION" ? "R2 only takes the region 'auto'" : `the R2 destinations may only be built from the ${name.endsWith("VERSION") ? "context output" : "secret"}`}.`);
 					}
 				}
 			}
@@ -1370,6 +1734,64 @@ export function checkWorkflows(read = (path) => readFileSync(path, "utf8"), list
 		const publishIndex = steps.findIndex((step) => /gh release edit .*--draft=false/.test(String(step.run ?? "")));
 		if (publishIndex === -1 || (pointerIndex !== -1 && publishIndex > pointerIndex)) {
 			fail(`${RELEASE_WORKFLOW}: job '${POINTER_JOB}' must publish the GitHub release before it moves the channel pointers.`);
+		}
+	}
+
+	// Review round 5, finding 4: the beta SHA256SUMS is signed and the bundle is published next to it,
+	// or every compiled beta install's `prime-agent update` fails closed.
+	{
+		const contract = BETA_SIGNATURES;
+		const sign = release.jobs[contract.signJob];
+		const publish = release.jobs[contract.publishJob];
+		const downloads = (job, name) => (job?.steps ?? []).filter((step) => step.uses?.startsWith("actions/download-artifact@") && step.with?.name === name);
+		if (!sign) fail(`${RELEASE_WORKFLOW}: expected a job named '${contract.signJob}' to sign the beta SHA256SUMS.`);
+		else {
+			const condition = String(sign.if ?? "");
+			if (!/needs\.context\.outputs\.publish_beta\s*==\s*'true'/.test(condition)) {
+				fail(`${RELEASE_WORKFLOW}: job '${contract.signJob}' must also run when needs.context.outputs.publish_beta == 'true'; an unsigned beta makes every compiled beta install's updater fail closed (if: ${condition.trim()}).`);
+			}
+			if (downloads(sign, contract.artifactsArtifact).length === 0) {
+				fail(`${RELEASE_WORKFLOW}: job '${contract.signJob}' must download '${contract.artifactsArtifact}' to sign the beta SHA256SUMS.`);
+			}
+			const upload = (sign.steps ?? []).find((step) => step.uses?.startsWith("actions/upload-artifact@") && step.with?.name === contract.artifact);
+			if (!upload) fail(`${RELEASE_WORKFLOW}: job '${contract.signJob}' must upload an artifact named '${contract.artifact}'.`);
+			else if (!String(upload.with?.path ?? "").split("\n").some((line) => line.trim().endsWith(`/${contract.bundle}`))) {
+				fail(`${RELEASE_WORKFLOW}: job '${contract.signJob}' artifact '${contract.artifact}' must contain ${contract.bundle} (path: ${String(upload.with?.path ?? "").trim()}).`);
+			}
+			const signs = (sign.steps ?? []).some((step) => new RegExp(`cosign sign-blob[^\\n]*--bundle \\S+/${contract.bundle.replaceAll(".", "\\.")}[^\\n]*\\n?[^\\n]*beta-artifacts/SHA256SUMS`).test(joinContinuations(String(step.run ?? "")).join("\n")));
+			if (!signs) fail(`${RELEASE_WORKFLOW}: job '${contract.signJob}' must run 'cosign sign-blob --yes --bundle <dir>/${contract.bundle} beta-artifacts/SHA256SUMS' for the beta.`);
+		}
+		if (!publish) fail(`${RELEASE_WORKFLOW}: expected a job named '${contract.publishJob}'.`);
+		else {
+			if (!needsOf(publish).includes(contract.signJob)) fail(`${RELEASE_WORKFLOW}: job '${contract.publishJob}' must need '${contract.signJob}' so the beta bundle exists before the beta is published.`);
+			const artifacts = downloads(publish, contract.artifactsArtifact);
+			const bundles = downloads(publish, contract.artifact);
+			if (artifacts.length !== 1 || bundles.length !== 1) {
+				fail(`${RELEASE_WORKFLOW}: job '${contract.publishJob}' must download '${contract.artifactsArtifact}' and '${contract.artifact}' exactly once each.`);
+			} else if (String(artifacts[0].with?.path) !== String(bundles[0].with?.path)) {
+				fail(`${RELEASE_WORKFLOW}: job '${contract.publishJob}' must download '${contract.artifact}' into the same directory as '${contract.artifactsArtifact}' (${artifacts[0].with?.path}) so the upload loop publishes ${contract.bundle} next to SHA256SUMS.`);
+			}
+			const directory = String(artifacts[0]?.with?.path ?? "artifacts");
+			const steps = publish.steps ?? [];
+			const uploadIndex = steps.findIndex((step) => step.name === contract.uploadStep);
+			if (uploadIndex === -1) fail(`${RELEASE_WORKFLOW}: job '${contract.publishJob}' must keep the step '${contract.uploadStep}'.`);
+			else {
+				const run = String(steps[uploadIndex].run ?? "");
+				if (!run.includes(`for file in ${directory}/*; do`)) fail(`${RELEASE_WORKFLOW}: job '${contract.publishJob}' step '${contract.uploadStep}' must upload every file in ${directory}/, including ${contract.bundle}.`);
+				if (casePatternMatches(run, contract.bundle)) fail(`${RELEASE_WORKFLOW}: job '${contract.publishJob}' step '${contract.uploadStep}' skips ${contract.bundle}; the bundle must be published next to SHA256SUMS.`);
+			}
+			const verifyIndex = steps.findIndex((step) => {
+				const lines = joinContinuations(String(step.run ?? ""));
+				return lines.some((line) => line.includes("cosign verify-blob") && line.includes(`--bundle ${directory}/${contract.bundle}`) && line.includes(`--certificate-oidc-issuer ${contract.issuer}`) && line.includes(`--certificate-identity "${contract.identity}"`) && /\s\S*\/SHA256SUMS\s*$/.test(line) && line.includes(`${directory}/SHA256SUMS`));
+			});
+			if (verifyIndex === -1) {
+				fail(`${RELEASE_WORKFLOW}: job '${contract.publishJob}' must run 'cosign verify-blob --bundle ${directory}/${contract.bundle} --certificate-oidc-issuer ${contract.issuer} --certificate-identity "${contract.identity}" ${directory}/SHA256SUMS' before uploading.`);
+			} else if (uploadIndex !== -1 && verifyIndex > uploadIndex) {
+				fail(`${RELEASE_WORKFLOW}: job '${contract.publishJob}' must verify the beta bundle before '${contract.uploadStep}'.`);
+			}
+			if (String(publish.env?.DEFAULT_BRANCH ?? "") !== contract.defaultBranch) {
+				fail(`${RELEASE_WORKFLOW}: job '${contract.publishJob}' must set DEFAULT_BRANCH to ${contract.defaultBranch}; the beta bundle identity is pinned to refs/heads/<default branch>.`);
+			}
 		}
 	}
 
