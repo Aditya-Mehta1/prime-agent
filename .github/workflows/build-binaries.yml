@@ -3,13 +3,27 @@ name: Release Prime Agent
 # Job graph (no job holds both a credential and repository code):
 #
 #   context -> standalone -> build -> validate-macos -> assemble -> sign
-#     assemble+sign -> github-release (DRAFT, records every asset digest)
+#     assemble+sign -> github-release (DRAFT: no tag is created for a draft;
+#                      refuses an existing v* tag at another commit; records
+#                      every asset digest GitHub stored)
 #       -> publish-r2 (no checkout; verifies against the GitHub digests,
-#                      refuses to overwrite, reads back, then moves pointers)
-#         -> finalize-release (undraft; the tag is created LAST)
-#           -> verify (clean runner, public URL, cosign + digests + --version)
-#           -> publish-npm / tap-bump (inert until enabled by a repository var)
+#                      writes ONLY the immutable releases/v<ver>/ objects,
+#                      refuses to overwrite, reads back. Moves NO pointer.)
+#         -> verify (clean runner; downloads the immutable prefix from the
+#                    public URL; cosign identity pinned to this workflow on
+#                    the default branch; digests; runs --version)
+#           -> finalize-release (re-checks the tag and the draft assets,
+#                    undrafts -> the v<ver> tag appears, proves tag == BUILD_REF,
+#                    and as its LAST step advances stable/latest.json/install.sh)
+#             -> publish-npm (from pack-npm, an unprivileged build job that
+#                    needs verify) / tap-bump - both inert until a repository
+#                    variable enables them
 #     assemble -> publish-beta-r2 -> github-release-beta (beta prefix only)
+#
+# Until finalize-release runs, nothing a user follows (the stable/latest.json
+# pointers, install.sh, the GitHub release, the tag) refers to the new version;
+# only the content-addressed releases/v<ver>/ objects exist, and verify has to
+# accept them before anything points at them.
 #
 # Tag pushes deliberately do NOT release; the release job creates the tag.
 # scripts/resolve-release-context.mjs decides whether a production publish may run
@@ -576,7 +590,53 @@ jobs:
           name: release-notes
           path: notes
 
+      - name: Refuse an existing tag at another commit
+        run: |
+          set -euo pipefail
+          TAG="v${PRODUCTION_VERSION}"
+          [[ "$BUILD_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "BUILD_REF is not a full commit SHA: $BUILD_REF" >&2; exit 1; }
+          # Prints the commit an existing tag points at (annotated tags are peeled),
+          # nothing when the tag does not exist, and fails on any other API error.
+          # Every check returns explicitly: `set -e` does not reach into a $(...)
+          # subshell, and this function is called from one.
+          resolve_tag_commit() {
+            local tag="$1" ref type sha
+            if ! ref=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" 2>/tmp/ref-error); then
+              if grep -q 'HTTP 404' /tmp/ref-error; then return 0; fi
+              cat /tmp/ref-error >&2
+              return 1
+            fi
+            if [ "$(jq -r .ref <<<"$ref")" != "refs/tags/${tag}" ]; then
+              echo "Unexpected ref answer for ${tag}: ${ref}" >&2
+              return 1
+            fi
+            type=$(jq -r .object.type <<<"$ref") || return 1
+            sha=$(jq -r .object.sha <<<"$ref") || return 1
+            if [ "$type" = tag ]; then
+              sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${sha}" --jq .object.sha) || return 1
+            fi
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "Tag ${tag} resolved to a non-SHA: ${sha}" >&2; return 1; }
+            printf '%s\n' "$sha"
+          }
+          tagged=$(resolve_tag_commit "$TAG")
+          if [ -n "$tagged" ] && [ "$tagged" != "$BUILD_REF" ]; then
+            # `gh release create --target` never moves an existing tag, so the
+            # assets built from BUILD_REF would be published under a tag that
+            # points somewhere else. Refuse.
+            echo "Tag ${TAG} already points at ${tagged}, not ${BUILD_REF}; refusing to publish." >&2
+            exit 1
+          fi
+          echo "Tag ${TAG}: ${tagged:-absent}"
+
       - name: Create or refresh the draft release
+        # A DRAFT does not create the git tag. The REST API creates
+        # refs/tags/<tag_name> from target_commitish only when the release is
+        # published (draft=false); `gh release create --draft` is that same POST
+        # with draft=true followed by the asset uploads. The tag therefore first
+        # exists in finalize-release, which proves it points at BUILD_REF.
+        # (docs.github.com/rest/releases/releases#create-a-release; GitHub staff
+        # in github.com/orgs/community/discussions/24690: "when creating a draft
+        # release the git tag is not being created".)
         run: |
           set -euo pipefail
           TAG="v${PRODUCTION_VERSION}"
@@ -594,6 +654,40 @@ jobs:
               --target "$BUILD_REF" \
               --notes-file notes/RELEASE_NOTES.md \
               artifacts/*
+          fi
+          # The draft must still be a draft and must target BUILD_REF.
+          gh release view "$TAG" --json isDraft,targetCommitish > /tmp/release.json
+          test "$(jq -r .isDraft /tmp/release.json)" = true
+          test "$(jq -r .targetCommitish /tmp/release.json)" = "$BUILD_REF"
+          # Creating the draft must not have created the tag; if it did, the tag
+          # has to point at BUILD_REF.
+          # Prints the commit an existing tag points at (annotated tags are peeled),
+          # nothing when the tag does not exist, and fails on any other API error.
+          # Every check returns explicitly: `set -e` does not reach into a $(...)
+          # subshell, and this function is called from one.
+          resolve_tag_commit() {
+            local tag="$1" ref type sha
+            if ! ref=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" 2>/tmp/ref-error); then
+              if grep -q 'HTTP 404' /tmp/ref-error; then return 0; fi
+              cat /tmp/ref-error >&2
+              return 1
+            fi
+            if [ "$(jq -r .ref <<<"$ref")" != "refs/tags/${tag}" ]; then
+              echo "Unexpected ref answer for ${tag}: ${ref}" >&2
+              return 1
+            fi
+            type=$(jq -r .object.type <<<"$ref") || return 1
+            sha=$(jq -r .object.sha <<<"$ref") || return 1
+            if [ "$type" = tag ]; then
+              sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${sha}" --jq .object.sha) || return 1
+            fi
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "Tag ${tag} resolved to a non-SHA: ${sha}" >&2; return 1; }
+            printf '%s\n' "$sha"
+          }
+          tagged=$(resolve_tag_commit "$TAG")
+          if [ -n "$tagged" ] && [ "$tagged" != "$BUILD_REF" ]; then
+            echo "Tag ${TAG} points at ${tagged}, not ${BUILD_REF}, after drafting the release." >&2
+            exit 1
           fi
 
       - name: Record the digest GitHub stored for every asset
@@ -648,7 +742,10 @@ jobs:
       PRODUCTION_VERSION: ${{ needs.context.outputs.production_version }}
     steps:
       # No checkout, no dependency install, no repository code. The credential
-      # only exists in the env of the two steps that talk to R2.
+      # only exists in the env of the single step that talks to R2. This job
+      # writes the content-addressed releases/v<ver>/ objects and nothing else:
+      # the channel pointers (stable, latest.json, install.sh, install-beta.sh)
+      # move in finalize-release, after verify has accepted these objects.
       - name: Download assembled production artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -741,67 +838,9 @@ jobs:
             echo "published ${key}"
           done
 
-      - name: Advance the production channel pointers
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_DEFAULT_REGION: auto
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
-          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-        run: |
-          set -euo pipefail
-          publish_pointer() {
-            local file="$1" key="$2" type="$3"
-            local expected
-            expected=$(sha256sum "$file" | cut -d' ' -f1)
-            aws s3 cp "$file" "s3://${R2_BUCKET}/${key}" \
-              --endpoint-url "$R2_ENDPOINT_URL" \
-              --content-type "$type" \
-              --cache-control no-cache \
-              --quiet
-            aws s3 cp "s3://${R2_BUCKET}/${key}" /tmp/pointer.bin --endpoint-url "$R2_ENDPOINT_URL" --quiet
-            local actual
-            actual=$(sha256sum /tmp/pointer.bin | cut -d' ' -f1)
-            rm -f /tmp/pointer.bin
-            test "$actual" = "$expected"
-            echo "pointer ${key}"
-          }
-
-          publish_pointer artifacts/latest.json latest.json application/json
-          publish_pointer artifacts/stable stable text/plain
-          publish_pointer artifacts/install.sh install.sh text/x-shellscript
-          publish_pointer artifacts/install-beta.sh install-beta.sh text/x-shellscript
-
-  finalize-release:
-    name: Publish GitHub release
-    needs: [context, publish-r2]
-    if: github.event_name != 'pull_request' && needs.context.outputs.publish_production == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    env:
-      BUILD_REF: ${{ needs.context.outputs.build_ref }}
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      PRODUCTION_VERSION: ${{ needs.context.outputs.production_version }}
-    steps:
-      - name: Undraft the release and create the tag last
-        run: |
-          set -euo pipefail
-          TAG="v${PRODUCTION_VERSION}"
-          gh release edit "$TAG" --draft=false --latest
-          # Undrafting creates the tag from the release target. Create it
-          # explicitly if GitHub did not, so the tag can never be missing.
-          if ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
-            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-              -f ref="refs/tags/${TAG}" \
-              -f sha="$BUILD_REF" >/dev/null
-          fi
-          tagged=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" --jq .object.sha)
-          echo "Tag ${TAG} -> ${tagged}"
-
   verify:
-    name: Verify published release
-    needs: [context, finalize-release]
+    name: Verify the immutable release objects
+    needs: [context, publish-r2]
     if: github.event_name != 'pull_request' && needs.context.outputs.publish_production == 'true'
     runs-on: ubuntu-latest
     permissions: {}
@@ -811,11 +850,14 @@ jobs:
       R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
     steps:
       # A clean runner, no repository checkout, no artifacts from this run: this
-      # job only sees what a user sees.
+      # job only sees what a user will see. It runs BEFORE finalize-release, so
+      # it reads the content-addressed releases/v<ver>/ prefix directly; no
+      # pointer, release or tag refers to this version yet, and none will unless
+      # this job passes.
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
-      - name: Download the published release from the public URL
+      - name: Download the immutable release objects from the public URL
         run: |
           set -euo pipefail
           test -n "$R2_PUBLIC_BASE_URL"
@@ -851,6 +893,195 @@ jobs:
           chmod +x extracted/prime-agent
           extracted/prime-agent --version | tee version.txt
           grep -q "$PRODUCTION_VERSION" version.txt
+
+  finalize-release:
+    name: Publish the release and advance the channel
+    needs: [context, verify]
+    if: github.event_name != 'pull_request' && needs.context.outputs.publish_production == 'true'
+    runs-on: ubuntu-latest
+    # The same protected environment as publish-r2: a manual release is approved
+    # once for the immutable upload and once more for making it public.
+    environment:
+      name: ${{ needs.context.outputs.publish_environment }}
+    permissions:
+      contents: write
+    env:
+      BUILD_REF: ${{ needs.context.outputs.build_ref }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PRODUCTION_VERSION: ${{ needs.context.outputs.production_version }}
+    steps:
+      # No checkout, no dependency install, no repository code. This is the only
+      # job that makes the version reachable: it undrafts the GitHub release
+      # (which creates the tag), proves the tag points at BUILD_REF, and only
+      # then moves stable / latest.json / install.sh. The R2 credential exists in
+      # the env of that last step alone.
+      - name: Download assembled production artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-final-production
+          path: artifacts
+
+      - name: Download signatures
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-signatures
+          path: artifacts
+
+      - name: Download the GitHub asset digest manifest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: github-asset-digests
+          path: manifest
+
+      - name: Verify every artifact against the digest GitHub recorded
+        run: |
+          set -euo pipefail
+          test -s manifest/github-assets.json
+          count=0
+          while IFS=$'\t' read -r name digest; do
+            test -f "artifacts/$name"
+            local_digest="sha256:$(sha256sum "artifacts/$name" | cut -d' ' -f1)"
+            test "$local_digest" = "$digest"
+            count=$((count + 1))
+          done < <(jq -r '.[] | [.name, .digest] | @tsv' manifest/github-assets.json)
+          test "$count" -gt 0
+          for file in artifacts/*; do
+            name=$(basename "$file")
+            jq -e --arg name "$name" 'any(.[]; .name == $name)' manifest/github-assets.json >/dev/null
+          done
+          for pointer in latest.json stable install.sh install-beta.sh; do
+            test -f "artifacts/${pointer}"
+          done
+          echo "Verified $count artifacts against the GitHub release digests."
+
+      - name: Refuse an existing tag at another commit and re-check the draft
+        run: |
+          set -euo pipefail
+          TAG="v${PRODUCTION_VERSION}"
+          [[ "$BUILD_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "BUILD_REF is not a full commit SHA: $BUILD_REF" >&2; exit 1; }
+          # Prints the commit an existing tag points at (annotated tags are peeled),
+          # nothing when the tag does not exist, and fails on any other API error.
+          # Every check returns explicitly: `set -e` does not reach into a $(...)
+          # subshell, and this function is called from one.
+          resolve_tag_commit() {
+            local tag="$1" ref type sha
+            if ! ref=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" 2>/tmp/ref-error); then
+              if grep -q 'HTTP 404' /tmp/ref-error; then return 0; fi
+              cat /tmp/ref-error >&2
+              return 1
+            fi
+            if [ "$(jq -r .ref <<<"$ref")" != "refs/tags/${tag}" ]; then
+              echo "Unexpected ref answer for ${tag}: ${ref}" >&2
+              return 1
+            fi
+            type=$(jq -r .object.type <<<"$ref") || return 1
+            sha=$(jq -r .object.sha <<<"$ref") || return 1
+            if [ "$type" = tag ]; then
+              sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${sha}" --jq .object.sha) || return 1
+            fi
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "Tag ${tag} resolved to a non-SHA: ${sha}" >&2; return 1; }
+            printf '%s\n' "$sha"
+          }
+          tagged=$(resolve_tag_commit "$TAG")
+          if [ -n "$tagged" ] && [ "$tagged" != "$BUILD_REF" ]; then
+            echo "Tag ${TAG} already points at ${tagged}, not ${BUILD_REF}; refusing to publish." >&2
+            exit 1
+          fi
+          # The release must still be the draft github-release created, aimed at
+          # BUILD_REF, and its assets must still be exactly the bytes whose
+          # digests github-release recorded (a draft is editable by anyone with
+          # write access until this step publishes it).
+          gh release view "$TAG" --json isDraft,targetCommitish > /tmp/release.json
+          test "$(jq -r .isDraft /tmp/release.json)" = true
+          test "$(jq -r .targetCommitish /tmp/release.json)" = "$BUILD_REF"
+          release_id=$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+            --jq ".[] | select(.tag_name == \"${TAG}\") | .id" | head -n 1)
+          test -n "$release_id"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets" --paginate \
+            --jq '[.[] | {name: .name, digest: .digest}] | sort_by(.name)' > /tmp/current-assets.json
+          jq '[.[] | {name: .name, digest: .digest}] | sort_by(.name)' manifest/github-assets.json > /tmp/recorded-assets.json
+          if ! cmp -s /tmp/current-assets.json /tmp/recorded-assets.json; then
+            echo "The draft release assets no longer match the digests recorded by github-release:" >&2
+            diff /tmp/recorded-assets.json /tmp/current-assets.json >&2 || true
+            exit 1
+          fi
+          echo "Draft ${TAG} targets ${BUILD_REF}; tag ${tagged:-absent}; $(jq length /tmp/current-assets.json) assets unchanged."
+
+      - name: Publish the release and prove the tag points at BUILD_REF
+        run: |
+          set -euo pipefail
+          TAG="v${PRODUCTION_VERSION}"
+          # Prints the commit an existing tag points at (annotated tags are peeled),
+          # nothing when the tag does not exist, and fails on any other API error.
+          # Every check returns explicitly: `set -e` does not reach into a $(...)
+          # subshell, and this function is called from one.
+          resolve_tag_commit() {
+            local tag="$1" ref type sha
+            if ! ref=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" 2>/tmp/ref-error); then
+              if grep -q 'HTTP 404' /tmp/ref-error; then return 0; fi
+              cat /tmp/ref-error >&2
+              return 1
+            fi
+            if [ "$(jq -r .ref <<<"$ref")" != "refs/tags/${tag}" ]; then
+              echo "Unexpected ref answer for ${tag}: ${ref}" >&2
+              return 1
+            fi
+            type=$(jq -r .object.type <<<"$ref") || return 1
+            sha=$(jq -r .object.sha <<<"$ref") || return 1
+            if [ "$type" = tag ]; then
+              sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${sha}" --jq .object.sha) || return 1
+            fi
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "Tag ${tag} resolved to a non-SHA: ${sha}" >&2; return 1; }
+            printf '%s\n' "$sha"
+          }
+          # Publishing the draft is what creates the tag, from the release target.
+          gh release edit "$TAG" --draft=false --latest
+          # Create it explicitly if GitHub did not, so the tag can never be missing.
+          if [ -z "$(resolve_tag_commit "$TAG")" ]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${TAG}" \
+              -f sha="$BUILD_REF" >/dev/null
+          fi
+          tagged=$(resolve_tag_commit "$TAG")
+          if [ "$tagged" != "$BUILD_REF" ]; then
+            echo "Tag ${TAG} points at ${tagged:-nothing}, not ${BUILD_REF}." >&2
+            exit 1
+          fi
+          test "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = false
+          echo "Published ${TAG} -> ${tagged}"
+
+      - name: Advance the production channel pointers
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_DEFAULT_REGION: auto
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+        run: |
+          set -euo pipefail
+          test -n "$R2_BUCKET"
+          test -n "$R2_ENDPOINT_URL"
+          publish_pointer() {
+            local file="$1" key="$2" type="$3"
+            local expected
+            expected=$(sha256sum "$file" | cut -d' ' -f1)
+            aws s3 cp "$file" "s3://${R2_BUCKET}/${key}" \
+              --endpoint-url "$R2_ENDPOINT_URL" \
+              --content-type "$type" \
+              --cache-control no-cache \
+              --quiet
+            aws s3 cp "s3://${R2_BUCKET}/${key}" /tmp/pointer.bin --endpoint-url "$R2_ENDPOINT_URL" --quiet
+            local actual
+            actual=$(sha256sum /tmp/pointer.bin | cut -d' ' -f1)
+            rm -f /tmp/pointer.bin
+            test "$actual" = "$expected"
+            echo "pointer ${key}"
+          }
+
+          publish_pointer artifacts/latest.json latest.json application/json
+          publish_pointer artifacts/stable stable text/plain
+          publish_pointer artifacts/install.sh install.sh text/x-shellscript
+          publish_pointer artifacts/install-beta.sh install-beta.sh text/x-shellscript
 
   publish-beta-r2:
     name: Publish beta to R2
@@ -1028,21 +1259,18 @@ jobs:
 
           gh release upload beta artifacts/* --clobber
 
-  publish-npm:
-    name: Publish to npm
+  pack-npm:
+    name: Pack npm packages
     needs: [context, verify]
-    # Inert until Kevin sets the NPM_PUBLISH_ENABLED variable, the npm org and the
-    # per-package trusted publishers exist. No NPM_TOKEN: publishing is OIDC only.
+    # Unprivileged: repository code runs here, no credential does. Inert until
+    # NPM_PUBLISH_ENABLED is set, like publish-npm.
     if: >-
       github.event_name != 'pull_request'
       && needs.context.outputs.publish_production == 'true'
       && vars.NPM_PUBLISH_ENABLED == 'true'
     runs-on: ubuntu-latest
-    environment:
-      name: release-npm
     permissions:
       contents: read
-      id-token: write
     env:
       BUILD_REF: ${{ needs.context.outputs.build_ref }}
       PRODUCTION_VERSION: ${{ needs.context.outputs.production_version }}
@@ -1056,9 +1284,18 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          # Node 24 ships npm >= 11.5.1, which trusted publishing requires.
-          node-version: '24'
-          registry-url: 'https://registry.npmjs.org'
+          node-version: '22'
+
+      - name: Install dependencies
+        # Same allowlist as the build job: no install scripts except esbuild's.
+        run: |
+          npm ci --ignore-scripts
+          npm rebuild esbuild
+
+      - name: Build
+        # pack-npm-packages.mjs stages each package's dist/, which a fresh checkout
+        # does not have.
+        run: npm run build
 
       - name: Download assembled production artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -1076,28 +1313,73 @@ jobs:
             --archives release-artifacts/production \
             --receipts release-artifacts/production/latest.json \
             --out-dir npm-packages
+          test -s npm-packages/manifest.json
+          ls -l npm-packages/artifacts
+
+      - name: Upload the npm package set
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: npm-packages
+          path: |
+            npm-packages/artifacts/*.tgz
+            npm-packages/manifest.json
+          if-no-files-found: error
+
+  publish-npm:
+    name: Publish to npm
+    needs: [context, pack-npm, finalize-release]
+    # Inert until Kevin sets the NPM_PUBLISH_ENABLED variable, the npm org and the
+    # per-package trusted publishers exist. No NPM_TOKEN: publishing is OIDC only.
+    if: >-
+      github.event_name != 'pull_request'
+      && needs.context.outputs.publish_production == 'true'
+      && vars.NPM_PUBLISH_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: release-npm
+    permissions:
+      id-token: write
+    steps:
+      # No checkout, no dependency install, no repository code: the OIDC token
+      # that npm trusts only ever meets the tarballs pack-npm staged.
+      - name: Download the npm package set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: npm-packages
+          path: npm-packages
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # Node 24 ships npm >= 11.5.1, which trusted publishing requires.
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
 
       - name: Publish every package with provenance
         run: |
           set -euo pipefail
+          test -s npm-packages/manifest.json
           # manifest.json records the dependency-safe publish order: platform binaries, then
-          # libraries, then the front door and its mirror last.
-          mapfile -t tarballs < <(node -e '
-            const manifest = require("./npm-packages/manifest.json");
-            for (const name of manifest.publishOrder) {
-              const entry = manifest.packages.find((candidate) => candidate.name === name);
-              if (!entry || !entry.tarball) throw new Error(`No tarball staged for ${name}`);
-              console.log(entry.tarball);
-            }
-          ')
-          test "${#tarballs[@]}" -gt 0
-          for tarball in "${tarballs[@]}"; do
-            npm publish "npm-packages/artifacts/${tarball}" --provenance --access public --ignore-scripts
+          # libraries, then the front door and its mirror last. Every tarball is re-hashed
+          # against the manifest before it is published.
+          names=()
+          while IFS= read -r name; do names+=("$name"); done < <(jq -r '.publishOrder[]' npm-packages/manifest.json)
+          test "${#names[@]}" -gt 0
+          for name in "${names[@]}"; do
+            tarball=$(jq -r --arg name "$name" '.packages[] | select(.name == $name) | .tarball // empty' npm-packages/manifest.json)
+            expected=$(jq -r --arg name "$name" '.packages[] | select(.name == $name) | .sha256 // empty' npm-packages/manifest.json)
+            test -n "$tarball" || { echo "No tarball staged for ${name}" >&2; exit 1; }
+            test -n "$expected" || { echo "No sha256 recorded for ${name}" >&2; exit 1; }
+            path="npm-packages/artifacts/${tarball}"
+            test -f "$path"
+            actual=$(sha256sum "$path" | cut -d' ' -f1)
+            test "$actual" = "$expected" || { echo "Digest mismatch for ${tarball}" >&2; exit 1; }
+            npm publish "$path" --provenance --access public --ignore-scripts
           done
 
   tap-bump:
     name: Bump the Homebrew tap formula
-    needs: [context, verify]
+    needs: [context, finalize-release]
     # Inert until the tap repository exists and HOMEBREW_TAP_REPO is set.
     if: >-
       github.event_name != 'pull_request'

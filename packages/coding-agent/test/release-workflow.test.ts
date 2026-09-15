@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { type SpawnSyncReturns, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -7,6 +7,7 @@ import { parse } from "yaml";
 
 interface Step {
 	name?: string;
+	env?: Record<string, string>;
 	run?: string;
 	uses?: string;
 	if?: string;
@@ -15,6 +16,8 @@ interface Step {
 }
 interface Job {
 	needs?: string | string[];
+	env?: Record<string, string>;
+	permissions?: Record<string, string>;
 	environment?: { name?: string } | string;
 	if?: string;
 	"continue-on-error"?: boolean;
@@ -97,11 +100,14 @@ describe("release workflow signature gates", () => {
 			"github-release",
 			"github-release-beta",
 			"finalize-release",
+			"publish-npm",
 			"tap-bump",
 		];
 		for (const entry of Object.values(release.jobs)) {
 			const writes = (entry.steps ?? []).filter((candidate) =>
-				/aws s3 cp|gh release (?:upload|create|edit)|gh api --method/.test(candidate.run ?? ""),
+				/aws s3 cp|gh release (?:upload|create|edit)|gh api --method|npm publish|git push/.test(
+					candidate.run ?? "",
+				),
 			);
 			if (writes.length === 0) continue;
 			expect(publishers).toContain(Object.keys(release.jobs).find((name) => release.jobs[name] === entry));
@@ -238,6 +244,346 @@ ${step(validation, "Verify and exercise exact final Mac archives").run}`,
 				expect(release.jobs["publish-r2"]!.environment).toEqual({
 					name: `\${{ needs.context.outputs.publish_environment }}`,
 				});
+			} finally {
+				rmSync(directory, { recursive: true, force: true });
+			}
+		},
+	);
+});
+
+function runStepScript(script: string, shims: string, env: Record<string, string>): SpawnSyncReturns<string> {
+	return spawnSync("bash", ["-e", "-o", "pipefail", "-c", `${shims}\n${script}`], {
+		cwd: mkdtempSync(join(tmpdir(), "prime-release-step-")),
+		env: { ...process.env, ...env },
+		encoding: "utf8",
+	});
+}
+
+const BUILD_REF = "1111111111111111111111111111111111111111";
+const OTHER_REF = "2222222222222222222222222222222222222222";
+const TAG_OBJECT = "3333333333333333333333333333333333333333";
+
+/** A `gh` shim whose `api repos/<r>/git/ref/tags/<tag>` answers with the given fixture. */
+function ghTagShim(
+	ref: { object: { type: string; sha: string }; ref?: string } | "404" | "500",
+	peeled = OTHER_REF,
+): string {
+	const body = ref === "404" || ref === "500" ? "" : JSON.stringify({ ref: ref.ref ?? "refs/tags/v1.2.3", ...ref });
+	return `
+gh() {
+  case "$*" in
+    "api repos/o/r/git/ref/tags/v1.2.3")
+      ${ref === "404" ? 'echo "gh: Not Found (HTTP 404)" >&2; return 1' : ""}
+      ${ref === "500" ? 'echo "gh: Internal Server Error (HTTP 500)" >&2; return 1' : ""}
+      printf '%s' '${body}' ;;
+    "api repos/o/r/git/tags/${TAG_OBJECT} --jq .object.sha")
+      echo "${peeled}" ;;
+    *) echo "unexpected gh call: $*" >&2; return 99 ;;
+  esac
+}
+`;
+}
+
+describe("release ordering: nothing is public before verification", () => {
+	const githubRelease = release.jobs["github-release"]!;
+	const publish = release.jobs["publish-r2"]!;
+	const verify = release.jobs.verify!;
+	const finalize = release.jobs["finalize-release"]!;
+
+	it("chains github-release -> publish-r2 -> verify -> finalize-release -> publish-npm / tap-bump", () => {
+		expect(publish.needs).toContain("github-release");
+		expect(verify.needs).toContain("publish-r2");
+		expect(verify.needs).not.toContain("finalize-release");
+		expect(finalize.needs).toContain("verify");
+		expect(release.jobs["pack-npm"]!.needs).toContain("verify");
+		expect(release.jobs["publish-npm"]!.needs).toEqual(expect.arrayContaining(["pack-npm", "finalize-release"]));
+		expect(release.jobs["tap-bump"]!.needs).toContain("finalize-release");
+		for (const job of [githubRelease, publish, verify, finalize]) requiresSuccess(job);
+	});
+
+	it("publish-r2 writes only the immutable prefix and never a channel pointer", () => {
+		const names = publish.steps.map((entry) => entry.name);
+		expect(names).not.toContain("Advance the production channel pointers");
+		const upload = step(publish, "Upload immutable release objects");
+		expect(upload.run).toContain(`prefix="releases/v\${PRODUCTION_VERSION}"`);
+		expect(upload.run).toContain("stable|latest.json) continue ;;");
+		for (const entry of publish.steps) {
+			expect(entry.run ?? "").not.toMatch(
+				/s3:\/\/\$\{R2_BUCKET\}\/(?:stable|latest\.json|install\.sh|install-beta\.sh)\b/,
+			);
+			expect(entry.run ?? "").not.toContain("publish_pointer");
+		}
+	});
+
+	it("verify reads the immutable prefix from the public URL with the cosign identity pinned, before finalize", () => {
+		expect(verify.environment).toBeUndefined();
+		expect(verify.steps.some((entry) => entry.uses?.startsWith("actions/checkout@"))).toBe(false);
+		expect(verify.steps.some((entry) => entry.uses?.startsWith("actions/download-artifact@"))).toBe(false);
+		const download = step(verify, "Download the immutable release objects from the public URL");
+		expect(download.run).toContain(`base="\${R2_PUBLIC_BASE_URL%/}/releases/v\${PRODUCTION_VERSION}"`);
+		expect(download.run).toContain("--proto '=https'");
+		const cosign = step(verify, "Verify the cosign signature over SHA256SUMS");
+		expect(cosign.run).toContain("--certificate-oidc-issuer https://token.actions.githubusercontent.com");
+		expect(cosign.run).toContain(
+			`--certificate-identity "https://github.com/\${GITHUB_REPOSITORY}/.github/workflows/build-binaries.yml@refs/heads/\${DEFAULT_BRANCH}"`,
+		);
+		const digests = step(verify, "Verify the digests and run the published binary");
+		expect(digests.run).toContain("sha256sum --check expected.sums");
+		expect(digests.run).toContain("extracted/prime-agent --version");
+	});
+
+	it("finalize-release undrafts, proves the tag, and advances the pointers last with step-scoped credentials", () => {
+		expect(finalize.environment).toEqual(publish.environment);
+		expect(finalize.steps.some((entry) => entry.uses?.startsWith("actions/checkout@"))).toBe(false);
+		const names = finalize.steps.map((entry) => entry.name);
+		const order = [
+			"Verify every artifact against the digest GitHub recorded",
+			"Refuse an existing tag at another commit and re-check the draft",
+			"Publish the release and prove the tag points at BUILD_REF",
+			"Advance the production channel pointers",
+		];
+		expect(order.map((name) => names.indexOf(name))).toEqual(
+			[...order.keys()].map((index) => names.length - order.length + index),
+		);
+		const pointers = step(finalize, "Advance the production channel pointers");
+		expect(finalize.steps.indexOf(pointers)).toBe(finalize.steps.length - 1);
+		expect(Object.keys(pointers.env ?? {})).toEqual(
+			expect.arrayContaining(["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "R2_BUCKET", "R2_ENDPOINT_URL"]),
+		);
+		for (const [name, value] of Object.entries(finalize.env ?? {})) {
+			if (name === "GH_TOKEN") continue;
+			expect(String(value)).not.toContain("secrets.");
+		}
+		for (const entry of finalize.steps) {
+			if (entry === pointers) continue;
+			expect(Object.values(entry.env ?? {}).join(" ")).not.toContain("secrets.");
+		}
+		for (const pointer of ["latest.json", "stable", "install.sh", "install-beta.sh"]) {
+			expect(pointers.run).toContain(`publish_pointer artifacts/${pointer} ${pointer} `);
+		}
+		const publishStep = step(finalize, "Publish the release and prove the tag points at BUILD_REF");
+		expect(publishStep.run).toContain('gh release edit "$TAG" --draft=false --latest');
+		expect(publishStep.run).toContain('if [ "$tagged" != "$BUILD_REF" ]; then');
+		const recheck = step(finalize, "Refuse an existing tag at another commit and re-check the draft");
+		expect(recheck.run).toContain("cmp -s /tmp/current-assets.json /tmp/recorded-assets.json");
+		expect(recheck.run).toContain('test "$(jq -r .isDraft /tmp/release.json)" = true');
+		expect(recheck.run).toContain('test "$(jq -r .targetCommitish /tmp/release.json)" = "$BUILD_REF"');
+	});
+
+	it("github-release drafts without a tag and refuses an existing tag at another commit", () => {
+		const names = githubRelease.steps.map((entry) => entry.name);
+		expect(names.indexOf("Refuse an existing tag at another commit")).toBeLessThan(
+			names.indexOf("Create or refresh the draft release"),
+		);
+		const create = step(githubRelease, "Create or refresh the draft release");
+		expect(create.run).toContain("--draft");
+		expect(create.run).not.toContain("--draft=false");
+		expect(create.run).not.toMatch(/git\/refs/); // the draft never creates a ref
+		expect(create.run).toContain('test "$(jq -r .isDraft /tmp/release.json)" = true');
+	});
+
+	describe.skipIf(process.platform === "win32")("the tag pre-check (bash, fake gh)", () => {
+		const precheck = step(githubRelease, "Refuse an existing tag at another commit").run!;
+		const env = { GITHUB_REPOSITORY: "o/r", PRODUCTION_VERSION: "1.2.3", BUILD_REF };
+
+		it.each([
+			["no tag yet", ghTagShim("404"), 0],
+			["a lightweight tag at BUILD_REF", ghTagShim({ object: { type: "commit", sha: BUILD_REF } }), 0],
+			[
+				"an annotated tag peeling to BUILD_REF",
+				ghTagShim({ object: { type: "tag", sha: TAG_OBJECT } }, BUILD_REF),
+				0,
+			],
+			["a lightweight tag at another commit", ghTagShim({ object: { type: "commit", sha: OTHER_REF } }), 1],
+			[
+				"an annotated tag peeling to another commit",
+				ghTagShim({ object: { type: "tag", sha: TAG_OBJECT } }, OTHER_REF),
+				1,
+			],
+			["an API failure that is not 404", ghTagShim("500"), 1],
+			[
+				"a ref answer for a different tag name",
+				ghTagShim({ ref: "refs/tags/v1.2.30", object: { type: "commit", sha: BUILD_REF } }),
+				1,
+			],
+		])("%s", (_label, shim, status) => {
+			const result = runStepScript(precheck, shim, env);
+			expect(result.status, result.stderr + result.stdout).toBe(status);
+			if (status === 1 && _label.includes("another commit")) expect(result.stderr).toContain("refusing to publish");
+		});
+
+		it("refuses a BUILD_REF that is not a full commit SHA", () => {
+			const result = runStepScript(precheck, ghTagShim("404"), { ...env, BUILD_REF: "main" });
+			expect(result.status).toBe(1);
+			expect(result.stderr).toContain("not a full commit SHA");
+		});
+
+		it("finalize-release refuses a draft whose assets, target or draft state changed since github-release", () => {
+			const recheck = step(finalize, "Refuse an existing tag at another commit and re-check the draft").run!;
+			const recorded = [
+				{ name: "SHA256SUMS", size: 1, digest: "sha256:aa" },
+				{ name: "install.sh", size: 2, digest: "sha256:bb" },
+			];
+			const shims = (options: {
+				isDraft?: boolean;
+				target?: string;
+				assets?: { name: string; digest: string }[];
+				tag?: string;
+			}) => `
+gh() {
+  case "$*" in
+    "api repos/o/r/git/ref/tags/v1.2.3")
+      ${options.tag ? `printf '%s' '${JSON.stringify({ ref: "refs/tags/v1.2.3", object: { type: "commit", sha: options.tag } })}'` : 'echo "gh: Not Found (HTTP 404)" >&2; return 1'} ;;
+    "release view v1.2.3 --json isDraft,targetCommitish")
+      printf '%s' '${JSON.stringify({ isDraft: options.isDraft ?? true, targetCommitish: options.target ?? BUILD_REF })}' ;;
+    "api repos/o/r/releases --paginate --jq .[] | select(.tag_name == \\"v1.2.3\\") | .id") echo 42 ;;
+    "api repos/o/r/releases/42/assets --paginate --jq [.[] | {name: .name, digest: .digest}] | sort_by(.name)")
+      printf '%s' '${JSON.stringify(options.assets ?? recorded)}' | jq 'map({name, digest}) | sort_by(.name)' ;;
+    *) echo "unexpected gh call: $*" >&2; return 99 ;;
+  esac
+}
+mkdir -p manifest
+printf '%s' '${JSON.stringify(recorded)}' > manifest/github-assets.json
+`;
+			const good = runStepScript(recheck, shims({}), env);
+			expect(good.status, good.stderr).toBe(0);
+			expect(good.stdout).toContain("2 assets unchanged");
+			expect(runStepScript(recheck, shims({ tag: BUILD_REF }), env).status).toBe(0);
+			expect(runStepScript(recheck, shims({ tag: OTHER_REF }), env).status).toBe(1);
+			expect(runStepScript(recheck, shims({ isDraft: false }), env).status).toBe(1);
+			expect(runStepScript(recheck, shims({ target: OTHER_REF }), env).status).toBe(1);
+			const swapped = runStepScript(
+				recheck,
+				shims({ assets: [recorded[0]!, { name: "install.sh", digest: "sha256:ee" }] }),
+				env,
+			);
+			expect(swapped.status).toBe(1);
+			expect(swapped.stderr).toContain("no longer match");
+			const extra = runStepScript(
+				recheck,
+				shims({ assets: [...recorded, { name: "evil.sh", digest: "sha256:ff" }] }),
+				env,
+			);
+			expect(extra.status).toBe(1);
+			expect(runStepScript(recheck, shims({ assets: [recorded[0]!] }), env).status).toBe(1);
+		});
+
+		it("finalize-release proves the tag points at BUILD_REF after publishing", () => {
+			const publishStep = step(finalize, "Publish the release and prove the tag points at BUILD_REF").run!;
+			const shims = (tagSha: string) => `
+gh() {
+  case "$*" in
+    "release edit v1.2.3 --draft=false --latest") echo "published" ;;
+    "api repos/o/r/git/ref/tags/v1.2.3") printf '%s' '${JSON.stringify({ ref: "refs/tags/v1.2.3", object: { type: "commit", sha: tagSha } })}' ;;
+    "release view v1.2.3 --json isDraft --jq .isDraft") echo false ;;
+    *) echo "unexpected gh call: $*" >&2; return 99 ;;
+  esac
+}
+`;
+			expect(runStepScript(publishStep, shims(BUILD_REF), env).status).toBe(0);
+			const wrong = runStepScript(publishStep, shims(OTHER_REF), env);
+			expect(wrong.status).toBe(1);
+			expect(wrong.stderr).toContain(`points at ${OTHER_REF}, not ${BUILD_REF}`);
+		});
+	});
+});
+
+describe("npm publication is split into an unprivileged pack job and a code-free publish job", () => {
+	const pack = release.jobs["pack-npm"]!;
+	const publishNpm = release.jobs["publish-npm"]!;
+
+	it("pack-npm builds from BUILD_REF without any credential", () => {
+		expect(pack.environment).toBeUndefined();
+		expect(pack.needs).toContain("verify");
+		const checkout = pack.steps.find((entry) => entry.uses?.startsWith("actions/checkout@"))!;
+		expect(checkout.with?.ref).toBe(`\${{ env.BUILD_REF }}`);
+		expect(checkout.with?.["persist-credentials"]).toBe(false);
+		expect(step(pack, "Install dependencies").run).toContain("npm ci --ignore-scripts\nnpm rebuild esbuild");
+		expect(step(pack, "Build").run).toBe("npm run build");
+		const packStep = step(pack, "Build the npm package set");
+		expect(packStep.run).toContain("node scripts/pack-npm-packages.mjs");
+		expect(packStep.run).toContain('--version "$PRODUCTION_VERSION"');
+		expect(packStep.run).toContain("--archives release-artifacts/production");
+		expect(packStep.run).toContain("--receipts release-artifacts/production/latest.json");
+		expect(packStep.run).toContain("--out-dir npm-packages");
+		expect(pack.steps.indexOf(step(pack, "Build"))).toBeLessThan(pack.steps.indexOf(packStep));
+		const upload = step(pack, "Upload the npm package set");
+		expect(upload.with?.name).toBe("npm-packages");
+		expect(upload.with?.path).toContain("npm-packages/artifacts/*.tgz");
+		expect(upload.with?.path).toContain("npm-packages/manifest.json");
+		for (const env of [pack.env ?? {}, ...pack.steps.map((entry) => entry.env ?? {})]) {
+			expect(Object.values(env).join(" ")).not.toContain("secrets.");
+		}
+		expect(pack.if).toContain("vars.NPM_PUBLISH_ENABLED == 'true'");
+	});
+
+	it("publish-npm holds only the OIDC token and touches no repository code", () => {
+		expect(publishNpm.environment).toEqual({ name: "release-npm" });
+		expect(publishNpm.if).toContain("vars.NPM_PUBLISH_ENABLED == 'true'");
+		expect(release.jobs["publish-npm"]).toMatchObject({ permissions: { "id-token": "write" } });
+		expect(Object.keys((publishNpm as unknown as { permissions: Record<string, string> }).permissions)).toEqual([
+			"id-token",
+		]);
+		for (const entry of publishNpm.steps) {
+			expect(entry.uses ?? "").not.toMatch(/actions\/checkout/);
+			expect(entry.run ?? "").not.toMatch(/npm (?:ci|install|rebuild|run)\b|npx|node scripts\//);
+		}
+		const download = publishNpm.steps.find((entry) => entry.uses?.startsWith("actions/download-artifact@"))!;
+		expect(download.with).toEqual({ name: "npm-packages", path: "npm-packages" });
+		const node = publishNpm.steps.find((entry) => entry.uses?.startsWith("actions/setup-node@"))!;
+		expect(node.with).toEqual({ "node-version": "24", "registry-url": "https://registry.npmjs.org" });
+		const publishStep = step(publishNpm, "Publish every package with provenance");
+		expect(publishStep.run).toContain('npm publish "$path" --provenance --access public --ignore-scripts');
+		expect(publishStep.run).toContain("'.publishOrder[]'");
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"publishes in manifest order and refuses a tarball whose digest changed",
+		() => {
+			const publishStep = step(publishNpm, "Publish every package with provenance").run!;
+			const directory = mkdtempSync(join(tmpdir(), "prime-npm-publish-"));
+			try {
+				mkdirSync(join(directory, "npm-packages/artifacts"), { recursive: true });
+				const packages = [
+					{ name: "@prime-intellect/agent-linux-x64", tarball: "linux.tgz", body: "linux" },
+					{ name: "@prime-intellect/ai", tarball: "ai.tgz", body: "ai" },
+					{ name: "prime-agent", tarball: "front.tgz", body: "front" },
+				];
+				for (const entry of packages)
+					writeFileSync(join(directory, "npm-packages/artifacts", entry.tarball), entry.body);
+				const sha = (body: string) =>
+					spawnSync("bash", ["-c", "printf '%s' \"$1\" | sha256sum | cut -d' ' -f1", "_", body], {
+						encoding: "utf8",
+					}).stdout.trim();
+				const manifest = {
+					publishOrder: ["prime-agent", "@prime-intellect/agent-linux-x64", "@prime-intellect/ai"],
+					packages: packages.map((entry) => ({
+						name: entry.name,
+						tarball: entry.tarball,
+						sha256: sha(entry.body),
+					})),
+				};
+				writeFileSync(join(directory, "npm-packages/manifest.json"), JSON.stringify(manifest));
+				const shim = 'npm() { echo "npm $*"; }';
+				const run = () =>
+					spawnSync("bash", ["-e", "-o", "pipefail", "-c", `${shim}\n${publishStep}`], {
+						cwd: directory,
+						encoding: "utf8",
+					});
+				const ok = run();
+				expect(ok.status, ok.stderr).toBe(0);
+				expect(ok.stdout.trim().split("\n")).toEqual(
+					["front.tgz", "linux.tgz", "ai.tgz"].map(
+						(tarball) =>
+							`npm publish npm-packages/artifacts/${tarball} --provenance --access public --ignore-scripts`,
+					),
+				);
+				writeFileSync(join(directory, "npm-packages/artifacts/linux.tgz"), "tampered");
+				const tampered = run();
+				expect(tampered.status).toBe(1);
+				expect(tampered.stderr).toContain("Digest mismatch for linux.tgz");
+				expect(tampered.stdout).toContain("front.tgz"); // the first publish happened, the tampered one did not
+				expect(tampered.stdout).not.toContain("linux.tgz --provenance");
 			} finally {
 				rmSync(directory, { recursive: true, force: true });
 			}
