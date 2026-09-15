@@ -578,8 +578,9 @@ export class AgentDaemon {
 	 * Settles when the armed supervisor availability check has run to completion
 	 * (including the reschedule it performs) or has been cancelled. The check is
 	 * a real async chain started from a timer callback, so this is the only way
-	 * an observer can tell that the monitor reached a steady state; the daemon
-	 * supervisor monitor tests await it instead of polling a timer loop.
+	 * to tell the monitor reached a steady state. It stays public because the
+	 * daemon supervisor monitor tests await it through structural access; no
+	 * production code reads it.
 	 */
 	supervisorAvailabilityCheckSettled?: Promise<void>;
 	private settleArmedSupervisorAvailabilityCheck?: () => void;
