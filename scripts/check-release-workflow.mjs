@@ -18,12 +18,13 @@
  * names a script) are forbidden outright in those jobs.
  */
 
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { posix } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { parse } from "yaml";
 
+const WORKFLOW_DIRECTORY = ".github/workflows";
 const RELEASE_WORKFLOW = ".github/workflows/build-binaries.yml";
 const STANDALONE_WORKFLOW = ".github/workflows/standalone-binaries.yml";
 const BUILD_WORKFLOWS = [RELEASE_WORKFLOW, STANDALONE_WORKFLOW];
@@ -86,14 +87,74 @@ export const TEST_SIGNER_FLAG = "--test-signer-json";
 export const TEST_SIGNER_STEP = { workflow: STANDALONE_WORKFLOW, job: "build", step: "Compile a test-signer binary for the updater test" };
 export const TEST_SIGNER_DIRECTORIES = ["binaries-test-signer", "test-release"];
 
-/** Actions that bring repository code or a toolchain onto a credential-bearing runner. */
-const FORBIDDEN_ACTIONS = [/(^|\/)checkout(@|$)/, /actions\/setup-node/, /oven-sh\/setup-bun/, /astral-sh\/setup-uv/, /setup-python/];
-/** publish-npm needs npm >= 11.5.1 for OIDC trusted publishing; setup-node is a pinned third-party action, not repository code. */
-const ALLOWED_ACTIONS = { "publish-npm": [/actions\/setup-node/] };
+/**
+ * The only actions a credential-bearing job may `uses:`. An allowlist, not a denylist: a
+ * SHA-pinned third-party action is still code that runs next to the credential, so every one a
+ * job needs is named here, per job. `*` applies to every credential-bearing job.
+ *   - publish-npm needs setup-node for npm >= 11.5.1 (OIDC trusted publishing).
+ *   - sign holds id-token:write and attestations:write and needs cosign, syft and the provenance action.
+ * `actions/github-script` is not used anywhere in the release and is therefore not allowed.
+ */
+export const ALLOWED_ACTIONS = {
+	"*": [/^actions\/download-artifact@/, /^actions\/upload-artifact@/],
+	"publish-npm": [/^actions\/setup-node@/],
+	sign: [/^sigstore\/cosign-installer@/, /^anchore\/sbom-action\/download-syft@/, /^actions\/attest-build-provenance@/],
+};
 
 const PACKAGE_MANAGERS = /^(npm|npx|yarn|pnpm|bun|bunx|corepack|uv|uvx|pip|pip3)$/;
 const SHELLS = /^(bash|sh|zsh|dash|ksh|ash|fish)$/;
 const INTERPRETERS = /^(node|nodejs|bash|sh|zsh|dash|ksh|ash|fish|python|python3|perl|ruby|tsx|ts-node|deno)$/;
+/**
+ * The only options an interpreter may carry in a credential-bearing job: the flag that introduces
+ * inline code written in the workflow file, and version/help. Everything else (`--import`,
+ * `--require`, `-r`, `--loader`, `--experimental-loader`, `--env-file`, `--run`, `-m`, `-I`, ...)
+ * loads code the checker cannot see and is refused before the file-argument scan.
+ */
+const INLINE_CODE_FLAGS = {
+	node: /^(-e|--eval|-p|--print)$/,
+	nodejs: /^(-e|--eval|-p|--print)$/,
+	tsx: /^(-e|--eval|-p|--print)$/,
+	"ts-node": /^(-e|--eval|-p|--print)$/,
+	python: /^-c$/,
+	python3: /^-c$/,
+	perl: /^-[eE]$/,
+	ruby: /^-e$/,
+};
+const INTERPRETER_INFO_FLAGS = /^(--version|-v|-V|--help|-h)$/;
+/**
+ * Package-manager invocations that run dependency lifecycle scripts (install-time code from the
+ * registry) and are therefore refused on every build runner unless `--ignore-scripts` is enabled.
+ * `npm rebuild` exists to run an install script, so it is never useful with `--ignore-scripts`;
+ * the single allowed form is the literal `npm rebuild esbuild` in the jobs listed in REBUILD_JOBS.
+ */
+const LIFECYCLE_SUBCOMMANDS = {
+	npm: /^(ci|install|i|in|ins|inst|insta|instal|isnt|isnta|isntal|isntall|add|install-clean|clean-install|ic|cit|install-test|it|update|up|upgrade|udpate|dedupe|ddp|find-dupes|prune|rebuild|rb|link|ln|exec|x|audit|restart)$/,
+	yarn: /^(|install|add|up|upgrade|upgrade-interactive|dedupe|dlx|import|link|rebuild)$/,
+	pnpm: /^(install|i|add|update|up|upgrade|rebuild|rb|dlx|exec|link|prune|dedupe|import|deploy)$/,
+	bun: /^(install|i|add|update|remove|rm|link|x|pm|create|c)$/,
+	uv: /^(pip|sync|add|remove|tool|run)$/,
+};
+/** Package managers that always install and run code with no lifecycle switch the checker trusts. */
+const ALWAYS_LIFECYCLE = /^(bunx|uvx|pip|pip3)$/;
+export const REBUILD_ALLOWLIST = { command: ["npm", "rebuild", "esbuild"], jobs: { [RELEASE_WORKFLOW]: ["build", "validate-macos", "pack-npm"], [STANDALONE_WORKFLOW]: ["build"] } };
+/** `if:` conditions that run a job or step after an upstream failure or cancellation. Nothing in the release may use one. */
+const STATUS_FUNCTIONS = /\b(always|failure|cancelled|success)\s*\(/;
+/** Every job that calls the standalone workflow must hold exactly these permissions and pass nothing else. */
+const STANDALONE_CALLER_PERMISSIONS = { contents: "read", "id-token": "write" };
+const STANDALONE_CALLER_INPUTS = ["build_ref"];
+/**
+ * The immutable-upload guard. `aws s3api head-object` fails for many reasons (a revoked token, a
+ * network error, a wrong endpoint); only an explicit 404 from the service proves the key is absent.
+ * Anything else must stop the release instead of uploading over an object it could not see.
+ * The exact lines are asserted so a loosened guard is a checker failure, not a review nit.
+ */
+export const HEAD_OBJECT_GUARD = {
+	reset: "head_status=0",
+	capture: "head_status=$?",
+	errorFile: "/tmp/head.err",
+	exists: 'if [ "$head_status" -eq 0 ]; then',
+	absent: `elif [ "$head_status" -eq 254 ] && grep -qE '^An error occurred \\((404|NotFound|NoSuchKey)\\) when calling the HeadObject operation' /tmp/head.err; then`,
+};
 const SOURCE_COMMANDS = /^(source|\.)$/;
 /** Commands whose effect the static checker cannot follow; forbidden outright in credential-bearing jobs. */
 const OPAQUE_EXECUTORS = /^(eval|xargs|parallel)$/;
@@ -459,26 +520,34 @@ export function splitWords(line) {
 }
 
 /**
- * Splits a `run` block into simple commands, skipping heredoc bodies and comments. Yields
- * `{ words, substitutions }` per command, where each word is `{ text, expansion }`.
+ * Splits a `run` block into simple commands. Yields `{ words, substitutions, redirections }` per
+ * command, where each word is `{ text, expansion }`.
+ *
+ * Heredocs are recognised from the parsed redirections (never from a regex over the raw line, so
+ * a here-string such as `<<<"$ref"` cannot open a fake heredoc that swallows the rest of the
+ * script). EVERY heredoc body is re-parsed as shell and yielded too - whatever program the
+ * heredoc feeds, a `node scripts/x.mjs` written in it is inspected. Feeding an interpreter from a
+ * heredoc is separately an error in credential-bearing jobs (see repositoryCodeReasons).
  */
 export function* shellCommands(script) {
-	let heredoc = null;
-	let heredocIsShell = false;
+	const heredocs = []; // pending delimiters for the current line, in order
+	let heredoc = null; // { delimiter, stripTabs }
 	let heredocBody = [];
 	let carried = "";
+	const finishHeredoc = function* () {
+		const body = heredocBody.join("\n");
+		heredocBody = [];
+		heredoc = heredocs.shift() ?? null;
+		yield* shellCommands(body);
+	};
 	for (const rawLine of joinContinuations(script)) {
 		if (heredoc !== null) {
-			if (rawLine.trim() === heredoc) {
-				heredoc = null;
-				// A heredoc fed to a shell IS shell code: inspect it like any other run block.
-				if (heredocIsShell) yield* shellCommands(heredocBody.join("\n"));
-				heredocBody = [];
-			} else heredocBody.push(rawLine);
+			const candidate = heredoc.stripTabs ? rawLine.replace(/^\t+/, "") : rawLine;
+			if (candidate === heredoc.delimiter) yield* finishHeredoc();
+			else heredocBody.push(rawLine);
 			continue;
 		}
 		const line = carried ? `${carried}\n${rawLine}` : rawLine;
-		const marker = line.match(/<<-?\s*(?:'([^']+)'|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))/);
 		const { commands, unterminated } = splitWords(line);
 		if (unterminated) {
 			// A quote or substitution spans lines; keep reading until it closes.
@@ -486,13 +555,17 @@ export function* shellCommands(script) {
 			continue;
 		}
 		carried = "";
-		if (marker) {
-			heredoc = marker[1] ?? marker[2] ?? marker[3];
-			heredocIsShell = commands.some((command) => command.redirections.some((entry) => entry.operator.startsWith("<<") && !entry.operator.startsWith("<<<")) && SHELLS.test(commandWordOf(command)?.text ?? ""));
+		for (const command of commands) {
+			for (const entry of command.redirections) {
+				const operator = entry.operator.replace(/^[0-9]+/, "");
+				if (operator === "<<" || operator === "<<-") heredocs.push({ delimiter: entry.text, stripTabs: operator === "<<-" });
+			}
+			yield command;
 		}
-		for (const command of commands) yield command;
+		heredoc = heredocs.shift() ?? null;
 	}
-	if (heredoc !== null && heredocIsShell) yield* shellCommands(heredocBody.join("\n"));
+	// An unterminated heredoc at the end of the script: inspect what we have, never drop it.
+	while (heredoc !== null) yield* finishHeredoc();
 	if (carried) {
 		// An unterminated construct at the end of the script: inspect what we have, never drop it.
 		for (const command of splitWords(carried).commands) yield command;
@@ -692,10 +765,22 @@ export function repositoryCodeReasons(input, cwd = "") {
 	if (RESOLUTION_BUILTINS.test(command)) {
 		reasons.push(`${command} changes how commands resolve or run, which the checker cannot follow`);
 	}
+	for (const name of assignedNames({ words })) {
+		if (STARTUP_ENV.test(name) && name !== "PATH") reasons.push(`sets ${name}, which loads code before the command runs: ${words.map((word) => word.text).join(" ")}`);
+	}
+	for (const word of words) {
+		// `env NODE_OPTIONS=--import=x node ...`: an assignment handed to a wrapper, not a prefix.
+		const name = ASSIGNMENT.test(word.text) ? word.text.match(/^[A-Za-z_][A-Za-z0-9_]*/)[0] : null;
+		if (name && name !== "PATH" && STARTUP_ENV.test(name) && !assignedNames({ words }).includes(name)) {
+			reasons.push(`sets ${name}, which loads code before the command runs: ${word.text}`);
+		}
+	}
 	if (PACKAGE_MANAGERS.test(command)) {
 		const sub = args[0]?.text ?? "";
 		if (command !== "npm" || !/^(publish|--version|-v|view|config)$/.test(sub)) {
 			reasons.push(`runs a package manager: ${command} ${sub}`.trim());
+		} else if (sub === "publish" && !ignoreScriptsEnabled(args)) {
+			reasons.push(`npm publish runs the package's publish lifecycle scripts without --ignore-scripts: ${words.map((word) => word.text).join(" ")}`);
 		}
 	}
 	if (SOURCE_COMMANDS.test(command) && args.length > 0) {
@@ -705,31 +790,140 @@ export function repositoryCodeReasons(input, cwd = "") {
 		reasons.push("find -exec runs a command the checker cannot see");
 	}
 	if (INTERPRETERS.test(command)) {
-		// An interpreter may only run inline code that is written here, in the workflow file: a
-		// heredoc (a shell heredoc is inspected by shellCommands) or a literal `-e` string.
-		// Everything else - a pipe, a file, an expansion, a shell `-c` string - is code the checker
-		// cannot see, and a shell `-c` string in particular defeats word splitting by design.
+		// An interpreter may only run inline code that is written here, in the workflow file, after
+		// the one flag that introduces it (`node -e`, `python3 -c`). Everything else - a pipe, a
+		// file, stdin, a heredoc, a here-string, an expansion, a preload option, a shell `-c`
+		// string - is code the checker cannot see.
 		if (piped) reasons.push(`${command} reads its script from a pipe the checker cannot see`);
 		for (const redirection of redirections) {
-			if (/^[0-9]*<$/.test(redirection.operator)) {
-				reasons.push(`${command} reads its script from a file: ${redirection.text}`);
-			} else if (redirection.operator.startsWith("<<<") && redirection.expansion) {
-				reasons.push(`${command} reads its script from an expansion the checker cannot see: ${redirection.text}`);
+			const operator = redirection.operator.replace(/^[0-9]+/, "");
+			if (operator === "<<" || operator === "<<-") {
+				reasons.push(`${command} reads its script from a heredoc the checker cannot follow: ${redirection.operator}${redirection.text}`);
+			} else if (operator === "<<<") {
+				reasons.push(`${command} reads its script from a here-string the checker cannot follow: ${redirection.operator}${redirection.text}`);
+			} else if (operator.startsWith("<")) {
+				reasons.push(`${command} reads its script from a file: ${redirection.operator}${redirection.text}`);
 			}
 		}
-		for (const arg of args) {
-			if (arg.text === "-" || arg.text === "--") break;
-			if (SHELLS.test(command) && (/^-[A-Za-z]*[cs]/.test(arg.text) || /^--(command|stdin)/.test(arg.text) || /^[-+]o$/.test(arg.text))) {
-				reasons.push(`${command} ${arg.text} runs inline or piped shell code the checker cannot see`);
+		const inlineFlag = INLINE_CODE_FLAGS[command];
+		for (const [position, arg] of args.entries()) {
+			if (arg.text === "-") {
+				reasons.push(`${command} reads its script from stdin (-), which the checker cannot see`);
 				break;
 			}
-			if (/^-[cem]$/.test(arg.text) || arg.text === "--eval" || arg.text === "--print" || arg.text === "-p") break; // inline code follows
-			if (arg.text.startsWith("-")) continue;
+			if (arg.text === "--") {
+				const next = args[position + 1];
+				if (next) reasons.push(`runs a file through ${command}: ${next.text}`);
+				break;
+			}
+			if (arg.text.startsWith("-") && !arg.expansion) {
+				if (INTERPRETER_INFO_FLAGS.test(arg.text)) continue;
+				if (SHELLS.test(command)) {
+					reasons.push(`${command} ${arg.text} runs inline or piped shell code the checker cannot see`);
+					break;
+				}
+				if (inlineFlag?.test(arg.text)) {
+					const code = args[position + 1];
+					if (!code) reasons.push(`${command} ${arg.text} names no inline code`);
+					else if (code.expansion) reasons.push(`${command} ${arg.text} runs code from an expansion the checker cannot see: ${code.text}`);
+					break; // inline code follows; its arguments are data
+				}
+				reasons.push(`${command} carries an option the checker does not allow (only ${inlineFlag ? `${inlineFlag.source.slice(2, -2).replaceAll("|", ", ")}, ` : ""}--version and --help): ${arg.text}`);
+				break;
+			}
+			if (arg.expansion && arg.text.startsWith("-")) {
+				reasons.push(`${command} carries an option built from an expansion the checker cannot see: ${arg.text}`);
+				break;
+			}
 			// The first positional argument is the script file. Whatever it is called, it is a file
 			// on this runner that the checker did not write.
 			reasons.push(`runs a file through ${command}: ${arg.text}`);
 			break;
 		}
+	}
+	return reasons;
+}
+
+/**
+ * True when `--ignore-scripts` is enabled on a package-manager command line and never disabled:
+ * bare, `--ignore-scripts=true` or `--ignore-scripts true`. `--ignore-scripts=false`,
+ * `--ignore-scripts false`, `--no-ignore-scripts` or any other value disables it, whatever else
+ * the line says.
+ */
+export function ignoreScriptsEnabled(args) {
+	const texts = args.map((arg) => (typeof arg === "string" ? arg : arg.text));
+	let enabled = false;
+	for (const [index, text] of texts.entries()) {
+		if (text === "--no-ignore-scripts") return false;
+		if (text.startsWith("--ignore-scripts=")) {
+			if (text !== "--ignore-scripts=true") return false;
+			enabled = true;
+		} else if (text === "--ignore-scripts") {
+			const next = texts[index + 1];
+			if (next === "false") return false;
+			if (next !== undefined && next !== "true" && /^(true|false|0|1|yes|no|on|off)$/i.test(next)) return false;
+			enabled = true;
+		}
+	}
+	return enabled;
+}
+
+/**
+ * Returns the reasons a simple command on a build runner would run dependency lifecycle scripts.
+ * `location` is `{ workflow, jobId }`; the literal `npm rebuild esbuild` is allowed only where
+ * REBUILD_ALLOWLIST says so.
+ */
+export function lifecycleReasons(input, location = {}) {
+	const command = asCommand(input);
+	const reasons = [];
+	for (const substitution of command.substitutions) {
+		for (const inner of shellCommands(substitution)) {
+			for (const reason of lifecycleReasons(inner, location)) reasons.push(`inside a command substitution: ${reason}`);
+		}
+	}
+	const index = commandIndex(command.words);
+	if (index === -1) return reasons;
+	const name = posix.basename(command.words[index].text);
+	if (!PACKAGE_MANAGERS.test(name)) return reasons;
+	const args = command.words.slice(index + 1);
+	const spelled = command.words.slice(index).map((word) => word.text).join(" ");
+	if (command.words[index].expansion || command.words[index].text !== name) {
+		reasons.push(`invokes ${name} through a path or expansion: ${spelled}`);
+		return reasons;
+	}
+	if (ALWAYS_LIFECYCLE.test(name)) {
+		reasons.push(`${name} installs and runs code from a registry, which the checker cannot allow on a release runner: ${spelled}`);
+		return reasons;
+	}
+	if (name === "npx") {
+		if (!ignoreScriptsEnabled(args)) reasons.push(`npx may install and run a package's lifecycle scripts; pass --ignore-scripts: ${spelled}`);
+		return reasons;
+	}
+	const subcommands = LIFECYCLE_SUBCOMMANDS[name];
+	if (!subcommands) return reasons; // corepack: downloads a package manager, runs no lifecycle script
+	// The subcommand is the first word. An option before it (`npm --prefix x install`) may or may
+	// not consume the next word, so the checker could not tell which command runs; refuse it.
+	const sub = args[0];
+	if (sub && sub.text.startsWith("-") && !INTERPRETER_INFO_FLAGS.test(sub.text)) {
+		reasons.push(`${name} carries options before its subcommand, so the checker cannot tell which command runs: ${spelled}`);
+		return reasons;
+	}
+	if (sub?.expansion) {
+		reasons.push(`${name} runs a subcommand built from an expansion the checker cannot see: ${spelled}`);
+		return reasons;
+	}
+	const subText = sub?.text ?? "";
+	if (!subcommands.test(subText)) return reasons;
+	if (name === "npm" && /^(rebuild|rb)$/.test(subText)) {
+		const allowedJobs = REBUILD_ALLOWLIST.jobs[location.workflow] ?? [];
+		const literal = [name, ...args.map((arg) => arg.text)].join(" ") === REBUILD_ALLOWLIST.command.join(" ");
+		if (!literal || !allowedJobs.includes(location.jobId)) {
+			reasons.push(`npm rebuild runs install scripts; only the literal '${REBUILD_ALLOWLIST.command.join(" ")}' is allowed, and only in ${Object.entries(REBUILD_ALLOWLIST.jobs).map(([workflow, jobs]) => `${workflow} (${jobs.join(", ")})`).join(" and ")}: ${spelled}`);
+		}
+		return reasons;
+	}
+	if (!ignoreScriptsEnabled(args)) {
+		reasons.push(`${name} ${subText} runs dependency lifecycle scripts without --ignore-scripts: ${spelled}`.replace("  ", " "));
 	}
 	return reasons;
 }
@@ -890,6 +1084,86 @@ export function r2StepReasons(jobId, run, { last = false, artifactDirectories = 
 	return { reasons, pointers };
 }
 
+/**
+ * Returns the reasons a step misreads `aws s3api head-object`. A failed head-object is NOT proof
+ * that the key is absent - a revoked token (403), a wrong endpoint or a network error fail too -
+ * so the only shape allowed is the guard in {@link HEAD_OBJECT_GUARD}:
+ *
+ *   head_status=0
+ *   aws s3api head-object ... >/tmp/head.json 2>/tmp/head.err || head_status=$?
+ *   if [ "$head_status" -eq 0 ]; then          # exists
+ *   elif [ "$head_status" -eq 254 ] && grep -qE '^An error occurred \((404|...)\) ...' /tmp/head.err; then   # absent
+ *   else ... exit 1 ... fi                      # anything else: stop
+ *
+ * head-object may never be an `if`/`!`/`while` condition, its stderr must be kept in the error
+ * file (not discarded or merged into stdout), `head_status` may not be assigned anywhere else,
+ * and the step must run under `set -euo pipefail`.
+ */
+export function headObjectGuardReasons(run) {
+	const reasons = [];
+	const commands = [...shellCommands(run)];
+	const spell = (command) => command.words.map((word) => word.text).join(" ");
+	const guard = HEAD_OBJECT_GUARD;
+	let count = 0;
+	commands.forEach((command, position) => {
+		const index = commandIndex(command.words);
+		if (index === -1) return;
+		const texts = command.words.slice(index).map((word) => word.text);
+		if (!(texts[0] === "aws" && texts[1] === "s3api" && texts[2] === "head-object")) return;
+		count += 1;
+		const spelled = texts.join(" ");
+		if (command.words.slice(0, index).some((word) => /^(if|!|while|until|elif)$/.test(word.text)) || command.piped) {
+			reasons.push(`uses aws s3api head-object as a condition, so a 403 or a network error would count as "absent": ${spelled}`);
+		}
+		const stderr = command.redirections.filter((entry) => /^2>/.test(entry.operator) || entry.operator.startsWith("&>"));
+		if (stderr.length !== 1 || stderr[0].operator !== "2>" || stderr[0].text !== guard.errorFile) {
+			reasons.push(`must keep the stderr of aws s3api head-object in ${guard.errorFile} so an explicit 404 can be told from any other error: ${spelled}`);
+		}
+		if (spell(commands[position - 1] ?? { words: [] }) !== guard.reset) {
+			reasons.push(`must reset '${guard.reset}' immediately before aws s3api head-object: ${spelled}`);
+		}
+		if (spell(commands[position + 1] ?? { words: [] }) !== guard.capture) {
+			reasons.push(`must capture the exit status with '|| ${guard.capture}' immediately after aws s3api head-object: ${spelled}`);
+		}
+	});
+	if (count === 0) return reasons;
+	if (spell(commands[0] ?? { words: [] }) !== "set -euo pipefail") reasons.push("must start with 'set -euo pipefail' when it calls aws s3api head-object");
+	for (const command of commands) {
+		const spelled = spell(command);
+		if (assignedNames(command).includes("head_status") && spelled !== guard.reset && spelled !== guard.capture) {
+			reasons.push(`assigns head_status outside the head-object guard: ${spelled}`);
+		}
+	}
+	const lines = String(run).split("\n").map((line) => line.trim());
+	const exists = lines.filter((line) => line === guard.exists).length;
+	const absent = lines.map((line, index) => (line === guard.absent ? index : -1)).filter((index) => index !== -1);
+	if (exists !== count) reasons.push(`must test the head-object status with exactly '${guard.exists}' once per head-object call (found ${exists} for ${count})`);
+	if (absent.length !== count) reasons.push(`must accept only an explicit 404 as "absent", spelled exactly: ${guard.absent} (found ${absent.length} for ${count})`);
+	for (const start of absent) {
+		let depth = 0;
+		let sawElse = false;
+		let sawExit = false;
+		let closed = false;
+		for (let index = start + 1; index < lines.length && !closed; index += 1) {
+			const line = lines[index];
+			if (/^(if|while|until|for|case)\b/.test(line) && !/\b(fi|done|esac)$/.test(line)) depth += 1;
+			else if (/^(fi|done|esac)$/.test(line)) {
+				if (depth > 0) depth -= 1;
+				else closed = true;
+			} else if (depth === 0) {
+				if (line.startsWith("elif")) {
+					reasons.push(`must not add another branch to the head-object guard: ${line}`);
+					break;
+				}
+				if (line === "else") sawElse = true;
+				else if (sawElse && line === "exit 1") sawExit = true;
+			}
+		}
+		if (!sawElse || !sawExit) reasons.push("must end the head-object guard with an 'else' branch that exits 1 for every other error");
+	}
+	return reasons;
+}
+
 /** True when an expression references any secret other than exactly `secrets.GITHUB_TOKEN`. */
 export function referencesSecret(text) {
 	return /\bsecrets\b/.test(String(text).replace(/\bsecrets\.GITHUB_TOKEN\b/g, ""));
@@ -905,11 +1179,26 @@ function expressionsOf(job) {
 	return expressions;
 }
 
+/**
+ * The `permissions:` of a job as `[scope, level]` pairs. The scalar forms are expanded rather than
+ * iterated as characters: `write-all` is every scope at write, `read-all` every scope at read.
+ */
+export function permissionEntries(permissions) {
+	if (permissions === undefined || permissions === null) return [];
+	if (typeof permissions === "string") {
+		if (permissions === "write-all") return [["*", "write"]];
+		if (permissions === "read-all") return [["*", "read"]];
+		return [["*", permissions]];
+	}
+	if (typeof permissions !== "object") return [["*", String(permissions)]];
+	return Object.entries(permissions).map(([scope, level]) => [scope, String(level)]);
+}
+
 /** True when a job holds something an attacker could exfiltrate or misuse. */
 export function isCredentialBearing(job) {
 	if (job.environment) return true;
-	for (const value of Object.values(job.permissions ?? {})) {
-		if (value === "write") return true;
+	for (const [, level] of permissionEntries(job.permissions)) {
+		if (level !== "read" && level !== "none") return true; // write, write-all, or anything the checker does not recognise
 	}
 	return expressionsOf(job).some(referencesSecret);
 }
@@ -919,7 +1208,7 @@ function needsOf(job) {
 	return Array.isArray(job.needs) ? job.needs : [job.needs];
 }
 
-export function checkWorkflows(read = (path) => readFileSync(path, "utf8")) {
+export function checkWorkflows(read = (path) => readFileSync(path, "utf8"), list = () => readdirSync(WORKFLOW_DIRECTORY)) {
 	const problems = [];
 	const fail = (message) => problems.push(message);
 	const release = parse(read(RELEASE_WORKFLOW));
@@ -931,10 +1220,37 @@ export function checkWorkflows(read = (path) => readFileSync(path, "utf8")) {
 	if (JSON.stringify(release.permissions ?? null) !== "{}") {
 		fail(`${RELEASE_WORKFLOW}: the workflow must declare 'permissions: {}' and let jobs opt in.`);
 	}
+	// A workflow-level env or default reaches every job, including the ones that run repository code.
+	for (const [name, value] of Object.entries(release.env ?? {})) {
+		if (referencesSecret(value)) fail(`${RELEASE_WORKFLOW}: the workflow-level env ${name} references a secret, which every job would receive; move it to the step that uses it.`);
+		if (STARTUP_ENV.test(name)) fail(`${RELEASE_WORKFLOW}: the workflow-level env sets ${name}, which loads code before any command runs.`);
+	}
+	if (release.defaults !== undefined && referencesSecret(JSON.stringify(release.defaults))) {
+		fail(`${RELEASE_WORKFLOW}: the workflow-level defaults reference a secret.`);
+	}
 
 	for (const [jobId, job] of Object.entries(release.jobs)) {
 		if (job.permissions === undefined) {
 			fail(`${RELEASE_WORKFLOW}: job '${jobId}' does not declare its own permissions.`);
+		} else if (typeof job.permissions !== "object" || job.permissions === null) {
+			fail(`${RELEASE_WORKFLOW}: job '${jobId}' declares 'permissions: ${job.permissions}'; spell out each scope instead of a blanket grant.`);
+		}
+		// Every job in the release is implicitly gated on its needs succeeding. A status function in
+		// `if:` replaces that gate, so a job could run after verify failed or the run was cancelled.
+		if (job.if !== undefined && STATUS_FUNCTIONS.test(String(job.if))) {
+			fail(`${RELEASE_WORKFLOW}: job '${jobId}' uses a status-check function in its 'if:', which would let it run after an upstream job failed or was cancelled: ${String(job.if).trim()}`);
+		}
+		if (job["continue-on-error"] !== undefined) {
+			fail(`${RELEASE_WORKFLOW}: job '${jobId}' sets continue-on-error, which lets a failed job count as success.`);
+		}
+		for (const step of job.steps ?? []) {
+			const label = step.name ?? step.uses ?? "(unnamed step)";
+			if (step.if !== undefined && STATUS_FUNCTIONS.test(String(step.if))) {
+				fail(`${RELEASE_WORKFLOW}: job '${jobId}' step '${label}' uses a status-check function in its 'if:', which would let it run after an earlier step failed: ${String(step.if).trim()}`);
+			}
+			if (step["continue-on-error"] !== undefined) {
+				fail(`${RELEASE_WORKFLOW}: job '${jobId}' step '${label}' sets continue-on-error, which lets a failed step count as success.`);
+			}
 		}
 		for (const [name, value] of Object.entries(job.env ?? {})) {
 			if (referencesSecret(value)) {
@@ -942,7 +1258,7 @@ export function checkWorkflows(read = (path) => readFileSync(path, "utf8")) {
 			}
 		}
 		if (!isCredentialBearing(job)) continue;
-		const allowed = ALLOWED_ACTIONS[jobId] ?? [];
+		const allowedActions = [...ALLOWED_ACTIONS["*"], ...(ALLOWED_ACTIONS[jobId] ?? [])];
 		const artifactDirectories = artifactDirectoriesOf(job);
 		// A default working directory or shell would change what every `run` line means.
 		for (const [scope, defaults] of [["the workflow", release.defaults], [`job '${jobId}'`, job.defaults]]) {
@@ -970,14 +1286,14 @@ export function checkWorkflows(read = (path) => readFileSync(path, "utf8")) {
 			if (step.shell !== undefined && !PLAIN_SHELL.test(String(step.shell))) {
 				fail(`${RELEASE_WORKFLOW}: credential-bearing job '${jobId}' must run bash; shell '${step.shell}' is code the checker cannot read (${label}).`);
 			}
-			if (step.uses) {
-				for (const pattern of FORBIDDEN_ACTIONS) {
-					if (pattern.test(step.uses) && !allowed.some((entry) => entry.test(step.uses))) {
-						fail(`${RELEASE_WORKFLOW}: credential-bearing job '${jobId}' must not use ${step.uses} (${label}).`);
-					}
-				}
-				if (step.uses.startsWith("./")) {
-					fail(`${RELEASE_WORKFLOW}: credential-bearing job '${jobId}' must not run a local action (${step.uses}).`);
+			if (step.uses !== undefined) {
+				// An allowlist: any action not named for this job - pinned or not, first- or third-party,
+				// local or remote - is code running next to the credential.
+				const uses = String(step.uses);
+				if (uses.startsWith("./")) {
+					fail(`${RELEASE_WORKFLOW}: credential-bearing job '${jobId}' must not run a local action (${uses}).`);
+				} else if (!allowedActions.some((pattern) => pattern.test(uses))) {
+					fail(`${RELEASE_WORKFLOW}: credential-bearing job '${jobId}' must not use ${uses}; only ${allowedActions.map((pattern) => pattern.source.replace(/^\^|@$/g, "").replaceAll("\\/", "/")).join(", ")} may run next to its credential (${label}).`);
 				}
 			}
 			const run = String(step.run ?? "");
@@ -1036,8 +1352,10 @@ export function checkWorkflows(read = (path) => readFileSync(path, "utf8")) {
 		}
 		steps.forEach((step, index) => {
 			const label = step.name ?? step.uses ?? "(unnamed step)";
-			const { reasons, pointers } = r2StepReasons(jobId, String(step.run ?? ""), { last: index === steps.length - 1, artifactDirectories });
+			const run = String(step.run ?? "");
+			const { reasons, pointers } = r2StepReasons(jobId, run, { last: index === steps.length - 1, artifactDirectories });
 			for (const reason of reasons) fail(`${RELEASE_WORKFLOW}: job '${jobId}' ${reason} (${label}).`);
+			for (const reason of headObjectGuardReasons(run)) fail(`${RELEASE_WORKFLOW}: job '${jobId}' ${reason} (${label}).`);
 			if (pointers.length > 0) pointerSteps.set(`${jobId}\u0000${index}`, pointers);
 		});
 	}
@@ -1063,9 +1381,11 @@ export function checkWorkflows(read = (path) => readFileSync(path, "utf8")) {
 					fail(`${path}: job '${jobId}' uses '${step.uses}' without a full commit SHA.`);
 				}
 				const run = String(step.run ?? "");
-				for (const line of run.split("\n")) {
-					if (/\bnpm ci\b/.test(line) && !line.includes("--ignore-scripts")) {
-						fail(`${path}: job '${jobId}' runs 'npm ci' without --ignore-scripts.`);
+				// Dependency install scripts never run on a machine that produces release bytes, whatever
+				// package manager or subcommand would run them.
+				for (const command of shellCommands(run)) {
+					for (const reason of lifecycleReasons(command, { workflow: path, jobId })) {
+						fail(`${path}: job '${jobId}' ${reason} (${step.name ?? step.uses ?? "(unnamed step)"}).`);
 					}
 				}
 				// The test signer override may be compiled in exactly one place: the standalone job's
@@ -1096,7 +1416,7 @@ export function checkWorkflows(read = (path) => readFileSync(path, "utf8")) {
 	const standalone = parse(read(STANDALONE_WORKFLOW));
 	// The standalone job compiles and tests repository code AND holds id-token:write. That is only
 	// safe because the identity it can mint - the called workflow path, standalone-binaries.yml -
-	// is not the one the updater pins. Nothing else may be granted to it, here or by its caller.
+	// is not the one the updater pins. Nothing else may be granted to it, here or by any caller.
 	const trust = read(RELEASE_TRUST_SOURCE);
 	const pinnedPath = trust.match(/RELEASE_SIGNER_WORKFLOW_PATH\s*=\s*"([^"]+)"/)?.[1];
 	if (pinnedPath !== RELEASE_WORKFLOW) {
@@ -1104,8 +1424,9 @@ export function checkWorkflows(read = (path) => readFileSync(path, "utf8")) {
 	}
 	for (const [jobId, job] of Object.entries(standalone.jobs ?? {})) {
 		if (job.environment) fail(`${STANDALONE_WORKFLOW}: job '${jobId}' must not run in an environment; it runs repository code.`);
-		for (const [scope, value] of Object.entries(job.permissions ?? {})) {
-			if (!(scope === "contents" && value === "read") && !(scope === "id-token" && value === "write")) {
+		if (typeof job.permissions === "string") fail(`${STANDALONE_WORKFLOW}: job '${jobId}' declares 'permissions: ${job.permissions}'; spell out contents:read and id-token:write.`);
+		for (const [scope, value] of permissionEntries(job.permissions)) {
+			if (STANDALONE_CALLER_PERMISSIONS[scope] !== value) {
 				fail(`${STANDALONE_WORKFLOW}: job '${jobId}' holds '${scope}: ${value}'; only contents:read and id-token:write are allowed next to repository code.`);
 			}
 		}
@@ -1113,13 +1434,33 @@ export function checkWorkflows(read = (path) => readFileSync(path, "utf8")) {
 			fail(`${STANDALONE_WORKFLOW}: job '${jobId}' references a secret; it runs repository code.`);
 		}
 	}
-	const caller = release.jobs.standalone;
-	if (caller?.uses !== `./${STANDALONE_WORKFLOW}`) {
+	if (release.jobs.standalone?.uses !== `./${STANDALONE_WORKFLOW}`) {
 		fail(`${RELEASE_WORKFLOW}: expected job 'standalone' to call ${STANDALONE_WORKFLOW}.`);
-	} else {
-		for (const [scope, value] of Object.entries(caller.permissions ?? {})) {
-			if (!(scope === "contents" && value === "read") && !(scope === "id-token" && value === "write")) {
-				fail(`${RELEASE_WORKFLOW}: job 'standalone' passes '${scope}: ${value}' to a workflow that runs repository code.`);
+	}
+	// Every caller of the standalone workflow, in every workflow file (ci.yml calls it too), passes
+	// exactly contents:read + id-token:write, no secrets, no environment, and only the declared input.
+	for (const file of list()) {
+		if (!/\.ya?ml$/.test(file)) continue;
+		const path = `${WORKFLOW_DIRECTORY}/${file}`;
+		const workflow = parse(read(path));
+		for (const [jobId, caller] of Object.entries(workflow?.jobs ?? {})) {
+			if (caller?.uses !== `./${STANDALONE_WORKFLOW}`) continue;
+			const expected = JSON.stringify(Object.entries(STANDALONE_CALLER_PERMISSIONS).sort());
+			const actual = typeof caller.permissions === "object" && caller.permissions !== null ? JSON.stringify(Object.entries(caller.permissions).map(([scope, level]) => [scope, String(level)]).sort()) : null;
+			if (actual !== expected) {
+				fail(`${path}: job '${jobId}' calls ${STANDALONE_WORKFLOW} with permissions '${caller.permissions === undefined ? "(none declared)" : JSON.stringify(caller.permissions)}'; it must pass exactly contents: read and id-token: write, and nothing else, to a workflow that runs repository code.`);
+			}
+			if ("secrets" in caller) {
+				fail(`${path}: job '${jobId}' passes secrets (${JSON.stringify(caller.secrets)}) to ${STANDALONE_WORKFLOW}, which runs repository code; no secret may reach it.`);
+			}
+			if (caller.environment !== undefined) {
+				fail(`${path}: job '${jobId}' runs ${STANDALONE_WORKFLOW} in an environment; the environment's secrets would reach repository code.`);
+			}
+			for (const input of Object.keys(caller.with ?? {})) {
+				if (!STANDALONE_CALLER_INPUTS.includes(input)) fail(`${path}: job '${jobId}' passes input '${input}' to ${STANDALONE_WORKFLOW}; only ${STANDALONE_CALLER_INPUTS.join(", ")} is declared.`);
+			}
+			if (expressionsOf(caller).some(referencesSecret)) {
+				fail(`${path}: job '${jobId}' references a secret while calling ${STANDALONE_WORKFLOW}.`);
 			}
 		}
 	}
