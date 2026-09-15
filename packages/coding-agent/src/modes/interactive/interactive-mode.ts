@@ -280,6 +280,7 @@ import {
 	getAvailableThemes,
 	getAvailableThemesWithPaths,
 	getEditorTheme,
+	getFlatMarkdownTheme,
 	getMarkdownTheme,
 	getThemeByName,
 	initTheme,
@@ -1914,6 +1915,14 @@ export class InteractiveMode {
 	private getMarkdownThemeWithSettings(): MarkdownTheme {
 		return {
 			...getMarkdownTheme(),
+			codeBlockIndent: this.settingsManager.getCodeBlockIndent(),
+		};
+	}
+
+	/** Summary cards render prose in one color instead of markdown element colors. */
+	private getFlatMarkdownThemeWithSettings(color: ThemeColor): MarkdownTheme {
+		return {
+			...getFlatMarkdownTheme(color),
 			codeBlockIndent: this.settingsManager.getCodeBlockIndent(),
 		};
 	}
@@ -6525,14 +6534,20 @@ export class InteractiveMode {
 			}
 			case "compactionSummary": {
 				this.chatContainer.addChild(new Spacer(1));
-				const component = new CompactionSummaryMessageComponent(message, this.getMarkdownThemeWithSettings());
+				const component = new CompactionSummaryMessageComponent(
+					message,
+					this.getFlatMarkdownThemeWithSettings("refinementSummary"),
+				);
 				component.setExpanded(this.toolOutputExpanded);
 				this.chatContainer.addChild(component);
 				break;
 			}
 			case "branchSummary": {
 				this.chatContainer.addChild(new Spacer(1));
-				const component = new BranchSummaryMessageComponent(message, this.getMarkdownThemeWithSettings());
+				const component = new BranchSummaryMessageComponent(
+					message,
+					this.getFlatMarkdownThemeWithSettings("customMessageText"),
+				);
 				component.setExpanded(this.toolOutputExpanded);
 				this.chatContainer.addChild(component);
 				break;
