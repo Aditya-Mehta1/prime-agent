@@ -319,6 +319,73 @@ ${step(validation, "Verify and exercise exact final Mac archives").run}`,
 	});
 
 	it.skipIf(process.platform === "win32")(
+		"the test-signer signing step verifies both bundles against the exact identity and exports the env contract",
+		() => {
+			const sign = step(standalone.jobs.build!, "Sign the test archives with this job's identity").run!;
+			const directory = mkdtempSync(join(tmpdir(), "prime-standalone-sign-"));
+			const shim = (accepted: string) => `
+cosign() {
+  case "$1" in
+    sign-blob) printf '{"bundle":true}' > "$4" ;;
+    verify-blob) [ "$7" = "${accepted}" ] ;;
+    *) echo "unexpected cosign call: $*" >&2; return 99 ;;
+  esac
+}
+`;
+			const env = {
+				RUNNER_TEMP: directory,
+				GITHUB_ENV: join(directory, "env"),
+				SIGNER_IDENTITY: "https://github.com/o/r/.github/workflows/standalone-binaries.yml@refs/pull/12/merge",
+				RELEASE_VERSION: "1.2.3",
+				TARGET_PLATFORM: "darwin-arm64",
+			};
+			const sha = (body: string) =>
+				spawnSync("bash", ["-c", "printf '%s' \"$1\" | shasum -a 256 | cut -d' ' -f1", "_", body], {
+					encoding: "utf8",
+				}).stdout.trim();
+			try {
+				for (const [channel, file] of [
+					["current", "prime-agent-1.2.3-darwin-arm64.tar.gz"],
+					["next", "prime-agent-99.0.0-darwin-arm64.tar.gz"],
+				]) {
+					mkdirSync(join(directory, "test-release", channel!), { recursive: true });
+					writeFileSync(join(directory, "test-release", channel!, file!), channel!);
+					writeFileSync(join(directory, "test-release", channel!, "SHA256SUMS"), `${sha(channel!)}  ${file}\n`);
+				}
+				const ok = runStepScript(sign, shim(env.SIGNER_IDENTITY), env);
+				expect(ok.status, ok.stderr).toBe(0);
+				expect(readFileSync(join(directory, "env"), "utf8")).toBe(
+					[
+						`PRIME_AGENT_TEST_ARCHIVE=${directory}/test-release/current/prime-agent-1.2.3-darwin-arm64.tar.gz`,
+						`PRIME_AGENT_TEST_SIGNATURE_BUNDLE=${directory}/test-release/current/SHA256SUMS.sigstore.json`,
+						`PRIME_AGENT_TEST_NEXT_ARCHIVE=${directory}/test-release/next/prime-agent-99.0.0-darwin-arm64.tar.gz`,
+						`PRIME_AGENT_TEST_NEXT_SIGNATURE_BUNDLE=${directory}/test-release/next/SHA256SUMS.sigstore.json`,
+						"",
+					].join("\n"),
+				);
+				for (const channel of ["current", "next"]) {
+					expect(readFileSync(join(directory, "test-release", channel, "SHA256SUMS.sigstore.json"), "utf8")).toBe(
+						'{"bundle":true}',
+					);
+				}
+				rmSync(join(directory, "env"));
+				// A certificate with any other identity, or a checksum that no longer matches, stops the job.
+				const wrong = runStepScript(
+					sign,
+					shim("https://github.com/o/r/.github/workflows/build-binaries.yml@refs/pull/12/merge"),
+					env,
+				);
+				expect(wrong.status).toBe(1);
+				writeFileSync(join(directory, "test-release/next/prime-agent-99.0.0-darwin-arm64.tar.gz"), "tampered");
+				const tampered = runStepScript(sign, shim(env.SIGNER_IDENTITY), env);
+				expect(tampered.status).toBe(1);
+			} finally {
+				rmSync(directory, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
 		"the test-signer steps refuse a certificate naming the caller workflow",
 		() => {
 			const resolve = step(standalone.jobs.build!, "Resolve the signer identity of this job").run!;

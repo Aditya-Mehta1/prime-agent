@@ -190,7 +190,11 @@ jobs:
           set -euo pipefail
           for channel in current next; do
             sums="$RUNNER_TEMP/test-release/$channel/SHA256SUMS"
-            (cd "$RUNNER_TEMP/test-release/$channel" && sha256sum --check SHA256SUMS)
+            if command -v sha256sum >/dev/null 2>&1; then
+              (cd "$RUNNER_TEMP/test-release/$channel" && sha256sum --check SHA256SUMS)
+            else
+              (cd "$RUNNER_TEMP/test-release/$channel" && shasum -a 256 --check SHA256SUMS)
+            fi
             cosign sign-blob --yes --bundle "$sums.sigstore.json" "$sums"
             cosign verify-blob \
               --bundle "$sums.sigstore.json" \
