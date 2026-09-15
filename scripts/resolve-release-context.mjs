@@ -4,11 +4,13 @@
  *
  * Besides the version/ref bookkeeping the release workflow has always done, this
  * script decides whether a production publish may run unattended. Production
- * publishing is unattended ONLY when the head commit resolves to a merged pull
- * request that bumped the version and carried at least one approving review from
- * a human. Everything else (direct push, workflow_dispatch, a retry riding an
- * unrelated merge, bot-only approvals) is routed to the `release-manual`
- * environment, which has required reviewers.
+ * publishing is unattended ONLY when the head commit is the merge commit of a
+ * pull request into the default branch that bumped the version and whose CURRENT
+ * review state is: at least one human approval of the head commit, no human
+ * requesting changes, dismissed approvals ignored. Everything else (direct push,
+ * workflow_dispatch, a retry riding an unrelated merge, bot-only or dismissed or
+ * stale approvals) is routed to the `release-manual` environment, which has
+ * required reviewers.
  *
  * The module exports pure-ish functions so the decision table can be unit tested
  * without a runner; `main()` wires the real git/gh/package.json implementations.
@@ -31,39 +33,106 @@ function isHumanReviewer(user) {
 	return !user.login.endsWith("[bot]");
 }
 
+/** Review states that express an opinion. COMMENTED and PENDING never change a reviewer's verdict. */
+const VERDICT_STATES = new Set(["APPROVED", "CHANGES_REQUESTED", "DISMISSED"]);
+
+function reviewOrder(a, b) {
+	const at = Date.parse(a.submitted_at ?? "") || 0;
+	const bt = Date.parse(b.submitted_at ?? "") || 0;
+	if (at !== bt) return at - bt;
+	return (Number(a.id) || 0) - (Number(b.id) || 0);
+}
+
 /**
- * Looks for a merged pull request whose merge commit is exactly `sha`, with at
- * least one APPROVED review left by a human.
+ * Reduces a pull request's review history to the CURRENT verdict of every human
+ * reviewer: the latest APPROVED / CHANGES_REQUESTED / DISMISSED review per login.
+ * A dismissed approval is not an approval; a later CHANGES_REQUESTED overrides an
+ * earlier approval by the same person; COMMENTED reviews carry no verdict.
+ *
+ * `headSha` is the pull request head: an approval that reviewed an older commit
+ * is stale and does not count, so code pushed after the last approval always
+ * needs a fresh human look before it can release unattended.
  */
-export function findApprovingPullRequest(deps, repository, sha) {
+export function evaluateReviews(reviews, headSha) {
+	const latest = new Map();
+	for (const review of [...reviews].filter((entry) => entry && typeof entry === "object").sort(reviewOrder)) {
+		if (!isHumanReviewer(review.user)) continue;
+		const state = String(review.state ?? "").toUpperCase();
+		if (!VERDICT_STATES.has(state)) continue;
+		latest.set(review.user.login, { state, commitId: review.commit_id ?? null });
+	}
+	const approvers = [];
+	const staleApprovers = [];
+	const blockers = [];
+	for (const [login, verdict] of latest) {
+		if (verdict.state === "CHANGES_REQUESTED") blockers.push(login);
+		else if (verdict.state === "APPROVED") {
+			if (headSha && verdict.commitId === headSha) approvers.push(login);
+			else staleApprovers.push(login);
+		}
+	}
+	return { approvers, staleApprovers, blockers };
+}
+
+/**
+ * Looks for a merged pull request into the default branch whose merge commit is
+ * exactly `sha` and whose CURRENT review state is: at least one human approval
+ * of the head commit and no human requesting changes.
+ */
+export function findApprovingPullRequest(deps, repository, sha, defaultBranch) {
 	const pulls = deps.ghJson(["api", "-H", "Accept: application/vnd.github+json", `repos/${repository}/commits/${sha}/pulls`]);
 	if (!Array.isArray(pulls)) {
 		return { approved: false, reason: `Could not list pull requests for ${sha}.` };
 	}
-	const merged = pulls.filter((pull) => pull && pull.merged_at && pull.merge_commit_sha === sha);
+	const merged = pulls.filter(
+		(pull) =>
+			pull &&
+			typeof pull.number === "number" &&
+			typeof pull.merged_at === "string" &&
+			pull.merged_at !== "" &&
+			pull.merge_commit_sha === sha &&
+			pull.base &&
+			pull.base.ref === defaultBranch,
+	);
 	if (merged.length === 0) {
-		return { approved: false, reason: `No merged pull request has ${sha} as its merge commit.` };
+		return { approved: false, reason: `No pull request merged into ${defaultBranch} has ${sha} as its merge commit.` };
 	}
+	const reasons = [];
 	for (const pull of merged) {
+		const headSha = pull.head && typeof pull.head.sha === "string" ? pull.head.sha : null;
+		if (!headSha) {
+			reasons.push(`#${pull.number}: head commit unknown`);
+			continue;
+		}
 		const reviews = deps.ghJson([
 			"api",
 			"--paginate",
+			"--slurp",
 			"-H",
 			"Accept: application/vnd.github+json",
 			`repos/${repository}/pulls/${pull.number}/reviews`,
 		]);
-		if (!Array.isArray(reviews)) continue;
-		const approval = reviews.find((review) => review && review.state === "APPROVED" && isHumanReviewer(review.user));
-		if (approval) {
+		const pages = Array.isArray(reviews) ? reviews : [];
+		const flat = pages.every(Array.isArray) ? pages.flat() : pages;
+		const { approvers, staleApprovers, blockers } = evaluateReviews(flat, headSha);
+		if (blockers.length > 0) {
+			reasons.push(`#${pull.number}: changes requested by @${blockers.join(", @")}`);
+			continue;
+		}
+		if (approvers.length > 0) {
 			return {
 				approved: true,
-				reason: `Pull request #${pull.number} was approved by @${approval.user.login}.`,
+				reason: `Pull request #${pull.number} is approved at its head commit by @${approvers.join(", @")}.`,
 				pullNumber: pull.number,
 			};
 		}
+		if (staleApprovers.length > 0) {
+			reasons.push(`#${pull.number}: the approval by @${staleApprovers.join(", @")} predates the head commit ${headSha}`);
+		} else {
+			reasons.push(`#${pull.number}: no current approving review from a human`);
+		}
 	}
-	const numbers = merged.map((pull) => `#${pull.number}`).join(", ");
-	return { approved: false, reason: `Merged pull request ${numbers} has no approving review from a human.` };
+	return { approved: false, reason: `Merged pull request has no approving review from a human (${reasons.join("; ")}).` };
 }
 
 export function resolveReleaseContext(env, deps) {
@@ -157,7 +226,7 @@ export function resolveReleaseContext(env, deps) {
 				requiresApproval = true;
 				approvalReason = `Resolved version ${productionVersion} does not match package.json (${packageVersion}).`;
 			} else {
-				const verdict = findApprovingPullRequest(deps, repository, sha);
+				const verdict = findApprovingPullRequest(deps, repository, sha, defaultBranch);
 				requiresApproval = !verdict.approved;
 				approvalReason = verdict.reason;
 			}
