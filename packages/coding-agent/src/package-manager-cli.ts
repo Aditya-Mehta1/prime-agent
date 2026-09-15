@@ -42,6 +42,7 @@ import {
 import {
 	APP_NAME,
 	CONFIG_DIR_NAME,
+	detectInstallMethod,
 	getAgentDir,
 	getDaemonUpdateRestartManifestPath,
 	getLegacyDaemonUpdateRestartManifestPath,
@@ -543,7 +544,11 @@ async function getSelfUpdatePlan(force: boolean, rollback = false, channel?: Upd
 	// A -beta install with no saved preference is on the nightly channel too; a missing manifest
 	// must never push it onto the stable registry package.
 	const effectiveChannel = resolveUpdateChannel(VERSION, channel);
-	if (isBunBinary) {
+	// Only a loose compiled binary belongs to the self-updater. A compiled binary that a package
+	// manager installed (our npm per-platform packages, a Homebrew keg) is updated by that manager,
+	// so it takes the registry path below and gets that manager's command or a clear instruction.
+	const installMethod = detectInstallMethod();
+	if (isBunBinary && installMethod === "bun-binary") {
 		try {
 			const plan = await getNativeUpdatePlan({ force, rollback, channel });
 			if (plan.refusedDowngradeTo) return behindChannelPlan(plan.refusedDowngradeTo, force, channel);
@@ -562,7 +567,13 @@ async function getSelfUpdatePlan(force: boolean, rollback = false, channel?: Upd
 			throw error;
 		}
 	}
-	if (rollback) throw new Error("Rollback is only available for managed compiled installations.");
+	if (rollback) {
+		if (isBunBinary && installMethod !== "bun-binary")
+			throw new Error(
+				`Rollback is only available for compiled installations managed by the ${APP_NAME} installer; this copy is managed by ${installMethod}.`,
+			);
+		throw new Error("Rollback is only available for managed compiled installations.");
+	}
 	try {
 		const latestRelease = await getLatestPiRelease(VERSION, { channel });
 		// The registry default resolves to the stable package, so a missing nightly manifest must not fall through to it.

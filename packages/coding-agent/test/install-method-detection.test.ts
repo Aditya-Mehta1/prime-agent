@@ -1,4 +1,13 @@
-import { mkdirSync, mkdtempSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	readlinkSync,
+	realpathSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -219,6 +228,27 @@ describe("detectInstallMethod for compiled copies", () => {
 			vi.unstubAllGlobals();
 			vi.unstubAllEnvs();
 		}
+	});
+
+	test("update planning consults the install method before choosing the native self-updater", () => {
+		// `isBunBinary` is fixed at module load from import.meta.url, so the branch cannot be driven
+		// from a unit test. Pin the structure instead: the native plan is reachable only when the
+		// classified method is the loose compiled binary, and a package-manager copy takes the
+		// registry path where `getSelfUpdateCommand` yields that manager's command.
+		const source = readFileSync(join(__dirname, "../src/package-manager-cli.ts"), "utf8");
+		const plan = source.slice(
+			source.indexOf("async function getSelfUpdatePlan"),
+			source.indexOf("async function runSelfUpdate("),
+		);
+		expect(plan).toMatch(/const installMethod = detectInstallMethod\(\);/);
+		expect(plan).toMatch(/if \(isBunBinary && installMethod === "bun-binary"\)/);
+		expect(plan.indexOf("detectInstallMethod()")).toBeLessThan(plan.indexOf("getNativeUpdatePlan("));
+		// A compiled copy that a package manager owns gets that manager's command from the registry path.
+		createNpmBinaryInstall();
+		expect(detectInstallMethod()).toBe("npm");
+		expect(getSelfUpdateCommand("prime-agent")?.display ?? getUpdateInstruction("prime-agent")).toMatch(
+			/npm install -g prime-agent/,
+		);
 	});
 
 	test("an npm-installed compiled binary reports npm and gets an npm instruction", () => {
