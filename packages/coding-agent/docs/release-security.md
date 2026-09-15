@@ -30,19 +30,29 @@ R2 credential and nothing else cannot produce a release that any existing instal
 
 ### Releases come only from an approved pull request
 
-`scripts/resolve-release-context.mjs` resolves the head commit to its merged pull request and
-requires at least one approving review from a human. Direct pushes, manual dispatches, bot-only
-approvals and retries riding an unrelated merge are routed to the `release-manual` environment, which
-requires a reviewer who did not trigger the run.
+`scripts/resolve-release-context.mjs` resolves the head commit to a pull request that was actually
+merged as that commit (`merged_at` set, `merge_commit_sha` equal, base is the default branch) and
+evaluates the pull request's **current** review state: the latest review per human reviewer must
+include an approval at the merged head, no human may have an outstanding change request, dismissed
+reviews do not count, and bot reviews are ignored. Direct pushes, manual dispatches, stale or
+dismissed approvals, and retries riding an unrelated merge are routed to the `release-manual`
+environment, which requires a reviewer who did not trigger the run.
 
-Pushing a `v*` tag does not start a release. The tag is created by the release job after publication.
+Pushing a `v*` tag does not start a release. A draft GitHub release creates no tag; the tag appears
+when `finalize-release` publishes the release, after `verify` accepted the artifacts, and the job
+then proves the tag points at the release commit. An existing `v*` tag at any other commit fails the
+release before anything is drafted.
 
 ### Credentials never share a machine with repository code
 
-The publishing jobs do not check out the repository, install dependencies, or run project scripts.
-They download artifacts, verify them, and upload them. R2 credentials are declared at **step** level,
-so they are absent from every other step in the same job. Build jobs, which do run repository and
-dependency code, hold no credentials at all.
+The publishing jobs (`github-release`, `publish-r2`, `finalize-release`, `publish-npm`) do not check
+out the repository, install dependencies, or run project scripts. They download artifacts, verify
+them, and upload them. R2 credentials are declared at **step** level, so they are absent from every
+other step in the same job. Build jobs, which do run repository and dependency code, hold no
+credentials at all - including `pack-npm`, which builds the registry packages and hands tarballs to
+`publish-npm` by artifact. `scripts/check-release-workflow.mjs` enforces this in CI: it derives which
+jobs are credential-bearing and fails if any of them checks out code, installs packages, or invokes
+anything under the repository.
 
 ### Dependency install scripts do not run on release machines
 
@@ -75,9 +85,16 @@ valid. The pinned values live in `packages/coding-agent/src/utils/release-trust.
 ### Publication is verified, immutable, and ordered
 
 `publish-r2` verifies every artifact against the digest GitHub recorded, refuses to overwrite an
-existing object under `releases/vX.Y.Z/`, reads each object back, and only then moves the channel
-pointers. The GitHub release is published and the tag created last, so a failed release leaves no
-public trace.
+existing object under `releases/vX.Y.Z/`, reads each object back, and writes **nothing else**: no
+channel pointer, no installer. `verify` then downloads those immutable objects from the public URL on
+a clean runner and checks the signature, the digests and the binary. Only after that does
+`finalize-release` publish the GitHub release, prove the tag, and - as its last step - move
+`stable`, `latest.json` and `install.sh`.
+
+So until `finalize-release` completes, nothing a user follows refers to the new version. A failure
+before or during `verify` leaves only content-addressed objects that no pointer names. A failure
+inside `finalize-release` can leave the tag and GitHub release without the pointers; re-running the
+pointer step is safe because it only names objects `verify` already accepted.
 
 ### The self-updater verifies, and fails closed
 

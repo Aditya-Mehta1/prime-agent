@@ -21,7 +21,7 @@ and anything that is *not* an approved version-bump pull request stops and waits
    later confirms that the merge commit belongs to a merged pull request whose *current* review
    state includes an approval from a human; dismissed approvals, outstanding change requests, and
    bot approvals do not count.
-3. **CI takes over.** The `Release Prime Agent` workflow runs on the merge:
+3. **CI takes over.** The `Release Prime Agent` workflow runs on the merge, in this order:
 
    | Job | What it does | Secrets |
    |---|---|---|
@@ -31,17 +31,18 @@ and anything that is *not* an approved version-bump pull request stops and waits
    | `validate-macos` | Re-verifies macOS signatures and matches every `executableSha256` receipt | none |
    | `assemble` | Renders the installer, verifies receipts, produces the final artifact set | none |
    | `sign` | cosign keyless signature over `SHA256SUMS`, SBOM per archive, build provenance | OIDC only |
-   | `github-release` | Creates a **draft** release, uploads assets, records GitHub's digests | `GITHUB_TOKEN` |
-   | `publish-r2` | Verifies artifacts against those digests, uploads immutably, moves the channel | R2, step-scoped |
-   | `finalize-release` | Publishes the release and creates the `vX.Y.Z` tag **last** | `GITHUB_TOKEN` |
-   | `verify` | Re-downloads from the public URL, verifies the signature, runs the binary | none |
-   | `publish-npm` | Publishes the registry packages over OIDC with provenance | OIDC only |
+   | `github-release` | Refuses an existing tag at another commit, creates a **draft** release (no tag yet), records GitHub's asset digests | `GITHUB_TOKEN` |
+   | `publish-r2` | Verifies every artifact against those digests, uploads **only** the immutable `releases/vX.Y.Z/` objects, refuses to overwrite, reads back. Moves no pointer. | R2, step-scoped |
+   | `verify` | Clean runner: downloads the immutable objects from the public URL, verifies the cosign signature and digests, runs the binary | none |
+   | `finalize-release` | Re-checks the draft assets and the tag, publishes the release (the `vX.Y.Z` tag appears here), proves the tag points at the release commit, then as its **last step** moves `stable`, `latest.json` and `install.sh` | `GITHUB_TOKEN`, then R2 step-scoped |
+   | `pack-npm` | Unprivileged: builds the workspace and stages the registry packages from the verified archives | none |
+   | `publish-npm` | No checkout: re-hashes each tarball against the manifest, publishes over OIDC with provenance | OIDC only |
    | `tap-bump` | Opens the Homebrew formula bump | tap token |
 
-4. **Watch `verify`.** It installs the way a user does and fails the run if anything does not match.
-
-Nothing is public before the artifacts pass verification: the GitHub release is drafted first, and
-the git tag is created only after R2 accepted the upload.
+4. **Watch `verify`.** It downloads what a user would download and fails the run if anything does not
+   match. Until `finalize-release` completes, nothing a user follows refers to the new version: the
+   channel pointers, `install.sh`, the GitHub release and the tag are all untouched. Only the
+   content-addressed `releases/vX.Y.Z/` objects exist, and `verify` has to accept them first.
 
 ## Nightly (beta)
 
@@ -64,16 +65,20 @@ Some publications cannot point at an approved release pull request:
 - a retry of a failed release that rides on an unrelated merge
 
 These still run, but `context` routes them to the `release-manual` environment, which requires a
-reviewer who did not trigger the run. Pushing a `v*` tag does **not** start a release at all; the tag
+reviewer who did not trigger the run. Two jobs run in that environment (`publish-r2` and
+`finalize-release`), so a break-glass release asks for approval twice: once before anything is
+uploaded, once before anything becomes public. Pushing a `v*` tag does **not** start a release at all; the tag
 is an output of the release, never an input.
 
 ## If a release fails
 
-- **Before `publish-r2`:** nothing was published. Fix the problem and re-run.
-- **During `publish-r2`:** uploads refuse to overwrite an existing object in `releases/vX.Y.Z/`, so a
-  retry is safe. The channel pointer moves only after every object is verified and read back.
-- **After publication:** the release is immutable. Ship a new patch version; do not rewrite a
-  published version.
+- **Before or during `publish-r2`, or in `verify`:** nothing a user can reach has changed. The
+  immutable objects may exist under `releases/vX.Y.Z/`, but no pointer, installer, release or tag
+  refers to them. Uploads refuse to overwrite, so a retry is safe.
+- **In `finalize-release`:** the tag and GitHub release may exist before the pointers move. If the
+  final pointer step failed, re-run it; it only writes pointers to objects `verify` already accepted.
+- **After the pointers move:** the release is live and immutable. Ship a new patch version; do not
+  rewrite a published version.
 - A version whose tag already points at a different commit is refused outright.
 
 ## Checking a published release by hand
