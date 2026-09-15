@@ -7,6 +7,7 @@ import type { ModelRegistry } from "../src/core/model-registry.js";
 import type { SessionInfo } from "../src/core/session-manager.js";
 import type { SettingsManager } from "../src/core/settings-manager.js";
 import {
+	AgentsViewMode,
 	createAgentsViewListCommand,
 	createAgentsViewReplyHeadline,
 	createAgentsViewResumeConfig,
@@ -56,6 +57,7 @@ import { formatAgentDepthLabel } from "../src/modes/interactive/interactive-mode
 import type { InteractiveModeUiServices } from "../src/modes/interactive/interactive-mode-services.js";
 import type { Theme } from "../src/modes/interactive/theme/theme.js";
 import * as paths from "../src/utils/paths.js";
+import { createDeferred } from "./suite/scheduling.js";
 
 function heartbeat(id: string, nextRunAt?: string, activeSessionId = "child", status: "active" | "paused" = "active") {
 	return {
@@ -2315,3 +2317,270 @@ function makeUiServices(cwd: string): InteractiveModeUiServices {
 		getThemes: (): Theme[] => [],
 	};
 }
+
+/**
+ * Session catalog refresh races folded in from the #502 unified-session-view regression file:
+ * overlapping polls, reconnect fences, and shutdown must never rewind the last complete catalog.
+ */
+describe("#502 agents view catalog refresh races", () => {
+	function privateMethod<T>(name: string): T {
+		const member = Reflect.get(AgentsViewMode.prototype, name) as T;
+		if (typeof member !== "function") {
+			throw new Error(`AgentsViewMode.${name} no longer exists; update this regression harness`);
+		}
+		return member;
+	}
+
+	function rawSavedSession(id: string) {
+		return {
+			path: `/tmp/${id}.jsonl`,
+			id,
+			cwd: "/tmp/project",
+			state: "idle",
+			created: new Date(0).toISOString(),
+			modified: new Date(0).toISOString(),
+			messageCount: 1,
+		};
+	}
+
+	function savedSession(id: string) {
+		return { path: `/tmp/${id}.jsonl`, id };
+	}
+
+	function refreshHarness() {
+		const persistentState: {
+			savedSessions?: unknown[];
+			lastSuccessfulSavedSessions?: unknown[];
+			heartbeats?: unknown[];
+			savedCatalogGeneration?: number;
+		} = {};
+		return {
+			reconnectPromise: undefined,
+			daemonShutdownReceived: false,
+			options: {},
+			savedCatalogGeneration: 0,
+			heartbeatCatalogGeneration: 0,
+			savedCatalogRefreshPending: false,
+			heartbeats: [] as unknown[],
+			savedSearchFetchStarted: false,
+			persistentState,
+			applySessionList: vi.fn(),
+			reconcileCatalogs: vi.fn(),
+			resolveMissingSelectionAnchor: vi.fn(),
+			setStatusMessage: vi.fn(),
+			startClientReconnect: vi.fn(),
+			rearmSavedSearchFetch: privateMethod<(this: unknown) => void>("rearmSavedSearchFetch"),
+		};
+	}
+
+	function savedScanHarness(previous: Array<{ path: string; id: string }>, client: unknown) {
+		const harness = {
+			...refreshHarness(),
+			savedSessions: previous,
+			lastSuccessfulSavedSessions: previous,
+			requireClient: () => client,
+			getSavedSessionCatalogContext: () => ({ cwd: "/tmp/project" }),
+		};
+		harness.persistentState.savedSessions = previous;
+		return harness;
+	}
+
+	test("an older overlapping heartbeat poll cannot overwrite the newer response", async () => {
+		const old = createDeferred<unknown>();
+		const newer = { job: { id: "new" } };
+		const client = {
+			isConnected: true,
+			hello: { protocol: { version: 3 } },
+			supportsServerCapability: () => true,
+			request: vi
+				.fn()
+				.mockReturnValueOnce(old.promise)
+				.mockResolvedValueOnce({ success: true, data: { heartbeats: [newer] } }),
+		};
+		const harness = { ...refreshHarness(), requireClient: () => client };
+		const refresh = privateMethod<(this: typeof harness) => Promise<unknown>>("refreshHeartbeats");
+
+		const oldPoll = refresh.call(harness);
+		await refresh.call(harness);
+		old.resolve({ success: true, data: { heartbeats: [{ job: { id: "old" } }] } });
+		await oldPoll;
+
+		expect(harness.heartbeats).toEqual([newer]);
+		expect(harness.reconcileCatalogs).toHaveBeenCalledOnce();
+	});
+
+	test("overlapping saved scans retain the last complete catalog after the newest scan fails", async () => {
+		const previous = [savedSession("previous")];
+		const older = createDeferred<{ success: true; data: { sessions: unknown[] } }>();
+		const harness = savedScanHarness(previous, {
+			request: vi
+				.fn()
+				.mockReturnValueOnce(older.promise)
+				.mockImplementationOnce(
+					async (
+						_command: unknown,
+						_timeout: unknown,
+						options: { onProgress: (update: { type: string; session: unknown }) => void },
+					) => {
+						options.onProgress({ type: "session_list_session", session: rawSavedSession("streamed") });
+						throw new Error("scan failed");
+					},
+				),
+		});
+		const refresh = privateMethod<(this: typeof harness) => Promise<boolean>>("refreshSavedSessions");
+
+		const oldScan = refresh.call(harness);
+		await Promise.resolve();
+		expect(await refresh.call(harness)).toBe(false);
+		older.resolve({ success: true, data: { sessions: [rawSavedSession("stale")] } });
+		expect(await oldScan).toBe(false);
+
+		expect([harness.savedSessions, harness.persistentState.savedSessions]).toEqual([previous, previous]);
+		expect(harness.savedCatalogRefreshPending).toBe(false);
+	});
+
+	test("reconnect retries the saved catalog and fences a stale startup scan", async () => {
+		const previous = [savedSession("previous")];
+		const startup = createDeferred<{ success: true; data: { sessions: unknown[] } }>();
+		const retried = createDeferred<{ success: true; data: { sessions: unknown[] } }>();
+		const harness = {
+			...savedScanHarness(previous, {
+				request: vi.fn().mockReturnValueOnce(startup.promise).mockReturnValueOnce(retried.promise),
+			}),
+			reconnectPromise: undefined as Promise<void> | undefined,
+		};
+		const refresh =
+			privateMethod<
+				(
+					this: typeof harness,
+					options?: { duringReconnect?: boolean; preserveStatusOnError?: boolean },
+				) => Promise<boolean>
+			>("refreshSavedSessions");
+
+		const startupScan = refresh.call(harness);
+		harness.reconnectPromise = Promise.resolve();
+		const retry = refresh.call(harness, { duringReconnect: true, preserveStatusOnError: true });
+		expect([harness.savedCatalogGeneration, harness.persistentState.savedCatalogGeneration]).toEqual([2, 2]);
+
+		retried.resolve({ success: true, data: { sessions: [rawSavedSession("retried")] } });
+		expect(await retry).toBe(true);
+		startup.resolve({ success: true, data: { sessions: [rawSavedSession("stale")] } });
+		expect(await startupScan).toBe(false);
+		expect(harness.savedSessions).toEqual([expect.objectContaining({ path: savedSession("retried").path })]);
+	});
+
+	test("failed saved retry during reconnect preserves status and complete catalog", async () => {
+		const previous = [savedSession("previous")];
+		const harness = {
+			...savedScanHarness(previous, {
+				request: async (
+					_command: unknown,
+					_timeout: unknown,
+					options: { onProgress: (update: { type: string; session: unknown }) => void },
+				) => {
+					options.onProgress({ type: "session_list_session", session: rawSavedSession("partial") });
+					throw new Error("retry failed");
+				},
+			}),
+			reconnectPromise: Promise.resolve(),
+		};
+
+		const refreshed = await privateMethod<
+			(
+				this: typeof harness,
+				options: { duringReconnect: boolean; preserveStatusOnError: boolean },
+			) => Promise<boolean>
+		>("refreshSavedSessions").call(harness, { duringReconnect: true, preserveStatusOnError: false });
+
+		expect(refreshed).toBe(false);
+		expect(harness.savedSessions).toEqual(previous);
+		expect(harness.persistentState.savedSessions).toEqual(previous);
+		expect(harness.setStatusMessage).not.toHaveBeenCalled();
+	});
+
+	test("reconnect stays active until the heartbeat catalog refresh succeeds", async () => {
+		vi.useFakeTimers();
+		try {
+			const live = makeSummary({ id: "live", activeSessionId: "live", sessionId: "session-live" });
+			const firstHeartbeatAttempt = createDeferred<void>();
+			let heartbeatAttempts = 0;
+			const client = {
+				hello: { protocol: { version: 3 } },
+				supportsServerCapability: () => true,
+				reconnect: vi.fn(async () => {}),
+				request: vi.fn(async (command: { type: string }) => {
+					if (command.type === "list") return { success: true, data: { sessions: [live] } };
+					heartbeatAttempts += 1;
+					if (heartbeatAttempts === 1) {
+						firstHeartbeatAttempt.resolve();
+						throw new Error("heartbeat connection lost");
+					}
+					return { success: true, data: { heartbeats: [{ job: { id: "healthy" } }] } };
+				}),
+			};
+			const harness = {
+				...refreshHarness(),
+				stopped: false,
+				reconnectTimedOut: false,
+				client,
+				options: { reconnectTimeoutMs: 10_000 },
+				requireClient: () => client,
+				rosterStore: { attach: vi.fn(async () => true), summaries: () => [live] },
+				refreshSavedSessions: vi.fn(async () => true),
+				refreshHeartbeats: vi.fn(async (_options?: { duringReconnect?: boolean }) => false),
+				armSavedSearchFetch: vi.fn(),
+				reconnectClient: vi.fn(async (_reconnectingClient: typeof client, _error: unknown) => {}),
+			};
+			const refreshHeartbeats =
+				privateMethod<(this: typeof harness, options?: { duringReconnect?: boolean }) => Promise<boolean>>(
+					"refreshHeartbeats",
+				);
+			const reconnectClient =
+				privateMethod<(this: typeof harness, reconnectingClient: typeof client, error: unknown) => Promise<void>>(
+					"reconnectClient",
+				);
+			harness.refreshHeartbeats.mockImplementation((options) => refreshHeartbeats.call(harness, options));
+			harness.reconnectClient.mockImplementation((reconnectingClient, error) =>
+				reconnectClient.call(harness, reconnectingClient, error),
+			);
+
+			privateMethod<(this: typeof harness, reconnectingClient: typeof client, error: unknown) => void>(
+				"startClientReconnect",
+			).call(harness, client, new Error("disconnected"));
+			await firstHeartbeatAttempt.promise;
+			await Promise.resolve();
+
+			expect(harness.reconnectPromise).toBeDefined();
+			expect(harness.applySessionList).not.toHaveBeenCalled();
+			expect(client.reconnect).toHaveBeenCalledOnce();
+
+			await vi.advanceTimersByTimeAsync(1_000);
+			await harness.reconnectPromise;
+
+			expect(client.reconnect).toHaveBeenCalledTimes(2);
+			expect(harness.applySessionList).toHaveBeenCalledWith([live], true);
+			expect(harness.heartbeats).toEqual([{ job: { id: "healthy" } }]);
+			// A query that outlived the outage re-fetches the saved catalog through the one arm predicate.
+			expect(harness.armSavedSearchFetch).toHaveBeenCalledWith({ duringReconnect: true });
+			expect(harness.reconnectPromise).toBeUndefined();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("a pending saved scan cannot overwrite daemon shutdown status", async () => {
+		const scan = createDeferred<void>();
+		const harness = savedScanHarness([], {
+			request: async () => {
+				await scan.promise;
+				throw new Error("scan failed");
+			},
+		});
+
+		const pending = privateMethod<(this: typeof harness) => Promise<boolean>>("refreshSavedSessions").call(harness);
+		harness.daemonShutdownReceived = true;
+		scan.resolve();
+		expect(await pending).toBe(false);
+		expect(harness.setStatusMessage).not.toHaveBeenCalled();
+	});
+});
