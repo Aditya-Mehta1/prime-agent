@@ -201,31 +201,49 @@ jobs:
             tar -xzf "$source_dir"/*.tar.gz -C "$destination"
           done
 
-      - name: Pack production release
-        if: env.PUBLISH_PRODUCTION == 'true'
+      - name: Pack enabled release channels
         env:
           PRIME_AGENT_DOWNLOAD_BASE_URL: ${{ github.event_name == 'pull_request' && 'https://example.invalid/prime-agent-validation' || vars.R2_PUBLIC_BASE_URL }}
         run: |
           test -n "$PRIME_AGENT_DOWNLOAD_BASE_URL"
-          npm run release:pack -- \
-            --channel stable \
-            --version "$PRODUCTION_VERSION" \
-            --base-url "$PRIME_AGENT_DOWNLOAD_BASE_URL" \
-            --binary-dir packages/coding-agent/binaries \
-            --out-dir packages/coding-agent/release/production
+          pack_pids=()
+          pack_channels=()
 
-      - name: Pack beta release
-        if: env.PUBLISH_BETA == 'true'
-        env:
-          PRIME_AGENT_DOWNLOAD_BASE_URL: ${{ github.event_name == 'pull_request' && 'https://example.invalid/prime-agent-validation' || vars.R2_PUBLIC_BASE_URL }}
-        run: |
-          test -n "$PRIME_AGENT_DOWNLOAD_BASE_URL"
-          npm run release:pack -- \
-            --channel beta \
-            --version "$BETA_VERSION" \
-            --base-url "$PRIME_AGENT_DOWNLOAD_BASE_URL" \
-            --binary-dir packages/coding-agent/binaries \
-            --out-dir packages/coding-agent/release/beta
+          if [ "$PUBLISH_PRODUCTION" = true ]; then
+            npm run release:pack -- \
+              --channel stable \
+              --version "$PRODUCTION_VERSION" \
+              --base-url "$PRIME_AGENT_DOWNLOAD_BASE_URL" \
+              --binary-dir packages/coding-agent/binaries \
+              --out-dir packages/coding-agent/release/production &
+            pack_pids+=("$!")
+            pack_channels+=(production)
+          fi
+
+          if [ "$PUBLISH_BETA" = true ]; then
+            npm run release:pack -- \
+              --channel beta \
+              --version "$BETA_VERSION" \
+              --base-url "$PRIME_AGENT_DOWNLOAD_BASE_URL" \
+              --binary-dir packages/coding-agent/binaries \
+              --out-dir packages/coding-agent/release/beta &
+            pack_pids+=("$!")
+            pack_channels+=(beta)
+          fi
+
+          if [ "${#pack_pids[@]}" -eq 0 ]; then
+            echo "At least one release channel must be enabled." >&2
+            exit 1
+          fi
+
+          pack_status=0
+          for index in "${!pack_pids[@]}"; do
+            if ! wait "${pack_pids[$index]}"; then
+              echo "Failed to pack ${pack_channels[$index]} release." >&2
+              pack_status=1
+            fi
+          done
+          exit "$pack_status"
 
       - name: Smoke test installer with npm 12
         run: |
@@ -263,6 +281,7 @@ jobs:
             PRIME_AGENT_INSTALLER_PLAIN=1 \
             sh /tmp/prime-agent-npm12-install.sh "$SMOKE_VERSION"
           test -x "$NPM_CONFIG_PREFIX/bin/prime-agent"
+          test "$("$NPM_CONFIG_PREFIX/bin/prime-agent" --version)" = "$SMOKE_VERSION"
 
       - name: Upload production artifacts
         if: env.PUBLISH_PRODUCTION == 'true'

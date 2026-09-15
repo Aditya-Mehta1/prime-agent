@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -19,12 +19,22 @@ interface Step {
 interface Matrix {
 	include: { channel?: string; platform: string; runner: string }[];
 }
+interface TestMatrix {
+	include: {
+		name: string;
+		package: string;
+		command: string;
+		install_node: boolean;
+		build: boolean;
+		install_uv: boolean;
+	}[];
+}
 interface Job {
 	needs?: string | string[];
 	if?: string;
 	"continue-on-error"?: boolean;
 	"runs-on"?: string;
-	strategy?: { "fail-fast"?: boolean; matrix: Matrix | string };
+	strategy?: { "fail-fast"?: boolean; matrix: Matrix | TestMatrix | string };
 	outputs?: Record<string, string>;
 	steps: Step[];
 	uses?: string;
@@ -66,6 +76,85 @@ function resolveValidationMatrix(publishProduction: boolean, publishBeta: boolea
 	});
 }
 
+function exercisePackStep(
+	publishProduction: boolean,
+	publishBeta: boolean,
+	failChannel = "",
+): {
+	status: number | null;
+	stderr: string;
+	args: Record<string, string | undefined>;
+	started: string[];
+	finished: string[];
+} {
+	const directory = mkdtempSync(join(tmpdir(), "prime-release-pack-"));
+	try {
+		const pack = step(release.jobs.build!, "Pack enabled release channels");
+		const harness = `npm() {
+  arguments="$*"
+  channel=
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = --channel ]; then
+      channel="$2"
+      break
+    fi
+    shift
+  done
+  [ "$channel" = stable ] || [ "$channel" = beta ] || return 96
+  printf '%s\n' "$arguments" > "$MOCK_PACK_DIR/call-$channel"
+  touch "$MOCK_PACK_DIR/started-$channel"
+  if [ "$MOCK_EXPECT_BOTH" = true ]; then
+    peer=stable
+    [ "$channel" = stable ] && peer=beta
+    attempts=0
+    until [ -f "$MOCK_PACK_DIR/started-$peer" ]; do
+      attempts=$((attempts + 1))
+      [ "$attempts" -lt 200 ] || return 97
+      sleep 0.01
+    done
+  fi
+  [ "$MOCK_SLOW_CHANNEL" != "$channel" ] || sleep 0.1
+  touch "$MOCK_PACK_DIR/finished-$channel"
+  [ "$MOCK_FAIL_CHANNEL" != "$channel" ] || return 42
+}
+${pack.run}`;
+		const result = spawnSync("bash", ["-e", "-o", "pipefail", "-c", harness], {
+			cwd: repository,
+			env: {
+				...process.env,
+				PUBLISH_PRODUCTION: String(publishProduction),
+				PUBLISH_BETA: String(publishBeta),
+				PRODUCTION_VERSION: "1.2.3",
+				BETA_VERSION: "1.2.3-beta.4",
+				PRIME_AGENT_DOWNLOAD_BASE_URL: "https://downloads.example.test/prime-agent",
+				MOCK_PACK_DIR: directory,
+				MOCK_EXPECT_BOTH: String(publishProduction && publishBeta),
+				MOCK_FAIL_CHANNEL: failChannel,
+				MOCK_SLOW_CHANNEL: failChannel === "stable" ? "beta" : failChannel === "beta" ? "stable" : "",
+			},
+			encoding: "utf8",
+			timeout: 5_000,
+		});
+		const channels = ["stable", "beta"];
+		return {
+			status: result.status,
+			stderr: result.stderr,
+			args: Object.fromEntries(
+				channels.map((channel) => [
+					channel,
+					existsSync(join(directory, `call-${channel}`))
+						? readFileSync(join(directory, `call-${channel}`), "utf8").trim()
+						: undefined,
+				]),
+			),
+			started: channels.filter((channel) => existsSync(join(directory, `started-${channel}`))),
+			finished: channels.filter((channel) => existsSync(join(directory, `finished-${channel}`))),
+		};
+	} finally {
+		rmSync(directory, { recursive: true, force: true });
+	}
+}
+
 function requiresSuccess(job: Job): void {
 	expect(job["continue-on-error"]).toBeUndefined();
 	// GitHub adds success() unless a status-check function overrides it.
@@ -76,6 +165,100 @@ function requiresSuccess(job: Job): void {
 	}
 }
 
+describe("CI test matrix setup pruning", () => {
+	it("declares the exact setup requirements and keeps every test command unchanged", () => {
+		const testMatrix = ci.jobs.test!.strategy!.matrix as TestMatrix;
+		expect(testMatrix.include).toEqual([
+			{
+				name: "agent-core",
+				package: "packages/agent",
+				command: "npm test",
+				install_node: true,
+				build: false,
+				install_uv: false,
+			},
+			{
+				name: "ai",
+				package: "packages/ai",
+				command: "npm test",
+				install_node: true,
+				build: false,
+				install_uv: false,
+			},
+			{
+				name: "tui",
+				package: "packages/tui",
+				command: "npm test",
+				install_node: true,
+				build: false,
+				install_uv: false,
+			},
+			{
+				name: "coding-agent 1/3",
+				package: "packages/coding-agent",
+				command: "npm run test:ci -- --shard=1/3",
+				install_node: true,
+				build: true,
+				install_uv: true,
+			},
+			{
+				name: "coding-agent 2/3",
+				package: "packages/coding-agent",
+				command: "npm run test:ci -- --shard=2/3",
+				install_node: true,
+				build: true,
+				install_uv: true,
+			},
+			{
+				name: "coding-agent 3/3",
+				package: "packages/coding-agent",
+				command: "npm run test:ci -- --shard=3/3",
+				install_node: true,
+				build: true,
+				install_uv: true,
+			},
+			{
+				name: "coding-agent process smoke",
+				package: "packages/coding-agent",
+				command: "npm run test:process",
+				install_node: true,
+				build: false,
+				install_uv: false,
+			},
+			{
+				name: "coding-agent kernel",
+				package: "packages/coding-agent",
+				command: "npm run test:kernel",
+				install_node: true,
+				build: false,
+				install_uv: true,
+			},
+			{
+				name: "runtime python",
+				package: "prime-agent-runtime",
+				command: "uv run python -m unittest discover -s test",
+				install_node: false,
+				build: false,
+				install_uv: true,
+			},
+		]);
+	});
+
+	it("guards only the test fanout setup and build steps with their matrix flags", () => {
+		const testJob = ci.jobs.test!;
+		for (const name of ["Setup Node.js", "Install system dependencies", "Install dependencies"]) {
+			expect(step(testJob, name).if).toBe("matrix.install_node");
+		}
+		expect(step(testJob, "Build").if).toBe("matrix.build");
+		expect(step(testJob, "Install uv").if).toBe("matrix.install_uv");
+
+		const buildCheck = ci.jobs["build-check"]!;
+		for (const name of ["Setup Node.js", "Install system dependencies", "Install dependencies", "Build", "Check"]) {
+			expect(step(buildCheck, name).if).toBeUndefined();
+		}
+	});
+});
+
 describe("release workflow signature gates", () => {
 	it("keeps queued release runs non-cancelling for FIFO safety", () => {
 		expect(release.concurrency?.group).toBe(
@@ -83,6 +266,76 @@ describe("release workflow signature gates", () => {
 		);
 		expect(release.concurrency?.["cancel-in-progress"]).toBe(false);
 		expect(release.concurrency?.queue).toBe("max");
+	});
+
+	it("joins exact stable and beta pack commands before smoke tests and uploads", () => {
+		const build = release.jobs.build!;
+		const pack = step(build, "Pack enabled release channels");
+		expect(build.steps.some((entry) => entry.name === "Pack production release")).toBe(false);
+		expect(build.steps.some((entry) => entry.name === "Pack beta release")).toBe(false);
+		expect(pack.if).toBeUndefined();
+		expect(pack.run).toContain(String.raw`--channel stable \
+    --version "$PRODUCTION_VERSION" \
+    --base-url "$PRIME_AGENT_DOWNLOAD_BASE_URL" \
+    --binary-dir packages/coding-agent/binaries \
+    --out-dir packages/coding-agent/release/production &`);
+		expect(pack.run).toContain(String.raw`--channel beta \
+    --version "$BETA_VERSION" \
+    --base-url "$PRIME_AGENT_DOWNLOAD_BASE_URL" \
+    --binary-dir packages/coding-agent/binaries \
+    --out-dir packages/coding-agent/release/beta &`);
+		expect(pack.run).toContain('pack_pids+=("$!")');
+		expect(pack.run).toContain(`for index in "\${!pack_pids[@]}"`);
+		expect(pack.run).toContain(`wait "\${pack_pids[$index]}"`);
+
+		const smoke = step(build, "Smoke test installer with npm 12");
+		expect(smoke.run).toContain('test "$("$NPM_CONFIG_PREFIX/bin/prime-agent" --version)" = "$SMOKE_VERSION"');
+		for (const prerequisite of ["Install dependencies", "Build", "Check"]) {
+			expect(build.steps.indexOf(step(build, prerequisite))).toBeLessThan(build.steps.indexOf(pack));
+		}
+		expect(build.steps.indexOf(pack)).toBeLessThan(build.steps.indexOf(smoke));
+		for (const upload of ["Upload production artifacts", "Upload beta artifacts"]) {
+			expect(build.steps.indexOf(pack)).toBeLessThan(build.steps.indexOf(step(build, upload)));
+		}
+	});
+
+	it("starts both enabled pack commands concurrently and waits for both", () => {
+		const result = exercisePackStep(true, true);
+		expect(result.status, result.stderr).toBe(0);
+		expect(result.started).toEqual(["stable", "beta"]);
+		expect(result.finished).toEqual(["stable", "beta"]);
+		expect(result.args).toEqual({
+			stable:
+				"run release:pack -- --channel stable --version 1.2.3 --base-url https://downloads.example.test/prime-agent --binary-dir packages/coding-agent/binaries --out-dir packages/coding-agent/release/production",
+			beta: "run release:pack -- --channel beta --version 1.2.3-beta.4 --base-url https://downloads.example.test/prime-agent --binary-dir packages/coding-agent/binaries --out-dir packages/coding-agent/release/beta",
+		});
+	});
+
+	it.each(["stable", "beta"])("waits for both packers and fails when %s fails", (failChannel) => {
+		const result = exercisePackStep(true, true, failChannel);
+		expect(result.status).not.toBe(0);
+		expect(result.stderr).toContain(`Failed to pack ${failChannel === "stable" ? "production" : "beta"} release.`);
+		expect(result.started).toEqual(["stable", "beta"]);
+		expect(result.finished).toEqual(["stable", "beta"]);
+	});
+
+	it.each([
+		[true, false, "stable"],
+		[false, true, "beta"],
+	] as const)("packs one enabled channel (%s, %s)", (publishProduction, publishBeta, channel) => {
+		const result = exercisePackStep(publishProduction, publishBeta);
+		expect(result.status, result.stderr).toBe(0);
+		expect(result.started).toEqual([channel]);
+		expect(result.finished).toEqual([channel]);
+		expect(result.args[channel]).toBeDefined();
+	});
+
+	it("fails pack setup when no channel is enabled", () => {
+		const result = exercisePackStep(false, false);
+		expect(result.status).not.toBe(0);
+		expect(result.stderr).toContain("At least one release channel must be enabled.");
+		expect(result.started).toEqual([]);
+		expect(result.finished).toEqual([]);
 	});
 
 	it("keeps every external release action pinned to a full commit", () => {
@@ -361,15 +614,11 @@ ${step(validation, "Verify and exercise exact final Mac archive").run}`,
 						{ channel: "beta", platform: "darwin-x64", runner: "macos-15-intel" },
 					],
 				});
-				for (const [name, channel] of [
-					["Pack production release", "stable"],
-					["Pack beta release", "beta"],
-				]) {
-					const pack = step(release.jobs.build!, name!);
-					expect(pack.run).toContain("npm run release:pack");
-					expect(pack.run).toContain(`--channel ${channel}`);
-					expect(pack.run).toContain("--binary-dir packages/coding-agent/binaries");
-				}
+				const pack = step(release.jobs.build!, "Pack enabled release channels");
+				expect(pack.run?.match(/npm run release:pack/g)).toHaveLength(2);
+				expect(pack.run).toContain("--channel stable");
+				expect(pack.run).toContain("--channel beta");
+				expect(pack.run?.match(/--binary-dir packages\/coding-agent\/binaries/g)).toHaveLength(2);
 				expect(release.jobs.publish!.if).toBe("github.event_name != 'pull_request'");
 			} finally {
 				rmSync(directory, { recursive: true, force: true });
