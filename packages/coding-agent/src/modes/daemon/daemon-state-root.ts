@@ -78,9 +78,6 @@ export function createDaemonStateRootMatcher(
 		if (normalized === root.defaultSocketPath || directory === socketDir || isInside(directory, agentDir)) {
 			return true;
 		}
-		// Compare canonical forms before giving up on the directory rules: the
-		// sweep reports the spelling each daemon bound, which can be a symlink
-		// alias of our own spelling while naming the same directory.
 		let canonicalDirectory = canonicalDirectories.get(directory);
 		if (canonicalDirectory === undefined) {
 			canonicalDirectory = canonicalizeDirectorySafely(directory);
