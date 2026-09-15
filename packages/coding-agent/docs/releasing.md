@@ -16,7 +16,7 @@ and anything that is *not* an approved version-bump pull request stops and waits
    then bumps the version in lockstep across the published packages, folds the `.changes/*.md`
    fragments into the changelogs, commits, pushes the branch, and opens the release pull request. It
    does not push `main`, does not create the tag, and does not publish anything. It refuses to run
-   if that release branch already exists.
+   unless the checkout is `main` at `origin/main`, and refuses if that release branch already exists.
 2. **Get the pull request reviewed and merge it.** This is the approval gate. The release workflow
    later confirms that the merge commit belongs to a merged pull request whose *current* review
    state includes an approval from a human; dismissed approvals, outstanding change requests, and

@@ -48,3 +48,15 @@ test("the release script refuses an existing release branch", () => {
 	assert.match(script, /git branch --list \$\{branch\}/);
 	assert.match(script, /git ls-remote --heads origin \$\{branch\}/);
 });
+
+test("the release script only prepares from an up-to-date main", () => {
+	assert.match(script, /git rev-parse --abbrev-ref HEAD/);
+	assert.match(script, /current !== "main"/);
+	assert.match(script, /git rev-parse origin\/main/);
+});
+
+test("a failed gh pr create does not abort after the branch was pushed", () => {
+	const call = script.indexOf("gh pr create --base main");
+	const opts = script.slice(call, call + 200);
+	assert.match(opts, /ignoreError: true/);
+});

@@ -93,8 +93,22 @@ function stageChangedFiles() {
  */
 function createReleaseBranch(version) {
 	const branch = `release/v${version}`;
-	const local = run(`git branch --list ${branch}`, { silent: true });
-	if (local && local.trim()) {
+	// A release ships exactly what main has. Starting from any other branch would fold that branch's
+	// unmerged commits into the release pull request.
+	const current = (run("git rev-parse --abbrev-ref HEAD", { silent: true }) || "").trim();
+	if (current !== "main") {
+		console.error(`Error: releases are prepared from main, not from ${current || "a detached HEAD"}.`);
+		process.exit(1);
+	}
+	run("git fetch origin main", { silent: true });
+	const local = run("git rev-parse HEAD", { silent: true }).trim();
+	const upstream = run("git rev-parse origin/main", { silent: true }).trim();
+	if (local !== upstream) {
+		console.error(`Error: local main (${local.slice(0, 9)}) is not origin/main (${upstream.slice(0, 9)}). Pull or reset first.`);
+		process.exit(1);
+	}
+	const existing = run(`git branch --list ${branch}`, { silent: true });
+	if (existing && existing.trim()) {
 		console.error(`Error: branch ${branch} already exists locally. Delete it or pick another version.`);
 		process.exit(1);
 	}
@@ -190,16 +204,18 @@ function openReleasePullRequest(version, branch) {
 	].join("\n");
 	const bodyFile = join(tmpdir(), `prime-agent-release-${version}.md`);
 	writeFileSync(bodyFile, `${body}\n`);
-	try {
-		const url = run(
-			`gh pr create --base main --head ${branch} --title "release v${version}" --body-file ${bodyFile}`,
-			{ silent: true },
-		);
-		return url.trim().split("\n").at(-1);
-	} catch {
+	// ignoreError: a missing or unauthenticated gh must not abort a run whose branch is already
+	// pushed; the caller prints the manual recovery instead.
+	const url = run(
+		`gh pr create --base main --head ${branch} --title "release v${version}" --body-file ${bodyFile}`,
+		{ silent: true, ignoreError: true },
+	);
+	const last = url?.trim().split("\n").at(-1);
+	if (!last || !/^https:\/\//.test(last)) {
 		console.warn(`  Could not open the pull request automatically; open it for ${branch} by hand.`);
 		return undefined;
 	}
+	return last;
 }
 
 function updateChangelogsForRelease(version) {
