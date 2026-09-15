@@ -19,6 +19,10 @@ function session(overrides: Partial<SessionSummary>): SessionSummary {
 	} as unknown as SessionSummary;
 }
 
+function reachable(...activeSessions: SessionSummary[]): RunningDaemonProbe {
+	return { reachable: true, activeSessions };
+}
+
 const ttyDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
 function setTTY(value: boolean): void {
 	Object.defineProperty(process.stdin, "isTTY", { value, configurable: true });
@@ -35,90 +39,32 @@ describe("confirmDaemonSessionLoss", () => {
 		}
 	});
 
-	// Stopping the daemon while a session is working loses that work, so the guard must
-	// only proceed unattended when nothing is busy.
+	// Stopping the daemon while a session is working loses that work: the guard may only
+	// proceed unattended when nothing is busy. Off a TTY every busy shape must abort.
 	it.each([
-		["proceeds when the daemon is unreachable", true, { reachable: false } as RunningDaemonProbe, false, true],
+		["the daemon is unreachable", { reachable: false }, false, true],
+		["force is set", reachable(session({ isStreaming: true })), true, true],
+		["no session is busy", reachable(session({}), session({})), false, true],
+		["a streaming session is busy", reachable(session({ isSessionActive: true, isStreaming: true })), false, false],
+		["a compacting session is busy", reachable(session({ isSessionActive: true, isCompacting: true })), false, false],
+		["a bash run is in flight", reachable(session({ isSessionActive: true, isBashRunning: true })), false, false],
 		[
-			"proceeds when force is set",
-			true,
-			{ reachable: true, activeSessions: [session({ isStreaming: true })] } as RunningDaemonProbe,
-			true,
-			true,
-		],
-		[
-			"proceeds when no session is busy",
-			true,
-			{ reachable: true, activeSessions: [session({ isStreaming: false }), session({})] } as RunningDaemonProbe,
-			false,
-			true,
-		],
-		[
-			"aborts when a queued session is busy off a TTY",
-			false,
-			{
-				reachable: true,
-				activeSessions: [
-					session({ isSessionActive: true, sessionActions: { queuedCount: 2, steering: [], followUps: [] } }),
-				],
-			} as RunningDaemonProbe,
+			"a session has queued work",
+			reachable(session({ isSessionActive: true, sessionActions: { queuedCount: 2, steering: [], followUps: [] } })),
 			false,
 			false,
 		],
+		["a session has running RLM children", reachable(session({ hasRunningRlmChildren: true })), false, false],
 		[
-			"aborts when a compacting session is busy off a TTY",
-			false,
-			{
-				reachable: true,
-				activeSessions: [session({ isSessionActive: true, isCompacting: true })],
-			} as RunningDaemonProbe,
+			"only client-owned sessions are busy",
+			{ reachable: true, activeSessions: [], busyClientOwnedSessionCount: 2 },
 			false,
 			false,
 		],
-		[
-			"aborts when a streaming session is busy off a TTY",
-			false,
-			{
-				reachable: true,
-				activeSessions: [session({ isSessionActive: true, isStreaming: true })],
-			} as RunningDaemonProbe,
-			false,
-			false,
-		],
-		[
-			"aborts when a running bash session is busy off a TTY",
-			false,
-			{
-				reachable: true,
-				activeSessions: [session({ isSessionActive: true, isBashRunning: true })],
-			} as RunningDaemonProbe,
-			false,
-			false,
-		],
-		[
-			"aborts when a session with running RLM children is busy off a TTY",
-			false,
-			{ reachable: true, activeSessions: [session({ hasRunningRlmChildren: true })] } as RunningDaemonProbe,
-			false,
-			false,
-		],
-		[
-			"aborts when only client-owned sessions are busy off a TTY",
-			false,
-			{ reachable: true, activeSessions: [], busyClientOwnedSessionCount: 2 } as RunningDaemonProbe,
-			false,
-			false,
-		],
-		[
-			"aborts when sessions cannot be listed off a TTY",
-			false,
-			{ reachable: true } as RunningDaemonProbe,
-			false,
-			false,
-		],
-	])("%s", async (_name, tty, probe, force, expected) => {
-		setTTY(tty);
+		["sessions cannot be listed", { reachable: true }, false, false],
+	])("proceeds only when safe: %s", async (_name, probe, force, expected) => {
+		setTTY(false);
 
-		expect(await confirmDaemonSessionLoss(probe, { force, copy: COPY })).toBe(expected);
+		expect(await confirmDaemonSessionLoss(probe as RunningDaemonProbe, { force, copy: COPY })).toBe(expected);
 	});
 });
