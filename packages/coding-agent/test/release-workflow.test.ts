@@ -191,12 +191,198 @@ ${step(validation, "Verify and exercise exact final Mac archives").run}`,
 		const test = step(build, "Test extracted application without JavaScript runtimes on PATH");
 		expect(test.run).toContain("test/compiled-artifact.test.ts");
 		expect(test.run).toContain("test/release-signatures.test.ts");
+		// The artifact tests read the RELEASE archive, never the test-signer one.
+		expect(test.run).toMatch(
+			/PRIME_AGENT_TEST_ARCHIVE="\$RELEASE_ARCHIVE" \\\n\s*npx tsx [^\n]*test\/compiled-artifact\.test\.ts/,
+		);
 		const upload = build.steps.find((entry) => entry.uses?.startsWith("actions/upload-artifact@"))!;
 		expect(upload.with?.path).toContain("binaries.json");
 		expect(build.steps.indexOf(test)).toBeLessThan(build.steps.indexOf(upload));
 		requiresSuccess(build);
 		expect(release.jobs.standalone!.with?.build_ref).toBe(`\${{ needs.context.outputs.build_ref }}`);
 	});
+
+	it("signs a test-signer build in the standalone job for the end-to-end updater test and never uploads it", () => {
+		const build = standalone.jobs.build!;
+		// The OIDC token is the only credential, and the caller passes exactly that through.
+		expect(build.permissions).toEqual({ contents: "read", "id-token": "write" });
+		expect(release.jobs.standalone!.permissions).toEqual({ contents: "read", "id-token": "write" });
+		expect(build.environment).toBeUndefined();
+		expect(JSON.stringify(build)).not.toMatch(/secrets\.(?!GITHUB_TOKEN\b)/);
+		expect(build.steps.some((entry) => entry.uses?.startsWith("sigstore/cosign-installer@"))).toBe(true);
+
+		const names = build.steps.map((entry) => entry.name);
+		const order = [
+			"Assemble native archive",
+			"Resolve the signer identity of this job",
+			"Compile a test-signer binary for the updater test",
+			"Sign the test archives with this job's identity",
+			"Remove the build paths from the test machine",
+			"Test extracted application without JavaScript runtimes on PATH",
+		];
+		expect(order.map((name) => names.indexOf(name))).toEqual(
+			[...order].map((_, index, all) => names.indexOf(all[0]!) + index),
+		);
+
+		// The identity is resolved from a real certificate before anything is compiled against it,
+		// and the caller path would mean this job can sign as the release: that fails hard.
+		const resolve = step(build, "Resolve the signer identity of this job");
+		expect(resolve.run).toContain("cosign sign-blob --yes --bundle");
+		expect(resolve.run).toContain("workflow_path=.github/workflows/standalone-binaries.yml");
+		expect(resolve.run).toContain("caller_path=.github/workflows/build-binaries.yml");
+		expect(resolve.run).toMatch(
+			/if verifies "https:\/\/github\.com\/\$\{GITHUB_REPOSITORY\}\/\$\{caller_path\}@\$\{GITHUB_REF\}"; then\n\s*echo "::error::[^\n]*\n\s*exit 1/,
+		);
+		expect(resolve.run).toContain(`--arg refPattern "^\${escaped_ref}\\$"`);
+		for (const field of [
+			"repositoryUri",
+			"workflowRepositoryUri",
+			"workflowPath",
+			"oidcIssuer",
+			"runnerEnvironment",
+			"refPattern",
+		]) {
+			expect(resolve.run).toContain(`${field}:`);
+		}
+		expect(resolve.run).toContain('> "$RUNNER_TEMP/test-release/signer.json"');
+
+		// Exactly one step compiles with the override, into a sibling directory it deletes again.
+		const compile = step(build, "Compile a test-signer binary for the updater test");
+		expect(compile.run).toContain(
+			'node packages/coding-agent/scripts/build-binary.mjs --platform "$TARGET_PLATFORM" --test-signer-json "$RUNNER_TEMP/test-release/signer.json"',
+		);
+		expect(compile.run).toContain(
+			'node scripts/assemble-release-archives.mjs packages/coding-agent/binaries-test-signer "$RUNNER_TEMP/test-release/current" "$RELEASE_VERSION"',
+		);
+		expect(compile.run).toContain(
+			'node scripts/assemble-release-archives.mjs packages/coding-agent/binaries-test-signer "$RUNNER_TEMP/test-release/next" 99.0.0',
+		);
+		expect(compile.run).toContain("rm -rf packages/coding-agent/binaries-test-signer");
+		for (const workflow of [release, standalone]) {
+			for (const [jobId, job] of Object.entries(workflow.jobs)) {
+				for (const entry of job.steps ?? []) {
+					if (entry === compile) continue;
+					expect(JSON.stringify(entry), `${jobId}: ${entry.name}`).not.toContain("--test-signer-json");
+					expect(JSON.stringify(entry), `${jobId}: ${entry.name}`).not.toContain(
+						"__PRIME_AGENT_RELEASE_SIGNER_OVERRIDE__",
+					);
+				}
+			}
+		}
+
+		// Both SHA256SUMS are signed and verified against the exact identity before the test runs.
+		const sign = step(build, "Sign the test archives with this job's identity");
+		expect(sign.run).toContain("for channel in current next; do");
+		expect(sign.run).toContain('cosign sign-blob --yes --bundle "$sums.sigstore.json" "$sums"');
+		expect(sign.run).toContain('--certificate-identity "$SIGNER_IDENTITY"');
+		expect(sign.run).toContain("--certificate-oidc-issuer https://token.actions.githubusercontent.com");
+		for (const [name, value] of [
+			[
+				"PRIME_AGENT_TEST_ARCHIVE",
+				"$RUNNER_TEMP/test-release/current/prime-agent-$RELEASE_VERSION-$TARGET_PLATFORM.tar.gz",
+			],
+			["PRIME_AGENT_TEST_SIGNATURE_BUNDLE", "$RUNNER_TEMP/test-release/current/SHA256SUMS.sigstore.json"],
+			["PRIME_AGENT_TEST_NEXT_ARCHIVE", "$RUNNER_TEMP/test-release/next/prime-agent-99.0.0-$TARGET_PLATFORM.tar.gz"],
+			["PRIME_AGENT_TEST_NEXT_SIGNATURE_BUNDLE", "$RUNNER_TEMP/test-release/next/SHA256SUMS.sigstore.json"],
+		]) {
+			expect(sign.run).toContain(`echo "${name}=${value}"`);
+		}
+		const test = step(build, "Test extracted application without JavaScript runtimes on PATH");
+		expect(test.run).toContain("test/native-installer.test.ts");
+		for (const name of [
+			"PRIME_AGENT_TEST_ARCHIVE",
+			"PRIME_AGENT_TEST_SIGNATURE_BUNDLE",
+			"PRIME_AGENT_TEST_NEXT_ARCHIVE",
+			"PRIME_AGENT_TEST_NEXT_SIGNATURE_BUNDLE",
+		]) {
+			expect(test.run).toContain(`test -f "$${name}"`);
+		}
+
+		// The uploaded artifact - what the release consumes - reads only the release directory.
+		const upload = build.steps.find((entry) => entry.uses?.startsWith("actions/upload-artifact@"))!;
+		const paths = upload.with!.path!.trim().split("\n");
+		expect(paths).toEqual(
+			["*.tar.gz", "SHA256SUMS", "binaries.json"].map((name) => `\${{ runner.temp }}/standalone/${name}`),
+		);
+		expect(upload.with!.path).not.toContain("test-release");
+		expect(upload.with!.path).not.toContain("binaries-test-signer");
+		expect(compile.run).not.toContain("$RUNNER_TEMP/standalone/");
+		expect(compile.run).toContain('test "$(find "$RUNNER_TEMP/standalone" -type f | wc -l | tr -d \' \')" -eq 3');
+
+		// validate-macos runs the production-pinned binary; nothing there can sign as the release,
+		// so the signed updater test does not run there.
+		const macos = step(release.jobs["validate-macos"]!, "Verify and exercise exact final Mac archives");
+		const vitest = macos.run!.split("\n").filter((line) => line.includes("vitest/dist/cli.js"));
+		expect(vitest).toHaveLength(1);
+		expect(vitest[0]).toContain("test/compiled-artifact.test.ts");
+		expect(vitest[0]).not.toContain("native-installer.test.ts");
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"the test-signer steps refuse a certificate naming the caller workflow",
+		() => {
+			const resolve = step(standalone.jobs.build!, "Resolve the signer identity of this job").run!;
+			const directory = mkdtempSync(join(tmpdir(), "prime-standalone-signer-"));
+			const shim = (identity: string) => `
+cosign() {
+  case "$1" in
+    sign-blob) printf '{}' > "$4" ;;
+    verify-blob) [ "$7" = "${identity}" ] ;;
+    *) echo "unexpected cosign call: $*" >&2; return 99 ;;
+  esac
+}
+`;
+			const env = {
+				RUNNER_TEMP: directory,
+				GITHUB_REPOSITORY: "o/r",
+				GITHUB_REF: "refs/pull/12/merge",
+				GITHUB_SHA: "abc",
+				GITHUB_RUN_ID: "1",
+				GITHUB_RUN_ATTEMPT: "1",
+				GITHUB_ENV: join(directory, "env"),
+			};
+			try {
+				const called = runStepScript(
+					resolve,
+					shim("https://github.com/o/r/.github/workflows/standalone-binaries.yml@refs/pull/12/merge"),
+					env,
+				);
+				expect(called.status, called.stderr).toBe(0);
+				expect(JSON.parse(readFileSync(join(directory, "test-release/signer.json"), "utf8"))).toEqual({
+					repositoryUri: "https://github.com/o/r",
+					workflowRepositoryUri: "https://github.com/o/r",
+					workflowPath: ".github/workflows/standalone-binaries.yml",
+					oidcIssuer: "https://token.actions.githubusercontent.com",
+					runnerEnvironment: "github-hosted",
+					refPattern: "^refs/pull/12/merge$",
+				});
+				expect(/^refs\/pull\/12\/merge$/.test("refs/pull/12/merge")).toBe(true);
+				expect(/^refs\/pull\/12\/merge$/.test("refs/pull/120/merge")).toBe(false);
+				expect(readFileSync(join(directory, "env"), "utf8")).toContain(
+					"SIGNER_IDENTITY=https://github.com/o/r/.github/workflows/standalone-binaries.yml@refs/pull/12/merge\n",
+				);
+				rmSync(join(directory, "env"));
+
+				const caller = runStepScript(
+					resolve,
+					shim("https://github.com/o/r/.github/workflows/build-binaries.yml@refs/pull/12/merge"),
+					env,
+				);
+				expect(caller.status).toBe(1);
+				expect(caller.stderr).toContain("could sign as the production release identity");
+
+				const other = runStepScript(
+					resolve,
+					shim("https://github.com/o/r/.github/workflows/standalone-binaries.yml@refs/heads/other"),
+					env,
+				);
+				expect(other.status).toBe(1);
+				expect(other.stderr).toContain("names neither");
+			} finally {
+				rmSync(directory, { recursive: true, force: true });
+			}
+		},
+	);
 
 	it.skipIf(process.platform === "win32")(
 		"selects both real packer paths for PR validation without allowing publication",
