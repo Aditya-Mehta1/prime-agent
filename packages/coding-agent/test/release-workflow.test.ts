@@ -105,7 +105,7 @@ describe("release workflow signature gates", () => {
 		];
 		for (const entry of Object.values(release.jobs)) {
 			const writes = (entry.steps ?? []).filter((candidate) =>
-				/aws s3 cp|gh release (?:upload|create|edit)|gh api --method|npm publish|git push/.test(
+				/aws s3 cp|gh release (?:upload|create|edit)|gh api --method|npm publish|git (?:-C \S+ )?push/.test(
 					candidate.run ?? "",
 				),
 			);
@@ -612,8 +612,11 @@ describe("release ordering: nothing is public before verification", () => {
 			expect(Object.values(entry.env ?? {}).join(" ")).not.toContain("secrets.");
 		}
 		for (const pointer of ["latest.json", "stable", "install.sh", "install-beta.sh"]) {
-			expect(pointers.run).toContain(`publish_pointer artifacts/${pointer} ${pointer} `);
+			// Spelled out in full: the release checker allows exactly these destinations, here only.
+			expect(pointers.run).toContain(`aws s3 cp artifacts/${pointer} "s3://\${R2_BUCKET}/${pointer}"`);
+			expect(pointers.run).toContain(`verify_pointer artifacts/${pointer} ${pointer}`);
 		}
+		expect(pointers.run).not.toMatch(/aws s3 cp "?\$file"? "s3:\/\/\$\{R2_BUCKET\}\/\$\{key\}"/);
 		const publishStep = step(finalize, "Publish the release and prove the tag points at BUILD_REF");
 		expect(publishStep.run).toContain('gh release edit "$TAG" --draft=false --latest');
 		expect(publishStep.run).toContain('if [ "$tagged" != "$BUILD_REF" ]; then');
@@ -842,4 +845,151 @@ describe("npm publication is split into an unprivileged pack job and a code-free
 			}
 		},
 	);
+});
+
+describe("tap-bump reruns safely and never touches the tap's default branch", () => {
+	const tap = release.jobs["tap-bump"]!;
+	const bump = step(tap, "Open or refresh the formula bump pull request");
+
+	it("leases the push on the branch it fetched and edits an existing pull request", () => {
+		expect(bump.run).toContain(
+			`lease=$(git -C "$workdir" ls-remote --heads origin "refs/heads/\${branch}" | cut -f1)`,
+		);
+		expect(bump.run).toContain(`git -C "$workdir" push origin "refs/heads/\${branch}:refs/heads/\${branch}"`);
+		expect(bump.run).toContain(`--force-with-lease="refs/heads/\${branch}:\${lease}"`);
+		expect(bump.run).not.toMatch(/git push origin "\$branch"/);
+		expect(bump.run).not.toMatch(/push[^\n]*--force(?!-with-lease)/);
+		expect(bump.run).toContain('test "$default_branch" != "$branch"');
+		expect(bump.run).toContain('gh pr edit "$existing" --repo "$TAP_REPO"');
+		expect(bump.run).toContain('gh pr create --repo "$TAP_REPO" --head "$branch" --base "$default_branch"');
+		// The job never changes directory: the checker only allows `cd` into downloaded artifacts.
+		expect(bump.run).not.toMatch(/(^|[;&|(]\s*|\n\s*)(cd|pushd|popd)\b/);
+	});
+
+	describe.skipIf(process.platform === "win32")("the step script (bash, fake gh/git)", () => {
+		const BRANCH = "prime-agent-1.2.3";
+		const digests = ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64"].map(
+			(platform, index) => [platform, String(index + 4).repeat(64)] as const,
+		);
+		const formula = [
+			"class PrimeAgent < Formula",
+			'  version "1.2.2"',
+			'  url "https://example.invalid/releases/v1.2.2/prime-agent-1.2.2-darwin-arm64.tar.gz"',
+			...digests.flatMap(([platform]) => [`  # ${platform}`, `  sha256 "${"0".repeat(64)}"`]),
+			"end",
+			"",
+		].join("\n");
+		const shims = (options: {
+			remoteSha?: string;
+			existingPr?: string;
+			merged?: boolean;
+			defaultBranch?: string;
+		}) => `
+log="$GITHUB_WORKSPACE/calls.log"
+mktemp() { mkdir -p "$GITHUB_WORKSPACE/tap"; echo "$GITHUB_WORKSPACE/tap"; }
+gh() {
+  echo "gh $*" >> "$log"
+  case "$1 $2" in
+    "repo clone") mkdir -p "$4/Formula"; cp "$GITHUB_WORKSPACE/formula.rb" "$4/Formula/prime-agent.rb" ;;
+    "pr list") printf '%s' '${options.existingPr ?? ""}' ;;
+    "pr edit"|"pr create") ;;
+    *) echo "unexpected gh call: $*" >&2; return 99 ;;
+  esac
+}
+git() {
+  echo "git $*" >> "$log"
+  if [ "$1" = -C ]; then shift 2; fi
+  while [ "$1" = -c ]; do shift 2; done
+  case "$1" in
+    symbolic-ref) echo '${options.defaultBranch ?? "main"}' ;;
+    ls-remote) ${options.remoteSha ? `printf '%s\\trefs/heads/%s\\n' '${options.remoteSha}' '${BRANCH}'` : "true"} ;;
+    diff) return ${options.merged ? 0 : 1} ;;
+    switch|commit|push) ;;
+    *) echo "unexpected git call: $*" >&2; return 99 ;;
+  esac
+}
+`;
+		const run = (options: Parameters<typeof shims>[0]) => {
+			const workspace = mkdtempSync(join(tmpdir(), "prime-tap-bump-"));
+			mkdirSync(join(workspace, "artifacts"));
+			writeFileSync(
+				join(workspace, "artifacts/SHA256SUMS"),
+				`${digests.map(([platform, digest]) => `${digest}  prime-agent-1.2.3-${platform}.tar.gz`).join("\n")}\n`,
+			);
+			writeFileSync(join(workspace, "formula.rb"), formula);
+			const result = runStepScript(bump.run!, shims(options), {
+				GITHUB_WORKSPACE: workspace,
+				GH_TOKEN: "token",
+				PRODUCTION_VERSION: "1.2.3",
+				TAP_REPO: "o/tap",
+			});
+			const calls = readFileSync(join(workspace, "calls.log"), "utf8").trim().split("\n");
+			const edited = (() => {
+				try {
+					return readFileSync(join(workspace, "tap/Formula/prime-agent.rb"), "utf8");
+				} catch {
+					return "";
+				}
+			})();
+			rmSync(workspace, { recursive: true, force: true });
+			return { result, calls, edited };
+		};
+		const pushes = (calls: string[]) => calls.filter((call) => / push /.test(call));
+
+		it("pushes with an empty lease and opens the pull request on the first run", () => {
+			const { result, calls, edited } = run({});
+			expect(result.status, result.stderr).toBe(0);
+			expect(pushes(calls)).toEqual([
+				`git -C ${calls.find((call) => call.startsWith("gh repo clone"))!.split(" ")[4]} push origin refs/heads/${BRANCH}:refs/heads/${BRANCH} --force-with-lease=refs/heads/${BRANCH}:`,
+			]);
+			expect(
+				calls.some((call) =>
+					call.startsWith(`gh pr create --repo o/tap --head ${BRANCH} --base main --title prime-agent 1.2.3`),
+				),
+			).toBe(true);
+			expect(calls.some((call) => call.startsWith("gh pr edit"))).toBe(false);
+			expect(edited).toContain('version "1.2.3"');
+			expect(edited).toContain("/releases/v1.2.3/");
+			for (const [platform, digest] of digests) expect(edited).toContain(`# ${platform}\n  sha256 "${digest}"`);
+		});
+
+		it("on a rerun leases the push on the fetched branch head and edits the existing pull request", () => {
+			const { result, calls } = run({ remoteSha: OTHER_REF, existingPr: "7" });
+			expect(result.status, result.stderr).toBe(0);
+			const [push, ...rest] = pushes(calls);
+			expect(rest).toEqual([]);
+			expect(push).toContain(
+				`push origin refs/heads/${BRANCH}:refs/heads/${BRANCH} --force-with-lease=refs/heads/${BRANCH}:${OTHER_REF}`,
+			);
+			expect(calls.some((call) => call.startsWith("gh pr edit 7 --repo o/tap --title prime-agent 1.2.3"))).toBe(
+				true,
+			);
+			expect(calls.some((call) => call.startsWith("gh pr create"))).toBe(false);
+		});
+
+		it("does nothing once the formula already describes the version", () => {
+			const { result, calls } = run({ merged: true, remoteSha: OTHER_REF });
+			expect(result.status, result.stderr).toBe(0);
+			expect(result.stdout).toContain("nothing to push");
+			expect(pushes(calls)).toEqual([]);
+			expect(calls.some((call) => call.startsWith("gh pr"))).toBe(false);
+		});
+
+		it("never pushes to the default branch, even when the clone's HEAD is the bump branch", () => {
+			for (const options of [{}, { remoteSha: OTHER_REF, existingPr: "7" }]) {
+				const { calls } = run(options);
+				for (const push of pushes(calls)) {
+					expect(push).not.toMatch(/\bmain\b/);
+					expect(push).toMatch(
+						new RegExp(
+							` origin refs/heads/${BRANCH}:refs/heads/${BRANCH} --force-with-lease=refs/heads/${BRANCH}:`,
+						),
+					);
+				}
+			}
+			const { result, calls } = run({ defaultBranch: BRANCH });
+			expect(result.status).toBe(1);
+			expect(pushes(calls)).toEqual([]);
+		});
+	});
 });

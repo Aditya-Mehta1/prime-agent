@@ -6,10 +6,15 @@ import { parse } from "yaml";
 
 import {
 	CREDENTIAL_JOBS,
+	PRODUCTION_POINTERS,
+	R2_WRITERS,
 	TEST_SIGNER_FLAG,
 	TEST_SIGNER_STEP,
+	artifactDirectoriesOf,
 	checkWorkflows,
+	credentialStepReasons,
 	isCredentialBearing,
+	r2StepReasons,
 	referencesSecret,
 	repositoryCodeReasons,
 	shellCommands,
@@ -407,11 +412,18 @@ test("the pointers may only move in finalize-release, after the release is publi
 	const early = mutate(RELEASE, (text) =>
 		text.replace(
 			"      - name: Publish the release and prove the tag points at BUILD_REF\n",
-			`${runStep("Advance first", 'publish_pointer artifacts/stable stable text/plain')}\n      - name: Publish the release and prove the tag points at BUILD_REF\n`,
+			`${runStep("Advance first", 'aws s3 cp artifacts/stable "s3://${R2_BUCKET}/stable" --quiet')}\n      - name: Publish the release and prove the tag points at BUILD_REF\n`,
 		),
 	);
 	problems = checkWorkflows(reader({ [RELEASE]: early }));
-	assert.ok(problems.some((problem) => problem.includes("must publish the GitHub release before it moves the channel pointers")));
+	assert.ok(problems.some((problem) => problem.includes("must publish the GitHub release before it moves the channel pointers")), problems.join("\n"));
+	assert.ok(problems.some((problem) => problem.includes("'finalize-release' must advance the channel pointers in its last step")), problems.join("\n"));
+
+	// Dropping one pointer from the last step is rejected: all four move together.
+	const partial = mutate(RELEASE, (text) => text.replace('          aws s3 cp artifacts/stable "s3://${R2_BUCKET}/stable" \\\n', '          aws s3 cp artifacts/stable "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/stable" \\\n'));
+	problems = checkWorkflows(reader({ [RELEASE]: partial }));
+	assert.ok(problems.some((problem) => problem.includes("missing: stable")), problems.join("\n"));
+	assert.ok(problems.some((problem) => problem.includes("outside the allowlist for 'finalize-release'")), problems.join("\n"));
 });
 
 test("the publication order is enforced: github-release -> publish-r2 -> verify -> finalize-release -> npm/tap", () => {
@@ -531,4 +543,226 @@ test("the test signer override may be compiled in exactly one standalone step an
 	broken = mutate(RELEASE, (text) => text.replace("    permissions:\n      contents: read\n      id-token: write\n    uses: ./.github/workflows/standalone-binaries.yml", "    permissions:\n      contents: write\n      id-token: write\n    uses: ./.github/workflows/standalone-binaries.yml"));
 	problems = checkWorkflows(reader({ [RELEASE]: broken }));
 	assert.ok(problems.some((problem) => problem.includes("passes 'contents: write'")), problems.join("\n"));
+});
+
+// Round 3, finding A: `cd scripts; bash publish` and friends. A directory change in a
+// credential-bearing job may only target a downloaded artifact directory, and whatever runs
+// afterwards is resolved against where it really runs.
+const DIRECTORY_EVASIONS = [
+	["cd then a bare interpreter argument", "cd scripts; bash publish", /changes directory outside the downloaded artifacts .*cd scripts/],
+	["cd then a bare name resolved against the new directory", "cd scripts; cat publish", /publish resolves to scripts\/publish from working directory scripts/],
+	["cd to $GITHUB_WORKSPACE", 'cd "$GITHUB_WORKSPACE" && bash x', /changes directory to a target the checker cannot resolve: cd \$GITHUB_WORKSPACE/],
+	["pushd", "pushd scripts", /changes directory outside the downloaded artifacts .*pushd scripts/],
+	["a subshell", "(cd scripts && ./publish)", /changes directory outside the downloaded artifacts .*cd scripts/],
+	["popd", "popd", /changes directory in a way the checker cannot follow: popd/],
+	["cd with no target (HOME)", "cd", /changes directory to a target the checker cannot resolve: cd/],
+	["cd -", "cd -", /changes directory to a target the checker cannot resolve: cd -/],
+	["cd ..", "cd artifacts && cd ..", /changes directory outside the downloaded artifacts .*cd \.\./],
+	["a traversal through an artifact directory", "cd artifacts/../scripts", /changes directory outside the downloaded artifacts .*cd artifacts\/\.\.\/scripts/],
+	["a subshell cd that leaks a bare name", "cd scripts; (cat x)", /x resolves to scripts\/x/],
+	["PATH pointing at the working directory", "PATH=.:$PATH publish", /modifies PATH/],
+	["export PATH", "export PATH=/tmp:$PATH", /modifies PATH/],
+	["an alias for aws", "shopt -s expand_aliases; alias aws='curl -X PUT'", /shopt changes how commands resolve/],
+	["a trap running code", "trap 'node publish' EXIT", /trap changes how commands resolve or run/],
+	["hash -p", "hash -p ./publish aws", /hash changes how commands resolve/],
+];
+
+test("a directory change is tracked across segments and is only allowed into a downloaded artifact directory (round 3, finding A)", () => {
+	const options = { artifactDirectories: ["artifacts", "manifest"] };
+	for (const [label, script, pattern] of DIRECTORY_EVASIONS) {
+		const reasons = credentialStepReasons(script, options);
+		assert.ok(reasons.some((reason) => pattern.test(reason)), `${label}: expected ${pattern}, got:\n${reasons.join("\n")}`);
+	}
+	// The directory change is scoped to a subshell.
+	assert.deepEqual(credentialStepReasons("(cd artifacts && cat SHA256SUMS); cat foo", options), []);
+	assert.deepEqual(credentialStepReasons("(cd artifacts && sha256sum --check SHA256SUMS)", options), []);
+	assert.deepEqual(credentialStepReasons("cd artifacts && cat SHA256SUMS", options), []);
+	assert.deepEqual(credentialStepReasons("cd manifest/sub && cat x", options), []);
+	assert.deepEqual(credentialStepReasons("cd -P artifacts && cat SHA256SUMS", options), []);
+	// Without any downloaded artifact there is nowhere to go.
+	assert.match(credentialStepReasons("cd artifacts", { artifactDirectories: [] }).join("\n"), /changes directory outside the downloaded artifacts \(none\)/);
+	// A step working-directory in an artifact directory is the starting point.
+	assert.deepEqual(credentialStepReasons("cat SHA256SUMS", { ...options, workingDirectory: "artifacts" }), []);
+	assert.match(credentialStepReasons("cat ../scripts/x", { ...options, workingDirectory: "artifacts" }).join("\n"), /references the checkout/);
+	// The word splitter records the parentheses around a command.
+	assert.deepEqual(splitWords("(cd a && b); c").commands.map((command) => [command.opens, command.closes]), [[1, 0], [0, 1], [0, 0]]);
+	assert.deepEqual(splitWords("a; b && c || d | e & f").commands.map((command) => command.words.map((word) => word.text)), [["a"], ["b"], ["c"], ["d"], ["e"], ["f"]]);
+});
+
+for (const jobId of ["publish-r2", "finalize-release", "publish-npm", "tap-bump", "github-release"]) {
+	test(`a directory change inside credential-bearing job ${jobId} is rejected in the workflow (round 3, finding A)`, () => {
+		for (const [label, script, pattern] of DIRECTORY_EVASIONS) {
+			const broken = mutate(RELEASE, (text) => appendStep(text, jobId, runStep("Sneak in a cd", `set -euo pipefail\n${script}`)));
+			const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+			assert.ok(
+				problems.some((problem) => problem.includes(`'${jobId}'`) && pattern.test(problem)),
+				`${label} in ${jobId}: expected ${pattern}, got:\n${problems.join("\n")}`,
+			);
+		}
+		// `working-directory:` on a step is the same evasion without a `cd`.
+		for (const directory of ["scripts", ".", "..", "${{ github.workspace }}", "/tmp", "artifacts/../packages"]) {
+			const broken = mutate(RELEASE, (text) => appendStep(text, jobId, `      - name: Sneak in a working directory\n        working-directory: '${directory}'\n        run: bash publish\n`));
+			const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+			assert.ok(
+				problems.some((problem) => problem.includes(`'${jobId}'`) && problem.includes("working directory other than a downloaded artifact directory")),
+				`working-directory: ${directory} in ${jobId}:\n${problems.join("\n")}`,
+			);
+		}
+		// A job-level default working directory or a non-bash shell is the same evasion again.
+		const defaults = mutate(RELEASE, (text) => text.replace(`\n  ${jobId}:\n`, `\n  ${jobId}:\n    defaults:\n      run:\n        working-directory: scripts\n`));
+		assert.ok(checkWorkflows(reader({ [RELEASE]: defaults })).some((problem) => problem.includes(`'${jobId}'`) && problem.includes("working directory other than a downloaded artifact directory")));
+		for (const shell of ["python", "node {0}", "pwsh"]) {
+			const broken = mutate(RELEASE, (text) => appendStep(text, jobId, `      - name: Sneak in another language\n        shell: '${shell}'\n        run: print(1)\n`));
+			assert.ok(checkWorkflows(reader({ [RELEASE]: broken })).some((problem) => problem.includes(`'${jobId}'`) && problem.includes("must run bash")), `shell: ${shell} in ${jobId}`);
+		}
+		// An environment variable that loads code before the first command is the same evasion without any command.
+		for (const [name, value] of [["BASH_ENV", "scripts/env.sh"], ["NODE_OPTIONS", "--require ./scripts/x.js"], ["PATH", "scripts:/usr/bin"], ["LD_PRELOAD", "/tmp/x.so"]]) {
+			const broken = mutate(RELEASE, (text) => appendStep(text, jobId, `      - name: Preload\n        env:\n          ${name}: '${value}'\n        run: echo hi\n`));
+			assert.ok(checkWorkflows(reader({ [RELEASE]: broken })).some((problem) => problem.includes(`'${jobId}'`) && problem.includes(`sets ${name}`)), `${name} in ${jobId}`);
+		}
+	});
+}
+
+test("a downloaded artifact directory is the one place a credential-bearing step may work in (round 3, finding A)", () => {
+	const release = parse(readFileSync(RELEASE, "utf8"));
+	assert.deepEqual(artifactDirectoriesOf(release.jobs["publish-r2"]), ["artifacts", "artifacts", "manifest"]);
+	assert.deepEqual(artifactDirectoriesOf(release.jobs["publish-npm"]), ["npm-packages"]);
+	assert.deepEqual(artifactDirectoriesOf({ steps: [{ uses: "actions/download-artifact@abc", with: { name: "x", path: "${{ runner.temp }}/x" } }] }), []);
+	// publish-beta-r2 legitimately cds into artifacts inside a subshell.
+	const beta = release.jobs["publish-beta-r2"].steps.find((step) => step.name === "Refuse anything that is not a beta artifact");
+	assert.match(beta.run, /\(cd artifacts && sha256sum --check SHA256SUMS\)/);
+	assert.deepEqual(checkWorkflows(), []);
+	const fine = mutate(RELEASE, (text) => appendStep(text, "publish-r2", "      - name: Work inside the artifacts\n        working-directory: artifacts\n        run: sha256sum --check SHA256SUMS\n"));
+	assert.deepEqual(checkWorkflows(reader({ [RELEASE]: fine })), []);
+});
+
+// Round 3, finding B: the pointer guard is an allowlist over every aws invocation, not a
+// denylist over the literal words `stable` and `latest.json`.
+const R2_EVASIONS = [
+	["a variable key", 'key=stable; aws s3 cp artifacts/stable "s3://${R2_BUCKET}/${key}"', /destination is outside the allowlist/],
+	["a variable bucket and key", 'B="$R2_BUCKET"; key=stable; aws s3 cp x "s3://$B/$key"', /destination must be spelled s3:\/\/\$\{R2_BUCKET\}\/<key>/],
+	["another bucket", 'aws s3 cp artifacts/stable "s3://$OTHER_BUCKET/stable"', /destination must be spelled/],
+	["an unbraced bucket", 'aws s3 cp artifacts/stable "s3://$R2_BUCKET/releases/v${PRODUCTION_VERSION}/stable"', /destination must be spelled/],
+	["aws s3 sync", 'aws s3 sync artifacts/ "s3://${R2_BUCKET}/"', /aws s3 sync is not allowed/],
+	["aws s3 mv", 'aws s3 mv artifacts/stable "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x"', /aws s3 mv is not allowed/],
+	["aws s3 rm", 'aws s3 rm "s3://${R2_BUCKET}/stable"', /aws s3 rm is not allowed/],
+	["aws s3api put-object", 'aws s3api put-object --bucket "$R2_BUCKET" --key stable --body artifacts/stable', /aws s3api put-object writes/],
+	["aws s3api copy-object", 'aws s3api copy-object --bucket "$R2_BUCKET" --key stable --copy-source "$R2_BUCKET/releases/v${PRODUCTION_VERSION}/stable"', /aws s3api copy-object writes/],
+	["--recursive to the bucket root", 'aws s3 cp artifacts "s3://${R2_BUCKET}/" --recursive', /option the checker does not allow: --recursive/],
+	["--recursive into the releases prefix", 'aws s3 cp artifacts "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/" --recursive', /option the checker does not allow: --recursive/],
+	["an --option=value the checker does not parse", 'aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x" --endpoint-url="$R2_ENDPOINT_URL"', /option the checker does not allow/],
+	["a command substitution as the object name", 'aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/$(basename artifacts/x)"', /never another expansion/],
+	["${name} bound by another loop", 'for name in stable latest.json; do aws s3 cp "artifacts/$name" "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/${name}"; done', /uses \$\{name\} where it is not the basename/],
+	["${name} bound from another directory", 'for file in /etc/*; do name=$(basename "$file"); aws s3 cp "$file" "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/${name}"; done', /uses \$\{name\} where it is not the basename/],
+	["${name} rebound after the loop head", 'for file in artifacts/*; do name=$(basename "$file"); name=stable; aws s3 cp "$file" "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/${name}"; done', /uses \$\{name\} where it is not the basename/],
+	["${name} rebound by read", 'for file in artifacts/*; do name=$(basename "$file"); read -r name < /tmp/x; aws s3 cp "$file" "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/${name}"; done', /uses \$\{name\} where it is not the basename/],
+	["$file rebound", 'for file in artifacts/*; do name=$(basename "$file"); file=/etc/passwd; aws s3 cp "$file" "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/${name}"; done', /uploads something other than a downloaded artifact/],
+	["a source outside the artifacts", 'aws s3 cp /etc/passwd "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/passwd"', /uploads something other than a downloaded artifact/],
+	["a reassigned version", 'PRODUCTION_VERSION=0.0.0; aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x"', /reassigns PRODUCTION_VERSION/],
+	["a reassigned bucket", 'export R2_BUCKET=other; aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x"', /reassigns R2_BUCKET/],
+	["a bucket read into a variable", 'read -r R2_BUCKET < /tmp/x', /reassigns R2_BUCKET/],
+	["aws through a path", '/usr/local/bin/aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x"', /through a path or expansion/],
+	["aws inside a command substitution", 'out=$(aws s3 cp artifacts/stable "s3://${R2_BUCKET}/stable")', /inside a command substitution: .*production pointer/],
+	["a service that is not s3", "aws sts get-caller-identity", /aws sts is not an R2 object operation/],
+	["a function that shadows aws", 'aws() { command aws "$@"; }', /aws must name a literal service and operation/],
+	["an expanded operation", 'op=cp; aws s3 "$op" artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x"', /aws must name a literal service and operation/],
+	["a pointer in publish-r2", 'aws s3 cp artifacts/stable "s3://${R2_BUCKET}/stable"', /only 'finalize-release' may write a production pointer/],
+	["latest.json in publish-r2", 'aws s3 cp artifacts/latest.json "s3://${R2_BUCKET}/latest.json"', /only 'finalize-release' may write a production pointer/],
+	["a prefix that is not releases/", 'aws s3 cp artifacts/x "s3://${R2_BUCKET}/v${PRODUCTION_VERSION}/x"', /destination is outside the allowlist/],
+	["a beta prefix in the production job", 'aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${BETA_VERSION}/x"', /destination is outside the allowlist/],
+	["a nested object path", 'aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/../stable"', /must be a literal or \$\{name\}/],
+	["three positionals", 'aws s3 cp artifacts/x artifacts/y "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x"', /exactly one source and one destination/],
+];
+
+test("every aws destination in a publish job must be spelled out against the allowlist (round 3, finding B)", () => {
+	const options = { artifactDirectories: ["artifacts", "manifest"] };
+	for (const [label, script, pattern] of R2_EVASIONS) {
+		const { reasons } = r2StepReasons("publish-r2", script, options);
+		assert.ok(reasons.some((reason) => pattern.test(reason)), `${label}: expected ${pattern}, got:\n${reasons.join("\n")}`);
+	}
+	// What the checked-in jobs do is accepted, one construct at a time.
+	const fine = (jobId, script, last = false) => {
+		const { reasons } = r2StepReasons(jobId, script, { ...options, last });
+		assert.deepEqual(reasons, [], `${jobId}: ${script}`);
+	};
+	fine("publish-r2", 'for file in artifacts/*; do\n  name=$(basename "$file")\n  aws s3 cp "$file" "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/${name}" --endpoint-url "$R2_ENDPOINT_URL" --content-type "$(content_type "$name")" --cache-control \'public, max-age=31536000, immutable\' --quiet\ndone');
+	fine("publish-r2", 'for file in artifacts/*; do name=$(basename "$file"); aws s3 cp "$file" "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/${name}"; done');
+	fine("publish-r2", 'aws s3 cp artifacts/SHA256SUMS "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/SHA256SUMS" --quiet');
+	fine("publish-r2", 'aws s3 cp "s3://${R2_BUCKET}/${key}" /tmp/readback.bin --endpoint-url "$R2_ENDPOINT_URL" --quiet');
+	fine("publish-r2", 'aws s3api head-object --bucket "$R2_BUCKET" --key "$key" --endpoint-url "$R2_ENDPOINT_URL" >/tmp/head.json 2>/dev/null');
+	fine("publish-r2", 'aws s3 ls "s3://${R2_BUCKET}/releases/"');
+	fine("publish-beta-r2", 'for file in artifacts/*; do name=$(basename "$file"); aws s3 cp "$file" "s3://${R2_BUCKET}/releases/v${BETA_VERSION}/${name}"; done');
+	fine("publish-beta-r2", 'aws s3 cp artifacts/beta "s3://${R2_BUCKET}/beta" --quiet\naws s3 cp artifacts/beta.json "s3://${R2_BUCKET}/beta.json" --quiet', true);
+	for (const pointer of PRODUCTION_POINTERS) fine("finalize-release", `aws s3 cp artifacts/${pointer} "s3://\${R2_BUCKET}/${pointer}" --cache-control no-cache --quiet`, true);
+	// The pointer keys fall out of the walk.
+	assert.deepEqual(r2StepReasons("finalize-release", 'aws s3 cp artifacts/stable "s3://${R2_BUCKET}/stable"\naws s3 cp artifacts/latest.json "s3://${R2_BUCKET}/latest.json"', { ...options, last: true }).pointers, ["stable", "latest.json"]);
+	// ...and never in an earlier step.
+	assert.match(r2StepReasons("finalize-release", 'aws s3 cp artifacts/stable "s3://${R2_BUCKET}/stable"', options).reasons.join("\n"), /in its last step; 'stable' is written earlier/);
+	assert.match(r2StepReasons("publish-beta-r2", 'aws s3 cp artifacts/beta "s3://${R2_BUCKET}/beta"', options).reasons.join("\n"), /in its last step; 'beta' is written earlier/);
+	// The beta job may never write a production pointer, and finalize never writes into releases/.
+	assert.match(r2StepReasons("publish-beta-r2", 'aws s3 cp artifacts/install.sh "s3://${R2_BUCKET}/install.sh"', { ...options, last: true }).reasons.join("\n"), /beta channel must never write a production pointer/);
+	assert.match(r2StepReasons("finalize-release", 'aws s3 cp artifacts/stable "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/stable"', { ...options, last: true }).reasons.join("\n"), /outside the allowlist for 'finalize-release'/);
+	// No other job may talk to R2 at all.
+	for (const jobId of ["github-release", "build", "assemble", "verify", "publish-npm", "tap-bump"]) {
+		assert.equal(jobId in R2_WRITERS, false);
+		assert.match(r2StepReasons(jobId, 'aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x"', options).reasons.join("\n"), /invokes the aws CLI; only publish-r2, publish-beta-r2, finalize-release/);
+		assert.match(r2StepReasons(jobId, 'aws s3api head-object --bucket b --key k', options).reasons.join("\n"), /invokes the aws CLI/);
+	}
+});
+
+for (const jobId of ["publish-r2", "publish-beta-r2", "finalize-release"]) {
+	test(`an aws write outside the allowlist inside ${jobId} is rejected in the workflow (round 3, finding B)`, () => {
+		for (const [label, script, pattern] of R2_EVASIONS) {
+			const broken = mutate(RELEASE, (text) => appendStep(text, jobId, runStep("Sneak in a write", `set -euo pipefail\n${script}`)));
+			const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+			// The generic messages differ per job (beta / finalize word their pointer refusals differently); every evasion must produce SOME aws finding for the job.
+			assert.ok(
+				problems.some((problem) => problem.includes(`'${jobId}'`) && (pattern.test(problem) || /aws|production pointer|reassigns/.test(problem))),
+				`${label} in ${jobId}: got:\n${problems.join("\n")}`,
+			);
+			if (jobId === "publish-r2") assert.ok(problems.some((problem) => problem.includes(`'${jobId}'`) && pattern.test(problem)), `${label} in ${jobId}: expected ${pattern}, got:\n${problems.join("\n")}`);
+		}
+	});
+}
+
+test("the R2 destination variables can only come from the secret and the context output (round 3, finding B)", () => {
+	for (const [jobId, name, value] of [
+		["publish-r2", "R2_BUCKET", "attacker-bucket"],
+		["publish-r2", "PRODUCTION_VERSION", "0.0.0"],
+		["publish-r2", "PRODUCTION_VERSION", "${{ github.event.inputs.version }}"],
+		["publish-beta-r2", "BETA_VERSION", "${{ needs.context.outputs.production_version }}"],
+		["finalize-release", "R2_ENDPOINT_URL", "https://attacker.invalid"],
+	]) {
+		const broken = mutate(RELEASE, (text) => appendStep(text, jobId, `      - name: Redirect the destination\n        env:\n          ${name}: '${value}'\n        run: echo hi\n`));
+		const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+		assert.ok(problems.some((problem) => problem.includes(`'${jobId}'`) && problem.includes(`sets ${name} to`)), `${jobId} ${name}=${value}:\n${problems.join("\n")}`);
+	}
+	// The job-level version is checked too.
+	const jobLevel = mutate(RELEASE, (text) =>
+		text.replace(
+			"    env:\n      PRODUCTION_VERSION: ${{ needs.context.outputs.production_version }}\n    steps:\n      # No checkout, no dependency install",
+			"    env:\n      PRODUCTION_VERSION: ${{ github.event.inputs.version }}\n    steps:\n      # No checkout, no dependency install",
+		),
+	);
+	assert.ok(checkWorkflows(reader({ [RELEASE]: jobLevel })).some((problem) => problem.includes("'publish-r2' job sets PRODUCTION_VERSION")));
+});
+
+test("aws anywhere outside the three R2 jobs is rejected in the workflow (round 3, finding B)", () => {
+	for (const jobId of ["github-release", "build", "assemble", "publish-npm", "tap-bump", "verify"]) {
+		const broken = mutate(RELEASE, (text) => appendStep(text, jobId, runStep("Sneak in aws", 'aws s3 cp artifacts/x "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/x"')));
+		const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+		assert.ok(problems.some((problem) => problem.includes(`'${jobId}'`) && problem.includes("invokes the aws CLI")), `${jobId}:\n${problems.join("\n")}`);
+	}
+});
+
+test("the checked-in publish steps spell out every destination (round 3, finding B)", () => {
+	const release = parse(readFileSync(RELEASE, "utf8"));
+	const upload = release.jobs["publish-r2"].steps.find((step) => step.name === "Upload immutable release objects");
+	assert.match(upload.run, /aws s3 cp "\$file" "s3:\/\/\$\{R2_BUCKET\}\/releases\/v\$\{PRODUCTION_VERSION\}\/\$\{name\}"/);
+	const beta = release.jobs["publish-beta-r2"].steps.find((step) => step.name === "Upload immutable beta objects");
+	assert.match(beta.run, /aws s3 cp "\$file" "s3:\/\/\$\{R2_BUCKET\}\/releases\/v\$\{BETA_VERSION\}\/\$\{name\}"/);
+	const pointers = release.jobs["finalize-release"].steps.at(-1);
+	for (const pointer of PRODUCTION_POINTERS) assert.ok(pointers.run.includes(`aws s3 cp artifacts/${pointer} "s3://\${R2_BUCKET}/${pointer}"`), pointer);
+	// The only `${key}` left is the read-back download; no upload destination is built from a variable.
+	assert.deepEqual(pointers.run.split("\n").filter((line) => line.includes("${key}")), ['  aws s3 cp "s3://${R2_BUCKET}/${key}" /tmp/pointer.bin --endpoint-url "$R2_ENDPOINT_URL" --quiet', '  echo "pointer ${key}"']);
 });
