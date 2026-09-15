@@ -8,18 +8,24 @@ import { NATIVE_PLATFORMS } from "../src/utils/native-installation.js";
 
 interface Step {
 	name?: string;
+	id?: string;
 	run?: string;
 	uses?: string;
 	if?: string;
 	"continue-on-error"?: boolean;
 	with?: Record<string, string>;
 }
+interface Matrix {
+	platform?: string[];
+	channel?: string[];
+	include: { platform: string; runner: string }[];
+}
 interface Job {
 	needs?: string | string[];
 	if?: string;
 	"continue-on-error"?: boolean;
 	"runs-on"?: string;
-	strategy?: { matrix: { include: { platform: string; runner: string }[] } };
+	strategy?: { matrix: Matrix };
 	steps: Step[];
 	with?: Record<string, string>;
 }
@@ -59,9 +65,20 @@ describe("release workflow signature gates", () => {
 		const validation = release.jobs["validate-macos"]!;
 		expect(validation.needs).toEqual(expect.arrayContaining(["release-context", "build"]));
 		expect(validation["runs-on"]).toBe(`\${{ matrix.runner }}`);
-		expect(validation.strategy?.matrix.include).toEqual([
+		const matrix = validation.strategy?.matrix;
+		expect(matrix?.platform).toEqual(["darwin-arm64", "darwin-x64"]);
+		expect(matrix?.channel).toEqual(["production", "beta"]);
+		expect(matrix?.include).toEqual([
 			{ platform: "darwin-arm64", runner: "macos-15" },
 			{ platform: "darwin-x64", runner: "macos-15-intel" },
+		]);
+		expect(
+			matrix!.platform!.flatMap((platform) => matrix!.channel!.map((channel) => ({ platform, channel }))),
+		).toEqual([
+			{ platform: "darwin-arm64", channel: "production" },
+			{ platform: "darwin-arm64", channel: "beta" },
+			{ platform: "darwin-x64", channel: "production" },
+			{ platform: "darwin-x64", channel: "beta" },
 		]);
 		const publish = release.jobs.publish!;
 		expect(publish.needs).toEqual(expect.arrayContaining(["build", "validate-macos"]));
@@ -70,16 +87,55 @@ describe("release workflow signature gates", () => {
 		requiresSuccess(publish);
 	});
 
+	it.each([
+		{ channel: "production", publishProduction: true, publishBeta: false, skip: false },
+		{ channel: "beta", publishProduction: true, publishBeta: false, skip: true },
+		{ channel: "production", publishProduction: false, publishBeta: true, skip: true },
+		{ channel: "beta", publishProduction: false, publishBeta: true, skip: false },
+		{ channel: "production", publishProduction: true, publishBeta: true, skip: false },
+		{ channel: "beta", publishProduction: true, publishBeta: true, skip: false },
+	])("gates the $channel matrix lane when skip=$skip", ({ channel, publishProduction, publishBeta, skip }) => {
+		const validation = release.jobs["validate-macos"]!;
+		expect(validation.if).toBe(
+			"needs.release-context.outputs.publish_production == 'true' || needs.release-context.outputs.publish_beta == 'true'",
+		);
+		const gate = step(validation, "Check channel is enabled");
+		expect(gate.id).toBe("gate");
+		expect(validation.steps[0]).toBe(gate);
+		for (const entry of validation.steps.slice(1)) {
+			expect(entry.if, entry.name).toBe("steps.gate.outputs.skip != 'true'");
+		}
+
+		const directory = mkdtempSync(join(tmpdir(), "prime-release-gate-"));
+		try {
+			const output = join(directory, "output");
+			const result = spawnSync("bash", ["-e", "-o", "pipefail", "-c", gate.run!], {
+				env: {
+					...process.env,
+					CHANNEL: channel,
+					PUBLISH_PRODUCTION: String(publishProduction),
+					PUBLISH_BETA: String(publishBeta),
+					GITHUB_OUTPUT: output,
+				},
+				encoding: "utf8",
+			});
+			expect(result.status, result.stderr).toBe(0);
+			expect(readFileSync(output, "utf8").trim()).toBe(`skip=${skip}`);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
 	it("tests final channel archives before uploading receipts, then checks receipts before external writes", () => {
 		const validation = release.jobs["validate-macos"]!;
-		const verify = step(validation, "Verify and exercise exact final Mac archives");
-		expect(verify.run).toContain("for channel in production beta");
+		const verify = step(validation, "Verify and exercise exact final Mac archive");
+		expect(verify.run).not.toContain("for channel in production beta");
 		expect(verify.run).toContain("validate-macos-release.mjs");
 		expect(verify.run).toContain("standalone-reference/binaries.json");
 		expect(verify.run).toContain("test/compiled-artifact.test.ts");
 		expect(verify.run).not.toMatch(/\|\|\s*(?:true|:)|continue-on-error/);
 		expect(validation.steps.indexOf(verify)).toBeLessThan(
-			validation.steps.indexOf(step(validation, "Upload native validation receipts")),
+			validation.steps.indexOf(step(validation, "Upload native validation receipt")),
 		);
 		const publish = release.jobs.publish!;
 		const gate = step(publish, "Match native validation to publication artifacts");
@@ -95,29 +151,25 @@ describe("release workflow signature gates", () => {
 		for (const write of writes) expect(publish.steps.indexOf(gate)).toBeLessThan(publish.steps.indexOf(write));
 	});
 
-	it.each([{ channels: ["production"] }, { channels: ["beta"] }, { channels: ["production", "beta"] }])(
-		"finds the downloaded manifests when publishing $channels",
-		({ channels }) => {
+	it.each([{ channel: "production" }, { channel: "beta" }])(
+		"finds the downloaded manifest when validating $channel",
+		({ channel }) => {
 			const validation = release.jobs["validate-macos"]!;
 			const directory = mkdtempSync(join(tmpdir(), "prime-release-downloads-"));
 			try {
 				mkdirSync(join(directory, "packages/coding-agent"), { recursive: true });
-				for (const channel of channels) {
-					const name = `prime-agent-${channel}`;
-					const download = validation.steps.find(
-						(entry) =>
-							entry.uses?.startsWith("actions/download-artifact@") &&
-							(entry.with?.name === name || entry.with?.pattern === "prime-agent-*"),
-					);
-					expect(download, `Missing download for ${channel}`).toBeDefined();
-					if (download!.if) expect(download!.if).toBe(`env.PUBLISH_${channel.toUpperCase()} == 'true'`);
-					// download-artifact nests pattern matches only when more than one artifact matches.
-					const destination = download!.with!.path!.replace(`\${{ runner.temp }}`, directory);
-					const path = download!.with!.name || channels.length === 1 ? destination : join(destination, name);
-					mkdirSync(path, { recursive: true });
-					writeFileSync(join(path, channel === "production" ? "latest.json" : "beta.json"), "{}");
-					writeFileSync(join(path, "prime-agent-1.2.3-darwin-arm64.tar.gz"), "");
-				}
+				const download = validation.steps.find(
+					(entry) =>
+						entry.uses?.startsWith("actions/download-artifact@") &&
+						entry.name === "Download exact final channel artifacts",
+				);
+				expect(download, `Missing download step`).toBeDefined();
+				const destination = download!
+					.with!.path!.replace(`\${{ runner.temp }}`, directory)
+					.replace(`\${{ matrix.channel }}`, channel);
+				mkdirSync(destination, { recursive: true });
+				writeFileSync(join(destination, channel === "production" ? "latest.json" : "beta.json"), "{}");
+				writeFileSync(join(destination, "prime-agent-1.2.3-darwin-arm64.tar.gz"), "");
 				const result = spawnSync(
 					"bash",
 					[
@@ -127,7 +179,7 @@ describe("release workflow signature gates", () => {
 						"-c",
 						`node() { test -f "$2/latest.json" || test -f "$2/beta.json"; }
 npx() { test -f "$PRIME_AGENT_TEST_ARCHIVE"; printf '%s\\n' "$PRIME_AGENT_TEST_ARCHIVE"; }
-${step(validation, "Verify and exercise exact final Mac archives").run}`,
+${step(validation, "Verify and exercise exact final Mac archive").run}`,
 					],
 					{
 						cwd: directory,
@@ -135,17 +187,14 @@ ${step(validation, "Verify and exercise exact final Mac archives").run}`,
 							...process.env,
 							RUNNER_TEMP: directory,
 							TARGET_PLATFORM: "darwin-arm64",
-							PUBLISH_PRODUCTION: String(channels.includes("production")),
-							PUBLISH_BETA: String(channels.includes("beta")),
+							CHANNEL: channel,
 						},
 						encoding: "utf8",
 					},
 				);
 				expect(result.status, result.stderr).toBe(0);
-				expect(result.stdout.trim().split("\n")).toEqual(
-					channels.map((channel) =>
-						join(directory, `final-artifacts/prime-agent-${channel}/prime-agent-1.2.3-darwin-arm64.tar.gz`),
-					),
+				expect(result.stdout.trim()).toBe(
+					join(directory, `final-artifacts/prime-agent-${channel}/prime-agent-1.2.3-darwin-arm64.tar.gz`),
 				);
 			} finally {
 				rmSync(directory, { recursive: true, force: true });

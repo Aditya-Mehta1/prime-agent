@@ -277,13 +277,20 @@ jobs:
           if-no-files-found: error
 
   validate-macos:
-    name: Final release (${{ matrix.platform }})
+    name: Final release (${{ matrix.channel }} ${{ matrix.platform }})
     needs: [release-context, build]
+    if: needs.release-context.outputs.publish_production == 'true' || needs.release-context.outputs.publish_beta == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
+        platform:
+          - darwin-arm64
+          - darwin-x64
+        channel:
+          - production
+          - beta
         include:
           - platform: darwin-arm64
             runner: macos-15
@@ -291,10 +298,23 @@ jobs:
             runner: macos-15-intel
     env:
       BUILD_REF: ${{ needs.release-context.outputs.build_ref }}
+      CHANNEL: ${{ matrix.channel }}
       PUBLISH_PRODUCTION: ${{ needs.release-context.outputs.publish_production }}
       PUBLISH_BETA: ${{ needs.release-context.outputs.publish_beta }}
     steps:
+      - name: Check channel is enabled
+        id: gate
+        run: |
+          if [ "$CHANNEL" = production ] && [ "$PUBLISH_PRODUCTION" != true ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif [ "$CHANNEL" = beta ] && [ "$PUBLISH_BETA" != true ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout validation source
+        if: steps.gate.outputs.skip != 'true'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ env.BUILD_REF }}
@@ -302,65 +322,61 @@ jobs:
           path: source
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: steps.gate.outputs.skip != 'true'
         with:
           node-version: '22'
           package-manager-cache: false
 
       - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        if: steps.gate.outputs.skip != 'true'
         with:
           version: '0.11.7'
           enable-cache: false
 
       - name: Install validation dependencies
+        if: steps.gate.outputs.skip != 'true'
         working-directory: source
         run: npm ci
 
-      - name: Download exact final production artifacts
-        if: env.PUBLISH_PRODUCTION == 'true'
+      - name: Download exact final channel artifacts
+        if: steps.gate.outputs.skip != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: prime-agent-production
-          path: ${{ runner.temp }}/final-artifacts/prime-agent-production
-
-      - name: Download exact final beta artifacts
-        if: env.PUBLISH_BETA == 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: prime-agent-beta
-          path: ${{ runner.temp }}/final-artifacts/prime-agent-beta
+          name: prime-agent-${{ matrix.channel }}
+          path: ${{ runner.temp }}/final-artifacts/prime-agent-${{ matrix.channel }}
 
       - name: Download tested executable identity
+        if: steps.gate.outputs.skip != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: standalone-${{ matrix.platform }}
           path: ${{ runner.temp }}/standalone-reference
 
       - name: Remove the build paths from the test machine
+        if: steps.gate.outputs.skip != 'true'
         run: mv "$GITHUB_WORKSPACE/source" "$RUNNER_TEMP/validation-source"
 
-      - name: Verify and exercise exact final Mac archives
+      - name: Verify and exercise exact final Mac archive
+        if: steps.gate.outputs.skip != 'true'
         working-directory: ${{ runner.temp }}/validation-source
         env:
           TARGET_PLATFORM: ${{ matrix.platform }}
         run: |
           export PRIME_AGENT_TEST_UV=$(command -v uv)
-          for channel in production beta; do
-            if [ "$channel" = production ] && [ "$PUBLISH_PRODUCTION" != true ]; then continue; fi
-            if [ "$channel" = beta ] && [ "$PUBLISH_BETA" != true ]; then continue; fi
-            artifacts="$RUNNER_TEMP/final-artifacts/prime-agent-$channel"
-            node scripts/validate-macos-release.mjs "$artifacts" "$TARGET_PLATFORM" \
-              "$RUNNER_TEMP/standalone-reference/binaries.json" \
-              "$RUNNER_TEMP/macos-validation/$channel-$TARGET_PLATFORM.json"
-            export PRIME_AGENT_TEST_ARCHIVE=$(find "$artifacts" -maxdepth 1 -name "*-$TARGET_PLATFORM.tar.gz")
-            test -n "$PRIME_AGENT_TEST_ARCHIVE"
-            (cd packages/coding-agent && npx tsx ../../node_modules/vitest/dist/cli.js --run test/compiled-artifact.test.ts test/native-installer.test.ts)
-          done
+          artifacts="$RUNNER_TEMP/final-artifacts/prime-agent-$CHANNEL"
+          node scripts/validate-macos-release.mjs "$artifacts" "$TARGET_PLATFORM" \
+            "$RUNNER_TEMP/standalone-reference/binaries.json" \
+            "$RUNNER_TEMP/macos-validation/$CHANNEL-$TARGET_PLATFORM.json"
+          export PRIME_AGENT_TEST_ARCHIVE=$(find "$artifacts" -maxdepth 1 -name "*-$TARGET_PLATFORM.tar.gz")
+          test -n "$PRIME_AGENT_TEST_ARCHIVE"
+          (cd packages/coding-agent && npx tsx ../../node_modules/vitest/dist/cli.js --run test/compiled-artifact.test.ts test/native-installer.test.ts)
 
-      - name: Upload native validation receipts
+      - name: Upload native validation receipt
+        if: steps.gate.outputs.skip != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: macos-validation-${{ matrix.platform }}
-          path: ${{ runner.temp }}/macos-validation/*.json
+          name: macos-validation-${{ matrix.channel }}-${{ matrix.platform }}
+          path: ${{ runner.temp }}/macos-validation/${{ matrix.channel }}-${{ matrix.platform }}.json
           if-no-files-found: error
 
   publish:
