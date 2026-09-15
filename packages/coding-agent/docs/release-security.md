@@ -56,7 +56,10 @@ jobs are credential-bearing (any environment, any write permission, or any secre
 the repository, changes directory anywhere but a downloaded-artifact directory, sets a
 `working-directory`, edits `PATH` or interpreter startup variables, or runs shell constructs whose
 target it cannot prove (`sh -c`, `eval`, command substitution, `xargs`, piping into an interpreter).
-It also holds a per-job command allowlist for those jobs (coreutils, `jq`, `tar`, `curl` with
+Every job the checker derives as credential-bearing must declare a GitHub environment; the only
+exemptions are jobs proved to hold nothing but a read-only or draft-only `GITHUB_TOKEN`, and any job
+with `contents: write` must be one of the named release jobs or depend on `verify`. It also holds a
+per-job command allowlist for those jobs (coreutils, `jq`, `tar`, `curl` with
 `--proto '=https'`, `gh`, plus `aws`/`cosign`/`npm`/`git` only where that job needs them; no
 interpreter of any kind), pins every `aws` call to `--endpoint-url "$R2_ENDPOINT_URL"`, and holds an
 allowlist for R2 writes: every upload destination must be a literal key under the immutable
