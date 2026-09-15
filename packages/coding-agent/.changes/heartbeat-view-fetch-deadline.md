@@ -1,0 +1,1 @@
+- Fixed the TUI heartbeat view freezing on busy sessions: catalog fetches now keep the last snapshot after a 10-second deadline and retry on the next heartbeats_changed event, instead of waiting behind an active turn indefinitely.

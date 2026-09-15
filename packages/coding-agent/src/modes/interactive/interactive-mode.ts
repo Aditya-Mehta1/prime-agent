@@ -583,6 +583,32 @@ const INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT = 400;
 // Coalesce at most this many heartbeats_changed refreshes into one refresh
 // promise; sustained churn must not hold rebindCurrentSession in a drain loop.
 const HEARTBEAT_REFRESH_DRAIN_LIMIT = 25;
+// A busy daemon can serialize a catalog fetch behind session work or worker
+// recovery for minutes; the TUI waits at most this long before keeping the
+// last catalog and letting the next heartbeats_changed event retry.
+export const HEARTBEAT_REFRESH_FETCH_TIMEOUT_MS = 10_000;
+
+/** Fetch the heartbeat catalog with a deadline; resolves undefined on expiry. */
+async function fetchHeartbeatsWithinDeadline(
+	connection: AgentConnection,
+): Promise<AgentConnectionHeartbeat[] | undefined> {
+	const fetch = connection.listHeartbeats();
+	// The deadline can settle first; a late failure must not surface as an
+	// unhandled rejection after this refresh has moved on.
+	void fetch.catch(() => undefined);
+	let timeout: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			fetch,
+			new Promise<undefined>((resolve) => {
+				timeout = setTimeout(() => resolve(undefined), HEARTBEAT_REFRESH_FETCH_TIMEOUT_MS);
+				timeout.unref?.();
+			}),
+		]);
+	} finally {
+		clearTimeout(timeout);
+	}
+}
 
 function initialRenderMessages(messages: AgentMessage[]): AgentMessage[] {
 	if (messages.length <= INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT) {
@@ -2657,8 +2683,14 @@ export class InteractiveMode {
 			// starve an awaiting rebind (and its transcript render) indefinitely.
 			for (let drain = 0; drain <= HEARTBEAT_REFRESH_DRAIN_LIMIT; drain++) {
 				this.heartbeatRefreshRequested = false;
-				const heartbeats = await connection.listHeartbeats();
+				const heartbeats = await fetchHeartbeatsWithinDeadline(connection);
 				if (this.isShuttingDown || this.isReturningToAgentsView || this.agentConnection !== connection) return;
+				if (heartbeats === undefined) {
+					// The fetch deadline expired: keep the last catalog and surface
+					// nothing further. A change event that arrived mid-fetch
+					// re-triggers a refresh through the follow-up scheduling below.
+					return;
+				}
 				this.applyHeartbeatCatalog(heartbeats);
 				if (!this.heartbeatRefreshRequested) return;
 			}
@@ -4183,7 +4215,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
 		this.defaultEditor.onAction("app.subagents.focus", () => this.focusSubagentSummary());
 		this.defaultEditor.onAction("app.heartbeats.open", () => {
-			void this.showHeartbeatManager();
+			this.showHeartbeatManager();
 		});
 		this.defaultEditor.onAction("app.editor.external", () => this.openExternalEditor());
 		this.defaultEditor.onAction("app.prompt.stash", () => this.handlePromptStash());
@@ -9930,17 +9962,16 @@ export class InteractiveMode {
 		}
 	}
 
-	private async showHeartbeatManager(): Promise<void> {
+	private showHeartbeatManager(): void {
 		if (this.heartbeatManagerHandle) {
 			this.heartbeatManagerHandle.focus();
 			return;
 		}
-		try {
-			await this.refreshHeartbeatCatalog();
-		} catch (error) {
-			this.showError(error instanceof Error ? error.message : String(error));
-			return;
-		}
+		// Stale-while-revalidate: open immediately with the cached catalog. A
+		// busy session can take minutes to answer the fetch, and the overlay
+		// must not wait for it; the background refresh updates the open view
+		// when fresh data lands (the component reads the catalog per render).
+		void this.refreshHeartbeatCatalog().catch(() => undefined);
 		const manager = new HeartbeatManagerComponent({
 			getHeartbeats: () => this.getScopedHeartbeats(),
 			getRows: () => this.ui.terminal.rows,
