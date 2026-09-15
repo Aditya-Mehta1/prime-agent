@@ -77,11 +77,11 @@ function requiresSuccess(job: Job): void {
 }
 
 describe("release workflow signature gates", () => {
-	it("cancels only superseded pull request release runs", () => {
+	it("keeps queued release runs non-cancelling for FIFO safety", () => {
 		expect(release.concurrency?.group).toBe(
 			`\${{ github.event_name == 'pull_request' && format('release-validation-pr-{0}', github.event.pull_request.number) || 'release-prime-agent' }}`,
 		);
-		expect(release.concurrency?.["cancel-in-progress"]).toBe(`\${{ github.event_name == 'pull_request' }}`);
+		expect(release.concurrency?.["cancel-in-progress"]).toBe(false);
 		expect(release.concurrency?.queue).toBe("max");
 	});
 

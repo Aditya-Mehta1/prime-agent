@@ -17,7 +17,7 @@ on:
 
 concurrency:
   group: ${{ github.event_name == 'pull_request' && format('release-validation-pr-{0}', github.event.pull_request.number) || 'release-prime-agent' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
   queue: max
 
 permissions:
