@@ -1066,7 +1066,7 @@ describe("agent trace upload", () => {
 
 		sessionManager.appendMessage(createAssistantMessage("hi"));
 		const armed = await scheduled.next();
-		expect(armed).toEqual({ delayMs: UPLOAD_DEBOUNCE_MS, holdsProcessOpen: false });
+		expect(armed).toEqual({ delayMs: UPLOAD_DEBOUNCE_MS });
 
 		await vi.advanceTimersByTimeAsync(armed.delayMs);
 		expect((await settled.next()).status).toBe("uploaded");

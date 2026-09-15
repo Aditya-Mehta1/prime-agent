@@ -83,8 +83,6 @@ export interface AgentTraceSessionUploadOptions extends Omit<AgentTraceUploadOpt
 
 export interface AgentTraceUploadSchedule {
 	delayMs: number;
-	/** True when the armed timer keeps the process alive; the scheduler always arms unref'd timers. */
-	holdsProcessOpen: boolean;
 }
 
 export interface AgentTraceUploadInstallOptions {
@@ -1144,7 +1142,7 @@ class AgentTraceUploadController {
 			void this.runScheduledUpload();
 		}, delayMs);
 		this.timeout.unref();
-		this.options.onUploadScheduled?.({ delayMs, holdsProcessOpen: this.timeout.hasRef() });
+		this.options.onUploadScheduled?.({ delayMs });
 	}
 
 	private async runScheduledUpload(): Promise<void> {
