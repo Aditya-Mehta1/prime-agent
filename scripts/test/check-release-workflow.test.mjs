@@ -5,15 +5,22 @@ import { test } from "node:test";
 import { parse } from "yaml";
 
 import {
+	ALLOWED_ACTIONS,
 	CREDENTIAL_JOBS,
+	HEAD_OBJECT_GUARD,
 	PRODUCTION_POINTERS,
 	R2_WRITERS,
+	REBUILD_ALLOWLIST,
 	TEST_SIGNER_FLAG,
 	TEST_SIGNER_STEP,
 	artifactDirectoriesOf,
 	checkWorkflows,
 	credentialStepReasons,
+	headObjectGuardReasons,
+	ignoreScriptsEnabled,
 	isCredentialBearing,
+	lifecycleReasons,
+	permissionEntries,
 	r2StepReasons,
 	referencesSecret,
 	repositoryCodeReasons,
@@ -23,6 +30,7 @@ import {
 
 const RELEASE = ".github/workflows/build-binaries.yml";
 const STANDALONE = ".github/workflows/standalone-binaries.yml";
+const CI = ".github/workflows/ci.yml";
 
 function reader(overrides = {}) {
 	return (path) => overrides[path] ?? readFileSync(path, "utf8");
@@ -287,12 +295,17 @@ test("the shell matcher understands continuations, heredocs, pipes and comments"
 			"digest=$(grep -E 'x' \\\n  \"$GITHUB_WORKSPACE/artifacts/SHA256SUMS\" | cut -d' ' -f1)\npython3 - \"$formula\" <<'PY'\nimport scripts/evil\nPY\n# node scripts/comment.mjs\necho ok # node scripts/comment.mjs\n",
 		),
 	];
+	// Round 4, finding 6: the heredoc body is re-parsed and yielded too, whatever program reads it.
 	assert.deepEqual(
 		commands.map((command) => command.words.map((word) => word.text)),
-		[["digest=$(grep -E 'x'    \"$GITHUB_WORKSPACE/artifacts/SHA256SUMS\" | cut -d' ' -f1)"], ["python3", "-", "$formula"], ["echo", "ok"]],
+		[["digest=$(grep -E 'x'    \"$GITHUB_WORKSPACE/artifacts/SHA256SUMS\" | cut -d' ' -f1)"], ["python3", "-", "$formula"], ["import", "scripts/evil"], ["echo", "ok"]],
 	);
 	assert.deepEqual(commands[0].substitutions, ["grep -E 'x'    \"$GITHUB_WORKSPACE/artifacts/SHA256SUMS\" | cut -d' ' -f1"]);
-	for (const command of commands) assert.deepEqual(repositoryCodeReasons(command), [], command.words.map((word) => word.text).join(" "));
+	assert.deepEqual(repositoryCodeReasons(commands[0]), []);
+	assert.match(repositoryCodeReasons(commands[1]).join("\n"), /python3 reads its script from a heredoc/);
+	assert.match(repositoryCodeReasons(commands[1]).join("\n"), /python3 reads its script from stdin/);
+	assert.match(repositoryCodeReasons(commands[2]).join("\n"), /references the checkout: scripts\/evil/);
+	assert.deepEqual(repositoryCodeReasons(commands[3]), []);
 });
 
 test("word splitting resolves adjacent quoted fragments the way a POSIX shell does (finding B)", () => {
@@ -342,7 +355,7 @@ test("indirection the checker cannot follow is an outright error (finding B)", (
 	assert.match(flagged("printf x | bash").join("\n"), /bash reads its script from a pipe/);
 	assert.match(flagged("cat x | node").join("\n"), /node reads its script from a pipe/);
 	assert.match(flagged("sh < ./x").join("\n"), /sh reads its script from a file/);
-	assert.match(flagged('sh <<<"$CMD"').join("\n"), /sh reads its script from an expansion/);
+	assert.match(flagged('sh <<<"$CMD"').join("\n"), /sh reads its script from a here-string/);
 	assert.match(flagged("x=`node scripts/x.mjs`").join("\n"), /inside a command substitution: references the checkout/);
 	assert.match(flagged("x=$(cat ./x.sh)").join("\n"), /command substitution names a script/);
 	assert.match(flagged("$(echo node) x").join("\n"), /command is a shell expansion/);
@@ -350,10 +363,10 @@ test("indirection the checker cannot follow is an outright error (finding B)", (
 	assert.match(flagged("find . -exec node {} \\;").join("\n"), /find -exec/);
 	assert.match(flagged("sh <<'EOF'\nnode scripts/x.mjs\nEOF").join("\n"), /references the checkout: scripts\/x.mjs/);
 	assert.match(flagged("bash publish").join("\n"), /runs a file through bash: publish/);
-	// A python heredoc is inline code written in the workflow, not shell to re-parse.
-	assert.deepEqual(flagged("python3 - \"$formula\" <<'PY'\nimport scripts/evil\nPY"), []);
-	// A heredoc fed to a shell IS shell code.
-	assert.deepEqual(flagged("sh <<'EOF'\necho fine\nEOF"), []);
+	// Round 4, finding 6: no interpreter may read from a heredoc, a here-string or stdin, and the body is inspected anyway.
+	assert.match(flagged("python3 - \"$formula\" <<'PY'\nimport scripts/evil\nPY").join("\n"), /python3 reads its script from a heredoc/);
+	assert.match(flagged("python3 - \"$formula\" <<'PY'\nimport scripts/evil\nPY").join("\n"), /references the checkout: scripts\/evil/);
+	assert.match(flagged("sh <<'EOF'\necho fine\nEOF").join("\n"), /sh reads its script from a heredoc/);
 });
 
 test("the shell matcher leaves legitimate credential-job commands alone", () => {
@@ -363,8 +376,11 @@ test("the shell matcher leaves legitimate credential-job commands alone", () => 
 		'cosign verify-blob --certificate-identity "https://github.com/o/r/.github/workflows/build-binaries.yml@refs/heads/main" SHA256SUMS',
 		"npm publish npm-packages/artifacts/x.tgz --provenance --access public --ignore-scripts",
 		"jq -r '.publishOrder[]' npm-packages/manifest.json",
-		"python3 - \"$formula\" \"$platform\"",
 		"node -e 'console.log(1)'",
+		"python3 -c 'print(1)'",
+		"node --version",
+		"sed -E \"s/x/${digest}/\" \"$formula\" > \"$formula.tmp\"",
+		"[[ \"$PRODUCTION_VERSION\" =~ $version_pattern ]] || { echo bad >&2; exit 1; }",
 		"sha256sum --check SHA256SUMS",
 		"command -v uv",
 		"count=$((count + 1))",
@@ -542,7 +558,7 @@ test("the test signer override may be compiled in exactly one standalone step an
 	assert.ok(problems.some((problem) => problem.includes("references a secret")), problems.join("\n"));
 	broken = mutate(RELEASE, (text) => text.replace("    permissions:\n      contents: read\n      id-token: write\n    uses: ./.github/workflows/standalone-binaries.yml", "    permissions:\n      contents: write\n      id-token: write\n    uses: ./.github/workflows/standalone-binaries.yml"));
 	problems = checkWorkflows(reader({ [RELEASE]: broken }));
-	assert.ok(problems.some((problem) => problem.includes("passes 'contents: write'")), problems.join("\n"));
+	assert.ok(problems.some((problem) => problem.includes("job 'standalone'") && problem.includes("must pass exactly contents: read and id-token: write")), problems.join("\n"));
 });
 
 // Round 3, finding A: `cd scripts; bash publish` and friends. A directory change in a
@@ -765,4 +781,448 @@ test("the checked-in publish steps spell out every destination (round 3, finding
 	for (const pointer of PRODUCTION_POINTERS) assert.ok(pointers.run.includes(`aws s3 cp artifacts/${pointer} "s3://\${R2_BUCKET}/${pointer}"`), pointer);
 	// The only `${key}` left is the read-back download; no upload destination is built from a variable.
 	assert.deepEqual(pointers.run.split("\n").filter((line) => line.includes("${key}")), ['  aws s3 cp "s3://${R2_BUCKET}/${key}" /tmp/pointer.bin --endpoint-url "$R2_ENDPOINT_URL" --quiet', '  echo "pointer ${key}"']);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Round 4: allowlists everywhere a credential is present, and the evasions the reviewer found.
+// ---------------------------------------------------------------------------------------------
+
+const SHA = "0000000000000000000000000000000000000000";
+const usesStep = (uses, name = "Sneak in an action") => `      - name: ${name}\n        uses: ${uses}\n`;
+
+test("credential-bearing jobs accept only allowlisted actions, never an arbitrary pinned one (round 4, finding 1 - critical)", () => {
+	// The reviewer's case: a SHA-pinned third-party action that is not on any denylist.
+	let broken = mutate(RELEASE, (text) => appendStep(text, "finalize-release", usesStep(`attacker/exfiltrate@${SHA}`)));
+	let problems = checkWorkflows(reader({ [RELEASE]: broken }));
+	assert.ok(problems.some((problem) => problem.includes("'finalize-release'") && problem.includes(`attacker/exfiltrate@${SHA}`) && problem.includes("must not use")), problems.join("\n"));
+	// Every credential-bearing job, including the ones that are only credential-bearing through a token or OIDC.
+	for (const jobId of ["publish-r2", "publish-beta-r2", "publish-npm", "tap-bump", "github-release", "github-release-beta", "sign"]) {
+		for (const uses of [`attacker/exfiltrate@${SHA}`, `actions/github-script@${SHA}`, `actions/cache@${SHA}`, `docker/login-action@${SHA}`, `actions/checkout@${SHA}`]) {
+			broken = mutate(RELEASE, (text) => appendStep(text, jobId, usesStep(uses)));
+			problems = checkWorkflows(reader({ [RELEASE]: broken }));
+			assert.ok(problems.some((problem) => problem.includes(`'${jobId}'`) && problem.includes(uses)), `${uses} in ${jobId}:\n${problems.join("\n")}`);
+		}
+	}
+	// An action allowed for one job is not allowed for another.
+	broken = mutate(RELEASE, (text) => appendStep(text, "finalize-release", usesStep(`sigstore/cosign-installer@${SHA}`)));
+	assert.ok(checkWorkflows(reader({ [RELEASE]: broken })).some((problem) => problem.includes("'finalize-release'") && problem.includes("cosign-installer")));
+	broken = mutate(RELEASE, (text) => appendStep(text, "sign", usesStep(`actions/setup-node@${SHA}`)));
+	assert.ok(checkWorkflows(reader({ [RELEASE]: broken })).some((problem) => problem.includes("'sign'") && problem.includes("setup-node")));
+	// The allowlist is exactly what the checked-in jobs use; github-script is not on it.
+	assert.equal(JSON.stringify(ALLOWED_ACTIONS).includes("github-script"), false);
+	const release = parse(readFileSync(RELEASE, "utf8"));
+	for (const [jobId, job] of Object.entries(release.jobs)) {
+		if (!isCredentialBearing(job)) continue;
+		const allowed = [...ALLOWED_ACTIONS["*"], ...(ALLOWED_ACTIONS[jobId] ?? [])];
+		for (const step of job.steps ?? []) {
+			if (step.uses) assert.ok(allowed.some((pattern) => pattern.test(step.uses)), `${jobId} uses ${step.uses}`);
+		}
+	}
+	assert.deepEqual(checkWorkflows(), []);
+});
+
+test("scalar permissions are read as grants, not iterated as characters (round 4, finding 2)", () => {
+	assert.deepEqual(permissionEntries("write-all"), [["*", "write"]]);
+	assert.deepEqual(permissionEntries("read-all"), [["*", "read"]]);
+	assert.deepEqual(permissionEntries({ contents: "write" }), [["contents", "write"]]);
+	assert.deepEqual(permissionEntries(undefined), []);
+	assert.equal(isCredentialBearing({ permissions: "write-all", steps: [] }), true);
+	assert.equal(isCredentialBearing({ permissions: "read-all", steps: [] }), false);
+	assert.equal(isCredentialBearing({ permissions: { contents: "read", "id-token": "write" }, steps: [] }), true);
+	// `build` checks the repository out; with write-all it is credential-bearing and the checkout is a violation.
+	const broken = mutate(RELEASE, (text) => text.replace("  build:\n    name: Pack release\n    runs-on: ubuntu-latest\n    needs: [context, standalone]\n    permissions:\n      contents: read\n", "  build:\n    name: Pack release\n    runs-on: ubuntu-latest\n    needs: [context, standalone]\n    permissions: write-all\n"));
+	assert.equal(isCredentialBearing(parse(broken).jobs.build), true);
+	const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+	assert.ok(problems.some((problem) => problem.includes("'build'") && problem.includes("actions/checkout")), problems.join("\n"));
+	assert.ok(problems.some((problem) => problem.includes("'build'") && problem.includes("permissions: write-all")), problems.join("\n"));
+	// read-all is a blanket grant too; every scope is spelled out.
+	const readAll = mutate(RELEASE, (text) => text.replace("  build:\n    name: Pack release\n    runs-on: ubuntu-latest\n    needs: [context, standalone]\n    permissions:\n      contents: read\n", "  build:\n    name: Pack release\n    runs-on: ubuntu-latest\n    needs: [context, standalone]\n    permissions: read-all\n"));
+	assert.ok(checkWorkflows(reader({ [RELEASE]: readAll })).some((problem) => problem.includes("'build'") && problem.includes("permissions: read-all")));
+	// The standalone job and its callers refuse a scalar as well.
+	const standalone = mutate(STANDALONE, (text) => text.replace("      contents: read\n      id-token: write\n", "").replace("    permissions:\n", "    permissions: write-all\n"));
+	assert.ok(checkWorkflows(reader({ [STANDALONE]: standalone })).some((problem) => problem.includes("permissions: write-all")));
+	const caller = mutate(RELEASE, (text) => text.replace("    permissions:\n      contents: read\n      id-token: write\n    uses: ./.github/workflows/standalone-binaries.yml", "    permissions: write-all\n    uses: ./.github/workflows/standalone-binaries.yml"));
+	assert.ok(checkWorkflows(reader({ [RELEASE]: caller })).some((problem) => problem.includes("job 'standalone'") && problem.includes("must pass exactly")));
+});
+
+test("a workflow-level env or default that carries a secret or a preload variable is rejected (round 4, finding 3)", () => {
+	const workflowLevel = (yaml) => mutate(RELEASE, (text) => text.replace("permissions: {}\n\njobs:\n", `permissions: {}\n${yaml}\njobs:\n`));
+	let problems = checkWorkflows(reader({ [RELEASE]: workflowLevel("env:\n  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}\n") }));
+	assert.ok(problems.some((problem) => problem.includes("workflow-level env AWS_SECRET_ACCESS_KEY references a secret")), problems.join("\n"));
+	problems = checkWorkflows(reader({ [RELEASE]: workflowLevel("env:\n  TOKENS: ${{ secrets.GITHUB_TOKEN }} ${{ secrets.HOMEBREW_TAP_TOKEN }}\n") }));
+	assert.ok(problems.some((problem) => problem.includes("workflow-level env TOKENS references a secret")), problems.join("\n"));
+	problems = checkWorkflows(reader({ [RELEASE]: workflowLevel("env:\n  NODE_OPTIONS: --require ./x.js\n") }));
+	assert.ok(problems.some((problem) => problem.includes("workflow-level env sets NODE_OPTIONS")), problems.join("\n"));
+	problems = checkWorkflows(reader({ [RELEASE]: workflowLevel("defaults:\n  run:\n    working-directory: ${{ secrets.WORKDIR }}\n") }));
+	assert.ok(problems.some((problem) => problem.includes("workflow-level defaults reference a secret")), problems.join("\n"));
+	// GITHUB_TOKEN alone at the workflow level is not a secret reference (it is checked per job as a permission).
+	problems = checkWorkflows(reader({ [RELEASE]: workflowLevel("env:\n  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n") }));
+	assert.equal(problems.some((problem) => problem.includes("workflow-level env")), false, problems.join("\n"));
+});
+
+test("no job or step in the release may run after an upstream failure through a status function (round 4, finding 4)", () => {
+	const release = parse(readFileSync(RELEASE, "utf8"));
+	// `!cancelled()` has to be wrapped in `${{ }}`: a bare `!` starts a YAML tag, which is why GitHub documents it that way.
+	const conditions = ["always()", "${{ !cancelled() }}", "failure()", "success() || failure()", "always() && needs.verify.result != 'skipped'", "${{ always() }}", "cancelled() == false"];
+	for (const jobId of ["github-release", "publish-r2", "verify", "finalize-release", "pack-npm", "publish-npm", "tap-bump", "publish-beta-r2", "github-release-beta", "sign"]) {
+		assert.ok(release.jobs[jobId].if, `${jobId} has an if`);
+		for (const condition of conditions) {
+			const broken = mutate(RELEASE, (text) => {
+				const start = text.indexOf(`\n  ${jobId}:\n`);
+				const folded = text.indexOf("    if: >-\n", start);
+				const single = text.indexOf("    if: github.event_name", start);
+				const nextJob = text.indexOf("\n  ", text.indexOf("    runs-on:", start));
+				if (folded !== -1 && folded < nextJob && (single === -1 || folded < single)) {
+					return `${text.slice(0, folded)}    if: >-\n      ${condition} &&\n${text.slice(folded + "    if: >-\n".length)}`;
+				}
+				assert.ok(single !== -1 && single < nextJob, `${jobId} has a single-line if`);
+				return `${text.slice(0, single)}    if: ${condition} && ${text.slice(single + "    if: ".length)}`;
+			});
+			const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+			assert.ok(problems.some((problem) => problem.includes(`job '${jobId}'`) && problem.includes("status-check function")), `${condition} on ${jobId}:\n${problems.join("\n")}`);
+		}
+	}
+	// A step-level status function and continue-on-error are the same evasion one level down.
+	for (const jobId of ["verify", "finalize-release", "publish-npm", "tap-bump"]) {
+		let broken = mutate(RELEASE, (text) => appendStep(text, jobId, "      - name: Run regardless\n        if: always()\n        run: echo hi\n"));
+		assert.ok(checkWorkflows(reader({ [RELEASE]: broken })).some((problem) => problem.includes(`'${jobId}'`) && problem.includes("status-check function")), jobId);
+		broken = mutate(RELEASE, (text) => appendStep(text, jobId, "      - name: Never fails\n        continue-on-error: true\n        run: false\n"));
+		assert.ok(checkWorkflows(reader({ [RELEASE]: broken })).some((problem) => problem.includes(`'${jobId}'`) && problem.includes("continue-on-error")), jobId);
+		broken = mutate(RELEASE, (text) => text.replace(`\n  ${jobId}:\n`, `\n  ${jobId}:\n    continue-on-error: true\n`));
+		assert.ok(checkWorkflows(reader({ [RELEASE]: broken })).some((problem) => problem.includes(`job '${jobId}'`) && problem.includes("continue-on-error")), jobId);
+	}
+	assert.deepEqual(checkWorkflows(), []);
+});
+
+test("no caller may pass secrets, an environment or an undeclared input to the standalone workflow (round 4, finding 5)", () => {
+	const callerLine = "    uses: ./.github/workflows/standalone-binaries.yml\n";
+	for (const [path, extra, expected] of [
+		[RELEASE, "    secrets: inherit\n", "passes secrets"],
+		[RELEASE, "    secrets:\n      TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}\n", "passes secrets"],
+		[RELEASE, "    secrets:\n      TOKEN: ${{ secrets.GITHUB_TOKEN }}\n", "passes secrets"],
+		[RELEASE, "    secrets: {}\n", "passes secrets"],
+		[RELEASE, "    environment: release-r2\n", "in an environment"],
+		[CI, "    secrets: inherit\n", "passes secrets"],
+		[CI, "    with:\n      build_ref: ${{ github.sha }}\n      extra: x\n", "passes input 'extra'"],
+	]) {
+		const broken = mutate(path, (text) => text.replace(callerLine, `${callerLine}${extra}`));
+		const problems = checkWorkflows(reader({ [path]: broken }));
+		assert.ok(problems.some((problem) => problem.startsWith(`${path}: job 'standalone'`) && problem.includes(expected)), `${path} + ${JSON.stringify(extra)}:\n${problems.join("\n")}`);
+	}
+});
+
+const HEREDOC_EVASIONS = [
+	["python3 - from a heredoc", "python3 - <<'PY'\nprint(1)\nPY", /python3 reads its script from a heredoc/],
+	["python3 from an unquoted heredoc", "python3 <<PY\nprint(1)\nPY", /python3 reads its script from a heredoc/],
+	["node - from a heredoc", "node - <<'JS'\nconsole.log(1)\nJS", /node reads its script from a heredoc/],
+	["node from a heredoc", "node <<'JS'\nconsole.log(1)\nJS", /node reads its script from a heredoc/],
+	["node from a <<- heredoc", "node <<-JS\n\tconsole.log(1)\n\tJS", /node reads its script from a heredoc/],
+	["perl from a heredoc", "perl <<'PL'\nprint 1\nPL", /perl reads its script from a heredoc/],
+	["node from a here-string", "node <<<'console.log(1)'", /node reads its script from a here-string/],
+	["node from stdin", "node -", /node reads its script from stdin/],
+	["python3 from stdin", "python3 - x", /python3 reads its script from stdin/],
+	["a heredoc body that names repository code, fed to cat", "cat <<'EOF' > /tmp/x\nnode scripts/release.mjs\nEOF", /references the checkout: scripts\/release\.mjs/],
+	["a heredoc body that names repository code, fed to tee", "tee /tmp/x <<EOF\nbash .github/scripts/x.sh\nEOF", /references the checkout: \.github\/scripts\/x\.sh/],
+	// The pre-existing evasion: a here-string looked like a heredoc opener and swallowed the rest of the script.
+	["a here-string followed by repository code", 'jq -r .ref <<<"$ref"\nnode scripts/release.mjs', /references the checkout: scripts\/release\.mjs/],
+	["a quoted here-string followed by repository code", "jq -r .ref <<<'EOF'\nnode scripts/release.mjs", /references the checkout: scripts\/release\.mjs/],
+	["a here-string on a numbered fd followed by repository code", 'cat 3<<<"x"\nnode scripts/release.mjs', /references the checkout: scripts\/release\.mjs/],
+];
+
+test("every heredoc body is inspected and no interpreter may read one (round 4, finding 6)", () => {
+	for (const [label, script, pattern] of HEREDOC_EVASIONS) {
+		const reasons = credentialStepReasons(script, { artifactDirectories: ["artifacts"] });
+		assert.ok(reasons.some((reason) => pattern.test(reason)), `${label}: expected ${pattern}, got:\n${reasons.join("\n")}`);
+	}
+	// The here-string no longer opens a heredoc: the following commands are parsed as commands.
+	assert.deepEqual([...shellCommands('jq -r .ref <<<"$ref"\necho after')].map((command) => command.words.map((word) => word.text)), [["jq", "-r", ".ref"], ["echo", "after"]]);
+	// Two heredocs on one line are both consumed, in order, and both bodies are inspected.
+	const two = [...shellCommands("cat <<A <<B\nnode scripts/a.mjs\nA\nbash scripts/b.sh\nB\necho done")];
+	assert.deepEqual(two.map((command) => command.words.map((word) => word.text)), [["cat"], ["node", "scripts/a.mjs"], ["bash", "scripts/b.sh"], ["echo", "done"]]);
+	// A heredoc fed to something harmless with a harmless body is fine.
+	assert.deepEqual(credentialStepReasons("cat <<'EOF' > /tmp/notes.md\nRelease notes\nEOF\necho ok"), []);
+});
+
+const INTERPRETER_EVASIONS = [
+	["node --import=", "node --import=./evil.mjs -e 1", /node carries an option the checker does not allow.*--import=\.\/evil\.mjs/],
+	["node --import", "node --import ./evil.mjs -e 1", /node carries an option the checker does not allow.*--import/],
+	["node --require", "node --require ./evil.js -e 1", /node carries an option the checker does not allow.*--require/],
+	["node -r", "node -r ./evil.js -e 1", /node carries an option the checker does not allow.*-r/],
+	["node --loader", "node --loader ./evil.mjs -e 1", /node carries an option the checker does not allow.*--loader/],
+	["node --experimental-loader", "node --experimental-loader=./evil.mjs -e 1", /node carries an option the checker does not allow.*--experimental-loader/],
+	["node --env-file", "node --env-file=.env -e 1", /node carries an option the checker does not allow.*--env-file/],
+	["node --run", "node --run build", /node carries an option the checker does not allow.*--run/],
+	["node --test", "node --test", /node carries an option the checker does not allow.*--test/],
+	["NODE_OPTIONS as a prefix", "NODE_OPTIONS=--import=./evil.mjs node -e 1", /sets NODE_OPTIONS, which loads code before the command runs/],
+	["NODE_OPTIONS through env", "env NODE_OPTIONS=--import=./evil.mjs node -e 1", /sets NODE_OPTIONS, which loads code before the command runs/],
+	["NODE_OPTIONS exported", "export NODE_OPTIONS=--import=./evil.mjs", /sets NODE_OPTIONS, which loads code before the command runs/],
+	["NODE_OPTIONS declared", "declare -x NODE_OPTIONS=--require=./evil.js", /sets NODE_OPTIONS/],
+	["NODE_OPTIONS read", "read -r NODE_OPTIONS < /tmp/x", /sets NODE_OPTIONS/],
+	["NODE_OPTIONS through sudo env", "sudo env NODE_OPTIONS=--import=./evil.mjs node -e 1", /sets NODE_OPTIONS/],
+	["PYTHONSTARTUP", "PYTHONSTARTUP=./evil.py python3 -c 1", /sets PYTHONSTARTUP/],
+	["PERL5OPT", "PERL5OPT=-M./evil perl -e 1", /sets PERL5OPT/],
+	["python3 -m", "python3 -m scripts.evil", /python3 carries an option the checker does not allow.*-m/],
+	["python3 -m http.server", "python3 -m http.server 8080", /python3 carries an option the checker does not allow/],
+	["python3 -I", "python3 -I -c 1", /python3 carries an option the checker does not allow/],
+	["perl -M", "perl -Mscripts::evil -e 1", /perl carries an option the checker does not allow/],
+	["ruby -r", "ruby -r./evil -e 1", /ruby carries an option the checker does not allow/],
+	["node -e from an expansion", 'node -e "$CODE"', /node -e runs code from an expansion/],
+	["python3 -c from an expansion", 'python3 -c "$(cat x)"', /python3 -c runs code from an expansion/],
+	["node -e with nothing", "node -e", /node -e names no inline code/],
+	["an option built from an expansion", 'node "--$FLAG" -e 1', /node carries an option built from an expansion/],
+	["an argument built from an expansion", 'node "$FLAG" x', /runs a file through node: \$FLAG/],
+	["node -- file", "node -- evil.js", /runs a file through node: evil\.js/],
+	["bash --rcfile", "bash --rcfile ./evil -i", /bash --rcfile runs inline or piped shell code/],
+	["bash -i", "bash -i", /bash -i runs inline or piped shell code/],
+	["sh -", "sh -", /sh reads its script from stdin/],
+	["deno run", "deno run evil.ts", /runs a file through deno: run/],
+];
+
+test("interpreters may carry only the inline-code flag; preload and module options are refused before the flag skip (round 4, finding 7)", () => {
+	const flagged = (line) => [...shellCommands(line)].flatMap((command) => repositoryCodeReasons(command));
+	for (const [label, script, pattern] of INTERPRETER_EVASIONS) {
+		const reasons = flagged(script);
+		assert.ok(reasons.some((reason) => pattern.test(reason)), `${label}: expected ${pattern}, got:\n${reasons.join("\n")}`);
+	}
+	for (const fine of ["node -e 'console.log(1)'", "node --eval 'console.log(1)'", "node -p '1 + 1'", "node --version", "node -v", "python3 -c 'print(1)'", "python3 --version", "perl -e 'print 1'", "ruby -e 'puts 1'", "bash --version"]) {
+		assert.deepEqual(flagged(fine), [], fine);
+	}
+});
+
+for (const jobId of ["publish-r2", "finalize-release", "publish-npm", "tap-bump"]) {
+	test(`heredoc and interpreter-option evasions inside credential-bearing job ${jobId} are rejected in the workflow (round 4, findings 6 and 7)`, () => {
+		for (const [label, script, pattern] of [...HEREDOC_EVASIONS, ...INTERPRETER_EVASIONS]) {
+			const broken = mutate(RELEASE, (text) => appendStep(text, jobId, runStep("Sneak in code", `set -euo pipefail\n${script}`)));
+			const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+			assert.ok(problems.some((problem) => problem.includes(`'${jobId}'`) && pattern.test(problem)), `${label} in ${jobId}: expected ${pattern}, got:\n${problems.join("\n")}`);
+		}
+	});
+}
+
+test("--ignore-scripts counts only when it is enabled (round 4, finding 8)", () => {
+	for (const args of [["--ignore-scripts"], ["--ignore-scripts", "true"], ["--ignore-scripts=true"], ["--foo", "--ignore-scripts", "bar"], ["--ignore-scripts", "--other"]]) {
+		assert.equal(ignoreScriptsEnabled(args), true, args.join(" "));
+	}
+	for (const args of [[], ["--ignore-scripts", "false"], ["--ignore-scripts=false"], ["--ignore-scripts=0"], ["--ignore-scripts=no"], ["--ignore-scripts", "0"], ["--no-ignore-scripts"], ["--ignore-scripts", "--ignore-scripts=false"], ["--ignore-scripts=false", "--ignore-scripts"], ["--ignore-script"], ["--ignore-scripts-not"]]) {
+		assert.equal(ignoreScriptsEnabled(args), false, args.join(" "));
+	}
+	for (const disabled of ["npm ci --ignore-scripts false", "npm ci --ignore-scripts=false", "npm ci --no-ignore-scripts", "npm ci --ignore-scripts=0", "npm ci --ignore-scripts --ignore-scripts=false"]) {
+		const broken = mutate(STANDALONE, (text) => text.replace("run: npm ci --ignore-scripts\n", `run: ${disabled}\n`));
+		const problems = checkWorkflows(reader({ [STANDALONE]: broken }));
+		assert.ok(problems.some((problem) => problem.includes("--ignore-scripts") && problem.includes(disabled)), `${disabled}:\n${problems.join("\n")}`);
+	}
+	// npm publish in the credential-bearing publish job must keep its --ignore-scripts too.
+	for (const disabled of ['npm publish "$path" --provenance --access public --ignore-scripts=false', 'npm publish "$path" --provenance --access public']) {
+		const broken = mutate(RELEASE, (text) => text.replace('npm publish "$path" --provenance --access public --ignore-scripts', disabled));
+		const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+		assert.ok(problems.some((problem) => problem.includes("'publish-npm'") && problem.includes("npm publish runs the package's publish lifecycle scripts")), `${disabled}:\n${problems.join("\n")}`);
+	}
+});
+
+const LIFECYCLE_EVASIONS = [
+	["npm install", "npm install", /npm install runs dependency lifecycle scripts without --ignore-scripts/],
+	["npm i", "npm i", /npm i runs dependency lifecycle scripts/],
+	["npm install --global", "npm install --global npm@12", /npm install runs dependency lifecycle scripts/],
+	["npm install with a disabled flag", "npm install --ignore-scripts=false", /npm install runs dependency lifecycle scripts/],
+	["npm ci", "npm ci", /npm ci runs dependency lifecycle scripts/],
+	["npm update", "npm update", /npm update runs dependency lifecycle scripts/],
+	["npm link", "npm link", /npm link runs dependency lifecycle scripts/],
+	["npm exec", "npm exec -- prime-agent", /npm exec runs dependency lifecycle scripts/],
+	["npm x", "npm x tsx x.ts", /npm x runs dependency lifecycle scripts/],
+	["npm prune", "npm prune --production", /npm prune runs dependency lifecycle scripts/],
+	["npm dedupe", "npm dedupe", /npm dedupe runs dependency lifecycle scripts/],
+	["npm audit fix", "npm audit fix", /npm audit runs dependency lifecycle scripts/],
+	["npm rebuild (all)", "npm rebuild", /npm rebuild runs install scripts; only the literal 'npm rebuild esbuild' is allowed/],
+	["npm rebuild another package", "npm rebuild koffi", /only the literal 'npm rebuild esbuild'/],
+	["npm rebuild two packages", "npm rebuild esbuild koffi", /only the literal 'npm rebuild esbuild'/],
+	["npm rebuild esbuild with a flag", "npm rebuild esbuild --foreground-scripts", /only the literal 'npm rebuild esbuild'/],
+	["npm rebuild esbuild --ignore-scripts (pointless)", "npm rebuild esbuild --ignore-scripts", /only the literal 'npm rebuild esbuild'/],
+	["npm rb", "npm rb esbuild", /only the literal 'npm rebuild esbuild'/],
+	["npm with config before the subcommand", "npm --prefix x install", /npm carries options before its subcommand/],
+	["npm with config that hides the subcommand", "npm --prefix foo install", /npm carries options before its subcommand/],
+	["yarn v1 install through a flag alone", "yarn --frozen-lockfile", /yarn carries options before its subcommand/],
+	["npx", "npx tsx x.ts", /npx may install and run a package's lifecycle scripts/],
+	["npx --yes", "npx --yes some-package", /npx may install/],
+	["npx with a disabled flag", "npx --ignore-scripts=false tsx x.ts", /npx may install/],
+	["bunx", "bunx tsx x.ts", /bunx installs and runs code from a registry/],
+	["yarn", "yarn", /yarn {2}runs dependency lifecycle scripts|yarn runs dependency lifecycle scripts/],
+	["yarn install", "yarn install --frozen-lockfile", /yarn install runs dependency lifecycle scripts/],
+	["yarn add", "yarn add x", /yarn add runs dependency lifecycle scripts/],
+	["yarn dlx", "yarn dlx tsx", /yarn dlx runs dependency lifecycle scripts/],
+	["pnpm install", "pnpm install", /pnpm install runs dependency lifecycle scripts/],
+	["pnpm i", "pnpm i --frozen-lockfile", /pnpm i runs dependency lifecycle scripts/],
+	["pnpm dlx", "pnpm dlx tsx", /pnpm dlx runs dependency lifecycle scripts/],
+	["bun install", "bun install", /bun install runs dependency lifecycle scripts/],
+	["bun add", "bun add x", /bun add runs dependency lifecycle scripts/],
+	["bun x", "bun x tsx", /bun x runs dependency lifecycle scripts/],
+	["pip install", "pip install requests", /pip installs and runs code from a registry/],
+	["pip3 install", "pip3 install requests", /pip3 installs and runs code from a registry/],
+	["uvx", "uvx ruff", /uvx installs and runs code from a registry/],
+	["uv pip install", "uv pip install requests", /uv pip runs dependency lifecycle scripts/],
+	["uv sync", "uv sync", /uv sync runs dependency lifecycle scripts/],
+	["uv run", "uv run x.py", /uv run runs dependency lifecycle scripts/],
+	["npm through a path", "/usr/local/bin/npm ci --ignore-scripts", /invokes npm through a path or expansion/],
+	["a subcommand from an expansion", 'npm "$SUB"', /npm runs a subcommand built from an expansion/],
+	["inside a command substitution", "out=$(npm install)", /inside a command substitution: npm install runs dependency lifecycle scripts/],
+	["after a continuation", "npm \\\n  install", /npm install runs dependency lifecycle scripts/],
+	["with an assignment prefix", "CI=1 npm install", /npm install runs dependency lifecycle scripts/],
+];
+
+test("every lifecycle-running package-manager command is refused on a build runner unless --ignore-scripts is enabled (round 4, finding 9)", () => {
+	const build = { workflow: RELEASE, jobId: "build" };
+	for (const [label, script, pattern] of LIFECYCLE_EVASIONS) {
+		const reasons = [...shellCommands(script)].flatMap((command) => lifecycleReasons(command, build));
+		assert.ok(reasons.some((reason) => pattern.test(reason)), `${label}: expected ${pattern}, got:\n${reasons.join("\n")}`);
+	}
+	// The literal rebuild is allowed in the allowlisted jobs only.
+	assert.deepEqual(REBUILD_ALLOWLIST.command, ["npm", "rebuild", "esbuild"]);
+	assert.deepEqual(Object.keys(REBUILD_ALLOWLIST.jobs), [RELEASE, STANDALONE]);
+	for (const [workflow, jobs] of Object.entries(REBUILD_ALLOWLIST.jobs)) {
+		for (const jobId of jobs) assert.deepEqual([...shellCommands("npm rebuild esbuild")].flatMap((command) => lifecycleReasons(command, { workflow, jobId })), [], `${workflow} ${jobId}`);
+	}
+	for (const location of [{ workflow: RELEASE, jobId: "assemble" }, { workflow: RELEASE, jobId: "publish-npm" }, { workflow: STANDALONE, jobId: "other" }, {}]) {
+		assert.match([...shellCommands("npm rebuild esbuild")].flatMap((command) => lifecycleReasons(command, location)).join("\n"), /only the literal 'npm rebuild esbuild' is allowed, and only in/);
+	}
+	// What the checked-in build jobs do is accepted, one construct at a time.
+	for (const fine of [
+		"npm ci --ignore-scripts",
+		"npm install --global --ignore-scripts npm@12.0.2",
+		"npm install --ignore-scripts=true",
+		"npx --ignore-scripts tsx ../../node_modules/vitest/dist/cli.js --run test/x.test.ts",
+		"pnpm install --ignore-scripts",
+		"bun install --ignore-scripts",
+		"yarn install --ignore-scripts",
+		"npm run build",
+		"npm run release:pack -- --channel stable",
+		"npm --version",
+		"npm view prime-agent version",
+		"npm publish x.tgz --provenance --access public --ignore-scripts",
+		"corepack enable",
+		"uv --version",
+		"echo npm install",
+	]) {
+		assert.deepEqual([...shellCommands(fine)].flatMap((command) => lifecycleReasons(command, build)), [], fine);
+	}
+	// ...and the workflow-level check reaches every job of both build workflows.
+	for (const [path, jobId] of [[RELEASE, "build"], [RELEASE, "assemble"], [RELEASE, "validate-macos"], [RELEASE, "pack-npm"], [RELEASE, "publish-npm"], [STANDALONE, "build"]]) {
+		for (const [label, script, pattern] of LIFECYCLE_EVASIONS) {
+			const broken = mutate(path, (text) => appendStep(text, jobId, runStep("Sneak in an install", script)));
+			const problems = checkWorkflows(reader({ [path]: broken }));
+			assert.ok(problems.some((problem) => problem.startsWith(`${path}: job '${jobId}'`) && pattern.test(problem)), `${label} in ${path} ${jobId}: expected ${pattern}, got:\n${problems.join("\n")}`);
+		}
+	}
+	// `npm rebuild esbuild` outside the allowlisted jobs is rejected in the workflow as well.
+	const broken = mutate(RELEASE, (text) => appendStep(text, "assemble", runStep("Rebuild here", "npm rebuild esbuild")));
+	assert.ok(checkWorkflows(reader({ [RELEASE]: broken })).some((problem) => problem.includes("'assemble'") && problem.includes("only the literal 'npm rebuild esbuild'")));
+	// The checked-in workflows carry no unflagged install anywhere.
+	for (const path of [RELEASE, STANDALONE]) {
+		const workflow = parse(readFileSync(path, "utf8"));
+		for (const [jobId, job] of Object.entries(workflow.jobs)) {
+			for (const step of job.steps ?? []) {
+				for (const command of shellCommands(String(step.run ?? ""))) assert.deepEqual(lifecycleReasons(command, { workflow: path, jobId }), [], `${path} ${jobId} ${step.name}`);
+			}
+		}
+	}
+});
+
+const HEAD_OBJECT_STEP = `set -euo pipefail
+for file in artifacts/*; do
+  name=$(basename "$file")
+  key="releases/v\${PRODUCTION_VERSION}/\${name}"
+  ${HEAD_OBJECT_GUARD.reset}
+  aws s3api head-object --bucket "$R2_BUCKET" --key "$key" \\
+    --endpoint-url "$R2_ENDPOINT_URL" >/tmp/head.json 2>${HEAD_OBJECT_GUARD.errorFile} || ${HEAD_OBJECT_GUARD.capture}
+  ${HEAD_OBJECT_GUARD.exists}
+    echo "unchanged \${key}"
+    continue
+  ${HEAD_OBJECT_GUARD.absent}
+    echo "absent \${key}"
+  else
+    echo "head-object failed" >&2
+    cat /tmp/head.err >&2
+    exit 1
+  fi
+  aws s3 cp "$file" "s3://\${R2_BUCKET}/releases/v\${PRODUCTION_VERSION}/\${name}" --quiet
+done`;
+
+test("aws s3api head-object may treat only an explicit 404 as absent (round 4, finding 10)", () => {
+	assert.deepEqual(headObjectGuardReasons(HEAD_OBJECT_STEP), []);
+	assert.deepEqual(headObjectGuardReasons("set -euo pipefail\naws s3 cp a s3://b/c"), []); // no head-object: nothing to guard
+	const variants = [
+		["head-object as an if condition", (text) => text.replace(`${HEAD_OBJECT_GUARD.reset}\n  aws s3api`, "if aws s3api").replace(` || ${HEAD_OBJECT_GUARD.capture}\n  ${HEAD_OBJECT_GUARD.exists}`, "; then"), /uses aws s3api head-object as a condition/],
+		["a negated condition", (text) => text.replace("  aws s3api", "  ! aws s3api"), /uses aws s3api head-object as a condition/],
+		["stderr discarded", (text) => text.replace(`2>${HEAD_OBJECT_GUARD.errorFile}`, "2>/dev/null"), /must keep the stderr of aws s3api head-object in \/tmp\/head\.err/],
+		["stderr merged into stdout", (text) => text.replace(`2>${HEAD_OBJECT_GUARD.errorFile}`, "2>&1"), /must keep the stderr/],
+		["stderr to another file", (text) => text.replace(`2>${HEAD_OBJECT_GUARD.errorFile}`, "2>/tmp/other.err"), /must keep the stderr/],
+		["no stderr redirection", (text) => text.replace(` 2>${HEAD_OBJECT_GUARD.errorFile}`, ""), /must keep the stderr/],
+		["no status reset", (text) => text.replace(`  ${HEAD_OBJECT_GUARD.reset}\n`, ""), /must reset 'head_status=0' immediately before/],
+		["a stale status from the previous iteration", (text) => text.replace(`  ${HEAD_OBJECT_GUARD.reset}\n`, "  true\n"), /must reset 'head_status=0' immediately before/],
+		["no status capture", (text) => text.replace(` || ${HEAD_OBJECT_GUARD.capture}`, " || true"), /must capture the exit status with '\|\| head_status=\$\?' immediately after/],
+		["any non-zero status treated as absent", (text) => text.replace(HEAD_OBJECT_GUARD.absent, 'elif [ "$head_status" -ne 0 ]; then'), /must accept only an explicit 404 as "absent", spelled exactly/],
+		["a 404 accepted without the exit code", (text) => text.replace(HEAD_OBJECT_GUARD.absent, "elif grep -q 404 /tmp/head.err; then"), /must accept only an explicit 404/],
+		["a 403 accepted as absent", (text) => text.replace("(404|NotFound|NoSuchKey)", "(403|404|NotFound|NoSuchKey)"), /must accept only an explicit 404/],
+		["the exists test loosened", (text) => text.replace(HEAD_OBJECT_GUARD.exists, 'if [ "$head_status" -ne 254 ]; then'), /must test the head-object status with exactly/],
+		["the else branch dropped", (text) => text.replace("  else\n    echo \"head-object failed\" >&2\n    cat /tmp/head.err >&2\n    exit 1\n", ""), /must end the head-object guard with an 'else' branch that exits 1/],
+		["the else branch does not exit", (text) => text.replace("    exit 1\n  fi", "    echo continuing anyway\n  fi"), /must end the head-object guard with an 'else' branch that exits 1/],
+		["another elif branch", (text) => text.replace("  else\n", '  elif [ "$head_status" -eq 403 ]; then\n    echo absent\n  else\n'), /must not add another branch to the head-object guard/],
+		["head_status reassigned elsewhere", (text) => text.replace("  fi\n", "  fi\n  head_status=254\n"), /assigns head_status outside the head-object guard/],
+		["no set -e", (text) => text.replace("set -euo pipefail\n", "set -uo pipefail\n"), /must start with 'set -euo pipefail'/],
+	];
+	for (const [label, mutateText, pattern] of variants) {
+		const broken = mutateText(HEAD_OBJECT_STEP);
+		assert.notEqual(broken, HEAD_OBJECT_STEP, `${label}: the mutation changed nothing`);
+		const reasons = headObjectGuardReasons(broken);
+		assert.ok(reasons.some((reason) => pattern.test(reason)), `${label}: expected ${pattern}, got:\n${reasons.join("\n")}`);
+	}
+	// Both checked-in upload loops carry the guard, and loosening either is a workflow failure.
+	const release = parse(readFileSync(RELEASE, "utf8"));
+	for (const [jobId, stepName] of [["publish-r2", "Upload immutable release objects"], ["publish-beta-r2", "Upload immutable beta objects"]]) {
+		const step = release.jobs[jobId].steps.find((entry) => entry.name === stepName);
+		assert.ok(step.run.includes(HEAD_OBJECT_GUARD.absent), `${jobId} carries the guard`);
+		assert.deepEqual(headObjectGuardReasons(step.run), [], jobId);
+		for (const [label, from, to, pattern] of [
+			["discarding stderr", `2>${HEAD_OBJECT_GUARD.errorFile} || ${HEAD_OBJECT_GUARD.capture}`, `2>/dev/null || ${HEAD_OBJECT_GUARD.capture}`, /must keep the stderr/],
+			["treating every failure as absent", HEAD_OBJECT_GUARD.absent, 'elif [ "$head_status" -ne 0 ]; then', /must accept only an explicit 404/],
+			["dropping the reset", `            ${HEAD_OBJECT_GUARD.reset}\n`, "", /must reset 'head_status=0'/],
+			["continuing on another error", "              cat /tmp/head.err >&2\n              exit 1\n", "              cat /tmp/head.err >&2\n", /'else' branch that exits 1/],
+		]) {
+			const broken = mutate(RELEASE, (text) => {
+				const start = text.indexOf(`\n  ${jobId}:\n`);
+				const index = text.indexOf(from, start);
+				assert.ok(index > start, `${jobId} contains ${from}`);
+				return `${text.slice(0, index)}${to}${text.slice(index + from.length)}`;
+			});
+			const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+			assert.ok(problems.some((problem) => problem.includes(`'${jobId}'`) && pattern.test(problem)), `${label} in ${jobId}: expected ${pattern}, got:\n${problems.join("\n")}`);
+		}
+	}
+});
+
+test("every caller of the standalone workflow - ci.yml included - passes exactly contents:read and id-token:write and no secret (round 4, finding 11)", () => {
+	const ci = parse(readFileSync(CI, "utf8"));
+	assert.equal(ci.jobs.standalone.uses, `./${STANDALONE}`);
+	assert.deepEqual(ci.jobs.standalone.permissions, { contents: "read", "id-token": "write" });
+	assert.equal("secrets" in ci.jobs.standalone, false);
+	const callerPermissions = "    permissions:\n      contents: read\n      id-token: write\n    uses: ./.github/workflows/standalone-binaries.yml\n";
+	for (const [label, replacement, expected] of [
+		["no permissions", "    uses: ./.github/workflows/standalone-binaries.yml\n", "(none declared)"],
+		["contents only", "    permissions:\n      contents: read\n    uses: ./.github/workflows/standalone-binaries.yml\n", "must pass exactly"],
+		["id-token only", "    permissions:\n      id-token: write\n    uses: ./.github/workflows/standalone-binaries.yml\n", "must pass exactly"],
+		["contents write", "    permissions:\n      contents: write\n      id-token: write\n    uses: ./.github/workflows/standalone-binaries.yml\n", "must pass exactly"],
+		["an extra scope", "    permissions:\n      contents: read\n      id-token: write\n      packages: write\n    uses: ./.github/workflows/standalone-binaries.yml\n", "must pass exactly"],
+		["write-all", "    permissions: write-all\n    uses: ./.github/workflows/standalone-binaries.yml\n", "must pass exactly"],
+		["empty permissions", "    permissions: {}\n    uses: ./.github/workflows/standalone-binaries.yml\n", "must pass exactly"],
+		["secrets inherit", `${callerPermissions}    secrets: inherit\n`, "passes secrets"],
+	]) {
+		for (const path of [CI, RELEASE]) {
+			const broken = mutate(path, (text) => text.replace(callerPermissions, replacement));
+			const problems = checkWorkflows(reader({ [path]: broken }));
+			assert.ok(problems.some((problem) => problem.startsWith(`${path}: job 'standalone'`) && problem.includes(expected)), `${label} in ${path}:\n${problems.join("\n")}`);
+		}
+	}
+	// A caller in any other workflow file is validated the same way.
+	const extra = "on: push\njobs:\n  sneaky:\n    secrets: inherit\n    uses: ./.github/workflows/standalone-binaries.yml\n";
+	const problems = checkWorkflows(reader({ ".github/workflows/extra.yml": extra }), () => ["build-binaries.yml", "ci.yml", "extra.yml"]);
+	assert.ok(problems.some((problem) => problem.startsWith(".github/workflows/extra.yml: job 'sneaky'") && problem.includes("passes secrets")), problems.join("\n"));
+	assert.ok(problems.some((problem) => problem.startsWith(".github/workflows/extra.yml: job 'sneaky'") && problem.includes("must pass exactly")), problems.join("\n"));
 });

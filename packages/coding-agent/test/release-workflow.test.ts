@@ -193,7 +193,7 @@ ${step(validation, "Verify and exercise exact final Mac archives").run}`,
 		expect(test.run).toContain("test/release-signatures.test.ts");
 		// The artifact tests read the RELEASE archive, never the test-signer one.
 		expect(test.run).toMatch(
-			/PRIME_AGENT_TEST_ARCHIVE="\$RELEASE_ARCHIVE" \\\n\s*npx tsx [^\n]*test\/compiled-artifact\.test\.ts/,
+			/PRIME_AGENT_TEST_ARCHIVE="\$RELEASE_ARCHIVE" \\\n\s*npx --ignore-scripts tsx [^\n]*test\/compiled-artifact\.test\.ts/,
 		);
 		const upload = build.steps.find((entry) => entry.uses?.startsWith("actions/upload-artifact@"))!;
 		expect(upload.with?.path).toContain("binaries.json");
@@ -847,6 +847,121 @@ describe("npm publication is split into an unprivileged pack job and a code-free
 	);
 });
 
+describe.skipIf(process.platform === "win32")(
+	"immutable uploads treat only an explicit 404 from head-object as absent (fake aws)",
+	() => {
+		const DIGEST_FILE = "prime-agent-1.2.3-linux-x64.tar.gz";
+		/**
+		 * A fake `aws` whose `s3api head-object` answers as configured. Uploads are recorded in
+		 * calls.log and stashed so the read-back download returns the same bytes.
+		 */
+		const shim = (head: { exit: number; stderr: string } | "exists") => `
+aws() {
+  echo "aws $*" >> "$LOG"
+  case "$1 $2" in
+    "s3api head-object")
+      ${head === "exists" ? 'echo "{}"; return 0' : `echo '${head.stderr}' >&2; return ${head.exit}`} ;;
+    "s3 cp")
+      if [ "\${4#s3://}" != "$4" ]; then cp "$3" "$STASH/$(basename "$3")"; else cp "$STASH/$(basename "$3")" "$4"; fi ;;
+    *) echo "unexpected aws call: $*" >&2; return 99 ;;
+  esac
+}
+`;
+		const run = (jobId: string, stepName: string, head: Parameters<typeof shim>[0], existing?: string) => {
+			const workspace = mkdtempSync(join(tmpdir(), "prime-head-object-"));
+			mkdirSync(join(workspace, "artifacts"));
+			mkdirSync(join(workspace, "stash"));
+			writeFileSync(join(workspace, "artifacts", DIGEST_FILE), "release bytes");
+			if (existing !== undefined) writeFileSync(join(workspace, "stash", DIGEST_FILE), existing);
+			const result = spawnSync(
+				"bash",
+				["-c", `${shim(head)}\ncd "$WORKSPACE"\n${step(release.jobs[jobId]!, stepName).run}`],
+				{
+					cwd: workspace,
+					env: {
+						...process.env,
+						WORKSPACE: workspace,
+						LOG: join(workspace, "calls.log"),
+						STASH: join(workspace, "stash"),
+						R2_BUCKET: "bucket",
+						R2_ENDPOINT_URL: "https://r2.invalid",
+						PRODUCTION_VERSION: "1.2.3",
+						BETA_VERSION: "1.2.3",
+					},
+					encoding: "utf8",
+				},
+			);
+			let calls: string[] = [];
+			try {
+				calls = readFileSync(join(workspace, "calls.log"), "utf8").trim().split("\n");
+			} catch {
+				calls = [];
+			}
+			rmSync(workspace, { recursive: true, force: true });
+			return { result, calls, uploads: calls.filter((call) => /^aws s3 cp .* s3:\/\//.test(call)) };
+		};
+		const NOT_FOUND = "An error occurred (404) when calling the HeadObject operation: Not Found";
+		const FORBIDDEN = "An error occurred (403) when calling the HeadObject operation: Forbidden";
+
+		for (const [jobId, stepName] of [
+			["publish-r2", "Upload immutable release objects"],
+			["publish-beta-r2", "Upload immutable beta objects"],
+		] as const) {
+			describe(jobId, () => {
+				it("uploads when head-object reports an explicit 404", () => {
+					const { result, uploads } = run(jobId, stepName, { exit: 254, stderr: NOT_FOUND });
+					expect(result.status, result.stderr).toBe(0);
+					expect(uploads).toEqual([
+						expect.stringContaining(
+							`aws s3 cp artifacts/${DIGEST_FILE} s3://bucket/releases/v1.2.3/${DIGEST_FILE}`,
+						),
+					]);
+					expect(result.stdout).toContain(`published releases/v1.2.3/${DIGEST_FILE}`);
+				});
+
+				it("refuses to upload when head-object fails with 403", () => {
+					const { result, uploads } = run(jobId, stepName, { exit: 254, stderr: FORBIDDEN });
+					expect(result.status).toBe(1);
+					expect(uploads).toEqual([]);
+					expect(result.stderr).toContain("refusing to guess whether it exists");
+					expect(result.stderr).toContain(FORBIDDEN);
+				});
+
+				it("refuses to upload when head-object fails for any other reason", () => {
+					for (const head of [
+						{ exit: 255, stderr: NOT_FOUND }, // a 404 message from an unexpected exit code
+						{ exit: 254, stderr: "" }, // no diagnostic at all
+						{ exit: 254, stderr: "Could not connect to the endpoint URL: https://r2.invalid" },
+						{ exit: 1, stderr: "aws: command not found" },
+						{ exit: 254, stderr: "An error occurred (404) when calling the GetObject operation: Not Found" },
+					]) {
+						const { result, uploads } = run(jobId, stepName, head);
+						expect(result.status, JSON.stringify(head)).toBe(1);
+						expect(uploads, JSON.stringify(head)).toEqual([]);
+					}
+				});
+
+				it("never uploads over an existing object", () => {
+					const { result, uploads } = run(jobId, stepName, "exists", "different bytes");
+					expect(uploads).toEqual([]);
+					if (jobId === "publish-r2") {
+						expect(result.status).toBe(1);
+						expect(result.stderr).toContain("Refusing to overwrite");
+						// The same bytes already stored is a no-op rerun, not an error.
+						const rerun = run(jobId, stepName, "exists", "release bytes");
+						expect(rerun.result.status, rerun.result.stderr).toBe(0);
+						expect(rerun.uploads).toEqual([]);
+						expect(rerun.result.stdout).toContain("unchanged");
+					} else {
+						expect(result.status).toBe(1);
+						expect(result.stderr).toContain("Refusing to overwrite existing beta object");
+					}
+				});
+			});
+		}
+	},
+);
+
 describe("tap-bump reruns safely and never touches the tap's default branch", () => {
 	const tap = release.jobs["tap-bump"]!;
 	const bump = step(tap, "Open or refresh the formula bump pull request");
@@ -864,6 +979,10 @@ describe("tap-bump reruns safely and never touches the tap's default branch", ()
 		expect(bump.run).toContain('gh pr create --repo "$TAP_REPO" --head "$branch" --base "$default_branch"');
 		// The job never changes directory: the checker only allows `cd` into downloaded artifacts.
 		expect(bump.run).not.toMatch(/(^|[;&|(]\s*|\n\s*)(cd|pushd|popd)\b/);
+		// The formula is rewritten with sed alone: no interpreter, no heredoc, in a job that holds the tap token.
+		expect(bump.run).not.toMatch(/<<|\bpython3?\b|\bnode\b|\bperl\b|\bruby\b/);
+		expect(bump.run).toContain('[[ "$PRODUCTION_VERSION" =~ $version_pattern ]]');
+		expect(bump.run).toContain('[[ "$digest" =~ ^[0-9a-f]{64}$ ]]');
 	});
 
 	describe.skipIf(process.platform === "win32")("the step script (bash, fake gh/git)", () => {
@@ -884,6 +1003,7 @@ describe("tap-bump reruns safely and never touches the tap's default branch", ()
 			existingPr?: string;
 			merged?: boolean;
 			defaultBranch?: string;
+			version?: string;
 		}) => `
 log="$GITHUB_WORKSPACE/calls.log"
 mktemp() { mkdir -p "$GITHUB_WORKSPACE/tap"; echo "$GITHUB_WORKSPACE/tap"; }
@@ -914,13 +1034,13 @@ git() {
 			mkdirSync(join(workspace, "artifacts"));
 			writeFileSync(
 				join(workspace, "artifacts/SHA256SUMS"),
-				`${digests.map(([platform, digest]) => `${digest}  prime-agent-1.2.3-${platform}.tar.gz`).join("\n")}\n`,
+				`${digests.map(([platform, digest]) => `${digest}  prime-agent-${options.version ?? "1.2.3"}-${platform}.tar.gz`).join("\n")}\n`,
 			);
 			writeFileSync(join(workspace, "formula.rb"), formula);
 			const result = runStepScript(bump.run!, shims(options), {
 				GITHUB_WORKSPACE: workspace,
 				GH_TOKEN: "token",
-				PRODUCTION_VERSION: "1.2.3",
+				PRODUCTION_VERSION: options.version ?? "1.2.3",
 				TAP_REPO: "o/tap",
 			});
 			const calls = readFileSync(join(workspace, "calls.log"), "utf8").trim().split("\n");
@@ -965,6 +1085,21 @@ git() {
 				true,
 			);
 			expect(calls.some((call) => call.startsWith("gh pr create"))).toBe(false);
+		});
+
+		it("refuses a version that is not a version before anything reaches sed", () => {
+			for (const version of ["1.2.3;rm -rf /", "1.2.3/e whoami", "1.2.3&", "v1.2.3", "", "1.2.3 4"]) {
+				const { result, calls, edited } = run({ version });
+				expect(result.status, version).toBe(1);
+				expect(result.stderr, version).toContain("PRODUCTION_VERSION is not a version");
+				expect(edited, version).toBe(formula);
+				expect(pushes(calls), version).toEqual([]);
+			}
+			// A prerelease is a version.
+			const { result, edited } = run({ version: "1.2.3-beta.1" });
+			expect(result.status, result.stderr).toBe(0);
+			expect(edited).toContain('version "1.2.3-beta.1"');
+			expect(edited).toContain("/releases/v1.2.3-beta.1/");
 		});
 
 		it("does nothing once the formula already describes the version", () => {

@@ -220,17 +220,17 @@ jobs:
         run: |
           set -euo pipefail
           PRIME_AGENT_TEST_ARCHIVE="$RELEASE_ARCHIVE" \
-            npx tsx ../../node_modules/vitest/dist/cli.js --run test/release-signatures.test.ts test/compiled-artifact.test.ts test/native-probe-timeout.test.ts
+            npx --ignore-scripts tsx ../../node_modules/vitest/dist/cli.js --run test/release-signatures.test.ts test/compiled-artifact.test.ts test/native-probe-timeout.test.ts
           if [ "$TEST_SIGNER" = true ]; then
             test -f "$PRIME_AGENT_TEST_ARCHIVE"
             test -f "$PRIME_AGENT_TEST_SIGNATURE_BUNDLE"
             test -f "$PRIME_AGENT_TEST_NEXT_ARCHIVE"
             test -f "$PRIME_AGENT_TEST_NEXT_SIGNATURE_BUNDLE"
-            npx tsx ../../node_modules/vitest/dist/cli.js --run test/native-installer.test.ts
+            npx --ignore-scripts tsx ../../node_modules/vitest/dist/cli.js --run test/native-installer.test.ts
           else
             echo "::warning::Fork pull request: no OIDC token, so the signed end-to-end updater test did not run. The push to main runs it."
             unset PRIME_AGENT_TEST_ARCHIVE PRIME_AGENT_TEST_SIGNATURE_BUNDLE PRIME_AGENT_TEST_NEXT_ARCHIVE PRIME_AGENT_TEST_NEXT_SIGNATURE_BUNDLE
-            npx tsx ../../node_modules/vitest/dist/cli.js --run test/native-installer.test.ts
+            npx --ignore-scripts tsx ../../node_modules/vitest/dist/cli.js --run test/native-installer.test.ts
           fi
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
