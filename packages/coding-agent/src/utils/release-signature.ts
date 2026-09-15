@@ -213,6 +213,60 @@ export interface FetchVerifiedDigestOptions {
 
 const DEFAULT_SIGNATURE_TIMEOUT_MS = 30000;
 
+const RELEASE_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+const RELEASE_ASSET_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/**
+ * Parse a download origin into a canonical `https://host[:port][/path]` string.
+ *
+ * The result is appended to (`/latest.json`, `/releases/v<version>/SHA256SUMS`), so anything that
+ * would change the meaning of that suffix is refused rather than repaired: a query string or fragment
+ * (the suffix would land inside them), embedded credentials (they would be sent to every download
+ * host and shown in the update UI), and any scheme other than https. Trailing slashes are dropped so
+ * paths are always joined with exactly one `/`. `label` names the setting in error messages.
+ */
+export function parseDownloadBaseUrl(raw: string, label = "The download base URL"): string {
+	const trimmed = raw.trim();
+	let parsed: URL;
+	try {
+		parsed = new URL(trimmed);
+	} catch {
+		throw new Error(`${label} is not a valid URL: ${raw}`);
+	}
+	if (parsed.protocol !== "https:") throw new Error(`${label} must use https, got ${parsed.protocol}//.`);
+	if (parsed.username || parsed.password) throw new Error(`${label} must not contain credentials.`);
+	// `new URL("https://x?").search` and `new URL("https://x#").hash` are both "", so check the raw text too.
+	if (parsed.search || trimmed.includes("?")) throw new Error(`${label} must not contain a query string.`);
+	if (parsed.hash || trimmed.includes("#")) throw new Error(`${label} must not contain a fragment.`);
+	if (!parsed.hostname) throw new Error(`${label} must name a host.`);
+	const pathname = parsed.pathname.replace(/\/+$/, "");
+	return `${parsed.origin}${pathname}`;
+}
+
+/**
+ * Build the URL of a release asset under `baseUrl` with the URL API, never by string concatenation.
+ * `baseUrl` is validated with {@link parseDownloadBaseUrl}; `version` and `asset` are restricted to
+ * the shapes the release layout uses so neither can introduce path segments, queries or fragments.
+ */
+export function releaseAssetUrl(baseUrl: string, version: string, asset: string): string {
+	if (!RELEASE_VERSION_PATTERN.test(version))
+		throw new ReleaseSignatureError(
+			`Refusing to build a release URL for invalid version ${JSON.stringify(version)}.`,
+		);
+	if (!RELEASE_ASSET_NAME_PATTERN.test(asset))
+		throw new ReleaseSignatureError(
+			`Refusing to build a release URL for invalid asset name ${JSON.stringify(asset)}.`,
+		);
+	let base: URL;
+	try {
+		base = new URL(parseDownloadBaseUrl(baseUrl));
+	} catch (error) {
+		throw new ReleaseSignatureError(error instanceof Error ? error.message : String(error), error);
+	}
+	base.pathname = `${base.pathname.replace(/\/+$/, "")}/releases/v${version}/${asset}`;
+	return base.href;
+}
+
 async function download(
 	url: string,
 	options: { timeoutMs: number; userAgent?: string; fetchImpl: typeof fetch },
@@ -241,14 +295,19 @@ async function download(
 export async function fetchVerifiedReleaseArtifactDigest(
 	options: FetchVerifiedDigestOptions,
 ): Promise<{ digest: string; signerIdentity: string; signerRef: string }> {
-	const base = `${options.baseUrl.replace(/\/+$/, "")}/releases/v${options.version}`;
 	const download_ = {
 		timeoutMs: options.timeoutMs ?? DEFAULT_SIGNATURE_TIMEOUT_MS,
 		userAgent: options.userAgent,
 		fetchImpl: options.fetchImpl ?? fetch,
 	};
-	const checksums = await download(`${base}/${RELEASE_CHECKSUMS_ASSET}`, download_);
-	const bundleBytes = await download(`${base}/${RELEASE_SIGNATURE_BUNDLE_ASSET}`, download_);
+	const checksums = await download(
+		releaseAssetUrl(options.baseUrl, options.version, RELEASE_CHECKSUMS_ASSET),
+		download_,
+	);
+	const bundleBytes = await download(
+		releaseAssetUrl(options.baseUrl, options.version, RELEASE_SIGNATURE_BUNDLE_ASSET),
+		download_,
+	);
 
 	let bundle: unknown;
 	try {

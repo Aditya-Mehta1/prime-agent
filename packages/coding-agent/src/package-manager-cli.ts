@@ -33,7 +33,12 @@ import {
 	launchDaemonUpdateRestartCoordinator,
 	waitForActiveDaemonUpdateRestartCoordinator,
 } from "./cli/daemon-update-restart.js";
-import { getNativeUpdatePlan, NativeReleaseUnavailableError } from "./cli/native-update.js";
+import {
+	describeNativeUpdatePlan,
+	getNativeUpdatePlan,
+	NativeReleaseUnavailableError,
+	type NativeUpdatePlan,
+} from "./cli/native-update.js";
 import {
 	APP_NAME,
 	CONFIG_DIR_NAME,
@@ -480,6 +485,15 @@ interface SelfUpdatePlan {
 	command?: SelfUpdateCommand;
 	/** The requested channel could not be resolved; nothing was installed and nothing should be persisted. */
 	unavailable?: boolean;
+	/** Present for compiled installations: what the plan trusts, reported before the installer runs. */
+	nativePlan?: NativeUpdatePlan;
+}
+
+/** Tell the user which signer the release was verified against and whether the download origin was overridden. */
+function printNativeUpdateProvenance(plan: NativeUpdatePlan): void {
+	const { notes, warnings } = describeNativeUpdatePlan(plan);
+	for (const line of notes) console.log(chalk.dim(line));
+	for (const line of warnings) console.error(chalk.yellow(line));
 }
 
 /** A cancelled or refused self-update: the interactive parent must not relaunch, a shell caller gets a failure. */
@@ -533,7 +547,14 @@ async function getSelfUpdatePlan(force: boolean, rollback = false, channel?: Upd
 			const plan = await getNativeUpdatePlan({ force, rollback, channel });
 			if (plan.refusedDowngradeTo) return behindChannelPlan(plan.refusedDowngradeTo, force, channel);
 			if (!plan.command) console.log(chalk.green(`${APP_NAME} is already up to date (v${plan.targetVersion})`));
-			return { installSpec: PACKAGE_NAME, packageName: PACKAGE_NAME, shouldRun: !!plan.command, ...plan };
+			return {
+				installSpec: PACKAGE_NAME,
+				packageName: PACKAGE_NAME,
+				shouldRun: !!plan.command,
+				targetVersion: plan.targetVersion,
+				command: plan.command,
+				nativePlan: plan,
+			};
 		} catch (error) {
 			if (effectiveChannel === "nightly" && error instanceof NativeReleaseUnavailableError)
 				return nightlyReleaseUnavailablePlan();
@@ -1738,6 +1759,8 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 						process.exitCode = 1;
 						return true;
 					}
+					// Say what is about to be installed and where it comes from before asking for confirmation.
+					if (selfUpdatePlan.nativePlan) printNativeUpdateProvenance(selfUpdatePlan.nativePlan);
 					// Confirm before the install, since upgrading the daemon afterward stops and resumes busy work.
 					const daemonSocketPath = resolveUpdateDaemonSocketPath(options.daemonSocketPath);
 					const daemonProbe = await probeRunningDaemonSessions(daemonSocketPath);

@@ -211,21 +211,84 @@ describe("npm package plan", () => {
 });
 
 describe("registry dependency guard", () => {
-	it("rejects specifiers npm cannot verify and accepts ranges and aliases", () => {
+	const accepted = [
+		"1.2.3",
+		"^1.2.3",
+		"~1.2.3",
+		"=1.2.3",
+		">=1 <2",
+		">=1.2.3-beta.1 <2",
+		"^1.2.3-rc.1 || ^2.0.0",
+		"npm:@primeintellect/prime-agent-ai@^1.2.3",
+		"npm:chalk@5.5.0",
+		"npm:@scope/name@>=1 <2",
+	];
+	const rejected: Array<[string, unknown]> = [
+		["ssh git shorthand", "git@github.com:attacker/pkg.git"],
+		["GitHub shorthand", "attacker/pkg#main"],
+		["github: prefix", "github:attacker/pkg"],
+		["git+https URL", "git+https://github.com/attacker/pkg.git"],
+		["https tarball URL", "https://pub.example.dev/releases/v1.2.3/prime-agent-ai-1.2.3.tgz"],
+		["http URL", "http://pub.example.dev/prime-agent-ai-1.2.3.tgz"],
+		["tarball without a scheme", "pub.example.dev/prime-agent-ai-1.2.3.tgz"],
+		["file: spec", "file:../prime-agent-ai"],
+		["link: spec", "link:../prime-agent-ai"],
+		["workspace: spec", "workspace:*"],
+		["workspace caret", "workspace:^"],
+		["portal: spec", "portal:../prime-agent-ai"],
+		["latest dist-tag", "latest"],
+		["arbitrary dist-tag", "next"],
+		["bare wildcard", "*"],
+		["x-range", "1.x"],
+		["bare major", "1"],
+		["hyphen range", "1.2.3 - 2.0.0"],
+		["build metadata", "1.2.3+build.1"],
+		["empty string", ""],
+		["surrounding whitespace", " ^1.2.3"],
+		["alias without a range", "npm:chalk"],
+		["alias with an empty range", "npm:chalk@"],
+		["alias onto a dist-tag", "npm:chalk@latest"],
+		["alias onto a wildcard", "npm:chalk@*"],
+		["alias onto a git URL", "npm:chalk@git+https://github.com/attacker/pkg.git"],
+		["alias with an uppercase name", "npm:Chalk@^5.0.0"],
+		["alias with a path-traversal name", "npm:../evil@1.0.0"],
+		["alias with a scoped path-traversal name", "npm:@scope/..@1.0.0"],
+		["alias with a bare scope", "npm:@scope@1.0.0"],
+		["non-string spec", 123],
+		["object spec", { version: "^1.2.3" }],
+	];
+
+	it.each(accepted)("accepts the plain range or alias %s", (spec) => {
+		expect(dependencies.isRegistryDependencySpec(spec)).toBe(true);
 		expect(() =>
-			dependencies.assertRegistryDependencies({
-				name: "prime-agent",
-				dependencies: {
-					"@earendil-works/pi-ai": "https://pub.example.dev/releases/v1.2.3/prime-agent-ai-1.2.3.tgz",
-				},
-			}),
-		).toThrow(/must be a registry range/);
-		expect(() =>
-			dependencies.assertRegistryDependencies({
-				name: "prime-agent",
-				dependencies: { "@earendil-works/pi-ai": "npm:@primeintellect/prime-agent-ai@^1.2.3", chalk: "^5.5.0" },
-			}),
+			dependencies.assertRegistryDependencies({ name: "prime-agent", dependencies: { dep: spec } }),
 		).not.toThrow();
+	});
+
+	it.each(rejected)("rejects %s", (_label, spec) => {
+		expect(dependencies.isRegistryDependencySpec(spec)).toBe(false);
+		for (const field of ["dependencies", "optionalDependencies", "peerDependencies"]) {
+			expect(() => dependencies.assertRegistryDependencies({ name: "prime-agent", [field]: { dep: spec } })).toThrow(
+				/must be a plain semver range or npm:<name>@<range> alias/,
+			);
+		}
+	});
+
+	it("rejects dependency maps that are not objects and keys that are not package names", () => {
+		expect(() => dependencies.assertRegistryDependencies({ name: "prime-agent", dependencies: ["^1.2.3"] })).toThrow(
+			/must be an object/,
+		);
+		expect(() =>
+			dependencies.assertRegistryDependencies({ name: "prime-agent", dependencies: { "../evil": "^1.2.3" } }),
+		).toThrow(/invalid package name/);
+		expect(() =>
+			dependencies.assertRegistryDependencies({ name: "prime-agent", dependencies: { Chalk: "^1.2.3" } }),
+		).toThrow(/invalid package name/);
+	});
+
+	it("keeps the real workspace manifests inside the allowlist", () => {
+		for (const entry of plan())
+			expect(() => dependencies.assertRegistryDependencies(entry.packageJson)).not.toThrow();
 	});
 
 	it("still produces R2 tarball URLs for the installer channel", () => {
@@ -304,6 +367,172 @@ describe.skipIf(process.platform === "win32")("staged output", () => {
 		]);
 		expect(result.status).not.toBe(0);
 		expect(existsSync(join(outDir, "important.txt"))).toBe(true);
+	});
+});
+
+describe.skipIf(process.platform === "win32")("receipt cross-check", () => {
+	type Receipt = { platform: string; file: string; sha256: string; executableSha256: string };
+
+	function validReceipts(): Receipt[] {
+		return platforms.map((platform) => ({
+			platform,
+			file: `prime-agent-${version}-${platform}.tar.gz`,
+			sha256: "c".repeat(64),
+			executableSha256: sha256(join(binaryDir, platform, "prime-agent")),
+		}));
+	}
+
+	function writeReceipts(binaries: unknown, extra: Record<string, unknown> = {}): string {
+		const file = join(mkdtempSync(join(root, "receipts-")), "latest.json");
+		writeFileSync(file, JSON.stringify({ version: `v${version}`, binaries, ...extra }));
+		return file;
+	}
+
+	it("accepts exactly one well-formed receipt per platform and carries it into the packages", () => {
+		const receipts = writeReceipts(validReceipts());
+		const { outDir, result } = stage(["--receipts", receipts]);
+		expect(result.status, result.stderr).toBe(0);
+		for (const platform of platforms) {
+			const receipt = readJson(join(outDir, "@primeintellect", `prime-agent-${platform}`, "receipts.json"));
+			expect(receipt.archive).toEqual({ file: `prime-agent-${version}-${platform}.tar.gz`, sha256: "c".repeat(64) });
+		}
+	});
+
+	it("refuses a receipts file that lacks a platform instead of skipping its digest check", () => {
+		const receipts = writeReceipts(validReceipts().filter((receipt) => receipt.platform !== "linux-arm64"));
+		const { result } = stage(["--receipts", receipts]);
+		expect(result.status).not.toBe(0);
+		expect(result.stderr).toContain("has no receipt for: linux-arm64");
+		expect(() => packer.readReceipts(receipts, version)).toThrow(/has no receipt for: linux-arm64/);
+	});
+
+	it("refuses a receipts file with two receipts for one platform", () => {
+		const valid = validReceipts();
+		const receipts = writeReceipts([...valid, { ...valid[0] }]);
+		const { result } = stage(["--receipts", receipts]);
+		expect(result.status).not.toBe(0);
+		expect(result.stderr).toContain("more than one receipt for darwin-arm64");
+	});
+
+	it("refuses a receipt for a platform this packer does not publish", () => {
+		const receipts = writeReceipts([
+			...validReceipts(),
+			{
+				platform: "win32-x64",
+				file: `prime-agent-${version}-win32-x64.tar.gz`,
+				sha256: "c".repeat(64),
+				executableSha256: "d".repeat(64),
+			},
+		]);
+		const { result } = stage(["--receipts", receipts]);
+		expect(result.status).not.toBe(0);
+		expect(result.stderr).toContain('unsupported platform "win32-x64"');
+	});
+
+	it.each([
+		["executableSha256 that is too short", { executableSha256: "abc" }],
+		["executableSha256 with uppercase hex", { executableSha256: "A".repeat(64) }],
+		["executableSha256 that is missing", { executableSha256: undefined }],
+		["sha256 that is not hex", { sha256: "z".repeat(64) }],
+		["sha256 that is a number", { sha256: 1 }],
+		["sha256 that is missing", { sha256: undefined }],
+	])("refuses a receipt with an %s", (_label, patch) => {
+		const valid = validReceipts();
+		valid[2] = { ...valid[2], ...(patch as Partial<Receipt>) };
+		const receipts = writeReceipts(valid);
+		const { result } = stage(["--receipts", receipts]);
+		expect(result.status).not.toBe(0);
+		expect(result.stderr).toContain("Receipt for linux-arm64");
+		expect(result.stderr).toContain("malformed");
+	});
+
+	it("refuses a receipt whose archive name does not belong to this release", () => {
+		const valid = validReceipts();
+		valid[3] = { ...valid[3], file: `prime-agent-9.9.9-linux-x64.tar.gz` };
+		const { result } = stage(["--receipts", writeReceipts(valid)]);
+		expect(result.status).not.toBe(0);
+		expect(result.stderr).toContain(
+			`names "prime-agent-9.9.9-linux-x64.tar.gz", not prime-agent-${version}-linux-x64.tar.gz`,
+		);
+	});
+
+	it("refuses a receipts file for another version or without a binaries array", () => {
+		const other = writeReceipts(validReceipts(), { version: "v9.9.9" });
+		expect(stage(["--receipts", other]).result.stderr).toContain("is for v9.9.9, not v1.2.3");
+		const empty = writeReceipts(undefined);
+		expect(stage(["--receipts", empty]).result.stderr).toContain('has no "binaries" array');
+		const notObject = writeReceipts([{}]);
+		expect(stage(["--receipts", notObject]).result.stderr).toContain("unsupported platform undefined");
+	});
+
+	describe("--archives", () => {
+		let archivesDir: string;
+		let archives: Receipt[];
+
+		beforeAll(() => {
+			archivesDir = mkdtempSync(join(root, "archives-"));
+			archives = platforms.map((platform) => {
+				const file = `prime-agent-${version}-${platform}.tar.gz`;
+				const tar = spawnSync("tar", ["-czf", join(archivesDir, file), "-C", join(binaryDir, platform), "."], {
+					encoding: "utf8",
+				});
+				expect(tar.status, tar.stderr).toBe(0);
+				return {
+					platform,
+					file,
+					sha256: sha256(join(archivesDir, file)),
+					executableSha256: sha256(join(binaryDir, platform, "prime-agent")),
+				};
+			});
+		});
+
+		function stageArchives(receipts: string) {
+			const outDir = mkdtempSync(join(root, "out-"));
+			rmSync(outDir, { recursive: true, force: true });
+			const result = pack([
+				"--archives",
+				archivesDir,
+				"--packages-dir",
+				packagesDir,
+				"--version",
+				version,
+				"--out-dir",
+				outDir,
+				"--skip-pack",
+				"--receipts",
+				receipts,
+			]);
+			return { outDir, result };
+		}
+
+		it("unpacks archives whose digests match the receipts", () => {
+			const { outDir, result } = stageArchives(writeReceipts(archives));
+			expect(result.status, result.stderr).toBe(0);
+			for (const receipt of archives) {
+				const staged = readJson(
+					join(outDir, "@primeintellect", `prime-agent-${receipt.platform}`, "receipts.json"),
+				);
+				expect(staged.archive).toEqual({ file: receipt.file, sha256: receipt.sha256 });
+				expect(staged.executableSha256).toBe(receipt.executableSha256);
+			}
+		});
+
+		it("refuses an archive whose digest disagrees with its receipt", () => {
+			const tampered = archives.map((receipt) =>
+				receipt.platform === "darwin-x64" ? { ...receipt, sha256: "e".repeat(64) } : receipt,
+			);
+			const { result } = stageArchives(writeReceipts(tampered));
+			expect(result.status).not.toBe(0);
+			expect(result.stderr).toContain("Archive mismatch for darwin-x64");
+		});
+
+		it("refuses to unpack anything when a platform has no receipt", () => {
+			const { result } = stageArchives(
+				writeReceipts(archives.filter((receipt) => receipt.platform !== "darwin-x64")),
+			);
+			expect(result.status).not.toBe(0);
+			expect(result.stderr).toContain("has no receipt for: darwin-x64");
+		});
 	});
 });
 

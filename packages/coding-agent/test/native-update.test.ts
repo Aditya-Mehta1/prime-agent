@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, readlinkSync, realpathSync, rmSync, symlinkSync
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { getNativeUpdatePlan } from "../src/cli/native-update.js";
+import { describeNativeUpdatePlan, getNativeUpdatePlan } from "../src/cli/native-update.js";
 import { NATIVE_RELEASE_ASSETS } from "../src/utils/native-installation.js";
 import { ReleaseSignatureError } from "../src/utils/release-signature.js";
 import { getLatestPiRelease } from "../src/utils/version-check.js";
@@ -170,15 +170,136 @@ describe("native release metadata isolation", () => {
 		expect(plan.command?.args).toContain("PRIME_AGENT_DOWNLOAD_BASE_URL=https://mirror.example");
 	});
 
-	it.each(["http://mirror.example", "not a url"])(
-		"refuses an origin override that is not an https URL: %s",
-		async (override) => {
-			vi.stubEnv("PRIME_AGENT_DOWNLOAD_BASE_URL", override);
+	it("canonicalises the override and builds every downstream URL from it with exactly one separator", async () => {
+		vi.stubEnv("PRIME_AGENT_DOWNLOAD_BASE_URL", "https://Mirror.example:8443/prime//");
+		const fetchMock = vi.fn(async (_input: string | URL) =>
+			Response.json({ version: "1.2.4", binaries: [artifact] }),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+		verifiedDigest.mockResolvedValue({
+			digest: artifact.sha256,
+			signerIdentity: SIGNER_IDENTITY,
+			signerRef: "refs/heads/main",
+		});
 
-			await expect(getNativeUpdatePlan({ force: false, rollback: false, executable })).rejects.toThrow(
-				/PRIME_AGENT_DOWNLOAD_BASE_URL/,
+		const plan = await getNativeUpdatePlan({ force: false, rollback: false, executable });
+
+		expect(plan.overriddenBaseUrl).toBe("https://mirror.example:8443/prime");
+		expect(fetchMock.mock.calls.map((call) => String(call[0]))).toEqual([
+			"https://mirror.example:8443/prime/latest.json",
+		]);
+		expect(verifiedDigest).toHaveBeenCalledWith(
+			expect.objectContaining({ baseUrl: "https://mirror.example:8443/prime" }),
+		);
+		expect(plan.command?.args).toContain("PRIME_AGENT_DOWNLOAD_BASE_URL=https://mirror.example:8443/prime");
+	});
+
+	it.each([
+		["http URL", "http://mirror.example", /must use https/],
+		["ftp URL", "ftp://mirror.example", /must use https/],
+		["not a URL", "not a url", /not a valid URL/],
+		["scheme-relative URL", "//mirror.example", /not a valid URL/],
+		["query string", "https://mirror.example/?channel=beta", /query string/],
+		["bare question mark", "https://mirror.example?", /query string/],
+		["query string on a path", "https://mirror.example/prime?x=1", /query string/],
+		["fragment", "https://mirror.example/#latest.json", /fragment/],
+		["bare hash", "https://mirror.example#", /fragment/],
+		["username and password", "https://user:pass@mirror.example", /credentials/],
+		["username only", "https://user@mirror.example", /credentials/],
+		["empty password", "https://user:@mirror.example", /credentials/],
+	])("refuses an origin override with a %s", async (_label, override, message) => {
+		vi.stubEnv("PRIME_AGENT_DOWNLOAD_BASE_URL", override);
+		const fetchMock = vi.fn();
+		vi.stubGlobal("fetch", fetchMock);
+
+		await expect(getNativeUpdatePlan({ force: false, rollback: false, executable })).rejects.toThrow(
+			/PRIME_AGENT_DOWNLOAD_BASE_URL/,
+		);
+		await expect(getNativeUpdatePlan({ force: false, rollback: false, executable })).rejects.toThrow(message);
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(verifiedDigest).not.toHaveBeenCalled();
+		expect(readlinkSync(join(root, "bin", "prime-agent"))).toBe(target);
+	});
+
+	it.each([
+		["query string", "https://releases.example/?x=1"],
+		["fragment", "https://releases.example/#x"],
+		["credentials", "https://user:pass@releases.example"],
+		["http scheme", "http://releases.example"],
+	])("refuses a recorded install source with a %s instead of appending to it", async (_label, source) => {
+		vi.stubEnv("PRIME_AGENT_DOWNLOAD_BASE_URL", "");
+		writeFileSync(join(root, "releases", `1.2.3-linux-x64-${"a".repeat(64)}`, ".install-source"), source);
+		const fetchMock = vi.fn();
+		vi.stubGlobal("fetch", fetchMock);
+
+		await expect(getNativeUpdatePlan({ force: false, rollback: false, executable })).rejects.toThrow(
+			/install source/,
+		);
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(verifiedDigest).not.toHaveBeenCalled();
+	});
+
+	describe("user-facing provenance lines", () => {
+		const serveRelease = () => {
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async () => Response.json({ version: "1.2.4", binaries: [artifact] })),
 			);
-			expect(verifiedDigest).not.toHaveBeenCalled();
-		},
-	);
+			verifiedDigest.mockResolvedValue({
+				digest: artifact.sha256,
+				signerIdentity: SIGNER_IDENTITY,
+				signerRef: "refs/heads/main",
+			});
+		};
+
+		it("names the verified signer and warns about the override when one is in effect", async () => {
+			vi.stubEnv("PRIME_AGENT_DOWNLOAD_BASE_URL", "https://mirror.example/");
+			serveRelease();
+
+			const { notes, warnings } = describeNativeUpdatePlan(
+				await getNativeUpdatePlan({ force: false, rollback: false, executable }),
+			);
+
+			expect(notes).toEqual([
+				`Release v1.2.4 checksums verified: signed by repository PrimeIntellect-ai/prime-agent, workflow .github/workflows/build-binaries.yml, ref refs/heads/main (${SIGNER_IDENTITY}).`,
+			]);
+			expect(warnings).toEqual([
+				"Warning: PRIME_AGENT_DOWNLOAD_BASE_URL overrides the recorded download origin. Release files will be fetched from https://mirror.example. The signature requirement is unchanged.",
+			]);
+		});
+
+		it("names the verified signer and prints no warning when the recorded origin is used", async () => {
+			vi.stubEnv("PRIME_AGENT_DOWNLOAD_BASE_URL", "");
+			serveRelease();
+
+			const { notes, warnings } = describeNativeUpdatePlan(
+				await getNativeUpdatePlan({ force: false, rollback: false, executable }),
+			);
+
+			expect(notes).toHaveLength(1);
+			expect(notes[0]).toContain(SIGNER_IDENTITY);
+			expect(notes[0]).toContain("repository PrimeIntellect-ai/prime-agent");
+			expect(warnings).toEqual([]);
+		});
+
+		it("says nothing for a plan that installs nothing", () => {
+			expect(describeNativeUpdatePlan({ targetVersion: "1.2.3" })).toEqual({ notes: [], warnings: [] });
+			expect(describeNativeUpdatePlan({ targetVersion: "1.2.3", refusedDowngradeTo: "1.0.0" })).toEqual({
+				notes: [],
+				warnings: [],
+			});
+		});
+
+		it("never claims a signature for a rollback plan", () => {
+			const { notes, warnings } = describeNativeUpdatePlan({
+				targetVersion: "1.2.2",
+				overriddenBaseUrl: "https://mirror.example",
+				command: { command: "/usr/bin/env", args: [], display: "prime-agent update --rollback" },
+			});
+			expect(notes).toEqual(["Restoring the retained release v1.2.2; no download or signature check is involved."]);
+			expect(notes.join("\n")).not.toMatch(/signed by/);
+			expect(warnings).toHaveLength(1);
+			expect(warnings[0]).toContain("https://mirror.example");
+		});
+	});
 });
