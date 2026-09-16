@@ -21,7 +21,7 @@ fancy-regex = "0.14"
 libc = "0.2"
 nix = { version = "0.29", features = ["signal", "process", "user", "fs", "dir"] }
 tokio-util = "0.7"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v7"] }
 sha2 = "0.10"
 hmac = "0.12"
 globset = "0.4"

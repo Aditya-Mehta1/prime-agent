@@ -1,4 +1,5 @@
 //! Session entry parsing, migration, context reconstruction, and tree.
+pub mod manager;
 pub mod tree;
 
 use std::collections::HashMap;
