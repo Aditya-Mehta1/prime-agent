@@ -7,6 +7,7 @@ import atexit
 import functools
 import json
 import os
+import re
 import secrets
 import selectors
 import shutil
@@ -937,7 +938,743 @@ class BashHandle:
         return f"<BashHandle pid={self._pid} {state} command={self.command!r}>"
 
 
-def bash(command: str) -> BashHandle:
+# Pipe-to-shell guard (wave-1 safety audit gap 3). `curl ... | sh` and
+# `sh -c "$(curl ...)"` run whatever the far end of a URL serves straight into
+# a shell, with no review step and no record of the bytes that ran. Detection
+# is text-only: a quote-aware split of the command into pipeline stages, a word
+# scan that folds quotes and escapes the shell's way, and a fail-closed reading
+# of what each stage feeds. No URL is fetched and no process starts, so a
+# command pays for one pass over its text -- times the nesting of the
+# substitutions it holds, which a depth cap bounds -- and nothing else.
+#
+# Exact rule set:
+#   * piped form: a pipeline stage whose command word is `curl` or `wget` that
+#     feeds a later stage of the same pipeline whose command word is a shell
+#     interpreter (`sh`, `bash`, `zsh`, `dash`, or `eval`/`source`/`.`). Output
+#     that passes through an intermediate stage still reaches the interpreter
+#     (`curl ... | cat | sh`), so the whole pipeline is read, not only the
+#     stage next to the download, and a stage whose own command word is a
+#     substitution that runs a download (`$(curl ...) | sh`) counts too;
+#   * substitution form: a `$(...)`, backtick, or unquoted `<(...)` payload
+#     whose command word is `curl`/`wget` used as an argument of a runner
+#     (`sh -c "$(curl ...)"`, `bash <(curl ...)`, `source <(curl ...)`), with
+#     or without `-c`/`-s`, plus the words the runner itself executes: the
+#     script a `-c`-style flag hands an interpreter (`sh -c "curl ... | sh"`,
+#     `bash -lc "..."`) and every argument of `eval` (`eval "curl ... | sh"`).
+#     `<(...)` is the read mirror, whose output a runner reads as a file; the
+#     write mirror `>(...)` is out of scope, because the download's output does
+#     not feed the runner there (`sh >(curl ...)` fetches, it does not run);
+#   * wrapper prefixes are read at both ends, so the command word behind one is
+#     the command: `env curl ... | sh`, `nice 5 curl ... | sh`,
+#     `stdbuf -oL curl ... | sh`, `busybox sh -c "..."`,
+#     `curl ... | env -i sh`, `curl ... | xargs sh`, `curl ... | busybox sh`.
+#     `command -v X` only looks X up, so that lookup is not a command word;
+#   * fail closed: a download that feeds a stage the scan cannot resolve
+#     (`curl ... | $SHELL_CMD`, `curl ... | "$(echo sh)"`) is refused, never
+#     silently allowed. An unterminated quote is unresolvable too, so a region
+#     holding one is re-read with its quote characters dropped and refused when
+#     the shape is still visible.
+# Quotes fold into the words they build the shell's way, so `"curl" ... | sh`
+# and `cu"rl" ... | sh` are the same command; single-quoted data and comments
+# are inert (`echo 'curl | sh'`, `echo hi # curl | sh`); a backslash-newline
+# continuation joins the words it splits; and ANSI-C `$'...'` quoting that
+# spells its word plainly (`$'curl'`) builds that word literally, while an
+# escape in it (`$'cur\x6c'`) makes the word unresolvable, which the receiver
+# side then refuses. Deliberately allowed: a download to a file or into a
+# redirect (`curl -o /tmp/x URL`, `curl URL > /tmp/x`), a download read
+# downstream (`curl ... | jq .`, `curl ... | grep name`) or handed to a
+# non-runner (`diff <(curl a) <(curl b)`), a plain `sh script.sh`, the
+# two-statement download-then-run sequence, and every command the patterns do
+# not name. Two documented over-refusals come from the same decision, that a
+# curl/wget stage feeding an interpreter is refused whatever the download's own
+# flags say: `curl -o /tmp/x URL | sh` writes to a file and feeds the pipe
+# nothing, and `command -p curl --version | sh` prints a version banner rather
+# than a script. Telling either apart from a download that does print needs the
+# flag-arity knowledge this guard does not model. A here-document body is data,
+# but it is scanned as live text, which can only over-refuse.
+#
+# The scan is linear in the size of the command, with a factor for substitution
+# nesting (each level re-reads its region), which the depth cap bounds; a large
+# flat command is one pass. Interpreters other than the four shells above and
+# the shell's own eval/source forms are out of scope: this guard covers the
+# foot-gun spellings, not every way to run code.
+
+# Bypass env var for the pipe-to-shell guard.
+BASH_PIPE_TO_SHELL_BYPASS_ENV = "PI_BASH_ALLOW_PIPE_TO_SHELL"
+
+# The bypass env var is honored only when present at kernel start: the model
+# can write os.environ, so a live read on each guard call would let a single
+# os.environ assignment neuter the guard. The frozen copy cannot change after
+# import; a value that appears mid-session only triggers a loud warning and
+# is ignored.
+_PIPE_TO_SHELL_BYPASS_AT_KERNEL_START = os.environ.get(
+    BASH_PIPE_TO_SHELL_BYPASS_ENV
+) not in (None, "", "0")
+
+_pipe_to_shell_late_bypass_warned = False
+
+
+class PipeToShellRefusalError(RuntimeError):
+    """A curl/wget download that a shell interpreter would run was refused."""
+
+
+# Commands whose output is remote code when the far end of a pipe is a URL.
+_DOWNLOAD_COMMANDS = ("curl", "wget")
+
+# Commands that run their stdin, their `-c` payload, or a named script as code.
+# The set is deliberately these four: other shells (`ksh`, `ash`, `mksh`,
+# `fish`) and other interpreters (`python3 -`, `perl`, `node`) are out of scope
+# for this foot-gun guard.
+_SHELL_INTERPRETERS = ("sh", "bash", "zsh", "dash")
+
+# Interpreters, plus the shell's own run-a-string-builtin forms: `eval` and
+# `source`/`.` run a payload the same way, so they are receivers too.
+_RUNNERS = _SHELL_INTERPRETERS + ("eval", "source", ".")
+
+# Wrapper commands that run another command: the word they name is the command
+# word, so a download or an interpreter behind one of these is still that
+# command (`env curl URL | sh`, `curl URL | nice sh`).
+_WRAPPER_COMMANDS = (
+    "env",
+    "time",
+    "nice",
+    "nohup",
+    "command",
+    "builtin",
+    "exec",
+    "timeout",
+    "stdbuf",
+    "ionice",
+    "xargs",
+    "busybox",
+    "sudo",
+)
+
+# Flags that consume the following word, per wrapper: only these take a value,
+# so `env -i sh` keeps `sh` as the command word while `stdbuf -i 0 sh` does
+# not (`-i` is boolean for env and a value flag for stdbuf).
+_WRAPPER_VALUE_FLAGS = {
+    "env": ("-u", "-C", "-S"),
+    "nice": ("-n",),
+    "timeout": ("-s", "-k"),
+    "stdbuf": ("-i", "-o", "-e"),
+    "ionice": ("-c", "-n", "-p", "-P", "-u"),
+    "sudo": ("-u", "-g", "-p", "-C", "-h", "-U", "-T", "-R", "-D"),
+}
+
+# `command -v X` and `command -V X` only look X up, so the prefix ends there
+# and X is never read as the command.
+_WRAPPER_LOOKUP_FLAGS = ("-v", "-V")
+
+# A `-c`-style flag (`-c`, `-lc`, `--command`) makes the next word a script the
+# interpreter runs, so that word is scanned as a nested command.
+_PAYLOAD_FLAG_RE = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")
+
+# Operators that join the stages of one pipeline.
+_PIPE_OPERATORS = ("|", "|&")
+
+# Operators that group commands without ending a pipeline: `(curl URL) | sh`
+# still pipes the download into the interpreter.
+_GROUPING_OPERATORS = ("(", ")")
+
+# Every character that ends a command stage.
+_PIPE_SHELL_SEPARATORS = "\n;|&()"
+
+# Characters a redirection operator can reach for as its target word.
+_REDIRECT_OPERATOR_CHARS = "<>"
+
+# POSIX `FOO=1` prefix words: the shell runs the rest of the stage with those
+# variables bound, so `FOO=1 curl ... | sh` is still a download piped into sh.
+_PIPE_SHELL_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+# Nesting of command substitutions the scan follows before refusing outright.
+_MAX_SUBSTITUTION_SCAN_DEPTH = 16
+
+# Loose shape for a region an unterminated quote left unresolvable: with the
+# quote characters dropped, a download word, a pipe, and an interpreter word
+# after it are enough to refuse.
+_LOOSE_PIPE_TO_SHELL_RE = re.compile(
+    r"\b(?:curl|wget)\b[^;\n]*\|[^;\n]*\b(?:" + "|".join(_SHELL_INTERPRETERS) + r")\b"
+)
+
+
+@dataclass(frozen=True)
+class _PipeShellWord:
+    """One shell word: the value the shell would build for it, the command
+    substitutions it carries, and whether the scan could resolve it."""
+
+    value: str
+    substitutions: tuple[tuple[int, int], ...]
+    resolvable: bool
+
+
+@dataclass(frozen=True)
+class _PipeShellStage:
+    """One command stage: the operator that ended it, its words, and the
+    command substitutions a redirection took out of those words (the shell
+    consumes the redirection, but its substitution still runs)."""
+
+    separator: str
+    words: tuple[_PipeShellWord, ...]
+    target_substitutions: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class _PipeShellRegion:
+    """One scanned region: its stages, the substitution interiors inside them,
+    and whether an unterminated quote left the region unresolvable."""
+
+    stages: tuple[_PipeShellStage, ...]
+    substitutions: tuple[tuple[int, int], ...]
+    unterminated_quote: bool
+
+
+def _command_name(value: str) -> str:
+    """The command name a word runs: its basename, as the shell resolves it."""
+    return value.rsplit("/", 1)[-1]
+
+
+def _matching_paren(command: str, open_index: int, end: int) -> int:
+    """Index of the `)` matching the `(` at `open_index`, or `end - 1`."""
+    depth = 0
+    index = open_index
+    while index < end:
+        if command[index] == "(":
+            depth += 1
+        elif command[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return end - 1
+
+
+def _parenthesized_span(command: str, index: int, end: int) -> tuple[int, int]:
+    """The interior span of the substitution whose opening parenthesis sits at
+    `index`, with the caller passing the index of that `(` (`$(` and `<(` both
+    pass `index + 1`). An unmatched opening keeps the rest of the region
+    visible, so a truncated payload still scans."""
+    close = _matching_paren(command, index, end)
+    if close == end - 1 and command[end - 1 : end] != ")":
+        return index + 1, end
+    return index + 1, close
+
+
+def _substitution_span(command: str, index: int, end: int) -> tuple[int, int] | None:
+    """The interior span of the command substitution starting at `index`, or
+    None when no substitution starts there. Both spellings are read: `$(...)`,
+    with its parenthesis matched, and the backtick pair."""
+    if command[index] == "`":
+        close = command.find("`", index + 1, end)
+        return index + 1, end if close == -1 else close
+    if command[index] == "$" and command[index + 1 : index + 2] == "(":
+        return _parenthesized_span(command, index + 1, end)
+    return None
+
+
+def _process_substitution_span(command: str, index: int, end: int) -> tuple[int, int]:
+    """The interior span of the process substitution starting at `<(`, whose
+    output is a file the command reads. Only the unquoted spelling counts:
+    quoting suppresses a process substitution the way it suppresses `$(...)`
+    in some contexts, and `echo "<(cmd)"` must stay inert."""
+    return _parenthesized_span(command, index + 1, end)
+
+
+def _scan_redirect_operator(command: str, index: int, end: int) -> tuple[int, bool]:
+    """Consume one redirection operator: the index after it, plus whether it
+    duplicates a descriptor (`2>&1`, `>&2`), which has no target word."""
+    if command[index] == "&":
+        index += 1  # `&>` / `&>>`: both streams, one target word
+    while index < end and command[index] in _REDIRECT_OPERATOR_CHARS:
+        index += 1
+    if index < end and command[index] == "&":
+        duplicate_end = index + 1
+        while duplicate_end < end and (
+            command[duplicate_end].isdigit() or command[duplicate_end] == "-"
+        ):
+            duplicate_end += 1
+        return duplicate_end, True
+    return index, False
+
+
+def _skip_redirect_target(
+    command: str, index: int, end: int
+) -> tuple[int, list[tuple[int, int]]]:
+    """Consume one redirection target word, reporting the command
+    substitutions inside it: the shell takes the redirection out of the argv,
+    but a substitution in the target still runs."""
+    substitutions: list[tuple[int, int]] = []
+    quote = ""
+    while index < end:
+        char = command[index]
+        if quote == "'":
+            if char == "'":
+                quote = ""
+            index += 1
+            continue
+        if quote == '"':
+            if char == '"':
+                quote = ""
+                index += 1
+                continue
+            if char == "\\" and index + 1 < end:
+                index += 2
+                continue
+            span = _substitution_span(command, index, end)
+            if span is not None:
+                substitutions.append(span)
+                index = span[1] + 1
+                continue
+            index += 1
+            continue
+        if char == "<" and command[index + 1 : index + 2] == "(":
+            # `sh < <(curl ...)`: the redirect target is a process substitution.
+            span = _process_substitution_span(command, index, end)
+            substitutions.append(span)
+            index = span[1] + 1
+            continue
+        if (
+            char in " \t\r\n"
+            or char in _PIPE_SHELL_SEPARATORS
+            or char in _REDIRECT_OPERATOR_CHARS
+        ):
+            break
+        if char == "\\" and index + 1 < end:
+            index += 2
+            continue
+        if char in "'\"":
+            quote = char
+            index += 1
+            continue
+        span = _substitution_span(command, index, end)
+        if span is not None:
+            substitutions.append(span)
+            index = span[1] + 1
+            continue
+        index += 1
+    return index, substitutions
+
+
+def _scan_pipe_shell_region(command: str, start: int, end: int) -> _PipeShellRegion:
+    """Split command[start:end] into pipeline stages and their words.
+
+    Quotes fold into the words they build (`"curl"` and `cu"rl"` both run
+    curl), a backslash-newline continuation joins the words it splits, ANSI-C
+    `$'...'` quoting builds its word literally, a `#` at a word boundary starts
+    a comment that runs to the end of the line, and a redirection is consumed
+    with its target word because the shell takes both out of the argv before
+    the command runs. A command substitution keeps its interior text inside the
+    enclosing word -- so a word carrying one never resolves -- while its
+    interior span is reported for the caller to scan as live commands. This is
+    a conservative approximation, not a parse: anything it cannot represent
+    exactly is reported as unresolvable, never silently allowed.
+    """
+    stages: list[_PipeShellStage] = []
+    substitutions: list[tuple[int, int]] = []
+    target_substitutions: list[tuple[int, int]] = []
+    words: list[_PipeShellWord] = []
+    chars: list[str] = []
+    word_start = -1
+    word_substitutions: list[tuple[int, int]] = []
+    resolvable = True
+    quote = ""
+    index = start
+
+    def flush_word(*, drop_numeric: bool = False) -> None:
+        nonlocal chars, word_start, word_substitutions, resolvable
+        if word_start != -1:
+            value = "".join(chars)
+            # A redirection's descriptor digit (`2>`) is not an argv word.
+            if not (drop_numeric and value.isdigit()):
+                words.append(
+                    _PipeShellWord(value, tuple(word_substitutions), resolvable)
+                )
+        chars = []
+        word_start = -1
+        word_substitutions = []
+        resolvable = True
+
+    def end_stage(separator: str) -> None:
+        flush_word()
+        stages.append(
+            _PipeShellStage(separator, tuple(words), tuple(target_substitutions))
+        )
+        words.clear()
+        target_substitutions.clear()
+
+    def start_word(offset: int) -> None:
+        nonlocal word_start
+        if word_start == -1:
+            word_start = offset
+
+    while index < end:
+        char = command[index]
+        if quote == "'":
+            if char == "'":
+                quote = ""
+            else:
+                chars.append(char)
+            index += 1
+            continue
+        if quote == '"':
+            if char == '"':
+                quote = ""
+                index += 1
+                continue
+            if char == "\\" and index + 1 < end and command[index + 1] in '"\\$`':
+                chars.append(command[index + 1])
+                index += 2
+                continue
+            span = _substitution_span(command, index, end)
+            if span is not None:
+                start_word(index)
+                word_substitutions.append(span)
+                substitutions.append(span)
+                resolvable = False
+                chars.append(command[index : span[1] + 1])
+                index = span[1] + 1
+                continue
+            if char == "$" or char == "`":
+                resolvable = False  # an expansion the scan cannot follow
+            chars.append(char)
+            index += 1
+            continue
+        if char == "\\":
+            if index + 1 < end and command[index + 1] == "\n":
+                index += 2  # line continuation: the word around it continues
+                continue
+            if index + 1 < end:
+                start_word(index)
+                chars.append(command[index + 1])
+                index += 2
+                continue
+            resolvable = False  # a region cut in half by a continuation
+            index += 1
+            continue
+        if char in " \t\r":
+            flush_word()
+            index += 1
+            continue
+        if char == "#" and word_start == -1:
+            while index < end and command[index] != "\n":
+                index += 1
+            continue
+        if char == "<" and command[index + 1 : index + 2] == "(":
+            # `<(...)` with no space is a process substitution (a file the
+            # command reads); `< (` with a space is a redirect, so this test
+            # runs before the redirection branch.
+            start_word(index)
+            span = _process_substitution_span(command, index, end)
+            word_substitutions.append(span)
+            substitutions.append(span)
+            resolvable = False
+            chars.append(command[index : span[1] + 1])
+            index = span[1] + 1
+            continue
+        if char in _REDIRECT_OPERATOR_CHARS or (
+            char == "&" and command[index + 1 : index + 2] in ("<", ">")
+        ):
+            flush_word(drop_numeric=True)
+            index, duplicates = _scan_redirect_operator(command, index, end)
+            if not duplicates:
+                while index < end and command[index] in " \t":
+                    index += 1
+                if index < end and (
+                    command[index] not in _PIPE_SHELL_SEPARATORS
+                    and command[index] not in _REDIRECT_OPERATOR_CHARS
+                ):
+                    index, nested = _skip_redirect_target(command, index, end)
+                    substitutions.extend(nested)
+                    target_substitutions.extend(nested)
+            continue
+        if char in _PIPE_SHELL_SEPARATORS:
+            operator = char
+            follower = command[index + 1 : index + 2]
+            if char in "|&" and follower == char:
+                operator = char * 2  # `||` and `&&` are not pipes
+                index += 1
+            elif char == "|" and follower == "&":
+                operator = "|&"  # stderr and stdout both reach the next stage
+                index += 1
+            end_stage(operator)
+            index += 1
+            continue
+        if char == "$" and command[index + 1 : index + 2] == "'":
+            start_word(index)
+            index += 2
+            closed = False
+            while index < end:
+                if command[index] == "\\" and index + 1 < end:
+                    resolvable = False  # ANSI-C escapes can spell any byte
+                    index += 1
+                    chars.append(command[index])
+                    index += 1
+                    continue
+                if command[index] == "'":
+                    closed = True
+                    index += 1
+                    break
+                chars.append(command[index])
+                index += 1
+            if not closed:
+                quote = "'"
+            continue
+        span = _substitution_span(command, index, end)
+        if span is not None:
+            start_word(index)
+            word_substitutions.append(span)
+            substitutions.append(span)
+            resolvable = False
+            chars.append(command[index : span[1] + 1])
+            index = span[1] + 1
+            continue
+        if char in "'\"":
+            start_word(index)
+            quote = char
+            index += 1
+            continue
+        if char == "$" or char == "`":
+            resolvable = False  # an expansion the scan cannot follow
+        start_word(index)
+        chars.append(char)
+        index += 1
+    end_stage("")
+    return _PipeShellRegion(tuple(stages), tuple(substitutions), bool(quote))
+
+
+def _stage_command_word(
+    words: tuple[_PipeShellWord, ...],
+) -> tuple[_PipeShellWord, int] | None:
+    """The word a stage would run, with its index: the first word after the
+    prefix the shell consumes before the command runs.
+
+    The prefix is read in one interleaved pass because its parts compose in any
+    order: assignments (`FOO=1`), wrapper commands (`env`, `nice`, `xargs`,
+    `sudo`), their flags and value words (`sudo -u root`, `timeout 5`), and
+    bare numbers (`nice 5 curl ...`). `command -v X` only looks X up, so that
+    lookup ends the prefix instead of handing X to the scan."""
+    index = 0
+    while index < len(words):
+        value = words[index].value
+        name = _command_name(value)
+        if _PIPE_SHELL_ASSIGNMENT_RE.match(value):
+            index += 1
+            continue
+        if name not in _WRAPPER_COMMANDS:
+            break
+        if (
+            name == "command"
+            and words[index + 1 : index + 2]
+            and words[index + 1].value in _WRAPPER_LOOKUP_FLAGS
+        ):
+            break
+        index += 1
+        value_flags = _WRAPPER_VALUE_FLAGS.get(name, ())
+        while index < len(words) and words[index].value.startswith("-"):
+            index += 2 if words[index].value in value_flags else 1
+        if index < len(words) and words[index].value.isdigit():
+            index += 1
+    if index >= len(words):
+        return None
+    return words[index], index
+
+
+def _region_runs_download(command: str, start: int, end: int, depth: int = 0) -> bool:
+    """Whether this region runs curl/wget as a command word, at any nesting."""
+    if depth > _MAX_SUBSTITUTION_SCAN_DEPTH:
+        return True  # absurdly nested: refuse rather than risk a miss
+    region = _scan_pipe_shell_region(command, start, end)
+    for stage in region.stages:
+        resolved = _stage_command_word(stage.words)
+        if resolved is not None and _command_name(resolved[0].value) in _DOWNLOAD_COMMANDS:
+            return True
+    return any(
+        _region_runs_download(command, nested_start, nested_end, depth + 1)
+        for nested_start, nested_end in region.substitutions
+    )
+
+
+def _word_runs_download(command: str, word: _PipeShellWord) -> bool:
+    """Whether a word's own substitutions run a download, so a stage whose
+    command word is one (`$(curl ...) | sh`) feeds the download downstream."""
+    return any(
+        _region_runs_download(command, nested_start, nested_end)
+        for nested_start, nested_end in word.substitutions
+    )
+
+
+def _stage_payload_runs_download(stage: _PipeShellStage, command_index: int) -> bool:
+    """Whether the words a runner was handed are a download it would run.
+
+    Each runner takes its code differently, so each reads its own words: a
+    `-c`-style flag hands an interpreter one script (`sh -c "curl URL | sh"`,
+    `bash -lc "..."`), `eval` runs every non-flag argument it is given
+    (`eval "curl URL | sh"`), and `source`/`.` runs the file its first argument
+    names. Words a runner does not execute are left alone, so a script argument
+    (`sh deploy.sh 'curl URL | sh'`) and a script path
+    (`. /dev/stdin 'curl URL | sh'`) stay data."""
+    words = stage.words
+    name = _command_name(words[command_index].value)
+    if name == "eval":
+        return any(
+            _pipe_shell_violation(word.value) is not None
+            for word in words[command_index + 1 :]
+            if not word.value.startswith("-")
+        )
+    if name in ("source", "."):
+        operand = words[command_index + 1 : command_index + 2]
+        return bool(operand) and _pipe_shell_violation(operand[0].value) is not None
+    for index in range(command_index + 1, len(words) - 1):
+        value = words[index].value
+        if value == "--command" or _PAYLOAD_FLAG_RE.match(value):
+            if _pipe_shell_violation(words[index + 1].value) is not None:
+                return True
+    return False
+
+
+def _stage_args_run_download(
+    command: str, stage: _PipeShellStage, command_index: int
+) -> bool:
+    """Whether a shell interpreter's argv carries a substitution that runs a
+    download of its own (`sh -c "$(curl ...)"`, `sh <<< "$(curl ...)"`)."""
+    nested_spans = [
+        span
+        for word in stage.words[command_index + 1 :]
+        for span in word.substitutions
+    ]
+    nested_spans.extend(stage.target_substitutions)
+    return any(
+        _region_runs_download(command, nested_start, nested_end)
+        for nested_start, nested_end in nested_spans
+    )
+
+
+def _pipe_shell_stage_violation(command: str, region: _PipeShellRegion) -> str | None:
+    """Why these stages run a download through a shell, or None."""
+    piped_download = False
+    for stage in region.stages:
+        if not stage.words:
+            # An empty stage is a grouping character, a doubled operator, or a
+            # newline that only continues the pipeline (`curl ... |` then a
+            # newline then `sh`), so it never ends the chain.
+            continue
+        resolved = _stage_command_word(stage.words)
+        if resolved is not None:
+            word, command_index = resolved
+            name = _command_name(word.value)
+            if piped_download:
+                if name in _RUNNERS:
+                    return "a download piped into a shell"
+                if not word.resolvable:
+                    # Fail closed: the receiver cannot be read, so it cannot be
+                    # cleared either.
+                    return "a download piped into a command the scan cannot resolve"
+            if name in _DOWNLOAD_COMMANDS or _word_runs_download(command, word):
+                piped_download = True
+            elif name in _RUNNERS and (
+                _stage_args_run_download(command, stage, command_index)
+                or _stage_payload_runs_download(stage, command_index)
+            ):
+                return "a download substituted into a shell"
+        if (
+            stage.separator not in _PIPE_OPERATORS
+            and stage.separator not in _GROUPING_OPERATORS
+        ):
+            piped_download = False
+    return None
+
+
+def _loose_shell_text(text: str) -> str:
+    """Text with its quote and escape characters dropped, for the fail-closed
+    re-read of a region an unterminated quote left unresolvable."""
+    return text.replace("'", "").replace('"', "").replace("\\", "")
+
+
+def _pipe_shell_violation(
+    command: str, start: int = 0, end: int | None = None, depth: int = 0
+) -> str | None:
+    """Why `command` would run a curl/wget download through a shell, or None.
+
+    The scan is text-only: the same command is refused whether or not the URL
+    answers, and nothing is fetched, spawned, or executed to decide.
+    """
+    if end is None:
+        end = len(command)
+    if depth > _MAX_SUBSTITUTION_SCAN_DEPTH:
+        # Fail closed, but state only what the scan knows: the region was not
+        # read, so it cannot be cleared.
+        return "substitutions nested too deeply for the scan to read"
+    region = _scan_pipe_shell_region(command, start, end)
+    violation = _pipe_shell_stage_violation(command, region)
+    if violation is not None:
+        return violation
+    for nested_start, nested_end in region.substitutions:
+        violation = _pipe_shell_violation(command, nested_start, nested_end, depth + 1)
+        if violation is not None:
+            return violation
+    if region.unterminated_quote and _LOOSE_PIPE_TO_SHELL_RE.search(
+        _loose_shell_text(command[start:end])
+    ):
+        return "a download piped or substituted into a shell"
+    return None
+
+
+def _format_pipe_to_shell_refusal(violation: str) -> str:
+    return "\n".join(
+        [
+            "Refusing to run this command: piping or substituting curl/wget",
+            "output into a shell interpreter downloads and executes remote code",
+            f"without review ({violation}).",
+            "",
+            "Download the script to a file, read the file, then run it in a",
+            "later command (curl -o script.sh URL, then sh script.sh).",
+            "",
+            "If the download is trusted, retry with",
+            "bash(command, allow_pipe_to_shell=True), or start the kernel with",
+            f"{BASH_PIPE_TO_SHELL_BYPASS_ENV}=1; the variable is frozen at kernel start,",
+            "so writing it mid-session never unlocks the guard.",
+        ]
+    )
+
+
+def _warn_once_about_late_pipe_to_shell_bypass() -> None:
+    """Warn (once) when the bypass env var appears mid-session.
+
+    The frozen launch-time copy is the only honored bypass, so a value that
+    shows up later is ignored; one os.environ write cannot unlock the guard.
+    Warn loudly so a deliberate bypass takes the documented path (restart the
+    kernel with the variable set) instead of looking like a no-op."""
+    global _pipe_to_shell_late_bypass_warned
+    if _pipe_to_shell_late_bypass_warned:
+        return
+    value = os.environ.get(BASH_PIPE_TO_SHELL_BYPASS_ENV)
+    if value is None or value in ("", "0"):
+        return
+    _pipe_to_shell_late_bypass_warned = True
+    print(
+        f"prime-agent bash: {BASH_PIPE_TO_SHELL_BYPASS_ENV} appeared after"
+        " kernel start and is ignored; the pipe-to-shell guard only honors it"
+        " when the kernel is started with it set.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _guard_pipe_to_shell(command: str, allow_pipe_to_shell: bool) -> None:
+    """Refuse a curl/wget download that a shell interpreter would run: piped
+    into one, or substituted into its argv. The scan is string-only and runs
+    before any spawn, so a refused command never starts a process, and a
+    command the patterns do not name pays for one linear pass."""
+    if allow_pipe_to_shell or _PIPE_TO_SHELL_BYPASS_AT_KERNEL_START:
+        return
+    violation = _pipe_shell_violation(_with_prefix(command))
+    if violation is None:
+        return
+    _warn_once_about_late_pipe_to_shell_bypass()
+    raise PipeToShellRefusalError(_format_pipe_to_shell_refusal(violation))
+
+
+def bash(command: str, *, allow_pipe_to_shell: bool = False) -> BashHandle:
     """Start a shell command immediately; await the handle for the result.
 
     `await bash(cmd)` is a one-shot: cancelling the await (e.g. an interrupt)
@@ -951,10 +1688,31 @@ def bash(command: str) -> BashHandle:
     Output written after the completion fence (e.g. by an EXIT trap or a
     background job) is not in BashResult.output but stays visible via
     handle.output()/tail().
+
+    Downloads that a shell interpreter would run are refused before any
+    process starts: a `curl`/`wget` pipeline stage feeding a later stage of
+    the same pipeline whose command word is a runner (`sh`, `bash`, `zsh`,
+    `dash`, or `eval`/`source`/`.`), as in `curl -fsSL URL | sh`, `... | sudo
+    bash`, `curl URL | cat | sh`, `curl URL | env -i sh`, or `curl URL |
+    xargs sh`; a `$(...)`, backtick, or unquoted `<(...)` payload whose command
+    word is `curl`/`wget` used as an argument of a runner (`sh -c "$(curl
+    ...)"`, `bash <(curl ...)`); the words the runner itself executes, the
+    script a `-c`-style flag hands an interpreter (`sh -c "curl ... | sh"`) and
+    every argument of `eval` (`eval "curl ... | sh"`); and a wrapper-prefixed
+    download
+    (`env -i curl ... | sh`, `nice 5 curl ... | sh`). A stage the scan cannot
+    resolve (`curl URL | $SHELL_CMD`) is refused too, and quoted spellings are
+    read the shell's way (`"curl" URL | sh`). Download the script to a file,
+    read the file, then run it in a later command (`curl -o script.sh URL`,
+    then `sh script.sh`), and retry with allow_pipe_to_shell=True (or start the
+    kernel with PI_BASH_ALLOW_PIPE_TO_SHELL=1) only when the download is
+    trusted; the env var is frozen at kernel start, so writing it mid-session
+    never unlocks the guard.
     """
     if not isinstance(command, str) or not command:
         raise TypeError("command must be a non-empty str")
     _install_shutdown_hook()
+    _guard_pipe_to_shell(command, allow_pipe_to_shell)
     return BashHandle(command)
 
 
