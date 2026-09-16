@@ -301,3 +301,67 @@ Live-TS goldens (read-only captures, protocol 7):
   messages (`crates/pa-core/src/session_engine/mod.rs` `persist_event`).
   Affects `get_session_stats.toolResults`, transcripts, and external
   tooling reading session files.
+
+## Battery findings (live A/B parity battery, run 20260916T210320Z)
+
+Standing battery harness committed at `scripts/battery/` (see
+`docs/parity-battery.md` for the flow list and re-run instructions). All
+gaps below are reproduced by the committed first run
+(`scripts/battery/runs/20260916T210320Z/`) except B-3, whose evidence is
+`runs/20260916T203149Z/` (superseded by the short-TMPDIR harness fix, the
+product gap remains). Categories: visual/behavior/protocol/timing.
+
+- B-1 (protocol, f1): Rust interactive drops `--provider`/`--model` CLI
+  flags; the daemon worker resolves its model from
+  `PRIME_AGENT_MODEL_PROVIDER`/`PRIME_AGENT_MODEL` env or its fallback (a
+  capture with `--provider battery --model mock-1` answered with
+  `prime-inference/z-ai/glm-5.3`). TS passes provider/model over the wire
+  config. Evidence:
+  `runs/20260916T210320Z/extras/rust-interactive-model-flags-session.jsonl`.
+- B-2 (visual, f1): TS shows the splash + first-run "Share agent traces
+  with Prime Intellect?" notice (Share / Not now, `/traces` hint); Rust
+  launches straight into the TUI with neither. Evidence:
+  `runs/20260916T210320Z/{ts,rust}/f1_launch/01-launch.txt`.
+- B-3 (timing, f1): Rust supervisor `WORKER_SPAWN_CONNECT_TIMEOUT_MS` is
+  15s (TS `WORKER_CONNECT_TIMEOUT_MS` is 30s), and the worker socket bind
+  fails when the AF_UNIX path exceeds 107 chars, so fresh installs on long
+  TMPDIR paths kill the interactive session ("session worker <id> did not
+  come up in time", TUI exits 1). Evidence:
+  `runs/20260916T203149Z/rust/` (failed worker boots), plus
+  `crates/pa-daemon/src/supervisor.rs` L48.
+- B-4 (protocol, f2): model tool surface differs - TS exposes only
+  `ipython`; Rust exposes `bash`, `edit`, `ipython`. Evidence:
+  `runs/20260916T210320Z/{ts,rust}/f2_prompt/mock-requests.json`.
+- B-5 (protocol, f2): TS prepends a `[harness-digest]` user message; Rust
+  sends none. Evidence: same capture as B-4.
+- B-6 (protocol, f2): system prompt differs (23119 vs 13526 chars): Rust
+  omits the conversation-log path, pre-installed packages line, installed
+  skill modules line, available-skills inventory, and harness-refinement
+  guidance. Evidence:
+  `runs/20260916T210320Z/protocol-request-diff.txt`.
+- B-7 (protocol, f2/f5): TS issues a post-turn status-line request to a
+  small model (`qwen/qwen3-30b-a3b-instruct-2507`); Rust issues none.
+  Evidence: `runs/20260916T210320Z/extras/ts-statusline-request.json`.
+- B-8 (protocol, f3/f8): session-file entry shapes differ - TS writes
+  `custom_message` (harness_digest), `service_tier_change`, and
+  `compaction` entries; Rust writes `custom` entries
+  (`prime-agent-rs.queue_snapshot`) and never `service_tier_change` or
+  `compaction`. Evidence: `runs/20260916T210320Z/f3_tool-session-shapes.json`,
+  `f8_resume-session-shapes.json`.
+- B-9 (visual, f4): TS `/` opens the slash-command menu; Rust `/` types into
+  the composer. Evidence:
+  `runs/20260916T210320Z/rust/f4_commands/01-slash-menu.txt`.
+- B-10 (protocol, f7): TS daemon `compact` works and returns
+  `{summary, firstKeptEntryId, tokensBefore, details{readFiles, modifiedFiles}}`;
+  Rust answers `{"command":"unknown"}`. Evidence:
+  `runs/20260916T210320Z/{ts,rust}/f7_compaction/compact-response.json`.
+  (Same as item 5 above, now with live mock-provider evidence.)
+- B-11 (behavior, f8): TS print `-c` refuses while the session is active in
+  the daemon ("Session is already active in <id>: <path>"); Rust `-c`
+  silently reopens the same file with no active-session guard. Evidence:
+  `runs/20260916T210320Z/ts/f8_resume/continue-cmd.json`.
+
+Passed-check highlights (both products agree, live through the mock):
+print-mode stdout identical; `ipython` tool turns execute in both;
+side questions stream `side_question_event` running->complete on both;
+wire attach returns the same snapshot data keys; CLI `attach` opens in both.
