@@ -17,6 +17,7 @@ use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, oneshot, Notify};
 
+use crate::agent_engine::{AgentEngineConfig, AgentSessionEngine};
 use crate::engine::{EngineEvent, PromptRequest, ScriptedEngine, SessionEngine};
 use crate::framing::{read_frame, write_frame, DEFAULT_PRIVATE_FRAME_LIMITS};
 use crate::journal::WorkerRecoveryJournal;
@@ -172,12 +173,35 @@ impl Worker {
         let idle_notify = Arc::new(Notify::new());
         // The turn runner runs for the whole process lifetime.
         {
+            // Scripted sessions serve the integration harness; sessions
+            // without a script run the real agent engine.
+            let engine: std::sync::Arc<dyn SessionEngine> = match &script {
+                Some(script) => std::sync::Arc::new(
+                    ScriptedEngine::from_value(script.clone()).unwrap_or_default(),
+                ),
+                None => {
+                    let cwd =
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    match AgentSessionEngine::new(AgentEngineConfig {
+                        cwd,
+                        agent_dir: config.agent_dir.clone(),
+                        provider: std::env::var("PRIME_AGENT_MODEL_PROVIDER").ok(),
+                        model: std::env::var("PRIME_AGENT_MODEL").ok(),
+                        api_key: None,
+                        session_dir: None,
+                    }) {
+                        Ok(engine) => std::sync::Arc::new(engine),
+                        // Runtime construction failed: degrade to the echo engine.
+                        Err(_) => std::sync::Arc::new(ScriptedEngine::default()),
+                    }
+                }
+            };
             let runner = TurnRunner {
                 core: Arc::clone(&core),
                 work_notify: Arc::clone(&work_notify),
                 idle_notify: Arc::clone(&idle_notify),
                 events: events.clone(),
-                script,
+                engine,
                 active_session_id,
             };
             tokio::spawn(async move {
@@ -1126,18 +1150,14 @@ struct TurnRunner {
     work_notify: Arc<Notify>,
     idle_notify: Arc<Notify>,
     events: broadcast::Sender<Arc<OutboundFrame>>,
-    script: Option<Value>,
+    engine: std::sync::Arc<dyn SessionEngine>,
     active_session_id: String,
 }
 
 impl TurnRunner {
     async fn run(self) {
-        let engine = self
-            .script
-            .clone()
-            .and_then(|script| ScriptedEngine::from_value(script).ok())
-            .unwrap_or_default();
         loop {
+            let engine = self.engine.clone();
             let item: Option<QueuedItem> = {
                 let mut core = self.core.lock().unwrap();
                 if core.shutdown_requested {
@@ -1157,7 +1177,7 @@ impl TurnRunner {
                 }
             };
             if let Some(item) = item {
-                self.run_turn(&engine, item).await;
+                self.run_turn(engine, item).await;
             } else {
                 self.idle_notify.notify_waiters();
                 self.work_notify.notified().await;
@@ -1165,7 +1185,7 @@ impl TurnRunner {
         }
     }
 
-    async fn run_turn(&self, engine: &ScriptedEngine, item: QueuedItem) {
+    async fn run_turn(&self, engine: std::sync::Arc<dyn SessionEngine>, item: QueuedItem) {
         self.emit_turn_event(json!({ "type": "agent_start" }));
         self.emit_turn_event(json!({ "type": "turn_start" }));
 

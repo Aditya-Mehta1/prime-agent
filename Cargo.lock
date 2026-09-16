@@ -1266,6 +1266,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures",
+ "pa-agent",
+ "pa-ai",
+ "pa-core",
  "pa-types",
  "serde",
  "serde_json",

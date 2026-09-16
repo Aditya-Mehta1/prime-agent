@@ -6,6 +6,7 @@
 //! restarts with backoff, and routes clients. Sessions persist as append-only
 //! JSONL under `<agent-dir>/sessions/` using the same layout as the TS product.
 
+pub mod agent_engine;
 pub mod descriptor;
 pub mod engine;
 pub mod framing;
