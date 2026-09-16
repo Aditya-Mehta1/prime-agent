@@ -334,15 +334,70 @@ export interface DaemonUpdateRestartWaitResult<T> {
 }
 
 /**
+ * Transport-level error codes that mean the socket was down while the daemon
+ * exited or its successor had not finished booting.
+ */
+const DAEMON_UPDATE_RESTART_TRANSIENT_ERROR_CODES = new Set([
+	"ECONNREFUSED",
+	"ECONNRESET",
+	"EPIPE",
+	"ENOENT",
+	"ETIMEDOUT",
+	"ECONNABORTED",
+]);
+
+/**
+ * True when an open failure is part of the normal update-restart window
+ * rather than a permanent failure: the preparing-restart rejection itself,
+ * transport failures while the daemon exits and its successor boots (socket
+ * close, connect and handshake timeouts), and session-not-restored-yet misses
+ * ("Unknown active session", a session still recovering). Permanent create and
+ * attach failures (e.g. a missing session import file) return false so the
+ * open fails immediately instead of hiding behind the bounded update wait.
+ */
+function isDaemonUpdateRestartTransientError(error: unknown): boolean {
+	if (isDaemonUpdateRestartingError(error)) return true;
+	if (!(error instanceof Error)) return false;
+	if (isUnknownActiveSessionError(error)) return true;
+	if (error instanceof DaemonSessionRecoveringError) return true;
+	const code = (error as NodeJS.ErrnoException).code;
+	if (typeof code === "string" && DAEMON_UPDATE_RESTART_TRANSIENT_ERROR_CODES.has(code)) return true;
+	return (
+		// Socket closed while the daemon exits for the restart.
+		error.message.startsWith("Connection to the Prime Agent daemon closed.") ||
+		// Connect failures while the successor socket is not listening yet.
+		error.message.startsWith("Failed to connect to the Prime Agent daemon:") ||
+		// A request attempted while the transport is down between daemon processes.
+		error.message.startsWith("Cannot send daemon command") ||
+		// Connect/handshake timeouts while the successor daemon boots.
+		/^Timed out after \d+ms (connecting to the Prime Agent daemon|waiting for the Prime Agent daemon handshake)/.test(
+			error.message,
+		)
+	);
+}
+
+function daemonUpdateRestartDeadlineError(waitMs: number, lastError: unknown): Error {
+	const lastErrorText =
+		lastError === undefined ? "none yet" : lastError instanceof Error ? lastError.message : String(lastError);
+	return new Error(
+		`The Prime Agent daemon did not finish its update restart within ${Math.round(waitMs / 1000)} seconds. Try opening this agent again once the update finishes. Last error: ${lastErrorText}`,
+	);
+}
+
+/**
  * Run an open attempt, retrying while the daemon is in the update-restart
  * transient state instead of failing the open. The first
- * "preparing an update restart" rejection arms the wait; once armed, transient
- * failures of the restart itself (socket close while the daemon exits,
- * connect errors while the successor boots, session-not-restored-yet misses)
- * stay inside the same bounded loop, because they are all part of the same
- * normal update restart. A non-update error before any update-restart signal
- * propagates unchanged; once the budget runs out the open fails with a clear
- * actionable message that includes the last error.
+ * "preparing an update restart" rejection arms the wait; once armed, only
+ * restart-transient failures of the restart itself (socket close while the
+ * daemon exits, connect errors while the successor boots, session-not-yet-
+ * restored misses) stay inside the same bounded loop, because they are all part
+ * of the same normal update restart, while permanent failures (e.g. a missing
+ * session file) propagate immediately instead of hiding behind the wait. A
+ * non-update error before any update-restart signal propagates unchanged. The
+ * wait budget bounds the whole wait: each attempt is raced against the
+ * remaining budget, so an in-flight attempt (e.g. a create request with its own
+ * 30-second timeout) cannot hold the open past the deadline, which fails with a
+ * clear actionable message that includes the last error.
  */
 export async function waitThroughDaemonUpdateRestart<T>(
 	attempt: () => Promise<T>,
@@ -352,22 +407,33 @@ export async function waitThroughDaemonUpdateRestart<T>(
 	const retryMs = options.retryMs ?? DAEMON_UPDATE_RESTART_OPEN_RETRY_MS;
 	const deadline = Date.now() + waitMs;
 	let sawUpdateRestart = false;
+	let lastError: unknown;
 	while (true) {
+		const deadlineError = daemonUpdateRestartDeadlineError(waitMs, lastError);
+		// An in-flight attempt (e.g. a create request with its own 30-second
+		// timeout) must not push the open past the deadline: race every attempt
+		// against the remaining budget so the bound holds.
+		let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+		const deadlineHit = new Promise<never>((_, reject) => {
+			deadlineTimer = setTimeout(() => reject(deadlineError), Math.max(0, deadline - Date.now()));
+		});
 		try {
-			const result = await attempt();
+			const result = await Promise.race([attempt(), deadlineHit]);
+			clearTimeout(deadlineTimer);
 			return { result, waitedForUpdateRestart: sawUpdateRestart };
 		} catch (error) {
+			clearTimeout(deadlineTimer);
+			if (error === deadlineError) throw deadlineError;
 			if (!sawUpdateRestart) {
 				if (!isDaemonUpdateRestartingError(error)) throw error;
 				sawUpdateRestart = true;
 				options.onWait?.(error);
+			} else if (!isDaemonUpdateRestartTransientError(error)) {
+				throw error;
 			}
+			lastError = error;
 			if (Date.now() + retryMs > deadline) {
-				throw new Error(
-					`The Prime Agent daemon did not finish its update restart within ${Math.round(waitMs / 1000)} seconds. Try opening this agent again once the update finishes. Last error: ${
-						error instanceof Error ? error.message : String(error)
-					}`,
-				);
+				throw daemonUpdateRestartDeadlineError(waitMs, lastError);
 			}
 			await new Promise((resolve) => setTimeout(resolve, retryMs));
 		}

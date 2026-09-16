@@ -20,7 +20,7 @@ import {
 	resolveAgentsViewLeftResult,
 	type UnifiedSessionRecord,
 } from "../src/modes/agents-view/agents-view-state.js";
-import { DaemonUpdateRestartingError } from "../src/modes/daemon/daemon-errors.js";
+import { DaemonSessionRecoveringError, DaemonUpdateRestartingError } from "../src/modes/daemon/daemon-errors.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import * as savedSessionCatalog from "../src/modes/daemon/saved-session-catalog.js";
 import type { InteractiveModeUiServices } from "../src/modes/interactive/interactive-mode-services.js";
@@ -1695,6 +1695,58 @@ describe("agents view open during a daemon update restart", () => {
 		expect(runs).toBe(2);
 	});
 
+	it("fails a permanent create failure immediately after the update wait is armed", async () => {
+		const saved = summary({
+			id: "missing-session-file",
+			activeSessionId: undefined,
+			lifecycle: "archived",
+			sessionFile: "/tmp/missing-session-file.jsonl",
+			sessionId: "missing-session-file",
+		});
+		let runs = 0;
+		vi.spyOn(AgentsViewMode.prototype, "run").mockImplementation(async function (this: AgentsViewMode) {
+			runs += 1;
+			if (runs === 1) {
+				return { type: "open", summary: saved, hasChildren: false };
+			}
+			// The permanent failure surfaced as itself, not masked as an
+			// update-restart timeout after the full wait budget.
+			expect(String(Reflect.get(this, "persistentState").statusMessage)).toContain(
+				"Failed to open agent: File not found: /tmp/missing-session-file.jsonl",
+			);
+			return { type: "exit" };
+		});
+		modeMocks.clientRequest
+			.mockResolvedValueOnce({
+				type: "response",
+				command: "create",
+				success: false,
+				error: "Daemon is preparing an update restart",
+				errorInfo: { code: "update_restarting" },
+			})
+			.mockResolvedValueOnce({
+				type: "response",
+				command: "create",
+				success: false,
+				error: "File not found: /tmp/missing-session-file.jsonl",
+				errorInfo: { code: "session_import_file_not_found", filePath: "/tmp/missing-session-file.jsonl" },
+			});
+		modeMocks.interactiveRun.mockResolvedValue({ type: "exit" } as never);
+
+		await runAgentsViewMode({
+			config: { cwd: process.cwd() },
+			socketPath: "/tmp/agents-view-test.sock",
+			uiServices: createUiServices(),
+		});
+
+		// One preparing-restart rejection armed the wait, then the permanent
+		// create failure propagated instead of retrying through the update
+		// window.
+		expect(modeMocks.clientRequest).toHaveBeenCalledTimes(2);
+		expect(modeMocks.interactiveRun).not.toHaveBeenCalled();
+		expect(runs).toBe(2);
+	});
+
 	it("fails a non-update open error immediately without retrying", async () => {
 		const saved = summary({
 			id: "missing-cwd-session",
@@ -1731,7 +1783,7 @@ describe("agents view open during a daemon update restart", () => {
 describe("waitThroughDaemonUpdateRestart", () => {
 	beforeEach(() => vi.clearAllMocks());
 
-	it("retries the transient rejection and reports that it waited", async () => {
+	it("retries every restart-transient failure and reports that it waited", async () => {
 		let attempts = 0;
 		const waited: unknown[] = [];
 		const outcome = await waitThroughDaemonUpdateRestart(
@@ -1739,14 +1791,82 @@ describe("waitThroughDaemonUpdateRestart", () => {
 				attempts += 1;
 				if (attempts === 1) throw new DaemonUpdateRestartingError();
 				if (attempts === 2) throw new Error("Daemon is preparing an update restart");
-				if (attempts === 3) throw new Error("connect ENOENT /tmp/daemon.sock"); // daemon exits for the restart
+				// The daemon exits and its successor boots during the restart; the
+				// open sees those as connection failures until it can reconnect.
+				if (attempts === 3)
+					throw new Error(
+						"Failed to connect to the Prime Agent daemon: connect ENOENT /tmp/agents-view-test.sock. Socket: /tmp/agents-view-test.sock.",
+					);
+				if (attempts === 4)
+					throw new Error("Connection to the Prime Agent daemon closed. Socket: /tmp/agents-view-test.sock.");
+				// The successor is up but has not finished restoring sessions yet.
+				if (attempts === 5) throw new Error("Unknown active session: update-restart-session");
+				if (attempts === 6) throw new DaemonSessionRecoveringError("update-restart-session");
 				return "opened";
 			},
 			{ waitMs: 5_000, retryMs: 1, onWait: (error) => waited.push(error) },
 		);
 		expect(outcome).toEqual({ result: "opened", waitedForUpdateRestart: true });
-		expect(attempts).toBe(4);
+		expect(attempts).toBe(7);
 		expect(waited).toHaveLength(1);
+	});
+
+	it("propagates a permanent create failure immediately instead of masking it as the update wait", async () => {
+		let attempts = 0;
+		const waited: unknown[] = [];
+		const failure = await waitThroughDaemonUpdateRestart(
+			async () => {
+				attempts += 1;
+				if (attempts === 1) throw new DaemonUpdateRestartingError();
+				// The daemon serializes a missing session import file as a plain
+				// create failure; retrying it for the whole update window would
+				// only mask the real problem.
+				throw new Error("File not found: /tmp/missing-session-file.jsonl");
+			},
+			{ waitMs: 5_000, retryMs: 1, onWait: (error) => waited.push(error) },
+		).catch((error: unknown) => error);
+		expect(failure).toBeInstanceOf(Error);
+		expect((failure as Error).message).toBe("File not found: /tmp/missing-session-file.jsonl");
+		expect(attempts).toBe(2);
+		expect(waited).toHaveLength(1);
+	});
+
+	it("fails at the deadline even when an in-flight attempt would block past it", async () => {
+		const startedAt = Date.now();
+		let attempts = 0;
+		await expect(
+			waitThroughDaemonUpdateRestart(
+				async () => {
+					attempts += 1;
+					if (attempts === 1) throw new DaemonUpdateRestartingError();
+					// A create request in flight just before the deadline would
+					// otherwise block for its own request timeout well past the
+					// wait budget.
+					await new Promise((resolve) => setTimeout(resolve, 1_200));
+					return "opened-late";
+				},
+				{ waitMs: 60, retryMs: 5 },
+			),
+		).rejects.toThrow(
+			/The Prime Agent daemon did not finish its update restart within \d+ seconds\. Try opening this agent again once the update finishes\. Last error: Daemon is preparing an update restart/,
+		);
+		expect(Date.now() - startedAt).toBeLessThan(600);
+		expect(attempts).toBe(2);
+	});
+
+	it("still opens when an attempt finishes inside the remaining budget", async () => {
+		let attempts = 0;
+		const outcome = await waitThroughDaemonUpdateRestart(
+			async () => {
+				attempts += 1;
+				if (attempts === 1) throw new DaemonUpdateRestartingError();
+				await new Promise((resolve) => setTimeout(resolve, 25));
+				return "opened";
+			},
+			{ waitMs: 2_000, retryMs: 1 },
+		);
+		expect(outcome).toEqual({ result: "opened", waitedForUpdateRestart: true });
+		expect(attempts).toBe(2);
 	});
 
 	it("propagates a non-update failure that arrives before any update-restart signal", async () => {
