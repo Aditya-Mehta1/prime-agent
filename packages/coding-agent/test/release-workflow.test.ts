@@ -1076,21 +1076,18 @@ aws() {
 					expect(bundle).toContain("--endpoint-url https://r2.invalid");
 				});
 
-				it("never uploads over an existing object", () => {
+				it("never uploads over an object with different bytes, but a same-bytes rerun finishes", () => {
+					// Both channels use the same immutability contract (round 10: a re-run of the same
+					// version must be able to finish what it already published).
 					const { result, uploads } = run(jobId, stepName, "exists", "different bytes");
 					expect(uploads).toEqual([]);
-					if (jobId === "publish-r2") {
-						expect(result.status).toBe(1);
-						expect(result.stderr).toContain("Refusing to overwrite");
-						// The same bytes already stored is a no-op rerun, not an error.
-						const rerun = run(jobId, stepName, "exists", "release bytes");
-						expect(rerun.result.status, rerun.result.stderr).toBe(0);
-						expect(rerun.uploads).toEqual([]);
-						expect(rerun.result.stdout).toContain("unchanged");
-					} else {
-						expect(result.status).toBe(1);
-						expect(result.stderr).toContain("Refusing to overwrite existing beta object");
-					}
+					expect(result.status).toBe(1);
+					expect(result.stderr).toContain("Refusing to overwrite");
+					// The same bytes already stored is a no-op rerun, not an error.
+					const rerun = run(jobId, stepName, "exists", "release bytes");
+					expect(rerun.result.status, rerun.result.stderr).toBe(0);
+					expect(rerun.uploads).toEqual([]);
+					expect(rerun.result.stdout).toContain("unchanged");
 				});
 			});
 		}
