@@ -1258,8 +1258,18 @@ jobs:
             aws s3api head-object --bucket "$R2_BUCKET" --key "$key" \
               --endpoint-url "$R2_ENDPOINT_URL" >/tmp/head.json 2>/tmp/head.err || head_status=$?
             if [ "$head_status" -eq 0 ]; then
-              echo "Refusing to overwrite existing beta object ${key}" >&2
-              exit 1
+              # The same beta version reuses its immutable prefix on a re-run: objects this
+              # workflow itself already published must let the run finish. Only bytes that differ
+              # from this build are refused.
+              aws s3 cp "s3://${R2_BUCKET}/${key}" /tmp/existing.bin --endpoint-url "$R2_ENDPOINT_URL" --quiet
+              existing_digest=$(sha256sum /tmp/existing.bin | cut -d' ' -f1)
+              rm -f /tmp/existing.bin
+              if [ "$existing_digest" != "$local_digest" ]; then
+                echo "Refusing to overwrite ${key}: stored ${existing_digest}, build ${local_digest}" >&2
+                exit 1
+              fi
+              echo "unchanged ${key}"
+              continue
             elif [ "$head_status" -eq 254 ] && grep -qE '^An error occurred \((404|NotFound|NoSuchKey)\) when calling the HeadObject operation' /tmp/head.err; then
               echo "absent ${key}"
             else
