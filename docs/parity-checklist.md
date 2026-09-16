@@ -148,25 +148,43 @@ second LLM turn over `previousTurns` with its own retry policy, events
   (running empty answer -> running partial -> complete; abort -> cancelled with
   the partial answer).
 
-## 4. Chunked snapshot streaming - missing (wire types present)
+## 4. Chunked snapshot streaming - done
 
-TS: `daemon-supervisor.ts` `streamSnapshot` (L5413): when the client
-advertises `chunked_snapshot`, attach snapshots stream as
-`session_snapshot_begin` / `session_snapshot_chunk` / `session_snapshot_end`
-over a transcript cache with reservations, duplicate validation, and abort
-signals.
+TS: `daemon-supervisor.ts` `streamSnapshot` (L5413) +
+`createStreamedAttachResult` (L5397), `daemon-mode.ts`
+`snapshotTransferId` + `createSnapshotTranscriptChunks`
+(`snapshot-transcript-cache.ts`, `SNAPSHOT_TARGET_CHUNK_BYTES` = 512 KiB):
+when the client advertises `chunked_snapshot`, the attach response omits the
+transcript (`messages` arrays emptied, `snapshotStream` descriptor added)
+and the snapshot streams as `session_snapshot_begin` /
+`session_snapshot_chunk` / `session_snapshot_end` records, one message
+array per record under the byte budget, ids shared across response and
+records.
 
-- missing: `crates/pa-types/src/daemon.rs` has `SessionSnapshotBegin`/`Chunk`/
-  `End`/`Failed` event shapes and `crates/pa-daemon/src/protocol.rs`
-  advertises the `chunked_snapshot` capability, but the supervisor never emits
-  them: attach always returns the full snapshot inside the response
-  (`crates/pa-daemon/src/supervisor.rs` route + `worker.rs` handle_attach).
+- done: `crates/pa-daemon/src/snapshot_stream.rs` (chunking, streamed-result
+  rewrite, event/failed record construction, capability normalization);
+  `crates/pa-daemon/src/supervisor.rs` routes attach/reattach for chunked
+  clients through it; legacy clients keep the full snapshot in the response.
+  The attach result now echoes the client's own capability set (live TS
+  golden; previously the supervisor's worker-facing set leaked).
+- verifier: `crates/pa-daemon/tests/supervisor_e2e.rs`
+  `chunked_snapshot_attach_streams_begin_chunk_end` (scripted 700 KB
+  transcript -> multi-chunk stream; reassembled transcript equals the
+  legacy client's full snapshot; snapshot id is
+  `<activeSessionId>-<generation>-<sequence>` from the event cursor) +
+  unit tests in `snapshot_stream.rs` (budget, oversized-message, failed
+  path, capability normalization). Live-TS golden:
+  `crates/pa-daemon/tests/goldens/chunked-attach-live-ts.json`, captured
+  read-only from `/tmp/prime-agent-1000/daemon.sock` (10-message session ->
+  1 chunk; 2219-message session -> 5 chunks of <= 512 KiB; client
+  capability echo; purpose `attach`).
+- design deviation (PORTING-NOTES): the Rust supervisor materializes the
+  whole snapshot before writing the streamed response, so the TS async
+  abort/reservation machinery collapses into the synchronous dispatch;
+  a malformed worker transcript surfaces as `session_snapshot_failed`
+  after the response, a snapshotless worker payload fails the attach
+  before any record exists.
 
-Follow-up spec (daemon lane): emit begin/chunk/end from the existing attach
-payload when the client capability is present, chunking the `messages` array
-by a target byte budget (~256 KiB); keep the non-chunked path for legacy
-clients. Differential verifier: golden event sequence captured from the TS
-supervisor with a chunked-snapshot client.
 
 ## 5. Compaction daemon wiring (`compact` on the daemon session) - missing
 

@@ -215,3 +215,43 @@ captures the pane, and asserts the structural contract + editor keys
   compares socket objects; under the supervisor split its observable behavior
   matches for the single-client flow).
 origin/main
+
+## Chunked snapshot streaming lane notes
+
+- Chunked attach (`chunked_snapshot` capability) is
+  `pa-daemon/src/snapshot_stream.rs`: the supervisor rewrites the worker's
+  attach result the way TS `createStreamedAttachResult` does - the snapshot
+  keeps an empty `messages` array, the top-level `messages` copy is dropped
+  (slim results never had one), and a `snapshotStream` descriptor
+  (`{id, messageCount, targetChunkBytes}`) is added - then emits
+  `session_snapshot_begin` / `session_snapshot_chunk` /
+  `session_snapshot_end` records after the response.
+- Byte budget is TS `SNAPSHOT_TARGET_CHUNK_BYTES` (512 KiB, not the ~256 KiB
+  the task sketch guessed): each chunk record's `messages` array is
+  serialized compact and flushed before exceeding the budget; a single
+  oversized message travels alone and is never split.
+- Snapshot id parity: the live TS daemon names it
+  `<activeSessionId>-<generation>-<sequence>` from the event cursor
+  (`daemon-mode.ts` `snapshotTransferId`), e.g. `d3ad819c5e92-427baf366601-567`.
+  The supervisor-side sha256 revision in `daemon-supervisor.ts`
+  `getOrCreateTranscriptCache` is the fallback for workers that do not
+  stream; since the Rust worker returns full snapshots, the cursor format is
+  the one clients actually see on the wire and is what the Rust port uses.
+- `purpose` on `session_snapshot_begin` is `attach` for attach and
+  `replacement` for reattach; the TS catch-up purpose value is `resync` on
+  the wire, so `pa_types::daemon::SnapshotPurpose::Catchup` now serializes
+  as `resync` (was a latent `catchup` wire divergence).
+- Design deviation: the Rust supervisor materializes the whole snapshot
+  before writing the streamed response (TS streams chunks asynchronously
+  after the response with abort controllers and transcript reservations).
+  The synchronous dispatch keeps the same client-visible record order and
+  makes mid-command aborts impossible; a malformed worker transcript
+  surfaces as `session_snapshot_failed` after the response (TS: transcript
+  cache failure mid-stream), and a snapshotless worker payload fails the
+  attach itself before any record exists (TS: `attachClient` throws).
+- `session_snapshot_failed` for genuine mid-stream aborts (TS aborts the
+  transfer on `session_closed`) does not occur: the supervisor's write loop
+  breaks the connection on socket errors exactly when TS destroys it.
+- The attach result now echoes the client's own (normalized) capability
+  set, matching the live TS golden; a capability-less client sees
+  `["attach_snapshot","event_sequence"]`.

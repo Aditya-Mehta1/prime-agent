@@ -153,11 +153,15 @@ pub struct SocketIdentity {
     pub ino: u64,
 }
 
+/// Purpose tag of a `session_snapshot_begin` record. The catch-up value is
+/// `resync` on the wire (`daemon-protocol.ts`:
+/// `"attach" | "replacement" | "resync"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SnapshotPurpose {
     Attach,
     Replacement,
+    #[serde(rename = "resync")]
     Catchup,
 }
 
@@ -384,6 +388,7 @@ pub enum DaemonOutbound {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn response_and_error_info_roundtrip() {
@@ -395,6 +400,27 @@ mod tests {
         );
         rt::<DaemonOutbound>(
             r#"{"type":"response","command":"import_jsonl","success":false,"error":"e","errorInfo":{"code":"session_import_file_not_found","filePath":"/x"}}"#,
+        );
+    }
+
+    #[test]
+    fn snapshot_purpose_tags_match_the_wire() {
+        assert_eq!(
+            serde_json::to_value(SnapshotPurpose::Attach).unwrap(),
+            json!("attach")
+        );
+        assert_eq!(
+            serde_json::to_value(SnapshotPurpose::Replacement).unwrap(),
+            json!("replacement")
+        );
+        // The catch-up purpose is `resync` on the wire, never `catchup`.
+        assert_eq!(
+            serde_json::to_value(SnapshotPurpose::Catchup).unwrap(),
+            json!("resync")
+        );
+        assert_eq!(
+            serde_json::from_value::<SnapshotPurpose>(json!("resync")).unwrap(),
+            SnapshotPurpose::Catchup
         );
     }
 

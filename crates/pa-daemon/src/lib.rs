@@ -17,6 +17,7 @@ pub mod protocol;
 pub mod session_stats;
 pub mod session_store;
 pub mod side_question;
+pub mod snapshot_stream;
 pub mod socket;
 pub mod supervisor;
 pub mod types;

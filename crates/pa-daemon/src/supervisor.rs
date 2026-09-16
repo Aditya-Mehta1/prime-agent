@@ -16,7 +16,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use pa_types::daemon::{
     DaemonCommand, DaemonOutbound, DaemonWorkerDescriptor, DaemonWorkerLifecycle,
-    DurableDaemonCreateCommand,
+    DurableDaemonCreateCommand, SnapshotPurpose,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -38,6 +38,7 @@ use crate::protocol::{
     DAEMON_SCHEMA_REVISION,
 };
 use crate::session_store::{find_most_recent_session_for_cwd, list_sessions};
+use crate::snapshot_stream::{attach_client_capabilities, stream_attach, wants_chunked};
 use crate::worker::{
     WORKER_ACTIVE_SESSION_ID_ENV, WORKER_INSTANCE_ID_ENV, WORKER_RECOVERY_JOURNAL_ENV,
     WORKER_ROLE_ENV, WORKER_SCRIPT_ENV, WORKER_SOCKET_ENV, WORKER_SUPERVISOR_SOCKET_ENV,
@@ -1273,9 +1274,19 @@ impl Supervisor {
                 // Worker replies carry no client request id; clients match
                 // responses by the id they sent, so stamp it back here.
                 response.id = Some(command_id.clone());
-                if let DaemonCommand::Attach { .. } | DaemonCommand::Reattach { .. } = command {
+                if let DaemonCommand::Attach {
+                    capabilities,
+                    supports_extension_ui,
+                    ..
+                }
+                | DaemonCommand::Reattach {
+                    capabilities,
+                    supports_extension_ui,
+                    ..
+                } = command
+                {
                     if response.success {
-                        if let Some(data) = &response.data {
+                        if let Some(data) = response.data.as_mut() {
                             let active_id = data
                                 .get("activeSessionId")
                                 .and_then(Value::as_str)
@@ -1283,6 +1294,24 @@ impl Supervisor {
                                 .unwrap_or_else(|| resident.worker_id.clone());
                             if !attached.iter().any(|id| id == &active_id) {
                                 attached.push(active_id.clone());
+                            }
+                            // The client's own capability set, not the
+                            // supervisor's worker-facing one, is echoed in
+                            // the attach result.
+                            let client_capabilities = attach_client_capabilities(
+                                capabilities.as_deref(),
+                                *supports_extension_ui,
+                            );
+                            if let Some(client) = data.get_mut("client") {
+                                client["capabilities"] = json!(client_capabilities.clone());
+                            }
+                            if wants_chunked(&client_capabilities) {
+                                let purpose = if matches!(command, DaemonCommand::Reattach { .. }) {
+                                    SnapshotPurpose::Replacement
+                                } else {
+                                    SnapshotPurpose::Attach
+                                };
+                                return streamed_attach_lines(response, &active_id, purpose);
                             }
                             return (vec![response_line(&response)], false);
                         }
@@ -1341,6 +1370,41 @@ impl Supervisor {
         // Wake the accept loop only after the workers stopped, so the process
         // cannot exit mid-stop and orphan a live worker.
         self.shutdown_notify.notify_one();
+    }
+}
+
+/// Attach outcome for a `chunked_snapshot` client: the response carries the
+/// snapshot header with an empty transcript plus a `snapshotStream`
+/// descriptor, and the transcript follows as `session_snapshot_begin` /
+/// `session_snapshot_chunk` / `session_snapshot_end` records. A snapshot
+/// that cannot be transferred after the response surfaces as
+/// `session_snapshot_failed` keyed by the same snapshot id.
+fn streamed_attach_lines(
+    mut response: DaemonResponse,
+    active_session_id: &str,
+    purpose: SnapshotPurpose,
+) -> (Vec<Value>, bool) {
+    let Some(data) = response.data.take() else {
+        return (vec![response_line(&response)], false);
+    };
+    match stream_attach(data, active_session_id, purpose) {
+        Ok((streamed, events)) => {
+            response.data = Some(streamed);
+            let mut lines = vec![response_line(&response)];
+            lines.extend(events.lines());
+            (lines, false)
+        }
+        // The snapshot could not even be identified: the attach itself
+        // fails, before any snapshot record exists on the wire.
+        Err(error) => (
+            vec![response_line(&response_failure(
+                response.id.as_deref(),
+                &response.command,
+                &error.to_string(),
+                None,
+            ))],
+            false,
+        ),
     }
 }
 
