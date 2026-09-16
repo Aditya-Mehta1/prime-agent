@@ -1207,6 +1207,93 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         elapsed = time.monotonic() - start
         self.assertLess(elapsed, 1.5)
 
+    async def test_refuses_env_chdir_and_execdir_relocations(self):
+        self._make_tree()
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        # env -C/--chdir and find -execdir relocate the invocation into
+        # directories the resolver cannot replay, so they are refused.
+        for command in [
+            "env -C / chmod -R 755 .",
+            "env --chdir / chmod -R 755 .",
+            "env -C ~ chmod -R 755 .",
+            "find / -execdir chmod -R 755 . \\;",
+            "find . -execdir chown -R user . +",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command, home=home.name)
+                self.assertIn("changes directory", message)
+                self.assertTrue(Path(home.name, "keep.txt").exists())
+        # env without a chdir stays fine.
+        result = await self._run("env FOO=1 chmod -R 755 sub")
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_refuses_env_split_string_payloads(self):
+        self._make_tree()
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        # GNU env -S splits the string and executes it: the payload is
+        # scanned like any wrapper payload.
+        for command in [
+            "env -S 'chmod -R 755 ~'",
+            'env -S "chown -R user ~"',
+            "env --split-string='chmod -R 755 ~'",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command, home=home.name)
+                self.assertIn("Refusing to run this recursive chmod/chown command", message)
+                self.assertTrue(Path(home.name, "keep.txt").exists())
+        result = await self._run("env -S 'echo hi'")
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_command_prefix_relocation_refuses_wrapper_scripts(self):
+        self._make_tree()
+        # A relocating command prefix moves the shell before every
+        # command, so a relative wrapper script cannot be resolved
+        # against the workspace.
+        with mock.patch.dict(
+            os.environ,
+            {"PRIME_AGENT_BASH_COMMAND_PREFIX": "cd /tmp"},
+        ):
+            message = await self._refused("bash safe-name.sh")
+        self.assertIn("changes directory", message)
+
+    async def test_bundled_option_values_do_not_skip_scripts(self):
+        self._make_tree()
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        Path(outside.name, "evil.sh").write_text("chmod -R 755 /\n")
+        evil = str(Path(outside.name, "evil.sh"))
+        # An option value bundled inside the same word (-ovi) must not
+        # make the walk drop the real script operand.
+        message = await self._refused(f"bash -ovi {evil}")
+        self.assertIn("outside the kernel workspace", message)
+        result = await self._run("bash -ovi ./script.sh || true")
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_source_path_hits_resolve_fully(self):
+        self._make_tree()
+        # A PATH hit is realpath'd before the location check, and a PATH
+        # assignment inside the command makes the resolution unresolvable.
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        Path(outside.name, "sub").mkdir(parents=True, exist_ok=True)
+        Path(outside.name, "sub", "pa-guard-path.sh").write_text("chmod -R 755 /\n")
+        victim = Path(outside.name, "sub", "pa-guard-path.sh")
+        inside_link_dir = Path(self.test_dir, "bindir")
+        inside_link_dir.mkdir()
+        os.symlink(str(Path(outside.name, "sub")), str(inside_link_dir / "linkdir"))
+        with mock.patch.dict(
+            os.environ,
+            {"PATH": os.environ["PATH"] + os.pathsep + str(inside_link_dir / "linkdir")},
+        ):
+            message = await self._refused("source pa-guard-path.sh")
+        self.assertIn("outside the kernel workspace", message)
+        message = await self._refused("PATH=/nonexistent source x.sh")
+        self.assertIn("outside the kernel workspace", message)
+
     async def test_xargs_false_positives_stay_allowed(self):
         # The xargs walk must stop at the command word: an operand named
         # xargs and a later xargs in a separate pipeline are not wraps.
