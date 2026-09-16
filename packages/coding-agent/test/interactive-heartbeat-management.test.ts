@@ -113,6 +113,51 @@ describe("interactive heartbeat management", () => {
 		expect(harness.refreshHeartbeatCatalog).toHaveBeenCalledOnce();
 	});
 
+	it("drops the stale row when the daemon no longer knows the heartbeat", async () => {
+		const stale = heartbeat({ activeSessionId: "gone-session" });
+		const entry = { job: stale, sessionName: "Gone session" };
+		const harness = Object.create(InteractiveMode.prototype) as HeartbeatManagementHarness;
+		harness.heartbeatCatalog = [entry];
+		harness.connectionState = { activeSessionId: "current-session" };
+		harness.agentConnection = {
+			manageHeartbeat: vi.fn(async () => {
+				throw new Error("No active heartbeat found: heartbeat-1");
+			}),
+		};
+		harness.patchConnectionState = vi.fn();
+		harness.applyHeartbeatCatalog = vi.fn();
+		harness.refreshHeartbeatCatalog = vi.fn(async () => {});
+
+		await expect(harness.manageHeartbeat(entry, "stop")).resolves.toBe(undefined);
+
+		expect(harness.agentConnection.manageHeartbeat).toHaveBeenCalledWith("gone-session", "heartbeat-1", "stop");
+		expect(harness.applyHeartbeatCatalog).toHaveBeenCalledWith([]);
+		expect(harness.refreshHeartbeatCatalog).toHaveBeenCalledOnce();
+		expect(harness.patchConnectionState).not.toHaveBeenCalled();
+	});
+
+	it("clears the local heartbeat when the stale row is the current session's own", async () => {
+		const stale = heartbeat({ activeSessionId: "current-session" });
+		const entry = { job: stale, sessionName: "Primary session" };
+		const harness = Object.create(InteractiveMode.prototype) as HeartbeatManagementHarness;
+		harness.heartbeatCatalog = [entry];
+		harness.connectionState = { activeSessionId: "current-session" };
+		harness.agentConnection = {
+			manageHeartbeat: vi.fn(async () => {
+				throw new Error("No active heartbeat found: heartbeat-1");
+			}),
+		};
+		harness.patchConnectionState = vi.fn();
+		harness.applyHeartbeatCatalog = vi.fn();
+		harness.refreshHeartbeatCatalog = vi.fn(async () => {});
+
+		await expect(harness.manageHeartbeat(entry, "stop")).resolves.toBe(undefined);
+
+		expect(harness.patchConnectionState).toHaveBeenCalledWith({ heartbeat: null });
+		expect(harness.applyHeartbeatCatalog).toHaveBeenCalledWith([]);
+		expect(harness.refreshHeartbeatCatalog).toHaveBeenCalledOnce();
+	});
+
 	it("scopes the catalog to the current session and its subagents", () => {
 		const own = { job: heartbeat() };
 		const child = {

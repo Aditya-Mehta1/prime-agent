@@ -10345,11 +10345,28 @@ export class InteractiveMode {
 		// cannot later revert its result; the action itself is authoritative
 		// and always applies.
 		const actionSeq = ++this.heartbeatCatalogSeq;
-		const updated = await this.agentConnection.manageHeartbeat(
-			heartbeat.job.activeSessionId,
-			heartbeat.job.id,
-			action,
-		);
+		let updated: AgentCronJob;
+		try {
+			updated = await this.agentConnection.manageHeartbeat(heartbeat.job.activeSessionId, heartbeat.job.id, action);
+		} catch (error) {
+			// A heartbeat whose owning session closed is no longer tracked by the daemon
+			// (the session cancelled its scheduled jobs): drop the stale row instead of
+			// wedging the Heartbeats screen on an entry that can never be managed.
+			if (!(error instanceof Error) || !error.message.startsWith("No active heartbeat found:")) {
+				throw error;
+			}
+			if (
+				action === "stop" &&
+				heartbeat.job.source === "heartbeat" &&
+				heartbeat.job.activeSessionId === this.connectionState?.activeSessionId
+			) {
+				this.patchConnectionState({ heartbeat: null });
+			}
+			this.heartbeatCatalogAppliedSeq = Math.max(this.heartbeatCatalogAppliedSeq, actionSeq);
+			this.applyHeartbeatCatalog(this.heartbeatCatalog.filter((entry) => entry.job.id !== heartbeat.job.id));
+			void this.refreshHeartbeatCatalog().catch(() => undefined);
+			return;
+		}
 		if (updated.source === "heartbeat" && updated.activeSessionId === this.connectionState?.activeSessionId) {
 			this.patchConnectionState({ heartbeat: action === "stop" ? null : updated });
 		}

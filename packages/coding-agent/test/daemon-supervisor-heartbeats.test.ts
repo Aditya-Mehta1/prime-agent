@@ -8,6 +8,7 @@ import {
 	DaemonSupervisor,
 	HEARTBEAT_LIST_FORWARD_TIMEOUT_MS,
 	HEARTBEAT_LIST_LAUNCH_WAIT_MS,
+	HEARTBEAT_MANAGE_FORWARD_TIMEOUT_MS,
 } from "../src/modes/daemon/daemon-supervisor.js";
 
 interface SupervisorHarness {
@@ -203,6 +204,58 @@ describe("daemon supervisor heartbeat aggregation", () => {
 		);
 	});
 
+	it("reports a gone heartbeat when the owning session is closed", async () => {
+		const supervisor = createSupervisorHarness();
+		// No workers and no durable session artifacts: the session closed and its
+		// scheduled jobs were cancelled with it, so the routing lookup fails.
+		supervisor.findWorkerForClient = vi.fn(async () => {
+			throw new Error("Unknown active session: gone-session");
+		});
+
+		await expect(
+			supervisor.handleCommand({} as DaemonSocketClient, {
+				id: "manage-gone",
+				type: "heartbeat_manage",
+				activeSessionId: "gone-session",
+				jobId: "heartbeat-1",
+				action: "stop",
+			}),
+		).rejects.toThrow("No active heartbeat found: heartbeat-1");
+	});
+
+	it("fails the manage forward when the worker outlives its budget", async () => {
+		vi.useFakeTimers();
+		try {
+			const supervisor = createSupervisorHarness();
+			const target = {
+				...worker("ready"),
+				heartbeatSnapshot: [{ job: { id: "heartbeat-1", activeSessionId: "session-1" } }],
+			};
+			supervisor.workers.set("target", target);
+			supervisor.forwardToWorker = vi.fn(() => new Promise<DaemonResponse>(() => {}));
+
+			const pending = supervisor.handleCommand({} as DaemonSocketClient, {
+				id: "manage-1",
+				type: "heartbeat_manage",
+				activeSessionId: "session-1",
+				jobId: "heartbeat-1",
+				action: "stop",
+			});
+			await vi.advanceTimersByTimeAsync(HEARTBEAT_MANAGE_FORWARD_TIMEOUT_MS);
+			await expect(pending).resolves.toMatchObject({
+				success: false,
+				error: expect.stringContaining("Timed out waiting for session worker to manage heartbeats"),
+			});
+			expect(supervisor.forwardToWorker).toHaveBeenCalledWith(
+				target,
+				expect.objectContaining({ type: "heartbeat_manage", jobId: "heartbeat-1" }),
+				HEARTBEAT_MANAGE_FORWARD_TIMEOUT_MS,
+			);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("uses the last complete worker snapshot during recovery", async () => {
 		const supervisor = createSupervisorHarness();
 		const first = worker("ready");
@@ -349,6 +402,7 @@ describe("daemon supervisor heartbeat aggregation", () => {
 		expect(supervisor.forwardToWorker).toHaveBeenCalledWith(
 			target,
 			expect.objectContaining({ type: "heartbeat_manage", jobId: "heartbeat-1" }),
+			HEARTBEAT_MANAGE_FORWARD_TIMEOUT_MS,
 		);
 		expect(target.heartbeatSnapshot).toEqual([]);
 	});

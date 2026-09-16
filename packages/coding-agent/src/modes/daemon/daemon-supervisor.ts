@@ -202,6 +202,10 @@ export const HEARTBEAT_LIST_LAUNCH_WAIT_MS = 15_000;
 // worker request default (24h) would turn a stuck worker into a client transport
 // timeout instead of a daemon-side failure.
 export const HEARTBEAT_LIST_FORWARD_TIMEOUT_MS = 25_000;
+// A stuck or still-recovering worker must fail inside the caller's request budget
+// (the client default is 30s) instead of wedging the Heartbeats screen behind the
+// 24h worker-request default — the same bound the list path carries.
+export const HEARTBEAT_MANAGE_FORWARD_TIMEOUT_MS = 25_000;
 const INPUT_PAUSE_CLEANUP_TIMEOUT_MS = 5_000;
 const UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS = 80_000;
 const UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS = 90_000;
@@ -2421,9 +2425,35 @@ export class DaemonSupervisor {
 						}
 					}
 				}
-				const worker = cachedWorker ?? (await this.findWorkerForClient(client, command.activeSessionId)).worker;
+				// A session that closed with reason "killed" cancels its scheduled jobs, so
+				// no cached snapshot, no passive store entry, and no addressable worker
+				// mean the heartbeat is gone — report that honestly instead of surfacing
+				// the session-routing error from findWorkerForClient.
+				let worker = cachedWorker;
+				if (!worker) {
+					try {
+						worker = (await this.findWorkerForClient(client, command.activeSessionId)).worker;
+					} catch (error) {
+						if (error instanceof Error && error.message.startsWith("Unknown active session:")) {
+							throw new Error(`No active heartbeat found: ${command.jobId}`);
+						}
+						throw error;
+					}
+				}
 				this.assertWorkerAccessibleToClient(client, worker, command.activeSessionId);
-				const response = await this.forwardToWorker(worker, command);
+				// A stuck or still-recovering worker must fail inside the caller's request
+				// budget instead of wedging the Heartbeats screen behind the 24h worker
+				// request default; a stop that lands after the deadline still converges the
+				// durable store and heartbeats_changed re-syncs the client.
+				const forward = this.forwardToWorker(worker, command, HEARTBEAT_MANAGE_FORWARD_TIMEOUT_MS);
+				const forwardDeadline = unrefDelay(HEARTBEAT_MANAGE_FORWARD_TIMEOUT_MS).then(() => {
+					throw new Error(
+						`Timed out waiting for session worker to manage heartbeats within ${HEARTBEAT_MANAGE_FORWARD_TIMEOUT_MS}ms`,
+					);
+				});
+				const response = await Promise.race([forward, forwardDeadline]).catch((error: unknown) =>
+					failure(command.id, command.type, error, serializeDaemonError(error)),
+				);
 				if (
 					response.success &&
 					response.data &&

@@ -1,0 +1,1 @@
+- Fixed the Heartbeats screen wedging after its session closed: stopping a heartbeat whose session is gone now fails fast inside the request budget instead of hanging behind a stuck worker, reports "No active heartbeat found" instead of a misleading "Unknown active session", and drops the stale row from the view.
