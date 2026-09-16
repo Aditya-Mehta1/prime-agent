@@ -8,6 +8,7 @@
 //! decides admission and persists what the loop produces.
 
 pub mod branch_summarization;
+pub mod compact_session;
 pub mod compaction;
 pub mod compaction_exec;
 pub mod compaction_utils;
@@ -22,6 +23,7 @@ use pa_types::session::AgentMessage as SessionAgentMessage;
 use pa_types::session::FileEntry;
 
 use crate::session::manager::SessionManager;
+use crate::session_engine::compaction_exec::CompactionResult;
 use crate::skills::PromptTemplate;
 use slash_commands::{parse_session_command, SessionSlashCommand, SlashCommandRegistry};
 
@@ -85,6 +87,43 @@ impl AgentSession {
             prompt_templates,
             slash_commands: SlashCommandRegistry::builtin(),
         }
+    }
+
+    /// Execute `/compact`: summarize the pre-cut prefix, persist the
+    /// compaction entry, and rebuild the loop context summary-first.
+    pub async fn compact(
+        &self,
+        custom_instructions: Option<&str>,
+        model: &pa_types::ai::Model,
+        api_key: Option<String>,
+    ) -> anyhow::Result<CompactionResult> {
+        let result = {
+            let mut session = self.session.lock().await;
+            crate::session_engine::compact_session::execute_compaction(
+                &mut session,
+                crate::session_engine::compact_session::CompactOptions {
+                    model: model.clone(),
+                    api_key,
+                    custom_instructions,
+                    settings: crate::session_engine::compaction::CompactionSettings::default(),
+                },
+            )
+            .await?
+        };
+        // Rebuild the loop context from the post-compaction session.
+        let rebuilt = {
+            let session = self.session.lock().await;
+            crate::session_engine::compact_session::rebuilt_context_after_compaction(&session)
+        };
+        let loop_messages: Vec<AgentMessage> = rebuilt
+            .into_iter()
+            .filter_map(|message| {
+                let value = serde_json::to_value(&message).ok()?;
+                serde_json::from_value::<AgentMessage>(value).ok()
+            })
+            .collect();
+        self.agent.set_messages(loop_messages).await;
+        Ok(result)
     }
 
     /// The underlying agent loop (steering, state, subscriptions).
