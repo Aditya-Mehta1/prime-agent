@@ -570,14 +570,46 @@ class ForcePushScanCostTest(unittest.TestCase):
                 self.assertTrue(
                     "scan budget" in outcome or "Refusing to run" in outcome, outcome
                 )
-        # The bare nesting (no `eval` wrapper, so no payload) is refused by the
-        # scan budget itself, and says so.
-        for depth in (5, 6):
+        # Deep nesting has its own reason and message: the cap, not the budget.
+        for depth in (4, 6):
             command = _nested_substitutions(depth, 3)
             with self.subTest(shape=f"bare depth{depth}", length=len(command)):
                 elapsed, outcome = self._probe_guard(command)
                 self.assertLess(elapsed, SCAN_BUDGET_SECONDS)
-                self.assertIn("scan budget", outcome, outcome)
+                self.assertIn("nest more than", outcome, outcome)
+        # The budget itself is a backstop for recursive blowup within the cap:
+        # thousands of sibling re-scans, which is not something an agent writes.
+        wide = " ".join("$(a)" for _ in range(6000))
+        elapsed, outcome = self._probe_guard(wide)
+        self.assertLess(elapsed, SCAN_BUDGET_SECONDS)
+        self.assertIn("scan budget", outcome)
+
+    def test_long_benign_text_is_never_refused_for_its_length(self):
+        # The budget counts nested re-scans, not characters: a long flat or
+        # multi-line command is ordinary text and must run. These shapes were
+        # refused for being a few KB long before the budget was reworked.
+        long_echo = "\n".join("echo hello world" for _ in range(2000))
+        long_loop = "\n".join("for f in *.txt; do echo $f; done" for _ in range(200))
+        long_heredoc = (
+            "python - <<'EOF'\n"
+            + "\n".join(f"print({index})" for index in range(1000))
+            + "\nEOF\n"
+        )
+        long_case = "\n".join("case $x in a) echo a;; esac" for _ in range(500))
+        cases = [
+            ("echo x2000", long_echo),
+            ("loop x200", long_loop),
+            ("heredoc 10.9KB", long_heredoc),
+            ("case x500", long_case),
+        ]
+        for name, command in cases:
+            with self.subTest(shape=name, length=len(command)):
+                self.assertGreaterEqual(len(command), 6_000)
+                elapsed, outcome = self._probe_guard(command)
+                self.assertLess(elapsed, SCAN_BUDGET_SECONDS)
+                self.assertIn("allowed", outcome, outcome)
+        # The longest one is well past 30 KB.
+        self.assertGreaterEqual(len(long_echo), 30_000)
 
     def test_realistic_nesting_is_not_refused_by_the_budget(self):
         # The budget must be generous for anything a person would really write.

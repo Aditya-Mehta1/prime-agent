@@ -1078,23 +1078,28 @@ class ForcePushRefusalError(RuntimeError):
 # deterministic work budget (units of scanned text, never wall-clock time) and
 # refuses when it runs out: a command the guard could not finish scanning is
 # refused, never allowed.
-# The budget is a base plus a small allowance per command character, so a long
-# but flat command (a heredoc, a big `python -c` string) is never refused while
-# the exponential shapes are: the three linear passes plus the top-level word
-# scan charge about four units per character, and the nesting multiplier is
-# what eats the rest. Measured charges: realistic commands (nested `$(...)`,
-# `eval`/`sh -c` payloads, pipelines) spend 100-5200 units; a plain 200 KB
-# command spends 800K against a 3.4M budget; nested-substitution shapes spend
-# 1.6M (depth 3) to 238M (depth 6) and are refused in milliseconds.
-_FP_SCAN_WORK_BUDGET_BASE = 250_000
-_FP_SCAN_WORK_BUDGET_PER_CHARACTER = 16
-# Nesting deeper than this is refused too: it keeps Python's recursion shallow
-# and bounds the exponential before the budget has to.
-_FP_MAX_SUBSTITUTION_DEPTH = 12
+# The budget counts NESTED RE-SCANS, not characters: entering a substitution
+# interior, a payload, or an alias body costs one unit, and the linear passes
+# (normalization, redaction masking, escape folding, the top-level word scan)
+# cost nothing. Length alone must never be a reason to refuse - a 34 KB heredoc
+# is ordinary text - while the shapes that really blow up are the ones with
+# exponentially many nested re-scans (depth x fanout). Measured entries: a flat
+# 34 KB command 0; realistic commands with a few substitutions or payloads
+# 1-400; the nesting shapes 81 (depth 4 fanout 3) up to 2187 (backtick depth 7
+# fanout 3).
+_FP_SCAN_WORK_BUDGET = 4_000
+# Nesting deeper than this is refused on its own, with its own message: three
+# levels of nested substitution is already more than any real command needs,
+# and the cap keeps Python's recursion shallow.
+_FP_MAX_SUBSTITUTION_DEPTH = 3
 
 
 class _FpScanLimitExceeded(Exception):
-    """The scan budget or the substitution-nesting cap was reached."""
+    """The scan budget ran out: too many nested re-scans."""
+
+
+class _FpNestingTooDeep(Exception):
+    """Command substitutions nest deeper than the guard follows."""
 
 
 class _FpScanBudget:
@@ -1103,13 +1108,10 @@ class _FpScanBudget:
     __slots__ = ("remaining", "depth")
 
     def __init__(self, command_length: int = 0) -> None:
-        self.remaining = (
-            _FP_SCAN_WORK_BUDGET_BASE
-            + _FP_SCAN_WORK_BUDGET_PER_CHARACTER * command_length
-        )
+        self.remaining = _FP_SCAN_WORK_BUDGET
         self.depth = 0
 
-    def charge(self, amount: int) -> None:
+    def charge(self, amount: int = 1) -> None:
         self.remaining -= amount
         if self.remaining < 0:
             raise _FpScanLimitExceeded()
@@ -1117,7 +1119,7 @@ class _FpScanBudget:
     def descend(self) -> None:
         self.depth += 1
         if self.depth > _FP_MAX_SUBSTITUTION_DEPTH:
-            raise _FpScanLimitExceeded()
+            raise _FpNestingTooDeep()
 
     def ascend(self) -> None:
         self.depth -= 1
@@ -1159,7 +1161,6 @@ in` is the single word `main`. Every later step works on the string
     quotes the shell drops the pair too and resolves backslash escapes (so a
     `\\"` does not end the string).
     """
-    _fp_scan_charge(len(command))
     chars: list[str] = []
     quote: str | None = None
     comment = False
@@ -1222,7 +1223,6 @@ def _fp_mask_redirections(command: str) -> str:
     syntax); quoted data, comments, command substitution, and process
     substitution stay live so the guard keeps seeing what executes.
     """
-    _fp_scan_charge(len(command))
     chars = list(command)
     quote: str | None = None
     comment = False
@@ -1286,6 +1286,7 @@ def _fp_mask_redirections(command: str) -> str:
                 # mask redirections inside it too (its own redirects are
                 # syntax).
                 j = _fp_matching_paren(command, i + 1, n)
+                _fp_scan_charge()
                 _fp_scan_descend()
                 interior = _fp_mask_redirections(command[i + 2 : j])
                 _fp_scan_ascend()
@@ -1293,6 +1294,7 @@ def _fp_mask_redirections(command: str) -> str:
                 i = j
             elif ch == "`":
                 j = _fp_matching_backtick(command, i, n)
+                _fp_scan_charge()
                 _fp_scan_descend()
                 interior = _fp_mask_redirections(command[i + 1 : j])
                 _fp_scan_ascend()
@@ -1309,7 +1311,6 @@ def _fp_strip_escapes(command: str) -> tuple[str, list[int]]:
     origin main` must scan as `git push ...`. Quoted and commented spans keep
     their backslashes: those are data or syntax handled elsewhere.
     """
-    _fp_scan_charge(len(command))
     chars: list[str] = []
     index_map: list[int] = []
     quote: str | None = None
@@ -1496,7 +1497,6 @@ def _fp_matching_paren(command: str, open_index: int, end: int) -> int:
             elif ch == ")":
                 depth -= 1
                 if depth == 0:
-                    _fp_scan_charge(i - open_index)
                     return i
         elif quote == "'":
             if ch == "'":
@@ -1507,7 +1507,6 @@ def _fp_matching_paren(command: str, open_index: int, end: int) -> int:
         elif ch == '"':
             quote = None
         i += 1
-    _fp_scan_charge(end - open_index)
     return end - 1
 
 
@@ -1531,7 +1530,6 @@ def _fp_matching_backtick(command: str, open_index: int, end: int) -> int:
             _fp_scan_charge(i - open_index)
             return i
         i += 1
-    _fp_scan_charge(end - open_index)
     return end - 1
 
 
@@ -1548,11 +1546,17 @@ def _fp_scan_words(command: str) -> list[_FpShellWord]:
     """
     words: list[_FpShellWord] = []
 
-    def scan_region(start: int, end: int, *, starts_command: bool) -> None:
-        # The work a region costs is proportional to the text it walks, and a
-        # substitution interior is walked again at every level that contains
-        # it, so charging here is what makes the budget track the real cost.
-        _fp_scan_charge(end - start)
+    def scan_region(
+        start: int, end: int, *, starts_command: bool, nested: bool = True
+    ) -> None:
+        # One unit per nested re-scan, and no charge for the text itself: the
+        # top-level pass over what the agent wrote is O(n) and must never be a
+        # reason to refuse, while every interior this walk enters is another
+        # pass over text a deeper level already covered.
+        if not nested:
+            _scan_region(start, end, starts_command=starts_command)
+            return
+        _fp_scan_charge()
         _fp_scan_descend()
         try:
             _scan_region(start, end, starts_command=starts_command)
@@ -1671,7 +1675,7 @@ def _fp_scan_words(command: str) -> list[_FpShellWord]:
             i += 1
         flush(False)
 
-    scan_region(0, len(command), starts_command=True)
+    scan_region(0, len(command), starts_command=True, nested=False)
     return words
 
 
@@ -1680,7 +1684,6 @@ def _fp_contained_in_later_word(words: list[_FpShellWord], index: int) -> bool:
     sits inside the enclosing word, which the scanner appends after the
     interiors it recursed into. Interiors execute inside the substitution,
     so walkers must look through them, not stop at them."""
-    _fp_scan_charge(len(words) - index)
     word = words[index]
     return any(
         word.start >= later.start and word.end <= later.end
@@ -1694,7 +1697,6 @@ def _fp_invocation_tokens(words: list[_FpShellWord], index: int) -> list[str]:
     Everything up to the next command boundary is one invocation; a
     command-substitution interior is skipped because it runs as its own
     command and the enclosing word follows it."""
-    _fp_scan_charge(len(words) - index)
     tokens = [words[index].value]
     for follower_index in range(index + 1, len(words)):
         follower = words[follower_index]
@@ -1867,6 +1869,7 @@ def _fp_expand_one_inline_git_alias(
     body = aliases[subcommand]
     if body is None or _FP_UNRESOLVABLE_ALIAS_BODY.search(body):
         return _FP_UNRESOLVABLE_ALIAS
+    _fp_scan_charge()  # an alias body is re-scanned as argv
     words, well_formed = _fp_literal_words(body.strip())
     if not well_formed or not words or any(word is None for word in words):
         return _FP_UNRESOLVABLE_ALIAS
@@ -2442,6 +2445,7 @@ def _fp_payload_hides_force_push(payload: str, depth: int = 0) -> bool:
     refused rather than missed."""
     if depth > _FP_MAX_PAYLOAD_DEPTH:
         return True  # too deeply nested to follow: refuse rather than miss
+    _fp_scan_charge()  # entering a payload is one more nested re-scan
     normalized, _index_map = _fp_strip_escapes(
         _fp_mask_redirections(_fp_normalize_continuations(payload))
     )
@@ -3247,6 +3251,20 @@ def _fp_format_eval_refusal() -> str:
     )
 
 
+def _fp_format_nesting_refusal() -> str:
+    return "\n".join(
+        [
+            "Refusing to run this force-push command: its command substitutions"
+            f" nest more than {_FP_MAX_SUBSTITUTION_DEPTH} levels deep, which"
+            " the guard does not follow, so what it runs cannot be verified.",
+            "",
+            "Flatten the substitutions (or run the inner command directly), or"
+            " retry with bash(command, allow_force_push=True), or start the"
+            f" kernel with {BASH_FORCE_PUSH_BYPASS_ENV}=1.",
+        ]
+    )
+
+
 def _fp_format_scan_refusal() -> str:
     return "\n".join(
         [
@@ -3365,6 +3383,8 @@ def _guard_force_push(command: str, allow_force_push: bool) -> None:
     _active_scan_budget = _FpScanBudget(len(command))
     try:
         _fp_guard_force_push(command)
+    except _FpNestingTooDeep:
+        raise ForcePushRefusalError(_fp_format_nesting_refusal()) from None
     except _FpScanLimitExceeded:
         # The guard could not finish scanning: refuse rather than allow
         # something it never verified.
