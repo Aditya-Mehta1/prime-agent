@@ -2888,6 +2888,37 @@ export class AgentDaemon {
 		parentState: ActiveSessionState,
 		options: CreateRlmSubagentRuntimeOptions,
 	): Promise<AgentSessionRuntime> {
+		// The parent session checked this sibling name before admission started,
+		// but that check raced every other name consumer: the ledger edge — the
+		// only durable record of the name — lands only at the end of this method.
+		// Hold a daemon-wide reservation for the whole admission and re-assert
+		// availability at this boundary, so a same-name sibling (parallel spawn,
+		// rename, or hydration) that landed between the parent check and here
+		// fails closed instead of appending a duplicate durable edge that later
+		// selectors cannot disambiguate.
+		const nameReservation = {
+			name: options.sessionName,
+			depth: options.rlmDepth,
+			parentSessionId: options.parentSession.sessionId,
+			...(options.parentSession.sessionFile ? { parentSessionPath: options.parentSession.sessionFile } : {}),
+		};
+		const reservationKey = sessionNameReservationKey(nameReservation);
+		if (this.pendingSessionNames.has(reservationKey)) {
+			throw new Error(formatAgentSessionNameUnavailable(options.sessionName, options.rlmDepth));
+		}
+		this.pendingSessionNames.add(reservationKey);
+		try {
+			await this.assertFamilySessionNameAvailable(nameReservation, parentState, true);
+			return await this.admitRlmSubagentRuntime(parentState, options);
+		} finally {
+			this.pendingSessionNames.delete(reservationKey);
+		}
+	}
+
+	private async admitRlmSubagentRuntime(
+		parentState: ActiveSessionState,
+		options: CreateRlmSubagentRuntimeOptions,
+	): Promise<AgentSessionRuntime> {
 		const sessionManager = SessionManager.create(options.parentSession.sessionManager.getCwd(), options.sessionDir);
 		sessionManager.newSession({
 			parentSession: options.parentSession.sessionFile,
