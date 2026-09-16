@@ -139,12 +139,13 @@ This matters because the updater, not the installer, is how most users receive m
 
 ### The installer verifies when it can, and says so when it cannot
 
-`install.sh` downloads `SHA256SUMS.sigstore.json` next to `SHA256SUMS` and refuses to continue if the
-bundle is missing. When `cosign` is on `PATH` it verifies the bundle against the release workflow's
-identity and fails closed on any mismatch. A POSIX shell script cannot verify a Sigstore bundle by
-itself, so **without cosign a fresh `curl | sh` install rests on TLS and the same-origin checksum**,
-and the installer prints exactly that. Set `PRIME_AGENT_REQUIRE_SIGNATURE=1` to make a missing
-`cosign` a hard failure. From the first `prime-agent update` onward the compiled binary verifies every
+`install.sh` verifies `SHA256SUMS.sigstore.json` against the release workflow's identity. With
+`cosign` on `PATH` the bundle is **required** and must verify; any mismatch or missing bundle fails
+the install. A POSIX shell script cannot verify a Sigstore bundle without cosign, and an unverified
+bundle's presence proves nothing, so **without cosign a fresh `curl | sh` install rests on TLS and
+the same-origin checksum** - the installer prints exactly that - and historical releases that
+predate signatures still install. Set `PRIME_AGENT_REQUIRE_SIGNATURE=1` to make a missing `cosign`
+a hard failure. From the first `prime-agent update` onward the compiled binary verifies every
 release itself, with no fallback.
 
 ### Installations know who owns them

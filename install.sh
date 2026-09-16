@@ -2119,11 +2119,11 @@ prime_agent_verify_release_inventory() {
 		printf 'TEST MODE: release signature verification skipped (PRIME_AGENT_SKIP_SIGNATURE_FOR_TESTS=1).\n' >&2
 		return 0
 	fi
-	inventory_bundle="$inventory_path.sigstore.json"
-	if ! prime_agent_curl_download -fsSL --connect-timeout 10 --max-time 120 "$inventory_url_base/SHA256SUMS.sigstore.json" -o "$inventory_bundle"; then
-		printf 'error: the release signature (SHA256SUMS.sigstore.json) could not be downloaded. Refusing to install an unsigned inventory.\n' >&2
-		return 1
-	fi
+	# cosign decides how strict this can be. With cosign, the bundle is REQUIRED and must verify:
+	# that is the fail-closed path. Without cosign a bundle cannot be verified at all - its presence
+	# would prove nothing - so the install takes the documented TLS-and-checksum fallback instead of
+	# refusing historical releases that predate signatures. PRIME_AGENT_REQUIRE_SIGNATURE=1 refuses
+	# the weaker path outright.
 	if ! command -v cosign >/dev/null 2>&1; then
 		if [ "${PRIME_AGENT_REQUIRE_SIGNATURE:-0}" = 1 ]; then
 			printf 'error: cosign is required to verify the release signature (PRIME_AGENT_REQUIRE_SIGNATURE=1) and was not found.\n' >&2
@@ -2131,6 +2131,11 @@ prime_agent_verify_release_inventory() {
 		fi
 		printf 'note: cosign was not found, so the release signature was not verified. This install relies on TLS and the release checksums; `prime-agent update` verifies signatures on every later update. Install cosign and set PRIME_AGENT_REQUIRE_SIGNATURE=1 to require it here.\n' >&2
 		return 0
+	fi
+	inventory_bundle="$inventory_path.sigstore.json"
+	if ! prime_agent_curl_download -fsSL --connect-timeout 10 --max-time 120 "$inventory_url_base/SHA256SUMS.sigstore.json" -o "$inventory_bundle"; then
+		printf 'error: the release signature (SHA256SUMS.sigstore.json) could not be downloaded. Refusing to install an unsigned inventory.\n' >&2
+		return 1
 	fi
 	if ! cosign verify-blob \
 		--bundle "$inventory_bundle" \

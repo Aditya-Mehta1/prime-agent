@@ -1127,12 +1127,21 @@ exec /bin/${operation} "$@"
 			expect(existsSync(join(home, "data/prime-agent/bin/prime-agent"))).toBe(false);
 		});
 
-		it("refuses to install when the signature bundle is missing from the release", async () => {
+		it("refuses a missing signature bundle when cosign is available, and falls back without it", async () => {
 			publish("1.0.0");
 			feed.delete("/releases/v1.0.0/SHA256SUMS.sigstore.json");
-			const result = await install("1.0.0");
-			expect(result.code).not.toBe(0);
-			expect(result.output).toContain("release signature (SHA256SUMS.sigstore.json) could not be downloaded");
+
+			// cosign present: the bundle is required, so a release without one is refused.
+			const shim = fakeCosign("pass");
+			const strict = await install("1.0.0", { PATH: `${shim}:/usr/bin:/bin` });
+			expect(strict.code).not.toBe(0);
+			expect(strict.output).toContain("release signature (SHA256SUMS.sigstore.json) could not be downloaded");
+
+			// cosign absent: the bundle cannot be verified anyway, so historical releases without one
+			// install through the documented TLS-and-checksum fallback.
+			const relaxed = await install("1.0.0");
+			expect(relaxed.code, relaxed.output).toBe(0);
+			expect(relaxed.output).toContain("cosign was not found");
 		});
 
 		it("without cosign it says so, and refuses when a signature is required", async () => {
