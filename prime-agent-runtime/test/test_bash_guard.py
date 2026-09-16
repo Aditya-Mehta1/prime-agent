@@ -71,6 +71,19 @@ CHMOD_MATCHING_COMMANDS = [
     "echo $(chmod -R 755 sub)",
     "chmod -R 755 sub # cleanup",
     "xargs chmod -R 755",
+    # ANSI-C quoting folds into the word exactly like bash: $'chmod' scans
+    # as chmod and $'-R' as -R, so both forms match like their unquoted
+    # spellings, and $"..." (locale quoting) matches like double quotes.
+    "$'chmod' -R 755 sub",
+    "chmod $'-R' 755 sub",
+    '$"chmod" -R 755 sub',
+    "chmod -R 755 $'sub'",
+    # GNU accepts every unambiguous prefix of --recursive: --rec through
+    # --recursiv all run recursively.
+    "chmod --rec 755 sub",
+    "chmod --recur 755 sub",
+    "chmod --recursiv 755 sub",
+    "chown --recurs user sub",
 ]
 
 CHMOD_NON_MATCHING_COMMANDS = [
@@ -91,6 +104,15 @@ CHMOD_NON_MATCHING_COMMANDS = [
     "git status",
     "echo hello world",
     "npm run check",
+    # ANSI-C quoting of plain data stays data: an echoed payload never
+    # scans as a command.
+    "echo $'chmod -R 755 sub'",
+    # --reference and --recursive share the --re prefix: the ambiguous
+    # --ref is not a recursive flag (GNU rejects it as ambiguous), and
+    # neither is any other long option.
+    "chmod --ref 755 sub",
+    "chmod --reference=/tmp/mode 755 sub",
+    "chmod --changes 755 sub",
 ]
 
 
@@ -120,6 +142,11 @@ class ChmodEvalPayloadDetectionTest(unittest.TestCase):
             '"eval" "chmod -R 755 ~"',
             "eval $(echo 'chmod -R 755 ~')",
             "eval 'chmod -R \\\n755 ~'",
+            # Mixed and nested wrapper forms: the quoted sh -c payload
+            # inside the eval payload must be rescanned too.
+            'eval \'bash -c "chmod -R 755 ~"\'',
+            'eval \'bash -c "chown -R user ~"\'',
+            "eval $'chmod -R 755 ~'",
         ]:
             with self.subTest(command=command):
                 self.assertTrue(
@@ -153,6 +180,16 @@ class ShellCPayloadDetectionTest(unittest.TestCase):
             "sh -e -c 'chmod -R 755 ~'",
             "sh -c $(echo 'chmod -R 755 ~')",
             "FOO=1 sh -c 'chmod -R 755 ~'",
+            # Nested wrapper payloads: an inner quoted wrapper (eval or
+            # another sh -c) is rescanned one quoting layer at a time.
+            'sh -c \'bash -c "chmod -R 755 ~"\'',
+            "bash -c 'eval \"chmod -R 755 ~\"'",
+            "bash -c $'chmod -R 755 ~'",
+            'bash -c $"chmod -R 755 ~"',
+            # Payloads hiding shell code the scanner cannot resolve.
+            "bash -c '$cmd -R 755 ~'",
+            "bash -c 'BASH_ENV=/tmp/x echo hi'",
+            'bash -c \'bash <(printf "chmod -R 755 ~")\'',
         ]:
             with self.subTest(command=command):
                 self.assertTrue(
@@ -167,6 +204,10 @@ class ShellCPayloadDetectionTest(unittest.TestCase):
             "bash -lc 'chmod 755 sub'",
             "sh --rcfile x -c 'echo hi'",
             "echo 'bash -c chmod -R 755 ~'",
+            # Still-quoted data and non-executor runs inside payloads stay
+            # inert: an echoed string never scans as a command.
+            "sh -c 'echo $x -R hi'",
+            "sh -c 'echo BASH_ENV=x'",
         ]:
             with self.subTest(command=command):
                 self.assertFalse(
@@ -502,6 +543,218 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
                 message = await self._refused(command)
                 self.assertIn("changes directory (or wraps the command in xargs)", message)
                 self.assertTrue(self._tracked("sub", "nested", "file.txt").exists())
+
+    async def test_refuses_unresolvable_command_names(self):
+        self._make_tree()
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        # A variable or substitution could expand into chmod/chown itself:
+        # with a recursive flag present the run is refused, not guessed at.
+        for command in [
+            "cmd=chmod; $cmd -R 755 ~",
+            "cmd=chown; $cmd -R user ~",
+            "$(printf chmod) -R 755 ~",
+            "`printf chmod` -R 755 ~",
+            "${cmd} -R 755 ~",
+            "sudo $cmd -R 755 ~",
+            "xargs $(printf chmod) -R 755 ~",
+            "FOO=1 $cmd -R 755 ~",
+            "cmd=chmod; $cmd --recursive 755 ~",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command, home=home.name)
+                self.assertIn("command name cannot be determined", message)
+                self.assertTrue(Path(home.name, "keep.txt").exists())
+        # Without a recursive flag, in a non-executor run, or behind a
+        # resolvable command word, nothing is refused.
+        result = await self._run("cmd=chmod; $cmd 755 sub")
+        self.assertEqual(result.exit_code, 0)
+        result = await self._run("echo $var -R hi")
+        self.assertEqual(result.exit_code, 0)
+        result = await self._run("FOO=$x chmod -R 755 sub")
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_refuses_ansi_c_quoted_forms(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        # $'...' folds into the word exactly like bash, so ANSI-C quoted
+        # command names, flags, and operands scan like their unquoted
+        # spellings.
+        for command in [
+            "$'chmod' -R 755 ~",
+            "chmod $'-R' 755 ~",
+            "$'chown' -R user ~",
+            "chmod -R 755 $'~'",
+            "chmod -R 755 $'~/sub'",
+            '$"chmod" -R 755 ~',
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command, home=home.name)
+                self.assertIn(
+                    "Refusing to run this recursive chmod/chown command", message
+                )
+                self.assertTrue(Path(home.name, "keep.txt").exists())
+        # In-workspace ANSI-C forms run like their unquoted spellings.
+        self._make_tree()
+        result = await self._run("chmod -R 755 $'sub'")
+        self.assertEqual(result.exit_code, 0)
+        result = await self._run("chmod $'-R' 755 $'sub'")
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_refuses_cdpath_relocations(self):
+        self._make_tree()
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        Path(outside.name, "sub").mkdir()
+        Path(outside.name, "sub", "file.txt").write_text("keep\n")
+        # With CDPATH armed, `cd sub` can land in any CDPATH directory
+        # before the workspace fallback, so the relocation is refused.
+        with mock.patch.dict(os.environ, {"CDPATH": outside.name}):
+            message = await self._refused("cd sub && chmod -R 755 .")
+        self.assertIn("changes directory", message)
+        self.assertTrue(Path(outside.name, "sub", "file.txt").exists())
+        # Dot-prefixed targets never consult CDPATH and stay resolvable.
+        with mock.patch.dict(os.environ, {"CDPATH": outside.name}):
+            result = await self._run("cd ./sub && chmod -R 755 .")
+            self.assertEqual(result.exit_code, 0)
+        # An empty CDPATH behaves like unset for bash, and so for the guard.
+        with mock.patch.dict(os.environ, {"CDPATH": ""}):
+            result = await self._run("cd sub && chmod -R 755 .")
+            self.assertEqual(result.exit_code, 0)
+        # A CDPATH assignment in the command arms the same fail-closed path.
+        message = await self._refused(
+            f"CDPATH={outside.name}; cd sub && chmod -R 755 ."
+        )
+        self.assertIn("changes directory", message)
+        self.assertTrue(Path(outside.name, "sub", "file.txt").exists())
+
+    async def test_refuses_bash_env_arming(self):
+        self._make_tree()
+        # bash runs $BASH_ENV before the command text, so arming it from
+        # the command is refused: that file's shell code is unscannable.
+        for command in [
+            "BASH_ENV=/tmp/x echo hi",
+            "FOO=1 BASH_ENV=/tmp/x echo hi",
+            "env BASH_ENV=/tmp/x echo hi",
+            "sudo BASH_ENV=/tmp/x echo hi",
+            "export BASH_ENV=/tmp/x",
+            "declare -x BASH_ENV=/tmp/x",
+            "bash -c 'BASH_ENV=/tmp/x echo hi'",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("BASH_ENV", message)
+        # Reading or removing BASH_ENV stays fine.
+        for command in [
+            "echo BASH_ENV=x",
+            'echo "$BASH_ENV"',
+            "unset BASH_ENV",
+            "env -u BASH_ENV echo hi",
+        ]:
+            with self.subTest(command=command):
+                result = await self._run(command)
+                self.assertEqual(result.exit_code, 0)
+
+    async def test_inherited_bash_env_is_stripped(self):
+        # The kernel child environment never carries BASH_ENV/ENV: bash
+        # would execute that file's shell code before every command, and
+        # the guard cannot scan a file.
+        victim = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, victim, ignore_errors=True)
+        Path(victim, "keep.txt").write_text("keep\n")
+        marker = Path(self.test_dir, "bash-env-ran")
+        env_file = Path(self.test_dir, "destructive-env.sh")
+        env_file.write_text(f"chmod -R 755 {victim}\ntouch {marker}\n")
+        with mock.patch.dict(os.environ, {"BASH_ENV": str(env_file)}):
+            result = await self._run("echo hi")
+        self.assertEqual(result.exit_code, 0)
+        self.assertFalse(marker.exists())  # the file never executed
+        self.assertTrue(Path(victim, "keep.txt").exists())
+        # A direct unit check on the child env construction.
+        with mock.patch.dict(os.environ, {"BASH_ENV": "/tmp/x", "ENV": "/tmp/y"}):
+            child_env = bash_module._child_env()
+        self.assertNotIn("BASH_ENV", child_env)
+        self.assertNotIn("ENV", child_env)
+
+    async def test_refuses_process_substitution_wrappers(self):
+        self._make_tree()
+        for command in [
+            "bash <(printf 'chmod -R 755 ~\\n')",
+            "sh <(printf 'chmod -R 755 ~\\n')",
+            ". <(printf 'chmod -R 755 ~\\n')",
+            "env bash <(printf 'chmod -R 755 ~\\n')",
+            "bash >(printf 'chmod -R 755 ~\\n')",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("process substitution", message)
+        # Process substitutions that never feed a shell wrapper stay fine.
+        result = await self._run("cat <(echo hi)")
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("hi", result.output)
+        result = await self._run("diff <(echo a) <(echo a)")
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_refuses_nested_quoted_wrappers(self):
+        self._make_tree()
+        for command, needle in [
+            ('eval \'bash -c "chmod -R 755 ~"\'', "in eval"),
+            ('sh -c \'bash -c "chmod -R 755 ~"\'', "`sh -c`"),
+            ('bash -c \'eval "chmod -R 755 ~"\'', "`sh -c`"),
+            ("eval $'chmod -R 755 ~'", "in eval"),
+            ("bash -c $'chmod -R 755 ~'", "`sh -c`"),
+            ('bash -c $"chmod -R 755 ~"', "`sh -c`"),
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn(needle, message)
+                self.assertTrue(self._tracked("sub", "nested", "file.txt").exists())
+        # Still-quoted data inside payloads stays inert.
+        result = await self._run('sh -c \'echo "chmod -R 755 ~"\'')
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_refuses_abbreviated_recursive_flags(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        # GNU accepts every unambiguous prefix of --recursive.
+        for command in [
+            "chmod --rec 755 ~",
+            "chmod --recur 755 ~",
+            "chmod --recurse 755 ~",
+            "chmod --recurs 755 ~",
+            "chmod --recursi 755 ~",
+            "chmod --recursiv 755 ~",
+            "chown --rec user ~",
+            "chown --recursiv user:group ~",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command, home=home.name)
+                self.assertIn(
+                    "Refusing to run this recursive chmod/chown command", message
+                )
+                self.assertTrue(Path(home.name, "keep.txt").exists())
+        # In-workspace abbreviated recursion is guarded, not blanket
+        # refused (BSD chmod errors on long options; || true covers both
+        # platforms), and the ambiguous --ref prefix is not a recursive flag.
+        self._make_tree()
+        result = await self._run("chmod --rec 755 sub || true")
+        self.assertEqual(result.exit_code, 0)
+        result = await self._run("chmod --ref 755 sub || true")
+        self.assertEqual(result.exit_code, 0)
+        self.assertNotEqual(result.output.strip(), "")
+
+    async def test_xargs_false_positives_stay_allowed(self):
+        # The xargs walk must stop at the command word: an operand named
+        # xargs and a later xargs in a separate pipeline are not wraps.
+        self._make_tree()
+        Path(self.test_dir, "xargs").mkdir()
+        result = await self._run("chmod -R 755 xargs")
+        self.assertEqual(result.exit_code, 0)
+        result = await self._run("chmod -R 755 sub; ls sub/nested | xargs cat")
+        self.assertEqual(result.exit_code, 0)
 
     async def test_cd_relocations_are_replayed(self):
         self._make_tree()
