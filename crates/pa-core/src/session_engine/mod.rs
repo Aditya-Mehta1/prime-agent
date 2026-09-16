@@ -18,6 +18,7 @@ pub mod goal_driver;
 pub mod headless;
 pub mod host_requests;
 pub mod messages;
+pub mod provider_adapter;
 pub mod refine;
 pub mod runtime;
 pub mod slash_commands;

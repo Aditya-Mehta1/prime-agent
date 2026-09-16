@@ -4,11 +4,13 @@
 
 use std::sync::Arc;
 
-use pa_agent::stream::{LlmContext, ModelStream, StreamFn, StreamRequestOptions};
-use pa_agent::types::{Model as AgentModel, ThinkingLevel};
+use pa_agent::types::Model as AgentModel;
 use pa_types::ai::Model;
 
 use crate::mode::{AppMode, MissingSubsystem, RunOptions};
+use pa_core::session_engine::provider_adapter::{
+    json_round_trip, map_thinking_level, real_stream_fn,
+};
 
 /// The runtime: implements the print (text) mode against the merged session
 /// engine. Modes not wired here still report their typed missing subsystem.
@@ -259,18 +261,6 @@ fn agent_event_json(event: &pa_agent::types::AgentEvent) -> Option<String> {
     Some(value.to_string())
 }
 
-fn map_thinking_level(level: pa_types::ai::ModelThinkingLevel) -> ThinkingLevel {
-    match level {
-        pa_types::ai::ModelThinkingLevel::Off => ThinkingLevel::Off,
-        pa_types::ai::ModelThinkingLevel::Minimal => ThinkingLevel::Minimal,
-        pa_types::ai::ModelThinkingLevel::Low => ThinkingLevel::Low,
-        pa_types::ai::ModelThinkingLevel::Medium => ThinkingLevel::Medium,
-        pa_types::ai::ModelThinkingLevel::High => ThinkingLevel::High,
-        pa_types::ai::ModelThinkingLevel::Xhigh => ThinkingLevel::Xhigh,
-        pa_types::ai::ModelThinkingLevel::Max => ThinkingLevel::Max,
-    }
-}
-
 fn select_model(
     registry: &mut pa_core::models::ModelRegistry,
     provider: Option<&str>,
@@ -326,223 +316,4 @@ fn builtin_tools(cwd: &std::path::Path) -> Vec<Arc<dyn pa_agent::types::AgentToo
                 as Arc<dyn pa_agent::types::AgentTool>
         })
         .collect()
-}
-
-/// Wire-shape conversion at the pa-agent/pa-ai boundary: both sides serialize
-/// to the same camelCase wire shapes.
-fn json_round_trip<T, U>(value: &T) -> Option<U>
-where
-    T: serde::Serialize,
-    U: serde::de::DeserializeOwned,
-{
-    serde_json::to_value(value)
-        .ok()
-        .and_then(|value| serde_json::from_value(value).ok())
-}
-
-/// A real pa-ai provider stream adapter for the agent loop.
-pub fn real_stream_fn(api_key: Option<String>, model: Model) -> StreamFn {
-    Arc::new(
-        move |_requested: AgentModel, context: LlmContext, options: StreamRequestOptions| {
-            let api_key = api_key.clone();
-            let model = model.clone();
-            Box::pin(async move {
-                let messages: Vec<pa_types::ai::Message> = context
-                    .messages
-                    .iter()
-                    .filter_map(json_round_trip)
-                    .collect();
-                let tools: Vec<pa_types::ai::Tool> =
-                    context.tools.iter().filter_map(json_round_trip).collect();
-                let ai_context = pa_types::ai::Context {
-                    system_prompt: context.system_prompt.clone(),
-                    messages,
-                    tools: Some(tools),
-                };
-                let stream_options = pa_ai::types::SimpleStreamOptions {
-                    base: pa_ai::types::StreamOptions {
-                        temperature: options.temperature,
-                        max_tokens: options.max_tokens,
-                        signal: None,
-                        api_key,
-                        transport: None,
-                        service_tier: None,
-                        cache_retention: None,
-                        session_id: options.session_id.clone(),
-                        on_payload: None,
-                        on_response: None,
-                        headers: None,
-                        metadata: None,
-                        timeout_ms: None,
-                    },
-                    reasoning: Some(match options.reasoning {
-                        ThinkingLevel::Off => pa_types::ai::ModelThinkingLevel::Off,
-                        ThinkingLevel::Minimal => pa_types::ai::ModelThinkingLevel::Minimal,
-                        ThinkingLevel::Low => pa_types::ai::ModelThinkingLevel::Low,
-                        ThinkingLevel::Medium => pa_types::ai::ModelThinkingLevel::Medium,
-                        ThinkingLevel::High => pa_types::ai::ModelThinkingLevel::High,
-                        ThinkingLevel::Xhigh => pa_types::ai::ModelThinkingLevel::Xhigh,
-                        ThinkingLevel::Max => pa_types::ai::ModelThinkingLevel::Max,
-                    }),
-                    thinking_budgets: None,
-                };
-                let stream = pa_ai::stream_simple(&model, &ai_context, Some(stream_options))
-                    .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-                // Pump pa-ai events into a pa-agent event stream (the loop's
-                // ModelStream): each provider event is forwarded verbatim.
-                let (handle, consumer) = pa_agent::stream::event_stream();
-                let forwarder = tokio::spawn(async move {
-                    let mut stream = stream;
-                    while let Some(event) = stream.next_event().await {
-                        if let Some(converted) = convert_event(&event) {
-                            handle.push(converted);
-                        }
-                    }
-                    let result = stream.result().await;
-                    if let Some(converted) =
-                        json_round_trip::<_, pa_agent::types::AssistantMessage>(&result)
-                    {
-                        handle.end(Some(converted));
-                    } else {
-                        handle.end(None);
-                    }
-                });
-                // Keep the pump task alive as long as the stream lives.
-                let (handle2, consumer) = (forwarder, consumer);
-                Ok(consumer_pump(handle2, consumer))
-            })
-        },
-    )
-}
-
-/// Convert one pa-ai stream event into the pa-agent loop's event enum.
-/// Payloads cross the boundary by wire-shape (JSON) round-trip.
-fn convert_event(
-    event: &pa_types::ai::AssistantMessageEvent,
-) -> Option<pa_agent::stream::AssistantMessageEvent> {
-    use pa_agent::stream::AssistantMessageEvent as Out;
-    use pa_types::ai::AssistantMessageEvent as In;
-    fn convert_partial(
-        message: &pa_types::ai::AssistantMessage,
-    ) -> pa_agent::types::AssistantMessage {
-        json_round_trip(message).expect("assistant wire shapes match")
-    }
-    Some(match event {
-        In::Start { partial } => Out::Start {
-            partial: convert_partial(partial),
-        },
-        In::TextStart {
-            content_index,
-            partial,
-        } => Out::TextStart {
-            content_index: *content_index as usize,
-            partial: convert_partial(partial),
-        },
-        In::TextDelta {
-            content_index,
-            delta,
-            partial,
-        } => Out::TextDelta {
-            content_index: *content_index as usize,
-            delta: delta.clone(),
-            partial: convert_partial(partial),
-        },
-        In::TextEnd {
-            content_index,
-            content,
-            partial,
-        } => Out::TextEnd {
-            content_index: *content_index as usize,
-            content: content.clone(),
-            partial: convert_partial(partial),
-        },
-        In::ThinkingStart {
-            content_index,
-            partial,
-        } => Out::ThinkingStart {
-            content_index: *content_index as usize,
-            partial: convert_partial(partial),
-        },
-        In::ThinkingDelta {
-            content_index,
-            delta,
-            partial,
-        } => Out::ThinkingDelta {
-            content_index: *content_index as usize,
-            delta: delta.clone(),
-            partial: convert_partial(partial),
-        },
-        In::ThinkingEnd {
-            content_index,
-            partial,
-            ..
-        } => Out::ThinkingEnd {
-            content_index: *content_index as usize,
-            partial: convert_partial(partial),
-        },
-        In::ToolcallStart {
-            content_index,
-            partial,
-        } => Out::ToolCallStart {
-            content_index: *content_index as usize,
-            partial: convert_partial(partial),
-        },
-        In::ToolcallDelta {
-            content_index,
-            delta,
-            partial,
-        } => Out::ToolCallDelta {
-            content_index: *content_index as usize,
-            delta: delta.clone(),
-            partial: convert_partial(partial),
-        },
-        In::ToolcallEnd {
-            content_index,
-            tool_call,
-            partial,
-        } => Out::ToolCallEnd {
-            content_index: *content_index as usize,
-            tool_call: json_round_trip(tool_call).expect("tool call wire shapes match"),
-            partial: convert_partial(partial),
-        },
-        In::Done { reason, message } => Out::Done {
-            reason: json_round_trip(reason).expect("stop reason wire shapes match"),
-            message: convert_partial(message),
-        },
-        In::Error { reason, error } => Out::Error {
-            reason: json_round_trip(reason).expect("stop reason wire shapes match"),
-            error: convert_partial(error),
-        },
-    })
-}
-
-/// Wrap the consumer so the pump task is aborted when the stream drops.
-fn consumer_pump(
-    forwarder: tokio::task::JoinHandle<()>,
-    consumer: pa_agent::stream::AssistantMessageEventStream,
-) -> Box<dyn ModelStream> {
-    Box::new(PumpedStream {
-        _forwarder: forwarder,
-        stream: consumer,
-    })
-}
-
-/// A ModelStream whose lifetime keeps the pa-ai pump task alive.
-struct PumpedStream {
-    _forwarder: tokio::task::JoinHandle<()>,
-    stream: pa_agent::stream::AssistantMessageEventStream,
-}
-
-impl ModelStream for PumpedStream {
-    fn next_event(
-        &mut self,
-    ) -> pa_agent::BoxFut<'_, Option<pa_agent::stream::AssistantMessageEvent>> {
-        self.stream.next_event()
-    }
-
-    fn result(
-        &mut self,
-    ) -> pa_agent::BoxFut<'_, anyhow::Result<pa_agent::types::AssistantMessage>> {
-        self.stream.result()
-    }
 }
