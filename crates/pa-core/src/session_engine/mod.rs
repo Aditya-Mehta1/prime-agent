@@ -14,6 +14,7 @@ pub mod compaction_exec;
 pub mod compaction_utils;
 pub mod messages;
 pub mod slash_commands;
+pub mod tool_bridge;
 
 use std::sync::Arc;
 
