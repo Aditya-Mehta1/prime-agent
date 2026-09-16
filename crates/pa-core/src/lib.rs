@@ -34,3 +34,6 @@ pub use tools::ipython::{
     KernelErrorInfo, KernelExecError, KernelExecutor,
 };
 pub use tools::rlm_bootstrap::{build_rlm_bootstrap_code, PythonSkillRuntimeInfo};
+// RLM kernel subsystem: persistent IPython kernel lifecycle.
+pub mod kernel;
+pub use kernel::ReplKernelManager;
