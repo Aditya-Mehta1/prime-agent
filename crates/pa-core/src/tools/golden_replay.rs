@@ -12,7 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::tools::bash::{self, BashToolOptions};
-use crate::tools::code_preview::{preview_bash_command, preview_ipython_code};
+use crate::tools::code_preview::preview_bash_command;
+use crate::tools::code_preview_python::preview_ipython_code;
 use crate::tools::edit::{create_edit_tool_definition, execute_edit, LocalEditOperations};
 use crate::tools::ipython::{
     self, ExecuteResult, ExecuteStatus, IpythonKernelProvisioner, IpythonToolOptions,
@@ -472,7 +473,7 @@ impl IpythonToolUi for KillChoiceUi {
         let choice = choices
             .iter()
             .find(|c| **c == ipython::BUSY_KERNEL_KILL_CHOICE)
-            .map(|c| c.to_string());
+            .map(std::string::ToString::to_string);
         Box::pin(std::future::ready(choice))
     }
 
@@ -653,23 +654,21 @@ fn golden_schema_group_matches_ts() {
 
 #[test]
 fn destructive_git_discard_detection_examples() {
-    assert!(bash::is_destructive_git_discard_command("git reset --hard"));
-    assert!(bash::is_destructive_git_discard_command(
-        "git checkout -- ."
-    ));
-    assert!(bash::is_destructive_git_discard_command("git clean -fd"));
-    assert!(bash::is_destructive_git_discard_command(
-        "git -C sub restore ."
-    ));
-    assert!(!bash::is_destructive_git_discard_command(
-        "echo 'git reset --hard'"
-    ));
-    assert!(!bash::is_destructive_git_discard_command(
-        "echo done # git reset --hard"
-    ));
-    assert!(!bash::is_destructive_git_discard_command("git status"));
-    assert!(!bash::is_destructive_git_discard_command("git clean -n"));
-    assert!(!bash::is_destructive_git_discard_command(
-        "git clean --dry-run -f"
-    ));
+    assert!(crate::tools::bash_guard::is_destructive_git_discard_command("git reset --hard"));
+    assert!(crate::tools::bash_guard::is_destructive_git_discard_command("git checkout -- ."));
+    assert!(crate::tools::bash_guard::is_destructive_git_discard_command("git clean -fd"));
+    assert!(crate::tools::bash_guard::is_destructive_git_discard_command("git -C sub restore ."));
+    assert!(
+        !crate::tools::bash_guard::is_destructive_git_discard_command("echo 'git reset --hard'")
+    );
+    assert!(
+        !crate::tools::bash_guard::is_destructive_git_discard_command(
+            "echo done # git reset --hard"
+        )
+    );
+    assert!(!crate::tools::bash_guard::is_destructive_git_discard_command("git status"));
+    assert!(!crate::tools::bash_guard::is_destructive_git_discard_command("git clean -n"));
+    assert!(
+        !crate::tools::bash_guard::is_destructive_git_discard_command("git clean --dry-run -f")
+    );
 }

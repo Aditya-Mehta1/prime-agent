@@ -65,6 +65,40 @@ impl HttpResponse {
         }
     }
 
+    /// Read the next raw byte chunk from the body (None at end of stream).
+    pub async fn next_bytes(&mut self) -> Result<Option<Vec<u8>>, ProviderError> {
+        if self
+            .signal
+            .as_ref()
+            .map(|signal| signal.is_cancelled())
+            .unwrap_or(false)
+        {
+            return Err(ProviderError::Aborted);
+        }
+        let signal = self.signal.clone();
+        let chunk = match signal {
+            Some(signal) => {
+                let next = self.body.chunk();
+                tokio::select! {
+                    _ = signal.cancelled() => return Err(ProviderError::Aborted),
+                    result = next => result,
+                }
+            }
+            None => self.body.chunk().await,
+        };
+        match chunk {
+            Ok(Some(bytes)) => Ok(Some(bytes.to_vec())),
+            Ok(None) => Ok(None),
+            Err(error) => Err(ProviderError::Http(ProviderHttpError {
+                message: format!("Failed to read provider response body: {error}"),
+                status: Some(self.status),
+                body: None,
+                headers: self.headers.clone(),
+                request_id: None,
+            })),
+        }
+    }
+
     /// Read the entire body as text (for error responses and small payloads).
     pub async fn read_all_text(&mut self) -> Result<String, ProviderError> {
         let mut out = String::new();

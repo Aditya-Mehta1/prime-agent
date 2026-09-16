@@ -212,7 +212,7 @@ pub fn truncate_tail(content: &str, options: TruncationOptions) -> TruncationRes
             truncated_by = TruncatedBy::Bytes;
             // Trailing blanks must not defeat the oversized-line rescue; keep as
             // many as the budget allows.
-            if collected.iter().all(|c| c.is_empty()) {
+            if collected.iter().all(String::is_empty) {
                 let kept_blanks = collected.len().min(max_bytes.saturating_sub(1));
                 collected.truncate(kept_blanks);
                 let truncated_line =

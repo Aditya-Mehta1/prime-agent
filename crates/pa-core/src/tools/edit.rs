@@ -62,7 +62,11 @@ pub fn edit_tool_details(diff: &str, first_changed_line: Option<usize>) -> serde
 
 /// Pluggable file operations for the edit tool (TS: `EditOperations`).
 ///
-/// The default is the local filesystem; override to delegate to remote systems.
+/// The default is the local filesystem; override to delegate to remote
+/// systems. Error messages must match Node `fs/promises` shapes (see the
+/// local impl) because they surface verbatim to the model.
+///
+/// Object-safe on purpose (`&dyn` injection without generics).
 pub trait EditOperations: Send + Sync {
     /// Read file contents, matching Node `fs/promises` error messages.
     fn read_file(&self, absolute_path: &str) -> std::io::Result<Vec<u8>>;
@@ -106,7 +110,7 @@ pub fn prepare_edit_arguments(mut input: serde_json::Value) -> serde_json::Value
         if edits.is_string() {
             if let Some(parsed) = serde_json::from_str::<serde_json::Value>(edits.as_str().unwrap())
                 .ok()
-                .filter(|v| v.is_array())
+                .filter(serde_json::Value::is_array)
             {
                 obj.insert("edits".to_string(), parsed);
             }
@@ -200,6 +204,12 @@ fn read_error_message(err: &std::io::Error, absolute_path: &str) -> String {
 ///
 /// Returns the model-facing result, or an error whose message is the
 /// model-facing error text (TS: the thrown error).
+#[tracing::instrument(
+    level = "debug",
+    name = "tool_edit_execute",
+    skip(cwd, ops, signal)
+    fields(path),
+)]
 pub async fn execute_edit(
     cwd: &str,
     ops: &dyn EditOperations,

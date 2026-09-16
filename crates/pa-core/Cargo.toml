@@ -13,6 +13,7 @@ fancy-regex = "0.14"
 libc = "0.2"
 nix = { version = "0.29", features = ["signal", "process", "user", "fs", "dir"] }
 tokio-util = "0.7"
+tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

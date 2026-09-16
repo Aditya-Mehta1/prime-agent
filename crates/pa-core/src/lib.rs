@@ -29,8 +29,8 @@ pub use tools::edit::{
 
 // ipython tool: definition + kernel lifecycle seam (RLM bootstrap included).
 pub use tools::ipython::{
-    build_rlm_bootstrap_code, create_ipython_tool_definition, ExecuteResult, ExecuteStatus,
-    IpythonKernelProvisioner, IpythonToolOptions, IpythonToolUi, KernelAttachment,
-    KernelBusyAfterInterruptError, KernelErrorInfo, KernelExecError, KernelExecutor,
-    PythonSkillRuntimeInfo,
+    create_ipython_tool_definition, ExecuteResult, ExecuteStatus, IpythonKernelProvisioner,
+    IpythonToolOptions, IpythonToolUi, KernelAttachment, KernelBusyAfterInterruptError,
+    KernelErrorInfo, KernelExecError, KernelExecutor,
 };
+pub use tools::rlm_bootstrap::{build_rlm_bootstrap_code, PythonSkillRuntimeInfo};

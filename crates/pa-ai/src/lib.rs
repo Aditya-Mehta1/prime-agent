@@ -19,6 +19,7 @@
 
 pub mod env_api_keys;
 pub mod models;
+pub mod models_generated;
 pub mod registry;
 pub mod types;
 

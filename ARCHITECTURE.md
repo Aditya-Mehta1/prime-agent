@@ -66,3 +66,12 @@ Rules:
 - Cross-crate access goes through minimal public APIs only; internals are `pub(crate)`.
 - If a change forces edits across many crate internals, the boundary is wrong - fix the boundary, not the call sites.
 - Each crate README declares scope, non-goals, and public API. Merges are rejected if they violate it.
+
+
+## Rendering ownership decision
+
+Tool-result rendering (the model-facing result text, diff rendering, truncation output) is owned by
+pa-core and delivered as data in pa-types entries. The TUI owns display-side rendering
+(markdown, colors, layout) and re-renders pa-types content blocks itself; pa-tui must never import
+pa-core. If a shared rendering primitive is truly needed by both, it belongs in pa-types as pure
+data helpers - not behavior.
