@@ -943,8 +943,9 @@ class BashHandle:
 # (packages/coding-agent/src/core/tools/bash.ts); the command taxonomy and
 # bypass semantics must stay identical between the two tools. On top of the
 # shared taxonomy, this port additionally hardens eval-wrapped payloads,
-# attached short options, and shell line continuations (hardening the
-# coding-agent tool still lacks; port it back when touching that file).
+# attached short options, shell line continuations, and shell redirections
+# (hardening the coding-agent tool still lacks; port it back when touching
+# that file).
 
 # Bypass env var for the destructive-git dirty-tree guard.
 BASH_DESTRUCTIVE_GIT_BYPASS_ENV = "PI_BASH_ALLOW_DESTRUCTIVE_GIT"
@@ -1060,6 +1061,109 @@ def _normalize_line_continuations(command: str) -> str:
     return "".join(chars)
 
 
+# A shell redirection word: optional fd, the operator, an optional &fd
+# duplication (which has no filename target), and an attached target (empty
+# for the `2> file` split form). Targets containing quotes, substitution, or
+# process-substitution syntax stay live: masking them could hide a command
+# substitution that executes.
+_REDIRECT_OPERATOR = re.compile(r"[0-9]*[<>]{1,3}(&[0-9]+)?")
+_STATIC_REDIRECT_TARGET = re.compile(r"""[^\s;&|<>()$`"']*""")
+
+
+def _mask_shell_redirections(command: str) -> str:
+    """Blank out shell redirection words, keeping character positions.
+
+    The shell consumes redirections (`2>/dev/null`, `> log`, `2>&1`,
+    `</dev/null`, heredoc markers) before git sees its argv, so a discard
+    like `git reset 2>/dev/null --hard` must scan as `git reset --hard`.
+    Only the operator and a fully static attached or next-word target are
+    masked (pure syntax); quoted data, comments, command substitution, and
+    process substitution stay live so the guard keeps seeing what executes.
+    """
+    chars = list(command)
+    quote: str | None = None
+    comment = False
+    i = 0
+    n = len(chars)
+    while i < n:
+        ch = chars[i]
+        if comment:
+            if ch == "\n":
+                comment = False
+            i += 1
+            continue
+        if quote is None:
+            if ch in ('"', "'"):
+                quote = ch
+                i += 1
+                continue
+            if ch == "#" and (i == 0 or re.match(r"[\s;&|(){}]", chars[i - 1])):
+                comment = True
+                i += 1
+                continue
+            if ch == "\\" and i + 1 < n:
+                i += 2  # escaped character stays as-is
+                continue
+            operator = _REDIRECT_OPERATOR.match(command, i)
+            if operator:
+                for j in range(operator.start(), operator.end()):
+                    chars[j] = " "
+                i = operator.end()
+                attached = _STATIC_REDIRECT_TARGET.match(command, i)
+                if attached.end() > i:
+                    target_start, target_end = attached.start(), attached.end()
+                elif operator.group(1):
+                    # A `2>&1` duplication carries its own target; the next
+                    # word belongs to the command, not the redirection.
+                    target_start = target_end = i
+                else:
+                    # `2> /dev/null`: a bare operator takes the next word.
+                    j = i
+                    while j < n and chars[j].isspace():
+                        j += 1
+                    detached = _STATIC_REDIRECT_TARGET.match(command, j)
+                    if detached.end() > j and j > i:
+                        target_start, target_end = detached.start(), detached.end()
+                    else:
+                        target_start = target_end = i
+                for j in range(target_start, target_end):
+                    chars[j] = " "
+                i = target_end
+                continue
+        elif quote == "'":
+            if ch == "'":
+                quote = None
+        elif ch == '"':
+            quote = None
+        elif ch == "\\" and i + 1 < n:
+            i += 1  # escaped character inside double quotes stays
+        elif ch == "$" and chars[i + 1 : i + 2] == "(":
+            # Command substitution inside double quotes still executes; mask
+            # redirections inside it too (its own redirects are syntax).
+            depth = 0
+            j = i + 1
+            while j < n:
+                if chars[j] == "(":
+                    depth += 1
+                elif chars[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            interior = _mask_shell_redirections(command[i + 2 : j])
+            chars[i + 2 : j] = list(interior)
+            i = j
+        elif ch == "`":
+            j = i + 1
+            while j < n and chars[j] != "`":
+                j += 1
+            interior = _mask_shell_redirections(command[i + 1 : j])
+            chars[i + 1 : j] = list(interior)
+            i = j
+        i += 1
+    return "".join(chars)
+
+
 def _mask_quoted_spans(command: str) -> str:
     """Blank out quoted data and comments, keeping character positions.
 
@@ -1150,7 +1254,7 @@ def _is_forced_clean_segment(args: str) -> bool:
 def _find_destructive_git_discard_commands(command: str) -> list[int]:
     """Find every destructive git discard command in `command`, returning the
     character index where each `git` token starts (empty when none match)."""
-    masked = _mask_quoted_spans(_normalize_line_continuations(command))
+    masked = _mask_quoted_spans(_mask_shell_redirections(_normalize_line_continuations(command)))
     indices: list[int] = []
     for pattern in (_DISCARD_CHECKOUT_PATTERN, _DISCARD_RESTORE_PATTERN, _DISCARD_RESET_PATTERN):
         indices.extend(match.start() for match in pattern.finditer(masked))
@@ -1219,7 +1323,7 @@ def _eval_payloads_hide_destructive_git(command: str, depth: int = 0) -> bool:
     """
     if depth > _MAX_EVAL_SCAN_DEPTH:
         return True  # absurdly nested evals: refuse rather than risk a miss
-    command = _normalize_line_continuations(command)
+    command = _mask_shell_redirections(_normalize_line_continuations(command))
     masked = _mask_quoted_spans(command)
     for match in re.finditer(r"\beval\b", masked):
         # The payload runs from just after the eval token to the next
@@ -1499,9 +1603,10 @@ def _guard_destructive_git(command: str, allow_destructive_git: bool) -> None:
         return
     # Match the prefixed command exactly as the shell will run it; the prefix
     # is replayed in the probe, so hook-provided shell setup applies to both.
-    # Line continuations are normalized first so the patterns and the probe
-    # resolution see the joined command.
-    resolved = _normalize_line_continuations(_with_prefix(command))
+    # Line continuations and shell redirections are normalized first (both
+    # length-preserving) so the patterns and the probe resolution see the
+    # same argv the shell will hand to git.
+    resolved = _mask_shell_redirections(_normalize_line_continuations(_with_prefix(command)))
     if "eval" in resolved and _eval_payloads_hide_destructive_git(resolved):
         # An eval payload hides where the discard runs; refuse rather than
         # probe a command the guard cannot replay.

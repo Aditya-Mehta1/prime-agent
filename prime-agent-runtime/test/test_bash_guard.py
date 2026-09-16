@@ -94,6 +94,13 @@ MATCHING_COMMANDS = [
     "git checkout -f main",
     "git checkout --force main",
     "git clean -f -- -n",
+    "git reset 2>/dev/null --hard",
+    "git reset 2> /dev/null --hard",
+    "git reset 2>&1 --hard",
+    "git 2>/dev/null reset --hard",
+    "git restore 2>/dev/null .",
+    "git clean -f 2>/dev/null",
+    "git checkout 2>/dev/null -- .",
     "git -Csub reset --hard",
     "git -cfoo.bar=1 reset --hard",
     "git reset \
@@ -130,6 +137,9 @@ NON_MATCHING_COMMANDS = [
     "git add .",
     "echo hello world",
     "npm run check",
+    "git status > status.txt",
+    "git log --oneline > log.txt 2>/dev/null",
+    "echo 2>/dev/null hi",
     "echo one \
  two",
     "git -Csub status",
@@ -467,6 +477,51 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
         self._init_dirty_repo()
         with self.assertRaises(DestructiveGitRefusalError):
             bash("# safe \\\ngit reset --hard")
+        self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
+
+    async def test_refuses_discards_with_shell_redirections(self):
+        self._init_dirty_repo()
+        for command in [
+            "git reset 2>/dev/null --hard",
+            "git reset 2> /dev/null --hard",
+            "git reset 2>&1 --hard",
+            "git 2>/dev/null reset --hard",
+            "git restore 2>/dev/null .",
+        ]:
+            with self.subTest(command=command):
+                with self.assertRaises(DestructiveGitRefusalError):
+                    bash(command)
+                self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
+                self.assertTrue(self._tracked("untracked.txt").exists())
+
+    async def test_safe_redirection_commands_still_run(self):
+        self._init_dirty_repo()
+        result = await bash("git status > status.txt")
+        self.assertEqual(result.exit_code, 0)
+        result = await bash("git log --oneline > log.txt 2>/dev/null")
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
+
+    async def test_redirect_targets_with_substitutions_stay_scannable(self):
+        # A command substitution as redirect target executes: its content
+        # must stay visible to the scan, and this one discards.
+        self._init_dirty_repo()
+        with self.assertRaises(DestructiveGitRefusalError):
+            bash("echo 2> $(git reset --hard)")
+        self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
+
+    async def test_redirections_in_cd_chains_do_not_block_the_probe(self):
+        _init_dirty_git_repo(str(self._tracked("sub")))
+        self._init_dirty_repo()
+        with self.assertRaises(DestructiveGitRefusalError) as caught:
+            bash("cd sub 2>/dev/null && git reset --hard")
+        self.assertIn("tracked.txt", str(caught.exception))
+        self.assertEqual(self._tracked("sub", "tracked.txt").read_text(), "modified\n")
+
+    async def test_eval_payloads_with_redirections_are_refused(self):
+        self._init_dirty_repo()
+        with self.assertRaises(DestructiveGitRefusalError):
+            bash("eval 'git reset 2>/dev/null --hard'")
         self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
 
     async def test_clean_fx_lists_ignored_files_it_would_delete(self):
