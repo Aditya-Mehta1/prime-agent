@@ -15,6 +15,8 @@ pub mod lease;
 pub mod paths;
 pub mod platform;
 pub mod protocol;
+pub mod registration;
+pub(crate) mod registry;
 pub mod session_stats;
 pub mod session_store;
 pub mod side_question;

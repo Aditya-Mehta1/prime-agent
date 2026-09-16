@@ -87,6 +87,11 @@ impl RotatingLog {
     }
 
     pub fn append(&self, line: &str) {
+        // The log lives in `<agent-dir>/logs`; create it if this is the first
+        // write (a fresh agent dir has no logs directory yet).
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)

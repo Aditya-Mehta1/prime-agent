@@ -50,6 +50,7 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "restart",
     "shutdown",
     "ack_result",
+    "worker_register",
 ];
 
 /// Parsed client command envelope.
@@ -481,6 +482,7 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::Restart { .. } => "restart",
         DaemonCommand::Shutdown { .. } => "shutdown",
         DaemonCommand::AckResult { .. } => "ack_result",
+        DaemonCommand::WorkerRegister { .. } => "worker_register",
         _ => "unknown",
     }
 }

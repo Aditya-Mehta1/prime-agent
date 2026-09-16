@@ -27,6 +27,7 @@ use crate::protocol::{
     response_failure, response_success, DaemonOutbound, DaemonResponse, DaemonResumeCursor,
     DaemonSessionClosedReason, DAEMON_APP_VERSION, DAEMON_SCHEMA_ID, DAEMON_SCHEMA_REVISION,
 };
+use crate::registration::RegistrationHandle;
 use crate::session_store::{session_file_name, SessionFile};
 use crate::types::{AgentConnectionState, SessionActionSnapshot, SessionSummary};
 
@@ -161,6 +162,8 @@ impl OutboundFrame {
 
 pub struct Worker {
     config: WorkerConfig,
+    /// Supervisor self-registration handle; `None` for standalone workers.
+    registration: Option<RegistrationHandle>,
     core: Arc<Mutex<SessionCore>>,
     engine: std::sync::Arc<dyn SessionEngine>,
     work_notify: Arc<Notify>,
@@ -172,7 +175,7 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn new(config: WorkerConfig) -> Self {
+    pub fn new(config: WorkerConfig, registration: Option<RegistrationHandle>) -> Self {
         let (events, _) = broadcast::channel(4096);
         let core = SessionCore {
             active_session_id: config.active_session_id.clone(),
@@ -241,6 +244,7 @@ impl Worker {
         );
         Worker {
             config,
+            registration,
             core,
             engine,
             work_notify,
@@ -672,6 +676,10 @@ impl Worker {
         // Recovery journal writes must not happen while holding the core
         // lock: record_recovery locks the core to read the store.
         let _ = self.record_recovery(true, "create");
+        let session_id = summary.session_id.clone();
+        if let Some(registration) = &self.registration {
+            registration.notify_session_created(session_id);
+        }
         self.work_notify.notify_one();
         response_success(
             None,
@@ -1561,7 +1569,10 @@ pub async fn run_worker() -> Result<()> {
         return Err(anyhow!("worker mode requires {WORKER_ROLE_ENV}=1"));
     }
     let config = WorkerConfig::from_env()?;
-    let worker = Arc::new(Worker::new(config));
+    // Self-registration: the supervisor's roster survives its own restarts
+    // because workers re-present their identity (liveness watch + backoff).
+    let registration = crate::registration::start(&config);
+    let worker = Arc::new(Worker::new(config, registration));
     worker.serve().await
 }
 

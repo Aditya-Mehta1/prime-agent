@@ -7,9 +7,8 @@
 //! restarted supervisor can adopt or relaunch live sessions, and routes
 //! commands and events between clients and workers (private-framed channel).
 
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,7 +21,7 @@ use pa_types::platform::transport::{bind_transport, connect_transport, Transport
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::descriptor::{
     create_command_payload, load_descriptors, persist_supervisor_config, persist_worker,
@@ -37,6 +36,7 @@ use crate::protocol::{
     response_success, DaemonResponse, DaemonRuntimeIdentity, DAEMON_APP_VERSION, DAEMON_SCHEMA_ID,
     DAEMON_SCHEMA_REVISION,
 };
+use crate::registry::{ResidentWorker, SessionRegistry, WorkerRegistration, WorkerRequest};
 use crate::session_store::{find_most_recent_session_for_cwd, list_sessions};
 use crate::snapshot_stream::{attach_client_capabilities, stream_attach, wants_chunked};
 use crate::worker::{
@@ -60,59 +60,6 @@ pub struct SupervisorOptions {
     pub agent_dir: PathBuf,
 }
 
-/// One resident session worker (port of `ResidentWorker`).
-struct ResidentWorker {
-    worker_id: String,
-    descriptor: Mutex<DaemonWorkerDescriptor>,
-    descriptor_path: PathBuf,
-    cmd_tx: Mutex<Option<mpsc::UnboundedSender<WorkerRequest>>>,
-    /// Pending replies for in-flight requests on the current connection.
-    pending: Mutex<HashMap<String, oneshot::Sender<DaemonResponse>>>,
-    intentional_stop: AtomicBool,
-    consecutive_failures: AtomicU32,
-}
-
-impl ResidentWorker {
-    fn new(
-        worker_id: String,
-        descriptor: DaemonWorkerDescriptor,
-        descriptor_path: PathBuf,
-    ) -> Arc<Self> {
-        Arc::new(ResidentWorker {
-            worker_id,
-            descriptor: Mutex::new(descriptor),
-            descriptor_path,
-            cmd_tx: Mutex::new(None),
-            pending: Mutex::new(HashMap::new()),
-            intentional_stop: AtomicBool::new(false),
-            consecutive_failures: AtomicU32::new(0),
-        })
-    }
-
-    async fn labels(&self) -> (String, String, String) {
-        let descriptor = self.descriptor.lock().await;
-        let session_file = descriptor.session_file.as_deref().unwrap_or_default();
-        let file_stem = std::path::Path::new(session_file)
-            .file_stem()
-            .map(|stem| stem.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let name = descriptor
-            .create_command
-            .rest
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        (descriptor.root_active_session_id.clone(), file_stem, name)
-    }
-}
-
-struct WorkerRequest {
-    request_id: String,
-    command_type: String,
-    payload: Value,
-}
-
 /// Which clients a worker outbound frame reaches.
 #[derive(Debug, Clone)]
 enum ClientRouting {
@@ -125,7 +72,7 @@ enum ClientRouting {
 pub struct Supervisor {
     options: SupervisorOptions,
     descriptor_dir: PathBuf,
-    workers: Mutex<HashMap<String, Arc<ResidentWorker>>>,
+    registry: SessionRegistry,
     /// Worker outbound frames, with their client routing.
     events: broadcast::Sender<(ClientRouting, Value)>,
     shutting_down: AtomicBool,
@@ -161,7 +108,7 @@ impl Supervisor {
         Ok(Supervisor {
             options,
             descriptor_dir,
-            workers: Mutex::new(HashMap::new()),
+            registry: SessionRegistry::new(),
             events,
             shutting_down: AtomicBool::new(false),
             shutdown_notify: tokio::sync::Notify::new(),
@@ -184,7 +131,16 @@ impl Supervisor {
         self.log
             .append(&format!("supervisor started pid {}", std::process::id()));
 
-        self.adopt_persisted_workers().await;
+        // Descriptor adoption runs concurrently with the accept loop: a
+        // supervisor restarted over live sessions must accept their
+        // self-registrations immediately, not behind the whole descriptor
+        // scan.
+        {
+            let supervisor = Arc::clone(&self);
+            tokio::spawn(async move {
+                supervisor.adopt_persisted_workers().await;
+            });
+        }
 
         while !self.shutting_down.load(Ordering::SeqCst) {
             let stream = tokio::select! {
@@ -218,38 +174,65 @@ impl Supervisor {
         self.log.append(&format!("[{}] {message}", util::now_iso()));
     }
 
+    /// Adopt or relaunch persisted workers, concurrently: one dead worker's
+    /// relaunch (create replay) must not delay adopting live sessions.
     async fn adopt_persisted_workers(self: &Arc<Self>) {
         let descriptors = load_descriptors(&self.descriptor_dir, &self.options.socket_path);
+        let mut tasks = Vec::new();
         for (path, descriptor) in descriptors {
-            let socket_path = PathBuf::from(&descriptor.socket_path);
-            let alive = socket::can_connect(&socket_path, Duration::from_millis(500)).await;
-            let worker_id = descriptor.worker_id.clone();
-            let pid = descriptor.pid;
-            let resident = ResidentWorker::new(worker_id.clone(), descriptor, path);
-            let result = if alive {
-                self.connect_worker(&resident).await
-            } else {
-                // Dead worker: relaunch from the durable create command. The
-                // worker rehydrates the session store, restoring history and
-                // the persisted queue snapshot.
-                self.relaunch_worker(&resident).await.map(|_| ())
-            };
-            match result {
-                Ok(()) => {
-                    self.workers
-                        .lock()
-                        .await
-                        .insert(worker_id.clone(), Arc::clone(&resident));
-                    self.spawn_monitor(Arc::clone(&resident), None, pid);
-                    self.log_line(&format!(
-                        "adopted session worker {worker_id} (was alive: {alive})"
-                    ));
-                }
-                Err(error) => {
-                    self.log_line(&format!("could not adopt worker {worker_id}: {error:#}"));
-                }
+            let supervisor = Arc::clone(self);
+            tasks.push(tokio::spawn(async move {
+                supervisor.adopt_persisted_worker(path, descriptor).await;
+            }));
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+
+    /// Adopt one persisted worker descriptor. Serialized against worker
+    /// self-registration by the per-worker adoption gate: whichever path
+    /// arrives first (descriptor scan or live re-registration) builds the
+    /// roster entry; the other one finds it present.
+    async fn adopt_persisted_worker(
+        self: &Arc<Self>,
+        path: PathBuf,
+        descriptor: crate::descriptor::WorkerDescriptor,
+    ) {
+        let worker_id = descriptor.worker_id.clone();
+        let guard = self.registry.adoption_guard(&worker_id).await;
+        if self.registry.get(&worker_id).await.is_some() {
+            // The worker re-registered before the descriptor scan reached it.
+            self.log_line(&format!(
+                "session worker {worker_id} already registered; skipping descriptor adoption"
+            ));
+            return;
+        }
+        let socket_path = PathBuf::from(&descriptor.socket_path);
+        let alive = socket::can_connect(&socket_path, Duration::from_millis(500)).await;
+        let pid = descriptor.pid;
+        let resident = ResidentWorker::new(worker_id.clone(), descriptor, path);
+        let result = if alive {
+            self.connect_worker(&resident).await
+        } else {
+            // Dead worker: relaunch from the durable create command. The
+            // worker rehydrates the session store, restoring history and
+            // the persisted queue snapshot.
+            self.relaunch_worker(&resident).await.map(|_| ())
+        };
+        match result {
+            Ok(()) => {
+                self.registry.insert(Arc::clone(&resident)).await;
+                self.spawn_monitor(Arc::clone(&resident), None, pid);
+                self.log_line(&format!(
+                    "adopted session worker {worker_id} (was alive: {alive})"
+                ));
+            }
+            Err(error) => {
+                self.log_line(&format!("could not adopt worker {worker_id}: {error:#}"));
             }
         }
+        drop(guard);
     }
 
     /// Watch a worker process: on unexpected exit, restart with backoff.
@@ -309,7 +292,7 @@ impl Supervisor {
                 descriptor.last_failure_at = Some(util::now_iso());
                 let _ = persist_worker(&resident.descriptor_path, &descriptor);
                 drop(descriptor);
-                self.workers.lock().await.remove(&resident.worker_id);
+                self.registry.remove(&resident.worker_id).await;
                 self.log_line(&format!(
                     "session worker {} failed after {failures} consecutive failures",
                     resident.worker_id
@@ -743,6 +726,10 @@ impl Supervisor {
         };
         let descriptor_path = self.descriptor_dir.join(format!("{worker_id}.json"));
         let resident = ResidentWorker::new(worker_id.clone(), descriptor, descriptor_path.clone());
+        // Register the resident before spawning the process: the worker
+        // self-registers on boot, and the registration handler must find its
+        // identity in the registry (registration races the create replay).
+        self.registry.insert(Arc::clone(&resident)).await;
         let child = self.spawn_worker_process(&resident).await?;
         self.connect_worker(&resident).await?;
         let create_payload = {
@@ -782,10 +769,6 @@ impl Supervisor {
             persist_worker(&descriptor_path, &descriptor)?;
         }
         let pid = child.id().unwrap_or(0);
-        self.workers
-            .lock()
-            .await
-            .insert(worker_id.clone(), Arc::clone(&resident));
         self.spawn_monitor(Arc::clone(&resident), Some(child), pid as u64);
         Ok(resident)
     }
@@ -871,7 +854,7 @@ impl Supervisor {
         // Detach from every attached session on disconnect (a TUI exit does
         // not stop the session; the worker keeps running).
         for active_session_id in attached.iter() {
-            if let Ok(resident) = self.resolve_worker(active_session_id).await {
+            if let Ok(resident) = self.registry.resolve(active_session_id).await {
                 let payload = json!({ "type": "detach", "clientId": effective_client_id });
                 let _ = self
                     .route_command(&resident, "detach", payload, ROUTE_TIMEOUT_MS)
@@ -970,6 +953,14 @@ impl Supervisor {
                     ),
                 }
             }
+            DaemonCommand::WorkerRegister { .. } => {
+                // Worker self-registration: rebuilds the roster entry from
+                // the worker's own identity instead of routing to a session.
+                let response = self
+                    .handle_worker_register(&command_id, &type_name, &envelope.command)
+                    .await;
+                (vec![response_line(&response)], false)
+            }
             command => {
                 self.route_client_command(
                     command,
@@ -981,6 +972,133 @@ impl Supervisor {
                 .await
             }
         }
+    }
+
+    /// `worker_register`: a session worker presenting its identity (boot
+    /// registration or re-registration after this supervisor restarted).
+    /// The token was issued when the supervisor spawned or adopted the
+    /// worker, so an unknown worker id or a token mismatch is rejected.
+    async fn handle_worker_register(
+        self: &Arc<Self>,
+        command_id: &str,
+        type_name: &str,
+        command: &DaemonCommand,
+    ) -> DaemonResponse {
+        let DaemonCommand::WorkerRegister {
+            active_session_id,
+            session_id,
+            socket_path,
+            worker_instance_id,
+            token,
+            pid,
+            ..
+        } = command
+        else {
+            return response_failure(Some(command_id), type_name, "not a registration", None);
+        };
+        let fail = |error: &str| response_failure(Some(command_id), type_name, error, None);
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return fail("Supervisor is shutting down");
+        }
+        if active_session_id.is_empty() || socket_path.is_empty() || *pid == 0 {
+            return fail("Session worker registration is missing identity fields");
+        }
+        let worker_instance_id =
+            (!worker_instance_id.is_empty()).then(|| worker_instance_id.clone());
+        let registration = WorkerRegistration {
+            active_session_id: active_session_id.clone(),
+            session_id: session_id
+                .clone()
+                .filter(|value: &String| !value.is_empty()),
+            socket_path: socket_path.clone(),
+            worker_instance_id: worker_instance_id.clone(),
+            pid: *pid,
+        };
+        // Serialize against descriptor adoption for the same worker.
+        let guard = self.registry.adoption_guard(active_session_id).await;
+        let resident = match self.registry.get(active_session_id).await {
+            Some(resident) => resident,
+            None => match self.adopt_registered_worker(&registration, token).await {
+                Ok(resident) => resident,
+                Err(error) => return fail(&format!("{error:#}")),
+            },
+        };
+        // Refresh the durable identity from the live worker (the token was
+        // issued by this supervisor; a mismatch is a rogue registration).
+        {
+            let mut descriptor = resident.descriptor.lock().await;
+            if token.as_str() != descriptor.authentication_token {
+                return fail("Session worker authentication failed");
+            }
+            descriptor.pid = *pid;
+            descriptor.socket_path = socket_path.clone();
+            descriptor.worker_instance_id = worker_instance_id.clone();
+            if let Some(session_id) = &registration.session_id {
+                descriptor.root_session_id = Some(session_id.clone());
+            }
+            descriptor.lifecycle = DaemonWorkerLifecycle::Ready;
+            let _ = persist_worker(&resident.descriptor_path, &descriptor);
+        }
+        let record = self.registry.record_registration(registration).await;
+        let verb = if record.epoch > 1 {
+            "re-registered"
+        } else {
+            "registered"
+        };
+        self.log_line(&format!(
+            "session worker {active_session_id} {verb} (epoch {}, pid {pid})",
+            record.epoch
+        ));
+        drop(guard);
+        response_success(
+            Some(command_id),
+            type_name,
+            Some(json!({
+                "workerId": active_session_id,
+                "sessionId": session_id,
+                "supervisorGeneration": format!("sup:{}", std::process::id()),
+                "supervisorPid": std::process::id(),
+                "epoch": record.epoch,
+            })),
+        )
+    }
+
+    /// A registration for a worker with no roster entry: adopt it from its
+    /// persisted descriptor (the durable fallback record). The registration
+    /// proves the worker process is alive; adoption connects it for routing.
+    async fn adopt_registered_worker(
+        self: &Arc<Self>,
+        registration: &WorkerRegistration,
+        token: &str,
+    ) -> Result<Arc<ResidentWorker>> {
+        let descriptor_path = self
+            .descriptor_dir
+            .join(format!("{}.json", registration.active_session_id));
+        let Ok(content) = std::fs::read_to_string(&descriptor_path) else {
+            return Err(anyhow!(
+                "Unknown session worker: {}",
+                registration.active_session_id
+            ));
+        };
+        let descriptor: crate::descriptor::WorkerDescriptor = serde_json::from_str(&content)
+            .with_context(|| format!("invalid descriptor {}", descriptor_path.display()))?;
+        crate::descriptor::validate_descriptor(&descriptor, &self.options.socket_path)?;
+        if token != descriptor.authentication_token.as_str() {
+            return Err(anyhow!("Session worker authentication failed"));
+        }
+        let worker_id = descriptor.worker_id.clone();
+        let resident = ResidentWorker::new(
+            registration.active_session_id.clone(),
+            descriptor,
+            descriptor_path,
+        );
+        self.connect_worker(&resident).await?;
+        self.registry.insert(Arc::clone(&resident)).await;
+        self.spawn_monitor(Arc::clone(&resident), None, registration.pid);
+        self.log_line(&format!(
+            "adopted session worker {worker_id} via self-registration"
+        ));
+        Ok(resident)
     }
 
     /// `list_saved_sessions` (port of `handleSavedSessionList`): stream
@@ -1004,8 +1122,7 @@ impl Supervisor {
         // Session-addressed form: use the live worker's cwd and session dir.
         let (cwd, session_dir) = match active_session_id {
             Some(active_session_id) => {
-                let workers = self.workers.lock().await;
-                let resident = workers.get(active_session_id);
+                let resident = self.registry.get(active_session_id).await;
                 match resident {
                     Some(resident) => {
                         let descriptor = resident.descriptor.lock().await;
@@ -1116,10 +1233,9 @@ impl Supervisor {
             _ => {
                 // Live residents of this supervisor.
                 let mut summaries = Vec::new();
-                let workers = self.workers.lock().await;
-                for (worker_id, resident) in workers.iter() {
+                for resident in self.registry.list().await {
                     let response = self
-                        .route_command(resident, "get_state", json!({}), ROUTE_TIMEOUT_MS)
+                        .route_command(&resident, "get_state", json!({}), ROUTE_TIMEOUT_MS)
                         .await;
                     match response {
                         Ok(response) if response.success => {
@@ -1127,7 +1243,7 @@ impl Supervisor {
                                 summaries.push(data);
                             }
                         }
-                        _ => summaries.push(offline_summary(worker_id)),
+                        _ => summaries.push(offline_summary(&resident.worker_id)),
                     }
                 }
                 summaries
@@ -1165,10 +1281,9 @@ impl Supervisor {
         if name.trim().is_empty() {
             return Err(anyhow!("Session name cannot be empty"));
         }
-        let workers = self.workers.lock().await;
-        for resident in workers.values() {
+        for resident in self.registry.list().await {
             let response = self
-                .route_command(resident, "get_state", json!({}), ROUTE_TIMEOUT_MS)
+                .route_command(&resident, "get_state", json!({}), ROUTE_TIMEOUT_MS)
                 .await;
             if let Ok(response) = response {
                 if let Some(data) = &response.data {
@@ -1187,43 +1302,6 @@ impl Supervisor {
         Ok(())
     }
 
-    async fn resolve_worker(self: &Arc<Self>, selector: &str) -> Result<Arc<ResidentWorker>> {
-        let workers = self.workers.lock().await;
-        if let Some(resident) = workers.get(selector) {
-            return Ok(Arc::clone(resident));
-        }
-        let mut matches: Vec<(Arc<ResidentWorker>, String, String)> = Vec::new();
-        for resident in workers.values() {
-            let (root_id, file_stem, name) = resident.labels().await;
-            if selector_matches(&root_id, selector)
-                || selector_matches(&file_stem, selector)
-                || (!name.is_empty() && name == selector)
-            {
-                matches.push((Arc::clone(resident), root_id, name));
-            }
-        }
-        if matches.len() == 1 {
-            return Ok(matches.pop().map(|(r, ..)| r).expect("one match"));
-        }
-        if matches.len() > 1 {
-            let rendered = matches
-                .iter()
-                .map(|(_, root, name)| {
-                    if name.is_empty() {
-                        root.clone()
-                    } else {
-                        format!("{root} ({name})")
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(anyhow!(
-                "Ambiguous active session \"{selector}\": matches {rendered}"
-            ));
-        }
-        Err(anyhow!("Unknown active session: {selector}"))
-    }
-
     async fn route_client_command(
         self: &Arc<Self>,
         command: &DaemonCommand,
@@ -1235,7 +1313,7 @@ impl Supervisor {
         let selector = command_active_session_id(command)
             .unwrap_or_default()
             .to_string();
-        let Ok(resident) = self.resolve_worker(&selector).await else {
+        let Ok(resident) = self.registry.resolve(&selector).await else {
             return (
                 vec![response_line(&response_failure(
                     Some(&command_id),
@@ -1355,20 +1433,19 @@ impl Supervisor {
             .route_command(resident, "shutdown", json!({}), ROUTE_TIMEOUT_MS)
             .await;
         let _ = std::fs::remove_file(&resident.descriptor_path);
-        self.workers.lock().await.remove(&resident.worker_id);
+        self.registry.remove(&resident.worker_id).await;
     }
 
     async fn begin_shutdown(self: &Arc<Self>) {
         self.shutting_down.store(true, Ordering::SeqCst);
-        let mut workers = self.workers.lock().await;
-        for resident in workers.values() {
+        for resident in self.registry.list().await {
             resident.intentional_stop.store(true, Ordering::SeqCst);
             let _ = self
-                .route_command(resident, "shutdown", json!({}), ROUTE_TIMEOUT_MS)
+                .route_command(&resident, "shutdown", json!({}), ROUTE_TIMEOUT_MS)
                 .await;
             let _ = std::fs::remove_file(&resident.descriptor_path);
         }
-        workers.clear();
+        self.registry.clear().await;
         // Wake the accept loop only after the workers stopped, so the process
         // cannot exit mid-stop and orphan a live worker.
         self.shutdown_notify.notify_one();
@@ -1422,13 +1499,6 @@ async fn write_line<W: AsyncWriteExt + Unpin>(writer: &mut W, value: &Value) -> 
     writer.write_all(line.as_bytes()).await?;
     writer.flush().await?;
     Ok(())
-}
-
-fn selector_matches(candidate: &str, suffix: &str) -> bool {
-    let normalize = |value: &str| -> String { value.replace('-', "").to_lowercase() };
-    let candidate = normalize(candidate);
-    let suffix = normalize(suffix);
-    !candidate.is_empty() && !suffix.is_empty() && candidate.ends_with(&suffix)
 }
 
 /// The worker-side command name plus payload for a routed client command.

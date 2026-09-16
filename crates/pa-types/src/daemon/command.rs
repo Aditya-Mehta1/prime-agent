@@ -1031,6 +1031,24 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    /// Session-worker self-registration (worker -> supervisor). A booting
+    /// worker presents its supervisor-issued identity so the supervisor can
+    /// rebuild its roster; the same command re-registers the worker after a
+    /// supervisor restart (the token was issued when the supervisor spawned
+    /// or adopted the worker, so only the real worker can present it).
+    WorkerRegister {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        socket_path: String,
+        worker_instance_id: String,
+        token: String,
+        pid: u64,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1067,6 +1085,13 @@ mod tests {
         );
         rt::<DaemonCommand>(
             r#"{"type":"cancel_prompt_admission","activeSessionId":"s1","admissionId":"a1","cancelOwned":true}"#,
+        );
+    }
+
+    #[test]
+    fn worker_register_roundtrip() {
+        rt::<DaemonCommand>(
+            r#"{"type":"worker_register","activeSessionId":"abc123def456","sessionId":"s-uuid","socketPath":"/tmp/w.sock","workerInstanceId":"inst-1","token":"tok","pid":4242}"#,
         );
     }
 
