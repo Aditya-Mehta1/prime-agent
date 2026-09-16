@@ -182,8 +182,11 @@ function scan(content, path = "") {
 		const line = lines[index];
 		const maskedLine = maskedLines[index];
 		const matchOutsideSyntax = (pattern) => {
-			const match = line.match(pattern);
-			return match && /\S/.test(maskedLine.slice(match.index ?? 0, (match.index ?? 0) + match[0].length)) ? match : undefined;
+			const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
+			for (const match of line.matchAll(new RegExp(pattern.source, flags))) {
+				if (/\S/.test(maskedLine.slice(match.index ?? 0, (match.index ?? 0) + match[0].length))) return match;
+			}
+			return undefined;
 		};
 		const titleMatch = line.match(/\b(?:it|test)(?:\.[A-Za-z]+|\([^)]*\))*\(\s*["'`]([^"'`]+)/);
 		const pythonTitleMatch = line.match(/^\s*(?:async\s+)?def\s+(test_[A-Za-z0-9_]+)/);
@@ -403,13 +406,16 @@ function changedLineStats(base) {
 	if (!base) return undefined;
 	const stats = { sourceAdded: 0, testAdded: 0, testDeleted: 0 };
 	const tracked = new Set();
-	const isSource = (path) => /(?:^|\/)(?:src|scripts)\//.test(path) && !testFilePattern.test(path);
-	const meaningfulSourceFlags = (lines) =>
-		maskJsSyntax(lines.join("\n"))
-			.split("\n")
+	const isSource = (path) =>
+		((!path.includes("/") && /\.(?:[cm]?[jt]sx?|py|sh)$/.test(path)) || /(?:^|\/)(?:src|scripts)\//.test(path)) &&
+		!testFilePattern.test(path);
+	const meaningfulSourceFlags = (lines, path) => {
+		const normalized = /\.(?:py|sh)$/.test(path) ? lines : maskJsSyntax(lines.join("\n")).split("\n");
+		return normalized
 			.map((line) => line.trim())
 			.map((line) => line.length > 0 && !/^#/.test(line) && !/^[{}()[\],;]+$/.test(line));
-	const meaningfulSourceCount = (lines) => meaningfulSourceFlags(lines).filter(Boolean).length;
+	};
+	const meaningfulSourceCount = (lines, path) => meaningfulSourceFlags(lines, path).filter(Boolean).length;
 	const record = (path, added, deleted) => {
 		tracked.add(path);
 		if (testFilePattern.test(path)) {
@@ -417,7 +423,7 @@ function changedLineStats(base) {
 			stats.testDeleted += deleted;
 		}
 	};
-	const roots = ["packages", "prime-agent-runtime", "scripts"];
+	const roots = ["."];
 	for (const row of git(["diff", "--numstat", "--no-renames", base, "--", ...roots]).split("\n")) {
 		if (!row) continue;
 		const [added, deleted, path] = row.split("\t");
@@ -428,7 +434,7 @@ function changedLineStats(base) {
 	let newLine = 0;
 	const flushSource = () => {
 		if (sourcePath && existsSync(resolve(root, sourcePath))) {
-			const flags = meaningfulSourceFlags(readFileSync(resolve(root, sourcePath), "utf8").split("\n"));
+			const flags = meaningfulSourceFlags(readFileSync(resolve(root, sourcePath), "utf8").split("\n"), sourcePath);
 			for (const line of addedSourceLines) if (flags[line - 1]) stats.sourceAdded += 1;
 		}
 		addedSourceLines = [];
@@ -458,7 +464,7 @@ function changedLineStats(base) {
 		const content = readFileSync(resolve(root, path), "utf8");
 		const added = content.length === 0 ? 0 : content.split("\n").length - (content.endsWith("\n") ? 1 : 0);
 		record(path, added, 0);
-		if (isSource(path)) stats.sourceAdded += meaningfulSourceCount(content.split("\n"));
+		if (isSource(path)) stats.sourceAdded += meaningfulSourceCount(content.split("\n"), path);
 	}
 	return stats;
 }
