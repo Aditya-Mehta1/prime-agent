@@ -331,8 +331,8 @@ fn normalize_versions(text: &str) -> String {
             }
             let token = &text[start..i];
             let trailing = token.ends_with('.');
-            let token = token.trim_end_matches('.');
-            let parts: Vec<&str> = token.split('.').collect();
+            let version_candidate = token.trim_end_matches('.');
+            let parts: Vec<&str> = version_candidate.split('.').collect();
             if parts.len() >= 2
                 && parts
                     .iter()
@@ -340,10 +340,9 @@ fn normalize_versions(text: &str) -> String {
             {
                 out.push_str(&format!("X{}.X.X", if trailing { "." } else { "" }));
             } else {
+                // Non-version digit runs are kept verbatim: trimming here
+                // would corrupt adjacent separators (e.g. git fetch ranges).
                 out.push_str(token);
-                if trailing {
-                    out.push('.');
-                }
             }
         } else {
             let ch = text[i..].chars().next().unwrap();

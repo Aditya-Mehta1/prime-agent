@@ -325,8 +325,8 @@ fn normalize_versions(text: &str) -> String {
             }
             let token = text[start..].chars().take(i - start).collect::<String>();
             let trailing = token.ends_with('.');
-            let token = token.trim_end_matches('.');
-            let parts: Vec<&str> = token.split('.').collect();
+            let version_candidate = token.trim_end_matches('.');
+            let parts: Vec<&str> = version_candidate.split('.').collect();
             if parts.len() >= 2
                 && parts
                     .iter()
@@ -337,10 +337,10 @@ fn normalize_versions(text: &str) -> String {
                     out.push('.');
                 }
             } else {
-                out.push_str(token);
-                if trailing {
-                    out.push('.');
-                }
+                // Non-version digit runs (hash fragments, numbers) are kept
+                // verbatim: trimming here would corrupt adjacent separators
+                // such as the `..` between git fetch commit ranges.
+                out.push_str(&token);
             }
         } else {
             let ch = text[i..].chars().next().unwrap();
@@ -376,6 +376,35 @@ fn normalize_hashes(text: &str) -> String {
         }
     }
     out
+}
+
+/// Git fetch ranges (`<old>..<new>`) must survive version normalization
+/// regardless of where digits appear in the commit hashes; `normalize_hashes`
+/// then reduces both sides to `<HASH>..<HASH>`. Regression: the old
+/// normalizer trimmed a `..` to `.` whenever the old hash ended in a digit
+/// and the new one started with a letter, which made the two drives'
+/// transcripts differ for ~29% of runs (the `move` commits are new every
+/// run, so the fetch line normalized asymmetrically).
+#[test]
+fn normalize_keeps_git_fetch_ranges_for_all_hash_shapes() {
+    let fetch_ranges = [
+        // Old hash ends in a digit, new hash starts with a letter.
+        "bbcac419e0abdc1240759f79111401e5e752bdc6..b3eb69bbb53ea3eaa2dd4ee957b572c2b598b346",
+        // Old hash ends in a digit, new hash starts with a digit.
+        "bbcac419e0abdc1240759f79111401e5e752bdc6..5ded43e37d19d1150f0c51cd6077b810ab876a24",
+        // Old hash ends in a letter.
+        "239ee46d9d33bb4ffebacbbca200b05116a1b0eb..ba60bc927f0cfc1fa2f10d7edd33c6f10d7c582b",
+    ];
+    for range in fetch_ranges {
+        assert_eq!(
+            normalize_hashes(&normalize_versions(range)),
+            "<HASH>..<HASH>",
+            "range: {range}"
+        );
+    }
+    // Real dotted versions still collapse to the placeholder.
+    assert_eq!(normalize_versions("version 1.0.0\n"), "version X.X.X\n");
+    assert_eq!(normalize_versions("9.9.9"), "X.X.X");
 }
 
 fn ts_binary() -> Option<PathBuf> {
