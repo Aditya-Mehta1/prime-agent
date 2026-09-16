@@ -58,3 +58,6 @@ Every contributor (human or agent) must read this before working on this repo.
 
 - TS prime-agent at ~/prime-agent is the parity ground truth (read-only).
 - OpenAI Codex (~/codex, Apache 2.0) is the design reference for agent internals; attribute ports.
+
+- PRs are squash-merged: one commit per PR, subject `scope: summary (#N)` (`gh pr merge --squash`).
+  Do not rewrite merged history - the repo is append-only.

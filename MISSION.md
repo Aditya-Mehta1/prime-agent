@@ -24,6 +24,7 @@ The only thing worth keeping is the behavior contract: a good inference harness 
   - The dependency graph is layered and cycle-free; document the direction in the workspace README and ARCHITECTURE.md, and keep it true in Cargo.toml.
   - If a change forces edits across many crates' internals, the boundary is wrong — fix the boundary, not the symptom. This is the anti-agent-session.ts rule: no file, module, or crate may become the place everything flows through.
 - The interactive agent view is the most important surface — the TUI session experience is what users live in, so build and polish it first and hardest. But every capability must also run headlessly with identical behavior, so the same product serves evals, sandboxes, and embedding inside other applications.
+- Config-defined models: users must be able to declare model entries (id, provider, endpoint, pricing, context window) in their config, and those entries survive catalog refreshes — custom or internal endpoints must not depend on API listing (the current product loses such models whenever its catalog cache is overwritten by the network-scoped /models response).
 - The end deliverable is an OS-agnostic compiled Prime Agent, without the bloat and fluff.
 
 Parity means user experience, not implementation internals. You may — and should — rethink mechanisms where the current design is broken, provided the user-visible behavior is preserved or improved. The daemon is the model case:
@@ -35,7 +36,7 @@ Parity means user experience, not implementation internals. You may — and shou
 
 ## Process
 
-- GitHub continuously: commit and push in small increments so progress is never lost. Use PRs wherever possible — branch per unit of work, run checks, self-merge (direct commits only for trivial fixes). Keep main always green.
+- GitHub continuously: commit and push in small increments so progress is never lost. Use PRs wherever possible — branch per unit of work, run checks, self-merge with **squash merges** (one commit per PR, subject like `scope: summary (#N)`; direct commits only for trivial fixes). Keep main always green.
 - Parallelize with subagents: after the initial scan, decompose into independent lanes (e.g. crates: TUI, providers, agent loop, RLM/kernel, coding-agent features, CLI), spawn one subagent per lane with its own branch/worktree, and integrate through PRs. Verify each subagent's work before merging; don't redo lanes inline. Parallelize everything that can be parallelized.
 - Work responsibly, not lazily: no stubs, no placeholder implementations, no todo!()/unimplemented!(), no swallowed errors. Read the TypeScript before porting a behavior and match it — don't guess. Nothing is done until it is verified against real product behavior, not just the compiler.
 
