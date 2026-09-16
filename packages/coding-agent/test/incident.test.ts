@@ -736,6 +736,27 @@ describe("worker pid attribution and anomalies", () => {
 		expect(events.every((item) => item.subject === "worker 5b1d3aeb91ee")).toBe(true);
 	});
 
+	it("keys unknown worker diagnostics as worker events", () => {
+		const socketPath = "/tmp/prime-agent-501/worker-98ed5cb228d2-aaaaaaaaaaaa.sock";
+		const entries = [1, 2, 3].map((index) =>
+			entry(
+				agentLogLine({
+					ts: `2026-09-10T20:0${index}:00.000Z`,
+					component: "coding-agent.daemon",
+					socketPath,
+					pid: 53615,
+					msg: `unrecognized worker diagnostic ${index}`,
+				}),
+			),
+		);
+		const events = collectIncidentEvents(entries, collectWorkerPidMap(entries));
+		const anomalies = computeIncidentAnomalies(events);
+		expect(anomalies.some((item) => item.summary.startsWith("worker aaaaaaaaaaaa: 3 warnings/errors over 2m"))).toBe(
+			true,
+		);
+		expect(anomalies.some((item) => item.summary.includes(socketPath))).toBe(false);
+	});
+
 	it("flags error bursts that are not timeouts", () => {
 		const entries = [1, 2, 3].map((index) =>
 			entry(

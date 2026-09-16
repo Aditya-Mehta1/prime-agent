@@ -494,9 +494,9 @@ function event(
 }
 
 /**
- * Supervisor-level events are keyed per daemon socket so anomalies and
- * aggregation never mix entries from two daemons sharing one agent.jsonl.
- * The per-daemon fallback log carries no socket field, so it keys on `daemon`.
+ * Key events on the entry's socket path so anomalies and aggregation never
+ * mix entries from different daemons sharing one agent.jsonl; entries without
+ * a socket field (the per-daemon fallback log) key on `daemon`.
  */
 function daemonSubject(entry: IncidentLogEntry): string {
 	return entry.socketPath ?? "daemon";
@@ -789,7 +789,7 @@ export function classifyIncidentEntry(entry: IncidentLogEntry, workerPids: Worke
 			entry.level === "error" ? "error" : "warn",
 			"supervisor",
 			"diagnostic",
-			daemonSubject(entry),
+			workerId ? `worker ${workerId}` : daemonSubject(entry),
 			truncateText(msg, SUMMARY_TRUNCATION),
 		);
 	}
