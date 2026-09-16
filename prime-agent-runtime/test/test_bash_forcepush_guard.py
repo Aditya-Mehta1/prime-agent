@@ -1541,7 +1541,9 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         ]:
             with self.subTest(command=command):
                 message = await self._refused(command)
-                self.assertIn("command word is a shell or brace expansion", message)
+                self.assertIn(
+                    "command word is argv the guard cannot resolve", message
+                )
         # An unresolvable command word with no force-push pattern next to it
         # stays inert, and a quoted brace is data.
         for command in [
@@ -1553,6 +1555,69 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         ]:
             with self.subTest(command=command):
                 self.assertIsNone(self._guard_verdict(command))
+
+    async def test_refuses_the_unresolvable_argv_family(self):
+        """P and U, P and E, and a wrapper carrying a force-push pattern.
+
+        Each of these runs a force push that a text scan cannot follow to: the
+        command word is decided at run time, a shell reads the command from a
+        pipe, here-string, or redirect, or an unmodeled wrapper runs it
+        somewhere the guard cannot see. They were all allowed before this round
+        and really force-updated a protected main.
+        """
+        repo, bare = self._make_repo("repo-family", branch="main")
+        self._diverge(repo, bare, "main")
+        os.chdir(self.test_dir)  # a non-repository workspace, as in the kernel
+        quote = "'"
+        here = self.test_dir / "payload.sh"
+        here.write_text("git push -f origin main\n")
+        for command in [
+            # P and U: a command word decided at run time.
+            f"c={quote}git push -f origin main{quote}; $c",
+            f"X=git; Y={quote}push -f origin main{quote}; $X $Y",
+            "git${IFS}push -f origin main",
+            f"$(printf {quote}git push -f origin main{quote})",
+            # P and E: a shell that reads the command from stdin.
+            f"echo {quote}git push -f origin main{quote} | sh",
+            f"printf {quote}git push -f origin main{quote} | bash",
+            f"bash <<< {quote}git push -f origin main{quote}",
+            f"echo x | xargs -I{{}} sh -c {quote}git push -f origin main{quote}",
+            f"sh < {here}",
+            # An unmodeled wrapper carrying a force-push pattern.
+            f"ssh build-box {quote}git push -f origin main{quote}",
+        ]:
+            with self.subTest(command=command):
+                await self._refused(command)
+        # The implicit-refspec form behind each wrapper: the guard cannot know
+        # where the wrapper really ran, so it refuses instead of probing the
+        # kernel cwd (a non-repository, where it would fail open).
+        for wrapper in ["chroot", "timeout", "parallel", "ssh", "docker", "sudo", "nsenter"]:
+            command = f"{wrapper} {repo} git push -f"
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("wrapper", message)
+
+    async def test_family_scoping_controls_stay_allowed(self):
+        repo, _bare = self._make_repo("repo-family-ctl", branch="main")
+        os.chdir(repo)
+        for command in [
+            "X=1; git push origin feature",
+            "echo $HOME && git push origin feature",
+            "ls $(pwd) && git status",
+            "X=$(date); echo $X",
+            'echo "$(git rev-parse HEAD)" | cut -c1-7',
+            "git status --short",
+            "git log --oneline -3",
+            "git push origin feature",
+            # An echo of a force-push string with no conduit and no unmodeled
+            # wrapper stays inert.
+            'echo "git push -f origin main"',
+        ]:
+            with self.subTest(command=command):
+                self.assertIsNone(self._guard_verdict(command))
+        # Already refused before this round and still refused: an unresolvable
+        # refspec.
+        self.assertIsNotNone(self._guard_verdict("BR=feature; git push origin $BR"))
 
     async def test_refuses_payloads_that_hold_an_expansion(self):
         repo, _bare = self._make_repo("repo-payload-expansion", branch="main")

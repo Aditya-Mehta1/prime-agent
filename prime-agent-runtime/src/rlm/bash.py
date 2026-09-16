@@ -1989,6 +1989,151 @@ def _fp_unquoted_text(text: str) -> str:
     return "".join(chars)
 
 
+# The "argv the guard cannot statically resolve" family:
+#
+#   P = a force-push pattern is present (in the visible text, including text the
+#       scanner folds into a quoted word value)
+#   U = a command run's command word is argv the guard cannot resolve: an
+#       expansion (variable, substitution, backtick, `${IFS}`), an unquoted
+#       brace expansion, or a wrapper the guard does not model
+#   E = an execution conduit: a pipe or input redirect into a shell
+#       interpreter, a here-string, or xargs driving one
+#
+# A shell text guard cannot follow any of those to the command that really runs,
+# so (P and U) and E are refused (and an unmodeled wrapper in command position
+# is refused whenever a force-push pattern is anywhere in the text, which also
+# covers `ssh build-box "git push -f origin main"`).
+_FP_PUSH_IN_TEXT = re.compile(r"(?<![A-Za-z0-9_])push(?![A-Za-z0-9_])")
+_FP_FORCE_IN_TEXT = re.compile(
+    r"(?<![A-Za-z0-9_])"
+    r"(?:--force(?![A-Za-z0-9_-])|--mirror(?![A-Za-z0-9_-])|-[A-Za-z]*f(?![A-Za-z0-9_-])|\+[^\s;&|()])"
+)
+# Wrappers that can change what or where the command runs (a child process, a
+# container, another host, another user, a changed root): the guard cannot model
+# them, so a force-push pattern next to one is refused.
+_FP_UNMODELED_WRAPPERS = (
+    "ssh",
+    "chroot",
+    "timeout",
+    "parallel",
+    "docker",
+    "podman",
+    "nsenter",
+    "unshare",
+    "bwrap",
+    "firejail",
+    "flatpak",
+    "systemd-run",
+    "runuser",
+    "su",
+    "doas",
+    "sudo",
+    "time",
+    "setsid",
+    "stdbuf",
+    "nohup",
+    "nice",
+    "xargs",
+)
+# Shells that read a script from their stdin when given a conduit.
+_FP_SHELL_INTERPRETER_IN_TEXT = re.compile(
+    r"(?<![A-Za-z0-9_./-])(?:sh|bash|zsh|dash|ksh)(?:\.exe)?(?![A-Za-z0-9_.-])",
+    re.IGNORECASE,
+)
+
+
+def _fp_flattened_text(words: list[_FpShellWord]) -> str:
+    """The command's word values joined by spaces.
+
+    Quotes are already folded away by the scanner, so a payload quoted into one
+    word (`ssh build-box "git push -f origin main"`) shows its text here."""
+    return " ".join(word.value for word in words)
+
+
+def _fp_force_push_pattern_in_text(text: str) -> bool:
+    """True when the text carries `push` together with a force signal."""
+    if not _FP_PUSH_IN_TEXT.search(text):
+        return False
+    return bool(_FP_FORCE_IN_TEXT.search(text))
+
+
+def _fp_is_unmodeled_wrapper(value: str) -> bool:
+    return _fp_command_name(value) in _FP_UNMODELED_WRAPPERS
+
+
+def _fp_unresolvable_command_words(
+    words: list[_FpShellWord], command: str
+) -> set[int]:
+    """Indices of command words the guard cannot resolve.
+
+    A command word is the first word of a run that is not an env assignment and
+    not a modeled wrapper (`GIT_DIR=... git push`), so the index points at what
+    the shell would really run."""
+    found: set[int] = set()
+    index = 0
+    total = len(words)
+    while index < total:
+        word = words[index]
+        if not word.starts_command or _fp_contained_in_later_word(words, index):
+            index += 1
+            continue
+        unquoted = _fp_unquoted_text(command[word.start : word.end])
+        if (
+            _FP_DYNAMIC_COMMAND_WORD.search(unquoted)
+            or _FP_BRACE_EXPANSION.search(unquoted)
+            or _fp_is_unmodeled_wrapper(unquoted.strip())
+        ):
+            found.add(index)
+        index += 1
+    return found
+
+
+def _fp_execution_conduit(words: list[_FpShellWord], text: str) -> bool:
+    """True when a shell interpreter can read the command it runs from stdin.
+
+    `echo 'git push -f origin main' | sh`, `bash <<< '...'`, `sh < payload.sh`,
+    and `xargs -I{} sh -c '...'` all hand the guard's text to a shell the guard
+    cannot see into, so they are refused rather than scanned."""
+    if "<<<" in text:
+        return True
+    if not _FP_SHELL_INTERPRETER_IN_TEXT.search(text):
+        return False
+    if "|" in text or "<" in text:
+        return True
+    return any(_fp_command_name(word.value) == "xargs" for word in words)
+
+
+def _fp_family_violation(words: list[_FpShellWord], text: str) -> str | None:
+    """Why this command belongs to the unresolvable-argv family, or None.
+
+    `text` is the command as written (before redirection masking), because a
+    conduit is made of the redirection characters the masker removes."""
+    command = _fp_mask_redirections(text)
+    if _fp_execution_conduit(words, text):
+        return (
+            "a shell reads the command it runs from a pipe, a here-string, or a"
+            " redirect, so the guard cannot see what executes"
+        )
+    flat = _fp_flattened_text(words)
+    if not _fp_force_push_pattern_in_text(flat):
+        return None
+    unresolvable = _fp_unresolvable_command_words(words, command)
+    if not unresolvable:
+        return None
+    if any(_fp_is_unmodeled_wrapper(words[index].value) for index in unresolvable):
+        return (
+            "an unmodeled wrapper (ssh, chroot, timeout, sudo, docker,"
+            " xargs, ...) is"
+            " in command position next to a force-push pattern, and the guard"
+            " cannot see what it runs or where"
+        )
+    return (
+        "its command word is argv the guard cannot resolve (an expansion or an"
+        " unquoted brace expansion) next to a force-push pattern, so what it"
+        " runs is decided at run time"
+    )
+
+
 def _fp_unresolvable_command_word_hides_force_push(
     words: list[_FpShellWord], command: str
 ) -> bool:
@@ -2121,7 +2266,13 @@ def _fp_invocation_context(
         elif re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", value):
             pass  # a benign env assignment applies only to this invocation
         elif name in _FP_COMMAND_WRAPPERS:
-            pass  # wrappers that cannot change directory or repository
+            if name in _FP_UNMODELED_WRAPPERS:
+                # `sudo`/`time`/`ssh`-style wrappers can run the command
+                # somewhere else (a child process, another user, another
+                # repository), so the cwd the guard would probe is not known.
+                relocated = True
+        elif _fp_is_unmodeled_wrapper(value):
+            relocated = True  # an unmodeled wrapper in front of the invocation
         else:
             break  # an argument or unknown wrapper: nothing more to learn
         j -= 1
@@ -2284,6 +2435,8 @@ def _fp_payload_hides_force_push(payload: str, depth: int = 0) -> bool:
         _fp_mask_redirections(_fp_normalize_continuations(payload))
     )
     words = _fp_scan_words(normalized)
+    if _fp_family_violation(words, payload) is not None:
+        return True  # the payload belongs to the unresolvable-argv family
     if _fp_unresolvable_command_word_hides_force_push(words, normalized):
         return True  # the payload's command word decides what runs
     if _fp_unresolvable_git_subcommand(words) is not None:
@@ -3245,6 +3398,11 @@ def _fp_guard_force_push(command: str) -> None:
             )
         )
     words = _fp_scan_words(normalized)
+    # The conduit scan reads the text before redirection masking: `<<<` and
+    # `<` are exactly what a masker removes, and they are the point here.
+    family_reason = _fp_family_violation(words, command_text)
+    if family_reason is not None:
+        raise ForcePushRefusalError(_fp_format_refusal(family_reason))
     if _fp_unresolvable_command_word_hides_force_push(words, normalized):
         raise ForcePushRefusalError(
             _fp_format_refusal(
