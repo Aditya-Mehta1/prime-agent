@@ -1246,14 +1246,28 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
             "builtin source move.sh && git push -f origin HEAD",
             ". move.sh && git push -f origin HEAD",
             "command source move.sh && git push -f origin HEAD",
+            # A quoted dot in command position is the same source builtin: the
+            # whitespace the pattern needs sits after the quote.
+            '"." ./move.sh && git push -f origin HEAD',
+            "'.' ./move.sh && git push -f origin HEAD",
+            '"." move.sh && git push -f origin HEAD',
+            '"." ./move.sh; git push -f origin HEAD',
+            # A sourced dot with no operand is refused too: bash errors on it
+            # (".: usage: . [-p path] filename"), so there is nothing to
+            # resolve and the shell cannot be replayed.
+            '"." && git push -f origin HEAD',
         ]:
             with self.subTest(command=command):
                 message = await self._refused(command)
                 self.assertIn("changes directory", message)
-        # A child shell never relocates the parent, and `cd .` is not a source.
+        # A child shell never relocates the parent, `cd .` is not a source, and
+        # a dot that is only an argument is not one either.
+        (repo / "move.sh").chmod(0o755)
         for command in [
             "sh move.sh && git push -f origin HEAD",
+            "./move.sh && git push -f origin HEAD",
             "cd . && git push -f origin HEAD",
+            'git status "." && git push -f origin HEAD',
         ]:
             with self.subTest(command=command):
                 result = await self._run(command)

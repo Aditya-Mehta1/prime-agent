@@ -2436,8 +2436,20 @@ _FP_SOURCE_COMMAND = re.compile(
 
 
 def _fp_part_sources_scripts(part: str) -> bool:
-    """True when one command run sources a script anywhere in it."""
-    return bool(_FP_SOURCE_COMMAND.search(part))
+    """True when one command run sources a script anywhere in it.
+
+    The pattern catches `source x` and `. x` as written, but a quoted or
+    backslash-escaped dot (`. ./setup.sh`, `"." ./setup.sh`) hides the
+    whitespace the pattern needs, so the scan also looks for `source` or `.`
+    in command position. A dot that is only an argument (`cd .`, `ls .`,
+    `git status "."`) is not a source, and `./setup.sh` runs a child process
+    that cannot relocate the shell."""
+    if _FP_SOURCE_COMMAND.search(part):
+        return True
+    return any(
+        word.value in ("source", ".") and word.starts_command
+        for word in _fp_scan_words(part)
+    )
 
 
 def _fp_resolve_push_cwd(
@@ -2457,7 +2469,7 @@ def _fp_resolve_push_cwd(
     moved the shell: the kernel workspace."""
     if not (
         re.search(r"\b(?:cd|pushd|popd|source)\b", prefix)
-        or _FP_SOURCE_COMMAND.search(prefix)
+        or _fp_part_sources_scripts(prefix)
         or "(" in prefix
     ):
         return None
