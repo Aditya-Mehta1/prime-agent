@@ -127,7 +127,6 @@ function maskJsSyntax(content) {
 			blockComment = true;
 			index += 1;
 		} else if (
-			templateExpressions.length > 0 &&
 			char === "/" &&
 			(lastCodeChar === "" ||
 				/[({[=,:;!?&|>~+*%^\-]/.test(lastCodeChar) ||
