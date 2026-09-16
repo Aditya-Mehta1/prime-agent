@@ -27,11 +27,11 @@ function resolveBase() {
 	}
 	if (process.env.GITHUB_BASE_REF) {
 		const remote = `origin/${process.env.GITHUB_BASE_REF}`;
-		if (git(["rev-parse", "--verify", remote], true)) return remote;
+		if (git(["rev-parse", "--verify", remote], true)) return git(["merge-base", "HEAD", remote], true) || remote;
 	}
 	const originMain = git(["rev-parse", "--verify", "origin/main"], true);
 	const head = git(["rev-parse", "HEAD"]);
-	if (originMain && originMain !== head) return "origin/main";
+	if (originMain && originMain !== head) return git(["merge-base", "HEAD", "origin/main"], true) || "origin/main";
 	return git(["rev-parse", "--verify", "HEAD^"], true) ? "HEAD^" : undefined;
 }
 
@@ -96,9 +96,17 @@ function maskJsSyntax(content) {
 	return masked;
 }
 
-function directObjectPropertyNames(argument) {
+function directObjectProperties(argument) {
 	const names = new Set();
-	if (!argument.trimStart().startsWith("{")) return names;
+	const numeric = new Set();
+	if (!argument.trimStart().startsWith("{")) return { names, numeric };
+	const record = (name, separator) => {
+		names.add(name);
+		if (argument[separator] !== ":") return;
+		let value = separator + 1;
+		while (/\s/.test(argument[value] ?? "")) value += 1;
+		if (/^[1-9][0-9_]*/.test(argument.slice(value))) numeric.add(name);
+	};
 	let depth = 0;
 	let cursor = 0;
 	let previous = "";
@@ -117,7 +125,7 @@ function directObjectPropertyNames(argument) {
 		}
 		if (char === '"' || char === "'" || char === "`") {
 			const quote = char;
-			let value = "";
+			let name = "";
 			let escaped = false;
 			cursor += 1;
 			while (cursor < argument.length) {
@@ -125,12 +133,12 @@ function directObjectPropertyNames(argument) {
 				if (escaped) escaped = false;
 				else if (quoted === "\\") escaped = true;
 				else if (quoted === quote) break;
-				else value += quoted;
+				else name += quoted;
 				cursor += 1;
 			}
 			let lookahead = cursor + 1;
 			while (/\s/.test(argument[lookahead] ?? "")) lookahead += 1;
-			if (depth === 1 && (previous === "{" || previous === ",") && argument[lookahead] === ":") names.add(value);
+			if (depth === 1 && (previous === "{" || previous === ",") && argument[lookahead] === ":") record(name, lookahead);
 			previous = "string";
 			cursor += 1;
 			continue;
@@ -142,7 +150,7 @@ function directObjectPropertyNames(argument) {
 			if (name) {
 				let lookahead = cursor + name.length;
 				while (/\s/.test(argument[lookahead] ?? "")) lookahead += 1;
-				if ([":", ",", "}"].includes(argument[lookahead])) names.add(name);
+				if ([":", ",", "}"].includes(argument[lookahead])) record(name, lookahead);
 				cursor += name.length;
 				previous = "identifier";
 				continue;
@@ -151,7 +159,7 @@ function directObjectPropertyNames(argument) {
 		if (!/\s/.test(char)) previous = char;
 		cursor += 1;
 	}
-	return names;
+	return { names, numeric };
 }
 
 function changedTestFiles(base) {
@@ -294,7 +302,7 @@ function scan(content, path = "") {
 			}
 			const optionNames = new Set();
 			for (const argument of argumentsBeforeCallback) {
-				for (const name of directObjectPropertyNames(argument)) optionNames.add(name);
+				for (const name of directObjectProperties(argument).names) optionNames.add(name);
 			}
 			const hasOption = (name) => optionNames.has(name);
 			const ownTitle = optionsRegion.match(/["'`]([^"'`]+)["'`]/)?.[1] ?? title;
@@ -334,7 +342,6 @@ function scan(content, path = "") {
 		}
 		if (matchOutsideSyntax(/\b(?:setTimeout|setInterval)\s*\(/)) add("wall-clock-timer", index + 1, "setTimeout/setInterval");
 		if (matchOutsideSyntax(/\bAtomics\.wait\s*\(/)) add("wall-clock-timer", index + 1, "Atomics.wait");
-		if (matchOutsideSyntax(/\.(?:listen|bind)\s*\(\s*[1-9][0-9_]*\b/)) add("fixed-resource", index + 1, "fixed bind/listen port");
 		const controlWindow = maskedLines.slice(index, index + 4).join(" ");
 		if (
 			/\bif\s*\([^)]*(?:process\.env|apiKey|credential|token|process\.platform|os\.(?:environ|getenv)|sys\.platform)/i.test(maskedLine) &&
@@ -347,6 +354,28 @@ function scan(content, path = "") {
 		}
 		if (matchOutsideSyntax(/\bexpect\s*\(\s*(?:true|false|[-+]?\d+(?:\.\d+)?|["'][^"']*["'])\s*\)/)) {
 			add("vacuous-assertion", index + 1, "literal expect");
+		}
+	}
+
+	for (const match of maskedContent.matchAll(/\.(?:listen|bind)\s*\(/g)) {
+		let argument = (match.index ?? 0) + match[0].length;
+		while (/\s/.test(maskedContent[argument] ?? "")) argument += 1;
+		let fixed = /^[1-9][0-9_]*/.test(maskedContent.slice(argument));
+		if (!fixed && maskedContent[argument] === "{") {
+			let depth = 0;
+			let closing = -1;
+			for (let cursor = argument; cursor < maskedContent.length; cursor += 1) {
+				if (maskedContent[cursor] === "{") depth += 1;
+				else if (maskedContent[cursor] === "}" && --depth === 0) {
+					closing = cursor;
+					break;
+				}
+			}
+			if (closing >= 0) fixed = directObjectProperties(content.slice(argument, closing + 1)).numeric.has("port");
+		}
+		if (fixed) {
+			const line = maskedContent.slice(0, match.index ?? 0).split("\n").length;
+			add("fixed-resource", line, "fixed bind/listen port", "<network resource>");
 		}
 	}
 
@@ -383,7 +412,7 @@ function scan(content, path = "") {
 				const testPropertyStart = rootOpening + testProperty.index;
 				const testOpening = content.indexOf("{", testPropertyStart);
 				const testClosing = findClosingBrace(testOpening);
-				const configNames = directObjectPropertyNames(content.slice(testOpening, testClosing + 1));
+				const configNames = directObjectProperties(content.slice(testOpening, testClosing + 1)).names;
 				const line = content.slice(0, testOpening).split("\n").length;
 				if (configNames.has("retry")) add("test-retry", line, "config retry option", "<vitest config>");
 				if (configNames.has("testTimeout") || configNames.has("hookTimeout")) {
