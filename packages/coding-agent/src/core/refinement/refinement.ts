@@ -668,7 +668,7 @@ export function formatHarnessStateForPrompt(
 			);
 		} else if (kind === "swarm" && entries.length > 0 && includeIpythonExamples) {
 			lines.push(
-				`${kind}: ${entries.length} (state-machine workflow specs; run one with \`await rlm.swarm.run('<id>')\`; execution lands in a follow-up PR)`,
+				`${kind}: ${entries.length} (state-machine workflow specs; run one with \`await rlm.swarm.run('<id>')\`; watch with \`rlm.swarm.status(run_id)\`, stop with \`rlm.swarm.stop(run_id)\`)`,
 			);
 		} else {
 			lines.push(`${kind}: ${entries.length}`);
