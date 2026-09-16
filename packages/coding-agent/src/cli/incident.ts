@@ -292,9 +292,7 @@ function workerIdForPid(workerPids: WorkerPidMap, pid: number | undefined, timeM
 	if (sightings === undefined || sightings.length === 0) {
 		return undefined;
 	}
-	// Sightings after the event belong to a later owner; fall back to the
-	// earliest one when the event precedes every sighting (e.g. log rotation).
-	let workerId = sightings[0]!.workerId;
+	let workerId: string | undefined;
 	for (const sighting of sightings) {
 		if (sighting.timeMs <= timeMs) {
 			workerId = sighting.workerId;
