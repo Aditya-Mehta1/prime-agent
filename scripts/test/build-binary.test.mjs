@@ -13,7 +13,7 @@ const VALID_SIGNER = {
 	repositoryUri: "https://github.com/example/prime-agent",
 	workflowRepositoryUri: "https://github.com/example/prime-agent",
 	workflowPath: ".github/workflows/standalone-binaries.yml",
-	oidcIssuer: "https://token.actions.githubusercontent.com",
+	oidcIssuer: "https://token.actions.githubusercontent.com", // codeql[js/incomplete-hostname-regexp] : a fixture value, never a regex
 	runnerEnvironment: "github-hosted",
 	refPattern: "^refs/pull/\\d+/merge$",
 };
@@ -59,6 +59,7 @@ for (const [name, mutate, message] of [
 	["missing field", (doc) => delete doc.oidcIssuer, /must set oidcIssuer/],
 	["unknown field", (doc) => (doc.extra = "x"), /unknown field extra/],
 	["http repository", (doc) => (doc.repositoryUri = "http://github.com/example/prime-agent"), /bare https URL/],
+	// codeql[js/incomplete-hostname-regexp] : a fixture value, never a regex
 	["credentials in issuer", (doc) => (doc.oidcIssuer = "https://user:pw@token.actions.githubusercontent.com"), /bare https URL/],
 	["workflow path without yml", (doc) => (doc.workflowPath = ".github/workflows/build"), /workflowPath/],
 	["absolute workflow path", (doc) => (doc.workflowPath = "/.github/workflows/build.yml"), /workflowPath/],
