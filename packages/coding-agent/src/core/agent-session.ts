@@ -12261,10 +12261,16 @@ export class AgentSession {
 		if (subtype === "credential_invalid" || subtype === "credential_expired" || subtype === "credential_missing") {
 			return true;
 		}
-		// A structured auth verdict still drives recovery when telemetry cannot identify the rejection reason.
+		// A structured auth verdict still drives recovery when telemetry cannot
+		// identify the rejection reason — the classifier may not know a provider's
+		// custom auth error shape. Statuses with their own semantic families
+		// (billing, permission, availability) keep their classification even
+		// when the subtype is unknown; any other status defers to the verdict.
+		const statusHasOwnSemantics =
+			status === 401 || status === 402 || status === 403 || (status !== null && status >= 500);
 		return (
 			this._getProviderStreamFailureKind(message) === "auth" &&
-			(subtype === "authentication_rejected" || (subtype === "unknown" && status === null))
+			(subtype === "authentication_rejected" || (subtype === "unknown" && !statusHasOwnSemantics))
 		);
 	}
 

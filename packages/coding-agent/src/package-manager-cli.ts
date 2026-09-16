@@ -1816,12 +1816,15 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 						return true;
 					}
 					installation?.installed();
-					installation?.finish("success");
 					const versionChange = selfUpdatePlan.targetVersion
 						? ` from v${VERSION} to v${selfUpdatePlan.targetVersion}`
 						: "";
 					console.log(chalk.green(`Updated ${APP_NAME}${versionChange}`));
 					if (process.env[SELF_UPDATE_INTERACTIVE_CHILD_ENV] === "1") {
+						// The interactive parent continues this attempt through the
+						// daemon restart and emits completed once, after its outcome;
+						// emitting it here would let a failed restart follow a
+						// completed:success event.
 						return true;
 					}
 					try {
@@ -1834,8 +1837,15 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 						});
 						installation?.restartResult(status);
 						reportDaemonUpdateRestartStatus(status);
+						// This process owns the restart too, so its outcome belongs
+						// on the completed event instead of a premature success.
+						installation?.finish(
+							status.phase === "failed" ? "failed" : "success",
+							status.phase === "failed" ? "daemon_restart_failed" : undefined,
+						);
 					} catch (error: unknown) {
 						installation?.fail("daemon_restart", error, "daemon_restart_failed");
+						installation?.finish("failed", "daemon_restart_failed");
 						console.error(
 							chalk.yellow(
 								`Warning: updated, but could not coordinate the daemon restart (${formatUnknownError(error)}).`,

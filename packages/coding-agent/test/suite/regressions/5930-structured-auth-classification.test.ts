@@ -29,6 +29,10 @@ describe("ENG-5930 structured authentication evidence", () => {
 		[undefined, undefined, true, "unknown"],
 		[undefined, "authentication_error", true, "authentication_rejected"],
 		[undefined, "insufficient_funds", false, "insufficient_balance"],
+		// A structured auth verdict drives recovery whatever HTTP status it
+		// carries; the status===null guard used to drop credential rotation for
+		// providers that reject authentication with a 400 instead of a 401.
+		[400, "authentication_failed", true, "unknown"],
 	] as const)(
 		"preserves structured auth recovery without misclassifying the rejection reason (%s, %s)",
 		async (status, providerErrorType, shouldUpdateCredentials, subtype) => {

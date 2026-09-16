@@ -483,6 +483,12 @@ describe("ProviderAuthFlows", () => {
 			throw failure;
 		});
 		host.onAuthError = vi.fn();
+		const showErrorOptions: Array<{ reportTelemetry?: boolean } | undefined> = [];
+		host.showError = (_message, options) => {
+			showErrorOptions.push(options);
+			// The real host reports the message unless the flow says it already did.
+			if (options?.reportTelemetry !== false) throw new Error("unreported-leg-must-still-report");
+		};
 		const finish = vi.fn();
 
 		const result = new ProviderAuthFlows(host).runLogout(finish);
@@ -492,6 +498,8 @@ describe("ProviderAuthFlows", () => {
 		await expect(result).resolves.toBeNull();
 		expect(finish).toHaveBeenCalledExactlyOnceWith("failed");
 		expect(host.onAuthError).toHaveBeenCalledExactlyOnceWith(failure, "openai", "logout");
+		// reportAuthError already reported this failure; the display leg must not.
+		expect(showErrorOptions).toEqual([{ reportTelemetry: false }]);
 	});
 
 	it("does not let optional observation callbacks interrupt a login", async () => {

@@ -25,9 +25,6 @@ const TELEMETRY_STATE_FILE = "telemetry.json";
 const TELEMETRY_STATE_VERSION = 1;
 const DEFAULT_BATCH_SIZE = 10;
 const DEFAULT_FLUSH_INTERVAL_MS = 10_000;
-// Occurrence errors wait this long for a capability answer before shipping
-// without their richer payloads; hoarding them forever would be worse.
-const CAPABILITY_SETTLE_WAIT_MS = 5 * 60_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 7_000;
 
 export type { TelemetryProperties } from "./telemetry-schema.js";
@@ -428,6 +425,13 @@ export class TelemetryClient implements TelemetrySink {
 			this.delivery.rejected++;
 			return;
 		}
+		// A settled legacy-only collector can never take this event; dropping it
+		// at enqueue keeps the queue from filling with events no flush would send.
+		// Before the first probe answers, support is unknown and events still queue.
+		if (this.capabilitiesSettled && !this.supportsV2 && !isLegacyTelemetryEvent(name)) {
+			this.delivery.overflow++;
+			return;
+		}
 		try {
 			this.installationId ??= getOrCreateTelemetryInstallationId(this.options.agentDir, this.randomId);
 			const event = { id: this.randomId(), name, timestamp: new Date(this.now()).toISOString(), properties: safe };
@@ -494,12 +498,9 @@ export class TelemetryClient implements TelemetrySink {
 	private discover(): void {
 		if (this.discovery || this.now() < this.nextDiscoveryAt || !this.enabled()) return;
 		this.nextDiscoveryAt = this.now() + 60_000;
-		this.supportsOriginalErrorMessages = false;
-		this.supportsPostHogExceptions = false;
-		this.supportsInstallationOutcomes = false;
-		// A refresh in progress makes the richer payload support unknown again
-		// until this probe answers; a failed probe leaves it unknown.
-		this.capabilitiesSettled = false;
+		// Previously negotiated capabilities survive a refresh in flight and a
+		// transiently failing probe; only a definitive collector answer may
+		// downgrade them, so a slow or flaky re-probe never strips pairs.
 		this.discovery = (async () => {
 			try {
 				const url = new URL(this.endpoint);
@@ -507,8 +508,14 @@ export class TelemetryClient implements TelemetrySink {
 				url.search = "";
 				const response = await this.request(url.toString(), { method: "GET" });
 				// A collector that rejects the probe outright has answered: it has no
-				// capability endpoint. Only transport failures leave support unknown.
-				if (response && [400, 404, 405, 422].includes(response.status)) this.capabilitiesSettled = true;
+				// capability endpoint, so the richer payloads are gone for good.
+				// Only transport failures leave support unknown.
+				if (response && [400, 404, 405, 422].includes(response.status)) {
+					this.supportsOriginalErrorMessages = false;
+					this.supportsPostHogExceptions = false;
+					this.supportsInstallationOutcomes = false;
+					this.capabilitiesSettled = true;
+				}
 				if (!response?.ok) return;
 				this.capabilitiesSettled = true;
 				const text = await response.text();
@@ -583,7 +590,6 @@ export class TelemetryClient implements TelemetrySink {
 
 	private async drainQueue(timeoutMs: number, final = false): Promise<void> {
 		const generation = this.queueGeneration;
-		const deadline = performance.now() + timeoutMs;
 		if (this.discovery) {
 			let timer: ReturnType<typeof setTimeout> | undefined;
 			const needsDiscovery = this.queue.some(
@@ -591,15 +597,24 @@ export class TelemetryClient implements TelemetrySink {
 					entry.event.name === "agent installation stage" ||
 					(entry.event.name === "agent error" && entry.event.properties.error_event_kind === "occurrence"),
 			);
+			// A last-chance flush must keep most of its budget for the send itself:
+			// a slow capability probe may not eat the whole shutdown window.
+			const waitMs = final
+				? Math.min(needsDiscovery ? timeoutMs : 250, Math.max(50, timeoutMs / 3))
+				: needsDiscovery
+					? timeoutMs
+					: Math.min(250, timeoutMs / 2);
 			await Promise.race([
 				this.discovery,
 				new Promise<void>((resolve) => {
-					timer = setTimeout(resolve, needsDiscovery ? timeoutMs : Math.min(250, timeoutMs / 2));
+					timer = setTimeout(resolve, waitMs);
 					timer.unref?.();
 				}),
 			]);
 			if (timer) clearTimeout(timer);
 		}
+		// The send budget starts after the discovery wait, not before it.
+		const deadline = performance.now() + timeoutMs;
 		if (generation !== this.queueGeneration) return;
 		this.queue = this.queue.filter((entry) => {
 			if (this.now() - entry.queuedAt > 86_400_000 || entry.attempts >= 5) {
@@ -621,15 +636,14 @@ export class TelemetryClient implements TelemetrySink {
 			const installationId = this.installationId;
 			const entries = pending.splice(0, this.batchSize).filter((entry) => {
 				// An unresolved capability refresh must not retire an unsent exception,
-				// and a failed probe leaves support unknown just as an in-flight one
-				// does. Past the wait window the analytics event still ships, so a
-				// collector that never answers cannot hoard errors forever.
+				// and a probe that has not answered yet leaves support unknown. With
+				// no negotiated schema support such events cannot ship anyway, so the
+				// hold only ever defers what a later flush can still deliver paired.
 				if (
 					!final &&
 					(this.discovery || !this.capabilitiesSettled) &&
 					entry.event.name === "agent error" &&
-					entry.event.properties.error_event_kind === "occurrence" &&
-					this.now() - entry.queuedAt < CAPABILITY_SETTLE_WAIT_MS
+					entry.event.properties.error_event_kind === "occurrence"
 				)
 					return false;
 				return entry.event.name === "agent installation stage"

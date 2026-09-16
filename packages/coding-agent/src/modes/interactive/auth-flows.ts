@@ -98,7 +98,7 @@ export interface ProviderAuthFlowsHost {
 	readonly ui: TUI;
 	readonly modelRegistry: ModelRegistry;
 	showStatus(message: string): void;
-	showError(message: string): void;
+	showError(message: string, options?: { reportTelemetry?: boolean }): void;
 	/**
 	 * Mount a provider-auth panel (login dialog or in-flow selector) in place of
 	 * the prompt area. Returns a callback that unmounts the panel and restores
@@ -198,7 +198,7 @@ export class ProviderAuthFlows {
 		if (!provider) {
 			return this.observeAuthentication(providerId, "oauth", async () => {
 				this.reportAuthError(new Error("Unknown MCP integration"), providerId, "login");
-				this.host.showError(`Unknown MCP integration: ${server}`);
+				this.host.showError(`Unknown MCP integration: ${server}`, { reportTelemetry: false });
 				return { status: "failed" };
 			});
 		}
@@ -292,7 +292,9 @@ export class ProviderAuthFlows {
 					} catch (error: unknown) {
 						finish("failed");
 						this.reportAuthError(error, providerOption.id, "logout");
-						this.host.showError(`Logout failed: ${error instanceof Error ? error.message : String(error)}`);
+						this.host.showError(`Logout failed: ${error instanceof Error ? error.message : String(error)}`, {
+							reportTelemetry: false,
+						});
 						resolve(null);
 					}
 				},
@@ -453,7 +455,7 @@ export class ProviderAuthFlows {
 			const errorMsg = error instanceof Error ? error.message : String(error);
 			if (errorMsg !== "Login cancelled") {
 				this.reportAuthError(error, providerId, "login");
-				this.host.showError(`Failed to set up ${providerName}: ${errorMsg}`);
+				this.host.showError(`Failed to set up ${providerName}: ${errorMsg}`, { reportTelemetry: false });
 				return { status: "failed" };
 			}
 			return { status: "cancelled" };
@@ -743,7 +745,7 @@ export class ProviderAuthFlows {
 			const errorMsg = error instanceof Error ? error.message : String(error);
 			if (!dialog.signal.aborted && errorMsg !== "Login cancelled") {
 				this.reportAuthError(error, providerId, "login");
-				this.host.showError(`Failed to login to ${providerName}: ${errorMsg}`);
+				this.host.showError(`Failed to login to ${providerName}: ${errorMsg}`, { reportTelemetry: false });
 				return { status: "failed" };
 			}
 			return { status: "cancelled" };
@@ -793,7 +795,7 @@ export class ProviderAuthFlows {
 			const errorMsg = error instanceof Error ? error.message : String(error);
 			if (errorMsg !== "Login cancelled") {
 				this.reportAuthError(error, providerId, "login");
-				this.host.showError(`Failed to save API key for ${providerName}: ${errorMsg}`);
+				this.host.showError(`Failed to save API key for ${providerName}: ${errorMsg}`, { reportTelemetry: false });
 				return { status: "failed" };
 			}
 			return { status: "cancelled" };
@@ -901,7 +903,7 @@ export class ProviderAuthFlows {
 			const errorMsg = error instanceof Error ? error.message : String(error);
 			if (errorMsg !== "Login cancelled") {
 				this.reportAuthError(error, providerId, "login");
-				this.host.showError(`Failed to login to ${providerName}: ${errorMsg}`);
+				this.host.showError(`Failed to login to ${providerName}: ${errorMsg}`, { reportTelemetry: false });
 				return { status: "failed" };
 			}
 			return { status: "cancelled" };

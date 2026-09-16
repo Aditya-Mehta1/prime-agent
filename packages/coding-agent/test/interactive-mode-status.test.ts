@@ -3655,10 +3655,12 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 				["user", { images: [], streamingBehavior: "steer", queueIfBusy: true }],
 			]);
 			expect(showError.mock.calls).toEqual([
-				["transient failure 1"],
-				["transient failure 2"],
-				["admission failure 1"],
-				["admission failure 2"],
+				// promptWithTelemetry already reports these failures with input
+				// correlation; the display leg must not report them a second time.
+				["transient failure 1", false],
+				["transient failure 2", false],
+				["admission failure 1", false],
+				["admission failure 2", false],
 				["Skipping startup prompt after 3 failed attempts: admission failure 3"],
 			]);
 
@@ -3718,7 +3720,9 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 			// An erroneous retry would already be scheduled; drain continuations.
 			for (let i = 0; i < 25; i++) await new Promise((resolve) => setImmediate(resolve));
 			expect(prompt).toHaveBeenCalledOnce();
-			expect(fakeThis.showError).toHaveBeenCalledWith("daemon admission uncertain");
+			// The prompt failure is already reported with input correlation by
+			// promptWithTelemetry; the display leg must not double-report it.
+			expect(fakeThis.showError).toHaveBeenCalledWith("daemon admission uncertain", false);
 			expect(fakeThis.promptStashState.stash).toEqual({
 				text: "startup [image #5] [image #6]",
 				images: [[6, firstImage]],

@@ -1836,13 +1836,15 @@ export class InteractiveMode {
 						// This attempt may already be session-owned, so never retry it. Preserve
 						// it and every not-yet-attempted startup prompt in original order.
 						this.retainStartupPromptDrafts(startupPrompts.slice(next));
-						this.showError(error.message);
+						// promptWithTelemetry already captured this failure with the input
+						// correlation; the display leg must not report it a second time.
+						this.showError(error.message, false);
 						settleStartupPrompts("retained");
 						return;
 					}
 					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 					if (++failures < 3) {
-						this.showError(errorMessage);
+						this.showError(errorMessage, false);
 						if (!(await startupRetryDelay())) return;
 						continue;
 					}
@@ -5433,7 +5435,9 @@ export class InteractiveMode {
 					} else {
 						this.retainSubmittedDraft(rejectedDraft, submissionGeneration, submissionStashState);
 					}
-					this.showError(error instanceof Error ? error.message : String(error));
+					// promptWithTelemetry already captured this failure with the input
+					// correlation; the display leg must not report it a second time.
+					this.showError(error instanceof Error ? error.message : String(error), false);
 					return;
 				}
 				this.updatePendingMessagesDisplay();
@@ -9313,7 +9317,7 @@ export class InteractiveMode {
 			ui: this.ui,
 			modelRegistry: this.modelRegistry,
 			showStatus: (message) => this.showStatus(message),
-			showError: (message) => this.showError(message),
+			showError: (message, options) => this.showError(message, options?.reportTelemetry !== false),
 			showAuthPanel,
 			getAuthPanelRows: () => Math.max(1, Math.min(20, this.ui.terminal.rows - 3)),
 			onAuthenticationStarted: (providerId, method) => {
@@ -9630,6 +9634,7 @@ export class InteractiveMode {
 			} catch {
 				// The update already completed; do not block relaunch on local teardown.
 			}
+			let daemonRestartFailed = false;
 			if (!updateResult.error && updateExitCode === 0) {
 				try {
 					installation?.stage("daemon_restart", "started");
@@ -9640,6 +9645,7 @@ export class InteractiveMode {
 						originActiveSessionId: this.connectionState?.activeSessionId,
 					});
 					installation?.restartResult(status);
+					daemonRestartFailed = status.phase === "failed";
 					const report = buildDaemonUpdateRestartReport(status);
 					for (const message of report.info) {
 						console.log(message);
@@ -9648,20 +9654,30 @@ export class InteractiveMode {
 						console.error(`Warning: ${warning}`);
 					}
 				} catch (error: unknown) {
+					daemonRestartFailed = true;
 					installation?.fail("daemon_restart", error, "daemon_restart_failed");
 					console.error(
 						`Warning: updated, but could not coordinate the daemon restart (${error instanceof Error ? error.message : String(error)}).`,
 					);
 				}
 			}
+			// The update child no longer emits its own completion: the restart
+			// outcome is part of this attempt, so completed lands once, after it,
+			// and a failed restart names its reason on the completed event.
+			installation?.finish(
+				daemonRestartFailed ? "failed" : "success",
+				daemonRestartFailed ? "daemon_restart_failed" : undefined,
+			);
 			const relaunch = createUpdatedCliSubprocessLaunchSpec(relaunchArgs);
 			installation?.stage("relaunch", "started");
 			await this.installationReady;
 			await installation?.flush();
 			installation?.dispose();
+			// The relaunched agent re-derives telemetry consent from its own
+			// settings; pinning the env here would silence an opt-in the user
+			// makes while this (pre-update) process is still running.
 			const relaunchEnvironment = {
 				...process.env,
-				...installationTelemetryEnvironment(installation),
 				[INSTALLATION_TELEMETRY_CONTEXT_ENV]: undefined,
 			};
 			const updateProcess = process as NodeJS.Process & { execve?: UpdateRelaunchExecve };

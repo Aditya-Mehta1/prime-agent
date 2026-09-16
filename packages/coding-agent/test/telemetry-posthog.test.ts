@@ -234,7 +234,7 @@ describe("client-owned PostHog errors", () => {
 		await client.flush();
 		expect(batches[0].events.map((event) => event.name)).toEqual(["agent error", "$exception"]);
 	});
-	it("ships an occurrence error unpaired once the capability wait lapses", async () => {
+	it("keeps previously negotiated pairs across a transient refresh failure", async () => {
 		let now = Date.now();
 		let discoveries = 0;
 		const { client, batches } = setup(support, accepted, {
@@ -244,33 +244,28 @@ describe("client-owned PostHog errors", () => {
 		client.capture(source.name, source.properties);
 		await client.flush();
 		expect(batches[0].events.map((event) => event.name)).toEqual(["agent error", "$exception"]);
-		// A refresh that never lands leaves the richer payloads unconfirmed.
+		// A refresh that fails transiently must not strip the negotiated pairs.
 		now += 60_001;
 		client.capture(source.name, source.properties);
 		await client.flush();
-		expect(batches).toHaveLength(1);
-		// A collector that never answers must not hoard errors forever.
-		now += 5 * 60_000 + 1;
-		await client.flush();
-		expect(batches[1].events.map((event) => event.name)).toEqual(["agent error"]);
+		expect(batches[1].events.map((event) => event.name)).toEqual(["agent error", "$exception"]);
 	});
 	it("never holds an occurrence error through a final flush", async () => {
 		let now = Date.now();
 		let discoveries = 0;
 		const { client, batches } = setup(support, accepted, {
 			now: () => now,
-			discover: () => (++discoveries === 1 ? Response.json(support) : new Response(null, { status: 503 })),
+			// The rediscovery at shutdown hangs: the final flush must not let a
+			// slow probe eat the send budget or re-hold the queued pair.
+			discover: () => (++discoveries === 1 ? Response.json(support) : (new Promise<Response>(() => {}) as never)),
 		});
 		client.capture(source.name, source.properties);
 		await client.flush();
 		expect(batches[0].events.map((event) => event.name)).toEqual(["agent error", "$exception"]);
 		now += 60_001;
 		client.capture(source.name, source.properties);
-		await client.flush();
-		expect(batches).toHaveLength(1);
-		// Shutdown has no later flush to wait for: send what the collector takes.
-		await client.flush({ final: true });
-		expect(batches[1].events.map((event) => event.name)).toEqual(["agent error"]);
+		await client.flush({ timeoutMs: 1_500, final: true });
+		expect(batches[1].events.map((event) => event.name)).toEqual(["agent error", "$exception"]);
 	});
 	it("never drains twice for concurrent final flushes", async () => {
 		const { client, batches } = setup();
