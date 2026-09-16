@@ -53,6 +53,13 @@ fn run_print_mode(options: &RunOptions) -> Result<i32, String> {
 async fn print_mode_main(options: &RunOptions) -> Result<i32, String> {
     let config = &options.config;
 
+    // Test seam: a scripted faux provider (`PRIME_AGENT_FAUX_SCRIPT` with
+    // `{"responses": ["text", ...]}`) drives the full print path without the
+    // network. Verification harness only; never set by the product.
+    if let Ok(script) = std::env::var("PRIME_AGENT_FAUX_SCRIPT") {
+        return faux_print_mode(options, &script).await;
+    }
+
     // Model registry: composed catalog + models.json with real auth.
     let auth = pa_core::auth::AuthStorage::create(&config.agent_dir);
     let mut registry =
@@ -103,89 +110,7 @@ async fn print_mode_main(options: &RunOptions) -> Result<i32, String> {
     .await
     .map_err(|error| format!("{error:#}"))?;
 
-    // JSON mode: emit the session header, then every loop event as JSONL.
-    let mut unsubscribe: Option<pa_agent::agent::Subscription> = None;
-    if options.app_mode == AppMode::Json {
-        let header = session_header_json(&engine, &config.cwd).await;
-        println!("{header}");
-        let subscription = engine
-            .session
-            .agent()
-            .subscribe(move |event, _signal| {
-                Box::pin(async move {
-                    if let Some(json) = agent_event_json(&event) {
-                        println!("{json}");
-                    }
-                    Ok(())
-                })
-            })
-            .await;
-        unsubscribe = Some(subscription);
-    }
-
-    // Admit the prompts, wait for the loop to settle, then select the
-    // terminal result.
-    let prompts: Vec<String> = options
-        .initial_message
-        .iter()
-        .cloned()
-        .chain(options.messages.iter().cloned())
-        .collect();
-    if prompts.is_empty() {
-        if let Some(subscription) = unsubscribe.take() {
-            subscription.unsubscribe().await;
-        }
-        return Ok(0);
-    }
-    for prompt in &prompts {
-        engine
-            .session
-            .prompt(prompt, Default::default())
-            .await
-            .map_err(|error| format!("{error:#}"))?;
-        engine.session.agent().wait_for_idle().await;
-    }
-
-    let state = engine.session.agent().state().await;
-    let messages: Vec<pa_types::session::AgentMessage> =
-        state.messages.iter().filter_map(json_round_trip).collect();
-    let result = pa_core::session_engine::headless::select_headless_terminal_result(&messages);
-
-    let mut exit_code = 0;
-    if options.app_mode == AppMode::Json {
-        // JSON mode: events already streamed; the terminal result only
-        // decides the exit code.
-        if let Some(primary) = &result.primary {
-            primary.stderr_text(&mut exit_code);
-        }
-    } else {
-        match result.primary {
-            Some(primary) => {
-                if let Some(stderr) = primary.stderr_text(&mut exit_code) {
-                    eprintln!("{stderr}");
-                }
-                if exit_code == 0 {
-                    if let Some(text) = primary.stdout_text() {
-                        println!("{text}");
-                    }
-                }
-            }
-            None => {
-                eprintln!("No response produced.");
-                exit_code = 1;
-            }
-        }
-    }
-    if let Some(subscription) = unsubscribe {
-        subscription.unsubscribe().await;
-    }
-    for outcome in result.compaction_outcomes {
-        eprintln!("{}", outcome.content);
-        if outcome.outcome == "failed" {
-            exit_code = 1;
-        }
-    }
-    Ok(exit_code)
+    run_prompts_and_emit(&engine, options).await
 }
 
 /// The session header line (TS `AgentConnectionSessionHeader` shape).
@@ -316,4 +241,158 @@ fn builtin_tools(cwd: &std::path::Path) -> Vec<Arc<dyn pa_agent::types::AgentToo
                 as Arc<dyn pa_agent::types::AgentTool>
         })
         .collect()
+}
+
+/// Admit prompts, stream json events when requested, and decide the exit code
+/// from the headless terminal result. Shared by the real and faux paths.
+async fn run_prompts_and_emit(
+    engine: &pa_core::session_engine::engine::SessionEngine,
+    options: &RunOptions,
+) -> Result<i32, String> {
+    let mut unsubscribe: Option<pa_agent::agent::Subscription> = None;
+    if options.app_mode == AppMode::Json {
+        let header = session_header_json(engine, &options.config.cwd).await;
+        println!("{header}");
+        unsubscribe = Some(
+            engine
+                .session
+                .agent()
+                .subscribe(move |event, _signal| {
+                    Box::pin(async move {
+                        if let Some(json) = agent_event_json(&event) {
+                            println!("{json}");
+                        }
+                        Ok(())
+                    })
+                })
+                .await,
+        );
+    }
+    for prompt in options
+        .initial_message
+        .iter()
+        .chain(options.messages.iter())
+    {
+        engine
+            .session
+            .prompt(prompt, Default::default())
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        engine.session.agent().wait_for_idle().await;
+    }
+    if let Some(subscription) = unsubscribe {
+        subscription.unsubscribe().await;
+    }
+    let state = engine.session.agent().state().await;
+    let messages: Vec<pa_types::session::AgentMessage> =
+        state.messages.iter().filter_map(json_round_trip).collect();
+    let result = pa_core::session_engine::headless::select_headless_terminal_result(&messages);
+    let mut exit_code = 0;
+    if options.app_mode == AppMode::Json {
+        if let Some(primary) = &result.primary {
+            primary.stderr_text(&mut exit_code);
+        }
+        for outcome in &result.compaction_outcomes {
+            if outcome.outcome == "failed" {
+                exit_code = 1;
+            }
+        }
+        return Ok(exit_code);
+    }
+    match result.primary {
+        Some(primary) => {
+            if let Some(stderr) = primary.stderr_text(&mut exit_code) {
+                eprintln!("{stderr}");
+            }
+            if exit_code == 0 {
+                if let Some(text) = primary.stdout_text() {
+                    println!("{text}");
+                }
+            }
+        }
+        None => {
+            eprintln!("No response produced.");
+            exit_code = 1;
+        }
+    }
+    for outcome in result.compaction_outcomes {
+        eprintln!("{}", outcome.content);
+        if outcome.outcome == "failed" {
+            exit_code = 1;
+        }
+    }
+    Ok(exit_code)
+}
+
+/// The faux-script print path: identical pipeline, scripted provider.
+async fn faux_print_mode(options: &RunOptions, script: &str) -> Result<i32, String> {
+    let config = &options.config;
+    let script: serde_json::Value = serde_json::from_str(script)
+        .map_err(|error| format!("invalid PRIME_AGENT_FAUX_SCRIPT: {error}"))?;
+    let responses: Vec<String> = script
+        .get("responses")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| match entry {
+                    serde_json::Value::String(text) => text.clone(),
+                    serde_json::Value::Object(map) => map
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    _ => String::new(),
+                })
+                .collect()
+        })
+        .ok_or_else(|| "PRIME_AGENT_FAUX_SCRIPT requires a responses array".to_string())?;
+    let registration =
+        pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
+            models: Some(vec![pa_ai::faux::FauxModelDefinition {
+                id: "faux-1".to_string(),
+                name: Some("Faux Model".to_string()),
+                reasoning: Some(false),
+                input: Some(vec![pa_types::ai::ModelInput::Text]),
+                cost: None,
+                context_window: Some(100_000),
+                max_tokens: Some(4_096),
+            }]),
+            ..Default::default()
+        });
+    registration.set_responses(
+        responses
+            .iter()
+            .map(|text| {
+                pa_ai::faux::FauxResponseStep::Message(pa_ai::faux::faux_assistant_text_message(
+                    text,
+                    pa_ai::faux::FauxAssistantMessageOptions::default(),
+                ))
+            })
+            .collect(),
+    );
+    let model = registration.get_model();
+    let agent_model = json_round_trip(&model).ok_or("model conversion failed")?;
+    let stream_fn = real_stream_fn(None, model);
+    let engine = pa_core::session_engine::engine::create_session(
+        pa_core::session_engine::engine::SessionEngineConfig {
+            cwd: config.cwd.clone(),
+            agent_dir: config.agent_dir.clone(),
+            model: Some(agent_model),
+            thinking_level: None,
+            stream_fn: Some(stream_fn),
+            tools: builtin_tools(&config.cwd),
+            custom_system_prompt: config.system_prompt.clone(),
+            prompt_guidelines: config.append_system_prompt.clone(),
+            generic_mcp_servers: vec![],
+            allow_recursion: None,
+            session_manager: None,
+            additional_skill_paths: vec![],
+            additional_prompt_paths: vec![],
+        },
+    )
+    .await
+    .map_err(|error| format!("{error:#}"))?;
+
+    run_prompts_and_emit(&engine, options).await
 }
