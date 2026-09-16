@@ -747,7 +747,10 @@ describe("self-update daemon restart", () => {
 					settled = true;
 				});
 
-				await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+				// Deterministic drain: give the loser's async lease acquisition
+				// real event-loop turns without a wall-clock sleep. It must not
+				// settle while the active coordinator still owns the lease.
+				for (let tick = 0; tick < 25; tick++) await new Promise((resolveTick) => setImmediate(resolveTick));
 				expect(settled).toBe(false);
 				activeStatus.update({
 					phase: "complete",

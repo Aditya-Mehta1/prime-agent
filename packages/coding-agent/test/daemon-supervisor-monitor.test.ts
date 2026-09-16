@@ -4,7 +4,6 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { setTimeout as realSleep } from "node:timers/promises";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as orphanProcessModule from "../src/core/orphan-process-journal.js";
@@ -153,6 +152,7 @@ interface SupervisorMonitorHarness {
 	shuttingDown: boolean;
 	supervisorAbsentSince?: number;
 	supervisorMonitorTimer?: ReturnType<typeof setTimeout>;
+	supervisorAvailabilityCheckSettled?: Promise<void>;
 	canConnectToSupervisor: (socketPath: string) => Promise<boolean>;
 	launchReplacementSupervisor: (socketPath: string) => Promise<void>;
 	scheduleSupervisorAvailabilityCheck: (socketPath: string, delayMs: number) => void;
@@ -304,6 +304,18 @@ function createHarness(canConnect: () => Promise<boolean>): SupervisorMonitorHar
 		canConnectToSupervisor: vi.fn(canConnect),
 		launchReplacementSupervisor: vi.fn(async () => undefined),
 	}) as SupervisorMonitorHarness;
+}
+
+/**
+ * Fires the armed availability check and waits for its real async chain (registry
+ * stat, probe, relaunch) to finish, so assertions never depend on how much work
+ * the scheduler happened to fit into a clock advance.
+ */
+async function settleSupervisorAvailabilityCheck(daemon: SupervisorMonitorHarness, advanceMs: number): Promise<void> {
+	const settled = daemon.supervisorAvailabilityCheckSettled;
+	expect(settled).toBeDefined();
+	await vi.advanceTimersByTimeAsync(advanceMs);
+	await settled;
 }
 
 describe("daemon worker supervisor monitoring", () => {
@@ -1194,18 +1206,10 @@ describe("daemon worker supervisor monitoring", () => {
 
 	it("does not poll a healthy supervisor after the startup check", async () => {
 		vi.useFakeTimers();
-		let resolveProbe: () => void = () => undefined;
-		const probeCompleted = new Promise<void>((resolve) => {
-			resolveProbe = resolve;
-		});
-		const daemon = createHarness(async () => {
-			resolveProbe();
-			return true;
-		});
+		const daemon = createHarness(async () => true);
 
 		daemon.scheduleSupervisorAvailabilityCheck("/tmp/supervisor.sock", 1500);
-		await vi.advanceTimersByTimeAsync(1500);
-		await probeCompleted;
+		await settleSupervisorAvailabilityCheck(daemon, 1500);
 		expect(daemon.canConnectToSupervisor).toHaveBeenCalledOnce();
 
 		await vi.advanceTimersByTimeAsync(60_000);
@@ -1230,29 +1234,16 @@ describe("daemon worker supervisor monitoring", () => {
 		// The supervisor socket is dead, comes up with the replacement launch,
 		// then dies again before the replacement ever claims the worker.
 		const probeResults = [false, true, false, false];
-		let probeCount = 0;
+		let probeIndex = 0;
 		const daemon = createHarness(async () => {
-			const result = probeResults[Math.min(probeCount, probeResults.length - 1)];
-			probeCount += 1;
+			const result = probeResults[Math.min(probeIndex, probeResults.length - 1)];
+			probeIndex += 1;
 			return result ?? false;
 		});
-		// Drive the fake clock until the expected number of probes have run;
-		// one advance alone does not flush the availability check chain. The
-		// chain also interleaves fake timers with real registry-lock I/O, and
-		// fake timers mock every in-process clock (Date, performance, hrtime),
-		// so wall-clock budgeting is impossible here: yield real time between
-		// advances instead — node:timers/promises stays unfaked — so the lock
-		// work can settle on slow runners before the budget runs out.
-		const advanceUntilProbes = async (expected: number) => {
-			for (let step = 0; probeCount < expected && step < 1000; step++) {
-				await vi.advanceTimersByTimeAsync(100);
-				if (probeCount < expected) await realSleep(2);
-			}
-			expect(probeCount).toBe(expected);
-		};
 
 		daemon.scheduleSupervisorAvailabilityCheck("/tmp/supervisor.sock", 1500);
-		await advanceUntilProbes(2);
+		await settleSupervisorAvailabilityCheck(daemon, 1500);
+		expect(daemon.canConnectToSupervisor).toHaveBeenCalledTimes(2);
 		expect(daemon.launchReplacementSupervisor).toHaveBeenCalledOnce();
 		// The replacement binding mid-launch restarts the orphan window...
 		expect(daemon.supervisorAbsentSince).toBeUndefined();
@@ -1260,7 +1251,7 @@ describe("daemon worker supervisor monitoring", () => {
 		// instead of orphaning the worker if the replacement exits unclaimed.
 		expect(daemon.supervisorMonitorTimer).toBeDefined();
 
-		await advanceUntilProbes(4);
+		await settleSupervisorAvailabilityCheck(daemon, 5000);
 		expect(daemon.launchReplacementSupervisor).toHaveBeenCalledTimes(2);
 		expect(daemon.canConnectToSupervisor).toHaveBeenCalledTimes(4);
 		expect(daemon.supervisorMonitorTimer).toBeDefined();
@@ -1268,28 +1259,20 @@ describe("daemon worker supervisor monitoring", () => {
 
 	it("retries when shutdown admission lookup fails", async () => {
 		vi.useFakeTimers();
-		let resolveProbe: () => void = () => undefined;
-		const probeCompleted = new Promise<void>((resolve) => {
-			resolveProbe = resolve;
-		});
-		const daemon = createHarness(async () => {
-			resolveProbe();
-			return true;
-		});
+		const daemon = createHarness(async () => true);
 		const registryDir = process.env[supervisorRegistryDirEnv];
 		if (!registryDir) throw new Error("Supervisor registry test directory was not set");
 		rmSync(registryDir, { recursive: true, force: true });
 		writeFileSync(registryDir, "not a directory");
 
 		daemon.scheduleSupervisorAvailabilityCheck("/tmp/supervisor.sock", 0);
-		await vi.advanceTimersByTimeAsync(0);
+		await settleSupervisorAvailabilityCheck(daemon, 0);
 		expect(daemon.canConnectToSupervisor).not.toHaveBeenCalled();
 		expect(daemon.supervisorMonitorTimer).toBeDefined();
 
 		rmSync(registryDir, { force: true });
 		mkdirSync(registryDir, { recursive: true });
-		await vi.advanceTimersByTimeAsync(5000);
-		await probeCompleted;
+		await settleSupervisorAvailabilityCheck(daemon, 5000);
 		expect(daemon.canConnectToSupervisor).toHaveBeenCalledOnce();
 	});
 

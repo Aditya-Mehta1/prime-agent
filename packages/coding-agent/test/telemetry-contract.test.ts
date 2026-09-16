@@ -86,6 +86,14 @@ function setup({
 	return { client, batches, fetch: fetcher };
 }
 
+function createDeferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((resolvePromise) => {
+		resolve = resolvePromise;
+	});
+	return { promise, resolve };
+}
+
 beforeEach(() => vi.stubEnv("DO_NOT_TRACK", "0"));
 afterEach(() => {
 	for (const path of directories.splice(0)) rmSync(path, { recursive: true, force: true });
@@ -266,14 +274,20 @@ describe("version negotiation, retry and consent", () => {
 	});
 
 	it("purges cached client queues synchronously on a settings off/on transition", async () => {
-		const { batches, fetch } = setup();
+		const posted = createDeferred<void>();
+		const { batches, fetch } = setup({
+			receive: (batch) => {
+				posted.resolve();
+				return accepted(batch);
+			},
+		});
 		vi.stubGlobal("fetch", fetch);
 		const options = { agentDir: directory(), settingsManager: SettingsManager.inMemory() };
 		captureTelemetryEvent({ ...options, name: "agent error", properties: error });
 		options.settingsManager.setTelemetryEnabled(false);
 		options.settingsManager.setTelemetryEnabled(true);
 		await captureAgentCommandUsed({ ...options, commandName: "model" });
-		await vi.waitFor(() => expect(batches).toHaveLength(1));
+		await posted.promise;
 		expect(batches[0].events.map((event) => event.name)).toEqual(["agent command used"]);
 	});
 	it("invalidates an old flush snapshot when disabling races with an acknowledged request", async () => {
@@ -281,16 +295,21 @@ describe("version negotiation, retry and consent", () => {
 		const firstResponse = new Promise<Response>((resolve) => {
 			release = resolve;
 		});
+		const firstPosted = createDeferred<void>();
 		const { client, batches } = setup({
 			batchSize: 1,
 			receive: (batch) => {
-				return batches.length === 1 ? firstResponse : accepted(batch);
+				if (batches.length === 1) {
+					firstPosted.resolve();
+					return firstResponse;
+				}
+				return accepted(batch);
 			},
 		});
 		client.capture("agent started", base);
 		client.capture("agent error", error);
 		const flushing = client.flush();
-		await vi.waitFor(() => expect(batches).toHaveLength(1));
+		await firstPosted.promise;
 		client.clearPending();
 		release(accepted(batches[0]));
 		await flushing;

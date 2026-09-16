@@ -33,6 +33,14 @@ let sink: Sink;
 let settingsManager: SettingsManager;
 const attempts: TelemetryInstallationAttempt[] = [];
 
+function createDeferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((resolvePromise) => {
+		resolve = resolvePromise;
+	});
+	return { promise, resolve };
+}
+
 beforeEach(() => {
 	root = mkdtempSync(join(tmpdir(), "prime-installation-test-"));
 	agentDir = join(root, "agent");
@@ -224,16 +232,18 @@ describe("private readiness markers", () => {
 	it("aborts readiness delivery on opt-out and does not replay it after re-enabling", async () => {
 		writeInstallationTelemetryState(agentDir, marker());
 		let postSignal: AbortSignal | null | undefined;
+		const postStarted = createDeferred<void>();
 		const fetch = vi.fn<typeof globalThis.fetch>(async (_url, init) => {
 			if (init?.method === "GET") return Response.json({ schema_versions: [1, 2], schema_revision: 3 });
 			postSignal = init?.signal;
+			postStarted.resolve();
 			return new Promise<Response>((_resolve, reject) => {
 				postSignal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
 			});
 		});
 		vi.stubGlobal("fetch", fetch);
 		const delivery = ready({ sink: undefined, readyKind: "headless" });
-		await vi.waitFor(() => expect(postSignal).toBeDefined());
+		await postStarted.promise;
 		settingsManager.setTelemetryEnabled(false);
 		expect(postSignal?.aborted).toBe(true);
 		settingsManager.setTelemetryEnabled(true);

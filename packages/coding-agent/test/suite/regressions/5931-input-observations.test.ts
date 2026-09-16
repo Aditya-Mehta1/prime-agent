@@ -13,6 +13,14 @@ const FIRST = "10000000-0000-4000-8000-000000000001";
 const SECOND = "10000000-0000-4000-8000-000000000002";
 const CLIENT = "10000000-0000-4000-8000-000000000003";
 
+function createDeferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((resolvePromise) => {
+		resolve = resolvePromise;
+	});
+	return { promise, resolve };
+}
+
 describe("ENG-5931 actual session input observation", () => {
 	const harnesses: Harness[] = [];
 	const cleanups: Array<() => void> = [];
@@ -50,11 +58,13 @@ describe("ENG-5931 actual session input observation", () => {
 	it("separates queued acceptance from delivery and sees cancellation without a provider call", async () => {
 		const { harness, observations } = await observedSession();
 		let release = () => {};
+		const firstCall = createDeferred<void>();
 		const held = new Promise<void>((resolve) => {
 			release = resolve;
 		});
 		harness.setResponses([
 			async () => {
+				firstCall.resolve();
 				await held;
 				return fauxAssistantMessage("finished");
 			},
@@ -62,7 +72,7 @@ describe("ENG-5931 actual session input observation", () => {
 		const first = harness.session.prompt("private first prompt", {
 			telemetryInput: { inputId: FIRST, clientSessionId: CLIENT },
 		});
-		await vi.waitFor(() => expect(harness.faux.state.callCount).toBe(1));
+		await firstCall.promise;
 		await harness.session.prompt("private queued prompt", {
 			streamingBehavior: "followUp",
 			queueIfBusy: true,
@@ -132,17 +142,19 @@ describe("ENG-5931 actual session input observation", () => {
 	it("does not emit late lifecycle data after opt-out and re-enable", async () => {
 		const { harness, observations, disable, enable } = await observedSession();
 		let release = () => {};
+		const firstCall = createDeferred<void>();
 		const held = new Promise<void>((resolve) => {
 			release = resolve;
 		});
 		harness.setResponses([
 			async () => {
+				firstCall.resolve();
 				await held;
 				return fauxAssistantMessage("finished");
 			},
 		]);
 		const first = harness.session.prompt("before opt out", { telemetryInput: { inputId: FIRST } });
-		await vi.waitFor(() => expect(harness.faux.state.callCount).toBe(1));
+		await firstCall.promise;
 		disable();
 		await harness.session.prompt("while opted out", {
 			streamingBehavior: "followUp",

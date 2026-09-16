@@ -168,7 +168,7 @@ afterEach(() => {
 
 describe("telemetry identity and transport", () => {
 	beforeEach(() => vi.stubEnv("DO_NOT_TRACK", "0"));
-	it("creates a private stable installation ID", () => {
+	it("persists a stable 0600 installation id and replaces invalid state", () => {
 		const agentDir = mkdtempSync(join(tmpdir(), "prime-agent-telemetry-"));
 		const randomId = uuidGenerator();
 
@@ -340,6 +340,7 @@ describe("telemetry controls", () => {
 describe("agent telemetry aggregation", () => {
 	beforeEach(() => {
 		vi.stubEnv("DO_NOT_TRACK", "0");
+		vi.stubEnv("PRIME_AGENT_TELEMETRY", "1");
 	});
 
 	it.each(["interactive", "rpc", "print", "unknown"] as const)(
