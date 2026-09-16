@@ -38,5 +38,6 @@ pub use tools::rlm_bootstrap::{build_rlm_bootstrap_code, PythonSkillRuntimeInfo}
 pub mod auth;
 pub mod kernel;
 pub mod models;
+pub mod prompts;
 pub mod settings;
 pub use kernel::ReplKernelManager;
