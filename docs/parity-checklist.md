@@ -109,6 +109,11 @@ tools, slash commands, keybindings). This is the largest remaining gap in
 the extensions area and blocks only extension-authored content, not the
 package install/remove flows landed here.
 
+Update: the host design decision landed as `docs/extensions-runner-design.md`
+(sidecar node runtime with a typed RPC surface; discovery ports to Rust, the
+TS module surface is preserved by the sidecar host script, staged plan with
+per-stage verifiers inside).
+
 ## 3. Side questions (`side_question_transcript`) - done
 
 TS: `packages/coding-agent/src/core/side-question.ts` (startSideQuestion:
