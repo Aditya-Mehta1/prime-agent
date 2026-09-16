@@ -95,6 +95,17 @@ describe("RLM bootstrap", () => {
 		expect(parsed?.websearch).toBe("No module named 'websearch'");
 	});
 
+	it("reports a skill whose import error is an empty string", () => {
+		// Python's str(ImportError()) is "" — an empty error is a legitimate
+		// report payload, and the only failed skill must still surface as
+		// unavailable instead of suppressing the whole report.
+		const parsed = parseUnavailablePythonSkills(
+			`${PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER}{"definitely_missing_skill":""}`,
+		);
+		expect(parsed).toEqual({ definitely_missing_skill: "" });
+		expect(Object.hasOwn(parsed ?? {}, "definitely_missing_skill")).toBe(true);
+	});
+
 	it("treats missing or malformed reports as no unavailable skills", () => {
 		expect(parseUnavailablePythonSkills("")).toBeUndefined();
 		expect(parseUnavailablePythonSkills("some unrelated kernel output")).toBeUndefined();

@@ -104,7 +104,9 @@ export function parseUnavailablePythonSkills(stdout: string): UnavailablePythonS
 	// key, not trip the inherited __proto__ setter.
 	const errors: UnavailablePythonSkills = Object.create(null) as UnavailablePythonSkills;
 	for (const [name, error] of Object.entries(parsed)) {
-		if (typeof error === "string" && error.length > 0) {
+		// Python's str(ImportError()) can be "", so an empty error still counts;
+		// only non-string entries are dropped.
+		if (typeof error === "string") {
 			errors[name] = error;
 		}
 	}
