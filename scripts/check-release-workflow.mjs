@@ -311,6 +311,41 @@ export function parseOptions(args, table, start = 0) {
 }
 
 /**
+ * An arithmetic body with its command and process substitutions blanked out: their words belong to
+ * commands the substitution walks inspect as commands, not to the arithmetic's variable references
+ * (review round 8, finding 3 - `x=$(( $(basename "$file") ))` was read as expanding `$basename`).
+ */
+function maskedSubstitutions(body) {
+	let masked = "";
+	let i = 0;
+	while (i < body.length) {
+		const ch = body[i];
+		if (ch === "`") {
+			const close = body.indexOf("`", i + 1);
+			const end = close === -1 ? body.length : close + 1;
+			masked += " ".repeat(end - i);
+			i = end;
+			continue;
+		}
+		if ((ch === "$" || ch === "<" || ch === ">") && body[i + 1] === "(") {
+			let depth = 1;
+			let j = i + 2;
+			while (j < body.length && depth > 0) {
+				if (body[j] === "(") depth += 1;
+				else if (body[j] === ")") depth -= 1;
+				j += 1;
+			}
+			masked += " ".repeat(j - i);
+			i = j;
+			continue;
+		}
+		masked += ch;
+		i += 1;
+	}
+	return masked;
+}
+
+/**
  * The variable names a word references, and the reasons it expands something the checker cannot
  * follow: an indirect expansion (`${!x}`), a transformation (`${x@P}` runs prompt expansion, which
  * runs commands), an assignment inside `$(( ))`. Command substitutions are skipped here: their
@@ -348,7 +383,7 @@ export function variableReferences(text) {
 				const end = skipParens(i + 3, 2);
 				const body = source.slice(i + 3, Math.max(i + 3, end - 2));
 				if (/(^|[^=!<>])=(?!=)|\+\+|--/.test(body)) reasons.push(`assigns a variable inside an arithmetic expansion: $((${body}))`);
-				for (const match of body.matchAll(/[A-Za-z_][A-Za-z0-9_]*/g)) names.push(match[0]);
+				for (const match of maskedSubstitutions(body).matchAll(/[A-Za-z_][A-Za-z0-9_]*/g)) names.push(match[0]);
 				i = end;
 			} else i = skipParens(i + 2, 1);
 			continue;
@@ -694,6 +729,31 @@ function joinContinuations(script) {
 const ANSI_C_ESCAPES = { n: "\n", t: "\t", r: "\r", a: "\x07", b: "\b", f: "\f", v: "\v", e: "\x1b", E: "\x1b", "\\": "\\", "'": "'", '"': '"', "?": "?" };
 
 /**
+ * The command substitutions an arithmetic body runs, surfaced for the walks that inspect
+ * `substitutions`: `x=$(( $($file) ))` executes the artifact the loop variable names (review
+ * round 8, finding 3). Pure arithmetic (`count + 1`) is data, so it stays out of command analysis.
+ */
+function arithmeticSubstitutions(body) {
+	const substitutions = [];
+	for (const command of splitWords(body).commands) substitutions.push(...command.substitutions);
+	return substitutions;
+}
+
+/**
+ * The position of the `case` that opens a `case ... in` construct, after any assignments and
+ * keywords that share its line (`do case "$x" in`); -1 when the first word that is neither an
+ * assignment nor a keyword is anything else (`echo case x in` is an echo).
+ */
+function caseHeadIndex(words) {
+	for (const [position, word] of words.entries()) {
+		if (!word.quoted && word.text === "case") return position;
+		if (ASSIGNMENT.test(word.text) || SHELL_KEYWORDS.test(word.text)) continue;
+		return -1;
+	}
+	return -1;
+}
+
+/**
  * POSIX-ish word splitting of one command line.
  *
  * Adjacent quoted and unquoted fragments form ONE word (`'node scr'"'"'ipts/x'` is the word
@@ -743,7 +803,9 @@ export function splitWords(line, { patternPosition = false } = {}) {
 	};
 	const endCommand = () => {
 		endWord();
-		if (words.length >= 3 && words[0].text === "case" && words[words.length - 1].text === "in" && !words[0].quoted) pattern = true;
+		// `case X in` begins the patterns; `do case X in` may open the case on the same line.
+		const caseAt = caseHeadIndex(words);
+		if (caseAt !== -1 && words[caseAt + 2]?.text === "in" && caseAt + 2 === words.length - 1) pattern = true;
 		if (words.length > 0 || substitutions.length > 0 || redirections.length > 0) {
 			// `opens` counts the `(` that preceded this command, `closes` the `)` that followed it,
 			// so a caller can scope a `cd` inside `( ... )` to the subshell.
@@ -893,7 +955,8 @@ export function splitWords(line, { patternPosition = false } = {}) {
 				if (c === "$" && source[i + 1] === "(") {
 					const arithmetic = source[i + 2] === "(";
 					const [inner, end] = scanParens(i + 2 + (arithmetic ? 1 : 0), arithmetic);
-					if (!arithmetic) substitutions.push(inner);
+					if (arithmetic) substitutions.push(...arithmeticSubstitutions(inner));
+					else substitutions.push(inner);
 					text += source.slice(i, end);
 					expansion = true;
 					i = end;
@@ -1004,7 +1067,8 @@ export function splitWords(line, { patternPosition = false } = {}) {
 			expansion = true;
 			const arithmetic = source[i + 2] === "(";
 			const [inner, end] = scanParens(i + 2 + (arithmetic ? 1 : 0), arithmetic);
-			if (!arithmetic) substitutions.push(inner);
+			if (arithmetic) substitutions.push(...arithmeticSubstitutions(inner));
+			else substitutions.push(inner);
 			text += source.slice(i, end);
 			i = end;
 			continue;
@@ -1056,9 +1120,24 @@ export function splitWords(line, { patternPosition = false } = {}) {
 				if (operator === ")") pattern = false;
 				continue;
 			}
+			// `case X in PATTERN)` or `case X in P1|P2)` on one line: the words after `in` are
+			// re-emitted as a case pattern command, exactly as a multi-line case would be, so the
+			// arm's body is read as its body and a `|` separates patterns, not commands (review
+			// round 8, finding 5 - a one-line arm could otherwise skip the bundle unseen).
+			const caseAt = caseHeadIndex(words);
+			const caseHead = caseAt !== -1 && words[caseAt + 2]?.text === "in" && (operator === "|" || operator === ")");
+			if (caseHead) {
+				endCommand();
+				const closed = commands.pop();
+				const patternWords = closed.words.slice(caseAt + 3);
+				commands.push({ ...closed, words: closed.words.slice(0, caseAt + 3), closes: 0, piped: false });
+				if (patternWords.length > 0) {
+					commands.push({ words: patternWords, substitutions: closed.substitutions, redirections: [], piped: false, opens: 0, closes: 0, casePattern: true, background: false });
+				}
+				pattern = operator === "|"; // more patterns follow a `|`; the body follows the `)`
+				continue;
+			}
 			nextPiped = operator === "|" || operator === "|&";
-			// `case X in PATTERN)` on one line: the `)` closes the pattern, not a subshell.
-			const caseHead = words.length >= 3 && words[0].text === "case" && words[2].text === "in" && !words[0].quoted;
 			endCommand();
 			if (operator === "&") {
 				// A bare `&` backgrounds the command (or the `{ ...; }`/`( ... )` group) it follows.
@@ -1067,10 +1146,7 @@ export function splitWords(line, { patternPosition = false } = {}) {
 			}
 			if (/^;;&?$|^;&$/.test(operator)) pattern = true;
 			else if (operator[0] === "(") pendingOpens += 1;
-			else if (operator[0] === ")") {
-				if (caseHead) pattern = false;
-				else if (commands.length > 0) commands[commands.length - 1].closes += 1;
-			}
+			else if (operator[0] === ")" && commands.length > 0) commands[commands.length - 1].closes += 1;
 			continue;
 		}
 		if (!inWord && (ch === "<" || ch === ">" || (/[0-9]/.test(ch) && REDIRECTION.test(source.slice(i))))) {
@@ -1272,7 +1348,7 @@ export function credentialStepReasons(run, { artifactDirectories = [], workingDi
 	// value that is a literal not beginning with `-` can never be an option; an expression
 	// (`${{ needs.* }}`, `${{ secrets.* }}`) is data the checker cannot see. Without `env` (unit
 	// tests) every allowlisted name counts as bound, and none as prefixed.
-	const state = { bound: new Set(GITHUB_DEFAULT_ENV), prefixed: new Set(GITHUB_DEFAULT_ENV), functions };
+	const state = { bound: new Set(GITHUB_DEFAULT_ENV), prefixed: new Set(GITHUB_DEFAULT_ENV), functions, values: new Map() };
 	if (env === undefined) for (const name of ALLOWED_VARIABLES) state.bound.add(name);
 	else {
 		for (const [name, value] of Object.entries(env)) {
@@ -1283,8 +1359,8 @@ export function credentialStepReasons(run, { artifactDirectories = [], workingDi
 	for (const command of shellCommands(run)) {
 		for (let n = 0; n < (command.opens ?? 0); n += 1) stack.push(cwd);
 		for (const reason of repositoryCodeReasons(command, cwd)) reasons.push(`must not run repository code: ${reason}`);
-		reasons.push(...commandAllowlistReasons(command, { jobId, functions, artifactDirectories }));
-		reasons.push(...expansionReasons(command, state, { artifactDirectories }));
+		reasons.push(...commandAllowlistReasons(command, { jobId, functions, artifactDirectories, values: state.values }));
+		reasons.push(...expansionReasons(command, state, { artifactDirectories, cwd }));
 		const index = commandIndex(command.words);
 		if (index !== -1) {
 			const name = command.words[index].text;
@@ -1477,38 +1553,188 @@ function optionNameExpands(word) {
 	return word.text.startsWith("-") && word.expansion && /[$`]/.test(word.text.split("=")[0]);
 }
 
-/** A glob from a `case` pattern as a regular expression (`*`, `?`, `[...]`; everything else literal). */
+/** POSIX character classes a `case` pattern may name, as JavaScript class members. */
+const POSIX_CLASSES = {
+	upper: "A-Z",
+	lower: "a-z",
+	alpha: "A-Za-z",
+	digit: "0-9",
+	alnum: "A-Za-z0-9",
+	space: "\\t\\n\\v\\f\\r ",
+	blank: "\\t ",
+	punct: "\\u0021-\\u002f\\u003a-\\u0040\\u005b-\\u0060\\u007b-\\u007e",
+	cntrl: "\\u0000-\\u001f\\u007f",
+	xdigit: "0-9A-Fa-f",
+	graph: "\\u0021-\\u007e",
+	print: "\\u0020-\\u007e",
+	word: "A-Za-z0-9_",
+};
+/** A bracket expression the translator cannot read matches every name, so a skip pattern can never be under-read. */
+const MATCH_ALL = /^[\s\S]*$/;
+
+/**
+ * Reads the bracket expression at `pattern[start]` (a `[`), as `[javascriptClass, indexAfter]` or
+ * null when it cannot be translated. A POSIX character class spans to its own `]`, so
+ * `[[:upper:]]HA256SUMS.sigstore.json` ends at the LAST `]`, not the first (review round 8, finding
+ * 6); `[!...]`/`[^...]` negate; a `]` first in the set and ranges are members. An unterminated `[`
+ * is the literal `[` bash reads; an unknown character class is unreadable (the caller fails closed).
+ */
+function bracketExpression(pattern, start) {
+	let j = start + 1;
+	let negated = false;
+	if (pattern[j] === "!" || pattern[j] === "^") {
+		negated = true;
+		j += 1;
+	}
+	let members = "";
+	if (pattern[j] === "]") {
+		members += "\\]";
+		j += 1;
+	}
+	while (j < pattern.length && pattern[j] !== "]") {
+		if (pattern[j] === "[" && pattern[j + 1] === ":") {
+			const close = pattern.indexOf(":]", j + 2);
+			if (close === -1) return null;
+			const translated = POSIX_CLASSES[pattern.slice(j + 2, close)];
+			if (translated === undefined) return null;
+			members += translated;
+			j = close + 2;
+			continue;
+		}
+		const member = pattern[j];
+		members += member === "\\" ? "\\\\" : member === "]" ? "\\]" : member === "^" ? "\\^" : member;
+		j += 1;
+	}
+	if (j >= pattern.length) return ["\\[", start + 1]; // an unterminated `[` is literal
+	return [negated ? `[^${members}]` : `[${members}]`, j + 1];
+}
+
+/**
+ * A glob from a `case` pattern as a regular expression (`*`, `?`, bracket expressions; everything
+ * else literal). A bracket expression that cannot be translated makes the whole pattern match every
+ * name: the only question it answers is "could this skip pattern name the signature bundle", and
+ * an unreadable pattern may (review round 8, finding 6).
+ */
 function globToRegExp(pattern) {
 	let source = "^";
-	for (let i = 0; i < pattern.length; i += 1) {
+	let i = 0;
+	while (i < pattern.length) {
 		const ch = pattern[i];
-		if (ch === "*") source += ".*";
-		else if (ch === "?") source += ".";
-		else if (ch === "[") {
-			const close = pattern.indexOf("]", i + 1);
-			if (close === -1) source += "\\[";
-			else {
-				source += `[${pattern.slice(i + 1, close).replace(/^!/, "^").replace(/\\/g, "\\\\")}]`;
-				i = close;
-			}
-		} else source += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		if (ch === "*") {
+			source += ".*";
+			i += 1;
+		} else if (ch === "?") {
+			source += ".";
+			i += 1;
+		} else if (ch !== "[") {
+			source += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+			i += 1;
+		} else {
+			const bracket = bracketExpression(pattern, i);
+			if (bracket === null) return MATCH_ALL;
+			source += bracket[0];
+			i = bracket[1];
+		}
 	}
 	return new RegExp(`${source}$`);
 }
 
 /**
+ * True when a command in a `case` arm's body leaves the loop or the step: a `continue`, `break`,
+ * `exit` or `return` in command position (or inside one of its command substitutions), or a call to
+ * a shell function the run block defined whose body - directly or through the functions it calls -
+ * does the same (review round 8, finding 5). `continue` and `break` inside a function still act on
+ * the caller's loop; `exit` ends the step; a body that might do any of the four never reaches the
+ * upload that follows.
+ */
+function leavesTheItem(command, effects) {
+	const walk = (entry) => {
+		for (const substitution of entry.substitutions) {
+			for (const inner of shellCommands(substitution)) if (walk(inner)) return true;
+		}
+		const index = commandIndex(entry.words);
+		if (index === -1) return false;
+		const word = entry.words[index];
+		if (word.expansion) return false; // cannot name a function or a control-flow word
+		return /^(continue|break|exit|return)$/.test(word.text) || (effects.get(word.text)?.size ?? 0) > 0;
+	};
+	return walk(command);
+}
+
+/**
+ * The control-flow effects (`continue`, `break`, `exit`, `return`) of every shell function the run
+ * block defines, as a name -> effect map (review round 8, finding 5). A body collects the effects of
+ * its own commands and the names it calls in command position; after the walk the call graph is
+ * resolved transitively (cycles are safe: a visited function contributes what was already found).
+ */
+function functionEffectsOf(run) {
+	const commands = [...shellCommands(run)].filter((command) => !command.casePattern && !command.heredoc);
+	const bodies = new Map(); // name -> { effects: Set, calls: Set }
+	const scopes = []; // the functions whose body is currently open, innermost last
+	for (const command of commands) {
+		const words = command.words;
+		const texts = words.map((word) => word.text);
+		const index = commandIndex(words);
+		// A definition: `name() {` (the `{` is the next command) or `function name {`.
+		if (index !== -1 && !words[index].expansion && (words[index].definesFunction || (index > 0 && texts[index - 1] === "function"))) {
+			bodies.set(texts[index], { effects: new Set(), calls: new Set() });
+			// The `{` may close this very command (`function name {`); else it is the next one.
+			scopes.push({ name: texts[index], depth: texts.at(-1) === "{" ? 1 : 0 });
+			continue;
+		}
+		const bare = words.length === 1 && !words[0].expansion;
+		if (bare && texts[0] === "{") {
+			// The `{` that opens a `name() {` body, or a nested group inside one.
+			if (scopes.length > 0) scopes[scopes.length - 1].depth += 1;
+			continue;
+		}
+		if (bare && texts[0] === "}") {
+			if (scopes.length > 0 && (scopes[scopes.length - 1].depth -= 1) === 0) scopes.pop();
+			continue;
+		}
+		if (scopes.length === 0) continue;
+		// Everything else belongs to the innermost open body: its control-flow words, and the
+		// functions it calls (resolved once the whole block has been walked).
+		const body = bodies.get(scopes[scopes.length - 1].name);
+		const walk = (entry) => {
+			for (const substitution of entry.substitutions) {
+				for (const inner of shellCommands(substitution)) walk(inner);
+			}
+			const at = commandIndex(entry.words);
+			if (at === -1) return;
+			const word = entry.words[at];
+			if (word.expansion) return;
+			if (/^(continue|break|exit|return)$/.test(word.text)) body.effects.add(word.text);
+			else if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(word.text)) body.calls.add(word.text);
+		};
+		walk(command);
+	}
+	const resolved = new Map();
+	const resolve = (name, seen) => {
+		const body = bodies.get(name);
+		if (!body) return new Set();
+		const effects = new Set(body.effects);
+		if (seen.has(name)) return effects; // a call cycle: its direct effects are all it can add
+		seen.add(name);
+		for (const call of body.calls) for (const effect of resolve(call, seen)) effects.add(effect);
+		return effects;
+	};
+	for (const name of bodies.keys()) resolved.set(name, resolve(name, new Set()));
+	return resolved;
+}
+
+/**
  * The `case` patterns (as glob strings) whose body leaves the loop or the step - `continue`, `break`,
- * `exit`, `return` - i.e. the names an upload loop skips.
+ * `exit`, `return`, directly or through a shell function the block defined - i.e. the names an upload
+ * loop skips.
  */
 export function caseSkipPatternsOf(run) {
+	const effects = functionEffectsOf(run);
 	const skipped = [];
 	let group = [];
 	let body = [];
 	const flush = () => {
-		if (group.length > 0 && body.some((command) => {
-			const index = commandIndex(command.words);
-			return index !== -1 && /^(continue|break|exit|return)$/.test(command.words[index].text);
-		})) {
+		if (group.length > 0 && body.some((command) => leavesTheItem(command, effects))) {
 			skipped.push(...group);
 		}
 		group = [];
@@ -1546,12 +1772,12 @@ export function casePatternMatches(run, name) {
  * a call to a defined function is allowed). `jobId` selects the per-job allowlist; without one only
  * the `*` set applies.
  */
-export function commandAllowlistReasons(input, { jobId = null, functions = new Set(), artifactDirectories = [] } = {}) {
+export function commandAllowlistReasons(input, { jobId = null, functions = new Set(), artifactDirectories = [], values } = {}) {
 	const command = asCommand(input);
 	const reasons = [];
 	for (const substitution of command.substitutions) {
 		for (const inner of shellCommands(substitution)) {
-			for (const reason of commandAllowlistReasons(inner, { jobId, functions, artifactDirectories })) reasons.push(`inside a command substitution: ${reason}`);
+			for (const reason of commandAllowlistReasons(inner, { jobId, functions, artifactDirectories, values })) reasons.push(`inside a command substitution: ${reason}`);
 		}
 	}
 	const words = command.words;
@@ -1787,7 +2013,13 @@ export function commandAllowlistReasons(input, { jobId = null, functions = new S
 		const positionals = parsed.positionals.map((position) => args[position]);
 		const targets = tool.targets === "last" ? positionals.slice(-1) : tool.targets === "all" ? positionals : [];
 		for (const target of targets) {
-			if (!target.expansion && touchesArtifacts(target.text, artifactDirectories)) reasons.push(`${name} writes into a downloaded artifact directory (${dashArtifacts.join(", ")}), which the job uploads as verified: ${spelled}`);
+			// A literal target is the path it spells; an expanded one is resolved through the values
+			// the step has bound, so `cp /tmp/evil "$file"` after `for file in <artifact dir>/*`
+			// writes into the directory the job uploads (review round 8, finding 4). A target whose
+			// value the checker cannot pin is not provably an artifact, so only the provable case is
+			// an error here; a REDIRECTION to one is refused outright in expansionReasons.
+			const lands = writeTargetLands(target, values, { artifactDirectories });
+			if (lands.class === "artifact") reasons.push(`${name} writes into a downloaded artifact directory (${dashArtifacts.join(", ")}), which the job uploads as verified: ${spelled}`);
 			if (writesOutsideScratch(target.text)) reasons.push(`${name} writes outside /tmp: a profile, a binary on PATH or a tool's configuration could be replaced: ${spelled}`);
 		}
 	}
@@ -1903,13 +2135,13 @@ export function toolArguments(name, args, { artifactDirectories = [] } = {}) {
  *   - Nothing may be written to `$GITHUB_ENV`, `$GITHUB_PATH` or into a downloaded artifact directory.
  * The command's own assignments are then bound for what follows.
  */
-export function expansionReasons(input, state, { artifactDirectories = [] } = {}) {
+export function expansionReasons(input, state, { artifactDirectories = [], cwd = "" } = {}) {
 	const command = asCommand(input);
 	const reasons = [];
 	const spelled = command.words.map((word) => word.text).join(" ");
 	for (const substitution of command.substitutions) {
 		for (const inner of shellCommands(substitution)) {
-			for (const reason of expansionReasons(inner, state, { artifactDirectories })) reasons.push(`inside a command substitution: ${reason}`);
+			for (const reason of expansionReasons(inner, state, { artifactDirectories, cwd })) reasons.push(`inside a command substitution: ${reason}`);
 		}
 	}
 	const check = (text, where) => {
@@ -1932,8 +2164,15 @@ export function expansionReasons(input, state, { artifactDirectories = [] } = {}
 		if (redirection.expansion) check(redirection.text, target);
 		if (STEP_STATE_FILES.test(redirection.text)) reasons.push(`writes to a file that sets the environment or PATH of every later step: ${target}`);
 		if (/^[0-9]*(>>|>\||>|&>>|&>|<>)$/.test(redirection.operator)) {
-			if (!redirection.expansion && touchesArtifacts(redirection.text, artifactDirectories)) reasons.push(`writes into a downloaded artifact directory, which the job uploads as verified: ${target}`);
-			if (writesOutsideScratch(redirection.text)) reasons.push(`writes outside /tmp: a profile, a binary on PATH or a tool's configuration could be replaced: ${target}`);
+			// Where the target lands, literal or expanded: a redirection may never write into a
+			// downloaded artifact directory, and an expanded target has to provably avoid one - the
+			// step's own bindings decide (`printf x > "$file"` after `for file in <artifact dir>/*`,
+			// review round 8, finding 4). A literal target resolves against the working directory
+			// the step has `cd`-ed into; an unknown one fails closed.
+			const lands = writeTargetLands(redirection, state.values, { artifactDirectories, cwd });
+			if (lands.class === "artifact") reasons.push(`writes into a downloaded artifact directory, which the job uploads as verified: ${target}`);
+			else if (lands.class === "unknown") reasons.push(`redirects to a target the checker cannot resolve, so it cannot prove it stays out of the downloaded artifact directories: ${target}`);
+			else if (writesOutsideScratch(lands.resolved ?? redirection.text)) reasons.push(`writes outside /tmp: a profile, a binary on PATH or a tool's configuration could be replaced: ${target}`);
 		}
 	}
 	if (command.casePattern || command.heredoc) return reasons; // data; bound nothing
@@ -1962,12 +2201,61 @@ export function expansionReasons(input, state, { artifactDirectories = [] } = {}
 			}
 		}
 	}
-	bindVariables(command, state);
+	bindVariables(command, state, { artifactDirectories });
 	return reasons;
 }
 
-/** Binds what a command assigns into `state.bound`, and tracks which of those values provably begin with a literal that is not `-`. */
-function bindVariables(command, state) {
+/**
+ * Where a value a command assigns provably lands, for the redirection and writing-coreutils target
+ * checks (review round 8, finding 4): "artifact" (inside a downloaded artifact directory),
+ * "scratch" (a literal /tmp path, under $RUNNER_TEMP, or what mktemp creates), "outside" (provably
+ * not inside the artifact directories) or "unknown" (the checker cannot pin it). `literal` is the
+ * value when it is spelled out in full, so an absolute path outside /tmp is still refused.
+ */
+function valueClassOf(text, values, artifactDirectories) {
+	const value = String(text);
+	if (!/[$`]/.test(value)) {
+		if (isArtifactPath(value, artifactDirectories) || isArtifactDirectory(value, artifactDirectories)) return { class: "artifact", literal: value };
+		return { class: TMP_FILE.test(value) ? "scratch" : "outside", literal: value };
+	}
+	// "$RUNNER_TEMP/x": the runner's scratch directory, with a literal file name under it.
+	const temp = value.match(/^\$\{?RUNNER_TEMP\}?\/([^$/`]*)$/);
+	if (temp && temp[1] !== "" && !hasDotSegment(value)) return { class: "scratch", literal: null };
+	// "$(mktemp ...)": mktemp creates its file under /tmp.
+	if (/^\$\(\s*mktemp\b[\s\S]*\)\s*$/.test(value)) return { class: "scratch", literal: null };
+	// A single variable, or a variable a literal suffix hangs on: wherever its binding lands.
+	const lead = value.match(/^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?(.*)$/s);
+	if (lead) {
+		if (GITHUB_DEFAULT_ENV.includes(lead[1])) return { class: lead[1] === "RUNNER_TEMP" ? "scratch" : "outside", literal: null };
+		const known = values?.get(lead[1]);
+		if (!known) return { class: "unknown", literal: null };
+		if (known.class === "artifact") return { class: "artifact", literal: null };
+		// A known literal value plus the suffix is still a literal the checker can read.
+		if (known.literal !== null) return valueClassOf(`${known.literal}${lead[2]}`, values, artifactDirectories);
+		return { class: known.class, literal: null };
+	}
+	return { class: "unknown", literal: null };
+}
+
+/**
+ * Where a write target lands: "artifact", "scratch", "outside" or "unknown", plus the resolved
+ * literal when there is one (review round 8, finding 4). A literal target also resolves against the
+ * working directory the step has `cd`-ed into, so `cd artifacts && printf x > SHA256SUMS` writes
+ * into the uploaded directory too. An expanded target is resolved through the values the step has
+ * bound (`printf x > "$file"` after `for file in <artifact dir>/*`); `scratch` and `outside` are
+ * provably not a verified artifact, `unknown` is not provably anything.
+ */
+function writeTargetLands(word, values, { artifactDirectories, cwd = "" } = {}) {
+	if (!word.expansion) {
+		const resolved = resolveAgainst(cwd, word) ?? word.text;
+		return { class: touchesArtifacts(resolved, artifactDirectories) ? "artifact" : "outside", resolved };
+	}
+	const value = valueClassOf(word.text, values, artifactDirectories);
+	return { class: value.class, resolved: value.class === "outside" ? value.literal : null };
+}
+
+/** Binds what a command assigns into `state.bound`, tracks which of those values provably begin with a literal that is not `-`, and where each value lands (review round 8, finding 4). */
+function bindVariables(command, state, { artifactDirectories = [] } = {}) {
 	const words = command.words;
 	const assignedHere = assignedNames(command);
 	for (const name of assignedHere) {
@@ -1980,12 +2268,31 @@ function bindVariables(command, state) {
 		const match = word.text.match(/^([A-Za-z_][A-Za-z0-9_]*)(\[[^\]]*\])?\+?=(.*)$/s);
 		if (match && assignedHere.includes(match[1]) && !match[2] && prefixedValue(match[3])) state.prefixed.add(match[1]);
 	}
-	// `for X in a b c`: prefixed when every item is.
+	// Where every assigned value lands; a name assigned without a value (`read x`, a bare `local x`)
+	// is unknown, and so is an array element or anything the checker cannot read.
+	for (const name of new Set(assignedHere)) {
+		let assigned = null;
+		for (const word of words) {
+			const match = word.text.match(new RegExp(`^${name}(\\[[^\\]]*\\])?\\+?=([\\s\\S]*)$`));
+			if (match && !match[1]) assigned = match[2];
+		}
+		state.values.set(name, assigned === null ? { class: "unknown", literal: null } : valueClassOf(assigned, state.values, artifactDirectories));
+	}
+	// `for X in a b c`: prefixed when every item is, and wherever the items land.
 	const texts = words.map((word) => word.text);
 	const at = texts.findIndex((text) => /^(for|select)$/.test(text));
 	if (at !== -1 && texts[at + 2] === "in" && words[at + 1]) {
 		const items = words.slice(at + 3).filter((word) => !/^(do|;)$/.test(word.text));
 		if (items.length > 0 && items.every((item) => prefixedValue(item.text))) state.prefixed.add(words[at + 1].text);
+		if (items.length > 0) {
+			const classes = items.map((item) => valueClassOf(item.text, state.values, artifactDirectories).class);
+			const combined = classes.includes("artifact")
+				? "artifact"
+				: classes.every((entry) => entry === "scratch" || entry === "outside")
+					? (classes.includes("scratch") ? "scratch" : "outside")
+					: "unknown";
+			state.values.set(words[at + 1].text, { class: combined, literal: null });
+		}
 	}
 }
 
@@ -2232,6 +2539,9 @@ export function r2StepReasons(jobId, run, { last = false, artifactDirectories = 
 	const reasons = [];
 	const pointers = [];
 	const bound = { file: false, name: false };
+	// Where every value the step assigns provably lands, for the local destination of a download
+	// (review round 8, finding 2).
+	const values = new Map();
 	const spell = (command, index) => command.words.slice(index).map((word) => word.text).join(" ");
 	const inspect = (command, context) => {
 		for (const substitution of command.substitutions) {
@@ -2256,6 +2566,21 @@ export function r2StepReasons(jobId, run, { last = false, artifactDirectories = 
 		} else {
 			if (assigned.includes("file")) bound.file = false;
 			if (assigned.includes("file") || assigned.includes("name")) bound.name = false;
+		}
+		// Where every value the statement assigns provably lands (review round 8, finding 2): a
+		// name assigned without a value (`read x`, a bare `local x`) is unknown.
+		for (const name of new Set(assigned)) {
+			let value = null;
+			for (const word of command.words) {
+				const match = word.text.match(new RegExp(`^${name}(\\[[^\\]]*\\])?\\+?=([\\s\\S]*)$`));
+				if (match && !match[1]) value = match[2];
+			}
+			values.set(name, value === null ? { class: "unknown", literal: null } : valueClassOf(value, values, artifactDirectories));
+		}
+		if (texts.length >= 4 && (texts[0] === "for" || texts[0] === "select") && texts[2] === "in" && !statement[1].expansion) {
+			const items = statement.slice(3).filter((word) => !/^(do|;)$/.test(word.text));
+			const classes = items.map((item) => valueClassOf(item.text, values, artifactDirectories).class);
+			values.set(texts[1], { class: classes.includes("artifact") ? "artifact" : classes.every((entry) => entry === "scratch" || entry === "outside") ? (classes.includes("scratch") ? "scratch" : "outside") : "unknown", literal: null });
 		}
 		const index = commandIndex(command.words);
 		if (index === -1) return;
@@ -2310,7 +2635,19 @@ export function r2StepReasons(jobId, run, { last = false, artifactDirectories = 
 			reasons.push(`${context}aws must carry --endpoint-url "$R2_ENDPOINT_URL" exactly once (found ${endpoints}): ${spelled}`);
 		}
 		if (service.text === "s3api") {
-			if (AWS_S3API_READS.test(operation.text)) return;
+			if (AWS_S3API_READS.test(operation.text)) {
+				// get-object writes the body to a local file too: the same destination rule as a
+				// download (review round 8, finding 2).
+				if (operation.text === "get-object") {
+					const output = positionals[0];
+					if (output) {
+						const landing = valueClassOf(output.text, values, artifactDirectories);
+						if (landing.class === "artifact") reasons.push(`${context}aws s3api get-object downloads over a downloaded artifact (${output.text}); a download may never replace a file the job uploads as verified: ${spelled}`);
+						else if (landing.class !== "scratch") reasons.push(`${context}aws s3api get-object downloads to ${output.text}, which is not a literal /tmp or $RUNNER_TEMP path or a variable this step bound to one: ${spelled}`);
+					}
+				}
+				return;
+			}
 			reasons.push(`${context}aws s3api ${operation.text} writes outside the 'aws s3 cp' allowlist: ${spelled}`);
 			return;
 		}
@@ -2330,7 +2667,14 @@ export function r2StepReasons(jobId, run, { last = false, artifactDirectories = 
 		const [source, destination] = positionals;
 		if (!destination.text.startsWith("s3://")) {
 			if (!source.text.startsWith("s3://")) reasons.push(`${context}aws s3 cp copies between local paths: ${spelled}`);
-			return; // a download; where it lands is checked like any other path
+			// The local destination of a download may never replace a verified artifact: it must be
+			// a literal /tmp path, under $RUNNER_TEMP, or a variable this step bound to one - never
+			// inside a downloaded artifact directory, and never through a `..` segment (review round
+			// 8, finding 2).
+			const landing = valueClassOf(destination.text, values, artifactDirectories);
+			if (landing.class === "artifact") reasons.push(`${context}aws s3 cp downloads over a downloaded artifact (${destination.text}); a download may never replace a file the job uploads as verified: ${spelled}`);
+			else if (landing.class !== "scratch") reasons.push(`${context}aws s3 cp downloads to ${destination.text}, which is not a literal /tmp or $RUNNER_TEMP path or a variable this step bound to one: ${spelled}`);
+			return;
 		}
 		// The source must be a downloaded artifact, spelled plainly: `artifacts/../x`, `./artifacts/x`,
 		// `/artifacts/x` and `~/artifacts/x` are not (review round 5, finding 3).
@@ -2727,7 +3071,13 @@ export function checkWorkflows(read = (path) => readFileSync(path, "utf8"), list
 				}
 			}
 			const run = String(step.run ?? "");
-			const options = { artifactDirectories, workingDirectory: workingDirectory === undefined ? "" : String(workingDirectory), jobId };
+			// The variables the step starts with: the workflow's, the job's and the step's `env:`, and
+			// nothing else - `with:` and `inputs:` reach a run block only as expression values inside
+			// `env:`, never as shell names. Threading it holds the real workflow to the binding rule
+			// of review round 7, finding 3, which until now only the unit tests enforced (review
+			// round 8, finding 1).
+			const env = { ...(release.env ?? {}), ...(job.env ?? {}), ...(step.env ?? {}) };
+			const options = { artifactDirectories, workingDirectory: workingDirectory === undefined ? "" : String(workingDirectory), jobId, env };
 			for (const reason of credentialStepReasons(run, options)) {
 				fail(`${RELEASE_WORKFLOW}: credential-bearing job '${jobId}' ${reason} (${label}).`);
 			}
