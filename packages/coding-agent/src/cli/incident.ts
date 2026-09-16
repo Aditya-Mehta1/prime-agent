@@ -78,7 +78,10 @@ const ERROR_BURST_THRESHOLD = 3;
 const SUMMARY_TRUNCATION = 120;
 const RECOVERY_BREAKDOWN_LIMIT = 4;
 const WORKER_SOCKET_PATTERN = /^worker-[0-9a-f]+-([0-9a-f]{12})\.sock$/;
-const DAEMON_LOG_FILE_PATTERN = /\.sock\.[0-9a-f]{8}\.log$/;
+// Per-daemon logs are named `<socket basename>.<hash8>.log` (config.ts
+// getDaemonLogPath); the socket basename itself may lack `.sock` for custom
+// sockets and Windows named pipes, so key on the hash suffix instead.
+const DAEMON_LOG_FILE_PATTERN = /\.[0-9a-f]{8}\.log$/;
 const BURST_CLASSES = new Set(["command-failure", "auth", "diagnostic"]);
 const LIFECYCLE_CLASSES = new Set(["worker-start", "worker-stop", "worker-crash", "worker-passivation"]);
 

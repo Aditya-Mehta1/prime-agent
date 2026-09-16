@@ -449,6 +449,20 @@ describe("runIncident over a fixture agent dir", () => {
 		);
 	});
 
+	it("falls back to daemon logs whose socket basename does not end in .sock", async () => {
+		// A daemon started with `--daemon-socket /tmp/prime-daemon` writes
+		// prime-daemon.<hash>.log, which has no .sock segment to match on.
+		mkdirSync(join(agentDir, "logs"), { recursive: true });
+		writeFileSync(
+			join(agentDir, "logs", "prime-daemon.a1b2c3d4.log"),
+			"[2026-09-10T20:00:05.000Z] supervisor: Daemon supervisor startup failed: Error: Lock file is already being held\n",
+		);
+		await runIncident({ since: "2026-09-10T20:00", until: "2026-09-10T20:30" });
+		const text = stripAnsi(logs.join("\n"));
+		expect(text).toContain("prime-daemon.a1b2c3d4.log");
+		expect(text).toContain("supervisor startup blocked: another daemon holds the lock");
+	});
+
 	it("falls back to the per-daemon log when agent.jsonl is empty or unreadable", async () => {
 		mkdirSync(join(agentDir, "logs"), { recursive: true });
 		const daemonLog = [
