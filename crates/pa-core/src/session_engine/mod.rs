@@ -14,6 +14,7 @@ pub mod compaction_exec;
 pub mod compaction_utils;
 pub mod engine;
 pub mod messages;
+pub mod refine;
 pub mod slash_commands;
 pub mod tool_bridge;
 
@@ -124,6 +125,53 @@ impl AgentSession {
                 serde_json::from_value::<AgentMessage>(value).ok()
             })
             .collect();
+        self.agent.set_messages(loop_messages).await;
+        Ok(result)
+    }
+
+    /// Execute `/refine`: plan, re-read, apply, and persist the continual
+    /// harness state for this session. The conversation snapshot comes from
+    /// the session entries (what the model would see on a rebuild).
+    pub async fn refine(
+        &self,
+        options: &refine::RefineOptions,
+        source: refine::RefinementSource,
+        model: &pa_types::ai::Model,
+        api_key: Option<String>,
+        global_harness_dir: std::path::PathBuf,
+    ) -> anyhow::Result<crate::refinement::RefinementResult> {
+        let result = {
+            let mut session = self.session.lock().await;
+            let messages: Vec<SessionAgentMessage> = session
+                .get_all_entries()
+                .iter()
+                .filter_map(|entry| match entry {
+                    FileEntry::Message { message, .. } => Some(message.clone()),
+                    _ => None,
+                })
+                .collect();
+            refine::execute_refinement(
+                &mut session,
+                &messages,
+                &global_harness_dir,
+                model,
+                options,
+                source,
+                refine::default_refiner_call(api_key),
+            )
+            .await?
+        };
+        // The notice entry must also enter the live loop context.
+        let session = self.session.lock().await;
+        let loop_messages: Vec<AgentMessage> =
+            crate::session_engine::compact_session::rebuilt_context_after_compaction(&session)
+                .into_iter()
+                .filter_map(|message| {
+                    let value = serde_json::to_value(&message).ok()?;
+                    serde_json::from_value::<AgentMessage>(value).ok()
+                })
+                .collect();
+        drop(session);
         self.agent.set_messages(loop_messages).await;
         Ok(result)
     }

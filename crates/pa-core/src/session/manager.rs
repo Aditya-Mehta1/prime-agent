@@ -830,6 +830,29 @@ impl SessionManager {
         id
     }
 
+    /// Append a custom message entry (compaction/refine notices, prompts).
+    pub fn append_custom_message(
+        &mut self,
+        custom_type: &str,
+        content: pa_types::ai::UserContent,
+        display: bool,
+        details: Option<serde_json::Value>,
+    ) -> String {
+        let base = self.next_base();
+        let id = base.id.clone().unwrap_or_default();
+        self.append_entry(FileEntry::CustomMessage {
+            payload: pa_types::session::CustomMessageEntry {
+                custom_type: custom_type.to_string(),
+                content,
+                details,
+                display,
+                rest: Default::default(),
+            },
+            base,
+        });
+        id
+    }
+
     /// Fold child usage into the target assistant message and record the
     /// attribution entry.
     pub fn append_child_usage_attribution(
