@@ -1183,6 +1183,7 @@ dependencies = [
  "pa-agent",
  "pa-ai",
  "pa-types",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
