@@ -123,6 +123,7 @@ describe("ModelRegistry", () => {
 			expect(auth).toEqual({
 				ok: true,
 				apiKey: "agent-key",
+				authSource: "stored",
 				headers: { "X-Prime-Team-ID": "team-1" },
 			});
 		});
@@ -1080,6 +1081,7 @@ describe("ModelRegistry", () => {
 			await expect(registry.getApiKeyAndHeaders(commandModel!)).resolves.toEqual({
 				ok: true,
 				apiKey: "command-key-1",
+				authSource: "models_json_command",
 				headers: { Authorization: "Bearer command-key-1" },
 			});
 
@@ -1090,6 +1092,7 @@ describe("ModelRegistry", () => {
 			await expect(registry.getApiKeyAndHeaders(commandModel!)).resolves.toEqual({
 				ok: true,
 				apiKey: "command-key-2",
+				authSource: "models_json_command",
 				headers: { Authorization: "Bearer command-key-2" },
 			});
 		});
