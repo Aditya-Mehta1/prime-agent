@@ -1,0 +1,7 @@
+{
+ "command": "unknown",
+ "error": "Unknown active session: ",
+ "id": "k1",
+ "success": false,
+ "type": "response"
+}

@@ -1274,6 +1274,7 @@ dependencies = [
  "pa-ai",
  "pa-core",
  "pa-types",
+ "regex",
  "serde",
  "serde_json",
  "sha2",

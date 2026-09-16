@@ -1,0 +1,20 @@
+{
+ "argv": [
+  "/home/ubuntu/lane-worktrees/gap-cli/target/release/prime-agent",
+  "-p",
+  "--daemon-socket",
+  "/home/ubuntu/lane-worktrees/gap-cli/scripts/battery/runs/20260916T221725Z/rust/daemon.sock",
+  "--provider",
+  "prime-inference",
+  "--model",
+  "mock-1",
+  "--offline",
+  "-c",
+  "Continue this session"
+ ],
+ "exit_code": 1,
+ "stdout": "",
+ "stderr": "Error: Session is already active in 50b7bdb5857d: /home/ubuntu/lane-worktrees/gap-cli/scripts/battery/runs/20260916T221725Z/rust/agent/sessions/01a0ac4d-7ad9-70e5-9bde-e5f4cc9314b6.jsonl\n",
+ "duration_s": 0.04,
+ "timeout": false
+}

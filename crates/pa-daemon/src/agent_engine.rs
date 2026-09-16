@@ -15,7 +15,8 @@ use pa_core::session_engine::provider_adapter::{json_round_trip, real_stream_fn}
 use pa_types::ai::Model;
 
 use crate::engine::{
-    EngineEvent, PromptRequest, SessionEngine, SideQuestionOutcome, SideQuestionRequest,
+    EngineEvent, EngineModelSelection, PromptRequest, SessionEngine, SideQuestionOutcome,
+    SideQuestionRequest,
 };
 
 /// Configuration for the real engine.
@@ -37,6 +38,10 @@ pub struct AgentEngineConfig {
 pub struct AgentSessionEngine {
     runtime: tokio::runtime::Runtime,
     config: AgentEngineConfig,
+    /// The authoritative model selection. Starts from the process fallback
+    /// (create config or worker env) and is re-bound when a session's create
+    /// command carries explicit wire flags.
+    selection: std::sync::RwLock<EngineModelSelection>,
     /// Built once on the first prompt, reused across prompts.
     session: tokio::sync::Mutex<Option<CoreSessionEngine>>,
 }
@@ -46,11 +51,33 @@ impl AgentSessionEngine {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
+        // Process-level fallback: the create config, else the worker env
+        // pair. A create command with explicit wire flags overrides both.
+        let selection = if config.provider.is_some() || config.model.is_some() {
+            EngineModelSelection {
+                provider: config.provider.clone(),
+                model: config.model.clone(),
+                api_key: config.api_key.clone(),
+            }
+        } else {
+            EngineModelSelection {
+                provider: std::env::var("PRIME_AGENT_MODEL_PROVIDER").ok(),
+                model: std::env::var("PRIME_AGENT_MODEL").ok(),
+                api_key: None,
+            }
+        };
         Ok(Self {
             runtime,
             config,
+            selection: std::sync::RwLock::new(selection),
             session: tokio::sync::Mutex::new(None),
         })
+    }
+
+    /// The current explicit selection (create-config flags merged over the
+    /// process fallback).
+    fn current_selection(&self) -> EngineModelSelection {
+        self.selection.read().expect("model selection lock").clone()
     }
 
     /// Resolve the model through the composed registry.
@@ -59,7 +86,8 @@ impl AgentSessionEngine {
         let registry =
             pa_core::models::ModelRegistry::create(auth, self.config.agent_dir.join("models.json"));
         let available: Vec<Model> = registry.get_available().into_iter().cloned().collect();
-        let Some(model_name) = self.config.model.as_deref() else {
+        let selection = self.current_selection();
+        let Some(model_name) = selection.model.as_deref() else {
             let all: Vec<Model> = registry.get_all().to_vec();
             if let Some(default) = pa_core::models::find_preferred_default_model(&available) {
                 return Ok(default.clone());
@@ -71,7 +99,7 @@ impl AgentSessionEngine {
             });
         };
         let resolved = pa_core::models::resolve_cli_model(
-            self.config.provider.as_deref(),
+            selection.provider.as_deref(),
             model_name,
             &available,
         );
@@ -92,10 +120,26 @@ impl AgentSessionEngine {
         self.resolve_registry_model()
     }
 
+    /// Resolve the request API key for `model`: the create-config key (the
+    /// TS `setRuntimeApiKey` path), else the registry's auth resolution
+    /// (auth storage, then the models.json provider `apiKey` — the same
+    /// sources `getApiKeyAndHeaders` merges in the TS product).
+    fn resolve_request_api_key(&self, model: &Model) -> Option<String> {
+        if let Some(api_key) = &self.current_selection().api_key {
+            return Some(api_key.clone());
+        }
+        let auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
+        let mut registry =
+            pa_core::models::ModelRegistry::create(auth, self.config.agent_dir.join("models.json"));
+        registry
+            .get_api_key_and_headers(model, model.headers.as_ref())
+            .api_key
+    }
+
     async fn build_session(&self, model: &Model) -> anyhow::Result<CoreSessionEngine> {
         let agent_model =
             json_round_trip(model).ok_or_else(|| anyhow::anyhow!("model conversion failed"))?;
-        let stream_fn = real_stream_fn(self.config.api_key.clone(), model.clone());
+        let stream_fn = real_stream_fn(self.resolve_request_api_key(model), model.clone());
         if let Some(session_dir) = &self.config.session_dir {
             std::fs::create_dir_all(session_dir)?;
         }
@@ -145,6 +189,24 @@ fn now_millis() -> u64 {
 impl SessionEngine for AgentSessionEngine {
     fn model_context_window(&self) -> Option<u64> {
         self.resolve_model().ok().map(|model| model.context_window)
+    }
+
+    fn configure_model(&self, selection: EngineModelSelection) {
+        // Merge like the TS runtime config: explicit wire flags replace the
+        // current selection; absent fields keep it.
+        let mut current = self.selection.write().expect("model selection lock");
+        if selection.provider.is_some() {
+            current.provider = selection.provider;
+        }
+        if selection.model.is_some() {
+            current.model = selection.model;
+        }
+        if selection.api_key.is_some() {
+            current.api_key = selection.api_key;
+        }
+        // The first prompt after create builds the session against this
+        // selection, so no invalidation is needed here: configure runs at
+        // create time, before any turn.
     }
 
     fn model_metadata(&self) -> Option<Value> {
@@ -450,6 +512,100 @@ impl AgentSessionEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A models.json custom provider (name has no env-key mapping), with an
+    /// apiKey the registry must resolve for request auth (the env-key map
+    /// alone cannot find it).
+    fn write_custom_provider_models_json(agent_dir: &std::path::Path, base_url: &str) {
+        std::fs::create_dir_all(agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("models.json"),
+            serde_json::json!({
+                "providers": {
+                    "battery": {
+                        "api": "openai-completions",
+                        "baseUrl": base_url,
+                        "apiKey": "sk-battery",
+                        "models": [
+                            {
+                                "id": "mock-1",
+                                "name": "Mock 1",
+                                "api": "openai-completions",
+                                "contextWindow": 128000,
+                                "maxTokens": 4096,
+                            }
+                        ]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn create_config_flags_reach_the_engine_model_resolution() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_custom_provider_models_json(&agent_dir, "http://127.0.0.1:9");
+
+        let engine = AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir: agent_dir.clone(),
+            // No process-level fallback: the wire flags must be the source.
+            provider: None,
+            model: None,
+            api_key: None,
+            session_dir: None,
+            faux_script: None,
+        })
+        .unwrap();
+        // The explicit selection from the session's create config is
+        // authoritative over any process-wide fallback model.
+        engine.configure_model(EngineModelSelection {
+            provider: Some("battery".to_string()),
+            model: Some("mock-1".to_string()),
+            api_key: None,
+        });
+        let model = engine.resolve_registry_model().expect("resolved model");
+        assert_eq!(model.provider, "battery");
+        assert_eq!(model.id, "mock-1");
+        // The registry resolves the models.json apiKey (the provider name has
+        // no env-key mapping), so the engine can authenticate without env.
+        assert_eq!(
+            engine.resolve_request_api_key(&model).as_deref(),
+            Some("sk-battery")
+        );
+    }
+
+    #[test]
+    fn configure_model_merges_only_present_fields() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_custom_provider_models_json(&agent_dir, "http://127.0.0.1:9");
+        let engine = AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir,
+            provider: Some("battery".to_string()),
+            model: Some("mock-1".to_string()),
+            api_key: Some("flag-key".to_string()),
+            session_dir: None,
+            faux_script: None,
+        })
+        .unwrap();
+        // A create config with only a model keeps the provider and key.
+        engine.configure_model(EngineModelSelection {
+            provider: None,
+            model: Some("mock-1".to_string()),
+            api_key: None,
+        });
+        let model = engine.resolve_registry_model().expect("resolved model");
+        assert_eq!(model.provider, "battery");
+        assert_eq!(
+            engine.resolve_request_api_key(&model).as_deref(),
+            Some("flag-key")
+        );
+    }
 
     #[test]
     fn agent_engine_reports_model_resolution_failures() {

@@ -1,0 +1,37 @@
+{
+ "command": "create",
+ "data": {
+  "activeSessionId": "2dd56f4898b3",
+  "activity": "idle",
+  "attachedClients": 0,
+  "created": "2026-09-16T22:14:10.265Z",
+  "cwd": "/home/ubuntu/lane-worktrees/gap-cli/scripts/battery/runs/20260916T221229Z/rust/work",
+  "hasRegisteredCronJob": false,
+  "id": "2dd56f4898b3",
+  "isBashRunning": false,
+  "isCompacting": false,
+  "isSessionActive": false,
+  "isStreaming": false,
+  "lastActivityAt": "2026-09-16T22:14:10.264Z",
+  "lifecycle": "resident",
+  "messageCount": 0,
+  "modified": "2026-09-16T22:14:10.264Z",
+  "rlmDepth": 0,
+  "runtimeKind": "top-level",
+  "sessionActions": {
+   "followUps": [],
+   "queuedCount": 0,
+   "steering": []
+  },
+  "sessionFile": "/home/ubuntu/lane-worktrees/gap-cli/scripts/battery/runs/20260916T221229Z/rust/agent/sessions/01a0ac48-d859-7546-8920-1c80324cf762.jsonl",
+  "sessionId": "01a0ac48-d859-7546-8920-1c80324cf762",
+  "sessionName": "battery-attach",
+  "thinkingLevel": "default",
+  "unfinishedActionCount": 0,
+  "workerPid": 1867369,
+  "workerState": "ready"
+ },
+ "id": "c1",
+ "success": true,
+ "type": "response"
+}

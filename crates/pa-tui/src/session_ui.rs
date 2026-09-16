@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use crate::chat::{ChatEntry, MessageBlock, ToolCallCard, ToolResultView, WorkingState};
 use crate::daemon_client::{DaemonClient, DaemonClientEvent};
-use crate::interactive::{InteractiveOptions, SessionSelection};
+use crate::interactive::{InteractiveOptions, ModelSelection, SessionSelection};
 use crate::keys::key_event_to_id;
 use crate::snapshot::{
     assistant_message_parts, attach_data_from_response, event_to_update, reconstruct, TurnUpdate,
@@ -30,6 +30,7 @@ pub(crate) struct SessionUi {
     cwd: PathBuf,
     session_dir: Option<PathBuf>,
     script_path: Option<PathBuf>,
+    model_selection: ModelSelection,
     /// Snapshot chat entries to fold into the view on the next rebuild.
     pending_snapshot: Option<Vec<ChatEntry>>,
     /// Snapshot labels (model) for the next rebuild.
@@ -70,6 +71,7 @@ impl SessionUi {
             cwd: options.cwd.clone(),
             session_dir: options.session_dir.clone(),
             script_path: options.script_path.clone(),
+            model_selection: options.model_selection.clone(),
             pending_snapshot: None,
             pending_model: None,
             context: None,
@@ -339,6 +341,7 @@ impl SessionUi {
             cwd: self.cwd.clone(),
             session_dir: self.session_dir.clone(),
             script_path: self.script_path.clone(),
+            model_selection: self.model_selection.clone(),
             no_session: false,
             session: SessionSelection::New,
             initial_message: None,

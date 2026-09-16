@@ -41,6 +41,17 @@ pub enum SessionSelection {
     Resume(PathBuf),
 }
 
+/// Explicit model selection carried into every `create` config: the CLI
+/// `--provider`/`--model`/`--api-key` flags. Explicit flags are
+/// authoritative end-to-end — the daemon worker resolves its session model
+/// from this selection instead of a process-wide fallback.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelSelection {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub api_key: Option<String>,
+}
+
 /// Options for one interactive run.
 #[derive(Debug, Clone)]
 pub struct InteractiveOptions {
@@ -52,6 +63,8 @@ pub struct InteractiveOptions {
     /// Scripted faux-engine script path. Verification seam only; the product
     /// never sets it.
     pub script_path: Option<PathBuf>,
+    /// Model flags to carry into the create config.
+    pub model_selection: ModelSelection,
     /// Create without a session file (`--no-session`).
     pub no_session: bool,
     pub session: SessionSelection,
@@ -71,6 +84,15 @@ impl InteractiveOptions {
         }
         if let Some(script) = &self.script_path {
             config["script"] = json!(script.display().to_string());
+        }
+        if let Some(provider) = &self.model_selection.provider {
+            config["provider"] = json!(provider);
+        }
+        if let Some(model) = &self.model_selection.model {
+            config["model"] = json!(model);
+        }
+        if let Some(api_key) = &self.model_selection.api_key {
+            config["apiKey"] = json!(api_key);
         }
         config
     }

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import re
 import json
 import os
 import shutil
@@ -44,6 +45,22 @@ NL = chr(10)
 ALL_FLOWS = ["f1_launch", "f2_prompt", "f3_tool", "f4_commands", "f5_side_questions", "f6_attach", "f7_compaction", "f8_resume", "f9_agents_view"]
 
 HELLO_TEXT = "battery hello from mock"
+# The dashboard status-line model the TS daemon asks after each turn (B-7).
+STATUSLINE_MODEL_ID = "qwen/qwen3-30b-a3b-instruct-2507"
+AGENT_STATUS_SYSTEM_PROMPT_PREFIX = "You generate a status line for an AI coding agent dashboard."
+
+
+def is_statusline_request(req) -> bool:
+    """A dashboard status-line request: the small model plus the fixed system prompt."""
+    body = req.get("body") or {}
+    messages = body.get("messages", [])
+    system = ""
+    if messages and isinstance(messages[0].get("content"), str):
+        system = messages[0]["content"]
+    return (
+        body.get("model") == STATUSLINE_MODEL_ID
+        and system.startswith(AGENT_STATUS_SYSTEM_PROMPT_PREFIX)
+    )
 
 
 class Battery:
@@ -89,14 +106,9 @@ class Battery:
         )
         side.env = B.scrubbed_env(agent, tmpdir)
         # Point both products at the mock through a provider whose API-key
-        # resolution both support: the TS reads models.json apiKey, the Rust
-        # daemon worker resolves PRIME_API_KEY by provider name.
+        # resolution both support: both read the models.json apiKey (the
+        # env key stays as the fallback both products share).
         side.env["PRIME_API_KEY"] = "sk-battery"
-        if name == "rust":
-            # The Rust daemon worker reads model selection from env (the TS
-            # daemon takes it over the wire); see the wire-config gap finding.
-            side.env["PRIME_AGENT_MODEL_PROVIDER"] = "prime-inference"
-            side.env["PRIME_AGENT_MODEL"] = "mock-1"
         side.write_models_json()
         self.sides[name] = side
         return side
@@ -250,6 +262,28 @@ class Battery:
                 )
             else:
                 self.record(flow, "behavior", f"{side.name}: first interactive prompt answered by the mock provider", gap=False)
+            # B-1: the explicit --provider/--model flags must be authoritative
+            # end-to-end; the first request the mock sees must be the flagged
+            # model, not a fallback.
+            requests = self.new_mock_requests(side, mark)
+            side.evidence_json(flow, "first-prompt-mock-requests.json", requests)
+            request_models = [
+                request["body"].get("model") for request in requests if request.get("body")
+            ]
+            if request_models and all(model == "mock-1" for model in request_models):
+                self.record(
+                    flow,
+                    "protocol",
+                    f"{side.name}: interactive model flags are authoritative (request model: {request_models[0]})",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow,
+                    "protocol",
+                    f"{side.name}: interactive model flags did not reach the provider request (models seen: {request_models})",
+                    evidence=side.root / flow / "first-prompt-mock-requests.json",
+                )
             B.tmux_kill(session)
 
     def f2_prompt(self) -> None:
@@ -313,8 +347,18 @@ class Battery:
         if ts_body is None or rs_body is None:
             self.record(flow, "protocol", f"no session request captured: ts={len(ts_reqs)} rust={len(rs_reqs)}")
             return
-        ts_extra = [r["body"].get("model") for r in ts_reqs if r["body"].get("model") != "mock-1"]
-        rs_extra = [r["body"].get("model") for r in rs_reqs if r["body"].get("model") != "mock-1"]
+        # The post-turn status-line request (B-7) is checked separately in
+        # f5 with a settled wait; a timing-sensitive capture here must not
+        # flap, so exclude it from the extra-request diff.
+        def extra_models(reqs):
+            return [
+                r["body"].get("model")
+                for r in reqs
+                if r["body"].get("model") not in ("mock-1", STATUSLINE_MODEL_ID)
+            ]
+
+        ts_extra = extra_models(ts_reqs)
+        rs_extra = extra_models(rs_reqs)
         if ts_extra != rs_extra:
             self.record(
                 flow,
@@ -489,17 +533,9 @@ class Battery:
             self.ensure_daemon(side)
             wire = B.Wire(side.daemon_socket)
             side.evidence_json(flow, "hello.json", wire.hello)
-            config = {
-                "cwd": str(side.work_dir),
-                "sessionDir": str(side.agent_dir / "sessions"),
-            }
-            if side.name == "ts":
-                config["provider"] = "prime-inference"
-                config["model"] = "mock-1"
-                config["executionMode"] = "print"
             create = wire.request(
                 "c1",
-                {"type": "create", "name": "battery-side-questions", "config": config},
+                {"type": "create", "name": "battery-side-questions", "config": self.session_config(side)},
                 timeout=120,
             )
             side.evidence_json(flow, "create-response.json", create)
@@ -574,7 +610,38 @@ class Battery:
             side.evidence_json(flow, "abort-unknown.json", abort)
             side.evidence_json(flow, "mock-requests.json", self.new_mock_requests(side, mark))
             wire.close()
+            # B-7: after a completed turn, the daemon session issues a second
+            # provider request for the dashboard status line (a small model).
+            # It may fire while the side question runs or up to the settle
+            # debounce later; wait out the debounce and filter the whole
+            # wire log for it.
+            time.sleep(5)
+            statusline = [req for req in side.mock.requests() if is_statusline_request(req)]
+            side.evidence_json(flow, "statusline-requests.json", statusline)
             self.copy_sessions(side, flow)
+
+        # B-7 differential: both sides must have issued the status-line
+        # request to the same small model after the turn.
+        status_rows = {}
+        for side in (self.sides["ts"], self.sides["rust"]):
+            path = side.root / flow / "statusline-requests.json"
+            requests = json.loads(path.read_text()) if path.exists() else []
+            status_rows[side.name] = len(requests)
+        if status_rows["ts"] and status_rows["rust"]:
+            self.record(
+                flow,
+                "protocol",
+                f"post-turn status-line request issued by both sides "
+                f"(ts={status_rows['ts']}, rust={status_rows['rust']} requests, model {STATUSLINE_MODEL_ID})",
+                gap=False,
+            )
+        else:
+            self.record(
+                flow,
+                "protocol",
+                f"post-turn status-line request missing: ts={status_rows['ts']} rust={status_rows['rust']}",
+                evidence="statusline-requests.json",
+            )
 
     def ensure_daemon(self, side: B.Side) -> None:
         """A daemon must be listening on the side socket; start one if not."""
@@ -677,12 +744,16 @@ class Battery:
             self.copy_sessions(side, flow)
 
     def session_config(self, side: B.Side) -> dict:
-        config = {"cwd": str(side.work_dir), "sessionDir": str(side.agent_dir / "sessions")}
-        if side.name == "ts":
-            config["provider"] = "prime-inference"
-            config["model"] = "mock-1"
-            config["executionMode"] = "print"
-        return config
+        # Identical on both sides: explicit provider/model flags ride the
+        # create config over the wire and are authoritative in the worker
+        # (B-1 differential check; no env-based model workaround).
+        return {
+            "cwd": str(side.work_dir),
+            "sessionDir": str(side.agent_dir / "sessions"),
+            "provider": "prime-inference",
+            "model": "mock-1",
+            "executionMode": "print",
+        }
 
     def f7_compaction(self) -> None:
         """Compaction: what the TS daemon does on 'compact'; what Rust does."""
@@ -773,15 +844,45 @@ class Battery:
             side.evidence_json(flow, "continue-cmd.json", rec)
             side.evidence_json(flow, "mock-requests.json", self.new_mock_requests(side, mark))
             self.copy_sessions(side, flow)
-            if rec["exit_code"] == 0 and rec["stdout"].strip():
-                self.record(flow, "behavior", f"{side.name}: print '-c' continued the previous session", gap=False)
-            else:
+
+        # B-11 differential: both sides must refuse to continue a session
+        # that is already active in the daemon, with the same message shape
+        # (the TS print path fails the daemon create with
+        # SessionAlreadyActiveError; the Rust print path guards identically).
+        def refused(rec):
+            return (
+                rec["exit_code"] == 1
+                and "Session is already active in " in rec["stdout"] + rec["stderr"]
+            )
+
+        def refusal_id(rec):
+            match = re.search(
+                r"Session is already active in ([0-9a-f]+):", rec["stdout"] + rec["stderr"]
+            )
+            return match.group(1) if match else None
+
+        if refused(recs["ts"]) and refused(recs["rust"]):
+            self.record(
+                flow,
+                "behavior",
+                f"print '-c' refuses a session active in the daemon on both sides: "
+                f"{refusal_id(recs['ts'])} (ts) vs {refusal_id(recs['rust'])} (rust)",
+                gap=False,
+            )
+        else:
+            for name, rec in recs.items():
+                if refused(rec):
+                    continue
+                detail = (rec["stdout"] + rec["stderr"]).strip()[:200]
                 self.record(
                     flow,
                     "behavior",
-                    f"{side.name}: print '-c' failed (exit={rec['exit_code']}): {(rec['stdout'] + rec['stderr']).strip()[:200]}",
+                    f"{name}: print '-c' did not refuse the active session (exit={rec['exit_code']}): {detail}",
+                    evidence=f"{name}/{flow}/continue-cmd.json",
                 )
-            # Interactive resume of the same session.
+
+        # Interactive resume of the same session.
+        for side in (self.sides["ts"], self.sides["rust"]):
             files = side.session_files()
             if files:
                 session = f"{self.runid}-f8-{side.name}"

@@ -27,6 +27,7 @@ use crate::descriptor::{
     create_command_payload, load_descriptors, persist_supervisor_config, persist_worker,
     PersistedSupervisorConfig, SUPERVISOR_CONFIG_FILE_NAME,
 };
+use crate::engine::EngineModelSelection;
 use crate::framing::{write_frame, PrivateFrameReader, DEFAULT_PRIVATE_FRAME_LIMITS};
 use crate::lease::is_process_alive;
 use crate::paths;
@@ -547,6 +548,17 @@ impl Supervisor {
                             })
                             .unwrap_or(ClientRouting::Broadcast);
                         let _ = events.send((routing, payload));
+                    } else if outbound_type == "session_status" {
+                        let active_session_id = payload
+                            .get("activeSessionId")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        let routing = active_session_id
+                            .map(|active_session_id| ClientRouting::AttachedSession {
+                                active_session_id,
+                            })
+                            .unwrap_or(ClientRouting::Broadcast);
+                        let _ = events.send((routing, payload));
                     } else if outbound_type == "side_question_event" {
                         let active_session_id = payload
                             .get("activeSessionId")
@@ -659,6 +671,22 @@ impl Supervisor {
             .and_then(|config| config.get("script"))
             .and_then(Value::as_str)
             .map(str::to_string);
+        // Explicit model selection from the create config: carried into the
+        // durable create command so respawned workers resolve the same model.
+        let model_selection = EngineModelSelection {
+            provider: config_object
+                .and_then(|config| config.get("provider"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            model: config_object
+                .and_then(|config| config.get("model"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            api_key: config_object
+                .and_then(|config| config.get("apiKey"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        };
         if *no_session == Some(true) && session_path.is_some() {
             return Err(anyhow!(
                 "Session cannot be both no-session and session-pathed"
@@ -687,6 +715,15 @@ impl Supervisor {
         }
         if let Some(script) = &script {
             durable_rest.insert("script".to_string(), json!(script));
+        }
+        if let Some(provider) = &model_selection.provider {
+            durable_rest.insert("provider".to_string(), json!(provider));
+        }
+        if let Some(model) = &model_selection.model {
+            durable_rest.insert("model".to_string(), json!(model));
+        }
+        if let Some(api_key) = &model_selection.api_key {
+            durable_rest.insert("apiKey".to_string(), json!(api_key));
         }
         let descriptor = DaemonWorkerDescriptor {
             version: 2,

@@ -12,7 +12,7 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::config;
 use crate::mode::RunOptions;
-use pa_tui::interactive::{InteractiveOptions, SessionSelection, UiMode};
+use pa_tui::interactive::{InteractiveOptions, ModelSelection, SessionSelection, UiMode};
 
 const DAEMON_STARTUP_TIMEOUT_MS: u64 = 30_000;
 const DAEMON_SHUTDOWN_WAIT_MS: u64 = 5_000;
@@ -63,6 +63,14 @@ fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<Inter
         cwd: config.cwd.clone(),
         session_dir,
         script_path,
+        // Explicit CLI model flags ride every create request (TS
+        // runtime-config propagation): the daemon worker must treat them as
+        // authoritative, not fall back to a process-wide model.
+        model_selection: ModelSelection {
+            provider: config.provider.clone(),
+            model: config.model.clone(),
+            api_key: config.api_key.clone(),
+        },
         no_session: options.session.no_session,
         session,
         initial_message: options.initial_message.clone(),

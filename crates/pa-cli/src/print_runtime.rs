@@ -291,6 +291,7 @@ fn build_session_manager(
             resolve_session_path(selector, &cwd, &session_dir).map_err(render_selector_error)?;
         return match resolved {
             ResolvedSession::Path(path) | ResolvedSession::Local(path) => {
+                assert_session_not_active_in_daemon(options.daemon_socket.as_deref(), &path)?;
                 open_session_file(&path, &session_dir, &cwd, explicit_cwd_override)
             }
             ResolvedSession::Global {
@@ -308,7 +309,10 @@ fn build_session_manager(
     if options.session.continue_recent {
         let most_recent = find_most_recent_session_for_cwd(&session_dir, &cwd);
         return match most_recent {
-            Some(path) => open_session_file(&path, &session_dir, &cwd, explicit_cwd_override),
+            Some(path) => {
+                assert_session_not_active_in_daemon(options.daemon_socket.as_deref(), &path)?;
+                open_session_file(&path, &session_dir, &cwd, explicit_cwd_override)
+            }
             None => Ok(SessionManager::persisted(&cwd, &session_dir)),
         };
     }
@@ -319,6 +323,58 @@ fn build_session_manager(
 /// explicit `--cwd` override wins, else the header's cwd, falling back to the
 /// process cwd for unreadable or new files. Resumed sessions keep the
 /// missing-cwd guard from main.ts.
+/// Guard the TS print path: `-c`/`-r` refuse to open a session file that a
+/// live daemon worker already hosts (`SessionAlreadyActiveError`, raised by
+/// the TS supervisor's create ownership check). The Rust print path runs
+/// in-process, so the guard probes the daemon's live roster first; when no
+/// daemon answers, the open proceeds like a TS run without a daemon.
+fn assert_session_not_active_in_daemon(
+    socket_path: Option<&str>,
+    session_path: &std::path::Path,
+) -> Result<(), String> {
+    let socket = crate::interactive_mode::resolve_socket_path(socket_path);
+    let Ok(mut client) = crate::daemon_client::DaemonClient::connect(&socket) else {
+        return Ok(());
+    };
+    let list = client
+        .request(pa_types::daemon::DaemonCommand::List {
+            id: None,
+            all: None,
+            cwd: None,
+            session_dir: None,
+            include_client_owned: None,
+            rest: Default::default(),
+        })
+        .map_err(|error| format!("Could not check active sessions: {error:#}"))?;
+    if !list.success {
+        return Ok(());
+    }
+    let target = pa_daemon::lease::canonical_session_path(session_path);
+    for row in list
+        .data
+        .and_then(|data| data.get("sessions").cloned())
+        .and_then(|sessions| sessions.as_array().cloned())
+        .unwrap_or_default()
+    {
+        let Some(file) = row.get("sessionFile").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if pa_daemon::lease::canonical_session_path(std::path::Path::new(file)) != target {
+            continue;
+        }
+        let active_session_id = row
+            .get("activeSessionId")
+            .or_else(|| row.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        return Err(format!(
+            "Session is already active in {active_session_id}: {}",
+            target.display()
+        ));
+    }
+    Ok(())
+}
+
 fn open_session_file(
     path: &std::path::Path,
     session_dir: &std::path::Path,

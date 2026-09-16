@@ -22,6 +22,7 @@ pub mod session_store;
 pub mod side_question;
 pub mod snapshot_stream;
 pub mod socket;
+pub mod status_line;
 pub mod supervisor;
 pub mod types;
 pub mod util;

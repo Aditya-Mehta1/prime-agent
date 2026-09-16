@@ -17,7 +17,9 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, oneshot, Notify};
 
 use crate::agent_engine::{AgentEngineConfig, AgentSessionEngine};
-use crate::engine::{EngineEvent, PromptRequest, ScriptedEngine, SessionEngine};
+use crate::engine::{
+    EngineEvent, EngineModelSelection, PromptRequest, ScriptedEngine, SessionEngine,
+};
 use crate::framing::{write_frame, DEFAULT_PRIVATE_FRAME_LIMITS};
 use crate::journal::WorkerRecoveryJournal;
 use crate::paths;
@@ -135,6 +137,32 @@ struct SessionCore {
     shutdown_requested: bool,
 }
 
+impl crate::status_line::StatusSession for SessionCore {
+    fn status_messages(&self) -> Vec<Value> {
+        self.store
+            .as_ref()
+            .map(|store| store.messages())
+            .unwrap_or_default()
+    }
+
+    fn status_busy(&self) -> bool {
+        self.busy
+    }
+
+    fn status_active_session_id(&self) -> String {
+        self.active_session_id.clone()
+    }
+
+    fn status_generation(&self) -> String {
+        self.generation.clone()
+    }
+
+    fn status_next_sequence(&mut self) -> u64 {
+        self.last_event_sequence += 1;
+        self.last_event_sequence
+    }
+}
+
 /// One outbound frame: the serialized JSON payload plus its private-frame
 /// `outboundType` (`session_event` or `side_question_event`), mirroring the
 /// TS worker frame header. The supervisor fans frames out per its own
@@ -149,6 +177,13 @@ impl OutboundFrame {
         OutboundFrame {
             payload,
             outbound_type: "session_event",
+        }
+    }
+
+    pub(crate) fn session_status(payload: Vec<u8>) -> Self {
+        OutboundFrame {
+            payload,
+            outbound_type: "session_status",
         }
     }
 
@@ -196,6 +231,17 @@ impl Worker {
         let core = Arc::new(Mutex::new(core));
         let work_notify = Arc::new(Notify::new());
         let idle_notify = Arc::new(Notify::new());
+        // The post-turn status line: turn-end notifications (debounced) and
+        // periodic sweeps ask the small dashboard model for a recap.
+        let status_runner = std::sync::Arc::new(crate::status_line::StatusLineRunner::new(
+            std::sync::Arc::clone(&core),
+            config.agent_dir.clone(),
+            events.clone(),
+        ));
+        let (status_notify, status_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            status_runner.run(status_rx).await;
+        });
         // The turn runner runs for the whole process lifetime. The command
         // dispatcher keeps the engine handle too (model metadata for the
         // stats commands).
@@ -252,6 +298,7 @@ impl Worker {
                 events: events.clone(),
                 engine: std::sync::Arc::clone(&engine),
                 active_session_id,
+                status_notify: status_notify.clone(),
             };
             tokio::spawn(async move {
                 runner.run().await;
@@ -620,6 +667,23 @@ impl Worker {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let name = payload.get("name").and_then(Value::as_str);
+        // Explicit model flags from the create config are authoritative for
+        // this session (TS runtime-config propagation): the engine rebinds
+        // its selection instead of falling back to a process-wide model.
+        self.engine.configure_model(EngineModelSelection {
+            provider: payload
+                .get("provider")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            model: payload
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            api_key: payload
+                .get("apiKey")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        });
         let cwd = payload
             .get("cwd")
             .and_then(Value::as_str)
@@ -1383,6 +1447,7 @@ struct TurnRunner {
     events: broadcast::Sender<Arc<OutboundFrame>>,
     engine: std::sync::Arc<dyn SessionEngine>,
     active_session_id: String,
+    status_notify: tokio::sync::mpsc::UnboundedSender<()>,
 }
 
 impl TurnRunner {
@@ -1598,6 +1663,9 @@ impl TurnRunner {
                 .events
                 .send(Arc::new(OutboundFrame::session_event(payload)));
         }
+        // A finished turn is the cue to refresh the session's status line
+        // (the runner debounces a burst into one request).
+        let _ = self.status_notify.send(());
         self.idle_notify.notify_waiters();
     }
 

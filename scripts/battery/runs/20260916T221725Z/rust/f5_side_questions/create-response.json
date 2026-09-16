@@ -1,0 +1,37 @@
+{
+ "command": "create",
+ "data": {
+  "activeSessionId": "6d8cb9cc2df0",
+  "activity": "idle",
+  "attachedClients": 0,
+  "created": "2026-09-16T22:18:47.881Z",
+  "cwd": "/home/ubuntu/lane-worktrees/gap-cli/scripts/battery/runs/20260916T221725Z/rust/work",
+  "hasRegisteredCronJob": false,
+  "id": "6d8cb9cc2df0",
+  "isBashRunning": false,
+  "isCompacting": false,
+  "isSessionActive": false,
+  "isStreaming": false,
+  "lastActivityAt": "2026-09-16T22:18:47.879Z",
+  "lifecycle": "resident",
+  "messageCount": 0,
+  "modified": "2026-09-16T22:18:47.879Z",
+  "rlmDepth": 0,
+  "runtimeKind": "top-level",
+  "sessionActions": {
+   "followUps": [],
+   "queuedCount": 0,
+   "steering": []
+  },
+  "sessionFile": "/home/ubuntu/lane-worktrees/gap-cli/scripts/battery/runs/20260916T221725Z/rust/agent/sessions/01a0ac4d-14c9-744d-919e-d8e725969872.jsonl",
+  "sessionId": "01a0ac4d-14c9-744d-919e-d8e725969872",
+  "sessionName": "battery-side-questions",
+  "thinkingLevel": "default",
+  "unfinishedActionCount": 0,
+  "workerPid": 1885103,
+  "workerState": "ready"
+ },
+ "id": "c1",
+ "success": true,
+ "type": "response"
+}

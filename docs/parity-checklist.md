@@ -302,21 +302,27 @@ Live-TS goldens (read-only captures, protocol 7):
   Affects `get_session_stats.toolResults`, transcripts, and external
   tooling reading session files.
 
-## Battery findings (live A/B parity battery, run 20260916T210320Z)
+## Battery findings (live A/B parity battery; first run 20260916T210320Z, fixed rows verified by run 20260916T221725Z)
 
 Standing battery harness committed at `scripts/battery/` (see
 `docs/parity-battery.md` for the flow list and re-run instructions). All
 gaps below are reproduced by the committed first run
 (`scripts/battery/runs/20260916T210320Z/`) except B-3, whose evidence is
 `runs/20260916T203149Z/` (superseded by the short-TMPDIR harness fix, the
-product gap remains). Categories: visual/behavior/protocol/timing.
+product gap remains). B-1, B-7, and B-11 are fixed (run
+`runs/20260916T221725Z/`); the same lane also ported the models.json
+`apiKey` resolution for daemon-worker request auth (no battery row).
+Categories: visual/behavior/protocol/timing.
 
-- B-1 (protocol, f1): Rust interactive drops `--provider`/`--model` CLI
-  flags; the daemon worker resolves its model from
-  `PRIME_AGENT_MODEL_PROVIDER`/`PRIME_AGENT_MODEL` env or its fallback (a
-  capture with `--provider battery --model mock-1` answered with
-  `prime-inference/z-ai/glm-5.3`). TS passes provider/model over the wire
-  config. Evidence:
+- B-1 (protocol, f1): FIXED. Rust interactive dropped `--provider`/`--model`
+  CLI flags (the daemon worker resolved its model from env or its fallback;
+  a capture with `--provider battery --model mock-1` answered with
+  `prime-inference/z-ai/glm-5.3`). The TUI create config now carries the
+  flags over the wire (TS runtime-config propagation), the supervisor
+  persists them into the durable create, and the worker binds them onto its
+  engine; env stays the no-flag fallback. Verified by run
+  `runs/20260916T221725Z/{ts,rust}/f1_launch/first-prompt-mock-requests.json`
+  (both sides request `mock-1`). Historical evidence:
   `runs/20260916T210320Z/extras/rust-interactive-model-flags-session.jsonl`.
 - B-2 (visual, f1): TS shows the splash + first-run "Share agent traces
   with Prime Intellect?" notice (Share / Not now, `/traces` hint); Rust
@@ -339,9 +345,13 @@ product gap remains). Categories: visual/behavior/protocol/timing.
   skill modules line, available-skills inventory, and harness-refinement
   guidance. Evidence:
   `runs/20260916T210320Z/protocol-request-diff.txt`.
-- B-7 (protocol, f2/f5): TS issues a post-turn status-line request to a
-  small model (`qwen/qwen3-30b-a3b-instruct-2507`); Rust issues none.
-  Evidence: `runs/20260916T210320Z/extras/ts-statusline-request.json`.
+- B-7 (protocol, f2/f5): FIXED. TS issues a post-turn status-line request
+  to a small model (`qwen/qwen3-30b-a3b-instruct-2507`); Rust now issues the
+  same request (daemon-session-summarizer port in
+  `crates/pa-daemon/src/status_line.rs`: same trigger, model, system prompt,
+  and max_tokens; recap broadcast as `session_status`). Verified by run
+  `runs/20260916T221725Z/{ts,rust}/f5_side_questions/statusline-requests.json`.
+  Historical evidence: `runs/20260916T210320Z/extras/ts-statusline-request.json`.
 - B-8 (protocol, f3/f8): session-file entry shapes differ - TS writes
   `custom_message` (harness_digest), `service_tier_change`, and
   `compaction` entries; Rust writes `custom` entries
@@ -356,9 +366,13 @@ product gap remains). Categories: visual/behavior/protocol/timing.
   Rust answers `{"command":"unknown"}`. Evidence:
   `runs/20260916T210320Z/{ts,rust}/f7_compaction/compact-response.json`.
   (Same as item 5 above, now with live mock-provider evidence.)
-- B-11 (behavior, f8): TS print `-c` refuses while the session is active in
-  the daemon ("Session is already active in <id>: <path>"); Rust `-c`
-  silently reopens the same file with no active-session guard. Evidence:
+- B-11 (behavior, f8): FIXED. TS print `-c` refuses while the session is
+  active in the daemon ("Session is already active in <id>: <path>"); the
+  Rust print path now guards `-c`/`-r` with a daemon live-roster probe and
+  refuses with the exact message (message + canonicalization from the
+  session-lease port). Verified by run
+  `runs/20260916T221725Z/{ts,rust}/f8_resume/continue-cmd.json` (both sides
+  exit 1 with the same shape). Historical evidence:
   `runs/20260916T210320Z/ts/f8_resume/continue-cmd.json`.
 
 Passed-check highlights (both products agree, live through the mock):

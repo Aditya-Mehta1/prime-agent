@@ -1213,3 +1213,74 @@ fn chunked_snapshot_attach_streams_begin_chunk_end() {
         serde_json::json!(["attach_snapshot", "event_sequence", "slim_attach"])
     );
 }
+
+/// B-1 parity: explicit `--provider`/`--model` flags ride the create config
+/// over the wire and are authoritative for the worker's model resolution —
+/// no process-wide fallback (env or registry default) may answer instead.
+/// The resolved model is observable through `get_session_stats`'s
+/// `contextUsage.contextWindow`, which comes from the engine's model.
+#[test]
+fn create_config_model_flags_reach_the_worker_engine() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("daemon-flags.sock");
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    // A models.json custom provider whose name has no env-key mapping: the
+    // only way the worker can resolve it is the wire config.
+    std::fs::write(
+        agent_dir.join("models.json"),
+        serde_json::json!({
+            "providers": {
+                "battery": {
+                    "api": "openai-completions",
+                    "baseUrl": "http://127.0.0.1:9",
+                    "apiKey": "sk-battery",
+                    "models": [
+                        {
+                            "id": "mock-1",
+                            "name": "Mock 1",
+                            "api": "openai-completions",
+                            "contextWindow": 128000,
+                            "maxTokens": 4096
+                        }
+                    ]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write models.json");
+    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let (mut client, _hello) = Client::connect(&socket);
+    client.send_command(
+        "c1",
+        serde_json::json!({
+            "type": "create",
+            "config": {
+                "cwd": dir.path().to_string_lossy(),
+                "sessionDir": agent_dir.join("sessions").to_string_lossy(),
+                "provider": "battery",
+                "model": "mock-1",
+            },
+        }),
+    );
+    let created = client.read_response("c1");
+    assert_eq!(created["success"], true, "create failed: {created}");
+    let session_id = created["data"]["id"]
+        .as_str()
+        .or_else(|| created["data"]["sessionId"].as_str())
+        .expect("session id in create response")
+        .to_string();
+    client.send_command(
+        "s1",
+        serde_json::json!({ "type": "get_session_stats", "activeSessionId": session_id }),
+    );
+    let stats = client.read_response("s1");
+    assert_eq!(stats["success"], true, "get_session_stats failed: {stats}");
+    // The flagged model's context window (128000) proves the worker engine
+    // resolved `battery/mock-1` from the create config.
+    assert_eq!(
+        stats["data"]["contextUsage"]["contextWindow"], 128000,
+        "context usage reflects the wire-flagged model: {stats}"
+    );
+}

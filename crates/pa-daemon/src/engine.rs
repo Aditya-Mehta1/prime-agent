@@ -20,6 +20,16 @@ pub struct PromptRequest {
     pub agent_message_id: Option<String>,
 }
 
+/// Explicit model selection from a session's create config (the wire
+/// `provider`/`model`/`apiKey` fields). `None` fields keep the engine's
+/// current selection, mirroring the TS runtime-config merge semantics.
+#[derive(Debug, Clone, Default)]
+pub struct EngineModelSelection {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub api_key: Option<String>,
+}
+
 /// Events an engine emits for one prompt, in order. The worker translates these
 /// into protocol events and session-store writes. Returning `false` from the
 /// emit callback cancels the prompt.
@@ -85,6 +95,13 @@ pub trait SessionEngine: Send + Sync {
     fn model_context_window(&self) -> Option<u64> {
         None
     }
+
+    /// Adopt the explicit model selection carried by the session's create
+    /// config. Explicit CLI flags must be authoritative end-to-end: the
+    /// selection reached the worker over the wire, so model resolution must
+    /// honor it instead of a process-wide fallback. Engines without a model
+    /// (the scripted harness) ignore it.
+    fn configure_model(&self, _selection: EngineModelSelection) {}
 
     /// The engine's resolved model as connection-state wire data
     /// (`{ id, provider, reasoning }`), when known. Drives the interactive

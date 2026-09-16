@@ -255,3 +255,44 @@ origin/main
 - The attach result now echoes the client's own (normalized) capability
   set, matching the live TS golden; a capability-less client sees
   `["attach_snapshot","event_sequence"]`.
+
+
+## Daemon model selection + status line (cli-flags-parity lane)
+
+- TS `main.ts` `runtimeConfigFromArgs` builds `AgentSessionRuntimeConfig`
+  (cwd, provider, model, apiKey, ...) and every daemon `create` carries it
+  (`daemon-protocol.ts` `create.config`). Ported: `pa-tui` forwards
+  `ModelSelection` (provider/model/apiKey) in the create config; the
+  supervisor persists it into the durable create command so respawned workers
+  resolve the same model; the worker binds it onto its engine
+  (`SessionEngine::configure_model`), which treats explicit flags as
+  authoritative over the process env fallback
+  (`PRIME_AGENT_MODEL_PROVIDER`/`PRIME_AGENT_MODEL` remain the fallback when a
+  create carries no flags).
+- TS API-key precedence for worker request auth (`main.ts`
+  `setRuntimeApiKey` for `--api-key`, `model-registry.ts`
+  `getApiKeyAndHeaders`): create-config key, then auth storage, then the
+  models.json provider `apiKey`; the pa-ai provider env-key map stays the
+  last resort inside the provider. Ported in `agent_engine.rs`
+  (`resolve_request_api_key`); custom provider names (no env mapping) now
+  authenticate from models.json.
+- TS daemon-session-summarizer.ts (status line): after each completed turn
+  (`turn_end`/`compaction_end` broadcast, 2s debounce) and every 25s sweep
+  for working sessions, the daemon asks a small model
+  (prime-inference/qwen/qwen3-30b-a3b-instruct-2507) for a dashboard recap:
+  fixed system prompt, `<agent-state>` + trailing-8-message conversation
+  body, max_tokens 400; result broadcast as `session_status` with the recap
+  text. Ported in `pa-daemon/src/status_line.rs`. Not ported: the settled
+  idle verdict persistence to the session journal (`appendAgentStatus`) —
+  the Rust session store has no agent-status entry type yet (belongs to the
+  session-shapes lane, B-8).
+- TS print-mode `-c`/`-r` active-session guard (`session-lease.ts`
+  `SessionAlreadyActiveError` -> supervisor `assertWorkerCreateOwner` on the
+  daemon create): a headless continue/resume refuses when the target session
+  file is live in the daemon ("Session is already active in <id>: <path>").
+  Ported in the Rust print path as a daemon-list probe before opening the
+  file (the Rust print path runs in-process, not over the daemon, so the
+  guard probes the supervisor's live roster first). The supervisor-level
+  reuse-vs-guard semantics of TS `createOrReuseWorker` (same owner reuses,
+  different owner refuses) and interactive resume's pre-resolution to attach
+  are not ported yet — a separate lane item.

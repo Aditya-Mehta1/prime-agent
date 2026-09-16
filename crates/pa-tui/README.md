@@ -9,7 +9,7 @@ Rendering (markdown, themes, layout, tool panels), editor (cursor/kill-ring/undo
 No session logic, no providers, no loop policy. The interactive UI renders daemon events and sends user intents (prompts, abort, switch) as daemon commands; the session loop itself lives in the pa-daemon worker. It never computes agent behavior and never spawns the supervisor (launch semantics live in pa-cli).
 
 ## Public API
-`app::run_app` (replay), `interactive::{run_interactive, InteractiveOptions, SessionSelection, UiMode, HeadlessPlan, InteractiveOutcome}` (daemon-attached), `daemon_client::{DaemonClient, DaemonClientEvent}` (wire client for the UI and the composition root), `session::SessionStream`, theming. Component internals `pub(crate)`.
+`app::run_app` (replay), `interactive::{run_interactive, InteractiveOptions, ModelSelection, SessionSelection, UiMode, HeadlessPlan, InteractiveOutcome}` (daemon-attached), `daemon_client::{DaemonClient, DaemonClientEvent}` (wire client for the UI and the composition root), `session::SessionStream`, theming. Component internals `pub(crate)`.
 
 ## Depends on
 pa-types only (the daemon wire protocol types live there). The headless `UiMode` is the verifier seam: it drives the identical attach/submit/stream/render path without a TTY and captures rendered frames.
