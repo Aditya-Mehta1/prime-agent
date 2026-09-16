@@ -9122,6 +9122,15 @@ export class AgentSession {
 		if (withoutOlderDigests.length !== this.agent.state.messages.length) {
 			this.agent.state.messages = withoutOlderDigests;
 		}
+		// The fresh append outranks the compaction snapshot the same way a newer
+		// digest entry does at rebuild time, so the live summary must yield its
+		// snapshot now: the context would otherwise render both the superseded
+		// snapshot and the fresh digest until the next rebuild.
+		for (const existing of this.agent.state.messages) {
+			if (existing.role === "compactionSummary" && existing.harnessDigest !== undefined) {
+				existing.harnessDigest = undefined;
+			}
+		}
 		this.agent.state.messages.push(message);
 	}
 

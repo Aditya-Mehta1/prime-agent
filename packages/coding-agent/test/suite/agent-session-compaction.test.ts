@@ -406,6 +406,15 @@ describe("AgentSession compaction", () => {
 		// The fresh digest replaces older copies instead of stacking them.
 		expect(digests).toHaveLength(1);
 		expect(getMessageText(digests[0])).toContain("[local:roundtrip_test_memory] Roundtrip memory");
+		// The live append must yield the summary snapshot too, not only older
+		// digest copies: before the next rebuild the context would otherwise
+		// carry both the superseded snapshot and the fresh digest.
+		const liveSummary = harness.session.messages.find((message) => message.role === "compactionSummary");
+		expect(liveSummary).toBeDefined();
+		expect((liveSummary as { harnessDigest?: string }).harnessDigest).toBeUndefined();
+		expect(
+			getMessageText(convertToLlm(harness.session.messages.filter((m) => m.role === "compactionSummary"))[0]),
+		).not.toContain("[harness-digest]");
 
 		// Resume rebuilds from persisted entries: the post-compaction digest is the
 		// newest one, so the superseded snapshot drops out of the built context.
