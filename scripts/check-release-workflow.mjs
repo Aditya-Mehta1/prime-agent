@@ -2423,6 +2423,19 @@ export function lifecycleReasons(input, location = {}) {
 const PACKAGE_MANAGER_ENTRYPOINTS = /(^|\/)(npm-cli\.[cm]?js|npx-cli\.[cm]?js|npm|npx|yarn(\.[cm]?js)?|pnpm(\.[cm]?js)?|bun|bunx|corepack(\.[cm]?js)?|pip3?|uv|uvx)$|\/node_modules\/(npm|npx|yarn|pnpm|corepack|\.bin)\//;
 
 /**
+ * True when every variable reference in `text` is one the runner itself provides
+ * ({@link GITHUB_DEFAULT_ENV}). In a BUILD job such a reference can only name runner state, never a
+ * file or value derived from the repository, so inline code like
+ * `node -p require('$RUNNER_TEMP/standalone-source/package.json').version` stays analyzable enough
+ * for the build rules. Anything else - a repository- or step-derived variable - keeps the
+ * conservative refusal.
+ */
+function runnerVariablesOnly(text) {
+	const names = [...text.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)/g)].map((match) => match[1]);
+	return names.length > 0 && names.every((name) => GITHUB_DEFAULT_ENV.includes(name));
+}
+
+/**
  * Returns the reasons a simple command on a build runner runs an interpreter in a way the checker
  * cannot follow (review round 6, finding 6). Build jobs legitimately run repository code through
  * node, sh and python3, so the rule is narrower than in credential-bearing jobs: the interpreter
@@ -2474,8 +2487,9 @@ export function buildStepReasons(input, location = {}) {
 			if (inlineFlag?.test(arg.text) || (SHELLS.test(name) && arg.text === "-c")) {
 				const code = args[position + 1];
 				if (!code) reasons.push(`${name} ${arg.text} names no inline code: ${spelled}`);
-				else if (code.expansion) reasons.push(`${name} ${arg.text} runs code from an expansion the checker cannot see: ${spelled}`);
-				else if (SHELLS.test(name)) {
+				else if (code.expansion && !runnerVariablesOnly(code.text))
+					reasons.push(`${name} ${arg.text} runs code from an expansion the checker cannot see: ${spelled}`);
+				else if (SHELLS.test(name) && !code.expansion) {
 					for (const inner of shellCommands(code.text)) {
 						for (const reason of [...lifecycleReasons(inner, location), ...buildStepReasons(inner, location)]) reasons.push(`inside ${name} -c: ${reason}`);
 					}

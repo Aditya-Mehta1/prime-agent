@@ -3,14 +3,15 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { releasePlatforms } from "../../../scripts/release-platforms.mjs";
+import { writeClipboardBinaryBinding } from "./clipboard-binary-binding.mjs";
 import { copyBinaryAssets, validateBinaryAssets } from "./copy-binary-assets.mjs";
 import { signMacosBinary } from "./macos-signature.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const packageDir = join(root, "packages/coding-agent");
-const platforms = ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64"];
-const usage =
-	"Usage: npm run build:binary -- [--platform darwin-arm64|darwin-x64|linux-arm64|linux-x64|all] [--test-signer-json <file>]";
+const platforms = releasePlatforms;
+const usage = `Usage: npm run build:binary -- [--platform ${[...platforms, "all"].join("|")}] [--test-signer-json <file>]`;
 
 /**
  * The compiled binary pins its release signer at COMPILE time through the
@@ -120,6 +121,7 @@ function main() {
 	for (const target of platform === "all" ? platforms : [platform]) {
 		const staging = mkdtempSync(join(outputRoot, ".build-"));
 		try {
+			writeClipboardBinaryBinding(join(packageDir, "dist/utils/clipboard-binary-binding.js"), target);
 			execFileSync(
 				bun,
 				[

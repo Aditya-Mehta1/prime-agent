@@ -2824,3 +2824,25 @@ test("case patterns are read with POSIX character classes and negations, as bash
 	const problems = checkWorkflows(reader({ [RELEASE]: broken }));
 	assert.ok(problems.some((problem) => /skips SHA256SUMS\.sigstore\.json/.test(problem)), problems.join("\n"));
 });
+
+test("build jobs may inline runner variables in interpreter code, but nothing else (merge of main's alpine step)", () => {
+	const build = {};
+	const reasonsFor = (script) => [...shellCommands(script)].flatMap((command) => buildStepReasons(command, build));
+	assert.deepEqual(
+		reasonsFor(`node -p require('$RUNNER_TEMP/standalone-source/package.json').version`),
+		[],
+		"a runner-provided variable in inline code stays analyzable",
+	);
+	for (const script of [
+		`node -p "require('$HOME/evil.mjs').version"`,
+		`node -p "require('$DIR/evil.mjs').version"`,
+	]) {
+		const reasons = reasonsFor(script);
+		assert.ok(reasons.length > 0, script);
+		assert.match(reasons.join("\n"), /cannot see/);
+	}
+	// A script FILE named by an expansion is still refused, runner variable or not.
+	const scriptReasons = reasonsFor(`node "$RUNNER_TEMP/x.mjs"`);
+	assert.ok(scriptReasons.length > 0, "an expanded script argument must be refused");
+	assert.match(scriptReasons.join("\n"), /expansion/);
+});
