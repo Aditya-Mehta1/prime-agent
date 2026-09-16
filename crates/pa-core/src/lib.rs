@@ -41,6 +41,7 @@ pub mod models;
 pub mod prompts;
 pub mod resources;
 pub mod session;
+pub mod session_engine;
 pub mod settings;
 pub mod skills;
 pub use kernel::ReplKernelManager;

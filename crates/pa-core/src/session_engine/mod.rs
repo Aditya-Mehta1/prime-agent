@@ -1,0 +1,295 @@
+//! AgentSession: the turn admission layer over the pa-agent loop.
+//! First slice of core/agent-session.ts: prompt normalization (templates),
+//! busy-admission rules (steer/follow-up), and SessionManager persistence.
+//!
+//! Design note: the TS class runs an internal action-store with admission
+//! epochs/tickets. The Rust port keeps the observable contract instead: the
+//! pa-agent Agent owns the loop and its steer/follow-up queues; this layer
+//! decides admission and persists what the loop produces.
+
+use std::sync::Arc;
+
+use pa_agent::agent::Agent;
+use pa_agent::types::{AgentEvent, AgentMessage, ThinkingLevel};
+use pa_types::session::AgentMessage as SessionAgentMessage;
+use pa_types::session::FileEntry;
+
+use crate::session::manager::SessionManager;
+use crate::skills::PromptTemplate;
+
+/// How a prompt submitted while the agent streams is scheduled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamingBehavior {
+    /// Interrupt the current turn and inject the message (queue mode "steer").
+    Steer,
+    /// Queue the message for after the current turn (queue mode "followUp").
+    FollowUp,
+}
+
+/// Options for `AgentSession::prompt`. Port of PromptOptions (used fields).
+#[derive(Debug, Default)]
+pub struct PromptOptions {
+    pub streaming_behavior: Option<StreamingBehavior>,
+    pub expand_prompt_templates: Option<bool>,
+    /// Queue instead of erroring when the session is busy (agent messages).
+    pub queue_if_busy: bool,
+}
+
+/// The session-bound agent: admission rules + persistence over the loop.
+pub struct AgentSession {
+    agent: Arc<Agent>,
+    session: Arc<tokio::sync::Mutex<SessionManager>>,
+    prompt_templates: Vec<PromptTemplate>,
+}
+
+impl AgentSession {
+    /// Build a session around a running agent loop.
+    pub async fn new(
+        agent: Arc<Agent>,
+        session: SessionManager,
+        prompt_templates: Vec<PromptTemplate>,
+    ) -> Self {
+        let session = Arc::new(tokio::sync::Mutex::new(session));
+        let persistence = session.clone();
+        agent
+            .subscribe(move |event, _signal| {
+                let persistence = persistence.clone();
+                Box::pin(async move {
+                    persist_event(&persistence, event).await;
+                    Ok(())
+                })
+            })
+            .await;
+        Self {
+            agent,
+            session,
+            prompt_templates,
+        }
+    }
+
+    /// The underlying agent loop (steering, state, subscriptions).
+    pub fn agent(&self) -> &Arc<Agent> {
+        &self.agent
+    }
+
+    /// Submit a prompt. When the agent is busy, `streaming_behavior` is
+    /// required (matching the TS admission error).
+    pub async fn prompt(&self, text: &str, options: PromptOptions) -> anyhow::Result<()> {
+        let expand = options.expand_prompt_templates.unwrap_or(true);
+        let normalized = if expand {
+            crate::skills::expand_prompt_template(text, &self.prompt_templates)
+        } else {
+            text.to_string()
+        };
+
+        let state = self.agent.state().await;
+        let busy = state.is_streaming;
+        if busy && options.streaming_behavior.is_none() {
+            anyhow::bail!(
+                "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."
+            );
+        }
+
+        // Persist the user message before admission, like the TS append path.
+        {
+            let mut session = self.session.lock().await;
+            session.append_message(SessionAgentMessage::User(pa_types::ai::UserMessage {
+                content: pa_types::ai::UserContent::Text(normalized.clone()),
+                timestamp: now_millis(),
+                rest: Default::default(),
+            }));
+        }
+
+        if busy {
+            let message = AgentMessage::Standard(pa_agent::types::Message::User(
+                pa_agent::types::UserMessage {
+                    content: pa_agent::types::UserContent::Text(normalized),
+                    timestamp: now_millis() as i64,
+                },
+            ));
+            match options.streaming_behavior {
+                Some(StreamingBehavior::Steer) => self.agent.steer(message),
+                Some(StreamingBehavior::FollowUp) => self.agent.follow_up(message),
+                None => unreachable!("busy without a streaming behavior errors above"),
+            }
+            Ok(())
+        } else {
+            self.agent
+                .prompt(pa_agent::agent::AgentPromptInput::text(normalized))
+                .await
+        }
+    }
+
+    /// Session id (persistence identity).
+    pub async fn session_id(&self) -> String {
+        self.session.lock().await.get_session_id().to_string()
+    }
+
+    /// Persisted entries (for UI resume and inspection).
+    pub async fn entries(&self) -> Vec<FileEntry> {
+        self.session.lock().await.get_entries().to_vec()
+    }
+
+    /// Model change bookkeeping (mirrors appendModelChange). The resolved
+    /// model is forwarded to the loop; pa-agent and pa-types serialize to the
+    /// same camelCase wire shape, so the boundary converts through JSON.
+    pub async fn set_model(
+        &self,
+        model: &pa_types::ai::Model,
+        provider: &str,
+        model_id: &str,
+    ) -> anyhow::Result<()> {
+        let wire: pa_agent::types::Model = serde_json::from_value(
+            serde_json::to_value(model).map_err(|error| anyhow::anyhow!(error.to_string()))?,
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        self.agent.set_model(wire).await;
+        let mut session = self.session.lock().await;
+        session.append_model_change(provider, model_id);
+        Ok(())
+    }
+
+    /// Thinking level bookkeeping (mirrors appendThinkingLevelChange).
+    pub async fn set_thinking_level(&self, level: ThinkingLevel) -> anyhow::Result<()> {
+        self.agent.set_thinking_level(level).await;
+        let mut session = self.session.lock().await;
+        session.append_thinking_level_change(&format!("{level:?}").to_lowercase());
+        Ok(())
+    }
+}
+
+async fn persist_event(session: &Arc<tokio::sync::Mutex<SessionManager>>, event: AgentEvent) {
+    if let AgentEvent::MessageEnd { message, .. } = event {
+        let Some(session_message) = loop_message_to_session(&message) else {
+            return;
+        };
+        let mut session = session.lock().await;
+        session.append_message(session_message);
+    }
+}
+
+/// Convert a loop message to its persisted form via the shared wire shape.
+fn loop_message_to_session(message: &AgentMessage) -> Option<SessionAgentMessage> {
+    let AgentMessage::Standard(inner) = message else {
+        return None;
+    };
+    serde_json::from_value(serde_json::to_value(inner).ok()?).ok()
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pa_agent::agent::{AgentInitialState, AgentOptions};
+    use pa_agent::scripted::ScriptedProvider;
+
+    fn test_model() -> pa_agent::types::Model {
+        serde_json::from_value(serde_json::json!({
+            "id": "m", "name": "m", "api": "openai-completions", "provider": "test",
+            "baseUrl": "http://localhost", "reasoning": false, "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 1000, "maxTokens": 100
+        }))
+        .unwrap()
+    }
+
+    async fn scripted_session() -> AgentSession {
+        let provider = Arc::new(ScriptedProvider::new(test_model()));
+        provider.push_text_turn("hello from the model");
+        let options = AgentOptions {
+            initial_state: AgentInitialState {
+                model: Some(test_model()),
+                ..Default::default()
+            },
+            stream_fn: Some(provider.stream_fn()),
+            ..Default::default()
+        };
+        let agent = Agent::new(options);
+        let tmp = tempfile::tempdir().unwrap();
+        let session = SessionManager::in_memory(tmp.path());
+        AgentSession::new(Arc::new(agent), session, vec![]).await
+    }
+
+    #[tokio::test]
+    async fn prompt_persists_user_and_assistant() {
+        let session = scripted_session().await;
+        session
+            .prompt("hi there", PromptOptions::default())
+            .await
+            .unwrap();
+        session.agent().wait_for_idle().await;
+        let entries = session.entries().await;
+        let roles: Vec<String> = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                FileEntry::Message {
+                    message: SessionAgentMessage::User(user),
+                    ..
+                } => Some(format!("user:{}", user.content.text())),
+                FileEntry::Message {
+                    message: SessionAgentMessage::Assistant(assistant),
+                    ..
+                } => Some(format!("assistant:{}", assistant.model)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            roles,
+            vec!["user:hi there".to_string(), "assistant:m".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn template_expansion_applies() {
+        let provider = Arc::new(ScriptedProvider::new(test_model()));
+        provider.push_text_turn("ok");
+        let options = AgentOptions {
+            initial_state: AgentInitialState {
+                model: Some(test_model()),
+                ..Default::default()
+            },
+            stream_fn: Some(provider.stream_fn()),
+            ..Default::default()
+        };
+        let agent = Agent::new(options);
+        let tmp = tempfile::tempdir().unwrap();
+        let session = SessionManager::in_memory(tmp.path());
+        let template = PromptTemplate {
+            name: "fix".to_string(),
+            description: "fix".to_string(),
+            argument_hint: None,
+            content: "Fix $1 please".to_string(),
+            source_info: crate::skills::create_synthetic_source_info(
+                "/p",
+                "local",
+                crate::skills::SourceScope::User,
+                None,
+            ),
+            file_path: "/p/fix.md".to_string(),
+        };
+        let engine = AgentSession::new(Arc::new(agent), session, vec![template]).await;
+        engine
+            .prompt("/fix lint", PromptOptions::default())
+            .await
+            .unwrap();
+        engine.agent().wait_for_idle().await;
+        let entries = engine.entries().await;
+        let user_text = entries
+            .iter()
+            .find_map(|entry| match entry {
+                FileEntry::Message {
+                    message: SessionAgentMessage::User(user),
+                    ..
+                } => Some(user.content.text()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(user_text, "Fix lint please");
+    }
+}
