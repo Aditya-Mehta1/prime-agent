@@ -7,6 +7,8 @@
 //! pa-agent Agent owns the loop and its steer/follow-up queues; this layer
 //! decides admission and persists what the loop produces.
 
+pub mod slash_commands;
+
 use std::sync::Arc;
 
 use pa_agent::agent::Agent;
@@ -16,6 +18,7 @@ use pa_types::session::FileEntry;
 
 use crate::session::manager::SessionManager;
 use crate::skills::PromptTemplate;
+use slash_commands::{parse_session_command, SessionSlashCommand, SlashCommandRegistry};
 
 /// How a prompt submitted while the agent streams is scheduled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +27,16 @@ pub enum StreamingBehavior {
     Steer,
     /// Queue the message for after the current turn (queue mode "followUp").
     FollowUp,
+}
+
+/// What `prompt` did with the input.
+#[derive(Debug, PartialEq)]
+pub enum PromptOutcome {
+    /// Input admitted to the model loop.
+    Prompt,
+    /// Input recognized as a session command (compact/refine/goal/autonomous).
+    /// Execution is the session engine's job; the caller observes it here.
+    SessionCommand(SessionSlashCommand),
 }
 
 /// Options for `AgentSession::prompt`. Port of PromptOptions (used fields).
@@ -40,6 +53,7 @@ pub struct AgentSession {
     agent: Arc<Agent>,
     session: Arc<tokio::sync::Mutex<SessionManager>>,
     prompt_templates: Vec<PromptTemplate>,
+    slash_commands: SlashCommandRegistry,
 }
 
 impl AgentSession {
@@ -64,6 +78,7 @@ impl AgentSession {
             agent,
             session,
             prompt_templates,
+            slash_commands: SlashCommandRegistry::builtin(),
         }
     }
 
@@ -72,15 +87,23 @@ impl AgentSession {
         &self.agent
     }
 
-    /// Submit a prompt. When the agent is busy, `streaming_behavior` is
-    /// required (matching the TS admission error).
-    pub async fn prompt(&self, text: &str, options: PromptOptions) -> anyhow::Result<()> {
+    /// Submit a prompt. Session commands (compact/refine/goal/autonomous)
+    /// are recognized before admission and never reach the model.
+    pub async fn prompt(
+        &self,
+        text: &str,
+        options: PromptOptions,
+    ) -> anyhow::Result<PromptOutcome> {
         let expand = options.expand_prompt_templates.unwrap_or(true);
         let normalized = if expand {
             crate::skills::expand_prompt_template(text, &self.prompt_templates)
         } else {
             text.to_string()
         };
+
+        if let Some(command) = parse_session_command(&self.slash_commands, &normalized) {
+            return Ok(PromptOutcome::SessionCommand(command));
+        }
 
         let state = self.agent.state().await;
         let busy = state.is_streaming;
@@ -89,8 +112,6 @@ impl AgentSession {
                 "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."
             );
         }
-
-        // Persist the user message before admission, like the TS append path.
         {
             let mut session = self.session.lock().await;
             session.append_message(SessionAgentMessage::User(pa_types::ai::UserMessage {
@@ -112,12 +133,12 @@ impl AgentSession {
                 Some(StreamingBehavior::FollowUp) => self.agent.follow_up(message),
                 None => unreachable!("busy without a streaming behavior errors above"),
             }
-            Ok(())
         } else {
             self.agent
                 .prompt(pa_agent::agent::AgentPromptInput::text(normalized))
-                .await
+                .await?;
         }
+        Ok(PromptOutcome::Prompt)
     }
 
     /// Session id (persistence identity).
@@ -291,5 +312,54 @@ mod tests {
             })
             .unwrap();
         assert_eq!(user_text, "Fix lint please");
+    }
+}
+
+#[cfg(test)]
+mod slash_session_tests {
+    use super::*;
+    use pa_agent::agent::{AgentInitialState, AgentOptions};
+    use pa_agent::scripted::ScriptedProvider;
+
+    fn test_model() -> pa_agent::types::Model {
+        serde_json::from_value(serde_json::json!({
+            "id": "m", "name": "m", "api": "openai-completions", "provider": "test",
+            "baseUrl": "http://localhost", "reasoning": false, "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 1000, "maxTokens": 100
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn session_commands_never_reach_the_model() {
+        let provider = Arc::new(ScriptedProvider::new(test_model()));
+        provider.push_text_turn("unused");
+        let options = AgentOptions {
+            initial_state: AgentInitialState {
+                model: Some(test_model()),
+                ..Default::default()
+            },
+            stream_fn: Some(provider.stream_fn()),
+            ..Default::default()
+        };
+        let agent = Agent::new(options);
+        let tmp = tempfile::tempdir().unwrap();
+        let session = SessionManager::in_memory(tmp.path());
+        let engine = AgentSession::new(Arc::new(agent), session, vec![]).await;
+        let outcome = engine
+            .prompt("/compact focus on tests", PromptOptions::default())
+            .await
+            .unwrap();
+        match &outcome {
+            PromptOutcome::SessionCommand(command) => {
+                assert_eq!(command.name, "compact");
+                assert_eq!(command.args, "focus on tests");
+            }
+            _ => panic!("expected a session command"),
+        }
+        // No model call and no persisted user message.
+        assert!(provider.calls().is_empty());
+        assert!(engine.entries().await.is_empty());
     }
 }

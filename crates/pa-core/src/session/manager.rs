@@ -569,7 +569,17 @@ impl SessionManager {
         self.session_file.as_deref()
     }
 
-    pub fn get_entries(&self) -> &[FileEntry] {
+    /// Entries excluding the session header (TS `getEntries()`).
+    pub fn get_entries(&self) -> Vec<FileEntry> {
+        self.file_entries
+            .iter()
+            .filter(|entry| !matches!(entry, FileEntry::Header { .. }))
+            .cloned()
+            .collect()
+    }
+
+    /// All entries including the header (whole-file views).
+    pub fn get_all_entries(&self) -> &[FileEntry] {
         &self.file_entries
     }
 
@@ -1015,7 +1025,7 @@ mod tests {
         let content = std::fs::read_to_string(&file).unwrap();
         std::fs::write(&file, content.trim_end()).unwrap();
         let reopened = SessionManager::open(tmp.path(), &dir, &file);
-        assert_eq!(reopened.get_entries().len(), 2); // header + assistant
+        assert_eq!(reopened.get_entries().len(), 1); // assistant (header excluded)
         assert_eq!(reopened.get_session_id(), manager.get_session_id());
     }
 

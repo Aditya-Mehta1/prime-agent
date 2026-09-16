@@ -26,8 +26,8 @@ impl SessionManager {
     /// True when the session holds user-meaningful content beyond the default
     /// creation prefix (model_change, thinking_level_change, service_tier_change).
     pub fn has_user_content(&self) -> bool {
-        let content_entries: Vec<&FileEntry> = self
-            .get_entries()
+        let owned_entries = self.get_entries();
+        let content_entries: Vec<&FileEntry> = owned_entries
             .iter()
             .filter(|entry| CONTENT_ENTRY_TYPES.contains(&entry_type(entry)))
             .collect();
