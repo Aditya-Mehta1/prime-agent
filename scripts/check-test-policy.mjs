@@ -54,6 +54,11 @@ function maskJsSyntax(content) {
 	let escaped = false;
 	let lineComment = false;
 	let blockComment = false;
+	let regex = false;
+	let regexEscaped = false;
+	let regexClass = false;
+	let lastCodeChar = "";
+	const templateExpressions = [];
 	let masked = "";
 	for (let index = 0; index < content.length; index += 1) {
 		const char = content[index];
@@ -73,12 +78,45 @@ function maskJsSyntax(content) {
 			} else masked += char === "\n" ? "\n" : " ";
 			continue;
 		}
+		if (regex) {
+			masked += char === "\n" ? "\n" : " ";
+			if (regexEscaped) regexEscaped = false;
+			else if (char === "\\") regexEscaped = true;
+			else if (char === "[") regexClass = true;
+			else if (char === "]") regexClass = false;
+			else if (char === "/" && !regexClass) {
+				regex = false;
+				lastCodeChar = "/";
+			}
+			continue;
+		}
 		if (quote) {
+			if (quote === "`" && !escaped && char === "$" && next === "{") {
+				masked += "  ";
+				templateExpressions.push(1);
+				lastCodeChar = "";
+				quote = undefined;
+				index += 1;
+				continue;
+			}
 			masked += char === "\n" ? "\n" : " ";
 			if (escaped) escaped = false;
 			else if (char === "\\") escaped = true;
 			else if (char === quote) quote = undefined;
 			continue;
+		}
+		if (templateExpressions.length > 0) {
+			if (char === "{") templateExpressions[templateExpressions.length - 1] += 1;
+			else if (char === "}") {
+				templateExpressions[templateExpressions.length - 1] -= 1;
+				if (templateExpressions[templateExpressions.length - 1] === 0) {
+					templateExpressions.pop();
+					lastCodeChar = "";
+					quote = "`";
+					masked += " ";
+					continue;
+				}
+			}
 		}
 		if (char === "/" && next === "/") {
 			masked += "  ";
@@ -88,10 +126,99 @@ function maskJsSyntax(content) {
 			masked += "  ";
 			blockComment = true;
 			index += 1;
+		} else if (
+			templateExpressions.length > 0 &&
+			char === "/" &&
+			(lastCodeChar === "" ||
+				/[({[=,:;!?&|>~+*%^\-]/.test(lastCodeChar) ||
+				/\b(?:return|throw|case|delete|void|typeof|yield|await|in|instanceof)\s*$/.test(masked.slice(masked.lastIndexOf("\n") + 1)))
+		) {
+			masked += " ";
+			regex = true;
+			regexEscaped = false;
+			regexClass = false;
 		} else if (char === '"' || char === "'" || char === "`") {
 			masked += " ";
 			quote = char;
-		} else masked += char;
+			lastCodeChar = "string";
+		} else {
+			masked += char;
+			if (!/\s/.test(char)) lastCodeChar = char;
+		}
+	}
+	return masked;
+}
+
+function maskPythonSyntax(content) {
+	let quote;
+	let escaped = false;
+	let fString = false;
+	let comment = false;
+	const interpolations = [];
+	let masked = "";
+	for (let index = 0; index < content.length; index += 1) {
+		const char = content[index];
+		const next = content[index + 1];
+		if (comment) {
+			if (char === "\n") {
+				comment = false;
+				masked += "\n";
+			} else masked += " ";
+			continue;
+		}
+		if (quote) {
+			if (fString && !escaped && char === "{" && next === "{") {
+				masked += "  ";
+				index += 1;
+				continue;
+			}
+			if (fString && !escaped && char === "{") {
+				masked += " ";
+				interpolations.push({ depth: 1, quote });
+				quote = undefined;
+				fString = false;
+				continue;
+			}
+			if (!escaped && content.startsWith(quote, index)) {
+				masked += " ".repeat(quote.length);
+				index += quote.length - 1;
+				quote = undefined;
+				fString = false;
+				continue;
+			}
+			masked += char === "\n" ? "\n" : " ";
+			if (escaped) escaped = false;
+			else if (char === "\\") escaped = true;
+			continue;
+		}
+		if (interpolations.length > 0) {
+			if (char === "{") interpolations[interpolations.length - 1].depth += 1;
+			else if (char === "}") {
+				interpolations[interpolations.length - 1].depth -= 1;
+				if (interpolations[interpolations.length - 1].depth === 0) {
+					const interpolation = interpolations.pop();
+					quote = interpolation.quote;
+					fString = true;
+					masked += " ";
+					continue;
+				}
+			}
+		}
+		if (char === "#") {
+			masked += " ";
+			comment = true;
+			continue;
+		}
+		if (char === '"' || char === "'") {
+			quote = content.startsWith(char.repeat(3), index) ? char.repeat(3) : char;
+			let prefix = index - 1;
+			while (prefix >= 0 && /[A-Za-z]/.test(content[prefix])) prefix -= 1;
+			fString = /^(?:f|fr|rf)$/i.test(content.slice(prefix + 1, index));
+			masked += " ".repeat(quote.length);
+			index += quote.length - 1;
+			continue;
+		}
+		masked += char;
 	}
 	return masked;
 }
@@ -174,7 +301,7 @@ function changedTestFiles(base) {
 
 function scan(content, path = "") {
 	const lines = content.split("\n");
-	const maskedContent = maskJsSyntax(content);
+	const maskedContent = path.endsWith(".py") ? maskPythonSyntax(content) : maskJsSyntax(content);
 	const maskedLines = maskedContent.split("\n");
 	const violations = [];
 	const isVitestConfig = /(?:^|\/)vitest\.config\.[cm]?[jt]s$/.test(path);
@@ -196,7 +323,7 @@ function scan(content, path = "") {
 			}
 			return undefined;
 		};
-		const titleMatch = line.match(/\b(?:it|test)(?:\.[A-Za-z]+|\([^)]*\))*\(\s*["'`]([^"'`]+)/);
+		const titleMatch = line.match(/(?<![\w$.])(?:it|test)(?:\.[A-Za-z]+|\([^)]*\))*\(\s*["'`]([^"'`]+)/);
 		const pythonTitleMatch = line.match(/^\s*(?:async\s+)?def\s+(test_[A-Za-z0-9_]+)/);
 		if (titleMatch) title = titleMatch[1];
 		else if (pythonTitleMatch) title = pythonTitleMatch[1];
@@ -210,15 +337,15 @@ function scan(content, path = "") {
 		}
 		const bracketModifier = matchOutsideSyntax(/\b(?:it|test|describe|suite|context)\s*\[\s*["'](skipIf|runIf|skip|todo|only|fails)["']\s*\]/);
 		if (bracketModifier) add("conditional-or-disabled-test", index + 1, `[${bracketModifier[1]}]`);
-		const pythonModifier = line.match(/@(?:unittest\.)?(skipIf|skipUnless|skip)\b|@pytest\.mark\.(skipif|skip)\b/);
+		const pythonModifier = maskedLine.match(/@(?:unittest\.)?(skipIf|skipUnless|skip)\b|@pytest\.mark\.(skipif|skip)\b/);
 		const pythonDecoratorTitle =
 			lines
 				.slice(index, index + 4)
 				.join(" ")
 				.match(/\bdef\s+(test_[A-Za-z0-9_]+)/)?.[1] ?? title;
 		if (pythonModifier) add("conditional-or-disabled-test", index + 1, pythonModifier[0], pythonDecoratorTitle);
-		if (/@pytest\.mark\.(?:flaky|repeat)\b/.test(line)) add("test-retry", index + 1, line.trim(), pythonDecoratorTitle);
-		if (/@pytest\.mark\.timeout\b/.test(line)) add("explicit-test-timeout", index + 1, "pytest timeout marker", pythonDecoratorTitle);
+		if (/@pytest\.mark\.(?:flaky|repeat)\b/.test(maskedLine)) add("test-retry", index + 1, line.trim(), pythonDecoratorTitle);
+		if (/@pytest\.mark\.timeout\b/.test(maskedLine)) add("explicit-test-timeout", index + 1, "pytest timeout marker", pythonDecoratorTitle);
 		const testStart = line.match(/^(\s*)(?:it|test|describe|suite|context)(?:\.[A-Za-z]+|\([^)]*\))*\s*(?:\(|`)/);
 		if (testStart) {
 			const indent = testStart[1];
@@ -337,7 +464,12 @@ function scan(content, path = "") {
 		if (matchOutsideSyntax(/\b(?:expect\.poll|vi\.waitFor|waitForTimeout)\s*\(/)) {
 			add("wall-clock-poll", index + 1, line.match(/(?:expect\.poll|vi\.waitFor|waitForTimeout)/)?.[0] ?? "poll");
 		}
-		if (matchOutsideSyntax(/\b(?:sleep|delay)\s*\(/) && !/\b(?:sleep|delay)\s*[:=]/.test(maskedLine)) {
+		const sleepCall = matchOutsideSyntax(/\b(?:sleep|delay)\s*\(/);
+		if (
+			sleepCall &&
+			!/(?:\bdef|\bfunction)\s*$/.test(maskedLine.slice(0, sleepCall.index ?? 0)) &&
+			!/\b(?:sleep|delay)\s*[:=]/.test(maskedLine)
+		) {
 			add("wall-clock-sleep", index + 1, "sleep/delay call");
 		}
 		if (matchOutsideSyntax(/\b(?:setTimeout|setInterval)\s*\(/)) add("wall-clock-timer", index + 1, "setTimeout/setInterval");
@@ -439,7 +571,9 @@ function changedLineStats(base) {
 		((!path.includes("/") && /\.(?:[cm]?[jt]sx?|py|sh)$/.test(path)) || /(?:^|\/)(?:src|scripts)\//.test(path)) &&
 		!testFilePattern.test(path);
 	const meaningfulSourceFlags = (lines, path) => {
-		const normalized = /\.(?:py|sh)$/.test(path) ? lines : maskJsSyntax(lines.join("\n")).split("\n");
+		const normalized = path.endsWith(".sh")
+			? lines
+			: (path.endsWith(".py") ? maskPythonSyntax(lines.join("\n")) : maskJsSyntax(lines.join("\n"))).split("\n");
 		return normalized
 			.map((line) => line.trim())
 			.map((line) => line.length > 0 && !/^#/.test(line) && !/^[{}()[\],;]+$/.test(line));
