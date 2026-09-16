@@ -37,6 +37,7 @@ import {
 	type DaemonResponse,
 	isUnknownDaemonCommandError,
 } from "../daemon/daemon-protocol.js";
+import { DaemonControlPlaneTransportError } from "../daemon/daemon-routed-client.js";
 import { resolveAttachModelFallbackMessage, type SessionSummary } from "../daemon/daemon-session-list.js";
 import { listDaemonHeartbeats } from "../daemon/heartbeat-catalog.js";
 import {
@@ -350,16 +351,21 @@ const DAEMON_UPDATE_RESTART_TRANSIENT_ERROR_CODES = new Set([
  * True when an open failure is part of the normal update-restart window
  * rather than a permanent failure: the preparing-restart rejection itself,
  * transport failures while the daemon exits and its successor boots (socket
- * close, connect and handshake timeouts), and session-not-restored-yet misses
- * ("Unknown active session", a session still recovering). Permanent create and
- * attach failures (e.g. a missing session import file) return false so the
- * open fails immediately instead of hiding behind the bounded update wait.
+ * close, connect/handshake/request timeouts, routed control-plane transport
+ * failures), and session-not-restored-yet misses ("Unknown active session", a
+ * session still recovering). Permanent create and attach failures (e.g. a
+ * missing session import file) return false so the open fails immediately
+ * instead of hiding behind the bounded update wait.
  */
 function isDaemonUpdateRestartTransientError(error: unknown): boolean {
 	if (isDaemonUpdateRestartingError(error)) return true;
 	if (!(error instanceof Error)) return false;
 	if (isUnknownActiveSessionError(error)) return true;
 	if (error instanceof DaemonSessionRecoveringError) return true;
+	// A routed session transport wraps any control-plane transport failure
+	// (socket close, connect, timeouts — the restart-window shapes above);
+	// capability errors stay unwrapped and permanent.
+	if (error instanceof DaemonControlPlaneTransportError) return true;
 	const code = (error as NodeJS.ErrnoException).code;
 	if (typeof code === "string" && DAEMON_UPDATE_RESTART_TRANSIENT_ERROR_CODES.has(code)) return true;
 	return (
@@ -369,8 +375,10 @@ function isDaemonUpdateRestartTransientError(error: unknown): boolean {
 		error.message.startsWith("Failed to connect to the Prime Agent daemon:") ||
 		// A request attempted while the transport is down between daemon processes.
 		error.message.startsWith("Cannot send daemon command") ||
-		// Connect/handshake timeouts while the successor daemon boots.
-		/^Timed out after \d+ms (connecting to the Prime Agent daemon|waiting for the Prime Agent daemon handshake)/.test(
+		// Transport timeouts while the daemon exits and its successor boots:
+		// connect, handshake, and in-flight requests (e.g. create) that cannot
+		// get a response until the successor is ready.
+		/^Timed out after \d+ms (connecting to the Prime Agent daemon|waiting for the Prime Agent daemon handshake|waiting for the Prime Agent daemon response to)/.test(
 			error.message,
 		)
 	);
@@ -397,17 +405,26 @@ function daemonUpdateRestartDeadlineError(waitMs: number, lastError: unknown): E
  * wait budget bounds the whole wait: each attempt is raced against the
  * remaining budget, so an in-flight attempt (e.g. a create request with its own
  * 30-second timeout) cannot hold the open past the deadline, which fails with a
- * clear actionable message that includes the last error.
+ * clear actionable message that includes the last error. A losing attempt that
+ * still settles afterwards is not abandoned silently: its result goes to
+ * onAbandoned for disposal and its failure is swallowed.
  */
 export async function waitThroughDaemonUpdateRestart<T>(
 	attempt: () => Promise<T>,
-	options: { waitMs?: number; retryMs?: number; onWait?: (error: unknown) => void } = {},
+	options: {
+		waitMs?: number;
+		retryMs?: number;
+		onWait?: (error: unknown) => void;
+		/** Called with the result of an attempt that resolves after the deadline already failed the open, so resources nobody receives can be disposed. */
+		onAbandoned?: (result: T) => void;
+	} = {},
 ): Promise<DaemonUpdateRestartWaitResult<T>> {
 	const waitMs = options.waitMs ?? DAEMON_UPDATE_RESTART_OPEN_WAIT_MS;
 	const retryMs = options.retryMs ?? DAEMON_UPDATE_RESTART_OPEN_RETRY_MS;
 	const deadline = Date.now() + waitMs;
 	let sawUpdateRestart = false;
 	let lastError: unknown;
+	let attemptAbandoned = false;
 	while (true) {
 		const deadlineError = daemonUpdateRestartDeadlineError(waitMs, lastError);
 		// An in-flight attempt (e.g. a create request with its own 30-second
@@ -417,13 +434,26 @@ export async function waitThroughDaemonUpdateRestart<T>(
 		const deadlineHit = new Promise<never>((_, reject) => {
 			deadlineTimer = setTimeout(() => reject(deadlineError), Math.max(0, deadline - Date.now()));
 		});
+		const attemptPromise = attempt();
+		// The race cannot cancel the losing attempt: when the deadline wins, a
+		// late success must still be disposed (nobody receives its result), and
+		// a late failure is expected and must not surface as unhandled.
+		void attemptPromise.then(
+			(result) => {
+				if (attemptAbandoned) options.onAbandoned?.(result);
+			},
+			() => undefined,
+		);
 		try {
-			const result = await Promise.race([attempt(), deadlineHit]);
+			const result = await Promise.race([attemptPromise, deadlineHit]);
 			clearTimeout(deadlineTimer);
 			return { result, waitedForUpdateRestart: sawUpdateRestart };
 		} catch (error) {
 			clearTimeout(deadlineTimer);
-			if (error === deadlineError) throw deadlineError;
+			if (error === deadlineError) {
+				attemptAbandoned = true;
+				throw deadlineError;
+			}
 			if (!sawUpdateRestart) {
 				if (!isDaemonUpdateRestartingError(error)) throw error;
 				sawUpdateRestart = true;
@@ -607,6 +637,12 @@ async function runAgentsViewLoop(
 				() => openAgentsViewSession(options, result.summary),
 				{
 					onWait: (error) => logClientError("Waiting for daemon update restart to finish before opening", error),
+					// An open that resolves after the deadline already failed the
+					// wait: dispose the connection nobody received instead of
+					// leaking it.
+					onAbandoned: (abandoned) => {
+						void abandoned.connection.dispose().catch(() => undefined);
+					},
 				},
 			);
 			opened = openedThroughUpdate.result;
