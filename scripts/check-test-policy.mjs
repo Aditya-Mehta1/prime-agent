@@ -128,6 +128,7 @@ function maskJsSyntax(content) {
 			index += 1;
 		} else if (
 			char === "/" &&
+			!/(?:\+\+|--)\s*$/.test(masked) &&
 			(lastCodeChar === "" ||
 				/[({[=,:;!?&|>~+*%^\-]/.test(lastCodeChar) ||
 				/\b(?:return|throw|case|delete|void|typeof|yield|await|in|instanceof)\s*$/.test(masked.slice(masked.lastIndexOf("\n") + 1)))
