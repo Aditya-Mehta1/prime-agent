@@ -246,11 +246,111 @@ pub struct ToolCall {
 }
 
 /// Content blocks allowed in user and tool-result messages.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+///
+/// The tagged forms (`type: "text"` / `type: "image"`) are the TS wire
+/// contract, but live session files also carry text blocks written without a
+/// `type` tag (earlier daemon builds persisted `{"text": ...}` directly), and
+/// newer builds may write block kinds this version does not model. Any block
+/// that is not a well-formed known variant is preserved verbatim as
+/// [`UserContentBlock::Raw`] so a session load never fails on an unknown
+/// shape and every entry round-trips losslessly - the same catch-all
+/// contract [`crate::session::FileEntry`] applies to whole entries.
+#[derive(Debug, Clone, PartialEq)]
 pub enum UserContentBlock {
     Text(TextContent),
     Image(ImageContent),
+    /// Un-modeled block: a missing or unknown `type` tag, or any other JSON
+    /// shape that is not a known variant. Serialized verbatim.
+    Raw(Value),
+}
+
+impl Serialize for UserContentBlock {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Text(text) => serialize_tagged_block("text", text, serializer),
+            Self::Image(image) => serialize_tagged_block("image", image, serializer),
+            Self::Raw(value) => value.serialize(serializer),
+        }
+    }
+}
+
+/// Serialize a known block as its flat wire object: the content fields plus
+/// the `type` tag (same output as the derived `#[serde(tag = "type")]` form).
+fn serialize_tagged_block<T: Serialize, S: serde::Serializer>(
+    tag: &str,
+    content: &T,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let mut value = serde_json::to_value(content)
+        .map_err(|e| <S::Error as serde::ser::Error>::custom(e.to_string()))?;
+    let Some(map) = value.as_object_mut() else {
+        return Err(<S::Error as serde::ser::Error>::custom(
+            "content block must serialize to an object",
+        ));
+    };
+    map.insert("type".to_string(), Value::String(tag.to_string()));
+    value.serialize(serializer)
+}
+
+impl<'de> Deserialize<'de> for UserContentBlock {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        let Some(kind) = value.get("type").and_then(Value::as_str) else {
+            return Ok(Self::Raw(value));
+        };
+        let payload = strip_block_tag(&value);
+        match kind {
+            "text" => serde_json::from_value::<TextContent>(payload)
+                .map(Self::Text)
+                .map_err(|e| <D::Error as serde::de::Error>::custom(e.to_string())),
+            "image" => serde_json::from_value::<ImageContent>(payload)
+                .map(Self::Image)
+                .map_err(|e| <D::Error as serde::de::Error>::custom(e.to_string())),
+            _ => Ok(Self::Raw(value)),
+        }
+    }
+}
+
+/// Copy of the block without its `type` tag, so the tag is not captured
+/// into the content catch-all map (the derived tagged form consumed it the
+/// same way and never exposed it in `rest`).
+fn strip_block_tag(value: &Value) -> Value {
+    let mut payload = value.clone();
+    if let Some(map) = payload.as_object_mut() {
+        map.remove("type");
+    }
+    payload
+}
+
+impl UserContentBlock {
+    /// Text carried by this block for provider payload conversion: the modeled
+    /// text, or the `text` string of an un-modeled block (live session files
+    /// carry bare `{"text": ...}` blocks with no `type` tag, and a provider
+    /// prompt must not silently lose them). Image blocks and raw blocks
+    /// without a `text` field return `None`. TS display paths stay
+    /// tag-strict ([`UserContent::text`] does not use this helper).
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text(content) => Some(content.text.as_str()),
+            Self::Image(_) => None,
+            Self::Raw(raw) => raw.get("text").and_then(Value::as_str),
+        }
+    }
+
+    /// Base64 image data and mime type carried by this block for provider
+    /// payload conversion: the modeled image, or the `data`/`mimeType`
+    /// fields of an un-modeled block.
+    pub fn image(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::Image(content) => Some((content.data.as_str(), content.mime_type.as_str())),
+            Self::Text(_) => None,
+            Self::Raw(raw) => {
+                let data = raw.get("data").and_then(Value::as_str)?;
+                let mime_type = raw.get("mimeType").and_then(Value::as_str)?;
+                Some((data, mime_type))
+            }
+        }
+    }
 }
 
 /// Content blocks allowed in assistant messages.
@@ -272,6 +372,10 @@ pub enum UserContent {
 
 impl UserContent {
     /// Concatenated text of all text blocks (string content is returned as-is).
+    ///
+    /// Tag-strict like the TS text extraction (`block.type === "text"`):
+    /// un-modeled [`UserContentBlock::Raw`] blocks contribute nothing here
+    /// even when they carry a bare `text` field.
     pub fn text(&self) -> String {
         match self {
             UserContent::Text(text) => text.clone(),
@@ -279,7 +383,7 @@ impl UserContent {
                 .iter()
                 .filter_map(|b| match b {
                     UserContentBlock::Text(t) => Some(t.text.clone()),
-                    UserContentBlock::Image(_) => None,
+                    UserContentBlock::Image(_) | UserContentBlock::Raw(_) => None,
                 })
                 .collect::<Vec<_>>()
                 .join(" "),
@@ -901,6 +1005,43 @@ mod tests {
         assert_roundtrip::<Model>(
             r#"{"id":"m2","name":"M2","api":"openai-completions","provider":"p","baseUrl":"https://y","reasoning":false,"input":["text"],"cost":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0},"contextWindow":1000,"maxTokens":100,"compat":{"thinkingFormat":"openrouter","openRouterRouting":{"only":["a"],"sort":{"by":"price","partition":"model"},"max_price":{"prompt":"0.5","completion":2}}}}"#,
         );
+    }
+
+    #[test]
+    fn user_content_untagged_text_block_roundtrips_losslessly() {
+        // Live session files carry user text blocks without a `type` tag
+        // (persisted by earlier daemon builds, e.g. session
+        // 01a0abe1-ab24-73c0-b363-0cc4e4d6cc5f.jsonl line 4). The block must
+        // deserialize and re-serialize verbatim, without injecting a tag.
+        assert_roundtrip::<Message>(r#"{"role":"user","content":[{"text":"hi"}],"timestamp":3}"#);
+    }
+
+    #[test]
+    fn user_content_unknown_block_kind_is_preserved() {
+        // A block kind this version does not model (written by a newer
+        // build) must never fail the load; it round-trips verbatim.
+        assert_roundtrip::<Message>(
+            r#"{"role":"user","content":[{"type":"video","url":"x","meta":{"a":1}}],"timestamp":4}"#,
+        );
+    }
+
+    #[test]
+    fn bare_block_payload_views() {
+        let content: UserContent = serde_json::from_str(
+            r#"[{"text":"hi"},{"type":"image","data":"QQ==","mimeType":"image/png"},{"type":"file","id":"f"}]"#,
+        )
+        .unwrap();
+        // Tag-strict display text ignores un-modeled blocks, matching the TS
+        // text extraction (`block.type === "text"`).
+        assert_eq!(content.text(), "");
+        let UserContent::Blocks(blocks) = content else {
+            panic!("expected blocks");
+        };
+        // Provider payload views recover the bare text/image structurally.
+        assert_eq!(blocks[0].text(), Some("hi"));
+        assert_eq!(blocks[1].image(), Some(("QQ==", "image/png")));
+        assert_eq!(blocks[2].text(), None);
+        assert_eq!(blocks[2].image(), None);
     }
 
     #[test]

@@ -1,28 +1,15 @@
-//! Round-trip tests over real captured session JSONL.
+//! Round-trip tests over captured session JSONL shapes.
 //!
-//! Verifier for the `pa-types` session port: every line of every session file
-//! under `PA_TYPES_SESSIONS_DIR` (default `~/.prime/agent/sessions`) must
-//! deserialize into [`FileEntry`] and re-serialize to the same JSON value.
-//! The directory is skipped when absent (e.g. CI) so the fixture test below
-//! still guarantees coverage.
+//! The committed corpus in `tests/data/` is the verifier: every line must
+//! deserialize into [`FileEntry`] and re-serialize to the same JSON value,
+//! including the live-session shapes that once failed the sweep (un-tagged
+//! user text blocks) and unknown entry types. Live session files are real
+//! user data on the host, so they are only read when explicitly opted in
+//! with `PA_TYPES_LIVE_SESSIONS=1`; the default test run is hermetic.
 
 use pa_types::session::FileEntry;
 use serde_json::Value;
 use std::path::PathBuf;
-
-fn sessions_dir() -> Option<PathBuf> {
-    std::env::var_os("PA_TYPES_SESSIONS_DIR")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| {
-                PathBuf::from(h)
-                    .join(".prime")
-                    .join("agent")
-                    .join("sessions")
-            })
-        })
-        .filter(|p| p.is_dir())
-}
 
 fn roundtrip_file(path: &std::path::Path) -> usize {
     let data = std::fs::read_to_string(path).expect("read session file");
@@ -52,11 +39,40 @@ fn roundtrip_file(path: &std::path::Path) -> usize {
 }
 
 #[test]
-fn real_captured_sessions_roundtrip_losslessly() {
-    let Some(dir) = sessions_dir() else {
-        eprintln!("no sessions dir present; skipping live-data test");
+fn committed_fixture_roundtrips() {
+    let mut lines = 0usize;
+    for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        lines += roundtrip_file(&path);
+    }
+    assert!(lines > 0, "no fixture lines found to verify");
+}
+
+/// Live sessions are opt-in: they are real user data whose presence and
+/// contents vary per machine (and per daemon crash), so a default test run
+/// must not depend on them. Set `PA_TYPES_LIVE_SESSIONS=1` (optionally with
+/// `PA_TYPES_SESSIONS_DIR` pointing at a sessions tree) to sweep them.
+#[test]
+fn live_captured_sessions_roundtrip_losslessly() {
+    if std::env::var_os("PA_TYPES_LIVE_SESSIONS").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        eprintln!("PA_TYPES_LIVE_SESSIONS not set; skipping live-data sweep");
         return;
-    };
+    }
+    let dir = std::env::var_os("PA_TYPES_SESSIONS_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| {
+                PathBuf::from(h)
+                    .join(".prime")
+                    .join("agent")
+                    .join("sessions")
+            })
+        })
+        .unwrap_or_else(|| panic!("PA_TYPES_LIVE_SESSIONS=1 but no sessions dir configured"));
+    assert!(dir.is_dir(), "sessions dir not found: {}", dir.display());
     let mut files = 0usize;
     let mut lines = 0usize;
     let mut stack = vec![dir];
@@ -75,15 +91,4 @@ fn real_captured_sessions_roundtrip_losslessly() {
     }
     assert!(files > 0, "no session files found to verify");
     eprintln!("round-tripped {lines} lines across {files} session files");
-}
-
-#[test]
-fn committed_fixture_roundtrips() {
-    for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data")).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        roundtrip_file(&path);
-    }
 }

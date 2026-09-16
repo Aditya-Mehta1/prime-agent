@@ -163,25 +163,36 @@ fn to_chat_messages(messages: &[Message], supports_images: bool) -> Vec<Value> {
                     continue;
                 }
                 crate::types::UserMessageContent::Blocks(blocks) => {
-                    let had_images = blocks
-                        .iter()
-                        .any(|item| matches!(item, crate::types::UserOrToolContent::Image(_)));
+                    let had_images = blocks.iter().any(|item| {
+                        matches!(
+                            crate::types::user_block_payload(item),
+                            crate::types::UserBlockPayload::Image { .. }
+                        )
+                    });
                     let mut content: Vec<Value> = Vec::new();
                     for item in blocks {
-                        match item {
-                            crate::types::UserOrToolContent::Text(text) => {
+                        match crate::types::user_block_payload(item) {
+                            crate::types::UserBlockPayload::Text(text) => {
                                 content.push(json!({
                                     "type": "text",
-                                    "text": sanitize_surrogates(&text.text),
+                                    "text": sanitize_surrogates(text),
                                 }));
                             }
-                            crate::types::UserOrToolContent::Image(image) if supports_images => {
+                            crate::types::UserBlockPayload::Image { data, mime_type }
+                                if supports_images =>
+                            {
                                 content.push(json!({
-                                        "type": "image_url",
-                                        "image_url": format!("data:{};base64,{}", image.mime_type, image.data),
-                                    }));
+                                    "type": "image_url",
+                                    "image_url": format!("data:{};base64,{}", mime_type, data),
+                                }));
                             }
-                            crate::types::UserOrToolContent::Image(_) => {}
+                            crate::types::UserBlockPayload::Image { .. } => {}
+                            crate::types::UserBlockPayload::Opaque(json) => {
+                                content.push(json!({
+                                    "type": "text",
+                                    "text": sanitize_surrogates(&json),
+                                }));
+                            }
                         }
                     }
                     if !content.is_empty() {

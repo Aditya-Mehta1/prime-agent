@@ -199,16 +199,19 @@ pub fn convert_messages(model: &Model, context: &Context) -> Vec<Value> {
                 UserMessageContent::Blocks(blocks) => {
                     let parts: Vec<Value> = blocks
                         .iter()
-                        .map(|item| match item {
-                            UserOrToolContent::Text(text) => {
-                                json!({ "text": sanitize_surrogates(&text.text) })
+                        .map(|item| match crate::types::user_block_payload(item) {
+                            crate::types::UserBlockPayload::Text(text) => {
+                                json!({ "text": sanitize_surrogates(text) })
                             }
-                            UserOrToolContent::Image(image) => json!({
+                            crate::types::UserBlockPayload::Image { data, mime_type } => json!({
                                 "inlineData": {
-                                    "mimeType": image.mime_type,
-                                    "data": image.data,
+                                    "mimeType": mime_type,
+                                    "data": data,
                                 },
                             }),
+                            crate::types::UserBlockPayload::Opaque(json) => {
+                                json!({ "text": sanitize_surrogates(&json) })
+                            }
                         })
                         .collect();
                     if parts.is_empty() {

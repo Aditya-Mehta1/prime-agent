@@ -99,6 +99,9 @@ pub fn estimate_tokens(message: &AgentMessage) -> u64 {
                     .map(|block| match block {
                         pa_types::ai::UserContentBlock::Text(text) => chars(&text.text),
                         pa_types::ai::UserContentBlock::Image(_) => 4_800, // ~1200 tokens
+                        // Un-modeled blocks have no modeled size; TS sizes
+                        // only typed blocks, so estimate zero.
+                        pa_types::ai::UserContentBlock::Raw(_) => 0,
                     })
                     .sum(),
             ),
@@ -110,6 +113,7 @@ pub fn estimate_tokens(message: &AgentMessage) -> u64 {
                 .map(|block| match block {
                     pa_types::ai::UserContentBlock::Text(text) => chars(&text.text),
                     pa_types::ai::UserContentBlock::Image(_) => 4_800,
+                    pa_types::ai::UserContentBlock::Raw(_) => 0,
                 })
                 .sum(),
         ),

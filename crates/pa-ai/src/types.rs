@@ -27,6 +27,43 @@ pub use pa_types::ai::{
 pub type JsonSchema = serde_json::Value;
 
 // ---------------------------------------------------------------------------
+// User/tool-result block payload view
+// ---------------------------------------------------------------------------
+
+/// Provider payload view of one user/tool-result content block.
+///
+/// Most provider conversions map a block to either a text part or an image
+/// part. Un-modeled blocks ([`UserOrToolContent::Raw`]: a missing `type` tag,
+/// as persisted by earlier daemon builds, or an unknown kind from a newer
+/// build) never reach the prompt as structured parts - a bare text block maps
+/// to [`UserBlockPayload::Text`], a bare image block to
+/// [`UserBlockPayload::Image`], and anything else to [`UserBlockPayload::Opaque`]
+/// (its JSON, as text) so no content is silently dropped from a request.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UserBlockPayload<'a> {
+    Text(&'a str),
+    Image { data: &'a str, mime_type: &'a str },
+    Opaque(String),
+}
+
+/// Classify a user/tool-result block for provider payload conversion.
+pub fn user_block_payload(block: &UserOrToolContent) -> UserBlockPayload<'_> {
+    if let Some(text) = block.text() {
+        return UserBlockPayload::Text(text);
+    }
+    if let Some((data, mime_type)) = block.image() {
+        return UserBlockPayload::Image { data, mime_type };
+    }
+    // Un-modeled without recognized text/image fields: pass the block JSON
+    // through as text so a resumed conversation never silently loses content.
+    let json = match serde_json::to_value(block) {
+        Ok(value) => value.to_string(),
+        Err(error) => format!("{{\"serialize_error\": {error:?}}}"),
+    };
+    UserBlockPayload::Opaque(json)
+}
+
+// ---------------------------------------------------------------------------
 // Hooks
 // ---------------------------------------------------------------------------
 

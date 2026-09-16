@@ -202,11 +202,12 @@ fn content_to_text(content: &UserMessageContent) -> String {
         UserMessageContent::Text(text) => text.clone(),
         UserMessageContent::Blocks(blocks) => blocks
             .iter()
-            .map(|block| match block {
-                crate::types::UserOrToolContent::Text(text) => text.text.clone(),
-                crate::types::UserOrToolContent::Image(image) => {
-                    format!("[image:{}:{}]", image.mime_type, image.data.len())
+            .map(|block| match crate::types::user_block_payload(block) {
+                crate::types::UserBlockPayload::Text(text) => text.to_string(),
+                crate::types::UserBlockPayload::Image { data, mime_type } => {
+                    format!("[image:{}:{}]", mime_type, data.len())
                 }
+                crate::types::UserBlockPayload::Opaque(json) => json,
             })
             .collect::<Vec<_>>()
             .join("\n"),
@@ -233,10 +234,13 @@ fn assistant_content_to_text(content: &[AssistantContent]) -> String {
 
 fn tool_result_to_text(message: &ToolResultMessage) -> String {
     let mut parts = vec![message.tool_name.clone()];
-    parts.extend(message.content.iter().map(|block| match block {
-        crate::types::UserOrToolContent::Text(text) => text.text.clone(),
-        crate::types::UserOrToolContent::Image(image) => {
-            format!("[image:{}:{}]", image.mime_type, image.data.len())
+    parts.extend(message.content.iter().map(|block| {
+        match crate::types::user_block_payload(block) {
+            crate::types::UserBlockPayload::Text(text) => text.to_string(),
+            crate::types::UserBlockPayload::Image { data, mime_type } => {
+                format!("[image:{}:{}]", mime_type, data.len())
+            }
+            crate::types::UserBlockPayload::Opaque(json) => json,
         }
     }));
     parts.join("\n")

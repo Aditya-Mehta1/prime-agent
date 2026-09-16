@@ -38,3 +38,6 @@
 {"type": "message","id": "c8","parentId": "p1","timestamp": "2026-01-01T00:00:00.000Z","message": {"role": "compactionSummary","summary": "S","tokensBefore": 10,"retainedMessageCount": 2,"customInstructions": "ci","harnessDigest": "d","timestamp": 1}}
 {"type": "message","id": "c9","parentId": "p1","timestamp": "2026-01-01T00:00:00.000Z","message": {"role": "user","content": [{"type": "text","text": "see"},{"type": "image","data": "QQ==","mimeType": "image/png"}],"timestamp": 1}}
 {"type": "child_usage_attributed","id": "ca","parentId": "p1","timestamp": "2026-01-01T00:00:00.000Z","targetId": "t","childUsage": {"input": 1,"output": 2,"cacheRead": 3,"cacheWrite": 4,"totalTokens": 10,"cost": {"input": 0.1,"output": 0.2,"cacheRead": 0,"cacheWrite": 0,"total": 0.3}},"aggregateUsage": {"input": 1,"output": 2,"cacheRead": 3,"cacheWrite": 4,"totalTokens": 10,"cost": {"input": 0.1,"output": 0.2,"cacheRead": 0,"cacheWrite": 0,"total": 0.3}},"origin": "direct_user"}
+{"type": "message","id": "X","parentId": "X","timestamp": "X","message": {"role": "user","content": [{"text": "X"}],"timestamp": 1789590088503}}
+{"type": "custom","customType": "prime-agent-rs.queue_snapshot","followUp": ["X"],"steering": [],"id": "X","parentId": "X","timestamp": "X"}
+{"type": "request_started","request_id": "X","session_id": "X"}

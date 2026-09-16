@@ -26,19 +26,39 @@ use pa_core::kernel::state_snapshot::{manifest_path_in, snapshot_path_in};
 /// The kernel Python with prime-agent-runtime installed. The TS product's
 /// auto-bootstrapped kernel venv is the ground-truth environment; this is
 /// exactly the interpreter `prime-agent` spawns.
-fn kernel_python() -> PathBuf {
+///
+/// The venv is ambient product state, not test input: it exists wherever a
+/// TS product instance bootstrapped a kernel. Tests that need it are skipped
+/// (with a note) rather than failing when it is absent, so the suite stays
+/// hermetic on machines without a live install; set `PA_CORE_KERNEL_PYTHON`
+/// to point at an explicit interpreter instead.
+fn kernel_python() -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os("PA_CORE_KERNEL_PYTHON") {
+        let explicit = PathBuf::from(explicit);
+        assert!(
+            explicit.exists(),
+            "PA_CORE_KERNEL_PYTHON {explicit:?} not found"
+        );
+        return Some(explicit);
+    }
     let candidate = PathBuf::from(
         std::env::var("HOME")
             .map(|home| format!("{home}/.prime/agent/kernel-venv/bin/python"))
             .unwrap_or_else(|_| "/home/ubuntu/.prime/agent/kernel-venv/bin/python".to_string()),
     );
-    assert!(candidate.exists(), "kernel python {candidate:?} not found");
-    candidate
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    eprintln!("kernel python {candidate:?} not found; skipping live kernel test");
+    None
 }
 
-fn test_options(snapshot_dir: Option<&std::path::Path>) -> KernelManagerOptions {
-    KernelManagerOptions {
-        python: Some(kernel_python()),
+/// Test options, or `None` when no kernel interpreter is available on this
+/// machine (see [`kernel_python`]); the caller skips the test then.
+fn test_options(snapshot_dir: Option<&std::path::Path>) -> Option<KernelManagerOptions> {
+    let python = kernel_python()?;
+    Some(KernelManagerOptions {
+        python: Some(python),
         cwd: Some(std::env::temp_dir()),
         env: HashMap::new(),
         session_id: Some("integration-test".to_string()),
@@ -55,7 +75,7 @@ fn test_options(snapshot_dir: Option<&std::path::Path>) -> KernelManagerOptions 
         // bootstrap after start; tests match that contract.
         bootstrap_code: Some(build_rlm_bootstrap_code(&[])),
         stderr_log_path: None,
-    }
+    })
 }
 
 /// Start a manager and run the RLM bootstrap, mirroring the TS provisioner
@@ -96,7 +116,10 @@ async fn execute(
 
 #[tokio::test]
 async fn kernel_state_persists_across_cells_and_turns() {
-    let manager = started_manager(test_options(None)).await;
+    let Some(options) = test_options(None) else {
+        return;
+    };
+    let manager = started_manager(options).await;
 
     // One turn defines; a separate call (a later "turn") uses.
     let first = execute(&manager, "x = 21\ny = 'hello'\nprint('defined')").await;
@@ -142,7 +165,10 @@ async fn kernel_state_persists_across_cells_and_turns() {
 
 #[tokio::test]
 async fn background_thread_output_is_separated_from_cell_output() {
-    let manager = started_manager(test_options(None)).await;
+    let Some(options) = test_options(None) else {
+        return;
+    };
+    let manager = started_manager(options).await;
     // A user thread writing after its cell finished lands in background output.
     let first = execute(
         &manager,
@@ -170,9 +196,12 @@ async fn background_thread_output_is_separated_from_cell_output() {
 
 #[tokio::test]
 async fn rlm_bootstrap_injects_the_kernel_surface() {
+    let Some(base) = test_options(None) else {
+        return;
+    };
     let options = KernelManagerOptions {
         bootstrap_code: Some(build_rlm_bootstrap_code(&[])),
-        ..test_options(None)
+        ..base
     };
     let manager = started_manager(options).await;
 
@@ -213,10 +242,13 @@ async fn host_requests_round_trip_to_registered_handlers() {
             }))
         }),
     );
+    let Some(base) = test_options(None) else {
+        return;
+    };
     let options = KernelManagerOptions {
         host_handlers: handlers,
         bootstrap_code: Some(build_rlm_bootstrap_code(&[])),
-        ..test_options(None)
+        ..base
     };
     let manager = started_manager(options).await;
 
@@ -260,7 +292,10 @@ async fn host_requests_round_trip_to_registered_handlers() {
 #[tokio::test]
 async fn kill9_then_restart_revives_snapshot_and_reports_unserializable() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let manager = started_manager(test_options(Some(dir.path()))).await;
+    let Some(options) = test_options(Some(dir.path())) else {
+        return;
+    };
+    let manager = started_manager(options).await;
 
     // Serializable variables plus one unserializable object (an open socket)
     // across separate turns.
@@ -301,7 +336,10 @@ async fn kill9_then_restart_revives_snapshot_and_reports_unserializable() {
     assert!(manager.is_defunct(), "killed kernel must settle defunct");
 
     // Restart-and-revive: a fresh manager on the same snapshot directory.
-    let revived = started_manager(test_options(Some(dir.path()))).await;
+    let Some(options) = test_options(Some(dir.path())) else {
+        return;
+    };
+    let revived = started_manager(options).await;
     let restore = tokio::time::timeout(Duration::from_secs(15), revived.restore_state())
         .await
         .expect("restore must settle");
@@ -342,7 +380,10 @@ async fn kill9_then_restart_revives_snapshot_and_reports_unserializable() {
 #[tokio::test]
 async fn graceful_shutdown_flushes_the_final_snapshot() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let manager = started_manager(test_options(Some(dir.path()))).await;
+    let Some(options) = test_options(Some(dir.path())) else {
+        return;
+    };
+    let manager = started_manager(options).await;
     execute(&manager, "persisted = 'value'\n").await;
 
     // shutdown({snapshot: true}) must flush the namespace without an
@@ -358,7 +399,10 @@ async fn graceful_shutdown_flushes_the_final_snapshot() {
     .expect("shutdown must settle");
     assert!(performed.expect("shutdown result"));
 
-    let revived = started_manager(test_options(Some(dir.path()))).await;
+    let Some(options) = test_options(Some(dir.path())) else {
+        return;
+    };
+    let revived = started_manager(options).await;
     let restore = revived
         .restore_state()
         .await

@@ -336,7 +336,15 @@ pub struct CustomMessageEntry {
 ///
 /// Every entry shares `id`, `parentId` (null at the root), and an ISO-8601
 /// `timestamp`; the `type` tag selects the payload.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Deserialization is catch-all like the TS loader (`JSON.parse` per line):
+/// an entry whose `type` is not a known kind - written by a newer build, or a
+/// different JSONL file in the sessions tree - is preserved verbatim as
+/// [`FileEntry::Unknown`] instead of failing the whole session load. A known
+/// kind that fails its own payload validation also degrades to `Unknown`
+/// (lossless: the original JSON is kept), so a corrupt line can never block
+/// a resume.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(
     tag = "type",
     rename_all = "snake_case",
@@ -431,20 +439,168 @@ pub enum FileEntry {
         #[serde(flatten)]
         base: EntryBase,
     },
-    /// Unknown entry types written by newer builds; preserved verbatim.
+    /// An entry this version does not model (unknown `type` tag, or a known
+    /// tag whose payload failed validation); preserved verbatim.
     Unknown {
         #[serde(flatten)]
         rest: JsonMap,
+    },
+}
+
+/// Derived internally-tagged deserialization form of [`FileEntry`] over the
+/// known entry types; [`FileEntry`] falls back to [`FileEntry::Unknown`] for
+/// anything else (see [`FileEntry`] docs).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+enum KnownFileEntry {
+    #[serde(rename = "session")]
+    Header {
+        #[serde(flatten)]
+        header: SessionHeader,
+    },
+    Message {
+        message: AgentMessage,
         #[serde(flatten)]
         base: EntryBase,
     },
+    ThinkingLevelChange {
+        #[serde(flatten)]
+        payload: ThinkingLevelChangeEntry,
+        #[serde(flatten)]
+        base: EntryBase,
+    },
+    ServiceTierChange {
+        #[serde(flatten)]
+        payload: ServiceTierChangeEntry,
+        #[serde(flatten)]
+        base: EntryBase,
+    },
+    ModelChange {
+        #[serde(flatten)]
+        payload: ModelChangeEntry,
+        #[serde(flatten)]
+        base: EntryBase,
+    },
+    Compaction {
+        #[serde(flatten)]
+        payload: CompactionEntry,
+        #[serde(flatten)]
+        base: EntryBase,
+    },
+    BranchSummary {
+        #[serde(flatten)]
+        payload: BranchSummaryEntry,
+        #[serde(flatten)]
+        base: EntryBase,
+    },
+    Custom {
+        #[serde(flatten)]
+        payload: CustomEntry,
+        #[serde(flatten)]
+        base: EntryBase,
+    },
+    ChildUsageAttributed {
+        #[serde(flatten)]
+        payload: ChildUsageAttributionEntry,
+        #[serde(flatten)]
+        base: EntryBase,
+    },
+    Label {
+        #[serde(flatten)]
+        payload: LabelEntry,
+        #[serde(flatten)]
+        base: EntryBase,
+    },
+    SessionInfo {
+        #[serde(flatten)]
+        payload: SessionInfoEntry,
+        #[serde(flatten)]
+        base: EntryBase,
+    },
+    SessionState {
+        #[serde(flatten)]
+        payload: SessionStateEntry,
+        #[serde(flatten)]
+        base: EntryBase,
+    },
+    AgentStatus {
+        #[serde(flatten)]
+        payload: AgentStatusEntry,
+        #[serde(flatten)]
+        base: EntryBase,
+    },
+    GitState {
+        #[serde(flatten)]
+        payload: GitStateEntry,
+        #[serde(flatten)]
+        base: EntryBase,
+    },
+    CustomMessage {
+        #[serde(flatten)]
+        payload: CustomMessageEntry,
+        #[serde(flatten)]
+        base: EntryBase,
+    },
+}
+
+impl From<KnownFileEntry> for FileEntry {
+    fn from(entry: KnownFileEntry) -> Self {
+        match entry {
+            KnownFileEntry::Header { header } => Self::Header { header },
+            KnownFileEntry::Message { message, base } => Self::Message { message, base },
+            KnownFileEntry::ThinkingLevelChange { payload, base } => {
+                Self::ThinkingLevelChange { payload, base }
+            }
+            KnownFileEntry::ServiceTierChange { payload, base } => {
+                Self::ServiceTierChange { payload, base }
+            }
+            KnownFileEntry::ModelChange { payload, base } => Self::ModelChange { payload, base },
+            KnownFileEntry::Compaction { payload, base } => Self::Compaction { payload, base },
+            KnownFileEntry::BranchSummary { payload, base } => {
+                Self::BranchSummary { payload, base }
+            }
+            KnownFileEntry::Custom { payload, base } => Self::Custom { payload, base },
+            KnownFileEntry::ChildUsageAttributed { payload, base } => {
+                Self::ChildUsageAttributed { payload, base }
+            }
+            KnownFileEntry::Label { payload, base } => Self::Label { payload, base },
+            KnownFileEntry::SessionInfo { payload, base } => Self::SessionInfo { payload, base },
+            KnownFileEntry::SessionState { payload, base } => Self::SessionState { payload, base },
+            KnownFileEntry::AgentStatus { payload, base } => Self::AgentStatus { payload, base },
+            KnownFileEntry::GitState { payload, base } => Self::GitState { payload, base },
+            KnownFileEntry::CustomMessage { payload, base } => {
+                Self::CustomMessage { payload, base }
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FileEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        // Known kinds parse through the tagged mirror; anything else degrades
+        // to the verbatim `Unknown` entry instead of failing the load.
+        match KnownFileEntry::deserialize(&value) {
+            Ok(entry) => Ok(FileEntry::from(entry)),
+            Err(_) => match value {
+                Value::Object(rest) => Ok(FileEntry::Unknown { rest }),
+                other => Err(<D::Error as serde::de::Error>::custom(format!(
+                    "session entry must be a JSON object, got {other}"
+                ))),
+            },
+        }
+    }
 }
 
 impl FileEntry {
     pub fn id(&self) -> Option<&str> {
         let base = match self {
             FileEntry::Header { header } => return Some(&header.id),
-            FileEntry::Unknown { rest, .. } => {
+            FileEntry::Unknown { rest } => {
                 return rest.get("id").and_then(|v| v.as_str());
             }
             FileEntry::Message { base, .. }
@@ -468,7 +624,10 @@ impl FileEntry {
     /// Parent entry id (None for the header / roots with no parent).
     pub fn parent_id(&self) -> Option<&str> {
         let base = match self {
-            FileEntry::Header { .. } | FileEntry::Unknown { .. } => None,
+            FileEntry::Header { .. } => return None,
+            FileEntry::Unknown { rest } => {
+                return rest.get("parentId").and_then(|v| v.as_str());
+            }
             FileEntry::Message { base, .. }
             | FileEntry::ThinkingLevelChange { base, .. }
             | FileEntry::ServiceTierChange { base, .. }
@@ -491,7 +650,7 @@ impl FileEntry {
     pub fn timestamp(&self) -> &str {
         let base = match self {
             FileEntry::Header { header } => return header.timestamp.as_str(),
-            FileEntry::Unknown { rest, .. } => {
+            FileEntry::Unknown { rest } => {
                 return rest
                     .get("timestamp")
                     .and_then(|value| value.as_str())
@@ -529,4 +688,62 @@ pub struct EntryBase {
     pub timestamp: Option<String>,
     #[serde(flatten)]
     pub rest: JsonMap,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(json: &str) -> FileEntry {
+        serde_json::from_str(json).expect("deserialize entry")
+    }
+
+    fn assert_roundtrips(json: &str) {
+        let original: Value = serde_json::from_str(json).unwrap();
+        let out = serde_json::to_string(&entry(json)).expect("serialize entry");
+        let reparsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(original, reparsed, "round trip changed the value: {out}");
+    }
+
+    #[test]
+    fn unknown_entry_type_is_preserved_verbatim() {
+        // Live shape from a daemon semantic-edge stream: an entry kind this
+        // version does not model must not fail the load.
+        let json = r#"{"type":"request_started","request_id":"r","session_id":"s"}"#;
+        let FileEntry::Unknown { rest } = entry(json) else {
+            panic!("expected an Unknown entry");
+        };
+        assert_eq!(rest.get("request_id").and_then(Value::as_str), Some("r"));
+        assert_roundtrips(json);
+    }
+
+    #[test]
+    fn unknown_entry_keeps_tree_fields() {
+        let json = r#"{"type":"future_kind","id":"f1","parentId":"p1","timestamp":"2026-01-01T00:00:00.000Z"}"#;
+        let parsed = entry(json);
+        assert_eq!(parsed.id(), Some("f1"));
+        assert_eq!(parsed.parent_id(), Some("p1"));
+        assert_eq!(parsed.timestamp(), "2026-01-01T00:00:00.000Z");
+        assert_roundtrips(json);
+    }
+
+    #[test]
+    fn malformed_known_entry_degrades_to_unknown_verbatim() {
+        // A known tag with an invalid payload must not fail the whole session
+        // load; the line is preserved exactly as written.
+        let json = r#"{"type":"model_change","id":"m1","provider":123,"modelId":null}"#;
+        let FileEntry::Unknown { rest } = entry(json) else {
+            panic!("expected an Unknown entry");
+        };
+        assert_eq!(
+            rest.get("type").and_then(Value::as_str),
+            Some("model_change")
+        );
+        assert_roundtrips(json);
+    }
+
+    #[test]
+    fn non_object_entry_is_rejected() {
+        assert!(serde_json::from_str::<FileEntry>(r#""not an entry""#).is_err());
+    }
 }

@@ -30,9 +30,10 @@ pub(crate) fn convert_content_blocks(content: &[UserOrToolContent]) -> Value {
     if !has_images {
         let text = content
             .iter()
-            .map(|block| match block {
-                UserOrToolContent::Text(text) => text.text.clone(),
-                UserOrToolContent::Image(image) => image.data.clone(),
+            .map(|block| match crate::types::user_block_payload(block) {
+                crate::types::UserBlockPayload::Text(text) => text.to_string(),
+                crate::types::UserBlockPayload::Image { data, .. } => data.to_string(),
+                crate::types::UserBlockPayload::Opaque(json) => json,
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -40,18 +41,22 @@ pub(crate) fn convert_content_blocks(content: &[UserOrToolContent]) -> Value {
     }
     let mut blocks: Vec<Value> = content
         .iter()
-        .map(|block| match block {
-            UserOrToolContent::Text(text) => json!({
+        .map(|block| match crate::types::user_block_payload(block) {
+            crate::types::UserBlockPayload::Text(text) => json!({
                 "type": "text",
-                "text": sanitize_surrogates(&text.text),
+                "text": sanitize_surrogates(text),
             }),
-            UserOrToolContent::Image(image) => json!({
+            crate::types::UserBlockPayload::Image { data, mime_type } => json!({
                 "type": "image",
                 "source": {
                     "type": "base64",
-                    "media_type": image.mime_type,
-                    "data": image.data,
+                    "media_type": mime_type,
+                    "data": data,
                 },
+            }),
+            crate::types::UserBlockPayload::Opaque(json) => json!({
+                "type": "text",
+                "text": sanitize_surrogates(&json),
             }),
         })
         .collect();
@@ -93,18 +98,22 @@ pub fn convert_messages(
                 UserMessageContent::Blocks(blocks) => {
                     let converted: Vec<Value> = blocks
                         .iter()
-                        .map(|item| match item {
-                            UserOrToolContent::Text(text) => json!({
+                        .map(|item| match crate::types::user_block_payload(item) {
+                            crate::types::UserBlockPayload::Text(text) => json!({
                                 "type": "text",
-                                "text": sanitize_surrogates(&text.text),
+                                "text": sanitize_surrogates(text),
                             }),
-                            UserOrToolContent::Image(image) => json!({
+                            crate::types::UserBlockPayload::Image { data, mime_type } => json!({
                                 "type": "image",
                                 "source": {
                                     "type": "base64",
-                                    "media_type": image.mime_type,
-                                    "data": image.data,
+                                    "media_type": mime_type,
+                                    "data": data,
                                 },
+                            }),
+                            crate::types::UserBlockPayload::Opaque(json) => json!({
+                                "type": "text",
+                                "text": sanitize_surrogates(&json),
                             }),
                         })
                         .collect();

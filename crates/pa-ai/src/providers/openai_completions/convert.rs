@@ -60,14 +60,18 @@ pub fn convert_messages(model: &Model, context: &Context, compat: &ResolvedCompa
                 UserMessageContent::Blocks(blocks) => {
                     let content: Vec<Value> = blocks
                         .iter()
-                        .map(|item| match item {
-                            UserOrToolContent::Text(text) => json!({
+                        .map(|item| match crate::types::user_block_payload(item) {
+                            crate::types::UserBlockPayload::Text(text) => json!({
                                 "type": "text",
-                                "text": sanitize_surrogates(&text.text),
+                                "text": sanitize_surrogates(text),
                             }),
-                            UserOrToolContent::Image(image) => json!({
+                            crate::types::UserBlockPayload::Image { data, mime_type } => json!({
                                 "type": "image_url",
-                                "image_url": { "url": format!("data:{};base64,{}", image.mime_type, image.data) },
+                                "image_url": { "url": format!("data:{};base64,{}", mime_type, data) },
+                            }),
+                            crate::types::UserBlockPayload::Opaque(json) => json!({
+                                "type": "text",
+                                "text": sanitize_surrogates(&json),
                             }),
                         })
                         .collect();

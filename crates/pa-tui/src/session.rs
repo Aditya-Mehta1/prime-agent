@@ -161,6 +161,9 @@ fn message_to_items(message: &AgentMessage) -> Vec<TranscriptItem> {
                 .map(|b| match b {
                     pa_types::ai::UserContentBlock::Text(t) => t.text.clone(),
                     pa_types::ai::UserContentBlock::Image(_) => String::new(),
+                    // Un-modeled blocks have no display text (TS renders only
+                    // typed text blocks).
+                    pa_types::ai::UserContentBlock::Raw(_) => String::new(),
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),

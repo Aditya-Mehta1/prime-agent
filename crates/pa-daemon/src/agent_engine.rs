@@ -215,7 +215,7 @@ impl SessionEngine for AgentSessionEngine {
         // The accepted user message is recorded by the worker.
         if !emit(EngineEvent::UserMessage(json!({
             "role": "user",
-            "content": [{ "text": request.message }],
+            "content": [{ "type": "text", "text": request.message }],
             "timestamp": now_millis(),
         }))) {
             return;

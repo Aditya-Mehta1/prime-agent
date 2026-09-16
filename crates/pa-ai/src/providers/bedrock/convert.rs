@@ -10,7 +10,7 @@ use crate::models::clamp_thinking_level;
 use crate::providers::transform_messages::transform_messages_with_normalizer;
 use crate::types::{
     AssistantContent, CacheRetention, Context, Message, Model, ModelThinkingLevel, Tool,
-    UserMessageContent, UserOrToolContent,
+    UserMessageContent,
 };
 use crate::utils_inner::sanitize_unicode::sanitize_surrogates;
 
@@ -172,12 +172,15 @@ pub fn convert_messages(
                     }
                     UserMessageContent::Blocks(blocks) => blocks
                         .iter()
-                        .map(|c| match c {
-                            UserOrToolContent::Text(text) => {
-                                json!({ "text": sanitize_surrogates(&text.text) })
+                        .map(|c| match crate::types::user_block_payload(c) {
+                            crate::types::UserBlockPayload::Text(text) => {
+                                json!({ "text": sanitize_surrogates(text) })
                             }
-                            UserOrToolContent::Image(image) => {
-                                json!({ "image": create_image_block(&image.mime_type, &image.data) })
+                            crate::types::UserBlockPayload::Image { data, mime_type } => {
+                                json!({ "image": create_image_block(mime_type, data) })
+                            }
+                            crate::types::UserBlockPayload::Opaque(json) => {
+                                json!({ "text": sanitize_surrogates(&json) })
                             }
                         })
                         .collect(),
@@ -271,12 +274,15 @@ pub fn convert_messages(
                     tool_results.push(json!({
                         "toolResult": {
                             "toolUseId": current.tool_call_id,
-                            "content": current.content.iter().map(|c| match c {
-                                UserOrToolContent::Text(text) => {
-                                    json!({ "text": sanitize_surrogates(&text.text) })
+                            "content": current.content.iter().map(|c| match crate::types::user_block_payload(c) {
+                                crate::types::UserBlockPayload::Text(text) => {
+                                    json!({ "text": sanitize_surrogates(text) })
                                 }
-                                UserOrToolContent::Image(image) => {
-                                    json!({ "image": create_image_block(&image.mime_type, &image.data) })
+                                crate::types::UserBlockPayload::Image { data, mime_type } => {
+                                    json!({ "image": create_image_block(mime_type, data) })
+                                }
+                                crate::types::UserBlockPayload::Opaque(json) => {
+                                    json!({ "text": sanitize_surrogates(&json) })
                                 }
                             }).collect::<Vec<Value>>(),
                             "status": if current.is_error { "error" } else { "success" },
