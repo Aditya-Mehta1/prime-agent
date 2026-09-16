@@ -7,6 +7,7 @@
 //! pa-agent Agent owns the loop and its steer/follow-up queues; this layer
 //! decides admission and persists what the loop produces.
 
+pub mod branch_summarization;
 pub mod compaction;
 pub mod compaction_exec;
 pub mod compaction_utils;
