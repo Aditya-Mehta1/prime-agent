@@ -1178,6 +1178,7 @@ dependencies = [
  "fancy-regex",
  "futures",
  "globset",
+ "hmac",
  "libc",
  "nix",
  "pa-agent",

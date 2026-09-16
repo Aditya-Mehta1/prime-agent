@@ -186,6 +186,17 @@ pub fn build_prime_inference_models(
     entries: &[PrimeInferenceCatalogEntry],
     include_private: bool,
 ) -> Option<Vec<Model>> {
+    build_prime_inference_models_with_minimum(bundled_models, entries, include_private, None)
+}
+
+/// Like [`build_prime_inference_models`] with an explicit coverage floor
+/// (`None` keeps the 50% default; `Some(0)` disables the check).
+pub fn build_prime_inference_models_with_minimum(
+    bundled_models: &[Model],
+    entries: &[PrimeInferenceCatalogEntry],
+    include_private: bool,
+    minimum_models: Option<usize>,
+) -> Option<Vec<Model>> {
     let bundled: HashMap<String, &Model> = bundled_models
         .iter()
         .map(|model| (model.id.to_lowercase(), model))
@@ -266,7 +277,8 @@ pub fn build_prime_inference_models(
             compat: Some(compat),
         });
     }
-    let minimum = ((bundled.len() as f64) * MIN_CATALOG_COVERAGE).ceil() as usize;
+    let minimum = minimum_models
+        .unwrap_or_else(|| ((bundled.len() as f64) * MIN_CATALOG_COVERAGE).ceil() as usize);
     let covered = models
         .iter()
         .filter(|model| bundled.contains_key(&model.id.to_lowercase()))
@@ -311,9 +323,11 @@ pub fn read_cached_prime_inference_models(
 /// Fetch the live catalog (5s timeout, 2 MiB cap).
 pub async fn fetch_prime_inference_model_catalog(
     headers: Option<&HashMap<String, String>>,
+    timeout_ms: u64,
+    allow_empty: bool,
 ) -> Result<(serde_json::Value, Vec<PrimeInferenceCatalogEntry>), String> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(FETCH_TIMEOUT_MS))
+        .timeout(std::time::Duration::from_millis(timeout_ms))
         .build()
         .map_err(|error| error.to_string())?;
     let mut request = client
@@ -337,7 +351,7 @@ pub async fn fetch_prime_inference_model_catalog(
     }
     let payload: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-    let entries = parse_prime_inference_model_catalog(&payload, false)?;
+    let entries = parse_prime_inference_model_catalog(&payload, allow_empty)?;
     Ok((payload, entries))
 }
 
@@ -351,7 +365,7 @@ pub async fn refresh_prime_inference_models(
     if offline {
         return cached;
     }
-    match fetch_prime_inference_model_catalog(None).await {
+    match fetch_prime_inference_model_catalog(None, FETCH_TIMEOUT_MS, false).await {
         Ok((payload, entries)) => match build_prime_inference_models(bundled, &entries, false) {
             Some(models) => {
                 let _ =

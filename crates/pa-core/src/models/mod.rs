@@ -1,8 +1,16 @@
 //! Model subsystem: resolver and Prime Inference private models.
 
+pub use private_auth::{
+    get_private_prime_inference_models, private_prime_authorization_fingerprint,
+    PrivatePrimeAuthorizationCache, PRIVATE_PRIME_AUTHORIZATION_CACHE_TTL_MS,
+};
+pub use registry::{ModelRegistry, ProviderRequestConfig, ResolvedRequestAuth};
+
 pub(crate) mod custom;
 pub(crate) mod prime_inference;
 pub(crate) mod prime_inference_catalog;
+pub(crate) mod private_auth;
+pub(crate) mod registry;
 pub(crate) mod resolver;
 
 pub use custom::{
