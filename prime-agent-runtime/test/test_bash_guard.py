@@ -1,0 +1,766 @@
+from __future__ import annotations
+
+import asyncio
+import io
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from contextlib import redirect_stderr
+from pathlib import Path
+from unittest import mock
+
+from rlm import bash
+from rlm.bash import BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV, DestructiveChmodRefusalError
+
+# The package re-exports the bash() function under the same name, so reach the
+# module through sys.modules for internals.
+bash_module = sys.modules["rlm.bash"]
+
+# Every spawned command and probe in this suite carries an explicit timeout.
+AWAIT_TIMEOUT = 10.0
+SUBPROCESS_TIMEOUT = 60
+
+
+def _prepare(command: str) -> str:
+    """The guard's own normalization pipeline, for detection-vector tests."""
+    resolved = bash_module._mask_shell_redirections(
+        bash_module._normalize_line_continuations(command)
+    )
+    normalized, _index_map = bash_module._strip_shell_escapes(resolved)
+    return normalized
+
+
+def _invocations(command: str) -> list[tuple[int, int, int]]:
+    return bash_module._find_recursive_chmod_chown_invocations(_prepare(command))
+
+
+# Vectors for the recursive chmod/chown detector: an invocation must carry a
+# recursive flag (-R bundled anywhere, or --recursive); a chmod without -R and
+# a chown without -R never match. Quoted command words and quoted flags fold
+# into their values, so they must match like the unquoted forms.
+CHMOD_MATCHING_COMMANDS = [
+    "chmod -R 755 sub",
+    "chmod --recursive 755 sub",
+    "chmod -vR 755 sub",
+    "chmod -R 755 sub --reference=/tmp/mode",
+    "chmod sub -R 755",
+    "chmod 755 -R sub",
+    "chown -R user sub",
+    "chown --recursive user:group sub",
+    "chown sub -R user",
+    "chmod -R 755",
+    "chmod -R 755 sub && chown -R user sub",
+    "chmod -R 755 sub; echo done",
+    "/bin/chmod -R 755 sub",
+    '"chmod" -R 755 sub',
+    "chmod '-R' 755 sub",
+    '"chown" "-R" user sub',
+    "\\chmod -R 755 sub",
+    "sudo chmod -R 755 sub",
+    "FOO=1 chmod -R 755 sub",
+    "chmod -R \\\n755 sub",
+    "chmod 2>/dev/null -R 755 sub",
+    "chmod -R 755 sub 2>/dev/null",
+    "chmod -R 755 &>/dev/null sub",
+    "chmod -R 755 -- sub",
+    "(chmod -R 755 sub)",
+    "{ chmod -R 755 sub; }",
+    "echo $(chmod -R 755 sub)",
+    "chmod -R 755 sub # cleanup",
+    "xargs chmod -R 755",
+]
+
+CHMOD_NON_MATCHING_COMMANDS = [
+    "chmod 755 sub",
+    "chmod -v 755 sub",
+    "chmod --changes 755 sub",
+    "chmod -r 755 sub",
+    "chmod +x sub",
+    "chmod 755 .git",
+    "chown user sub",
+    "chown -h user sub",
+    "chown user:group sub",
+    "chmod -- 755 sub",
+    "echo 'chmod -R 755 ~'",
+    'echo "chmod -R 755 ~"',
+    "# chmod -R 755 sub",
+    "echo one \\\n two",
+    "git status",
+    "echo hello world",
+    "npm run check",
+]
+
+
+class RecursiveChmodDetectionTest(unittest.TestCase):
+    def test_matches_recursive_chmod_chown(self):
+        for command in CHMOD_MATCHING_COMMANDS:
+            with self.subTest(command=command):
+                self.assertTrue(_invocations(command))
+
+    def test_does_not_match_other_commands(self):
+        for command in CHMOD_NON_MATCHING_COMMANDS:
+            with self.subTest(command=command):
+                self.assertFalse(_invocations(command))
+
+    def test_counts_each_invocation_in_compound_commands(self):
+        self.assertEqual(len(_invocations("chmod -R 755 sub && chown -R u sub")), 2)
+
+
+class ChmodEvalPayloadDetectionTest(unittest.TestCase):
+    def test_eval_payloads_hiding_recursive_chmod_chown(self):
+        for command in [
+            "eval 'chmod -R 755 ~'",
+            'eval "chown -R user ~"',
+            "eval 'cd sub && chmod -R 755 .'",
+            'eval "chmod -R 755 ~"',
+            "eval 'eval \"chmod -R 755 ~\"'",
+            '"eval" "chmod -R 755 ~"',
+            "eval $(echo 'chmod -R 755 ~')",
+            "eval 'chmod -R \\\n755 ~'",
+        ]:
+            with self.subTest(command=command):
+                self.assertTrue(
+                    bash_module._eval_payloads_hide_recursive_chmod(command)
+                )
+
+    def test_safe_eval_payloads_stay_unflagged(self):
+        for command in [
+            "eval",
+            "eval 'echo hi'",
+            "eval 'chmod 755 sub'",
+            'eval "echo \'chmod -R 755 ~\'"',
+            "eval 'echo \"chmod -R 755 ~\"'",
+            "echo 'eval chmod -R 755 ~'",
+            "npm run eval:suite",
+        ]:
+            with self.subTest(command=command):
+                self.assertFalse(
+                    bash_module._eval_payloads_hide_recursive_chmod(command)
+                )
+
+
+class ShellCPayloadDetectionTest(unittest.TestCase):
+    def test_shell_c_payloads_hiding_recursive_chmod_chown(self):
+        for command in [
+            "sh -c 'chmod -R 755 ~'",
+            'bash -c "chown -R user ~"',
+            "bash -lc 'chmod -R 755 ~'",
+            "bash -xc 'chmod -R 755 ~'",
+            "zsh -c 'chmod -R 755 ~'",
+            "sh -e -c 'chmod -R 755 ~'",
+            "sh -c $(echo 'chmod -R 755 ~')",
+            "FOO=1 sh -c 'chmod -R 755 ~'",
+        ]:
+            with self.subTest(command=command):
+                self.assertTrue(
+                    bash_module._shell_c_payloads_hide_recursive_chmod(command)
+                )
+
+    def test_safe_shell_c_payloads_stay_unflagged(self):
+        for command in [
+            "sh -c 'echo hi'",
+            "sh -c 'echo \"chmod -R 755 ~\"'",
+            'bash -c "echo \'chmod -R 755 ~\'"',
+            "bash -lc 'chmod 755 sub'",
+            "sh --rcfile x -c 'echo hi'",
+            "echo 'bash -c chmod -R 755 ~'",
+        ]:
+            with self.subTest(command=command):
+                self.assertFalse(
+                    bash_module._shell_c_payloads_hide_recursive_chmod(command)
+                )
+
+
+class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._prev_cwd = os.getcwd()
+        self._prev_env = dict(os.environ)
+        os.environ.pop(BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV, None)
+        os.environ.pop("PRIME_AGENT_BASH_COMMAND_PREFIX", None)
+        # The launch-time bypass snapshot is a module attribute frozen at
+        # import; pin it to "unset" so tests stay deterministic.
+        frozen_patch = mock.patch.object(
+            bash_module, "_DESTRUCTIVE_CHMOD_BYPASS_AT_KERNEL_START", False
+        )
+        frozen_patch.start()
+        self.addCleanup(frozen_patch.stop)
+        late_warn_patch = mock.patch.object(
+            bash_module, "_destructive_chmod_late_bypass_warned", False
+        )
+        late_warn_patch.start()
+        self.addCleanup(late_warn_patch.stop)
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        # Restore cwd before the temp dir disappears (cleanups run LIFO).
+        self.addCleanup(self._restore_env)
+        self.addCleanup(os.chdir, self._prev_cwd)
+        self.test_dir = temp.name
+        os.chdir(self.test_dir)
+
+    def _restore_env(self):
+        os.environ.clear()
+        os.environ.update(self._prev_env)
+
+    def _make_tree(self) -> None:
+        Path(self.test_dir, "sub", "nested").mkdir(parents=True, exist_ok=True)
+        Path(self.test_dir, "sub", "nested", "file.txt").write_text("x\n")
+        Path(self.test_dir, "my dir").mkdir(exist_ok=True)
+        Path(self.test_dir, "my dir", "file.txt").write_text("x\n")
+        Path(self.test_dir, "file.txt").write_text("x\n")
+
+    def _outside_target(self) -> Path:
+        """A sibling directory outside the workspace with a file in it."""
+        outside = Path(self.test_dir).parent / (
+            "outside-sibling-" + os.path.basename(self.test_dir)
+        )
+        outside.mkdir(exist_ok=True)
+        (outside / "file.txt").write_text("keep\n")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        return outside
+
+    def _tracked(self, *parts: str) -> Path:
+        return Path(self.test_dir, *parts)
+
+    async def _run(self, command: str, **kwargs):
+        return await asyncio.wait_for(bash(command, **kwargs), AWAIT_TIMEOUT)
+
+    async def _refused(self, command: str, home: str | None = None):
+        with mock.patch.dict(os.environ, {"HOME": home} if home else {}):
+            with self.assertRaises(DestructiveChmodRefusalError) as caught:
+                bash(command)
+        return str(caught.exception)
+
+    async def test_refuses_escapes_to_home_root_and_outside_trees(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        for command in [
+            "chmod -R 755 ~",
+            "chmod -R 755 ~/",
+            "chmod -R 755 ~/anything",
+            "chmod -R 755 $HOME",
+            "chmod -R 755 $HOME/anything",
+            "chmod -R 755 ${HOME}/anything",
+            "chown -R user ~",
+            "chown -R user $HOME",
+            "chmod -R 755 /",
+            "chmod -R 755 //",
+            "chown -R user /",
+            "chmod -R 755 /tmp/pa-chmod-guard-elsewhere",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command, home=home.name)
+                self.assertIn("Refusing to run this recursive chmod/chown command", message)
+                self.assertTrue(Path(home.name, "keep.txt").exists())
+
+    async def test_refuses_parent_directory_escapes(self):
+        self._make_tree()
+        outside = self._outside_target()
+        for command in [
+            "chmod -R 755 ..",
+            "chmod -R 755 ./..",
+            f"chmod -R 755 ../{outside.name}",
+            "chown -R user ..",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("Refusing to run this recursive chmod/chown command", message)
+                self.assertTrue((outside / "file.txt").exists())
+                self.assertTrue(self._tracked("sub", "nested", "file.txt").exists())
+
+    async def test_refuses_dot_dirs_and_dotfiles(self):
+        self._make_tree()
+        Path(self.test_dir, ".git", "objects").mkdir(parents=True, exist_ok=True)
+        Path(self.test_dir, ".env").write_text("SECRET=1\n")
+        Path(self.test_dir, "sub", ".env.local").write_text("SECRET=1\n")
+        Path(self.test_dir, ".venv", "bin").mkdir(parents=True, exist_ok=True)
+        for command in [
+            "chmod -R 755 .git",
+            "chmod -R 755 sub/.git",
+            "chmod -R 755 .env",
+            "chmod -R 755 .env.local",
+            "chmod -R 755 sub/.env.local",
+            "chmod -R 755 .venv",
+            "chown -R user .git",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("Refusing to run this recursive chmod/chown command", message)
+                self.assertIn("dot", message.lower())
+                self.assertEqual(self._tracked(".env").read_text(), "SECRET=1\n")
+
+    async def test_refuses_operands_it_cannot_resolve(self):
+        self._make_tree()
+        for command in [
+            "chmod -R 755 *",
+            "chmod -R 755 build/*",
+            "chmod -R 755 $SECRET",
+            "chmod -R 755 $(pwd)",
+            "chmod -R 755 `pwd`",
+            "chmod -R 755 ~otheruser",
+            "chmod -R 755 {}",
+            "chown -R $(id -u) sub",
+            "echo hi | xargs chmod -R 755",
+            "find . -name x -exec chmod -R 755 {} +",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("Refusing to run this recursive chmod/chown command", message)
+                self.assertTrue(self._tracked("sub", "nested", "file.txt").exists())
+
+    async def test_refuses_quoted_command_and_flag_forms(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        for command in [
+            '"chmod" -R 755 ~',
+            "chmod '-R' 755 ~",
+            '"chmod" "-R" "755" ~',
+            '"chown" -R user ~',
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command, home=home.name)
+                self.assertIn("Refusing to run this recursive chmod/chown command", message)
+                self.assertTrue(Path(home.name, "keep.txt").exists())
+
+    async def test_symlink_escape_refused(self):
+        victim = tempfile.TemporaryDirectory()
+        self.addCleanup(victim.cleanup)
+        Path(victim.name, "keep").mkdir()
+        os.symlink(victim.name, str(self._tracked("link")))
+        message = await self._refused("chmod -R 755 link")
+        self.assertIn("Refusing to run this recursive chmod/chown command", message)
+        self.assertTrue(Path(victim.name, "keep").exists())
+
+    async def test_allows_inside_workspace_recursion(self):
+        for command in [
+            "chmod -R 755 sub",
+            "chmod -R 755 ./sub",
+            "chmod -R 755 sub/nested",
+            'chmod -R 755 "my dir"',
+            "chmod -R 755 $PWD/sub",
+            "chmod -R 755 .",
+            "chmod -R 755 ./",
+            "chmod -R 755 sub/..",
+            "chmod -R u+x sub",
+            f"chown -R {os.getuid()} sub",
+            f"chown -R {os.getuid()}:{os.getgid()} sub",
+            'chmod -R 755 sub ./"my dir"',
+        ]:
+            with self.subTest(command=command):
+                self._make_tree()
+                result = await self._run(command)
+                self.assertEqual(result.exit_code, 0)
+
+    async def test_reference_values_are_not_checked_as_operands(self):
+        self._make_tree()
+        # --reference only reads a mode, so its value may name any path; the
+        # mode conflict makes chmod itself fail, but the guard must not.
+        result = await self._run("chmod -R --reference=/etc/hosts 755 sub")
+        self.assertNotEqual(result.exit_code, 0)
+
+    async def test_non_recursive_chmod_chown_untouched(self):
+        self._make_tree()
+        Path(self.test_dir, ".git").mkdir()
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        # No -R anywhere: the guard must not match, even for escapes.
+        with mock.patch.dict(os.environ, {"HOME": home.name}):
+            for command in ["chmod 755 ~", "chown %d ~" % os.getuid()]:
+                with self.subTest(command=command):
+                    result = await self._run(command)
+                    self.assertEqual(result.exit_code, 0)
+        result = await self._run("chmod 755 .git")
+        self.assertEqual(result.exit_code, 0)
+        result = await self._run("chmod +x sub")
+        self.assertEqual(result.exit_code, 0)
+        result = await self._run("chown %d sub" % os.getuid())
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_kwarg_bypass_runs_the_change(self):
+        outside = self._outside_target()
+        result = await self._run(
+            f"chmod -R 755 ../{outside.name}", allow_destructive_chmod=True
+        )
+        self.assertEqual(result.exit_code, 0)
+        self.assertTrue((outside / "file.txt").exists())
+
+    async def test_frozen_bypass_env_honored_when_set_at_launch(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "pa-chmodguard-noop").mkdir()
+        with (
+            mock.patch.dict(os.environ, {"HOME": home.name}),
+            mock.patch.object(
+                bash_module, "_DESTRUCTIVE_CHMOD_BYPASS_AT_KERNEL_START", True
+            ),
+        ):
+            result = await self._run("chmod -R 755 ~/pa-chmodguard-noop")
+            self.assertEqual(result.exit_code, 0)
+
+    async def test_frozen_bypass_zero_still_refuses(self):
+        with mock.patch.object(
+            bash_module, "_DESTRUCTIVE_CHMOD_BYPASS_AT_KERNEL_START", False
+        ):
+            message = await self._refused("chmod -R 755 ~")
+        self.assertIn("Refusing to run this recursive chmod/chown command", message)
+
+    async def test_mid_session_env_write_does_not_unlock(self):
+        stderr = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV: "1"}),
+            redirect_stderr(stderr),
+        ):
+            message = await self._refused("chmod -R 755 ~")
+        self.assertIn("Refusing to run this recursive chmod/chown command", message)
+        warning = stderr.getvalue()
+        self.assertIn(BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV, warning)
+        self.assertIn("appeared after kernel start", warning)
+        # The warning fires once, and a falsy mid-session value stays inert.
+        second = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV: "0"}),
+            redirect_stderr(second),
+        ):
+            await self._refused("chmod -R 755 /")
+        self.assertEqual(second.getvalue(), "")
+
+    async def test_refuses_eval_wrapped_recursion(self):
+        self._make_tree()
+        for command in [
+            "eval 'chmod -R 755 ~'",
+            'eval "chown -R user ~"',
+            "eval 'eval \"chmod -R 755 ~\"'",
+            '"eval" "chmod -R 755 ~"',
+            "eval 'cd sub && chmod -R 755 .'",
+            "eval $(echo 'chmod -R 755 ~')",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("wraps a recursive chmod/chown in eval", message)
+                self.assertTrue(self._tracked("sub", "nested", "file.txt").exists())
+
+    async def test_eval_refusal_honors_the_bypass_kwarg(self):
+        self._make_tree()
+        result = await self._run(
+            "eval 'chmod -R 755 sub'", allow_destructive_chmod=True
+        )
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_safe_eval_commands_still_run(self):
+        result = await self._run("eval 'echo hi'")
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("hi", result.output)
+        # Unquoting one level at a time must not mistake still-quoted data
+        # for a payload command: this eval only prints the string.
+        result = await self._run("eval \"echo 'chmod -R 755 ~'\"")
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("chmod -R 755 ~", result.output)
+
+    async def test_refuses_shell_c_wrapped_recursion(self):
+        self._make_tree()
+        for command in [
+            "sh -c 'chmod -R 755 ~'",
+            "bash -c 'chown -R user ~'",
+            "bash -lc 'chmod -R 755 ~'",
+            "sh -c $(echo 'chmod -R 755 ~')",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("inside a quoted `sh -c` payload", message)
+                self.assertTrue(self._tracked("sub", "nested", "file.txt").exists())
+
+    async def test_safe_shell_c_commands_still_run(self):
+        result = await self._run("sh -c 'echo hi'")
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("hi", result.output)
+        result = await self._run("sh -c 'echo \"chmod -R 755 ~\"'")
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("chmod -R 755 ~", result.output)
+
+    async def test_quoted_data_is_untouched(self):
+        for command in [
+            "echo 'chmod -R 755 ~'",
+            'echo "chown -R user ~"',
+        ]:
+            with self.subTest(command=command):
+                result = await self._run(command)
+                self.assertEqual(result.exit_code, 0)
+
+    async def test_refuses_xargs_fed_recursion(self):
+        self._make_tree()
+        for command in [
+            "echo hi | xargs chmod -R 755",
+            "find . | xargs chmod -R 755",
+            "xargs chmod -R 755 < list.txt",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("changes directory (or wraps the command in xargs)", message)
+                self.assertTrue(self._tracked("sub", "nested", "file.txt").exists())
+
+    async def test_cd_relocations_are_replayed(self):
+        self._make_tree()
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        # Resolvable in-workspace relocations run.
+        for command in [
+            "cd sub && chmod -R 755 .",
+            "cd sub && chmod -R 755 nested",
+            "cd sub && chmod -R 755 ..",
+            '(cd sub) && chmod -R 755 .',
+            "{ cd sub && chmod -R 755 .; }",
+            'cd "my dir" && chmod -R 755 .',
+            "cd 'sub' && chmod -R 755 ..",
+        ]:
+            with self.subTest(command=command):
+                result = await self._run(command)
+                self.assertEqual(result.exit_code, 0)
+        # Relocations out of the workspace are refused.
+        for command in [
+            "cd ~ && chmod -R 755 .",
+            "cd $HOME && chmod -R 755 .",
+            "cd / && chmod -R 755 x",
+            "cd .. && chmod -R 755 .",
+            'cd ".." && chmod -R 755 .',
+            'cd "sub" && chmod -R 755 ../..',
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command, home=home.name)
+                self.assertIn("Refusing to run this recursive chmod/chown command", message)
+                self.assertTrue(Path(home.name, "keep.txt").exists())
+        # Relocations the resolver cannot replay safely are refused.
+        for command in [
+            "cd sub; chmod -R 755 .",
+            "cd sub || chmod -R 755 .",
+            "pushd sub && chmod -R 755 .",
+            "cd $(pwd) && chmod -R 755 .",
+            "cd ~otheruser && chmod -R 755 .",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("changes directory", message)
+
+    async def test_relocated_recursion_must_stay_inside_the_workspace(self):
+        self._make_tree()
+        outside = self._outside_target()
+        message = await self._refused(f"cd sub && chmod -R 755 ../../{outside.name}")
+        self.assertIn("Refusing to run this recursive chmod/chown command", message)
+        self.assertTrue((outside / "file.txt").exists())
+
+    async def test_kernel_cwd_is_home_scenario(self):
+        # A kernel can boot with cwd == HOME; HOME itself must stay refused
+        # while in-workspace recursion runs.
+        with mock.patch.dict(os.environ, {"HOME": self.test_dir}):
+            self._make_tree()
+            for command in ["chmod -R 755 ~", "chmod -R 755 $HOME", "chmod -R 755 ."]:
+                with self.subTest(command=command):
+                    message = await self._refused(command)
+                    self.assertIn(
+                        "Refusing to run this recursive chmod/chown command", message
+                    )
+            self.assertTrue(self._tracked("sub", "nested", "file.txt").exists())
+            result = await self._run("chmod -R 755 sub")
+            self.assertEqual(result.exit_code, 0)
+
+    async def test_hardened_forms_are_refused(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        for command in [
+            "chmod 2>/dev/null -R 755 ~",
+            "chmod -R \\\n755 ~",
+            "chmod -R 755 &>/dev/null ~",
+            "\\chmod -R 755 ~",
+            "/bin/chmod -R 755 ~",
+            "sudo chmod -R 755 ~",
+            '"chmod" -R 755 ~',
+            "FOO=1 chmod -R 755 ~",
+            "chmod -R 755 ~ # cleanup",
+            "chmod -R 755 -- ~",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command, home=home.name)
+                self.assertIn("Refusing to run this recursive chmod/chown command", message)
+                self.assertTrue(Path(home.name, "keep.txt").exists())
+
+    async def test_refuses_compound_when_any_invocation_escapes(self):
+        self._make_tree()
+        message = await self._refused("chmod -R 755 sub && chmod -R 755 ..")
+        self.assertIn("Refusing to run this recursive chmod/chown command", message)
+        self.assertTrue(self._tracked("sub", "nested", "file.txt").exists())
+        # Every invocation inside the workspace stays allowed.
+        self._make_tree()
+        result = await self._run('chmod -R 755 sub && chmod -R 755 "my dir"')
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_refusal_lists_both_bypasses(self):
+        message = await self._refused("chmod -R 755 ~")
+        self.assertIn("allow_destructive_chmod=True", message)
+        self.assertIn(BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV, message)
+
+    async def test_guard_only_resolves_on_pattern_match(self):
+        self._make_tree()
+        resolver = mock.Mock(return_value=None)
+        with mock.patch.object(bash_module, "_resolve_chmod_effective_cwd", resolver):
+            result = await self._run("echo hi")
+            self.assertEqual(result.exit_code, 0)
+            result = await self._run("chmod 755 sub")
+            self.assertEqual(result.exit_code, 0)
+            resolver.assert_not_called()
+            await self._refused("chmod -R 755 ~")
+        resolver.assert_called_once()
+
+    async def test_command_prefix_chmod_is_guarded(self):
+        self._make_tree()
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        with mock.patch.dict(
+            os.environ,
+            {"PRIME_AGENT_BASH_COMMAND_PREFIX": "chmod -R 755 /"},
+        ):
+            message = await self._refused("echo hi")
+        self.assertIn("Refusing to run this recursive chmod/chown command", message)
+
+    async def test_command_prefix_relocation_is_refused(self):
+        self._make_tree()
+        with mock.patch.dict(
+            os.environ,
+            {"PRIME_AGENT_BASH_COMMAND_PREFIX": "cd /tmp"},
+        ):
+            message = await self._refused("chmod -R 755 sub")
+        self.assertIn("changes directory", message)
+
+    async def test_command_prefix_with_escapes_does_not_skip_user_cds(self):
+        # A prefix containing shell escapes must not shift the prefix
+        # boundary: the user cd out of the workspace must still be resolved
+        # (and refused), not silently treated as prefix text.
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        with mock.patch.dict(
+            os.environ,
+            {"PRIME_AGENT_BASH_COMMAND_PREFIX": "export X=a\\ b"},
+        ):
+            message = await self._refused("cd ~ && chmod -R 755 .", home=home.name)
+        self.assertIn("Refusing to run this recursive chmod/chown command", message)
+
+    async def test_benign_command_prefix_still_allows_recursion(self):
+        self._make_tree()
+        with mock.patch.dict(
+            os.environ,
+            {"PRIME_AGENT_BASH_COMMAND_PREFIX": "export GUARD_TEST_VAR=1"},
+        ):
+            result = await self._run("chmod -R 755 sub")
+            self.assertEqual(result.exit_code, 0)
+
+
+class FrozenBypassEnvLaunchTest(unittest.TestCase):
+    """Launch-level behavior of the frozen bypass env var, in fresh kernels."""
+
+    def _workspace_with_outside_sibling(self) -> tuple[str, str]:
+        workspace = tempfile.mkdtemp(prefix="chmod-guard-launch-")
+        self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
+        outside = str(Path(workspace).parent / (Path(workspace).name + "-outside"))
+        Path(outside).mkdir(exist_ok=True)
+        (Path(outside) / "file.txt").write_text("keep\n")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        return workspace, outside
+
+    def _launch(
+        self, cwd: str, extra_env: dict[str, str], script: str | None = None
+    ) -> subprocess.CompletedProcess:
+        # The escape command names the owned sibling dir, so a bypassed run
+        # succeeds and an armed guard refuses before touching it.
+        command = f"chmod -R 755 ../{Path(cwd).name}-outside"
+        probe = script or (
+            "import asyncio\n"
+            "import sys\n"
+            "from rlm import bash\n"
+            "async def main():\n"
+            "    result = await bash(sys.argv[1])\n"
+            "    return result.exit_code\n"
+            "raise SystemExit(asyncio.run(main()))\n"
+        )
+        return subprocess.run(
+            [sys.executable, "-c", probe, command],
+            cwd=cwd,
+            env={**os.environ, **extra_env},
+            capture_output=True,
+            text=True,
+            timeout=SUBPROCESS_TIMEOUT,
+        )
+
+    def test_launch_value_disables_the_guard_for_that_kernel(self):
+        workspace, outside = self._workspace_with_outside_sibling()
+        completed = self._launch(workspace, {BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV: "1"})
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_falsy_launch_value_keeps_the_guard_armed(self):
+        workspace, outside = self._workspace_with_outside_sibling()
+        completed = self._launch(workspace, {BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV: "0"})
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("Refusing to run", completed.stderr)
+        self.assertTrue((Path(outside) / "file.txt").exists())
+
+    def test_absent_launch_value_keeps_the_guard_armed(self):
+        workspace, outside = self._workspace_with_outside_sibling()
+        env = dict(os.environ)
+        env.pop(BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV, None)
+        command = f"chmod -R 755 ../{Path(workspace).name}-outside"
+        probe = (
+            "import asyncio\n"
+            "import sys\n"
+            "from rlm import bash\n"
+            "async def main():\n"
+            "    result = await bash(sys.argv[1])\n"
+            "    return result.exit_code\n"
+            "raise SystemExit(asyncio.run(main()))\n"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", probe, command],
+            cwd=workspace,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=SUBPROCESS_TIMEOUT,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("Refusing to run", completed.stderr)
+
+    def test_mid_session_os_environ_write_does_not_unlock_a_fresh_kernel(self):
+        workspace, outside = self._workspace_with_outside_sibling()
+        probe = (
+            "import asyncio\n"
+            "import sys\n"
+            "from rlm import bash\n"  # kernel start: the variable is absent
+            "import os\n"
+            f"os.environ[{BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV!r}] = '1'\n"
+            "async def main():\n"
+            "    result = await bash(sys.argv[1])\n"
+            "    return result.exit_code\n"
+            "raise SystemExit(asyncio.run(main()))\n"
+        )
+        env = dict(os.environ)
+        env.pop(BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV, None)
+        command = f"chmod -R 755 ../{Path(workspace).name}-outside"
+        completed = subprocess.run(
+            [sys.executable, "-c", probe, command],
+            cwd=workspace,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=SUBPROCESS_TIMEOUT,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("Refusing to run", completed.stderr)
+        self.assertIn("appeared after kernel start", completed.stderr)
+        self.assertTrue((Path(outside) / "file.txt").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

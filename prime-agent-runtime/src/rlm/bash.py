@@ -7,6 +7,7 @@ import atexit
 import functools
 import json
 import os
+import re
 import secrets
 import selectors
 import shutil
@@ -937,7 +938,1029 @@ class BashHandle:
         return f"<BashHandle pid={self._pid} {state} command={self.command!r}>"
 
 
-def bash(command: str) -> BashHandle:
+
+
+# Recursive chmod/chown workspace-escape guard (wave-1 safety audit gap 4).
+# The kernel cwd can be HOME or any directory outside a project checkout, so
+# a recursive chmod/chown issued from the kernel can silently take out the
+# home directory or the filesystem root. Detection is string-only best-effort
+# shell-text heuristics; on a match every operand the guard can resolve is
+# checked, and operands it cannot resolve statically are refused, never
+# silently allowed.
+
+# Bypass env var for the recursive chmod/chown guard.
+BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV = "PI_BASH_ALLOW_DESTRUCTIVE_CHMOD"
+
+# The bypass env var is honored only when present at kernel start: the model
+# can write os.environ, so a live read on each guard call would let a single
+# os.environ assignment neuter the guard. The frozen copy cannot change after
+# import; a value that appears mid-session only triggers a loud warning and
+# is ignored.
+_DESTRUCTIVE_CHMOD_BYPASS_AT_KERNEL_START = os.environ.get(
+    BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV
+) not in (None, "", "0")
+
+_destructive_chmod_late_bypass_warned = False
+
+
+class DestructiveChmodRefusalError(RuntimeError):
+    """A recursive chmod/chown was refused for escaping the workspace."""
+
+
+# Shell-text normalization for the guard's scans: line continuations and
+# redirections are folded or masked first so the patterns and the operand
+# resolver see the argv the shell will hand to chmod/chown.
+
+
+def _normalize_line_continuations(command: str) -> str:
+    """Collapse unquoted backslash-newline line continuations to spaces.
+
+    The shell runs `chmod -R \
+755 ~` (one backslash before the newline) as a single `chmod -R 755 ~`
+    command, so the chmod/chown scan must see through continuations. The
+    replacement is length-preserving so the scan's
+    character indices stay aligned with the original command. Single-quoted
+    backslash-newlines are literal data and a newline always ends a comment,
+    so those are left untouched (both are still masked or live as before).
+    """
+    chars = list(command)
+    quote: str | None = None
+    comment = False
+    i = 0
+    n = len(chars)
+    while i < n:
+        ch = chars[i]
+        if comment:
+            if ch == "\n":
+                comment = False
+        elif quote is None:
+            if ch in ('"', "'"):
+                quote = ch
+            elif ch == "#" and (i == 0 or re.match(r"[\s;&|(){}]", chars[i - 1])):
+                comment = True
+            elif ch == "\\" and i + 1 < n and chars[i + 1] == "\n":
+                chars[i] = " "
+                chars[i + 1] = " "
+                i += 1
+        elif quote == "'":
+            if ch == "'":
+                quote = None
+        elif ch == '"':
+            quote = None
+        elif ch == "\\" and i + 1 < n:
+            i += 1  # inside double quotes the mask already folds escapes
+        i += 1
+    return "".join(chars)
+
+
+# A shell redirection word: optional fd, the operator, an optional &fd
+# duplication (which has no filename target), and an attached target (empty
+# for the `2> file` split form). Targets containing quotes, substitution, or
+# process-substitution syntax stay live: masking them could hide a command
+# substitution that executes.
+_REDIRECT_OPERATOR = re.compile(r"(?:&>{1,2}|>&|[0-9]*[<>]{1,3}(&[0-9]+)?)")
+_STATIC_REDIRECT_TARGET = re.compile(r"""[^\s;&|<>()$`"']*""")
+
+
+def _mask_shell_redirections(command: str) -> str:
+    """Blank out shell redirection words, keeping character positions.
+
+    The shell consumes redirections (`2>/dev/null`, `> log`, `2>&1`,
+    `</dev/null`, heredoc markers) before chmod sees its argv, so a command
+    like `chmod 2>/dev/null -R 755 ~` must scan as `chmod -R 755 ~`.
+    Only the operator and a fully static attached or next-word target are
+    masked (pure syntax); quoted data, comments, command substitution, and
+    process substitution stay live so the guard keeps seeing what executes.
+    """
+    chars = list(command)
+    quote: str | None = None
+    comment = False
+    i = 0
+    n = len(chars)
+    while i < n:
+        ch = chars[i]
+        if comment:
+            if ch == "\n":
+                comment = False
+            i += 1
+            continue
+        if quote is None:
+            if ch in ('"', "'"):
+                quote = ch
+                i += 1
+                continue
+            if ch == "#" and (i == 0 or re.match(r"[\s;&|(){}]", chars[i - 1])):
+                comment = True
+                i += 1
+                continue
+            if ch == "\\" and i + 1 < n:
+                i += 2  # escaped character stays as-is
+                continue
+            operator = _REDIRECT_OPERATOR.match(command, i)
+            if operator:
+                for j in range(operator.start(), operator.end()):
+                    chars[j] = " "
+                i = operator.end()
+                attached = _STATIC_REDIRECT_TARGET.match(command, i)
+                if attached.end() > i:
+                    target_start, target_end = attached.start(), attached.end()
+                elif operator.group(1):
+                    # A `2>&1` duplication carries its own target; the next
+                    # word belongs to the command, not the redirection.
+                    target_start = target_end = i
+                else:
+                    # `2> /dev/null`: a bare operator takes the next word.
+                    j = i
+                    while j < n and chars[j].isspace():
+                        j += 1
+                    detached = _STATIC_REDIRECT_TARGET.match(command, j)
+                    if detached.end() > j and j > i:
+                        target_start, target_end = detached.start(), detached.end()
+                    else:
+                        target_start = target_end = i
+                for j in range(target_start, target_end):
+                    chars[j] = " "
+                i = target_end
+                continue
+        elif quote == "'":
+            if ch == "'":
+                quote = None
+        elif ch == '"':
+            quote = None
+        elif ch == "\\" and i + 1 < n:
+            i += 1  # escaped character inside double quotes stays
+        elif ch == "$" and chars[i + 1 : i + 2] == "(":
+            # Command substitution inside double quotes still executes; mask
+            # redirections inside it too (its own redirects are syntax).
+            depth = 0
+            j = i + 1
+            while j < n:
+                if chars[j] == "(":
+                    depth += 1
+                elif chars[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            interior = _mask_shell_redirections(command[i + 2 : j])
+            chars[i + 2 : j] = list(interior)
+            i = j
+        elif ch == "`":
+            j = i + 1
+            while j < n and chars[j] != "`":
+                j += 1
+            interior = _mask_shell_redirections(command[i + 1 : j])
+            chars[i + 1 : j] = list(interior)
+            i = j
+        i += 1
+    return "".join(chars)
+
+
+def _strip_shell_escapes(command: str) -> tuple[str, list[int]]:
+    """Remove unquoted backslash escapes, mapping indices back to the input.
+
+    The shell treats an unquoted `\\X` as a literal X, so `ch\\mod -R
+    755 ~` must scan as `chmod -R 755 ~`. Quoted and commented spans
+    keep their backslashes: those are data or syntax handled elsewhere.
+    """
+    chars: list[str] = []
+    index_map: list[int] = []
+    quote: str | None = None
+    comment = False
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if comment:
+            chars.append(ch)
+            index_map.append(i)
+            if ch == "\n":
+                comment = False
+            i += 1
+        elif quote is None:
+            if ch in ('"', "'"):
+                quote = ch
+                chars.append(ch)
+                index_map.append(i)
+            elif ch == "#" and (i == 0 or re.match(r"[\s;&|(){}]", command[i - 1])):
+                comment = True
+                chars.append(ch)
+                index_map.append(i)
+            elif ch == "\\" and i + 1 < n and command[i + 1] != "\n":
+                chars.append(command[i + 1])  # literal X: drop the backslash
+                index_map.append(i + 1)
+                i += 1
+            else:
+                chars.append(ch)
+                index_map.append(i)
+            i += 1
+        else:
+            chars.append(ch)
+            index_map.append(i)
+            if quote == "'":
+                if ch == "'":
+                    quote = None
+            elif ch == '"':
+                quote = None
+            elif ch == "\\" and i + 1 < n:
+                chars.append(command[i + 1])
+                index_map.append(i + 1)
+                i += 1
+            i += 1
+    return "".join(chars), index_map
+
+
+# `eval` re-parses its payload, so a quoted argument that the plain scan
+# must treat as data still executes. Unquote each eval payload one
+# shell quoting layer at a time and rescan; a recursive chmod/chown found in
+# any layer is refused outright because the payload can relocate or chain
+# freely.
+_MAX_EVAL_SCAN_DEPTH = 10
+
+
+def _unquote_one_level(text: str) -> str:
+    """Remove the outermost quoting layer from `text`.
+
+    Inner quotes stay quoted so the next scan layer still treats them as
+    data: `eval "echo 'chmod -R 755 ~'"` must stay harmless after the first
+    unquote, while `eval 'cd sub && chmod -R 755 ~'` must not. Quote
+    characters become spaces so unquoting never joins separate words.
+    """
+    chars = list(text)
+    quote: str | None = None
+    i = 0
+    n = len(chars)
+    while i < n:
+        ch = chars[i]
+        if quote is None:
+            if ch in ('"', "'"):
+                quote = ch
+                chars[i] = " "
+            elif ch == "\\" and i + 1 < n:
+                i += 1  # keep escaped characters as they are
+        elif quote == "'":
+            if ch == "'":
+                quote = None
+                chars[i] = " "
+        elif ch == '"':
+            quote = None
+            chars[i] = " "
+        elif ch == "\\" and i + 1 < n:
+            i += 1  # escaped character inside double quotes stays
+        i += 1
+    return "".join(chars)
+
+
+@dataclass(frozen=True)
+class _ShellWord:
+    """One shell word: its unquoted argv value plus the span it came from."""
+
+    value: str
+    start: int
+    end: int
+    starts_command: bool  # first word of a fresh (sub)command context
+
+
+def _matching_paren(command: str, open_index: int, end: int) -> int:
+    """Index of the `)` matching the `(` at `open_index`, or `end - 1`."""
+    depth = 0
+    i = open_index
+    while i < end:
+        if command[i] == "(":
+            depth += 1
+        elif command[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return end - 1
+
+
+def _scan_shell_words(command: str) -> list[_ShellWord]:
+    """Split `command` into shell words the way the shell builds argv.
+
+    Quotes and backslash escapes fold into the word value, comments are
+    skipped, and command substitution (`$(...)`, backticks) keeps its
+    interior scanned as live commands because it executes; the substituted
+    result itself stays in the enclosing word, so an operand carrying it
+    reads as unresolvable. Redirections are masked by the caller. This is
+    a conservative approximation, not a parse: anything it cannot represent
+    exactly ends up refused, never silently allowed.
+    """
+    words: list[_ShellWord] = []
+
+    def scan_region(start: int, end: int, *, starts_command: bool) -> None:
+        i = start
+        value: list[str] = []
+        word_start = -1
+        word_starts_command = False
+        first_word_pending = starts_command
+
+        def flush(starts_next_command: bool) -> None:
+            nonlocal word_start, first_word_pending
+            if word_start != -1:
+                words.append(_ShellWord("".join(value), word_start, i, word_starts_command))
+                value.clear()
+                word_start = -1
+                first_word_pending = starts_next_command
+            else:
+                first_word_pending = first_word_pending or starts_next_command
+
+        while i < end:
+            ch = command[i]
+            if ch in " \t\r":
+                flush(False)  # whitespace: the next word continues this command
+                i += 1
+                continue
+            if ch in "\n;|&()<>":
+                flush(True)  # command boundary: the next word starts a command
+                i += 1
+                continue
+            if ch == "#" and word_start == -1:
+                while i < end and command[i] != "\n":
+                    i += 1
+                continue
+            if word_start == -1:
+                word_start = i
+                word_starts_command = first_word_pending
+                first_word_pending = False
+            if ch == "\\" and i + 1 < end:
+                value.append(command[i + 1])
+                i += 2
+                continue
+            if ch == "'":
+                j = i + 1
+                while j < end and command[j] != "'":
+                    j += 1
+                value.append(command[i + 1 : j])
+                i = j + 1
+                continue
+            if ch == '"':
+                j = i + 1
+                while j < end:
+                    inner = command[j]
+                    if inner == "\\" and j + 1 < end:
+                        value.append(command[j + 1])
+                        j += 2
+                        continue
+                    if inner == '"':
+                        j += 1
+                        break
+                    if inner == "$" and command[j + 1 : j + 2] == "(":
+                        close = _matching_paren(command, j + 1, end)
+                        scan_region(j + 2, close, starts_command=True)
+                        value.append(command[j + 1 : close + 1])
+                        j = close + 1
+                        continue
+                    if inner == "`":
+                        close = command.find("`", j + 1, end)
+                        if close == -1:
+                            close = end - 1
+                        scan_region(j + 1, close, starts_command=True)
+                        value.append(command[j + 1 : close + 1])
+                        j = close + 1
+                        continue
+                    value.append(inner)
+                    j += 1
+                i = j
+                continue
+            if ch == "$" and command[i + 1 : i + 2] == "(":
+                close = _matching_paren(command, i + 1, end)
+                scan_region(i + 2, close, starts_command=True)
+                value.append(command[i + 1 : close + 1])
+                i = close + 1
+                continue
+            if ch == "`":
+                close = command.find("`", i + 1, end)
+                if close == -1:
+                    close = end - 1
+                scan_region(i + 1, close, starts_command=True)
+                value.append(command[i + 1 : close + 1])
+                i = close + 1
+                continue
+            value.append(ch)
+            i += 1
+        flush(False)
+
+    scan_region(0, len(command), starts_command=True)
+    return words
+
+
+def _is_chmod_chown_word(value: str) -> bool:
+    """True when the word invokes chmod/chown, including slash-qualified
+    forms (`/bin/chmod`, `./chown`) that basename-match the real command."""
+    return os.path.basename(value) in ("chmod", "chown")
+
+
+def _is_recursive_chmod_chown_token_run(tokens: list[str]) -> bool:
+    """True when a token run contains a recursive flag: `-R` (bundled with
+    other short options anywhere) or `--recursive`."""
+    for token in tokens:
+        if token == "--recursive":
+            return True
+        if token.startswith("-") and not token.startswith("--") and "R" in token[1:]:
+            return True
+    return False
+
+
+def _contained_in_later_word(words: list[_ShellWord], index: int) -> bool:
+    """True when words[index] is a command-substitution interior: its span
+    sits inside the enclosing word, which the scanner appends after the
+    interiors it recursed into. Interiors execute inside the substitution,
+    so walkers must look through them, not stop at them."""
+    word = words[index]
+    return any(
+        word.start >= later.start and word.end <= later.end
+        for later in words[index + 1 :]
+    )
+
+
+def _find_recursive_chmod_chown_invocations(
+    command: str, words: list[_ShellWord] | None = None
+) -> list[tuple[int, int, int]]:
+    """Find every recursive chmod/chown invocation, returning each as a
+    (start, end, word_index) span: from the command word to the last word of
+    the invocation (before the next command). Words fold quotes and escapes
+    into their values, so quoted command names (`"chmod" -R 755 ~`) and
+    quoted flags (`chmod '-R' 755 ~`) scan exactly like their unquoted
+    forms."""
+    if words is None:
+        words = _scan_shell_words(command)
+    invocations: list[tuple[int, int, int]] = []
+    for index, word in enumerate(words):
+        if not _is_chmod_chown_word(word.value):
+            continue
+        end = word.end
+        tokens = [word.value]
+        for follower_index in range(index + 1, len(words)):
+            follower = words[follower_index]
+            if follower.starts_command:
+                if _contained_in_later_word(words, follower_index):
+                    continue  # substitution interior: the enclosing word follows
+                break
+            tokens.append(follower.value)
+            end = follower.end
+        if _is_recursive_chmod_chown_token_run(tokens):
+            invocations.append((word.start, end, index))
+    return invocations
+
+
+def _eval_payloads_hide_recursive_chmod(command: str, depth: int = 0) -> bool:
+    """True when a quoted `eval` payload hides a recursive chmod/chown.
+
+    Each eval word's payload (the words up to the next command boundary) is
+    unquoted one shell quoting layer at a time and rescanned, so nested evals
+    and nested quoting levels are handled without ever confusing quoted data
+    with executable text; a recursive chmod/chown found in any layer is
+    refused outright because the payload can relocate or chain freely.
+    Command substitution stays outside this check: its output is unknowable
+    statically, and the substitution itself already runs (and is scanned)
+    before eval sees the result.
+    """
+    if depth > _MAX_EVAL_SCAN_DEPTH:
+        return True  # absurdly nested evals: refuse rather than risk a miss
+    words = _scan_shell_words(command)
+    for index, word in enumerate(words):
+        if word.value != "eval":
+            continue
+        payload_parts: list[str] = []
+        for follower_index in range(index + 1, len(words)):
+            follower = words[follower_index]
+            if follower.starts_command:
+                if _contained_in_later_word(words, follower_index):
+                    continue  # substitution interior: the enclosing word follows
+                break
+            payload_parts.append(command[follower.start : follower.end])
+        payload = _unquote_one_level(" ".join(payload_parts))
+        normalized, _index_map = _strip_shell_escapes(
+            _mask_shell_redirections(_normalize_line_continuations(payload))
+        )
+        if _find_recursive_chmod_chown_invocations(normalized):
+            return True
+        if _eval_payloads_hide_recursive_chmod(payload, depth + 1):
+            return True
+    return False
+
+
+class _UnresolvableChmodCwd:
+    """The directory a recursive chmod/chown would run in cannot be determined."""
+
+
+_UNRESOLVABLE_CHMOD_CWD = _UnresolvableChmodCwd()
+
+
+def _resolve_chmod_cd_target(arg: str, current: str | None, workspace: str) -> str | None:
+    """Resolve one statically-known `cd` argument against the running
+    directory (None = the kernel workspace), logical like the shell's default
+    `cd -L`. Returns None when the target cannot be resolved statically (bare
+    `cd` without a usable HOME, `cd -`/options, or another user's home)."""
+    if not arg:
+        # A bare `cd` goes home; expanduser matches what the child shell sees.
+        try:
+            return os.path.expanduser("~")
+        except (OSError, RuntimeError):
+            return None
+    if arg.startswith("-"):
+        return None  # `cd -`, `cd -L`, `cd -- ...`: not statically resolvable
+    if arg.startswith("~"):
+        if arg == "~" or arg.startswith("~/"):
+            try:
+                return os.path.expanduser(arg)
+            except (OSError, RuntimeError):
+                return None
+        return None  # ~otheruser: another user's home directory
+    return arg if os.path.isabs(arg) else os.path.join(current or workspace, arg)
+
+
+def _statically_resolvable_cd_arg(raw: str) -> str | None:
+    """Unquote one cd argument to its literal path, or None when it cannot
+    be resolved statically. Quotes fold before resolution: `cd ".."`
+    relocates to the parent directory, and resolving the raw text with its
+    quote characters would name a directory that does not exist."""
+    if not raw or re.search(r"[$`;&|()<>#]", raw):
+        return None
+    words, well_formed = _shell_words(raw)
+    if not well_formed or len(words) != 1 or not words[0]:
+        return None  # empty, multi-word, or inexact: refuse to guess
+    return words[0]
+
+
+def _resolve_chmod_effective_cwd(
+    prefix: str, user_command_start: int, workspace: str
+) -> "str | None | _UnresolvableChmodCwd":
+    """Resolve the directory a chmod/chown at the end of `prefix` runs in.
+
+    Statically-known `cd` relocations earlier in the command are replayed:
+    parens groups run in subshells (their cds do not persist, an open
+    group's do), brace groups run in the current shell, and anything that
+    could relocate but cannot be resolved statically (pushd/popd, cd with
+    substitution, an untrackable or unquotable argument, a `;`-separated cd
+    whose success is unknowable) returns _UNRESOLVABLE_CHMOD_CWD so the
+    caller refuses. Returns None when no cd moved the shell: the kernel
+    workspace."""
+    if not (re.search(r"\b(?:cd|pushd|popd)\b", prefix) or "(" in prefix):
+        return None
+    current: str | None = None
+    open_groups: list[str | None] = []
+    paren_depth = 0
+    saw_cd = False
+    cd_pending_separator = False
+    offset = 0
+    for part in re.split(r"(&&|\|\||;|\||\n)", prefix):
+        start = offset
+        offset += len(part)
+        if start < user_command_start:
+            continue  # command-prefix region: user shell setup, not model text
+        if part in ("&&", "||", ";", "|", "\n"):
+            if cd_pending_separator and part in (";", "\n"):
+                # The cd may or may not have succeeded; both outcomes leave
+                # the chmod in a different directory the guard cannot pick.
+                return _UNRESOLVABLE_CHMOD_CWD
+            if part in ("||", "|") and saw_cd:
+                return _UNRESOLVABLE_CHMOD_CWD  # cd success no longer guaranteed
+            cd_pending_separator = False
+            continue
+        trimmed = part.strip()
+        opens = len(re.findall(r"\(", part))
+        closes = len(re.findall(r"\)", part))
+        inside_group = paren_depth > 0 or opens > 0
+        for _ in range(opens):
+            open_groups.append(current)  # a subshell starts from a copy
+        paren_depth = max(0, paren_depth + opens - closes)
+        if inside_group:
+            body = re.sub(r"[)\s]+$", "", re.sub(r"^[(\s]+", "", trimmed))
+            cd_match = re.match(r"cd\s*(.*)$", body)
+            if cd_match:
+                arg = _statically_resolvable_cd_arg(cd_match.group(1).strip())
+                if arg is None:
+                    return _UNRESOLVABLE_CHMOD_CWD
+                resolved = _resolve_chmod_cd_target(arg, current, workspace)
+                if resolved is None:
+                    return _UNRESOLVABLE_CHMOD_CWD
+                current = resolved
+                saw_cd = True
+                cd_pending_separator = True
+            elif re.search(r"\b(?:cd|pushd|popd)\b", trimmed):
+                return _UNRESOLVABLE_CHMOD_CWD  # group content we cannot track
+            # A closed group's cds do not persist: restore the pre-group dir.
+            if paren_depth == 0 and open_groups:
+                current = open_groups.pop()
+            continue
+        # Brace groups run in the current shell, so a `{ cd sub && chmod -R
+        # 755 .; }` relocates like a bare cd chain.
+        group_free = re.sub(r"^\{\s*", "", trimmed)
+        cd_match = re.match(r"cd\s*(.*)$", group_free)
+        if not cd_match:
+            if re.search(r"\b(?:cd|pushd|popd)\b", group_free):
+                # An assignment or wrapper prefix before cd (for example
+                # `FOO=1 cd sub`) relocates in ways the resolver cannot replay.
+                return _UNRESOLVABLE_CHMOD_CWD
+            cd_pending_separator = False
+            continue
+        arg = _statically_resolvable_cd_arg(cd_match.group(1).strip())
+        if arg is None:
+            return _UNRESOLVABLE_CHMOD_CWD
+        resolved = _resolve_chmod_cd_target(arg, current, workspace)
+        if resolved is None:
+            return _UNRESOLVABLE_CHMOD_CWD
+        current = resolved
+        saw_cd = True
+        cd_pending_separator = True
+    return current
+
+
+_CHMOD_GLOB_OR_SUBSTITUTION = re.compile(r"""[$`*?{}\[\]]""")
+
+
+def _resolve_chmod_operand(text: str, base: str, home_env: str | None) -> str | None:
+    """Resolve one operand to the absolute path chmod/chown will act on.
+
+    `base` is the effective directory and `home_env` the HOME the child
+    shell expands, both matching what the command will actually see. Returns
+    the realpath'd target, or None when the operand cannot be resolved
+    statically (a glob, command substitution, an unknown env var, or another
+    user's home): callers must refuse those rather than guess."""
+    s = text
+    if s.startswith("~"):
+        if not (s == "~" or s.startswith("~/")):
+            return None  # ~otheruser: another user's home directory
+        try:
+            s = os.path.expanduser(s)
+        except (OSError, RuntimeError):
+            return None
+        if not s or s.startswith("~"):
+            return None
+    if home_env is not None:
+        s = s.replace("${HOME}", home_env).replace("$HOME", home_env)
+    elif "${HOME}" in s or "$HOME" in s:
+        return None  # HOME unset: the shell expands it to an empty string
+    s = s.replace("${PWD}", base).replace("$PWD", base)
+    if not s or _CHMOD_GLOB_OR_SUBSTITUTION.search(s):
+        return None
+    candidate = s if os.path.isabs(s) else os.path.join(base, s)
+    try:
+        # realpath, not normpath: a symlinked operand or a `..` that follows a
+        # symlink resolves the way the filesystem will, so the escape check
+        # sees the directory chmod actually reaches.
+        return os.path.realpath(candidate)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _chmod_operand_violation(
+    resolved: str | None, workspace: str, home_real: str | None
+) -> str | None:
+    """Why a resolved operand must be refused, or None when it is safe.
+
+    A target must stay inside the kernel workspace and must never name the
+    home directory, the filesystem root, or anything under a dot-directory
+    or dotfile (for example .git). When the workspace itself is / every
+    operand escapes it, so the check refuses everything."""
+    if resolved is None:
+        return "cannot be resolved statically (glob, substitution, or quotes)"
+    if resolved == os.sep:
+        return "names the filesystem root (/)"
+    if home_real is not None and resolved == home_real:
+        return "names the home directory"
+    if resolved != workspace and not resolved.startswith(workspace + os.sep):
+        return "escapes the kernel workspace"
+    if resolved != workspace:
+        components = resolved[len(workspace) + 1 :].split(os.sep)
+        if any(component.startswith(".") for component in components):
+            return "names a dot-directory or dotfile (e.g. .git)"
+    return None
+
+
+def _shell_words(region: str) -> tuple[list[str | None], bool]:
+    """Split one invocation region into shell words, quoting-aware.
+
+    Each word is the literal text the shell would pass (quotes removed,
+    unquoted escapes folded) or None when the word contains something the
+    resolver must refuse to guess at: command substitution, an unterminated
+    quote, or a process substitution. Unquoted separators and comments stop
+    the scan. The second value is False when the region ended mid-quote."""
+    words: list[str | None] = []
+    current: list[str] = []
+    unknown = False
+    well_formed = True
+
+    def flush_word() -> None:
+        nonlocal unknown
+        if current:
+            words.append(None if unknown else "".join(current))
+        current.clear()
+        unknown = False
+
+    i = 0
+    n = len(region)
+    while i < n and well_formed:
+        ch = region[i]
+        if ch.isspace():
+            flush_word()
+            i += 1
+        elif ch == "\\" and i + 1 < n:
+            current.append(region[i + 1])
+            i += 2
+        elif ch == "'":
+            end = region.find("'", i + 1)
+            if end == -1:
+                well_formed = False
+                break
+            current.extend(region[i + 1 : end])
+            i = end + 1
+        elif ch == '"':
+            end = i + 1
+            closed = False
+            while end < n:
+                c = region[end]
+                if c == "\\" and end + 1 < n and region[end + 1] in '"$`\\':
+                    end += 2
+                    continue
+                if c == '"':
+                    closed = True
+                    break
+                end += 1
+            if not closed:
+                well_formed = False
+                break
+            body = re.sub(r'\\(["$`\\])', r"\1", region[i + 1 : end])
+            if re.search(r"[$`]", body):
+                unknown = True  # substitution inside double quotes: unknowable
+            current.extend(body)
+            i = end + 1
+        elif ch == "#" and not current:
+            break  # a comment ends the invocation region
+        elif ch in ";&|\n)":
+            flush_word()
+            break  # end of this invocation
+        elif ch in "(<>":
+            flush_word()
+            words.append(None)
+            break  # process substitution or a stray operator: refuse to guess
+        else:
+            current.append(ch)
+            i += 1
+    flush_word()
+    return words, well_formed
+
+
+def _chmod_operand_words(words: list[str | None], well_formed: bool) -> list[str | None]:
+    """Pick the operand words of one chmod/chown invocation.
+
+    Options are skipped (with the separate values of --reference/--from, whose
+    files are only read, never modified), and after `--` every word is an
+    operand. The first word is the command itself and the first operand is the
+    mode (or chown owner spec); that token flows through the same resolution
+    as the rest, which is harmless for a mode token and required for every
+    file operand after it. A region that ended mid-quote contributes one
+    unresolvable operand so the caller refuses it."""
+    operands: list[str | None] = []
+    after_ddash = False
+    skip_value = False
+    for index, word in enumerate(words):
+        if index == 0:
+            continue
+        if skip_value:
+            skip_value = False
+            continue
+        if not after_ddash and word == "--":
+            after_ddash = True
+            continue
+        if (
+            not after_ddash
+            and word is not None
+            and word.startswith("-")
+            and word != "-"
+        ):
+            if word in ("--reference", "--from"):
+                skip_value = True  # the next word is that option's value
+            continue
+        operands.append(word)
+    if not well_formed:
+        operands.append(None)
+    return operands
+
+
+def _format_chmod_operand_refusal(
+    operand: str | None, resolved: str | None, workspace: str, reason: str
+) -> str:
+    lines = ["Refusing to run this recursive chmod/chown command:"]
+    if operand is None:
+        lines.append(f"  an operand {reason}.")
+    elif resolved is None:
+        lines.append(f'  the operand "{operand}" {reason}.')
+    else:
+        lines.append(f'  the operand "{operand}" {reason} ({resolved}).')
+    lines.extend(
+        [
+            "Recursive chmod/chown must stay inside the kernel workspace"
+            f" ({workspace}) and must never target the home directory,"
+            ' dot-directories (e.g. .git), dotfiles, or the filesystem root.',
+            "",
+            "To run it intentionally, retry with"
+            " bash(command, allow_destructive_chmod=True), or start the"
+            f" kernel with {BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV}=1.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _format_chmod_relocation_refusal() -> str:
+    return "\n".join(
+        [
+            "Refusing to run this recursive chmod/chown command: it changes"
+            " directory (or wraps the command in xargs) first, and the"
+            " directory or targets it would act on cannot be determined"
+            " safely.",
+            "",
+            "Run it as its own command from the target directory, or retry"
+            " with bash(command, allow_destructive_chmod=True), or start the"
+            f" kernel with {BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV}=1.",
+        ]
+    )
+
+
+def _format_chmod_eval_refusal() -> str:
+    return "\n".join(
+        [
+            "Refusing to run this recursive chmod/chown command: it wraps a"
+            " recursive chmod/chown in eval, and the directories it targets"
+            " cannot be resolved safely.",
+            "",
+            "Run it directly, or retry with"
+            " bash(command, allow_destructive_chmod=True), or start the"
+            f" kernel with {BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV}=1.",
+        ]
+    )
+
+
+def _warn_once_about_late_destructive_chmod_bypass() -> None:
+    """Warn (once) when the bypass env var appears mid-session.
+
+    The frozen launch-time copy is the only honored bypass, so a value that
+    shows up later is ignored; one os.environ write cannot unlock the guard.
+    Warn loudly so a deliberate bypass takes the documented path (restart
+    the kernel with the variable set) instead of looking like a no-op."""
+    global _destructive_chmod_late_bypass_warned
+    if _destructive_chmod_late_bypass_warned:
+        return
+    value = os.environ.get(BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV)
+    if value is None or value in ("", "0"):
+        return
+    _destructive_chmod_late_bypass_warned = True
+    print(
+        f"prime-agent bash: {BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV} appeared after"
+        " kernel start and is ignored; the recursive chmod/chown guard only"
+        " honors it when the kernel is started with it set.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+_SHELL_C_INTERPRETERS = ("sh", "bash", "zsh", "dash", "ksh")
+
+
+def _shell_c_payloads_hide_recursive_chmod(command: str) -> bool:
+    """True when a quoted `sh -c`-style payload hides a recursive chmod/chown.
+
+    A quoted `-c` payload executes exactly like an eval payload, but the
+    plain scan cannot see into it (the quoted payload folds into one word),
+    so the payload is unquoted one shell quoting level and rescanned. Short
+    flags may be bundled, so any short-option cluster carrying `c` (a bare
+    `-c`, or `-lc` and friends) hands the shell its payload. Doubly-quoted
+    data stays inert: `sh -c 'echo "chmod -R 755 ~"'` must not trigger, while
+    `sh -c 'chmod -R 755 ~'` must. Unquoted payloads are scanned as plain
+    invocations already and are skipped here."""
+    words = _scan_shell_words(command)
+    for index, word in enumerate(words):
+        if os.path.basename(word.value) not in _SHELL_C_INTERPRETERS:
+            continue
+        c_pending = False
+        for follower_index in range(index + 1, len(words)):
+            follower = words[follower_index]
+            if follower.starts_command:
+                if _contained_in_later_word(words, follower_index):
+                    continue  # substitution interior: the enclosing word follows
+                break
+            token = follower.value
+            if c_pending:
+                payload_source = command[follower.start : follower.end]
+                if payload_source.startswith(("'", '"')):
+                    payload = _unquote_one_level(payload_source)
+                    normalized, _index_map = _strip_shell_escapes(
+                        _mask_shell_redirections(_normalize_line_continuations(payload))
+                    )
+                    if _find_recursive_chmod_chown_invocations(normalized):
+                        return True
+                break  # the payload word ends this shell invocation
+            if token == "--":
+                break
+            if (
+                token.startswith("-")
+                and token != "-"
+                and not token.startswith("--")
+                and "c" in token[1:]
+            ):
+                c_pending = True
+    return False
+
+
+def _format_chmod_shell_c_refusal() -> str:
+    return "\n".join(
+        [
+            "Refusing to run this recursive chmod/chown command: it runs a"
+            " recursive chmod/chown inside a quoted `sh -c` payload whose"
+            " targets cannot be resolved safely.",
+            "",
+            "Run it directly, or retry with"
+            " bash(command, allow_destructive_chmod=True), or start the"
+            f" kernel with {BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV}=1.",
+        ]
+    )
+
+
+def _guard_destructive_chmod(command: str, allow_destructive_chmod: bool) -> None:
+    """Refuse recursive chmod/chown commands whose operands could escape the
+    kernel workspace or hit the home directory, dot-directories, dotfiles, or
+    the filesystem root. Pattern matching is string-only and the operand
+    resolver runs only on a match, so other commands pay nothing."""
+    if allow_destructive_chmod or _DESTRUCTIVE_CHMOD_BYPASS_AT_KERNEL_START:
+        return
+    command_prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
+    resolved = _mask_shell_redirections(_normalize_line_continuations(_with_prefix(command)))
+    normalized, index_map = _strip_shell_escapes(resolved)
+    # The cheap gates scan `normalized` with quotes intact: a quoted command
+    # word (`"eval"`, `"bash"`) still executes, so quote-aware masking must
+    # not blind them.
+    if re.search(r"\beval\b", normalized) and _eval_payloads_hide_recursive_chmod(resolved):
+        # An eval payload hides where the recursion runs; refuse rather than
+        # resolve a command the guard cannot see.
+        raise DestructiveChmodRefusalError(_format_chmod_eval_refusal())
+    if re.search(r"\b(?:sh|bash|zsh|dash|ksh)\b", normalized) and _shell_c_payloads_hide_recursive_chmod(
+        resolved
+    ):
+        # A quoted `sh -c` payload executes like an eval payload and hides
+        # its operands from the plain scan.
+        raise DestructiveChmodRefusalError(_format_chmod_shell_c_refusal())
+    words = _scan_shell_words(normalized)
+    invocations = _find_recursive_chmod_chown_invocations(normalized, words)
+    if not invocations:
+        return
+    # The command prefix is user-configured shell setup replayed before every
+    # command; a cd in it relocates everything, which the resolver cannot
+    # track from model text alone.
+    if command_prefix and re.search(r"\b(?:cd|pushd|popd)\b", command_prefix):
+        raise DestructiveChmodRefusalError(_format_chmod_relocation_refusal())
+    _warn_once_about_late_destructive_chmod_bypass()
+    # `normalized` drops backslash escapes, so the prefix boundary maps
+    # through the strip index map instead of the raw prefix length.
+    if command_prefix:
+        prefix_end = len(command_prefix) + 1
+        user_command_start = next(
+            (i for i, orig in enumerate(index_map) if orig >= prefix_end),
+            len(normalized),
+        )
+    else:
+        user_command_start = 0
+    try:
+        kernel_cwd = os.getcwd()
+    except OSError:
+        return  # the spawn itself will fail; the guard must not mask that error
+    workspace = os.path.realpath(kernel_cwd)
+    home_env = os.environ.get("HOME") or None
+    home_real = None
+    if home_env is not None:
+        try:
+            home_real = os.path.realpath(home_env)
+        except (OSError, RuntimeError, ValueError):
+            home_real = None
+    for start, end, word_index in invocations:
+        # xargs feeds paths on stdin the guard never sees; refuse rather than
+        # check only the flags.
+        for earlier in words[word_index - 1 :: -1]:
+            if os.path.basename(earlier.value) == "xargs":
+                raise DestructiveChmodRefusalError(_format_chmod_relocation_refusal())
+            if earlier.starts_command:
+                break
+        effective_cwd = _resolve_chmod_effective_cwd(normalized[:start], user_command_start, workspace)
+        if effective_cwd is _UNRESOLVABLE_CHMOD_CWD:
+            raise DestructiveChmodRefusalError(_format_chmod_relocation_refusal())
+        base = workspace if effective_cwd is None else effective_cwd
+        region_words, well_formed = _shell_words(normalized[start:end])
+        for operand in _chmod_operand_words(region_words, well_formed):
+            resolved_operand = (
+                _resolve_chmod_operand(operand, base, home_env)
+                if operand is not None
+                else None
+            )
+            reason = _chmod_operand_violation(resolved_operand, workspace, home_real)
+            if reason is not None:
+                raise DestructiveChmodRefusalError(
+                    _format_chmod_operand_refusal(operand, resolved_operand, workspace, reason)
+                )
+
+
+def bash(command: str, *, allow_destructive_chmod: bool = False) -> BashHandle:
     """Start a shell command immediately; await the handle for the result.
 
     `await bash(cmd)` is a one-shot: cancelling the await (e.g. an interrupt)
@@ -951,10 +1974,18 @@ def bash(command: str) -> BashHandle:
     Output written after the completion fence (e.g. by an EXIT trap or a
     background job) is not in BashResult.output but stays visible via
     handle.output()/tail().
+
+    Recursive chmod/chown commands (`chmod -R ...`, `chown -R ...`) are
+    refused while any operand they name resolves outside the kernel
+    workspace or onto the home directory, a dot-directory (e.g. .git), a
+    dotfile, or the filesystem root; retry with allow_destructive_chmod=True
+    (or start the kernel with PI_BASH_ALLOW_DESTRUCTIVE_CHMOD=1) only when
+    the recursion is intentional.
     """
     if not isinstance(command, str) or not command:
         raise TypeError("command must be a non-empty str")
     _install_shutdown_hook()
+    _guard_destructive_chmod(command, allow_destructive_chmod)
     return BashHandle(command)
 
 
