@@ -1,5 +1,5 @@
-//! Domain types for the agent loop, mirroring `packages/agent/src/types.ts` and
-//! the `@earendil-works/pi-ai` message types it builds on.
+//! Domain types for the agent loop, mirroring the TS reference
+//! (`packages/agent/src/types.ts` and its AI message types).
 //!
 //! Serde field names use camelCase so serialized messages match the TS wire
 //! format exactly (important for the proxy protocol and session JSONL parity).
