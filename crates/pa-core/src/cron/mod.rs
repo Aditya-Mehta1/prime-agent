@@ -3,6 +3,7 @@
 //! Port of the pure-function half of core/cron-jobs.ts; the file-backed job
 //! store lives in the `store` submodule.
 
+pub mod scheduler;
 pub mod store;
 
 use std::collections::BTreeSet;
