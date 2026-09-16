@@ -435,6 +435,7 @@ pub fn find_destructive_git_discard_commands(command: &str) -> Vec<usize> {
 }
 
 /// True when `command` contains a git discard command.
+#[allow(dead_code)]
 pub fn is_destructive_git_discard_command(command: &str) -> bool {
     !find_destructive_git_discard_commands(command).is_empty()
 }
@@ -447,9 +448,6 @@ pub struct DiscardProbeTarget {
     /// git status command for this discard.
     pub git_status_command: String,
 }
-
-/// The probe cannot safely determine the repository the discard targets.
-pub const UNRESOLVABLE_DISCARD_TARGET: () = ();
 
 /// Result of resolving a discard command's probe location.
 #[derive(Debug, Clone, PartialEq, Eq)]

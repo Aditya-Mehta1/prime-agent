@@ -86,8 +86,11 @@ impl EditOperations for LocalEditOperations {
     fn access(&self, absolute_path: &str) -> std::io::Result<()> {
         // Mirror Node fs.access(path, R_OK | W_OK) via access(2).
         let path = std::path::Path::new(absolute_path);
-        nix::unistd::access(path, nix::unistd::AccessFlags::R_OK | nix::unistd::AccessFlags::W_OK)
-            .map_err(|_| std::io::Error::last_os_error())
+        nix::unistd::access(
+            path,
+            nix::unistd::AccessFlags::R_OK | nix::unistd::AccessFlags::W_OK,
+        )
+        .map_err(|_| std::io::Error::last_os_error())
     }
 }
 

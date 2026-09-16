@@ -316,14 +316,6 @@ pub fn kernel_restart_notice() -> &'static str {
     "<ipython_kernel_reset>\nThe Python kernel was restarted after a previous interrupted cell kept running. Variables, imports, async tasks, and open resources from before the restart are no longer available; recreate them before using them.\n</ipython_kernel_reset>"
 }
 
-/// The user choice when the kernel is busy after an interrupt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BusyKernelAction {
-    Wait,
-    Kill,
-    Cancel,
-}
-
 /// The UI surface the ipython tool needs from the host session
 /// (the `ExtensionContext` in TS).
 pub trait IpythonToolUi: Send + Sync {

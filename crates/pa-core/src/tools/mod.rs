@@ -1,17 +1,27 @@
 //! Tool implementations ported from `packages/coding-agent/src/core/tools/`.
+//!
+//! All modules are `pub(crate)` internals of the tools subsystem; the
+//! crate facade (crate root) re-exports only the public tool surface.
 
-pub mod bash;
-pub mod code_preview;
-pub mod edit;
-pub mod edit_diff;
-pub mod file_mutation_queue;
-pub mod ipython;
-pub mod ipython_cell_code;
-pub mod output_accumulator;
-pub mod path_utils;
-pub mod render_utils;
-pub mod shell_utils;
-pub mod tool_definition;
-pub mod truncate;
-
-pub use shell_utils::sanitize_binary_output;
+pub(crate) mod bash;
+// Rendering preview helpers (TS code-preview.ts). Unused by the engine's
+// headless core for now; pa-tui owns terminal rendering, but the behavior
+// lives here with the other tool modules for parity tests.
+#[allow(dead_code)]
+pub(crate) mod code_preview;
+pub(crate) mod edit;
+pub(crate) mod edit_diff;
+pub(crate) mod file_mutation_queue;
+pub(crate) mod golden_replay;
+pub(crate) mod ipython;
+pub(crate) mod ipython_cell_code;
+pub(crate) mod output_accumulator;
+#[allow(dead_code)] // util module; every fn exercised by unit + golden tests
+pub(crate) mod path_utils;
+#[allow(dead_code)] // render helpers; consumed by the TUI-side renderer (parity-ported here)
+pub(crate) mod render_utils;
+#[allow(dead_code)] // util module; fully exercised by unit + golden tests
+pub(crate) mod shell_utils;
+pub(crate) mod tool_definition;
+#[allow(dead_code)] // util module; fully exercised by unit + golden tests
+pub(crate) mod truncate;

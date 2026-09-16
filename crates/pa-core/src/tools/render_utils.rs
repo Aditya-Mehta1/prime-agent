@@ -9,7 +9,7 @@ use base64::Engine;
 
 use pa_types::ai::{ImageContent, TextContent, UserContentBlock};
 
-use crate::tools::sanitize_binary_output;
+use crate::tools::shell_utils::sanitize_binary_output;
 
 /// `[Image: ...]` fallback text for an image that cannot be displayed.
 pub fn image_fallback(

@@ -6,27 +6,27 @@
 //! truncation boundaries, destructive-git refusals, ipython result
 //! composition, and the exact tool schemas.
 
+#![cfg(test)]
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use pa_core::tools::bash::{self, BashToolOptions};
-use pa_core::tools::code_preview::{preview_bash_command, preview_ipython_code};
-use pa_core::tools::edit::{create_edit_tool_definition, execute_edit, LocalEditOperations};
-use pa_core::tools::ipython::{
+use crate::tools::bash::{self, BashToolOptions};
+use crate::tools::code_preview::{preview_bash_command, preview_ipython_code};
+use crate::tools::edit::{create_edit_tool_definition, execute_edit, LocalEditOperations};
+use crate::tools::ipython::{
     self, ExecuteResult, ExecuteStatus, IpythonKernelProvisioner, IpythonToolOptions,
     IpythonToolUi, KernelAttachment, KernelBusyAfterInterruptError, KernelErrorInfo,
-    KernelExecError, KernelExecutor, KernelExecuteOptions,
+    KernelExecError, KernelExecuteOptions, KernelExecutor,
 };
-use pa_core::tools::tool_definition::ToolDefinition;
-use pa_core::tools::truncate::{truncate_head, truncate_tail, TruncationOptions};
+use crate::tools::tool_definition::ToolDefinition;
+use crate::tools::truncate::{truncate_head, truncate_tail, TruncationOptions};
 
 const CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/corpus");
 
 fn corpus(name: &str) -> serde_json::Value {
     let path = Path::new(CORPUS_DIR).join(format!("{name}.json"));
-    serde_json::from_str(&std::fs::read_to_string(path).expect("corpus file"))
-        .expect("corpus JSON")
+    serde_json::from_str(&std::fs::read_to_string(path).expect("corpus file")).expect("corpus JSON")
 }
 
 /// Normalize temp paths the same way harness.mjs does.
@@ -83,11 +83,8 @@ fn make_fixture(case: &serde_json::Value) -> (tempfile::TempDir, String) {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).expect("mkdir");
             }
-            std::fs::write(
-                &path,
-                content.as_str().expect("file content is a string"),
-            )
-            .expect("write fixture file");
+            std::fs::write(&path, content.as_str().expect("file content is a string"))
+                .expect("write fixture file");
         }
     }
     if let Some(commands) = case.get("fixture").and_then(serde_json::Value::as_array) {
@@ -99,26 +96,20 @@ fn make_fixture(case: &serde_json::Value) -> (tempfile::TempDir, String) {
                 .current_dir(dir.path())
                 .status()
                 .expect("run fixture command");
-            assert!(
-                status.success(),
-                "fixture command failed: {command}"
-            );
+            assert!(status.success(), "fixture command failed: {command}");
         }
     }
     let dir_path = dir.path().to_string_lossy().into_owned();
     (dir, dir_path)
 }
 
-fn truncation_json(result: &pa_core::tools::truncate::TruncationResult) -> serde_json::Value {
+fn truncation_json(result: &crate::tools::truncate::TruncationResult) -> serde_json::Value {
     bash::truncation_to_json(result)
 }
 
-#[allow(unused_variables)]
 fn assert_json_eq(actual: serde_json::Value, expected: serde_json::Value, what: &str) {
     if actual != expected {
-        panic!(
-            "{what} mismatch\nexpected: {expected}\n  actual: {actual}"
-        );
+        panic!("{what} mismatch\nexpected: {expected}\n  actual: {actual}");
     }
 }
 
@@ -133,7 +124,7 @@ async fn golden_edit_group_matches_ts() {
         let (dir, dir_path) = make_fixture(case);
         let mut input = case["input"].clone();
         if case["applyPrepareArguments"].as_bool().unwrap_or(false) {
-            input = pa_core::tools::edit::prepare_edit_arguments(input);
+            input = crate::tools::edit::prepare_edit_arguments(input);
             // The TS harness records the prepared input for such cases.
             assert_json_eq(
                 input.clone(),
@@ -145,7 +136,10 @@ async fn golden_edit_group_matches_ts() {
         let recorded = &case["result"];
         match result {
             Ok(result) => {
-                assert!(recorded["ok"].as_bool().expect("ok"), "edit/{name}: TS failed, Rust succeeded");
+                assert!(
+                    recorded["ok"].as_bool().expect("ok"),
+                    "edit/{name}: TS failed, Rust succeeded"
+                );
                 let text = result.content[0].as_text().expect("text block").to_string();
                 assert_eq!(
                     text,
@@ -161,7 +155,10 @@ async fn golden_edit_group_matches_ts() {
                 }
             }
             Err(err) => {
-                assert!(!recorded["ok"].as_bool().expect("ok"), "edit/{name}: TS succeeded, Rust failed: {err}");
+                assert!(
+                    !recorded["ok"].as_bool().expect("ok"),
+                    "edit/{name}: TS succeeded, Rust failed: {err}"
+                );
                 assert_eq!(
                     err.to_string(),
                     recorded["error"].as_str().expect("error"),
@@ -204,7 +201,8 @@ async fn golden_bash_group_matches_ts() {
                 &BashToolOptions::default(),
                 case["command"].as_str().expect("command"),
                 case.get("timeout").and_then(serde_json::Value::as_f64),
-                case.get("allowDestructiveGit").and_then(serde_json::Value::as_bool),
+                case.get("allowDestructiveGit")
+                    .and_then(serde_json::Value::as_bool),
                 None,
                 None,
             )
@@ -212,14 +210,20 @@ async fn golden_bash_group_matches_ts() {
             let err = result.expect_err("cwd-missing must fail");
             assert_eq!(
                 err.to_string(),
-                format!("Working directory does not exist: {dir_path}\nCannot execute bash commands."),
+                format!(
+                    "Working directory does not exist: {dir_path}\nCannot execute bash commands."
+                ),
                 "bash/{name}"
             );
             checked += 1;
             continue;
         }
         let (dir, dir_path) = make_fixture(case);
-        if case.get("envBypass").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+        if case
+            .get("envBypass")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
             std::env::set_var("PI_BASH_ALLOW_DESTRUCTIVE_GIT", "1");
         }
         let result = bash::execute_bash(
@@ -227,7 +231,8 @@ async fn golden_bash_group_matches_ts() {
             &BashToolOptions::default(),
             case["command"].as_str().expect("command"),
             case.get("timeout").and_then(serde_json::Value::as_f64),
-            case.get("allowDestructiveGit").and_then(serde_json::Value::as_bool),
+            case.get("allowDestructiveGit")
+                .and_then(serde_json::Value::as_bool),
             None,
             None,
         )
@@ -238,8 +243,12 @@ async fn golden_bash_group_matches_ts() {
         let recorded = &case["result"];
         match result {
             Ok(result) => {
-                assert!(recorded["ok"].as_bool().expect("ok"), "bash/{name}: TS failed, Rust succeeded");
-                let text = norm_string(result.content[0].as_text().expect("text block"), tmp_root());
+                assert!(
+                    recorded["ok"].as_bool().expect("ok"),
+                    "bash/{name}: TS failed, Rust succeeded"
+                );
+                let text =
+                    norm_string(result.content[0].as_text().expect("text block"), tmp_root());
                 let expected_text = recorded["text"].as_str().expect("text");
                 if text != expected_text {
                     // Stdout/stderr interleaving is OS-timing dependent in
@@ -264,11 +273,16 @@ async fn golden_bash_group_matches_ts() {
                 }
                 // Truncated runs must advertise a real, non-empty full-output file.
                 if let Some(record) = recorded.get("fullOutputFile") {
-                    let raw_path = result.details.as_ref()
+                    let raw_path = result
+                        .details
+                        .as_ref()
                         .and_then(|d| d.get("fullOutputPath"))
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_string);
-                    assert!(record["exists"].as_bool().unwrap_or(false), "bash/{name} full output file must exist");
+                    assert!(
+                        record["exists"].as_bool().unwrap_or(false),
+                        "bash/{name} full output file must exist"
+                    );
                     let path = raw_path.expect("fullOutputPath present");
                     let bytes = std::fs::metadata(&path).expect("full output file").len();
                     assert!(bytes > 0, "bash/{name} full output file must be non-empty");
@@ -278,7 +292,10 @@ async fn golden_bash_group_matches_ts() {
                 }
             }
             Err(err) => {
-                assert!(!recorded["ok"].as_bool().expect("ok"), "bash/{name}: TS succeeded, Rust failed: {err}");
+                assert!(
+                    !recorded["ok"].as_bool().expect("ok"),
+                    "bash/{name}: TS succeeded, Rust failed: {err}"
+                );
                 assert_eq!(
                     norm_string(&err.to_string(), tmp_root()),
                     norm_string(recorded["error"].as_str().expect("error"), tmp_root()),
@@ -307,8 +324,16 @@ fn golden_truncate_group_matches_ts() {
         );
         let head = truncate_head(content, options);
         let tail = truncate_tail(content, options);
-        assert_json_eq(truncation_json(&head), case["head"].clone(), "truncate/{name} head");
-        assert_json_eq(truncation_json(&tail), case["tail"].clone(), "truncate/{name} tail");
+        assert_json_eq(
+            truncation_json(&head),
+            case["head"].clone(),
+            &format!("truncate/{name} head"),
+        );
+        assert_json_eq(
+            truncation_json(&tail),
+            case["tail"].clone(),
+            &format!("truncate/{name} tail"),
+        );
         checked += 1;
     }
     assert_eq!(checked, corpus["caseCount"].as_u64().expect("caseCount"));
@@ -320,11 +345,11 @@ fn golden_preview_group_matches_ts() {
     let mut checked = 0;
     for case in corpus["cases"].as_array().expect("cases array") {
         let input = case["input"].as_str().expect("input");
-        let language = |l: pa_core::tools::code_preview::CodePreviewLanguage| {
+        let language = |l: crate::tools::code_preview::CodePreviewLanguage| {
             serde_json::json!({
                 "language": match l {
-                    pa_core::tools::code_preview::CodePreviewLanguage::Bash => "bash",
-                    pa_core::tools::code_preview::CodePreviewLanguage::Python => "python",
+                    crate::tools::code_preview::CodePreviewLanguage::Bash => "bash",
+                    crate::tools::code_preview::CodePreviewLanguage::Python => "python",
                 },
             })
         };
@@ -355,7 +380,7 @@ struct MockKernel {
 
 #[derive(Clone)]
 enum MockOutcome {
-    Ok(ExecuteResult),
+    Ok(Box<ExecuteResult>),
     Busy,
 }
 
@@ -393,14 +418,14 @@ impl KernelExecutor for MockKernel {
         let item = {
             let executions = self.executions.lock().unwrap();
             if executions.is_empty() {
-                MockOutcome::Ok(ExecuteResult::default())
+                MockOutcome::Ok(Box::default())
             } else {
                 let last = executions.len() - 1;
                 executions[self.next_index.fetch_add(1, Ordering::SeqCst).min(last)].clone()
             }
         };
         let item = match item {
-            MockOutcome::Ok(result) => Ok(result),
+            MockOutcome::Ok(result) => Ok(*result),
             MockOutcome::Busy => Err(KernelExecError::BusyAfterInterrupt(
                 KernelBusyAfterInterruptError::default(),
             )),
@@ -419,7 +444,7 @@ impl IpythonKernelProvisioner for MockProvisioner {
     fn ensure(
         &self,
         _on_progress: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
-        _signal: Option<pa_core::tools::tool_definition::AbortSignal>,
+        _signal: Option<crate::tools::tool_definition::AbortSignal>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = anyhow::Result<Box<dyn KernelExecutor>>> + Send>,
     > {
@@ -442,7 +467,7 @@ impl IpythonToolUi for KillChoiceUi {
         &self,
         _prompt: &str,
         choices: &[&str],
-        _signal: Option<&pa_core::tools::tool_definition::AbortSignal>,
+        _signal: Option<&crate::tools::tool_definition::AbortSignal>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>> {
         let choice = choices
             .iter()
@@ -458,21 +483,26 @@ fn mock_execution(entry: &serde_json::Value) -> MockOutcome {
     if entry.get("thrown").is_some() {
         return MockOutcome::Busy;
     }
-    let mut result = ExecuteResult::default();
-    result.status = match entry["status"].as_str().unwrap_or("ok") {
-        "ok" => ExecuteStatus::Ok,
-        "error" => ExecuteStatus::Error,
-        "aborted" => ExecuteStatus::Aborted,
-        other => panic!("unknown status {other}"),
+    let mut result = ExecuteResult {
+        status: match entry["status"].as_str().unwrap_or("ok") {
+            "ok" => ExecuteStatus::Ok,
+            "error" => ExecuteStatus::Error,
+            "aborted" => ExecuteStatus::Aborted,
+            other => panic!("unknown status {other}"),
+        },
+        stdout: entry["stdout"].as_str().unwrap_or("").to_string(),
+        stderr: entry["stderr"].as_str().unwrap_or("").to_string(),
+        result: entry
+            .get("result")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        duration_ms: entry.get("durationMs").and_then(serde_json::Value::as_u64),
+        background_output: entry
+            .get("backgroundOutput")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        ..ExecuteResult::default()
     };
-    result.stdout = entry["stdout"].as_str().unwrap_or("").to_string();
-    result.stderr = entry["stderr"].as_str().unwrap_or("").to_string();
-    result.result = entry.get("result").and_then(serde_json::Value::as_str).map(str::to_string);
-    result.duration_ms = entry.get("durationMs").and_then(serde_json::Value::as_u64);
-    result.background_output = entry
-        .get("backgroundOutput")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
     if let Some(error) = entry.get("error") {
         result.error = Some(KernelErrorInfo {
             ename: error["ename"].as_str().unwrap_or("").to_string(),
@@ -489,7 +519,7 @@ fn mock_execution(entry: &serde_json::Value) -> MockOutcome {
         });
     }
     result.attachments = Vec::<KernelAttachment>::new();
-    MockOutcome::Ok(result)
+    MockOutcome::Ok(Box::new(result))
 }
 
 #[tokio::test]
@@ -522,17 +552,16 @@ async fn golden_ipython_group_matches_ts() {
                 None
             },
         };
-        let result = ipython::execute_ipython(
-            &options,
-            case["code"].as_str().expect("code"),
-            None,
-            None,
-        )
-        .await;
+        let result =
+            ipython::execute_ipython(&options, case["code"].as_str().expect("code"), None, None)
+                .await;
         let recorded = &case["result"];
         match result {
             Ok(result) => {
-                assert!(recorded["ok"].as_bool().expect("ok"), "ipython/{name}: TS failed, Rust succeeded");
+                assert!(
+                    recorded["ok"].as_bool().expect("ok"),
+                    "ipython/{name}: TS failed, Rust succeeded"
+                );
                 assert_eq!(
                     result.is_error,
                     recorded["isError"].as_bool().expect("isError"),
@@ -546,7 +575,10 @@ async fn golden_ipython_group_matches_ts() {
                 );
             }
             Err(err) => {
-                assert!(!recorded["ok"].as_bool().expect("ok"), "ipython/{name}: TS succeeded, Rust failed: {err}");
+                assert!(
+                    !recorded["ok"].as_bool().expect("ok"),
+                    "ipython/{name}: TS succeeded, Rust failed: {err}"
+                );
                 assert_eq!(
                     err.to_string(),
                     recorded["error"].as_str().expect("error"),
@@ -559,7 +591,11 @@ async fn golden_ipython_group_matches_ts() {
             "execute": kernel.exec_calls.load(Ordering::SeqCst),
             "kill": provisioner.kill_calls.load(Ordering::SeqCst),
         });
-        assert_json_eq(calls, case["provisionerCalls"].clone(), "ipython/{name} calls");
+        assert_json_eq(
+            calls,
+            case["provisionerCalls"].clone(),
+            "ipython/{name} calls",
+        );
         checked += 1;
     }
     assert_eq!(checked, corpus["caseCount"].as_u64().expect("caseCount"));
@@ -576,7 +612,7 @@ fn golden_schema_group_matches_ts() {
         let definition: ToolDefinition = match tool {
             "bash" => bash::create_bash_tool_definition("/tmp"),
             "edit" => create_edit_tool_definition("/tmp"),
-            "ipython" => pa_core::tools::ipython::create_ipython_tool_definition(
+            "ipython" => crate::tools::ipython::create_ipython_tool_definition(
                 "/tmp",
                 IpythonToolOptions {
                     provisioner: Arc::new(MockProvisioner {
@@ -602,7 +638,7 @@ fn golden_schema_group_matches_ts() {
         });
         if let Some(mode) = definition.execution_mode {
             actual["executionMode"] = serde_json::json!(match mode {
-                pa_core::tools::tool_definition::ExecutionMode::Sequential => "sequential",
+                crate::tools::tool_definition::ExecutionMode::Sequential => "sequential",
             });
         }
         actual["parameters"] = definition.parameters.clone();
@@ -618,12 +654,22 @@ fn golden_schema_group_matches_ts() {
 #[test]
 fn destructive_git_discard_detection_examples() {
     assert!(bash::is_destructive_git_discard_command("git reset --hard"));
-    assert!(bash::is_destructive_git_discard_command("git checkout -- ."));
+    assert!(bash::is_destructive_git_discard_command(
+        "git checkout -- ."
+    ));
     assert!(bash::is_destructive_git_discard_command("git clean -fd"));
-    assert!(bash::is_destructive_git_discard_command("git -C sub restore ."));
-    assert!(!bash::is_destructive_git_discard_command("echo 'git reset --hard'"));
-    assert!(!bash::is_destructive_git_discard_command("echo done # git reset --hard"));
+    assert!(bash::is_destructive_git_discard_command(
+        "git -C sub restore ."
+    ));
+    assert!(!bash::is_destructive_git_discard_command(
+        "echo 'git reset --hard'"
+    ));
+    assert!(!bash::is_destructive_git_discard_command(
+        "echo done # git reset --hard"
+    ));
     assert!(!bash::is_destructive_git_discard_command("git status"));
     assert!(!bash::is_destructive_git_discard_command("git clean -n"));
-    assert!(!bash::is_destructive_git_discard_command("git clean --dry-run -f"));
+    assert!(!bash::is_destructive_git_discard_command(
+        "git clean --dry-run -f"
+    ));
 }

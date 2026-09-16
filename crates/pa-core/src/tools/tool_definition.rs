@@ -136,6 +136,7 @@ impl ToolDefinition {
 
 /// Wrap a `ToolDefinition` into the plain executable form used by the agent
 /// runtime (TS: `wrapToolDefinition`).
+#[allow(dead_code)]
 pub fn wrap_tool_definition(definition: &ToolDefinition) -> WrappedTool {
     WrappedTool {
         name: definition.name.clone(),
@@ -173,6 +174,7 @@ impl WrappedTool {
 
 /// Synthesize a minimal [`ToolDefinition`] from a plain executable tool
 /// (TS: `createToolDefinitionFromAgentTool`).
+#[allow(dead_code)]
 pub fn tool_definition_from_wrapped(tool: &WrappedTool) -> ToolDefinition {
     ToolDefinition {
         name: tool.name.clone(),

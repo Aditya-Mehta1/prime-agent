@@ -614,7 +614,11 @@ impl<'a> DiffEngine<'a> {
         // The loop always terminates via the done path for well-formed input
         // (maxEditLength = newLen + oldLen bounds the Myers search), but the
         // seed is kept as a safe terminal answer.
-        self.build_values(best_path.get(&(-max_edit_length)).and_then(|p| p.last_component))
+        self.build_values(
+            best_path
+                .get(&(-max_edit_length))
+                .and_then(|p| p.last_component),
+        )
     }
 }
 
@@ -782,6 +786,7 @@ impl Default for DiffStringContext {
 
 /// Optional parameters for [`generate_diff_string`].
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct DiffStringContext {
     pub context_lines: usize,
     pub start_line: usize,
@@ -797,12 +802,14 @@ pub fn generate_diff_string_default(old_content: &str, new_content: &str) -> Dif
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct EditDiffResult {
     pub diff: String,
     pub first_changed_line: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum EditDiffOutcome {
     Ok(EditDiffResult),
     Err(String),
@@ -810,6 +817,7 @@ pub enum EditDiffOutcome {
 
 /// Compute the diff for one or more edit operations without applying them.
 /// Used for preview rendering in the TUI before the tool executes.
+#[allow(dead_code)]
 pub fn compute_edits_diff(path: &str, edits: &[Edit], cwd: &str) -> EditDiffOutcome {
     let absolute_path = resolve_to_cwd(path, cwd);
 
@@ -827,6 +835,7 @@ pub fn compute_edits_diff(path: &str, edits: &[Edit], cwd: &str) -> EditDiffOutc
 }
 
 /// Strip the BOM, normalize endings, apply the edits, and generate the diff.
+#[allow(dead_code)]
 pub fn apply_edits_with_diff(
     raw_content: &str,
     edits: &[Edit],
@@ -864,6 +873,7 @@ pub fn errno_name(err: &std::io::Error) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn access_readable(path: &str) -> Result<(), String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let metadata = std::fs::metadata(path).map_err(|err| errno_name(&err))?;

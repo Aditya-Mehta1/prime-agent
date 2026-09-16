@@ -222,6 +222,7 @@ impl OutputSpill {
     }
 
     /// Flush and settle: the complete file's path, or None when degraded.
+    #[allow(dead_code)]
     pub async fn finalize(&mut self) -> Option<String> {
         self.finalize_sync()
     }
@@ -357,6 +358,7 @@ impl OutputAccumulator {
     }
 
     /// Settle the spill; afterwards `snapshot().full_output_path` is terminal.
+    #[allow(dead_code)]
     pub async fn close_temp_file(&mut self) {
         self.spill.finalize().await;
     }
