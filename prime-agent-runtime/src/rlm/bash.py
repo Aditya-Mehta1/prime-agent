@@ -7,6 +7,7 @@ import atexit
 import functools
 import json
 import os
+import re
 import secrets
 import selectors
 import shutil
@@ -937,7 +938,224 @@ class BashHandle:
         return f"<BashHandle pid={self._pid} {state} command={self.command!r}>"
 
 
-def bash(command: str) -> BashHandle:
+# Secret-echo guard (wave-1 safety audit gap 5). Kernel bash output is echoed
+# into the transcript, so whatever a command prints there persists in session
+# logs that models and users read later. Two shapes leak secrets that way: a
+# bare environment dump, and a read of a known secret file under the user's
+# home. Detection is one masked scan of the command text -- two
+# length-preserving mask passes and a segment split -- with no filesystem
+# access and no operand resolution, so an ordinary command pays for that scan
+# and nothing else.
+#
+# Exact rule set:
+#   * a command segment whose command word is `env` or `printenv` with nothing
+#     but flags after it (`env`, `env -0`, `printenv -i`), or `export` with a
+#     `-p` flag and no variable name, is a full-environment dump; the same
+#     dump piped into `grep` is the targeted read the refusal message
+#     suggests, so that one filtered form is allowed;
+#   * a `cat`/`echo` segment naming `~/.ssh`, `~/.gnupg`, or
+#     `~/.aws/credentials`, in the `~` spelling (expands only unquoted) or the
+#     `$HOME`/`${HOME}` spelling (expands unquoted and inside double quotes),
+#     is a secret-file read.
+# Single-quoted spans and comments are literal data, so they are masked before
+# the scan (see _mask_literals). Deliberately not matched: a `.env`-class file
+# in the workspace, a directory listing, a one-variable read, quoted data, and
+# every other command the patterns do not name. `env -u FOO` and `env FOO=1`
+# with no command word dump the environment too, but telling them apart from
+# the executor forms (`env -u FOO cmd`, `env FOO=1 cmd`) needs flag-arity
+# knowledge this foot-gun guard does not model.
+
+# Bypass env var for the secret-echo guard.
+BASH_SECRET_ECHO_BYPASS_ENV = "PI_BASH_ALLOW_SECRET_ECHO"
+
+# The bypass env var is honored only when present at kernel start: the model
+# can write os.environ, so a live read on each guard call would let a single
+# os.environ assignment neuter the guard. The frozen copy cannot change after
+# import; a value that appears mid-session only triggers a loud warning and
+# is ignored.
+_SECRET_ECHO_BYPASS_AT_KERNEL_START = os.environ.get(
+    BASH_SECRET_ECHO_BYPASS_ENV
+) not in (None, "", "0")
+
+_secret_echo_late_bypass_warned = False
+
+
+class SecretEchoRefusalError(RuntimeError):
+    """A command that would echo secrets into the transcript was refused."""
+
+
+# Secret paths under the user's home: private keys and credential stores. The
+# trailing lookahead keeps a longer name (`.sshfoo`) from matching.
+_SECRET_HOME_PATH = r"/(?:\.ssh|\.gnupg)(?![\w.-])|/\.aws/credentials(?![\w.-])"
+_TILDE_SECRET_PATH_RE = re.compile(r"~(?:" + _SECRET_HOME_PATH + r")")
+_HOME_VAR_SECRET_PATH_RE = re.compile(r"\$\{?HOME\}?(?:" + _SECRET_HOME_PATH + r")")
+
+# Characters that end one command segment and start the next.
+_SEGMENT_SEPARATORS = ";|&()\n"
+
+# Commands that print a whole environment when given no other word.
+_DUMP_COMMANDS = ("env", "printenv")
+
+# Commands whose operands the scan reads for a secret path.
+_SECRET_READ_COMMANDS = ("cat", "echo")
+
+# The pipe target that turns a bare dump into a targeted read.
+_TARGETED_READ_COMMAND = "grep"
+
+
+def _mask_literals(command: str, *, double_quotes: bool) -> str:
+    """Blank out the spans the shell treats as literal data, length-preserving.
+
+    Single-quoted spans never expand, and a `#` at a word boundary starts a
+    comment that runs to end of line, so both are always masked. A double
+    quote expands `$HOME` but not `~`, so the caller masks double-quoted spans
+    for the `~` pattern and leaves them live for the `$HOME` pattern. Only the
+    interiors are blanked, so the result keeps the length and the character
+    indices of the command the shell runs.
+    """
+    chars = list(command)
+    n = len(chars)
+    i = 0
+    while i < n:
+        ch = chars[i]
+        if ch == "'" or (ch == '"' and double_quotes):
+            quote = ch
+            j = i + 1
+            while j < n and chars[j] != quote:
+                # A backslash escapes the next character inside double quotes only.
+                j += 2 if quote == '"' and chars[j] == "\\" else 1
+            for k in range(i + 1, min(j, n)):
+                chars[k] = " "
+            i = j + 1
+        elif ch == "#" and (i == 0 or chars[i - 1] in " \t\n;&|(){}"):
+            while i < n and chars[i] != "\n":
+                chars[i] = " "
+                i += 1
+        else:
+            i += 1
+    return "".join(chars)
+
+
+def _command_segments(masked: str) -> list[tuple[int, int, str]]:
+    """(start, end, separating character) for each command segment.
+
+    Segments split on unquoted `;`, `&`, `|`, `(`, `)`, and newlines, so the
+    scan never reads the command word of one segment together with an operand
+    from another. The separating character is returned so the caller can tell
+    a bare dump piped into grep from a bare dump.
+    """
+    segments: list[tuple[int, int, str]] = []
+    start = 0
+    for index, char in enumerate(masked):
+        if char in _SEGMENT_SEPARATORS:
+            segments.append((start, index, char))
+            start = index + 1
+    segments.append((start, len(masked), ""))
+    return segments
+
+
+def _is_bare_dump(words: list[str]) -> bool:
+    """Whether these words print a whole environment with no filter."""
+    if words[0] in _DUMP_COMMANDS:
+        # Nothing but flags after the command word: `env -0` prints the same
+        # unfiltered dump in NUL-separated form.
+        return all(word.startswith("-") for word in words[1:])
+    if words[0] == "export":
+        # Only the `-p` dump form prints values, and only when no variable
+        # name narrows the output.
+        flags = [word for word in words[1:] if word.startswith("-")]
+        names = [word for word in words[1:] if not word.startswith("-")]
+        return not names and any("p" in flag for flag in flags)
+    return False
+
+
+def _secret_echo_violation(command: str) -> str | None:
+    """Why `command` would echo secrets into the transcript, or None.
+
+    The scan is text-only: the same command is refused whether or not the
+    file it names exists.
+    """
+    literal = _mask_literals(command, double_quotes=True)
+    expanded = _mask_literals(command, double_quotes=False)
+    segments = _command_segments(literal)
+    for index, (start, end, separator) in enumerate(segments):
+        words = literal[start:end].split()
+        if not words:
+            continue
+        if _is_bare_dump(words):
+            # `env | grep SAFE_VAR` is the targeted read the refusal message
+            # suggests, so that one filtered form stays allowed.
+            if separator == "|" and index + 1 < len(segments):
+                next_start, next_end, _next_separator = segments[index + 1]
+                follower = literal[next_start:next_end].split()
+                if follower[:1] == [_TARGETED_READ_COMMAND]:
+                    continue
+            return "the full environment"
+        if words[0] in _SECRET_READ_COMMANDS and (
+            _TILDE_SECRET_PATH_RE.search(literal[start:end])
+            or _HOME_VAR_SECRET_PATH_RE.search(expanded[start:end])
+        ):
+            return "a known secret file"
+    return None
+
+
+def _format_secret_echo_refusal(violation: str) -> str:
+    return "\n".join(
+        [
+            f"Refusing to run this command: it would print {violation} into",
+            "the transcript, where the output persists in session logs that",
+            "models and users read later.",
+            "",
+            "Read only what you need instead: printenv SAFE_VAR for a single",
+            "variable, env | grep SAFE_VAR to filter a dump, or grep KEY",
+            "<file> for one key out of a file.",
+            "",
+            "If the full output is intentional, retry with",
+            "bash(command, allow_secret_echo=True), or start the kernel with",
+            f"{BASH_SECRET_ECHO_BYPASS_ENV}=1.",
+        ]
+    )
+
+
+def _warn_once_about_late_secret_echo_bypass() -> None:
+    """Warn (once) when the bypass env var appears mid-session.
+
+    The frozen launch-time copy is the only honored bypass, so a value that
+    shows up later is ignored; one os.environ write cannot unlock the guard.
+    Warn loudly so a deliberate bypass takes the documented path (restart the
+    kernel with the variable set) instead of looking like a no-op."""
+    global _secret_echo_late_bypass_warned
+    if _secret_echo_late_bypass_warned:
+        return
+    value = os.environ.get(BASH_SECRET_ECHO_BYPASS_ENV)
+    if value is None or value in ("", "0"):
+        return
+    _secret_echo_late_bypass_warned = True
+    print(
+        f"prime-agent bash: {BASH_SECRET_ECHO_BYPASS_ENV} appeared after"
+        " kernel start and is ignored; the secret-echo guard only honors it"
+        " when the kernel is started with it set.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _guard_secret_echo(command: str, allow_secret_echo: bool) -> None:
+    """Refuse commands that would echo secrets into the transcript: a bare
+    environment dump, or a read of a known secret file under the user's home.
+    The scan is string-only and runs before any spawn, so a refused command
+    never starts a process, and a command the patterns do not name pays for
+    one masked scan."""
+    if allow_secret_echo or _SECRET_ECHO_BYPASS_AT_KERNEL_START:
+        return
+    violation = _secret_echo_violation(_with_prefix(command))
+    if violation is None:
+        return
+    _warn_once_about_late_secret_echo_bypass()
+    raise SecretEchoRefusalError(_format_secret_echo_refusal(violation))
+
+
+def bash(command: str, *, allow_secret_echo: bool = False) -> BashHandle:
     """Start a shell command immediately; await the handle for the result.
 
     `await bash(cmd)` is a one-shot: cancelling the await (e.g. an interrupt)
@@ -951,10 +1169,24 @@ def bash(command: str) -> BashHandle:
     Output written after the completion fence (e.g. by an EXIT trap or a
     background job) is not in BashResult.output but stays visible via
     handle.output()/tail().
+
+    Commands that echo secrets into the transcript are refused before any
+    process starts, because that output persists in session logs that models
+    and users read later: a bare environment dump (`env`, `printenv`,
+    `export -p`, and flags-only forms such as `env -0`), or a `cat`/`echo`
+    of a known secret file under the home directory (`~/.ssh`, `~/.gnupg`,
+    `~/.aws/credentials`, written with either the `~` or the `$HOME`
+    spelling). Read one value instead
+    (`printenv SAFE_VAR`), filter a dump through a grep for the key you need
+    (`env | grep SAFE_VAR`), and retry with allow_secret_echo=True (or start
+    the kernel with PI_BASH_ALLOW_SECRET_ECHO=1) only when the full output is
+    intentional; the env var is read once at kernel start, so writing it
+    mid-session never unlocks the guard.
     """
     if not isinstance(command, str) or not command:
         raise TypeError("command must be a non-empty str")
     _install_shutdown_hook()
+    _guard_secret_echo(command, allow_secret_echo)
     return BashHandle(command)
 
 
