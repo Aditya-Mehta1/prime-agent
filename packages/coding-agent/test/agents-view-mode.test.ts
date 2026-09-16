@@ -25,6 +25,7 @@ import {
 	type UnifiedSessionRecord,
 } from "../src/modes/agents-view/agents-view-state.js";
 import { DaemonSessionRecoveringError, DaemonUpdateRestartingError } from "../src/modes/daemon/daemon-errors.js";
+import { DaemonControlPlaneTransportError } from "../src/modes/daemon/daemon-routed-client.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import * as savedSessionCatalog from "../src/modes/daemon/saved-session-catalog.js";
 import type { InteractiveModeUiServices } from "../src/modes/interactive/interactive-mode-services.js";
@@ -44,14 +45,17 @@ vi.mock("../src/config.js", async (importOriginal) => {
 	return { ...actual, appendRotatingLog: vi.fn() };
 });
 
-vi.mock("../src/modes/daemon/daemon-client.js", () => ({
-	DaemonClient: class {
-		connect = vi.fn(async () => undefined);
-		close = vi.fn();
-		request = modeMocks.clientRequest;
-	},
-	getDaemonSocketCloseReason: vi.fn(),
-}));
+vi.mock("../src/modes/daemon/daemon-client.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../src/modes/daemon/daemon-client.js")>();
+	return {
+		...actual,
+		DaemonClient: class {
+			connect = vi.fn(async () => undefined);
+			close = vi.fn();
+			request = modeMocks.clientRequest;
+		},
+	};
+});
 
 vi.mock("../src/modes/agent-connection/daemon-agent-connection.js", () => ({
 	DaemonAgentConnection: Object.assign(function DaemonAgentConnection() {}, {
@@ -2342,15 +2346,24 @@ describe("waitThroughDaemonUpdateRestart", () => {
 					);
 				if (attempts === 4)
 					throw new Error("Connection to the Prime Agent daemon closed. Socket: /tmp/agents-view-test.sock.");
+				if (attempts === 5)
+					throw new Error(
+						'Timed out after 30000ms waiting for the Prime Agent daemon response to "create". Socket: /tmp/agents-view-test.sock.',
+					);
+				// A routed session transport wraps control-plane transport failures.
+				if (attempts === 6)
+					throw new DaemonControlPlaneTransportError(
+						new Error("Connection to the Prime Agent daemon closed. Socket: /tmp/agents-view-test.sock."),
+					);
 				// The successor is up but has not finished restoring sessions yet.
-				if (attempts === 5) throw new Error("Unknown active session: update-restart-session");
-				if (attempts === 6) throw new DaemonSessionRecoveringError("update-restart-session");
+				if (attempts === 7) throw new Error("Unknown active session: update-restart-session");
+				if (attempts === 8) throw new DaemonSessionRecoveringError("update-restart-session");
 				return "opened";
 			},
 			{ waitMs: 5_000, retryMs: 1, onWait: (error) => waited.push(error) },
 		);
 		expect(outcome).toEqual({ result: "opened", waitedForUpdateRestart: true });
-		expect(attempts).toBe(7);
+		expect(attempts).toBe(9);
 		expect(waited).toHaveLength(1);
 	});
 
@@ -2395,6 +2408,62 @@ describe("waitThroughDaemonUpdateRestart", () => {
 		);
 		expect(Date.now() - startedAt).toBeLessThan(600);
 		expect(attempts).toBe(2);
+	});
+
+	it("disposes an attempt that resolves after the deadline won the race", async () => {
+		let attempts = 0;
+		const abandoned: unknown[] = [];
+		await expect(
+			waitThroughDaemonUpdateRestart(
+				async () => {
+					attempts += 1;
+					if (attempts === 1) throw new DaemonUpdateRestartingError();
+					// Resolves after the deadline has already failed the open.
+					await new Promise((resolve) => setTimeout(resolve, 120));
+					return "opened-late";
+				},
+				{ waitMs: 50, retryMs: 5, onAbandoned: (result) => abandoned.push(result) },
+			),
+		).rejects.toThrow(
+			/The Prime Agent daemon did not finish its update restart within \d+ seconds\. Try opening this agent again once the update finishes\. Last error: Daemon is preparing an update restart/,
+		);
+		// Give the abandoned attempt time to resolve past the deadline.
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		expect(attempts).toBe(2);
+		expect(abandoned).toEqual(["opened-late"]);
+	});
+
+	it("swallows a late failure from an attempt abandoned by the deadline without reporting it unhandled", async () => {
+		let attempts = 0;
+		const abandoned: unknown[] = [];
+		const unhandled: unknown[] = [];
+		const onUnhandled = (error: unknown) => unhandled.push(error);
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			await expect(
+				waitThroughDaemonUpdateRestart(
+					async () => {
+						attempts += 1;
+						if (attempts === 1) throw new DaemonUpdateRestartingError();
+						// Rejects after the deadline has already failed the open.
+						await new Promise((resolve) => setTimeout(resolve, 120));
+						throw new Error(
+							"Failed to connect to the Prime Agent daemon: connect ECONNREFUSED /tmp/agents-view-test.sock. Socket: /tmp/agents-view-test.sock.",
+						);
+					},
+					{ waitMs: 50, retryMs: 5, onAbandoned: (result) => abandoned.push(result) },
+				),
+			).rejects.toThrow(
+				/The Prime Agent daemon did not finish its update restart within \d+ seconds\. Try opening this agent again once the update finishes\. Last error: Daemon is preparing an update restart/,
+			);
+			// Give the abandoned attempt time to reject past the deadline.
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			expect(attempts).toBe(2);
+			expect(abandoned).toEqual([]);
+			expect(unhandled).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
 	});
 
 	it("still opens when an attempt finishes inside the remaining budget", async () => {
