@@ -612,6 +612,22 @@ describe("worker pid attribution and anomalies", () => {
 		expect(text).toContain("command attach failed: timed out waiting for worker response (x4, until 09-10 20:21:00)");
 	});
 
+	it("does not report isolated failures days apart as one burst", () => {
+		const base = {
+			component: "coding-agent.daemon-supervisor",
+			socketPath: "/tmp/prime-agent-501/daemon.sock",
+			msg: "Supervisor command send_message failed: Error: Unknown active session: aabbccddeeff",
+		};
+		const entries = [
+			entry(agentLogLine({ ...base, ts: "2026-09-10T20:00:00.000Z" })),
+			entry(agentLogLine({ ...base, ts: "2026-09-12T20:00:00.000Z" })),
+			entry(agentLogLine({ ...base, ts: "2026-09-14T20:00:00.000Z" })),
+		];
+		const events = collectIncidentEvents(entries, collectWorkerPidMap(entries));
+		const anomalies = computeIncidentAnomalies(events);
+		expect(anomalies.some((item) => item.summary.includes("warnings/errors"))).toBe(false);
+	});
+
 	it("flags error bursts that are not timeouts", () => {
 		const entries = [1, 2, 3].map((index) =>
 			entry(

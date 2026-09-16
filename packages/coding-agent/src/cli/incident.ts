@@ -75,6 +75,8 @@ export class IncidentUsageError extends Error {}
 const DEFAULT_WINDOW_MS = 24 * 60 * 60 * 1000;
 const STALL_GAP_MS = 10 * 60 * 1000;
 const ERROR_BURST_THRESHOLD = 3;
+/** A burst is several warnings/errors close together; isolated failures far apart are not one incident. */
+const ERROR_BURST_WINDOW_MS = 10 * 60 * 1000;
 const SUMMARY_TRUNCATION = 120;
 const RECOVERY_BREAKDOWN_LIMIT = 4;
 const WORKER_SOCKET_PATTERN = /^worker-[0-9a-f]+-([0-9a-f]{12})\.sock$/;
@@ -847,13 +849,31 @@ export function computeIncidentAnomalies(events: readonly IncidentEvent[]): Inci
 		}
 		const burst = group.filter((incident) => BURST_CLASSES.has(incident.eventClass));
 		if (burst.length >= ERROR_BURST_THRESHOLD) {
-			const span = burst[burst.length - 1]!.timeMs - burst[0]!.timeMs;
-			push(
-				burst[0]!.timeMs,
-				maxSeverity(burst),
-				subject,
-				`${subject}: ${burst.length} warnings/errors over ${formatIncidentDuration(span)}`,
-			);
+			// Only events within ERROR_BURST_WINDOW_MS of each other form a burst;
+			// three isolated warnings days apart in a long window are not one.
+			let bestStart = 0;
+			let bestCount = 0;
+			let start = 0;
+			for (let end = 0; end < burst.length; end++) {
+				while (burst[end]!.timeMs - burst[start]!.timeMs > ERROR_BURST_WINDOW_MS) {
+					start++;
+				}
+				const count = end - start + 1;
+				if (count > bestCount) {
+					bestCount = count;
+					bestStart = start;
+				}
+			}
+			if (bestCount >= ERROR_BURST_THRESHOLD) {
+				const cluster = burst.slice(bestStart, bestStart + bestCount);
+				const span = cluster[cluster.length - 1]!.timeMs - cluster[0]!.timeMs;
+				push(
+					cluster[0]!.timeMs,
+					maxSeverity(cluster),
+					subject,
+					`${subject}: ${cluster.length} warnings/errors over ${formatIncidentDuration(span)}`,
+				);
+			}
 		}
 		if (subject.startsWith("session ")) {
 			for (let index = 1; index < group.length; index++) {
