@@ -294,6 +294,21 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
     let sessions = list["data"]["sessions"].as_array().expect("sessions");
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0]["id"], session_id.as_str());
+    // Session-summary fields match the TS `SessionSummary` wire shape.
+    assert_eq!(sessions[0]["runtimeKind"], "top-level");
+    assert_eq!(sessions[0]["rlmDepth"], 0);
+    assert_eq!(sessions[0]["unfinishedActionCount"], 0);
+    assert!(sessions[0]["modified"]
+        .as_str()
+        .is_some_and(|v| v.ends_with('Z')));
+    assert!(sessions[0]["lastActivityAt"]
+        .as_str()
+        .is_some_and(|v| v.ends_with('Z')));
+    // Usage from the scripted turn: input tokens and cost, zero total absent.
+    let usage = &sessions[0]["usage"];
+    assert!(usage["inputTokens"].as_u64().unwrap_or_default() > 0);
+    assert!(usage["outputTokens"].as_u64().unwrap_or_default() > 0);
+    assert!(usage["cost"].as_f64().unwrap_or_default() >= 0.0);
 
     // Second turn of the script replays the next response.
     client.send_command(

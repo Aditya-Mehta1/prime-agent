@@ -597,13 +597,70 @@ impl Worker {
         let store = core.store.as_ref();
         let streaming = core.busy;
         let queued = core.steering.len() + core.follow_up.len();
+        // `modified` is the session file mtime; `lastActivityAt` prefers the
+        // newest message timestamp (port of `summaryForActiveSession`).
+        let modified = store
+            .and_then(|store| std::fs::metadata(&store.path).ok())
+            .and_then(|metadata| metadata.modified().ok())
+            .map(|time| {
+                crate::util::iso_from_unix_ms(
+                    time.duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or_default(),
+                )
+            });
+        let messages = store.map(|store| store.messages()).unwrap_or_default();
+        let last_activity_at = messages
+            .iter()
+            .rev()
+            .find_map(crate::types::message_timestamp_ms)
+            .map(crate::util::iso_from_unix_ms)
+            .or_else(|| modified.clone())
+            .or_else(|| store.map(|store| store.header.timestamp.clone()));
+        // Usage: summed assistant usage (`sessionUsageSummaryFrom`), absent
+        // when everything is zero.
+        let mut input_tokens = 0u64;
+        let mut output_tokens = 0u64;
+        let mut cost = 0.0f64;
+        for message in &messages {
+            if crate::types::message_role(message) != Some("assistant") {
+                continue;
+            }
+            let Some(usage) = message.get("usage") else {
+                continue;
+            };
+            input_tokens += usage
+                .get("input")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            input_tokens += usage
+                .get("cacheRead")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            input_tokens += usage
+                .get("cacheWrite")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            output_tokens += usage
+                .get("output")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            cost += usage
+                .get("cost")
+                .and_then(|cost| cost.get("total"))
+                .and_then(Value::as_f64)
+                .unwrap_or_default();
+        }
+        let usage = (input_tokens > 0 || output_tokens > 0 || cost > 0.0).then(
+            || json!({ "inputTokens": input_tokens, "outputTokens": output_tokens, "cost": cost }),
+        );
         SessionSummary {
             id: core.active_session_id.clone(),
             lifecycle: "resident".to_string(),
             activity: if streaming { "working" } else { "idle" }.to_string(),
             is_session_active: streaming || queued > 0,
             has_registered_cron_job: Some(false),
-            last_activity_at: None,
+            last_activity_at,
             rlm_depth: Some(0),
             active_session_id: Some(core.active_session_id.clone()),
             session_id: store
@@ -621,16 +678,18 @@ impl Worker {
             session_actions: self.snapshot_locked(core),
             streaming_message: None,
             created: store.map(|s| s.header.timestamp.clone()),
-            modified: None,
+            modified,
             first_message: store.and_then(|s| s.first_message()),
             parent_session_path: None,
-            usage: None,
+            usage,
             worker_state: Some("ready".to_string()),
             worker_pid: Some(std::process::id()),
             status_label: None,
             summary: None,
             task_state: None,
             model: None,
+            runtime_kind: Some("top-level".to_string()),
+            unfinished_action_count: Some(0),
         }
     }
 

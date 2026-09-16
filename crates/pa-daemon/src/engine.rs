@@ -87,6 +87,16 @@ impl ScriptedEngine {
     }
 }
 
+/// Plausible usage block so scripted messages match the real engine's wire
+/// shape (and exercise summary aggregation).
+fn scripted_usage() -> Value {
+    json!({
+        "input": 120, "output": 8, "cacheRead": 0, "cacheWrite": 0,
+        "totalTokens": 128,
+        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 },
+    })
+}
+
 impl SessionEngine for ScriptedEngine {
     fn run_prompt(
         &self,
@@ -112,14 +122,15 @@ impl SessionEngine for ScriptedEngine {
             emit(cancelled());
             return;
         }
+        let usage = scripted_usage();
         if !emit(EngineEvent::AssistantUpdate(
-            json!({"role": "assistant", "content": "", "provider": "scripted", "model": "faux-1", "timestamp": crate::util::now_ms()}),
+            json!({"role": "assistant", "content": "", "provider": "scripted", "model": "faux-1", "usage": usage.clone(), "timestamp": crate::util::now_ms()}),
         )) {
             emit(cancelled());
             return;
         }
         if !emit(EngineEvent::AssistantMessage(
-            json!({"role": "assistant", "content": text, "provider": "scripted", "model": "faux-1", "timestamp": crate::util::now_ms()}),
+            json!({"role": "assistant", "content": text, "provider": "scripted", "model": "faux-1", "usage": usage, "timestamp": crate::util::now_ms()}),
         )) {
             emit(cancelled());
             return;

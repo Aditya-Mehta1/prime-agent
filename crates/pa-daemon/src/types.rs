@@ -100,6 +100,10 @@ pub struct SessionSummary {
     pub task_state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unfinished_action_count: Option<u32>,
 }
 
 /// Port of `SessionActionSnapshot` (core/session-action-store.ts).
