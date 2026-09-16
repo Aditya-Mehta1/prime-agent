@@ -1545,6 +1545,8 @@ def _fp_scan_words(command: str) -> list[_FpShellWord]:
     exactly ends up refused, never silently allowed.
     """
     words: list[_FpShellWord] = []
+    contained: list[bool] = []
+    interior_depth = 0  # > 0 while the scanner is inside a substitution
 
     def scan_region(
         start: int, end: int, *, starts_command: bool, nested: bool = True
@@ -1553,14 +1555,17 @@ def _fp_scan_words(command: str) -> list[_FpShellWord]:
         # top-level pass over what the agent wrote is O(n) and must never be a
         # reason to refuse, while every interior this walk enters is another
         # pass over text a deeper level already covered.
+        nonlocal interior_depth
         if not nested:
             _scan_region(start, end, starts_command=starts_command)
             return
         _fp_scan_charge()
         _fp_scan_descend()
+        interior_depth += 1
         try:
             _scan_region(start, end, starts_command=starts_command)
         finally:
+            interior_depth -= 1
             _fp_scan_ascend()
 
     def _scan_region(start: int, end: int, *, starts_command: bool) -> None:
@@ -1574,6 +1579,7 @@ def _fp_scan_words(command: str) -> list[_FpShellWord]:
             nonlocal word_start, first_word_pending
             if word_start != -1:
                 words.append(_FpShellWord("".join(value), word_start, i, word_starts_command))
+                contained.append(interior_depth > 0)
                 value.clear()
                 word_start = -1
                 first_word_pending = starts_next_command
@@ -1676,14 +1682,35 @@ def _fp_scan_words(command: str) -> list[_FpShellWord]:
         flush(False)
 
     scan_region(0, len(command), starts_command=True, nested=False)
-    return words
+    return _FpShellWords(words, contained)
+
+
+class _FpShellWords(list):
+    """The words of one scan, with each word's interior flag recorded.
+
+    `contained[i]` says words[i] is a command-substitution interior: it was
+    emitted while the scanner was inside a substitution, and the word that
+    encloses it is appended right after that interior is scanned. Recording the
+    flag as the word is built is what keeps the walkers linear -- testing each
+    word against every later word was quadratic in the word count (a 56 KB
+    benign command spent 3.6s in that one test)."""
+
+    __slots__ = ("contained",)
+
+    def __init__(self, words: list[_FpShellWord], contained: list[bool]) -> None:
+        super().__init__(words)
+        self.contained = contained
 
 
 def _fp_contained_in_later_word(words: list[_FpShellWord], index: int) -> bool:
-    """True when words[index] is a command-substitution interior: its span
-    sits inside the enclosing word, which the scanner appends after the
-    interiors it recursed into. Interiors execute inside the substitution,
-    so walkers must look through them, not stop at them."""
+    """True when words[index] is a command-substitution interior.
+
+    Interiors execute inside the substitution, so walkers must look through
+    them, not stop at them. The answer is precomputed by `_fp_scan_words`; for
+    a plain list the slow test is used instead."""
+    contained = getattr(words, "contained", None)
+    if contained is not None and len(contained) == len(words):
+        return contained[index]
     word = words[index]
     return any(
         word.start >= later.start and word.end <= later.end

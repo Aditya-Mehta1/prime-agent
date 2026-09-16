@@ -584,6 +584,31 @@ class ForcePushScanCostTest(unittest.TestCase):
         self.assertLess(elapsed, SCAN_BUDGET_SECONDS)
         self.assertIn("scan budget", outcome)
 
+    def test_large_benign_command_is_allowed_and_linear(self):
+        # The word scan used to test every word against every later word, so a
+        # multi-line command cost seconds of blocked kernel time (224 KB spent
+        # 16.4s). Each word's interior flag is recorded as the word is built
+        # now, so the cost is linear in the command length: the same shape must
+        # both run and stay well inside the bound, with the growth per doubling
+        # close to two rather than four.
+        timings = []
+        for count in (1000, 2000, 4000, 8000):
+            command = "\n".join("git log --oneline | head -3" for _ in range(count))
+            with self.subTest(lines=count, length=len(command)):
+                elapsed, outcome = self._probe_guard(command)
+                self.assertGreaterEqual(len(command), 10_000)
+                self.assertIn("allowed", outcome, outcome)
+                self.assertLess(
+                    elapsed,
+                    SCAN_BUDGET_SECONDS,
+                    f"{elapsed:.3f}s for {len(command)} bytes",
+                )
+                timings.append(elapsed)
+        # A linear scan roughly doubles per doubling; quadratic growth would
+        # quadruple. The bound is loose so the assertion is about the shape of
+        # the curve, not about this machine's speed.
+        self.assertLess(timings[-1], max(timings[0], 0.01) * 16)
+
     def test_long_benign_text_is_never_refused_for_its_length(self):
         # The budget counts nested re-scans, not characters: a long flat or
         # multi-line command is ordinary text and must run. These shapes were
