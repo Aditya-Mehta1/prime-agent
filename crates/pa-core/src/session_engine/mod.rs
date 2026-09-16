@@ -15,6 +15,7 @@ pub mod compaction_exec;
 pub mod compaction_utils;
 pub mod engine;
 pub mod goal_driver;
+pub mod headless;
 pub mod host_requests;
 pub mod messages;
 pub mod refine;
