@@ -71,9 +71,9 @@ enum ClientRouting {
 }
 
 pub struct Supervisor {
-    options: SupervisorOptions,
+    pub(crate) options: SupervisorOptions,
     descriptor_dir: PathBuf,
-    registry: SessionRegistry,
+    pub(crate) registry: SessionRegistry,
     /// Worker outbound frames, with their client routing.
     events: broadcast::Sender<(ClientRouting, Value)>,
     shutting_down: AtomicBool,
@@ -323,7 +323,7 @@ impl Supervisor {
         }
     }
 
-    fn is_stopping(&self, resident: &Arc<ResidentWorker>) -> bool {
+    pub(crate) fn is_stopping(&self, resident: &Arc<ResidentWorker>) -> bool {
         self.shutting_down.load(Ordering::SeqCst)
             || resident.intentional_stop.load(Ordering::SeqCst)
     }
@@ -598,10 +598,26 @@ impl Supervisor {
                 response.error.unwrap_or_default()
             ));
         }
+        // Peer-transport capability rides on the worker instance id (the TS
+        // worker only advertises `direct_peer_transport` with one).
+        let peer_transport_capable = response
+            .data
+            .as_ref()
+            .and_then(|data| data.get("capabilities"))
+            .and_then(Value::as_array)
+            .map(|capabilities| {
+                capabilities
+                    .iter()
+                    .any(|capability| capability == "direct_peer_transport")
+            })
+            .unwrap_or(false);
+        resident
+            .peer_transport_capable
+            .store(peer_transport_capable, Ordering::SeqCst);
         Ok(())
     }
 
-    async fn route_command(
+    pub(crate) async fn route_command(
         &self,
         resident: &Arc<ResidentWorker>,
         command_type: &str,
@@ -989,6 +1005,17 @@ impl Supervisor {
                         false,
                     ),
                 }
+            }
+            DaemonCommand::GetDirectWorkerTransport {
+                active_session_id, ..
+            } => {
+                // Direct-attach ticket: the supervisor issues a single-use
+                // grant for a registered session and hands the client the
+                // worker's own socket; it stays out of the streaming path.
+                let response = self
+                    .handle_get_direct_worker_transport(&command_id, &type_name, active_session_id)
+                    .await;
+                (vec![response_line(&response)], false)
             }
             DaemonCommand::WorkerRegister { .. } => {
                 // Worker self-registration: rebuilds the roster entry from

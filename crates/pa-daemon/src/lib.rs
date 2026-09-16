@@ -13,6 +13,8 @@ pub mod framing;
 pub mod journal;
 pub mod lease;
 pub mod paths;
+pub(crate) mod peer;
+pub(crate) mod peer_tickets;
 pub mod platform;
 pub mod protocol;
 pub mod registration;

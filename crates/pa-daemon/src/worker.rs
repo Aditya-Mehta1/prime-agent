@@ -23,6 +23,7 @@ use crate::engine::{
 use crate::framing::{write_frame, DEFAULT_PRIVATE_FRAME_LIMITS};
 use crate::journal::WorkerRecoveryJournal;
 use crate::paths;
+use crate::peer::{peer_command_allowed, ConnectionRole, PeerGrantStore, PEER_COMMAND_NOT_ALLOWED};
 use crate::protocol::{
     create_daemon_event_meta, create_daemon_replay_info, current_protocol_info,
     default_client_capabilities, default_server_capabilities, normalize_client_capabilities,
@@ -98,6 +99,13 @@ impl WorkerConfig {
     }
 }
 
+/// Result of one connection's authentication command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthOutcome {
+    Authenticated,
+    Failed,
+}
+
 /// Queue delivery lanes (port of the session action store's two deliveries).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lane {
@@ -122,7 +130,7 @@ struct QueuedItem {
 
 /// The live session: store, queue, sequencing. Shared by the connection tasks
 /// and the turn runner; every access is through the core mutex.
-struct SessionCore {
+pub(crate) struct SessionCore {
     active_session_id: String,
     generation: String,
     last_event_sequence: u64,
@@ -131,7 +139,7 @@ struct SessionCore {
     steering: VecDeque<QueuedItem>,
     follow_up: VecDeque<QueuedItem>,
     busy: bool,
-    created: bool,
+    pub(crate) created: bool,
     attached_client_ids: Vec<String>,
     abort_requested: bool,
     shutdown_requested: bool,
@@ -196,10 +204,10 @@ impl OutboundFrame {
 }
 
 pub struct Worker {
-    config: WorkerConfig,
+    pub(crate) config: WorkerConfig,
     /// Supervisor self-registration handle; `None` for standalone workers.
     registration: Option<RegistrationHandle>,
-    core: Arc<Mutex<SessionCore>>,
+    pub(crate) core: Arc<Mutex<SessionCore>>,
     engine: std::sync::Arc<dyn SessionEngine>,
     work_notify: Arc<Notify>,
     idle_notify: Arc<Notify>,
@@ -207,6 +215,8 @@ pub struct Worker {
     recovery: Mutex<Option<WorkerRecoveryJournal>>,
     /// Live side-question runs (registry, guards, event frames).
     side_questions: crate::side_question::SideQuestionManager,
+    /// Single-use peer-transport grants (worker memory only).
+    pub(crate) peer_grants: PeerGrantStore,
 }
 
 impl Worker {
@@ -320,6 +330,7 @@ impl Worker {
             events,
             recovery: Mutex::new(None),
             side_questions,
+            peer_grants: PeerGrantStore::new(),
         }
     }
 
@@ -392,15 +403,25 @@ impl Worker {
             return Ok(());
         }
 
+        // The connection's authenticated role, shared with the event
+        // fan-out task (streaming is gated on it).
+        let role = Arc::new(std::sync::Mutex::new(ConnectionRole::Unauthenticated));
+
         // Event fan-out: this connection's subscription to the shared pump.
+        // Only authenticated roles stream: the supervisor always, a session
+        // client only while it holds an attach on the session.
         let mut events = self.events.subscribe();
         {
             let worker = Arc::clone(&self);
             let writer = Arc::clone(&writer);
+            let role = Arc::clone(&role);
             tokio::spawn(async move {
                 loop {
                     match events.recv().await {
                         Ok(frame) => {
+                            if !role.lock().unwrap().streams_events() {
+                                continue;
+                            }
                             let active_session_id = active_session_id_of(&frame.payload);
                             let header = json!({
                                 "kind": "outbound",
@@ -424,7 +445,6 @@ impl Worker {
 
         let mut reader =
             crate::framing::PrivateFrameReader::new(reader, DEFAULT_PRIVATE_FRAME_LIMITS);
-        let mut authenticated = false;
         loop {
             let frame: Option<crate::framing::PrivateFrame> = reader.read_frame().await?;
             let Some(frame) = frame else {
@@ -448,70 +468,135 @@ impl Worker {
                 eprintln!("[worker {}] got command {command_type}", std::process::id());
             }
 
-            if !authenticated {
-                if command_type != "worker_auth" {
-                    let failure = response_failure(
-                        Some(&request_id),
-                        "worker_auth",
-                        "Worker authentication failed",
-                        None,
-                    );
-                    let _ = self
-                        .write_frame(
+            let current_role = role.lock().unwrap().clone();
+            match current_role {
+                ConnectionRole::Unauthenticated => {
+                    // The first command authenticates the connection; a
+                    // failed authentication ends it (TS worker branch).
+                    let outcome = self
+                        .authenticate_connection(
+                            &command_type,
+                            &payload,
+                            &request_id,
+                            &role,
                             &writer,
-                            &json!({ "kind": "outbound", "requestId": request_id, "outboundType": "response" }),
-                            &serde_json::to_vec(&failure).unwrap_or_default(),
                         )
                         .await;
-                    break;
-                }
-                match self.authenticate(&payload) {
-                    Ok(()) => {
-                        if std::env::var("PA_DAEMON_DEBUG").is_ok() {
-                            eprintln!("[worker {}] auth ok", std::process::id());
-                        }
-                        authenticated = true;
-                        // The roster capability is always granted; the peer
-                        // transport capability rides on the worker instance
-                        // id, like the TS worker.
-                        let mut capabilities = vec!["agent_roster".to_string()];
-                        if !self.config.worker_instance_id.is_empty() {
-                            capabilities.push("direct_peer_transport".to_string());
-                        }
-                        let success = response_success(
-                            Some(&request_id),
-                            "worker_auth",
-                            Some(json!({ "capabilities": capabilities })),
-                        );
-                        self.write_response_frame(&writer, &request_id, &success)
-                            .await;
+                    if outcome == AuthOutcome::Failed {
+                        break;
                     }
-                    Err(error) => {
+                }
+                ConnectionRole::Supervisor { ref generation } => {
+                    if command_type == "worker_register_peer_transport" {
+                        let response =
+                            self.handle_worker_register_peer_transport(&payload, generation);
+                        self.write_response_frame(&writer, &request_id, &response)
+                            .await;
+                        continue;
+                    }
+                    let response = self.dispatch(&command_type, &payload).await;
+                    self.write_response_frame(&writer, &request_id, &response)
+                        .await;
+                    if command_type == "shutdown" && response.success {
+                        // Shutdown keeps the resume entry and exits the
+                        // process, like the TS close path
+                        // (`closeKeepsResumeEntry("shutdown")`).
+                        let _ = self.record_recovery(false, "shutdown");
+                        std::process::exit(0);
+                    }
+                }
+                ConnectionRole::SessionClient { ref session } => {
+                    // A direct peer may only run session-plane commands for
+                    // the grant's session (TS `peerClaims` gate).
+                    if !peer_command_allowed(&command_type, &payload, &session.grant) {
                         let failure = response_failure(
                             Some(&request_id),
-                            "worker_auth",
-                            &error.to_string(),
+                            &command_type,
+                            PEER_COMMAND_NOT_ALLOWED,
                             None,
                         );
                         self.write_response_frame(&writer, &request_id, &failure)
                             .await;
-                        break;
+                        continue;
                     }
+                    let response = self.dispatch(&command_type, &payload).await;
+                    if response.success {
+                        match command_type.as_str() {
+                            "attach" => session.mark_attached(),
+                            "detach" => session.mark_detached(),
+                            _ => {}
+                        }
+                    }
+                    self.write_response_frame(&writer, &request_id, &response)
+                        .await;
                 }
-                continue;
-            }
-
-            let response = self.dispatch(&command_type, &payload).await;
-            self.write_response_frame(&writer, &request_id, &response)
-                .await;
-            if command_type == "shutdown" && response.success {
-                // Shutdown keeps the resume entry and exits the process, like
-                // the TS close path (`closeKeepsResumeEntry("shutdown")`).
-                let _ = self.record_recovery(false, "shutdown");
-                std::process::exit(0);
             }
         }
         Ok(())
+    }
+
+    /// Authenticate one connection's first command: `worker_auth` promotes
+    /// the connection to the supervisor role, `peer_auth` to a session
+    /// client role holding a burned single-use grant. Writes the response.
+    async fn authenticate_connection(
+        self: &Arc<Self>,
+        command_type: &str,
+        payload: &Value,
+        request_id: &str,
+        role: &Arc<std::sync::Mutex<ConnectionRole>>,
+        writer: &Arc<tokio::sync::Mutex<Box<dyn pa_types::platform::transport::AsyncWriteHalf>>>,
+    ) -> AuthOutcome {
+        if command_type == "peer_auth" {
+            return self
+                .handle_peer_auth(payload, request_id, role, writer)
+                .await;
+        }
+        if command_type != "worker_auth" {
+            let failure = response_failure(
+                Some(request_id),
+                "worker_auth",
+                "Worker authentication failed",
+                None,
+            );
+            self.write_response_frame(writer, request_id, &failure)
+                .await;
+            return AuthOutcome::Failed;
+        }
+        match self.authenticate(payload) {
+            Ok(()) => {
+                if std::env::var("PA_DAEMON_DEBUG").is_ok() {
+                    eprintln!("[worker {}] auth ok", std::process::id());
+                }
+                let generation = payload
+                    .get("supervisorGeneration")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                // The roster capability is always granted; the peer
+                // transport capability rides on the worker instance
+                // id, like the TS worker.
+                let mut capabilities = vec!["agent_roster".to_string()];
+                if !self.config.worker_instance_id.is_empty() {
+                    capabilities.push("direct_peer_transport".to_string());
+                }
+                let success = response_success(
+                    Some(request_id),
+                    "worker_auth",
+                    Some(json!({ "capabilities": capabilities })),
+                );
+                *role.lock().unwrap() = ConnectionRole::Supervisor { generation };
+                self.write_response_frame(writer, request_id, &success)
+                    .await;
+                AuthOutcome::Authenticated
+            }
+            Err(error) => {
+                let failure =
+                    response_failure(Some(request_id), "worker_auth", &error.to_string(), None);
+                self.write_response_frame(writer, request_id, &failure)
+                    .await;
+                AuthOutcome::Failed
+            }
+        }
     }
 
     fn authenticate(&self, payload: &Value) -> Result<()> {
@@ -557,7 +642,7 @@ impl Worker {
         Ok(())
     }
 
-    async fn write_frame(
+    pub(crate) async fn write_frame(
         &self,
         writer: &Arc<tokio::sync::Mutex<Box<dyn pa_types::platform::transport::AsyncWriteHalf>>>,
         header: &Value,
@@ -569,7 +654,7 @@ impl Worker {
             .context("write private frame")
     }
 
-    async fn write_response_frame(
+    pub(crate) async fn write_response_frame(
         &self,
         writer: &Arc<tokio::sync::Mutex<Box<dyn pa_types::platform::transport::AsyncWriteHalf>>>,
         request_id: &str,
@@ -1441,7 +1526,7 @@ fn restore_queue_snapshot(store: &SessionFile) -> (VecDeque<QueuedItem>, VecDequ
 /// The turn runner: drains the queue one turn at a time, running the session
 /// engine and emitting the agent-loop event lifecycle.
 struct TurnRunner {
-    core: Arc<Mutex<SessionCore>>,
+    pub(crate) core: Arc<Mutex<SessionCore>>,
     work_notify: Arc<Notify>,
     idle_notify: Arc<Notify>,
     events: broadcast::Sender<Arc<OutboundFrame>>,

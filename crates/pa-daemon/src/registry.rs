@@ -43,6 +43,9 @@ pub(crate) struct ResidentWorker {
     pub(crate) pending: Mutex<HashMap<String, tokio::sync::oneshot::Sender<DaemonResponse>>>,
     pub(crate) intentional_stop: AtomicBool,
     pub(crate) consecutive_failures: AtomicU32,
+    /// The worker advertised `direct_peer_transport` in its `worker_auth`
+    /// response (TS `workerAuthAdvertisesPeerTransport`).
+    pub(crate) peer_transport_capable: AtomicBool,
 }
 
 impl ResidentWorker {
@@ -59,6 +62,7 @@ impl ResidentWorker {
             pending: Mutex::new(HashMap::new()),
             intentional_stop: AtomicBool::new(false),
             consecutive_failures: AtomicU32::new(0),
+            peer_transport_capable: AtomicBool::new(false),
         })
     }
 

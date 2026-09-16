@@ -24,6 +24,7 @@ pub const DAEMON_APP_VERSION: &str = concat!("pa-daemon-rs-", env!("CARGO_PKG_VE
 /// Command types the daemon recognizes (TS `DAEMON_COMMAND_TYPES`).
 pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "list",
+    "get_direct_worker_transport",
     "list_saved_sessions",
     "create",
     "attach",
@@ -454,6 +455,7 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
 pub fn command_type_name(command: &DaemonCommand) -> &'static str {
     match command {
         DaemonCommand::List { .. } => "list",
+        DaemonCommand::GetDirectWorkerTransport { .. } => "get_direct_worker_transport",
         DaemonCommand::ListSavedSessions { .. } => "list_saved_sessions",
         DaemonCommand::Create { .. } => "create",
         DaemonCommand::Attach { .. } => "attach",

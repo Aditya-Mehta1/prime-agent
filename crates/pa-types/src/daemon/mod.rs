@@ -104,7 +104,9 @@ pub struct DaemonEventMeta {
 }
 
 mod command;
+pub mod framing;
 mod outbound;
+mod plane;
 mod worker;
 
 pub use command::{
@@ -117,6 +119,7 @@ pub use outbound::{
     DaemonPeerTransportTicket, DaemonResponse, DaemonRuntimeIdentity, DaemonSavedSessionInfo,
     DaemonSessionClosedReason, DaemonSessionSnapshot, SnapshotPurpose, SocketIdentity,
 };
+pub use plane::{command_plane, is_session_plane_daemon_command, DaemonCommandPlane};
 pub use worker::{
     DaemonPeerCommand, DaemonUpdateRestartManifest, DaemonUpdateRestartQueue,
     DaemonUpdateRestartSession, DaemonWorkerCommand, DaemonWorkerDescriptor,

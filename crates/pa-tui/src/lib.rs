@@ -11,6 +11,7 @@ pub mod chat;
 pub mod chrome;
 pub mod code_preview;
 pub mod daemon_client;
+pub mod direct_transport;
 pub mod editor;
 pub mod interactive;
 pub mod keybindings;

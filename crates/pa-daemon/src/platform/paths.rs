@@ -67,31 +67,13 @@ pub fn worker_socket_path(supervisor_socket_path: &Path, worker_id: &str) -> Pat
     ))
 }
 
-/// Filesystem identity of a bound socket, guarding stale-file cleanup against
-/// a socket re-created by another supervisor incarnation. `None` on Windows:
-/// named pipes leave no file to clean up (TS treats identity as undefined
-/// there and skips the ownership check).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SocketIdentity {
-    pub dev: u64,
-    pub ino: u64,
-}
+// Socket-filesystem identity is the shared platform contract
+// `pa_types::platform::socket_identity` (re-exported through
+// `crate::platform`): the same helper serves stale-file cleanup here and
+// direct-transport ticket validation in pa-tui/pa-cli clients.
 
-#[cfg(unix)]
-pub fn socket_identity(path: &Path) -> Option<SocketIdentity> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = std::fs::symlink_metadata(path).ok()?;
-    Some(SocketIdentity {
-        dev: metadata.dev(),
-        ino: metadata.ino(),
-    })
-}
-
-#[cfg(not(unix))]
-pub fn socket_identity(_path: &Path) -> Option<SocketIdentity> {
-    None
-}
-
+pub use pa_types::daemon::SocketIdentity;
+pub use pa_types::platform::socket_identity;
 #[cfg(test)]
 mod tests {
     use super::*;

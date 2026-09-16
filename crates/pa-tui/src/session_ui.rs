@@ -93,27 +93,61 @@ impl SessionUi {
 
     /// Detach the current session and attach `id`, rebuilding the transcript
     /// from the slim attach snapshot.
+    ///
+    /// The attach itself travels over a direct worker link when the
+    /// supervisor issues a ticket (best effort: every failure keeps the
+    /// supervisor-routed path, and a failed direct attach retries once over
+    /// the supervisor).
     async fn attach_session(&mut self, active_session_id: &str) -> Result<()> {
         let previous = self.active_session_id.clone();
         if !previous.is_empty() && previous != active_session_id {
             let _ = self.detach().await;
         }
-        let data = self
+        // A direct link is bound to one session: drop it when switching.
+        if self
             .client
-            .request_ok(DaemonCommand::Attach {
-                id: None,
-                active_session_id: active_session_id.to_string(),
-                supports_extension_ui: None,
-                client_id: None,
-                capabilities: None,
-                resume_cursor: None,
-                telemetry_disabled: None,
-                recovery_config: None,
-                env: None,
-                launch_env: None,
-                rest: Default::default(),
-            })
-            .await?;
+            .direct_session_id()
+            .is_some_and(|direct| direct != active_session_id)
+        {
+            self.client.drop_direct();
+        }
+        let attach_command = |session_id: &str| DaemonCommand::Attach {
+            id: None,
+            active_session_id: session_id.to_string(),
+            supports_extension_ui: None,
+            client_id: None,
+            capabilities: None,
+            resume_cursor: None,
+            telemetry_disabled: None,
+            recovery_config: None,
+            env: None,
+            launch_env: None,
+            rest: Default::default(),
+        };
+        let direct_attached = self
+            .client
+            .upgrade_direct(active_session_id)
+            .await
+            .unwrap_or(false);
+        let attached = match self
+            .client
+            .request_ok(attach_command(active_session_id))
+            .await
+        {
+            Ok(data) => data,
+            Err(error) => {
+                if !direct_attached {
+                    return Err(error);
+                }
+                // The direct attach failed: one supervisor-routed retry
+                // (TS `DaemonAgentConnection.attach` fallback).
+                self.client.drop_direct();
+                self.client
+                    .request_ok(attach_command(active_session_id))
+                    .await?
+            }
+        };
+        let data = attached;
         let attach = attach_data_from_response(&data)?;
         let reconstructed = reconstruct(&attach);
         self.active_session_id = attach.active_session_id;

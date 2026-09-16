@@ -7,9 +7,11 @@
 //! native process queries on Windows later. Adding a platform means adding an
 //! implementation - call sites never branch on `cfg` themselves.
 
+pub mod identity;
 pub mod process;
 pub mod transport;
 
+pub use identity::socket_identity;
 pub use process::{is_process_alive, process_start_id};
 pub use transport::{
     bind_transport, connect_blocking, connect_transport, BlockingTransportStream,

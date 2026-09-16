@@ -36,6 +36,62 @@ pub fn iso_from_unix_ms(ms: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
 }
 
+/// Epoch milliseconds from an RFC 3339 UTC timestamp
+/// (`YYYY-MM-DDTHH:MM:SS[.fff]Z`, the shape `now_iso` writes and the TS
+/// product's `new Date().toISOString()`). `None` for anything else.
+pub fn iso_to_unix_ms(iso: &str) -> Option<u64> {
+    let bytes = iso.as_bytes();
+    if bytes.len() < 19
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || (bytes[10] != b'T' && bytes[10] != b' ')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+    let year: i64 = iso.get(0..4)?.parse().ok()?;
+    let month = iso.get(5..7)?.parse::<u32>().ok()?;
+    let day = iso.get(8..10)?.parse::<u32>().ok()?;
+    let hour = iso.get(11..13)?.parse::<u32>().ok()?;
+    let minute = iso.get(14..16)?.parse::<u32>().ok()?;
+    let second = iso.get(17..19)?.parse::<u32>().ok()?;
+    let millis: u64 = if bytes.len() > 20 && bytes[19] == b'.' {
+        let digits: String = iso[20..].chars().take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() {
+            return None;
+        }
+        let mut scaled = [b'0'; 3];
+        for (slot, digit) in scaled.iter_mut().zip(digits.as_bytes()) {
+            *slot = *digit;
+        }
+        String::from_utf8(scaled.to_vec()).ok()?.parse().ok()?
+    } else {
+        0
+    };
+    if !(1..=12).contains(&month) || day == 0 || day > 31 || hour > 23 || minute > 59 || second > 59
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    let secs = days * 86_400 + hour as i64 * 3_600 + minute as i64 * 60 + second as i64;
+
+    if secs < 0 {
+        return None;
+    }
+    Some((secs * 1000 + millis as i64) as u64)
+}
+
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy as i64;
+    era * 146_097 + doe - 719_468
+}
+
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);

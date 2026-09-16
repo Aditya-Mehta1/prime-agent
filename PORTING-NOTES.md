@@ -256,6 +256,76 @@ origin/main
   set, matching the live TS golden; a capability-less client sees
   `["attach_snapshot","event_sequence"]`.
 
+HEAD
+## Thin-supervisor stage 2 (direct-attach transport) lane notes
+
+- Shared wire mechanics moved to pa-types because pa-tui (pa-types only) must
+  speak the worker socket as a direct-attach client: the private-frame codec
+  (`daemon::framing`, served from pa-daemon as a re-export), the command-plane
+  table (`daemon::plane`, TS `DAEMON_COMMAND_PLANE` verbatim - the worker gates
+  peer links with it and the routed client picks the socket with it), and the
+  platform socket-identity stat (`platform::identity`). The TS peer-grant and
+  ticket wire shapes (`DaemonWorkerPeerGrant`, `DaemonPeerCommand`,
+  `DaemonPeerTransportTicket`) already lived there.
+- Ticket issuance (`peer_tickets.rs`, TS `issuePeerTransport`): the supervisor
+  resolves a registered session, requires a ready/connected/peer-capable worker
+  (capability captured from the worker's `worker_auth` response,
+  TS `workerAuthAdvertisesPeerTransport`), pins the exact worker instance id
+  and socket-filesystem identity (dev+ino), mints a single-use grant with the
+  TS `PEER_TRANSPORT_GRANT_TTL_MS` = 10s TTL, pushes it into the worker
+  (`worker_register_peer_transport`, 3s round trip), and returns the ticket.
+  Deviations, documented in code: (1) the process-identity check is live-pid
+  liveness rather than TS's `processStartId` pin (the Rust supervisor never
+  populated `process_start_id`); (2) the client-owned-worker refusal has no
+  Rust equivalent (every spawned/adopted worker is a resident session, and
+  `owner_client_id` today records the creating client for all workers - a TS
+  semantic that predates this lane); (3) the grant token is one v4 UUID's hex
+  (122 bits, single-use + 10s TTL) instead of TS's 32 random bytes in
+  base64url; comparison is sha256-then-constant-time like TS
+  `timingSafeEqual`.
+- Worker grant store (`peer.rs`, TS `peerGrants` + `peer_auth` +
+  `worker_register_peer_transport`): grants live in worker memory only, burn
+  on first use BEFORE the token is checked (a failed presentation also burns),
+  expire at their TTL (registration rejects grants expiring more than 30s out,
+  `PEER_GRANT_TTL_LIMIT_MS`), and are capped at 1024 after an expired sweep.
+  Registration additionally validates the grant's `issuerGeneration` against
+  the authenticated supervisor connection's generation (TS compares against
+  the `boundClaim`).
+- Worker connection roles: `worker_auth` promotes a connection to
+  `Supervisor` (full command set, always streams events);
+  `peer_auth` promotes to `SessionClient` (session-plane commands for the
+  grant's session only - the TS `peerClaims` gate with the exact TS failure
+  string "Command is not allowed on this direct peer transport"). Event
+  fan-out is now role-gated: unauthenticated connections never receive the
+  session stream, and a session client streams only while it holds an attach
+  (its `attach` succeeded, `detach` stops the stream) - TS streams to
+  `state.clients`, not to every socket.
+- Client routed transport (`pa-tui/src/direct_transport.rs` + `DaemonClient`,
+  TS `daemon-routed-client.ts`): `upgrade_direct` is TS
+  `createDaemonSessionTransport` - require the `direct_peer_transport`
+  capability, request `get_direct_worker_transport` (5s, no recovery), validate
+  the ticket (shape, target session, freshness, socket identity re-stat),
+  connect (1s), read hello, `peer_auth` (3s). Any failure silently keeps the
+  supervisor-routed path (transition-period fallback). Session-plane commands
+  for the link's session then ride the worker socket; control stays on the
+  supervisor. A dead link discovered before the frame is queued falls back to
+  the supervisor; a sent request that times out surfaces the error and is
+  never retried (no double execution of prompts, TS comment parity). A failed
+  direct attach retries once over the supervisor (TS
+  `DaemonAgentConnection.attach`), and switching sessions drops the link (a
+  grant is bound to one session).
+- Direct attach commands are stamped with the client id and the same
+  slim-snapshot capability set the supervisor's routed attach injects
+  (`["attach_snapshot","event_sequence","slim_attach"]`), so both paths return
+  identical attach results. The TS routed client sends its own raw
+  capabilities (including `chunked_snapshot`); the Rust worker returns full
+  snapshots on the direct path, so the slim set is the honest contract for now.
+- e2e (`tests/direct_attach_e2e.rs`): ticket field/ttl assertions, grant
+  single-use (replay rejected with the TS string), control-plane denial on a
+  peer link, mid-stream kill -9 of the supervisor with the direct stream
+  continuing, supervisor restart + roster rebuild + fresh ticket + reattach +
+  second scripted turn, and live grant expiry after the 10s TTL.
+
 
 ## Daemon model selection + status line (cli-flags-parity lane)
 
@@ -295,4 +365,4 @@ origin/main
   guard probes the supervisor's live roster first). The supervisor-level
   reuse-vs-guard semantics of TS `createOrReuseWorker` (same owner reuses,
   different owner refuses) and interactive resume's pre-resolution to attach
-  are not ported yet — a separate lane item.
+  are not ported yet — a separate lane item.origin/main

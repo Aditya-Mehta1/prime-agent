@@ -5,7 +5,12 @@ The single shared vocabulary crate. Nothing else is shared between crates.
 ## Scope
 Wire and domain types + serde only: AI messages/content blocks/tool calls/usage/stream events, session JSONL entry schema, daemon wire protocol messages, worker frames.
 
-Platform contracts (`platform`): the cross-crate transport and process-identity traits. pa-types is the only crate every transport consumer can depend on (pa-tui depends on pa-types alone), so the shared trait vocabulary and its cfg-gated Unix implementations live here. Windows support later means implementing these traits, not re-plumbing callers.
+Daemon wire mechanics shared by the serving side (pa-daemon) and clients (pa-tui/pa-cli) live here because pa-tui depends on pa-types alone:
+- `daemon::framing`: the private-frame codec of the worker socket (direct-attach clients speak it too).
+- `daemon::plane`: the session/control command-plane table (worker-side peer gating and client-side socket routing both read it).
+- `daemon::{DaemonPeerTransportTicket, DaemonWorkerPeerGrant, DaemonPeerCommand}`: the direct-transport ticket and grant wire shapes.
+
+Platform contracts (`platform`): the cross-crate transport, process-identity, and socket-identity helpers. pa-types is the only crate every transport consumer can depend on (pa-tui depends on pa-types alone), so the shared trait vocabulary and its cfg-gated Unix implementations live here. Windows support later means implementing these traits, not re-plumbing callers.
 
 ## Non-goals
 No provider logic, no session logic, no UI. Beyond pure data helpers and the platform contracts, no behavior: a domain type that wants a method belongs in the owning crate.
