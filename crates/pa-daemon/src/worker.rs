@@ -13,13 +13,12 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
-use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, oneshot, Notify};
 
 use crate::agent_engine::{AgentEngineConfig, AgentSessionEngine};
 use crate::engine::{EngineEvent, PromptRequest, ScriptedEngine, SessionEngine};
-use crate::framing::{read_frame, write_frame, DEFAULT_PRIVATE_FRAME_LIMITS};
+use crate::framing::{write_frame, DEFAULT_PRIVATE_FRAME_LIMITS};
 use crate::journal::WorkerRecoveryJournal;
 use crate::paths;
 use crate::protocol::{
@@ -317,11 +316,11 @@ impl Worker {
             });
         }
 
-        let mut reader = BufReader::new(reader);
+        let mut reader =
+            crate::framing::PrivateFrameReader::new(reader, DEFAULT_PRIVATE_FRAME_LIMITS);
         let mut authenticated = false;
         loop {
-            let frame: Option<crate::framing::PrivateFrame> =
-                read_frame(&mut reader, DEFAULT_PRIVATE_FRAME_LIMITS).await?;
+            let frame: Option<crate::framing::PrivateFrame> = reader.read_frame().await?;
             let Some(frame) = frame else {
                 break;
             };

@@ -28,7 +28,7 @@ use crate::descriptor::{
     create_command_payload, load_descriptors, persist_supervisor_config, persist_worker,
     PersistedSupervisorConfig, SUPERVISOR_CONFIG_FILE_NAME,
 };
-use crate::framing::{read_frame, write_frame, DEFAULT_PRIVATE_FRAME_LIMITS};
+use crate::framing::{write_frame, PrivateFrameReader, DEFAULT_PRIVATE_FRAME_LIMITS};
 use crate::lease::is_process_alive;
 use crate::paths;
 use crate::protocol::{
@@ -495,10 +495,8 @@ impl Supervisor {
             let reader_resident = Arc::clone(resident);
             let events = events.clone();
             tokio::spawn(async move {
-                let mut reader = BufReader::new(reader);
-                while let Ok(Some(frame)) =
-                    read_frame(&mut reader, DEFAULT_PRIVATE_FRAME_LIMITS).await
-                {
+                let mut reader = PrivateFrameReader::new(reader, DEFAULT_PRIVATE_FRAME_LIMITS);
+                while let Ok(Some(frame)) = reader.read_frame().await {
                     if std::env::var("PA_DAEMON_DEBUG").is_ok() {
                         eprintln!(
                             "[supervisor] worker frame: {:?}",

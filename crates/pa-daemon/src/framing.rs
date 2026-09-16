@@ -140,29 +140,50 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Read one frame from a byte stream; `Ok(None)` on clean EOF at a frame boundary.
-pub async fn read_frame<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    limits: PrivateFrameLimits,
-) -> Result<Option<PrivateFrame>> {
-    let mut decoder = PrivateFrameDecoder::new(limits);
-    let mut chunk = [0u8; 8192];
-    loop {
-        let read = reader.read(&mut chunk).await?;
-        if read == 0 {
-            decoder
-                .finish()
-                .with_context(|| "private frame channel ended mid-frame")?;
-            if decoder.buffered_bytes() == 0 {
-                return Ok(None);
-            }
-            return Err(anyhow!("Private frame channel ended mid-frame"));
+/// Stateful frame reader over a byte stream. Frames that arrive in the same
+/// chunk (or arrive while previous frames wait in the queue) are all handed
+/// out one `read_frame` call at a time; partial frames stay buffered until the
+/// next chunk completes them. `Ok(None)` means clean EOF at a frame boundary.
+pub struct PrivateFrameReader<R> {
+    reader: R,
+    decoder: PrivateFrameDecoder,
+    queue: std::collections::VecDeque<PrivateFrame>,
+}
+
+impl<R: AsyncRead + Unpin> PrivateFrameReader<R> {
+    pub fn new(reader: R, limits: PrivateFrameLimits) -> Self {
+        Self {
+            reader,
+            decoder: PrivateFrameDecoder::new(limits),
+            queue: std::collections::VecDeque::new(),
         }
-        // push() returns every frame completed by this chunk; partial frames
-        // stay buffered inside the decoder for the next read.
-        let frames = decoder.push(&chunk[..read])?;
-        if let Some(frame) = frames.into_iter().next() {
-            return Ok(Some(frame));
+    }
+
+    /// Buffered bytes of a partially received frame, if any.
+    pub fn buffered_bytes(&self) -> usize {
+        self.decoder.buffered_bytes()
+    }
+
+    pub async fn read_frame(&mut self) -> Result<Option<PrivateFrame>> {
+        let mut chunk = [0u8; 8192];
+        loop {
+            if let Some(frame) = self.queue.pop_front() {
+                return Ok(Some(frame));
+            }
+            let read = self.reader.read(&mut chunk).await?;
+            if read == 0 {
+                self.decoder
+                    .finish()
+                    .with_context(|| "private frame channel ended mid-frame")?;
+                if self.decoder.buffered_bytes() == 0 {
+                    return Ok(None);
+                }
+                return Err(anyhow!("Private frame channel ended mid-frame"));
+            }
+            // push() returns every frame completed by this chunk; partial
+            // frames stay buffered inside the decoder for the next read.
+            let frames = self.decoder.push(&chunk[..read])?;
+            self.queue.extend(frames);
         }
     }
 }
@@ -208,7 +229,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_frame_round_trips_over_duplex() {
-        let (mut client, mut server) = tokio::io::duplex(64);
+        let (mut client, server) = tokio::io::duplex(64);
         // Interleave write/read: the 64-byte duplex buffer cannot hold two
         // frames at once, so a write blocks until the peer reads it.
         write_frame(
@@ -219,7 +240,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let first = read_frame(&mut server, DEFAULT_PRIVATE_FRAME_LIMITS)
+        let mut frame_reader = PrivateFrameReader::new(server, DEFAULT_PRIVATE_FRAME_LIMITS);
+        let first = frame_reader
+            .read_frame()
             .await
             .unwrap()
             .expect("first frame");
@@ -233,11 +256,38 @@ mod tests {
         )
         .await
         .unwrap();
-        let second = read_frame(&mut server, DEFAULT_PRIVATE_FRAME_LIMITS)
+        let second = frame_reader
+            .read_frame()
             .await
             .unwrap()
             .expect("second frame");
         assert_eq!(second.payload, b"{\"y\":2}");
+    }
+
+    #[tokio::test]
+    async fn frame_reader_yields_every_frame_in_one_chunk() {
+        // Two frames coalesced into one chunk must both come out; the old
+        // one-shot reader dropped all but the first frame of a burst.
+        let first = encode_private_frame(
+            &header("command"),
+            b"{\"a\":1}",
+            DEFAULT_PRIVATE_FRAME_LIMITS,
+        )
+        .unwrap();
+        let second = encode_private_frame(
+            &header("outbound"),
+            b"{\"b\":2}",
+            DEFAULT_PRIVATE_FRAME_LIMITS,
+        )
+        .unwrap();
+        let wire: Vec<u8> = [first, second].concat();
+        let mut frame_reader =
+            PrivateFrameReader::new(std::io::Cursor::new(wire), DEFAULT_PRIVATE_FRAME_LIMITS);
+        let frame = frame_reader.read_frame().await.unwrap().unwrap();
+        assert_eq!(frame.payload, b"{\"a\":1}");
+        let frame = frame_reader.read_frame().await.unwrap().unwrap();
+        assert_eq!(frame.payload, b"{\"b\":2}");
+        assert!(frame_reader.read_frame().await.unwrap().is_none());
     }
 
     #[test]
