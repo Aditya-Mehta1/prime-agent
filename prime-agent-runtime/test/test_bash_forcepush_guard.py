@@ -96,6 +96,47 @@ FORCE_PUSH_MATCHING_COMMANDS = [
     "echo main | xargs git push -f origin",
     "git push -f origin $BRANCH",
     "git push -f origin HEAD",
+    # The shell joins a backslash-newline continuation into one token, decodes
+    # ANSI-C (`$'...'`) escapes, and resolves `$"..."` as a double-quoted
+    # string, so these reach git as the force pushes they spell out.
+    "git push -f origin ma\\\nin",
+    "git push -\\\nf origin main",
+    "gi\\\nt push -f origin main",
+    'git push -f origin "ma\\\nin"',
+    "$'git' push -f origin main",
+    "$'\\x67it' push -f origin main",
+    "$'\\u0067it' push -f origin main",
+    '$"git" push -f origin main',
+    "git $'push' -f origin main",
+    "git push -$'f' origin main",
+    "git push $'--force' origin main",
+    # The kernel also runs on case-insensitive filesystems, where `GIT` and
+    # `/usr/bin/GIT` resolve to the `git` binary.
+    "GIT push -f origin main",
+    "Git.exe push -f origin main",
+    "/usr/bin/GIT push -f origin main",
+    # git rewrites argv with an inline alias body before it parses it.
+    "git -c alias.p='push -f origin main' p",
+    "git -c alias.a=p -c alias.p='push -f origin main' a",
+    "git -c alias.p='push -f origin main' -C repo p",
+    # An alias whose name shadows a builtin is never used by git, so the
+    # builtin push must still be found.
+    "git -c alias.push='status' push -f origin main",
+]
+
+# Vectors whose push argument the shell expands. An unquoted `$f` can expand
+# into `-f`, and any dynamic refspec can be a `+`-refspec naming a protected
+# branch, so the scanner cannot prove these are not force pushes: they must be
+# treated as guarded rather than allowed as plain pushes.
+FORCE_PUSH_UNRESOLVABLE_ARGUMENT_COMMANDS = [
+    "f=-f; git push $f origin main",
+    "f='-f origin'; git push $f",
+    "git push $REMOTE origin main",
+    "git push origin $BRANCH",
+    "BRANCH=+main; git push origin $BRANCH",
+    "git push origin 'main*'",
+    "git push --repo=$REMOTE main",
+    "git push --force-with-lease origin $BRANCH",
 ]
 
 FORCE_PUSH_NON_MATCHING_COMMANDS = [
@@ -126,12 +167,26 @@ FORCE_PUSH_NON_MATCHING_COMMANDS = [
     'echo "git push -f origin main"',
     "# git push -f origin main",
     "git --exec-path push -f origin main",
+    # Wrappers and quoting that do not carry a push stay inert.
+    "git -c alias.s=status s",
+    "git -c alias.co=checkout co",
+    "git -c alias.push='status' push --dry-run -f origin main",
+    "env -C . echo hi",
+    "env -S 'git status'",
+    "printf $'%s\\n' hi",
+    'echo $"hello"',
+    "echo $'tab\\there'",
 ]
 
 
 class ForcePushDetectionTest(unittest.TestCase):
     def test_matches_force_pushes(self):
         for command in FORCE_PUSH_MATCHING_COMMANDS:
+            with self.subTest(command=command):
+                self.assertTrue(_guarded_runs(command))
+
+    def test_matches_unresolvable_push_arguments(self):
+        for command in FORCE_PUSH_UNRESOLVABLE_ARGUMENT_COMMANDS:
             with self.subTest(command=command):
                 self.assertTrue(_guarded_runs(command))
 
@@ -146,6 +201,58 @@ class ForcePushDetectionTest(unittest.TestCase):
         )
         self.assertFalse(args.force)
         self.assertTrue(args.dry_run is False)
+
+
+class ForcePushScannerFidelityTest(unittest.TestCase):
+    """The scan must read the text the way the shell does."""
+
+    def test_line_continuations_join_words(self):
+        self.assertEqual(_prepare("git push -f origin ma\\\nin"), "git push -f origin main")
+        self.assertEqual(_prepare("gi\\\nt push -\\\nf origin main"), "git push -f origin main")
+
+    def test_ansi_c_words_decode_like_the_shell(self):
+        for command, expected in [
+            ("$'git'", "git"),
+            ("$'\\x67it'", "git"),
+            ("$'\\u0067it'", "git"),
+            ("$'\\101BC'", "ABC"),
+            ('$"git"', "git"),
+            ("$'ma\\in'", "main"),
+        ]:
+            with self.subTest(command=command):
+                words = bash_module._fp_scan_words(_prepare(command))
+                self.assertEqual([word.value for word in words], [expected])
+
+    def test_double_quoted_escape_does_not_end_the_string(self):
+        command = 'echo "a \\" b"'
+        stripped, _index_map = bash_module._fp_strip_escapes(command)
+        self.assertEqual(stripped, command)
+        words = bash_module._fp_scan_words(_prepare(command))
+        self.assertEqual([word.value for word in words], ["echo", 'a " b'])
+
+    def test_redirections_inside_double_quotes_stay_visible(self):
+        # The quoted span is data: masking it as a redirection would change the
+        # word the target check reads.
+        command = 'git push -f origin " > x" main'
+        self.assertIn('" > x"', _prepare(command))
+
+    def test_url_and_scp_remotes_are_not_refspecs(self):
+        for first in [
+            "https://example.invalid/x.git",
+            "ssh://example.invalid/x.git",
+            "git@github.com:org/repo.git",
+            "example.invalid:org/repo.git",
+            "C:\\repo",
+        ]:
+            with self.subTest(first=first):
+                args = bash_module._fp_parse_push_args(["git", "push", "-f", first], 1)
+                self.assertEqual(args.refspecs, [])
+        # A refspec that merely carries a colon still names its target.
+        args = bash_module._fp_parse_push_args(["git", "push", "-f", "origin", "main:main"], 1)
+        self.assertEqual(args.refspecs, ["main:main"])
+        args = bash_module._fp_parse_push_args(["git", "push", "-f", "main:main"], 1)
+        self.assertEqual(args.refspecs, ["main:main"])
+
 
 
 class ForcePushEvalPayloadTest(unittest.TestCase):
@@ -287,9 +394,14 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         return await asyncio.wait_for(bash(command, **kwargs), AWAIT_TIMEOUT)
 
     async def _refused(self, command: str) -> str:
-        with self.assertRaises(ForcePushRefusalError) as caught:
-            bash(command)
-        return str(caught.exception)
+        try:
+            handle = bash(command)
+        except ForcePushRefusalError as refusal:
+            return str(refusal)
+        # Only reachable while the guard is broken: the command was already
+        # spawned, so stop it before failing the test.
+        handle.kill()
+        self.fail(f"expected a force-push refusal for {command!r}")
 
     async def test_refuses_force_push_to_main_and_master(self):
         repo, _bare = self._make_repo("repo-main")
@@ -522,6 +634,217 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         ):
             result = await self._run("git push -f origin feature")
             self.assertEqual(result.exit_code, 0, result.output)
+
+
+    async def test_refuses_implicit_force_push_without_upstream(self):
+        repo, _bare = self._make_repo("repo-no-upstream")
+        # push.default=current maps the implicit refspec onto origin/main, and
+        # the branch has no upstream for the guard to probe.
+        self._git("config", "push.default", "current", cwd=repo)
+        self._git("branch", "--unset-upstream", cwd=repo)
+        os.chdir(repo)
+        for command in ["git push -f origin", "git push -f"]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("push.default", message)
+
+    async def test_refuses_url_and_scp_remote_force_pushes(self):
+        repo, bare = self._make_repo("repo-url-remote")
+        os.chdir(repo)
+        # git reads the first positional as the repository, so a colon inside a
+        # URL is not a refspec separator: the push is implicit and takes its
+        # target from the current branch.
+        for command in [
+            f"git push -f file://{bare}",
+            "git push -f https://example.invalid/x.git",
+            "git push -f git@github.com:org/repo.git",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("upstream", message)
+
+    async def test_refuses_ansi_c_quoted_force_push(self):
+        repo, _bare = self._make_repo("repo-ansi-c")
+        os.chdir(repo)
+        for command in [
+            "$'git' push -f origin main",
+            "$'\\x67it' push -f origin main",
+            "$'\\u0067it' push -f origin main",
+            '$"git" push -f origin main',
+            "git $'push' -f origin main",
+            "git push -$'f' origin main",
+            "git push $'--force' origin main",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("main", message)
+        # An ANSI-C payload hides a whole command; it is refused outright.
+        for command in [
+            "sh -c $'git push -f origin main'",
+            "eval $'git push -f origin main'",
+        ]:
+            with self.subTest(command=command):
+                await self._refused(command)
+
+    async def test_ansi_c_quoting_without_a_push_stays_allowed(self):
+        repo, _bare = self._make_repo("repo-ansi-c-ok")
+        os.chdir(repo)
+        result = await self._run("printf $'%s\\n' hi")
+        self.assertEqual(result.exit_code, 0, result.output)
+        result = await self._run("echo $'tab\\there'")
+        self.assertEqual(result.exit_code, 0, result.output)
+
+    async def test_refuses_line_continuations_that_join_tokens(self):
+        repo, _bare = self._make_repo("repo-continuation")
+        os.chdir(repo)
+        for command in [
+            "git push -f origin ma\\\nin",
+            "git push -\\\nf origin main",
+            "gi\\\nt push -f origin main",
+            'git push -f origin "ma\\\nin"',
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("main", message)
+        # A path that merely looks like a continuation is not one.
+        message = await self._refused("git push -f origin ma\\\nin")
+        self.assertIn("main", message)
+
+    async def test_refuses_dynamic_push_arguments(self):
+        repo, _bare = self._make_repo("repo-dynamic")
+        os.chdir(repo)
+        for command in [
+            "f=-f; git push $f origin main",
+            "f='-f origin'; git push $f",
+            "BRANCH=+main; git push origin $BRANCH",
+            "git push origin $BRANCH",
+            "git push --force-with-lease origin $BRANCH",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("cannot be verified statically", message)
+
+    async def test_refuses_aliased_force_push(self):
+        repo, _bare = self._make_repo("repo-alias")
+        os.chdir(repo)
+        for command in [
+            "git -c alias.p='push -f origin main' p",
+            "git -c alias.a=p -c alias.p='push -f origin main' a",
+            "git -c alias.p='push -f origin main' -C . p",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("main", message)
+        # A shell-alias body, a body from the environment, and a chain longer
+        # than the guard follows are refused rather than guessed at.
+        for command in [
+            "git -c alias.p='!git push -f origin main' p",
+            "git --config-env=alias.p=BODY p",
+            "git -c alias.a=b -c alias.b=c -c alias.c=d -c alias.d=e"
+            " -c alias.e=f -c alias.f=g -c alias.g=h -c alias.h=i -c alias.i=j"
+            " -c alias.j=k -c alias.k='push -f origin main' a",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("alias", message)
+
+    async def test_inline_aliases_without_a_push_stay_allowed(self):
+        repo, _bare = self._make_repo("repo-alias-ok")
+        os.chdir(repo)
+        result = await self._run("git -c alias.s=status s")
+        self.assertEqual(result.exit_code, 0, result.output)
+        result = await self._run("git -c alias.co=checkout co")
+        self.assertEqual(result.exit_code, 0, result.output)
+        # An alias that shadows the builtin name is never used by git, so the
+        # builtin push is what runs and the guard still sees it.
+        message = await self._refused("git -c alias.push='status' push -f origin main")
+        self.assertIn("main", message)
+
+    async def test_refuses_subcommands_git_may_resolve_through_an_alias(self):
+        repo, bare = self._make_repo("repo-repo-alias")
+        # A repo-local alias is invisible in the command text: `git p` looks
+        # like an unknown subcommand, and git rewrites it into a force push.
+        self._git("config", "alias.p", "push -f origin main", cwd=repo)
+        os.chdir(repo)
+        before = self._git("rev-parse", "main", cwd=bare).stdout
+        message = await self._refused("git p")
+        self.assertIn("alias", message)
+        self.assertEqual(self._git("rev-parse", "main", cwd=bare).stdout, before)
+        # A global alias is just as invisible.
+        message = await self._refused("git -c alias.q='push -f origin main' q")
+        self.assertIn("main", message)
+        # Built-in subcommands are never resolved through an alias, so they
+        # keep running.
+        result = await self._run("git status")
+        self.assertEqual(result.exit_code, 0, result.output)
+
+    async def test_refuses_trailing_line_continuation(self):
+        repo, _bare = self._make_repo("repo-trailing-backslash")
+        os.chdir(repo)
+        # The kernel appends the command to a script, so a trailing backslash
+        # joins it with text the guard cannot see.
+        message = await self._refused("git push -f origin main\\")
+        self.assertIn("line continuation", message)
+        # An escaped backslash is not a continuation.
+        result = await self._run("git push -f origin main\\\\")
+        self.assertNotEqual(result.exit_code, 0)  # git rejects the refspec
+
+    async def test_refuses_case_insensitive_git_command_names(self):
+        repo, _bare = self._make_repo("repo-case")
+        os.chdir(repo)
+        for command in [
+            "GIT push -f origin main",
+            "Git.EXE push -f origin main",
+            "/usr/bin/GIT push -f origin main",
+            "SUDO git push -f origin main",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("main", message)
+
+    async def test_refuses_env_relocation_and_split_string(self):
+        repo, _bare = self._make_repo("repo-env")
+        os.chdir(self.test_dir)  # not a repository: git fails the push itself
+        message = await self._refused(f"env -C {repo} git push -f origin")
+        self.assertIn("changes directory", message)
+        message = await self._refused(f"env --chdir={repo} git push -f origin")
+        self.assertIn("changes directory", message)
+        message = await self._refused(f"env --chdir {repo} git push -f origin")
+        self.assertIn("changes directory", message)
+        for command in [
+            "env -S 'git push -f origin main'",
+            "env -iS'git push -f origin main'",
+            "env --split-string='git push -f origin main'",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("env -S", message)
+
+    async def test_env_wrappers_without_a_hidden_push_stay_allowed(self):
+        repo, _bare = self._make_repo("repo-env-ok")
+        os.chdir(repo)
+        result = await self._run("env -S 'git status'")
+        self.assertEqual(result.exit_code, 0, result.output)
+        result = await self._run("env -S 'git push --force-with-lease origin feature'")
+        self.assertEqual(result.exit_code, 0, result.output)
+        result = await self._run("env echo hi")
+        self.assertEqual(result.exit_code, 0, result.output)
+
+    async def test_force_push_allowlist_still_runs(self):
+        repo, bare = self._make_repo("repo-allowlist")
+        self._diverge(repo, bare, "feature")
+        os.chdir(repo)
+        for command in [
+            "git push -f origin feature",
+            "git push origin +feature",
+            "git push --force-with-lease origin feature",
+            "git push --force-if-includes --force-with-lease origin feature",
+            "git push origin feature",
+            "git push --tags",
+        ]:
+            with self.subTest(command=command):
+                result = await self._run(command)
+                self.assertEqual(result.exit_code, 0, result.output)
 
 
 class ForcePushFrozenBypassTest(unittest.TestCase):

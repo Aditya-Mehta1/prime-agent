@@ -947,9 +947,79 @@ class BashHandle:
 # Detection is string-only shell-text scanning in the shape of the other
 # kernel bash guards; the upstream probe runs only after a force pattern
 # matches, and non-force pushes pay nothing.
+#
+# The scan sees the text the way the shell does -- line continuations joined,
+# quoted and escaped characters folded, ANSI-C (`$'...'`) escapes decoded,
+# git aliases defined with `-c alias.X=...` expanded -- and something it
+# cannot resolve is refused rather than guessed at: a push argument carrying a
+# variable, glob, or substitution; an implicit refspec when the branch has no
+# upstream (the target then comes from push.default / remote.<name>.push /
+# remote.<name>.mirror); a git command line whose `env`/`xargs`/alias wrapper
+# hides what runs; or a command that changes directory before pushing. It
+# fails open only where git fails on its own: not a repository, a detached
+# HEAD, or a remote that does not exist.
 
 # Bypass env var for the force-push guard.
 BASH_FORCE_PUSH_BYPASS_ENV = "PI_BASH_ALLOW_FORCE_PUSH"
+
+# Command words that run git. Matched case-insensitively: the kernel runs on
+# macOS and Windows, whose filesystems resolve `GIT`, `/usr/bin/GIT`, and
+# `SH` to the same binaries as their lowercase spellings.
+_FP_GIT_COMMAND_NAMES = ("git", "git.exe")
+_FP_ENV_COMMAND_NAMES = ("env", "env.exe")
+_FP_XARGS_COMMAND_NAMES = ("xargs", "xargs.exe")
+_FP_COMMAND_WRAPPERS = (
+    "sudo",
+    "env",
+    "command",
+    "builtin",
+    "nice",
+    "nohup",
+    "stdbuf",
+    "setsid",
+    "time",
+)
+
+
+def _fp_command_name(value: str) -> str:
+    """A command word's name, folded for the filesystems the kernel runs on."""
+    return os.path.basename(value).casefold()
+
+
+# git's own subcommands (git --list-cmds=builtins). git never resolves one of
+# these through `alias.<name>`, so a name that is NOT here is either a
+# repository/user alias or an external `git-<name>` program, and either can run
+# a force push the command text does not show.
+_FP_GIT_BUILTINS = frozenset(
+    (
+    "add", "am", "annotate", "apply", "archive", "backfill", "bisect", "blame",
+    "branch", "bugreport", "bundle", "cat-file", "check-attr", "check-ignore",
+    "check-mailmap", "check-ref-format", "checkout", "checkout--worker",
+    "checkout-index", "cherry", "cherry-pick", "clean", "clone", "column", "commit",
+    "commit-graph", "commit-tree", "config", "count-objects", "credential",
+    "credential-cache", "credential-cache--daemon", "credential-store", "describe",
+    "diagnose", "diff", "diff-files", "diff-index", "diff-pairs", "diff-tree",
+    "difftool", "fast-export", "fast-import", "fetch", "fetch-pack", "fmt-merge-msg",
+    "for-each-ref", "for-each-repo", "format-patch", "format-rev", "fsck",
+    "fsck-objects", "fsmonitor--daemon", "gc", "get-tar-commit-id", "grep",
+    "hash-object", "help", "history", "hook", "index-pack", "init", "init-db",
+    "interpret-trailers", "last-modified", "log", "ls-files", "ls-remote", "ls-tree",
+    "mailinfo", "mailsplit", "maintenance", "merge", "merge-base", "merge-file",
+    "merge-index", "merge-ours", "merge-recursive", "merge-recursive-ours",
+    "merge-recursive-theirs", "merge-subtree", "merge-tree", "mktag", "mktree",
+    "multi-pack-index", "mv", "name-rev", "notes", "pack-objects", "pack-redundant",
+    "pack-refs", "patch-id", "pickaxe", "prune", "prune-packed", "pull", "push",
+    "range-diff", "read-tree", "rebase", "receive-pack", "reflog", "refs", "remote",
+    "remote-ext", "remote-fd", "repack", "replace", "replay", "repo", "rerere", "reset",
+    "restore", "rev-list", "rev-parse", "revert", "rm", "send-pack", "shortlog", "show",
+    "show-branch", "show-index", "show-ref", "sparse-checkout", "stage", "stash",
+    "status", "stripspace", "submodule--helper", "switch", "symbolic-ref", "tag",
+    "unpack-file", "unpack-objects", "update-index", "update-ref", "update-server-info",
+    "upload-archive", "upload-archive--writer", "upload-pack", "url-parse", "var",
+    "verify-commit", "verify-pack", "verify-tag", "version", "whatchanged", "worktree",
+    "write-tree",
+    )
+)
 
 # The bypass env var is honored only when present at kernel start: the model
 # can write os.environ, so a live read on each guard call would let a single
@@ -974,42 +1044,58 @@ class ForcePushRefusalError(RuntimeError):
 
 
 def _fp_normalize_continuations(command: str) -> str:
-    """Collapse unquoted backslash-newline line continuations to spaces.
+    """Remove backslash-newline line continuations the way the shell does.
 
-    The shell runs `git push -f \
-origin main` as one `git push -f origin main`
-    command, so the force-push scan must see through continuations. The
-    replacement is length-preserving so the scan's character indices stay
-    aligned with the original command. Single-quoted backslash-newlines are
-    literal data and a newline always ends a comment, so those are left
-    untouched.
+    The shell deletes the pair and joins what surrounds it, so it runs
+    `git push -f \
+origin main` as one `git push -f origin main` command and splits
+    nothing: `ma\
+in` is the single word `main`. Every later step works on the string
+    this returns, so dropping the two characters keeps the scan aligned with
+    what executes. Single-quoted backslash-newlines are literal data and a
+    newline always ends a comment, so those are left untouched; inside double
+    quotes the shell drops the pair too and resolves backslash escapes (so a
+    `\\"` does not end the string).
     """
-    chars = list(command)
+    chars: list[str] = []
     quote: str | None = None
     comment = False
     i = 0
-    n = len(chars)
+    n = len(command)
     while i < n:
-        ch = chars[i]
+        ch = command[i]
         if comment:
+            chars.append(ch)
             if ch == "\n":
                 comment = False
         elif quote is None:
             if ch in ('"', "'"):
                 quote = ch
-            elif ch == "#" and (i == 0 or re.match(r"[\s;&|(){}]", chars[i - 1])):
+            elif ch == "#" and (i == 0 or re.match(r"[\s;&|(){}]", command[i - 1])):
                 comment = True
-            elif ch == "\\" and i + 1 < n and chars[i + 1] == "\n":
-                chars[i] = " "
-                chars[i + 1] = " "
-                i += 1
+            if ch == "\\" and i + 1 < n and command[i + 1] == "\n":
+                i += 2  # a continuation: the shell joins the two sides
+                continue
+            chars.append(ch)
         elif quote == "'":
+            chars.append(ch)
             if ch == "'":
                 quote = None
-        elif quote == '"':
-            quote = None
         elif ch == "\\" and i + 1 < n:
-            i += 1  # inside double quotes the mask already folds escapes
+            # Inside double quotes a backslash-newline joins the two sides;
+            # any other escape ends the string only after the escaped
+            # character, so the pair is kept for the later scan.
+            if command[i + 1] == "\n":
+                i += 2
+                continue
+            chars.append(ch)
+            chars.append(command[i + 1])
+            i += 2
+            continue
+        else:
+            chars.append(ch)
+            if ch == '"':
+                quote = None
         i += 1
     return "".join(chars)
 
@@ -1087,32 +1173,34 @@ def _fp_mask_redirections(command: str) -> str:
             if ch == "'":
                 quote = None
         elif quote == '"':
-            quote = None
-        elif ch == "\\" and i + 1 < n:
-            i += 1  # escaped character inside double quotes stays
-        elif ch == "$" and chars[i + 1 : i + 2] == "(":
-            # Command substitution inside double quotes still executes; mask
-            # redirections inside it too (its own redirects are syntax).
-            depth = 0
-            j = i + 1
-            while j < n:
-                if chars[j] == "(":
-                    depth += 1
-                elif chars[j] == ")":
-                    depth -= 1
-                    if depth == 0:
-                        break
-                j += 1
-            interior = _fp_mask_redirections(command[i + 2 : j])
-            chars[i + 2 : j] = list(interior)
-            i = j
-        elif ch == "`":
-            j = i + 1
-            while j < n and chars[j] != "`":
-                j += 1
-            interior = _fp_mask_redirections(command[i + 1 : j])
-            chars[i + 1 : j] = list(interior)
-            i = j
+            if ch == '"':
+                quote = None
+            elif ch == "\\" and i + 1 < n:
+                i += 1  # escaped character inside double quotes stays
+            elif ch == "$" and chars[i + 1 : i + 2] == "(":
+                # Command substitution inside double quotes still executes;
+                # mask redirections inside it too (its own redirects are
+                # syntax).
+                depth = 0
+                j = i + 1
+                while j < n:
+                    if chars[j] == "(":
+                        depth += 1
+                    elif chars[j] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    j += 1
+                interior = _fp_mask_redirections(command[i + 2 : j])
+                chars[i + 2 : j] = list(interior)
+                i = j
+            elif ch == "`":
+                j = i + 1
+                while j < n and chars[j] != "`":
+                    j += 1
+                interior = _fp_mask_redirections(command[i + 1 : j])
+                chars[i + 1 : j] = list(interior)
+                i = j
         i += 1
     return "".join(chars)
 
@@ -1162,11 +1250,15 @@ def _fp_strip_escapes(command: str) -> tuple[str, list[int]]:
                 if ch == "'":
                     quote = None
             elif quote == '"':
-                quote = None
-            elif ch == "\\" and i + 1 < n:
-                chars.append(command[i + 1])
-                index_map.append(i + 1)
-                i += 1
+                if ch == '"':
+                    quote = None
+                elif ch == "\\" and i + 1 < n:
+                    # A quoted escape stays in the text: the word scan resolves
+                    # it, and skipping the pair keeps `\\"` from ending the
+                    # string here.
+                    chars.append(command[i + 1])
+                    index_map.append(i + 1)
+                    i += 1
             i += 1
     return "".join(chars), index_map
 
@@ -1203,6 +1295,70 @@ def _fp_unquote_one_level(text: str) -> str:
             i += 1  # escaped character inside double quotes stays
         i += 1
     return "".join(chars)
+
+
+# bash `$'...'` (ANSI-C quoting) escapes. The shell decodes them before it
+# builds argv, so `$'\x67it'` is the command word `git`; a scan that keeps the
+# raw text cannot see that.
+_FP_ANSI_C_ESCAPES = {
+    "a": "\a",
+    "b": "\b",
+    "e": "\x1b",
+    "E": "\x1b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "v": "\v",
+    "\\": "\\",
+    "'": "'",
+    '"': '"',
+    "?": "?",
+}
+_FP_ANSI_C_OCTAL = "01234567"
+_FP_ANSI_C_HEX = "0123456789abcdefABCDEF"
+
+
+def _fp_ansi_c_decoded(body: str) -> str:
+    """Decode the body of a `$'...'` word the way bash does.
+
+    Unknown escapes resolve to the escaped character itself, exactly as the
+    shell resolves them, so the decoded text is what git would see in argv."""
+    out: list[str] = []
+    i = 0
+    n = len(body)
+    while i < n:
+        ch = body[i]
+        if ch != "\\" or i + 1 >= n:
+            out.append(ch)
+            i += 1
+            continue
+        esc = body[i + 1]
+        i += 2
+        if esc in _FP_ANSI_C_ESCAPES:
+            out.append(_FP_ANSI_C_ESCAPES[esc])
+            continue
+        if esc in _FP_ANSI_C_OCTAL:
+            digits = esc
+            while len(digits) < 3 and i < n and body[i] in _FP_ANSI_C_OCTAL:
+                digits += body[i]
+                i += 1
+            out.append(chr(int(digits, 8) & 0xFF))
+            continue
+        if esc in ("x", "u", "U"):
+            width = {"x": 2, "u": 4, "U": 8}[esc]
+            digits = ""
+            while len(digits) < width and i < n and body[i] in _FP_ANSI_C_HEX:
+                digits += body[i]
+                i += 1
+            out.append(chr(int(digits, 16)) if digits else esc)
+            continue
+        if esc == "c" and i < n:
+            out.append(chr(ord(body[i].upper()) & 0x1F))
+            i += 1
+            continue
+        out.append(esc)  # an unknown escape is the character itself
+    return "".join(out)
 
 
 @dataclass(frozen=True)
@@ -1282,6 +1438,29 @@ def _fp_scan_words(command: str) -> list[_FpShellWord]:
                 value.append(command[i + 1])
                 i += 2
                 continue
+            if ch == "$" and command[i + 1 : i + 2] == "'":
+                # `$'...'` is ANSI-C quoting: its escapes are decoded before
+                # the shell builds argv, so `$'\x67it'` is the command word
+                # `git` and `$'ma\in'` is the word `main`.
+                j = i + 2
+                body: list[str] = []
+                while j < end:
+                    if command[j] == "\\" and command[j + 1 : j + 2] == "'":
+                        body.append("'")  # \' is a literal quote, not the end
+                        j += 2
+                        continue
+                    if command[j] == "'":
+                        break
+                    body.append(command[j])
+                    j += 1
+                value.append(_fp_ansi_c_decoded("".join(body)))
+                i = j + 1
+                continue
+            if ch == "$" and command[i + 1 : i + 2] == '"':
+                # `$"..."` is a translatable double-quoted string: drop the `$`
+                # and let the double-quote scan read it.
+                i += 1
+                continue
             if ch == "'":
                 j = i + 1
                 while j < end and command[j] != "'":
@@ -1352,6 +1531,23 @@ def _fp_contained_in_later_word(words: list[_FpShellWord], index: int) -> bool:
     )
 
 
+def _fp_invocation_tokens(words: list[_FpShellWord], index: int) -> list[str]:
+    """The argv values of the command that starts at words[index].
+
+    Everything up to the next command boundary is one invocation; a
+    command-substitution interior is skipped because it runs as its own
+    command and the enclosing word follows it."""
+    tokens = [words[index].value]
+    for follower_index in range(index + 1, len(words)):
+        follower = words[follower_index]
+        if follower.starts_command:
+            if not _fp_contained_in_later_word(words, follower_index):
+                break
+            continue  # substitution interior: the enclosing word follows
+        tokens.append(follower.value)
+    return tokens
+
+
 # git global options that take the next token as their value (space-separated
 # form); attached `--opt=value` forms never consume a separate token.
 _FP_GIT_GLOBAL_VALUE_SHORT = {"-c", "-C"}
@@ -1363,8 +1559,13 @@ _FP_GIT_GLOBAL_VALUE_LONG = {
     "--super-prefix",
     "--config-env",
 }
-# git global options that relocate the repository a push would target.
-_FP_GIT_GLOBAL_RELOCATING = ("-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env")
+# A remote can be a URL or an scp-like path -- `https://host/x.git`,
+# `git@github.com:org/repo.git`, `host.name:path`, `C:\repo` -- and git reads
+# the first positional as the repository before it reads any refspec, so a
+# colon inside one is not a refspec separator.
+_FP_URL_OR_SCP_REMOTE = re.compile(
+    r"""^(?:[A-Za-z][A-Za-z0-9+.\-]*://|[^/@:]+@[^/:]+:|[A-Za-z]:[\\/]|[^/@:]+(?:\.[^/@:]+)+:)"""
+)
 
 # git push options that take the next token as their value (space-separated
 # form); `--signed[=x]` and `--recurse-submodules[=x]` are attached-only, and
@@ -1423,6 +1624,7 @@ class _FpPushRun:
     tokens: list[str]  # argv values from the git word to the run's end
     relocated: bool  # -C/--git-dir-style relocation or GIT_DIR=... prefix
     xargs_fed: bool  # xargs feeds refspecs the guard cannot see
+    unresolvable_alias: bool = False  # an inline `alias.X` hides this run
 
 
 @dataclass(frozen=True)
@@ -1434,6 +1636,154 @@ class _FpPushArgs:
     wildcard: bool  # --all / --mirror: every branch is a target
     refspecs: list[str]
     repo_option: bool  # --repo named the remote: positionals are refspecs
+    unresolvable: str | None = None  # argv word holding a variable/glob/...
+
+
+# An inline configuration that defines an alias for the subcommand the very
+# same command line invokes: git rewrites argv with the alias body, so
+# `git -c alias.p='push -f origin main' p` runs a force push that a scan
+# looking for the `push` word never sees.
+_FP_MAX_ALIAS_DEPTH = 10
+# An alias body the guard must not guess at: a shell (`!`) alias, or a body
+# carrying substitution, quoting, or control syntax whose split the guard
+# cannot reproduce exactly.
+_FP_UNRESOLVABLE_ALIAS_BODY = re.compile(r"""[$`'"\\;&|()<>#!\n]""")
+
+
+class _FpUnresolvableAlias:
+    """An inline git alias whose expansion cannot be resolved statically."""
+
+
+_FP_UNRESOLVABLE_ALIAS = _FpUnresolvableAlias()
+
+
+def _fp_inline_alias_configs(tokens: list[str]) -> tuple[dict[str, str | None], int]:
+    """Inline `alias.*` bodies in the global-option region of `tokens`, plus
+    the index of the subcommand word (`len(tokens)` when there is none).
+
+    A body is None when the definition does not carry it statically:
+    `--config-env=alias.p=SOME_VAR` reads the body from the environment."""
+    aliases: dict[str, str | None] = {}
+    i = 1
+    n = len(tokens)
+    while i < n:
+        token = tokens[i]
+        if token == "--":
+            return aliases, n
+        if not token.startswith("-") or token == "-":
+            return aliases, i
+        value: str | None = None
+        from_environment = False
+        if token in ("-c", "--config-env"):
+            if i + 1 >= n:
+                return aliases, n
+            value = tokens[i + 1]
+            from_environment = token == "--config-env"
+            i += 2
+        elif token.startswith("--config-env="):
+            value = token[len("--config-env=") :]
+            from_environment = True
+            i += 1
+        elif token.startswith("-c") and len(token) > 2:
+            value = token[2:]  # the attached -c<name>=<value> form
+            i += 1
+        elif token in _FP_GIT_GLOBAL_VALUE_SHORT or token in _FP_GIT_GLOBAL_VALUE_LONG:
+            i += 2  # an option with a space-separated value
+        else:
+            i += 1  # an attached-value or valueless global option
+        if value is None or not value.startswith("alias."):
+            continue
+        name, separator, body = value[len("alias.") :].partition("=")
+        if separator and name:
+            aliases[name] = None if from_environment else body
+    return aliases, n
+
+
+def _fp_expand_one_inline_git_alias(
+    tokens: list[str],
+) -> "list[str] | _FpUnresolvableAlias | None":
+    """Rewrite `git ... -c alias.X=<body> ... X ...` into the argv git runs.
+
+    Returns None when no inline alias applies, the rewritten tokens when one
+    does, and _FP_UNRESOLVABLE_ALIAS when the body cannot be expanded
+    statically (a `!` shell alias, a body from the environment, or one
+    carrying substitution the guard cannot reproduce)."""
+    aliases, subcommand_index = _fp_inline_alias_configs(tokens)
+    if not aliases or subcommand_index >= len(tokens):
+        return None
+    subcommand = tokens[subcommand_index]
+    if subcommand not in aliases:
+        return None
+    body = aliases[subcommand]
+    if body is None or _FP_UNRESOLVABLE_ALIAS_BODY.search(body):
+        return _FP_UNRESOLVABLE_ALIAS
+    words, well_formed = _fp_literal_words(body.strip())
+    if not well_formed or not words or any(word is None for word in words):
+        return _FP_UNRESOLVABLE_ALIAS
+    return [
+        tokens[0],
+        *tokens[1:subcommand_index],
+        *words,
+        *tokens[subcommand_index + 1 :],
+    ]
+
+
+def _fp_expand_alias_chain(tokens: list[str]) -> "list[str] | _FpUnresolvableAlias":
+    """Expand inline `alias.X` definitions until the argv stops changing.
+
+    Refuses (_FP_UNRESOLVABLE_ALIAS) a body the guard cannot expand, and a
+    chain longer than _FP_MAX_ALIAS_DEPTH."""
+    current = tokens
+    for _ in range(_FP_MAX_ALIAS_DEPTH):
+        expanded = _fp_expand_one_inline_git_alias(current)
+        if expanded is _FP_UNRESOLVABLE_ALIAS:
+            return _FP_UNRESOLVABLE_ALIAS
+        if expanded is None:
+            return current
+        current = expanded
+    return _FP_UNRESOLVABLE_ALIAS  # a chain longer than the guard follows
+
+
+def _fp_expand_inline_git_aliases(tokens: list[str]) -> "list[str] | _FpUnresolvableAlias":
+    """Resolve inline `alias.X` definitions for the invoked subcommand.
+
+    Returns the tokens unchanged when no inline alias applies, or when the
+    expansion holds no `push`: an alias whose name shadows a builtin is never
+    used by git (`-c alias.push=... push` still runs the builtin), so only an
+    expansion that carries a push may replace the argv the guard already sees.
+    Refuses a body the guard cannot expand, and an alias chain deeper than
+    _FP_MAX_ALIAS_DEPTH."""
+    expanded = _fp_expand_alias_chain(tokens)
+    if expanded is _FP_UNRESOLVABLE_ALIAS:
+        return _FP_UNRESOLVABLE_ALIAS
+    if expanded == tokens or _fp_find_push_subcommand(expanded)[0] is None:
+        return tokens
+    return expanded
+
+
+def _fp_unresolvable_git_subcommand(words: list[_FpShellWord]) -> str | None:
+    """The first git subcommand the guard cannot resolve, or None.
+
+    git runs a name that is not one of its builtins through `alias.<name>` in
+    the repository, the user, or the system config, or through an external
+    `git-<name>` program on PATH; either can run a force push the command text
+    does not show. An inline `-c alias.<name>=...` is expanded first, so a name
+    the guard can still resolve to a harmless builtin passes."""
+    for index, word in enumerate(words):
+        if _fp_command_name(word.value) not in _FP_GIT_COMMAND_NAMES:
+            continue
+        tokens = _fp_invocation_tokens(words, index)
+        expanded = _fp_expand_alias_chain(tokens)
+        if expanded is _FP_UNRESOLVABLE_ALIAS:
+            continue  # refused already: the run finder marks this invocation
+        _aliases, subcommand_index = _fp_inline_alias_configs(expanded)
+        if subcommand_index >= len(expanded):
+            continue  # `git --version` and friends run no subcommand
+        subcommand = expanded[subcommand_index]
+        if subcommand in _FP_GIT_BUILTINS:
+            continue
+        return subcommand
+    return None
 
 
 def _fp_find_git_push_runs(words: list[_FpShellWord]) -> list[_FpPushRun]:
@@ -1448,22 +1798,27 @@ def _fp_find_git_push_runs(words: list[_FpShellWord]) -> list[_FpPushRun]:
     """
     runs: list[_FpPushRun] = []
     for index, word in enumerate(words):
-        if os.path.basename(word.value) not in ("git", "git.exe"):
+        if _fp_command_name(word.value) not in _FP_GIT_COMMAND_NAMES:
             continue
-        tokens = [word.value]
-        for follower_index in range(index + 1, len(words)):
-            follower = words[follower_index]
-            if follower.starts_command:
-                if not _fp_contained_in_later_word(words, follower_index):
-                    break
-                continue  # substitution interior: the enclosing word follows
-            tokens.append(follower.value)
-        push_index, global_relocated = _fp_find_push_subcommand(tokens)
+        tokens = _fp_invocation_tokens(words, index)
+        prefix_relocated, xargs_fed = _fp_invocation_context(words, index)
+        expanded = _fp_expand_inline_git_aliases(tokens)
+        if expanded is _FP_UNRESOLVABLE_ALIAS:
+            # The command line defines an alias for the word it invokes and the
+            # guard cannot read the body: refuse rather than miss a push.
+            runs.append(_FpPushRun(index, 0, tokens, prefix_relocated, xargs_fed, True))
+            continue
+        push_index, global_relocated = _fp_find_push_subcommand(expanded)
         if push_index is None:
             continue
-        prefix_relocated, xargs_fed = _fp_invocation_context(words, index)
         runs.append(
-            _FpPushRun(index, push_index, tokens, global_relocated or prefix_relocated, xargs_fed)
+            _FpPushRun(
+                index,
+                push_index,
+                expanded,
+                global_relocated or prefix_relocated,
+                xargs_fed,
+            )
         )
     return runs
 
@@ -1479,27 +1834,38 @@ def _fp_invocation_context(
     stops it."""
     relocated = False
     xargs_fed = False
-    wrappers = ("sudo", "env", "command", "builtin", "nice", "nohup", "stdbuf")
+    command_start = git_index
+    while command_start > 0 and not words[command_start].starts_command:
+        command_start -= 1
+    if any(
+        _fp_command_name(word.value) in _FP_ENV_COMMAND_NAMES
+        for word in words[command_start:git_index]
+    ):
+        # `env` can move the invocation (`env -C DIR git push -f`) and its
+        # option words end the walk below, so the cwd the guard would probe is
+        # not necessarily the one the push runs in.
+        relocated = True
     j = git_index - 1
     while j >= 0:
         prev = words[j]
         value = prev.value
+        name = _fp_command_name(value)
         if prev.starts_command and not (
             re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", value)
-            or os.path.basename(value) == "xargs"
-            or value in wrappers
+            or name in _FP_XARGS_COMMAND_NAMES
+            or name in _FP_COMMAND_WRAPPERS
         ):
             break  # a real command precedes: nothing of this invocation's
         if _fp_contained_in_later_word(words, j):
             j -= 1  # substitution interior before the enclosing word
             continue
-        if os.path.basename(value) == "xargs":
+        if name in _FP_XARGS_COMMAND_NAMES:
             xargs_fed = True  # refspecs arrive on stdin, unseen by the guard
         elif re.match(r"^GIT_[A-Z_]+=", value):
             relocated = True  # GIT_DIR/GIT_WORK_TREE/... select another repository
         elif re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", value):
             pass  # a benign env assignment applies only to this invocation
-        elif value in wrappers:
+        elif name in _FP_COMMAND_WRAPPERS:
             pass  # wrappers that cannot change directory or repository
         else:
             break  # an argument or unknown wrapper: nothing more to learn
@@ -1515,12 +1881,18 @@ def _fp_parse_push_args(tokens: list[str], push_index: int) -> _FpPushArgs:
     dry_run = False
     wildcard = False
     repo_option = False
+    unresolvable: str | None = None
     positionals: list[str] = []
     options_done = False
     i = push_index + 1
     n = len(tokens)
     while i < n:
         token = tokens[i]
+        if unresolvable is None and _FP_GLOB_OR_SUBSTITUTION.search(token):
+            # A word the shell expands (a variable, a substitution, a glob) can
+            # become `-f`, or a `+`-refspec naming a protected branch, or the
+            # remote, so the invocation cannot be proven non-force.
+            unresolvable = token
         if options_done:
             positionals.append(token)
             i += 1
@@ -1576,14 +1948,55 @@ def _fp_parse_push_args(tokens: list[str], push_index: int) -> _FpPushArgs:
             or first.startswith("refs/")
             or re.search(r"[*?\[]", first)
         )
-        if not refspec_shaped:
-            refspecs = positionals[1:]  # the first positional names the remote
-    return _FpPushArgs(force, dry_run, wildcard, refspecs, repo_option)
+        if not refspec_shaped or _FP_URL_OR_SCP_REMOTE.match(first):
+            # The first positional names the remote; git reads a URL or
+            # scp-like word as the repository even though it carries a colon,
+            # so an implicit refspec (push.default, remote.<name>.push,
+            # remote.<name>.mirror) picks the branches it would force.
+            refspecs = positionals[1:]
+    return _FpPushArgs(force, dry_run, wildcard, refspecs, repo_option, unresolvable)
 
 
 def _fp_is_guarded_push(args: _FpPushArgs) -> bool:
-    """True when the invocation carries force and is not a dry run."""
-    return (args.force or any(spec.startswith("+") for spec in args.refspecs)) and not args.dry_run
+    """True when the invocation carries force and is not a dry run.
+
+    A word the scanner cannot resolve counts as force: the shell may expand it
+    into a force flag or into a `+`-refspec before git reads argv."""
+    return (
+        args.force
+        or args.unresolvable is not None
+        or any(spec.startswith("+") for spec in args.refspecs)
+    ) and not args.dry_run
+
+
+def _fp_run_is_guarded(run: _FpPushRun) -> bool:
+    """Whether one scanned `git ... push` run needs the violation check."""
+    return run.unresolvable_alias or _fp_is_guarded_push(
+        _fp_parse_push_args(run.tokens, run.push_index)
+    )
+
+
+def _fp_payload_hides_force_push(payload: str) -> bool:
+    """True when a payload the shell re-reads as a command hides a force push.
+
+    The payload is command text, so it goes through the same normalization,
+    masking, escape folding, and word scan as a top-level command."""
+    normalized, _index_map = _fp_strip_escapes(
+        _fp_mask_redirections(_fp_normalize_continuations(payload))
+    )
+    return any(
+        _fp_run_is_guarded(run)
+        for run in _fp_find_git_push_runs(_fp_scan_words(normalized))
+    )
+
+
+def _fp_payload_is_ansi_c(source: str) -> bool:
+    """True for a `$'...'`/`$"..."` payload word.
+
+    ANSI-C quoting decodes escapes before the payload runs, and the guard does
+    not reproduce that split, so a payload carrying one is refused outright
+    rather than scanned as text it is not."""
+    return source.startswith("$'") or source.startswith('$"')
 
 
 # `eval` re-parses its payload, so a quoted argument that the plain scan must
@@ -1606,15 +2019,14 @@ def _fp_eval_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
             if follower.starts_command:
                 if not _fp_contained_in_later_word(words, follower_index):
                     break
-                continue
-            payload_parts.append(command[follower.start : follower.end])
+                continue  # substitution interior: the enclosing word follows
+            payload_source = command[follower.start : follower.end]
+            if _fp_payload_is_ansi_c(payload_source):
+                return True  # the guard does not reproduce an ANSI-C payload
+            payload_parts.append(payload_source)
         payload = _fp_unquote_one_level(" ".join(payload_parts))
-        normalized, _index_map = _fp_strip_escapes(
-            _fp_mask_redirections(_fp_normalize_continuations(payload))
-        )
-        for run in _fp_find_git_push_runs(_fp_scan_words(normalized)):
-            if _fp_is_guarded_push(_fp_parse_push_args(run.tokens, run.push_index)):
-                return True
+        if _fp_payload_hides_force_push(payload):
+            return True
         if _fp_eval_payloads_hide_force_push(payload, depth + 1):
             return True
     return False
@@ -1634,7 +2046,7 @@ def _fp_shell_c_payloads_hide_force_push(command: str) -> bool:
     are scanned as plain invocations already and are skipped here."""
     words = _fp_scan_words(command)
     for index, word in enumerate(words):
-        if os.path.basename(word.value) not in _FP_SHELL_C_INTERPRETERS:
+        if _fp_command_name(word.value) not in _FP_SHELL_C_INTERPRETERS:
             continue
         c_pending = False
         for follower_index in range(index + 1, len(words)):
@@ -1646,14 +2058,11 @@ def _fp_shell_c_payloads_hide_force_push(command: str) -> bool:
             token = follower.value
             if c_pending:
                 payload_source = command[follower.start : follower.end]
+                if _fp_payload_is_ansi_c(payload_source):
+                    return True  # the guard does not reproduce an ANSI-C payload
                 if payload_source.startswith(("'", '"')):
-                    payload = _fp_unquote_one_level(payload_source)
-                    normalized, _index_map = _fp_strip_escapes(
-                        _fp_mask_redirections(_fp_normalize_continuations(payload))
-                    )
-                    for run in _fp_find_git_push_runs(_fp_scan_words(normalized)):
-                        if _fp_is_guarded_push(_fp_parse_push_args(run.tokens, run.push_index)):
-                            return True
+                    if _fp_payload_hides_force_push(_fp_unquote_one_level(payload_source)):
+                        return True
                 break  # the payload word ends this shell invocation
             if token == "--":
                 break
@@ -1664,6 +2073,69 @@ def _fp_shell_c_payloads_hide_force_push(command: str) -> bool:
                 and "c" in token[1:]
             ):
                 c_pending = True
+    return False
+
+
+_FP_ENV_COMMAND_NAMES = ("env", "env.exe")
+
+
+def _fp_env_payload_hides_force_push_source(payload_source: str) -> bool:
+    """Whether one `env -S` payload word hides a force push."""
+    if _fp_payload_is_ansi_c(payload_source):
+        return True  # the guard does not reproduce an ANSI-C split
+    return _fp_payload_hides_force_push(_fp_unquote_one_level(payload_source))
+
+
+def _fp_env_payloads_hide_force_push(command: str) -> bool:
+    """True when an `env -S`/`--split-string` payload hides a force push.
+
+    `env -S 'git push -f origin main'` splits that one word into the argv git
+    receives, so the plain scan -- which sees a single quoted word -- cannot
+    see the push. An ANSI-C-quoted payload is refused outright: the guard does
+    not reproduce its split. Unquoted payloads need no handling here; the plain
+    scan already reads them as the words they are."""
+    words = _fp_scan_words(command)
+    for index, word in enumerate(words):
+        if os.path.basename(word.value).casefold() not in _FP_ENV_COMMAND_NAMES:
+            continue
+        payload_pending = False
+        for follower_index in range(index + 1, len(words)):
+            follower = words[follower_index]
+            if follower.starts_command and not _fp_contained_in_later_word(
+                words, follower_index
+            ):
+                break
+            token = follower.value
+            payload_source = command[follower.start : follower.end]
+            if payload_pending:
+                if _fp_payload_is_ansi_c(payload_source):
+                    return True
+                if _fp_payload_hides_force_push(_fp_unquote_one_level(payload_source)):
+                    return True
+                break  # this env invocation is clean; check the next one
+            if token == "--":
+                break
+            if token == "--split-string":
+                payload_pending = True
+                continue
+            if token.startswith("--split-string="):
+                if _fp_env_payload_hides_force_push_source(
+                    payload_source[len("--split-string=") :]
+                ):
+                    return True
+                break
+            if token.startswith("-") and not token.startswith("--"):
+                short = token[1:]
+                if "S" in short:
+                    attached = short[short.index("S") + 1 :]
+                    offset = follower.start + 1 + short.index("S") + 1
+                    if attached:
+                        if _fp_env_payload_hides_force_push_source(
+                            command[offset : follower.end]
+                        ):
+                            return True
+                        break
+                    payload_pending = True
     return False
 
 
@@ -1904,33 +2376,34 @@ def _fp_resolve_push_cwd(
 
 @dataclass(frozen=True)
 class _FpUpstreamInfo:
-    """The current branch's upstream, from a `git rev-parse` probe."""
+    """The current branch and its upstream, from a `git rev-parse` probe."""
 
-    upstream_ref: str  # e.g. "origin/main"
-    upstream_branch: str  # the branch name on the remote, e.g. "main"
+    upstream_ref: str | None  # e.g. "origin/main"; None when there is none
     current_branch: str  # e.g. "feature" (or "HEAD" when detached)
 
 
 # One probe answers every question the guard asks about a repository: the
-# upstream ref (implicit refspecs), the upstream branch name (to tell `git
-# push -f origin main` on an ordinary branch apart from nothing at all), and
-# the current branch (explicit `HEAD` refspecs).
+# upstream ref (implicit refspecs) and the current branch (explicit `HEAD`
+# refspecs). An empty first line means the branch has no upstream, which is
+# not the same as "not a repository": an implicit push then takes its target
+# from configuration (push.default, remote.<name>.push, remote.<name>.mirror)
+# the guard cannot read.
 _FP_UPSTREAM_PROBE = r"""cur=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || exit 1
-up=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null) || exit 1
-merge=$(git config --get "branch.$cur.merge" 2>/dev/null) || exit 1
-printf '%s\n%s\n%s\n' "$up" "${merge#refs/heads/}" "$cur"
+up=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null) || up=
+printf '%s\n%s\n' "$up" "$cur"
 """
 
 
 def _fp_probe_upstream(
     cwd: str, cache: dict[str, "_FpUpstreamInfo | None"]
 ) -> _FpUpstreamInfo | None:
-    """Probe the current branch's upstream with `git rev-parse @{u}`.
+    """Probe the current branch and its upstream with `git rev-parse @{u}`.
 
-    Fails open (returns None) when the probe cannot run or reports no
-    upstream -- no repo, no upstream, detached HEAD: git then fails the push
-    itself under the default push.default, and there is no upstream the
-    guard could be protecting. The child shell and env match what the
+    Returns None when the probe cannot run, the directory is not a repository,
+    or HEAD is detached: git then fails an implicit push itself. An info with
+    no upstream_ref is NOT that case -- the branch exists but has no upstream,
+    so an implicit push takes its target from configuration the guard cannot
+    read, and the caller must refuse. The child shell and env match what the
     guarded command itself would see."""
     if cwd in cache:
         return cache[cwd]
@@ -1949,13 +2422,11 @@ def _fp_probe_upstream(
         info = None
     else:
         if completed.returncode == 0:
-            lines = [
-                line
-                for line in completed.stdout.decode("utf-8", errors="replace").splitlines()
-                if line
-            ]
-            if len(lines) == 3 and lines[0] and lines[1] and lines[2]:
-                info = _FpUpstreamInfo(lines[0], lines[1], lines[2])
+            lines = completed.stdout.decode("utf-8", errors="replace").split("\n")
+            upstream_ref = lines[0] if lines else ""
+            current_branch = lines[1] if len(lines) > 1 else ""
+            if current_branch and (upstream_ref or current_branch != "HEAD"):
+                info = _FpUpstreamInfo(upstream_ref or None, current_branch)
     cache[cwd] = info
     return info
 
@@ -1977,8 +2448,18 @@ def _fp_push_violation(
     probe_cache: dict[str, "_FpUpstreamInfo | None"],
 ) -> str | None:
     """Why this force push must be refused, or None when it may run."""
+    if run.unresolvable_alias:
+        return _fp_format_alias_refusal()
     force = args.force or any(spec.startswith("+") for spec in args.refspecs)
-    if not force or args.dry_run:
+    if args.dry_run:
+        return None
+    if args.unresolvable is not None:
+        return _fp_format_refusal(
+            f'the push argument "{args.unresolvable}" cannot be verified'
+            " statically: the shell may expand it into a force flag or into a"
+            " refspec naming a protected branch before git reads argv"
+        )
+    if not force:
         return None
     git_start = words[run.git_index].start
     in_prefix = git_start < user_command_start
@@ -2057,7 +2538,14 @@ def _fp_push_violation(
     resolved_cwd = kernel_cwd if cwd is None else cwd
     probed = _fp_probe_upstream(resolved_cwd, probe_cache)
     if probed is None:
-        return None  # no upstream (or probe failure): fail open, git errors on its own
+        return None  # not a repository: fail open, git errors on its own
+    if probed.upstream_ref is None:
+        return _fp_format_refusal(
+            "without a refspec, and with no upstream on the current branch"
+            f' "{probed.current_branch}", the push target comes from'
+            " push.default, remote.<name>.push, or remote.<name>.mirror"
+            " configuration the guard cannot read"
+        )
     return _fp_format_refusal(
         "without a refspec it would force-push the current branch onto its"
         f' upstream "{probed.upstream_ref}"'
@@ -2123,6 +2611,49 @@ def _fp_format_shell_c_refusal() -> str:
     )
 
 
+def _fp_format_alias_refusal() -> str:
+    return "\n".join(
+        [
+            "Refusing to run this force-push command: it defines a git alias"
+            " (`-c alias.X=...`) for the subcommand it invokes, and the argv"
+            " that alias expands to cannot be resolved safely.",
+            "",
+            "Run the push directly with the aliased name spelled out, or retry"
+            " with bash(command, allow_force_push=True), or start the kernel"
+            f" with {BASH_FORCE_PUSH_BYPASS_ENV}=1.",
+        ]
+    )
+
+
+def _fp_format_git_subcommand_refusal(subcommand: str) -> str:
+    return "\n".join(
+        [
+            f"Refusing to run this git command: `{subcommand}` is not one of"
+            " git's built-in subcommands, so it is a repository or user alias"
+            " (or an external `git-` program) whose argv the guard cannot see."
+            " An alias can force-push a protected branch.",
+            "",
+            "Run the subcommand git resolves to directly, or retry with"
+            " bash(command, allow_force_push=True), or start the kernel with"
+            f" {BASH_FORCE_PUSH_BYPASS_ENV}=1.",
+        ]
+    )
+
+
+def _fp_format_env_refusal() -> str:
+    return "\n".join(
+        [
+            "Refusing to run this force-push command: it runs a force-push"
+            " inside an `env -S`/`--split-string` payload whose target cannot"
+            " be resolved safely.",
+            "",
+            "Run it directly, or retry with"
+            " bash(command, allow_force_push=True), or start the kernel with"
+            f" {BASH_FORCE_PUSH_BYPASS_ENV}=1.",
+        ]
+    )
+
+
 def _fp_warn_once_about_late_force_push_bypass() -> None:
     """Warn (once) when the bypass env var appears mid-session.
 
@@ -2150,13 +2681,15 @@ def _guard_force_push(command: str, allow_force_push: bool) -> None:
     """Refuse force-pushes (`git push --force`, `-f`, `+`-refspecs) whose
     target is protected: a refspec naming main/master or `@{u}`, or the
     current upstream (probed with `git rev-parse @{u}`) when the refspec is
-    implicit. Pattern matching is string-only; the upstream probe runs only
-    on a match, so plain pushes pay nothing. `--force-with-lease` and
+    implicit; a branch with no upstream counts as unresolvable and is refused
+    with it. Pattern matching is string-only; the upstream probe runs only on
+    a match, so plain pushes pay nothing. `--force-with-lease` and
     `--force-if-includes` are never refused."""
     if allow_force_push or _FORCE_PUSH_BYPASS_AT_KERNEL_START:
         return
     command_prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
-    resolved = _fp_mask_redirections(_fp_normalize_continuations(_with_prefix(command)))
+    command_text = _with_prefix(command)
+    resolved = _fp_mask_redirections(_fp_normalize_continuations(command_text))
     normalized, index_map = _fp_strip_escapes(resolved)
     # The cheap gates scan `normalized` with quotes intact: a quoted command
     # word (`"eval"`, `"bash"`) still executes, so quote-aware masking must
@@ -2165,15 +2698,40 @@ def _guard_force_push(command: str, allow_force_push: bool) -> None:
         # An eval payload hides where the push runs; refuse rather than
         # resolve a command the guard cannot see.
         raise ForcePushRefusalError(_fp_format_eval_refusal())
-    if re.search(r"\b(?:sh|bash|zsh|dash|ksh)\b", normalized) and _fp_shell_c_payloads_hide_force_push(
+    if re.search(
+        r"\b(?:sh|bash|zsh|dash|ksh)\b", normalized, re.IGNORECASE
+    ) and _fp_shell_c_payloads_hide_force_push(resolved):
+        # `SH -c '...'` runs a real shell on a case-insensitive filesystem.
+        raise ForcePushRefusalError(_fp_format_shell_c_refusal())
+    if re.search(r"\benv\b", normalized) and _fp_env_payloads_hide_force_push(
         resolved
     ):
-        raise ForcePushRefusalError(_fp_format_shell_c_refusal())
+        # `env -S` splits one word into the argv git receives; refuse rather
+        # than resolve a command the guard cannot see.
+        raise ForcePushRefusalError(_fp_format_env_refusal())
+    trailing_backslashes = len(command_text) - len(command_text.rstrip("\\"))
+    if trailing_backslashes % 2 and re.search(r"\bgit\b", normalized):
+        # An odd trailing backslash escapes the newline the kernel appends
+        # after the command, so the shell joins it with text the guard cannot
+        # see. Refuse rather than guess where the command ends.
+        raise ForcePushRefusalError(
+            _fp_format_refusal(
+                "it ends with a line continuation, so the shell joins it with"
+                " the text that follows in the script the kernel runs"
+            )
+        )
     words = _fp_scan_words(normalized)
+    unresolvable_subcommand = _fp_unresolvable_git_subcommand(words)
+    if unresolvable_subcommand is not None:
+        # A subcommand git does not know is a repository alias or an external
+        # `git-<name>` program: the guard cannot see what it runs.
+        raise ForcePushRefusalError(
+            _fp_format_git_subcommand_refusal(unresolvable_subcommand)
+        )
     guarded: list[tuple[_FpPushRun, _FpPushArgs]] = []
     for run in _fp_find_git_push_runs(words):
         args = _fp_parse_push_args(run.tokens, run.push_index)
-        if _fp_is_guarded_push(args):
+        if run.unresolvable_alias or _fp_is_guarded_push(args):
             guarded.append((run, args))
     if not guarded:
         return
@@ -2228,9 +2786,14 @@ def bash(command: str, *, allow_force_push: bool = False) -> BashHandle:
     refspecs) are refused while their target is protected: a refspec naming
     main/master or `@{u}`, every branch under `--all`/`--mirror`, or, when
     the refspec is implicit, the current upstream (probed with `git rev-parse
-    @{u}`). `--force-with-lease` and `--force-if-includes` are never refused;
-    retry a deliberate force-push with bash(command, allow_force_push=True),
-    or start the kernel with PI_BASH_ALLOW_FORCE_PUSH=1.
+    @{u}`), including a branch that has no upstream at all. A push the scan
+    cannot resolve is refused too: an argument carrying a variable, glob, or
+    substitution; an ANSI-C-quoted command word; a git alias the command line
+    defines for itself; `env -S`/`xargs` wrappers; a command that changes
+    directory or repository first. `--force-with-lease` and
+    `--force-if-includes` are never refused; retry a deliberate force-push
+    with bash(command, allow_force_push=True), or start the kernel with
+    PI_BASH_ALLOW_FORCE_PUSH=1.
     """
     if not isinstance(command, str) or not command:
         raise TypeError("command must be a non-empty str")
