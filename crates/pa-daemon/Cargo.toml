@@ -1,0 +1,8 @@
+[package]
+name = "pa-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Session supervisor, worker processes, and wire protocol."
+
+[dependencies]

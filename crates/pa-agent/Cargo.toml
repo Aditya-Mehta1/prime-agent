@@ -1,0 +1,8 @@
+[package]
+name = "pa-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Agent loop for Prime Agent."
+
+[dependencies]

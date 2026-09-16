@@ -58,4 +58,4 @@ Before writing Rust, read Jarred Sumner's "Rewriting Bun in Rust" (https://bun.c
 
 ## Environment
 
-Dev work happens in the permanent Prime sandbox `prime-agent-rust` (Rust toolchain, gh and prime CLIs authenticated). The Rust code lives in ~/prime-agent-rs (this repo). Agent state (~/.prime: sessions, subagents, skills, memories) syncs to kevinjosethomas/prime-agent-state every 15 minutes — never commit credentials. The TS reference is at ~/prime-agent (read-only; do not modify).
+Dev work happens on the dev box (ubuntu@195.242.10.125 — 4 vCPU, 15 GB, 485 GB; Rust toolchain, gh and prime CLIs authenticated). The Rust code lives in ~/prime-agent-rs (this repo). Agent state (~/.prime: sessions, subagents, skills, memories) syncs to kevinjosethomas/prime-agent-state every 15 minutes — never commit credentials. The TS reference is at ~/prime-agent (read-only; do not modify).

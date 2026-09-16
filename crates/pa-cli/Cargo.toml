@@ -1,0 +1,12 @@
+[package]
+name = "pa-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The prime-agent binary."
+
+[dependencies]
+
+[[bin]]
+name = "prime-agent"
+path = "src/main.rs"

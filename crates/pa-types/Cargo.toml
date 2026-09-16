@@ -1,0 +1,8 @@
+[package]
+name = "pa-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared domain and wire types for Prime Agent."
+
+[dependencies]
