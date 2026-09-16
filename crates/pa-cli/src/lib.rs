@@ -8,6 +8,9 @@
 pub(crate) mod args;
 pub(crate) mod command_registry;
 pub(crate) mod config;
+pub(crate) mod daemon_client;
+pub(crate) mod daemon_command;
+pub(crate) mod daemon_session_list;
 pub(crate) mod global_flags;
 pub(crate) mod initial_message;
 pub(crate) mod mcp_command;

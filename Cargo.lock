@@ -1224,11 +1224,13 @@ dependencies = [
  "pa-agent",
  "pa-ai",
  "pa-core",
+ "pa-daemon",
  "pa-types",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

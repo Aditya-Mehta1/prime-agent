@@ -87,6 +87,25 @@ const CORPUS: &[&[&str]] = &[
     &["--list-models"],
     &["--list-models", "gpt"],
     &["--list-models=gpt"],
+    // Daemon client connect failure against a socket that never exists: the
+    // full error text (socket + daemon log path) is deterministic.
+    &[
+        "--daemon-socket",
+        "/nonexistent-pa-daemon-differential.sock",
+        "list",
+    ],
+    &[
+        "--daemon-socket",
+        "/nonexistent-pa-daemon-differential.sock",
+        "list",
+        "--json",
+    ],
+    &[
+        "--daemon-socket",
+        "/nonexistent-pa-daemon-differential.sock",
+        "stop",
+        "some-agent",
+    ],
     // Flag interdependency validation.
     &["--fork", "x", "--continue"],
     &["--fork", "x", "--resume", "y"],

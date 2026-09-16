@@ -10,6 +10,8 @@ pa-types = { path = "../pa-types" }
 pa-core = { path = "../pa-core" }
 pa-ai = { path = "../pa-ai" }
 pa-agent = { path = "../pa-agent" }
+pa-daemon = { path = "../pa-daemon" }
+uuid = { version = "1", features = ["v4"] }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }

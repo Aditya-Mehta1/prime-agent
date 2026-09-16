@@ -149,22 +149,22 @@ pub fn handle_public_command(args: &[String]) -> PublicCommandResult {
             attach_agent: None,
             exit_code: None,
         },
-        "list" => run_internal_agent_command(&rest),
+        "list" => run_internal_agent_command("list", &rest),
         "attach" => run_attach(&rest),
         "stop" => {
             if !require_operand_count(&rest, 1, Some(1), "stop") {
                 return handled_failed();
             }
-            run_internal_agent_command(&rest)
+            run_internal_agent_command("kill", &rest)
         }
         "rename" => {
             if !require_operand_count(&rest, 2, None, "rename") {
                 return handled_failed();
             }
-            run_internal_agent_command(&rest)
+            run_internal_agent_command("rename", &rest)
         }
-        "send" => run_internal_agent_command(&rest),
-        "schedule" => run_nested_agent_command("schedule", &rest),
+        "send" => run_internal_agent_command("send", &rest),
+        "schedule" => run_nested_agent_command("schedule", "cron", &rest),
         "status" => run_status(&rest),
         "doctor" => run_doctor(&rest),
         "shutdown" => run_shutdown(&rest),
@@ -246,11 +246,21 @@ fn reject_removed_command(args: &[String]) -> PublicCommandResult {
     )
 }
 
-fn run_internal_agent_command(_args: &[String]) -> PublicCommandResult {
-    fail(unavailable("the daemon client"), None)
+/// The internal daemon client command behind a public command: `list` stays
+/// `list`, `stop` becomes `kill`, and nested `schedule` becomes `cron`, like
+/// `runInternalAgentCommand`/`runNestedAgentCommand` in public-command.ts.
+fn run_internal_agent_command(command: &str, args: &[String]) -> PublicCommandResult {
+    match crate::daemon_command::run_daemon_command(command, args) {
+        Ok(()) => handled(),
+        Err(error) => fail(error.to_string(), None),
+    }
 }
 
-fn run_nested_agent_command(parent: &str, args: &[String]) -> PublicCommandResult {
+fn run_nested_agent_command(
+    parent: &str,
+    internal_command: &str,
+    args: &[String],
+) -> PublicCommandResult {
     let subcommand = args.first().map(String::as_str);
     let children: Vec<&str> = get_child_command_specs(&[parent])
         .into_iter()
@@ -276,7 +286,7 @@ fn run_nested_agent_command(parent: &str, args: &[String]) -> PublicCommandResul
     if parent == "schedule" && !validate_schedule_args(args) {
         return handled_failed();
     }
-    run_internal_agent_command(args)
+    run_internal_agent_command(internal_command, args)
 }
 
 fn validate_schedule_args(args: &[String]) -> bool {
