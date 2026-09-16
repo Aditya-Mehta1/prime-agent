@@ -1514,30 +1514,22 @@ def _fp_matching_paren(command: str, open_index: int, end: int) -> int:
 def _fp_matching_backtick(command: str, open_index: int, end: int) -> int:
     """Index of the backtick closing the one at `open_index`, or `end - 1`.
 
-    Same quoting rule as `_fp_matching_paren`: a backtick inside quotes or
-    behind a backslash is data, and an unterminated substitution reports the
-    last character so its tail is still scanned."""
-    quote: str | None = None
+    Bash ends an old-style substitution at the first backtick a backslash does
+    not escape: quotes inside the backquotes do not protect one, so
+    ``echo "`printf '`' ; git push -f origin main`"`` closes at the backtick
+    inside the single quotes. This lookup therefore follows the backslash rule
+    only -- `_fp_matching_paren` keeps the quote-aware rule, because a `)` in a
+    `$(...)` really is protected by quotes. An unterminated substitution reports
+    the last character so its tail is still scanned."""
     i = open_index + 1
     while i < end:
         ch = command[i]
-        if quote is None:
-            if ch == "\\" and i + 1 < end:
-                i += 2
-                continue
-            if ch in ("'", '"'):
-                quote = ch
-            elif ch == "`":
-                _fp_scan_charge(i - open_index)
-                return i
-        elif quote == "'":
-            if ch == "'":
-                quote = None
-        elif ch == "\\" and i + 1 < end:
+        if ch == "\\" and i + 1 < end:
             i += 2
             continue
-        elif ch == '"':
-            quote = None
+        if ch == "`":
+            _fp_scan_charge(i - open_index)
+            return i
         i += 1
     _fp_scan_charge(end - open_index)
     return end - 1
@@ -1953,6 +1945,78 @@ def _fp_expand_inline_git_aliases(tokens: list[str]) -> "list[str] | _FpUnresolv
 _FP_WORD_EDGE_NOISE = " \t\r\n\"'\\`;&|()<>"
 
 
+# A command word the guard cannot resolve: it holds a shell expansion (an
+# unquoted `$` or backtick) or an unquoted brace expansion (`{a,b}`, `{1..3}`).
+# `$(printf git) push -f origin main` and `{git,-c} ... push -f origin main`
+# really run `git push -f origin main`, but the command word scans as the
+# substitution text or the brace text, so no git invocation is visible.
+_FP_DYNAMIC_COMMAND_WORD = re.compile(r"""[$`]""")
+_FP_BRACE_EXPANSION = re.compile(r"\{[^{}\s]*(?:,|\.\.)[^{}\s]*\}")
+
+
+def _fp_unquoted_text(text: str) -> str:
+    """`text` with every quoted or backslash-escaped span blanked out.
+
+    Only what the shell expands unquoted matters here, and inside quotes a
+    brace or a `$` is data."""
+    chars = list(text)
+    quote: str | None = None
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if quote is None:
+            if ch in ("'", '"'):
+                quote = ch
+                chars[i] = " "
+            elif ch == "\\" and i + 1 < n:
+                chars[i] = " "
+                chars[i + 1] = " "
+                i += 1
+        elif quote == "'":
+            if ch == "'":
+                quote = None
+            chars[i] = " "
+        elif ch == "\\" and i + 1 < n:
+            chars[i] = " "
+            chars[i + 1] = " "
+            i += 1
+        else:
+            if ch == '"':
+                quote = None
+            chars[i] = " "
+        i += 1
+    return "".join(chars)
+
+
+def _fp_unresolvable_command_word_hides_force_push(
+    words: list[_FpShellWord], command: str
+) -> bool:
+    """True when an unresolvable command word sits in a force-push command run.
+
+    The word decides what runs, so when the same run also carries `push` with a
+    force signal (a force flag, an unresolvable argument, a `+`-refspec, or
+    `--mirror`) the run is refused. The same word with no push pattern next to
+    it stays inert: `$HOME/bin/tool args`, `$(which x) --version`,
+    `cp {a,b}.txt /tmp`, and `ls '*.{ts,tsx}'` (quoted braces are data)."""
+    for index, word in enumerate(words):
+        if not word.starts_command or _fp_contained_in_later_word(words, index):
+            continue  # a substitution interior is not the command word
+        unquoted = _fp_unquoted_text(command[word.start : word.end])
+        if not (
+            _FP_DYNAMIC_COMMAND_WORD.search(unquoted)
+            or _FP_BRACE_EXPANSION.search(unquoted)
+        ):
+            continue
+        tokens = _fp_invocation_tokens(words, index)
+        for push_index, token in enumerate(tokens[1:], start=1):
+            if token != "push":
+                continue
+            if _fp_is_guarded_push(_fp_parse_push_args(tokens, push_index)):
+                return True
+    return False
+
+
 def _fp_unresolvable_git_subcommand(words: list[_FpShellWord]) -> str | None:
     """The first git subcommand the guard cannot resolve, or None.
 
@@ -2220,6 +2284,8 @@ def _fp_payload_hides_force_push(payload: str, depth: int = 0) -> bool:
         _fp_mask_redirections(_fp_normalize_continuations(payload))
     )
     words = _fp_scan_words(normalized)
+    if _fp_unresolvable_command_word_hides_force_push(words, normalized):
+        return True  # the payload's command word decides what runs
     if _fp_unresolvable_git_subcommand(words) is not None:
         # A payload runs the same commands a top-level line does, so a git
         # subcommand the guard cannot resolve is refused here too: a repository
@@ -2242,6 +2308,18 @@ def _fp_payload_hides_force_push(payload: str, depth: int = 0) -> bool:
         re.search(r"\benv\b", normalized, re.IGNORECASE)
         and _fp_env_payloads_hide_force_push(normalized, depth + 1)
     )
+
+
+_FP_PAYLOAD_EXPANSION = re.compile(r"""[$`]""")
+
+
+def _fp_payload_has_expansion(text: str) -> bool:
+    """True when a payload's text carries a shell expansion.
+
+    `cmd='git push -f origin main'; sh -c "$cmd"` runs the value of `$cmd`, not
+    the literal text the guard reads, so a payload holding `$` or a backtick
+    cannot be scanned statically and is refused."""
+    return bool(_FP_PAYLOAD_EXPANSION.search(text))
 
 
 def _fp_payload_is_ansi_c(source: str) -> bool:
@@ -2281,6 +2359,10 @@ def _fp_eval_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
             payload_parts.append(payload_source)
             value_parts.append(follower.value)
         payload = _fp_unquote_one_level(" ".join(payload_parts))
+        if _fp_payload_has_expansion(payload):
+            # The expansion decides what runs: `cmd='git push -f origin main';
+            # eval "$cmd"` never contains the push text.
+            return True
         if _fp_payload_hides_force_push(payload, depth + 1):
             return True
         # The raw sources lose one escaping layer per nesting level, and the
@@ -2316,15 +2398,22 @@ def _fp_shell_c_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
         c_pending = False
         for follower_index in range(index + 1, len(words)):
             follower = words[follower_index]
-            if follower.starts_command:
-                if not _fp_contained_in_later_word(words, follower_index):
-                    break
+            if _fp_contained_in_later_word(words, follower_index):
+                # A substitution interior is scanned as its own command; the
+                # word that holds it follows and is the payload candidate, so
+                # `sh -c "$(echo hi)"` is not mistaken for `sh -c echo`.
                 continue
+            if follower.starts_command:
+                break
             token = follower.value
             if c_pending:
                 payload_source = command[follower.start : follower.end]
                 if _fp_payload_is_ansi_c(payload_source):
                     return True  # the guard does not reproduce an ANSI-C payload
+                if _fp_payload_has_expansion(payload_source):
+                    # The expansion decides what runs, quoted or not:
+                    # `cmd='git push -f origin main'; sh -c "$cmd"`.
+                    return True
                 if payload_source.startswith(("'", '"')):
                     if _fp_payload_hides_force_push(
                         _fp_unquote_one_level(payload_source), depth + 1
@@ -2370,6 +2459,10 @@ def _fp_env_payload_hides_force_push_source(
     walk reaches the command inside."""
     if _fp_payload_is_ansi_c(payload_source):
         return True  # the guard does not reproduce an ANSI-C split
+    if _fp_payload_has_expansion(payload_source) or _fp_payload_has_expansion(
+        payload_value
+    ):
+        return True  # the expansion's value decides what runs
     if _fp_payload_hides_force_push(
         _fp_unquote_one_level(payload_source), depth + 1
     ):
@@ -2396,9 +2489,9 @@ def _fp_env_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
         payload_pending = False
         for follower_index in range(index + 1, len(words)):
             follower = words[follower_index]
-            if follower.starts_command and not _fp_contained_in_later_word(
-                words, follower_index
-            ):
+            if _fp_contained_in_later_word(words, follower_index):
+                continue  # substitution interior: the enclosing word follows
+            if follower.starts_command:
                 break
             token = follower.value
             payload_source = command[follower.start : follower.end]
@@ -3152,6 +3245,14 @@ def _fp_guard_force_push(command: str) -> None:
             )
         )
     words = _fp_scan_words(normalized)
+    if _fp_unresolvable_command_word_hides_force_push(words, normalized):
+        raise ForcePushRefusalError(
+            _fp_format_refusal(
+                "its command word is a shell or brace expansion, and the same"
+                " command line carries a force-push pattern the guard cannot"
+                " attribute to a command it can see"
+            )
+        )
     unresolvable_subcommand = _fp_unresolvable_git_subcommand(words)
     if unresolvable_subcommand is not None:
         # A subcommand git does not know is a repository alias or an external

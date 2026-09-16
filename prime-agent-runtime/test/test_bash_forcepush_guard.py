@@ -471,6 +471,16 @@ def _substitution_chain(
     return command
 
 
+def _nested_substitutions(depth: int, fanout: int, leaf: str = FORCE_PUSH_LEAF) -> str:
+    """`$(...)` nested `depth` times without the `eval` wrapper.
+
+    No payload is involved, so this one is bounded only by the scan budget."""
+    command = leaf
+    for _ in range(depth):
+        command = " ".join("$(" + command + ")" for _ in range(fanout))
+    return command
+
+
 class ForcePushScanCostTest(unittest.TestCase):
     """A pathological word must not wedge the scan (py/redos, CWE-1333).
 
@@ -480,11 +490,16 @@ class ForcePushScanCostTest(unittest.TestCase):
     """
 
     def _probe(self, body: str, argument: str) -> tuple[float, str]:
+        # The command travels on stdin, not in argv: Linux caps one argument at
+        # MAX_ARG_STRLEN (128 KB) and the deepest latency vector is 176 KB, so
+        # passing it as an argument fails there with
+        # "OSError: [Errno 7] Argument list too long" (it happened to work on
+        # macOS, which has no such cap).
         probe = (
             "import sys, time\n"
             "import rlm.bash\n"
             "module = sys.modules['rlm.bash']\n"
-            "argument = sys.argv[1]\n"
+            "argument = sys.stdin.read()\n"
             "outcome = 'n/a'\n"
             "started = time.monotonic()\n"
             f"{body}\n"
@@ -492,7 +507,8 @@ class ForcePushScanCostTest(unittest.TestCase):
         )
         try:
             completed = subprocess.run(
-                [sys.executable, "-c", probe, argument],
+                [sys.executable, "-c", probe],
+                input=argument,
                 capture_output=True,
                 text=True,
                 env=dict(os.environ),
@@ -547,8 +563,20 @@ class ForcePushScanCostTest(unittest.TestCase):
                     SCAN_BUDGET_SECONDS,
                     f"{elapsed:.3f}s for {name} ({len(command)} bytes)",
                 )
-                # Fail closed: the guard cannot verify what it did not scan.
+                # Fail closed, and say why: these shapes are refused either by
+                # the scan budget or by the payload rule that a payload holding
+                # an expansion is unresolvable, both in milliseconds.
                 self.assertIn("refused", outcome, outcome)
+                self.assertTrue(
+                    "scan budget" in outcome or "Refusing to run" in outcome, outcome
+                )
+        # The bare nesting (no `eval` wrapper, so no payload) is refused by the
+        # scan budget itself, and says so.
+        for depth in (5, 6):
+            command = _nested_substitutions(depth, 3)
+            with self.subTest(shape=f"bare depth{depth}", length=len(command)):
+                elapsed, outcome = self._probe_guard(command)
+                self.assertLess(elapsed, SCAN_BUDGET_SECONDS)
                 self.assertIn("scan budget", outcome, outcome)
 
     def test_realistic_nesting_is_not_refused_by_the_budget(self):
@@ -1410,13 +1438,151 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         os.chdir(repo)
         # A `)` or backtick inside quotes is data, not the end of the
         # substitution, so the interior (where the push runs) must be scanned.
-        for command in [
-            """echo "$(printf ')'; git push -f origin main)" """,
-            "echo \"`printf '`' ; git push -f origin main`\"",
-        ]:
+        for command in ["""echo "$(printf ')'; git push -f origin main)" """]:
             with self.subTest(command=command):
                 message = await self._refused(command)
                 self.assertIn("Refusing to run this force-push command", message)
+        # The backtick analogue with a trailing backtick is not a bypass: bash
+        # ends the substitution at the first unescaped backtick, so the single
+        # quote inside it is unterminated and bash reports
+        # "unexpected EOF while looking for matching `'`" (rc=2) without running
+        # anything, measured with the same string. The guard therefore allows
+        # it, which is the fail-open case where git and bash fail on their own.
+        self.assertIsNone(
+            self._guard_verdict("echo \"`printf '`' ; git push -f origin main`\"")
+        )
+
+    async def test_refuses_backquote_substitutions_bash_ends_early(self):
+        repo, bare = self._make_repo("repo-backquote", branch="main")
+        self._diverge(repo, bare, "main")
+        os.chdir(repo)
+        backtick = "`"
+        quote = "'"
+        # Bash ends an old-style substitution at the first backtick a backslash
+        # does not escape, so the single quote inside does not hide the
+        # terminator: the substitution is `echo '` and the rest of the line is a
+        # new command, which is the force push. A quote-aware matcher instead
+        # swallowed the whole tail inside the substitution and found nothing.
+        for prefix in ["echo ", "ls ", "true ", "printf "]:
+            command = f"{backtick}{prefix}{quote}{backtick} git push -f origin main"
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("Refusing to run this force-push command", message)
+        # Nested backticks: `echo `git push -f origin main``.
+        command = f"{backtick}echo {backtick}git push -f origin main{backtick}{backtick}"
+        message = await self._refused(command)
+        self.assertIn("Refusing to run this force-push command", message)
+
+    def test_backtick_matcher_follows_bash(self):
+        # Pin the matcher against bash's own parse: the interior it reports must
+        # be the command bash runs. `echo <string>` makes that observable (the
+        # substitution's output becomes the echo's argument), so the two runs
+        # must print the same thing. Only the well-formed strings are compared
+        # this way; the boundary-sensitive malformed ones are covered by
+        # test_refuses_backquote_substitutions_bash_ends_early, where bash
+        # really force-pushes a protected branch with the S2 shape.
+        cases = [
+            "`printf %s a`",
+            "`echo hi`",
+            '`printf %s "a b"`',
+            "`printf %s a; printf %s b`",
+        ]
+        for command in cases:
+            with self.subTest(command=command):
+                close = bash_module._fp_matching_backtick(command, 0, len(command))
+                interior = command[1:close]
+                whole = subprocess.run(
+                    ["bash", "-c", "echo " + command],
+                    capture_output=True,
+                    text=True,
+                    timeout=GIT_TIMEOUT,
+                )
+                mine = subprocess.run(
+                    ["bash", "-c", interior],
+                    capture_output=True,
+                    text=True,
+                    timeout=GIT_TIMEOUT,
+                )
+                self.assertEqual(whole.returncode, 0, whole.stderr)
+                self.assertEqual(mine.returncode, 0, mine.stderr)
+                self.assertEqual(
+                    whole.stdout.rstrip("\n"),
+                    mine.stdout.rstrip("\n"),
+                    f"matcher interior {interior!r} does not match bash's parse",
+                )
+        # The rule itself: the first backtick a backslash does not escape ends
+        # the substitution, quotes do not hide one, and an escaped one does not
+        # end it (so the closer is the final backtick there).
+        backtick = "`"
+        quote = "'"
+        first = f"a{backtick}b"
+        self.assertEqual(
+            bash_module._fp_matching_backtick(
+                backtick + first + backtick, 0, len(backtick + first + backtick)
+            ),
+            2,
+        )
+        escaped = backtick + "echo " + "\\" + backtick + backtick
+        self.assertEqual(
+            bash_module._fp_matching_backtick(escaped, 0, len(escaped)), len(escaped) - 1
+        )
+        s2 = backtick + "echo " + quote + backtick + " git push -f origin main"
+        self.assertEqual(bash_module._fp_matching_backtick(s2, 0, len(s2)), 7)
+
+    async def test_refuses_command_words_built_from_expansions(self):
+        repo, _bare = self._make_repo("repo-dynamic-command-word", branch="main")
+        os.chdir(repo)
+        # The command word decides what runs: `$(printf git) push -f origin
+        # main` is a git force push, but the word scans as the substitution.
+        for command in [
+            "$(printf git) push -f origin main",
+            "{git,-c} user.email=x push -f origin main",
+            "{git,-c,user.name=z} push -f origin main",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("command word is a shell or brace expansion", message)
+        # An unresolvable command word with no force-push pattern next to it
+        # stays inert, and a quoted brace is data.
+        for command in [
+            "$HOME/bin/tool args",
+            "$(which x) --version",
+            "ls '*.{ts,tsx}'",
+            "cp {a,b}.txt /tmp",
+            "{ echo hi; } && git push origin feature",
+        ]:
+            with self.subTest(command=command):
+                self.assertIsNone(self._guard_verdict(command))
+
+    async def test_refuses_payloads_that_hold_an_expansion(self):
+        repo, _bare = self._make_repo("repo-payload-expansion", branch="main")
+        os.chdir(repo)
+        # `cmd='git push -f origin main'; sh -c "$cmd"` runs the value of $cmd,
+        # not the literal text, so the payload cannot be scanned statically.
+        for command in [
+            'cmd=\'git push -f origin main\'; sh -c "$cmd"',
+            'cmd=\'git push -f origin main\'; eval "$cmd"',
+            'cmd=\'git push -f origin main\'; env -S "$cmd"',
+            'cmd=\'git push -f origin main\'; sh -c $cmd',
+        ]:
+            with self.subTest(command=command):
+                await self._refused(command)
+        # Declared consequence: a payload holding an expansion is refused even
+        # when the expansion looks harmless, because the expansion decides what
+        # runs and the guard cannot see it. These two were allowed before this
+        # rule and are asserted REFUSED on purpose.
+        for command in ['eval "$(echo hi)"', 'sh -c "$(echo hi)"']:
+            with self.subTest(command=command):
+                await self._refused(command)
+        # A literal payload without an expansion is still scanned normally.
+        for command in [
+            'eval "echo hi"',
+            'sh -c "echo hi"',
+            """sh -c 'sh -c "git status"'""",
+            """env -S 'git status'""",
+        ]:
+            with self.subTest(command=command):
+                self.assertIsNone(self._guard_verdict(command))
 
     async def test_refuses_sourced_script_relocation(self):
         repo, bare = self._make_repo("repo-source")  # branch feature + upstream
