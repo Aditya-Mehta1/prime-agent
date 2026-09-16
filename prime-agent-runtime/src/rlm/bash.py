@@ -986,38 +986,64 @@ def _fp_command_name(value: str) -> str:
     return os.path.basename(value).casefold()
 
 
-# git's own subcommands (git --list-cmds=builtins). git never resolves one of
-# these through `alias.<name>`, so a name that is NOT here is either a
-# repository/user alias or an external `git-<name>` program, and either can run
-# a force push the command text does not show.
-_FP_GIT_BUILTINS = frozenset(
+# git's own command table: `git --list-cmds=builtins,main` -- the builtins plus
+# the commands git ships as scripts (submodule, subtree, send-email, daemon,
+# filter-branch, ...) -- calibrated to the two git versions verified here:
+# Apple git 2.50.1 (/usr/bin/git, 170 names) intersected with Homebrew git
+# 2.55.0 (/opt/homebrew/bin/git, 181 names) = 169 names.
+#
+# git resolves a name in this table before any alias: a builtin is dispatched
+# directly and a shipped script is found as `git-<name>` on the exec path, both
+# ahead of `alias.<name>` (verified: `-c alias.status=... status` and
+# `-c alias.submodule=... submodule` run the command, while `-c alias.p=... p`
+# runs the alias). A name OUTSIDE the table is therefore either a repository or
+# user alias or an external `git-<name>` program, and either can run a force
+# push the command text does not show.
+#
+# The set is static on purpose. The running git cannot be asked: the guard
+# cannot see a per-command PATH change, so `PATH=/usr/bin git history` would be
+# resolved as "known" from a newer git while the older one actually runs and
+# expands `alias.history`. Calibrating to the older baseline refuses a command
+# that only a newer git knows (history, repo, url-parse, format-rev,
+# last-modified, instaweb, cvsserver, ...) rather than trusting it.
+#
+# "No allowlisted name is alias-reachable" holds for gits at or above the
+# calibration baseline (Apple 2.50.1, the older of the two). A host git older
+# than that could still ship a command on this list that its own dispatcher does
+# not know, and `alias.<name>` would then run instead: that version skew is a
+# known limitation, not a checked property.
+_FP_GIT_COMMANDS = frozenset(
     (
     "add", "am", "annotate", "apply", "archive", "backfill", "bisect", "blame",
     "branch", "bugreport", "bundle", "cat-file", "check-attr", "check-ignore",
     "check-mailmap", "check-ref-format", "checkout", "checkout--worker",
     "checkout-index", "cherry", "cherry-pick", "clean", "clone", "column", "commit",
     "commit-graph", "commit-tree", "config", "count-objects", "credential",
-    "credential-cache", "credential-cache--daemon", "credential-store", "describe",
-    "diagnose", "diff", "diff-files", "diff-index", "diff-pairs", "diff-tree",
-    "difftool", "fast-export", "fast-import", "fetch", "fetch-pack", "fmt-merge-msg",
-    "for-each-ref", "for-each-repo", "format-patch", "format-rev", "fsck",
+    "credential-cache", "credential-cache--daemon", "credential-osxkeychain",
+    "credential-store", "daemon", "describe", "diagnose", "diff", "diff-files",
+    "diff-index", "diff-pairs", "diff-tree", "difftool", "difftool--helper",
+    "fast-export", "fast-import", "fetch", "fetch-pack", "filter-branch",
+    "fmt-merge-msg", "for-each-ref", "for-each-repo", "format-patch", "fsck",
     "fsck-objects", "fsmonitor--daemon", "gc", "get-tar-commit-id", "grep",
-    "hash-object", "help", "history", "hook", "index-pack", "init", "init-db",
-    "interpret-trailers", "last-modified", "log", "ls-files", "ls-remote", "ls-tree",
-    "mailinfo", "mailsplit", "maintenance", "merge", "merge-base", "merge-file",
-    "merge-index", "merge-ours", "merge-recursive", "merge-recursive-ours",
-    "merge-recursive-theirs", "merge-subtree", "merge-tree", "mktag", "mktree",
-    "multi-pack-index", "mv", "name-rev", "notes", "pack-objects", "pack-redundant",
-    "pack-refs", "patch-id", "pickaxe", "prune", "prune-packed", "pull", "push",
-    "range-diff", "read-tree", "rebase", "receive-pack", "reflog", "refs", "remote",
-    "remote-ext", "remote-fd", "repack", "replace", "replay", "repo", "rerere", "reset",
-    "restore", "rev-list", "rev-parse", "revert", "rm", "send-pack", "shortlog", "show",
-    "show-branch", "show-index", "show-ref", "sparse-checkout", "stage", "stash",
-    "status", "stripspace", "submodule--helper", "switch", "symbolic-ref", "tag",
-    "unpack-file", "unpack-objects", "update-index", "update-ref", "update-server-info",
-    "upload-archive", "upload-archive--writer", "upload-pack", "url-parse", "var",
-    "verify-commit", "verify-pack", "verify-tag", "version", "whatchanged", "worktree",
-    "write-tree",
+    "hash-object", "help", "hook", "http-backend", "http-fetch", "http-push",
+    "imap-send", "index-pack", "init", "init-db", "interpret-trailers", "log",
+    "ls-files", "ls-remote", "ls-tree", "mailinfo", "mailsplit", "maintenance", "merge",
+    "merge-base", "merge-file", "merge-index", "merge-octopus", "merge-one-file",
+    "merge-ours", "merge-recursive", "merge-recursive-ours", "merge-recursive-theirs",
+    "merge-resolve", "merge-subtree", "merge-tree", "mergetool", "mktag", "mktree",
+    "multi-pack-index", "mv", "name-rev", "notes", "p4", "pack-objects",
+    "pack-redundant", "pack-refs", "patch-id", "pickaxe", "prune", "prune-packed",
+    "pull", "push", "quiltimport", "range-diff", "read-tree", "rebase", "receive-pack",
+    "reflog", "refs", "remote", "remote-ext", "remote-fd", "remote-ftp", "remote-ftps",
+    "remote-http", "remote-https", "repack", "replace", "replay", "request-pull",
+    "rerere", "reset", "restore", "rev-list", "rev-parse", "revert", "rm", "send-email",
+    "send-pack", "sh-i18n--envsubst", "shell", "shortlog", "show", "show-branch",
+    "show-index", "show-ref", "sparse-checkout", "stage", "stash", "status",
+    "stripspace", "submodule", "submodule--helper", "subtree", "switch", "symbolic-ref",
+    "tag", "unpack-file", "unpack-objects", "update-index", "update-ref",
+    "update-server-info", "upload-archive", "upload-archive--writer", "upload-pack",
+    "var", "verify-commit", "verify-pack", "verify-tag", "version", "web--browse",
+    "whatchanged", "worktree", "write-tree",
     )
 )
 
@@ -1738,21 +1764,47 @@ def _fp_expand_alias_chain(tokens: list[str]) -> "list[str] | _FpUnresolvableAli
         expanded = _fp_expand_one_inline_git_alias(current)
         if expanded is _FP_UNRESOLVABLE_ALIAS:
             return _FP_UNRESOLVABLE_ALIAS
-        if expanded is None:
-            return current
+        if expanded is None or expanded == current:
+            return current  # no alias applies, or the chain reached a fixpoint
         current = expanded
     return _FP_UNRESOLVABLE_ALIAS  # a chain longer than the guard follows
+
+
+def _fp_effective_subcommand(tokens: list[str]) -> "str | _FpUnresolvableAlias | None":
+    """The subcommand git would run for this `git ...` command line.
+
+    None when the line invokes no subcommand. A name in git's own command table
+    is the subcommand git runs whatever aliases exist (git ignores
+    `alias.status`, `alias.push`, ...), so it is returned as written; any other
+    name is first looked up through the inline `-c alias.X=...` definitions, and
+    an expansion the guard cannot follow comes back as _FP_UNRESOLVABLE_ALIAS."""
+    _aliases, subcommand_index = _fp_inline_alias_configs(tokens)
+    if subcommand_index >= len(tokens):
+        return None
+    subcommand = tokens[subcommand_index]
+    if subcommand in _FP_GIT_COMMANDS:
+        return subcommand
+    expanded = _fp_expand_alias_chain(tokens)
+    if expanded is _FP_UNRESOLVABLE_ALIAS:
+        return _FP_UNRESOLVABLE_ALIAS
+    _expanded_aliases, expanded_index = _fp_inline_alias_configs(expanded)
+    if expanded_index >= len(expanded):
+        return None
+    return expanded[expanded_index]
 
 
 def _fp_expand_inline_git_aliases(tokens: list[str]) -> "list[str] | _FpUnresolvableAlias":
     """Resolve inline `alias.X` definitions for the invoked subcommand.
 
-    Returns the tokens unchanged when no inline alias applies, or when the
-    expansion holds no `push`: an alias whose name shadows a builtin is never
-    used by git (`-c alias.push=... push` still runs the builtin), so only an
-    expansion that carries a push may replace the argv the guard already sees.
-    Refuses a body the guard cannot expand, and an alias chain deeper than
-    _FP_MAX_ALIAS_DEPTH."""
+    Returns the tokens unchanged when no inline alias applies, when the invoked
+    name is one git resolves itself (`-c alias.status=... status` still runs the
+    builtin, `-c alias.push=... push` still runs the builtin push), or when the
+    expansion holds no `push`: only an expansion that carries a push may replace
+    the argv the guard already sees. Refuses a body the guard cannot expand, and
+    an alias chain deeper than _FP_MAX_ALIAS_DEPTH."""
+    _aliases, subcommand_index = _fp_inline_alias_configs(tokens)
+    if subcommand_index < len(tokens) and tokens[subcommand_index] in _FP_GIT_COMMANDS:
+        return tokens  # git runs its own command, not the alias
     expanded = _fp_expand_alias_chain(tokens)
     if expanded is _FP_UNRESOLVABLE_ALIAS:
         return _FP_UNRESOLVABLE_ALIAS
@@ -1764,24 +1816,20 @@ def _fp_expand_inline_git_aliases(tokens: list[str]) -> "list[str] | _FpUnresolv
 def _fp_unresolvable_git_subcommand(words: list[_FpShellWord]) -> str | None:
     """The first git subcommand the guard cannot resolve, or None.
 
-    git runs a name that is not one of its builtins through `alias.<name>` in
-    the repository, the user, or the system config, or through an external
-    `git-<name>` program on PATH; either can run a force push the command text
-    does not show. An inline `-c alias.<name>=...` is expanded first, so a name
-    the guard can still resolve to a harmless builtin passes."""
+    A name outside git's own command table is resolved through `alias.<name>`
+    (repository, user, or system config) or through an external `git-<name>`
+    program on PATH; either can run a force push the command text does not
+    show. An inline `-c alias.<name>=...` is followed first, so a name the guard
+    can still resolve to a command git runs itself passes."""
     for index, word in enumerate(words):
         if _fp_command_name(word.value) not in _FP_GIT_COMMAND_NAMES:
             continue
         tokens = _fp_invocation_tokens(words, index)
-        expanded = _fp_expand_alias_chain(tokens)
-        if expanded is _FP_UNRESOLVABLE_ALIAS:
-            continue  # refused already: the run finder marks this invocation
-        _aliases, subcommand_index = _fp_inline_alias_configs(expanded)
-        if subcommand_index >= len(expanded):
-            continue  # `git --version` and friends run no subcommand
-        subcommand = expanded[subcommand_index]
-        if subcommand in _FP_GIT_BUILTINS:
-            continue
+        subcommand = _fp_effective_subcommand(tokens)
+        if subcommand is None or subcommand is _FP_UNRESOLVABLE_ALIAS:
+            continue  # no subcommand, or already refused as an alias
+        if subcommand in _FP_GIT_COMMANDS:
+            continue  # git runs this command itself, whatever aliases exist
         return subcommand
     return None
 
@@ -1976,17 +2024,39 @@ def _fp_run_is_guarded(run: _FpPushRun) -> bool:
     )
 
 
-def _fp_payload_hides_force_push(payload: str) -> bool:
+_FP_MAX_PAYLOAD_DEPTH = 10
+
+
+def _fp_payload_hides_force_push(payload: str, depth: int = 0) -> bool:
     """True when a payload the shell re-reads as a command hides a force push.
 
     The payload is command text, so it goes through the same normalization,
-    masking, escape folding, and word scan as a top-level command."""
+    masking, escape folding, and word scan as a top-level command -- and then
+    through the same nested-payload scans, because a payload can hold another
+    payload (`env -S 'sh -c "git push -f origin main"'`) that the plain scan
+    reads as one quoted word. Nesting deeper than _FP_MAX_PAYLOAD_DEPTH is
+    refused rather than missed."""
+    if depth > _FP_MAX_PAYLOAD_DEPTH:
+        return True  # too deeply nested to follow: refuse rather than miss
     normalized, _index_map = _fp_strip_escapes(
         _fp_mask_redirections(_fp_normalize_continuations(payload))
     )
-    return any(
+    if any(
         _fp_run_is_guarded(run)
         for run in _fp_find_git_push_runs(_fp_scan_words(normalized))
+    ):
+        return True
+    if re.search(r"\beval\b", normalized) and _fp_eval_payloads_hide_force_push(
+        normalized, depth + 1
+    ):
+        return True
+    if re.search(
+        r"\b(?:sh|bash|zsh|dash|ksh)\b", normalized, re.IGNORECASE
+    ) and _fp_shell_c_payloads_hide_force_push(normalized, depth + 1):
+        return True
+    return bool(
+        re.search(r"\benv\b", normalized)
+        and _fp_env_payloads_hide_force_push(normalized, depth + 1)
     )
 
 
@@ -2025,7 +2095,7 @@ def _fp_eval_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
                 return True  # the guard does not reproduce an ANSI-C payload
             payload_parts.append(payload_source)
         payload = _fp_unquote_one_level(" ".join(payload_parts))
-        if _fp_payload_hides_force_push(payload):
+        if _fp_payload_hides_force_push(payload, depth + 1):
             return True
         if _fp_eval_payloads_hide_force_push(payload, depth + 1):
             return True
@@ -2035,7 +2105,7 @@ def _fp_eval_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
 _FP_SHELL_C_INTERPRETERS = ("sh", "bash", "zsh", "dash", "ksh")
 
 
-def _fp_shell_c_payloads_hide_force_push(command: str) -> bool:
+def _fp_shell_c_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
     """True when a quoted `sh -c`-style payload hides a force push.
 
     A quoted `-c` payload executes exactly like an eval payload, but the
@@ -2044,6 +2114,8 @@ def _fp_shell_c_payloads_hide_force_push(command: str) -> bool:
     hands the shell its payload. Doubly-quoted data stays inert: `sh -c
     'echo "git push -f origin main"'` must not trigger. Unquoted payloads
     are scanned as plain invocations already and are skipped here."""
+    if depth > _FP_MAX_PAYLOAD_DEPTH:
+        return True  # nested too deep to follow: refuse
     words = _fp_scan_words(command)
     for index, word in enumerate(words):
         if _fp_command_name(word.value) not in _FP_SHELL_C_INTERPRETERS:
@@ -2061,7 +2133,9 @@ def _fp_shell_c_payloads_hide_force_push(command: str) -> bool:
                 if _fp_payload_is_ansi_c(payload_source):
                     return True  # the guard does not reproduce an ANSI-C payload
                 if payload_source.startswith(("'", '"')):
-                    if _fp_payload_hides_force_push(_fp_unquote_one_level(payload_source)):
+                    if _fp_payload_hides_force_push(
+                        _fp_unquote_one_level(payload_source), depth + 1
+                    ):
                         return True
                 break  # the payload word ends this shell invocation
             if token == "--":
@@ -2079,14 +2153,14 @@ def _fp_shell_c_payloads_hide_force_push(command: str) -> bool:
 _FP_ENV_COMMAND_NAMES = ("env", "env.exe")
 
 
-def _fp_env_payload_hides_force_push_source(payload_source: str) -> bool:
+def _fp_env_payload_hides_force_push_source(payload_source: str, depth: int) -> bool:
     """Whether one `env -S` payload word hides a force push."""
     if _fp_payload_is_ansi_c(payload_source):
         return True  # the guard does not reproduce an ANSI-C split
-    return _fp_payload_hides_force_push(_fp_unquote_one_level(payload_source))
+    return _fp_payload_hides_force_push(_fp_unquote_one_level(payload_source), depth + 1)
 
 
-def _fp_env_payloads_hide_force_push(command: str) -> bool:
+def _fp_env_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
     """True when an `env -S`/`--split-string` payload hides a force push.
 
     `env -S 'git push -f origin main'` splits that one word into the argv git
@@ -2094,6 +2168,8 @@ def _fp_env_payloads_hide_force_push(command: str) -> bool:
     see the push. An ANSI-C-quoted payload is refused outright: the guard does
     not reproduce its split. Unquoted payloads need no handling here; the plain
     scan already reads them as the words they are."""
+    if depth > _FP_MAX_PAYLOAD_DEPTH:
+        return True  # nested too deep to follow: refuse
     words = _fp_scan_words(command)
     for index, word in enumerate(words):
         if os.path.basename(word.value).casefold() not in _FP_ENV_COMMAND_NAMES:
@@ -2108,9 +2184,7 @@ def _fp_env_payloads_hide_force_push(command: str) -> bool:
             token = follower.value
             payload_source = command[follower.start : follower.end]
             if payload_pending:
-                if _fp_payload_is_ansi_c(payload_source):
-                    return True
-                if _fp_payload_hides_force_push(_fp_unquote_one_level(payload_source)):
+                if _fp_env_payload_hides_force_push_source(payload_source, depth):
                     return True
                 break  # this env invocation is clean; check the next one
             if token == "--":
@@ -2120,7 +2194,7 @@ def _fp_env_payloads_hide_force_push(command: str) -> bool:
                 continue
             if token.startswith("--split-string="):
                 if _fp_env_payload_hides_force_push_source(
-                    payload_source[len("--split-string=") :]
+                    payload_source[len("--split-string=") :], depth
                 ):
                     return True
                 break
@@ -2131,7 +2205,7 @@ def _fp_env_payloads_hide_force_push(command: str) -> bool:
                     offset = follower.start + 1 + short.index("S") + 1
                     if attached:
                         if _fp_env_payload_hides_force_push_source(
-                            command[offset : follower.end]
+                            command[offset : follower.end], depth
                         ):
                             return True
                         break
@@ -2399,12 +2473,16 @@ def _fp_probe_upstream(
 ) -> _FpUpstreamInfo | None:
     """Probe the current branch and its upstream with `git rev-parse @{u}`.
 
-    Returns None when the probe cannot run, the directory is not a repository,
-    or HEAD is detached: git then fails an implicit push itself. An info with
-    no upstream_ref is NOT that case -- the branch exists but has no upstream,
-    so an implicit push takes its target from configuration the guard cannot
-    read, and the caller must refuse. The child shell and env match what the
-    guarded command itself would see."""
+    Returns None when the probe cannot run or the directory is not a
+    repository (git itself then fails an implicit push), and an info whenever
+    the probe ran inside a repository -- including a detached HEAD, reported as
+    the branch `HEAD`. An info with no upstream_ref is not "nothing to
+    protect": the branch (or detached HEAD) has no upstream, so an implicit
+    push takes its target from configuration the guard cannot read --
+    push.default=matching/current push every matching branch name and
+    remote.<name>.mirror pushes everything, none of which HEAD opts out of --
+    and the caller must refuse. The child shell and env match what the guarded
+    command itself would see."""
     if cwd in cache:
         return cache[cwd]
     info: _FpUpstreamInfo | None = None
@@ -2425,7 +2503,9 @@ def _fp_probe_upstream(
             lines = completed.stdout.decode("utf-8", errors="replace").split("\n")
             upstream_ref = lines[0] if lines else ""
             current_branch = lines[1] if len(lines) > 1 else ""
-            if current_branch and (upstream_ref or current_branch != "HEAD"):
+            if current_branch:
+                # A detached HEAD reports "HEAD": the repository exists, so the
+                # configuration behind an implicit push is still in play.
                 info = _FpUpstreamInfo(upstream_ref or None, current_branch)
     cache[cwd] = info
     return info
@@ -2628,14 +2708,18 @@ def _fp_format_alias_refusal() -> str:
 def _fp_format_git_subcommand_refusal(subcommand: str) -> str:
     return "\n".join(
         [
-            f"Refusing to run this git command: `{subcommand}` is not one of"
-            " git's built-in subcommands, so it is a repository or user alias"
-            " (or an external `git-` program) whose argv the guard cannot see."
-            " An alias can force-push a protected branch.",
+            f"Refusing to run this git command: `{subcommand}` is outside the"
+            " git command set this guard was calibrated against (Apple git"
+            " 2.50.1 and Homebrew git 2.55.0), so it is a repository or user"
+            " alias, or an external `git-` program, or a command only a newer"
+            " git knows: the guard cannot verify what it runs. An alias can"
+            " force-push a protected branch, which is why an unknown name is"
+            " refused even when it looks harmless.",
             "",
-            "Run the subcommand git resolves to directly, or retry with"
-            " bash(command, allow_force_push=True), or start the kernel with"
-            f" {BASH_FORCE_PUSH_BYPASS_ENV}=1.",
+            f"Spell out the real subcommand, or run the underlying program"
+            f" (for `{subcommand}`) directly. To run this command as written,"
+            " retry with bash(command, allow_force_push=True), or start the"
+            f" kernel with {BASH_FORCE_PUSH_BYPASS_ENV}=1.",
         ]
     )
 
@@ -2683,8 +2767,13 @@ def _guard_force_push(command: str, allow_force_push: bool) -> None:
     current upstream (probed with `git rev-parse @{u}`) when the refspec is
     implicit; a branch with no upstream counts as unresolvable and is refused
     with it. Pattern matching is string-only; the upstream probe runs only on
-    a match, so plain pushes pay nothing. `--force-with-lease` and
-    `--force-if-includes` are never refused."""
+    a match, so plain pushes pay nothing. A literal `--force-with-lease` or
+    `--force-if-includes` is never refused, but an unresolvable push argument
+    is refused regardless of them: it can expand to `-f`, which skips the
+    lease compare-and-swap (measured on git 2.55: a bare `--force-with-lease`
+    over a stale remote-tracking ref is rejected as `stale info`, while
+    `--force-with-lease -f` and `--force-with-lease origin +main` rewrite the
+    ref)."""
     if allow_force_push or _FORCE_PUSH_BYPASS_AT_KERNEL_START:
         return
     command_prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
@@ -2790,8 +2879,10 @@ def bash(command: str, *, allow_force_push: bool = False) -> BashHandle:
     cannot resolve is refused too: an argument carrying a variable, glob, or
     substitution; an ANSI-C-quoted command word; a git alias the command line
     defines for itself; `env -S`/`xargs` wrappers; a command that changes
-    directory or repository first. `--force-with-lease` and
-    `--force-if-includes` are never refused; retry a deliberate force-push
+    directory or repository first. A literal `--force-with-lease` or
+    `--force-if-includes` is never refused, but an argument the scan cannot
+    resolve is refused regardless of them: the shell can expand it into `-f`,
+    and `-f` skips the lease compare-and-swap. Retry a deliberate force-push
     with bash(command, allow_force_push=True), or start the kernel with
     PI_BASH_ALLOW_FORCE_PUSH=1.
     """
