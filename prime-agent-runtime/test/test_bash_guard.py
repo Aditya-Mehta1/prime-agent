@@ -240,7 +240,7 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(Path(repo, "tracked.txt").read_text(), "modified\n")
                 self.assertTrue(Path(repo, "untracked.txt").exists())
 
-    async def test_refusal_lists_dirty_paths_and_both_bypasses(self):
+    async def test_refusal_lists_dirty_paths_and_the_kwarg_bypass(self):
         self._init_dirty_repo()
         with self.assertRaises(DestructiveGitRefusalError) as caught:
             bash("git checkout -- .")
@@ -249,8 +249,10 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("tracked.txt", message)
         self.assertIn("untracked.txt", message)
         self.assertIn("Commit, stash, or stage your work first.", message)
+        # Only the per-call kwarg is visible to the running model; the env
+        # var is a launch-time option and must not be advertised here.
         self.assertIn("allow_destructive_git=True", message)
-        self.assertIn(BASH_DESTRUCTIVE_GIT_BYPASS_ENV, message)
+        self.assertNotIn(BASH_DESTRUCTIVE_GIT_BYPASS_ENV, message)
 
     async def test_elides_long_dirty_path_lists(self):
         self._init_dirty_repo()
@@ -273,19 +275,72 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(self._tracked("tracked.txt").read_text(), "committed\n")
 
-    async def test_bypass_env_var_runs_discard(self):
+    async def test_env_var_set_after_kernel_start_cannot_bypass(self):
+        # The kernel is arbitrary Python, so the bypass variable is read
+        # once at kernel start; a cell that writes it mid-session must not
+        # silently disarm the guard.
         self._init_dirty_repo()
         with mock.patch.dict(os.environ, {BASH_DESTRUCTIVE_GIT_BYPASS_ENV: "1"}):
-            result = await bash("git reset --hard")
-        self.assertEqual(result.exit_code, 0)
-        self.assertEqual(self._tracked("tracked.txt").read_text(), "committed\n")
-
-    async def test_bypass_env_var_zero_still_refuses(self):
-        self._init_dirty_repo()
+            with self.assertRaises(DestructiveGitRefusalError) as caught:
+                bash("git reset --hard")
+        message = str(caught.exception)
+        self.assertIn("allow_destructive_git=True", message)
+        self.assertIn("appeared after the kernel started", message)
+        self.assertIn("ignores it", message)
+        self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
+        # A falsy mid-session value stays inert too.
         with mock.patch.dict(os.environ, {BASH_DESTRUCTIVE_GIT_BYPASS_ENV: "0"}):
             with self.assertRaises(DestructiveGitRefusalError):
                 bash("git reset --hard")
         self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
+
+    def test_env_var_at_kernel_start_is_frozen_and_honored(self):
+        # Launch a fresh kernel in a subprocess: the variable present at
+        # kernel start disables the guard for that whole kernel; a falsy
+        # launch value keeps it armed.
+        probe = (
+            "import asyncio\n"
+            "from rlm import bash\n"
+            "async def main():\n"
+            "    result = await bash('git reset --hard')\n"
+            "    return result.exit_code\n"
+            "raise SystemExit(asyncio.run(main()))\n"
+        )
+        for launch_value, expect_refusal in [("1", False), ("0", True)]:
+            with self.subTest(launch_value=launch_value):
+                repo = str(self._tracked(f"launch-{launch_value}"))
+                _init_dirty_git_repo(repo)
+                completed = subprocess.run(
+                    [sys.executable, "-c", probe],
+                    cwd=repo,
+                    env={
+                        **os.environ,
+                        BASH_DESTRUCTIVE_GIT_BYPASS_ENV: launch_value,
+                        "GIT_CONFIG_NOSYSTEM": "1",
+                    },
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if expect_refusal:
+                    self.assertNotEqual(completed.returncode, 0)
+                    self.assertIn("Refusing to run", completed.stderr)
+                    self.assertEqual(Path(repo, "tracked.txt").read_text(), "modified\n")
+                else:
+                    self.assertEqual(completed.returncode, 0)
+                    self.assertEqual(Path(repo, "tracked.txt").read_text(), "committed\n")
+
+    async def test_frozen_bypass_not_leaked_into_child_environments(self):
+        # When the variable was absent at kernel start, kernel-spawned
+        # children must not inherit a mid-session write (a child kernel
+        # would freeze it as its own launch-time bypass).
+        with (
+            mock.patch.dict(os.environ, {BASH_DESTRUCTIVE_GIT_BYPASS_ENV: "1"}),
+            mock.patch.object(bash_module, "_BASH_DESTRUCTIVE_GIT_BYPASS_AT_START", True),
+        ):
+            child_env = bash_module._child_env()
+        # With the variable present at launch, children inherit it.
+        self.assertEqual(child_env.get(BASH_DESTRUCTIVE_GIT_BYPASS_ENV), "1")
 
     async def test_fails_open_outside_a_git_repository(self):
         os.chdir(self.test_dir)

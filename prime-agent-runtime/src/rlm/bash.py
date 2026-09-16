@@ -947,7 +947,10 @@ class BashHandle:
 # (hardening the coding-agent tool still lacks; port it back when touching
 # that file).
 
-# Bypass env var for the destructive-git dirty-tree guard.
+# Bypass env var for the destructive-git dirty-tree guard. Read once at
+# kernel start (module import) and frozen: it is a user-launch option, not a
+# mid-session switch (see _BASH_DESTRUCTIVE_GIT_BYPASS_AT_START); the
+# per-call allow_destructive_git kwarg is the only in-session bypass.
 BASH_DESTRUCTIVE_GIT_BYPASS_ENV = "PI_BASH_ALLOW_DESTRUCTIVE_GIT"
 
 GIT_STATUS_PORCELAIN_COMMAND = "git status --porcelain --untracked-files=all"
@@ -1619,6 +1622,15 @@ def _is_truthy_env_value(value: str | None) -> bool:
     return value is not None and value not in ("", "0")
 
 
+# The bypass env var is a user-launch option, not a model-visible switch:
+# the kernel snapshots it once at import (kernel start), so a cell that
+# writes it mid-session cannot silently disarm the guard. Only the
+# per-call allow_destructive_git kwarg is visible to the running model.
+_BASH_DESTRUCTIVE_GIT_BYPASS_AT_START = _is_truthy_env_value(
+    os.environ.get(BASH_DESTRUCTIVE_GIT_BYPASS_ENV)
+)
+
+
 def _probe_uncommitted_changes(probe_command: str, cwd: str) -> list[str] | None:
     """Probe at-risk files via `git status --porcelain --untracked-files=all`
     (plus `--ignored=matching` when the discard deletes ignored files) in
@@ -1658,47 +1670,69 @@ def _format_dirty_tree_refusal(dirty_paths: list[str], includes_ignored_files: b
     lines.append("Commit, stash, or stage your work first.")
     lines.append(
         "To discard these changes intentionally, retry with"
-        " bash(command, allow_destructive_git=True), or set"
-        f" {BASH_DESTRUCTIVE_GIT_BYPASS_ENV}=1."
+        " bash(command, allow_destructive_git=True)."
     )
+    note = _format_late_bypass_env_note()
+    if note:
+        lines.extend(("", note))
     return "\n".join(lines)
 
 
-def _format_eval_refusal() -> str:
-    return "\n".join(
-        [
-            "Refusing to run this destructive git command: it wraps a git"
-            " discard in eval, and the uncommitted changes of the repository"
-            " it targets cannot be checked safely.",
-            "",
-            "Run the discard directly, or retry with"
-            " bash(command, allow_destructive_git=True), or set"
-            f" {BASH_DESTRUCTIVE_GIT_BYPASS_ENV}=1.",
-        ]
+def _format_late_bypass_env_note() -> str:
+    """Loud note when the bypass env var appears mid-session.
+
+    The variable is read once at kernel start, so a later write cannot
+    disarm the guard; saying so explicitly keeps the refusal honest
+    instead of silently ignoring the change.
+    """
+    if _BASH_DESTRUCTIVE_GIT_BYPASS_AT_START:
+        return ""
+    if not _is_truthy_env_value(os.environ.get(BASH_DESTRUCTIVE_GIT_BYPASS_ENV)):
+        return ""
+    return (
+        f"{BASH_DESTRUCTIVE_GIT_BYPASS_ENV} appeared after the kernel started,"
+        " so the guard ignores it: the variable is read once at launch, by the"
+        " user who starts the kernel. Use bash(command,"
+        " allow_destructive_git=True) for an intentional discard, or relaunch"
+        " the kernel with the variable in the environment."
     )
+
+
+def _format_eval_refusal() -> str:
+    lines = [
+        "Refusing to run this destructive git command: it wraps a git"
+        " discard in eval, and the uncommitted changes of the repository"
+        " it targets cannot be checked safely.",
+        "",
+        "Run the discard directly, or retry with"
+        " bash(command, allow_destructive_git=True).",
+    ]
+    note = _format_late_bypass_env_note()
+    if note:
+        lines.extend(("", note))
+    return "\n".join(lines)
 
 
 def _format_relocation_refusal() -> str:
-    return "\n".join(
-        [
-            "Refusing to run this destructive git command: it changes directory (or"
-            " repository) first, and the uncommitted changes of the repository it"
-            " targets cannot be checked safely.",
-            "",
-            "Run the discard as its own command from the target directory, or retry"
-            " with bash(command, allow_destructive_git=True), or set"
-            f" {BASH_DESTRUCTIVE_GIT_BYPASS_ENV}=1.",
-        ]
-    )
+    lines = [
+        "Refusing to run this destructive git command: it changes directory (or"
+        " repository) first, and the uncommitted changes of the repository it"
+        " targets cannot be checked safely.",
+        "",
+        "Run the discard as its own command from the target directory, or retry"
+        " with bash(command, allow_destructive_git=True).",
+    ]
+    note = _format_late_bypass_env_note()
+    if note:
+        lines.extend(("", note))
+    return "\n".join(lines)
 
 
 def _guard_destructive_git(command: str, allow_destructive_git: bool) -> None:
     """Refuse destructive git discard commands while the tree they target is
     dirty. The pattern check is string-only and the probe runs only on a
     match, so clean runs pay nothing."""
-    if allow_destructive_git or _is_truthy_env_value(
-        os.environ.get(BASH_DESTRUCTIVE_GIT_BYPASS_ENV)
-    ):
+    if allow_destructive_git or _BASH_DESTRUCTIVE_GIT_BYPASS_AT_START:
         return
     # Match the prefixed command exactly as the shell will run it; the prefix
     # is replayed in the probe, so hook-provided shell setup applies to both.
@@ -1762,7 +1796,9 @@ def bash(command: str, *, allow_destructive_git: bool = False) -> BashHandle:
     Destructive git discard commands (`git checkout -- .`, `git restore .`,
     `git reset --hard`, forced `git clean`) are refused while the repository
     they target has uncommitted changes; retry with allow_destructive_git=True
-    (or PI_BASH_ALLOW_DESTRUCTIVE_GIT=1) only when the discard is intentional.
+    only when the discard is intentional. PI_BASH_ALLOW_DESTRUCTIVE_GIT=1 in
+    the launching environment disables the guard for the whole kernel; it is
+    read once at kernel start, so writing it mid-session has no effect.
     """
     if not isinstance(command, str) or not command:
         raise TypeError("command must be a non-empty str")
@@ -1840,7 +1876,7 @@ def _child_env() -> dict[str, str]:
     per-command inline assignment (`GIT_EDITOR=vim git commit`) still wins
     because it replaces the exported value for that command.
     """
-    return {
+    env = {
         **os.environ,
         "NO_COLOR": "1",
         "TERM": "dumb",
@@ -1857,6 +1893,12 @@ def _child_env() -> dict[str, str]:
         "GIT_PAGER": "cat",
         "DEBIAN_FRONTEND": "noninteractive",
     }
+    if not _BASH_DESTRUCTIVE_GIT_BYPASS_AT_START:
+        # Do not leak a mid-session bypass write into child kernels: they
+        # freeze their own launch-time copy, and an inherited forged value
+        # would arm as if the user had authorized it at launch.
+        env.pop(BASH_DESTRUCTIVE_GIT_BYPASS_ENV, None)
+    return env
 
 
 def _signal_group(pid: int, sig: int) -> bool:
