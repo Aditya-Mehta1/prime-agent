@@ -1499,8 +1499,8 @@ impl Inner {
                         .map(|c| c.to_string())
                         .unwrap_or("null".to_string()),
                     exit.signal
-                            .map(|s| s.to_string())
-                            .unwrap_or("null".to_string()),
+                        .map(|s| s.to_string())
+                        .unwrap_or("null".to_string()),
                 ));
             }
             live_kernels::remove(&inner);
