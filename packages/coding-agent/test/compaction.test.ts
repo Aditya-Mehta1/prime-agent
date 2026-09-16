@@ -11,6 +11,7 @@ import {
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,
 	estimateContextTokens,
+	estimateSummaryRequestTokens,
 	findCutPoint,
 	getLastAssistantUsage,
 	prepareCompaction,
@@ -537,6 +538,72 @@ describe("prepareCompaction with previous compaction", () => {
 		expect(summarizedText).toContain("user msg 3 - kept by compaction1");
 		expect(summarizedText).not.toContain("First summary");
 		expect(preparation!.previousSummary).toBe("First summary");
+	});
+});
+
+describe("estimateSummaryRequestTokens", () => {
+	it("ignores a stale previous summary on a split turn with nothing to summarize", () => {
+		const u1 = createMessageEntry(createUserMessage("user msg 1 (summarized by compaction1) ".repeat(10)));
+		const a1 = createMessageEntry(createAssistantMessage("assistant msg 1 ".repeat(25)));
+		const u2 = createMessageEntry(createUserMessage("user msg 2 - kept by compaction1 ".repeat(12)));
+		const a2 = createMessageEntry(createAssistantMessage("assistant msg 2 ".repeat(25)));
+		const compaction1 = createCompactionEntry("First summary", u2.id);
+		const u3 = createMessageEntry(createUserMessage("user msg 3 ".repeat(11)));
+		const a3 = createMessageEntry(createAssistantMessage("assistant msg 3 ".repeat(8)));
+
+		const settings: CompactionSettings = {
+			...DEFAULT_COMPACTION_SETTINGS,
+			keepRecentTokens: 120,
+		};
+		const preparation = prepareCompaction([u1, a1, u2, a2, compaction1, u3, a3], settings);
+
+		// The cut lands on the assistant reply inside the kept turn: a split turn
+		// whose history slice is empty (the boundary already starts at the turn).
+		expect(preparation).toBeDefined();
+		expect(preparation!.firstKeptEntryId).toBe(a2.id);
+		expect(preparation!.isSplitTurn).toBe(true);
+		expect(preparation!.messagesToSummarize).toHaveLength(0);
+		expect(preparation!.turnPrefixMessages).toHaveLength(1);
+		expect(preparation!.previousSummary).toBe("First summary");
+
+		// compact() skips the history wire call for this shape ("No prior
+		// history." needs no model), so the stale previous summary must not
+		// grow the estimated request: only the turn-prefix call is issued.
+		expect(estimateSummaryRequestTokens(preparation!)).toBe(
+			estimateSummaryRequestTokens({ ...preparation!, previousSummary: undefined }),
+		);
+	});
+
+	it("still counts the refresh call a stale summary adds without a split turn", () => {
+		const u1 = createMessageEntry(createUserMessage("user msg 1 (summarized by compaction1) ".repeat(10)));
+		const a1 = createMessageEntry(createAssistantMessage("assistant msg 1 ".repeat(25)));
+		const u2 = createMessageEntry(createUserMessage("user msg 2 - kept by compaction1 ".repeat(12)));
+		const a2 = createMessageEntry(createAssistantMessage("assistant msg 2 ".repeat(8)));
+		const compaction1 = createCompactionEntry("First summary", u2.id);
+		const u3 = createMessageEntry(createUserMessage("user msg 3 ".repeat(11)));
+		const a3 = createMessageEntry(createAssistantMessage("assistant msg 3 ".repeat(8)));
+
+		const settings: CompactionSettings = {
+			...DEFAULT_COMPACTION_SETTINGS,
+			keepRecentTokens: 120,
+		};
+		const preparation = prepareCompaction([u1, a1, u2, a2, compaction1, u3, a3], settings);
+
+		// The cut lands back on the boundary's own user message: a non-split
+		// compaction with no new history but a stale summary to refresh.
+		expect(preparation).toBeDefined();
+		expect(preparation!.firstKeptEntryId).toBe(u2.id);
+		expect(preparation!.isSplitTurn).toBe(false);
+		expect(preparation!.messagesToSummarize).toHaveLength(0);
+		expect(preparation!.turnPrefixMessages).toHaveLength(0);
+		expect(preparation!.previousSummary).toBe("First summary");
+
+		// compact() issues the history wire call unconditionally outside split
+		// turns (the update template refreshes the previous summary), so the
+		// stale summary must grow the estimated request.
+		expect(estimateSummaryRequestTokens(preparation!)).toBeGreaterThan(
+			estimateSummaryRequestTokens({ ...preparation!, previousSummary: undefined }),
+		);
 	});
 });
 

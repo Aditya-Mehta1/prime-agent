@@ -2,7 +2,7 @@ import type * as PiAi from "@earendil-works/pi-ai";
 import { type AssistantMessage, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SUMMARIZATION_SYSTEM_PROMPT } from "../../src/core/compaction/utils.js";
-import { createHarness, type Harness } from "./harness.js";
+import { createHarness, getMessageText, type Harness } from "./harness.js";
 
 const { completeSimpleMock } = vi.hoisted(() => ({
 	completeSimpleMock: vi.fn(),
@@ -58,7 +58,12 @@ describe("AgentSession compaction auxiliary model", () => {
 	});
 
 	async function createCompactionHarness(
-		options: { auxiliaryModel?: string; sessionReasoning?: boolean; auxContextWindow?: number } = {},
+		options: {
+			auxiliaryModel?: string;
+			sessionReasoning?: boolean;
+			auxContextWindow?: number;
+			keepRecentTokens?: number;
+		} = {},
 	): Promise<Harness> {
 		const harness = await createHarness({
 			models: [
@@ -67,7 +72,7 @@ describe("AgentSession compaction auxiliary model", () => {
 			],
 			settings: {
 				...(options.auxiliaryModel === undefined ? {} : { auxiliaryModel: options.auxiliaryModel }),
-				compaction: { keepRecentTokens: 1 },
+				compaction: { keepRecentTokens: options.keepRecentTokens ?? 1 },
 			},
 			persistSession: true,
 		});
@@ -183,6 +188,52 @@ describe("AgentSession compaction auxiliary model", () => {
 				),
 			).toBe(false);
 			expect(result.firstKeptEntryId).toBeTruthy();
+		} finally {
+			warnSpy.mockRestore();
+		}
+	});
+
+	it("routes a split-turn prefix summary to the auxiliary model despite a stale previous summary", async () => {
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const harness = await createCompactionHarness({
+				auxiliaryModel: "faux/aux-model",
+				auxContextWindow: 10000,
+				keepRecentTokens: 120,
+			});
+			const longText = "long turn text ".repeat(28);
+			const shortText = "short turn text ".repeat(8);
+
+			// Two long turns: compaction 1 cuts at the second user message (a
+			// non-split cut), so its history call must overflow the 10000-token
+			// auxiliary window — the reserved completion budget alone exceeds it —
+			// and route to the session model.
+			harness.setResponses([fauxAssistantMessage(longText), fauxAssistantMessage(longText)]);
+			await harness.session.prompt(longText);
+			await harness.session.prompt(longText);
+			const first = await harness.session.compact();
+			expect(first.firstKeptEntryId).toBeTruthy();
+			const callsAfterFirst = summaryCalls().length;
+			expect(callsAfterFirst).toBe(1);
+			for (const call of summaryCalls()) {
+				expect(call[0]).toMatchObject({ provider: "faux", id: "session-model" });
+			}
+
+			// A short third turn: compaction 2 cuts at the assistant reply inside
+			// the kept turn — a split turn whose history slice is empty, so compact()
+			// issues only the turn-prefix call ("No prior history." needs no wire
+			// call). The stale previous summary must not inflate the estimated
+			// request and evict the auxiliary model that fits the real call.
+			harness.setResponses([fauxAssistantMessage(shortText)]);
+			await harness.session.prompt(shortText);
+			const second = await harness.session.compact();
+
+			expect(second.summary).toContain("No prior history.");
+			const compactionTwoCalls = summaryCalls().slice(callsAfterFirst);
+			expect(compactionTwoCalls).toHaveLength(1);
+			const [prefixCall] = compactionTwoCalls;
+			expect(getMessageText(prefixCall[1].messages[0])).toContain("PREFIX of a turn");
+			expect(prefixCall[0]).toMatchObject({ provider: "faux", id: "aux-model" });
 		} finally {
 			warnSpy.mockRestore();
 		}

@@ -863,12 +863,15 @@ async function generateTurnPrefixSummary(
  * issue, not the average. 0 means no summary request is applicable.
  */
 export function estimateSummaryRequestTokens(preparation: CompactionPreparation, customInstructions?: string): number {
-	const { messagesToSummarize, turnPrefixMessages, previousSummary, settings } = preparation;
+	const { messagesToSummarize, turnPrefixMessages, isSplitTurn, previousSummary, settings } = preparation;
 	const systemPromptTokens = Math.ceil(SUMMARIZATION_SYSTEM_PROMPT.length / 4);
 	let required = 0;
-	// The history slice exists whenever a summary call runs; without new messages
-	// or a previous summary compact skips it ("No prior history") instead.
-	if (messagesToSummarize.length > 0 || previousSummary) {
+	// compact() issues the history slice for every compaction except a split
+	// turn with a non-empty prefix and nothing to summarize ("No prior history"
+	// needs no wire call); a stale previousSummary alone never adds a request
+	// compact() skips.
+	const issuesHistoryCall = messagesToSummarize.length > 0 || !(isSplitTurn && turnPrefixMessages.length > 0);
+	if (issuesHistoryCall) {
 		let promptText = `<conversation>\n${serializeConversation(convertToLlm(messagesToSummarize))}\n</conversation>\n\n`;
 		if (previousSummary) {
 			promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
