@@ -62,6 +62,15 @@ Before writing Rust, read Jarred Sumner's "Rewriting Bun in Rust" (https://bun.c
 
 Second reference for agent-specific implementation details: OpenAI Codex (https://github.com/openai/codex) — a mature Rust agent harness, cloned at ~/codex on the dev box. It has accurate implementations of the internals that are easy to get wrong: token counting, maintaining the KV-cacheable prefix across turns, streaming provider responses, context/compaction management, session persistence, and tool execution. When implementing these, cross-check your approach against codex's code (and against the TS reference, which stays the parity ground truth — remember cache-prefix stability is a first-class concern; never adopt a pattern without checking what it does to the cacheable prefix). Codex is Apache 2.0: study freely; if you port specific code, attribute it.
 
+Also take infrastructural discipline from codex — its AGENTS.md (~/codex/AGENTS.md) is the template for repo governance. Adapt these into the new repo's own AGENTS.md and enforce them in lane prompts and PR review:
+- Module-size caps — the concrete anti-god-module rule: target modules under 500 LoC (excluding tests); past ~800 LoC, new functionality goes in a new module unless documented otherwise; applies hardest to high-touch orchestration files (the agent-session.ts class of file). When extracting, move the related tests and docs with the code.
+- Lint discipline as a merge gate: `cargo fmt --check` and `clippy -D warnings` clean before every merge. Clippy style rules: inline format args, collapse ifs, method references over closures, exhaustive matches without wildcard arms.
+- API shape: no opaque bool/Option positional params — enums, named methods, newtypes, or `/*param_name*/` comments when unavoidable. New traits get doc comments explaining their role. Prefer native RPITIT trait methods with explicit `Send` bounds over `async_trait`/`#[allow(async_fn_in_trait)]`.
+- Privacy: private modules with an explicitly exported public crate API (this is the ownership rule made mechanical).
+- Test discipline: compare whole objects, not field-by-field; no tests for statically-defined values; no negative tests for removed logic.
+- Change hygiene: dependency edits include their lockfile update in the same change; no single-use tiny helper methods; `#[tracing::instrument]` on definitions rather than `.instrument()` at call sites.
+Skip codex-specific machinery (Bazel, just, sandbox env vars, CODEX_ internals) — adopt the discipline, not their build system.
+
 ## Environment
 
 Dev work happens on the dev box (ubuntu@195.242.10.125 — 4 vCPU, 15 GB, 485 GB; Rust toolchain, gh and prime CLIs authenticated). The Rust code lives in ~/prime-agent-rs (this repo). Agent state (~/.prime: sessions, subagents, skills, memories) syncs to kevinjosethomas/prime-agent-state every 15 minutes — never commit credentials. The TS reference is at ~/prime-agent (read-only; do not modify).

@@ -6,3 +6,23 @@ license.workspace = true
 description = "Provider APIs, model registry, and streaming for Prime Agent."
 
 [dependencies]
+pa-types = { path = "../pa-types" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+regex = "1"
+rand = "0.8"
+base64 = "0.22"
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+rsa = { version = "0.9", features = ["sha2"] }
+url = "2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
