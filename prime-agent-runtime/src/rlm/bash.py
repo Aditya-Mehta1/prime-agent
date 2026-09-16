@@ -1133,6 +1133,10 @@ class _PipeShellWord:
     value: str
     substitutions: tuple[tuple[int, int], ...]
     resolvable: bool
+    # Whether quote characters built this word: a quoted word is data the
+    # shell passed through, never a reserved word (`"{"` runs a program
+    # named `{`; it does not open a brace group).
+    quoted: bool = False
 
 
 @dataclass(frozen=True)
@@ -1167,13 +1171,39 @@ def _command_name(value: str) -> str:
 
 
 def _matching_paren(command: str, open_index: int, end: int) -> int:
-    """Index of the `)` matching the `(` at `open_index`, or `end - 1`."""
+    """Index of the `)` matching the `(` at `open_index`, or `end - 1`.
+
+    Quotes and escapes are read because a `)` inside them does not close the
+    substitution (`$( : ')'; curl URL)` must scan the curl, not stop at the
+    quoted paren)."""
     depth = 0
     index = open_index
+    quote = ""
     while index < end:
-        if command[index] == "(":
+        char = command[index]
+        if quote == "'":
+            if char == "'":
+                quote = ""
+            index += 1
+            continue
+        if quote == '"':
+            if char == '"':
+                quote = ""
+            elif char == "\\" and index + 1 < end:
+                index += 2
+                continue
+            index += 1
+            continue
+        if char == "\\":
+            index += 2
+            continue
+        if char in "'\"":
+            quote = char
+            index += 1
+            continue
+        if char == "(":
             depth += 1
-        elif command[index] == ")":
+        elif char == ")":
             depth -= 1
             if depth == 0:
                 return index
@@ -1197,7 +1227,19 @@ def _substitution_span(command: str, index: int, end: int) -> tuple[int, int] | 
     None when no substitution starts there. Both spellings are read: `$(...)`,
     with its parenthesis matched, and the backtick pair."""
     if command[index] == "`":
-        close = command.find("`", index + 1, end)
+        # A backslash-escaped backtick does not close the substitution (the
+        # shell only ends one at an unescaped backtick), so the close is
+        # searched skipping escaped characters.
+        close = index + 1
+        while close < end:
+            if command[close] == "\\" and close + 1 < end:
+                close += 2
+                continue
+            if command[close] == "`":
+                break
+            close += 1
+        else:
+            close = -1
         return index + 1, end if close == -1 else close
     if command[index] == "$" and command[index + 1 : index + 2] == "(":
         return _parenthesized_span(command, index + 1, end)
@@ -1364,22 +1406,26 @@ def _scan_pipe_shell_region(command: str, start: int, end: int) -> _PipeShellReg
     chars: list[str] = []
     word_start = -1
     word_substitutions: list[tuple[int, int]] = []
+    word_quoted = False
     resolvable = True
     quote = ""
     index = start
 
     def flush_word(*, drop_numeric: bool = False) -> None:
-        nonlocal chars, word_start, word_substitutions, resolvable
+        nonlocal chars, word_start, word_substitutions, word_quoted, resolvable
         if word_start != -1:
             value = "".join(chars)
             # A redirection's descriptor digit (`2>`) is not an argv word.
             if not (drop_numeric and value.isdigit()):
                 words.append(
-                    _PipeShellWord(value, tuple(word_substitutions), resolvable)
+                    _PipeShellWord(
+                        value, tuple(word_substitutions), resolvable, word_quoted
+                    )
                 )
         chars = []
         word_start = -1
         word_substitutions = []
+        word_quoted = False
         resolvable = True
 
     def end_stage(separator: str) -> None:
@@ -1466,6 +1512,15 @@ def _scan_pipe_shell_region(command: str, start: int, end: int) -> _PipeShellReg
         if char in _REDIRECT_OPERATOR_CHARS or (
             char == "&" and command[index + 1 : index + 2] in ("<", ">")
         ):
+            if command[index : index + 2] == ">(":
+                # A write process substitution: the redirection feeds this
+                # process its bytes on stdin, so a runner there executes them.
+                flush_word(drop_numeric=True)
+                span = _parenthesized_span(command, index + 1, end)
+                substitutions.append(span)
+                target_substitutions.append(span)
+                index = span[1] + 1
+                continue
             if command[index : index + 2] == "<<" and command[index + 2 : index + 3] != "<":
                 # A here-document's body is stdin below the line's newline, so
                 # only its delimiter is consumed here: the line's own pipeline
@@ -1527,6 +1582,7 @@ def _scan_pipe_shell_region(command: str, start: int, end: int) -> _PipeShellReg
             continue
         if char == "$" and command[index + 1 : index + 2] == "'":
             start_word(index)
+            word_quoted = True
             index += 2
             closed = False
             while index < end:
@@ -1556,6 +1612,7 @@ def _scan_pipe_shell_region(command: str, start: int, end: int) -> _PipeShellReg
             continue
         if char in "'\"":
             start_word(index)
+            word_quoted = True
             quote = char
             index += 1
             continue
@@ -1590,7 +1647,9 @@ def _stage_command_word(
         if _PIPE_SHELL_ASSIGNMENT_RE.match(value):
             index += 1
             continue
-        if value in _PIPE_SHELL_RESERVED_WORDS:
+        if value in _PIPE_SHELL_RESERVED_WORDS and not words[index].quoted:
+            # A quoted word is data the shell passed through, not a reserved
+            # word, so `"{" sh` runs a program named `{`.
             index += 1
             continue
         if name not in _WRAPPER_COMMANDS:
@@ -1604,7 +1663,12 @@ def _stage_command_word(
         index += 1
         value_flags = _WRAPPER_VALUE_FLAGS.get(name, ())
         while index < len(words) and words[index].value.startswith("-"):
-            index += 2 if words[index].value in value_flags else 1
+            if words[index].value in value_flags or _wrapper_cluster_takes_value(
+                name, words[index].value
+            ):
+                index += 2
+            else:
+                index += 1
         if index < len(words) and (
             words[index].value.isdigit()
             or (name == "timeout" and _WRAPPER_DURATION_RE.match(words[index].value))
@@ -1624,6 +1688,12 @@ def _region_runs_download(command: str, start: int, end: int, depth: int = 0) ->
         resolved = _stage_command_word(stage.words)
         if resolved is not None and _command_name(resolved[0].value) in _DOWNLOAD_COMMANDS:
             return True
+        for body_start, body_end, _quoted in stage.heredoc_bodies:
+            # A here-document body inside this region is live text: whatever
+            # the region feeds runs it, and a download spelled in it counts
+            # (`sh -c "$(cat <<EOF ... curl ... EOF ...)"`).
+            if _region_runs_download(command, body_start, body_end, depth + 1):
+                return True
     return any(
         _region_runs_download(command, nested_start, nested_end, depth + 1)
         for nested_start, nested_end in region.substitutions
@@ -1717,6 +1787,67 @@ def _stage_heredoc_body_runs_download(
     return False
 
 
+def _wrapper_cluster_takes_value(name: str, value: str) -> bool:
+    """Whether a bundled short-option cluster (`-su`) ends in a character that
+    takes the next word as its operand: sudo's `-su root` binds `root` to the
+    `-u` at the cluster's tail, exactly like `-s -u root`."""
+    if not value.startswith("-") or value.startswith("--") or len(value) < 2:
+        return False
+    value_chars = {
+        flag[1:] for flag in _WRAPPER_VALUE_FLAGS.get(name, ()) if len(flag) == 2
+    }
+    return value[-1] in value_chars
+
+
+def _stage_env_s_operand(words: tuple[_PipeShellWord, ...]) -> _PipeShellWord | None:
+    """The operand a `env -S` prefix hands the shell as argv, or None. GNU env
+    runs the string as a command line, so the operand is live text."""
+    for index, word in enumerate(words):
+        if _command_name(word.value) == "env":
+            cursor = index + 1
+            while cursor < len(words) - 1:
+                value = words[cursor].value
+                if value in ("-S", "--split-string"):
+                    return words[cursor + 1]
+                if value.startswith("-"):
+                    cursor += 1
+                    continue
+                break
+    return None
+
+
+def _text_runs_download(text: str, depth: int = 0) -> bool:
+    """Whether a command-line string runs curl/wget anywhere in it: as a
+    stage's command word, or inside a word the string carries (a `-c` payload
+    `sh -c "curl URL"` folded to one word)."""
+    if depth > 4:
+        return True  # fail closed: absurdly nested text
+    region = _scan_pipe_shell_region(text, 0, len(text))
+    for stage in region.stages:
+        resolved = _stage_command_word(stage.words)
+        if resolved is not None and _command_name(resolved[0].value) in _DOWNLOAD_COMMANDS:
+            return True
+        for word in stage.words:
+            if word.value not in _DOWNLOAD_COMMANDS and _text_runs_download(
+                word.value, depth + 1
+            ):
+                return True
+    return False
+
+
+def _stage_targets_run_shell(command: str, stage: _PipeShellStage) -> bool:
+    """Whether a redirection target of this stage is a process substitution
+    that runs a shell: `>(sh)` receives the stage's output on stdin and
+    executes it."""
+    for start, end in stage.target_substitutions:
+        region = _scan_pipe_shell_region(command, start, end)
+        for inner in region.stages:
+            resolved = _stage_command_word(inner.words)
+            if resolved is not None and _command_name(resolved[0].value) in _RUNNERS:
+                return True
+    return False
+
+
 def _stage_runs_stdin_shell(words: tuple[_PipeShellWord, ...]) -> bool:
     """Whether a wrapper-only stage starts a shell reading stdin: `sudo -s`
     and `sudo -i` with no further command run the user's shell with the
@@ -1728,9 +1859,25 @@ def _stage_runs_stdin_shell(words: tuple[_PipeShellWord, ...]) -> bool:
             shell_flag = False
             while cursor < len(words):
                 value = words[cursor].value
-                if value in value_flags:
+                if value in value_flags or _wrapper_cluster_takes_value(
+                    "sudo", value
+                ):
+                    if value not in value_flags and ("s" in value or "i" in value):
+                        # A bundled cluster can carry both (`-su`: the shell
+                        # flag and the operand-taking `-u` at its tail).
+                        shell_flag = True
                     cursor += 2  # the flag's operand is not a command
-                elif value in ("-s", "-i"):
+                elif value in ("--shell", "--login"):
+                    shell_flag = True
+                    cursor += 1
+                elif (
+                    value.startswith("-")
+                    and not value.startswith("--")
+                    and len(value) > 1
+                    and ("s" in value or "i" in value)
+                ):
+                    # A combined short cluster containing -s or -i (`-si`)
+                    # starts the shell the same way.
                     shell_flag = True
                     cursor += 1
                 elif value.startswith("-"):
@@ -1741,18 +1888,25 @@ def _stage_runs_stdin_shell(words: tuple[_PipeShellWord, ...]) -> bool:
     return False
 
 
-def _region_runs_shell(region: _PipeShellRegion) -> bool:
-    """Whether any stage of this region runs a shell interpreter, including a
-    wrapper-only stage that starts one on stdin."""
-    for stage in region.stages:
-        if not stage.words:
-            continue
-        resolved = _stage_command_word(stage.words)
-        if resolved is not None:
-            if _command_name(resolved[0].value) in _RUNNERS:
+def _continuation_runs_shell(region: _PipeShellRegion, position: int) -> bool:
+    """Whether the stages this one pipes into (its own continuation, not the
+    whole region) run a shell: a here-document body is read as a script only
+    when the pipe chain it feeds actually reaches an interpreter."""
+    cursor = position + 1
+    while cursor < len(region.stages):
+        stage = region.stages[cursor]
+        if stage.words:
+            resolved = _stage_command_word(stage.words)
+            if resolved is not None:
+                if _command_name(resolved[0].value) in _RUNNERS:
+                    return True
+            elif _stage_runs_stdin_shell(stage.words):
                 return True
-        elif _stage_runs_stdin_shell(stage.words):
-            return True
+        if stage.separator not in _PIPE_OPERATORS and stage.separator not in _GROUPING_OPERATORS:
+            # A grouping separator continues the chain (`cat <<EOF | (sh)`
+            # pipes into the subshell's sh).
+            return False
+        cursor += 1
     return False
 
 
@@ -1782,18 +1936,22 @@ def _pipe_shell_stage_violation(
     command: str, region: _PipeShellRegion, depth: int = 0
 ) -> str | None:
     """Why these stages run a download through a shell, or None."""
-    # A here-document body reaches whatever its owner's stdout feeds, so a
-    # body is read as a script only when a runner is actually fed.
-    runs_shell = _region_runs_shell(region)
     piped_download = False
     brace_depth = 0
-    for stage in region.stages:
+    for position, stage in enumerate(region.stages):
         if not stage.words:
-            # An empty stage is a grouping character, a doubled operator, or a
-            # newline that only continues the pipeline (`curl ... |` then a
-            # newline then `sh`), so it never ends the chain.
+            # An empty stage is a grouping character, a doubled operator, or
+            # the newline of a continued pipeline (`curl ... |` newline `sh`).
+            # A statement separator does end the chain: `(curl URL); sh` runs
+            # two statements, and the second one inherits no pipeline state.
+            # The newline right after a pipe only continues that pipeline.
+            if stage.separator in (";", "\n", "&", "&&", "||") and not (
+                position > 0
+                and region.stages[position - 1].separator in _PIPE_OPERATORS
+            ):
+                piped_download = False
             continue
-        if stage.words[0].value == "{":
+        if stage.words[0].value == "{" and not stage.words[0].quoted:
             # A brace group keeps the stages inside it feeding the same
             # pipeline (`{ curl ...; } | sh`), so the separators inside it
             # must not end the chain.
@@ -1827,6 +1985,34 @@ def _pipe_shell_stage_violation(
                 or _stage_heredoc_body_runs_download(command, stage, depth)
             ):
                 return "a download substituted into a shell"
+        if piped_download and _stage_targets_run_shell(command, stage):
+            # A `>(sh)` target receives this stage's output and executes it.
+            return "a download piped into a shell"
+        env_s_operand = _stage_env_s_operand(stage.words)
+        if env_s_operand is not None:
+            # `env -S` runs its operand as a command line.
+            violation = _pipe_shell_violation(
+                env_s_operand.value, 0, None, depth + 1
+            )
+            if violation is not None:
+                return violation
+            if _text_runs_download(env_s_operand.value):
+                piped_download = True
+            operand_region = _scan_pipe_shell_region(
+                env_s_operand.value, 0, len(env_s_operand.value)
+            )
+            for operand_stage in operand_region.stages:
+                operand_resolved = _stage_command_word(operand_stage.words)
+                if operand_resolved is not None and _command_name(
+                    operand_resolved[0].value
+                ) in _RUNNERS:
+                    # The operand names the runner, so the stage's other
+                    # inputs are that runner's payload (`env -S 'sh' <
+                    # <(curl ...)` reads the mirror into the sh it starts).
+                    if _stage_args_run_download(
+                        command, stage, operand_resolved[1]
+                    ) or _stage_heredoc_body_runs_download(command, stage, depth):
+                        return "a download substituted into a shell"
         if stage.heredoc_bodies and not (
             resolved is not None and _command_name(resolved[0].value) in _RUNNERS
         ):
@@ -1840,18 +2026,21 @@ def _pipe_shell_stage_violation(
                 return violation
             if (
                 stage.separator in _PIPE_OPERATORS
-                and runs_shell
+                and _continuation_runs_shell(region, position)
                 and _stage_heredoc_body_runs_download(command, stage, depth)
             ):
                 return "a download piped into a shell"
+        if brace_depth and stage.words[-1].value == "}" and not stage.words[-1].quoted:
+            # Close the group before the reset check: a group that ends on a
+            # statement separator (`{ curl URL; }; sh`) leaves no pipeline
+            # state for the next statement.
+            brace_depth -= 1
         if (
             stage.separator not in _PIPE_OPERATORS
             and stage.separator not in _GROUPING_OPERATORS
             and brace_depth == 0
         ):
             piped_download = False
-        if brace_depth and stage.words[-1].value == "}":
-            brace_depth -= 1
     return None
 
 
