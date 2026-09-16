@@ -6,3 +6,22 @@ license.workspace = true
 description = "Session supervisor, worker processes, and wire protocol."
 
 [dependencies]
+pa-types = { path = "../pa-types" }
+anyhow = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4", "v7"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "pa-daemon"
+path = "src/main.rs"
+
+[lints]
+workspace = true

@@ -1,0 +1,648 @@
+//! Append-only session store on disk.
+//!
+//! Port of the session-file layout of `core/session-manager.ts`: one JSONL file
+//! per session under `<agent-dir>/sessions/<uuid>.jsonl`, first line is the
+//! `session` header, entries form a parent-id chain (tree). Layout compatibility
+//! with the TS product is load-bearing: TUI reattach, checkpoint/resume, and
+//! external tooling read the same files.
+
+use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+pub const CURRENT_SESSION_VERSION: u32 = 3;
+/// Entry types that represent user intent (vs daemon bookkeeping).
+const CONTENT_ENTRY_TYPES: &[&str] = &[
+    "message",
+    "custom_message",
+    "custom",
+    "model_change",
+    "thinking_level_change",
+    "service_tier_change",
+    "session_info",
+    "label",
+    "compaction",
+    "branch_summary",
+];
+
+pub fn new_session_id() -> String {
+    uuid::Uuid::now_v7().to_string()
+}
+
+fn new_entry_id(used: &HashMap<String, ()>) -> String {
+    for _ in 0..100 {
+        let id: String = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        if !used.contains_key(&id) {
+            return id;
+        }
+    }
+    uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
+}
+
+pub use pa_types::session::SessionHeader;
+
+/// One stored entry: message lifecycle, bookkeeping, or a custom record.
+/// Fields beyond the entry envelope are preserved as raw JSON.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionEntry {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub id: String,
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    pub timestamp: String,
+    #[serde(flatten)]
+    pub fields: Value,
+}
+
+impl SessionEntry {
+    fn new(
+        type_: &str,
+        parent_id: Option<String>,
+        used: &HashMap<String, ()>,
+        fields: Value,
+    ) -> Self {
+        SessionEntry {
+            type_: type_.to_string(),
+            id: new_entry_id(used),
+            parent_id,
+            timestamp: crate::util::now_iso(),
+            fields,
+        }
+    }
+}
+
+/// A loaded session: header plus the full entry chain, indexed by id.
+#[derive(Debug, Clone)]
+pub struct SessionFile {
+    pub path: PathBuf,
+    pub header: SessionHeader,
+    entries: Vec<SessionEntry>,
+    by_id: HashMap<String, usize>,
+    leaf_id: Option<String>,
+}
+
+pub fn session_file_name(session_id: &str) -> String {
+    format!("{session_id}.jsonl")
+}
+
+pub fn parse_session_entries(content: &str) -> Vec<Value> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            serde_json::from_str(trimmed).ok()
+        })
+        .collect()
+}
+
+/// Read the first line of a session file and parse it as a header.
+pub fn read_session_header(path: &Path) -> Option<SessionHeader> {
+    let content = fs::read_to_string(path).ok()?;
+    let first = content.lines().next()?;
+    let value: Value = serde_json::from_str(first.trim()).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("session") {
+        return None;
+    }
+    serde_json::from_value(value).ok()
+}
+
+/// A session file is valid when its first line is a `session` header with an id.
+pub fn is_valid_session_file(path: &Path) -> bool {
+    read_session_header(path)
+        .map(|header| !header.id.is_empty())
+        .unwrap_or(false)
+}
+
+impl SessionFile {
+    /// Load an existing session file. Errors when the header is missing/invalid.
+    pub fn open(path: &Path) -> Result<Self> {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("read session file {}", path.display()))?;
+        let mut lines = content.lines().filter(|l| !l.trim().is_empty());
+        let first = lines
+            .next()
+            .ok_or_else(|| anyhow!("empty session file {}", path.display()))?;
+        let header_value: Value = serde_json::from_str(first.trim())
+            .with_context(|| format!("invalid session header in {}", path.display()))?;
+        if header_value.get("type").and_then(Value::as_str) != Some("session") {
+            return Err(anyhow!("missing session header in {}", path.display()));
+        }
+        let header: SessionHeader = serde_json::from_value(header_value)
+            .with_context(|| format!("invalid session header in {}", path.display()))?;
+        let mut file = SessionFile {
+            path: path.to_path_buf(),
+            header,
+            entries: Vec::new(),
+            by_id: HashMap::new(),
+            leaf_id: None,
+        };
+        for line in lines {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<SessionEntry>(trimmed) {
+                Ok(entry) => file.push_index(entry),
+                // Malformed lines are skipped, matching the TS loader.
+                Err(_) => continue,
+            }
+        }
+        Ok(file)
+    }
+
+    /// Create a new in-memory session; persisted with the first flush.
+    pub fn create(cwd: &str, parent_session: Option<&str>, rlm_depth: u32) -> Self {
+        let header = SessionHeader {
+            version: Some(CURRENT_SESSION_VERSION),
+            id: new_session_id(),
+            timestamp: crate::util::now_iso(),
+            cwd: cwd.to_string(),
+            parent_session: parent_session.map(str::to_string),
+            rlm_depth: Some(rlm_depth as u64),
+            git: None,
+            rest: Default::default(),
+        };
+        SessionFile {
+            path: PathBuf::new(),
+            header,
+            entries: Vec::new(),
+            by_id: HashMap::new(),
+            leaf_id: None,
+        }
+    }
+
+    fn push_index(&mut self, entry: SessionEntry) {
+        self.by_id.insert(entry.id.clone(), self.entries.len());
+        self.leaf_id = Some(entry.id.clone());
+        self.entries.push(entry);
+    }
+
+    pub fn entries(&self) -> &[SessionEntry] {
+        &self.entries
+    }
+
+    pub fn entry(&self, id: &str) -> Option<&SessionEntry> {
+        self.by_id.get(id).map(|&index| &self.entries[index])
+    }
+
+    pub fn leaf_id(&self) -> Option<&str> {
+        self.leaf_id.as_deref()
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.header.id
+    }
+
+    /// Walk the leaf-to-root entry path (the active branch).
+    pub fn branch(&self) -> Vec<&SessionEntry> {
+        let mut path = Vec::new();
+        let mut current = self.leaf_id.as_deref().and_then(|id| self.entry(id));
+        while let Some(entry) = current {
+            path.push(entry);
+            current = entry.parent_id.as_deref().and_then(|id| self.entry(id));
+        }
+        path.reverse();
+        path
+    }
+
+    /// Session name from the latest `session_info` entry.
+    pub fn session_name(&self) -> Option<&str> {
+        self.entries()
+            .iter()
+            .rev()
+            .find(|entry| entry.type_ == "session_info")
+            .and_then(|entry| entry.fields.get("name"))
+            .and_then(Value::as_str)
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
+    }
+
+    /// Lifecycle state from the latest `session_state` entry.
+    pub fn state(&self) -> Option<String> {
+        self.entries()
+            .iter()
+            .rev()
+            .find(|entry| entry.type_ == "session_state")
+            .and_then(|entry| entry.fields.get("state"))
+            .and_then(|state| state.get("status"))
+            .and_then(Value::as_str)
+            .map(normalize_state_status)
+    }
+
+    pub fn messages(&self) -> Vec<Value> {
+        let mut messages = Vec::new();
+        for entry in self.branch() {
+            if entry.type_ == "message" {
+                if let Some(message) = entry.fields.get("message") {
+                    messages.push(message.clone());
+                }
+            }
+        }
+        messages
+    }
+
+    pub fn message_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.type_ == "message").count()
+    }
+
+    pub fn first_message(&self) -> Option<String> {
+        self.entries
+            .iter()
+            .filter(|e| e.type_ == "message")
+            .filter_map(|e| e.fields.get("message"))
+            .find(|m| message_role(m) == Some("user"))
+            .map(message_text)
+            .filter(|t| !t.is_empty())
+    }
+
+    /// True when the session holds user-meaningful persisted content (port of
+    /// `hasUserContent`): the default model/thinking/service-tier creation
+    /// prefix is skipped.
+    pub fn has_user_content(&self) -> bool {
+        let content: Vec<&SessionEntry> = self
+            .entries
+            .iter()
+            .filter(|entry| CONTENT_ENTRY_TYPES.contains(&entry.type_.as_str()))
+            .collect();
+        let mut start = 0usize;
+        if content.get(start).map(|e| e.type_.as_str()) == Some("model_change") {
+            start += 1;
+        }
+        if content.get(start).map(|e| e.type_.as_str()) == Some("thinking_level_change") {
+            start += 1;
+        }
+        if content.get(start).map(|e| e.type_.as_str()) == Some("service_tier_change") {
+            start += 1;
+        }
+        content.len() > start
+    }
+
+    fn index_map(&self) -> HashMap<String, ()> {
+        self.entries.iter().map(|e| (e.id.clone(), ())).collect()
+    }
+
+    pub fn append_entry(&mut self, type_: &str, fields: Value) -> String {
+        let parent_id = self.leaf_id.clone();
+        let entry = SessionEntry::new(type_, parent_id, &self.index_map(), fields);
+        let id = entry.id.clone();
+        self.push_index(entry);
+        id
+    }
+
+    pub fn append_message(&mut self, message: Value) -> String {
+        self.append_entry("message", serde_json::json!({ "message": message }))
+    }
+
+    pub fn append_session_state(&mut self, status: &str) -> String {
+        self.append_entry(
+            "session_state",
+            serde_json::json!({ "state": { "status": status } }),
+        )
+    }
+
+    pub fn append_session_info(&mut self, name: &str) -> String {
+        self.append_entry("session_info", serde_json::json!({ "name": name.trim() }))
+    }
+
+    pub fn append_model_change(&mut self, provider: &str, model_id: &str) -> String {
+        self.append_entry(
+            "model_change",
+            serde_json::json!({ "provider": provider, "modelId": model_id }),
+        )
+    }
+
+    pub fn append_thinking_level_change(&mut self, level: &str) -> String {
+        self.append_entry(
+            "thinking_level_change",
+            serde_json::json!({ "thinkingLevel": level }),
+        )
+    }
+
+    /// Write the full file atomically (header + every entry), like `_rewriteFile`.
+    pub fn rewrite(&self) -> Result<()> {
+        let path = self.path.as_path();
+        let Some(path) = (if path.as_os_str().is_empty() {
+            None
+        } else {
+            Some(path)
+        }) else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create session dir {}", parent.display()))?;
+        }
+        let temp = path.with_extension(format!("jsonl.tmp-{}", std::process::id()));
+        {
+            let file =
+                fs::File::create(&temp).with_context(|| format!("create {}", temp.display()))?;
+            let mut writer = std::io::BufWriter::new(file);
+            write_line(&mut writer, &session_header_line(&self.header))?;
+            for entry in &self.entries {
+                write_line(&mut writer, entry)?;
+            }
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+        }
+        fs::rename(&temp, path).with_context(|| format!("persist {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Append one entry line to the file, rewriting first when the file is missing.
+    pub fn persist_entry(&mut self, entry_type: &str, fields: Value) -> Result<String> {
+        let id = self.append_entry(entry_type, fields);
+        if !self.path.as_os_str().is_empty() && self.path.exists() {
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+                .with_context(|| format!("append to {}", self.path.display()))?;
+            let mut writer = std::io::BufWriter::new(file);
+            let entry = self.entries.last().expect("entry just appended");
+            write_line(&mut writer, entry)?;
+            writer.flush()?;
+            writer.get_ref().sync_data()?;
+        } else {
+            self.rewrite()?;
+        }
+        Ok(id)
+    }
+
+    /// Point the session at a concrete file path (after `create`), preserving entries.
+    pub fn set_path(&mut self, path: PathBuf) {
+        self.path = path;
+    }
+}
+
+/// The stored first line: the typed header plus the `session` type tag.
+pub fn session_header_line(header: &SessionHeader) -> Value {
+    let mut value = serde_json::to_value(header).unwrap_or(Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("type".to_string(), Value::String("session".to_string()));
+    }
+    value
+}
+
+fn write_line<T: Serialize>(writer: &mut impl Write, value: &T) -> Result<()> {
+    let mut line = serde_json::to_string(value)?;
+    line.push('\n');
+    writer.write_all(line.as_bytes())?;
+    Ok(())
+}
+
+fn message_role(message: &Value) -> Option<&str> {
+    message.get("role").and_then(Value::as_str)
+}
+
+fn message_text(message: &Value) -> String {
+    crate::types::message_text(message)
+}
+
+fn normalize_state_status(status: &str) -> String {
+    match status {
+        "hidden" | "sleep" => "archived".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Port of `readSessionInfo`'s fold (single pass, no resume cache): the durable
+/// metadata the daemon list surfaces for one session file.
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    pub path: PathBuf,
+    pub id: String,
+    pub cwd: String,
+    pub name: Option<String>,
+    pub state: Option<String>,
+    pub model: Option<(String, String)>,
+    pub parent_session_path: Option<String>,
+    pub rlm_depth: u32,
+    pub created: String,
+    pub modified: String,
+    pub message_count: usize,
+    pub first_message: String,
+}
+
+pub fn read_session_info(path: &Path) -> Option<SessionInfo> {
+    let content = fs::read_to_string(path).ok()?;
+    let mut header: Option<SessionHeader> = None;
+    let mut name = None;
+    let mut state = None;
+    let mut model = None;
+    let mut message_count = 0usize;
+    let mut first_message = String::new();
+    let mut last_activity_ms: Option<u64> = None;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<SessionEntry>(trimmed) else {
+            continue;
+        };
+        match entry.type_.as_str() {
+            "session" => {
+                let parsed: SessionHeader = serde_json::from_str(trimmed).ok()?;
+                header = Some(parsed);
+            }
+            "session_info" => {
+                name = entry
+                    .fields
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_string)
+            }
+            "session_state" => {
+                if let Some(status) = entry
+                    .fields
+                    .get("state")
+                    .and_then(|s| s.get("status"))
+                    .and_then(Value::as_str)
+                {
+                    state = Some(normalize_state_status(status));
+                }
+            }
+            "model_change" => {
+                model = Some((
+                    entry.fields.get("provider")?.as_str()?.to_string(),
+                    entry.fields.get("modelId")?.as_str()?.to_string(),
+                ));
+            }
+            "message" => {
+                message_count += 1;
+                if let Some(message) = entry.fields.get("message") {
+                    let role = message_role(message);
+                    if role == Some("assistant") {
+                        if let (Some(provider), Some(model_id)) = (
+                            message.get("provider").and_then(Value::as_str),
+                            message.get("model").and_then(Value::as_str),
+                        ) {
+                            model = Some((provider.to_string(), model_id.to_string()));
+                        }
+                    }
+                    if matches!(role, Some("user" | "assistant")) {
+                        if let Some(timestamp) = message.get("timestamp").and_then(Value::as_u64) {
+                            last_activity_ms = Some(last_activity_ms.unwrap_or(0).max(timestamp));
+                        }
+                    }
+                    if role == Some("user") && first_message.is_empty() {
+                        let text = message_text(message);
+                        if !text.is_empty() {
+                            first_message = text;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let header = header?;
+    let modified_ms = last_activity_ms.unwrap_or(0);
+    let modified = if modified_ms > 0 {
+        crate::util::iso_from_unix_ms(modified_ms)
+    } else {
+        crate::util::iso_from_unix_ms(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        )
+    };
+    Some(SessionInfo {
+        path: path.to_path_buf(),
+        id: header.id,
+        cwd: header.cwd,
+        name,
+        state,
+        model,
+        parent_session_path: header.parent_session,
+        rlm_depth: header.rlm_depth.unwrap_or(0) as u32,
+        created: header.timestamp,
+        modified,
+        message_count,
+        first_message: if first_message.is_empty() {
+            "(no messages)".to_string()
+        } else {
+            first_message
+        },
+    })
+}
+
+/// List every valid session file in a directory, most recently modified first
+/// (port of `SessionManager.listAll`).
+pub fn list_sessions(session_dir: &Path) -> Vec<SessionInfo> {
+    let Ok(read) = fs::read_dir(session_dir) else {
+        return Vec::new();
+    };
+    let mut infos: Vec<(SessionInfo, std::time::SystemTime)> = read
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .filter_map(|path| {
+            let modified = fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+            read_session_info(&path).map(|info| (info, modified))
+        })
+        .collect();
+    infos.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
+    infos.into_iter().map(|(info, _)| info).collect()
+}
+
+/// Most recent valid session for a cwd (port of `findMostRecentSessionForCwd`).
+pub fn find_most_recent_session_for_cwd(session_dir: &Path, cwd: &str) -> Option<PathBuf> {
+    list_sessions(session_dir)
+        .into_iter()
+        .find(|info| {
+            !info.cwd.is_empty()
+                && Path::new(&info.cwd)
+                    .canonicalize()
+                    .map(|p| {
+                        p == Path::new(cwd)
+                            .canonicalize()
+                            .unwrap_or_else(|_| PathBuf::from(cwd))
+                    })
+                    .unwrap_or_else(|_| info.cwd == cwd)
+        })
+        .map(|info| info.path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pa-daemon-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn creates_and_loads_a_session() {
+        let dir = temp_dir();
+        let mut session = SessionFile::create("/tmp", None, 0);
+        let path = dir.join(session_file_name(session.session_id()));
+        session.set_path(path.clone());
+        session.append_session_state("active");
+        session.append_message(json!({"role": "user", "content": "hi", "timestamp": 1u64}));
+        session.append_message(json!({"role": "assistant", "content": "hello", "provider": "p", "model": "m", "timestamp": 2u64}));
+        session.rewrite().unwrap();
+
+        let loaded = SessionFile::open(&path).unwrap();
+        assert_eq!(loaded.session_id(), session.session_id());
+        assert_eq!(loaded.message_count(), 2);
+        assert_eq!(loaded.state().as_deref(), Some("active"));
+        let messages = loaded.messages();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(crate::types::message_text(&messages[0]), "hi");
+
+        let info = read_session_info(&path).unwrap();
+        assert_eq!(info.message_count, 2);
+        assert_eq!(info.first_message, "hi");
+        assert_eq!(
+            info.model.as_ref().map(|(p, m)| (p.as_str(), m.as_str())),
+            Some(("p", "m"))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn entry_chain_links_parents() {
+        let mut session = SessionFile::create("/tmp", None, 0);
+        let a = session.append_entry("custom", json!({"customType": "x"}));
+        let b = session.append_entry("custom", json!({"customType": "y"}));
+        assert_eq!(
+            session.entry(&b).unwrap().parent_id.as_deref(),
+            Some(a.as_str())
+        );
+        assert_eq!(session.leaf_id(), Some(b.as_str()));
+    }
+
+    #[test]
+    fn skips_malformed_lines() {
+        let dir = temp_dir();
+        let path = dir.join("s.jsonl");
+        fs::write(
+            &path,
+            format!(
+                "{}\nnot json\n{}\n",
+                json!({"type":"session","version":3,"id":"abc","timestamp":"t","cwd":"/x"}),
+                json!({"type":"message","id":"aaaa1111","parentId":null,"timestamp":"t","message":{"role":"user","content":"hi"}})
+            ),
+        )
+        .unwrap();
+        let loaded = SessionFile::open(&path).unwrap();
+        assert_eq!(loaded.message_count(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
