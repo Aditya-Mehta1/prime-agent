@@ -20,7 +20,23 @@ function agentStub(activeSessionId: string) {
 
 function createController(): AgentObserveController {
 	return {
-		listAgents: vi.fn(() => ({ current: agentStub("alpha"), agents: [] })),
+		listAgents: vi.fn(() => ({
+			current: { ...agentStub("alpha"), usage: { inputTokens: 100, outputTokens: 20, cost: 0.5 } },
+			agents: [
+				{
+					sessionId: "session-gamma",
+					relationship: "sibling" as const,
+					status: "idle",
+					isCurrent: false,
+					isStreaming: false,
+					isCompacting: false,
+					attachedClients: 0,
+					queuedCount: 0,
+					isSessionActive: false,
+					usage: { inputTokens: 5, outputTokens: 1, cost: 0.01 },
+				},
+			],
+		})),
 		getAgent: vi.fn((target: string) => ({ agent: agentStub(target) })),
 		recentMessages: vi.fn((input: { target: string; limit?: number; maxChars?: number }) => ({
 			agent: agentStub(input.target),
@@ -37,7 +53,10 @@ describe("AgentSession agent observe host requests", () => {
 		const controller = createController();
 		const harness = await createHarness({ agentObserveController: controller });
 		try {
-			harness.session.handleAgentObserveHostRequest("agent_observe.list");
+			expect(harness.session.handleAgentObserveHostRequest("agent_observe.list")).toMatchObject({
+				current: { activeSessionId: "alpha", usage: { inputTokens: 100, outputTokens: 20, cost: 0.5 } },
+				agents: [{ sessionId: "session-gamma", usage: { inputTokens: 5, outputTokens: 1, cost: 0.01 } }],
+			});
 			harness.session.handleAgentObserveHostRequest("agent_observe.get", { target: "beta" });
 			harness.session.handleAgentObserveHostRequest("agent_observe.recent", {
 				target: "beta",

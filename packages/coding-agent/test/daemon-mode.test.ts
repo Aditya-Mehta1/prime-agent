@@ -22,7 +22,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
 import { AGENT_FAMILY_REACH_ERROR, type AgentSessionMessageController } from "../src/core/agent-messages.js";
-import type { AgentObserveController } from "../src/core/agent-observe.js";
+import type { AgentObserveController, AgentObserveListResult } from "../src/core/agent-observe.js";
 import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.js";
 import { installAgentTraceUpload } from "../src/core/agent-traces.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
@@ -37,6 +37,7 @@ import {
 	SessionManager,
 } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
+import type { SessionUsageSummary } from "../src/core/usage.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import {
 	AgentDaemon,
@@ -713,6 +714,80 @@ describe("daemon mode helpers", () => {
 				origin: "agent",
 			}),
 		).rejects.toThrow("missing model");
+	});
+
+	it("carries each live member's own session usage in the agent-observe roster", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const liveSession = (sessionId: string, sessionName: string, usage?: SessionUsageSummary) => ({
+			sessionId,
+			sessionName,
+			sessionFile: undefined,
+			sessionManager: { getCwd: () => "/tmp" },
+			model: undefined,
+			thinkingLevel: "off",
+			isStreaming: false,
+			isCompacting: false,
+			isBashRunning: false,
+			isRetrying: false,
+			hasAcceptedPromptInFlight: false,
+			unfinishedActionCount: 0,
+			isSessionActive: false,
+			getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
+			getOwnUsageSummary: () => usage,
+			messages: [],
+			state: { pendingToolCalls: new Set(), streamingMessage: undefined },
+			hasRunningRlmChildren: () => false,
+		});
+		const currentState = makeState("current");
+		currentState.runtime = {
+			...currentState.runtime,
+			cwd: "/tmp",
+			diagnostics: [],
+			modelFallbackMessage: undefined,
+			session: liveSession("session-current", "Current", { inputTokens: 120, outputTokens: 40, cost: 0.5 }),
+		} as never;
+		const residentState = makeState("resident");
+		residentState.runtime = {
+			...residentState.runtime,
+			cwd: "/tmp",
+			diagnostics: [],
+			modelFallbackMessage: undefined,
+			session: liveSession("session-resident", "Resident", { inputTokens: 7, outputTokens: 3, cost: 0.01 }),
+		} as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			createAgentFamilyCatalog: ReturnType<typeof vi.fn>;
+			createAgentObserveListResult(current: ActiveSessionState): Promise<AgentObserveListResult>;
+		};
+		internals.sessions.set(currentState.activeSessionId, currentState);
+		internals.sessions.set(residentState.activeSessionId, residentState);
+		internals.createAgentFamilyCatalog = vi.fn(async () => [
+			{ id: "session-current", name: "Current", depth: 0, status: "running", sessionPath: "/tmp/current.jsonl" },
+			{ id: "session-resident", name: "Resident", depth: 0, status: "idle", sessionPath: "/tmp/resident.jsonl" },
+			{
+				id: "session-archived",
+				name: "archivist",
+				depth: 0,
+				status: "inactive",
+				sessionPath: "/tmp/archivist.jsonl",
+				cwd: "/tmp/archivist",
+				messageCount: 3,
+			},
+		]);
+
+		const listed = await internals.createAgentObserveListResult(currentState);
+		expect(listed.current.usage).toEqual({ inputTokens: 120, outputTokens: 40, cost: 0.5 });
+		expect(listed.agents.find((agent) => agent.sessionId === "session-resident")?.usage).toEqual({
+			inputTokens: 7,
+			outputTokens: 3,
+			cost: 0.01,
+		});
+		expect(listed.agents.find((agent) => agent.sessionId === "session-archived")).not.toHaveProperty("usage");
 	});
 
 	it("resolves a reopened child's persisted header parent relative to its session file", () => {
