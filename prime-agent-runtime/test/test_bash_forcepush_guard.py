@@ -126,6 +126,10 @@ FORCE_PUSH_MATCHING_COMMANDS = [
     "git push -f origin",
     "git push -f --all",
     "git push --force --mirror origin",
+    # `--mirror` is `--all` plus a forced push of every ref, so it carries
+    # force without a force flag; `--all` alone stays non-force.
+    "git push --mirror origin",
+    "git push --mirror",
     "git push -fv origin main",
     "git push -f origin main --",
     "git push --force --repo=origin main",
@@ -207,7 +211,6 @@ FORCE_PUSH_NON_MATCHING_COMMANDS = [
     "git push origin",
     "git push -u origin main",
     "git push --all",
-    "git push --mirror origin",
     "git push --tags",
     "git push origin --delete main",
     "git push --force-with-lease origin main",
@@ -288,6 +291,18 @@ class ForcePushScannerFidelityTest(unittest.TestCase):
                 words = bash_module._fp_scan_words(_prepare(command))
                 self.assertEqual([word.value for word in words], [expected])
 
+    def test_ansi_c_code_points_are_bounded(self):
+        # `$'\UFFFFFFFF'` is out of range: chr() must not raise, or every
+        # command text carrying it takes bash() down before it spawns.
+        for source, expected in [
+            ("$'\\UFFFFFFFF'", chr(0x10FFFF)),
+            ("$'\\U0010FFFF'", chr(0x10FFFF)),
+            ("$'\\U0001F600'", chr(0x1F600)),
+            ("$'\\u0041BC'", "ABC"),
+        ]:
+            with self.subTest(source=source):
+                words = bash_module._fp_scan_words(_prepare(source))
+                self.assertEqual([word.value for word in words], [expected])
     def test_double_quoted_escape_does_not_end_the_string(self):
         command = 'echo "a \\" b"'
         stripped, _index_map = bash_module._fp_strip_escapes(command)
@@ -608,6 +623,23 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
             raise AssertionError(f"git {' '.join(args)!r} failed: {completed.stderr}")
         return completed
 
+    def _configure_identity(self, path: Path) -> None:
+        """Give `path` the identity this suite commits with.
+
+        `user.useConfigOnly=true` is part of it on purpose: it forbids git's
+        fallback guess from the passwd entry or the host name, so a repository
+        missing the identity fails the test here instead of only on a CI runner
+        whose guess yields an empty `user.name` (fatal: empty ident name not
+        allowed)."""
+        for key, value in [
+            ("user.email", "guard@example.com"),
+            ("user.name", "Guard Test"),
+            ("commit.gpgsign", "false"),
+            ("tag.gpgsign", "false"),
+            ("user.useConfigOnly", "true"),
+        ]:
+            self._git("config", key, value, cwd=path)
+
     def _make_repo(self, name: str, branch: str = "feature") -> tuple[Path, Path]:
         """A local repo with a bare remote, main pushed, and `branch` checked
         out tracking its own name (upstream: <remote>/<branch>)."""
@@ -616,10 +648,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         bare = self.test_dir / f"{name}-remote.git"
         self._git("init", "-q", "--bare", "-b", "main", str(bare), cwd=self.test_dir)
         self._git("init", "-q", "-b", "main", cwd=repo)
-        self._git("config", "user.email", "guard@example.com", cwd=repo)
-        self._git("config", "user.name", "Guard Test", cwd=repo)
-        self._git("config", "commit.gpgsign", "false", cwd=repo)
-        self._git("config", "tag.gpgsign", "false", cwd=repo)
+        self._configure_identity(repo)
         (repo / "file.txt").write_text("one\n")
         self._git("add", ".", cwd=repo)
         self._git("commit", "-q", "-m", "init", cwd=repo)
@@ -634,9 +663,11 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         """Make local and remote `branch` histories diverge, so pushing needs force."""
         clone = self.test_dir / f"{repo.name}-clone"
         self._git("clone", "-q", "-b", branch, str(bare), str(clone), cwd=self.test_dir)
-        self._git("config", "user.email", "guard@example.com", cwd=clone)
-        self._git("config", "user.name", "Guard Test", cwd=clone)
-        self._git("config", "commit.gpgsign", "false", cwd=clone)
+        self._configure_identity(clone)
+        # The repo the caller handed in may itself be a fresh clone (the quoted
+        # tilde, CDPATH, and sourced-script tests pass one), so configure it
+        # too: the commits below run in it.
+        self._configure_identity(repo)
         (clone / "file.txt").write_text("remote\n")
         self._git("commit", "-q", "-am", "remote change", cwd=clone)
         self._git("push", "-q", "origin", f"HEAD:refs/heads/{branch}", cwd=clone)
@@ -744,10 +775,22 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
     async def test_refuses_wildcard_force_pushes(self):
         repo, _bare = self._make_repo("repo-wild")
         os.chdir(repo)
-        for command in ["git push -f --all", "git push --force --mirror origin"]:
+        for command in [
+            "git push -f --all",
+            "git push --force --mirror origin",
+            # `--mirror` is `--all` plus a forced push of every ref, so it needs
+            # no force flag of its own; `--all` only fast-forwards.
+            "git push --mirror origin",
+            "git push --mirror",
+        ]:
             with self.subTest(command=command):
                 message = await self._refused(command)
                 self.assertIn("every branch", message)
+        # A dry run changes nothing, and `--all` alone is not force.
+        result = await self._run("git push --mirror --dry-run origin")
+        self.assertEqual(result.exit_code, 0, result.output)
+        result = await self._run("git push --all --dry-run origin")
+        self.assertEqual(result.exit_code, 0, result.output)
 
     async def test_refuses_xargs_fed_force_push(self):
         repo, _bare = self._make_repo("repo-xargs")
@@ -1191,6 +1234,38 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         result = await self._run("git -c alias.push='push -f origin main' push")
         self.assertEqual(result.exit_code, 0, result.output)
 
+    async def test_every_repo_the_suite_commits_in_has_an_identity(self):
+        """Commits must not depend on git guessing an identity.
+
+        The CI runner's guess yields an empty `user.name` ("fatal: empty ident
+        name not allowed"), so every repository this suite commits in carries
+        the explicit identity from `_configure_identity` *and*
+        `user.useConfigOnly=true`, which forbids the guess. The commits below
+        run with the guess forbidden, which is the deterministic local
+        equivalent of that runner.
+        """
+        repo, bare = self._make_repo("repo-identity", branch="main")
+        protected = self.test_dir / "identity-clone"
+        self._git("clone", "-q", str(bare), str(protected), cwd=self.test_dir)
+        self._diverge(protected, bare, "main")
+        for path in (repo, protected, self.test_dir / f"{protected.name}-clone"):
+            with self.subTest(repo=str(path.name)):
+                self.assertEqual(
+                    self._git("config", "user.email", cwd=path).stdout.strip(),
+                    "guard@example.com",
+                )
+                self.assertEqual(
+                    self._git("config", "user.name", cwd=path).stdout.strip(),
+                    "Guard Test",
+                )
+                self.assertEqual(
+                    self._git("config", "user.useConfigOnly", cwd=path).stdout.strip(),
+                    "true",
+                )
+                (path / "identity.txt").write_text("x\n")
+                self._git("add", ".", cwd=path)
+                self._git("commit", "-q", "-m", "identity check", cwd=path)
+
     async def test_refuses_quoted_tilde_cd(self):
         repo, bare = self._make_repo("repo-tilde", branch="main")
         # `cd "~"` enters a directory literally named `~`, while the guard used
@@ -1233,6 +1308,35 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
             self._guard_verdict("cd ./repo && git push -f origin HEAD")
         )
 
+    async def test_out_of_range_ansi_c_escape_does_not_crash_the_guard(self):
+        repo, _bare = self._make_repo("repo-ansi-c-range")
+        os.chdir(repo)
+        # chr() used to raise ValueError on $'\UFFFFFFFF', so bash() failed
+        # before it spawned anything: any command text carrying the escape
+        # became unrunnable. The code point is bounded now, which leaves these
+        # commands to run normally.
+        for command in [
+            "echo $'\\UFFFFFFFF'",
+            "echo $'\\UFFFFFFFF' && echo $'\\u0042'",
+            "git push --force-with-lease origin feature # $'\\UFFFFFFFF'",
+        ]:
+            with self.subTest(command=command):
+                result = await self._run(command)
+                self.assertEqual(result.exit_code, 0, result.output)
+
+    async def test_refuses_substitutions_with_quoted_delimiters(self):
+        repo, _bare = self._make_repo("repo-quoted-delimiter", branch="main")
+        os.chdir(repo)
+        # A `)` or backtick inside quotes is data, not the end of the
+        # substitution, so the interior (where the push runs) must be scanned.
+        for command in [
+            """echo "$(printf ')'; git push -f origin main)" """,
+            "echo \"`printf '`' ; git push -f origin main`\"",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("Refusing to run this force-push command", message)
+
     async def test_refuses_sourced_script_relocation(self):
         repo, bare = self._make_repo("repo-source")  # branch feature + upstream
         protected = self.test_dir / "protected"
@@ -1272,6 +1376,40 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
             with self.subTest(command=command):
                 result = await self._run(command)
                 self.assertEqual(result.exit_code, 0, result.output)
+
+    async def test_boolean_negations_win_when_they_come_last(self):
+        repo, _bare = self._make_repo("repo-negations", branch="main")
+        os.chdir(repo)
+        # `--no-dry-run` after `--dry-run` really forces.
+        message = await self._refused("git push -f --dry-run --no-dry-run origin main")
+        self.assertIn("main", message)
+        message = await self._refused("git push --no-force --force origin main")
+        self.assertIn("main", message)
+        # `--no-force` after a force flag does not force, and the push runs.
+        for command in [
+            "git push -f --no-force origin main",
+            "git push --force --no-force origin main",
+            "git push --force --dry-run origin main",
+        ]:
+            with self.subTest(command=command):
+                result = await self._run(command)
+                self.assertEqual(result.exit_code, 0, result.output)
+
+    def test_parse_tracks_force_dry_run_and_wildcard_with_last_wins(self):
+        parse = bash_module._fp_parse_push_args
+        for tokens, expected in [
+            (["git", "push", "--mirror", "origin"], (True, False, True)),
+            (["git", "push", "--all", "origin"], (False, False, True)),
+            (["git", "push", "--mirror", "--no-mirror", "origin"], (False, False, False)),
+            (["git", "push", "--all", "--no-all", "origin"], (False, False, False)),
+            (["git", "push", "-f", "--no-force", "origin", "main"], (False, False, False)),
+            (["git", "push", "--no-force", "-f", "origin", "main"], (True, False, False)),
+            (["git", "push", "-f", "--dry-run", "--no-dry-run", "origin", "main"], (True, False, False)),
+            (["git", "push", "-n", "--no-dry-run", "-f", "origin", "main"], (True, False, False)),
+        ]:
+            with self.subTest(tokens=tokens):
+                args = parse(list(tokens), 1)
+                self.assertEqual((args.force, args.dry_run, args.wildcard), expected)
 
     async def test_refuses_lone_positional_remote_spellings(self):
         repo, _bare = self._make_repo("repo-lone-positional", branch="main")
@@ -1342,9 +1480,22 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         for command in [
             "git push origin @{u}",
             "git push --force-with-lease origin @{u}",
+            "git push origin @{upstream}",
+            "git push origin @{-1}",
         ]:
             with self.subTest(command=command):
                 self.assertIsNone(self._guard_verdict(command))
+        # The exemption covers a word that is entirely `@{...}`: an expansion
+        # tail in the same word is unresolvable again (git rejects these as
+        # refspecs, so they cannot rewrite anything, but the guard should not
+        # be the reason they look inert).
+        for command in [
+            """git push origin @{u}$(printf " -f main")""",
+            'X="-f main"; git push origin @{u}$X',
+            "git push origin @{u}`printf ' -f main'`",
+        ]:
+            with self.subTest(command=command):
+                self.assertIsNotNone(self._guard_verdict(command))
         for command in [
             "git push -f origin @{u}",
             "git push -f origin HEAD:@{u}",
@@ -1462,10 +1613,16 @@ class ForcePushFrozenBypassTest(unittest.TestCase):
         bare = Path(temp.name) / "remote.git"
         self._git("init", "-q", "--bare", "-b", "main", str(bare), cwd=Path(temp.name))
         self._git("init", "-q", "-b", "main", cwd=self.workspace)
-        self._git("config", "user.email", "guard@example.com", cwd=self.workspace)
-        self._git("config", "user.name", "Guard Test", cwd=self.workspace)
-        self._git("config", "commit.gpgsign", "false", cwd=self.workspace)
-        self._git("config", "tag.gpgsign", "false", cwd=self.workspace)
+        for key, value in [
+            ("user.email", "guard@example.com"),
+            ("user.name", "Guard Test"),
+            ("commit.gpgsign", "false"),
+            ("tag.gpgsign", "false"),
+            # Never let git guess an identity: the CI runner's guess yields an
+            # empty user name, and the tests must not depend on that guess.
+            ("user.useConfigOnly", "true"),
+        ]:
+            self._git("config", key, value, cwd=self.workspace)
         (self.workspace / "file.txt").write_text("local\n")
         self._git("add", ".", cwd=self.workspace)
         self._git("commit", "-q", "-m", "init", cwd=self.workspace)
@@ -1474,10 +1631,14 @@ class ForcePushFrozenBypassTest(unittest.TestCase):
         # Diverge main so a force-push is a real rewrite.
         clone = Path(temp.name) / "clone"
         self._git("clone", "-q", str(bare), str(clone), cwd=Path(temp.name))
-        self._git("config", "user.email", "guard@example.com", cwd=clone)
-        self._git("config", "user.name", "Guard Test", cwd=clone)
-        self._git("config", "commit.gpgsign", "false", cwd=clone)
-        self._git("config", "tag.gpgsign", "false", cwd=clone)
+        for key, value in [
+            ("user.email", "guard@example.com"),
+            ("user.name", "Guard Test"),
+            ("commit.gpgsign", "false"),
+            ("tag.gpgsign", "false"),
+            ("user.useConfigOnly", "true"),
+        ]:
+            self._git("config", key, value, cwd=clone)
         (clone / "file.txt").write_text("remote\n")
         self._git("commit", "-q", "-am", "remote change", cwd=clone)
         self._git("push", "-q", "origin", "main", cwd=clone)

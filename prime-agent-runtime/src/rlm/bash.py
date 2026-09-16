@@ -1221,9 +1221,7 @@ def _fp_mask_redirections(command: str) -> str:
                 chars[i + 2 : j] = list(interior)
                 i = j
             elif ch == "`":
-                j = i + 1
-                while j < n and chars[j] != "`":
-                    j += 1
+                j = _fp_matching_backtick(command, i, n)
                 interior = _fp_mask_redirections(command[i + 1 : j])
                 chars[i + 1 : j] = list(interior)
                 i = j
@@ -1377,7 +1375,10 @@ def _fp_ansi_c_decoded(body: str) -> str:
             while len(digits) < width and i < n and body[i] in _FP_ANSI_C_HEX:
                 digits += body[i]
                 i += 1
-            out.append(chr(int(digits, 16)) if digits else esc)
+            # Bound the code point: `$'\UFFFFFFFF'` would otherwise raise
+            # ValueError and take `bash()` down with it before it spawns
+            # anything. bash itself does not produce that character either.
+            out.append(chr(min(int(digits, 16), 0x10FFFF)) if digits else esc)
             continue
         if esc == "c" and i < n:
             out.append(chr(ord(body[i].upper()) & 0x1F))
@@ -1398,16 +1399,68 @@ class _FpShellWord:
 
 
 def _fp_matching_paren(command: str, open_index: int, end: int) -> int:
-    """Index of the `)` matching the `(` at `open_index`, or `end - 1`."""
+    """Index of the `)` matching the `(` at `open_index`, or `end - 1`.
+
+    A `)` inside quotes or behind a backslash is data rather than the end of
+    the substitution, so the scan follows the shell's quoting:
+    `"$(printf ')'; git push -f origin main)"` closes at the last `)`, and the
+    interior -- which is where the push runs -- is scanned. An unterminated
+    substitution reports the last character, so its whole tail is scanned."""
     depth = 0
+    quote: str | None = None
     i = open_index
     while i < end:
-        if command[i] == "(":
-            depth += 1
-        elif command[i] == ")":
-            depth -= 1
-            if depth == 0:
+        ch = command[i]
+        if quote is None:
+            if ch == "\\" and i + 1 < end:
+                i += 2
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+        elif quote == "'":
+            if ch == "'":
+                quote = None
+        elif ch == "\\" and i + 1 < end:
+            i += 2
+            continue
+        elif ch == '"':
+            quote = None
+        i += 1
+    return end - 1
+
+
+def _fp_matching_backtick(command: str, open_index: int, end: int) -> int:
+    """Index of the backtick closing the one at `open_index`, or `end - 1`.
+
+    Same quoting rule as `_fp_matching_paren`: a backtick inside quotes or
+    behind a backslash is data, and an unterminated substitution reports the
+    last character so its tail is still scanned."""
+    quote: str | None = None
+    i = open_index + 1
+    while i < end:
+        ch = command[i]
+        if quote is None:
+            if ch == "\\" and i + 1 < end:
+                i += 2
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+            elif ch == "`":
                 return i
+        elif quote == "'":
+            if ch == "'":
+                quote = None
+        elif ch == "\\" and i + 1 < end:
+            i += 2
+            continue
+        elif ch == '"':
+            quote = None
         i += 1
     return end - 1
 
@@ -1512,9 +1565,7 @@ def _fp_scan_words(command: str) -> list[_FpShellWord]:
                         j = close + 1
                         continue
                     if inner == "`":
-                        close = command.find("`", j + 1, end)
-                        if close == -1:
-                            close = end - 1
+                        close = _fp_matching_backtick(command, j, end)
                         scan_region(j + 1, close, starts_command=True)
                         value.append(command[j : close + 1])
                         j = close + 1
@@ -1530,9 +1581,7 @@ def _fp_scan_words(command: str) -> list[_FpShellWord]:
                 i = close + 1
                 continue
             if ch == "`":
-                close = command.find("`", i + 1, end)
-                if close == -1:
-                    close = end - 1
+                close = _fp_matching_backtick(command, i, end)
                 scan_region(i + 1, close, starts_command=True)
                 value.append(command[i : close + 1])
                 i = close + 1
@@ -1930,7 +1979,8 @@ def _fp_parse_push_args(tokens: list[str], push_index: int) -> _FpPushArgs:
     refspecs) in the order git parses them."""
     force = False
     dry_run = False
-    wildcard = False
+    all_refs = False
+    mirror = False
     repo_option = False
     unresolvable: str | None = None
     positionals: list[str] = []
@@ -1942,15 +1992,18 @@ def _fp_parse_push_args(tokens: list[str], push_index: int) -> _FpPushArgs:
         if (
             unresolvable is None
             and _FP_GLOB_OR_SUBSTITUTION.search(token)
-            and not token.startswith("@{")
+            and not _FP_STATIC_AT_BRACE.fullmatch(token)
         ):
             # A word the shell expands (a variable, a substitution, a glob) can
             # become `-f`, or a `+`-refspec naming a protected branch, or the
-            # remote, so the invocation cannot be proven non-force. `@{...}` is
-            # git's own syntax rather than a shell expansion, so it is not
-            # unresolvable; the dedicated `@{` target check still refuses a
-            # forced push that names it (`git push -f origin @{u}`, and
-            # `HEAD:@{u}` through its own target).
+            # remote, so the invocation cannot be proven non-force. A word that
+            # is exactly `@{...}` is git's own syntax rather than a shell
+            # expansion, so that one is not unresolvable; the dedicated `@{`
+            # target check still refuses a forced push that names it
+            # (`git push -f origin @{u}`, and `HEAD:@{u}` through its own
+            # target). Anything else in the same word (`@{u}$(printf " -f
+            # main")`, `@{u}$X`, a backtick tail) is an expansion tail and stays
+            # unresolvable.
             unresolvable = token
         if options_done:
             positionals.append(token)
@@ -1961,14 +2014,28 @@ def _fp_parse_push_args(tokens: list[str], push_index: int) -> _FpPushArgs:
             i += 1
             continue
         if token.startswith("--"):
+            # git's own parse-options accepts the `--no-` form of every
+            # valueless boolean here, and the last one on the line wins, so
+            # `-f --dry-run --no-dry-run` really forces and
+            # `--force --no-force` does not.
             if token == "--force":
                 force = True
+            elif token == "--no-force":
+                force = False
             elif token.startswith(("--force-with-lease", "--force-if-includes")):
                 pass  # lease-protected or advisory forms are never bare force
             elif token == "--dry-run":
                 dry_run = True
-            elif token in ("--all", "--mirror"):
-                wildcard = True
+            elif token == "--no-dry-run":
+                dry_run = False
+            elif token == "--all":
+                all_refs = True
+            elif token == "--no-all":
+                all_refs = False
+            elif token == "--mirror":
+                mirror = True
+            elif token == "--no-mirror":
+                mirror = False
             elif token == "--repo":
                 repo_option = True
                 i += 1  # consume the space-separated repository value
@@ -2013,7 +2080,16 @@ def _fp_parse_push_args(tokens: list[str], push_index: int) -> _FpPushArgs:
     # refspec implicit, and the implicit path (upstream probe, or a refusal
     # when there is nothing to verify against) decides what it would rewrite.
     refspecs = positionals if repo_option else positionals[1:]
-    return _FpPushArgs(force, dry_run, wildcard, refspecs, repo_option, unresolvable)
+    # `--mirror` is `--all` plus a forced, prune-by-default push of every ref,
+    # so it carries force with it; `--all` only fast-forwards and does not.
+    return _FpPushArgs(
+        force or mirror,
+        dry_run,
+        all_refs or mirror,
+        refspecs,
+        repo_option,
+        unresolvable,
+    )
 
 
 def _fp_is_guarded_push(args: _FpPushArgs) -> bool:
@@ -2653,6 +2729,10 @@ _FP_PROTECTED_BRANCHES = ("main", "master")
 # Substitution, globs, and brace expansion in a refspec: the target cannot
 # be checked statically, so the guard refuses rather than guess.
 _FP_GLOB_OR_SUBSTITUTION = re.compile(r"""[$`*?{}\[\]]""")
+# A refspec that is entirely git's `@{...}` syntax (`@{u}`, `@{upstream}`,
+# `@{-1}`): git's own short form, not a shell expansion, so it is the only
+# brace-bearing word the unresolvable-argument rule spares.
+_FP_STATIC_AT_BRACE = re.compile(r"@\{[A-Za-z0-9_./-]*\}")
 
 
 def _fp_push_violation(
