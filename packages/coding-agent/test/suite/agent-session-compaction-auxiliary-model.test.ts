@@ -58,12 +58,12 @@ describe("AgentSession compaction auxiliary model", () => {
 	});
 
 	async function createCompactionHarness(
-		options: { auxiliaryModel?: string; sessionReasoning?: boolean } = {},
+		options: { auxiliaryModel?: string; sessionReasoning?: boolean; auxContextWindow?: number } = {},
 	): Promise<Harness> {
 		const harness = await createHarness({
 			models: [
 				{ id: "session-model", name: "Session Model", reasoning: options.sessionReasoning },
-				{ id: "aux-model", name: "Aux Model" },
+				{ id: "aux-model", name: "Aux Model", contextWindow: options.auxContextWindow },
 			],
 			settings: {
 				...(options.auxiliaryModel === undefined ? {} : { auxiliaryModel: options.auxiliaryModel }),
@@ -131,6 +131,58 @@ describe("AgentSession compaction auxiliary model", () => {
 			expect(message).toContain('auxiliaryModel "faux/missing-model" unusable for compaction summary');
 			// Caught error details can embed credential material, so they must not be logged.
 			expect(message).not.toContain("unavailable, unauthenticated, or expired");
+		} finally {
+			warnSpy.mockRestore();
+		}
+	});
+
+	it("falls back to the session model when the auxiliary model cannot fit the summary request", async () => {
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const harness = await createCompactionHarness({
+				auxiliaryModel: "faux/aux-model",
+				auxContextWindow: 8192,
+			});
+			const result = await compactAfterTwoTurns(harness);
+
+			// The serialized conversation plus the reserved completion budget cannot
+			// fit 8192 tokens, so routing the summary there would fail over-limit and
+			// leave compaction unable to reclaim context; the session model must run it.
+			const calls = summaryCalls();
+			expect(calls.length).toBeGreaterThan(0);
+			for (const call of calls) {
+				expect(call[0]).toMatchObject({ provider: "faux", id: "session-model" });
+			}
+			expect(warnSpy).toHaveBeenCalledTimes(1);
+			const [message] = warnSpy.mock.calls[0];
+			expect(message).toContain('auxiliaryModel "faux/aux-model" unusable for compaction summary');
+			// The compaction still lands, so the fallback reclaimed context as usual.
+			expect(result.firstKeptEntryId).toBeTruthy();
+		} finally {
+			warnSpy.mockRestore();
+		}
+	});
+
+	it("keeps the auxiliary model when its context window fits the summary request", async () => {
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const harness = await createCompactionHarness({
+				auxiliaryModel: "faux/aux-model",
+				auxContextWindow: 131072,
+			});
+			const result = await compactAfterTwoTurns(harness);
+
+			const calls = summaryCalls();
+			expect(calls.length).toBeGreaterThan(0);
+			for (const call of calls) {
+				expect(call[0]).toMatchObject({ provider: "faux", id: "aux-model" });
+			}
+			expect(
+				warnSpy.mock.calls.some(([message]) =>
+					String(message).includes('auxiliaryModel "faux/aux-model" unusable for compaction summary'),
+				),
+			).toBe(false);
+			expect(result.firstKeptEntryId).toBeTruthy();
 		} finally {
 			warnSpy.mockRestore();
 		}

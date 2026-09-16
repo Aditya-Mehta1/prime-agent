@@ -109,6 +109,7 @@ import {
 	collectEntriesForBranchSummary,
 	compact,
 	estimateContextTokens,
+	estimateSummaryRequestTokens,
 	generateBranchSummary,
 	prepareCompaction,
 	serializeConversation,
@@ -8442,11 +8443,14 @@ export class AgentSession {
 				// provider's prefix-cache entry for the session: an aborted compaction
 				// leaves the context unchanged but the next turn re-reads all of it.
 				// Route summaries to the auxiliary model when one is configured.
-				const summarization = (await this._resolveAuxiliaryModel("compaction summary", {
-					model,
-					apiKey,
-					headers,
-				})) ?? {
+				const summarization = (await this._resolveAuxiliaryModel(
+					"compaction summary",
+					{ model, apiKey, headers },
+					// The summary request serializes the whole conversation, so a
+					// smaller auxiliary window must fall back to the session model
+					// instead of failing over-limit and stranding the context.
+					estimateSummaryRequestTokens(preparation, customInstructions),
+				)) ?? {
 					model,
 					apiKey,
 					headers,
@@ -9007,6 +9011,7 @@ export class AgentSession {
 	private async _resolveAuxiliaryModel(
 		purpose: string,
 		fallback?: { model: Model<Api>; apiKey: string; headers?: Record<string, string> },
+		requiredContextTokens?: number,
 	): Promise<{ model: Model<Api>; apiKey: string; headers?: Record<string, string> } | undefined> {
 		const sessionModel = this.model;
 		if (!sessionModel) {
@@ -9031,6 +9036,21 @@ export class AgentSession {
 				throw new Error(`model "${selector}" is unavailable, unauthenticated, or expired`);
 			}
 			const { apiKey, headers, requestModel } = await this._getRequiredRequestAuth(model);
+			// Callers that know the size of the request they will issue pass it in:
+			// an auxiliary model whose context window cannot hold that request
+			// fails over-limit on the wire (e.g. a compaction summary covering the
+			// whole conversation), leaving the caller unable to make progress. A
+			// known window that is too small routes to the session model through the
+			// warning below; an unknown window (<= 0) keeps the routing as-is
+			// rather than guessing. The throw lands in the catch, whose logging
+			// stays selector-only (CodeQL js/clear-text-logging).
+			if (
+				requiredContextTokens !== undefined &&
+				requestModel.contextWindow > 0 &&
+				requestModel.contextWindow < requiredContextTokens
+			) {
+				throw new Error("auxiliary model context window is too small for the request");
+			}
 			return { model: requestModel, apiKey, headers };
 		} catch {
 			// Error details from the auth stack can embed credential material, so only
