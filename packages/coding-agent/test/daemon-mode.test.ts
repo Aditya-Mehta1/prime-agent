@@ -759,6 +759,14 @@ describe("daemon mode helpers", () => {
 			modelFallbackMessage: undefined,
 			session: liveSession("session-resident", "Resident", { inputTokens: 7, outputTokens: 3, cost: 0.01 }),
 		} as never;
+		const freshState = makeState("fresh");
+		freshState.runtime = {
+			...freshState.runtime,
+			cwd: "/tmp",
+			diagnostics: [],
+			modelFallbackMessage: undefined,
+			session: liveSession("session-fresh", "Fresh"),
+		} as never;
 		const internals = daemon as unknown as {
 			sessions: Map<string, ActiveSessionState>;
 			createAgentFamilyCatalog: ReturnType<typeof vi.fn>;
@@ -766,9 +774,11 @@ describe("daemon mode helpers", () => {
 		};
 		internals.sessions.set(currentState.activeSessionId, currentState);
 		internals.sessions.set(residentState.activeSessionId, residentState);
+		internals.sessions.set(freshState.activeSessionId, freshState);
 		internals.createAgentFamilyCatalog = vi.fn(async () => [
 			{ id: "session-current", name: "Current", depth: 0, status: "running", sessionPath: "/tmp/current.jsonl" },
 			{ id: "session-resident", name: "Resident", depth: 0, status: "idle", sessionPath: "/tmp/resident.jsonl" },
+			{ id: "session-fresh", name: "Fresh", depth: 0, status: "idle", sessionPath: "/tmp/fresh.jsonl" },
 			{
 				id: "session-archived",
 				name: "archivist",
@@ -787,6 +797,7 @@ describe("daemon mode helpers", () => {
 			outputTokens: 3,
 			cost: 0.01,
 		});
+		expect(listed.agents.find((agent) => agent.sessionId === "session-fresh")).not.toHaveProperty("usage");
 		expect(listed.agents.find((agent) => agent.sessionId === "session-archived")).not.toHaveProperty("usage");
 	});
 
