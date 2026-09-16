@@ -110,6 +110,11 @@ FORCE_PUSH_MATCHING_COMMANDS = [
     "git push -f origin main:refs/heads/main",
     "git push -f origin refs/heads/main",
     "git push -f origin HEAD:main",
+    "git push -f origin HEAD:heads/main",
+    "git push -f origin main:heads/main",
+    # `-oo` is `-o o`: the rest of that cluster is the option's value and the
+    # next token is still a flag, so `-f` is a real force.
+    "git push -oo -f origin main",
     "git push -f origin :main",
     "git push -f origin main:",
     "git push -f origin @{u}",
@@ -215,6 +220,9 @@ FORCE_PUSH_NON_MATCHING_COMMANDS = [
     "git push -nf origin main",
     "git push --dry-run -f origin main",
     "git push -v -q origin main",
+    # `-of` is `-o f`: the rest of the cluster is the option's value, so no
+    # force flag is set.
+    "git push -of origin main",
     "git checkout --force main",
     "git config push.default matching",
     "git status",
@@ -293,11 +301,6 @@ class ForcePushScannerFidelityTest(unittest.TestCase):
         command = 'git push -f origin " > x" main'
         self.assertIn('" > x"', _prepare(command))
 
-    @unittest.skipUnless(
-        hasattr(bash_module, "_fp_payload_hides_force_push"),
-        "the payload walk was added with the force-push guard hardening; the"
-        " same vectors are covered end to end by test_refuses_nested_payloads",
-    )
     def test_deep_payload_chains_are_refused_by_the_depth_cap(self):
         # The payload walk counts two levels per nesting layer and refuses once
         # it passes _FP_MAX_PAYLOAD_DEPTH, so a chain it cannot follow is
@@ -326,20 +329,31 @@ class ForcePushScannerFidelityTest(unittest.TestCase):
                 )
 
     def test_url_and_scp_remotes_are_not_refspecs(self):
+        # git reads the first positional as the repository whatever it looks
+        # like, so none of these are refspecs; the push is implicit and the
+        # upstream rules decide. Real git answers `Could not resolve hostname`
+        # for the colon forms, which is how this list was verified.
         for first in [
             "https://example.invalid/x.git",
             "ssh://example.invalid/x.git",
             "git@github.com:org/repo.git",
             "example.invalid:org/repo.git",
+            "localhost:repo.git",
+            "myhost:path",
+            "origin:main",
+            "+main:main",
+            "refs/heads/main:refs/heads/main",
+            "main:main",
+            ":main",
             "C:\\repo",
         ]:
             with self.subTest(first=first):
                 args = bash_module._fp_parse_push_args(["git", "push", "-f", first], 1)
                 self.assertEqual(args.refspecs, [])
-        # A refspec that merely carries a colon still names its target.
-        args = bash_module._fp_parse_push_args(["git", "push", "-f", "origin", "main:main"], 1)
-        self.assertEqual(args.refspecs, ["main:main"])
-        args = bash_module._fp_parse_push_args(["git", "push", "-f", "main:main"], 1)
+        # A remote first still leaves everything after it as refspecs.
+        args = bash_module._fp_parse_push_args(
+            ["git", "push", "-f", "origin", "main:main"], 1
+        )
         self.assertEqual(args.refspecs, ["main:main"])
 
 
@@ -513,11 +527,6 @@ class ForcePushScanCostTest(unittest.TestCase):
         self.assertGreaterEqual(refused, 1)
 
 
-@unittest.skipUnless(
-    hasattr(bash_module, "_fp_env_payloads_hide_force_push"),
-    "the env-payload scanner was added with the force-push guard hardening;"
-    " its vectors are covered end to end by test_refuses_nested_payloads",
-)
 class ForcePushEnvPayloadTest(unittest.TestCase):
     """`env -S`/`--split-string` splits one word into the argv git receives."""
 
@@ -637,6 +646,14 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
     async def _run(self, command: str, **kwargs) -> object:
         return await asyncio.wait_for(bash(command, **kwargs), AWAIT_TIMEOUT)
 
+    def _guard_verdict(self, command: str) -> str | None:
+        """Run only the guard (no spawn) and return its refusal, or None."""
+        try:
+            bash_module._guard_force_push(command, False)
+        except ForcePushRefusalError as refusal:
+            return str(refusal)
+        return None
+
     async def _refused(self, command: str) -> str:
         try:
             handle = bash(command)
@@ -659,6 +676,9 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
             "git push origin +main",
             "git push -f origin master",
             "git push -f origin main:refs/heads/main",
+            # git accepts the short `heads/` spelling for the same destination.
+            "git push -f origin HEAD:heads/main",
+            "git push -f origin main:heads/main",
             "echo ok; git push -f origin main",
         ]:
             with self.subTest(command=command):
@@ -1170,6 +1190,153 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         # allows it (git then does a plain implicit push).
         result = await self._run("git -c alias.push='push -f origin main' push")
         self.assertEqual(result.exit_code, 0, result.output)
+
+    async def test_refuses_quoted_tilde_cd(self):
+        repo, bare = self._make_repo("repo-tilde", branch="main")
+        # `cd "~"` enters a directory literally named `~`, while the guard used
+        # to expand the tilde to HOME and probe the wrong place.
+        literal = self.test_dir / "~"
+        self._git("clone", "-q", str(bare), str(literal), cwd=self.test_dir)
+        self._diverge(literal, bare, "main")
+        os.chdir(self.test_dir)
+        for command in ['cd "~" && git push -f origin HEAD', "cd '~' && git push -f origin HEAD"]:
+            with self.subTest(command=command):
+                # The guard replays the literal `~` directory and refuses the
+                # HEAD push there, naming the branch it found.
+                message = await self._refused(command)
+                self.assertIn("main", message)
+        # A bare `cd ~` still goes home, which is not a repository here, so the
+        # guard falls open and git fails the push itself.
+        self.assertIsNone(
+            self._guard_verdict("cd ~ && git push -f origin HEAD")
+        )
+
+    async def test_refuses_relative_cd_when_cdpath_can_redirect_it(self):
+        repo, bare = self._make_repo("repo-cdpath", branch="main")
+        other = self.test_dir / "other"
+        other.mkdir()
+        self._git("clone", "-q", str(bare), "repo", cwd=other)
+        diverged = other / "repo"
+        self._diverge(diverged, bare, "main")
+        os.chdir(self.test_dir)  # no ./repo here: only CDPATH finds one
+        with mock.patch.dict(os.environ, {"CDPATH": str(other)}):
+            for command in [
+                "cd repo && git push -f origin HEAD",
+                "cd repo && git push -f origin",
+            ]:
+                with self.subTest(command=command):
+                    message = await self._refused(command)
+                    self.assertIn("changes directory", message)
+        # A target that opts out of CDPATH is still resolvable: `./repo` does
+        # not exist here, so the guard replays the named directory.
+        self.assertIsNone(
+            self._guard_verdict("cd ./repo && git push -f origin HEAD")
+        )
+
+    async def test_refuses_sourced_script_relocation(self):
+        repo, bare = self._make_repo("repo-source")  # branch feature + upstream
+        protected = self.test_dir / "protected"
+        self._git("clone", "-q", str(bare), str(protected), cwd=self.test_dir)
+        self._diverge(protected, bare, "feature")
+        script = repo / "move.sh"
+        script.write_text(f"cd {protected}\n")
+        os.chdir(repo)
+        for command in [
+            "eval '. move.sh' && git push -f origin HEAD",
+            "builtin source move.sh && git push -f origin HEAD",
+            ". move.sh && git push -f origin HEAD",
+            "command source move.sh && git push -f origin HEAD",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("changes directory", message)
+        # A child shell never relocates the parent, and `cd .` is not a source.
+        for command in [
+            "sh move.sh && git push -f origin HEAD",
+            "cd . && git push -f origin HEAD",
+        ]:
+            with self.subTest(command=command):
+                result = await self._run(command)
+                self.assertEqual(result.exit_code, 0, result.output)
+
+    async def test_refuses_lone_positional_remote_spellings(self):
+        repo, _bare = self._make_repo("repo-lone-positional", branch="main")
+        os.chdir(repo)
+        # Real git reads the first positional as the repository for all of
+        # these and answers `Could not resolve hostname` for the colon forms,
+        # so none of them carries a refspec: the push is implicit and the
+        # upstream rules decide.
+        for command in [
+            "git push -f localhost:nonexistent.git",
+            "git push -f myhost:path",
+            "git push -f origin:main",
+            "git push -f +main:main",
+            "git push -f refs/heads/main:refs/heads/main",
+            "git push -f :main",
+            "git push -f main",
+            "git push -f origin main:main",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("Refusing to run this force-push command", message)
+
+    async def test_refuses_env_gate_with_uppercase_names(self):
+        repo, _bare = self._make_repo("repo-upper-env")
+        os.chdir(repo)
+        for command in [
+            "ENV -S 'git push -f origin main'",
+            "Env --split-string 'git push -f origin main'",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("env -S", message)
+        # The same names without a hidden push stay inert.
+        self.assertIsNone(self._guard_verdict("ENV -S 'git status'"))
+
+    async def test_refuses_unresolvable_subcommands_inside_payloads(self):
+        repo, _bare = self._make_repo("repo-payload-subcommand")
+        os.chdir(repo)
+        # A payload runs the same commands a top-level line does, so a git
+        # subcommand the guard cannot resolve is refused inside it too: a
+        # repository alias would otherwise run unchecked.
+        self._git("config", "alias.p", "push -f origin main", cwd=repo)
+        for command in [
+            'sh -c "git p"',
+            "eval 'git p'",
+            'sh -c "git lfs push"',
+            "env -S 'git p'",
+            'sh -c "sh -c \\"git p\\"" ',
+        ]:
+            with self.subTest(command=command):
+                await self._refused(command)
+        # Benign payloads keep working, including nested chains and commands
+        # git resolves itself.
+        for command in [
+            'sh -c "git status"',
+            'sh -c "sh -c \\"git status\\"" ',
+            'eval "git submodule status"',
+        ]:
+            with self.subTest(command=command):
+                self.assertIsNone(self._guard_verdict(command))
+
+    async def test_at_brace_refspecs_are_not_unresolvable_words(self):
+        repo, _bare = self._make_repo("repo-at-brace", branch="main")
+        os.chdir(repo)
+        # `@{...}` is git syntax, not a shell expansion: a plain push that
+        # names it is left to git (which rejects the refspec itself), while a
+        # forced push that targets it is still refused.
+        for command in [
+            "git push origin @{u}",
+            "git push --force-with-lease origin @{u}",
+        ]:
+            with self.subTest(command=command):
+                self.assertIsNone(self._guard_verdict(command))
+        for command in [
+            "git push -f origin @{u}",
+            "git push -f origin HEAD:@{u}",
+        ]:
+            with self.subTest(command=command):
+                self.assertIsNotNone(self._guard_verdict(command))
 
     async def test_self_referencing_alias_is_not_reported_as_unresolvable(self):
         repo, _bare = self._make_repo("repo-alias-self")

@@ -1585,38 +1585,6 @@ _FP_GIT_GLOBAL_VALUE_LONG = {
     "--super-prefix",
     "--config-env",
 }
-# A remote can be a URL or an scp-like path -- `https://host/x.git`,
-# `git@github.com:org/repo.git`, `host.name:path`, `C:\repo` -- and git reads
-# the first positional as the repository before it reads any refspec, so a
-# colon inside one is not a refspec separator. The classification is linear:
-# the single pattern that used to do this nested a `+` inside a `+`
-# (`[^/@:]+(?:\.[^/@:]+)+:`), which backtracked exponentially on a long word
-# with many dot-separated groups (py/redos, CWE-1333), and it runs on every
-# guarded command that carries a git word.
-_FP_URL_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
-_FP_SCP_USER_HOST = re.compile(r"^[^/@:]+@[^/:]+:")
-_FP_WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
-
-
-def _fp_is_url_or_scp_remote(word: str) -> bool:
-    """True when `word` names a remote by URL or scp-like path.
-
-    git reads the first positional as the repository, so these are remotes even
-    though they carry a colon: `https://host/x.git`, `file:///srv/x.git`,
-    `ssh://...`, `git@github.com:org/repo.git`, `host.name:path`, and the
-    Windows `C:\repo` / `C:/repo` paths. A word that merely carries a colon is
-    not one (`main:main`, `HEAD:feature`, `refs/heads/x:refs/heads/y`)."""
-    if _FP_URL_SCHEME.match(word) or _FP_SCP_USER_HOST.match(word):
-        return True
-    if _FP_WINDOWS_DRIVE.match(word):
-        return True
-    # The remaining shape is `host.name:path`: the part before the first colon
-    # is a host with a dot in it, and holds no `/` or `@`.
-    host, separator, _path = word.partition(":")
-    if not separator or not host or "/" in host or "@" in host:
-        return False
-    return "." in host
-
 # git push options that take the next token as their value (space-separated
 # form); `--signed[=x]` and `--recurse-submodules[=x]` are attached-only, and
 # `--force-with-lease[=x]`/`--force-if-includes` are never force flags.
@@ -1837,6 +1805,14 @@ def _fp_expand_inline_git_aliases(tokens: list[str]) -> "list[str] | _FpUnresolv
     return expanded
 
 
+# Characters a re-parsed payload can leave on the edge of a word when one
+# escaping layer is consumed (`git status\"` scans as the command word
+# `status`): the name check trims them so a mangled view of a command git runs
+# itself is not mistaken for an alias. The mangling only ever adds or drops
+# quote characters, so it cannot turn one command name into another.
+_FP_WORD_EDGE_NOISE = " \t\r\n\"'\\`;&|()<>"
+
+
 def _fp_unresolvable_git_subcommand(words: list[_FpShellWord]) -> str | None:
     """The first git subcommand the guard cannot resolve, or None.
 
@@ -1852,9 +1828,12 @@ def _fp_unresolvable_git_subcommand(words: list[_FpShellWord]) -> str | None:
         subcommand = _fp_effective_subcommand(tokens)
         if subcommand is None or subcommand is _FP_UNRESOLVABLE_ALIAS:
             continue  # no subcommand, or already refused as an alias
-        if subcommand in _FP_GIT_COMMANDS:
+        name = subcommand.strip(_FP_WORD_EDGE_NOISE)
+        if not name:
+            continue
+        if name in _FP_GIT_COMMANDS:
             continue  # git runs this command itself, whatever aliases exist
-        return subcommand
+        return name
     return None
 
 
@@ -1960,10 +1939,18 @@ def _fp_parse_push_args(tokens: list[str], push_index: int) -> _FpPushArgs:
     n = len(tokens)
     while i < n:
         token = tokens[i]
-        if unresolvable is None and _FP_GLOB_OR_SUBSTITUTION.search(token):
+        if (
+            unresolvable is None
+            and _FP_GLOB_OR_SUBSTITUTION.search(token)
+            and not token.startswith("@{")
+        ):
             # A word the shell expands (a variable, a substitution, a glob) can
             # become `-f`, or a `+`-refspec naming a protected branch, or the
-            # remote, so the invocation cannot be proven non-force.
+            # remote, so the invocation cannot be proven non-force. `@{...}` is
+            # git's own syntax rather than a shell expansion, so it is not
+            # unresolvable; the dedicated `@{` target check still refuses a
+            # forced push that names it (`git push -f origin @{u}`, and
+            # `HEAD:@{u}` through its own target).
             unresolvable = token
         if options_done:
             positionals.append(token)
@@ -1997,35 +1984,35 @@ def _fp_parse_push_args(tokens: list[str], push_index: int) -> _FpPushArgs:
             i += 1
             continue
         if token.startswith("-") and token != "-":
+            cluster = token[1:]
             consumes_value = False
-            for ch in token[1:]:
+            for position, ch in enumerate(cluster):
                 if ch == "f":
                     force = True
                 elif ch == "n":
                     dry_run = True
                 elif ch in _FP_PUSH_VALUE_SHORT:
-                    consumes_value = True
+                    # git reads the REST of the cluster as this option's value,
+                    # so nothing after it is a flag: `-oo` is `-o o` (and the
+                    # next token is still a flag), while `-of` is `-o f` and
+                    # never carries a force flag.
+                    consumes_value = position == len(cluster) - 1
+                    break
             i += 1 if consumes_value else 0
             i += 1
             continue
         positionals.append(token)
         i += 1
-    refspecs = positionals
-    if not repo_option and positionals:
-        first = positionals[0]
-        refspec_shaped = (
-            ":" in first
-            or first.startswith("+")
-            or first.startswith("@{")
-            or first.startswith("refs/")
-            or re.search(r"[*?\[]", first)
-        )
-        if not refspec_shaped or _fp_is_url_or_scp_remote(first):
-            # The first positional names the remote; git reads a URL or
-            # scp-like word as the repository even though it carries a colon,
-            # so an implicit refspec (push.default, remote.<name>.push,
-            # remote.<name>.mirror) picks the branches it would force.
-            refspecs = positionals[1:]
+    # git always reads the first positional as the repository, whatever it
+    # looks like: `git push localhost:repo.git`, `git push origin:main`,
+    # `git push +main:main`, `git push refs/heads/main:refs/heads/main`, and
+    # `git push :main` all try to reach a remote by that name (real git answers
+    # with ssh host errors for the colon forms), so a lone positional never
+    # carries a refspec. Only `--repo` moves the remote out of the positionals.
+    # A remote named by a URL, an scp-like path, or a `name:path` leaves the
+    # refspec implicit, and the implicit path (upstream probe, or a refusal
+    # when there is nothing to verify against) decides what it would rewrite.
+    refspecs = positionals if repo_option else positionals[1:]
     return _FpPushArgs(force, dry_run, wildcard, refspecs, repo_option, unresolvable)
 
 
@@ -2065,10 +2052,14 @@ def _fp_payload_hides_force_push(payload: str, depth: int = 0) -> bool:
     normalized, _index_map = _fp_strip_escapes(
         _fp_mask_redirections(_fp_normalize_continuations(payload))
     )
-    if any(
-        _fp_run_is_guarded(run)
-        for run in _fp_find_git_push_runs(_fp_scan_words(normalized))
-    ):
+    words = _fp_scan_words(normalized)
+    if _fp_unresolvable_git_subcommand(words) is not None:
+        # A payload runs the same commands a top-level line does, so a git
+        # subcommand the guard cannot resolve is refused here too: a repository
+        # alias or an external `git-` program (`sh -c "git p"`) would otherwise
+        # run unchecked inside the payload.
+        return True
+    if any(_fp_run_is_guarded(run) for run in _fp_find_git_push_runs(words)):
         return True
     if re.search(r"\beval\b", normalized) and _fp_eval_payloads_hide_force_push(
         normalized, depth + 1
@@ -2078,8 +2069,10 @@ def _fp_payload_hides_force_push(payload: str, depth: int = 0) -> bool:
         r"\b(?:sh|bash|zsh|dash|ksh)\b", normalized, re.IGNORECASE
     ) and _fp_shell_c_payloads_hide_force_push(normalized, depth + 1):
         return True
+    # The command-name checks fold case (`ENV`, `ENV.EXE`, `SH`), so the cheap
+    # gate has to match them the same way or the scan never runs.
     return bool(
-        re.search(r"\benv\b", normalized)
+        re.search(r"\benv\b", normalized, re.IGNORECASE)
         and _fp_env_payloads_hide_force_push(normalized, depth + 1)
     )
 
@@ -2356,39 +2349,95 @@ def _fp_literal_words(region: str) -> tuple[list[str | None], bool]:
     return words, well_formed
 
 
-def _fp_static_arg(raw: str) -> str | None:
+@dataclass(frozen=True)
+class _FpStaticArg:
+    """One cd/pushd argument the resolver could read literally."""
+
+    value: str
+    tilde_expands: bool  # the raw word began with an unquoted `~`
+
+
+# A bare `cd`: no argument at all, so it goes to HOME.
+_FP_BARE_CD_ARG = _FpStaticArg("", False)
+
+
+def _fp_static_arg(raw: str) -> _FpStaticArg | None:
     """Unquote one cd/pushd argument to its literal path, or None when it
-    cannot be resolved statically (empty, multi-word, or inexact)."""
+    cannot be resolved statically (empty, multi-word, or inexact).
+
+    The returned value also records whether the shell would expand a leading
+    `~`: it does so only when the tilde is the first character of the word as
+    written, so `cd ~` and `cd ~/x` move to the home directory while `cd "~"`
+    and `cd '~'` enter a directory literally named `~`."""
     if not raw or re.search(r"[$`;&|()<>#]", raw):
         return None
     words, well_formed = _fp_literal_words(raw)
     if not well_formed or len(words) != 1 or not words[0]:
         return None  # empty, multi-word, or inexact: refuse to guess
-    return words[0]
+    return _FpStaticArg(words[0], raw.startswith("~"))
 
 
-def _fp_resolve_cd_target(arg: str, current: str | None, workspace: str) -> str | None:
+def _fp_cdpath_redirects() -> bool:
+    """True when `CDPATH` could redirect a relative `cd` target.
+
+    A non-empty CDPATH makes the shell search other directories first for a
+    relative operand, so the directory the guard would replay is not the one
+    the shell enters."""
+    try:
+        return bool(_child_env().get("CDPATH"))
+    except (OSError, RuntimeError, ValueError):
+        return True  # cannot read the environment: refuse rather than guess
+
+
+def _fp_resolve_cd_target(
+    arg: _FpStaticArg, current: str | None, workspace: str
+) -> str | None:
     """Resolve one statically-known `cd` argument against the running
     directory (None = the kernel workspace), logical like the shell's
     default `cd -L`. Returns None when the target cannot be resolved
-    statically (bare `cd` without a usable HOME, `cd -`/options, or
-    another user's home)."""
-    if not arg:
+    statically (bare `cd` without a usable HOME, `cd -`/options, another
+    user's home, a quoted `~`, or anything `CDPATH` could redirect)."""
+    if not arg.value:
         # A bare `cd` goes home; expanduser matches what the child shell sees.
         try:
             return os.path.expanduser("~")
         except (OSError, RuntimeError):
             return None
-    if arg.startswith("-"):
+    target = arg.value
+    if target.startswith("-"):
         return None  # `cd -`, `cd -L`, `cd -- ...`: not statically resolvable
-    if arg.startswith("~"):
-        if arg == "~" or arg.startswith("~/"):
+    if target.startswith("~"):
+        if not arg.tilde_expands:
+            # Quoted or escaped: the shell keeps the literal name, so `cd "~"`
+            # enters `./~` rather than the home directory.
+            return os.path.join(current or workspace, target)
+        if target == "~" or target.startswith("~/"):
             try:
-                return os.path.expanduser(arg)
+                return os.path.expanduser(target)
             except (OSError, RuntimeError):
                 return None
         return None  # ~otheruser: another user's home directory
-    return arg if os.path.isabs(arg) else os.path.join(current or workspace, arg)
+    if os.path.isabs(target):
+        return target
+    if not target.startswith(".") and _fp_cdpath_redirects():
+        # `CDPATH` is searched for a plain relative operand (a leading `/`,
+        # `.`, or `..` opts out), so the target cannot be pinned down.
+        return None
+    return os.path.join(current or workspace, target)
+
+
+# A command run that sources a script: `source` or a standalone `.` word
+# followed by what it sources, however it is reached (`eval '. move.sh'`,
+# `builtin source move.sh`). A `.` inside a path (`./repo`, `../x`, `a.b`) or
+# as an argument on its own (`cd .`) is not a source: `.` needs an operand.
+_FP_SOURCE_COMMAND = re.compile(
+    r"""(?:^|[\s;&|()'"=])(?:source|\.)[ \t]+[^\s;&|()]"""
+)
+
+
+def _fp_part_sources_scripts(part: str) -> bool:
+    """True when one command run sources a script anywhere in it."""
+    return bool(_FP_SOURCE_COMMAND.search(part))
 
 
 def _fp_resolve_push_cwd(
@@ -2408,7 +2457,7 @@ def _fp_resolve_push_cwd(
     moved the shell: the kernel workspace."""
     if not (
         re.search(r"\b(?:cd|pushd|popd|source)\b", prefix)
-        or re.search(r"(?:^|[;&|()\s])\.[\s=]", prefix)
+        or _FP_SOURCE_COMMAND.search(prefix)
         or "(" in prefix
     ):
         return None
@@ -2438,9 +2487,13 @@ def _fp_resolve_push_cwd(
         trimmed = part.strip()
         if not trimmed:
             continue
-        first_word = re.split(r"\s+", trimmed)[0]
-        if first_word in ("source", "."):
-            return _FP_UNRESOLVABLE_CWD  # a sourced script relocates arbitrarily
+        if _fp_part_sources_scripts(trimmed):
+            # A sourced script relocates the shell arbitrarily, and it can hide
+            # behind a wrapper or inside quotes (`builtin source move.sh`,
+            # `eval '. move.sh'`), so the whole command run is unresolvable.
+            # `sh move.sh && ...` is NOT this case: a child shell never
+            # relocates the parent.
+            return _FP_UNRESOLVABLE_CWD
         if re.search(r"(^|\s)GIT_[A-Z_]+=", trimmed):
             return _FP_UNRESOLVABLE_CWD  # the assignment selects another repository
         opens = len(re.findall(r"\(", trimmed))
@@ -2475,7 +2528,11 @@ def _fp_resolve_push_cwd(
                 pending[-1] = False
                 continue
             raw_arg = cd_match.group(1)
-            arg = _fp_static_arg(raw_arg.strip()) if raw_arg is not None else ""
+            arg = (
+                _fp_static_arg(raw_arg.strip())
+                if raw_arg is not None
+                else _FP_BARE_CD_ARG
+            )
             if arg is None:
                 return _FP_UNRESOLVABLE_CWD
             resolved = _fp_resolve_cd_target(arg, current, workspace)
@@ -2499,7 +2556,11 @@ def _fp_resolve_push_cwd(
             pending[-1] = False
             continue
         raw_arg = cd_match.group(1)
-        arg = _fp_static_arg(raw_arg.strip()) if raw_arg is not None else ""
+        arg = (
+            _fp_static_arg(raw_arg.strip())
+            if raw_arg is not None
+            else _FP_BARE_CD_ARG
+        )
         if arg is None:
             return _FP_UNRESOLVABLE_CWD
         resolved = _fp_resolve_cd_target(arg, current, workspace)
@@ -2645,8 +2706,12 @@ def _fp_push_violation(
                 return _fp_format_refusal(
                     f'the refspec "{refspec}" names the current upstream'
                 )
-            if target.startswith("refs/heads/"):
-                target = target[len("refs/heads/") :]
+            for prefix in ("refs/heads/", "heads/"):
+                # git accepts the short `heads/main` spelling for the same
+                # destination, so a force push to it rewrites the branch.
+                if target.startswith(prefix):
+                    target = target[len(prefix) :]
+                    break
             if target in _FP_PROTECTED_BRANCHES:
                 return _fp_format_refusal(
                     f'it would force-push "{target}"'
@@ -2857,14 +2922,14 @@ def _guard_force_push(command: str, allow_force_push: bool) -> None:
     ) and _fp_shell_c_payloads_hide_force_push(resolved):
         # `SH -c '...'` runs a real shell on a case-insensitive filesystem.
         raise ForcePushRefusalError(_fp_format_shell_c_refusal())
-    if re.search(r"\benv\b", normalized) and _fp_env_payloads_hide_force_push(
-        resolved
+    if re.search(r"\benv\b", normalized, re.IGNORECASE) and (
+        _fp_env_payloads_hide_force_push(resolved)
     ):
         # `env -S` splits one word into the argv git receives; refuse rather
         # than resolve a command the guard cannot see.
         raise ForcePushRefusalError(_fp_format_env_refusal())
     trailing_backslashes = len(command_text) - len(command_text.rstrip("\\"))
-    if trailing_backslashes % 2 and re.search(r"\bgit\b", normalized):
+    if trailing_backslashes % 2 and re.search(r"\bgit\b", normalized, re.IGNORECASE):
         # An odd trailing backslash escapes the newline the kernel appends
         # after the command, so the shell joins it with text the guard cannot
         # see. Refuse rather than guess where the command ends.
