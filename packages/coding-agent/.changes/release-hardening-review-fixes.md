@@ -21,3 +21,4 @@ there is no runtime input (environment, file or flag) that can set it.
 - Changed `prime-agent update` to refuse an invalid `PRIME_AGENT_DOWNLOAD_BASE_URL` instead of silently falling back to the npm registry package.
 - Changed `prime-agent update` to route a compiled binary that npm or Homebrew installed through that package manager instead of the self-updater, and to recognise a Homebrew keg only under a real Homebrew prefix or with brew's install receipt.
 - Added release signature verification to the installer: `install.sh` now requires `SHA256SUMS.sigstore.json`, verifies it with cosign when available, and honours `PRIME_AGENT_REQUIRE_SIGNATURE=1`.
+- Changed `prime-agent update` to accept a valid `PRIME_AGENT_DOWNLOAD_BASE_URL` override even when the recorded install origin is a legacy `http:` source, instead of forcing a reinstall.

@@ -160,7 +160,11 @@ export async function getNativeUpdatePlan(options: {
 	try {
 		recordedBaseUrl = parseDownloadBaseUrl(installation.baseUrl, "The recorded install source (.install-source)");
 	} catch (error) {
-		if (!options.rollback) throw error;
+		// The recorded origin only decides where bytes come from when nothing overrides it. With
+		// PRIME_AGENT_DOWNLOAD_BASE_URL set, a legacy (`http:`) or damaged recorded origin is never
+		// fetched from - it is only compared for the equal-origin note - so it must not block an
+		// update whose download origin is explicitly named and valid.
+		if (!options.rollback && requestedBaseUrl === undefined) throw error;
 	}
 	const baseUrl = requestedBaseUrl ?? recordedBaseUrl ?? installation.baseUrl;
 	// An override that names the recorded origin changes nothing and is not reported as an override.

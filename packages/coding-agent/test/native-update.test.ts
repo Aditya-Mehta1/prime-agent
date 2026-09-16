@@ -317,6 +317,31 @@ describe("native release metadata isolation", () => {
 			});
 		});
 
+		it("a valid https override moves a legacy install forward: the recorded origin is only compared", async () => {
+			const override = "https://mirror.example/prime-agent";
+			vi.stubEnv("PRIME_AGENT_DOWNLOAD_BASE_URL", override);
+			retainPreviousRelease();
+			const fetchMock = vi.fn(async () =>
+				Response.json({ version: "1.2.4", binaries: [{ ...artifact, executableSha256: "d".repeat(64) }] }),
+			);
+			vi.stubGlobal("fetch", fetchMock);
+			verifiedDigest.mockResolvedValue({
+				digest: artifact.sha256,
+				signerIdentity:
+					"https://github.com/PrimeIntellect-ai/prime-agent/.github/workflows/build-binaries.yml@refs/heads/main",
+			});
+
+			const plan = await getNativeUpdatePlan({ force: false, rollback: false, executable });
+
+			// The download origin is the explicit override; the recorded http origin never decides it.
+			// The manifest (and so the download) goes to the override, not the recorded http origin.
+			expect(fetchMock).toHaveBeenCalledWith(`${override}/latest.json`, expect.anything());
+			expect(plan.overriddenBaseUrl).toBe(override);
+			expect(plan.command?.args).toContain(`PRIME_AGENT_DOWNLOAD_BASE_URL=${override}`);
+			const { warnings } = describeNativeUpdatePlan(plan);
+			expect(warnings.join("\n")).toContain(override);
+		});
+
 		it("still refuses to download from the same legacy origin", async () => {
 			vi.stubEnv("PRIME_AGENT_DOWNLOAD_BASE_URL", "");
 			retainPreviousRelease();
