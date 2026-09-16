@@ -212,7 +212,7 @@ impl Default for UserContent {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(tag = "type", rename_all = "camelCase")]
 pub enum UserPart {
     Text(TextContent),
     Image(ImageContent),

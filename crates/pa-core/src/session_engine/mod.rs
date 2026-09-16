@@ -227,14 +227,10 @@ impl AgentSession {
                 "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."
             );
         }
-        {
-            let mut session = self.session.lock().await;
-            session.append_message(SessionAgentMessage::User(pa_types::ai::UserMessage {
-                content: pa_types::ai::UserContent::Text(normalized.clone()),
-                timestamp: now_millis(),
-                rest: Default::default(),
-            }));
-        }
+        // User messages persist through the loop's `message_end` event (the
+        // persistence subscription in `from_session_arc`), matching the TS
+        // reference: `_processAgentEvent` is the only appendMessage path for
+        // user prompts. Appending here as well would double-persist.
 
         if busy {
             let message = AgentMessage::Standard(pa_agent::types::Message::User(

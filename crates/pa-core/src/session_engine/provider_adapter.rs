@@ -240,3 +240,45 @@ impl ModelStream for PumpedStream {
         self.stream.result()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Regression guard for the pa-agent -> pa-ai message boundary: the wire
+    //! round-trip must keep user messages. `UserPart` must stay `type`-tagged
+    //! like the TS wire format; an untagged variant serializes parts without
+    //! `"type"`, the pa-ai shape rejects them, and `real_stream_fn` silently
+    //! dropped every prompt admitted via `AgentPromptInput::Text` (content
+    //! parts), leaving the provider with a system prompt only.
+
+    use super::*;
+
+    #[test]
+    fn prompt_text_message_round_trips() {
+        let message = pa_agent::types::AgentMessage::Standard(pa_agent::types::Message::User(
+            pa_agent::types::UserMessage {
+                content: pa_agent::types::UserContent::Parts(vec![
+                    pa_agent::types::UserPart::Text(pa_agent::types::TextContent {
+                        text: "reply with ok".into(),
+                        text_signature: None,
+                    }),
+                ]),
+                timestamp: 1,
+            },
+        ));
+        let converted: Option<pa_types::ai::Message> = json_round_trip(&message);
+        assert_eq!(
+            converted,
+            Some(pa_types::ai::Message::User(pa_types::ai::UserMessage {
+                content: pa_types::ai::UserContent::Blocks(vec![
+                    pa_types::ai::UserContentBlock::Text(pa_types::ai::TextContent {
+                        text: "reply with ok".into(),
+                        text_signature: None,
+                        rest: Default::default(),
+                    }),
+                ]),
+                timestamp: 1,
+                rest: Default::default(),
+            }))
+        );
+    }
+}

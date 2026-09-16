@@ -110,3 +110,25 @@ captures the pane, and asserts the structural contract + editor keys
   prompt, footer, collapsed-mode line) instead of a same-session side-by-side.
 - Thinking blocks are excluded from replay transcripts (TS renders them
   collapsed); `--show-thinking` placeholder flag retained for a future port.
+
+
+## pa-ai / real-provider lane notes
+
+- `PRIME_INFERENCE_BASE_URL` now mirrors the TS reference exactly: the TS
+  binary's provider config (`packages/coding-agent/src/core/prime-inference-model-catalog.ts`)
+  declares `https://api.pinference.ai/api/v1`; the old Rust value
+  (`https://inference.primeintellect.ai/v1`) does not resolve on this box. The
+  generated catalog (`pa-ai models.generated.json`) already carried the pinference
+  URL; only the private-model / live-catalog constant and the catalog-refresh
+  fetch diverged. A differential test reads the TS source as the golden.
+- `pa_agent::types::UserPart` was `serde(untagged)`, but the TS wire format
+  (`packages/ai/src/types.ts` `UserMessage.content`) is `type`-tagged parts
+  (`{"type":"text", ...}`). The untagged form failed the pa-agent -> pa-ai
+  JSON round-trip in `real_stream_fn`, so every prompt admitted through
+  `AgentPromptInput::Text` was silently dropped before reaching the provider.
+  `session_engine::provider_adapter` has a regression test for the boundary.
+- `AgentSession::prompt` eagerly appended the user message to the session;
+  the TS reference persists user prompts only from the agent `message_end`
+  event (`_processAgentEvent`). The eager append double-persisted once the
+  wire shape was fixed; it was removed (in-memory persistence parity verified
+  by the existing `prompt_persists_user_and_assistant` test).
