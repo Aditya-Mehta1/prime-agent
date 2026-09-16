@@ -6,3 +6,6 @@ license.workspace = true
 description = "Shared domain and wire types for Prime Agent."
 
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

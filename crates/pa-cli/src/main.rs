@@ -1,1 +1,3 @@
-fn main() { println!("prime-agent-rs"); }
+fn main() {
+    println!("prime-agent-rs");
+}
