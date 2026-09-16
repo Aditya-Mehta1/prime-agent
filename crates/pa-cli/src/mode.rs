@@ -140,9 +140,6 @@ pub struct RunOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissingSubsystem {
     SessionEngine,
-    InteractiveTui,
-    DaemonSupervisor,
-    DaemonClient,
     ModelRegistry,
     SessionExport,
     PackageManager,
@@ -152,9 +149,6 @@ impl MissingSubsystem {
     pub fn subsystem_name(&self) -> &'static str {
         match self {
             MissingSubsystem::SessionEngine => "the session engine (pa-core)",
-            MissingSubsystem::InteractiveTui => "the interactive terminal UI (pa-tui)",
-            MissingSubsystem::DaemonSupervisor => "the daemon supervisor (pa-daemon)",
-            MissingSubsystem::DaemonClient => "the daemon client (pa-daemon)",
             MissingSubsystem::ModelRegistry => "the model registry (pa-ai)",
             MissingSubsystem::SessionExport => "the session HTML exporter (pa-core)",
             MissingSubsystem::PackageManager => "the capability package manager (pa-core)",
@@ -197,12 +191,8 @@ impl Runtime for UnavailableRuntime {
         if options.export.is_some() {
             return Err(MissingSubsystem::SessionExport);
         }
-        Err(match options.app_mode {
-            AppMode::Interactive => MissingSubsystem::InteractiveTui,
-            AppMode::Print | AppMode::Json => MissingSubsystem::SessionEngine,
-            AppMode::Rpc | AppMode::Acp => MissingSubsystem::SessionEngine,
-            AppMode::Daemon => MissingSubsystem::DaemonSupervisor,
-        })
+        let _ = options.app_mode;
+        Err(MissingSubsystem::SessionEngine)
     }
 }
 

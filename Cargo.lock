@@ -1225,6 +1225,7 @@ dependencies = [
  "pa-ai",
  "pa-core",
  "pa-daemon",
+ "pa-tui",
  "pa-types",
  "serde",
  "serde_json",

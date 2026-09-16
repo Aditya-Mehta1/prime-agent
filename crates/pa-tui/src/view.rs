@@ -95,6 +95,13 @@ impl AgentView {
                     out.push(vec![Span::styled(format!("⚙ {model_id}"), style)]);
                     out.push(Vec::new());
                 }
+                TranscriptItem::SystemNote { text } => {
+                    let style = self.theme.fg_style(ThemeColor::Muted);
+                    for line in text.lines() {
+                        out.push(vec![Span::styled(line.to_string(), style)]);
+                    }
+                    out.push(Vec::new());
+                }
             }
         }
         out

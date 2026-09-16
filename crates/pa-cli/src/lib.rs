@@ -10,9 +10,11 @@ pub(crate) mod command_registry;
 pub(crate) mod config;
 pub(crate) mod daemon_client;
 pub(crate) mod daemon_command;
+pub(crate) mod daemon_mode;
 pub(crate) mod daemon_session_list;
 pub(crate) mod global_flags;
 pub(crate) mod initial_message;
+pub(crate) mod interactive_mode;
 pub(crate) mod mcp_command;
 pub(crate) mod mode;
 pub(crate) mod package_command;
@@ -23,6 +25,12 @@ pub(crate) mod public_command;
 pub use mode::{AppMode, MissingSubsystem, RunOptions, Runtime, UnavailableRuntime};
 pub mod print_runtime;
 pub use print_runtime::PrintRuntime;
+
+/// Daemon wiring shared by the interactive runtime and the integration
+/// tests: spawn/probe the supervisor on a socket, and map `--daemon-socket`.
+pub use interactive_mode::{
+    ensure_daemon_running, ensure_daemon_running_with, resolve_socket_path,
+};
 
 /// Entry point shared by the binary and the integration tests. Returns the
 /// process exit code.
@@ -109,6 +117,19 @@ fn main_impl(args: Vec<String>, runtime: &dyn mode::Runtime) -> Result<i32, Stri
     ) && !parsed.file_args.is_empty()
     {
         return Err("@file arguments are not supported in RPC or daemon mode".to_string());
+    }
+
+    // Daemon worker processes start with the worker role env var set (TS
+    // `isDaemonWorkerProcess`, scoped to daemon-mode argv, checked after the
+    // shared mode validations): route straight into the worker runtime. The
+    // supervisor launches workers as `prime-agent worker`.
+    let is_worker_process =
+        std::env::var(pa_daemon::worker::WORKER_ROLE_ENV).unwrap_or_default() == "1";
+    if is_worker_process
+        && (args.first().map(String::as_str) == Some("worker")
+            || args.windows(2).any(|pair| pair == ["--mode", "daemon"]))
+    {
+        return run_worker_mode();
     }
 
     if let Some(fork) = &parsed.fork {
@@ -209,6 +230,19 @@ fn main_impl(args: Vec<String>, runtime: &dyn mode::Runtime) -> Result<i32, Stri
     match runtime.run(&options) {
         Ok(exit_code) => Ok(exit_code),
         Err(missing) => Err(missing.error_message()),
+    }
+}
+
+/// Run the daemon session-worker runtime (the process the supervisor spawns
+/// for each live session).
+fn run_worker_mode() -> Result<i32, String> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    match runtime.block_on(pa_daemon::worker::run_worker()) {
+        Ok(()) => Ok(0),
+        Err(error) => Err(format!("{error:#}")),
     }
 }
 

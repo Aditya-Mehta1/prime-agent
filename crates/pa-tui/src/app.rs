@@ -168,7 +168,7 @@ pub fn dispatch_events(editor: &mut Editor, on_submit: &mut dyn FnMut(&str)) {
     }
 }
 
-fn draw(
+pub(crate) fn draw(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     view: &mut AgentView,
 ) -> Result<()> {

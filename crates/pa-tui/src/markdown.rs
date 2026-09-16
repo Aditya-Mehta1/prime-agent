@@ -571,7 +571,9 @@ pub fn wrap_spans(spans: &[Span], width: usize, base: Style, out: &mut Vec<Line>
         out.push(spans.to_vec());
         return;
     }
-    // tokens: (text, style); even entries words, odd entries single-space gaps
+    // tokens: (text, style); alternating words and single-space gaps. A gap
+    // at a span boundary must survive (bold text followed by " plain"), so
+    // whitespace runs collapse to one gap token across the whole line.
     let mut tokens: Vec<(String, Style)> = Vec::new();
     for span in spans {
         let mut word = String::new();
@@ -579,6 +581,9 @@ pub fn wrap_spans(spans: &[Span], width: usize, base: Style, out: &mut Vec<Line>
             if ch == ' ' {
                 if !word.is_empty() {
                     tokens.push((std::mem::take(&mut word), span.style));
+                }
+                let gap_already_emitted = tokens.last().is_some_and(|(text, _)| text == " ");
+                if !gap_already_emitted {
                     tokens.push((" ".to_string(), span.style));
                 }
             } else {
@@ -720,6 +725,28 @@ mod tests {
         let spans = render_inline("a **b** `c` [d](http://e)", &style);
         let texts: Vec<&str> = spans.iter().map(|s| s.content.as_str()).collect();
         assert_eq!(texts, vec!["a ", "b", " ", "c", " ", "d", " (http://e)"]);
+    }
+
+    #[test]
+    fn styled_span_boundaries_keep_their_spaces() {
+        // A gap starting a new span must not be swallowed by the wrap pass.
+        let style = MarkdownStyle::default();
+        let lines = render_markdown("**Hello.** I can render", 80, &style);
+        let joined: String = lines[0].iter().map(|s| s.content.as_str()).collect();
+        assert_eq!(joined, "Hello. I can render");
+        // Whitespace runs still collapse to a single gap across spans.
+        let spans = render_inline("a **b**   c", &style);
+        let wrapped = wrap_spans_to_text(&spans, 40);
+        assert_eq!(wrapped, "a b c");
+    }
+
+    fn wrap_spans_to_text(spans: &[Span], width: usize) -> String {
+        let mut lines: Vec<Line> = Vec::new();
+        wrap_spans(spans, width, Style::default(), &mut lines);
+        lines
+            .iter()
+            .flat_map(|l| l.iter().map(|s| s.content.as_str()))
+            .collect()
     }
 
     #[test]

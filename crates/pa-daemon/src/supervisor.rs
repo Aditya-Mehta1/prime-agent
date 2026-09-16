@@ -128,6 +128,10 @@ pub struct Supervisor {
     /// Worker outbound frames, with their client routing.
     events: broadcast::Sender<(ClientRouting, Value)>,
     shutting_down: AtomicBool,
+    /// Wakes the accept loop when [`Supervisor::begin_shutdown`] sets the
+    /// flag: a listening socket blocks in `accept` until a client connects,
+    /// so the shutdown must interrupt it for the process to exit.
+    shutdown_notify: tokio::sync::Notify,
     log: paths::RotatingLog,
 }
 
@@ -159,6 +163,7 @@ impl Supervisor {
             workers: Mutex::new(HashMap::new()),
             events,
             shutting_down: AtomicBool::new(false),
+            shutdown_notify: tokio::sync::Notify::new(),
             log,
         })
     }
@@ -179,14 +184,18 @@ impl Supervisor {
         self.adopt_persisted_workers().await;
 
         while !self.shutting_down.load(Ordering::SeqCst) {
-            let (stream, _addr) = match listener.accept().await {
-                Ok(accepted) => accepted,
-                Err(error) => {
-                    if self.shutting_down.load(Ordering::SeqCst) {
-                        break;
+            let (stream, _addr) = tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        if self.shutting_down.load(Ordering::SeqCst) {
+                            continue;
+                        }
+                        return Err(anyhow!("supervisor accept: {error}"));
                     }
-                    return Err(anyhow!("supervisor accept: {error}"));
-                }
+                },
+                // begin_shutdown fired: loop back and fall out of the loop.
+                _ = self.shutdown_notify.notified() => continue,
             };
             let supervisor = Arc::clone(&self);
             tokio::spawn(async move {
@@ -1329,6 +1338,9 @@ impl Supervisor {
             let _ = std::fs::remove_file(&resident.descriptor_path);
         }
         workers.clear();
+        // Wake the accept loop only after the workers stopped, so the process
+        // cannot exit mid-stop and orphan a live worker.
+        self.shutdown_notify.notify_one();
     }
 }
 

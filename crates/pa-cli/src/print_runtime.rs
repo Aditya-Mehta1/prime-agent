@@ -38,9 +38,27 @@ impl crate::mode::Runtime for PrintRuntime {
                     Ok(1)
                 }
             },
-            AppMode::Interactive | AppMode::Rpc | AppMode::Acp | AppMode::Daemon => {
-                Err(MissingSubsystem::SessionEngine)
+            // The interactive TUI attaches through the daemon (spawning a
+            // supervisor when none is running); the daemon mode runs the
+            // supervisor in-process. Runtime failures print themselves and
+            // exit non-zero, so the typed channel stays for unwired modes.
+            AppMode::Interactive => match crate::interactive_mode::run_interactive_mode(options) {
+                Ok(code) => Ok(code),
+                Err(error) => {
+                    eprintln!("Error: {error:#}");
+                    Ok(1)
+                }
+            },
+            AppMode::Daemon => {
+                match crate::daemon_mode::run_daemon_mode(options.daemon_socket.as_deref()) {
+                    Ok(code) => Ok(code),
+                    Err(error) => {
+                        eprintln!("Error: {error:#}");
+                        Ok(1)
+                    }
+                }
             }
+            AppMode::Rpc | AppMode::Acp => Err(MissingSubsystem::SessionEngine),
         }
     }
 }

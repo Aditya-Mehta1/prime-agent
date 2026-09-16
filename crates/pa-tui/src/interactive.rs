@@ -1,0 +1,339 @@
+//! Interactive agent session over the daemon: attach to a live session, send
+//! prompts, render streamed assistant output, and switch sessions. This is
+//! the interactive product surface of `crates/pa-tui` (the port of the
+//! interactive mode's daemon-attach path); the session loop itself keeps
+//! running in the daemon worker, so closing the UI detaches instead of
+//! stopping the session.
+//!
+//! Two UI sources drive the same loop: a crossterm terminal (raw mode, alt
+//! screen) and a headless plan (programmatic input, captured frames). The
+//! headless source is the verifier seam: it exercises the identical
+//! attach/submit/stream/render path without a TTY.
+
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use serde_json::{json, Value};
+
+use crate::daemon_client::DaemonClient;
+use crate::session_ui::SessionUi;
+use crate::view::AgentView;
+
+use crossterm::event::KeyEvent;
+use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
+use tokio::sync::mpsc;
+
+/// Which session the interactive run opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionSelection {
+    /// Create a fresh session (`create`, then `attach`).
+    New,
+    /// Attach an existing live session by active session id.
+    Attach(String),
+    /// Create with `continueRecent`: the supervisor picks the most recent
+    /// saved session for the cwd.
+    ContinueRecent,
+    /// Create with `sessionPath`: reopen a saved session file (`--resume`).
+    Resume(PathBuf),
+}
+
+/// Options for one interactive run.
+#[derive(Debug, Clone)]
+pub struct InteractiveOptions {
+    pub socket_path: PathBuf,
+    pub cwd: PathBuf,
+    /// Persistence directory for new sessions (`sessionDir` in the create
+    /// config; defaults to the daemon's sessions dir when `None`).
+    pub session_dir: Option<PathBuf>,
+    /// Scripted faux-engine script path. Verification seam only; the product
+    /// never sets it.
+    pub script_path: Option<PathBuf>,
+    /// Create without a session file (`--no-session`).
+    pub no_session: bool,
+    pub session: SessionSelection,
+    /// Prompt sent immediately after attach (CLI message arguments).
+    pub initial_message: Option<String>,
+    pub theme: String,
+}
+
+impl InteractiveOptions {
+    /// The `create` config carried on every new-session request.
+    pub(crate) fn create_config(&self) -> Value {
+        let mut config = json!({ "cwd": self.cwd.display().to_string() });
+        if let Some(session_dir) = &self.session_dir {
+            config["sessionDir"] = json!(session_dir.display().to_string());
+        }
+        if let Some(script) = &self.script_path {
+            config["script"] = json!(script.display().to_string());
+        }
+        config
+    }
+}
+
+/// How the UI is driven.
+pub enum UiMode {
+    /// Raw-mode terminal on stdout.
+    Terminal,
+    /// Headless plan: submitted prompts plus idle barriers, with rendered
+    /// frames captured for assertions.
+    Headless(HeadlessPlan),
+}
+
+/// A scripted headless run.
+#[derive(Debug, Clone)]
+pub struct HeadlessPlan {
+    pub steps: Vec<HeadlessStep>,
+    pub width: u16,
+    pub height: u16,
+}
+
+#[derive(Debug, Clone)]
+pub enum HeadlessStep {
+    /// Submit text (the same editor submit path as a user typing it).
+    Submit(String),
+    /// Hold until the current turn finishes (bounded by `timeout_ms`).
+    WaitIdle { timeout_ms: u64 },
+}
+
+/// Result of an interactive run: session identity plus, in headless mode, the
+/// rendered frames.
+#[derive(Debug, Clone, Default)]
+pub struct InteractiveOutcome {
+    pub active_session_id: String,
+    pub session_id: String,
+    pub last_assistant_text: Option<String>,
+    pub frames: Vec<String>,
+}
+
+/// Inputs consumed by the UI loop. Terminal keys arrive one event at a time;
+/// headless steps arrive as whole submissions.
+enum UiInput {
+    Key(KeyEvent),
+    Paste(String),
+    Submit(String),
+    WaitIdle { timeout_ms: u64 },
+    HeadlessDone,
+}
+
+/// Run the interactive UI until the user exits (terminal) or the plan
+/// completes (headless).
+pub async fn run_interactive(
+    options: InteractiveOptions,
+    ui: UiMode,
+) -> Result<InteractiveOutcome> {
+    let (client, mut events) = DaemonClient::connect(&options.socket_path)
+        .await
+        .with_context(|| "the interactive UI could not attach to the daemon")?;
+    let mut session = SessionUi::open(client, &options).await?;
+
+    let theme = crate::app::load_theme(&options.theme);
+    let mut view = AgentView::new(theme);
+    session.rebuild_view(&mut view);
+    if let Some(initial) = &options.initial_message {
+        session.submit_prompt(initial, &mut view).await?;
+    }
+
+    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiInput>();
+    let mut renderer = Renderer::setup(ui, ui_tx)?;
+    let mut pending: VecDeque<UiInput> = VecDeque::new();
+    let mut running = true;
+    let mut headless_done = false;
+    let mut wait_idle_deadline: Option<Instant> = None;
+
+    while running {
+        // Process one queued UI input. A WaitIdle step is a barrier: it stays
+        // at the head of the queue until the turn finishes (or its deadline).
+        if let Some(UiInput::WaitIdle { timeout_ms }) = pending.front() {
+            let timeout_ms = *timeout_ms;
+            if session.turn_active {
+                if wait_idle_deadline.is_none() {
+                    wait_idle_deadline = Some(Instant::now() + Duration::from_millis(timeout_ms));
+                } else if Instant::now() > wait_idle_deadline.unwrap() {
+                    wait_idle_deadline = None;
+                    pending.pop_front();
+                    session.note("timed out waiting for the turn to finish", &mut view);
+                }
+            } else {
+                wait_idle_deadline = None;
+                pending.pop_front();
+            }
+        } else if let Some(input) = pending.pop_front() {
+            session.dirty = true;
+            match input {
+                UiInput::Key(key) => {
+                    session.handle_key(key, &mut view, &mut running).await?;
+                }
+                UiInput::Paste(text) => {
+                    let _ = view.editor.handle_paste(&text);
+                }
+                UiInput::Submit(text) => session.submit_prompt(&text, &mut view).await?,
+                UiInput::HeadlessDone => headless_done = true,
+                UiInput::WaitIdle { .. } => unreachable!("barrier handled above"),
+            }
+        }
+        if headless_done
+            && pending.is_empty()
+            && !session.turn_active
+            && wait_idle_deadline.is_none()
+            && !session.dirty
+        {
+            break;
+        }
+
+        tokio::select! {
+            maybe_event = events.recv() => {
+                match maybe_event {
+                    Some(event) => session.apply_client_event(event, &mut view),
+                    None => {
+                        session.note("the daemon connection closed", &mut view);
+                        running = false;
+                    }
+                }
+            }
+            maybe_input = ui_rx.recv() => {
+                if let Some(input) = maybe_input {
+                    pending.push_back(input);
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+
+        if let Some(renderer) = renderer.is_terminal_mut() {
+            crate::app::draw(renderer, &mut view)?;
+            session.dirty = false;
+        } else if session.dirty {
+            renderer.render_headless(&mut session, &mut view);
+        }
+        if session.exit_requested {
+            running = false;
+        }
+    }
+
+    // Detach explicitly so the session's attached-client count stays honest;
+    // the supervisor also detaches this connection when the socket closes.
+    let _ = session.detach().await;
+    let outcome = InteractiveOutcome {
+        active_session_id: session.active_session_id.clone(),
+        session_id: session.session_id.clone(),
+        last_assistant_text: session.last_assistant_text.clone(),
+        frames: renderer.finish(),
+    };
+    session.client.close();
+    Ok(outcome)
+}
+
+/// Rendering sink: the real terminal or headless frame capture.
+enum Renderer {
+    Terminal(Terminal<CrosstermBackend<std::io::Stdout>>),
+    Headless {
+        width: u16,
+        height: u16,
+        frames: Vec<String>,
+    },
+}
+
+impl Renderer {
+    fn setup(ui: UiMode, ui_tx: mpsc::UnboundedSender<UiInput>) -> Result<Renderer> {
+        match ui {
+            UiMode::Terminal => {
+                terminal::enable_raw_mode()?;
+                crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
+                // One reader thread feeds the loop; crossterm events are
+                // process-global and must be read from a single place.
+                std::thread::spawn(move || loop {
+                    if !crossterm::event::poll(Duration::from_millis(100)).unwrap_or(false) {
+                        continue;
+                    }
+                    match crossterm::event::read() {
+                        Ok(crossterm::event::Event::Key(key)) => {
+                            if ui_tx.send(UiInput::Key(key)).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(crossterm::event::Event::Paste(text)) => {
+                            if ui_tx.send(UiInput::Paste(text)).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                });
+                let backend = CrosstermBackend::new(std::io::stdout());
+                Ok(Renderer::Terminal(Terminal::new(backend)?))
+            }
+            UiMode::Headless(plan) => {
+                let steps = plan.steps;
+                tokio::spawn(async move {
+                    for step in steps {
+                        match step {
+                            HeadlessStep::Submit(text) => {
+                                if ui_tx.send(UiInput::Submit(text)).is_err() {
+                                    return;
+                                }
+                            }
+                            HeadlessStep::WaitIdle { timeout_ms } => {
+                                if ui_tx.send(UiInput::WaitIdle { timeout_ms }).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    let _ = ui_tx.send(UiInput::HeadlessDone);
+                });
+                Ok(Renderer::Headless {
+                    width: plan.width,
+                    height: plan.height,
+                    frames: Vec::new(),
+                })
+            }
+        }
+    }
+
+    fn is_terminal_mut(&mut self) -> Option<&mut Terminal<CrosstermBackend<std::io::Stdout>>> {
+        match self {
+            Renderer::Terminal(terminal) => Some(terminal),
+            Renderer::Headless { .. } => None,
+        }
+    }
+
+    /// Capture one frame as plain text (headless assertions).
+    fn render_headless(&mut self, session: &mut SessionUi, view: &mut AgentView) {
+        let Renderer::Headless {
+            width,
+            height,
+            frames,
+        } = self
+        else {
+            return;
+        };
+        let text = crate::app::render_frame_text(view, *width, *height).join("\n");
+        if std::env::var("PA_TUI_DEBUG_EVENTS").is_ok() {
+            eprintln!(
+                "[tui-frame] len={} has_second={} has_again={}",
+                text.len(),
+                text.contains("second turn"),
+                text.contains("again")
+            );
+        }
+        if frames.last().map(String::as_str) != Some(text.as_str()) {
+            frames.push(text);
+        }
+        session.dirty = false;
+    }
+
+    fn finish(self) -> Vec<String> {
+        match self {
+            Renderer::Terminal(_) => {
+                let _ = terminal::disable_raw_mode();
+                let _ = crossterm::execute!(std::io::stdout(), LeaveAlternateScreen);
+                Vec::new()
+            }
+            Renderer::Headless { frames, .. } => frames,
+        }
+    }
+}

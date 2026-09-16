@@ -7,11 +7,15 @@
 pub mod ansi;
 pub mod app;
 pub mod autocomplete;
+pub mod daemon_client;
 pub mod editor;
+pub mod interactive;
 pub mod keybindings;
 pub mod keys;
 pub mod markdown;
 pub mod session;
+pub mod session_ui;
+pub mod snapshot;
 pub mod theme;
 pub mod view;
 pub mod width;

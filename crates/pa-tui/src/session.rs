@@ -40,6 +40,10 @@ pub enum TranscriptItem {
         provider: String,
         model_id: String,
     },
+    /// Client-side notice (command output, errors, list rows) rendered muted.
+    SystemNote {
+        text: String,
+    },
 }
 
 /// Live event surfaced through a [`SessionStream`].

@@ -9,7 +9,7 @@ Argument parsing matching the TS CLI exactly, mode selection (interactive/headle
 No business logic; it composes pa-daemon, pa-core, pa-tui, pa-ai via their public APIs only.
 
 ## Public API
-The `prime-agent` executable surface (flags, subcommands, exit codes). Internal lib types `pub(crate)`.
+The `prime-agent` executable surface (flags, subcommands, exit codes). Internal lib types `pub(crate)`, plus the daemon wiring (`interactive_mode::{ensure_daemon_running, ensure_daemon_running_with, resolve_socket_path}`) exported for the integration verifier.
 
 ## Depends on
 pa-types, pa-ai, pa-agent, pa-core, pa-daemon, pa-tui (one-way, composition root).
