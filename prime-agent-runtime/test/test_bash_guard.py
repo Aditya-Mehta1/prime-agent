@@ -35,6 +35,11 @@ def _init_dirty_git_repo(root: str) -> None:
     """Create a git repository with one committed file plus two uncommitted changes."""
     Path(root).mkdir(parents=True, exist_ok=True)
     _run_git(root, "init", "-q")
+    # The isolated HOME hides any global identity, so configure one per repo
+    # exactly like the coding-agent guard test does.
+    _run_git(root, "config", "user.email", "test@example.com")
+    _run_git(root, "config", "user.name", "Test")
+    _run_git(root, "config", "commit.gpgsign", "false")
     Path(root, "tracked.txt").write_text("committed\n")
     _run_git(root, "add", "tracked.txt")
     _run_git(root, "commit", "-q", "-m", "init")
