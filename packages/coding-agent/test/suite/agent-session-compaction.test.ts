@@ -1,4 +1,6 @@
-import { appendFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AgentMessage, ShouldStopAfterTurnContext } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
@@ -9,11 +11,11 @@ import {
 	type Usage,
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../../src/config.js";
 import type { AgentSession } from "../../src/core/agent-session.js";
 import type { ExtensionFactory } from "../../src/core/extensions/types.js";
-import { convertToLlm } from "../../src/core/messages.js";
+import { convertToLlm, HARNESS_DIGEST_CUSTOM_TYPE } from "../../src/core/messages.js";
 import { getLocalHarnessStateDir, loadHarnessState, saveHarnessState } from "../../src/core/refinement/index.js";
 import { SessionManager } from "../../src/core/session-manager.js";
 import { assistantMsg, userMsg } from "../utilities.js";
@@ -339,6 +341,87 @@ describe("AgentSession compaction", () => {
 		expect((harness.session.messages[0] as { harnessDigest?: string }).harnessDigest).toContain(
 			"[local:compaction_test_memory] Compaction test memory",
 		);
+	});
+
+	it("keeps the newest digest across a compaction roundtrip and drops superseded copies", async () => {
+		// Empty global store: digest content must reflect only the local test entry.
+		const previousAgentDir = process.env.PRIME_AGENT_CODING_AGENT_DIR;
+		const agentDir = join(tmpdir(), `pi-digest-roundtrip-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(agentDir, { recursive: true });
+		process.env.PRIME_AGENT_CODING_AGENT_DIR = agentDir;
+		onTestFinished(() => {
+			rmSync(agentDir, { recursive: true, force: true });
+			if (previousAgentDir === undefined) delete process.env.PRIME_AGENT_CODING_AGENT_DIR;
+			else process.env.PRIME_AGENT_CODING_AGENT_DIR = previousAgentDir;
+		});
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			persistSession: true,
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("one response"),
+			fauxAssistantMessage("two response"),
+			fauxAssistantMessage("first summary"),
+			fauxAssistantMessage("first turn summary"),
+			fauxAssistantMessage("three response"),
+		]);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+		await harness.session.compact();
+
+		// The compaction head carries the snapshot digest and no stacked digest copies.
+		const head = harness.session.messages[0];
+		expect(head).toMatchObject({ role: "compactionSummary" });
+		expect((head as { harnessDigest?: string }).harnessDigest).toBeTruthy();
+
+		// Change the harness on disk, then cross a cold boundary after the compaction.
+		const localDir = getLocalHarnessStateDir(harness.sessionManager.getSessionArtifactDir());
+		expect(localDir).toBeDefined();
+		const state = loadHarnessState(localDir, "local");
+		state.entries.memory.roundtrip_test_memory = {
+			id: "roundtrip_test_memory",
+			kind: "memory",
+			title: "Roundtrip memory",
+			content: "Written between compaction and resume.",
+			path: "general",
+			scope: "local",
+			reference: {},
+			arguments: {},
+			metadata: {},
+			source: "refine",
+			created_at: "2026-09-07T00:00:00.000Z",
+			updated_at: "2026-09-07T00:00:00.000Z",
+			version: 1,
+		};
+		saveHarnessState(localDir!, state);
+
+		await harness.session.prompt("three");
+		const postCompactionUser = harness.session.getUserMessagesForForking().at(-1);
+		expect(postCompactionUser).toBeDefined();
+		await harness.session.navigateTree(postCompactionUser!.entryId);
+		const digests = harness.session.messages.filter(
+			(message) => message.role === "custom" && message.customType === HARNESS_DIGEST_CUSTOM_TYPE,
+		);
+		// The fresh digest replaces older copies instead of stacking them.
+		expect(digests).toHaveLength(1);
+		expect(getMessageText(digests[0])).toContain("[local:roundtrip_test_memory] Roundtrip memory");
+
+		// Resume rebuilds from persisted entries: the post-compaction digest is the
+		// newest one, so the superseded snapshot drops out of the built context.
+		const sessionFile = harness.sessionManager.getSessionFile();
+		harness.session.dispose();
+		const resumed = await createHarness({ existingSessionFile: sessionFile });
+		harnesses.push(resumed);
+		const resumedSummary = resumed.session.messages.find((message) => message.role === "compactionSummary");
+		expect(resumedSummary).toBeDefined();
+		expect((resumedSummary as { harnessDigest?: string }).harnessDigest).toBeUndefined();
+		const resumedDigests = resumed.session.messages.filter(
+			(message) => message.role === "custom" && message.customType === HARNESS_DIGEST_CUSTOM_TYPE,
+		);
+		expect(resumedDigests).toHaveLength(1);
+		expect(getMessageText(resumedDigests[0])).toContain("[local:roundtrip_test_memory] Roundtrip memory");
+		expect(getMessageText(convertToLlm([resumedSummary!])[0])).not.toContain("[harness-digest]");
 	});
 
 	it.each([

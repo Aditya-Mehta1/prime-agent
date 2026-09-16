@@ -1011,7 +1011,8 @@ describe("Harness digest at cold boundaries", () => {
 		const resumedStale = await createHarness({ existingSessionFile: sessionFile });
 		harnesses.push(resumedStale);
 		const digests = digestMessages(resumedStale);
-		expect(digests.length).toBe(2);
+		// The fresh digest replaces the stale copy instead of stacking another.
+		expect(digests.length).toBe(1);
 		expect(resumedStale.session.messages.at(-1)).toBe(digests.at(-1));
 		expect(getMessageText(digests.at(-1))).toContain("[local:resume_test_memory] Resume test memory");
 	});

@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
+import { HARNESS_DIGEST_CUSTOM_TYPE } from "../../src/core/messages.js";
 import {
 	type BranchSummaryEntry,
 	buildSessionContext,
 	type CompactionEntry,
+	type CustomMessageEntry,
 	type ModelChangeEntry,
 	type ServiceTierChangeEntry,
 	type SessionEntry,
@@ -51,6 +53,35 @@ function compaction(id: string, parentId: string | null, summary: string, firstK
 
 function branchSummary(id: string, parentId: string | null, summary: string, fromId: string): BranchSummaryEntry {
 	return { type: "branch_summary", id, parentId, timestamp: "2025-01-01T00:00:00Z", summary, fromId };
+}
+
+function harnessDigestEntry(id: string, parentId: string | null, digest: string): CustomMessageEntry {
+	return {
+		type: "custom_message",
+		id,
+		parentId,
+		timestamp: "2025-01-01T00:00:00Z",
+		customType: HARNESS_DIGEST_CUSTOM_TYPE,
+		content: `[harness-digest]\n\n${digest}`,
+		details: { digest },
+		display: false,
+	};
+}
+
+function customNote(id: string, parentId: string | null, note: string): CustomMessageEntry {
+	return {
+		type: "custom_message",
+		id,
+		parentId,
+		timestamp: "2025-01-01T00:00:00Z",
+		customType: "extension.note",
+		content: note,
+		display: true,
+	};
+}
+
+function digestMessagesOf(messages: ReturnType<typeof buildSessionContext>["messages"]) {
+	return messages.filter((message) => message.role === "custom" && message.customType === HARNESS_DIGEST_CUSTOM_TYPE);
 }
 
 function thinkingLevel(id: string, parentId: string | null, level: string): ThinkingLevelChangeEntry {
@@ -278,6 +309,126 @@ describe("buildSessionContext", () => {
 			];
 			const ctx = buildSessionContext(entries, "2");
 			expect(ctx.messages).toHaveLength(1);
+		});
+	});
+
+	describe("harness digest dedupe", () => {
+		it("keeps only the newest digest custom message", () => {
+			const entries: SessionEntry[] = [
+				msg("1", null, "user", "hello"),
+				harnessDigestEntry("2", "1", "digest-a"),
+				msg("3", "2", "assistant", "first reply"),
+				harnessDigestEntry("4", "3", "digest-b"),
+				msg("5", "4", "assistant", "second reply"),
+				harnessDigestEntry("6", "5", "digest-c"),
+				msg("7", "6", "assistant", "third reply"),
+			];
+			const ctx = buildSessionContext(entries);
+
+			const digests = digestMessagesOf(ctx.messages);
+			expect(digests).toHaveLength(1);
+			expect(digests[0]).toMatchObject({ role: "custom", details: { digest: "digest-c" } });
+			expect(ctx.messages).toHaveLength(5);
+			expect(ctx.messages.map((m) => m.role)).toEqual(["user", "assistant", "assistant", "custom", "assistant"]);
+		});
+
+		it("keeps only the newest digest on the navigated branch", () => {
+			const entries: SessionEntry[] = [
+				msg("1", null, "user", "hello"),
+				harnessDigestEntry("2", "1", "digest-old"),
+				msg("3", "2", "user", "branch point"),
+				harnessDigestEntry("4", "3", "digest-branch-a"),
+				msg("5", "4", "assistant", "reply a"),
+				harnessDigestEntry("6", "3", "digest-branch-b"),
+				msg("7", "6", "assistant", "reply b"),
+			];
+
+			const ctxA = buildSessionContext(entries, "5");
+			const digestsA = digestMessagesOf(ctxA.messages);
+			expect(digestsA).toHaveLength(1);
+			expect(digestsA[0]).toMatchObject({ role: "custom", details: { digest: "digest-branch-a" } });
+
+			const ctxB = buildSessionContext(entries, "7");
+			const digestsB = digestMessagesOf(ctxB.messages);
+			expect(digestsB).toHaveLength(1);
+			expect(digestsB[0]).toMatchObject({ role: "custom", details: { digest: "digest-branch-b" } });
+		});
+
+		it("leaves sessions without digests and non-digest custom messages unchanged", () => {
+			const entries: SessionEntry[] = [
+				msg("1", null, "user", "hello"),
+				customNote("2", "1", "note one"),
+				msg("3", "2", "assistant", "reply"),
+				customNote("4", "3", "note two"),
+				msg("5", "4", "user", "again"),
+			];
+			const ctx = buildSessionContext(entries);
+
+			expect(ctx.messages).toHaveLength(5);
+			expect(ctx.messages.map((m) => m.role)).toEqual(["user", "custom", "assistant", "custom", "user"]);
+			expect(ctx.messages[1]).toMatchObject({ role: "custom", content: "note one" });
+			expect(ctx.messages[3]).toMatchObject({ role: "custom", content: "note two" });
+		});
+
+		it("drops retained digest messages when the compaction snapshot is newer", () => {
+			const entries: SessionEntry[] = [
+				harnessDigestEntry("1", null, "retained digest"),
+				msg("2", "1", "user", "kept question"),
+				msg("3", "2", "assistant", "kept answer"),
+				{
+					...compaction("4", "3", "Summary", "1"),
+					harnessDigest: "snapshot digest",
+				},
+				msg("5", "4", "user", "after compaction"),
+			];
+			const ctx = buildSessionContext(entries);
+
+			expect(ctx.messages[0]).toMatchObject({ role: "compactionSummary" });
+			expect((ctx.messages[0] as { harnessDigest?: string }).harnessDigest).toBe("snapshot digest");
+			// The snapshot is the newest digest, so no digest custom message rides along.
+			expect(digestMessagesOf(ctx.messages)).toHaveLength(0);
+			expect(ctx.messages).toHaveLength(4);
+			expect(ctx.messages.map((m) => m.role)).toEqual(["compactionSummary", "user", "assistant", "user"]);
+		});
+
+		it("keeps the newest post-compaction digest and drops the superseded snapshot", () => {
+			const entries: SessionEntry[] = [
+				msg("1", null, "user", "question"),
+				msg("2", "1", "assistant", "answer"),
+				{
+					...compaction("3", "2", "Summary", "1"),
+					harnessDigest: "snapshot digest",
+				},
+				harnessDigestEntry("4", "3", "digest-after-compaction"),
+				msg("5", "4", "user", "later"),
+				harnessDigestEntry("6", "5", "newest digest"),
+				msg("7", "6", "assistant", "final"),
+			];
+			const ctx = buildSessionContext(entries);
+
+			expect(ctx.messages[0]).toMatchObject({ role: "compactionSummary" });
+			expect((ctx.messages[0] as { harnessDigest?: string }).harnessDigest).toBeUndefined();
+			const digests = digestMessagesOf(ctx.messages);
+			expect(digests).toHaveLength(1);
+			expect(digests[0]).toMatchObject({ role: "custom", details: { digest: "newest digest" } });
+			expect(ctx.messages).toHaveLength(6);
+		});
+
+		it("keeps the newest retained digest when the compaction has no snapshot", () => {
+			const entries: SessionEntry[] = [
+				harnessDigestEntry("1", null, "retained old"),
+				harnessDigestEntry("2", "1", "retained newest"),
+				msg("3", "2", "user", "kept question"),
+				compaction("4", "3", "Summary", "1"),
+				msg("5", "4", "user", "after compaction"),
+			];
+			const ctx = buildSessionContext(entries);
+
+			expect(ctx.messages[0]).toMatchObject({ role: "compactionSummary" });
+			expect((ctx.messages[0] as { harnessDigest?: string }).harnessDigest).toBeUndefined();
+			const digests = digestMessagesOf(ctx.messages);
+			expect(digests).toHaveLength(1);
+			expect(digests[0]).toMatchObject({ role: "custom", details: { digest: "retained newest" } });
 		});
 	});
 });
