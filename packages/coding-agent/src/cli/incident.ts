@@ -249,19 +249,57 @@ function workerIdFromSocketPath(socketPath: string | undefined): string | undefi
 	return WORKER_SOCKET_PATTERN.exec(basename(socketPath))?.[1];
 }
 
-/** Map pid -> worker ids from every entry whose socket path names a worker socket. */
-export function collectWorkerPidMap(entries: readonly IncidentLogEntry[]): Map<number, Set<string>> {
-	const map = new Map<number, Set<string>>();
+/** One log sighting of a worker id owning a pid at a timestamp. */
+export interface WorkerPidSighting {
+	timeMs: number;
+	workerId: string;
+}
+
+/**
+ * pid -> worker-id sightings, ordered by time. A pid can be reused by a later
+ * worker, so attribution picks the owner at the event time, not the union of
+ * every id ever seen on the pid.
+ */
+export type WorkerPidMap = ReadonlyMap<number, ReadonlyArray<WorkerPidSighting>>;
+
+/** Map pid -> worker-id sightings from entries whose socket path names a worker socket. */
+export function collectWorkerPidMap(entries: readonly IncidentLogEntry[]): WorkerPidMap {
+	const map = new Map<number, WorkerPidSighting[]>();
 	for (const entry of entries) {
 		const workerId = workerIdFromSocketPath(entry.socketPath);
 		if (workerId === undefined || entry.pid === undefined) {
 			continue;
 		}
-		const ids = map.get(entry.pid) ?? new Set<string>();
-		ids.add(workerId);
-		map.set(entry.pid, ids);
+		const sightings = map.get(entry.pid) ?? [];
+		sightings.push({ timeMs: entry.timeMs, workerId });
+		map.set(entry.pid, sightings);
+	}
+	for (const sightings of map.values()) {
+		sightings.sort((a, b) => a.timeMs - b.timeMs);
 	}
 	return map;
+}
+
+/** The worker that owned `pid` at `timeMs`: the latest sighting at or before it. */
+function workerIdForPid(workerPids: WorkerPidMap, pid: number | undefined, timeMs: number): string | undefined {
+	if (pid === undefined) {
+		return undefined;
+	}
+	const sightings = workerPids.get(pid);
+	if (sightings === undefined || sightings.length === 0) {
+		return undefined;
+	}
+	// Sightings after the event belong to a later owner; fall back to the
+	// earliest one when the event precedes every sighting (e.g. log rotation).
+	let workerId = sightings[0]!.workerId;
+	for (const sighting of sightings) {
+		if (sighting.timeMs <= timeMs) {
+			workerId = sighting.workerId;
+		} else {
+			break;
+		}
+	}
+	return workerId;
 }
 
 function classifyCommandFailure(
@@ -459,13 +497,9 @@ function daemonSubject(entry: IncidentLogEntry): string {
 }
 
 /** Classify a provider-failure entry into an aggregate-friendly anomaly event. */
-function providerFailureEvent(
-	entry: IncidentLogEntry,
-	workerPids: ReadonlyMap<number, ReadonlySet<string>>,
-): IncidentEvent | undefined {
-	const ids = entry.pid !== undefined ? workerPids.get(entry.pid) : undefined;
-	const subject =
-		ids && ids.size === 1 ? `worker ${[...ids][0]}` : entry.pid !== undefined ? `pid ${entry.pid}` : "provider";
+function providerFailureEvent(entry: IncidentLogEntry, workerPids: WorkerPidMap): IncidentEvent | undefined {
+	const workerId = workerIdForPid(workerPids, entry.pid, entry.timeMs);
+	const subject = workerId ? `worker ${workerId}` : entry.pid !== undefined ? `pid ${entry.pid}` : "provider";
 	if (entry.msg !== "provider stream failure") {
 		return event(
 			entry,
@@ -486,15 +520,12 @@ function providerFailureEvent(
 		eventClass: "provider",
 		subject,
 		summary: `provider stream failure (${kind}${statusText}) for ${subject}`,
-		tokens: ids && ids.size === 1 ? [[...ids][0]!] : [],
+		tokens: workerId ? [workerId] : [],
 	};
 }
 
 /** Classify one log entry into an incident event; undefined when the entry is noise. */
-export function classifyIncidentEntry(
-	entry: IncidentLogEntry,
-	workerPids: ReadonlyMap<number, ReadonlySet<string>>,
-): IncidentEvent | undefined {
+export function classifyIncidentEntry(entry: IncidentLogEntry, workerPids: WorkerPidMap): IncidentEvent | undefined {
 	const msg = firstLine(entry.msg);
 	const workerId = workerIdFromSocketPath(entry.socketPath);
 
@@ -763,10 +794,7 @@ export function classifyIncidentEntry(
  * to the structured log and to the worker stderr forward (same summary, same
  * second).
  */
-export function collectIncidentEvents(
-	entries: readonly IncidentLogEntry[],
-	workerPids: ReadonlyMap<number, ReadonlySet<string>>,
-): IncidentEvent[] {
+export function collectIncidentEvents(entries: readonly IncidentLogEntry[], workerPids: WorkerPidMap): IncidentEvent[] {
 	const events: IncidentEvent[] = [];
 	const lastSeen = new Map<string, number>();
 	for (const entry of entries) {

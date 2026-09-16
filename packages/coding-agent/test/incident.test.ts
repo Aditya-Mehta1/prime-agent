@@ -628,6 +628,53 @@ describe("worker pid attribution and anomalies", () => {
 		expect(anomalies.some((item) => item.summary.includes("warnings/errors"))).toBe(false);
 	});
 
+	it("attributes provider failures to the worker owning the pid at that time", () => {
+		const workerA = "/tmp/prime-agent-501/worker-98ed5cb228d2-aaaaaaaaaaaa.sock";
+		const workerB = "/tmp/prime-agent-501/worker-98ed5cb228d2-bbbbbbbbbbbb.sock";
+		const lines = [
+			agentLogLine({
+				ts: "2026-09-10T20:00:00.000Z",
+				component: "coding-agent.daemon",
+				socketPath: workerA,
+				pid: 53615,
+				msg: `Prime Agent daemon listening on ${workerA}`,
+			}),
+			agentLogLine({
+				ts: "2026-09-10T20:01:00.000Z",
+				level: "error",
+				component: "ai.provider",
+				pid: 53615,
+				msg: "provider stream failure",
+				kind: "rate_limit",
+				status: 429,
+			}),
+			// The same pid is reused by a replacement worker an hour later.
+			agentLogLine({
+				ts: "2026-09-10T21:00:00.000Z",
+				component: "coding-agent.daemon",
+				socketPath: workerB,
+				pid: 53615,
+				msg: `Prime Agent daemon listening on ${workerB}`,
+			}),
+			agentLogLine({
+				ts: "2026-09-10T21:01:00.000Z",
+				level: "error",
+				component: "ai.provider",
+				pid: 53615,
+				msg: "provider stream failure",
+				kind: "rate_limit",
+				status: 429,
+			}),
+		];
+		const entries = lines.map((line) => entry(line));
+		const events = collectIncidentEvents(entries, collectWorkerPidMap(entries));
+		const summaries = events.filter((item) => item.eventClass === "provider").map((item) => item.summary);
+		expect(summaries).toEqual([
+			"provider stream failure (rate_limit 429) for worker aaaaaaaaaaaa",
+			"provider stream failure (rate_limit 429) for worker bbbbbbbbbbbb",
+		]);
+	});
+
 	it("flags error bursts that are not timeouts", () => {
 		const entries = [1, 2, 3].map((index) =>
 			entry(
