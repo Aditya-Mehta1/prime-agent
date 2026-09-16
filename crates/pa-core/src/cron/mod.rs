@@ -1,6 +1,9 @@
 //! Cron scheduling core: schedule parsing (`in`/`every`/`at`/cron),
 //! five-field cron expression evaluation, and `/heartbeat` command parsing.
-//! Port of the pure-function half of core/cron-jobs.ts.
+//! Port of the pure-function half of core/cron-jobs.ts; the file-backed job
+//! store lives in the `store` submodule.
+
+pub mod store;
 
 use std::collections::BTreeSet;
 
@@ -46,18 +49,33 @@ pub struct AgentCronSchedule {
     pub interval_ms: Option<u64>,
 }
 
-/// One scheduled job (persisted wire shape).
+/// One scheduled job (persisted wire shape). Session identity fields are
+/// required (the TS guard rejects records without them).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentCronJob {
     pub id: String,
-    pub label: Option<String>,
-    #[serde(rename = "type")]
-    pub source: String,
-    pub runtime_kind: String,
     pub status: JobStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_kind: Option<String>,
+    /// Delivery mode for heartbeat jobs when the session is busy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_mode: Option<DeliveryMode>,
+    pub active_session_id: String,
+    pub session_id: String,
+    pub session_file: String,
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub prompt: String,
     pub schedule: AgentCronSchedule,
-    #[serde(rename = "nextRunAt")]
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: String,
+    #[serde(rename = "nextRunAt", default, skip_serializing_if = "Option::is_none")]
     pub next_run_at: Option<String>,
     #[serde(rename = "lastRunAt", default, skip_serializing_if = "Option::is_none")]
     pub last_run_at: Option<String>,
@@ -67,15 +85,10 @@ pub struct AgentCronJob {
         skip_serializing_if = "Option::is_none"
     )]
     pub last_skipped_at: Option<String>,
-    #[serde(rename = "runCount", default)]
-    pub run_count: u64,
-    pub prompt: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delivery_mode: Option<DeliveryMode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
+    #[serde(rename = "runCount", default)]
+    pub run_count: u64,
 }
 
 /// Parsed `/heartbeat` command.
@@ -515,7 +528,10 @@ fn consume_leading_every_schedule(text: &str) -> Option<(String, String)> {
 }
 
 pub fn is_heartbeat_cron_job(job: &AgentCronJob) -> bool {
-    job.source == "heartbeat" || job.source == "rlm_heartbeat"
+    matches!(
+        job.source.as_deref(),
+        Some("heartbeat") | Some("rlm_heartbeat")
+    )
 }
 
 /// Whether a due heartbeat should wait instead of firing now.
@@ -748,7 +764,7 @@ fn strip_matching_quotes(value: &str) -> &str {
 }
 
 /// ISO-8601 parse to epoch millis (RFC 3339 subset).
-fn parse_iso_millis(text: &str) -> Option<u64> {
+pub(crate) fn parse_iso_millis(text: &str) -> Option<u64> {
     // Delegate to time-like parsing: chrono is available via pa-ai? Keep a
     // small parser for the common ISO shapes.
     let text = text.trim();
@@ -1041,23 +1057,28 @@ mod tests {
     fn heartbeat_deferral_rules() {
         let job = |source: &str, mode: Option<DeliveryMode>| AgentCronJob {
             id: "j1".to_string(),
-            label: None,
-            source: source.to_string(),
-            runtime_kind: "top-level".to_string(),
             status: JobStatus::Active,
+            source: Some(source.to_string()),
+            runtime_kind: Some("top-level".to_string()),
+            delivery_mode: mode,
+            active_session_id: "active".to_string(),
+            session_id: "session".to_string(),
+            session_file: "/s/file.jsonl".to_string(),
+            cwd: "/w".to_string(),
+            label: None,
             schedule: AgentCronSchedule {
                 kind: ScheduleKind::Interval,
                 expression: "every 5m".to_string(),
                 interval_ms: Some(300_000),
             },
+            created_at: String::new(),
+            updated_at: String::new(),
             next_run_at: Some("2000-01-01T00:00:00Z".to_string()),
             last_run_at: None,
             last_skipped_at: None,
             run_count: 0,
             prompt: "ping".to_string(),
             last_error: None,
-            delivery_mode: mode,
-            session_id: None,
         };
         let idle = HeartbeatSessionActivity::default();
         let streaming = HeartbeatSessionActivity {
@@ -1107,10 +1128,17 @@ mod tests {
     fn due_jobs_and_formatting() {
         let mut job = AgentCronJob {
             id: "job1".to_string(),
-            label: Some("sweep".to_string()),
-            source: "cron".to_string(),
-            runtime_kind: "top-level".to_string(),
             status: JobStatus::Active,
+            source: Some("cron".to_string()),
+            runtime_kind: Some("top-level".to_string()),
+            delivery_mode: None,
+            active_session_id: "active".to_string(),
+            session_id: "session".to_string(),
+            session_file: "/s/file.jsonl".to_string(),
+            cwd: "/w".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            label: Some("sweep".to_string()),
             schedule: AgentCronSchedule {
                 kind: ScheduleKind::Interval,
                 expression: "every 5m".to_string(),
@@ -1122,8 +1150,6 @@ mod tests {
             run_count: 3,
             prompt: "keep   working".to_string(),
             last_error: Some("boom".to_string()),
-            delivery_mode: None,
-            session_id: None,
         };
         assert!(is_due_job(&job, 946_684_800_001));
         assert!(!is_due_job(&job, 946_684_799_999));
