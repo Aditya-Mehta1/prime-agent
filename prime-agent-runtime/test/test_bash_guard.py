@@ -1006,6 +1006,112 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         result = await self._run("cat <<-")
         self.assertNotEqual(result.exit_code, 0)
 
+    async def test_ansi_c_overflow_escape_does_not_crash(self):
+        # An ANSI-C escape above Unicode's maximum code point is preserved
+        # instead of crashing the guard; bash itself errors on it.
+        result = await self._run("echo $'\\U00110000' || true")
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_refuses_wrapper_scripts_outside_the_workspace(self):
+        self._make_tree()
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        # A bare shell wrapper executes a script file the guard cannot scan;
+        # inputs from outside the workspace (or unresolvable paths) are
+        # refused, in-workspace scripts stay allowed.
+        for command in [
+            "bash /tmp/pa-guard-script.sh",
+            "sh /tmp/pa-guard-script.sh",
+            "bash < /tmp/pa-guard-script.sh",
+            "sh </tmp/pa-guard-script.sh",
+            "bash ~/pa-guard-script.sh",
+            "bash $script",
+            "source /tmp/pa-guard-script.sh",
+            ". /tmp/pa-guard-script.sh",
+            "bash ../pa-guard-script.sh",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command, home=home.name)
+                self.assertIn("outside the kernel workspace", message)
+                self.assertTrue(Path(home.name, "keep.txt").exists())
+        # In-workspace script inputs stay allowed, and a -c payload governs.
+        Path(self.test_dir, "ok.sh").write_text("echo ran\n")
+        result = await self._run("bash ./ok.sh")
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("ran", result.output)
+        result = await self._run("bash < ./ok.sh")
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("ran", result.output)
+        result = await self._run("source ./ok.sh")
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_refuses_recursive_traps(self):
+        self._make_tree()
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        # A trap body executes at trigger time, so it is scanned like any
+        # wrapper payload.
+        for command in [
+            "trap 'chmod -R 755 ~' EXIT",
+            'trap "chown -R user ~" DEBUG',
+            "trap 'chmod -R 755 /' ERR",
+            'bash -c \'trap "chmod -R 755 ~" EXIT\'',
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command, home=home.name)
+                self.assertIn("Refusing to run this recursive chmod/chown command", message)
+                self.assertTrue(Path(home.name, "keep.txt").exists())
+        # Benign traps stay fine.
+        result = await self._run("trap 'echo done' EXIT")
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_refuses_dynamic_commands_behind_more_executors(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        # Command-executing wrappers beyond the first set: a dynamic command
+        # word behind them is refused with a recursive flag in the run.
+        for command in [
+            "nice $cmd -R 755 ~",
+            "timeout 5 $cmd -R 755 ~",
+            "setsid $cmd -R 755 ~",
+            "stdbuf -o0 $cmd -R 755 ~",
+            "ionice -c2 $cmd -R 755 ~",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command, home=home.name)
+                self.assertIn("command name cannot be determined", message)
+                self.assertTrue(Path(home.name, "keep.txt").exists())
+        # Known-benign runs with variables and -R stay untouched.
+        result = await self._run("grep -R $pattern file.txt || true")
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_refuses_unresolvable_wrapper_payloads(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        # A quoted wrapper payload whose command position is a variable or
+        # substitution is refused outright: the payload could be any
+        # command, including a recursive chmod the guard never sees.
+        for command in [
+            "p='chmod -R 755 ~'; bash -c \"$p\"",
+            "p='chmod -R 755 ~'; sh -c \"$p\"",
+            "p='chown -R user ~'; eval \"$p\"",
+            'bash -c "$(printf %s \'chmod -R 755 ~\')"',
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command, home=home.name)
+                self.assertIn("Refusing to run this recursive chmod/chown command", message)
+                self.assertTrue(Path(home.name, "keep.txt").exists())
+        # Resolvable payload content with variables in data position stays
+        # fine.
+        result = await self._run("bash -c 'echo $x'")
+        self.assertEqual(result.exit_code, 0)
+        result = await self._run("sh -c 'echo $x -R hi'")
+        self.assertEqual(result.exit_code, 0)
+
     async def test_xargs_false_positives_stay_allowed(self):
         # The xargs walk must stop at the command word: an operand named
         # xargs and a later xargs in a separate pipeline are not wraps.

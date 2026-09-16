@@ -1380,7 +1380,12 @@ def _fold_ansi_c(body: str) -> str:
                 digits += body[j]
                 j += 1
             if digits:
-                out.append(chr(int(digits, 16)))
+                try:
+                    out.append(chr(int(digits, 16)))
+                except ValueError:
+                    # Above Unicode's maximum code point: preserve the
+                    # escape instead of crashing the guard on command text.
+                    out.append("\\" + esc + digits)
                 i = j
             else:
                 out.append("\\")
@@ -1627,7 +1632,7 @@ def _find_recursive_chmod_chown_invocations(
     return invocations
 
 
-_WRAPPER_PAYLOAD_KINDS = ("eval", "shell_c", "alias")
+_WRAPPER_PAYLOAD_KINDS = ("eval", "shell_c", "alias", "trap")
 
 
 def _wrapper_payload_sources(
@@ -1648,7 +1653,9 @@ def _wrapper_payload_sources(
             kind = "shell_c"
         elif "alias" in kinds and os.path.basename(word.value) == "alias":
             kind = "alias"
-        if kind in ("eval", "alias"):
+        elif "trap" in kinds and word.value == "trap":
+            kind = "trap"
+        if kind in ("eval", "alias", "trap"):
             payload_parts: list[str] = []
             for follower_index in range(index + 1, len(words)):
                 follower = words[follower_index]
@@ -1669,8 +1676,13 @@ def _wrapper_payload_sources(
                     break
                 token = follower.value
                 if c_pending:
+                    if _contained_in_later_word(words, follower_index):
+                        continue  # substitution interior: the enclosing word is the payload
                     payload_source = text[follower.start : follower.end]
-                    if payload_source.startswith(("'", '"', "$'", '$"')):
+                    # An unquoted command substitution or backtick payload
+                    # is unscannable output: accept it so the payload scan
+                    # fails closed on it.
+                    if payload_source.startswith(("'", '"', "$'", '$"', "$(", "`")):
                         sources.append(payload_source)
                     break  # the payload word ends this shell invocation
                 if token == "--":
@@ -1704,7 +1716,9 @@ def _payload_text_hides_shell_code(text: str, depth: int = 0) -> str | None:
     words = _scan_shell_words(normalized)
     if _bash_env_words_arm_shell_code(words):
         return "bash_env"
-    if _unresolvable_words_could_recurse(words, normalized):
+    if _unresolvable_words_could_recurse(
+        words, normalized, require_recursive_flag=False
+    ):
         return "unresolvable_command"
     if _process_substitution_feeds_wrapper(normalized, words):
         return "process_substitution"
@@ -2173,6 +2187,15 @@ _UNRESOLVABLE_COMMAND_EXECUTORS = (
     "exec",
     "command",
     "find",
+    "nice",
+    "timeout",
+    "setsid",
+    "stdbuf",
+    "ionice",
+    "parallel",
+    "time",
+    "strace",
+    "valgrind",
 )
 # Heads whose operand arming BASH_ENV executes before the command runs.
 _ENV_ARMING_HEADS = ("env", "export", "declare", "typeset", "sudo", "nohup")
@@ -2230,14 +2253,21 @@ def _word_could_expand(word: _ShellWord, span_source: str) -> bool:
 
 
 def _unresolvable_words_could_recurse(
-    words: list[_ShellWord], normalized: str | None = None
+    words: list[_ShellWord],
+    normalized: str | None = None,
+    *,
+    require_recursive_flag: bool = True,
 ) -> bool:
     """True when a word the scanner cannot statically resolve could expand
     into a recursive chmod/chown command: a variable, command or process
     substitution, or backtick expansion in command position, or inside a
     run of command-executing wrappers (xargs, sudo, env, nohup, exec,
-    command, find). Fail-closed: with a recursive flag in the run the
-    command is refused, never guessed at."""
+    command, find, nice, timeout, setsid, stdbuf, ionice, parallel, time,
+    strace, valgrind). Fail-closed: with a recursive flag in the run the
+    command is refused, never guessed at; inside a quoted wrapper payload
+    the flag requirement is dropped (require_recursive_flag=False),
+    because the whole payload could be the recursive chmod, flags and
+    all, folded into the unresolvable word."""
     head: _ShellWord | None = None
     for index, word in enumerate(words):
         # Substitution interiors execute inside the substitution; the run
@@ -2258,8 +2288,11 @@ def _unresolvable_words_could_recurse(
         )
         if not (effective_command or executor_run):
             continue
-        if _is_recursive_chmod_chown_token_run(_run_tokens_from(words, index)):
-            return True
+        if require_recursive_flag and not _is_recursive_chmod_chown_token_run(
+            _run_tokens_from(words, index)
+        ):
+            continue
+        return True
     return False
 
 
@@ -2325,6 +2358,18 @@ def _substitution_spans(command: str) -> list[tuple[int, int]]:
                 i += 1
             elif ch == '"':
                 quote = None
+            elif ch == "$" and command[i + 1 : i + 2] == "(":
+                # Substitutions still execute inside double quotes: their
+                # output is shell text, so they are recorded here too.
+                close = _matching_paren(command, i + 1, n)
+                spans.append((i, close))
+                i = close
+            elif ch == "`":
+                close = command.find("`", i + 1)
+                if close == -1:
+                    close = n - 1
+                spans.append((i, close))
+                i = close
         elif ch in ('"', "'"):
             quote = ch
         elif ch == "$" and command[i + 1 : i + 2] == "(":
@@ -2435,6 +2480,9 @@ def _process_substitution_feeds_wrapper(
     return False
 
 
+# Wrappers that execute a named script file (argument or stdin redirect).
+_SCRIPT_INPUT_WRAPPERS = ("sh", "bash", "zsh", "dash", "ksh", "source", ".")
+
 _FUNCTION_DEFINITION = re.compile(r"\(\s*\)\s*[({]|function\s+[A-Za-z_]")
 
 
@@ -2453,6 +2501,81 @@ def _function_definition_could_recurse(
         _is_recursive_chmod_chown_token_run([word.value]) for word in words
     )
     return has_chmod_word and has_recursive_flag
+
+
+def _refuse_unscanned_wrapper_scripts(
+    raw: str, normalized: str, words: list[_ShellWord]
+) -> None:
+    """Refuse a bare shell wrapper whose script input lives outside the
+    kernel workspace (or cannot be resolved): the wrapper executes that
+    file's content as shell code, which the guard cannot scan statically.
+    Script arguments (`bash /tmp/x.sh`, `source ~/rc`) and stdin
+    redirections (`bash < /tmp/x.sh`) are resolved like chmod operands;
+    in-workspace inputs stay allowed, and a `-c` payload governs."""
+    try:
+        kernel_cwd = os.getcwd()
+    except OSError:
+        return  # the spawn itself will fail; the guard must not mask that error
+    workspace = os.path.realpath(kernel_cwd)
+    home_env = os.environ.get("HOME") or None
+    home_real = None
+    if home_env is not None:
+        try:
+            home_real = os.path.realpath(home_env)
+        except (OSError, RuntimeError, ValueError):
+            home_real = None
+    head: _ShellWord | None = None
+    for index, word in enumerate(words):
+        if word.starts_command and not _contained_in_later_word(words, index):
+            head = word
+        if os.path.basename(word.value) not in _SCRIPT_INPUT_WRAPPERS:
+            continue
+        introduced = word.starts_command or (
+            head is not None
+            and (
+                _ASSIGNMENT_WORD.match(head.value)
+                or os.path.basename(head.value) in _PROC_SUB_INTRODUCERS
+            )
+        )
+        if not introduced:
+            continue
+        script_word: _ShellWord | None = None
+        governed = False
+        for follower_index in range(index + 1, len(words)):
+            follower = words[follower_index]
+            if follower.starts_command:
+                if _contained_in_later_word(words, follower_index):
+                    continue
+                break
+            token = follower.value
+            if token.startswith("-") and token != "-" and not token.startswith("--"):
+                if "c" in token[1:]:
+                    governed = True
+                continue
+            if token == "--":
+                continue
+            if _contained_in_later_word(words, follower_index):
+                continue  # substitution interior: the enclosing word follows
+            script_word = follower
+            break
+        if governed:
+            continue
+        candidates: list[str] = []
+        if script_word is not None:
+            candidates.append(script_word.value)
+        # A stdin redirection from a file: the text is masked in
+        # `normalized`, so read the wrapper's raw command region instead
+        # (an ordinary `<`, not <<, <<<, or <( ...)).
+        raw_end = script_word.end if script_word is not None else word.end
+        region = re.split(r"[;&|\n]", raw[raw_end:], 1)[0]
+        for match in re.finditer(r"<(?![<(])\s*([^\s;&|)]+)", region):
+            candidates.append(match.group(1))
+        for candidate in candidates:
+            resolved = _resolve_chmod_operand(candidate, workspace, home_env)
+            if _chmod_operand_violation(resolved, workspace, home_real) is not None:
+                raise DestructiveChmodRefusalError(
+                    _format_chmod_wrapper_script_refusal(candidate)
+                )
 
 
 def _shell_wrapper_reads_pipe(normalized: str, words: list[_ShellWord]) -> bool:
@@ -2483,6 +2606,8 @@ def _shell_wrapper_reads_pipe(normalized: str, words: list[_ShellWord]) -> bool:
                 continue
             if token == "--":
                 continue
+            if _contained_in_later_word(words, follower_index):
+                continue  # substitution interior: the enclosing word follows
             script_arg = True
             break
         if not c_payload and not script_arg:
@@ -2529,6 +2654,34 @@ def _format_chmod_definition_refusal() -> str:
             " be resolved statically.",
             "",
             "Write the chmod/chown command literally, or retry with"
+            " bash(command, allow_destructive_chmod=True), or start the"
+            f" kernel with {BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV}=1.",
+        ]
+    )
+
+
+def _format_chmod_wrapper_script_refusal(script: str) -> str:
+    return "\n".join(
+        [
+            "Refusing to run this command: a shell wrapper executes a script"
+            f' from outside the kernel workspace ("{script}"), and that'
+            " file's content cannot be scanned statically.",
+            "",
+            "Run it from inside the workspace, or retry with"
+            " bash(command, allow_destructive_chmod=True), or start the"
+            f" kernel with {BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV}=1.",
+        ]
+    )
+
+
+def _format_chmod_trap_refusal() -> str:
+    return "\n".join(
+        [
+            "Refusing to run this recursive chmod/chown command: it"
+            " installs a trap whose body runs a recursive chmod/chown the"
+            " guard cannot resolve safely.",
+            "",
+            "Run it directly, or retry with"
             " bash(command, allow_destructive_chmod=True), or start the"
             f" kernel with {BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV}=1.",
         ]
@@ -2640,6 +2793,20 @@ def _alias_payloads_hide_recursive_chmod(command: str) -> str | None:
     return None
 
 
+def _trap_payloads_hide_recursive_chmod(command: str) -> str | None:
+    """Why a trap body hides shell code the guard must refuse (truthy), or
+    None when it does not: a trap body executes at trigger time (EXIT,
+    DEBUG runs before every command), and a body carrying a recursive
+    chmod/chown is refused because nothing else in the command shows it."""
+    words = _scan_shell_words(command)
+    for source in _wrapper_payload_sources(words, command, ("trap",)):
+        payload = _unquote_one_level(_expand_ansi_c_payloads(source))
+        reason = _payload_text_hides_shell_code(payload)
+        if reason is not None:
+            return reason
+    return None
+
+
 def _format_chmod_shell_c_refusal() -> str:
     return "\n".join(
         [
@@ -2716,6 +2883,22 @@ def _guard_destructive_chmod(command: str, allow_destructive_chmod: bool) -> Non
         # A bare shell wrapper fed by a pipe executes the piped text as
         # shell code, which the guard cannot scan statically.
         raise DestructiveChmodRefusalError(_format_chmod_pipe_fed_wrapper_refusal())
+    trap_reason = (
+        _trap_payloads_hide_recursive_chmod(resolved)
+        if any(word.value == "trap" for word in words)
+        else None
+    )
+    if trap_reason == "recursive_chmod":
+        # A trap body executes at trigger time; a recursive chmod in it is
+        # refused because nothing else in the command shows it.
+        raise DestructiveChmodRefusalError(_format_chmod_trap_refusal())
+    if trap_reason:
+        raise DestructiveChmodRefusalError(_payload_reason_message(trap_reason))
+    if any(os.path.basename(word.value) in _SCRIPT_INPUT_WRAPPERS for word in words):
+        # A bare shell wrapper executes a script file the guard cannot
+        # scan: inputs from outside the workspace (or unresolvable paths)
+        # are refused; in-workspace scripts and -c payloads stay fine.
+        _refuse_unscanned_wrapper_scripts(raw, normalized, words)
     if eval_reason == "recursive_chmod":
         # An eval payload hides where the recursion runs; refuse rather than
         # resolve a command the guard cannot see.
