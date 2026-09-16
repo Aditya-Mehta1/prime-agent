@@ -20,7 +20,7 @@ pub struct PromptRequest {
 /// Events an engine emits for one prompt, in order. The worker translates these
 /// into protocol events and session-store writes. Returning `false` from the
 /// emit callback cancels the prompt.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum EngineEvent {
     /// The user message that was accepted (recorded into the session store).
     UserMessage(Value),

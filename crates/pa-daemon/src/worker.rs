@@ -189,6 +189,7 @@ impl Worker {
                         model: std::env::var("PRIME_AGENT_MODEL").ok(),
                         api_key: None,
                         session_dir: None,
+                        faux_script: None,
                     }) {
                         Ok(engine) => std::sync::Arc::new(engine),
                         // Runtime construction failed: degrade to the echo engine.
