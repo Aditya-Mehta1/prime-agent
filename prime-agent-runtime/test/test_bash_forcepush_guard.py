@@ -452,6 +452,25 @@ class ForcePushShellCPayloadTest(unittest.TestCase):
                 )
 
 
+def _substitution_chain(
+    depth: int, fanout: int, leaf: str = FORCE_PUSH_LEAF, delimiter: str = "$"
+) -> str:
+    """The reviewer's nested-substitution generator.
+
+    Each layer wraps `fanout` copies of the previous text in a substitution and
+    then in `eval "<...>"`, so the text and the scan work grow exponentially in
+    `depth` while the command stays a single payload.
+    """
+    command = leaf
+    for _ in range(depth):
+        if delimiter == "$":
+            wrapped = " ".join("$(" + command + ")" for _ in range(fanout))
+        else:
+            wrapped = " ".join("`" + command + "`" for _ in range(fanout))
+        command = "eval " + json.dumps(wrapped)
+    return command
+
+
 class ForcePushScanCostTest(unittest.TestCase):
     """A pathological word must not wedge the scan (py/redos, CWE-1333).
 
@@ -498,6 +517,68 @@ class ForcePushScanCostTest(unittest.TestCase):
 
     def _time_guard(self, command: str) -> tuple[float, str]:
         """Seconds the guard needs for one command, plus its verdict."""
+        return self._probe(
+            "try:\n"
+            "    module._guard_force_push(argument, False)\n"
+            "    outcome = 'allowed'\n"
+            "except Exception as refusal:\n"
+            "    outcome = 'refused: ' + str(refusal).splitlines()[0]\n",
+            command,
+        )
+
+    def test_nested_substitutions_are_refused_quickly(self):
+        # The scan walks substitution interiors recursively, so these shapes
+        # used to cost 13.8s (depth 5) up to more than 30s (depth 6+) and could
+        # wedge kernel bash() before it spawned anything. The scan budget now
+        # refuses them in milliseconds.
+        for name, command in [
+            ("sub depth4 fanout3", _substitution_chain(4, 3)),
+            ("sub depth5 fanout3", _substitution_chain(5, 3)),
+            ("sub depth6 fanout3", _substitution_chain(6, 3)),
+            ("sub depth8 fanout2", _substitution_chain(8, 2)),
+            ("sub depth6 fanout3 benign", _substitution_chain(6, 3, "git status")),
+            ("backtick depth6 fanout3", _substitution_chain(6, 3, delimiter="`")),
+            ("backtick depth7 fanout3", _substitution_chain(7, 3, delimiter="`")),
+        ]:
+            with self.subTest(shape=name, length=len(command)):
+                elapsed, outcome = self._probe_guard(command)
+                self.assertLess(
+                    elapsed,
+                    SCAN_BUDGET_SECONDS,
+                    f"{elapsed:.3f}s for {name} ({len(command)} bytes)",
+                )
+                # Fail closed: the guard cannot verify what it did not scan.
+                self.assertIn("refused", outcome, outcome)
+                self.assertIn("scan budget", outcome, outcome)
+
+    def test_realistic_nesting_is_not_refused_by_the_budget(self):
+        # The budget must be generous for anything a person would really write.
+        for command in [
+            'echo "$(git status)"',
+            'echo "$(date)"',
+            "X=$(git rev-parse HEAD); echo $X",
+            'eval "$(echo hi)"',
+            'sh -c "$(echo hi)"',
+            "git log --oneline | head -3",
+            'echo "$(cat f.txt)"',
+            "for i in 1 2 3; do echo $i; done",
+            'echo "$(git status --short)" && ls',
+            "echo $(echo $(echo $(echo hi)))",
+            """eval "$(eval "$(eval 'echo hi')")" """,
+            'git push -f origin $(git rev-parse --abbrev-ref HEAD) branch',
+        ]:
+            with self.subTest(command=command):
+                elapsed, outcome = self._probe_guard(command)
+                self.assertLess(elapsed, SCAN_BUDGET_SECONDS)
+                self.assertNotIn("scan budget", outcome, outcome)
+
+    def _probe_guard(self, command: str) -> tuple[float, str]:
+        """Wall-clock seconds and verdict for one command, in its own process.
+
+        A separate interpreter with an explicit timeout means a wedged scan
+        fails the test instead of hanging the suite, which is what the
+        pre-budget numbers (13.8s to more than 30s per shape) would do.
+        """
         return self._probe(
             "try:\n"
             "    module._guard_force_push(argument, False)\n"
