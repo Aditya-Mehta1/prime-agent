@@ -725,6 +725,8 @@ describe("issue #4257 update restart resume", () => {
 			type: "response",
 			command: "create",
 			success: false,
+			error: "Daemon is preparing an update restart",
+			errorInfo: { code: "update_restarting" },
 		});
 	});
 
