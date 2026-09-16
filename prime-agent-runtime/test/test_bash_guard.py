@@ -101,6 +101,9 @@ MATCHING_COMMANDS = [
     "git restore 2>/dev/null .",
     "git clean -f 2>/dev/null",
     "git checkout 2>/dev/null -- .",
+    "git restore --staged --worktree .",
+    "git restore -SW .",
+    "source setup.sh && git reset --hard",
     "git restore --quiet .",
     "git restore -q .",
     "git restore --quiet --source=HEAD .",
@@ -156,6 +159,8 @@ NON_MATCHING_COMMANDS = [
     "export FOO=1",
     "git restore --staged --quiet .",
     "echo \\# git reset --hard",
+    "cat <<EOF\\ngit reset --hard\\nEOF",
+    "git restore --staged .",
     "echo one \
  two",
     "git -Csub status",
@@ -679,6 +684,42 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(DestructiveGitRefusalError):
                     bash(command)
                 self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
+
+    async def test_refuses_source_relocations_as_unresolvable(self):
+        self._init_dirty_repo()
+        for command in ["source setup.sh && git reset --hard", ". setup.sh && git reset --hard"]:
+            with self.subTest(command=command):
+                with self.assertRaises(DestructiveGitRefusalError) as caught:
+                    bash(command)
+                self.assertIn("changes directory (or repository) first", str(caught.exception))
+
+    async def test_refuses_staged_and_worktree_restore_discards(self):
+        self._init_dirty_repo()
+        for command in ["git restore --staged --worktree .", "git restore -SW .", "git restore -WS ."]:
+            with self.subTest(command=command):
+                with self.assertRaises(DestructiveGitRefusalError):
+                    bash(command)
+                self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
+        # Index-only restores stay allowed.
+        result = await bash("git restore --staged .")
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
+
+    async def test_heredoc_bodies_are_inert_but_substitutions_live(self):
+        self._init_dirty_repo()
+        result = await bash("cat <<EOF\ngit reset --hard\nEOF")
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
+        with self.assertRaises(DestructiveGitRefusalError):
+            bash("cat <<EOF\n$(git reset --hard)\nEOF")
+        self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
+
+    async def test_quoted_data_in_substitutions_is_inert(self):
+        self._init_dirty_repo()
+        result = await bash('echo "$(echo \'git reset --hard\')"')
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("git reset --hard", result.output)
+        self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
 
     async def test_clean_fx_lists_ignored_files_it_would_delete(self):
         self._init_dirty_repo()

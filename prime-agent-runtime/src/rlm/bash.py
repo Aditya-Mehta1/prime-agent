@@ -1008,13 +1008,44 @@ _DISCARD_CHECKOUT_PATTERN = re.compile(
     + r"""|[^\s;&|()]+\s+(?:--\s+)?(?:\./?|:/)"""
     + r"""|(?:-f|--force)\s+[^\s;&|()]+)(?=\s|$|[;&|)])"""
 )
+# Restore options accepted before the pathspec; the capture lets the finder
+# check whether staged (index-only) or worktree flags are in play.
+_RESTORE_OPTION = re.compile(
+    r"""(?:--source(?:=\S+)?|--worktree|--staged|--quiet|-s\s+\S+|-s[^\s;&|]+|-S[^\s;&|]*|-W[^\s;&|]*|-q[^\s;&|]*|--)\s+"""
+)
 _DISCARD_RESTORE_PATTERN = re.compile(
     r"\bgit\s+"
     + _GIT_GLOBAL_OPTIONS
     + r"restore\s+"
-    + r"""(?:(?:--source|--worktree|--quiet)(?:=\S+)?\s+|-s(?:\s+\S+|[^\s]+)\s+|-q\s+|-W\s+|--\s+)*"""
+    + r"((?:"""
+    + _RESTORE_OPTION.pattern
+    + r""")*)"""
     + r"""(?:\./?|:/)(?=\s|$|[;&|)])"""
 )
+
+
+def _restore_options_discard_worktree(option_region: str) -> bool:
+    """`git restore` targets the working tree by default; `--staged`/`-S`
+    alone restores only the index. Bundled shorts keep their meaning:
+    `-SW` restores both targets."""
+    tokens = [token for token in re.split(r"\s+", option_region) if token]
+    for token in tokens:
+        if token == "--":
+            break  # everything after -- is a pathspec
+        if token.startswith("--"):
+            if token.startswith("--worktree"):
+                return True
+        elif "W" in token:
+            return True
+    for token in tokens:
+        if token == "--":
+            break
+        if token.startswith("--"):
+            if token.startswith("--staged"):
+                return False
+        elif "S" in token:
+            return False
+    return True  # no flags: default worktree restore
 _DISCARD_RESET_PATTERN = re.compile(
     r"\bgit\s+" + _GIT_GLOBAL_OPTIONS + r"reset\s+(?:(?:-[^\s;&|]+)\s+)*--hard\b"
 )
@@ -1062,6 +1093,38 @@ def _normalize_line_continuations(command: str) -> str:
             i += 1  # inside double quotes the mask already folds escapes
         i += 1
     return "".join(chars)
+
+
+def _mask_heredoc_body(chars: list[str], command: str, start: int, end: int) -> None:
+    """Blank heredoc data in place, keeping substitution spans live.
+
+    A heredoc body never executes as shell commands, but `$(...)` and
+    backtick spans inside it expand (and so can execute) before cat sees
+    the text; those stay live for the discard scan.
+    """
+    i = start
+    while i < end:
+        ch = command[i]
+        if ch == "$" and command[i + 1 : i + 2] == "(":
+            depth = 0
+            j = i
+            while j < end:
+                if command[j] == "(":
+                    depth += 1
+                elif command[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            i = j + 1
+        elif ch == "`":
+            j = i + 1
+            while j < end and command[j] != "`":
+                j += 1
+            i = j + 1
+        else:
+            chars[i] = " "
+            i += 1
 
 
 # A shell redirection word: optional fd, the operator, an optional &fd
@@ -1131,6 +1194,26 @@ def _mask_shell_redirections(command: str) -> str:
                         target_start = target_end = i
                 for j in range(target_start, target_end):
                     chars[j] = " "
+                if operator.group(0) == "<<" and target_end > operator.end():
+                    # A heredoc body is inert data: blank it up to the
+                    # delimiter line, keeping command substitution live
+                    # (it executes even inside a heredoc). Without a
+                    # terminator, leave the text live (conservative).
+                    delimiter = command[target_start:target_end]
+                    pos = command.find("\n", target_end)
+                    while pos != -1:
+                        line_stop = command.find("\n", pos + 1)
+                        line = (
+                            command[pos + 1 :]
+                            if line_stop == -1
+                            else command[pos + 1 : line_stop]
+                        )
+                        if line.rstrip() == delimiter:
+                            _mask_heredoc_body(
+                                chars, command, target_end, len(command) if line_stop == -1 else line_stop
+                            )
+                            break
+                        pos = line_stop
                 i = target_end
                 continue
         elif quote == "'":
@@ -1259,7 +1342,9 @@ def _mask_quoted_spans(command: str) -> str:
             chars[i + 1] = " "
             i += 1
         elif ch == "$" and i + 1 < n and chars[i + 1] == "(":
-            # Command substitution inside double quotes still executes; keep it live.
+            # Command substitution inside double quotes still executes; keep
+            # it live, but its interior is a fresh shell context: quoted data
+            # inside it must stay data (recursively masked).
             depth = 0
             j = i
             while j < n:
@@ -1270,12 +1355,17 @@ def _mask_quoted_spans(command: str) -> str:
                     if depth == 0:
                         break
                 j += 1
+            interior = _mask_quoted_spans(command[i + 2 : j])
+            chars[i + 2 : j] = list(interior)
             i = j - 1
         elif ch == "`":
-            # Backtick substitution inside double quotes still executes; keep it live.
+            # Backtick substitution inside double quotes still executes; keep
+            # it live, masking quoted data in its interior like $().
             j = i + 1
             while j < n and chars[j] != "`":
                 j += 1
+            interior = _mask_quoted_spans(command[i + 1 : j])
+            chars[i + 1 : j] = list(interior)
             i = j - 1
         else:
             chars[i] = " "
@@ -1316,8 +1406,11 @@ def _find_destructive_git_discard_commands(command: str) -> list[int]:
     )
     masked = _mask_quoted_spans(normalized)
     indices: list[int] = []
-    for pattern in (_DISCARD_CHECKOUT_PATTERN, _DISCARD_RESTORE_PATTERN, _DISCARD_RESET_PATTERN):
+    for pattern in (_DISCARD_CHECKOUT_PATTERN, _DISCARD_RESET_PATTERN):
         indices.extend(match.start() for match in pattern.finditer(masked))
+    for match in _DISCARD_RESTORE_PATTERN.finditer(masked):
+        if _restore_options_discard_worktree(match.group(1)):
+            indices.append(match.start())
     for match in _DISCARD_CLEAN_PATTERN.finditer(masked):
         if _is_forced_clean_segment(match.group(1)):
             indices.append(match.start())
@@ -1508,9 +1601,13 @@ def _resolve_discard_probe_target(
         for index in range(len(segments) - 1):
             if seg_positions[index] < user_command_start:
                 continue  # command-prefix region: replayed verbatim
+            seg_tokens = [token for token in re.split(r"\s+", segments[index].strip()) if token]
+            if seg_tokens and seg_tokens[0] in ("source", "."):
+                # A sourced script runs in the current shell and may `cd`,
+                # so the discard's directory cannot be replayed safely.
+                return _UNRESOLVABLE_DISCARD_TARGET
             if parts[2 * index + 1] not in (";", "&&", "\n"):
                 continue  # pipe/subshell or short-circuit: the env does not persist
-            seg_tokens = [token for token in re.split(r"\s+", segments[index].strip()) if token]
             if not seg_tokens:
                 continue
             if seg_tokens[0] == "export":
