@@ -931,6 +931,81 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Refusing to run this recursive chmod/chown command", message)
                 self.assertTrue(Path(home.name, "keep.txt").exists())
 
+    async def test_refuses_heredoc_fed_wrapper_bodies(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        # A shell wrapper fed by a here-document runs the body as its
+        # script, so the body is scanned with the full guard instead of
+        # staying masked; a heredoc inside a command substitution flows out
+        # as text that can become code, so its body is scanned too.
+        for command in [
+            "bash <<EOF\nchmod -R 755 ~\nEOF",
+            "sh <<EOF\nchmod -R 755 ~\nEOF",
+            "sh <<'EOF'\nchmod -R 755 ~\nEOF",
+            'bash <<"EOF"\nchown -R user ~\nEOF',
+            "bash -s <<EOF\nchmod -R 755 ~\nEOF",
+            'eval "$(cat <<EOF\nchmod -R 755 ~\nEOF)"',
+            "bash <<EOF\ncd ~ && chmod -R 755 .\nEOF",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command, home=home.name)
+                self.assertIn("Refusing to run this recursive chmod/chown command", message)
+                self.assertTrue(Path(home.name, "keep.txt").exists())
+        # Benign wrapper bodies and data bodies for non-wrappers stay fine,
+        # and in-workspace recursion inside a wrapper body stays allowed.
+        result = await self._run("bash <<EOF\necho hi\nEOF")
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("hi", result.output)
+        result = await self._run("cat <<EOF\nchmod -R 755 ~\nEOF")
+        self.assertEqual(result.exit_code, 0)
+        self._make_tree()
+        result = await self._run("bash <<EOF\nchmod -R 755 sub\nEOF")
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_refuses_procsub_after_option_arguments(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        # Option words and their arguments no longer hide a process
+        # substitution feeding the wrapper.
+        for command in [
+            "bash -o vi <(printf 'chmod -R 755 ~\\n')",
+            "bash --rcfile <(printf 'chmod -R 755 ~\\n')",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command, home=home.name)
+                self.assertIn("process substitution", message)
+                self.assertTrue(Path(home.name, "keep.txt").exists())
+        # A -c payload still governs.
+        result = await self._run("bash -c 'echo hi' <(echo x)")
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_refuses_subshell_function_bodies(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        # A function body may be any compound command: a subshell body
+        # forwards "$@" exactly like a brace body.
+        for command in [
+            'f() (chmod "$@"); f -R 755 ~',
+            'function f (chmod "$@"); f -R 755 ~',
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command, home=home.name)
+                self.assertIn("Refusing to run this recursive chmod/chown command", message)
+                self.assertTrue(Path(home.name, "keep.txt").exists())
+        result = await self._run('f() (echo hi); f')
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_trailing_heredoc_operator_does_not_crash(self):
+        # A heredoc operator at end of string is a shell syntax error, not
+        # a guard crash: the command runs to bash's own error.
+        result = await self._run("cat <<")
+        self.assertNotEqual(result.exit_code, 0)
+        result = await self._run("cat <<-")
+        self.assertNotEqual(result.exit_code, 0)
+
     async def test_xargs_false_positives_stay_allowed(self):
         # The xargs walk must stop at the command word: an operand named
         # xargs and a later xargs in a separate pipeline are not wraps.

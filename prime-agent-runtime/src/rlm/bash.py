@@ -1024,6 +1024,46 @@ _REDIRECT_OPERATOR = re.compile(r"(?:&>{1,2}|>&|[0-9]*[<>]{1,3}(&[0-9]+)?)(?!\()
 _STATIC_REDIRECT_TARGET = re.compile(r"""[^\s;&|<>()$`"']*""")
 
 
+def _locate_heredoc(command: str, operator: re.Match) -> tuple[str | None, int, int | None, bool]:
+    """Locate the here-document starting after `operator` (an already
+    matched fd-prefixed `<<`/`<<-`): returns the delimiter text, the end of
+    the delimiter word, the end of the terminator line (None when the
+    terminator is missing or the delimiter cannot be resolved statically --
+    an expandable delimiter leaves the body extent unknowable), and whether
+    `<<-` strips leading tabs from terminator lines."""
+    n = len(command)
+    heredoc_tabs = command[operator.end() : operator.end() + 1] == "-"
+    j = operator.end() + (1 if heredoc_tabs else 0)
+    while j < n and command[j].isspace():
+        j += 1
+    delim_start = j
+    if j < n and command[j] in ("'", '"'):
+        quote_char = command[j]
+        j += 1
+        while j < n and command[j] != quote_char:
+            j += 1
+        delim = command[delim_start + 1 : j]
+        j += 1
+    else:
+        delim_match = _STATIC_REDIRECT_TARGET.match(command, j)
+        j = delim_match.end()
+        delim = delim_match.group(0)
+    if not delim or re.search(r"[$`\\]", delim):
+        return None, min(j, n), None, heredoc_tabs
+    pos = j
+    while pos < n:
+        line_end = command.find("\n", pos)
+        line = command[pos :] if line_end == -1 else command[pos : line_end]
+        if heredoc_tabs:
+            line = line.lstrip("\t")
+        if line == delim:
+            return delim, j, (n if line_end == -1 else line_end), heredoc_tabs
+        if line_end == -1:
+            break
+        pos = line_end + 1
+    return delim, j, None, heredoc_tabs
+
+
 def _mask_shell_redirections(command: str) -> str:
     """Blank out shell redirection words, keeping character positions.
 
@@ -1069,45 +1109,17 @@ def _mask_shell_redirections(command: str) -> str:
                 # terminator line are all consumed by the shell, and the
                 # body is data (an unmatched quote in it must not corrupt
                 # the later scan), so they are masked through the
-                # terminator. `<<-` strips leading tabs from terminator
-                # lines; an expandable delimiter leaves the body extent
-                # unknowable, so the operator alone is masked. Without a
-                # terminator bash swallows the whole rest as body and
-                # nothing after it executes, so the rest may stay live.
-                heredoc_tabs = command[operator.end()] == "-"
-                j = operator.end() + (1 if heredoc_tabs else 0)
-                while j < n and command[j].isspace():
-                    j += 1
-                delim_start = j
-                if j < n and command[j] in ("'", '"'):
-                    quote_char = command[j]
-                    j += 1
-                    while j < n and command[j] != quote_char:
-                        j += 1
-                    delim = command[delim_start + 1 : j]
-                    j += 1
-                else:
-                    delim_match = _STATIC_REDIRECT_TARGET.match(command, j)
-                    j = delim_match.end()
-                    delim = delim_match.group(0)
-                for k in range(operator.start(), min(j, n)):
+                # terminator. Without a terminator bash swallows the whole
+                # rest as body and nothing after it executes, so the rest
+                # may stay live; a body that executes as a wrapper's
+                # script is scanned separately by the guard.
+                delim, delim_end, body_end, _tabs = _locate_heredoc(command, operator)
+                for k in range(operator.start(), min(delim_end, n)):
                     chars[k] = " "
-                pos = j
-                if delim and not re.search(r"[$`\\]", delim):
-                    while pos < n:
-                        line_end = command.find("\n", pos)
-                        line = command[pos :] if line_end == -1 else command[pos : line_end]
-                        if heredoc_tabs:
-                            line = line.lstrip("\t")
-                        if line == delim:
-                            for k in range(j, (n if line_end == -1 else line_end)):
-                                chars[k] = " "
-                            pos = n if line_end == -1 else line_end
-                            break
-                        if line_end == -1:
-                            break
-                        pos = line_end + 1
-                i = max(pos, j)
+                if body_end is not None:
+                    for k in range(delim_end, body_end):
+                        chars[k] = " "
+                i = delim_end if body_end is None else body_end
                 continue
             if operator:
                 for j in range(operator.start(), operator.end()):
@@ -2274,6 +2286,92 @@ def _bash_env_words_arm_shell_code(words: list[_ShellWord]) -> bool:
     return False
 
 
+def _word_before(command: str, end: int, *, skip_options: bool = False) -> str | None:
+    """The shell word ending at `end` (ignoring trailing whitespace), or
+    None when none exists. With skip_options, option words are skipped
+    backward so the reader of a redirection is found (bash -s <<EOF reads
+    as bash)."""
+    j = end
+    while True:
+        while j > 0 and command[j - 1].isspace():
+            j -= 1
+        k = j
+        while k > 0 and not command[k - 1].isspace() and command[k - 1] not in ";&|<>(){}":
+            k -= 1
+        word = command[k:j]
+        if not word:
+            return None
+        if skip_options and word != "--" and word.startswith("-"):
+            j = k
+            continue
+        return word
+
+
+def _substitution_spans(command: str) -> list[tuple[int, int]]:
+    """Spans of command substitutions (`$(...)`) and backticks in
+    `command`, honoring quoting: their output becomes shell text, so a
+    here-document inside one can flow out as code."""
+    spans: list[tuple[int, int]] = []
+    quote: str | None = None
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+        elif quote == '"':
+            if ch == "\\":
+                i += 1
+            elif ch == '"':
+                quote = None
+        elif ch in ('"', "'"):
+            quote = ch
+        elif ch == "$" and command[i + 1 : i + 2] == "(":
+            close = _matching_paren(command, i + 1, n)
+            spans.append((i, close))
+            i = close
+        elif ch == "`":
+            close = command.find("`", i + 1)
+            if close == -1:
+                close = n - 1
+            spans.append((i, close))
+            i = close
+        i += 1
+    return spans
+
+
+def _heredoc_bodies_hide_shell_code(raw: str, allow_destructive_chmod: bool) -> None:
+    """Refuse here-document bodies that execute as shell code: a shell
+    wrapper directly fed by the heredoc (`bash <<EOF ... EOF`) runs the
+    body as its script, so the body is scanned with the full guard
+    (in-workspace recursion stays allowed); a heredoc inside a command
+    substitution or backtick (`eval "$(cat <<EOF ...)"`) flows out as text
+    that can become code, so its body is scanned the same way. Bodies read
+    as data by non-wrapper commands stay inert (masked), and an
+    unterminated heredoc executes nothing after it."""
+    substitution_spans = _substitution_spans(raw)
+    for operator in _REDIRECT_OPERATOR.finditer(raw):
+        op_text = operator.group(0)
+        if "<<<" in op_text or not op_text.endswith("<<"):
+            continue
+        delim, delim_end, body_end, _tabs = _locate_heredoc(raw, operator)
+        if not delim or body_end is None:
+            continue
+        body = raw[delim_end:body_end]
+        if not body.strip():
+            continue
+        reader = _word_before(raw, operator.start(), skip_options=True)
+        reader_is_wrapper = reader is not None and os.path.basename(reader) in _SHELL_C_INTERPRETERS
+        inside_substitution = any(
+            start < operator.start() < end for start, end in substitution_spans
+        )
+        if reader_is_wrapper or inside_substitution:
+            # The body executes as shell code: run the full guard on it
+            # (operand resolution included), propagating its refusal.
+            _guard_destructive_chmod(body.strip("\n"), allow_destructive_chmod)
+
+
 def _process_substitution_feeds_wrapper(
     normalized: str, words: list[_ShellWord] | None = None
 ) -> bool:
@@ -2327,17 +2425,17 @@ def _process_substitution_feeds_wrapper(
             break  # the first non-flag word is the script argument
         if governed:
             continue
-        rest = normalized[rest_from :].lstrip()
-        if (
-            rest.startswith(("<(", ">("))
-            or rest.startswith("<<<")
-            or re.match(r"<\s*<\(", rest)
-        ):
+        # Fail closed over the wrapper's own command region: an option
+        # word, its argument, or a long option between the wrapper and the
+        # marker must not hide it, so any input-feeding marker in the
+        # region before the next command boundary refuses the wrapper.
+        region = re.split(r"[;&|\n]", normalized[rest_from:], 1)[0]
+        if "<(" in region or ">(" in region or "<<<" in region:
             return True
     return False
 
 
-_FUNCTION_DEFINITION = re.compile(r"\(\s*\)\s*\{|function\s+[A-Za-z_]")
+_FUNCTION_DEFINITION = re.compile(r"\(\s*\)\s*[({]|function\s+[A-Za-z_]")
 
 
 def _function_definition_could_recurse(
@@ -2568,7 +2666,8 @@ def _guard_destructive_chmod(command: str, allow_destructive_chmod: bool) -> Non
     if allow_destructive_chmod or _DESTRUCTIVE_CHMOD_BYPASS_AT_KERNEL_START:
         return
     command_prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
-    resolved = _mask_shell_redirections(_normalize_line_continuations(_with_prefix(command)))
+    raw = _normalize_line_continuations(_with_prefix(command))
+    resolved = _mask_shell_redirections(raw)
     normalized, index_map = _strip_shell_escapes(resolved)
     words = _scan_shell_words(normalized)
     # BASH_ENV: non-interactive bash runs that file before the command
@@ -2581,6 +2680,11 @@ def _guard_destructive_chmod(command: str, allow_destructive_chmod: bool) -> Non
     # guard cannot scan, so that wrapper form is refused.
     if re.search(r"[<>]\(|<<<", normalized) and _process_substitution_feeds_wrapper(normalized, words):
         raise DestructiveChmodRefusalError(_format_chmod_process_substitution_refusal())
+    # Here-document bodies that execute as shell code (a wrapper fed by the
+    # heredoc, or a heredoc flowing out of a substitution) are scanned with
+    # the full guard; data bodies stay masked and inert.
+    if "<<" in raw:
+        _heredoc_bodies_hide_shell_code(raw, allow_destructive_chmod)
     # The cheap gates are word-driven, not raw-text-driven: quote- and
     # ANSI-C-encoded wrapper names (`e"val"`, `$'bash'`) fold to the
     # wrapper word in the scan even though no contiguous `eval`/`bash` text
