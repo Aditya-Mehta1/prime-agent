@@ -329,6 +329,16 @@ describe("parseIncidentTimeBound", () => {
 		);
 	});
 
+	it("rejects timezone offsets with an invalid minute component", () => {
+		// RFC 3339 offsets allow minutes 00-59 only; +00:60 must not shift by an hour.
+		for (const garbage of ["2026-09-16T20:02+00:60", "2026-09-16T20:02-05:90", "2026-09-16T20:02+24:00"]) {
+			expect(() => parseIncidentTimeBound(garbage, now, "--since")).toThrow(IncidentUsageError);
+		}
+		expect(parseIncidentTimeBound("2026-09-16T20:02+05:45", now, "--since")).toBe(
+			Date.parse("2026-09-16T14:17:00.000Z"),
+		);
+	});
+
 	it("rejects garbage and impossible dates with a clear usage error", () => {
 		for (const garbage of ["yesterday", "2026-13-01", "2026-09-32", "25:00", "2026-09-16T"]) {
 			expect(() => parseIncidentTimeBound(garbage, now, "--since")).toThrow(IncidentUsageError);

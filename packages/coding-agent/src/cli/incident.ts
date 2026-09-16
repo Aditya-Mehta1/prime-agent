@@ -144,8 +144,9 @@ export function parseIncidentTimeBound(value: string, now: Date, flag: string): 
 	}
 	const sign = zone[0] === "-" ? -1 : 1;
 	const digits = zone.slice(1).replace(":", "");
-	const offsetMinutes = Number(digits.slice(0, 2)) * 60 + Number(digits.slice(2) || 0);
-	if (!Number.isFinite(offsetMinutes) || offsetMinutes >= 24 * 60) {
+	const offsetMinute = Number(digits.slice(2) || 0);
+	const offsetMinutes = Number(digits.slice(0, 2)) * 60 + offsetMinute;
+	if (!Number.isFinite(offsetMinutes) || offsetMinutes >= 24 * 60 || offsetMinute >= 60) {
 		throw invalid();
 	}
 	return baseMs - sign * offsetMinutes * 60_000;
