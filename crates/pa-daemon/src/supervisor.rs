@@ -1125,17 +1125,7 @@ impl Supervisor {
                             if !attached.iter().any(|id| id == &active_id) {
                                 attached.push(active_id.clone());
                             }
-                            // Legacy convenience event before the response.
-                            let attached_event = json!({
-                                "type": "session_attached",
-                                "activeSessionId": active_id,
-                                "state": data.get("state"),
-                                "messages": data.get("messages"),
-                                "snapshot": data.get("snapshot"),
-                                "replay": data.get("replay"),
-                                "lastEventSequence": data.get("lastEventSequence"),
-                            });
-                            return (vec![attached_event, response_line(&response)], false);
+                            return (vec![response_line(&response)], false);
                         }
                     }
                     return (vec![response_line(&response)], false);
@@ -1222,6 +1212,17 @@ fn client_command_payload(
     let mut payload = serde_json::to_value(command)?;
     if let Some(object) = payload.as_object_mut() {
         object.insert("clientId".to_string(), json!(client_id));
+        // The supervisor always attaches slim, like the TS supervisor's
+        // `attachClient`: summary and messages travel inside the snapshot.
+        if matches!(
+            command,
+            DaemonCommand::Attach { .. } | DaemonCommand::Reattach { .. }
+        ) {
+            object.insert(
+                "capabilities".to_string(),
+                json!(["attach_snapshot", "event_sequence", "slim_attach"]),
+            );
+        }
         // Create carries its fields under `config`; the worker reads them flat.
         if let Some(config) = object.remove("config") {
             if let Some(config) = config.as_object() {

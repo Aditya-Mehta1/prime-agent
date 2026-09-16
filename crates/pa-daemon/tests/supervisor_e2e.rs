@@ -238,6 +238,53 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
     );
     let attached = client.read_response("a1");
     assert_eq!(attached["success"], true, "attach failed: {attached}");
+    // Attach wire shape (differential goldens from the TS supervisor): slim
+    // attach carries summary/messages only inside the snapshot, no
+    // `session_attached` convenience event precedes the response.
+    let data = &attached["data"];
+    let keys: Vec<&str> = data
+        .as_object()
+        .expect("attach data object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            "activeSessionId",
+            "client",
+            "lastEventCursor",
+            "lastEventSequence",
+            "protocol",
+            "replay",
+            "snapshot",
+        ]
+    );
+    let snapshot = &data["snapshot"];
+    let snapshot_keys: Vec<&str> = snapshot
+        .as_object()
+        .expect("snapshot object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        snapshot_keys,
+        vec![
+            "activeSessionId",
+            "children",
+            "lastEventCursor",
+            "lastEventSequence",
+            "messages",
+            "state",
+            "summary",
+        ]
+    );
+    assert_eq!(snapshot["children"], serde_json::json!([]));
+    assert_eq!(
+        data["client"]["capabilities"],
+        serde_json::json!(["attach_snapshot", "event_sequence", "slim_attach"])
+    );
+    assert_eq!(data["replay"]["status"], "complete");
 
     client.send_command(
         "p1",

@@ -773,18 +773,27 @@ impl Worker {
             "messages": messages,
             "lastEventSequence": last_event_sequence,
             "lastEventCursor": cursor,
+            // RLM child roster; empty for top-level daemon sessions.
+            "children": [],
         });
-        let result = json!({
+        // Slim clients read summary/messages from the snapshot; duplicating
+        // them at the top level would serialize the history twice per attach
+        // (port of `createAttachResult`).
+        let slim = capabilities.iter().any(|cap| cap == "slim_attach");
+        let mut result = json!({
             "protocol": { "name": "prime-agent.daemon", "version": 7 },
             "activeSessionId": active_session_id,
-            "state": summary_value,
-            "messages": messages,
             "snapshot": snapshot,
             "replay": replay,
             "lastEventSequence": last_event_sequence,
             "lastEventCursor": cursor,
             "client": { "id": client_id, "capabilities": capabilities },
         });
+        if !slim {
+            result["state"] = summary_value;
+            result["messages"] = Value::Array(messages);
+        }
+
         response_success(None, "attach", Some(result))
     }
 
