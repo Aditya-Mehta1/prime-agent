@@ -20,7 +20,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Generator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, cast
 
@@ -1145,8 +1145,10 @@ class _PipeShellStage:
     words: tuple[_PipeShellWord, ...]
     target_substitutions: tuple[tuple[int, int], ...]
     # Here-document bodies feeding this stage (`sh <<EOF ... EOF`): the span
-    # each body occupies, so a runner stage can read its script.
-    heredoc_bodies: tuple[tuple[int, int], ...] = ()
+    # each body occupies and whether its delimiter was quoted (an unquoted
+    # body's substitutions expand at read time), so the owner's script is
+    # readable where the shell makes it one.
+    heredoc_bodies: tuple[tuple[int, int, bool], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1285,23 +1287,26 @@ def _skip_redirect_target(
     return index, substitutions
 
 
-def _scan_heredoc(
+def _scan_heredoc_delimiter(
     command: str, index: int, end: int
-) -> tuple[int, tuple[int, int] | None]:
-    """Consume a here-document at `index` (its `<<` operator): the index of
-    the end of its body, plus the body's span for the stage to read. The
-    delimiter may be quoted (which only stops the shell from expanding the
-    body: a runner still executes its text), and `<<-` only strips tabs. A
-    missing delimiter or body consumes nothing and reads none."""
+) -> tuple[int, tuple[str, bool] | None]:
+    """Consume a here-document's `<<` operator and its delimiter word: the
+    index after the delimiter, plus the delimiter and whether it was quoted.
+    The body is read at the line's newline, so the line's own pipeline
+    (`cat <<EOF | sh`) stays in the stream to be read as stages. Quoting the
+    delimiter only stops the shell from expanding the body (a runner still
+    executes its text), and `<<-` only strips tabs."""
     index += 2
     if index < end and command[index] == "-":
         index += 1
     while index < end and command[index] in " \t":
         index += 1
     delimiter = ""
+    quoted = False
     while index < end:
         char = command[index]
         if char in "'\"":
+            quoted = True
             index += 1
             continue  # quoting a delimiter only suppresses expansion
         if char in " \t\r\n" or char in _PIPE_SHELL_SEPARATORS:
@@ -1310,23 +1315,27 @@ def _scan_heredoc(
         index += 1
     if not delimiter:
         return index, None
-    newline = command.find("\n", index)
-    if newline == -1 or newline >= end:
-        return end, None
-    body_start = newline + 1
+    return index, (delimiter, quoted)
+
+
+def _scan_heredoc_body(
+    command: str, index: int, end: int, delimiter: str
+) -> tuple[int, tuple[int, int] | None]:
+    """Consume a here-document body at `index` (its opening newline): the
+    index its delimiter line starts at, plus the body's span. A body whose
+    delimiter line never comes runs to the end, and an empty one reads
+    none."""
+    body_start = index + 1
     line_start = body_start
     body_end = end
     while line_start < end:
         line_end = command.find("\n", line_start)
         if line_end == -1 or line_end >= end:
-            body_end = end
             break
         if command[line_start:line_end].lstrip("\t").rstrip("\r") == delimiter:
             body_end = line_start
             break
         line_start = line_end + 1
-    else:
-        body_end = end
     if body_end <= body_start:
         return body_end, None
     return body_end, (body_start, body_end)
@@ -1349,7 +1358,8 @@ def _scan_pipe_shell_region(command: str, start: int, end: int) -> _PipeShellReg
     stages: list[_PipeShellStage] = []
     substitutions: list[tuple[int, int]] = []
     target_substitutions: list[tuple[int, int]] = []
-    heredoc_bodies: list[tuple[int, int]] = []
+    pending_heredocs: list[tuple[str, bool, int]] = []
+    stage_heredoc_bodies: dict[int, list[tuple[int, int, bool]]] = {}
     words: list[_PipeShellWord] = []
     chars: list[str] = []
     word_start = -1
@@ -1379,12 +1389,10 @@ def _scan_pipe_shell_region(command: str, start: int, end: int) -> _PipeShellReg
                 separator,
                 tuple(words),
                 tuple(target_substitutions),
-                tuple(heredoc_bodies),
             )
         )
         words.clear()
         target_substitutions.clear()
-        heredoc_bodies.clear()
 
     def start_word(offset: int) -> None:
         nonlocal word_start
@@ -1459,12 +1467,14 @@ def _scan_pipe_shell_region(command: str, start: int, end: int) -> _PipeShellReg
             char == "&" and command[index + 1 : index + 2] in ("<", ">")
         ):
             if command[index : index + 2] == "<<" and command[index + 2 : index + 3] != "<":
-                # A here-document's body is stdin, not commands: consume it out
-                # of the stage stream and hand its span to this stage.
+                # A here-document's body is stdin below the line's newline, so
+                # only its delimiter is consumed here: the line's own pipeline
+                # (`cat <<EOF | sh`) is read as stages, and the body is
+                # attached to the stage that owns the `<<`.
                 flush_word(drop_numeric=True)
-                index, body = _scan_heredoc(command, index, end)
-                if body is not None:
-                    heredoc_bodies.append(body)
+                index, pending = _scan_heredoc_delimiter(command, index, end)
+                if pending is not None:
+                    pending_heredocs.append((*pending, len(stages)))
                 continue
             flush_word(drop_numeric=True)
             index, duplicates = _scan_redirect_operator(command, index, end)
@@ -1480,6 +1490,30 @@ def _scan_pipe_shell_region(command: str, start: int, end: int) -> _PipeShellReg
                     target_substitutions.extend(nested)
             continue
         if char in _PIPE_SHELL_SEPARATORS:
+            resume = None
+            if char == "\n" and pending_heredocs:
+                # The here-document bodies start below this newline, in the
+                # order their `<<` operators appeared, and each ends at its
+                # own delimiter line, where the stream resumes.
+                cursor = index
+                for (
+                    pending_delimiter,
+                    pending_quoted,
+                    pending_stage,
+                ) in pending_heredocs:
+                    cursor, body = _scan_heredoc_body(
+                        command, cursor, end, pending_delimiter
+                    )
+                    if body is not None:
+                        stage_heredoc_bodies.setdefault(pending_stage, []).append(
+                            (*body, pending_quoted)
+                        )
+                    resume = cursor
+                    cursor_next = command.find("\n", cursor)
+                    if cursor_next == -1 or cursor_next >= end:
+                        break
+                    cursor = cursor_next
+                pending_heredocs.clear()
             operator = char
             follower = command[index + 1 : index + 2]
             if char in "|&" and follower == char:
@@ -1489,7 +1523,7 @@ def _scan_pipe_shell_region(command: str, start: int, end: int) -> _PipeShellReg
                 operator = "|&"  # stderr and stdout both reach the next stage
                 index += 1
             end_stage(operator)
-            index += 1
+            index = resume if resume is not None else index + 1
             continue
         if char == "$" and command[index + 1 : index + 2] == "'":
             start_word(index)
@@ -1531,6 +1565,10 @@ def _scan_pipe_shell_region(command: str, start: int, end: int) -> _PipeShellReg
         chars.append(char)
         index += 1
     end_stage("")
+    stages = [
+        replace(stage, heredoc_bodies=tuple(stage_heredoc_bodies.get(position, ())))
+        for position, stage in enumerate(stages)
+    ]
     return _PipeShellRegion(tuple(stages), tuple(substitutions), bool(quote))
 
 
@@ -1654,14 +1692,19 @@ def _stage_args_run_download(
 
 
 def _stage_heredoc_body_runs_download(
-    command: str, stage: _PipeShellStage
+    command: str, stage: _PipeShellStage, depth: int = 0
 ) -> bool:
-    """Whether a runner stage's here-document bodies are a script that runs a
-    download through a shell: `sh <<EOF` executes the body's text, whether the
-    pipeline is spelled in the body or arrives through a `$(curl ...)` the
-    shell expands first. A non-runner's bodies stay data."""
-    for body_start, body_end in stage.heredoc_bodies:
-        if _pipe_shell_violation(command, body_start, body_end) is not None:
+    """Whether this stage's here-document bodies are a script that runs a
+    download through a shell: a runner (`sh <<EOF`) executes the body's text,
+    whether the pipeline is spelled in the body or arrives through a
+    `$(curl ...)` the shell expands first, and a stage whose stdout continues
+    into a runner hands it the same text, so the caller reads it the same
+    way."""
+    for body_start, body_end, _quoted in stage.heredoc_bodies:
+        if (
+            _pipe_shell_violation(command, body_start, body_end, depth + 1)
+            is not None
+        ):
             return True
         region = _scan_pipe_shell_region(command, body_start, body_end)
         for body_stage in region.stages:
@@ -1680,25 +1723,81 @@ def _stage_runs_stdin_shell(words: tuple[_PipeShellWord, ...]) -> bool:
     pipeline's output on stdin, exactly like a bare `sh`."""
     for index, word in enumerate(words):
         if _command_name(word.value) == "sudo":
+            value_flags = _WRAPPER_VALUE_FLAGS.get("sudo", ())
+            cursor = index + 1
             shell_flag = False
-            for later in words[index + 1 :]:
-                if later.value in ("-s", "-i"):
+            while cursor < len(words):
+                value = words[cursor].value
+                if value in value_flags:
+                    cursor += 2  # the flag's operand is not a command
+                elif value in ("-s", "-i"):
                     shell_flag = True
-                elif not later.value.startswith("-"):
+                    cursor += 1
+                elif value.startswith("-"):
+                    cursor += 1
+                else:
                     return False  # a command follows: this is a normal sudo
             return shell_flag
     return False
 
 
-def _pipe_shell_stage_violation(command: str, region: _PipeShellRegion) -> str | None:
+def _region_runs_shell(region: _PipeShellRegion) -> bool:
+    """Whether any stage of this region runs a shell interpreter, including a
+    wrapper-only stage that starts one on stdin."""
+    for stage in region.stages:
+        if not stage.words:
+            continue
+        resolved = _stage_command_word(stage.words)
+        if resolved is not None:
+            if _command_name(resolved[0].value) in _RUNNERS:
+                return True
+        elif _stage_runs_stdin_shell(stage.words):
+            return True
+    return False
+
+
+def _stage_body_substitution_violation(
+    command: str, stage: _PipeShellStage, depth: int
+) -> str | None:
+    """Why the substitutions of an unquoted here-document body run a
+    download through a shell, whatever stage owns the body. The shell
+    expands an unquoted body at read time, so `cat <<EOF` ... `$(curl ... |
+    sh)` ... `EOF` runs the pipeline inside the substitution without the
+    body's text ever reaching a runner; a quoted delimiter leaves the body
+    inert data."""
+    for body_start, body_end, quoted in stage.heredoc_bodies:
+        if quoted:
+            continue
+        region = _scan_pipe_shell_region(command, body_start, body_end)
+        for nested_start, nested_end in region.substitutions:
+            violation = _pipe_shell_violation(
+                command, nested_start, nested_end, depth + 1
+            )
+            if violation is not None:
+                return violation
+    return None
+
+
+def _pipe_shell_stage_violation(
+    command: str, region: _PipeShellRegion, depth: int = 0
+) -> str | None:
     """Why these stages run a download through a shell, or None."""
+    # A here-document body reaches whatever its owner's stdout feeds, so a
+    # body is read as a script only when a runner is actually fed.
+    runs_shell = _region_runs_shell(region)
     piped_download = False
+    brace_depth = 0
     for stage in region.stages:
         if not stage.words:
             # An empty stage is a grouping character, a doubled operator, or a
             # newline that only continues the pipeline (`curl ... |` then a
             # newline then `sh`), so it never ends the chain.
             continue
+        if stage.words[0].value == "{":
+            # A brace group keeps the stages inside it feeding the same
+            # pipeline (`{ curl ...; } | sh`), so the separators inside it
+            # must not end the chain.
+            brace_depth += 1
         resolved = _stage_command_word(stage.words)
         if resolved is None and piped_download and _stage_runs_stdin_shell(
             stage.words
@@ -1725,14 +1824,34 @@ def _pipe_shell_stage_violation(command: str, region: _PipeShellRegion) -> str |
             elif name in _RUNNERS and (
                 _stage_args_run_download(command, stage, command_index)
                 or _stage_payload_runs_download(stage, command_index)
-                or _stage_heredoc_body_runs_download(command, stage)
+                or _stage_heredoc_body_runs_download(command, stage, depth)
             ):
                 return "a download substituted into a shell"
+        if stage.heredoc_bodies and not (
+            resolved is not None and _command_name(resolved[0].value) in _RUNNERS
+        ):
+            # A stage that is not itself a runner holds its here-document
+            # bodies as data, with the two reads the shell forces anyway: the
+            # substitutions of an unquoted body expand at read time whatever
+            # the owner, and a body whose owner's stdout continues into a
+            # runner of this region is that runner's script.
+            violation = _stage_body_substitution_violation(command, stage, depth)
+            if violation is not None:
+                return violation
+            if (
+                stage.separator in _PIPE_OPERATORS
+                and runs_shell
+                and _stage_heredoc_body_runs_download(command, stage, depth)
+            ):
+                return "a download piped into a shell"
         if (
             stage.separator not in _PIPE_OPERATORS
             and stage.separator not in _GROUPING_OPERATORS
+            and brace_depth == 0
         ):
             piped_download = False
+        if brace_depth and stage.words[-1].value == "}":
+            brace_depth -= 1
     return None
 
 
@@ -1757,7 +1876,7 @@ def _pipe_shell_violation(
         # read, so it cannot be cleared.
         return "substitutions nested too deeply for the scan to read"
     region = _scan_pipe_shell_region(command, start, end)
-    violation = _pipe_shell_stage_violation(command, region)
+    violation = _pipe_shell_stage_violation(command, region, depth)
     if violation is not None:
         return violation
     for nested_start, nested_end in region.substitutions:
