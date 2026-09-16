@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AgentObserveController } from "../../src/core/agent-observe.js";
+import type { SessionUsageSummary } from "../../src/core/usage.js";
 import { createHarness } from "./harness.js";
 
-function agentStub(activeSessionId: string) {
+function agentStub(activeSessionId: string, usage?: SessionUsageSummary) {
 	return {
 		activeSessionId,
 		sessionId: `session-${activeSessionId}`,
@@ -15,12 +16,21 @@ function agentStub(activeSessionId: string) {
 		messageCount: 1,
 		queuedCount: 0,
 		isSessionActive: false,
+		...(usage ? { usage } : {}),
 	};
 }
 
 function createController(): AgentObserveController {
 	return {
-		listAgents: vi.fn(() => ({ current: agentStub("alpha"), agents: [] })),
+		listAgents: vi.fn(() => ({
+			current: agentStub("alpha", { inputTokens: 100, outputTokens: 20, cost: 0.5 }),
+			agents: [
+				{
+					...agentStub("gamma", { inputTokens: 5, outputTokens: 1, cost: 0.01 }),
+					relationship: "sibling" as const,
+				},
+			],
+		})),
 		getAgent: vi.fn((target: string) => ({ agent: agentStub(target) })),
 		recentMessages: vi.fn((input: { target: string; limit?: number; maxChars?: number }) => ({
 			agent: agentStub(input.target),
@@ -37,7 +47,10 @@ describe("AgentSession agent observe host requests", () => {
 		const controller = createController();
 		const harness = await createHarness({ agentObserveController: controller });
 		try {
-			harness.session.handleAgentObserveHostRequest("agent_observe.list");
+			expect(harness.session.handleAgentObserveHostRequest("agent_observe.list")).toMatchObject({
+				current: { activeSessionId: "alpha", usage: { inputTokens: 100, outputTokens: 20, cost: 0.5 } },
+				agents: [{ sessionId: "session-gamma", usage: { inputTokens: 5, outputTokens: 1, cost: 0.01 } }],
+			});
 			harness.session.handleAgentObserveHostRequest("agent_observe.get", { target: "beta" });
 			harness.session.handleAgentObserveHostRequest("agent_observe.recent", {
 				target: "beta",

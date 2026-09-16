@@ -1,5 +1,6 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AgentFamilyRelationship } from "./agent-messages.js";
+import type { SessionUsageSummary } from "./usage.js";
 
 export const AGENT_OBSERVE_SKILL_NAME = "agent-observe";
 /** Shared cap for the message previews carried by roster rows. */
@@ -22,6 +23,8 @@ export interface AgentObserveAgentSummary {
 	isCompacting: boolean;
 	attachedClients: number;
 	messageCount?: number;
+	/** Own session usage for live sessions; absent for members with no live session in this daemon. */
+	usage?: SessionUsageSummary;
 	queuedCount: number;
 	isSessionActive: boolean;
 	repliedSinceTask?: boolean;

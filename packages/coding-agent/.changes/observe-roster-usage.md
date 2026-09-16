@@ -1,0 +1,1 @@
+- Changed the agent-observe family roster to carry each live member's session usage (input/output tokens and cost) so observing agents can see per-agent spend without attaching.

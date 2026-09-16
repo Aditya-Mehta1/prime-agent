@@ -3581,6 +3581,7 @@ export class AgentDaemon {
 			isCompacting: summary.isCompacting,
 			attachedClients: summary.attachedClients,
 			messageCount: summary.messageCount,
+			...(summary.usage ? { usage: summary.usage } : {}),
 			queuedCount: summary.sessionActions.queuedCount,
 			isSessionActive: summary.isSessionActive,
 			...(summary.parentActiveSessionId ? { parentActiveSessionId: summary.parentActiveSessionId } : {}),
