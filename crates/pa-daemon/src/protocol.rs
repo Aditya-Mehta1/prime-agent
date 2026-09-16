@@ -220,12 +220,39 @@ pub fn default_server_capabilities() -> Vec<DaemonServerCapability> {
                 "rlm_quiescence_barrier",
                 "session_input_pause",
                 "acp_mcp_servers",
+                "agent_roster",
+                "direct_peer_transport",
             ]
             .iter()
             .map(|cap| cap.to_string()),
         )
         .map(|cap| cap.to_string())
         .collect()
+}
+
+/// Parse a client command line the way the TS supervisor does: only
+/// `type: "command"` envelopes are accepted; bare commands fail with the
+/// protocol error, because the supervisor has no pre-envelope clients.
+pub fn parse_supervisor_command_line(
+    line: &str,
+) -> Result<DaemonCommandEnvelope, EnvelopeParseError> {
+    let value: Value = serde_json::from_str(line)
+        .map_err(|e| EnvelopeParseError::Invalid(format!("invalid JSON: {e}")))?;
+    if value.get("type").and_then(Value::as_str) != Some("command") {
+        return Err(EnvelopeParseError::ProtocolTooOld(
+            DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION,
+        ));
+    }
+    parse_daemon_command_line(line)
+}
+
+/// `proc:<start_time>` identity of a process, read from `/proc/<pid>/stat`
+/// (field 22). `None` when the platform has no procfs.
+pub fn process_start_id(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let command_end = stat.rfind(')')?;
+    let start_time = stat[command_end + 2..].split(' ').nth(19)?;
+    (!start_time.is_empty()).then(|| format!("proc:{start_time}"))
 }
 
 /// Port of `createDaemonEventMeta`.

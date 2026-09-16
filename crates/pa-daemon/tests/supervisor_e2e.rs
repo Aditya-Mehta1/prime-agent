@@ -82,6 +82,15 @@ impl Client {
         self.writer.flush().expect("flush");
     }
 
+    fn send_command(&mut self, id: &str, command: serde_json::Value) {
+        self.send(&serde_json::json!({
+            "type": "command",
+            "id": id,
+            "protocol": { "name": "prime-agent.daemon", "version": 7 },
+            "command": command,
+        }));
+    }
+
     fn read_line(&mut self) -> serde_json::Value {
         let mut line = String::new();
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -129,9 +138,65 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
     let _daemon = spawn_daemon(&socket, &agent_dir);
     let (mut client, hello) = Client::connect(&socket);
     assert_eq!(hello["type"], "daemon_hello");
+    // Differential goldens captured from the TS supervisor
+    // (`prime-agent --mode daemon`, protocol 7, schema 28).
+    assert_eq!(
+        hello["protocol"],
+        serde_json::json!({
+            "name": "prime-agent.daemon", "version": 7
+        })
+    );
+    assert_eq!(
+        hello["schemaId"].as_str().map(|v| v.to_string()),
+        Some("protocol-7-schema-28-92bc5368a082".to_string())
+    );
+    assert!(hello["supervisorOwnerToken"].is_string());
+    assert!(hello["supervisorProcessStartId"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("proc:"));
+    assert_eq!(
+        hello["serverCapabilities"],
+        serde_json::json!([
+            "attach_snapshot",
+            "event_sequence",
+            "extension_ui",
+            "slim_attach",
+            "chunked_snapshot",
+            "client_owned_sessions",
+            "delete_rlm_subagent",
+            "heartbeat_catalog",
+            "heartbeat_management",
+            "model_catalog",
+            "side_question_transcript",
+            "transient_bash",
+            "session_input_admission",
+            "prompt_admission_cancellation",
+            "owned_prompt_cancellation",
+            "queue_message_mutation",
+            "authoritative_child_roster",
+            "owned_session_recovery_context",
+            "rlm_quiescence_barrier",
+            "session_input_pause",
+            "acp_mcp_servers",
+            "agent_roster",
+            "direct_peer_transport",
+        ])
+    );
+
+    // Bare commands are rejected exactly like the TS supervisor: the
+    // client-facing protocol requires the command envelope.
+    client.send(&serde_json::json!({ "type": "list", "id": "bare" }));
+    let rejected = client.read_response("bare");
+    assert_eq!(rejected["command"], "parse");
+    assert_eq!(rejected["success"], false);
+    assert_eq!(
+        rejected["error"],
+        "Daemon commands require protocol 7 or newer"
+    );
 
     // Empty list: no live sessions.
-    client.send(&serde_json::json!({ "type": "list", "id": "l1" }));
+    client.send_command("l1", serde_json::json!({ "type": "list" }));
     let list = client.read_response("l1");
     assert_eq!(list["success"], true, "list failed: {list}");
     assert_eq!(list["data"]["sessions"], serde_json::json!([]));
@@ -147,15 +212,17 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
         .to_string(),
     )
     .expect("write script");
-    client.send(&serde_json::json!({
-        "type": "create",
-        "id": "c1",
-        "config": {
-            "cwd": dir.path().to_string_lossy(),
-            "sessionDir": agent_dir.join("sessions").to_string_lossy(),
-            "script": script_path.to_string_lossy(),
-        },
-    }));
+    client.send_command(
+        "c1",
+        serde_json::json!({
+            "type": "create",
+            "config": {
+                "cwd": dir.path().to_string_lossy(),
+                "sessionDir": agent_dir.join("sessions").to_string_lossy(),
+                "script": script_path.to_string_lossy(),
+            },
+        }),
+    );
     let created = client.read_response("c1");
     assert_eq!(created["success"], true, "create failed: {created}");
     let session_id = created["data"]["id"]
@@ -165,15 +232,17 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
         .to_string();
 
     // Attach and stream the first turn.
-    client.send(&serde_json::json!({
-        "type": "attach", "id": "a1", "activeSessionId": session_id,
-    }));
+    client.send_command(
+        "a1",
+        serde_json::json!({ "type": "attach", "activeSessionId": session_id }),
+    );
     let attached = client.read_response("a1");
     assert_eq!(attached["success"], true, "attach failed: {attached}");
 
-    client.send(&serde_json::json!({
-        "type": "prompt", "id": "p1", "activeSessionId": session_id, "message": "hi",
-    }));
+    client.send_command(
+        "p1",
+        serde_json::json!({ "type": "prompt", "activeSessionId": session_id, "message": "hi" }),
+    );
     let prompt_ack = client.read_response("p1");
     assert_eq!(prompt_ack["success"], true, "prompt failed: {prompt_ack}");
 
@@ -205,9 +274,13 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
     assert_eq!(final_text, "hello from scripted");
 
     // The final answer is queryable.
-    client.send(&serde_json::json!({
-        "type": "get_last_assistant_text", "id": "g1", "activeSessionId": session_id,
-    }));
+    client.send_command(
+        "g1",
+        serde_json::json!({
+            "type": "get_last_assistant_text",
+            "activeSessionId": session_id,
+        }),
+    );
     let last = client.read_response("g1");
     assert_eq!(
         last["success"], true,
@@ -216,22 +289,30 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
     assert_eq!(last["data"]["text"], "hello from scripted");
 
     // The session appears in list.
-    client.send(&serde_json::json!({ "type": "list", "id": "l2" }));
+    client.send_command("l2", serde_json::json!({ "type": "list" }));
     let list = client.read_response("l2");
     let sessions = list["data"]["sessions"].as_array().expect("sessions");
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0]["id"], session_id.as_str());
 
     // Second turn of the script replays the next response.
-    client.send(&serde_json::json!({
-        "type": "prompt_and_wait", "id": "p2", "activeSessionId": session_id,
-        "message": "again",
-    }));
+    client.send_command(
+        "p2",
+        serde_json::json!({
+            "type": "prompt_and_wait",
+            "activeSessionId": session_id,
+            "message": "again",
+        }),
+    );
     let done = client.read_response("p2");
     assert_eq!(done["success"], true, "prompt_and_wait failed: {done}");
-    client.send(&serde_json::json!({
-        "type": "get_last_assistant_text", "id": "g2", "activeSessionId": session_id,
-    }));
+    client.send_command(
+        "g2",
+        serde_json::json!({
+            "type": "get_last_assistant_text",
+            "activeSessionId": session_id,
+        }),
+    );
     let last = client.read_response("g2");
     assert_eq!(last["data"]["text"], "second turn");
 }

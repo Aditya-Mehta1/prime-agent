@@ -33,7 +33,7 @@ use crate::lease::is_process_alive;
 use crate::paths;
 use crate::protocol::{
     command_active_session_id, command_type_name, current_protocol_info,
-    default_server_capabilities, parse_daemon_command_line, response_failure, response_line,
+    default_server_capabilities, parse_supervisor_command_line, response_failure, response_line,
     response_success, DaemonResponse, DaemonRuntimeIdentity, DAEMON_APP_VERSION, DAEMON_SCHEMA_ID,
     DAEMON_SCHEMA_REVISION,
 };
@@ -770,8 +770,8 @@ impl Supervisor {
             }),
             supervisor_generation: Some(format!("sup:{}", std::process::id())),
             supervisor_pid: Some(std::process::id() as u64),
-            supervisor_owner_token: None,
-            supervisor_process_start_id: None,
+            supervisor_owner_token: Some(uuid::Uuid::new_v4().to_string()),
+            supervisor_process_start_id: crate::protocol::process_start_id(std::process::id()),
             supervisor_socket_path: Some(self.options.socket_path.to_string_lossy().to_string()),
             client_id: client_id.clone(),
             server_capabilities: default_server_capabilities(),
@@ -843,7 +843,7 @@ impl Supervisor {
         effective_client_id: &mut String,
         attached: &mut Vec<String>,
     ) -> (Vec<Value>, bool) {
-        let envelope = match parse_daemon_command_line(line) {
+        let envelope = match parse_supervisor_command_line(line) {
             Ok(envelope) => envelope,
             Err(error) => {
                 let id = salvage_id(line);
