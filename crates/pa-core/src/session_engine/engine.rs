@@ -14,6 +14,7 @@ use pa_agent::types::{Model, ThinkingLevel};
 use crate::resources::{load_resources, ResourceLoaderOptions};
 use crate::session::manager::SessionManager;
 use crate::skills::PromptTemplate;
+use pa_types::session::FileEntry;
 
 use super::{AgentSession, PromptOptions, PromptOutcome};
 
@@ -122,13 +123,53 @@ pub async fn create_session(config: SessionEngineConfig) -> anyhow::Result<Sessi
         ));
     }
 
+    // sdk.ts `createAgentSession` parity: a session manager that already
+    // holds messages is a resume — the loop starts from the persisted
+    // context. Fresh sessions record the creation prefix (model_change +
+    // thinking_level_change); resumed sessions only record the thinking level
+    // when no earlier entry set it.
+    let (existing_messages, has_thinking_entry) = {
+        let session = wiring.session.lock().await;
+        let messages = super::compact_session::rebuilt_context_after_compaction(&session);
+        let has_thinking_entry = session
+            .get_all_entries()
+            .iter()
+            .any(|entry| matches!(entry, FileEntry::ThinkingLevelChange { .. }));
+        (messages, has_thinking_entry)
+    };
+    let thinking_level = config.thinking_level.unwrap_or(ThinkingLevel::Off);
+    {
+        let mut session = wiring.session.lock().await;
+        if existing_messages.is_empty() {
+            session.append_model_change(&model.provider, &model.id);
+            session.append_thinking_level_change(&format!("{thinking_level:?}").to_lowercase());
+        } else if !has_thinking_entry {
+            session.append_thinking_level_change(&format!("{thinking_level:?}").to_lowercase());
+        }
+    }
+    // The loop consumes agent-side messages; session entries cross through
+    // the shared wire shape (same conversion the compaction rebuild uses).
+    let initial_messages = if existing_messages.is_empty() {
+        None
+    } else {
+        Some(
+            existing_messages
+                .into_iter()
+                .filter_map(|message| {
+                    let value = serde_json::to_value(&message).ok()?;
+                    serde_json::from_value(value).ok()
+                })
+                .collect(),
+        )
+    };
+
     let agent = Agent::new(AgentOptions {
         initial_state: AgentInitialState {
             system_prompt: Some(system_prompt.clone()),
             model: Some(model),
-            thinking_level: config.thinking_level,
+            thinking_level: Some(thinking_level),
             tools: Some(tools),
-            messages: None,
+            messages: initial_messages,
         },
         stream_fn: Some(stream_fn),
         ..Default::default()

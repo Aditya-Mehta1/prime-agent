@@ -5,6 +5,9 @@
 use std::sync::Arc;
 
 use pa_agent::types::Model as AgentModel;
+use pa_core::session::discovery::{
+    find_most_recent_session_for_cwd, resolve_session_path, ResolvedSession, SessionSelectorError,
+};
 use pa_types::ai::Model;
 
 use crate::mode::{AppMode, MissingSubsystem, RunOptions};
@@ -87,7 +90,7 @@ async fn print_mode_main(options: &RunOptions) -> Result<i32, String> {
             cwd: config.cwd.clone(),
             agent_dir: config.agent_dir.clone(),
             model: Some(agent_model),
-            thinking_level: config.thinking.map(map_thinking_level),
+            thinking_level: Some(resolve_thinking_level(config, &model)),
             stream_fn: Some(stream_fn),
             tools: builtin_tools(&config.cwd),
             custom_system_prompt: config.system_prompt.clone(),
@@ -211,20 +214,132 @@ fn select_model(
         .ok_or_else(|| "No matching model found.".to_string())
 }
 
+/// Resolve the session thinking level with the sdk.ts `createAgentSession`
+/// order: the CLI flag, then the settings default, then "medium" — always
+/// clamped to what the model supports.
+fn resolve_thinking_level(
+    config: &crate::mode::RuntimeConfig,
+    model: &Model,
+) -> pa_agent::types::ThinkingLevel {
+    use pa_types::ai::ModelThinkingLevel;
+    let settings = pa_core::settings::SettingsManager::create(&config.cwd, &config.agent_dir);
+    let requested = match config.thinking {
+        Some(level) => level,
+        None => match settings.get_default_thinking_level() {
+            Some(level) => match level {
+                pa_core::settings::ThinkingLevelSetting::Off => ModelThinkingLevel::Off,
+                pa_core::settings::ThinkingLevelSetting::Minimal => ModelThinkingLevel::Minimal,
+                pa_core::settings::ThinkingLevelSetting::Low => ModelThinkingLevel::Low,
+                pa_core::settings::ThinkingLevelSetting::Medium => ModelThinkingLevel::Medium,
+                pa_core::settings::ThinkingLevelSetting::High => ModelThinkingLevel::High,
+                pa_core::settings::ThinkingLevelSetting::Xhigh => ModelThinkingLevel::Xhigh,
+                pa_core::settings::ThinkingLevelSetting::Max => ModelThinkingLevel::Max,
+            },
+            // TS `DEFAULT_THINKING_LEVEL`.
+            None => ModelThinkingLevel::Medium,
+        },
+    };
+    let clamped = pa_ai::models::clamp_thinking_level(model, requested);
+    map_thinking_level(clamped)
+}
+
+/// Build the session manager for a headless run, mirroring the flag order of
+/// TS `createSessionManager` (noSession -> fork -> resume -> continue ->
+/// create). `--no-session` never reaches here: the caller passes `None` to
+/// the engine, which builds the in-memory manager itself.
 fn build_session_manager(
     options: &RunOptions,
 ) -> Result<pa_core::session::manager::SessionManager, String> {
+    use pa_core::session::manager::SessionManager;
     let cwd = options.config.cwd.clone();
-    if options.session.no_session {
-        return Ok(pa_core::session::manager::SessionManager::in_memory(&cwd));
+    if let Some(selector) = &options.session.fork {
+        // TS print mode forks through SessionManager.forkFrom; the Rust port
+        // does not implement fork yet, so fail loudly instead of silently
+        // starting an unrelated fresh session.
+        let _ = selector;
+        return Err("--fork is not supported in print mode yet".to_string());
     }
     let session_dir = options
         .session
         .session_dir
         .clone()
         .unwrap_or_else(|| options.config.agent_dir.join("sessions"));
-    std::fs::create_dir_all(&session_dir).map_err(|error| error.to_string())?;
-    Ok(pa_core::session::manager::SessionManager::in_memory(&cwd))
+    // main.ts `explicitCwdOverride`: with --cwd, the flag's directory wins
+    // over the stored session cwd on resume.
+    let explicit_cwd_override = options.session.cwd_from_flag.then_some(cwd.as_path());
+    if let Some(selector) = &options.session.resume {
+        let resolved =
+            resolve_session_path(selector, &cwd, &session_dir).map_err(render_selector_error)?;
+        return match resolved {
+            ResolvedSession::Path(path) | ResolvedSession::Local(path) => {
+                open_session_file(&path, &session_dir, &cwd, explicit_cwd_override)
+            }
+            ResolvedSession::Global {
+                path: _,
+                cwd: session_cwd,
+            } => {
+                // Print mode has no fork prompt; mirror the TS non-TTY path.
+                Err(format!(
+                    "session {selector} belongs to a different project ({}). Pass --fork {selector} to use it here, or run from that project's directory.",
+                    session_cwd.display()
+                ))
+            }
+        };
+    }
+    if options.session.continue_recent {
+        let most_recent = find_most_recent_session_for_cwd(&session_dir, &cwd);
+        return match most_recent {
+            Some(path) => open_session_file(&path, &session_dir, &cwd, explicit_cwd_override),
+            None => Ok(SessionManager::persisted(&cwd, &session_dir)),
+        };
+    }
+    Ok(SessionManager::persisted(&cwd, &session_dir))
+}
+
+/// Open a session file with the TS `SessionManager.open` cwd semantics: an
+/// explicit `--cwd` override wins, else the header's cwd, falling back to the
+/// process cwd for unreadable or new files. Resumed sessions keep the
+/// missing-cwd guard from main.ts.
+fn open_session_file(
+    path: &std::path::Path,
+    session_dir: &std::path::Path,
+    fallback_cwd: &std::path::Path,
+    explicit_cwd_override: Option<&std::path::Path>,
+) -> Result<pa_core::session::manager::SessionManager, String> {
+    let session_cwd = explicit_cwd_override
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| {
+            let header = pa_core::session::manager::read_session_header(path);
+            header
+                .filter(|header| !header.cwd.is_empty())
+                .map(|header| std::path::PathBuf::from(&header.cwd))
+                .unwrap_or_else(|| fallback_cwd.to_path_buf())
+        });
+    let manager = pa_core::session::manager::SessionManager::open(&session_cwd, session_dir, path);
+    // main.ts getMissingSessionCwdIssue: a session stored against a deleted
+    // directory must not silently continue somewhere else.
+    if !manager.get_cwd().exists() {
+        let session_file = manager
+            .get_session_file()
+            .map(|path| format!("\nSession file: {}", path.display()))
+            .unwrap_or_default();
+        return Err(format!(
+            "Stored session working directory does not exist: {}{session_file}\nCurrent working directory: {}",
+            manager.get_cwd().display(),
+            fallback_cwd.display()
+        ));
+    }
+    Ok(manager)
+}
+
+/// Render a selector failure with the main.ts formatting: the error message
+/// plus the browse hint.
+fn render_selector_error(error: SessionSelectorError) -> String {
+    format!(
+        "{}.{}\nOpen prime-agent and press left-arrow to browse sessions.",
+        error.message(),
+        error.suggestion().unwrap_or_default()
+    )
 }
 
 /// Bridge the loop tools (bash/edit/ipython) into the session.
@@ -373,20 +488,28 @@ async fn faux_print_mode(options: &RunOptions, script: &str) -> Result<i32, Stri
     );
     let model = registration.get_model();
     let agent_model = json_round_trip(&model).ok_or("model conversion failed")?;
-    let stream_fn = real_stream_fn(None, model);
+    let stream_fn = real_stream_fn(None, model.clone());
+    // The faux path shares the session-manager wiring (persist / --no-session
+    // / --resume / --continue) with the real provider path so binary-level
+    // tests can verify persistence without the network.
+    let session_manager = if options.session.no_session {
+        None
+    } else {
+        Some(build_session_manager(options)?)
+    };
     let engine = pa_core::session_engine::engine::create_session(
         pa_core::session_engine::engine::SessionEngineConfig {
             cwd: config.cwd.clone(),
             agent_dir: config.agent_dir.clone(),
             model: Some(agent_model),
-            thinking_level: None,
+            thinking_level: Some(resolve_thinking_level(config, &model)),
             stream_fn: Some(stream_fn),
             tools: builtin_tools(&config.cwd),
             custom_system_prompt: config.system_prompt.clone(),
             prompt_guidelines: config.append_system_prompt.clone(),
             generic_mcp_servers: vec![],
             allow_recursion: None,
-            session_manager: None,
+            session_manager,
             additional_skill_paths: vec![],
             additional_prompt_paths: vec![],
         },

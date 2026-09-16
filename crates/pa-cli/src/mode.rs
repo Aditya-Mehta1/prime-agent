@@ -109,6 +109,10 @@ pub struct SessionOptions {
     pub fork: Option<String>,
     pub no_session: bool,
     pub session_dir: Option<PathBuf>,
+    /// True when `--cwd` selected the working directory; resumed sessions
+    /// then use that directory instead of the header cwd (main.ts
+    /// `explicitCwdOverride`).
+    pub cwd_from_flag: bool,
 }
 
 /// Everything the CLI hands to the runtime, mirroring what `main.ts` computes

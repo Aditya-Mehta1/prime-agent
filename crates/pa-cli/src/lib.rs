@@ -167,7 +167,10 @@ fn main_impl(args: Vec<String>, runtime: &dyn mode::Runtime) -> Result<i32, Stri
         .session_dir
         .as_deref()
         .map(crate::config::expand_tilde_path)
-        .or_else(crate::config::get_session_dir_env_override);
+        .or_else(crate::config::get_session_dir_env_override)
+        // main.ts sessionDir resolution: the cwd-scoped settings manager is
+        // consulted after the flag and env overrides, before the default.
+        .or_else(|| pa_core::settings::SettingsManager::create(&cwd, &agent_dir).get_session_dir());
 
     let mut cli_messages = parsed.messages.clone();
     let initial_message =
@@ -189,6 +192,7 @@ fn main_impl(args: Vec<String>, runtime: &dyn mode::Runtime) -> Result<i32, Stri
             fork: parsed.fork.clone(),
             no_session: parsed.no_session,
             session_dir,
+            cwd_from_flag: parsed.cwd.is_some(),
         },
         messages: cli_messages,
         initial_message,
