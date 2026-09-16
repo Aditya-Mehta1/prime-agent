@@ -11,6 +11,7 @@ import {
 	type AgentsViewPersistentState,
 	createInitialAgentsViewPersistentState,
 	runAgentsViewMode,
+	waitThroughDaemonUpdateRestart,
 } from "../src/modes/agents-view/agents-view-mode.js";
 import * as agentsViewState from "../src/modes/agents-view/agents-view-state.js";
 import {
@@ -19,6 +20,7 @@ import {
 	resolveAgentsViewLeftResult,
 	type UnifiedSessionRecord,
 } from "../src/modes/agents-view/agents-view-state.js";
+import { DaemonUpdateRestartingError } from "../src/modes/daemon/daemon-errors.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import * as savedSessionCatalog from "../src/modes/daemon/saved-session-catalog.js";
 import type { InteractiveModeUiServices } from "../src/modes/interactive/interactive-mode-services.js";
@@ -1628,6 +1630,149 @@ describe("agents view reply delivery on inactive sessions", () => {
 		expect(runAgentsViewCommand).toHaveBeenCalledWith(
 			{ name: "kill", args: "" },
 			expect.objectContaining({ activeSessionId: "active-9" }),
+		);
+	});
+});
+
+describe("agents view open during a daemon update restart", () => {
+	beforeAll(() => setKeybindings(new KeybindingsManager()));
+	beforeEach(() => vi.clearAllMocks());
+
+	it("waits through the preparing-restart rejection and opens once the update finishes", async () => {
+		const saved = summary({
+			id: "update-restart-session",
+			activeSessionId: undefined,
+			lifecycle: "archived",
+			sessionFile: "/tmp/update-restart-session.jsonl",
+			sessionId: "update-restart-session",
+		});
+		let runs = 0;
+		vi.spyOn(AgentsViewMode.prototype, "run").mockImplementation(async function (this: AgentsViewMode) {
+			runs += 1;
+			if (runs === 1) {
+				return { type: "open", summary: saved, hasChildren: false };
+			}
+			// The wait surfaced a retry notice instead of "Failed to open agent".
+			expect(String(Reflect.get(this, "persistentState").statusMessage)).toContain(
+				"Waited for the Prime Agent daemon update restart to finish",
+			);
+			return { type: "exit" };
+		});
+		modeMocks.clientRequest
+			.mockResolvedValueOnce({
+				type: "response",
+				command: "create",
+				success: false,
+				error: "Daemon is preparing an update restart",
+				errorInfo: { code: "update_restarting" },
+			})
+			.mockResolvedValueOnce({
+				type: "response",
+				command: "create",
+				success: true,
+				data: { ...saved, activeSessionId: "resumed-after-update", lifecycle: "live" },
+			});
+		modeMocks.interactiveRun.mockResolvedValue({
+			type: "agents_view",
+			source: {
+				activeSessionId: "resumed-after-update",
+				sessionId: saved.sessionId,
+				cwd: saved.cwd,
+			},
+		} as never);
+
+		await runAgentsViewMode({
+			config: { cwd: process.cwd() },
+			socketPath: "/tmp/agents-view-test.sock",
+			uiServices: createUiServices(),
+		});
+
+		// One rejected create during the preparing-restart window, one retried
+		// create after it: the open wait is the only extra request.
+		expect(modeMocks.clientRequest).toHaveBeenCalledTimes(2);
+		expect((modeMocks.clientRequest.mock.calls[0] as unknown as { type: string }[])[0]?.type).toBe("create");
+		expect(modeMocks.interactiveRun).toHaveBeenCalledOnce();
+		expect(runs).toBe(2);
+	});
+
+	it("fails a non-update open error immediately without retrying", async () => {
+		const saved = summary({
+			id: "missing-cwd-session",
+			activeSessionId: undefined,
+			lifecycle: "archived",
+			sessionFile: "/tmp/missing-cwd-session.jsonl",
+			sessionId: "missing-cwd-session",
+		});
+		let runs = 0;
+		vi.spyOn(AgentsViewMode.prototype, "run").mockImplementation(async () => {
+			runs += 1;
+			return runs === 1 ? { type: "open", summary: saved, hasChildren: false } : { type: "exit" };
+		});
+		modeMocks.clientRequest.mockResolvedValue({
+			type: "response",
+			command: "create",
+			success: false,
+			error: "spawn EMFILE",
+		});
+		modeMocks.interactiveRun.mockResolvedValue({ type: "exit" } as never);
+
+		await runAgentsViewMode({
+			config: { cwd: process.cwd() },
+			socketPath: "/tmp/agents-view-test.sock",
+			uiServices: createUiServices(),
+		});
+
+		expect(modeMocks.clientRequest).toHaveBeenCalledTimes(1);
+		expect((modeMocks.clientRequest.mock.calls[0] as unknown as { type: string }[])[0]?.type).toBe("create");
+		expect(modeMocks.interactiveRun).not.toHaveBeenCalled();
+	});
+});
+
+describe("waitThroughDaemonUpdateRestart", () => {
+	beforeEach(() => vi.clearAllMocks());
+
+	it("retries the transient rejection and reports that it waited", async () => {
+		let attempts = 0;
+		const waited: unknown[] = [];
+		const outcome = await waitThroughDaemonUpdateRestart(
+			async () => {
+				attempts += 1;
+				if (attempts === 1) throw new DaemonUpdateRestartingError();
+				if (attempts === 2) throw new Error("Daemon is preparing an update restart");
+				if (attempts === 3) throw new Error("connect ENOENT /tmp/daemon.sock"); // daemon exits for the restart
+				return "opened";
+			},
+			{ waitMs: 5_000, retryMs: 1, onWait: (error) => waited.push(error) },
+		);
+		expect(outcome).toEqual({ result: "opened", waitedForUpdateRestart: true });
+		expect(attempts).toBe(4);
+		expect(waited).toHaveLength(1);
+	});
+
+	it("propagates a non-update failure that arrives before any update-restart signal", async () => {
+		let attempts = 0;
+		await expect(
+			waitThroughDaemonUpdateRestart(
+				async () => {
+					attempts += 1;
+					throw new Error("spawn EMFILE");
+				},
+				{ waitMs: 5_000, retryMs: 1 },
+			),
+		).rejects.toThrow("spawn EMFILE");
+		expect(attempts).toBe(1);
+	});
+
+	it("fails with a bounded, actionable message when the update never finishes", async () => {
+		await expect(
+			waitThroughDaemonUpdateRestart(
+				async () => {
+					throw new Error("Daemon is preparing an update restart");
+				},
+				{ waitMs: 25, retryMs: 10 },
+			),
+		).rejects.toThrow(
+			/The Prime Agent daemon did not finish its update restart within \d+ seconds\. Try opening this agent again once the update finishes\. Last error: Daemon is preparing an update restart/,
 		);
 	});
 });

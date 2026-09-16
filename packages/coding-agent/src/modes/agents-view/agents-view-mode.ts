@@ -29,7 +29,7 @@ import { ensureTool } from "../../utils/tools-manager.js";
 import { DaemonAgentConnection } from "../agent-connection/daemon-agent-connection.js";
 import type { AgentConnectionHeartbeat, AgentConnectionSavedSessionInfo } from "../agent-connection/types.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../daemon/daemon-client.js";
-import { DaemonSessionRecoveringError } from "../daemon/daemon-errors.js";
+import { DaemonSessionRecoveringError, isDaemonUpdateRestartingError } from "../daemon/daemon-errors.js";
 import {
 	collectDaemonClientEnv,
 	type DaemonClosingReason,
@@ -316,6 +316,62 @@ interface OpenedAgentsViewSession {
 	connection: DaemonAgentConnection;
 	summary: SessionSummary;
 	cwdFallbackNotice?: string;
+	updateRestartWaitNotice?: string;
+}
+
+/**
+ * Bounded wait budget for an open that arrives while the daemon is preparing
+ * an update restart. Mirrors the update coordinator's worst case (100s
+ * prepare + supervisor stop + 60s successor startup + session restore), the
+ * same budget attached sessions get to reconnect after an update.
+ */
+export const DAEMON_UPDATE_RESTART_OPEN_WAIT_MS = 240_000;
+const DAEMON_UPDATE_RESTART_OPEN_RETRY_MS = 500;
+
+export interface DaemonUpdateRestartWaitResult<T> {
+	result: T;
+	waitedForUpdateRestart: boolean;
+}
+
+/**
+ * Run an open attempt, retrying while the daemon is in the update-restart
+ * transient state instead of failing the open. The first
+ * "preparing an update restart" rejection arms the wait; once armed, transient
+ * failures of the restart itself (socket close while the daemon exits,
+ * connect errors while the successor boots, session-not-restored-yet misses)
+ * stay inside the same bounded loop, because they are all part of the same
+ * normal update restart. A non-update error before any update-restart signal
+ * propagates unchanged; once the budget runs out the open fails with a clear
+ * actionable message that includes the last error.
+ */
+export async function waitThroughDaemonUpdateRestart<T>(
+	attempt: () => Promise<T>,
+	options: { waitMs?: number; retryMs?: number; onWait?: (error: unknown) => void } = {},
+): Promise<DaemonUpdateRestartWaitResult<T>> {
+	const waitMs = options.waitMs ?? DAEMON_UPDATE_RESTART_OPEN_WAIT_MS;
+	const retryMs = options.retryMs ?? DAEMON_UPDATE_RESTART_OPEN_RETRY_MS;
+	const deadline = Date.now() + waitMs;
+	let sawUpdateRestart = false;
+	while (true) {
+		try {
+			const result = await attempt();
+			return { result, waitedForUpdateRestart: sawUpdateRestart };
+		} catch (error) {
+			if (!sawUpdateRestart) {
+				if (!isDaemonUpdateRestartingError(error)) throw error;
+				sawUpdateRestart = true;
+				options.onWait?.(error);
+			}
+			if (Date.now() + retryMs > deadline) {
+				throw new Error(
+					`The Prime Agent daemon did not finish its update restart within ${Math.round(waitMs / 1000)} seconds. Try opening this agent again once the update finishes. Last error: ${
+						error instanceof Error ? error.message : String(error)
+					}`,
+				);
+			}
+			await new Promise((resolve) => setTimeout(resolve, retryMs));
+		}
+	}
 }
 
 export function resolveAgentsViewOpenCwd(
@@ -478,13 +534,30 @@ async function runAgentsViewLoop(
 
 		let opened: OpenedAgentsViewSession | undefined;
 		try {
-			opened = await openAgentsViewSession(options, result.summary);
+			// An auto-update can fence session opens as "preparing an update
+			// restart" at the exact moment the user hits enter; the restart is a
+			// normal transient state, so wait through it instead of failing.
+			const openedThroughUpdate = await waitThroughDaemonUpdateRestart(
+				() => openAgentsViewSession(options, result.summary),
+				{
+					onWait: (error) => logClientError("Waiting for daemon update restart to finish before opening", error),
+				},
+			);
+			opened = openedThroughUpdate.result;
 			persistentState.backSession = opened.summary;
-			if (opened.cwdFallbackNotice) {
-				persistentState.statusMessage = combineAgentsViewStartupNotices(
-					result.statusMessage,
-					opened.cwdFallbackNotice,
-				);
+			if (openedThroughUpdate.waitedForUpdateRestart) {
+				opened = {
+					...opened,
+					updateRestartWaitNotice:
+						"Waited for the Prime Agent daemon update restart to finish before opening this agent",
+				};
+			}
+			const openStartupNotice = combineAgentsViewStartupNotices(
+				opened.cwdFallbackNotice,
+				opened.updateRestartWaitNotice,
+			);
+			if (openStartupNotice) {
+				persistentState.statusMessage = combineAgentsViewStartupNotices(result.statusMessage, openStartupNotice);
 			}
 			const uiServices = await resolveAgentsViewSessionUiServices(options, opened.summary);
 			const interactiveMode = new InteractiveMode({
@@ -496,7 +569,7 @@ async function runAgentsViewLoop(
 				bindLocalSessionExtensions: false,
 				migratedProviders: options.migratedProviders,
 				modelFallbackMessage: resolveAttachModelFallbackMessage(opened.summary, options.modelFallbackMessage),
-				startupNotice: combineAgentsViewStartupNotices(result.statusMessage, opened.cwdFallbackNotice),
+				startupNotice: combineAgentsViewStartupNotices(result.statusMessage, openStartupNotice),
 				verbose: options.verbose,
 				returnToAgentsView: true,
 				forceFullscreen: true,

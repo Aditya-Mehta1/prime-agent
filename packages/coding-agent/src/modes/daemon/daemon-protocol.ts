@@ -1029,6 +1029,7 @@ export type DaemonErrorInfo =
 	| { code: "session_import_file_not_found"; filePath: string }
 	| { code: "session_already_active"; sessionPath: string; activeSessionId?: string }
 	| { code: "session_recovering"; activeSessionId: string }
+	| { code: "update_restarting" }
 	| { code: "command_result_uncertain"; clientId: DaemonClientId; commandId: DaemonCommandId };
 
 export type DaemonSessionClosedReason = "killed" | "shutdown" | "completed" | "replaced" | "update";

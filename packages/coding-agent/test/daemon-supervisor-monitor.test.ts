@@ -4583,6 +4583,7 @@ describe("daemon worker supervisor monitoring", () => {
 			await prepare;
 			await expect(client.request({ type: "abort", activeSessionId: "missing" })).resolves.toMatchObject({
 				error: "Daemon is preparing an update restart",
+				errorInfo: { code: "update_restarting" },
 			});
 		} finally {
 			client.close();
