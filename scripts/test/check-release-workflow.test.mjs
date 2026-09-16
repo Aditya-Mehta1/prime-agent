@@ -340,7 +340,10 @@ test("word splitting resolves adjacent quoted fragments the way a POSIX shell do
 	assert.deepEqual(words("a '#' b"), [["a", "#", "b"]]);
 	assert.deepEqual(words('a > out 2>&1 <<<"x" >>log'), [["a"]]);
 	assert.deepEqual(words("names+=(\"$name\") x"), [['names+=("$name")', "x"]]);
-	assert.deepEqual(words("case \"$1\" in *.sh) echo a ;; esac"), [["case", "$1", "in", "*.sh"], ["echo", "a"], ["esac"]]);
+	// A one-line `case X in PATTERN)` re-emits the pattern as its own case-pattern command, so the
+	// arm's body is read as its body (review round 8, finding 5).
+	assert.deepEqual(words("case \"$1\" in *.sh) echo a ;; esac"), [["case", "$1", "in"], ["*.sh"], ["echo", "a"], ["esac"]]);
+	assert.deepEqual(splitWords("case \"$1\" in *.sh) echo a ;; esac").commands.map((command) => command.casePattern), [false, true, false, false]);
 	// Expansions are recorded, and substitutions are surfaced for inspection.
 	const [sub] = splitWords("x=$(a | b) `c` <(d) \"$(e)\" $((1 + 2))").commands;
 	assert.deepEqual(sub.substitutions, ["a | b", "c", "d", "e"]);
@@ -2606,4 +2609,218 @@ test("an executor's child is held to the lifecycle rules: corepack, npx, version
 			assert.ok(problems.some((problem) => problem.startsWith(`${path}: job '${jobId}'`) && /runs dependency lifecycle scripts without --ignore-scripts/.test(problem)), `${script} in ${path} ${jobId}:\n${problems.join("\n")}`);
 		}
 	}
+});
+
+// ---------------------------------------------------------------------------------------------
+// Review round 8.
+// ---------------------------------------------------------------------------------------------
+
+test("the workflow-level walk binds only what the workflow's, the job's and the step's env declare (round 8, finding 1)", () => {
+	// The reviewer's case: an allowlisted variable the step never binds. With `env` threaded the
+	// unit tests already refused it (round 7, finding 3); the workflow-level walk never passed
+	// `env`, so every allowlisted name counted as bound and the rule was dead against the real
+	// workflow.
+	const broken = mutate(RELEASE, (text) => appendStep(text, "publish-r2", runStep("Sneak an unbound variable", 'set -euo pipefail\necho "$TAG"')));
+	const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+	assert.ok(problems.some((problem) => problem.includes("'publish-r2'") && /expands \$TAG before this step binds it/.test(problem)), problems.join("\n"));
+	// Every credential-bearing job: a name bound nowhere in the step's env and not assigned in the
+	// step itself is refused, even though another job or step binds it.
+	for (const jobId of ALL_CREDENTIAL_JOBS) {
+		const each = mutate(RELEASE, (text) => appendStep(text, jobId, runStep("Sneak an unbound variable", 'set -euo pipefail\necho "$existing"')));
+		const found = checkWorkflows(reader({ [RELEASE]: each }));
+		assert.ok(found.some((problem) => problem.includes(`'${jobId}'`) && /expands \$existing before this step binds it/.test(problem)), `${jobId}:\n${found.join("\n")}`);
+	}
+	// What the step's env declares is bound, whatever expression fills the value - `inputs:` and
+	// `with:` reach a run block only as values inside `env:`, never as shell names.
+	const stepEnv = mutate(RELEASE, (text) => appendStep(text, "publish-r2", "      - name: Bind it in the step\n        env:\n          BUILD_REF: ${{ inputs.build_ref }}\n        run: |\n          set -euo pipefail\n          echo \"$BUILD_REF\"\n"));
+	assert.deepEqual(checkWorkflows(reader({ [RELEASE]: stepEnv })), []);
+	// What the job's env declares is bound in every one of its steps.
+	const jobEnv = mutate(RELEASE, (text) => appendStep(text, "publish-r2", runStep("Use the job env", 'set -euo pipefail\ntest -n "$PRODUCTION_VERSION"')));
+	assert.deepEqual(checkWorkflows(reader({ [RELEASE]: jobEnv })), []);
+	// The checked-in workflow binds every variable it expands: threading `env` changed nothing there.
+	assert.deepEqual(checkWorkflows(), []);
+});
+
+test("aws s3 cp may download only to a literal /tmp or $RUNNER_TEMP path, never over a verified artifact (round 8, finding 2)", () => {
+	const options = { artifactDirectories: ["artifacts", "manifest"] };
+	const download = (target) => `aws s3 cp "s3://\${R2_BUCKET}/\${key}" ${target} --endpoint-url "$R2_ENDPOINT_URL" --quiet`;
+	// The reviewer's case: a credential job replaces a verified artifact with a download.
+	const evasion = 'aws s3 cp "s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/SHA256SUMS" artifacts/SHA256SUMS --endpoint-url "$R2_ENDPOINT_URL" --quiet';
+	const caught = r2StepReasons("publish-r2", evasion, options);
+	assert.match(caught.reasons.join("\n"), /downloads over a downloaded artifact \(artifacts\/SHA256SUMS\); a download may never replace a file the job uploads as verified/, evasion);
+	// Every other destination the checker cannot pin to the runner's scratch space.
+	for (const target of ['"$file"', '"$name"', "artifacts/../SHA256SUMS", "/home/runner/x", '"$RUNNER"']) {
+		const { reasons } = r2StepReasons("publish-r2", `for file in artifacts/*; do name=$(basename "$file"); ${download(target)}; done`, options);
+		assert.ok(reasons.some((reason) => /downloads (over a downloaded artifact|to .*which is not a literal \/tmp or \$RUNNER_TEMP path)/.test(reason)), `${target}:\n${reasons.join("\n")}`);
+	}
+	// What passes: the literal /tmp and $RUNNER_TEMP forms the checked-in workflow uses, and a
+	// variable the step itself bound to one of them.
+	for (const fine of [
+		'aws s3 cp "s3://${R2_BUCKET}/${key}" /tmp/readback.bin --endpoint-url "$R2_ENDPOINT_URL" --quiet',
+		'aws s3 cp "s3://${R2_BUCKET}/${key}" "$RUNNER_TEMP/readback.bin" --endpoint-url "$R2_ENDPOINT_URL" --quiet',
+		'out=$(mktemp)\naws s3 cp "s3://${R2_BUCKET}/${key}" "$out" --endpoint-url "$R2_ENDPOINT_URL" --quiet',
+		'out=/tmp/readback.bin\naws s3 cp "s3://${R2_BUCKET}/${key}" "$out" --endpoint-url "$R2_ENDPOINT_URL" --quiet',
+	]) {
+		const { reasons } = r2StepReasons("publish-r2", fine, options);
+		assert.deepEqual(reasons.filter((reason) => /downloads/.test(reason)), [], fine);
+	}
+	// s3api get-object writes a local file too: the same destination rule.
+	const getObject = r2StepReasons("publish-r2", 'for file in artifacts/*; do aws s3api get-object --bucket "$R2_BUCKET" --key "$key" artifacts/SHA256SUMS --endpoint-url "$R2_ENDPOINT_URL"; done', options);
+	assert.match(getObject.reasons.join("\n"), /get-object downloads over a downloaded artifact/);
+	const getObjectFine = r2StepReasons("publish-r2", 'aws s3api get-object --bucket "$R2_BUCKET" --key "$key" /tmp/head.json --endpoint-url "$R2_ENDPOINT_URL"', options);
+	assert.deepEqual(getObjectFine.reasons.filter((reason) => /downloads/.test(reason)), []);
+	// In the workflow: the exact evasion, in a step that carries the R2 credential.
+	const broken = mutate(RELEASE, (text) => appendStep(text, "publish-r2", "      - name: Download over an artifact\n        env:\n          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}\n          AWS_DEFAULT_REGION: auto\n          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}\n          R2_BUCKET: ${{ secrets.R2_BUCKET }}\n          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}\n        run: |\n          set -euo pipefail\n          aws s3 cp \"s3://${R2_BUCKET}/releases/v${PRODUCTION_VERSION}/SHA256SUMS\" artifacts/SHA256SUMS --endpoint-url \"$R2_ENDPOINT_URL\" --quiet\n"));
+	const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+	assert.ok(problems.some((problem) => problem.includes("'publish-r2'") && /downloads over a downloaded artifact/.test(problem)), problems.join("\n"));
+});
+
+test("arithmetic expansions no longer hide the command substitutions inside them (round 8, finding 3)", () => {
+	// The reviewer's case: the artifact the loop variable names is executed.
+	const evasion = 'for file in artifacts/*; do x=$(( $($file) )); done';
+	const reasons = credentialStepReasons(evasion, { jobId: "publish-r2", artifactDirectories: ["artifacts"] });
+	assert.match(reasons.join("\n"), /inside a command substitution: the command is a shell expansion the checker cannot resolve: \$file/, evasion);
+	// The parser surfaces the nested substitution; pure arithmetic is still data, not a command.
+	assert.deepEqual(splitWords("x=$(( $($file) ))").commands[0].substitutions, ["$file"]);
+	assert.deepEqual(splitWords("x=$(( $(cat \"$file\") + 1 ))").commands[0].substitutions, ["cat \"$file\""]);
+	assert.deepEqual(splitWords("x=$(( 1 + 2 ))").commands[0].substitutions, []);
+	assert.deepEqual(splitWords("x=$(( $((1 + 2)) + $(date) ))").commands[0].substitutions, ["date"]);
+	// The round-7 shape is unchanged: an ordinary list of substitutions keeps every non-arithmetic one.
+	assert.deepEqual(splitWords('x=$(a | b) `c` <(d) "$(e)" $((1 + 2))').commands[0].substitutions, ["a | b", "c", "d", "e"]);
+	// A nested command the checker can read is held to the rules; pure arithmetic runs nothing.
+	const fine = credentialStepReasons('for file in artifacts/*; do x=$(( $(basename "$file") )); done\ncount=0\ncount=$((count + 1))\ntest "$count" -gt 0', { jobId: "publish-r2", artifactDirectories: ["artifacts"] });
+	assert.deepEqual(fine, []);
+	// In the workflow.
+	const broken = mutate(RELEASE, (text) => appendStep(text, "publish-r2", runStep("Sneak arithmetic", "set -euo pipefail\nfor file in artifacts/*; do x=$(( $($file) )); done")));
+	const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+	assert.ok(problems.some((problem) => problem.includes("'publish-r2'") && /the command is a shell expansion the checker cannot resolve/.test(problem)), problems.join("\n"));
+});
+
+test("a write target is resolved through the step's bindings: redirections and writing coreutils (round 8, finding 4)", () => {
+	const options = { jobId: "publish-beta-r2", artifactDirectories: ["artifacts"] };
+	// The reviewer's case: the loop variable names a verified artifact, and the redirection
+	// overwrites it. Before the fix an expanded target skipped the artifact check entirely.
+	const evasion = 'for file in artifacts/*; do printf malicious > "$file"; done';
+	assert.match(credentialStepReasons(evasion, options).join("\n"), /writes into a downloaded artifact directory, which the job uploads as verified: >\$file/, evasion);
+	// A redirection to a variable provably bound OUTSIDE the artifact directories still passes:
+	// /tmp, $RUNNER_TEMP, mktemp, a literal relative path, and the runner's own files.
+	for (const fine of [
+		'out=/tmp/report.txt\nprintf "%s\\n" x > "$out"',
+		'rewritten="$RUNNER_TEMP/prime-agent.rb"\n: > "$rewritten"\nprintf "%s\\n" y >> "$rewritten"',
+		'out=$(mktemp)\nprintf x > "$out"',
+		'out=notes/report.txt\nprintf x > "$out"',
+		'echo "is_head=true" >> "$GITHUB_OUTPUT"',
+	]) {
+		assert.deepEqual(credentialStepReasons(fine, options).filter((reason) => /writes into a downloaded artifact|cannot prove it stays out|writes outside \/tmp/.test(reason)), [], fine);
+	}
+	// Fail closed: a value the checker cannot pin, one that lands outside /tmp, and one that lands
+	// in the artifact directory through a variable; a literal target also resolves against the
+	// working directory the step has cd-ed into.
+	for (const [script, pattern] of [
+		['name=$(cat /tmp/x)\nprintf y > "$name"', /cannot prove it stays out of the downloaded artifact directories/],
+		['read -r name\nprintf y > "$name"', /cannot prove it stays out of the downloaded artifact directories/],
+		['out=/usr/local/bin/evil\nprintf y > "$out"', /writes outside \/tmp/],
+		['out=artifacts/SHA256SUMS\nprintf y > "$out"', /writes into a downloaded artifact directory/],
+		['cd artifacts && printf y > SHA256SUMS', /writes into a downloaded artifact directory/],
+	]) {
+		assert.match(credentialStepReasons(script, options).join("\n"), pattern, script);
+	}
+	// The writing coreutils are resolved the same way: a loop variable names the artifact directory.
+	for (const script of [
+		'for file in artifacts/*; do cp /tmp/evil "$file"; done',
+		'for file in artifacts/*; do mv /tmp/evil "$file"; done',
+		'for file in artifacts/*; do tee "$file" </dev/null; done',
+		'for file in artifacts/*; do rm -f "$file"; done',
+		'for file in artifacts/*; do chmod +x "$file"; done',
+	]) {
+		assert.match(credentialStepReasons(script, options).join("\n"), /writes into a downloaded artifact directory/, script);
+	}
+	// The tap-bump shape: a variable under $RUNNER_TEMP is provably outside, however deep.
+	assert.deepEqual(credentialStepReasons('workdir="$RUNNER_TEMP/tap"\nmkdir "$workdir"\nformula="$workdir/Formula/prime-agent.rb"\nmv /tmp/rewritten "$formula"', { ...options, jobId: "tap-bump" }), []);
+	// A writing coreutils target the checker cannot pin is NOT proved to be an artifact; a
+	// REDIRECTION to one is refused outright above.
+	assert.deepEqual(credentialStepReasons('name=$(cat /tmp/x)\nrm -f -- "$name"', options), []);
+	// In the workflow.
+	const broken = mutate(RELEASE, (text) => appendStep(text, "publish-beta-r2", runStep("Overwrite an artifact", 'set -euo pipefail\nfor file in artifacts/*; do printf malicious > "$file"; done')));
+	const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+	assert.ok(problems.some((problem) => problem.includes("'publish-beta-r2'") && /writes into a downloaded artifact directory/.test(problem)), problems.join("\n"));
+});
+
+test("a case arm that calls a defined function which skips the item counts as a skip (round 8, finding 5)", () => {
+	// The reviewer's case: the arm's body is a function call, and the function continues the loop.
+	const evasion = 'skip_bundle() {\n  continue\n}\nfor file in artifacts/*; do\n  name=$(basename "$file")\n  case "$name" in\n    SHA256SUMS.sigstore.json) skip_bundle ;;\n  esac\n  echo upload "$name"\ndone';
+	assert.deepEqual(caseSkipPatternsOf(evasion), ["SHA256SUMS.sigstore.json"], evasion);
+	assert.equal(casePatternMatches(evasion, BETA_SIGNATURES.bundle), true);
+	// Every control-flow word a function may hide, in both definition forms and transitively.
+	for (const [label, define] of [
+		["continue", "skip_bundle() {\n  continue\n}"],
+		["break", "skip_bundle() {\n  break\n}"],
+		["exit", "function skip_bundle {\n  exit 1\n}"],
+		["return", "function skip_bundle {\n  return 1\n}"],
+		["a transitive call", "skip_bundle() {\n  helper\n}\nhelper() {\n  continue\n}"],
+		["a call cycle", "skip_bundle() {\n  helper\n}\nhelper() {\n  skip_bundle\n  continue\n}"],
+		["an effect inside a command substitution", "skip_bundle() {\n  out=$(continue)\n}"],
+	]) {
+		const script = `${define}\nfor file in artifacts/*; do\n  case "$(basename "$file")" in\n    *) skip_bundle ;;\n  esac\n  echo upload\ndone`;
+		assert.equal(casePatternMatches(script, BETA_SIGNATURES.bundle), true, `${label}:\n${script}`);
+		assert.deepEqual(caseSkipPatternsOf(script), ["*"], `${label}:\n${script}`);
+	}
+	// A function that only echoes skips nothing; an undefined name cannot (and is an allowlist error).
+	const harmless = 'note() { echo skip; }\nfor file in artifacts/*; do\n  case "$(basename "$file")" in\n    *) note ;;\n  esac\n  echo upload\ndone';
+	assert.deepEqual(caseSkipPatternsOf(harmless), []);
+	assert.equal(casePatternMatches(harmless, BETA_SIGNATURES.bundle), false);
+	// The direct word inside the arm's own body still counts, and a case written on ONE line is
+	// parsed into the same pattern and body commands as a multi-line one (the pattern is re-emitted
+	// as a case pattern, `do` prefix included).
+	for (const script of [
+		'for f in x; do case "$f" in SHA256SUMS.sigstore.json) continue ;; esac; done',
+		'skip_bundle() { continue; }\nfor f in x; do case "$f" in beta|beta.json) continue ;; SHA256SUMS.sigstore.json) skip_bundle ;; esac; done',
+		'skip_bundle() { continue; }\ncase "$name" in SHA256SUMS.sigstore.json) skip_bundle ;; esac',
+	]) {
+		assert.equal(casePatternMatches(script, BETA_SIGNATURES.bundle), true, script);
+	}
+	assert.deepEqual(caseSkipPatternsOf('skip_bundle() { continue; }\ncase "$name" in beta|beta.json) continue ;; SHA256SUMS.sigstore.json) skip_bundle ;; esac'), ["beta", "beta.json", "SHA256SUMS.sigstore.json"]);
+	// In the workflow: the beta upload loop cannot skip the bundle through a defined function.
+	const broken = mutate(RELEASE, (text) => text.replace(
+		"          for file in artifacts/*; do\n            name=$(basename \"$file\")\n            case \"$name\" in\n              beta|beta.json) continue ;;\n            esac",
+		"          skip_bundle() {\n            continue\n          }\n          for file in artifacts/*; do\n            name=$(basename \"$file\")\n            case \"$name\" in\n              beta|beta.json) continue ;;\n              SHA256SUMS.sigstore.json) skip_bundle ;;\n            esac",
+	));
+	const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+	assert.ok(problems.some((problem) => /skips SHA256SUMS\.sigstore\.json/.test(problem)), problems.join("\n"));
+});
+
+test("case patterns are read with POSIX character classes and negations, as bash reads them (round 8, finding 6)", () => {
+	const skip = (pattern) => `case "$name" in\n  ${pattern}) continue ;;\nesac`;
+	// The reviewer's case: globToRegExp stopped at the first `]`, so the class never matched the
+	// bundle name - and bash's upload loop silently skipped it.
+	const evasion = "[[:upper:]]HA256SUMS.sigstore.json";
+	assert.equal(casePatternMatches(skip(evasion), BETA_SIGNATURES.bundle), true, evasion);
+	assert.deepEqual(caseSkipPatternsOf(skip(evasion)), [evasion]);
+	// Classes, negations, unions, ranges and members.
+	for (const [pattern, want] of [
+		["[[:upper:]]HA256SUMS.sigstore.json", true],
+		["[!s]HA256SUMS.sigstore.json", true],
+		["[^s]HA256SUMS.sigstore.json", true],
+		["[![:lower:]]HA256SUMS.sigstore.json", true],
+		["[![:digit:]]HA256SUMS.sigstore.json", true],
+		["[[:upper:][:digit:]]HA256SUMS.sigstore.json", true],
+		["SHA[[:digit:]]56SUMS.sigstore.json", true],
+		["[S]HA256SUMS.sigstore.json", true],
+		["[[:lower:]]HA256SUMS.sigstore.json", false],
+		["[[:digit:]]HA256SUMS.sigstore.json", false],
+		["[[:xdigit:]]HA256SUMS.sigstore.json", false],
+		["[a-z!]HA256SUMS.sigstore.json", false],
+		["[[:upper:]]sha256sums.sigstore.json", false],
+		// An unreadable class matches EVERYTHING (fail closed); an unterminated `[`, and a leading
+		// `]`, are the literals bash reads.
+		["[[:unknownclass:]]*", true],
+		["[a[b", false],
+		["[]HA256SUMS.sigstore.json", false],
+	]) {
+		assert.equal(casePatternMatches(skip(pattern), BETA_SIGNATURES.bundle), want, pattern);
+	}
+	// In the workflow: the beta upload loop cannot skip the bundle behind a character class.
+	const broken = mutate(RELEASE, (text) => text.replace("              beta|beta.json) continue ;;\n", "              beta|beta.json) continue ;;\n              [[:upper:]]HA256SUMS.sigstore.json) continue ;;\n"));
+	const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+	assert.ok(problems.some((problem) => /skips SHA256SUMS\.sigstore\.json/.test(problem)), problems.join("\n"));
 });
