@@ -260,6 +260,24 @@ impl GoalDriver {
         None
     }
 
+    /// Complete the goal (host `goal.complete()`).
+    pub fn complete(&mut self, session: &mut SessionManager) {
+        if self.state.objective.is_none() || self.state.status == GoalStatus::Idle {
+            return;
+        }
+        let goal = self.with_accounted_wall_clock();
+        self.set_state(
+            session,
+            GoalState {
+                active: false,
+                status: GoalStatus::Complete,
+                last_reason: Some("Goal achieved".to_string()),
+                last_error: None,
+                ..goal
+            },
+        );
+    }
+
     /// Terminal-assistant handling: `aborted` keeps the goal, `error` fails it.
     pub fn finish_for_terminal_message(
         &mut self,
