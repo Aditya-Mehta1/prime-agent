@@ -2109,6 +2109,16 @@ prime_agent_release_signer_oidc_issuer='https://token.actions.githubusercontent.
 prime_agent_verify_release_inventory() {
 	inventory_path="$1"
 	inventory_url_base="$2"
+	# Test feeds (npm-12 smoke, the benchmark harness, release-format fixtures) cannot mint a real
+	# cosign bundle - only the release workflow's OIDC identity can. They already run under
+	# PRIME_AGENT_ALLOW_INSECURE_HTTP_FOR_TESTS, the strictly-test-mode flag that permits loopback
+	# http feeds; production never sets it. Signature verification may be skipped only when BOTH
+	# flags are set, and the skip is announced on stderr. Every other path - including every
+	# production install - downloads the bundle and verifies it (or fails).
+	if [ "${PRIME_AGENT_ALLOW_INSECURE_HTTP_FOR_TESTS:-0}" = 1 ] && [ "${PRIME_AGENT_SKIP_SIGNATURE_FOR_TESTS:-0}" = 1 ]; then
+		printf 'TEST MODE: release signature verification skipped (PRIME_AGENT_SKIP_SIGNATURE_FOR_TESTS=1).\n' >&2
+		return 0
+	fi
 	inventory_bundle="$inventory_path.sigstore.json"
 	if ! prime_agent_curl_download -fsSL --connect-timeout 10 --max-time 120 "$inventory_url_base/SHA256SUMS.sigstore.json" -o "$inventory_bundle"; then
 		printf 'error: the release signature (SHA256SUMS.sigstore.json) could not be downloaded. Refusing to install an unsigned inventory.\n' >&2
