@@ -754,7 +754,9 @@ describe("InteractiveMode prompt stash", () => {
 		else first.resolve();
 		await firstSubmission;
 
-		if (firstError) expect(mode.showError).toHaveBeenCalledWith(firstError);
+		// The prompt-failure capture already reported it with input
+		// correlation; the display leg must not report it a second time.
+		if (firstError) expect(mode.showError).toHaveBeenCalledWith(firstError, false);
 		if (newer === "draft and stash") {
 			expect(mode.editor.getText()).toBe("newer editor draft");
 			expect(mode.promptStash).toBe(newerStash);
@@ -788,7 +790,7 @@ describe("InteractiveMode prompt stash", () => {
 			await firstSubmission;
 
 			expect(mode.editor.getText()).toBe(newerInput === "typing" ? "newer input" : "");
-			expect(mode.showError).toHaveBeenCalledWith("late follow-up rejection");
+			expect(mode.showError).toHaveBeenCalledWith("late follow-up rejection", false);
 		},
 	);
 
@@ -812,7 +814,7 @@ describe("InteractiveMode prompt stash", () => {
 			queueIfBusy: true,
 			images: [],
 		});
-		expect(mode.showError).toHaveBeenCalledWith("send failed");
+		expect(mode.showError).toHaveBeenCalledWith("send failed", false);
 		expect(mode.editor.getText()).toBe("quick follow-up");
 		expect(mode.promptStash?.text).toBe("half-written draft");
 	});

@@ -2151,10 +2151,10 @@ export class InteractiveMode {
 
 		// One sequence for every first launch. Signing in is instant when a Prime
 		// CLI token is already on disk, so users who arrive with credentials still
-		// reach the same account, provider and trace questions. The splash covers
-		// the whole screen, so the login panel must render as an overlay above it
-		// instead of inline behind it.
-		const authResult = await this.createAuthFlows({ overlay: true }).runPrimeInferenceLogin();
+		// reach the same account, provider and trace questions. The login and the
+		// questions after it mount inside the onboarding surface, so the flows are
+		// the inline ones rather than overlays.
+		const authResult = await this.createAuthFlows().runPrimeInferenceLogin();
 		if (abort.signal.aborted || authResult.status !== "success") {
 			this.onboardingExitOutcome = authResult.status === "failed" ? "failed" : "canceled";
 			splash.dismiss();
