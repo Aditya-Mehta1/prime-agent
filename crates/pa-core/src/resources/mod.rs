@@ -1,8 +1,10 @@
 //! Project context files (AGENTS.md/CLAUDE.md discovery) and the resource
 //! loader. Port of core/resource-loader.ts, scoped to the session engine's
-//! needs: skills, prompt templates, agents files, and system-prompt sources.
-//! Extensions (JS plugins) and package-manager resolution are a seam — they
-//! surface as extra skill/prompt paths; themes live in pa-tui.
+//! needs: skills, prompt templates, agents files, and system-prompt sources,
+//! resolved from configured packages, settings, auto-discovery, and bundled
+//! skills through the package manager. The extension *runner* (loading and
+//! executing extension modules) is a downstream seam; theme loading lives
+//! in pa-tui.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -68,12 +70,14 @@ pub fn load_project_context_files(cwd: &Path, agent_dir: &Path) -> Vec<ContextFi
     context_files
 }
 
-/// Extra resource paths contributed by extensions (loader seam).
-#[derive(Debug, Default, Clone)]
-pub struct ResourceExtensionPaths {
-    pub skill_paths: Vec<String>,
-    pub prompt_paths: Vec<String>,
-}
+// Session resource resolution (package-manager `resolve()` + CLI extension
+// sources) feeds the loader below.
+pub(crate) mod resolution;
+
+use anyhow::Result;
+
+use crate::packages::BundledSkillsDir;
+use crate::settings::SettingsManager;
 
 /// Loaded resources for a session.
 #[derive(Debug, Default)]
@@ -84,14 +88,25 @@ pub struct LoadedResources {
     pub agents_files: Vec<ContextFile>,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Vec<String>,
+    /// Enabled extension entry points, in precedence order (the extension
+    /// runner consumes these; it is not part of this lane's surface).
+    pub extension_paths: Vec<String>,
 }
 
-/// Resource loading options (mirrors the TS DefaultResourceLoaderOptions,
-/// minus extension/theme machinery).
-#[derive(Debug, Default)]
+/// Resource loading options (the TS DefaultResourceLoaderOptions surface,
+/// minus the extension-runner/theme machinery).
+#[derive(Default)]
 pub struct ResourceLoaderOptions {
     pub cwd: PathBuf,
     pub agent_dir: PathBuf,
+    /// Settings manager for package resolution; loaded from disk when `None`.
+    pub settings: Option<SettingsManager>,
+    /// Built-in skills directory (default: the packaged layout).
+    pub bundled_skills_dir: BundledSkillsDir,
+    /// CLI extension sources resolved in the temporary scope.
+    pub additional_extension_sources: Vec<String>,
+    /// Extra force-exclude patterns for built-in skills.
+    pub extra_builtin_skill_overrides: Vec<String>,
     pub additional_skill_paths: Vec<String>,
     pub additional_prompt_paths: Vec<String>,
     pub no_skills: bool,
@@ -101,33 +116,36 @@ pub struct ResourceLoaderOptions {
     pub append_system_prompt: Vec<String>,
 }
 
-/// Load all session resources from disk. The settings-driven package
-/// resolution (npm:/git: sources) is not ported yet; explicit paths and the
-/// default user/project directories are.
-pub fn load_resources(options: &ResourceLoaderOptions) -> LoadedResources {
-    let mut resources = LoadedResources::default();
+impl ResourceLoaderOptions {
+    /// Options with just the working directories set.
+    pub fn new(cwd: impl Into<PathBuf>, agent_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            cwd: cwd.into(),
+            agent_dir: agent_dir.into(),
+            ..Default::default()
+        }
+    }
+}
 
-    // Skills: explicit paths + the default user/project skills dirs (the
-    // package-manager resolution step contributes these in TS).
-    let default_dirs: Vec<String> = if options.no_skills {
-        Vec::new()
-    } else {
-        vec![
-            options
-                .agent_dir
-                .join("skills")
-                .to_string_lossy()
-                .to_string(),
-            options
-                .cwd
-                .join(crate::skills::loader::CONFIG_DIR_NAME)
-                .join("skills")
-                .to_string_lossy()
-                .to_string(),
-        ]
+/// Load all session resources: package-manager resolution (configured
+/// packages, settings arrays, auto-discovery, bundled skills) feeds the
+/// enabled skill and prompt paths; CLI extension sources resolve in the
+/// temporary scope.
+pub fn load_resources(mut options: ResourceLoaderOptions) -> Result<LoadedResources> {
+    let settings = options
+        .settings
+        .take()
+        .unwrap_or_else(|| SettingsManager::create(&options.cwd, &options.agent_dir));
+    let resolution = resolution::resolve_session_resources(&options, settings)?;
+
+    let mut resources = LoadedResources {
+        extension_paths: resolution.extension_paths.clone(),
+        ..Default::default()
     };
-    let skill_paths = merge_paths(&options.additional_skill_paths, &default_dirs);
-    let skills_result = if options.no_skills && skill_paths.is_empty() {
+
+    // Skills: CLI paths + additional paths first, then resolved paths in
+    // precedence order; name collisions resolve first-wins in load order.
+    let skills_result = if options.no_skills && resolution.skill_paths.is_empty() {
         crate::skills::LoadSkillsResult {
             skills: Vec::new(),
             diagnostics: Vec::new(),
@@ -136,12 +154,27 @@ pub fn load_resources(options: &ResourceLoaderOptions) -> LoadedResources {
         load_skills(&LoadSkillsOptions {
             cwd: options.cwd.clone(),
             agent_dir: options.agent_dir.clone(),
-            skill_paths,
+            skill_paths: resolution.skill_paths.clone(),
             include_defaults: false,
         })
     };
-    resources.skills = skills_result.skills;
+    resources.skills = skills_result
+        .skills
+        .into_iter()
+        .map(|mut skill| {
+            if let Some(source_info) =
+                resolution::find_source_info(&resolution.source_infos, &skill.file_path)
+            {
+                skill.source_info = source_info;
+            }
+            skill
+        })
+        .collect();
     resources.skill_diagnostics = skills_result.diagnostics;
+    // Resolution-time warnings (e.g. missing bundled skills directory).
+    resources
+        .skill_diagnostics
+        .extend(resolution.resolved.diagnostics.clone());
     for path in &options.additional_skill_paths {
         if is_local_path(path)
             && !Path::new(path).exists()
@@ -157,36 +190,28 @@ pub fn load_resources(options: &ResourceLoaderOptions) -> LoadedResources {
         }
     }
 
-    // Prompt templates: explicit paths + the default prompt dirs.
-    let default_prompt_dirs: Vec<String> = if options.no_prompt_templates {
-        Vec::new()
-    } else {
-        vec![
-            options
-                .agent_dir
-                .join("prompts")
-                .to_string_lossy()
-                .to_string(),
-            options
-                .cwd
-                .join(crate::skills::loader::CONFIG_DIR_NAME)
-                .join("prompts")
-                .to_string_lossy()
-                .to_string(),
-        ]
-    };
-    let prompt_paths = merge_paths(&options.additional_prompt_paths, &default_prompt_dirs);
-    let all_prompts = if options.no_prompt_templates && prompt_paths.is_empty() {
+    // Prompt templates: CLI paths + resolved paths, then additional paths.
+    let all_prompts = if options.no_prompt_templates && resolution.prompt_paths.is_empty() {
         Vec::new()
     } else {
         load_prompt_templates(&LoadPromptTemplatesOptions {
             cwd: options.cwd.clone(),
             agent_dir: options.agent_dir.clone(),
-            prompt_paths,
+            prompt_paths: resolution.prompt_paths.clone(),
             include_defaults: false,
         })
     };
-    resources.prompts = dedupe_prompts(all_prompts);
+    resources.prompts = dedupe_prompts(all_prompts)
+        .into_iter()
+        .map(|mut prompt| {
+            if let Some(source_info) =
+                resolution::find_source_info(&resolution.source_infos, Path::new(&prompt.file_path))
+            {
+                prompt.source_info = source_info;
+            }
+            prompt
+        })
+        .collect();
     for path in &options.additional_prompt_paths {
         if is_local_path(path) && !Path::new(path).exists() {
             resources.skill_diagnostics.push(ResourceDiagnostic::Error {
@@ -222,7 +247,7 @@ pub fn load_resources(options: &ResourceLoaderOptions) -> LoadedResources {
         .filter_map(|source| resolve_prompt_input(source))
         .collect();
 
-    resources
+    Ok(resources)
 }
 
 fn diagnostics_path(diagnostic: &ResourceDiagnostic) -> Option<String> {
@@ -249,17 +274,6 @@ fn is_local_path(path: &str) -> bool {
         || trimmed.starts_with("https://"))
 }
 
-fn merge_paths(primary: &[String], additional: &[String]) -> Vec<String> {
-    let mut merged = Vec::new();
-    let mut seen = HashSet::new();
-    for path in primary.iter().chain(additional) {
-        if seen.insert(path.clone()) {
-            merged.push(path.clone());
-        }
-    }
-    merged
-}
-
 /// Later same-name templates win? No: TS dedupe keeps the FIRST of each name.
 fn dedupe_prompts(prompts: Vec<PromptTemplate>) -> Vec<PromptTemplate> {
     let mut seen = HashSet::new();
@@ -274,9 +288,7 @@ fn dedupe_prompts(prompts: Vec<PromptTemplate>) -> Vec<PromptTemplate> {
 
 /// cwd/{CONFIG_DIR_NAME}/SYSTEM.md then agentDir/SYSTEM.md.
 pub fn discover_system_prompt_file(cwd: &Path, agent_dir: &Path) -> Option<PathBuf> {
-    let project = cwd
-        .join(crate::skills::loader::CONFIG_DIR_NAME)
-        .join("SYSTEM.md");
+    let project = cwd.join(crate::settings::CONFIG_DIR_NAME).join("SYSTEM.md");
     if project.exists() {
         return Some(project);
     }
@@ -290,7 +302,7 @@ pub fn discover_system_prompt_file(cwd: &Path, agent_dir: &Path) -> Option<PathB
 /// cwd/{CONFIG_DIR_NAME}/APPEND_SYSTEM.md then agentDir/APPEND_SYSTEM.md.
 pub fn discover_append_system_prompt_file(cwd: &Path, agent_dir: &Path) -> Option<PathBuf> {
     let project = cwd
-        .join(crate::skills::loader::CONFIG_DIR_NAME)
+        .join(crate::settings::CONFIG_DIR_NAME)
         .join("APPEND_SYSTEM.md");
     if project.exists() {
         return Some(project);
@@ -327,10 +339,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let agent_dir = tmp.path().join("agent");
         let project = tmp.path().join("proj");
-        fs::create_dir_all(agent_dir.join(".prime")).unwrap();
-        fs::create_dir_all(project.join(".prime")).unwrap();
-        fs::write(agent_dir.join(".prime").join("SYSTEM.md"), "global system").unwrap();
-        fs::write(project.join(".prime").join("SYSTEM.md"), "project system").unwrap();
+        fs::create_dir_all(agent_dir.join(".prime").join("agent")).unwrap();
+        fs::create_dir_all(project.join(".prime").join("agent")).unwrap();
+        fs::write(
+            agent_dir.join(".prime").join("agent").join("SYSTEM.md"),
+            "global system",
+        )
+        .unwrap();
+        fs::write(
+            project.join(".prime").join("agent").join("SYSTEM.md"),
+            "project system",
+        )
+        .unwrap();
         let found = discover_system_prompt_file(&project, &agent_dir).unwrap();
         assert!(found.to_string_lossy().contains("proj"));
         // Content resolution reads the file.
@@ -346,32 +366,133 @@ mod tests {
         let agent_dir = tmp.path().join("agent");
         let cwd = tmp.path().join("proj");
         fs::create_dir_all(agent_dir.join("skills").join("alpha")).unwrap();
-        fs::create_dir_all(cwd.join(".prime").join("prompts")).unwrap();
+        fs::create_dir_all(cwd.join(".prime").join("agent").join("prompts")).unwrap();
         fs::create_dir_all(&cwd).unwrap();
         fs::write(
             agent_dir.join("skills").join("alpha").join("SKILL.md"),
             "---\nname: alpha\ndescription: Alpha skill\n---\nbody",
         )
         .unwrap();
-        fs::write(cwd.join(".prime").join("prompts").join("fix.md"), "Fix $1").unwrap();
+        fs::write(
+            cwd.join(".prime")
+                .join("agent")
+                .join("prompts")
+                .join("fix.md"),
+            "Fix $1",
+        )
+        .unwrap();
         fs::write(cwd.join("AGENTS.md"), "Project rules").unwrap();
-        fs::write(cwd.join(".prime").join("SYSTEM.md"), "custom system").unwrap();
-        let resources = load_resources(&ResourceLoaderOptions {
+        fs::write(
+            cwd.join(".prime").join("agent").join("SYSTEM.md"),
+            "custom system",
+        )
+        .unwrap();
+        let resources = load_resources(ResourceLoaderOptions {
             cwd: cwd.clone(),
             agent_dir: agent_dir.clone(),
-            additional_skill_paths: vec![],
-            additional_prompt_paths: vec![],
-            no_skills: false,
-            no_prompt_templates: false,
-            no_context_files: false,
-            system_prompt: None,
-            append_system_prompt: vec![],
-        });
+            ..Default::default()
+        })
+        .unwrap();
         assert!(resources.skills.iter().any(|s| s.name == "alpha"));
         assert!(resources.prompts.iter().any(|p| p.name == "fix"));
         assert_eq!(resources.agents_files.len(), 1);
         assert_eq!(resources.agents_files[0].content, "Project rules");
         assert_eq!(resources.system_prompt.as_deref(), Some("custom system"));
         assert!(resources.append_system_prompt.is_empty());
+    }
+
+    #[test]
+    fn package_provided_skills_and_prompts_load_into_a_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let cwd = tmp.path().join("proj");
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        // A local package with a skill and a prompt.
+        let pkg = tmp.path().join("fixture-pkg");
+        fs::create_dir_all(pkg.join("skills").join("pack-skill")).unwrap();
+        fs::create_dir_all(pkg.join("prompts")).unwrap();
+        fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"fixture-pkg","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        fs::write(
+            pkg.join("skills").join("pack-skill").join("SKILL.md"),
+            "---\nname: pack-skill\ndescription: From the package\n---\nBody",
+        )
+        .unwrap();
+        fs::write(pkg.join("prompts").join("fix.md"), "Fix $1").unwrap();
+        fs::write(
+            agent_dir.join("settings.json"),
+            serde_json::json!({"packages": ["../fixture-pkg"]}).to_string(),
+        )
+        .unwrap();
+
+        let resources = load_resources(ResourceLoaderOptions::new(&cwd, &agent_dir)).unwrap();
+        let skill = resources
+            .skills
+            .iter()
+            .find(|skill| skill.name == "pack-skill")
+            .expect("package skill loaded");
+        assert_eq!(skill.source_info.source, "../fixture-pkg");
+        assert_eq!(
+            skill.source_info.origin,
+            crate::skills::SourceOrigin::Package
+        );
+        let prompt = resources
+            .prompts
+            .iter()
+            .find(|prompt| prompt.name == "fix")
+            .expect("package prompt loaded");
+        assert_eq!(prompt.source_info.source, "../fixture-pkg");
+    }
+
+    #[test]
+    fn project_auto_skills_win_name_collisions_over_user_auto() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let cwd = tmp.path().join("proj");
+        fs::create_dir_all(agent_dir.join("skills").join("alpha")).unwrap();
+        fs::create_dir_all(
+            cwd.join(".prime")
+                .join("agent")
+                .join("skills")
+                .join("alpha"),
+        )
+        .unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        fs::write(
+            agent_dir.join("skills").join("alpha").join("SKILL.md"),
+            "---\nname: alpha\ndescription: User alpha\n---\nBody",
+        )
+        .unwrap();
+        fs::write(
+            cwd.join(".prime")
+                .join("agent")
+                .join("skills")
+                .join("alpha")
+                .join("SKILL.md"),
+            "---\nname: alpha\ndescription: Project alpha\n---\nBody",
+        )
+        .unwrap();
+
+        let resources = load_resources(ResourceLoaderOptions::new(&cwd, &agent_dir)).unwrap();
+        let alpha: Vec<_> = resources
+            .skills
+            .iter()
+            .filter(|skill| skill.name == "alpha")
+            .collect();
+        assert_eq!(alpha.len(), 1, "same name resolves to one skill");
+        assert_eq!(alpha[0].description, "Project alpha");
+        assert_eq!(
+            alpha[0].source_info.scope,
+            crate::skills::SourceScope::Project
+        );
+        // The loser surfaces as a collision diagnostic.
+        assert!(resources
+            .skill_diagnostics
+            .iter()
+            .any(|d| matches!(d, ResourceDiagnostic::Collision { .. })));
     }
 }

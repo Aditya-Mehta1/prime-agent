@@ -115,6 +115,7 @@ impl AgentSessionEngine {
             session_manager: Some(session_manager),
             additional_skill_paths: vec![],
             additional_prompt_paths: vec![],
+            extra_builtin_skill_overrides: vec![],
         })
         .await
     }

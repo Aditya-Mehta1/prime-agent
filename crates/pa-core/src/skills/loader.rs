@@ -24,7 +24,7 @@ pub struct LoadSkillsResult {
 }
 
 /// Agent-side config dir name (TS CONFIG_DIR_NAME).
-pub const CONFIG_DIR_NAME: &str = ".prime";
+pub const CONFIG_DIR_NAME: &str = ".prime/agent";
 
 fn normalize_path(input: &str) -> PathBuf {
     let trimmed = input.trim();
@@ -249,7 +249,7 @@ mod tests {
         write_skill(&agent_dir.join("skills"), "alpha", "user alpha");
         write_skill(&agent_dir.join("skills"), "beta", "user beta");
         write_skill(
-            &project.join(".prime").join("skills"),
+            &project.join(".prime").join("agent").join("skills"),
             "beta",
             "project beta",
         );

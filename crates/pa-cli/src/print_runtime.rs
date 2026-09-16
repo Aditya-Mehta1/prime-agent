@@ -126,6 +126,7 @@ async fn print_mode_main(options: &RunOptions) -> Result<i32, String> {
                 .iter()
                 .map(|path| path.display().to_string())
                 .collect(),
+            extra_builtin_skill_overrides: vec![],
         },
     )
     .await
@@ -462,20 +463,52 @@ async fn faux_print_mode(options: &RunOptions, script: &str) -> Result<i32, Stri
     let config = &options.config;
     let script: serde_json::Value = serde_json::from_str(script)
         .map_err(|error| format!("invalid PRIME_AGENT_FAUX_SCRIPT: {error}"))?;
-    let responses: Vec<String> = script
+    // Response entries: a plain string (or `{"text": ...}`) answers with
+    // fixed text; `{"systemPrompt": true}` answers with the request's system
+    // prompt (binary-level verification of session assembly; never used by
+    // the product).
+    let response_steps: Vec<pa_ai::faux::FauxResponseStep> = script
         .get("responses")
         .and_then(serde_json::Value::as_array)
         .map(|entries| {
             entries
                 .iter()
                 .map(|entry| match entry {
-                    serde_json::Value::String(text) => text.clone(),
-                    serde_json::Value::Object(map) => map
-                        .get("text")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    _ => String::new(),
+                    serde_json::Value::String(text) => pa_ai::faux::FauxResponseStep::Message(
+                        pa_ai::faux::faux_assistant_text_message(
+                            text,
+                            pa_ai::faux::FauxAssistantMessageOptions::default(),
+                        ),
+                    ),
+                    serde_json::Value::Object(map) => {
+                        if map.get("systemPrompt").and_then(serde_json::Value::as_bool)
+                            == Some(true)
+                        {
+                            pa_ai::faux::FauxResponseStep::Factory(std::sync::Arc::new(
+                                |context, _options, _call, _model| {
+                                    Ok(pa_ai::faux::faux_assistant_text_message(
+                                        context.system_prompt.as_deref().unwrap_or_default(),
+                                        pa_ai::faux::FauxAssistantMessageOptions::default(),
+                                    ))
+                                },
+                            ))
+                        } else {
+                            pa_ai::faux::FauxResponseStep::Message(
+                                pa_ai::faux::faux_assistant_text_message(
+                                    map.get("text")
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or_default(),
+                                    pa_ai::faux::FauxAssistantMessageOptions::default(),
+                                ),
+                            )
+                        }
+                    }
+                    _ => pa_ai::faux::FauxResponseStep::Message(
+                        pa_ai::faux::faux_assistant_text_message(
+                            "",
+                            pa_ai::faux::FauxAssistantMessageOptions::default(),
+                        ),
+                    ),
                 })
                 .collect()
         })
@@ -493,17 +526,7 @@ async fn faux_print_mode(options: &RunOptions, script: &str) -> Result<i32, Stri
             }]),
             ..Default::default()
         });
-    registration.set_responses(
-        responses
-            .iter()
-            .map(|text| {
-                pa_ai::faux::FauxResponseStep::Message(pa_ai::faux::faux_assistant_text_message(
-                    text,
-                    pa_ai::faux::FauxAssistantMessageOptions::default(),
-                ))
-            })
-            .collect(),
-    );
+    registration.set_responses(response_steps);
     let model = registration.get_model();
     let agent_model = json_round_trip(&model).ok_or("model conversion failed")?;
     let stream_fn = real_stream_fn(None, model.clone());
@@ -530,6 +553,7 @@ async fn faux_print_mode(options: &RunOptions, script: &str) -> Result<i32, Stri
             session_manager,
             additional_skill_paths: vec![],
             additional_prompt_paths: vec![],
+            extra_builtin_skill_overrides: vec![],
         },
     )
     .await

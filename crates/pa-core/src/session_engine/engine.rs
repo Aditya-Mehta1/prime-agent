@@ -45,6 +45,9 @@ pub struct SessionEngineConfig {
     pub additional_skill_paths: Vec<String>,
     /// Extra prompt-template paths.
     pub additional_prompt_paths: Vec<String>,
+    /// Force-exclude patterns for built-in skills (e.g. unauthenticated
+    /// integrations); the MCP manager seam.
+    pub extra_builtin_skill_overrides: Vec<String>,
 }
 
 /// An assembled, running session.
@@ -60,9 +63,12 @@ pub struct SessionEngine {
 /// loop with persistence wiring.
 pub async fn create_session(config: SessionEngineConfig) -> anyhow::Result<SessionEngine> {
     let cwd = config.cwd.clone();
-    let resources = load_resources(&ResourceLoaderOptions {
+    let resources = load_resources(ResourceLoaderOptions {
         cwd: cwd.clone(),
         agent_dir: config.agent_dir.clone(),
+        settings: None,
+        additional_extension_sources: Vec::new(),
+        extra_builtin_skill_overrides: config.extra_builtin_skill_overrides.clone(),
         additional_skill_paths: config.additional_skill_paths.clone(),
         additional_prompt_paths: config.additional_prompt_paths.clone(),
         no_skills: false,
@@ -70,7 +76,8 @@ pub async fn create_session(config: SessionEngineConfig) -> anyhow::Result<Sessi
         no_context_files: false,
         system_prompt: config.custom_system_prompt.clone(),
         append_system_prompt: Vec::new(),
-    });
+        ..Default::default()
+    })?;
 
     let system_prompt = crate::prompts::system_prompt::build_system_prompt(
         &crate::prompts::system_prompt::BuildSystemPromptOptions {
@@ -269,6 +276,7 @@ mod tests {
             session_manager: None,
             additional_skill_paths: vec![],
             additional_prompt_paths: vec![],
+            extra_builtin_skill_overrides: vec![],
         })
         .await
         .unwrap();

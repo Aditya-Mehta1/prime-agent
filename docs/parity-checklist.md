@@ -74,8 +74,33 @@ session resource resolution) plus the extension runner under
   update-restart coordinator (`cli/daemon-update-restart.ts`). The Rust CLI
   reports a typed "self-update is not available in this build yet" error
   until that lane lands.
-- missing (spec below): resource resolution (`resolve()` -> `ResolvedPaths`)
-  and the extension runner.
+- done: resource resolution (`resolve()` -> `ResolvedPaths`).
+  `crates/pa-core/src/packages/resolve/` ports `DefaultPackageManager
+  .resolve()`: precedence-ranked resolution of extensions/skills/prompts/
+  themes from configured packages (pi manifest in package.json, convention
+  dirs, filter patterns with the `!`/`+`/`-` override forms), settings
+  top-level arrays (paths relative to the settings base, `applyPatterns`),
+  auto-discovery (`<base>/skills|prompts|themes|extensions` dirs,
+  `.agents/skills` ancestor scan up to the git root, pi-mode SKILL.md
+  stopping rule, `.gitignore`/`.ignore`/`.fdignore` rules), and bundled
+  skills (exe-adjacent `skills/`, websearch + builtin-override excludes).
+  First-wins collision order sorts by the TS `resourcePrecedenceRank`
+  (project settings > project auto > user settings > user auto > package >
+  builtin); dedupe by canonicalized path (symlinked trees resolve once).
+  `resolveExtensionSources` covers the CLI-extension temporary scope with
+  auto-refresh of unpinned temporary git sources; missing configured sources
+  install on resolve unless offline (or skipped via the on-missing policy).
+  The resource loader (`crates/pa-core/src/resources`) consumes the enabled
+  paths and provenance (SourceInfo) so sessions see package-provided
+  skills/prompts; extension *paths* are resolved and surfaced for the
+  extension-runner lane.
+  Verifier: `crates/pa-core/src/packages/resolve/tests.rs` (54 ported TS
+  test cases: settings entries, auto-discovery, ignore files, symlinks,
+  pattern forms, package dedupe, offline/missing-source policies, bundled
+  skills) plus `crates/pa-cli/tests/package_resources_e2e.rs`: a
+  settings-configured fixture package provides a skill that appears in a
+  created session's skill list through the full binary pipeline.
+- missing (spec below): the extension runner.
 
 Follow-up spec - resource resolution (skills/resources lane, ~600-800 LoC):
 port `DefaultPackageManager.resolve()`: precedence-ranked resolution of

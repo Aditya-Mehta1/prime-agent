@@ -2,14 +2,18 @@
 //! local-dir package sources against the settings store, plus the
 //! configured-npm/git child-process flows.
 //!
-//! Non-goals (follow-up specs in `docs/parity-checklist.md`): resource
-//! resolution for sessions (`resolve()` -> skills/prompts/themes/extension
-//! paths), the extension runner, and Prime Agent self-updates.
+//! Session resource resolution lives here as well: `PackageManager::resolve`
+//! produces the ranked skill/prompt/theme/extension paths sessions consume.
+//!
+//! Non-goals (follow-up specs in `docs/parity-checklist.md`): the extension
+//! *runner* (loading/executing extension modules) and Prime Agent
+//! self-updates.
 
 mod git;
 mod manager;
 mod npm;
 mod process;
+pub(crate) mod resolve;
 mod source;
 mod update;
 
@@ -17,8 +21,12 @@ mod update;
 mod tests;
 
 pub use manager::{
-    ConfiguredPackage, PackageManager, PackageUpdate, ProgressAction, ProgressEvent,
-    ProgressEventKind, UserOrProject,
+    BundledSkillsDir, ConfiguredPackage, PackageManager, PackageManagerOptions, PackageUpdate,
+    ProgressAction, ProgressEvent, ProgressEventKind, UserOrProject,
+};
+pub use resolve::{
+    MetadataSource, MissingSourceAction, PathMetadata, ResolveExtensionOptions, ResolvedPaths,
+    ResolvedResource, ResourceOrigin, ResourceType,
 };
 pub use source::{GitSource, LocalSource, NpmSource, ParsedSource, SourceScope};
 
@@ -37,6 +45,15 @@ pub(crate) fn is_offline_mode_enabled() -> bool {
             value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
         })
         .unwrap_or(false)
+}
+
+/// The directory of built-in skills shipped with the package: `skills/`
+/// next to the executable (the packaged layout; TS `getBundledSkillsDir`).
+pub(crate) fn get_bundled_skills_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("skills")))
+        .unwrap_or_else(|| PathBuf::from("skills"))
 }
 
 /// Stable temporary directory for resolve-only package installs:

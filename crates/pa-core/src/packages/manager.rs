@@ -66,14 +66,42 @@ pub struct PackageUpdate {
 /// Progress sink for install/remove/update operations.
 type ProgressCallback = Box<dyn Fn(&ProgressEvent) + Send>;
 
+/// Built-in skills directory selection: the packaged layout, disabled
+/// entirely, or an explicit directory.
+#[derive(Debug, Clone, Default)]
+pub enum BundledSkillsDir {
+    /// Exe-adjacent `skills/` (the packaged layout).
+    #[default]
+    Packaged,
+    /// Built-in skills disabled (tests, embedded hosts).
+    Disabled,
+    /// An explicit directory.
+    Directory(PathBuf),
+}
+
+/// Construction options for [`PackageManager`].
+pub struct PackageManagerOptions {
+    pub cwd: PathBuf,
+    pub agent_dir: PathBuf,
+    pub settings: SettingsManager,
+    /// Built-in skills directory (default: the packaged layout).
+    pub bundled_skills_dir: BundledSkillsDir,
+    /// Extra force-exclude patterns for built-in skills (e.g. `-<server>/SKILL.md`
+    /// overrides from integrations the user is not logged into).
+    pub extra_builtin_skill_overrides: Vec<String>,
+}
+
 /// The package manager. Owns a settings manager; mutates the `packages`
-/// arrays in the user or project scope.
+/// arrays in the user or project scope, and resolves session resources.
 pub struct PackageManager {
     cwd: PathBuf,
     agent_dir: PathBuf,
     settings: SettingsManager,
     progress: Option<ProgressCallback>,
     global_npm_root: Option<PathBuf>,
+    /// `None` disables built-in skills entirely.
+    bundled_skills_dir: Option<PathBuf>,
+    extra_builtin_skill_overrides: Vec<String>,
 }
 
 impl PackageManager {
@@ -82,17 +110,39 @@ impl PackageManager {
         agent_dir: impl Into<PathBuf>,
         settings: SettingsManager,
     ) -> Self {
-        Self {
+        Self::with_options(PackageManagerOptions {
             cwd: cwd.into(),
             agent_dir: agent_dir.into(),
             settings,
+            bundled_skills_dir: BundledSkillsDir::Packaged,
+            extra_builtin_skill_overrides: Vec::new(),
+        })
+    }
+
+    pub fn with_options(options: PackageManagerOptions) -> Self {
+        let bundled_skills_dir = match options.bundled_skills_dir {
+            BundledSkillsDir::Packaged => Some(super::get_bundled_skills_dir()),
+            BundledSkillsDir::Disabled => None,
+            BundledSkillsDir::Directory(dir) => Some(dir),
+        };
+        Self {
+            cwd: options.cwd,
+            agent_dir: options.agent_dir,
+            settings: options.settings,
             progress: None,
             global_npm_root: None,
+            bundled_skills_dir,
+            extra_builtin_skill_overrides: options.extra_builtin_skill_overrides,
         }
     }
 
     pub fn settings(&self) -> &SettingsManager {
         &self.settings
+    }
+
+    /// Reload both settings scopes from storage (resolve reads live settings).
+    pub fn reload_settings(&mut self) -> Result<()> {
+        self.settings.reload()
     }
 
     pub(super) fn cwd(&self) -> &std::path::Path {
@@ -105,6 +155,34 @@ impl PackageManager {
 
     pub(super) fn settings_npm_command(&self) -> Option<Vec<String>> {
         self.settings.settings().npm_command.clone()
+    }
+
+    /// Built-in skills directory; `None` when disabled.
+    pub(super) fn bundled_skills_dir(&self) -> Option<&PathBuf> {
+        self.bundled_skills_dir.as_ref()
+    }
+
+    /// Settings flag: load built-in skills (default true).
+    pub(super) fn enable_builtin_skills(&self) -> bool {
+        self.settings
+            .settings()
+            .enable_builtin_skills
+            .unwrap_or(true)
+    }
+
+    /// Settings flag: the bundled websearch skill (default true).
+    pub(super) fn bundled_websearch_enabled(&self) -> bool {
+        self.settings
+            .settings()
+            .bundled_skills
+            .as_ref()
+            .and_then(|bundled| bundled.websearch)
+            .unwrap_or(true)
+    }
+
+    /// Extra force-exclude patterns for built-in skills.
+    pub(super) fn extra_builtin_skill_overrides(&self) -> &[String] {
+        &self.extra_builtin_skill_overrides
     }
 
     pub fn set_progress_callback(&mut self, callback: ProgressCallback) {
@@ -303,7 +381,7 @@ impl PackageManager {
         };
     }
 
-    fn base_dir_for_scope(&self, scope: SourceScope) -> PathBuf {
+    pub(super) fn base_dir_for_scope(&self, scope: SourceScope) -> PathBuf {
         match scope {
             SourceScope::Project => self.cwd.join(super::CONFIG_DIR_NAME),
             SourceScope::User => self.agent_dir.clone(),
@@ -373,7 +451,7 @@ impl PackageManager {
         }
     }
 
-    fn resolve_path(&self, input: &str) -> PathBuf {
+    pub(super) fn resolve_path(&self, input: &str) -> PathBuf {
         let trimmed = input.trim();
         if let Some(path) = expand_tilde(trimmed) {
             return path;
@@ -381,7 +459,7 @@ impl PackageManager {
         super::source::lexical_resolve(&self.cwd, trimmed)
     }
 
-    fn resolve_path_from_base(&self, input: &str, base: &Path) -> PathBuf {
+    pub(super) fn resolve_path_from_base(&self, input: &str, base: &Path) -> PathBuf {
         let trimmed = input.trim();
         if let Some(path) = expand_tilde(trimmed) {
             return path;
@@ -391,7 +469,7 @@ impl PackageManager {
 
     // -- npm ------------------------------------------------------------------
 
-    fn global_npm_root(&self) -> Result<PathBuf> {
+    pub(super) fn global_npm_root(&self) -> Result<PathBuf> {
         if let Some(root) = &self.global_npm_root {
             return Ok(root.clone());
         }
@@ -400,7 +478,7 @@ impl PackageManager {
         Ok(root)
     }
 
-    fn install_npm(
+    pub(super) fn install_npm(
         &mut self,
         source: &NpmSource,
         scope: SourceScope,
@@ -492,7 +570,11 @@ impl PackageManager {
         )
     }
 
-    fn install_git_source(&mut self, source: &GitSource, scope: SourceScope) -> Result<()> {
+    pub(super) fn install_git_source(
+        &mut self,
+        source: &GitSource,
+        scope: SourceScope,
+    ) -> Result<()> {
         let npm_command = self.settings.settings().npm_command.clone();
         git::install_git(
             source,
