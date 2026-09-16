@@ -1,350 +1,421 @@
-//! Interactive agent view: transcript + editor, themed like the TS product.
-//!
-//! Layout parity: user messages render as padded background blocks
-//! (`userMessageBg`), assistant text as markdown, tool calls as panel lines
-//! (`toolPanelBg` with a "⏺ toolname" header), a `─` separator above the
-//! editor, and the editor with a "> " prompt prefix and "↑/↓ N more" scroll
-//! indicators (dynamic-border.ts + editor.ts).
+//! Interactive agent view: fullscreen chat frame composed like the TS
+//! interactive mode — a pinned top bar, a scrollable transcript window
+//! (splash, chat rows, loader), and a dock (prompt-context line, editor
+//! surface, tray). The session loop folds events into the view; this module
+//! owns row geometry and scroll behavior only.
 
+use crate::chat::{
+    render_assistant, render_loader, render_text_rows, render_tool_card, render_user_block,
+    ChatEntry, Detail, WorkingState,
+};
+use crate::chrome::{
+    conversation_detail_status, render_prompt_context, render_splash, render_top_bar, render_tray,
+    ChromeState,
+};
 use crate::editor::Editor;
-use crate::markdown::render_markdown;
 use crate::session::TranscriptItem;
-use crate::theme::{Theme, ThemeBg, ThemeColor};
+use crate::theme::{Theme, ThemeColor};
+use crate::width::str_width;
 use crate::{Line, Span};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
+
+/// Minimum transcript rows when the dock would crowd them out
+/// (TS `FULLSCREEN_MIN_TRANSCRIPT_ROWS`).
+pub const FULLSCREEN_MIN_TRANSCRIPT_ROWS: usize = 3;
 
 pub struct AgentView {
-    pub transcript: Vec<TranscriptItem>,
-    pub editor: Editor,
     pub theme: Theme,
-    pub model_label: String,
-    pub status: String,
-    /// Transcript scroll offset in rendered lines (0 = following the tail).
-    pub scroll_lines: usize,
+    pub editor: Editor,
+    pub chrome: ChromeState,
+    pub chat: Vec<ChatEntry>,
+    pub detail: Detail,
+    pub working: Option<WorkingState>,
+    /// Animation frame for spinners and the working icon.
+    pub pulse_frame: usize,
+    /// When the current working loader started (elapsed label).
+    pub working_since: Option<std::time::Instant>,
+    scroll_top: usize,
+    following: bool,
+    /// Rows of the terminal the editor should lay out against.
+    terminal_rows: u16,
+    /// Cursor cell within the last dock render: (dock row, column).
+    dock_cursor: Option<(usize, usize)>,
+    /// Window height of the last composed frame (cursor positioning).
+    window_rows: usize,
 }
 
 impl AgentView {
     pub fn new(theme: Theme) -> Self {
         Self {
-            transcript: Vec::new(),
-            editor: Editor::new(),
             theme,
-            model_label: String::new(),
-            status: String::new(),
-            scroll_lines: 0,
+            editor: Editor::new(),
+            chrome: ChromeState::default(),
+            chat: Vec::new(),
+            detail: Detail::Overview,
+            working: None,
+            pulse_frame: 0,
+            working_since: None,
+            scroll_top: 0,
+            following: true,
+            terminal_rows: 24,
+            dock_cursor: None,
+            window_rows: 0,
         }
     }
 
+    pub fn set_terminal_rows(&mut self, rows: u16) {
+        self.terminal_rows = rows;
+    }
+
+    /// Append one chat component.
+    pub fn push_entry(&mut self, entry: ChatEntry) {
+        self.chat.push(entry);
+    }
+
+    /// Append a replay transcript item (mapped onto chat components).
     pub fn push(&mut self, item: TranscriptItem) {
-        self.transcript.push(item);
+        self.chat.push(item_to_entry(item));
     }
 
-    /// Render the transcript lines for a given width.
-    pub fn render_transcript(&self, width: usize) -> Vec<Line> {
-        let mut out: Vec<Line> = Vec::new();
-        let md = crate::markdown::MarkdownStyle::from_theme(&self.theme);
-        for item in &self.transcript {
-            match item {
-                TranscriptItem::UserMessage { text } => {
-                    self.render_user_block(text, width, &mut out);
+    /// The conversation-detail label for the prompt-context row.
+    fn detail_label(&self) -> String {
+        let key = crate::keybindings::KeybindingsManager::new()
+            .first_key("app.tools.expand")
+            .map(|key| crate::keybindings::format_key_text(&key))
+            .unwrap_or_default();
+        // The TS label: "Details" keeps the expand hint (only "Expanded"
+        // collapses).
+        match self.detail {
+            Detail::Overview => conversation_detail_status(false, &key),
+            Detail::Details => format!("Details mode ({key} to expand)"),
+        }
+    }
+
+    /// Scroll position of the transcript window: following keeps the tail
+    /// pinned; otherwise the offset stays where the user left it.
+    pub fn scroll_by(&mut self, delta: isize) {
+        self.following = false;
+        self.scroll_top = (self.scroll_top as isize + delta).max(0) as usize;
+    }
+
+    pub fn follow(&mut self) {
+        self.following = true;
+    }
+
+    /// Render the scrollable transcript: splash rows, chat component rows,
+    /// and the working loader when a turn is active.
+    pub fn render_transcript(&mut self, width: usize) -> Vec<Line> {
+        if let (Some(working), Some(since)) = (&mut self.working, self.working_since) {
+            working.elapsed_secs = since.elapsed().as_secs();
+        }
+        let mut lines: Vec<Line> = render_splash(&self.chrome, &self.theme, width);
+        let mut first = true;
+        for entry in &self.chat {
+            match entry {
+                ChatEntry::Status { text, warning } => {
+                    let style = if *warning {
+                        self.theme.fg_style(ThemeColor::Warning)
+                    } else {
+                        self.theme.fg_style(ThemeColor::Dim)
+                    };
+                    lines.push(Vec::new());
+                    lines.extend(render_text_rows(text, style, width));
                 }
-                TranscriptItem::Assistant { text } => {
-                    let lines = render_markdown(text, width, &md);
-                    out.extend(lines);
-                    out.push(Vec::new());
-                }
-                TranscriptItem::ToolCall {
-                    name, arguments, ..
-                } => {
-                    self.render_tool_header(name, Some(arguments), width, &mut out);
-                }
-                TranscriptItem::ToolResult {
-                    tool_name, text, ..
-                } => {
-                    self.render_tool_header(tool_name, None, width, &mut out);
-                    for line in text.lines().take(8) {
-                        self.panel_line(line, width, &mut out);
+                ChatEntry::User { text } => {
+                    if !first {
+                        lines.push(Vec::new());
                     }
-                    if text.lines().count() > 8 {
-                        self.panel_line(
-                            &format!("… +{} more lines", text.lines().count() - 8),
-                            width,
-                            &mut out,
-                        );
-                    }
-                    out.push(Vec::new());
+                    lines.extend(render_user_block(text, &self.theme, width));
                 }
-                TranscriptItem::BashExecution {
-                    command, exit_code, ..
-                } => {
-                    self.render_tool_header(
-                        &format!("bash (exit {})", exit_code.unwrap_or(0)),
-                        Some(command),
-                        width,
-                        &mut out,
-                    );
-                    out.push(Vec::new());
+                ChatEntry::Assistant(message) => {
+                    lines.extend(render_assistant(message, self.detail, &self.theme, width));
                 }
-                TranscriptItem::AgentStatus { summary, .. } => {
-                    let style = self.theme.fg_style(ThemeColor::Muted);
-                    out.push(vec![Span::styled(format!("⏳ {summary}"), style)]);
-                    out.push(Vec::new());
-                }
-                TranscriptItem::ModelChange { model_id, .. } => {
-                    let style = self.theme.fg_style(ThemeColor::Muted);
-                    out.push(vec![Span::styled(format!("⚙ {model_id}"), style)]);
-                    out.push(Vec::new());
-                }
-                TranscriptItem::SystemNote { text } => {
-                    let style = self.theme.fg_style(ThemeColor::Muted);
-                    for line in text.lines() {
-                        out.push(vec![Span::styled(line.to_string(), style)]);
-                    }
-                    out.push(Vec::new());
+                ChatEntry::Tool(card) => {
+                    lines.extend(render_tool_card(card, self.pulse_frame, &self.theme, width));
                 }
             }
+            first = false;
         }
-        out
-    }
-
-    fn render_user_block(&self, text: &str, width: usize, out: &mut Vec<Line>) {
-        let md = crate::markdown::MarkdownStyle::from_theme(&self.theme);
-        let content_width = width.saturating_sub(4).max(1);
-        let body_style = self.theme.fg_style(ThemeColor::UserMessageText);
-        let rendered = render_markdown(text, content_width, &md);
-        let blank = self.blank_bg_line(width);
-        out.push(blank.clone());
-        if rendered.is_empty() {
-            out.push(self.bg_line(&format!("  {}  ", ""), width));
+        if let Some(working) = &self.working {
+            lines.extend(render_loader(working, self.pulse_frame, &self.theme, width));
         }
-        for line in &rendered {
-            let mut spans: Vec<Span> = Vec::new();
-            for s in line {
-                spans.push(Span::styled(s.content.clone(), body_style.patch(s.style)));
-            }
-            out.push(self.bg_line_spans(&spans, width));
-        }
-        out.push(blank);
-        out.push(Vec::new());
+        lines
     }
 
-    fn bg_style(&self) -> Style {
-        self.theme.bg_style(ThemeBg::UserMessageBg)
+    /// Render the dock: prompt-context row(s), the editor surface, the tray.
+    pub fn render_dock(&mut self, width: usize) -> Vec<Line> {
+        let mut lines = render_prompt_context(&self.detail_label(), &self.theme, width);
+        let context_rows = lines.len();
+        let (editor_rows, cursor) = self.render_editor_surface(width);
+        self.dock_cursor = cursor.map(|(row, col)| (context_rows + row, col));
+        lines.extend(editor_rows);
+        lines.push(render_tray(&self.chrome, &self.theme, width));
+        lines
     }
 
-    fn blank_bg_line(&self, width: usize) -> Line {
-        self.bg_line("", width)
-    }
-
-    fn bg_line(&self, _content: &str, width: usize) -> Line {
-        let style = self.bg_style();
-        vec![Span::styled(" ".repeat(width), style)]
-    }
-
-    fn bg_line_spans(&self, spans: &[Span], width: usize) -> Line {
-        let style = self.bg_style();
-        let used: usize = spans
-            .iter()
-            .map(|s| crate::width::str_width(&s.content))
-            .sum();
-        let mut line: Line = Vec::with_capacity(spans.len() + 1);
-        line.push(Span::styled("  ", style));
-        for s in spans {
-            line.push(s.clone());
-        }
-        line.push(Span::styled(
-            " ".repeat(width.saturating_sub(used + 2)),
-            style,
-        ));
-        line.push(Span::styled("  ", style));
-        line
-    }
-
-    fn render_tool_header(
-        &self,
-        name: &str,
-        args: Option<&str>,
-        width: usize,
-        out: &mut Vec<Line>,
-    ) {
-        let title_style = self.theme.fg_style(ThemeColor::ToolTitle);
-        let mut header = format!("⏺ {name}");
-        if let Some(args) = args {
-            let preview: String = args
-                .chars()
-                .filter(|&c| c != '\n')
-                .take(width.saturating_sub(header.chars().count() + 6))
-                .collect();
-            if !preview.is_empty() {
-                header.push_str(&format!(" {preview}"));
-            }
-        }
-        self.panel_line_raw(vec![Span::styled(header, title_style)], width, out);
-    }
-
-    fn panel_line(&self, content: &str, width: usize, out: &mut Vec<Line>) {
-        let style = self.theme.fg_style(ThemeColor::ToolOutput);
-        self.panel_line_raw(vec![Span::styled(content.to_string(), style)], width, out);
-    }
-
-    fn panel_line_raw(&self, spans: Line, width: usize, out: &mut Vec<Line>) {
-        let bg = self.theme.bg_style(ThemeBg::ToolPanelBg);
-        let used: usize = spans
-            .iter()
-            .map(|s| crate::width::str_width(&s.content))
-            .sum();
-        let mut line: Line = Vec::new();
-        line.push(Span::styled("  ", bg));
-        for s in spans {
-            line.push(Span::styled(s.content, bg.patch(s.style)));
-        }
-        line.push(Span::styled(" ".repeat(width.saturating_sub(used + 4)), bg));
-        line.push(Span::styled("  ", bg));
-        out.push(line);
-    }
-
-    /// Render the editor block for a given width/height, including the
-    /// separator line, prompt prefix, scroll indicators, and status footer.
-    pub fn render_editor(&mut self, width: usize, height: u16) -> EditorFrame {
-        let border_style = self.theme.fg_style(ThemeColor::Border);
+    /// The editor surface (TS `Editor.render` with a background): a blank
+    /// bg row, content rows with the `> ` prompt and a reverse-video cursor,
+    /// and a trailing bg row. Scroll indicators replace the blank rows.
+    fn render_editor_surface(&mut self, width: usize) -> (Vec<Line>, Option<(usize, usize)>) {
+        let bg = crate::chrome::editor_background(&self.theme);
+        let border = self.theme.fg_style(ThemeColor::BorderMuted);
+        let padding_x = 2usize;
+        let content_width = width.saturating_sub(padding_x * 2).max(1);
         let prompt = "> ";
-        let prompt_width = crate::width::str_width(prompt);
-        let layout_width = (width.saturating_sub(prompt_width)).max(1);
-        let (visible, scroll_offset, hidden_above, hidden_below) =
-            self.editor.visible_window(layout_width, height);
-
-        let mut lines: Vec<Line> = Vec::new();
-        if hidden_above > 0 {
-            let indicator = format!("─── ↑ {hidden_above} more ");
-            let rest = width.saturating_sub(crate::width::str_width(&indicator));
-            lines.push(vec![Span::styled(
-                format!("{}{}", indicator, "─".repeat(rest)),
-                border_style,
-            )]);
+        let prompt_width = str_width(prompt);
+        let input_width = content_width.saturating_sub(prompt_width).max(1);
+        let layout_width = input_width;
+        let (visible, scroll_offset, _hidden_above, hidden_below) =
+            self.editor.visible_window(layout_width, self.terminal_rows);
+        let mut rows: Vec<Line> = Vec::new();
+        if scroll_offset > 0 {
+            let indicator = format!(" \u{2191} {scroll_offset} more");
+            rows.push(indicator_row(&indicator, bg, border, width));
         } else {
-            lines.push(vec![Span::styled("─".repeat(width.max(1)), border_style)]);
+            rows.push(vec![Span::styled(" ".repeat(width), bg)]);
         }
-
-        for line in &visible {
-            let spans: Line = vec![
-                Span::styled(prompt.to_string(), border_style),
-                Span::styled(line.text.clone(), Style::default()),
-            ];
-            lines.push(spans);
+        let mut cursor: Option<(usize, usize)> = None;
+        for (index, line) in visible.iter().enumerate() {
+            let mut row: Line = vec![Span::styled(" ".to_string(), bg)];
+            // The `> ` prompt prefix renders plain on the surface background
+            // (TS `formatPromptPrefix` styles only `!` bash prompts).
+            if index == 0 {
+                row.push(Span::styled(prompt.to_string(), bg));
+            } else {
+                row.push(Span::styled(" ".repeat(prompt_width), bg));
+            }
+            row.push(Span::styled(" ".to_string(), bg));
+            let text: &str = &line.text;
+            let before = line.cursor_pos.min(text.chars().count()).to_string();
+            let _ = before;
+            let (head, tail) = split_at_chars(text, line.cursor_pos.min(text.chars().count()));
+            let mut used = str_width(text);
+            if line.has_cursor {
+                if tail.is_empty() {
+                    row.push(Span::styled(head.to_string(), bg));
+                    row.push(Span::styled(
+                        " ".to_string(),
+                        bg.add_modifier(Modifier::REVERSED),
+                    ));
+                    used += 1;
+                } else {
+                    let first = tail.chars().next().unwrap_or(' ');
+                    let rest: String = tail[first.len_utf8()..].to_string();
+                    row.push(Span::styled(head.to_string(), bg));
+                    row.push(Span::styled(
+                        first.to_string(),
+                        bg.add_modifier(Modifier::REVERSED),
+                    ));
+                    row.push(Span::styled(rest, bg));
+                }
+                cursor = Some((index + 1, str_width(head) + 4));
+            } else {
+                row.push(Span::styled(text.to_string(), bg));
+            }
+            row.push(Span::styled(
+                " ".repeat(input_width.saturating_sub(used)),
+                bg,
+            ));
+            row.push(Span::styled(" ".repeat(padding_x), bg));
+            rows.push(row);
         }
-
         if hidden_below > 0 {
-            let indicator = format!("─── ↓ {hidden_below} more ");
-            let rest = width.saturating_sub(crate::width::str_width(&indicator));
-            lines.push(vec![Span::styled(
-                format!("{}{}", indicator, "─".repeat(rest)),
-                border_style,
-            )]);
+            rows.push(indicator_row(
+                &format!(" \u{2193} {hidden_below} more"),
+                bg,
+                border,
+                width,
+            ));
         } else {
-            lines.push(vec![Span::styled("─".repeat(width.max(1)), border_style)]);
+            rows.push(vec![Span::styled(" ".repeat(width), bg)]);
         }
-
-        let cursor = self.editor.cursor_visual(&visible);
-        EditorFrame {
-            lines,
-            cursor_row: cursor.map(|(r, _)| r + 1),
-            cursor_col: cursor.map(|(_, c)| c + prompt_width),
-            _scroll_offset: scroll_offset,
-        }
+        (rows, cursor)
     }
 
-    /// Status footer: model label + task status (right-aligned in TS footer).
-    pub fn render_footer(&self, width: usize) -> Line {
-        let muted = self.theme.fg_style(ThemeColor::Muted);
-        let accent = self.theme.fg_style(ThemeColor::Accent);
-        let mut left = String::new();
-        if !self.model_label.is_empty() {
-            left.push_str(&self.model_label);
-        }
-        if !self.status.is_empty() {
-            if !left.is_empty() {
-                left.push_str(" · ");
-            }
-            left.push_str(&self.status);
-        }
-        let mut line = Vec::new();
-        if left.is_empty() {
-            line.push(Span::styled(" ".repeat(width), muted));
+    /// Compose the fullscreen frame: top bar, transcript window (padded),
+    /// dock at the bottom — exactly `height` rows.
+    pub fn render_frame(&mut self, width: usize, height: usize) -> Vec<Line> {
+        let top = render_top_bar(&self.chrome, &self.theme, width);
+        let transcript = self.render_transcript(width);
+        let dock = self.render_dock(width);
+        let dock_height = dock
+            .len()
+            .min(height.saturating_sub(FULLSCREEN_MIN_TRANSCRIPT_ROWS));
+        let dock: Vec<Line> = if dock.len() > dock_height {
+            dock[dock.len() - dock_height..].to_vec()
         } else {
-            line.push(Span::styled(left.clone(), accent));
-            let pad = width.saturating_sub(crate::width::str_width(&left));
-            line.push(Span::styled(" ".repeat(pad), muted));
+            dock
+        };
+        let window_height = height
+            .saturating_sub(1 + dock.len())
+            .max(FULLSCREEN_MIN_TRANSCRIPT_ROWS.min(height.saturating_sub(1 + dock.len())));
+        let max_scroll = transcript.len().saturating_sub(window_height);
+        if self.following {
+            self.scroll_top = max_scroll;
+        } else {
+            self.scroll_top = self.scroll_top.min(max_scroll);
         }
-        line
+        let start = self.scroll_top.min(max_scroll);
+        self.window_rows = window_height;
+        let mut frame: Vec<Line> = Vec::with_capacity(height);
+        frame.push(pad_row(top, width));
+        for line in &transcript[start..(start + window_height).min(transcript.len())] {
+            frame.push(pad_row(line.clone(), width));
+        }
+        while frame.len() < height.saturating_sub(dock.len()) {
+            frame.push(vec![Span::raw(" ".repeat(width))]);
+        }
+        for line in dock {
+            frame.push(pad_row(line, width));
+        }
+        frame
+    }
+
+    /// Hardware cursor position within the last composed frame (0-based row,
+    /// 0-based column), when the editor surface drew the cursor.
+    pub fn frame_cursor(&self) -> Option<(usize, usize)> {
+        self.dock_cursor
+            .map(|(row, col)| (row + 1 + self.window_rows, col))
     }
 }
 
-/// One rendered editor frame with cursor coordinates (row within frame lines,
-/// column within the frame width).
-pub struct EditorFrame {
-    pub lines: Vec<Line>,
-    pub cursor_row: Option<usize>,
-    pub cursor_col: Option<usize>,
-    pub _scroll_offset: usize,
+/// Split a string at a char boundary.
+fn split_at_chars(text: &str, at: usize) -> (&str, &str) {
+    let mut end = text.len();
+    let mut count = 0;
+    for (index, _) in text.char_indices() {
+        if count == at {
+            end = index;
+            break;
+        }
+        count += 1;
+    }
+    if count < at {
+        return (text, "");
+    }
+    (&text[..end], &text[end..])
+}
+
+/// One scroll-indicator surface row (`↑ N more` on the editor background).
+fn indicator_row(indicator: &str, bg: Style, border: Style, width: usize) -> Line {
+    let mut row: Line = vec![Span::styled(indicator.to_string(), border)];
+    let used = str_width(indicator);
+    row.push(Span::styled(" ".repeat(width.saturating_sub(used)), bg));
+    row
+}
+
+/// Pad a rendered row to the full width (default background).
+fn pad_row(line: Line, width: usize) -> Line {
+    let used: usize = line.iter().map(|s| str_width(&s.content)).sum();
+    let mut out = line;
+    if used < width {
+        out.push(Span::raw(" ".repeat(width - used)));
+    }
+    out
+}
+
+/// Map a replay transcript item onto a chat component.
+fn item_to_entry(item: TranscriptItem) -> ChatEntry {
+    match item {
+        TranscriptItem::UserMessage { text } => ChatEntry::User { text },
+        TranscriptItem::SystemNote { text } => ChatEntry::Status {
+            text,
+            warning: false,
+        },
+        TranscriptItem::Assistant { text } => {
+            ChatEntry::Assistant(Box::new(crate::chat::AssistantMessage {
+                blocks: vec![crate::chat::MessageBlock::Text(text)],
+                has_tool_calls: false,
+                streaming: false,
+            }))
+        }
+        TranscriptItem::ToolCall {
+            id,
+            name,
+            arguments,
+        } => ChatEntry::Tool(Box::new(crate::chat::ToolCallCard {
+            id,
+            name,
+            args: serde_json::from_str(&arguments).unwrap_or(serde_json::Value::Null),
+            started: false,
+            result: None,
+            result_partial: false,
+        })),
+        TranscriptItem::ToolResult {
+            tool_call_id,
+            tool_name,
+            text,
+        } => ChatEntry::Tool(Box::new(crate::chat::ToolCallCard {
+            id: tool_call_id,
+            name: tool_name,
+            args: serde_json::Value::Null,
+            started: true,
+            result: Some(crate::chat::ToolResultView {
+                content: vec![serde_json::json!({ "type": "text", "text": text })],
+                details: serde_json::Value::Null,
+                is_error: false,
+            }),
+            result_partial: false,
+        })),
+        TranscriptItem::BashExecution {
+            command, exit_code, ..
+        } => ChatEntry::Tool(Box::new(crate::chat::ToolCallCard {
+            id: String::new(),
+            name: "bash".to_string(),
+            args: serde_json::json!({ "command": command, "exitCode": exit_code }),
+            started: true,
+            result: None,
+            result_partial: false,
+        })),
+        TranscriptItem::AgentStatus { summary, .. } => ChatEntry::Status {
+            text: summary,
+            warning: false,
+        },
+        TranscriptItem::ModelChange { model_id, .. } => ChatEntry::Status {
+            text: format!("\u{2699} {model_id}"),
+            warning: false,
+        },
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::ColorMode;
+    use crate::theme::{ColorMode, Theme};
 
     fn view() -> AgentView {
         AgentView::new(Theme::builtin("prime", ColorMode::TrueColor))
     }
 
-    #[test]
-    fn user_block_has_bg() {
-        let mut v = view();
-        v.push(TranscriptItem::UserMessage {
-            text: "hello there".to_string(),
-        });
-        let lines = v.render_transcript(40);
-        assert!(lines.len() >= 3);
-        let bg = v.theme.bg_style(ThemeBg::UserMessageBg).bg;
-        assert!(lines[0][0].style.bg == bg);
+    fn text_of(line: &Line) -> String {
+        line.iter().map(|s| s.content.as_str()).collect::<String>()
     }
 
     #[test]
-    fn assistant_markdown() {
+    fn frame_is_exactly_height_rows() {
         let mut v = view();
-        v.push(TranscriptItem::Assistant {
-            text: "# Title\n\nbody".to_string(),
-        });
-        let lines = v.render_transcript(40);
-        assert!(lines
-            .iter()
-            .any(|l| { !l.is_empty() && l[0].content == "Title" }));
+        v.chrome.version = "0.0.0".to_string();
+        v.chrome.cwd = "/tmp/project".to_string();
+        v.chrome.chat_name = "project".to_string();
+        let frame = v.render_frame(80, 24);
+        assert_eq!(frame.len(), 24);
+        assert!(frame.iter().all(|l| str_width(&text_of(l)) <= 80));
+        let joined = frame.iter().map(text_of).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("prime agent v0.0.0"));
+        assert!(joined.contains("Collapsed mode (Ctrl+O to expand)"));
+        assert!(joined.contains(">"));
     }
 
     #[test]
-    fn tool_panel() {
+    fn dock_pads_window_between_splash_and_editor() {
         let mut v = view();
-        v.push(TranscriptItem::ToolCall {
-            id: "1".to_string(),
-            name: "ipython".to_string(),
-            arguments: "{\"code\": \"print(1)\"}".to_string(),
-        });
-        let lines = v.render_transcript(40);
-        assert!(lines
-            .iter()
-            .any(|l| l.iter().any(|s| s.content.contains("⏺ ipython"))));
-    }
-
-    #[test]
-    fn editor_frame_separator_and_prompt() {
-        let mut v = view();
-        v.editor.handle_input("h");
-        v.editor.handle_input("i");
-        let frame = v.render_editor(40, 24);
-        assert_eq!(frame.lines[0][0].content, "─".repeat(40));
-        assert_eq!(frame.lines[1][0].content, "> ");
-        assert_eq!(frame.lines[1][1].content, "hi");
-        assert_eq!(frame.cursor_row, Some(1));
-        assert_eq!(frame.cursor_col, Some(4));
+        v.chrome.version = "0.0.0".to_string();
+        v.chrome.cwd = "/w".to_string();
+        v.chrome.chat_name = "w".to_string();
+        let frame = v.render_frame(60, 40);
+        assert_eq!(frame.len(), 40);
+        // The editor prompt sits above the (empty) tray row.
+        let joined = frame.iter().map(text_of).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("Collapsed mode"));
     }
 }

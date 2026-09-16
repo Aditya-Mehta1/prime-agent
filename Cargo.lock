@@ -1290,6 +1290,7 @@ dependencies = [
  "anyhow",
  "clap",
  "crossterm",
+ "fancy-regex",
  "pa-types",
  "ratatui",
  "serde",

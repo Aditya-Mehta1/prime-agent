@@ -5,7 +5,7 @@
 use crate::editor::{Editor, EditorEvent};
 use crate::keys::key_event_to_id;
 use crate::session::{SessionEvent, SessionStream};
-use crate::theme::{ColorMode, Theme};
+use crate::theme::Theme;
 use crate::view::AgentView;
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -34,17 +34,11 @@ impl Default for AppOptions {
 }
 
 pub fn load_theme(name: &str) -> Theme {
-    let mode = if std::env::var("COLORTERM")
-        .ok()
-        .is_some_and(|v| v.contains("truecolor"))
-        || std::env::var("TERM")
-            .ok()
-            .is_some_and(|v| v.contains("256color"))
-    {
-        ColorMode::TrueColor
-    } else {
-        ColorMode::Color256
-    };
+    let mode = crate::theme::detect_color_mode();
+    // The default brand theme when the caller passes none (empty) or an
+    // unknown name; only known builtins resolve.
+    let known = ["prime", "dark", "light"];
+    let name = if known.contains(&name) { name } else { "prime" };
     Theme::builtin(name, mode)
 }
 
@@ -55,6 +49,9 @@ pub fn run_app(
     options: AppOptions,
     mut on_submit: Box<dyn FnMut(&str) + Send>,
 ) -> Result<()> {
+    // The TS theme emits raw ANSI color codes regardless of NO_COLOR; match
+    // that so the same terminal renders the same frames either way.
+    crossterm::style::force_color_output(true);
     terminal::enable_raw_mode()?;
     crossterm::execute!(stdout(), EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout());
@@ -72,7 +69,7 @@ pub fn run_app(
             match stream.poll()? {
                 SessionEvent::Item(item) => {
                     if let crate::session::TranscriptItem::ModelChange { model_id, .. } = &item {
-                        view.model_label = model_id.clone();
+                        view.chrome.model_id = Some(model_id.clone());
                     }
                     view.push(item);
                     if options.replay_delay_ms > 0 {
@@ -84,7 +81,7 @@ pub fn run_app(
         }
 
         let (_w, h) = crossterm::terminal::size()?;
-        view.editor.set_terminal_rows(h);
+        view.set_terminal_rows(h);
         draw(&mut terminal, &mut view)?;
 
         // Input.
@@ -173,89 +170,32 @@ pub(crate) fn draw(
     view: &mut AgentView,
 ) -> Result<()> {
     let area = terminal.size()?;
+    let frame_area = ratatui::layout::Rect::new(0, 0, area.width, area.height);
     let width = area.width as usize;
     let height = area.height as usize;
-    let footer = view.render_footer(width);
-    let frame = view.render_editor(width, area.height);
-    let footer_lines: usize = if footer.is_empty() { 0 } else { 1 };
-    let editor_lines = frame.lines.len();
-    let transcript_height = height.saturating_sub(editor_lines + footer_lines);
-    let transcript = view.render_transcript(width);
-
+    let frame = view.render_frame(width, height);
+    let cursor = view.frame_cursor();
     terminal.draw(|f| {
-        use ratatui::layout::Rect;
-        let mut y = 0u16;
-        // Transcript: show the tail.
-        if transcript_height > 0 {
-            let skip = transcript.len().saturating_sub(transcript_height);
-            let lines: Vec<ratatui::text::Line<'static>> = transcript[skip..]
-                .iter()
-                .map(crate::markdown::to_ratatui_line)
-                .collect();
-            let area_rect = Rect::new(0, y, area.width, transcript_height as u16);
-            let mut text = ratatui::text::Text::from(lines);
-            text.style = ratatui::style::Style::default();
-            f.render_widget(text, area_rect);
-            y += transcript_height as u16;
-        }
-        // Editor block.
-        let editor_area = Rect::new(0, y, area.width, editor_lines as u16);
-        let lines: Vec<ratatui::text::Line<'static>> = frame
-            .lines
-            .iter()
-            .map(crate::markdown::to_ratatui_line)
-            .collect();
-        f.render_widget(ratatui::text::Text::from(lines), editor_area);
-        // Cursor.
-        if let (Some(row), Some(col)) = (frame.cursor_row, frame.cursor_col) {
-            if (y as usize + row) < height {
-                f.set_cursor_position(ratatui::layout::Position::new(
-                    col.min(area.width as usize - 1) as u16,
-                    y + row as u16,
-                ));
+        let lines: Vec<ratatui::text::Line<'static>> =
+            frame.iter().map(crate::markdown::to_ratatui_line).collect();
+        f.render_widget(ratatui::text::Text::from(lines), frame_area);
+        if let Some((row, col)) = cursor {
+            if row < height && col < width {
+                f.set_cursor_position(ratatui::layout::Position::new(col as u16, row as u16));
             }
-        }
-        // Footer.
-        if footer_lines == 1 {
-            let foot_area = Rect::new(0, y + editor_lines as u16, area.width, 1);
-            f.render_widget(
-                ratatui::text::Text::from(vec![crate::markdown::to_ratatui_line(&footer)]),
-                foot_area,
-            );
         }
     })?;
     Ok(())
 }
 
-/// Render one frame to stdout as plain text (headless structural dump used by
-/// the tmux verifier and diff tests). ANSI styling is stripped.
+/// Render one frame as plain text (headless structural dump used by the tmux
+/// verifier and diff tests). ANSI styling is stripped.
 pub fn render_frame_text(view: &mut AgentView, width: u16, height: u16) -> Vec<String> {
-    let mut buf = String::new();
-    let footer = view.render_footer(width as usize);
-    let frame = view.render_editor(width as usize, height);
-    let footer_lines: usize = if footer.is_empty() { 0 } else { 1 };
-    let editor_lines = frame.lines.len();
-    let transcript_height = (height as usize).saturating_sub(editor_lines + footer_lines);
-    let transcript = view.render_transcript(width as usize);
-    let skip = transcript.len().saturating_sub(transcript_height);
-    let mut lines: Vec<String> = Vec::new();
-    for line in &transcript[skip..] {
-        lines.push(line.iter().map(|s| s.content.as_str()).collect());
-    }
-    while lines.len() < transcript_height {
-        lines.push(String::new());
-    }
-    for line in &frame.lines {
-        lines.push(line.iter().map(|s| s.content.as_str()).collect());
-    }
-    if footer_lines == 1 {
-        lines.push(footer.iter().map(|s| s.content.as_str()).collect());
-    }
-    while lines.len() < height as usize {
-        lines.push(String::new());
-    }
-    let _ = &mut buf;
-    lines
+    let frame = view.render_frame(width as usize, height as usize);
+    frame
+        .iter()
+        .map(|line| line.iter().map(|s| s.content.as_str()).collect())
+        .collect()
 }
 
 #[allow(dead_code)]

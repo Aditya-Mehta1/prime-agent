@@ -58,6 +58,8 @@ pub struct InteractiveOptions {
     /// Prompt sent immediately after attach (CLI message arguments).
     pub initial_message: Option<String>,
     pub theme: String,
+    /// Product version for the brand splash.
+    pub version: String,
 }
 
 impl InteractiveOptions {
@@ -125,6 +127,9 @@ pub async fn run_interactive(
     options: InteractiveOptions,
     ui: UiMode,
 ) -> Result<InteractiveOutcome> {
+    // The TS theme emits raw ANSI color codes regardless of NO_COLOR; match
+    // that so the same terminal renders the same frames either way.
+    crossterm::style::force_color_output(true);
     let (client, mut events) = DaemonClient::connect(&options.socket_path)
         .await
         .with_context(|| "the interactive UI could not attach to the daemon")?;
@@ -132,7 +137,16 @@ pub async fn run_interactive(
 
     let theme = crate::app::load_theme(&options.theme);
     let mut view = AgentView::new(theme);
+    apply_startup_chrome(&mut view, &options);
+    session.refresh_stats().await;
     session.rebuild_view(&mut view);
+    if let Some(notice) = check_tmux_keyboard_setup().await {
+        view.push_entry(crate::chat::ChatEntry::Status {
+            text: format!("\u{26a0} {notice}"),
+            warning: true,
+        });
+        session.dirty = true;
+    }
     if let Some(initial) = &options.initial_message {
         session.submit_prompt(initial, &mut view).await?;
     }
@@ -184,10 +198,18 @@ pub async fn run_interactive(
             break;
         }
 
+        let was_active = session.turn_active;
         tokio::select! {
             maybe_event = events.recv() => {
                 match maybe_event {
-                    Some(event) => session.apply_client_event(event, &mut view),
+                    Some(event) => {
+                        session.apply_client_event(event, &mut view);
+                        // A settled turn refreshes the tray's context usage.
+                        if was_active && !session.turn_active {
+                            session.refresh_stats().await;
+                            session.rebuild_tray(&mut view);
+                        }
+                    }
                     None => {
                         session.note("the daemon connection closed", &mut view);
                         running = false;
@@ -200,6 +222,11 @@ pub async fn run_interactive(
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+
+        // Spinner animation: the loader frame advances while a turn runs.
+        if session.turn_active {
+            view.pulse_frame = view.pulse_frame.wrapping_add(1);
         }
 
         if let Some(renderer) = renderer.is_terminal_mut() {
@@ -224,6 +251,54 @@ pub async fn run_interactive(
     };
     session.client.close();
     Ok(outcome)
+}
+
+/// Seed the static chrome state for a fresh interactive run: splash
+/// version/cwd, top-bar name, and the `manage` hint for persisted sessions.
+fn apply_startup_chrome(view: &mut AgentView, options: &InteractiveOptions) {
+    view.chrome.version = options.version.clone();
+    view.chrome.cwd = options.cwd.to_string_lossy().to_string();
+    view.chrome.chat_name = crate::chrome::display_name(&view.chrome.cwd);
+    view.chrome.show_manage = !options.no_session;
+}
+
+/// The tmux keyboard notice (TS `checkTmuxKeyboardSetup`): warn once per
+/// start when tmux runs without `extended-keys`. Runs `tmux show` read-only
+/// against the ambient socket; a timeout or error suppresses the notice.
+async fn check_tmux_keyboard_setup() -> Option<String> {
+    if std::env::var("TMUX").is_err() {
+        return None;
+    }
+    let query = |option: &'static str| async move {
+        tokio::time::timeout(
+            Duration::from_millis(2_000),
+            tokio::task::spawn_blocking(move || {
+                std::process::Command::new("tmux")
+                    .args(["show", "-gv", option])
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+            }),
+        )
+        .await
+        .ok()
+        .and_then(|joined| joined.ok())
+        .and_then(|output| output.ok())
+        .and_then(|output| {
+            if output.status.success() {
+                Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+    };
+    let extended_keys = query("extended-keys").await?;
+    if extended_keys != "on" && extended_keys != "always" {
+        return Some(
+            "tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to ~/.tmux.conf and restart tmux.".to_string(),
+        );
+    }
+    None
 }
 
 /// Rendering sink: the real terminal or headless frame capture.

@@ -815,5 +815,7 @@ pub fn faux_image(data: &str, mime_type: &str) -> ImageContent {
     }
 }
 
+pub mod script;
+
 #[cfg(test)]
 mod tests;

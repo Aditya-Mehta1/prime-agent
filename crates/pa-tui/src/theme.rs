@@ -262,13 +262,31 @@ pub enum ColorMode {
     Color256,
 }
 
+/// TS `detectColorMode`: truecolor unless the terminal is truly limited.
+/// tmux reports `screen*` but forwards 24-bit color, so it stays truecolor;
+/// only genuine GNU screen (no `$TMUX`) falls back to the 256-color cube.
 pub fn detect_color_mode() -> ColorMode {
     let colorterm = std::env::var("COLORTERM").unwrap_or_default();
-    if colorterm.contains("truecolor") || colorterm.contains("24bit") {
-        ColorMode::TrueColor
-    } else {
-        ColorMode::Color256
+    if colorterm == "truecolor" || colorterm == "24bit" {
+        return ColorMode::TrueColor;
     }
+    if std::env::var_os("WT_SESSION").is_some() {
+        return ColorMode::TrueColor;
+    }
+    let term = std::env::var("TERM").unwrap_or_default();
+    if term == "dumb" || term.is_empty() || term == "linux" {
+        return ColorMode::Color256;
+    }
+    if std::env::var("TERM_PROGRAM").as_deref() == Ok("Apple_Terminal") {
+        return ColorMode::Color256;
+    }
+    let in_tmux = std::env::var_os("TMUX").is_some() || term.starts_with("tmux");
+    let genuine_screen =
+        term == "screen" || term.starts_with("screen-") || term.starts_with("screen.");
+    if !in_tmux && genuine_screen {
+        return ColorMode::Color256;
+    }
+    ColorMode::TrueColor
 }
 
 fn to_terminal_color(color: Color, mode: ColorMode) -> Color {

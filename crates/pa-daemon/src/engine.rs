@@ -27,10 +27,32 @@ pub struct PromptRequest {
 pub enum EngineEvent {
     /// The user message that was accepted (recorded into the session store).
     UserMessage(Value),
-    /// An assistant message update (streaming); the payload is the full message.
-    AssistantUpdate(Value),
+    /// An assistant message update (streaming); the payload is the full
+    /// message, plus the provider stream event that produced it (the TS wire
+    /// carries `assistantMessageEvent` so clients can track activity).
+    AssistantUpdate {
+        message: Value,
+        stream_event: Option<Value>,
+    },
     /// The final assistant message (recorded into the session store).
     AssistantMessage(Value),
+    /// A tool call started executing.
+    ToolExecutionStart {
+        tool_call_id: String,
+        tool_name: String,
+        args: Value,
+    },
+    /// A tool produced a partial result while still executing.
+    ToolExecutionUpdate {
+        tool_call_id: String,
+        partial_result: Value,
+    },
+    /// A tool call finished; `is_error` mirrors the tool result.
+    ToolExecutionEnd {
+        tool_call_id: String,
+        result: Value,
+        is_error: bool,
+    },
     /// The prompt completed (successfully or not).
     Done(std::result::Result<(), String>),
 }
@@ -61,6 +83,13 @@ pub trait SessionEngine: Send + Sync {
     /// Drives the `contextUsage` estimate in `get_session_stats`; engines
     /// without model metadata report `None` and the field is omitted.
     fn model_context_window(&self) -> Option<u64> {
+        None
+    }
+
+    /// The engine's resolved model as connection-state wire data
+    /// (`{ id, provider, reasoning }`), when known. Drives the interactive
+    /// splash and tray labels.
+    fn model_metadata(&self) -> Option<Value> {
         None
     }
 }
@@ -241,6 +270,14 @@ fn scripted_usage() -> Value {
 }
 
 impl SessionEngine for ScriptedEngine {
+    fn model_metadata(&self) -> Option<Value> {
+        Some(json!({
+            "id": "faux-1",
+            "provider": "scripted",
+            "reasoning": false,
+        }))
+    }
+
     fn run_prompt(
         &self,
         prompt_index: usize,
@@ -266,9 +303,10 @@ impl SessionEngine for ScriptedEngine {
             return;
         }
         let usage = scripted_usage();
-        if !emit(EngineEvent::AssistantUpdate(
-            json!({"role": "assistant", "content": "", "provider": "scripted", "model": "faux-1", "usage": usage.clone(), "timestamp": crate::util::now_ms()}),
-        )) {
+        if !emit(EngineEvent::AssistantUpdate {
+            message: json!({"role": "assistant", "content": "", "provider": "scripted", "model": "faux-1", "usage": usage.clone(), "timestamp": crate::util::now_ms()}),
+            stream_event: None,
+        }) {
             emit(cancelled());
             return;
         }

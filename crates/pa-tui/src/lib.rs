@@ -7,6 +7,9 @@
 pub mod ansi;
 pub mod app;
 pub mod autocomplete;
+pub mod chat;
+pub mod chrome;
+pub mod code_preview;
 pub mod daemon_client;
 pub mod editor;
 pub mod interactive;

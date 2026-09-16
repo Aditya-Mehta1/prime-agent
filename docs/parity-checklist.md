@@ -365,3 +365,42 @@ Passed-check highlights (both products agree, live through the mock):
 print-mode stdout identical; `ipython` tool turns execute in both;
 side questions stream `side_question_event` running->complete on both;
 wire attach returns the same snapshot data keys; CLI `attach` opens in both.
+
+## 9. Interactive TUI visual parity - done for the scripted core states
+
+Verified by a tmux frame-diff harness (`scripts/visual_parity.py`): the harness
+drives the installed TS binary and the Rust binary side by side in tmux, runs
+the same scripted turn on both (faux model with content-block responses: a
+thinking block, a text block, an `ipython` tool call, and a final answer), and
+compares `tmux capture-pane -e` frames after normalizing volatile content
+(versions, session ids, durations, token counts, spinner frames).
+
+Verified states (both at 120x36 and 220x50, PASS on 2025-06-27):
+- (a) fresh start: splash + header (model/cwd), prompt, footer, collapsed-mode
+  indicator, empty editor on `userMessageBg`.
+- (b) idle after a turn with a tool-call card: user block, assistant text,
+  collapsed ipython card (`\u2713 python \u00b7 <code preview> \u00b7 \u2191 N \u2193 M lines \u00b7 <duration>`),
+  final answer, tray stats.
+- (c) thinking visible (Ctrl+O): dim thinking block between user message and
+  assistant text, `Details mode` indicator.
+- (d) spinner/working state: loader row with activity label, elapsed seconds,
+  token estimate, spinner frames.
+
+Deliberate deviations / notes:
+- The Rust binary does not ship the `prime-agent-runtime` sidecar next to the
+  binary like the TS release does; the harness sets `PI_PACKAGE_DIR` to the
+  installed TS release directory so both run the same kernel runtime
+  (`find_runtime_package_dir` in the harness).
+- `code_preview` helpers are vendored under `crates/pa-tui/src/code_preview/`
+  (pa-tui may not depend on pa-core); consolidation into pa-types is a
+  follow-up.
+- Tool-card output rows beyond the collapsed line ("all" mode) and markdown
+  block types outside the scripted content are not yet frame-verified.
+- The harness normalizes boundary foreground resets
+  (`\x1b[39m` at end-of-row vs before next row's margin): tmux emits the same
+  reset at either position for identical screens.
+- The daemon worker exposes an event-log seam (`PA_DAEMON_EVENT_LOG=<path>`)
+  used to verify wire parity during harness development.
+
+Run it: `python3 scripts/visual_parity.py --sizes 120x36 220x50` (requires the
+TS binary on PATH and a built `target/debug/prime-agent`).

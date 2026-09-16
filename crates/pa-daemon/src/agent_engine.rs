@@ -147,6 +147,16 @@ impl SessionEngine for AgentSessionEngine {
         self.resolve_model().ok().map(|model| model.context_window)
     }
 
+    fn model_metadata(&self) -> Option<Value> {
+        let model = self.resolve_model().ok()?;
+        Some(json!({
+            "id": model.id,
+            "name": model.name,
+            "provider": model.provider,
+            "reasoning": model.reasoning,
+        }))
+    }
+
     fn run_side_question(
         &self,
         request: SideQuestionRequest,
@@ -290,10 +300,6 @@ impl AgentSessionEngine {
                         match &event {
                             AgentEvent::MessageStart {
                                 message: agent_message,
-                            }
-                            | AgentEvent::MessageUpdate {
-                                message: agent_message,
-                                ..
                             } => {
                                 if matches!(
                                     agent_message,
@@ -302,9 +308,63 @@ impl AgentSessionEngine {
                                     )
                                 ) {
                                     if let Some(value) = session_wire_value(agent_message) {
-                                        let _ = tx.send(EngineEvent::AssistantUpdate(value));
+                                        let _ = tx.send(EngineEvent::AssistantUpdate {
+                                            message: value,
+                                            stream_event: Some(json!({ "type": "start" })),
+                                        });
                                     }
                                 }
+                            }
+                            AgentEvent::MessageUpdate {
+                                message: agent_message,
+                                assistant_message_event: stream_event,
+                            } => {
+                                if matches!(
+                                    agent_message,
+                                    pa_agent::types::AgentMessage::Standard(
+                                        pa_agent::types::Message::Assistant(_)
+                                    )
+                                ) {
+                                    if let Some(value) = session_wire_value(agent_message) {
+                                        let _ = tx.send(EngineEvent::AssistantUpdate {
+                                            message: value,
+                                            stream_event: stream_event_value(stream_event),
+                                        });
+                                    }
+                                }
+                            }
+                            AgentEvent::ToolExecutionStart {
+                                tool_call_id,
+                                tool_name,
+                                args,
+                            } => {
+                                let _ = tx.send(EngineEvent::ToolExecutionStart {
+                                    tool_call_id: tool_call_id.clone(),
+                                    tool_name: tool_name.clone(),
+                                    args: args.clone(),
+                                });
+                            }
+                            AgentEvent::ToolExecutionUpdate {
+                                tool_call_id,
+                                partial_result,
+                                ..
+                            } => {
+                                let _ = tx.send(EngineEvent::ToolExecutionUpdate {
+                                    tool_call_id: tool_call_id.clone(),
+                                    partial_result: tool_result_wire_value(partial_result),
+                                });
+                            }
+                            AgentEvent::ToolExecutionEnd {
+                                tool_call_id,
+                                result,
+                                is_error,
+                                ..
+                            } => {
+                                let _ = tx.send(EngineEvent::ToolExecutionEnd {
+                                    tool_call_id: tool_call_id.clone(),
+                                    result: tool_result_wire_value(result),
+                                    is_error: *is_error,
+                                });
                             }
                             _ => {}
                         }
@@ -427,52 +487,14 @@ mod tests {
     }
 }
 
-/// Register the faux provider from a `{"responses": [...]}` script and return
-/// its model. Verification harness only; never set by the product.
+/// Register the faux provider from a script and return its model. Scripts
+/// carry plain-text responses (strings or `{"text"}` objects) or content-block
+/// arrays (thinking, text, tool calls) so harnesses can script full turns.
+/// Verification harness only; never set by the product.
 fn faux_model_from_script(script: &str) -> anyhow::Result<Model> {
     let script: serde_json::Value = serde_json::from_str(script)?;
-    let responses: Vec<String> = script
-        .get("responses")
-        .and_then(serde_json::Value::as_array)
-        .map(|entries| {
-            entries
-                .iter()
-                .map(|entry| match entry {
-                    serde_json::Value::String(text) => text.clone(),
-                    serde_json::Value::Object(map) => map
-                        .get("text")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    _ => String::new(),
-                })
-                .collect()
-        })
-        .ok_or_else(|| anyhow::anyhow!("responses array required"))?;
-    let registration =
-        pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
-            models: Some(vec![pa_ai::faux::FauxModelDefinition {
-                id: "faux-1".to_string(),
-                name: Some("Faux Model".to_string()),
-                reasoning: Some(false),
-                input: Some(vec![pa_types::ai::ModelInput::Text]),
-                cost: None,
-                context_window: Some(100_000),
-                max_tokens: Some(4_096),
-            }]),
-            ..Default::default()
-        });
-    registration.set_responses(
-        responses
-            .iter()
-            .map(|text| {
-                pa_ai::faux::FauxResponseStep::Message(pa_ai::faux::faux_assistant_text_message(
-                    text,
-                    pa_ai::faux::FauxAssistantMessageOptions::default(),
-                ))
-            })
-            .collect(),
-    );
+    let parsed = pa_ai::faux::script::parse_faux_script(&script).map_err(anyhow::Error::msg)?;
+    let registration = pa_ai::faux::script::register_faux_provider_from_script(&parsed);
     Ok(registration.get_model())
 }
 
@@ -507,7 +529,7 @@ fn agent_engine_streams_updates_and_final_message() {
     assert!(matches!(&events[0], EngineEvent::UserMessage(_)));
     assert!(events
         .iter()
-        .any(|event| matches!(event, EngineEvent::AssistantUpdate(_))));
+        .any(|event| matches!(event, EngineEvent::AssistantUpdate { .. })));
     let final_index = events
         .iter()
         .position(|event| matches!(event, EngineEvent::AssistantMessage(_)))
@@ -522,6 +544,43 @@ fn agent_engine_streams_updates_and_final_message() {
 }
 
 /// Serialize a pa-agent message through the session wire shape (adds `role`).
+/// Wire form of one provider stream event (TS `assistantMessageEvent`):
+/// the event `type` plus the `delta` when the event carries one.
+fn stream_event_value(event: &pa_agent::stream::AssistantMessageEvent) -> Option<Value> {
+    use pa_agent::stream::AssistantMessageEvent;
+    let (kind, delta) = match event {
+        AssistantMessageEvent::Start { .. } => ("start", None),
+        AssistantMessageEvent::TextStart { .. } => ("text_start", None),
+        AssistantMessageEvent::TextDelta { delta, .. } => ("text_delta", Some(delta.as_str())),
+        AssistantMessageEvent::TextEnd { .. } => ("text_end", None),
+        AssistantMessageEvent::ThinkingStart { .. } => ("thinking_start", None),
+        AssistantMessageEvent::ThinkingDelta { delta, .. } => {
+            ("thinking_delta", Some(delta.as_str()))
+        }
+        AssistantMessageEvent::ThinkingEnd { .. } => ("thinking_end", None),
+        AssistantMessageEvent::ToolCallStart { .. } => ("toolcall_start", None),
+        AssistantMessageEvent::ToolCallDelta { delta, .. } => {
+            ("toolcall_delta", Some(delta.as_str()))
+        }
+        AssistantMessageEvent::ToolCallEnd { .. } => ("toolcall_end", None),
+        AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. } => return None,
+    };
+    match delta {
+        Some(delta) => Some(json!({ "type": kind, "delta": delta })),
+        None => Some(json!({ "type": kind })),
+    }
+}
+
+/// Wire form of one tool result (the TS tool-execution event payload).
+fn tool_result_wire_value(result: &pa_agent::types::AgentToolResult) -> Value {
+    let content: Vec<Value> = result
+        .content
+        .iter()
+        .map(|block| serde_json::to_value(block).unwrap_or(Value::Null))
+        .collect();
+    json!({ "content": content, "details": result.details })
+}
+
 fn session_wire_value(agent_message: &pa_agent::types::AgentMessage) -> Option<Value> {
     use pa_agent::types::Message as LoopMessage;
     let session_message = match agent_message {

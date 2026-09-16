@@ -67,6 +67,7 @@ fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<Inter
         session,
         initial_message: options.initial_message.clone(),
         theme: String::new(),
+        version: crate::config::VERSION.to_string(),
     })
 }
 

@@ -7,7 +7,7 @@
 //! arrays, with or without explicit block `type` tags, covering the shapes
 //! the scripted harness and the real engine both emit.
 
-use crate::session::TranscriptItem;
+use crate::chat::{AssistantMessage, ChatEntry, MessageBlock, ToolCallCard};
 use pa_types::daemon::{DaemonEventCursor, DaemonReplayInfo};
 use serde::Deserialize;
 use serde_json::Value;
@@ -39,13 +39,13 @@ pub struct AttachClient {
     pub capabilities: Vec<String>,
 }
 
-/// A reconstructed attach: view-ready transcript plus identity/state labels.
+/// A reconstructed attach: view-ready chat entries plus identity labels.
 #[derive(Debug, Clone, Default)]
 pub struct Reconstructed {
-    pub transcript: Vec<TranscriptItem>,
-    /// Model label for the footer (`state.model`).
-    pub model_label: String,
-    /// Session display name for the footer.
+    pub chat: Vec<ChatEntry>,
+    /// Current model id (`state.model.id`), when the session reports one.
+    pub model_id: Option<String>,
+    /// Session display name.
     pub session_name: Option<String>,
     /// Session id of the persisted session file.
     pub session_id: String,
@@ -53,9 +53,9 @@ pub struct Reconstructed {
 }
 
 impl Reconstructed {
-    /// Fold one raw message into the transcript.
+    /// Fold one raw message into the chat entries.
     pub fn push_message(&mut self, message: &Value) {
-        self.transcript.extend(message_value_to_items(message));
+        self.chat.extend(message_value_to_entries(message));
     }
 }
 
@@ -68,15 +68,14 @@ pub fn reconstruct(attach: &AttachData) -> Reconstructed {
         .map(|messages| {
             messages
                 .iter()
-                .flat_map(message_value_to_items)
+                .flat_map(message_value_to_entries)
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
     let state = snapshot.get("state");
-    let model_label = state
+    let model_id = state
         .and_then(|state| state.get("model"))
-        .and_then(model_label_value)
-        .unwrap_or_default();
+        .and_then(model_id_value);
     let session_name = state
         .and_then(|state| state.get("sessionName"))
         .and_then(Value::as_str)
@@ -92,11 +91,21 @@ pub fn reconstruct(attach: &AttachData) -> Reconstructed {
         .or(attach.last_event_sequence)
         .unwrap_or_default();
     Reconstructed {
-        transcript: messages,
-        model_label,
+        chat: messages,
+        model_id,
         session_name,
         session_id,
         last_event_sequence,
+    }
+}
+
+/// The model id from a `state.model` wire value (`{id, provider}` or a
+/// display string).
+fn model_id_value(model: &Value) -> Option<String> {
+    match model {
+        Value::String(label) => Some(label.clone()),
+        Value::Object(map) => map.get("id").and_then(Value::as_str).map(str::to_string),
+        _ => None,
     }
 }
 
@@ -105,21 +114,6 @@ pub fn attach_data_from_response(data: &Value) -> anyhow::Result<AttachData> {
     serde_json::from_value(data.clone()).map_err(|error| {
         anyhow::anyhow!("the daemon returned an unrecognizable attach result: {error}")
     })
-}
-
-fn model_label_value(model: &Value) -> Option<String> {
-    match model {
-        Value::String(label) => Some(label.clone()),
-        Value::Object(map) => {
-            let model_id = map.get("modelId").and_then(Value::as_str)?;
-            let provider = map.get("provider").and_then(Value::as_str);
-            Some(match provider {
-                Some(provider) => format!("{provider}/{model_id}"),
-                None => model_id.to_string(),
-            })
-        }
-        _ => None,
-    }
 }
 
 /// One live session event decoded for the transcript (the `event` field of
@@ -131,8 +125,30 @@ pub enum TurnUpdate {
     /// `message_start` with a user message.
     UserMessage(String),
     /// `message_start`/`message_update`/`message_end` with an assistant
-    /// message; `streaming` distinguishes in-flight from final.
-    AssistantMessage { text: String, streaming: bool },
+    /// message (raw wire value); `streaming` distinguishes in-flight from
+    /// final.
+    AssistantMessage {
+        message: Value,
+        streaming: bool,
+        stream_event: Option<Value>,
+    },
+    /// `tool_execution_start`: a tool call began executing.
+    ToolExecutionStart {
+        tool_call_id: String,
+        tool_name: String,
+        args: Value,
+    },
+    /// `tool_execution_update`: a partial tool result.
+    ToolExecutionUpdate {
+        tool_call_id: String,
+        partial: Value,
+    },
+    /// `tool_execution_end`: the final tool result.
+    ToolExecutionEnd {
+        tool_call_id: String,
+        result: Value,
+        is_error: bool,
+    },
     /// `turn_end`, with the turn error string when the turn failed.
     TurnEnded { error: Option<String> },
     /// `agent_end`: the prompt queue drained.
@@ -153,7 +169,7 @@ pub fn event_to_update(event: &Value) -> Option<TurnUpdate> {
         }),
         "agent_end" => Some(TurnUpdate::Idle),
         "message_start" | "message_update" | "message_end" => {
-            let message = event.get("message")?;
+            let message = event.get("message")?.clone();
             let event_type = event.get("type").and_then(Value::as_str);
             let streaming = event_type != Some("message_end");
             match message.get("role").and_then(Value::as_str) {
@@ -162,15 +178,49 @@ pub fn event_to_update(event: &Value) -> Option<TurnUpdate> {
                 Some("user") if event_type == Some("message_update") => {
                     Some(TurnUpdate::StatusUpdate)
                 }
-                Some("user") => Some(TurnUpdate::UserMessage(message_text(message))),
+                Some("user") => Some(TurnUpdate::UserMessage(message_text(&message))),
                 Some("assistant") => Some(TurnUpdate::AssistantMessage {
-                    text: message_text(message),
+                    message,
                     streaming,
+                    stream_event: event.get("assistantMessageEvent").cloned(),
                 }),
                 _ => Some(TurnUpdate::StatusUpdate),
             }
         }
-        // Tool execution and queue churn only affect the status line here.
+        "tool_execution_start" => Some(TurnUpdate::ToolExecutionStart {
+            tool_call_id: event
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            tool_name: event
+                .get("toolName")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            args: event.get("args").cloned().unwrap_or(Value::Null),
+        }),
+        "tool_execution_update" => Some(TurnUpdate::ToolExecutionUpdate {
+            tool_call_id: event
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            partial: event.get("partialResult").cloned().unwrap_or(Value::Null),
+        }),
+        "tool_execution_end" => Some(TurnUpdate::ToolExecutionEnd {
+            tool_call_id: event
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            result: event.get("result").cloned().unwrap_or(Value::Null),
+            is_error: event
+                .get("isError")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        }),
+        // Queue churn and unknown events only affect the status line.
         _ => Some(TurnUpdate::StatusUpdate),
     }
 }
@@ -202,65 +252,110 @@ fn block_text(block: &Value) -> Option<String> {
     }
 }
 
-/// Fold one raw message into transcript items. Assistant messages may expand
-/// into multiple items (text blocks plus tool calls).
-/// Fold one raw message into transcript items. Assistant messages may expand
-/// into multiple items (text blocks plus tool calls).
-pub fn message_value_to_items(message: &Value) -> Vec<TranscriptItem> {
+/// Fold one raw message into chat entries. Assistant messages expand into a
+/// message component (ordered text/thinking blocks) plus one card per tool
+/// call, in content order.
+pub fn message_value_to_entries(message: &Value) -> Vec<ChatEntry> {
     let role = message
         .get("role")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let content = message.get("content");
     match role {
-        "user" => content.map(|content| {
-            vec![TranscriptItem::UserMessage {
-                text: content_to_text(content),
-            }]
-        }),
-        "assistant" => match content {
-            // Plain-string assistant content: one text item.
-            Some(Value::String(text)) => {
-                Some(vec![TranscriptItem::Assistant { text: text.clone() }])
-            }
-            Some(Value::Array(blocks)) => Some(
-                blocks
-                    .iter()
-                    .filter_map(|block| {
-                        if let Some(text) = block.get("text").and_then(Value::as_str) {
-                            return Some(TranscriptItem::Assistant {
-                                text: text.to_string(),
-                            });
-                        }
-                        if block.get("type").and_then(Value::as_str) == Some("toolCall") {
-                            return Some(TranscriptItem::ToolCall {
-                                id: block
-                                    .get("id")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                name: block
-                                    .get("name")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                arguments: block
-                                    .get("arguments")
-                                    .cloned()
-                                    .map(|value| value.to_string())
-                                    .unwrap_or_default(),
-                            });
-                        }
-                        None
-                    })
-                    .collect(),
-            ),
-            _ => None,
-        },
-        // Other roles (tool results, bookkeeping) have no rendering here yet.
-        _ => None,
+        "user" => vec![ChatEntry::User {
+            text: content_to_text(message.get("content").unwrap_or(&Value::Null)),
+        }],
+        "assistant" => assistant_value_to_entries(message),
+        // Other roles (tool results, bookkeeping) have no rendering here:
+        // live tool results arrive as tool_execution events instead.
+        _ => Vec::new(),
     }
-    .unwrap_or_default()
+}
+
+/// Decode an assistant wire message into a message component plus tool cards.
+pub fn assistant_value_to_entries(message: &Value) -> Vec<ChatEntry> {
+    let (blocks, tool_calls) = assistant_message_parts(message);
+    if blocks.is_empty() && tool_calls.is_empty() {
+        return Vec::new();
+    }
+    let mut entries = Vec::new();
+    if !blocks.is_empty() || message.get("errorMessage").is_some() {
+        entries.push(ChatEntry::Assistant(Box::new(AssistantMessage {
+            blocks,
+            has_tool_calls: !tool_calls.is_empty(),
+            streaming: false,
+        })));
+    }
+    for (id, name, args) in tool_calls {
+        entries.push(ChatEntry::Tool(Box::new(ToolCallCard {
+            id,
+            name,
+            args,
+            started: false,
+            result: None,
+            result_partial: false,
+        })));
+    }
+    entries
+}
+
+/// The ordered visible blocks (thinking, text) and tool calls of one
+/// assistant wire message.
+pub fn assistant_message_parts(
+    message: &Value,
+) -> (Vec<MessageBlock>, Vec<(String, String, Value)>) {
+    let mut blocks = Vec::new();
+    let mut tool_calls = Vec::new();
+    match message.get("content") {
+        Some(Value::String(text)) => {
+            if !text.is_empty() {
+                blocks.push(MessageBlock::Text(text.clone()));
+            }
+        }
+        Some(Value::Array(array)) => {
+            for block in array {
+                let block_type = block.get("type").and_then(Value::as_str);
+                match block_type {
+                    Some("thinking") => {
+                        let thinking = block.get("thinking").and_then(Value::as_str);
+                        if let Some(thinking) = thinking.filter(|text| !text.trim().is_empty()) {
+                            blocks.push(MessageBlock::Thinking(thinking.to_string()));
+                        }
+                    }
+                    Some("text") => {
+                        let text = block.get("text").and_then(Value::as_str);
+                        if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
+                            blocks.push(MessageBlock::Text(text.to_string()));
+                        }
+                    }
+                    Some("toolCall") => {
+                        tool_calls.push((
+                            block
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            block
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            block.get("arguments").cloned().unwrap_or(Value::Null),
+                        ));
+                    }
+                    None => {
+                        // Untagged text blocks (the scripted engine's form).
+                        let text = block.get("text").and_then(Value::as_str);
+                        if let Some(text) = text.filter(|text| !text.is_empty()) {
+                            blocks.push(MessageBlock::Text(text.to_string()));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    (blocks, tool_calls)
 }
 
 fn content_to_text(content: &Value) -> String {
@@ -328,17 +423,10 @@ mod tests {
         let data = attach_data_from_response(&slim_attach()).unwrap();
         assert_eq!(data.active_session_id, "abc123def456");
         let view = reconstruct(&data);
-        assert_eq!(
-            view.transcript,
-            vec![
-                TranscriptItem::UserMessage {
-                    text: "hello".to_string()
-                },
-                TranscriptItem::Assistant {
-                    text: "hi there".to_string()
-                },
-            ]
-        );
+        assert_eq!(view.chat.len(), 2);
+        assert!(matches!(&view.chat[0], ChatEntry::User { text } if text == "hello"));
+        assert!(matches!(&view.chat[1], ChatEntry::Assistant(m) if m.blocks
+            == vec![MessageBlock::Text("hi there".to_string())]));
         assert_eq!(view.session_id, "0199-sess");
         assert_eq!(view.session_name.as_deref(), Some("my session"));
         assert_eq!(view.last_event_sequence, 9);
@@ -346,29 +434,30 @@ mod tests {
 
     #[test]
     fn decodes_block_content() {
-        let items = message_value_to_items(&json!({
+        let items = message_value_to_entries(&json!({
             "role": "user",
             "content": [{ "text": "hello " }, { "text": "world" }],
         }));
         assert_eq!(
             items,
-            vec![TranscriptItem::UserMessage {
+            vec![ChatEntry::User {
                 text: "hello world".to_string()
             }]
         );
-        let items = message_value_to_items(&json!({
+        let items = message_value_to_entries(&json!({
             "role": "assistant",
             "content": [
+                { "type": "thinking", "thinking": "hmm" },
                 { "type": "text", "text": "working" },
                 { "type": "toolCall", "id": "t1", "name": "bash", "arguments": { "command": "ls" } },
             ],
         }));
         assert_eq!(items.len(), 2);
-        assert!(matches!(&items[0], TranscriptItem::Assistant { text } if text == "working"));
         assert!(matches!(
-            &items[1],
-            TranscriptItem::ToolCall { name, .. } if name == "bash"
+            &items[0],
+            ChatEntry::Assistant(m) if m.blocks.len() == 2 && m.has_tool_calls
         ));
+        assert!(matches!(&items[1], ChatEntry::Tool(card) if card.name == "bash"));
     }
 
     #[test]
@@ -384,25 +473,19 @@ mod tests {
             "message": { "role": "assistant", "content": "work" },
         }))
         .unwrap();
-        assert_eq!(
-            partial,
-            TurnUpdate::AssistantMessage {
-                text: "work".to_string(),
-                streaming: true
-            }
-        );
+        assert!(matches!(
+            &partial,
+            TurnUpdate::AssistantMessage { message, streaming: true, .. } if message["content"] == "work"
+        ));
         let final_message = event_to_update(&json!({
             "type": "message_end",
             "message": { "role": "assistant", "content": "done" },
         }))
         .unwrap();
-        assert_eq!(
-            final_message,
-            TurnUpdate::AssistantMessage {
-                text: "done".to_string(),
-                streaming: false
-            }
-        );
+        assert!(matches!(
+            &final_message,
+            TurnUpdate::AssistantMessage { message, streaming: false, .. } if message["content"] == "done"
+        ));
         let ended = event_to_update(&json!({ "type": "turn_end" })).unwrap();
         assert_eq!(ended, TurnUpdate::TurnEnded { error: None });
         let failed = event_to_update(&json!({ "type": "turn_end", "error": "boom" })).unwrap();

@@ -9,11 +9,13 @@ use anyhow::{anyhow, Context, Result};
 use pa_types::daemon::DaemonCommand;
 use serde_json::Value;
 
+use crate::chat::{ChatEntry, MessageBlock, ToolCallCard, ToolResultView, WorkingState};
 use crate::daemon_client::{DaemonClient, DaemonClientEvent};
 use crate::interactive::{InteractiveOptions, SessionSelection};
 use crate::keys::key_event_to_id;
-use crate::session::TranscriptItem;
-use crate::snapshot::{attach_data_from_response, event_to_update, reconstruct, TurnUpdate};
+use crate::snapshot::{
+    assistant_message_parts, attach_data_from_response, event_to_update, reconstruct, TurnUpdate,
+};
 use crate::view::AgentView;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -28,12 +30,20 @@ pub(crate) struct SessionUi {
     cwd: PathBuf,
     session_dir: Option<PathBuf>,
     script_path: Option<PathBuf>,
-    /// Snapshot transcript to fold into the view on the next rebuild.
-    pending_snapshot: Option<Vec<TranscriptItem>>,
+    /// Snapshot chat entries to fold into the view on the next rebuild.
+    pending_snapshot: Option<Vec<ChatEntry>>,
+    /// Snapshot labels (model) for the next rebuild.
+    pending_model: Option<String>,
+    /// Context usage + cost refreshed from `get_session_stats`.
+    context: Option<crate::chrome::ContextUsage>,
+    cost_usd: Option<f64>,
     /// Rows of the most recent `/list` (for `/switch <n>`).
     list_rows: Vec<Value>,
     pub(crate) turn_active: bool,
+    /// The chat index of the assistant message still streaming.
     streaming_index: Option<usize>,
+    /// Streaming token estimate for the loader (activity tracker).
+    working_tokens: u64,
     pub(crate) last_assistant_text: Option<String>,
     pub(crate) exit_requested: bool,
     pub(crate) dirty: bool,
@@ -61,9 +71,13 @@ impl SessionUi {
             session_dir: options.session_dir.clone(),
             script_path: options.script_path.clone(),
             pending_snapshot: None,
+            pending_model: None,
+            context: None,
+            cost_usd: None,
             list_rows: Vec::new(),
             turn_active: false,
             streaming_index: None,
+            working_tokens: 0,
             last_assistant_text: None,
             exit_requested: false,
             dirty: true,
@@ -103,16 +117,21 @@ impl SessionUi {
         self.active_session_id = attach.active_session_id;
         self.session_id = reconstructed.session_id;
         self.session_name = reconstructed.session_name;
-        self.last_assistant_text =
-            reconstructed
-                .transcript
-                .iter()
-                .rev()
-                .find_map(|item| match item {
-                    TranscriptItem::Assistant { text } => Some(text.clone()),
-                    _ => None,
-                });
-        self.pending_snapshot = Some(reconstructed.transcript);
+        self.pending_model = reconstructed.model_id;
+        self.last_assistant_text = reconstructed
+            .chat
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                ChatEntry::Assistant(message) => {
+                    message.blocks.iter().rev().find_map(|block| match block {
+                        MessageBlock::Text(text) => Some(text.clone()),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            });
+        self.pending_snapshot = Some(reconstructed.chat);
         self.turn_active = false;
         self.streaming_index = None;
         Ok(())
@@ -121,26 +140,70 @@ impl SessionUi {
     /// Fold the pending snapshot into the view (fresh transcript, footer
     /// labels). Called after attach and after every session switch.
     pub(crate) fn rebuild_view(&mut self, view: &mut AgentView) {
-        view.transcript.clear();
+        view.chat.clear();
         if let Some(items) = self.pending_snapshot.take() {
-            for item in items {
-                view.push(item);
+            for entry in items {
+                view.push_entry(entry);
             }
         }
-        view.model_label = self.session_display();
-        view.status = "idle".to_string();
+        if let Some(model) = self.pending_model.take() {
+            view.chrome.model_id = Some(model);
+        }
+        view.chrome.chat_name = self.session_display();
+        view.chrome.context = self.context;
+        view.chrome.cost_usd = self.cost_usd;
+        view.working = None;
+        view.follow();
         self.dirty = true;
     }
 
     fn session_display(&self) -> String {
         self.session_name
             .clone()
-            .unwrap_or_else(|| self.active_session_id.clone())
+            .unwrap_or_else(|| crate::chrome::display_name(&self.cwd.to_string_lossy()))
+    }
+
+    /// Refresh context usage and session spend from `get_session_stats`
+    /// (the TS tray's connection refresh): tokens, context window, percent,
+    /// and the branch total cost.
+    pub(crate) async fn refresh_stats(&mut self) {
+        let Ok(data) = self
+            .client
+            .request_ok(DaemonCommand::GetSessionStats {
+                id: None,
+                active_session_id: self.active_session_id.clone(),
+                rest: Default::default(),
+            })
+            .await
+        else {
+            return;
+        };
+        if let Some(usage) = data.get("contextUsage") {
+            let tokens = usage.get("tokens").and_then(Value::as_u64);
+            let window = usage.get("contextWindow").and_then(Value::as_u64);
+            if let (Some(tokens), Some(window)) = (tokens, window) {
+                self.context = Some(crate::chrome::ContextUsage {
+                    tokens,
+                    context_window: window,
+                });
+            }
+        }
+        self.cost_usd = data.get("cost").and_then(Value::as_f64);
+        self.dirty = true;
+    }
+
+    /// Re-apply the refreshed context usage and cost to the chrome state.
+    pub(crate) fn rebuild_tray(&mut self, view: &mut AgentView) {
+        view.chrome.context = self.context;
+        view.chrome.cost_usd = self.cost_usd;
+        view.chrome.chat_name = self.session_display();
+        self.dirty = true;
     }
 
     pub(crate) fn note(&mut self, text: &str, view: &mut AgentView) {
-        view.push(TranscriptItem::SystemNote {
+        view.push_entry(ChatEntry::Status {
             text: text.to_string(),
+            warning: false,
         });
         self.dirty = true;
     }
@@ -192,9 +255,42 @@ impl SessionUi {
         if !self.turn_active {
             self.turn_active = true;
         }
-        view.status = "working".to_string();
+        self.start_loader(view);
         self.dirty = true;
         Ok(())
+    }
+
+    /// The working loader starts with a `Waiting` activity and a zero token
+    /// count (stream events accumulate tokens and switch the label).
+    fn start_loader(&mut self, view: &mut AgentView) {
+        view.working = Some(WorkingState {
+            activity: "Waiting",
+            download: false,
+            tokens: 0,
+            elapsed_secs: 0,
+        });
+        view.working_since = Some(std::time::Instant::now());
+        self.working_tokens = 0;
+    }
+
+    /// Update the loader from one provider stream event (the activity
+    /// tracker: thinking/text/toolcall deltas switch the label and
+    /// accumulate the token estimate at 4 chars per token).
+    fn track_stream_activity(&mut self, event: &Value, view: &mut AgentView) {
+        let (activity, download) = match event.get("type").and_then(Value::as_str) {
+            Some("thinking_start") | Some("thinking_delta") => ("Thinking", true),
+            Some("text_start") | Some("text_delta") => ("Writing", true),
+            Some("toolcall_start") | Some("toolcall_delta") => ("Writing code", true),
+            _ => return,
+        };
+        if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+            self.working_tokens += (delta.chars().count() as f64 / 4.0).round() as u64;
+        }
+        if let Some(working) = &mut view.working {
+            working.activity = activity;
+            working.download = download;
+            working.tokens = self.working_tokens;
+        }
     }
 
     /// Slash commands: session management without a full command palette.
@@ -247,6 +343,7 @@ impl SessionUi {
             session: SessionSelection::New,
             initial_message: None,
             theme: String::new(),
+            version: String::new(),
         }
     }
 
@@ -363,6 +460,14 @@ impl SessionUi {
             view.editor.cancel_autocomplete();
             return Ok(());
         }
+        if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            view.detail = match view.detail {
+                crate::chat::Detail::Overview => crate::chat::Detail::Details,
+                crate::chat::Detail::Details => crate::chat::Detail::Overview,
+            };
+            self.dirty = true;
+            return Ok(());
+        }
         let Some(id) = key_event_to_id(&key) else {
             return Ok(());
         };
@@ -396,7 +501,7 @@ impl SessionUi {
             } => {
                 if active_session_id == self.active_session_id {
                     self.turn_active = false;
-                    view.status = "idle".to_string();
+                    view.working = None;
                     self.note(&format!("session closed ({reason})"), view);
                 }
             }
@@ -413,31 +518,39 @@ impl SessionUi {
         match update {
             TurnUpdate::TurnStarted => {
                 self.turn_active = true;
-                view.status = "working".to_string();
+                self.start_loader(view);
             }
             TurnUpdate::UserMessage(text) => {
-                view.push(TranscriptItem::UserMessage { text });
+                view.push_entry(ChatEntry::User { text });
             }
-            TurnUpdate::AssistantMessage { text, streaming } => {
-                if !text.is_empty() {
-                    self.last_assistant_text = Some(text.clone());
-                }
-                match self.streaming_index {
-                    Some(index) => {
-                        if let Some(TranscriptItem::Assistant { text: slot }) =
-                            view.transcript.get_mut(index)
-                        {
-                            *slot = text;
-                        }
-                    }
-                    None => {
-                        view.transcript.push(TranscriptItem::Assistant { text });
-                        self.streaming_index = Some(view.transcript.len() - 1);
-                    }
-                }
-                if !streaming {
-                    self.streaming_index = None;
-                }
+            TurnUpdate::AssistantMessage {
+                message,
+                streaming,
+                stream_event,
+            } => {
+                self.apply_assistant_message(&message, streaming, stream_event.as_ref(), view);
+            }
+            TurnUpdate::ToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                args,
+            } => {
+                self.apply_tool_start(&tool_call_id, &tool_name, args, view);
+                self.set_working_activity("Executing", false, view);
+            }
+            TurnUpdate::ToolExecutionUpdate {
+                tool_call_id,
+                partial,
+            } => {
+                self.apply_tool_result(&tool_call_id, partial, false, true, view);
+            }
+            TurnUpdate::ToolExecutionEnd {
+                tool_call_id,
+                result,
+                is_error,
+            } => {
+                self.apply_tool_result(&tool_call_id, result, is_error, false, view);
+                self.set_working_activity("Waiting", false, view);
             }
             TurnUpdate::TurnEnded { error } => {
                 // Only the engine's own turn_end clears the busy state:
@@ -445,19 +558,169 @@ impl SessionUi {
                 // not cancel a turn admitted in between (prompt queueing).
                 self.streaming_index = None;
                 self.turn_active = false;
-                view.status = "idle".to_string();
+                view.working = None;
+                view.working_since = None;
                 if let Some(error) = error {
-                    self.note(&format!("turn failed: {error}"), view);
+                    view.push_entry(ChatEntry::Status {
+                        text: format!("turn failed: {error}"),
+                        warning: true,
+                    });
                 }
             }
             TurnUpdate::Idle => {
                 if !self.turn_active {
-                    view.status = "idle".to_string();
+                    view.working = None;
                 }
             }
             TurnUpdate::StatusUpdate => {}
         }
         self.dirty = true;
+    }
+
+    /// Apply an assistant message frame: an open streaming message is
+    /// updated in place; otherwise the message expands into a chat component
+    /// plus a card per tool call.
+    fn apply_assistant_message(
+        &mut self,
+        message: &Value,
+        streaming: bool,
+        stream_event: Option<&Value>,
+        view: &mut AgentView,
+    ) {
+        if let Some(event) = stream_event {
+            self.track_stream_activity(event, view);
+        }
+        let (blocks, tool_calls) = assistant_message_parts(message);
+        if let Some(text) = blocks.iter().rev().find_map(|block| match block {
+            MessageBlock::Text(text) => Some(text.clone()),
+            _ => None,
+        }) {
+            self.last_assistant_text = Some(text);
+        }
+        let has_tool_calls = !tool_calls.is_empty();
+        // A message_start always opens a new streaming message (the engine
+        // emits one per provider call); later frames update it in place.
+        let starts_message = matches!(
+            stream_event.and_then(|event| event.get("type").and_then(Value::as_str)),
+            Some("start")
+        );
+        if starts_message {
+            self.streaming_index = None;
+        }
+        match self.streaming_index {
+            Some(index) => {
+                if let Some(ChatEntry::Assistant(open)) = view.chat.get_mut(index) {
+                    open.blocks = blocks;
+                    open.has_tool_calls = has_tool_calls;
+                    open.streaming = streaming;
+                }
+            }
+            None => {
+                if !blocks.is_empty() {
+                    view.push_entry(ChatEntry::Assistant(Box::new(
+                        crate::chat::AssistantMessage {
+                            blocks,
+                            has_tool_calls,
+                            streaming,
+                        },
+                    )));
+                    self.streaming_index = Some(view.chat.len() - 1);
+                }
+            }
+        }
+        for (id, name, args) in tool_calls {
+            // A streamed tool call first appears queued; the execution start
+            // event flips it to running.
+            if !view
+                .chat
+                .iter()
+                .any(|entry| matches!(entry, ChatEntry::Tool(card) if card.id == id))
+            {
+                view.push_entry(ChatEntry::Tool(Box::new(ToolCallCard {
+                    id,
+                    name,
+                    args,
+                    started: false,
+                    result: None,
+                    result_partial: false,
+                })));
+            }
+        }
+        if !streaming {
+            self.streaming_index = None;
+        }
+    }
+
+    /// `tool_execution_start`: mark the matching card running (or create it
+    /// when the message frame has not arrived yet).
+    fn apply_tool_start(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+        args: Value,
+        view: &mut AgentView,
+    ) {
+        for entry in &mut view.chat {
+            if let ChatEntry::Tool(card) = entry {
+                if card.id == tool_call_id {
+                    card.started = true;
+                    if !args.is_null() {
+                        card.args = args;
+                    }
+                    return;
+                }
+            }
+        }
+        view.push_entry(ChatEntry::Tool(Box::new(ToolCallCard {
+            id: tool_call_id.to_string(),
+            name: tool_name.to_string(),
+            args,
+            started: true,
+            result: None,
+            result_partial: false,
+        })));
+    }
+
+    /// Attach a (partial or final) tool result to the matching card.
+    fn apply_tool_result(
+        &mut self,
+        tool_call_id: &str,
+        result: Value,
+        is_error: bool,
+        partial: bool,
+        view: &mut AgentView,
+    ) {
+        let result = ToolResultView {
+            content: result
+                .get("content")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            details: result.get("details").cloned().unwrap_or(Value::Null),
+            is_error,
+        };
+        for entry in &mut view.chat {
+            if let ChatEntry::Tool(card) = entry {
+                if card.id == tool_call_id {
+                    card.result = Some(result);
+                    card.result_partial = partial;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Update the loader activity label (agent-activity tracker subset).
+    fn set_working_activity(
+        &mut self,
+        activity: &'static str,
+        download: bool,
+        view: &mut AgentView,
+    ) {
+        if let Some(working) = &mut view.working {
+            working.activity = activity;
+            working.download = download;
+        }
     }
 }
 

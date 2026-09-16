@@ -203,6 +203,27 @@ impl Worker {
             // Scripted sessions serve the integration harness; sessions
             // without a script run the real agent engine.
             let engine: std::sync::Arc<dyn SessionEngine> = match &script {
+                // A `{"engine": "faux", ...}` script drives the real agent
+                // engine over the scripted faux provider (full turns with
+                // tools, thinking, and token-paced streaming). Verification
+                // harness only; the product never sets a script.
+                Some(script) if script.get("engine") == Some(&serde_json::json!("faux")) => {
+                    let cwd =
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    match AgentSessionEngine::new(AgentEngineConfig {
+                        cwd,
+                        agent_dir: config.agent_dir.clone(),
+                        provider: None,
+                        model: None,
+                        api_key: None,
+                        session_dir: None,
+                        faux_script: Some(script.to_string()),
+                    }) {
+                        Ok(engine) => std::sync::Arc::new(engine),
+                        // Runtime construction failed: degrade to the echo engine.
+                        Err(_) => std::sync::Arc::new(ScriptedEngine::default()),
+                    }
+                }
                 Some(script) => std::sync::Arc::new(
                     ScriptedEngine::from_value(script.clone()).unwrap_or_default(),
                 ),
@@ -1179,7 +1200,7 @@ impl Worker {
         AgentConnectionState {
             active_session_id: Some(core.active_session_id.clone()),
             cwd: core.cwd.clone(),
-            model: None,
+            model: self.engine.model_metadata(),
             thinking_level: "default".to_string(),
             service_tier: "auto".to_string(),
             available_thinking_levels: vec!["default".to_string()],
@@ -1446,12 +1467,58 @@ impl TurnRunner {
                     EngineEvent::UserMessage(message) => {
                         json!({ "type": "message_start", "message": message })
                     }
-                    EngineEvent::AssistantUpdate(message) => {
-                        json!({ "type": "message_update", "message": message })
+                    EngineEvent::AssistantUpdate {
+                        message,
+                        stream_event,
+                    } => {
+                        // A provider `start` begins a new assistant message;
+                        // later stream events update it (TS message_start vs
+                        // message_update).
+                        let starts_message = stream_event
+                            .as_ref()
+                            .and_then(|event| event.get("type"))
+                            .and_then(Value::as_str)
+                            == Some("start");
+                        let mut event = json!({
+                            "type": if starts_message { "message_start" } else { "message_update" },
+                            "message": message,
+                        });
+                        if let Some(stream_event) = stream_event {
+                            event["assistantMessageEvent"] = stream_event;
+                        }
+                        event
                     }
                     EngineEvent::AssistantMessage(message) => {
                         json!({ "type": "message_end", "message": message })
                     }
+                    EngineEvent::ToolExecutionStart {
+                        tool_call_id,
+                        tool_name,
+                        args,
+                    } => json!({
+                        "type": "tool_execution_start",
+                        "toolCallId": tool_call_id,
+                        "toolName": tool_name,
+                        "args": args,
+                    }),
+                    EngineEvent::ToolExecutionUpdate {
+                        tool_call_id,
+                        partial_result,
+                    } => json!({
+                        "type": "tool_execution_update",
+                        "toolCallId": tool_call_id,
+                        "partialResult": partial_result,
+                    }),
+                    EngineEvent::ToolExecutionEnd {
+                        tool_call_id,
+                        result,
+                        is_error,
+                    } => json!({
+                        "type": "tool_execution_end",
+                        "toolCallId": tool_call_id,
+                        "result": result,
+                        "isError": is_error,
+                    }),
                     EngineEvent::Done(Ok(())) => json!({ "type": "turn_end" }),
                     EngineEvent::Done(Err(error)) => {
                         json!({ "type": "turn_end", "error": error })
@@ -1463,6 +1530,18 @@ impl TurnRunner {
                 if let Some(result) = done_result {
                     if let Some(done) = done.take() {
                         let _ = done.send(result);
+                    }
+                }
+                // Verification seam: dump the emitted session events for
+                // harness debugging (PA_DAEMON_EVENT_LOG=<path>).
+                if let Ok(path) = std::env::var("PA_DAEMON_EVENT_LOG") {
+                    use std::io::Write;
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                    {
+                        let _ = writeln!(file, "{}", event_json);
                     }
                 }
                 let outbound = DaemonOutbound::SessionEvent {
