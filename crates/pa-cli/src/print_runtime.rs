@@ -26,11 +26,16 @@ impl crate::mode::Runtime for PrintRuntime {
                     Ok(1)
                 }
             },
-            AppMode::Json
-            | AppMode::Interactive
-            | AppMode::Rpc
-            | AppMode::Acp
-            | AppMode::Daemon => Err(MissingSubsystem::SessionEngine),
+            AppMode::Json => match run_print_mode(options) {
+                Ok(code) => Ok(code),
+                Err(message) => {
+                    eprintln!("Error: {message}");
+                    Ok(1)
+                }
+            },
+            AppMode::Interactive | AppMode::Rpc | AppMode::Acp | AppMode::Daemon => {
+                Err(MissingSubsystem::SessionEngine)
+            }
         }
     }
 }
@@ -96,6 +101,26 @@ async fn print_mode_main(options: &RunOptions) -> Result<i32, String> {
     .await
     .map_err(|error| format!("{error:#}"))?;
 
+    // JSON mode: emit the session header, then every loop event as JSONL.
+    let mut unsubscribe: Option<pa_agent::agent::Subscription> = None;
+    if options.app_mode == AppMode::Json {
+        let header = session_header_json(&engine, &config.cwd).await;
+        println!("{header}");
+        let subscription = engine
+            .session
+            .agent()
+            .subscribe(move |event, _signal| {
+                Box::pin(async move {
+                    if let Some(json) = agent_event_json(&event) {
+                        println!("{json}");
+                    }
+                    Ok(())
+                })
+            })
+            .await;
+        unsubscribe = Some(subscription);
+    }
+
     // Admit the prompts, wait for the loop to settle, then select the
     // terminal result.
     let prompts: Vec<String> = options
@@ -105,6 +130,9 @@ async fn print_mode_main(options: &RunOptions) -> Result<i32, String> {
         .chain(options.messages.iter().cloned())
         .collect();
     if prompts.is_empty() {
+        if let Some(subscription) = unsubscribe.take() {
+            subscription.unsubscribe().await;
+        }
         return Ok(0);
     }
     for prompt in &prompts {
@@ -122,21 +150,32 @@ async fn print_mode_main(options: &RunOptions) -> Result<i32, String> {
     let result = pa_core::session_engine::headless::select_headless_terminal_result(&messages);
 
     let mut exit_code = 0;
-    match result.primary {
-        Some(primary) => {
-            if let Some(stderr) = primary.stderr_text(&mut exit_code) {
-                eprintln!("{stderr}");
-            }
-            if exit_code == 0 {
-                if let Some(text) = primary.stdout_text() {
-                    println!("{text}");
+    if options.app_mode == AppMode::Json {
+        // JSON mode: events already streamed; the terminal result only
+        // decides the exit code.
+        if let Some(primary) = &result.primary {
+            primary.stderr_text(&mut exit_code);
+        }
+    } else {
+        match result.primary {
+            Some(primary) => {
+                if let Some(stderr) = primary.stderr_text(&mut exit_code) {
+                    eprintln!("{stderr}");
+                }
+                if exit_code == 0 {
+                    if let Some(text) = primary.stdout_text() {
+                        println!("{text}");
+                    }
                 }
             }
+            None => {
+                eprintln!("No response produced.");
+                exit_code = 1;
+            }
         }
-        None => {
-            eprintln!("No response produced.");
-            exit_code = 1;
-        }
+    }
+    if let Some(subscription) = unsubscribe {
+        subscription.unsubscribe().await;
     }
     for outcome in result.compaction_outcomes {
         eprintln!("{}", outcome.content);
@@ -145,6 +184,79 @@ async fn print_mode_main(options: &RunOptions) -> Result<i32, String> {
         }
     }
     Ok(exit_code)
+}
+
+/// The session header line (TS `AgentConnectionSessionHeader` shape).
+async fn session_header_json(
+    engine: &pa_core::session_engine::engine::SessionEngine,
+    cwd: &std::path::Path,
+) -> String {
+    // The header carries session identity fields; emit what the engine
+    // exposes today (id + cwd) with the TS envelope shape.
+    let session_id = engine.session.session_id().await;
+    serde_json::json!({
+        "type": "session",
+        "version": 2,
+        "id": session_id,
+        "cwd": cwd.display().to_string(),
+    })
+    .to_string()
+}
+
+/// Serialize one loop event to the TS session_event wire shape.
+fn agent_event_json(event: &pa_agent::types::AgentEvent) -> Option<String> {
+    use pa_agent::types::AgentEvent;
+    fn message_value(value: &pa_agent::types::AgentMessage) -> serde_json::Value {
+        json_round_trip(value).unwrap_or(serde_json::Value::Null)
+    }
+    let value = match event {
+        AgentEvent::AgentStart => serde_json::json!({ "type": "agent_start" }),
+        AgentEvent::AgentEnd { messages } => serde_json::json!({
+            "type": "agent_end",
+            "messages": messages.iter().map(message_value).collect::<Vec<_>>(),
+        }),
+        AgentEvent::TurnStart => serde_json::json!({ "type": "turn_start" }),
+        AgentEvent::TurnEnd {
+            message,
+            tool_results,
+        } => serde_json::json!({
+            "type": "turn_end",
+            "message": message_value(message),
+            "toolResults": tool_results.iter().map(|r| json_round_trip(r).unwrap_or(serde_json::Value::Null)).collect::<Vec<_>>(),
+        }),
+        AgentEvent::MessageStart { message: m } => serde_json::json!({
+            "type": "message_start",
+            "message": message_value(m),
+        }),
+        AgentEvent::MessageUpdate { .. } => return None,
+        AgentEvent::MessageEnd { message: m } => serde_json::json!({
+            "type": "message_end",
+            "message": message_value(m),
+        }),
+        AgentEvent::ToolExecutionStart {
+            tool_call_id,
+            tool_name,
+            args,
+        } => serde_json::json!({
+            "type": "tool_execution_start",
+            "toolCallId": tool_call_id,
+            "toolName": tool_name,
+            "args": args,
+        }),
+        AgentEvent::ToolExecutionUpdate { .. } => return None,
+        AgentEvent::ToolExecutionEnd {
+            tool_call_id,
+            tool_name,
+            result,
+            ..
+        } => serde_json::json!({
+            "type": "tool_execution_end",
+            "toolCallId": tool_call_id,
+            "toolName": tool_name,
+            "result": json_round_trip(result).unwrap_or(serde_json::Value::Null),
+        }),
+    };
+    Some(value.to_string())
 }
 
 fn map_thinking_level(level: pa_types::ai::ModelThinkingLevel) -> ThinkingLevel {
