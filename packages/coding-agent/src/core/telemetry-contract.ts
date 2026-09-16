@@ -195,6 +195,14 @@ const commonProperties = {
 	schema_revision: revision,
 	build_channel: enumRule(["release", "prerelease", "development", "unknown"], "unknown"),
 	workload_origin: enumRule(["interactive", "automated", "internal", "test", "unknown"], "unknown"),
+	// Platform fidelity descriptor: locally derived, coarse binary-targeting
+	// facts. os_release is the one raw string (capped at 64 characters) and is
+	// documented to users as not guaranteed non-identifying.
+	libc: enumRule(["glibc", "musl", "none", "unknown"], "unknown"),
+	libc_version: { kind: "string", max: 32, fallback: "unknown" },
+	cpu_baseline: enumRule(["avx2", "no_avx2", "avx2_assumed", "not_applicable", "unknown"], "unknown"),
+	os_release: { kind: "string", max: 64, fallback: "unknown" },
+	os_product_version: { kind: "string", max: 32, fallback: "unknown" },
 } satisfies Record<string, TelemetryPropertyRule>;
 
 const sessionProperties = {

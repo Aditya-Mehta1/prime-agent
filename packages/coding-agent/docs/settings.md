@@ -92,7 +92,22 @@ The stable `latest.json` and beta `beta.json` manifests use the same JSON shape:
 
 Prime Agent sends pseudonymous usage, timing, and safe error reports to Prime Intellect by default, using PostHog for analytics and error tracking. These include version and operating-system category, setup stages, feature outcomes, execution mode (`interactive`, `print`, `json`, `rpc`, or `acp`), run outcomes, measured delays, token usage, optional estimated cost, tool success counts, retries, and compactions. Error reports include categories, stable codes, reviewed diagnostic messages and exact Prime Agent error wording from a fixed reviewed list. Recognized system errors can use a fixed description instead, labeled separately. See [telemetry definitions and delivery limits](telemetry.md).
 
-Prime Agent excludes prompts, responses, thinking, tool arguments/results, command text, repository data, environment variables, credentials, stack traces, logs and hardware identifiers. Arbitrary error text can echo a prompt, so it is omitted even after credential redaction; its code and safe diagnostic still identify the failure. Both Prime Agent and the collector validate permitted message text and credentials before sending it to PostHog. A random installation ID is stored as `telemetry.json` in the configured agent directory (normally `~/.prime/agent/`).
+Every event also carries a small platform descriptor, used to decide which prebuilt binaries Prime Agent has to ship:
+
+| Property | Values |
+|----------|--------|
+| `os_family` | `linux`, `darwin`, `win32`, ... |
+| `architecture` | `arm64`, `x64`, ... |
+| `install_method` | `bun-binary`, `homebrew`, `npm`, `pnpm`, `yarn`, `bun`, `unknown` |
+| `libc` | `glibc`, `musl`, `none` (not Linux), `unknown` |
+| `libc_version` | glibc runtime version such as `2.39`, else `unknown` |
+| `cpu_baseline` | `avx2`, `no_avx2` (both measured on x86_64), `avx2_assumed` (Intel Macs, inferred), `not_applicable` (not x86_64), `unknown` |
+| `os_release` | kernel version such as `6.8.0-45-generic` or `24.6.0` |
+| `os_product_version` | macOS product version such as `15.6`; `unknown` elsewhere |
+
+Most of these are coarse platform categories shared by millions of machines. `os_release` is the one exception: it is the raw kernel release string, capped at 64 characters. Stock kernel names such as `6.8.0-45-generic` are shared widely, but custom or self-built kernels can embed organization-, user-, or machine-specific labels in that string, so `os_release` is not guaranteed to be non-identifying. The remaining fields contain no hostname, username, path, serial number, or other hardware identifier.
+
+Prime Agent excludes prompts, responses, thinking, tool arguments/results, command text, repository data, environment variables, credentials, stack traces, logs, filenames, paths, raw error messages, hostnames, usernames, emails, and hardware identifiers. Arbitrary error text can echo a prompt, so it is omitted even after credential redaction; its code and safe diagnostic still identify the failure. Both Prime Agent and the collector validate permitted message text and credentials before sending it to PostHog. A random installation ID is stored as `telemetry.json` in the configured agent directory (normally `~/.prime/agent/`).
 
 Telemetry can be disabled globally or for an individual project. Project settings can only further restrict telemetry: they cannot re-enable a global opt-out or suppress the global one-time disclosure.
 

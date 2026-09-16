@@ -9,6 +9,7 @@ import { writeFileAtomicSync } from "../utils/atomic-file.js";
 import type { AgentSession, AgentSessionEvent } from "./agent-session.js";
 import type { AgentExecutionMode } from "./agent-session-config.js";
 import type { AuthCredential, AuthStatus } from "./auth-storage.js";
+import { platformFidelity } from "./platform-fidelity.js";
 import type { SettingsManager } from "./settings-manager.js";
 import { isBuiltinSlashCommandName, resolveBuiltinSlashCommandName } from "./slash-commands.js";
 import {
@@ -749,6 +750,7 @@ export class TelemetryClient implements TelemetrySink {
 }
 
 function baseProperties(executionMode: TelemetryExecutionMode): TelemetryProperties {
+	const fidelity = platformFidelity();
 	return {
 		version: VERSION,
 		os_family: platform(),
@@ -760,6 +762,11 @@ function baseProperties(executionMode: TelemetryExecutionMode): TelemetryPropert
 		workload_origin: ["internal", "test"].includes(process.env.PRIME_AGENT_TELEMETRY_ORIGIN ?? "")
 			? (process.env.PRIME_AGENT_TELEMETRY_ORIGIN ?? "unknown")
 			: "unknown",
+		libc: fidelity.libc,
+		libc_version: fidelity.libc_version,
+		cpu_baseline: fidelity.cpu_baseline,
+		os_release: fidelity.os_release,
+		os_product_version: fidelity.os_product_version,
 	};
 }
 

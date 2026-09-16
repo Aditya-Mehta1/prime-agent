@@ -16,6 +16,7 @@ import { SettingsManager } from "../src/core/settings-manager.js";
 import type { TelemetryProperties } from "../src/core/telemetry.js";
 import { reportTelemetryError, withTelemetryErrorContext } from "../src/core/telemetry-errors.js";
 import {
+	type AuthenticationResult,
 	type AuthFlowObservation,
 	ProviderAuthFlows,
 	type ProviderAuthFlowsHost,
@@ -99,6 +100,44 @@ function createHost(authStorage: AuthStorage): {
 		panels,
 	};
 }
+
+describe("Prime login completion guard", () => {
+	it("does not complete the Prime login after the dialog was aborted", async () => {
+		const onAuthChanged = vi.fn();
+		const host = {
+			modelRegistry: { refresh: vi.fn(), authStorage: { setPrimeInferenceApiKey: vi.fn() } },
+			onAuthChanged,
+			isOnboardingSurface: () => true,
+		};
+		const flows = new ProviderAuthFlows(host as never);
+		const complete = (
+			flows as unknown as {
+				completePrimeInferenceLogin: (
+					apiKey: string,
+					dialog: unknown,
+					close: () => void,
+					team?: unknown,
+				) => Promise<AuthenticationResult>;
+			}
+		).completePrimeInferenceLogin;
+		const controller = new AbortController();
+		controller.abort();
+		const dialog = { signal: controller.signal } as never;
+		const select = vi
+			.spyOn(
+				flows as unknown as { selectPrimeInferenceTeam: () => Promise<string | undefined> },
+				"selectPrimeInferenceTeam",
+			)
+			.mockResolvedValue(undefined);
+
+		const result = await complete.call(flows, "key", dialog, () => {}, undefined);
+
+		expect(result).toEqual({ status: "cancelled" });
+		expect(onAuthChanged).not.toHaveBeenCalled();
+		expect(host.modelRegistry.refresh).not.toHaveBeenCalled();
+		expect(select).toHaveBeenCalledOnce();
+	});
+});
 
 describe("ProviderAuthFlows", () => {
 	let tempDir: string;

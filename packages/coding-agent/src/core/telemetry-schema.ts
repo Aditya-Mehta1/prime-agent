@@ -39,6 +39,15 @@ function sanitizeValue(value: unknown, rule: TelemetryPropertyRule): TelemetryPr
 				: "0.0.0";
 		case "boolean":
 			return typeof value === "boolean" ? value : undefined;
+		case "string":
+			// Locally derived, explicitly allowlisted values with a hard length
+			// cap — the only free-text fields the contract ever accepts.
+			return typeof value === "string" &&
+				value.length > 0 &&
+				value.length <= (rule.max ?? 128) &&
+				!/\r|\n/.test(value)
+				? value
+				: rule.fallback;
 		case "number":
 			if (
 				typeof value !== "number" ||
