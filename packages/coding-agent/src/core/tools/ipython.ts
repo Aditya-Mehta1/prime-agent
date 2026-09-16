@@ -76,6 +76,15 @@ except Exception as _prime_agent_rlm_error:
  */
 export const PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER = "__PRIME_AGENT_PYTHON_SKILL_IMPORT_ERRORS__";
 
+/**
+ * Output cap for the provisioner's single bootstrap execute. The report marker
+ * prints only after every skill import, so a chatty import can push it past
+ * the default 65,536-char stdout cap, and a truncated stdout would silently
+ * drop the unavailable-skills report. Only this execute gets the raised cap;
+ * every other execute keeps DEFAULT_MAX_OUTPUT_CHARS.
+ */
+export const BOOTSTRAP_MAX_OUTPUT_CHARS = 1_048_576;
+
 /** Map of skill import name -> import error, parsed from a bootstrap cell's stdout. */
 export type UnavailablePythonSkills = Record<string, string>;
 
@@ -561,6 +570,8 @@ export class IpythonKernelProvisioner {
 				this.emitStartupProgress("Preparing Python runtime...");
 				const bootstrap = await m.execute(bootstrapCode, {
 					signal: startupSignal,
+					// Imports print before the report marker; see BOOTSTRAP_MAX_OUTPUT_CHARS.
+					maxOutputChars: BOOTSTRAP_MAX_OUTPUT_CHARS,
 				});
 				if (bootstrap.status !== "ok") {
 					const details = [bootstrap.stderr, bootstrap.error?.traceback.join("\n")].filter(Boolean).join("\n");

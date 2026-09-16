@@ -179,6 +179,24 @@ describe("IpythonKernelProvisioner", () => {
 		}
 	}, 60_000);
 
+	it("reports unavailable python skills when imports print past the default stdout cap", async () => {
+		const marker = join(tempDir, "snapshot-flushed");
+		const python = writeFakeReplRuntime(marker, {
+			// The marker prints only after every skill import, so a chatty import
+			// can push it past the default 65,536-char stdout cap.
+			executeStdout: `${"x".repeat(70_000)}\n${PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER}{"websearch":"No module named 'websearch'"}`,
+		});
+		const onUnavailableSkills = vi.fn();
+		const provisioner = new IpythonKernelProvisioner(tempDir, { python, onUnavailableSkills });
+		try {
+			await provisioner.ensure();
+			expect(onUnavailableSkills).toHaveBeenCalledTimes(1);
+			expect(onUnavailableSkills).toHaveBeenCalledWith({ websearch: "No module named 'websearch'" });
+		} finally {
+			await provisioner.dispose();
+		}
+	}, 60_000);
+
 	it("does not report unavailable python skills after a clean bootstrap", async () => {
 		const marker = join(tempDir, "snapshot-flushed");
 		const python = writeFakeReplRuntime(marker, { executeStdout: "" });
