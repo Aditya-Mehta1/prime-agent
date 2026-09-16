@@ -464,6 +464,56 @@ impl FileEntry {
         };
         base.id.as_deref()
     }
+
+    /// Parent entry id (None for the header / roots with no parent).
+    pub fn parent_id(&self) -> Option<&str> {
+        let base = match self {
+            FileEntry::Header { .. } | FileEntry::Unknown { .. } => None,
+            FileEntry::Message { base, .. }
+            | FileEntry::ThinkingLevelChange { base, .. }
+            | FileEntry::ServiceTierChange { base, .. }
+            | FileEntry::ModelChange { base, .. }
+            | FileEntry::Compaction { base, .. }
+            | FileEntry::BranchSummary { base, .. }
+            | FileEntry::Custom { base, .. }
+            | FileEntry::ChildUsageAttributed { base, .. }
+            | FileEntry::Label { base, .. }
+            | FileEntry::SessionInfo { base, .. }
+            | FileEntry::SessionState { base, .. }
+            | FileEntry::AgentStatus { base, .. }
+            | FileEntry::GitState { base, .. }
+            | FileEntry::CustomMessage { base, .. } => Some(base),
+        };
+        base?.parent_id.as_deref()
+    }
+
+    /// ISO-8601 entry timestamp; empty string when absent (older v1 lines).
+    pub fn timestamp(&self) -> &str {
+        let base = match self {
+            FileEntry::Header { header } => return header.timestamp.as_str(),
+            FileEntry::Unknown { rest, .. } => {
+                return rest
+                    .get("timestamp")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+            }
+            FileEntry::Message { base, .. }
+            | FileEntry::ThinkingLevelChange { base, .. }
+            | FileEntry::ServiceTierChange { base, .. }
+            | FileEntry::ModelChange { base, .. }
+            | FileEntry::Compaction { base, .. }
+            | FileEntry::BranchSummary { base, .. }
+            | FileEntry::Custom { base, .. }
+            | FileEntry::ChildUsageAttributed { base, .. }
+            | FileEntry::Label { base, .. }
+            | FileEntry::SessionInfo { base, .. }
+            | FileEntry::SessionState { base, .. }
+            | FileEntry::AgentStatus { base, .. }
+            | FileEntry::GitState { base, .. }
+            | FileEntry::CustomMessage { base, .. } => base,
+        };
+        base.timestamp.as_deref().unwrap_or_default()
+    }
 }
 
 /// Fields shared by every non-header entry.
