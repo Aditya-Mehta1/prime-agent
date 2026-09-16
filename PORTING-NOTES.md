@@ -132,3 +132,43 @@ captures the pane, and asserts the structural contract + editor keys
   event (`_processAgentEvent`). The eager append double-persisted once the
   wire shape was fixed; it was removed (in-memory persistence parity verified
   by the existing `prompt_persists_user_and_assistant` test).
+
+## package-manager lane notes
+
+- Source parsing (`crates/pa-core/src/packages/source.rs`) ports
+  `core/utils/git.ts` `parseGitUrl` + `utils/paths.ts` `isLocalPath`. The
+  hosted-git-info dependency is covered by a subset (shortcut prefixes
+  `github:`/`gitlab:`/`bitbucket:`/`gist:`, known domains, `git+` schemes,
+  `#committish`); the generic fallback already covers every other host, so
+  the observable behavior matches the TS on all documented forms.
+- Product quirks preserved deliberately (all verified against the TS binary):
+  - `git://host/path` parses as a LOCAL path (the `git:` prefix is stripped
+    before the protocol check), so `package install git://...` reports
+    "Path does not exist".
+  - `github.com/user/repo` shorthand is local without the `git:` prefix and
+    git with it.
+  - Local settings entries store paths relative to their settings base
+    (agent dir / project config dir), so `package remove` only matches by
+    equivalent resolved identity - cwd-relative and settings-relative forms
+    of the same stored entry do NOT match each other.
+  - Update order: npm version probes run first, then one batched npm install
+    per scope (`install -g pkg@latest`), then git fetch/reset/clean. Update
+    is sequential in this port; the TS runs probes at concurrency 4, which
+    only affects wall time, not output.
+- Settings writes use a field-scoped read-merge-write under the settings
+  lock (`persist_scope_field`), matching the TS `persistScopedSettings`
+  (fields added to the file after this manager loaded survive); a scope
+  whose settings file failed to parse is never written (the TS load-error
+  guard).
+- CLI output parity is plain-text: pa-cli carries no color layer (chalk
+  levels are dropped when piped anyway), so transcript comparisons with the
+  TS binary use piped output, which strips chalk colors.
+- Self-update (`prime-agent update`) is a typed boundary: native release
+  manifests + daemon update-restart coordination are a separate lane.
+  `package update` (extensions-only) completes fully.
+- Differential verifier: `crates/pa-cli/tests/package_e2e.rs` uses an
+  embedded-path npm shim via the `npmCommand` setting and an ssh shim
+  (GIT_SSH_COMMAND) mapping `ssh://localhost/...` onto a local bare repo -
+  the only git transports the source parser accepts are https/ssh/git, so a
+  local fixture needs the ssh shim (git daemon `git://` URLs are not
+  parseable sources).

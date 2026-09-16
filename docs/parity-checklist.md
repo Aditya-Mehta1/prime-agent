@@ -34,24 +34,80 @@ Follow-up spec (CLI lane): wire a pa-cli daemon client (connect to
 `~/.prime/agent/daemon.sock`, hello + envelope commands) behind
 `list`/`agents`/`attach`; the supervisor side is already parity-tested.
 
-## 2. Extensions / package-manager (pa-cli seam) - partial
+## 2. Extensions / package-manager - partial (CLI half done)
 
 TS: `packages/coding-agent/src/core/package-manager.ts` (2443 LoC: install/
-remove/update of npm/git/local packages, settings `packages` records) plus the
-extension runner under `packages/coding-agent/src/core/extensions/`.
+remove/update of npm/git/local packages, settings `packages` records, and
+session resource resolution) plus the extension runner under
+`packages/coding-agent/src/core/extensions/` (loader.ts/runner.ts/types.ts,
+~3.3k LoC, jiti-based TS module loading).
 
-- partial: `crates/pa-cli/src/package_command.rs` ports
-  `package-manager-cli.ts` parsing/validation/help exactly, then stops with a
-  typed error: "needs the package manager subsystem, which is not available in
-  this build yet". `crates/pa-core/src/settings/types.rs` carries the `packages`
-  settings field so config round-trips.
-- missing: the subsystem itself (fetch/clone, settings mutation, extension
-  load/bind). No verifier exists for it yet.
+- done: the package-manager CLI subsystem. `crates/pa-core/src/packages/`
+  ports install/remove/list/update for `npm:` (npm CLI child process via the
+  `npmCommand` setting, global root via `npm root -g`, bun `pm bin -g`
+  special case), git (`git clone`/`checkout`, fetch/reset/clean updates,
+  remove with empty-parent pruning, GIT_TERMINAL_PROMPT=0 remote probes),
+  and local-dir sources (bind by path, settings stored relative to the
+  settings base). Settings mutation goes through
+  `SettingsManager::set_packages`/`set_project_packages` (field-scoped
+  merge into the current file; a scope whose file failed to parse is never
+  written). Source parsing matches TS exactly, including the quirks:
+  `git://host/path` parses as a LOCAL path (the `git:` prefix strips the
+  protocol), shorthand only with the `git:` prefix, hosted shortcut forms
+  (`github:`, `gitlab:`, `bitbucket:`, `gist:`), and `#`/`@` ref pinning
+  (pinned packages never auto-update).
+  `crates/pa-cli/src/package_command.rs` runs every subcommand to
+  completion: `install`/`remove`/`list`/`update [source]`, progress lines,
+  `Installed`/`Removed`/`Updated` output, "No matching package found"
+  errors with suggestions, and settings-load warnings
+  (`Warning (package command, <scope> settings): ...`).
+  Verifier: `crates/pa-cli/tests/package_e2e.rs` drives a 25-step corpus
+  (local-dir, npm-shim, git-ssh-shim fixture) against BOTH the TS binary
+  and the Rust binary and asserts identical stdout/stderr/exit codes after
+  path/hash normalization, plus direct Rust-sandbox assertions (settings
+  documents, npm project prefix, git dir pruning). No network is used;
+  npm-network behavior needs no `#[ignore]` marker because the shim covers
+  the flows offline.
+- missing (typed boundary): Prime Agent self-update - the `prime-agent
+  update` / `package update --self` half needs the native release plan
+  (`cli/native-update.ts`, release manifests, rollback) and the daemon
+  update-restart coordinator (`cli/daemon-update-restart.ts`). The Rust CLI
+  reports a typed "self-update is not available in this build yet" error
+  until that lane lands.
+- missing (spec below): resource resolution (`resolve()` -> `ResolvedPaths`)
+  and the extension runner.
 
-Follow-up spec (new lane, ~1.5-2k LoC): port `package-manager.ts` install/
-remove/list/update for `npm:`, `git:`/URL/ssh, and local-dir sources against
-the settings `packages` array; add an e2e verifier installing a local fixture
-package into a temp HOME and asserting `package list` output parity.
+Follow-up spec - resource resolution (skills/resources lane, ~600-800 LoC):
+port `DefaultPackageManager.resolve()`: precedence-ranked resolution of
+extensions/skills/prompts/themes from (a) configured packages (pi manifest in
+`package.json`, convention dirs, filter patterns with `!`/`+`/`-` override
+forms), (b) settings top-level arrays (paths relative to the settings base,
+`applyPatterns` enable/disable), (c) auto-discovery (`<base>/skills|prompts|
+themes|extensions` dirs, `.agents/skills` ancestor scan up to the git root,
+pi-mode SKILL.md stopping rule), (d) bundled skills with the websearch and
+builtin-override exclude patterns. Consumers: `crates/pa-core/src/resources`
+(resource-loader.ts) and startup notices (`check_for_available_updates` +
+`modes/shared/startup-notices.ts` - already ported on the manager).
+First-wins name collision resolution sorts by the TS `resourcePrecedenceRank`
+(project settings > project auto > user settings > user auto > package >
+builtin); dedupe by canonicalized path. `resolveExtensionSources` (temporary
+scope + auto-refresh of unpinned temporary git sources) belongs to this port
+as well.
+
+Follow-up spec - extension runner (design lane, needs a runtime decision):
+TS extensions are TypeScript/JS modules loaded with jiti into the agent
+process (loader.ts aliases `@earendil-works/pi-*` packages into the built
+dist), exposing lifecycle hooks and custom tools through `ExtensionRunner`.
+A Rust process cannot import TS modules; the port needs a deliberate host
+design before any code: either a sidecar JS runtime (node/bun subprocess with
+a typed RPC surface mirroring `extensions/types.ts`), or a wasm/plugin
+contract, plus the resource loading of resolved extension paths from the
+resolution lane above. Surface to preserve: the `pi.extensions`/
+`extensions/index.ts|js` discovery conventions and the extension event
+surface consumed by sessions (`BeforeProviderRequest`, `AgentEnd`, custom
+tools, slash commands, keybindings). This is the largest remaining gap in
+the extensions area and blocks only extension-authored content, not the
+package install/remove flows landed here.
 
 ## 3. Side questions (`side_question_transcript`) - missing
 

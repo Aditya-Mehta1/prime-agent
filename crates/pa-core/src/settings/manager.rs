@@ -28,6 +28,10 @@ pub struct SettingsManager {
     merged: Settings,
     runtime_overrides: Settings,
     errors: Vec<SettingsError>,
+    /// Load failures per scope; a scope whose file failed to parse is never
+    /// written back (the TS `save` guard against clobbering bad settings).
+    global_load_error: Option<String>,
+    project_load_error: Option<String>,
 }
 
 impl SettingsManager {
@@ -36,6 +40,8 @@ impl SettingsManager {
         let mut errors = Vec::new();
         let global = load_scope(storage.as_ref(), SettingsScope::Global, &mut errors);
         let project = load_scope(storage.as_ref(), SettingsScope::Project, &mut errors);
+        let (global, global_load_error) = global;
+        let (project, project_load_error) = project;
         let merged = deep_merge(&global, &project);
         Self {
             storage,
@@ -44,6 +50,8 @@ impl SettingsManager {
             merged,
             runtime_overrides: Settings::default(),
             errors,
+            global_load_error,
+            project_load_error,
         }
     }
 
@@ -90,11 +98,23 @@ impl SettingsManager {
         &self.errors
     }
 
+    /// Take and clear the recorded settings errors (warnings are printed once
+    /// by the CLI commands that surface them).
+    pub fn drain_errors(&mut self) -> Vec<SettingsError> {
+        std::mem::take(&mut self.errors)
+    }
+
     /// Reload both scopes from storage.
     pub fn reload(&mut self) -> Result<()> {
         let mut errors = std::mem::take(&mut self.errors);
-        self.global = load_scope(self.storage.as_ref(), SettingsScope::Global, &mut errors);
-        self.project = load_scope(self.storage.as_ref(), SettingsScope::Project, &mut errors);
+        let (global, global_load_error) =
+            load_scope(self.storage.as_ref(), SettingsScope::Global, &mut errors);
+        let (project, project_load_error) =
+            load_scope(self.storage.as_ref(), SettingsScope::Project, &mut errors);
+        self.global = global;
+        self.project = project;
+        self.global_load_error = global_load_error;
+        self.project_load_error = project_load_error;
         self.errors = errors;
         self.merged = deep_merge(&self.global, &self.project);
         Ok(())
@@ -197,6 +217,71 @@ impl SettingsManager {
     pub fn set_onboarding_completed(&mut self, completed: bool) -> Result<()> {
         self.global.onboarding_completed = Some(completed);
         self.save_global()
+    }
+
+    /// Replace the `packages` array in the global settings file.
+    pub fn set_packages(&mut self, packages: Vec<serde_json::Value>) {
+        self.global.packages = Some(packages.clone());
+        self.persist_scope_field(
+            SettingsScope::Global,
+            "packages",
+            serde_json::Value::Array(packages),
+        );
+        self.merged = deep_merge(&self.global, &self.project);
+    }
+
+    /// Replace the `packages` array in the project settings file.
+    pub fn set_project_packages(&mut self, packages: Vec<serde_json::Value>) {
+        self.project.packages = Some(packages.clone());
+        self.persist_scope_field(
+            SettingsScope::Project,
+            "packages",
+            serde_json::Value::Array(packages),
+        );
+        self.merged = deep_merge(&self.global, &self.project);
+    }
+
+    /// Write one field into a scope's file, merging with the current on-disk
+    /// document so concurrently-added fields survive. Settings failures are
+    /// recorded as warnings, never thrown (the TS save contract).
+    fn persist_scope_field(&mut self, scope: SettingsScope, field: &str, value: serde_json::Value) {
+        let load_error = match scope {
+            SettingsScope::Global => self.global_load_error.clone(),
+            SettingsScope::Project => self.project_load_error.clone(),
+        };
+        if let Some(message) = load_error {
+            let label = match scope {
+                SettingsScope::Global => "Global",
+                SettingsScope::Project => "Project",
+            };
+            self.errors.push(SettingsError {
+                scope,
+                message: format!(
+                    "{label} settings not saved: settings file failed to parse: {message}"
+                ),
+            });
+            return;
+        }
+        let result = self.storage.with_lock(scope, &mut |current| {
+            let mut map: serde_json::Map<String, serde_json::Value> = current
+                .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+                .and_then(|value| match value {
+                    serde_json::Value::Object(mut map) => {
+                        super::merge::migrate(&mut map);
+                        Some(map)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            map.insert(field.to_string(), value.clone());
+            serde_json::to_string_pretty(&serde_json::Value::Object(map)).ok()
+        });
+        if let Err(error) = result {
+            self.errors.push(SettingsError {
+                scope,
+                message: error.to_string(),
+            });
+        }
     }
 
     // -- getters with TS semantics ------------------------------------------
@@ -337,7 +422,7 @@ fn load_scope(
     storage: &dyn SettingsStorage,
     scope: SettingsScope,
     errors: &mut Vec<SettingsError>,
-) -> Settings {
+) -> (Settings, Option<String>) {
     let mut content: Option<String> = None;
     let mut load_error: Option<String> = None;
     let result = storage.with_lock(scope, &mut |current| {
@@ -349,10 +434,10 @@ fn load_scope(
             scope,
             message: error.to_string(),
         });
-        return Settings::default();
+        return (Settings::default(), Some(error.to_string()));
     }
     let Some(content) = content else {
-        return Settings::default();
+        return (Settings::default(), None);
     };
     let value: serde_json::Value = match serde_json::from_str(&content) {
         Ok(value) => value,
@@ -362,8 +447,11 @@ fn load_scope(
         }
     };
     if let Some(message) = load_error {
-        errors.push(SettingsError { scope, message });
-        return Settings::default();
+        errors.push(SettingsError {
+            scope,
+            message: message.clone(),
+        });
+        return (Settings::default(), Some(message));
     }
     // Migrate the raw document, then load leniently.
     let migrated = match value {
@@ -373,7 +461,7 @@ fn load_scope(
         }
         other => other,
     };
-    from_value_lenient(&migrated)
+    (from_value_lenient(&migrated), None)
 }
 
 #[cfg(test)]

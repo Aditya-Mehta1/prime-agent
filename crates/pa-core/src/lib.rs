@@ -42,6 +42,7 @@ pub mod goals;
 pub mod kernel;
 pub mod mcp;
 pub mod models;
+pub mod packages;
 pub mod prompts;
 pub mod refinement;
 pub mod resources;

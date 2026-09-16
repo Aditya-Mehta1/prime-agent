@@ -2,7 +2,9 @@
 //! `package-manager-cli.ts` (`handlePackageCommand`, `parsePackageCommand`,
 //! `printPackageCommandHelp`).
 
-use crate::config::{APP_NAME, CONFIG_DIR_NAME};
+use pa_core::packages::{PackageManager, ProgressEvent, ProgressEventKind, UserOrProject};
+
+use crate::config::{get_agent_dir, APP_NAME, CONFIG_DIR_NAME};
 
 use crate::public_command::{
     DAEMON_UPDATE_RESTART_COORDINATOR_FLAG, DAEMON_UPDATE_RESTART_ORIGIN_FLAG,
@@ -52,11 +54,34 @@ impl PackageCommand {
     }
 }
 
+/// What `update` targets: Prime Agent itself, installed packages, or both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UpdateTarget {
+    All,
+    SelfOnly,
+    Extensions { source: Option<String> },
+}
+
+impl UpdateTarget {
+    fn includes_self(&self) -> bool {
+        matches!(self, UpdateTarget::All | UpdateTarget::SelfOnly)
+    }
+
+    fn includes_extensions(&self) -> bool {
+        match self {
+            UpdateTarget::Extensions { .. } => true,
+            UpdateTarget::All => true,
+            UpdateTarget::SelfOnly => false,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct PackageCommandOptions {
     local: bool,
     help: bool,
     rollback: bool,
+    update_target: Option<UpdateTarget>,
     invalid_option: Option<String>,
     invalid_argument: Option<String>,
     missing_option_value: Option<String>,
@@ -297,6 +322,35 @@ fn parse_package_command(args: &[String]) -> Option<PackageCommandOptions> {
         }
     }
 
+    if command == PackageCommand::Update {
+        let update_target = if let Some(extension_source) = extension_flag_source {
+            UpdateTarget::Extensions {
+                source: Some(extension_source),
+            }
+        } else if let Some(source) = &options.source {
+            if is_self_update_source(source) {
+                if extensions_flag {
+                    UpdateTarget::All
+                } else {
+                    UpdateTarget::SelfOnly
+                }
+            } else {
+                UpdateTarget::Extensions {
+                    source: Some(source.clone()),
+                }
+            }
+        } else if self_flag && extensions_flag {
+            UpdateTarget::All
+        } else if self_flag {
+            UpdateTarget::SelfOnly
+        } else if extensions_flag {
+            UpdateTarget::Extensions { source: None }
+        } else {
+            UpdateTarget::All
+        };
+        options.update_target = Some(update_target);
+    }
+
     Some(options)
 }
 
@@ -398,11 +452,133 @@ pub fn handle_package_command(args: &[String]) -> PackageCommandOutcome {
         );
     }
 
-    // Everything past this point needs the package manager subsystem.
-    fail(
-        &format!(
-            "the \"{command_name}\" package operation needs the package manager subsystem, which is not available in this build yet"
-        ),
-        None,
-    )
+    // Everything past this point runs the package manager subsystem.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let agent_dir = get_agent_dir();
+    let mut settings = pa_core::settings::SettingsManager::create(&cwd, &agent_dir);
+    report_settings_errors(&mut settings, "package command");
+
+    let mut manager = PackageManager::new(cwd, agent_dir, settings);
+    manager.set_progress_callback(Box::new(|event: &ProgressEvent| {
+        if event.kind == ProgressEventKind::Start {
+            if let Some(message) = &event.message {
+                println!("{message}");
+            }
+        }
+    }));
+
+    let scope = if options.local {
+        UserOrProject::Project
+    } else {
+        UserOrProject::User
+    };
+
+    let result = match command {
+        PackageCommand::Install => {
+            let source = options.source.as_deref().expect("checked above");
+            manager
+                .install_and_persist(source, scope)
+                .map(|()| println!("Installed {source}"))
+        }
+        PackageCommand::Remove => {
+            let source = options.source.as_deref().expect("checked above");
+            manager.remove_and_persist(source, scope).map(|removed| {
+                if !removed {
+                    eprintln!("No matching package found for {source}");
+                    std::process::exit(1);
+                }
+                println!("Removed {source}");
+            })
+        }
+        PackageCommand::List => {
+            print_package_list(&manager.list_configured_packages());
+            Ok(())
+        }
+        PackageCommand::Update => run_package_update(&mut manager, options.update_target),
+    };
+
+    match result {
+        Ok(()) => HANDLED_OK,
+        Err(error) => fail(&format!("Error: {error}"), None),
+    }
+}
+
+/// Update installed packages (and Prime Agent itself when the target asks
+/// for it; the self-update half is a native-release subsystem that is not
+/// linked into this build).
+fn run_package_update(
+    manager: &mut PackageManager,
+    target: Option<UpdateTarget>,
+) -> anyhow::Result<()> {
+    let target = target.unwrap_or(UpdateTarget::All);
+    if target.includes_extensions() {
+        let update_source = match &target {
+            UpdateTarget::Extensions { source } => source.as_deref(),
+            _ => None,
+        };
+        manager.update(update_source)?;
+        match update_source {
+            Some(source) => println!("Updated {source}"),
+            None => println!("Updated packages"),
+        }
+    }
+    if target.includes_self() {
+        anyhow::bail!("self-update is not available in this build yet; native release updates are not linked in");
+    }
+    Ok(())
+}
+
+/// Print the configured package list (user section, then project section).
+fn print_package_list(packages: &[pa_core::packages::ConfiguredPackage]) {
+    if packages.is_empty() {
+        println!("No packages installed.");
+        return;
+    }
+    let user_packages: Vec<_> = packages
+        .iter()
+        .filter(|package| package.scope == UserOrProject::User)
+        .collect();
+    let project_packages: Vec<_> = packages
+        .iter()
+        .filter(|package| package.scope == UserOrProject::Project)
+        .collect();
+    if !user_packages.is_empty() {
+        println!("User packages:");
+        for package in &user_packages {
+            print_configured_package(package);
+        }
+    }
+    if !project_packages.is_empty() {
+        if !user_packages.is_empty() {
+            println!();
+        }
+        println!("Project packages:");
+        for package in &project_packages {
+            print_configured_package(package);
+        }
+    }
+}
+
+fn print_configured_package(package: &pa_core::packages::ConfiguredPackage) {
+    let display = if package.filtered {
+        format!("{} (filtered)", package.source)
+    } else {
+        package.source.clone()
+    };
+    println!("  {display}");
+    if let Some(installed_path) = &package.installed_path {
+        println!("    {}", installed_path.display());
+    }
+}
+
+/// Print settings-load warnings exactly once (`Warning (<context>, <scope>
+/// settings): <message>`).
+fn report_settings_errors(settings: &mut pa_core::settings::SettingsManager, context: &str) {
+    for error in settings.drain_errors() {
+        let scope = match error.scope {
+            pa_core::settings::SettingsScope::Global => "global",
+            pa_core::settings::SettingsScope::Project => "project",
+        };
+        eprintln!("Warning ({context}, {scope} settings): {}", error.message);
+    }
 }
