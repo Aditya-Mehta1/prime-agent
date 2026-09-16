@@ -941,7 +941,10 @@ class BashHandle:
 # ---------------------------------------------------------------------------
 # Destructive-git dirty-tree guard. Ported from the coding-agent bash tool
 # (packages/coding-agent/src/core/tools/bash.ts); the command taxonomy and
-# bypass semantics must stay identical between the two tools.
+# bypass semantics must stay identical between the two tools. On top of the
+# shared taxonomy, this port additionally hardens eval-wrapped payloads,
+# attached short options, and shell line continuations (hardening the
+# coding-agent tool still lacks; port it back when touching that file).
 
 # Bypass env var for the destructive-git dirty-tree guard.
 BASH_DESTRUCTIVE_GIT_BYPASS_ENV = "PI_BASH_ALLOW_DESTRUCTIVE_GIT"
@@ -1014,6 +1017,47 @@ _DISCARD_RESET_PATTERN = re.compile(
 _DISCARD_CLEAN_PATTERN = re.compile(
     r"\bgit\s+" + _GIT_GLOBAL_OPTIONS + r"clean\s+([^;&|]*)"
 )
+
+
+def _normalize_line_continuations(command: str) -> str:
+    """Collapse unquoted backslash-newline line continuations to spaces.
+
+    The shell runs `git reset \
+--hard` (one backslash before the newline) as a single `git reset --hard`
+    command, so the discard patterns must see through continuations. The
+    replacement is length-preserving so the scan's
+    character indices stay aligned with the original command. Single-quoted
+    backslash-newlines are literal data and a newline always ends a comment,
+    so those are left untouched (both are still masked or live as before).
+    """
+    chars = list(command)
+    quote: str | None = None
+    comment = False
+    i = 0
+    n = len(chars)
+    while i < n:
+        ch = chars[i]
+        if comment:
+            if ch == "\n":
+                comment = False
+        elif quote is None:
+            if ch in ('"', "'"):
+                quote = ch
+            elif ch == "#" and (i == 0 or re.match(r"[\s;&|(){}]", chars[i - 1])):
+                comment = True
+            elif ch == "\\" and i + 1 < n and chars[i + 1] == "\n":
+                chars[i] = " "
+                chars[i + 1] = " "
+                i += 1
+        elif quote == "'":
+            if ch == "'":
+                quote = None
+        elif ch == '"':
+            quote = None
+        elif ch == "\\" and i + 1 < n:
+            i += 1  # inside double quotes the mask already folds escapes
+        i += 1
+    return "".join(chars)
 
 
 def _mask_quoted_spans(command: str) -> str:
@@ -1106,7 +1150,7 @@ def _is_forced_clean_segment(args: str) -> bool:
 def _find_destructive_git_discard_commands(command: str) -> list[int]:
     """Find every destructive git discard command in `command`, returning the
     character index where each `git` token starts (empty when none match)."""
-    masked = _mask_quoted_spans(command)
+    masked = _mask_quoted_spans(_normalize_line_continuations(command))
     indices: list[int] = []
     for pattern in (_DISCARD_CHECKOUT_PATTERN, _DISCARD_RESTORE_PATTERN, _DISCARD_RESET_PATTERN):
         indices.extend(match.start() for match in pattern.finditer(masked))
@@ -1121,6 +1165,76 @@ def is_destructive_git_discard_command(command: str) -> bool:
     working-tree changes (`git checkout -- .`, `git restore .`,
     `git reset --hard`, forced `git clean`)."""
     return bool(_find_destructive_git_discard_commands(command))
+
+
+# `eval` re-parses its payload, so a quoted argument that the masking of the
+# plain scan must treat as data still executes. Unquote each eval payload one
+# shell quoting layer at a time and rescan; a discard found in any layer is
+# refused outright because the payload can relocate or chain freely.
+_MAX_EVAL_SCAN_DEPTH = 10
+
+
+def _unquote_one_level(text: str) -> str:
+    """Remove the outermost quoting layer from `text`.
+
+    Inner quotes stay quoted so the next scan layer still treats them as
+    data: `eval "echo 'git reset --hard'"` must stay harmless after the first
+    unquote, while `eval 'cd sub && git reset --hard'` must not. Quote
+    characters become spaces so unquoting never joins separate words.
+    """
+    chars = list(text)
+    quote: str | None = None
+    i = 0
+    n = len(chars)
+    while i < n:
+        ch = chars[i]
+        if quote is None:
+            if ch in ('"', "'"):
+                quote = ch
+                chars[i] = " "
+            elif ch == "\\" and i + 1 < n:
+                i += 1  # keep escaped characters as they are
+        elif quote == "'":
+            if ch == "'":
+                quote = None
+                chars[i] = " "
+        elif ch == '"':
+            quote = None
+            chars[i] = " "
+        elif ch == "\\" and i + 1 < n:
+            i += 1  # escaped character inside double quotes stays
+        i += 1
+    return "".join(chars)
+
+
+def _eval_payloads_hide_destructive_git(command: str, depth: int = 0) -> bool:
+    """True when a quoted `eval` payload hides a destructive git discard.
+
+    Only unquoted eval tokens are scanned (a masked eval cannot run), and
+    each payload is unquoted one layer at a time so nested evals and nested
+    quoting levels are handled without ever confusing quoted data with
+    executable text. Command substitution stays outside this check: its
+    output is unknowable statically, and the substitution itself already
+    runs (and is scanned) before eval sees the result.
+    """
+    if depth > _MAX_EVAL_SCAN_DEPTH:
+        return True  # absurdly nested evals: refuse rather than risk a miss
+    command = _normalize_line_continuations(command)
+    masked = _mask_quoted_spans(command)
+    for match in re.finditer(r"\beval\b", masked):
+        # The payload runs from just after the eval token to the next
+        # unquoted command separator (masked text keeps those live).
+        region_end = len(command)
+        for j in range(match.end(), len(masked)):
+            if masked[j] in ";&|\n":
+                region_end = j
+                break
+        payload = _unquote_one_level(command[match.end() : region_end])
+        if _find_destructive_git_discard_commands(payload):
+            return True
+        if "eval" in payload and _eval_payloads_hide_destructive_git(payload, depth + 1):
+            return True
+    return False
 
 
 def _resolve_discard_probe_target(
@@ -1144,8 +1258,14 @@ def _resolve_discard_probe_target(
         if token in ("reset", "checkout", "clean", "restore"):
             subcommand_index = index
             break
-        if token == "-C":
-            directory = tokens[index + 1] if index + 1 < len(tokens) else None
+        # Attached short options such as `git -Csub reset --hard` relocate exactly
+        # like the space-separated forms, so treat their values the same way.
+        if token == "-C" or (token.startswith("-C") and len(token) > 2):
+            directory = (
+                token[2:]
+                if token != "-C"
+                else tokens[index + 1] if index + 1 < len(tokens) else None
+            )
             # A quoted, escaped, or substituted path cannot be replayed as a
             # single token; refuse rather than probe a truncated directory.
             if not directory or re.search(r"""["'\\$`]""", directory):
@@ -1155,11 +1275,25 @@ def _resolve_discard_probe_target(
             dash_c_dir = f"{dash_c_dir} -C {directory}" if dash_c_dir else directory
         elif token.startswith(("--git-dir", "--work-tree", "--prefix")):
             return _UNRESOLVABLE_DISCARD_TARGET
-        elif token == "-c":
-            config = tokens[index + 1] if index + 1 < len(tokens) else None
+        elif token == "-c" or (token.startswith("-c") and len(token) > 2):
+            config = (
+                token[2:]
+                if token != "-c"
+                else tokens[index + 1] if index + 1 < len(tokens) else None
+            )
             # core.worktree/core.bare relocate the repository the discard targets.
             if config and re.match(r"core\.(worktree|bare)(=|$)", config):
                 return _UNRESOLVABLE_DISCARD_TARGET
+        elif (
+            token.startswith("-")
+            and not token.startswith("--")
+            and re.search(r"[Cc]", token[1:])
+        ):
+            # Bundled short options that include -C/-c (for example
+            # `git -pCsub reset --hard`) relocate the repository in ways the
+            # token replay above cannot express; refuse instead of probing
+            # the wrong directory.
+            return _UNRESOLVABLE_DISCARD_TARGET
         # Other flags do not relocate.
 
     # git clean -x/-X also deletes ignored files, so its probe must include them.
@@ -1252,7 +1386,7 @@ def _resolve_discard_probe_target(
             # backgrounding, comments, or quotes split by segmenting) leaves
             # the target repository unknown; refuse rather than probe blindly.
             balanced = arg.count('"') % 2 == 0 and arg.count("'") % 2 == 0
-            if not balanced or (arg and re.search(r'''[$`;&|()<>#"]''', arg)):
+            if not balanced or (arg and re.search(r'''[$`;&|()<>#]''', arg)):
                 return _UNRESOLVABLE_DISCARD_TARGET
             saw_cd = True
             cd_pending_separator = True
@@ -1327,6 +1461,20 @@ def _format_dirty_tree_refusal(dirty_paths: list[str], includes_ignored_files: b
     return "\n".join(lines)
 
 
+def _format_eval_refusal() -> str:
+    return "\n".join(
+        [
+            "Refusing to run this destructive git command: it wraps a git"
+            " discard in eval, and the uncommitted changes of the repository"
+            " it targets cannot be checked safely.",
+            "",
+            "Run the discard directly, or retry with"
+            " bash(command, allow_destructive_git=True), or set"
+            f" {BASH_DESTRUCTIVE_GIT_BYPASS_ENV}=1.",
+        ]
+    )
+
+
 def _format_relocation_refusal() -> str:
     return "\n".join(
         [
@@ -1351,7 +1499,13 @@ def _guard_destructive_git(command: str, allow_destructive_git: bool) -> None:
         return
     # Match the prefixed command exactly as the shell will run it; the prefix
     # is replayed in the probe, so hook-provided shell setup applies to both.
-    resolved = _with_prefix(command)
+    # Line continuations are normalized first so the patterns and the probe
+    # resolution see the joined command.
+    resolved = _normalize_line_continuations(_with_prefix(command))
+    if "eval" in resolved and _eval_payloads_hide_destructive_git(resolved):
+        # An eval payload hides where the discard runs; refuse rather than
+        # probe a command the guard cannot replay.
+        raise DestructiveGitRefusalError(_format_eval_refusal())
     discard_indices = _find_destructive_git_discard_commands(resolved)
     if not discard_indices:
         return

@@ -89,6 +89,14 @@ MATCHING_COMMANDS = [
     "git checkout -f main",
     "git checkout --force main",
     "git clean -f -- -n",
+    "git -Csub reset --hard",
+    "git -cfoo.bar=1 reset --hard",
+    "git reset \
+--hard",
+    "git checkout -- \
+.",
+    "git clean -f \
+-d",
 ]
 
 NON_MATCHING_COMMANDS = [
@@ -117,6 +125,10 @@ NON_MATCHING_COMMANDS = [
     "git add .",
     "echo hello world",
     "npm run check",
+    "echo one \
+ two",
+    "git -Csub status",
+    "# git reset --hard",
 ]
 
 
@@ -130,6 +142,35 @@ class DestructiveGitDetectionTest(unittest.TestCase):
         for command in NON_MATCHING_COMMANDS:
             with self.subTest(command=command):
                 self.assertFalse(is_destructive_git_discard_command(command))
+
+
+class EvalPayloadDetectionTest(unittest.TestCase):
+    def test_eval_payloads_hiding_discards(self):
+        for command in [
+            "eval 'git reset --hard'",
+            'eval "git clean -f"',
+            "eval 'cd sub && git reset --hard'",
+            "eval 'git checkout -- .'",
+            'eval "git restore ."',
+            "eval 'eval \"git reset --hard\"'",
+            "GIT_DIR=sub/.git eval 'git reset --hard'",
+            "eval 'git reset \\\n--hard'",
+        ]:
+            with self.subTest(command=command):
+                self.assertTrue(bash_module._eval_payloads_hide_destructive_git(command))
+
+    def test_safe_eval_payloads_stay_unflagged(self):
+        for command in [
+            "eval",
+            "eval 'echo hi'",
+            "eval 'git status'",
+            "eval 'echo \"git reset --hard\"'",
+            "eval \"echo 'git reset --hard'\"",
+            "echo 'eval git reset --hard'",
+            "npm run eval:suite",
+        ]:
+            with self.subTest(command=command):
+                self.assertFalse(bash_module._eval_payloads_hide_destructive_git(command))
 
 
 class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
@@ -300,6 +341,128 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(DestructiveGitRefusalError) as caught:
                     bash(command)
                 self.assertIn("changes directory (or repository) first", str(caught.exception))
+
+    async def test_refuses_eval_wrapped_discards(self):
+        self._init_dirty_repo()
+        for command in [
+            "eval 'git reset --hard'",
+            'eval "git clean -f"',
+            "eval 'eval \"git reset --hard\"'",
+            "eval 'cd sub && git reset --hard'",
+        ]:
+            with self.subTest(command=command):
+                with self.assertRaises(DestructiveGitRefusalError) as caught:
+                    bash(command)
+                self.assertIn("wraps a git discard in eval", str(caught.exception))
+                self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
+                self.assertTrue(self._tracked("untracked.txt").exists())
+
+    async def test_eval_refusal_honors_the_bypass_kwarg(self):
+        self._init_dirty_repo()
+        result = await bash("eval 'git reset --hard'", allow_destructive_git=True)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(self._tracked("tracked.txt").read_text(), "committed\n")
+
+    async def test_safe_eval_commands_still_run(self):
+        self._init_dirty_repo()
+        result = await bash("eval 'echo hi'")
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("hi", result.output)
+        # Unquoting one level at a time must not mistake still-quoted data for
+        # a payload command: this eval only prints the string.
+        result = await bash("eval \"echo 'git reset --hard'\"")
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("git reset --hard", result.output)
+        self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
+
+    async def test_quoted_cd_relocations_are_replayed_in_the_probe(self):
+        _init_dirty_git_repo(str(self._tracked("my repo")))
+        self._init_dirty_repo()
+        with self.assertRaises(DestructiveGitRefusalError) as caught:
+            bash('cd "my repo" && git reset --hard')
+        self.assertIn("tracked.txt", str(caught.exception))
+        self.assertEqual(self._tracked("my repo", "tracked.txt").read_text(), "modified\n")
+
+    async def test_allows_quoted_cd_discard_when_target_is_clean(self):
+        _init_dirty_git_repo(str(self._tracked("my repo")))
+        _run_git(str(self._tracked("my repo")), "add", "-A")
+        _run_git(str(self._tracked("my repo")), "commit", "-q", "-m", "second")
+        self._init_dirty_repo()
+        result = await bash('cd "my repo" && git reset --hard')
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_attached_dash_c_values_relocate_the_probe(self):
+        _init_dirty_git_repo(str(self._tracked("sub")))
+        # The parent tree stays clean: the probe must follow the attached
+        # value, not probe the current directory.
+        self._init_dirty_repo()
+        _run_git(self.test_dir, "add", "-A")
+        _run_git(self.test_dir, "commit", "-q", "-m", "second")
+        with self.assertRaises(DestructiveGitRefusalError) as caught:
+            bash("git -Csub reset --hard")
+        self.assertIn("tracked.txt", str(caught.exception))
+        self.assertEqual(self._tracked("sub", "tracked.txt").read_text(), "modified\n")
+
+    async def test_attached_dash_c_probe_follows_the_value_not_the_parent_tree(self):
+        # Stock git rejects attached short options itself ("unknown option:
+        # -Csub"), so the form can never discard anything; the guard still
+        # resolves the attached value the way the thread asks instead of
+        # silently probing the parent tree.
+        _init_dirty_git_repo(str(self._tracked("sub")))
+        _run_git(str(self._tracked("sub")), "add", "-A")
+        _run_git(str(self._tracked("sub")), "commit", "-q", "-m", "second")
+        self._init_dirty_repo()  # the parent tree stays dirty
+        result = await bash("git -Csub reset --hard")
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
+
+    async def test_refuses_attached_and_bundled_relocations_it_cannot_replay(self):
+        self._init_dirty_repo()
+        for command in [
+            "git -ccore.worktree=sub reset --hard",
+            "git -ccore.bare=1 reset --hard",
+            "git -pCsub reset --hard",
+            "git -qC sub reset --hard",
+        ]:
+            with self.subTest(command=command):
+                with self.assertRaises(DestructiveGitRefusalError) as caught:
+                    bash(command)
+                self.assertIn("changes directory (or repository) first", str(caught.exception))
+
+    async def test_attached_benign_dash_c_configs_do_not_relocate(self):
+        self._init_dirty_repo()
+        with self.assertRaises(DestructiveGitRefusalError) as caught:
+            bash("git -cfoo.bar=1 reset --hard")
+        self.assertIn("uncommitted change(s)", str(caught.exception))
+        self.assertNotIn("changes directory (or repository) first", str(caught.exception))
+
+    async def test_refuses_discards_split_over_line_continuations(self):
+        self._init_dirty_repo()
+        for command in [
+            "git reset \\\n--hard",
+            "git checkout -- \\\n.",
+            "git clean -f \\\n-d",
+        ]:
+            with self.subTest(command=command):
+                with self.assertRaises(DestructiveGitRefusalError):
+                    bash(command)
+                self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
+                self.assertTrue(self._tracked("untracked.txt").exists())
+
+    async def test_line_continuations_in_safe_commands_still_run(self):
+        self._init_dirty_repo()
+        result = await bash("echo one \\\n two")
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("one", result.output)
+        self.assertIn("two", result.output)
+
+    async def test_comment_newline_still_ends_the_line_before_a_discard(self):
+        # A backslash-newline inside a comment does not join lines: the
+        # newline ends the comment and the next line runs for real.
+        self._init_dirty_repo()
+        with self.assertRaises(DestructiveGitRefusalError):
+            bash("# safe \\\ngit reset --hard")
+        self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
 
     async def test_clean_fx_lists_ignored_files_it_would_delete(self):
         self._init_dirty_repo()
