@@ -9921,8 +9921,12 @@ export class InteractiveMode {
 			} catch {
 				// The update already completed; do not block relaunch on local teardown.
 			}
+			// A failed update child has already emitted its own completed event;
+			// the parent must not contradict it with a success outcome. Only a
+			// successful child hands the attempt over to this restart phase.
+			const childFailed = Boolean(updateResult.error) || updateExitCode !== 0;
 			let daemonRestartFailed = false;
-			if (!updateResult.error && updateExitCode === 0) {
+			if (!childFailed) {
 				try {
 					installation?.stage("daemon_restart", "started");
 					const status = await launchDaemonUpdateRestartCoordinator({
@@ -9948,13 +9952,15 @@ export class InteractiveMode {
 					);
 				}
 			}
-			// The update child no longer emits its own completion: the restart
-			// outcome is part of this attempt, so completed lands once, after it,
-			// and a failed restart names its reason on the completed event.
-			installation?.finish(
-				daemonRestartFailed ? "failed" : "success",
-				daemonRestartFailed ? "daemon_restart_failed" : undefined,
-			);
+			if (!childFailed) {
+				// The update child no longer emits its own completion: the restart
+				// outcome is part of this attempt, so completed lands once, after it,
+				// and a failed restart names its reason on the completed event.
+				installation?.finish(
+					daemonRestartFailed ? "failed" : "success",
+					daemonRestartFailed ? "daemon_restart_failed" : undefined,
+				);
+			}
 			const relaunch = createUpdatedCliSubprocessLaunchSpec(relaunchArgs);
 			installation?.stage("relaunch", "started");
 			await this.installationReady;

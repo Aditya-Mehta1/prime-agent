@@ -849,11 +849,6 @@ export function captureTelemetryEvent(options: CaptureTelemetryEventOptions): vo
 
 const sessionContexts = new WeakMap<AgentSession, { sessionId: string; runId?: string }>();
 
-export function getTelemetrySessionContext(session: AgentSession): { sessionId: string; runId?: string } | undefined {
-	const context = sessionContexts.get(session);
-	return context ? { ...context } : undefined;
-}
-
 export async function captureOnboardingCompleted(options: CaptureOnboardingCompletedOptions): Promise<void> {
 	captureTelemetryEvent({
 		...options,
