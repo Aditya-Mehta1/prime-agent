@@ -2084,6 +2084,7 @@ def _fp_eval_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
         if word.value != "eval":
             continue
         payload_parts: list[str] = []
+        value_parts: list[str] = []
         for follower_index in range(index + 1, len(words)):
             follower = words[follower_index]
             if follower.starts_command:
@@ -2094,8 +2095,16 @@ def _fp_eval_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
             if _fp_payload_is_ansi_c(payload_source):
                 return True  # the guard does not reproduce an ANSI-C payload
             payload_parts.append(payload_source)
+            value_parts.append(follower.value)
         payload = _fp_unquote_one_level(" ".join(payload_parts))
         if _fp_payload_hides_force_push(payload, depth + 1):
+            return True
+        # The raw sources lose one escaping layer per nesting level, and the
+        # folded word values are the same text with that layer already resolved
+        # (they are exactly what the shell passes to the inner command), so look
+        # at both: an `eval`-first chain of alternating eval/sh layers is only
+        # reachable through the second look.
+        if _fp_payload_hides_force_push(" ".join(value_parts), depth + 1):
             return True
         if _fp_eval_payloads_hide_force_push(payload, depth + 1):
             return True
@@ -2137,6 +2146,17 @@ def _fp_shell_c_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
                         _fp_unquote_one_level(payload_source), depth + 1
                     ):
                         return True
+                # The raw source loses one escaping layer per nesting level, so
+                # past the first level it no longer starts with a quote and the
+                # branch above stops recursing. The folded word value the scan
+                # already built is the same command text with that layer gone,
+                # so look at it too: `sh -c "sh -c \"sh -c \\\"...\""` is
+                # three levels of shell, and only the value walk reaches the
+                # third. Both looks are needed -- the value alone misses an
+                # alternating eval/sh chain, whose layers consume the escaping
+                # differently.
+                if _fp_payload_hides_force_push(follower.value, depth + 1):
+                    return True
                 break  # the payload word ends this shell invocation
             if token == "--":
                 break
@@ -2153,11 +2173,26 @@ def _fp_shell_c_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
 _FP_ENV_COMMAND_NAMES = ("env", "env.exe")
 
 
-def _fp_env_payload_hides_force_push_source(payload_source: str, depth: int) -> bool:
-    """Whether one `env -S` payload word hides a force push."""
+def _fp_env_payload_hides_force_push_source(
+    payload_source: str, payload_value: str, depth: int
+) -> bool:
+    """Whether one `env -S` payload hides a force push.
+
+    Two looks, like the `sh -c` payload scan. The raw source is the payload as
+    written, one shell quoting layer deep; the folded word value is the same
+    text with that layer already consumed by the word scan. A chain of nested
+    payloads needs both: the raw source loses one escaping layer per level, so
+    past the first level it no longer starts with a quote and only the value
+    walk reaches the command inside."""
     if _fp_payload_is_ansi_c(payload_source):
         return True  # the guard does not reproduce an ANSI-C split
-    return _fp_payload_hides_force_push(_fp_unquote_one_level(payload_source), depth + 1)
+    if _fp_payload_hides_force_push(
+        _fp_unquote_one_level(payload_source), depth + 1
+    ):
+        return True
+    if payload_value == payload_source:
+        return False  # nothing folded away: the look above already covered it
+    return _fp_payload_hides_force_push(payload_value, depth + 1)
 
 
 def _fp_env_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
@@ -2184,7 +2219,9 @@ def _fp_env_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
             token = follower.value
             payload_source = command[follower.start : follower.end]
             if payload_pending:
-                if _fp_env_payload_hides_force_push_source(payload_source, depth):
+                if _fp_env_payload_hides_force_push_source(
+                    payload_source, token, depth
+                ):
                     return True
                 break  # this env invocation is clean; check the next one
             if token == "--":
@@ -2194,7 +2231,9 @@ def _fp_env_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
                 continue
             if token.startswith("--split-string="):
                 if _fp_env_payload_hides_force_push_source(
-                    payload_source[len("--split-string=") :], depth
+                    payload_source[len("--split-string=") :],
+                    token[len("--split-string=") :],
+                    depth,
                 ):
                     return True
                 break
@@ -2205,7 +2244,9 @@ def _fp_env_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
                     offset = follower.start + 1 + short.index("S") + 1
                     if attached:
                         if _fp_env_payload_hides_force_push_source(
-                            command[offset : follower.end], depth
+                            command[offset : follower.end],
+                            token[len(("-" + short[: short.index("S") + 1])) :],
+                            depth,
                         ):
                             return True
                         break

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import os
 import subprocess
 import sys
@@ -23,6 +24,36 @@ bash_module = sys.modules["rlm.bash"]
 AWAIT_TIMEOUT = 10.0
 GIT_TIMEOUT = 60
 KERNEL_LAUNCH_TIMEOUT = 90
+
+
+FORCE_PUSH_LEAF = "git push -f origin main"
+
+
+def _sh_payload_chain(depth: int, leaf: str = FORCE_PUSH_LEAF) -> str:
+    """`sh -c` nested `depth` times around `leaf`, each layer JSON-quoted.
+
+    Building the layers this way consumes one shell escaping layer per level,
+    which is what made the third level and deeper invisible to a payload scan
+    that only re-read the raw source text."""
+    command = leaf
+    for _ in range(depth):
+        command = "sh -c " + json.dumps(command)
+    return command
+
+
+def _alternating_payload_chain(
+    depth: int, first: str = "sh", leaf: str = FORCE_PUSH_LEAF
+) -> str:
+    """`sh -c` and `eval` alternating `depth` times around `leaf`.
+
+    The two re-parsers consume escaping differently (`eval` keeps its raw
+    sources, `sh -c` resolves them through the word scan), so a chain that
+    starts with `eval` is only reachable through the folded-value look."""
+    command = leaf
+    for layer in range(depth):
+        kind = first if layer % 2 == 0 else ("eval" if first == "sh" else "sh")
+        command = ("sh -c " if kind == "sh" else "eval ") + json.dumps(command)
+    return command
 
 
 def _prepare(command: str) -> str:
@@ -242,6 +273,38 @@ class ForcePushScannerFidelityTest(unittest.TestCase):
         command = 'git push -f origin " > x" main'
         self.assertIn('" > x"', _prepare(command))
 
+    @unittest.skipUnless(
+        hasattr(bash_module, "_fp_payload_hides_force_push"),
+        "the payload walk was added with the force-push guard hardening; the"
+        " same vectors are covered end to end by test_refuses_nested_payloads",
+    )
+    def test_deep_payload_chains_are_refused_by_the_depth_cap(self):
+        # The payload walk counts two levels per nesting layer and refuses once
+        # it passes _FP_MAX_PAYLOAD_DEPTH, so a chain it cannot follow is
+        # refused rather than missed: a benign chain past the cap is refused.
+        self.assertLessEqual(
+            getattr(bash_module, "_FP_MAX_PAYLOAD_DEPTH", 10),
+            10,
+            "the payload depth cap must stay small enough to bound the walk",
+        )
+        for depth in (2, 3, 5):
+            with self.subTest(depth=depth):
+                self.assertFalse(
+                    bash_module._fp_payload_hides_force_push(
+                        _sh_payload_chain(depth, "git status")
+                    )
+                )
+        for depth in (8, 12):
+            with self.subTest(depth=depth):
+                self.assertTrue(
+                    bash_module._fp_payload_hides_force_push(
+                        _sh_payload_chain(depth, "git status")
+                    )
+                )
+                self.assertTrue(
+                    bash_module._fp_payload_hides_force_push(_sh_payload_chain(depth))
+                )
+
     def test_url_and_scp_remotes_are_not_refspecs(self):
         for first in [
             "https://example.invalid/x.git",
@@ -274,6 +337,9 @@ class ForcePushEvalPayloadTest(unittest.TestCase):
             # A payload holding another payload: the inner command only exists
             # after the outer one runs, so each scanner must consult the others.
             'eval \'sh -c "git push -f origin main"\'',
+            "eval " + json.dumps(_sh_payload_chain(3)),
+            _alternating_payload_chain(5, "eval"),
+            _alternating_payload_chain(15, "eval"),
         ]:
             with self.subTest(command=command):
                 self.assertTrue(
@@ -287,6 +353,7 @@ class ForcePushEvalPayloadTest(unittest.TestCase):
             "eval 'echo hi'",
             "eval \"echo 'git push -f origin main'\"",
             "eval 'git status'",
+            "eval " + json.dumps(_sh_payload_chain(3, "git status")),
         ]:
             with self.subTest(command=command):
                 self.assertFalse(
@@ -303,6 +370,13 @@ class ForcePushShellCPayloadTest(unittest.TestCase):
             "sh -c 'cd repo && git push -f'",
             'sh -c "eval \'git push -f origin main\'"',
             'sh -c "env -S \'git push -f origin main\'"',
+            # Deeper chains: every nesting level consumes one escaping layer,
+            # so these are only reachable through the folded-value look.
+            _sh_payload_chain(3),
+            _sh_payload_chain(4),
+            _sh_payload_chain(5),
+            _alternating_payload_chain(5),
+            _alternating_payload_chain(15),
         ]:
             with self.subTest(command=command):
                 self.assertTrue(
@@ -317,6 +391,11 @@ class ForcePushShellCPayloadTest(unittest.TestCase):
             "bash -c 'git status'",
             'sh -c "eval \'echo hi\'"',
             "env -S 'sh -c \"git status\"'",
+            # Nested chains the guard can still follow stay unflagged, and so
+            # does a nested literal lease push.
+            _sh_payload_chain(2, "git status"),
+            _sh_payload_chain(3, "git status"),
+            _sh_payload_chain(3, "git push --force-with-lease origin feature"),
         ]:
             with self.subTest(command=command):
                 self.assertFalse(
@@ -342,6 +421,7 @@ class ForcePushEnvPayloadTest(unittest.TestCase):
             # after env runs, so the scanners have to consult each other.
             "env -S 'eval \"git push -f origin main\"'",
             "env -S 'sh -c \"git push -f origin main\"'",
+            "env -S " + json.dumps(_sh_payload_chain(3)),
         ]:
             with self.subTest(command=command):
                 self.assertTrue(
@@ -357,6 +437,7 @@ class ForcePushEnvPayloadTest(unittest.TestCase):
             "env -C . git status",
             "env VERSION=1 git status",
             "echo env -S",
+            "env -S " + json.dumps(_sh_payload_chain(2, "git status")),
         ]:
             with self.subTest(command=command):
                 self.assertFalse(
@@ -909,6 +990,17 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
             """sh -c "eval 'git push -f origin main'" """,
             """env -S 'eval "git push -f origin main"'""",
             """sh -c "env -S 'sh -c \\"git push -f origin main\\"'" """,
+            # Three or more re-parser layers, in both chain shapes, and an
+            # `env -S` wrapping a three-layer chain.
+            _sh_payload_chain(3),
+            _sh_payload_chain(4),
+            _sh_payload_chain(5),
+            "env -S " + json.dumps(_sh_payload_chain(3)),
+            _alternating_payload_chain(5, "sh"),
+            _alternating_payload_chain(5, "eval"),
+            _alternating_payload_chain(15, "eval"),
+            # Past the depth cap the guard refuses rather than guess.
+            _sh_payload_chain(8),
         ]:
             with self.subTest(command=command):
                 await self._refused(command)
@@ -920,6 +1012,13 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
             """env -S 'sh -c "git status"'""",
             """sh -c "eval 'echo hi'" """,
             """env -S 'sh -c "git push --force-with-lease origin feature"'""",
+            _sh_payload_chain(2, "git status"),
+            _sh_payload_chain(3, "git status"),
+            "env -S " + json.dumps(_sh_payload_chain(2, "git status")),
+            _sh_payload_chain(3, "git push --force-with-lease origin feature"),
+            # An echo of the payload text is not a push, at any level the guard
+            # can still follow.
+            """echo "sh -c \\"git push -f origin main\\"" """,
         ]:
             with self.subTest(command=command):
                 result = await self._run(command)
