@@ -209,18 +209,12 @@ mod tests {
     #[tokio::test]
     async fn read_frame_round_trips_over_duplex() {
         let (mut client, mut server) = tokio::io::duplex(64);
+        // Interleave write/read: the 64-byte duplex buffer cannot hold two
+        // frames at once, so a write blocks until the peer reads it.
         write_frame(
             &mut client,
             &header("command"),
             b"{\"x\":1}",
-            DEFAULT_PRIVATE_FRAME_LIMITS,
-        )
-        .await
-        .unwrap();
-        write_frame(
-            &mut client,
-            &header("command"),
-            b"{\"y\":2}",
             DEFAULT_PRIVATE_FRAME_LIMITS,
         )
         .await
@@ -231,6 +225,14 @@ mod tests {
             .expect("first frame");
         assert_eq!(first.header["kind"], "command");
         assert_eq!(first.payload, b"{\"x\":1}");
+        write_frame(
+            &mut client,
+            &header("command"),
+            b"{\"y\":2}",
+            DEFAULT_PRIVATE_FRAME_LIMITS,
+        )
+        .await
+        .unwrap();
         let second = read_frame(&mut server, DEFAULT_PRIVATE_FRAME_LIMITS)
             .await
             .unwrap()

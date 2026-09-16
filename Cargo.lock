@@ -1156,6 +1156,7 @@ dependencies = [
  "futures",
  "libc",
  "nix",
+ "pa-ai",
  "pa-types",
  "serde",
  "serde_json",
