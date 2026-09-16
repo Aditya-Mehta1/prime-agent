@@ -39,6 +39,7 @@ pub mod auth;
 pub mod kernel;
 pub mod models;
 pub mod prompts;
+pub mod refinement;
 pub mod resources;
 pub mod session;
 pub mod session_engine;
