@@ -717,7 +717,7 @@ impl SessionManager {
         }
     }
 
-    fn append_entry(&mut self, entry: FileEntry) {
+    pub(crate) fn append_entry(&mut self, entry: FileEntry) {
         self.file_entries.push(entry);
         let index = self.file_entries.len() - 1;
         if matches!(
@@ -736,7 +736,7 @@ impl SessionManager {
         self.persist_entry(index);
     }
 
-    fn next_base(&self) -> EntryBase {
+    pub(crate) fn next_base(&self) -> EntryBase {
         EntryBase {
             id: Some(generate_id(&self.by_id.keys().cloned().collect())),
             parent_id: self.leaf_id.clone(),
@@ -874,6 +874,42 @@ impl SessionManager {
             base,
         });
         id
+    }
+
+    /// Look up an entry by id (file position index).
+    pub fn get_entry_by_id(&self, id: &str) -> Option<&FileEntry> {
+        self.by_id.get(id).map(|&index| &self.file_entries[index])
+    }
+
+    /// The active label for a target entry id.
+    pub fn get_label(&self, target_id: &str) -> Option<String> {
+        self.labels_by_id.get(target_id).cloned()
+    }
+
+    /// Move the leaf (used by branch/branchWithSummary).
+    pub(crate) fn set_leaf_id(&mut self, leaf_id: Option<&str>) {
+        self.leaf_id = leaf_id.map(str::to_string);
+    }
+
+    /// Apply a label entry to the label index (last label wins).
+    pub(crate) fn apply_label_entry(
+        &mut self,
+        target_id: &str,
+        label: Option<&str>,
+        timestamp: &str,
+    ) {
+        match label {
+            Some(label) => {
+                self.labels_by_id
+                    .insert(target_id.to_string(), label.to_string());
+                self.label_timestamps_by_id
+                    .insert(target_id.to_string(), timestamp.to_string());
+            }
+            None => {
+                self.labels_by_id.remove(target_id);
+                self.label_timestamps_by_id.remove(target_id);
+            }
+        }
     }
 
     pub fn append_session_state(&mut self, status: SessionStateStatus) -> String {
