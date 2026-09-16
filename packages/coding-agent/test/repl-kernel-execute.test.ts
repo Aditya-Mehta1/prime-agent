@@ -196,4 +196,14 @@ describeIf("ReplKernelManager execute (real runtime)", () => {
 		expect(second.stdout).not.toContain("SECRET-thread");
 		expect(second.backgroundOutput ?? "").toContain("SECRET-thread");
 	}, 30_000);
+
+	it("marks both streams truncated when chunked writes hit the cell output cap", async () => {
+		manager = new ReplKernelManager({ python: python as string, cwd: dir });
+		const r = await manager.execute("import sys\nsys.stdout.write('o' * 300_000)\nsys.stderr.write('e' * 300_000)");
+		expect(r.status).toBe("ok");
+		const marker = "\n[... output truncated at 65536 chars ...]";
+		expect(r.stdout).toBe("o".repeat(65_536) + marker);
+		expect(r.stderr).toBe("e".repeat(65_536) + marker);
+		// test-policy: allow explicit-test-timeout -- real-kernel spawn and 600 Ki-char chunked writes need headroom past the 5s default
+	}, 30_000);
 });

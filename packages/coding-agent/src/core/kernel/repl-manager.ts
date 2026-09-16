@@ -826,6 +826,8 @@ export class ReplKernelManager {
 		}
 		if (type === "stdout" || type === "stderr") {
 			const text = typeof event.text === "string" ? event.text : "";
+			// Chunked kernel frames can fill a stream to exactly maxChars; every later
+			// dropped frame must still flag truncation so the marker is emitted.
 			if (type === "stdout") {
 				if (execution.stdout.length < execution.maxChars) {
 					execution.stdout += text;
@@ -833,6 +835,8 @@ export class ReplKernelManager {
 						execution.stdout = execution.stdout.slice(0, execution.maxChars);
 						execution.stdoutTruncated = true;
 					}
+				} else if (text) {
+					execution.stdoutTruncated = true;
 				}
 			} else {
 				if (execution.stderr.length < execution.maxChars) {
@@ -841,6 +845,8 @@ export class ReplKernelManager {
 						execution.stderr = execution.stderr.slice(0, execution.maxChars);
 						execution.stderrTruncated = true;
 					}
+				} else if (text) {
+					execution.stderrTruncated = true;
 				}
 			}
 			execution.opts.onStream?.(text, type);

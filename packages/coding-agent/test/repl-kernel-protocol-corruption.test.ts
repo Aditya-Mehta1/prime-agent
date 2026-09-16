@@ -357,17 +357,7 @@ describe("ReplKernelManager corrupt protocol repair", () => {
 		}
 	});
 
-	it("repairs after an oversized unterminated protocol line", async () => {
-		const { manager } = newManager();
-		try {
-			await expect(manager.execute("corrupt-huge-line")).rejects.toThrow(/oversized protocol line/);
-			expect((await manager.execute("read")).status).toBe("ok");
-		} finally {
-			await manager.shutdown({ snapshot: true, drainHostRequests: true });
-		}
-	});
-
-	it("repairs an object frame with an unknown event kind instead of hanging the request", async () => {
+	it("repairs after an unknown event kind or an oversized unterminated protocol line", async () => {
 		const { manager, countPath } = newManager();
 		try {
 			await expect(manager.execute("corrupt-unknown-kind")).rejects.toThrow(
@@ -375,6 +365,8 @@ describe("ReplKernelManager corrupt protocol repair", () => {
 			);
 			await expect(manager.execute("read")).resolves.toMatchObject({ status: "ok", stdout: "fresh" });
 			expect(spawnCount(countPath)).toBe(2);
+			await expect(manager.execute("corrupt-huge-line")).rejects.toThrow(/oversized protocol line/);
+			expect((await manager.execute("read")).status).toBe("ok");
 		} finally {
 			await manager.shutdown({ snapshot: true, drainHostRequests: true });
 		}
