@@ -892,6 +892,12 @@ impl Supervisor {
                     .await;
                 (vec![response_line(&response)], false)
             }
+            DaemonCommand::ListSavedSessions { .. } => {
+                let lines = self
+                    .handle_saved_session_list(&envelope.command, &command_id)
+                    .await;
+                (lines, false)
+            }
             DaemonCommand::Create { .. } => {
                 match self
                     .handle_create(&envelope.command, effective_client_id.clone())
@@ -927,6 +933,114 @@ impl Supervisor {
                 .await
             }
         }
+    }
+
+    /// `list_saved_sessions` (port of `handleSavedSessionList`): stream
+    /// `session_list_item`/`session_list_progress` events, then a final
+    /// response with the full saved-session rows.
+    async fn handle_saved_session_list(
+        self: &Arc<Self>,
+        command: &DaemonCommand,
+        command_id: &str,
+    ) -> Vec<Value> {
+        let DaemonCommand::ListSavedSessions {
+            cwd,
+            session_dir,
+            active_session_id,
+            scope,
+            ..
+        } = command
+        else {
+            return Vec::new();
+        };
+        // Session-addressed form: use the live worker's cwd and session dir.
+        let (cwd, session_dir) = match active_session_id {
+            Some(active_session_id) => {
+                let workers = self.workers.lock().await;
+                let resident = workers.get(active_session_id);
+                match resident {
+                    Some(resident) => {
+                        let descriptor = resident.descriptor.lock().await;
+                        let cwd = descriptor
+                            .create_command
+                            .rest
+                            .get("cwd")
+                            .and_then(Value::as_str)
+                            .unwrap_or("/")
+                            .to_string();
+                        let session_dir = descriptor
+                            .create_command
+                            .rest
+                            .get("sessionDir")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        (cwd, session_dir)
+                    }
+                    None => {
+                        return vec![response_line(&response_failure(
+                            Some(command_id),
+                            "list_saved_sessions",
+                            &format!("Unknown active session: {active_session_id}"),
+                            None,
+                        ))];
+                    }
+                }
+            }
+            None => {
+                let Some(cwd) = cwd else {
+                    // The TS supervisor runs Node's path.resolve on the
+                    // missing cwd; reproduce the observable error string.
+                    return vec![response_line(&response_failure(
+                        Some(command_id),
+                        "list_saved_sessions",
+                        "The \"paths[0]\" property must be of type string, got undefined",
+                        None,
+                    ))];
+                };
+                (cwd.clone(), session_dir.clone())
+            }
+        };
+        let dir = session_dir
+            .map(|dir| crate::paths::expand_tilde(&dir))
+            .unwrap_or_else(|| crate::paths::sessions_dir(&self.options.agent_dir));
+        let scope_current = scope.as_str() == Some("current");
+        let mut infos = crate::session_store::list_sessions(&dir);
+        if scope_current {
+            infos.retain(|info| info.cwd == cwd);
+        }
+        let total = infos.len();
+        let mut lines = Vec::new();
+        for (index, info) in infos.iter().enumerate() {
+            let row = saved_session_row(info);
+            let mut item = json!({
+                "id": command_id,
+                "type": "session_list_item",
+                "command": "list_saved_sessions",
+                "session": row,
+            });
+            if let Some(active_session_id) = active_session_id {
+                item["activeSessionId"] = json!(active_session_id);
+            }
+            lines.push(item);
+            let mut progress = json!({
+                "id": command_id,
+                "type": "session_list_progress",
+                "command": "list_saved_sessions",
+                "loaded": index + 1,
+                "total": total,
+            });
+            if let Some(active_session_id) = active_session_id {
+                progress["activeSessionId"] = json!(active_session_id);
+            }
+            lines.push(progress);
+        }
+        let sessions: Vec<Value> = infos.iter().map(saved_session_row).collect();
+        lines.push(response_line(&response_success(
+            Some(command_id),
+            "list_saved_sessions",
+            Some(json!({ "sessions": sessions })),
+        )));
+        lines
     }
 
     async fn handle_list(
@@ -1277,4 +1391,36 @@ fn offline_summary(worker_id: &str) -> Value {
 pub async fn run_supervisor(options: SupervisorOptions) -> Result<()> {
     let supervisor = Arc::new(Supervisor::new(options)?);
     supervisor.run().await
+}
+
+/// Saved-session row (port of `serializeSavedSessionInfo`).
+fn saved_session_row(info: &crate::session_store::SessionInfo) -> Value {
+    let mut row = json!({
+        "path": info.path.to_string_lossy(),
+        "id": info.id,
+        "cwd": info.cwd,
+        "rlmDepth": info.rlm_depth,
+        "created": info.created,
+        "modified": info.modified,
+        "messageCount": info.message_count,
+        "firstMessage": info.first_message,
+        // The scan does not concatenate the transcript; consumers use the
+        // per-session read paths for full text.
+        "allMessagesText": "",
+        "state": info.state.as_ref().map(|state| json!({ "status": state })),
+    });
+    let object = row.as_object_mut().expect("row object");
+    if let Some(name) = &info.name {
+        object.insert("name".to_string(), json!(name));
+    }
+    if let Some(parent) = &info.parent_session_path {
+        object.insert("parentSessionPath".to_string(), json!(parent));
+    }
+    if let Some((provider, model_id)) = &info.model {
+        object.insert(
+            "model".to_string(),
+            json!({ "provider": provider, "modelId": model_id }),
+        );
+    }
+    row
 }

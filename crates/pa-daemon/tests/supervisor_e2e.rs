@@ -357,6 +357,63 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
     assert!(usage["outputTokens"].as_u64().unwrap_or_default() > 0);
     assert!(usage["cost"].as_f64().unwrap_or_default() >= 0.0);
 
+    // Saved-session listing: item + progress events, then the final response
+    // (differential shape from the TS supervisor's `handleSavedSessionList`).
+    client.send_command("e1", serde_json::json!({ "type": "list_saved_sessions" }));
+    let rejected = client.read_response("e1");
+    assert_eq!(rejected["success"], false);
+    assert_eq!(
+        rejected["error"],
+        "The \"paths[0]\" property must be of type string, got undefined"
+    );
+    client.send_command(
+        "sl1",
+        serde_json::json!({
+            "type": "list_saved_sessions",
+            "cwd": dir.path().to_string_lossy(),
+            "sessionDir": agent_dir.join("sessions").to_string_lossy(),
+            "scope": "all",
+        }),
+    );
+    let mut items = 0usize;
+    let mut progress = 0usize;
+    let mut rows = Vec::new();
+    let saved = loop {
+        let line = client.read_line();
+        match line["type"].as_str() {
+            Some("session_list_item") => {
+                items += 1;
+                let session = line["session"].clone();
+                assert!(session["path"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .ends_with(".jsonl"));
+                assert!(session["firstMessage"].is_string());
+                assert!(session["state"]["status"].is_string());
+                rows.push(session);
+            }
+            Some("session_list_progress") => {
+                progress += 1;
+                assert!(line["loaded"].as_u64().unwrap_or_default() > 0);
+                assert!(
+                    line["total"].as_u64().unwrap_or_default()
+                        >= line["loaded"].as_u64().unwrap_or_default()
+                );
+            }
+            _ if line["id"] == "sl1" => break line,
+            _ => {}
+        }
+    };
+    assert_eq!(
+        saved["success"], true,
+        "list_saved_sessions failed: {saved}"
+    );
+    assert_eq!(items, 1, "expected exactly the one created session");
+    assert!(progress >= 1);
+    let sessions = saved["data"]["sessions"].as_array().expect("sessions");
+    assert_eq!(sessions.len(), items);
+    assert_eq!(rows[0], sessions[0]);
+
     // Second turn of the script replays the next response.
     client.send_command(
         "p2",
