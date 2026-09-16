@@ -7,6 +7,7 @@
 //! pa-agent Agent owns the loop and its steer/follow-up queues; this layer
 //! decides admission and persists what the loop produces.
 
+pub mod compaction;
 pub mod slash_commands;
 
 use std::sync::Arc;
