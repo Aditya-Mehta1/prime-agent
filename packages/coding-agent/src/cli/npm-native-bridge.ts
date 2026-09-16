@@ -93,12 +93,15 @@ function runInstaller(command: string, version: string, environment: NodeJS.Proc
 		};
 		// Install handlers before spawning so an immediately ready installer cannot expose
 		// a window where the bridge receives the default signal action before cleanup.
+		const scheduleForceKill = () => {
+			forceTimer ??= setTimeout(() => terminate("SIGKILL"), 1000);
+			forceTimer.unref();
+		};
 		const handlers = signals.map((signal) => {
 			const handler = () => {
 				parentSignal ??= signal;
 				terminate(signal);
-				forceTimer ??= setTimeout(() => terminate("SIGKILL"), 1000);
-				forceTimer.unref();
+				scheduleForceKill();
 			};
 			process.on(signal, handler);
 			return handler;
@@ -127,8 +130,7 @@ function runInstaller(command: string, version: string, environment: NodeJS.Proc
 		child.once("close", (status, signal) => finish({ status, signal }));
 		timeout = setTimeout(() => {
 			terminate("SIGTERM");
-			forceTimer = setTimeout(() => terminate("SIGKILL"), 1000);
-			forceTimer.unref();
+			scheduleForceKill();
 		}, 450000);
 		if (parentSignal) terminate(parentSignal);
 	});
