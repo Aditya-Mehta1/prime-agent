@@ -1184,7 +1184,6 @@ def main() -> None:
     user_module.__dict__["__builtins__"] = __builtins__
     sys.modules["__main__"] = user_module
 
-    signal.signal(signal.SIGINT, _sigint_handler)
     _send({"event": "ready", "protocol": PROTOCOL_VERSION, "python": platform.python_version()})
 
     # The event-loop stack (asyncio plus its ssl, concurrent.futures, and
@@ -1200,6 +1199,10 @@ def main() -> None:
     threading.Thread(target=_read_requests, args=(stdin_fd, queue), daemon=True).start()
 
     _serve_task = _loop.create_task(_serve(queue, user_module.__dict__))
+    # _sigint_handler has no task to target before serving starts, so installing
+    # it earlier would silently swallow a Ctrl-C during this boot window; the
+    # default handler must stay in charge until the loop and serve task exist.
+    signal.signal(signal.SIGINT, _sigint_handler)
     # A KeyboardInterrupt escaping a cell or background task stops
     # run_until_complete; the interrupt is already recorded, so resume serving.
     while not _serve_task.done():

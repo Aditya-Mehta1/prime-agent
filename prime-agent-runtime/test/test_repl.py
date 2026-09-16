@@ -157,6 +157,77 @@ class ReplTest(unittest.TestCase):
         self.assertEqual(one(events, "result")["text"], "True")
         self.assertEqual(one(events, "done")["status"], "ok")
 
+    def test_sigint_during_boot_window_terminates_kernel(self):
+        # Regression: _sigint_handler has no task to target before serving
+        # starts, so installing it before the deferred event-loop boot let a
+        # Ctrl-C during that window be silently swallowed. The default handler
+        # must stay in charge until the loop and serve task exist, so a SIGINT
+        # delivered mid-boot stops the kernel instead of vanishing.
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = os.path.join(tmp, "boot-window-open")
+            release = os.path.join(tmp, "boot-window-release")
+            # A fake `asyncio` parks the kernel inside the post-ready
+            # deferred import -- the boot window where an early handler
+            # install would swallow SIGINT. Without parking, the window is
+            # too short to hit deterministically.
+            with open(os.path.join(tmp, "asyncio.py"), "w") as fake_asyncio:
+                fake_asyncio.write(
+                    "import os, time\n"
+                    f"open({marker!r}, 'w').write('1')\n"
+                    "deadline = time.monotonic() + 30.0\n"
+                    f"while not os.path.exists({release!r}):\n"
+                    "    if time.monotonic() > deadline:\n"
+                    "        raise TimeoutError('boot window never released')\n"
+                    "    time.sleep(0.01)\n"
+                )
+            env = {
+                **os.environ,
+                "PYTHONPATH": tmp + os.pathsep + SRC + os.pathsep + os.environ.get("PYTHONPATH", ""),
+            }
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "rlm.repl"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+            self.addCleanup(self._stop_bounded, proc)
+
+            # Ready fires before the deferred import; then the fake parks the kernel.
+            lines: queue.Queue[object] = queue.Queue()
+            threading.Thread(target=lambda: lines.put(proc.stdout.readline()), daemon=True).start()
+            try:
+                ready_line = lines.get(timeout=30)
+            except queue.Empty:
+                self.fail("kernel never sent the ready event")
+            self.assertIn('"event":"ready"', ready_line)
+            deadline = time.monotonic() + 30.0
+            while not os.path.exists(marker):
+                self.assertLess(time.monotonic(), deadline, "kernel never entered the boot window")
+                time.sleep(0.01)
+
+            self.assertIsNone(proc.poll(), "kernel exited inside the boot window before SIGINT")
+            os.kill(proc.pid, signal.SIGINT)
+
+            try:
+                stdout, stderr = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.fail("SIGINT during the boot window was swallowed; kernel kept booting")
+            self.assertNotEqual(proc.returncode, 0)
+            # The kernel's stderr ships as protocol events; the unhandled
+            # interrupt surfaces in the captured streams.
+            self.assertIn("KeyboardInterrupt", stdout + stderr)
+
+    @staticmethod
+    def _stop_bounded(proc: subprocess.Popen[str]) -> None:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=10)
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
+
     def test_result_echo(self):
         events = self.repl.execute("a", "1+1")
         self.assertEqual(one(events, "result")["text"], "2")
