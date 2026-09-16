@@ -368,6 +368,7 @@ describe("registry dependency guard", () => {
 	});
 });
 
+// test-policy: allow conditional-or-disabled-test -- git and tar fixtures only run on posix hosts
 describe.skipIf(process.platform === "win32")("staged output", () => {
 	it("writes one directory per package plus a manifest describing the publish order", () => {
 		const { outDir, result } = stage();
@@ -435,6 +436,7 @@ describe.skipIf(process.platform === "win32")("staged output", () => {
 	});
 });
 
+// test-policy: allow conditional-or-disabled-test -- git and tar fixtures only run on posix hosts
 describe.skipIf(process.platform === "win32")("receipt cross-check", () => {
 	type Receipt = { platform: string; file: string; sha256: string; executableSha256: string };
 
@@ -601,6 +603,7 @@ describe.skipIf(process.platform === "win32")("receipt cross-check", () => {
 	});
 });
 
+// test-policy: allow conditional-or-disabled-test -- git and tar fixtures only run on posix hosts
 describe.skipIf(process.platform === "win32")("bin shim resolution", () => {
 	const key = `${process.platform}-${process.arch}`;
 
@@ -626,6 +629,7 @@ describe.skipIf(process.platform === "win32")("bin shim resolution", () => {
 		});
 	}
 
+	// test-policy: allow conditional-or-disabled-test -- git and tar fixtures only run on posix hosts
 	it.skipIf(!platforms.includes(`${process.platform}-${process.arch}`))(
 		"executes the platform binary, forwards arguments and propagates the exit code",
 		() => {
@@ -639,6 +643,7 @@ describe.skipIf(process.platform === "win32")("bin shim resolution", () => {
 		},
 	);
 
+	// test-policy: allow conditional-or-disabled-test -- git and tar fixtures only run on posix hosts
 	it.skipIf(!platforms.includes(`${process.platform}-${process.arch}`))(
 		"fails closed when the receipt does not match the installed binary",
 		() => {

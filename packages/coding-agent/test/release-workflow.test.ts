@@ -389,6 +389,7 @@ cosign() {
 		},
 	);
 
+	// test-policy: allow conditional-or-disabled-test -- git and tar fixtures only run on posix hosts
 	it.skipIf(process.platform === "win32")(
 		"the test-signer steps refuse a certificate naming the caller workflow",
 		() => {
@@ -483,6 +484,7 @@ cosign() {
 		for (const platform of releasePlatforms) expect(stage.run).not.toContain(` ${platform} `);
 	});
 
+	// test-policy: allow conditional-or-disabled-test -- git and tar fixtures only run on posix hosts
 	it.skipIf(process.platform === "win32")(
 		"selects both real packer paths for PR validation without allowing publication",
 		() => {
@@ -738,6 +740,7 @@ describe("release ordering: nothing is public before verification", () => {
 		expect(create.run).toContain('test "$(jq -r .isDraft /tmp/release.json)" = true');
 	});
 
+	// test-policy: allow conditional-or-disabled-test -- git and tar fixtures only run on posix hosts
 	describe.skipIf(process.platform === "win32")("the tag pre-check (bash, fake gh)", () => {
 		const precheck = step(githubRelease, "Refuse an existing tag at another commit").run!;
 		const env = { GITHUB_REPOSITORY: "o/r", PRODUCTION_VERSION: "1.2.3", BUILD_REF };
@@ -893,6 +896,7 @@ describe("npm publication is split into an unprivileged pack job and a code-free
 		expect(publishStep.run).toContain("'.publishOrder[]'");
 	});
 
+	// test-policy: allow conditional-or-disabled-test -- git and tar fixtures only run on posix hosts
 	it.skipIf(process.platform === "win32")(
 		"publishes in manifest order and refuses a tarball whose digest changed",
 		() => {
@@ -947,6 +951,7 @@ describe("npm publication is split into an unprivileged pack job and a code-free
 	);
 });
 
+// test-policy: allow conditional-or-disabled-test -- git and tar fixtures only run on posix hosts
 describe.skipIf(process.platform === "win32")(
 	"immutable uploads treat only an explicit 404 from head-object as absent (fake aws)",
 	() => {
@@ -1122,6 +1127,7 @@ describe("tap-bump reruns safely and never touches the tap's default branch", ()
 		expect(bump.run).toContain('[[ "$digest" =~ ^[0-9a-f]{64}$ ]]');
 	});
 
+	// test-policy: allow conditional-or-disabled-test -- git and tar fixtures only run on posix hosts
 	describe.skipIf(process.platform === "win32")("the step script (bash, fake gh/git)", () => {
 		const BRANCH = "prime-agent-1.2.3";
 		const digests = ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64"].map(

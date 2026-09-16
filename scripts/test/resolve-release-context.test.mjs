@@ -481,6 +481,7 @@ function runScript(repo, bin, env) {
 	return { result, outputs };
 }
 
+// test-policy: allow conditional-or-disabled-test -- the git-based simulation only runs where git is available
 test("scratch repository: the real script routes a version bump by its current review state", { skip: process.platform === "win32" }, () => {
 	const repo = scratchRepository();
 	try {

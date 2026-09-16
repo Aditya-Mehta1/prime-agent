@@ -835,6 +835,7 @@ test("credential-bearing jobs accept only allowlisted actions, never an arbitrar
 	assert.equal(JSON.stringify(ALLOWED_ACTIONS).includes("github-script"), false);
 	const release = parse(readFileSync(RELEASE, "utf8"));
 	for (const [jobId, job] of Object.entries(release.jobs)) {
+		// test-policy: allow environment-gated-path -- iterating only the derived credential jobs is the assertion itself, not an environment gate
 		if (!isCredentialBearing(job)) continue;
 		const allowed = [...ALLOWED_ACTIONS["*"], ...(ALLOWED_ACTIONS[jobId] ?? [])];
 		for (const step of job.steps ?? []) {
@@ -1496,6 +1497,7 @@ for (const jobId of ALL_CREDENTIAL_JOBS) {
 test("the checked-in credential-bearing jobs use only allowlisted commands, and the allowlist names nothing that runs code", () => {
 	const release = parse(readFileSync(RELEASE, "utf8"));
 	for (const [jobId, job] of Object.entries(release.jobs)) {
+		// test-policy: allow environment-gated-path -- iterating only the derived credential jobs is the assertion itself, not an environment gate
 		if (!isCredentialBearing(job)) continue;
 		const artifactDirectories = artifactDirectoriesOf(job);
 		for (const step of job.steps ?? []) {
