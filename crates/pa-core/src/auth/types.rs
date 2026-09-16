@@ -20,7 +20,7 @@ pub enum AuthCredential {
     #[serde(rename = "api_key")]
     ApiKey {
         key: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "primeTeam", default, skip_serializing_if = "Option::is_none")]
         prime_team: Option<PrimeTeamCredential>,
     },
     #[serde(rename = "oauth")]
