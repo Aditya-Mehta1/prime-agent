@@ -40,6 +40,7 @@ pub mod autonomous;
 pub mod cron;
 pub mod goals;
 pub mod kernel;
+pub mod mcp;
 pub mod models;
 pub mod prompts;
 pub mod refinement;
