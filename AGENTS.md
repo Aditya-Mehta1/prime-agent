@@ -30,7 +30,7 @@
 - If you create or modify a test file, you MUST run that test file and iterate until it passes.
 - When writing tests, run them, identify issues in either the test or implementation, and iterate until fixed.
 - For `packages/coding-agent/test/suite/`, use `test/suite/harness.ts` plus the faux provider. Do not use real provider APIs, real API keys, or paid tokens.
-- Before adding, keeping, or deleting a test, apply `## Testing Policy
+## Testing Policy
 
 - `npm run check:test-policy` is required. Never weaken it or add a broad exclusion. A platform exception must use `// test-policy: allow <rule> -- <specific reason>` immediately above one expression, and CI must run that test on a supported platform.
 - A test must fail when the behavior it covers is broken. Temporarily revert or stub the production behavior to prove the failure. If the test still passes, delete it.

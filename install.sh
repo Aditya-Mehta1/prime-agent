@@ -1983,11 +1983,6 @@ prime_agent_native_probe_timeout() {
 prime_agent_native_probe() (
 	# macOS does not ship timeout; keep the deadline independent of Node and Python.
 	native_probe_pid=
-	case "${PRIME_AGENT_PROBE_TIMEOUT_SECONDS:-}" in
-		'' | *[!0-9]* | 0 | 0*) native_probe_timeout=10 ;;
-		??????*) native_probe_timeout=10 ;;
-		*) native_probe_timeout=$PRIME_AGENT_PROBE_TIMEOUT_SECONDS ;;
-	esac
 	trap '
 		if [ -n "$native_probe_pid" ]; then
 			kill -KILL "$native_probe_pid" 2>/dev/null || :
