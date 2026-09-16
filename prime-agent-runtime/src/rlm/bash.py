@@ -1563,11 +1563,13 @@ def _scan_pipe_shell_region(command: str, start: int, end: int) -> _PipeShellReg
                         stage_heredoc_bodies.setdefault(pending_stage, []).append(
                             (*body, pending_quoted)
                         )
-                    resume = cursor
                     cursor_next = command.find("\n", cursor)
                     if cursor_next == -1 or cursor_next >= end:
                         break
-                    cursor = cursor_next
+                    cursor = cursor_next + 1
+                # Each consumed body's delimiter line is here-document
+                # mechanics, not stages: the stream resumes past its newline.
+                resume = cursor
                 pending_heredocs.clear()
             operator = char
             follower = command[index + 1 : index + 2]
@@ -1663,9 +1665,8 @@ def _stage_command_word(
         index += 1
         value_flags = _WRAPPER_VALUE_FLAGS.get(name, ())
         while index < len(words) and words[index].value.startswith("-"):
-            if words[index].value in value_flags or _wrapper_cluster_takes_value(
-                name, words[index].value
-            ):
+            _, cluster_operand = _wrapper_cluster_flags(name, words[index].value)
+            if words[index].value in value_flags or cluster_operand:
                 index += 2
             else:
                 index += 1
@@ -1787,16 +1788,25 @@ def _stage_heredoc_body_runs_download(
     return False
 
 
-def _wrapper_cluster_takes_value(name: str, value: str) -> bool:
-    """Whether a bundled short-option cluster (`-su`) ends in a character that
-    takes the next word as its operand: sudo's `-su root` binds `root` to the
-    `-u` at the cluster's tail, exactly like `-s -u root`."""
+def _wrapper_cluster_flags(name: str, value: str) -> tuple[bool, bool]:
+    """(shell flag, next word is an operand) for a bundled short-option
+    cluster, read the way getopt reads it: left to right, where the FIRST
+    value-taking character either ends the cluster (`-su root` binds root as
+    `-u`'s operand) or has the rest attached as its operand (`-uMath sh`:
+    `Math` is the operand and `sh` stays the command)."""
     if not value.startswith("-") or value.startswith("--") or len(value) < 2:
-        return False
+        return False, False
     value_chars = {
         flag[1:] for flag in _WRAPPER_VALUE_FLAGS.get(name, ()) if len(flag) == 2
     }
-    return value[-1] in value_chars
+    shell = False
+    for position, char in enumerate(value[1:]):
+        if char in value_chars:
+            takes_next = len(value) - 2 == position
+            return shell, takes_next
+        if name == "sudo" and char in ("s", "i"):
+            shell = True
+    return shell, False
 
 
 def _stage_env_s_operand(words: tuple[_PipeShellWord, ...]) -> _PipeShellWord | None:
@@ -1805,12 +1815,30 @@ def _stage_env_s_operand(words: tuple[_PipeShellWord, ...]) -> _PipeShellWord | 
     for index, word in enumerate(words):
         if _command_name(word.value) == "env":
             cursor = index + 1
-            while cursor < len(words) - 1:
+            while cursor < len(words):
                 value = words[cursor].value
+                # The exact forms and the attached forms come first: an
+                # attached `-S<...>` operand does not end in S by accident
+                # of its payload (`-S'echo S'` is the attached form, not a
+                # cluster).
                 if value in ("-S", "--split-string"):
-                    return words[cursor + 1]
+                    return words[cursor + 1] if cursor + 1 < len(words) else None
+                if value.startswith("-S") and len(value) > 2:
+                    return _PipeShellWord(value[2:], (), True, True)
+                if value.startswith("--split-string="):
+                    return _PipeShellWord(value[len("--split-string=") :], (), True, True)
+                if (
+                    value.startswith("-")
+                    and not value.startswith("--")
+                    and value.endswith("S")
+                    and len(value) > 1
+                ):
+                    # A bundled cluster ending in the -S flag (`-iS`) takes
+                    # the next word as its operand.
+                    return words[cursor + 1] if cursor + 1 < len(words) else None
                 if value.startswith("-"):
-                    cursor += 1
+                    _, cluster_operand = _wrapper_cluster_flags("env", value)
+                    cursor += 2 if cluster_operand else 1
                     continue
                 break
     return None
@@ -1828,9 +1856,13 @@ def _text_runs_download(text: str, depth: int = 0) -> bool:
         if resolved is not None and _command_name(resolved[0].value) in _DOWNLOAD_COMMANDS:
             return True
         for word in stage.words:
-            if word.value not in _DOWNLOAD_COMMANDS and _text_runs_download(
-                word.value, depth + 1
-            ):
+            # Only a word that carries shell separators can hold a nested
+            # script (`sh -c "curl URL"` folds to one word); a bare token
+            # (`echo`, `hi`) is never a script of its own.
+            if any(
+                char.isspace() or char in _PIPE_SHELL_SEPARATORS
+                for char in word.value
+            ) and _text_runs_download(word.value, depth + 1):
                 return True
     return False
 
@@ -1844,6 +1876,8 @@ def _stage_targets_run_shell(command: str, stage: _PipeShellStage) -> bool:
         for inner in region.stages:
             resolved = _stage_command_word(inner.words)
             if resolved is not None and _command_name(resolved[0].value) in _RUNNERS:
+                return True
+            if resolved is None and _stage_runs_stdin_shell(inner.words):
                 return True
     return False
 
@@ -1859,10 +1893,12 @@ def _stage_runs_stdin_shell(words: tuple[_PipeShellWord, ...]) -> bool:
             shell_flag = False
             while cursor < len(words):
                 value = words[cursor].value
-                if value in value_flags or _wrapper_cluster_takes_value(
-                    "sudo", value
-                ):
-                    if value not in value_flags and ("s" in value or "i" in value):
+                if value in value_flags:
+                    cursor += 2  # the flag's operand is not a command
+                    continue
+                cluster_shell, cluster_operand = _wrapper_cluster_flags("sudo", value)
+                if cluster_operand:
+                    if cluster_shell:
                         # A bundled cluster can carry both (`-su`: the shell
                         # flag and the operand-taking `-u` at its tail).
                         shell_flag = True
@@ -1893,6 +1929,7 @@ def _continuation_runs_shell(region: _PipeShellRegion, position: int) -> bool:
     whole region) run a shell: a here-document body is read as a script only
     when the pipe chain it feeds actually reaches an interpreter."""
     cursor = position + 1
+    previous_separator = region.stages[position].separator
     while cursor < len(region.stages):
         stage = region.stages[cursor]
         if stage.words:
@@ -1902,10 +1939,17 @@ def _continuation_runs_shell(region: _PipeShellRegion, position: int) -> bool:
                     return True
             elif _stage_runs_stdin_shell(stage.words):
                 return True
+        if not stage.words and previous_separator in _PIPE_OPERATORS:
+            # The empty stage is the newline after a pipe (`cat <<EOF |`
+            # newline ... body ... receiver): the chain continues to it.
+            previous_separator = stage.separator
+            cursor += 1
+            continue
         if stage.separator not in _PIPE_OPERATORS and stage.separator not in _GROUPING_OPERATORS:
             # A grouping separator continues the chain (`cat <<EOF | (sh)`
             # pipes into the subshell's sh).
             return False
+        previous_separator = stage.separator
         cursor += 1
     return False
 
@@ -1938,6 +1982,11 @@ def _pipe_shell_stage_violation(
     """Why these stages run a download through a shell, or None."""
     piped_download = False
     brace_depth = 0
+    paren_depth = 0
+    # A pipe separator opens the pipeline until its right-hand side arrives:
+    # blank lines and grouping between the two do not end it (real bash reads
+    # `curl U |` newline newline `sh` as one pipeline).
+    pipeline_open = False
     for position, stage in enumerate(region.stages):
         if not stage.words:
             # An empty stage is a grouping character, a doubled operator, or
@@ -1945,10 +1994,11 @@ def _pipe_shell_stage_violation(
             # A statement separator does end the chain: `(curl URL); sh` runs
             # two statements, and the second one inherits no pipeline state.
             # The newline right after a pipe only continues that pipeline.
-            if stage.separator in (";", "\n", "&", "&&", "||") and not (
-                position > 0
-                and region.stages[position - 1].separator in _PIPE_OPERATORS
-            ):
+            if stage.separator == "(":
+                paren_depth += 1
+            elif stage.separator == ")":
+                paren_depth = max(0, paren_depth - 1)
+            elif stage.separator in (";", "\n", "&", "&&", "||") and not pipeline_open:
                 piped_download = False
             continue
         if stage.words[0].value == "{" and not stage.words[0].quoted:
@@ -2030,6 +2080,8 @@ def _pipe_shell_stage_violation(
                 and _stage_heredoc_body_runs_download(command, stage, depth)
             ):
                 return "a download piped into a shell"
+        if stage.words:
+            pipeline_open = stage.separator in _PIPE_OPERATORS
         if brace_depth and stage.words[-1].value == "}" and not stage.words[-1].quoted:
             # Close the group before the reset check: a group that ends on a
             # statement separator (`{ curl URL; }; sh`) leaves no pipeline
@@ -2039,6 +2091,7 @@ def _pipe_shell_stage_violation(
             stage.separator not in _PIPE_OPERATORS
             and stage.separator not in _GROUPING_OPERATORS
             and brace_depth == 0
+            and paren_depth == 0
         ):
             piped_download = False
     return None
