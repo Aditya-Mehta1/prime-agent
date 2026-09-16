@@ -200,6 +200,35 @@ function safeCode(value: unknown): keyof typeof CODE_SUBTYPES | undefined {
 	return Object.hasOwn(CODE_SUBTYPES, normalized) ? (normalized as keyof typeof CODE_SUBTYPES) : undefined;
 }
 
+/**
+ * Structured evidence outranks prose: once a status or provider code has named
+ * the subtype, the category must follow that subtype instead of the raw
+ * message, whose wording can still say "auth" on a billing or availability
+ * failure — the exact misclassification this work removes.
+ */
+const SUBTYPE_CATEGORIES: Readonly<Record<TelemetryErrorSubtype, TelemetryLegacyErrorCategory>> = {
+	credential_missing: "authentication",
+	credential_invalid: "authentication",
+	credential_expired: "authentication",
+	authentication_rejected: "authentication",
+	permission_denied: "other",
+	model_access_denied: "other",
+	insufficient_balance: "other",
+	quota_exceeded: "rate_limit",
+	rate_limited: "rate_limit",
+	network_error: "network",
+	timeout: "timeout",
+	provider_unavailable: "provider_unavailable",
+	refusal: "other",
+	malformed_response: "other",
+	context_limit: "context_limit",
+	configuration_error: "other",
+	filesystem_error: "other",
+	session_unavailable: "other",
+	cancelled: "other",
+	unknown: "other",
+};
+
 export function telemetryLegacyErrorCategory(message: string): TelemetryLegacyErrorCategory {
 	const error = message.toLowerCase();
 	if (/\b401\b|\b403\b|auth|api.?key|credential|unauthori[sz]ed|forbidden/.test(error)) return "authentication";
@@ -333,8 +362,9 @@ export function classifyTelemetryError(error: unknown): TelemetryErrorClassifica
 			source = "reviewed_message";
 		}
 	}
+	const category = source === "unknown" ? telemetryLegacyErrorCategory(message) : SUBTYPE_CATEGORIES[subtype];
 	return {
-		error_category: telemetryLegacyErrorCategory(message),
+		error_category: category,
 		error_subtype: subtype,
 		error_code: code ?? "unknown",
 		http_status: status ?? null,

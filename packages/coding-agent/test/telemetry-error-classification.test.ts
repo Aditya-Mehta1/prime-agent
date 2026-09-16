@@ -6,19 +6,19 @@ const SECRET = "sensitive-canary-api-key-private-path-request-id-prompt";
 
 describe("safe telemetry error classification", () => {
 	it.each([
-		[402, "insufficient_funds", "insufficient_balance"],
-		[402, "insufficient_quota", "quota_exceeded"],
-		[503, "authentication_error", "provider_unavailable"],
-		[403, "authentication_error", "permission_denied"],
-		[403, "model_access_denied", "model_access_denied"],
-		[401, undefined, "authentication_rejected"],
-		[401, "invalid_api_key", "credential_invalid"],
-		[401, "token_expired", "credential_expired"],
-		[402, undefined, "unknown"],
-		[402, "authentication_error", "unknown"],
-		[429, undefined, "rate_limited"],
-		[504, undefined, "timeout"],
-	] as const)("classifies status %s and reason %s without trusting prose", (status, code, subtype) => {
+		[402, "insufficient_funds", "insufficient_balance", "other"],
+		[402, "insufficient_quota", "quota_exceeded", "rate_limit"],
+		[503, "authentication_error", "provider_unavailable", "provider_unavailable"],
+		[403, "authentication_error", "permission_denied", "other"],
+		[403, "model_access_denied", "model_access_denied", "other"],
+		[401, undefined, "authentication_rejected", "authentication"],
+		[401, "invalid_api_key", "credential_invalid", "authentication"],
+		[401, "token_expired", "credential_expired", "authentication"],
+		[402, undefined, "unknown", "other"],
+		[402, "authentication_error", "unknown", "other"],
+		[429, undefined, "rate_limited", "rate_limit"],
+		[504, undefined, "timeout", "timeout"],
+	] as const)("classifies status %s and reason %s without trusting prose", (status, code, subtype, category) => {
 		const error = Object.assign(new Error(`Authentication failed: API key ${SECRET}`), {
 			status,
 			error: { code, message: SECRET },
@@ -28,7 +28,10 @@ describe("safe telemetry error classification", () => {
 		const result = classifyTelemetryError(error);
 		expect(result.error_subtype).toBe(subtype);
 		expect(result.http_status).toBe(status);
-		expect(result.error_category).toBe("authentication");
+		// The category follows the structured subtype, not the prose: a billing
+		// or permission failure must not keep the credential category just
+		// because the message says "Authentication".
+		expect(result.error_category).toBe(category);
 		expect(JSON.stringify(result)).not.toContain(SECRET);
 		expect(result.diagnostic_message).toBe(TELEMETRY_ERROR_MESSAGES[subtype]);
 	});

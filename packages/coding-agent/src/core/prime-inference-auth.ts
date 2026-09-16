@@ -573,32 +573,18 @@ function formatAccessFailure(result: Exclude<PrimeInferenceAccessResult, { ok: t
 async function observeLoginValidation(
 	check: () => Promise<PrimeInferenceAccessResult>,
 	callbacks: PrimeInferenceLoginCallbacks,
-	provider: string,
+	_provider: string,
 ): Promise<PrimeInferenceAccessResult> {
 	const startedAt = performance.now();
 	let outcome: "completed" | "failed" = "failed";
+	// Validation failures are reported by whoever turns them into a failure:
+	// the login UI reports thrown access errors inside the authentication
+	// scope, so reporting here as well would upload each one twice, and the
+	// onValidation observation below is the designed record of every outcome.
 	try {
 		const result = await check();
 		if (result.ok) outcome = "completed";
-		else if (!callbacks.signal?.aborted)
-			reportTelemetryError({
-				error: result,
-				component: "authentication",
-				operation: "validate",
-				stage: "authentication",
-				provider,
-			});
 		return result;
-	} catch (error) {
-		if (!callbacks.signal?.aborted)
-			reportTelemetryError({
-				error,
-				component: "authentication",
-				operation: "validate",
-				stage: "authentication",
-				provider,
-			});
-		throw error;
 	} finally {
 		try {
 			if (!callbacks.signal?.aborted)
