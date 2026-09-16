@@ -178,6 +178,9 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
                 },
             ):
                 handle = bash('echo "$NO_COLOR $TERM"')
+                # The handle keeps the caller's text for display (the
+                # completion notice and repr), not the prefixed script.
+                self.assertEqual(handle.command, 'echo "$NO_COLOR $TERM"')
                 result = await handle
                 # The inactive record lands slightly after finalize, once the group exits.
                 records = await _poll_journal(journal, count=2)
@@ -471,8 +474,8 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
             pids: list[int] = []
             original_init = bash_module.BashHandle.__init__
 
-            def capturing_init(handle_self, command):
-                original_init(handle_self, command)
+            def capturing_init(handle_self, command, script=None):
+                original_init(handle_self, command, script=script)
                 pids.append(handle_self._pid)
 
             async def run_oneshot():
@@ -499,8 +502,8 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
             pids: list[int] = []
             original_init = bash_module.BashHandle.__init__
 
-            def capturing_init(handle_self, command):
-                original_init(handle_self, command)
+            def capturing_init(handle_self, command, script=None):
+                original_init(handle_self, command, script=script)
                 pids.append(handle_self._pid)
 
             async def run_oneshot():
@@ -574,8 +577,8 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
         pids: list[int] = []
         original_init = bash_module.BashHandle.__init__
 
-        def capturing_init(handle_self, command):
-            original_init(handle_self, command)
+        def capturing_init(handle_self, command, script=None):
+            original_init(handle_self, command, script=script)
             pids.append(handle_self._pid)
 
         async def run_oneshot():
