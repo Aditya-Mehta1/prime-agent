@@ -463,6 +463,25 @@ describe("runIncident over a fixture agent dir", () => {
 		expect(text).toContain("supervisor startup blocked: another daemon holds the lock");
 	});
 
+	it("uses the pre-resolved window passed by the caller", async () => {
+		mkdirSync(join(agentDir, "logs"), { recursive: true });
+		writeFileSync(
+			join(agentDir, "logs", "agent.jsonl"),
+			`${agentLogLine({
+				ts: "2026-09-10T20:02:39.764Z",
+				component: "coding-agent.daemon-supervisor",
+				msg: "Supervisor command attach failed: Error: Timed out waiting for daemon worker response to attach",
+			})}\n`,
+		);
+		await runIncident(
+			{},
+			{ sinceMs: Date.parse("2026-09-10T20:00:00Z"), untilMs: Date.parse("2026-09-10T20:30:00Z") },
+		);
+		const text = stripAnsi(logs.join("\n"));
+		expect(text).toContain("Window: 09-10 20:00:00 → 09-10 20:30:00 UTC (30m)");
+		expect(text).toContain("command attach failed: timed out waiting for worker response");
+	});
+
 	it("falls back to the per-daemon log when agent.jsonl is empty or unreadable", async () => {
 		mkdirSync(join(agentDir, "logs"), { recursive: true });
 		const daemonLog = [

@@ -1115,9 +1115,13 @@ export function resolveIncidentWindow(options: IncidentCommandOptions, now: Date
 	return { sinceMs, untilMs };
 }
 
-/** Entry point for `prime-agent incident`; prints the timeline to stdout. */
-export async function runIncident(options: IncidentCommandOptions): Promise<void> {
-	const { sinceMs, untilMs } = resolveIncidentWindow(options, new Date());
+/**
+ * Entry point for `prime-agent incident`; prints the timeline to stdout.
+ * Callers that validate the window pass it back so relative `HH:MM` bounds
+ * resolve exactly once instead of again against a later clock reading.
+ */
+export async function runIncident(options: IncidentCommandOptions, window?: IncidentWindow): Promise<void> {
+	const { sinceMs, untilMs } = window ?? resolveIncidentWindow(options, new Date());
 	const logSource = readIncidentLogEntries();
 	if (logSource.entries.length === 0 && logSource.scannedCount === 0) {
 		console.log(`No daemon logs found under ${getLogsDir()}.`);
