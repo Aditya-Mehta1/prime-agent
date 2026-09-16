@@ -18,7 +18,11 @@ The only thing worth keeping is the behavior contract: a good inference harness 
 
 - Full feature parity: the exact same product and eval experience — TUI, verifiers flow, end-user experience, and the model-facing surface RLM-1 is post-trained on (tool names, rlm recursion API, skill contract, system-prompt structure).
 - Much faster, far more reliable, and much lighter: a fraction of the ~200K product LOC, and tests that actually catch regressions instead of the current low-value volume.
-- Clean, modular design, since we now know what the final state looks like: TUI, provider APIs, agent loop, RLM primitives (persistent IPython-kernel state, recursive subagents, skills), and coding-agent features fully decoupled, so each layer can be extended independently in the future.
+- Clean, modular design with hard ownership boundaries, since we now know what the final state looks like: TUI, provider APIs, agent loop, RLM primitives (persistent IPython-kernel state, recursive subagents, skills), and coding-agent features fully decoupled, so each layer can be extended independently in the future. Enforce it structurally:
+  - Every crate owns exactly one area, declared in its own README (scope, explicit non-goals, and its public API). No shared kitchen-sink crates: one crate holds the cross-cutting type vocabulary and nothing else.
+  - Public API at crate boundaries stays minimal — `pub(crate)` inside; no re-exporting internals across crates. A crate may never reach into another crate's internals.
+  - The dependency graph is layered and cycle-free; document the direction in the workspace README and ARCHITECTURE.md, and keep it true in Cargo.toml.
+  - If a change forces edits across many crates' internals, the boundary is wrong — fix the boundary, not the symptom. This is the anti-agent-session.ts rule: no file, module, or crate may become the place everything flows through.
 - The interactive agent view is the most important surface — the TUI session experience is what users live in, so build and polish it first and hardest. But every capability must also run headlessly with identical behavior, so the same product serves evals, sandboxes, and embedding inside other applications.
 - The end deliverable is an OS-agnostic compiled Prime Agent, without the bloat and fluff.
 

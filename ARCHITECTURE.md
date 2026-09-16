@@ -40,3 +40,29 @@ Parity contract = user experience + model-facing surface, not internal mechanism
 - Read the TS file in full before porting its behavior. The TS product on PATH is ground truth.
 - Every crate: `cargo fmt`, `cargo clippy -D warnings`, `cargo test` green before merge.
 - Verifiers: tmux-driven UX checks and differential tests against the installed TS binary.
+
+
+## Dependency direction (hard rule)
+
+Cycle-free, one direction, enforced in Cargo.toml and at review:
+
+```
+pa-types  <-- shared vocabulary, nothing else is shared
+   ^
+   |        pa-ai (providers/registry)
+   |           ^
+   |           |     pa-agent (loop)
+   |           |        ^
+   |           |        |     pa-core (session engine)
+   |           |        |        ^
+   |           |        |        |     pa-daemon (supervision)
+   |           |        |        |        ^
+pa-tui --> pa-types only;  pa-cli --> everything (composition root)
+```
+
+Rules:
+- pa-types depends on nothing in the workspace.
+- A crate may depend only on crates below it in this diagram. No cycles, ever.
+- Cross-crate access goes through minimal public APIs only; internals are `pub(crate)`.
+- If a change forces edits across many crate internals, the boundary is wrong - fix the boundary, not the call sites.
+- Each crate README declares scope, non-goals, and public API. Merges are rejected if they violate it.
