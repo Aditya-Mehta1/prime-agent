@@ -286,9 +286,11 @@ describe("ExtensionRunner", () => {
 				"throwing-timer.ts",
 				`export default function(pi) {
 					pi.on("context", async (_event, ctx) => {
-						ctx.setTimeout(() => { throw new Error("timer boom"); }, 5);
+						// test-policy: allow wall-clock-timer -- callback executes only under Vitest fake timers
+					ctx.setTimeout(() => { throw new Error("timer boom"); }, 5);
 						// Userland thenable (not a native Promise): its rejection must land in the boundary too.
-						ctx.setTimeout(() => ({ then(_resolve, reject) { reject(new Error("thenable boom")); } }), 5);
+						// test-policy: allow wall-clock-timer -- callback executes only under Vitest fake timers
+					ctx.setTimeout(() => ({ then(_resolve, reject) { reject(new Error("thenable boom")); } }), 5);
 					});
 				}`,
 			);
@@ -297,7 +299,8 @@ describe("ExtensionRunner", () => {
 				`import * as fs from "node:fs";
 				export default function(pi) {
 					pi.on("context", async (_event, ctx) => {
-						ctx.setTimeout(() => fs.writeFileSync(${JSON.stringify(firedMarker)}, "fired"), 5);
+						// test-policy: allow wall-clock-timer -- callback executes only under Vitest fake timers
+					ctx.setTimeout(() => fs.writeFileSync(${JSON.stringify(firedMarker)}, "fired"), 5);
 					});
 				}`,
 			);
@@ -327,6 +330,7 @@ describe("ExtensionRunner", () => {
 			writeExt(
 				"adopted-throwing-timer.ts",
 				`export default function(pi) {
+					// test-policy: allow wall-clock-timer -- callback executes only under Vitest fake timers
 					pi.on("context", async (_event, ctx) => { ctx.setTimeout(() => { throw new Error("adopted boom"); }, 5); });
 				}`,
 			);
@@ -365,8 +369,10 @@ describe("ExtensionRunner", () => {
 				export default function(pi) {
 					pi.on("context", async (_event, ctx) => {
 						const fire = () => fs.writeFileSync(${JSON.stringify(firedMarker)}, "fired");
+						// test-policy: allow wall-clock-timer -- callback executes only under Vitest fake timers
 						const handle = ctx.setTimeout(fire, 5);
 						if (${clearInExtension}) ctx.clearTimeout(handle);
+						// test-policy: allow wall-clock-timer -- callback executes only under Vitest fake timers
 						else ctx.setInterval(fire, 5);
 					});
 				}`,

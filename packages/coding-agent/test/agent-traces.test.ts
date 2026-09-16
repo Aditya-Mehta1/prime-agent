@@ -12,6 +12,7 @@ import {
 	type AgentTraceUploadDelay,
 	type AgentTraceUploadInstallation,
 	type AgentTraceUploadInstallOptions,
+	type AgentTraceUploadResult,
 	type AgentTraceUploadSchedule,
 	catchUpAgentTraceUploads,
 	findAgentTraceFiles,
@@ -236,7 +237,7 @@ interface RetryCase {
 	expectedAttempts: number;
 	/** Backoff waits the upload arms between attempts, with jitter pinned to its floor. */
 	expectedDelaysMs: number[];
-	expectedResult: Record<string, unknown>;
+	expectedResult: AgentTraceUploadResult;
 }
 
 const retryCases: RetryCase[] = [
@@ -245,7 +246,13 @@ const retryCases: RetryCase[] = [
 		steps: [netError("ECONNRESET"), httpResponse(200)],
 		expectedAttempts: 2,
 		expectedDelaysMs: [400],
-		expectedResult: { status: "uploaded", bytesStored: 42 },
+		expectedResult: {
+			status: "uploaded",
+			sessionId: "retry-session",
+			traceId: "retry-session",
+			bytesStored: 42,
+			key: undefined,
+		},
 	},
 	{
 		name: "stops retrying connection failures at the retry bound",
@@ -266,35 +273,53 @@ const retryCases: RetryCase[] = [
 		steps: [httpResponse(503), httpResponse(503), httpResponse(200)],
 		expectedAttempts: 3,
 		expectedDelaysMs: [400, 800],
-		expectedResult: { status: "uploaded", bytesStored: 42 },
+		expectedResult: {
+			status: "uploaded",
+			sessionId: "retry-session",
+			traceId: "retry-session",
+			bytesStored: 42,
+			key: undefined,
+		},
 	},
 	{
 		name: "does not retry a permanent HTTP response",
 		steps: [httpResponse(400)],
 		expectedAttempts: 1,
 		expectedDelaysMs: [],
-		expectedResult: { status: "failed", statusCode: 400 },
+		expectedResult: { status: "failed", statusCode: 400, message: "unavailable", retryAfterMs: undefined },
 	},
 	{
 		name: "returns a rate-limited response instead of sleeping in-request",
 		steps: [httpResponse(429)],
 		expectedAttempts: 1,
 		expectedDelaysMs: [],
-		expectedResult: { status: "failed", statusCode: 429 },
+		expectedResult: { status: "failed", statusCode: 429, message: "unavailable", retryAfterMs: undefined },
 	},
 	{
 		name: "honors Retry-After on a retried 503",
 		steps: [httpResponse(503, 17), httpResponse(200)],
 		expectedAttempts: 2,
 		expectedDelaysMs: [17_000],
-		expectedResult: { status: "uploaded", bytesStored: 42 },
+		expectedResult: {
+			status: "uploaded",
+			sessionId: "retry-session",
+			traceId: "retry-session",
+			bytesStored: 42,
+			key: undefined,
+		},
 	},
 	{
 		name: "caps Retry-After at the platform rate-limit window",
 		steps: [httpResponse(503, 3_600), httpResponse(200)],
 		expectedAttempts: 2,
 		expectedDelaysMs: [60_000],
-		expectedResult: { status: "uploaded", bytesStored: 42 },
+		expectedResult: {
+			status: "uploaded",
+			sessionId: "retry-session",
+			traceId: "retry-session",
+			bytesStored: 42,
+			key: undefined,
+		},
 	},
 ];
 
@@ -451,7 +476,7 @@ describe("agent trace upload", () => {
 		const [firstStart = 0] = transport.startTimes;
 		expect(transport.startTimes.map((start) => start - firstStart)).toEqual(cumulativeStarts(expectedDelaysMs));
 		expect(transport.startTimes).toHaveLength(expectedAttempts);
-		expect(result).toMatchObject(expectedResult);
+		expect(result).toEqual(expectedResult);
 	});
 
 	it.each([
@@ -646,7 +671,6 @@ describe("agent trace upload", () => {
 		expect(result.results).toHaveLength(0);
 	});
 
-	// Runs before any other install: the startup catch-up fires once per process.
 	it("catches up on install with exactly what a previous process never uploaded, then goes quiet", async () => {
 		const cwd = join(tempDir, "project");
 		const sessionDir = join(tempDir, "sessions");
@@ -654,9 +678,13 @@ describe("agent trace upload", () => {
 		const missedFile = sessionFileOf(writeSession(cwd, sessionDir, "missed-session"));
 		writeOutboxEntry(tempDir, missedFile);
 
+		// startupCatchUp is process-scoped. A fresh module makes this test independent
+		// of which install test Vitest executes first.
+		vi.resetModules();
+		const { installAgentTraceUpload: installFreshAgentTraceUpload } = await import("../src/core/agent-traces.js");
 		const calls: FetchCall[] = [];
 		const options = traceOptions(createFetchRecorder(calls));
-		const installation = installAgentTraceUpload(
+		const installation = installFreshAgentTraceUpload(
 			liveSession("live-session"),
 			installOptions(createFetchRecorder(calls)),
 		);
@@ -787,21 +815,39 @@ describe("agent trace upload", () => {
 		expect(calls).toHaveLength(0);
 	});
 
-	it("creates no outbox intent while trace sharing is disabled", async () => {
+	it("creates no outbox intent or retroactive wire upload while trace sharing is disabled", async () => {
 		vi.useFakeTimers();
 		const sessionManager = liveSession("opted-out-session");
 		const ledgerPath = join(tempDir, "artifacts", "semantic-edges.jsonl");
+		const calls: FetchCall[] = [];
+		const settingsManager = SettingsManager.inMemory({ agentTraces: { enabled: false } });
+		const scheduled = createSignalQueue<AgentTraceUploadSchedule>();
+		const settled = createSignalQueue<AgentTraceUploadCycleOutcome>();
 		install(sessionManager, {
-			...installOptions(createFetchRecorder([]), false),
+			...installOptions(createFetchRecorder(calls), false),
+			settingsManager,
 			semanticEdgesLedgerPath: ledgerPath,
+			onUploadScheduled: scheduled.push,
+			onUploadSettled: settled.push,
 		});
 		sessionManager.appendMessage(createUserMessage("private"));
 		sessionManager.appendMessage(createAssistantMessage("also private"));
 
-		// Neither kind leaves a durable entry: enabling sharing later must not
-		// retroactively collect sessions recorded while sharing was off.
+		await vi.advanceTimersByTimeAsync((await scheduled.next()).delayMs);
+		expect(await settled.next()).toEqual({ status: "disabled" });
 		expect(readOutboxEntry(tempDir, sessionFileOf(sessionManager))).toBeUndefined();
 		expect(readOutboxEntry(tempDir, ledgerPath)).toBeUndefined();
+		expect(calls).toHaveLength(0);
+
+		// Enabling later cannot discover or upload the opted-out content because
+		// the disabled persists left no durable intent for startup catch-up.
+		settingsManager.setAgentTracesEnabled(true);
+		expect(await catchUpAgentTraceUploads({ ...traceOptions(createFetchRecorder(calls)), settingsManager })).toEqual({
+			pruned: 0,
+			semanticEdgeLedgersPending: 0,
+			results: [],
+		});
+		expect(calls).toHaveLength(0);
 	});
 
 	it("counts appended ledger bytes as pending, stays quiet at the cursor, and prunes deleted ledgers", async () => {
@@ -870,10 +916,19 @@ describe("agent trace upload", () => {
 		const { size, mtimeMs } = await stat(sessionFile);
 		expect(readOutboxEntry(tempDir, sessionFile)).toEqual({ sessionFile, size, mtimeMs });
 
-		// The next persist lands inside the minute window, so its upload waits for the window to close.
+		// The next persist lands inside the minute window. It cannot upload even
+		// one millisecond early, and starts exactly when the window closes.
 		sessionManager.appendMessage(createUserMessage("next"));
-		expect((await scheduled.next()).delayMs).toBe(UPLOAD_MIN_INTERVAL_MS);
+		const throttled = await scheduled.next();
+		expect(throttled).toEqual({ delayMs: UPLOAD_MIN_INTERVAL_MS });
+		await vi.advanceTimersByTimeAsync(throttled.delayMs - 1);
 		expect(calls).toHaveLength(1);
+		expect(settled.buffered()).toBe(0);
+
+		await vi.advanceTimersByTimeAsync(1);
+		expect((await settled.next()).status).toBe("uploaded");
+		expect(calls).toHaveLength(2);
+		expect(calls[1].init.body).toBe(readFileSync(sessionFile, "utf8"));
 	});
 
 	it.each([

@@ -290,15 +290,23 @@ describe("AgentSession queue characterization", () => {
 			const id = `agentmsg_${phase}_coalesced_owner`;
 			withStreaming(harness, true);
 			const earlyDelivery = harness.session.waitForAgentMessagePromptDelivery(id);
+			const admissionCompleted = createDeferred();
 
 			const completion = harness.session.promptAndWait("accepted", {
 				streamingBehavior: "followUp",
 				followUpQueueKey: "same",
 				agentMessageId: id,
 				resumeIfIdle: true,
+				preflightResult: (accepted, queued) => {
+					if (phase === "queued") {
+						expect({ accepted, queued }).toEqual({ accepted: true, queued: true });
+						admissionCompleted.resolve();
+					}
+				},
 			});
 			if (phase === "queued") {
-				await vi.waitFor(() => expect(harness.session.getFollowUpMessages()).toEqual(["accepted"]));
+				await admissionCompleted.promise;
+				expect(harness.session.getFollowUpMessages()).toEqual(["accepted"]);
 			} else {
 				withStreaming(harness, false);
 				await prepared.promise;
@@ -558,7 +566,7 @@ describe("AgentSession queue characterization", () => {
 				};
 			},
 		},
-	])("waitForIdle yields to timers while queued work is $name", async ({ arm }) => {
+	])("waitForIdle parks while queued work is $name", async ({ arm }) => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("done")]);
@@ -567,8 +575,16 @@ describe("AgentSession queue characterization", () => {
 		const originalWaitForIdle = harness.session.agent.waitForIdle.bind(harness.session.agent);
 		let waitCalls = 0;
 		vi.spyOn(harness.session.agent, "waitForIdle").mockImplementation(async () => {
-			if (++waitCalls > 100) throw new Error("waitForIdle spun without yielding");
+			waitCalls++;
 			await originalWaitForIdle();
+		});
+		const checkpointWaiters = (harness.session as unknown as { _sessionInputCheckpointWaiters: Set<() => void> })
+			._sessionInputCheckpointWaiters;
+		const waitParked = createDeferred();
+		const originalAdd = checkpointWaiters.add.bind(checkpointWaiters);
+		const addWaiter = vi.spyOn(checkpointWaiters, "add").mockImplementation((waiter) => {
+			waitParked.resolve();
+			return originalAdd(waiter);
 		});
 		const waiting = harness.session.waitForIdle().then(
 			() => ({ ok: true as const }),
@@ -576,10 +592,11 @@ describe("AgentSession queue characterization", () => {
 		);
 
 		try {
-			await new Promise<void>((resolve) => setTimeout(resolve, 0));
-			expect(waitCalls).toBeLessThan(100);
+			await waitParked.promise;
+			expect(waitCalls).toBe(0);
 			expect(harness.session.getFollowUpMessages()).toEqual(["queued input"]);
 		} finally {
+			addWaiter.mockRestore();
 			release();
 		}
 		expect(await waiting).toEqual({ ok: true });
@@ -654,10 +671,9 @@ describe("AgentSession queue characterization", () => {
 			agentPromptText("agentmsg_after_abort", "late child result"),
 		);
 		const lateRejection = expect(lateAgentMessage).rejects.toThrow("queued session input is suspended");
-		await new Promise<void>((resolve) => setTimeout(resolve, 0));
+		await lateRejection;
 
 		await resume(harness);
-		await lateRejection;
 		await harness.session.waitForIdle();
 		expect(getUserTexts(harness)).toEqual(userTexts);
 	});
@@ -668,20 +684,24 @@ describe("AgentSession queue characterization", () => {
 		await harness.session.followUp("cleared while suspended");
 		harness.session.requestAbort();
 		expect(harness.session.getFollowUpMessages()).toEqual(["cleared while suspended"]);
+		const checkpointWaiters = (harness.session as unknown as { _sessionInputCheckpointWaiters: Set<() => void> })
+			._sessionInputCheckpointWaiters;
+		const waitParked = createDeferred();
+		const originalAdd = checkpointWaiters.add.bind(checkpointWaiters);
+		const addWaiter = vi.spyOn(checkpointWaiters, "add").mockImplementation((waiter) => {
+			waitParked.resolve();
+			return originalAdd(waiter);
+		});
 		const waiting = harness.session.waitForIdle().then(
 			() => ({ ok: true as const }),
 			(error: unknown) => ({ ok: false as const, error }),
 		);
-		await new Promise<void>((resolve) => setTimeout(resolve, 0));
+		await waitParked.promise;
+		addWaiter.mockRestore();
+
 		const cleared = harness.session.clearQueue();
 		expect(cleared.followUp).toEqual(["cleared while suspended"]);
-		const outcome = await Promise.race([
-			waiting,
-			new Promise<{ ok: false; error: Error }>((resolve) =>
-				setTimeout(() => resolve({ ok: false, error: new Error("waitForIdle hung after clearQueue") }), 500),
-			),
-		]);
-		expect(outcome).toEqual({ ok: true });
+		expect(await waiting).toEqual({ ok: true });
 	});
 
 	it("restores next-turn context from cancelled actions in action order", async () => {
@@ -770,7 +790,7 @@ describe("AgentSession action commit-fence races", () => {
 				interruption,
 			})),
 		),
-	])("settles one $kind exactly once when $interruption wins the commit fence", async ({ kind, interruption }) => {
+	])("settles a $kind with the $interruption commit-fence outcome", async ({ kind, interruption }) => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		if (kind === "turn") harness.setResponses([fauxAssistantMessage("done")]);
@@ -795,16 +815,9 @@ describe("AgentSession action commit-fence races", () => {
 		} else {
 			completion = harness.session.promptAndWait(text);
 		}
-		let settlementCount = 0;
 		const outcome = completion.then(
-			() => {
-				settlementCount++;
-				return "resolved" as const;
-			},
-			() => {
-				settlementCount++;
-				return "rejected" as const;
-			},
+			() => ({ status: "resolved" as const }),
+			(error: unknown) => ({ status: "rejected" as const, error }),
 		);
 		await reached.promise;
 
@@ -822,17 +835,27 @@ describe("AgentSession action commit-fence races", () => {
 			expect(harness.session.getSessionActionRecoverySnapshot().actions).toHaveLength(1);
 			if (interruption === "pause") pause?.release();
 			else harness.session.resumeQueuedWork();
-			expect(await outcome).toBe("resolved");
+			expect(await outcome).toEqual({ status: "resolved" });
 			await harness.session.waitForIdle();
 			expect(deliveredCount(harness, kind, text)).toBe(1);
 			expect(harness.session.getSessionActionRecoverySnapshot().actions).toHaveLength(0);
 		} else {
-			expect(await outcome).toBe("rejected");
+			const settled = await outcome;
+			expect(settled.status).toBe("rejected");
+			if (settled.status !== "rejected") throw new Error("Expected terminal interruption to reject");
+			expect(settled.error).toEqual(
+				expect.objectContaining({
+					message:
+						interruption === "clear"
+							? "Queued agent message was cleared before delivery."
+							: kind === "command"
+								? "Session disposed before prompt completion."
+								: "Session disposed before prompt delivery.",
+				}),
+			);
 			expect(deliveredCount(harness, kind, text)).toBe(0);
 			expect(harness.session.getSessionActionRecoverySnapshot().actions).toHaveLength(0);
 		}
-		await Promise.resolve();
-		expect(settlementCount).toBe(1);
 	});
 
 	it.each([
@@ -1137,15 +1160,17 @@ describe("AgentSession scheduler scenarios", () => {
 		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
 		harnesses.push(harness);
 		const internals = harness.session as unknown as SteeringStopInternals;
-		const removedTexts = ["first", "second", "same heartbeat", "clear me"];
-		let continuationSawRemoved = false;
+		const agentPrompt = agentPromptText("agentmsg_s2_clear", "clear me");
+		const followUpAgentPrompt = agentPromptText("agentmsg_s2_follow", "clear me too");
+		const removedInputs = new Set(["first", "second", "same heartbeat", agentPrompt, followUpAgentPrompt]);
+		let continuationRemovedInputs: string[] = [];
 		harness.setResponses([
 			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
 			(context) => {
-				continuationSawRemoved = context.messages.some(
-					(message) =>
-						message.role === "user" && removedTexts.some((text) => getMessageText(message).includes(text)),
-				);
+				continuationRemovedInputs = context.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.filter((text) => removedInputs.has(text));
 				return fauxAssistantMessage("continued clean");
 			},
 			fauxAssistantMessage("keep me done"),
@@ -1171,7 +1196,6 @@ describe("AgentSession scheduler scenarios", () => {
 		await harness.session.steer("second", undefined, { queueKey: "same-steer" });
 		expect(harness.session.getSteeringMessages()).toEqual(["first", "second"]);
 		expect(internals._steeringStopPending).toBe(true);
-		const agentPrompt = agentPromptText("agentmsg_s2_clear", "clear me");
 		const delivery = harness.session.waitForAgentMessagePromptDelivery("agentmsg_s2_clear");
 		await harness.session.queueAgentMessagePrompt(agentPrompt, "steer");
 
@@ -1198,7 +1222,6 @@ describe("AgentSession scheduler scenarios", () => {
 		expect(harness.session.removeQueuedFollowUp("hb:one")).toBe(true);
 		expect(harness.session.removeQueuedFollowUp("hb:one")).toBe(false);
 		expect(harness.session.getFollowUpMessages()).toEqual(["same heartbeat", "keep me"]);
-		const followUpAgentPrompt = agentPromptText("agentmsg_s2_follow", "clear me too");
 		await harness.session.queueAgentMessagePrompt(followUpAgentPrompt, "followUp");
 		const spoofedPlain = agentPromptText("agentmsg_spoof", "ordinary user text");
 		await harness.session.followUp(spoofedPlain);
@@ -1226,7 +1249,7 @@ describe("AgentSession scheduler scenarios", () => {
 		releaseToolExecution();
 		await promptPromise;
 		await harness.session.waitForIdle();
-		expect(continuationSawRemoved).toBe(false);
+		expect(continuationRemovedInputs).toEqual([]);
 		expect(getUserTexts(harness)).toEqual(["start", "keep me", spoofedPlain]);
 		expect(getAssistantTexts(harness)).toEqual(["", "continued clean", "keep me done", "spoof done"]);
 		expect(harness.session.queuedActionCount).toBe(0);
@@ -1799,8 +1822,17 @@ describe("AgentSession queue regressions", () => {
 		const originalTurn = harness.session.prompt("start");
 		await started.promise;
 		const pause = harness.session.acquireQueuedWorkPause();
+		const checkpointWaiters = (harness.session as unknown as { _sessionInputCheckpointWaiters: Set<() => void> })
+			._sessionInputCheckpointWaiters;
+		const admissionBlocked = createDeferred();
+		const originalAdd = checkpointWaiters.add.bind(checkpointWaiters);
+		const addWaiter = vi.spyOn(checkpointWaiters, "add").mockImplementation((waiter) => {
+			admissionBlocked.resolve();
+			return originalAdd(waiter);
+		});
 		const heartbeat = harness.session.promptHeartbeat(heartbeatJob(), { streamingBehavior: "followUp" });
-		await Promise.resolve();
+		await admissionBlocked.promise;
+		addWaiter.mockRestore();
 		expect(harness.session.getSessionActionRecoverySnapshot().actions).toHaveLength(0);
 
 		pause.release();
@@ -1914,10 +1946,10 @@ describe("AgentSession queue regressions", () => {
 		await harness.session.waitForSessionInputIdle();
 
 		const [queued] = harness.session.getSessionActionRecoverySnapshot().actions;
-		expect(queued?.payload).toMatchObject({ text: "queued prompt" });
-		expect(
-			queued?.payload.kind === "turn" ? queued.payload.records.filter((record) => record.role === "prefix") : [],
-		).toEqual([]);
+		expect(queued).toBeDefined();
+		expect(queued?.payload).toMatchObject({ kind: "turn", text: "queued prompt" });
+		if (!queued || queued.payload.kind !== "turn") throw new Error("Expected an undelivered turn action");
+		expect(queued.payload.records.filter((record) => record.role === "prefix")).toEqual([]);
 		expect(conversationMessages(harness.session)).toEqual([
 			expect.objectContaining({ customType: IPYTHON_STATE_RESTORED_CUSTOM_TYPE }),
 		]);
@@ -2097,7 +2129,14 @@ describe("AgentSession queue regressions", () => {
 	])("ENG-4653: starts a new turn for $kind queued from agent_end", async ({ kind, queue }) => {
 		const harness = await createHarness();
 		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("first turn complete"), fauxAssistantMessage("second turn")]);
+		const secondTurnStarted = createDeferred();
+		harness.setResponses([
+			fauxAssistantMessage("first turn complete"),
+			() => {
+				secondTurnStarted.resolve();
+				return fauxAssistantMessage("second turn");
+			},
+		]);
 		let queued = false;
 		const unsubscribe = harness.session.agent.subscribe(async (event) => {
 			if (event.type !== "agent_end" || queued) return;
@@ -2106,9 +2145,10 @@ describe("AgentSession queue regressions", () => {
 		});
 
 		await harness.session.prompt("start");
-		await vi.waitFor(() => expect(harness.faux.state.callCount).toBe(2));
-		await harness.session.agent.waitForIdle();
-		await vi.waitFor(() => expect(harness.session.queuedActionCount).toBe(0));
+		await secondTurnStarted.promise;
+		await harness.session.waitForIdle();
+		expect(harness.faux.state.callCount).toBe(2);
+		expect(harness.session.queuedActionCount).toBe(0);
 		unsubscribe();
 
 		expect(getUserTexts(harness)).toEqual(["start", kind === "steering" ? "stop heartbeat" : "continue after end"]);
@@ -2119,12 +2159,19 @@ describe("AgentSession queue regressions", () => {
 	it("ENG-4653: starts a turn for an explicit steering message accepted while idle", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("idle steering handled")]);
+		const turnStarted = createDeferred();
+		harness.setResponses([
+			() => {
+				turnStarted.resolve();
+				return fauxAssistantMessage("idle steering handled");
+			},
+		]);
 
 		await harness.session.steer("recover stale routing", undefined, { resumeIfIdle: true });
-		await vi.waitFor(() => expect(harness.faux.state.callCount).toBe(1));
-		await harness.session.agent.waitForIdle();
-		await vi.waitFor(() => expect(harness.session.queuedActionCount).toBe(0));
+		await turnStarted.promise;
+		await harness.session.waitForIdle();
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(harness.session.queuedActionCount).toBe(0);
 
 		expect(getUserTexts(harness)).toEqual(["recover stale routing"]);
 		expect(harness.eventsOfType("agent_start")).toHaveLength(1);

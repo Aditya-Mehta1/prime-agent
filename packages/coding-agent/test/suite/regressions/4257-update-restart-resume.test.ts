@@ -373,19 +373,20 @@ describe("update restart queue recovery over the daemon RPC boundary (issue #425
 		const internals = createDaemonInternals(harness, { worker: { restoreActiveSessionId: activeSessionId } });
 		const state = createState(harness, activeSessionId);
 		internals.sessions.set(activeSessionId, state);
+		vi.useFakeTimers();
 		internals.cronScheduler.start();
 		try {
 			internals.registerCronStoreForState(state);
 			internals.rebindCronJobsToState(state);
-			await vi.waitFor(() => {
-				expect(internals.cronStore.list().find((job) => job.id === heartbeat.id)?.runCount).toBe(1);
-			});
+			await internals.cronScheduler.runDue();
+			expect(internals.cronStore.list().find((job) => job.id === heartbeat.id)?.runCount).toBe(1);
 
 			const recovered = internals.cronStore.list().find((job) => job.id === heartbeat.id);
 			expect(recovered).toMatchObject({ status: "active", runCount: 1, prompt: "continue after the update" });
 			expect(Date.parse(recovered?.nextRunAt ?? "")).toBeGreaterThan(Date.now());
 		} finally {
 			internals.cronScheduler.stop();
+			vi.useRealTimers();
 		}
 	});
 });

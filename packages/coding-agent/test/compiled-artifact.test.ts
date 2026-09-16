@@ -20,16 +20,13 @@ import { createServer } from "node:http2";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { deflateSync } from "node:zlib";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
 
-// Every deadline inside a test or hook must stay strictly below the surrounding vitest budget,
-// otherwise the slower standalone runners kill the test before its own diagnostic can report.
-const RUN_TIMEOUT = 60000;
+// Keep process-local failure deadlines below Vitest's default budget so failures report their
+// stderr instead of being replaced by a suite-wide timeout.
+const RUN_TIMEOUT = 25000;
 const CONNECT_TIMEOUT = 5000;
-const GRACEFUL_EXIT_TIMEOUT = 3000;
-const TEARDOWN_TIMEOUT = 10000;
-vi.setConfig({ testTimeout: 120000, hookTimeout: 60000 });
 
 const archive = process.env.PRIME_AGENT_TEST_ARCHIVE;
 const uv = process.env.PRIME_AGENT_TEST_UV;
@@ -42,34 +39,13 @@ let cwd = "";
 let socket = "";
 let environment: NodeJS.ProcessEnv;
 
-function hasExited(pid: number): boolean {
+/** SIGKILL is a deterministic teardown signal and cannot be blocked by the supervisor. */
+function terminateSupervisor(pid: number): void {
 	try {
-		process.kill(pid, 0);
-		return false;
+		process.kill(pid, "SIGKILL");
 	} catch {
-		return true;
+		/* The supervisor already exited after acknowledging shutdown. */
 	}
-}
-
-/** SIGKILL cannot be blocked, so the supervisor exit is reached without waiting on a graceful shutdown. */
-async function terminateSupervisor(pid: number): Promise<void> {
-	const escalateAt = Date.now() + GRACEFUL_EXIT_TIMEOUT;
-	await expect
-		.poll(
-			() => {
-				if (hasExited(pid)) return true;
-				if (Date.now() >= escalateAt) {
-					try {
-						process.kill(pid, "SIGKILL");
-					} catch {
-						/* Exited between the check and the signal. */
-					}
-				}
-				return false;
-			},
-			{ timeout: TEARDOWN_TIMEOUT },
-		)
-		.toBe(true);
 }
 
 async function run(args: string[], extraEnv: NodeJS.ProcessEnv = {}, timeout = RUN_TIMEOUT, input?: string) {
@@ -217,7 +193,7 @@ describe.skipIf(!archive)("extracted standalone archive", () => {
 		}
 		// The supervisor is terminated even when the shutdown request failed, so an unresponsive
 		// daemon reports its own error instead of leaking a process into the next test.
-		if (supervisorPid !== undefined) await terminateSupervisor(supervisorPid);
+		if (supervisorPid !== undefined) terminateSupervisor(supervisorPid);
 		for (const child of children) if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
 		children.clear();
 		if (shutdownError) throw shutdownError;

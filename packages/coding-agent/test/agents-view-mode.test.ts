@@ -189,6 +189,49 @@ const settingsManager = {
 describe("AgentsViewMode", () => {
 	beforeAll(() => setKeybindings(new KeybindingsManager()));
 	beforeEach(() => vi.clearAllMocks());
+
+	it("keeps the queried selection when a remembered session arrives later", () => {
+		const remembered = summary({
+			id: "remembered",
+			activeSessionId: "remembered",
+			sessionId: "remembered-session",
+			sessionFile: "/tmp/remembered.jsonl",
+			sessionName: "match remembered",
+		});
+		const fallback = summary({ sessionName: "match fallback" });
+		const persistentState = createInitialAgentsViewPersistentState({ initialSession: remembered });
+		persistentState.savedCatalogLoaded = true;
+		const view = new AgentsViewMode({ config: {}, uiServices: createUiServices() }, persistentState);
+		try {
+			Reflect.set(view, "lastListedSummaries", [fallback]);
+			invoke("reconcileCatalogs", view);
+			expect(Reflect.get(view, "selectionAnchorPending")).toBe(true);
+
+			invoke("setSearchQuery", view, "match");
+			expect(Reflect.get(view, "selectionAnchorPending")).toBe(false);
+			expect(persistentState.selectedSessionKey?.sessionId).toBe(fallback.sessionId);
+
+			Reflect.set(view, "lastListedSummaries", [remembered, fallback]);
+			invoke("reconcileCatalogs", view);
+			const rows = Reflect.get(view, "rows") as AgentsViewRow[];
+			expect(rows[Reflect.get(view, "selectedIndex") as number]?.summary.sessionId).toBe(fallback.sessionId);
+		} finally {
+			stopThemeWatcher();
+		}
+	});
+
+	it("loads the saved catalog on view entry without a search query", () => {
+		const self = {
+			savedSearchFetchStarted: false,
+			persistentState: {},
+			refreshSavedSessions: vi.fn(async () => true),
+		};
+
+		invoke("armSavedSearchFetch", self);
+
+		expect(self.refreshSavedSessions).toHaveBeenCalledOnce();
+		expect(self.savedSearchFetchStarted).toBe(true);
+	});
 	// [name, row state, daemon delete capability, cancel result, warning]
 	// A subagent row is only ever stopped, never deleted, while its subtree still works.
 	it.each([
@@ -1149,6 +1192,100 @@ describe("agents view reply delivery on inactive sessions", () => {
 		firstMessage: "opener",
 	});
 
+	it("arms a saved reply from its persisted recap and lets ctrl+c disarm it", async () => {
+		const requestRender = vi.fn();
+		const handleCtrlC = vi.fn();
+		const self: Record<string, unknown> = {
+			rows: [
+				{ kind: "agent", selectable: true, identity: "file:/tmp/sessions/saved-1.jsonl", summary: savedSummary },
+			],
+			selectedIndex: 0,
+			pendingDeleteAgent: undefined,
+			replyTarget: undefined,
+			renameTarget: undefined,
+			setReplyTarget: vi.fn((target: unknown) => {
+				self.replyTarget = target;
+			}),
+			ui: { requestRender },
+			clearStickyStatusMessage: vi.fn(),
+			keybindings: { matches: (_data: string, action: string) => action === "app.clear" },
+			handleCtrlC,
+		};
+
+		await invoke("toggleReplyTarget", self);
+		expect(self.replyTarget).toEqual({ key: "saved-1", summary: savedSummary });
+		expect(self.replyLastAssistantText).toBe("Persisted recap text");
+		expect(requestRender).toHaveBeenCalledOnce();
+
+		invoke("handleInput", self, "\x03");
+		expect(self.replyTarget).toBeUndefined();
+		expect(handleCtrlC).not.toHaveBeenCalled();
+	});
+
+	it("keeps the cwd-fallback notice visible after the reply is sent", async () => {
+		const savedWithMissingCwd = { ...savedSummary, cwd: "/definitely/not/a/real/dir/for/this/test" };
+		const request = vi.fn(async () => ({
+			success: true,
+			data: { ...savedWithMissingCwd, lifecycle: "live", activeSessionId: "active-9" },
+		}));
+		const setStatusMessage = vi.fn();
+		const self: Record<string, unknown> = {
+			options: { config: { cwd: process.cwd() } },
+			requireClient: () => ({ request }),
+			findSummaryByActiveSessionId: () => undefined,
+			inactiveAgentIdentities: new Set(["file:/tmp/sessions/saved-1.jsonl"]),
+			setStatusMessage,
+			selectSummary: vi.fn(),
+			sendPrompt: vi.fn(async () => {}),
+		};
+
+		await invoke("sendReply", self, { key: "saved-1", summary: savedWithMissingCwd }, "wake up");
+
+		expect(setStatusMessage).toHaveBeenLastCalledWith(expect.stringContaining("Original directory is missing"), {
+			sticky: true,
+		});
+	});
+
+	it("submits alt+enter as a follow-up only for an armed non-empty reply", () => {
+		const submit = vi.fn(async () => {});
+		invoke("handleReplyFollowUp", { replyTarget: undefined, editor: { getExpandedText: () => "text" }, submit });
+		invoke("handleReplyFollowUp", {
+			replyTarget: { key: "active-1", summary: savedSummary },
+			editor: { getExpandedText: () => "   " },
+			submit,
+		});
+		expect(submit).not.toHaveBeenCalled();
+
+		invoke("handleReplyFollowUp", {
+			replyTarget: { key: "active-1", summary: savedSummary },
+			editor: { getExpandedText: () => "expanded paste body" },
+			submit,
+		});
+		expect(submit).toHaveBeenCalledWith("expanded paste body", "followUp");
+	});
+
+	it("creates a new daemon session over a dedicated connection and opens it", async () => {
+		const created = replySummary({ id: "active-new", activeSessionId: "active-new", lifecycle: "live" });
+		const request = vi.fn(async () => ({ success: true, data: created }));
+		const close = vi.fn();
+		const self: Record<string, unknown> = {
+			creatingNewSession: false,
+			stopped: false,
+			options: { config: { cwd: process.cwd() } },
+			connectDedicatedClient: vi.fn(async () => ({ request, close })),
+			setStatusMessage: vi.fn(),
+			selectSummary: vi.fn(),
+			finish: vi.fn(),
+		};
+
+		await expect(invoke("createNewSession", self)).resolves.toBe(true);
+		expect(request).toHaveBeenCalledWith(expect.objectContaining({ type: "create" }));
+		expect(self.selectSummary).toHaveBeenCalledWith(created);
+		expect(self.finish).toHaveBeenCalledWith({ type: "open", summary: created });
+		expect(close).toHaveBeenCalledOnce();
+		expect(self.creatingNewSession).toBe(false);
+	});
+
 	it("resumes a saved session before delivering the reply", async () => {
 		const request = vi.fn(async (command: { type: string }) => {
 			if (command.type === "create") {
@@ -1188,10 +1325,15 @@ describe("agents view reply delivery on inactive sessions", () => {
 
 	it("does not select a resumed session after its reply target is cancelled", async () => {
 		let finishResume: ((result: { success: true; data: SessionSummary }) => void) | undefined;
+		let signalResumeStarted!: () => void;
+		const resumeStarted = new Promise<void>((resolve) => {
+			signalResumeStarted = resolve;
+		});
 		const request = vi.fn(
 			() =>
 				new Promise<{ success: true; data: SessionSummary }>((resolve) => {
 					finishResume = resolve;
+					signalResumeStarted();
 				}),
 		);
 		const target = { key: "saved-1", summary: savedSummary };
@@ -1212,7 +1354,8 @@ describe("agents view reply delivery on inactive sessions", () => {
 		};
 
 		const reply = invoke("sendReply", self, target, "wake up") as Promise<boolean>;
-		await vi.waitFor(() => expect(request).toHaveBeenCalledOnce());
+		await resumeStarted;
+		expect(request).toHaveBeenCalledOnce();
 		self.replyTarget = undefined;
 		finishResume?.({
 			success: true,
@@ -1317,6 +1460,15 @@ describe("agents view reply delivery on inactive sessions", () => {
 
 		await invoke("submit", self, "wake up");
 
+		expect(request).toHaveBeenCalledOnce();
+		expect(request).toHaveBeenCalledWith(
+			expect.objectContaining({ type: "create", sessionPath: savedSummary.sessionFile }),
+		);
+		expect(sendPrompt).toHaveBeenCalledTimes(failure === "resume" ? 0 : 1);
+		expect(self.selectSummary).toHaveBeenCalledTimes(failure === "resume" ? 0 : 1);
+		expect(self.setStatusMessage).toHaveBeenLastCalledWith(`Failed to send reply: ${failure} failed`);
+		expect(self.replyTarget).toBe(target);
+		expect(self.setReplyTarget).not.toHaveBeenCalled();
 		expect(editor.setText).toHaveBeenNthCalledWith(1, "");
 		expect(editor.getText()).toBe(replacement ?? "wake up");
 		expect(inactiveAgentIdentities.has("file:/tmp/sessions/saved-1.jsonl")).toBe(remainsInactive);

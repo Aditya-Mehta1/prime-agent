@@ -538,65 +538,93 @@ describe("agents view state", () => {
 	// Rollups walk the whole ancestor chain: a busy descendant raises the running tally on
 	// every idle ancestor without promoting it out of Idle, and heartbeat-armed descendants
 	// never count as busy.
-	// [name, leaf state, chain depth, expected running tally, summary title, leaf status label]
+	// [name, leaf state, chain depth, expected running tally, root summary, nested summary, leaf status label]
 	test.each([
-		["a retained heartbeat one level down", "heartbeat", 1, 0, "1 subagent · 1 heartbeat active", "heartbeat active"],
-		["a busy grandchild", "working", 2, 1, "1 subagent running", undefined],
-		["a heartbeat-armed grandchild", "heartbeat", 2, 0, "1 subagent", "heartbeat active"],
-	] as const)("rolls up %s onto every idle ancestor", (_name, leafState, depth, running, title, leafLabel) => {
-		const idleAncestor = (id: string, parent?: string) =>
-			makeSummary({
-				id,
-				activeSessionId: id,
-				sessionId: `${id}-session`,
-				sessionName: id,
-				activity: "idle",
-				taskState: "completed",
-				messageCount: 2,
-				...(parent ? { runtimeKind: "subagent" as const, parentActiveSessionId: parent } : {}),
-				...(leafState === "working" && !parent ? { hasRunningRlmChildren: true } : {}),
-			});
-		const ancestors = depth === 2 ? ["root", "child"] : ["root"];
-		const summaries = [
-			idleAncestor("root"),
-			...(depth === 2 ? [idleAncestor("child", "root")] : []),
-			makeSummary({
-				id: "leaf",
-				activeSessionId: "leaf",
-				sessionId: "leaf-session",
-				sessionName: "leaf",
-				runtimeKind: "subagent",
-				parentActiveSessionId: ancestors[ancestors.length - 1]!,
-				...(leafState === "working"
-					? { activity: "working" as const, isSessionActive: true, isStreaming: true }
-					: { hasActiveHeartbeat: true, activity: "idle" as const, taskState: "completed" as const }),
-			}),
-		];
+		[
+			"a retained heartbeat one level down",
+			"heartbeat",
+			1,
+			0,
+			"1 subagent · 1 heartbeat active",
+			"1 subagent · 1 heartbeat active",
+			"heartbeat active",
+		],
+		["a busy grandchild", "working", 2, 1, "1 subagent running", "1 subagent running", undefined],
+		[
+			"a heartbeat-armed grandchild",
+			"heartbeat",
+			2,
+			0,
+			"1 subagent",
+			"1 subagent · 1 heartbeat active",
+			"heartbeat active",
+		],
+	] as const)(
+		"rolls up %s onto every idle ancestor",
+		(_name, leafState, depth, running, rootTitle, nestedTitle, leafLabel) => {
+			const idleAncestor = (id: string, parent?: string) =>
+				makeSummary({
+					id,
+					activeSessionId: id,
+					sessionId: `${id}-session`,
+					sessionName: id,
+					activity: "idle",
+					taskState: "completed",
+					messageCount: 2,
+					...(parent ? { runtimeKind: "subagent" as const, parentActiveSessionId: parent } : {}),
+				});
+			const ancestors = depth === 2 ? ["root", "child"] : ["root"];
+			const summaries = [
+				idleAncestor("root"),
+				...(depth === 2 ? [idleAncestor("child", "root")] : []),
+				makeSummary({
+					id: "leaf",
+					activeSessionId: "leaf",
+					sessionId: "leaf-session",
+					sessionName: "leaf",
+					runtimeKind: "subagent",
+					parentActiveSessionId: ancestors[ancestors.length - 1]!,
+					...(leafState === "working"
+						? { activity: "working" as const, isSessionActive: true, isStreaming: true }
+						: { hasActiveHeartbeat: true, activity: "idle" as const, taskState: "completed" as const }),
+				}),
+			];
 
-		const collapsed = buildAgentsViewRows(summaries);
-		expect(collapsed[0]).toMatchObject({ kind: "agent", section: "idle", runningSubagentCount: running });
-		expect(collapsed[0]?.statusLabel).toBe("completed");
-		expect(collapsed[1]).toMatchObject({
-			kind: "subagent-summary",
-			section: "idle",
-			title,
-			runningSubagentCount: running,
-		});
+			const collapsed = buildAgentsViewRows(summaries);
+			expect(collapsed[0]).toMatchObject({ kind: "agent", section: "idle", runningSubagentCount: running });
+			expect(collapsed[0]?.statusLabel).toBe("completed");
 
-		// Expanding each ancestor in turn keeps every level idle and carries the tally down.
-		const expandedIdentities = new Set<string>();
-		let rows = collapsed;
-		for (const ancestor of ancestors) {
-			const row = rows.find((candidate) => candidate.title === ancestor);
-			expect(row).toMatchObject({ section: "idle", statusLabel: "completed", runningSubagentCount: running });
-			expandedIdentities.add(row?.identity ?? "");
-			rows = buildAgentsViewRows(summaries, expandedIdentities);
-		}
-		// Only the leaf itself is busy; its ancestors stay in Idle.
-		const leaf = rows.find((row) => row.title === "leaf");
-		expect(leaf).toMatchObject({ kind: "subagent", section: leafState === "working" ? "running" : "idle" });
-		if (leafLabel) expect(leaf?.statusLabel).toBe(leafLabel);
-	});
+			// Expanding each ancestor in turn keeps every level idle and exposes the
+			// user-visible summary carrying the same recursive tally.
+			const expandedIdentities = new Set<string>();
+			let rows = collapsed;
+			for (const [index, ancestor] of ancestors.entries()) {
+				const row = rows.find((candidate) => candidate.title === ancestor);
+				expect(row).toMatchObject({ section: "idle", statusLabel: "completed", runningSubagentCount: running });
+				expect(
+					rows.find(
+						(candidate) => candidate.kind === "subagent-summary" && candidate.parentIdentity === row?.identity,
+					),
+				).toMatchObject({
+					section: "idle",
+					title: index === 0 ? rootTitle : nestedTitle,
+					runningSubagentCount: running,
+				});
+				expandedIdentities.add(row?.identity ?? "");
+				rows = buildAgentsViewRows(summaries, expandedIdentities);
+				expect(
+					rows.find(
+						(candidate) => candidate.kind === "subagent-summary" && candidate.parentIdentity === row?.identity,
+					),
+				).toMatchObject({ expanded: true });
+			}
+			// Only the leaf itself is busy; its ancestors stay in Idle.
+			const leaf = rows.find((row) => row.title === "leaf");
+			expect(leaf).toMatchObject({ kind: "subagent", section: leafState === "working" ? "running" : "idle" });
+			if (leafLabel) expect(leaf?.statusLabel).toBe(leafLabel);
+			else expect(leaf?.statusLabel).not.toBe("heartbeat active");
+		},
+	);
 
 	test("keeps the recursive total complete when search filters out a descendant", () => {
 		const parent = makeSummary({
@@ -1986,10 +2014,14 @@ describe("#502 agents view catalog refresh races", () => {
 	test("overlapping saved scans retain the last complete catalog after the newest scan fails", async () => {
 		const previous = [savedSession("previous")];
 		const older = createDeferred<{ success: true; data: { sessions: unknown[] } }>();
+		const olderStarted = createDeferred();
 		const harness = savedScanHarness(previous, {
 			request: vi
 				.fn()
-				.mockReturnValueOnce(older.promise)
+				.mockImplementationOnce(() => {
+					olderStarted.resolve();
+					return older.promise;
+				})
 				.mockImplementationOnce(
 					async (
 						_command: unknown,
@@ -2004,7 +2036,7 @@ describe("#502 agents view catalog refresh races", () => {
 		const refresh = privateMethod<(this: typeof harness) => Promise<boolean>>("refreshSavedSessions");
 
 		const oldScan = refresh.call(harness);
-		await Promise.resolve();
+		await olderStarted.promise;
 		expect(await refresh.call(harness)).toBe(false);
 		older.resolve({ success: true, data: { sessions: [rawSavedSession("stale")] } });
 		expect(await oldScan).toBe(false);
@@ -2077,6 +2109,13 @@ describe("#502 agents view catalog refresh races", () => {
 		try {
 			const live = makeSummary({ id: "live", activeSessionId: "live", sessionId: "session-live" });
 			const firstHeartbeatAttempt = createDeferred<void>();
+			const retryScheduled = createDeferred<void>();
+			const fakeSetTimeout = globalThis.setTimeout;
+			vi.spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
+				const timer = fakeSetTimeout(...args);
+				if (args[1] === 1_000) retryScheduled.resolve();
+				return timer;
+			}) as typeof setTimeout);
 			let heartbeatAttempts = 0;
 			const client = {
 				hello: { protocol: { version: 3 } },
@@ -2122,7 +2161,7 @@ describe("#502 agents view catalog refresh races", () => {
 				"startClientReconnect",
 			).call(harness, client, new Error("disconnected"));
 			await firstHeartbeatAttempt.promise;
-			await Promise.resolve();
+			await retryScheduled.promise;
 
 			expect(harness.reconnectPromise).toBeDefined();
 			expect(harness.applySessionList).not.toHaveBeenCalled();
@@ -2138,6 +2177,7 @@ describe("#502 agents view catalog refresh races", () => {
 			expect(harness.armSavedSearchFetch).toHaveBeenCalledWith({ duringReconnect: true });
 			expect(harness.reconnectPromise).toBeUndefined();
 		} finally {
+			vi.restoreAllMocks();
 			vi.useRealTimers();
 		}
 	});

@@ -794,9 +794,14 @@ describe("Agent integration with the faux provider", () => {
 			},
 		});
 
-		const promptPromise = agent.prompt("Count slowly from 1 to 20.");
-		setTimeout(() => agent.abort(), 30);
-		await promptPromise;
+		let aborted = false;
+		agent.subscribe((event) => {
+			if (!aborted && event.type === "message_update" && event.message.role === "assistant") {
+				aborted = true;
+				agent.abort();
+			}
+		});
+		await agent.prompt("Count slowly from 1 to 20.");
 
 		expect(agent.state.isStreaming).toBe(false);
 		const lastMessage = agent.state.messages[agent.state.messages.length - 1];

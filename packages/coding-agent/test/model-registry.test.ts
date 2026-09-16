@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Api, Context, Model, OpenAICompletionsCompat } from "@earendil-works/pi-ai";
+import type { Api, Model, OpenAICompletionsCompat } from "@earendil-works/pi-ai";
 import { getApiProvider, getModels } from "@earendil-works/pi-ai";
 import { getOAuthProvider, registerOAuthProvider } from "@earendil-works/pi-ai/oauth";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -70,23 +70,6 @@ describe("ModelRegistry", () => {
 	function writeRawModelsJson(providers: Record<string, unknown>) {
 		writeFileSync(modelsJsonPath, JSON.stringify({ providers }));
 	}
-
-	const openAiModel: Model<Api> = {
-		id: "test-openai-model",
-		name: "Test OpenAI Model",
-		api: "openai-completions",
-		provider: "openai",
-		baseUrl: "https://api.openai.com/v1",
-		reasoning: false,
-		input: ["text"],
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 128000,
-		maxTokens: 4096,
-	};
-
-	const emptyContext: Context = {
-		messages: [],
-	};
 
 	describe("baseUrl override (no custom models)", () => {
 		test("overriding baseUrl keeps every built-in model and rewrites only that provider", () => {
@@ -608,33 +591,40 @@ describe("ModelRegistry", () => {
 
 		test("unregisterProvider restores the built-in OAuth provider", () => {
 			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			const builtInOAuthProvider = getOAuthProvider("anthropic");
+			expect(builtInOAuthProvider).toBeDefined();
 
 			registry.registerProvider("anthropic", { oauth: demoOAuth("Custom Anthropic OAuth") });
 			expect(getOAuthProvider("anthropic")?.name).toBe("Custom Anthropic OAuth");
 
 			registry.unregisterProvider("anthropic");
 
-			expect(getOAuthProvider("anthropic")?.name).not.toBe("Custom Anthropic OAuth");
+			expect(getOAuthProvider("anthropic")).toBe(builtInOAuthProvider);
 		});
 
 		test("unregisterProvider restores the built-in API stream handler", () => {
 			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			const builtInApiProvider = getApiProvider("openai-completions");
+			expect(builtInApiProvider).toBeDefined();
+			const customStreamSimple = () => {
+				throw new Error("custom streamSimple override");
+			};
 
 			registry.registerProvider("stream-override-provider", {
 				api: "openai-completions",
-				streamSimple: () => {
-					throw new Error("custom streamSimple override");
-				},
+				streamSimple: customStreamSimple,
 			});
-			expect(() => getApiProvider("openai-completions")?.streamSimple(openAiModel, emptyContext)).toThrow(
-				"custom streamSimple override",
-			);
+			const customApiProvider = getApiProvider("openai-completions");
+			expect(customApiProvider).toBeDefined();
+			expect(customApiProvider?.streamSimple).not.toBe(builtInApiProvider?.streamSimple);
 
 			registry.unregisterProvider("stream-override-provider");
 
-			expect(() => getApiProvider("openai-completions")?.streamSimple(openAiModel, emptyContext)).not.toThrow(
-				"custom streamSimple override",
-			);
+			const restoredApiProvider = getApiProvider("openai-completions");
+			expect(restoredApiProvider).toBeDefined();
+			expect(restoredApiProvider?.streamSimple).not.toBe(customApiProvider?.streamSimple);
+			expect(restoredApiProvider?.streamSimple.name).toBe(builtInApiProvider?.streamSimple.name);
+			expect(restoredApiProvider?.stream.name).toBe(builtInApiProvider?.stream.name);
 		});
 
 		describe("dynamic provider override persistence", () => {
@@ -1067,6 +1057,41 @@ describe("ModelRegistry", () => {
 				fetchSpy.mockRestore();
 				vi.unstubAllEnvs();
 			}
+		});
+
+		test("resolves rotated environment and command credentials without caching", async () => {
+			const envKey = "TEST_API_KEY_ROTATION_98765";
+			const tokenFile = join(tempDir, "rotating-models-json-token");
+			const tokenPath = toShPath(tokenFile);
+			vi.stubEnv(envKey, "env-key-1");
+			writeFileSync(tokenFile, "command-key-1");
+			writeRawModelsJson({
+				"env-provider": providerWithApiKey(envKey),
+				"command-provider": {
+					...providerWithApiKey(`!sh -c 'cat "${tokenPath}"'`),
+					authHeader: true,
+				},
+			});
+
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			const commandModel = registry.find("command-provider", "test-model");
+			expect(commandModel).toBeDefined();
+			await expect(registry.getApiKeyForProvider("env-provider")).resolves.toBe("env-key-1");
+			await expect(registry.getApiKeyAndHeaders(commandModel!)).resolves.toEqual({
+				ok: true,
+				apiKey: "command-key-1",
+				headers: { Authorization: "Bearer command-key-1" },
+			});
+
+			vi.stubEnv(envKey, "env-key-2");
+			writeFileSync(tokenFile, "command-key-2");
+
+			await expect(registry.getApiKeyForProvider("env-provider")).resolves.toBe("env-key-2");
+			await expect(registry.getApiKeyAndHeaders(commandModel!)).resolves.toEqual({
+				ok: true,
+				apiKey: "command-key-2",
+				headers: { Authorization: "Bearer command-key-2" },
+			});
 		});
 
 		test("changed command-backed apiKey no longer matches stale models.json marker", async () => {

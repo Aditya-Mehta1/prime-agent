@@ -250,7 +250,6 @@ describe("herdrAgentStateExtension", () => {
 		await waitForRequests(1);
 		await handlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown", reason }, ctx);
 		handlers.get("agent_start")?.[0]?.({ type: "agent_start" }, ctx);
-		await new Promise((resolve) => setTimeout(resolve, 100));
 
 		expect(requests.at(-1)?.method).toBe(expectedLastMethod);
 		expect(requests.filter((r) => r.method === "pane.release_agent")).toHaveLength(expectedReleases);

@@ -142,7 +142,8 @@ describe("AgentSession prompt characterization", () => {
 
 	it("runs a tool call turn: parallel tool results then a single follow-up LLM response", async () => {
 		const toolRuns: string[] = [];
-		const makeTool = (name: string, delayMs: number): AgentTool => ({
+		const fastCompleted = createDeferred();
+		const makeTool = (name: string): AgentTool => ({
 			name,
 			label: name,
 			description: `${name} tool`,
@@ -150,15 +151,16 @@ describe("AgentSession prompt characterization", () => {
 			execute: async (_toolCallId, params) => {
 				const value =
 					typeof params === "object" && params !== null && "value" in params ? String(params.value) : "";
-				await new Promise((resolve) => setTimeout(resolve, delayMs));
+				if (name === "slow") await fastCompleted.promise;
 				toolRuns.push(`${name}:${value}`);
+				if (name === "fast") fastCompleted.resolve();
 				return {
 					content: [{ type: "text", text: `${name}:${value}` }],
 					details: { value },
 				};
 			},
 		});
-		const harness = await createHarness({ tools: [makeTool("slow", 25), makeTool("fast", 0)] });
+		const harness = await createHarness({ tools: [makeTool("slow"), makeTool("fast")] });
 		harnesses.push(harness);
 
 		harness.setResponses([
@@ -173,7 +175,7 @@ describe("AgentSession prompt characterization", () => {
 
 		await harness.session.prompt("run tools");
 
-		expect(toolRuns.sort()).toEqual(["fast:b", "slow:a"]);
+		expect(toolRuns).toEqual(["fast:b", "slow:a"]);
 		expect(harness.session.messages.filter((message) => message.role === "toolResult")).toHaveLength(2);
 		expect(harness.session.messages[harness.session.messages.length - 1]?.role).toBe("assistant");
 	});

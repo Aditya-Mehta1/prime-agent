@@ -3443,13 +3443,18 @@ describe("DaemonAgentConnection deferred session events", () => {
 					snapshot.lastEventCursor = { generation: "restarted", sequence: 1 };
 					fakeClient.emitMessage({ type: "session_resynced", activeSessionId: "active-1", snapshot });
 				}
-				const listener = vi.fn();
+				let resolveConnected!: () => void;
+				const connected = new Promise<void>((resolve) => {
+					resolveConnected = resolve;
+				});
+				const listener = vi.fn((event: AgentConnectionEvent) => {
+					if (event.type === "connection_status" && event.status === "connected") resolveConnected();
+				});
 				connection.subscribe(listener);
 				expect(listener).not.toHaveBeenCalled();
 				if (boundary.startsWith("update-")) {
-					await vi.waitFor(() =>
-						expect(listener).toHaveBeenCalledWith({ type: "connection_status", status: "connected" }),
-					);
+					await connected;
+					expect(listener).toHaveBeenCalledWith({ type: "connection_status", status: "connected" });
 					expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ type: "extension_ui_request" }));
 					fakeClient.emitMessage({
 						type: "extension_ui_request",

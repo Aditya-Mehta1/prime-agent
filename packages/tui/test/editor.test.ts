@@ -301,19 +301,20 @@ describe("Editor component", () => {
 	});
 
 	describe("Grapheme-aware text wrapping", () => {
-		const widthCases: { name: string; text: string; width: number; atMost?: boolean; content?: string[] }[] = [
-			{ name: "wide emojis", text: "Hello ✅ World", width: 20 },
-			{ name: "emoji-only text", text: "✅✅✅✅✅✅", width: 10 },
-			{ name: "an isolated Thai AM cluster", text: "ำabc", width: 8 },
-			{ name: "an isolated Lao AM cluster", text: "ຳabc", width: 8 },
+		const widthCases: { name: string; text: string; width: number; content: string[] }[] = [
+			{ name: "wide emojis", text: "Hello ✅ World", width: 20, content: ["Hello ✅ World"] },
+			{ name: "emoji-only text", text: "✅✅✅✅✅✅", width: 10, content: ["✅✅✅✅", "✅✅"] },
+			{ name: "an isolated Thai AM cluster", text: "ำabc", width: 8, content: ["ำabc"] },
+			{ name: "an isolated Lao AM cluster", text: "ຳabc", width: 8, content: ["ຳabc"] },
 			{ name: "CJK characters (2 columns each)", text: "日本語テスト", width: 11, content: ["日本語テス", "ト"] },
 			{ name: "mixed ASCII and wide characters", text: "Test ✅ OK 日本", width: 16, content: ["Test ✅ OK 日本"] },
 			{
 				name: "a long URL broken at character level",
 				text: "Check https://example.com/very/long/path here",
 				width: 30,
+				content: ["Check", "https://example.com/very/long", "/path here"],
 			},
-			{ name: "an emoji at the wrap boundary", text: "0123456789✅", width: 11, atMost: true },
+			{ name: "an emoji at the wrap boundary", text: "0123456789✅", width: 11, content: ["0123456789", "✅"] },
 		];
 
 		for (const testCase of widthCases) {
@@ -321,19 +322,18 @@ describe("Editor component", () => {
 				const editor = newEditor();
 				editor.setText(testCase.text);
 
-				const lines = editor.render(testCase.width);
-				for (const line of lines.slice(1, -1)) {
-					const lineWidth = visibleWidth(line);
-					if (testCase.atMost) {
-						assert.ok(lineWidth <= testCase.width, `width ${lineWidth} exceeds ${testCase.width}`);
-					} else {
-						assert.strictEqual(lineWidth, testCase.width, `width ${lineWidth}, expected ${testCase.width}`);
-					}
+				const contentLines = editor.render(testCase.width).slice(1, -1);
+				for (const line of contentLines) {
+					assert.strictEqual(
+						visibleWidth(line),
+						testCase.width,
+						`visible width of ${JSON.stringify(stripVTControlCharacters(line))}`,
+					);
 				}
-				if (testCase.content) {
-					const contentLines = lines.slice(1, -1).map((line) => stripVTControlCharacters(line).trim());
-					assert.deepStrictEqual(contentLines, testCase.content);
-				}
+				assert.deepStrictEqual(
+					contentLines.map((line) => stripVTControlCharacters(line).trimEnd()),
+					testCase.content,
+				);
 			});
 		}
 
@@ -362,6 +362,28 @@ describe("Editor component", () => {
 	describe("wordWrapLine", () => {
 		const lorem = "Lorem ipsum dolor sit amet,";
 		const loremHead = "Lorem ipsum dolor sit ";
+
+		function assertWrappedLine(
+			line: string,
+			width: number,
+			expectedTexts: string[],
+			segments?: Intl.SegmentData[],
+		): void {
+			const chunks = wordWrapLine(line, width, segments);
+			assert.deepStrictEqual(
+				chunks.map((chunk) => chunk.text),
+				expectedTexts,
+			);
+
+			let expectedStart = 0;
+			for (const chunk of chunks) {
+				assert.strictEqual(chunk.startIndex, expectedStart, `gap or overlap before ${JSON.stringify(chunk.text)}`);
+				assert.strictEqual(chunk.text, line.slice(chunk.startIndex, chunk.endIndex));
+				expectedStart = chunk.endIndex;
+			}
+			assert.strictEqual(expectedStart, line.length, "chunks must cover the complete source line");
+		}
+
 		const wrapCases: [name: string, line: string, width: number, chunks: string[]][] = [
 			[
 				"wraps a word to the next line when it ends exactly at the width",
@@ -422,10 +444,7 @@ describe("Editor component", () => {
 
 		for (const [name, line, width, chunks] of wrapCases) {
 			it(name, () => {
-				assert.deepStrictEqual(
-					wordWrapLine(line, width).map((chunk) => chunk.text),
-					chunks,
-				);
+				assertWrappedLine(line, width, chunks);
 			});
 		}
 
@@ -441,38 +460,51 @@ describe("Editor component", () => {
 		}
 
 		const marker = "[paste #1 +20 lines]";
-		const atomicCases: [name: string, parts: string[], first?: string, last?: string][] = [
-			["splits an oversized atomic segment across multiple chunks", ["A", marker, "B"]],
-			["splits an oversized atomic segment at the start of the line", [marker, "B"], undefined, "B"],
-			["splits an oversized atomic segment at the end of the line", ["A", marker], "A"],
-			["splits consecutive oversized atomic segments", [marker, "[paste #2 +30 lines]"]],
-			["wraps normally after an oversized atomic segment", [marker, ..." hello world"], undefined, "world"],
+		const atomicCases: [name: string, parts: string[], chunks: string[]][] = [
+			[
+				"splits an oversized atomic segment across multiple chunks",
+				["A", marker, "B"],
+				["A", "[paste #1 ", "+20 lines]", "B"],
+			],
+			[
+				"splits an oversized atomic segment at the start of the line",
+				[marker, "B"],
+				["[paste #1 ", "+20 lines]", "B"],
+			],
+			[
+				"splits an oversized atomic segment at the end of the line",
+				["A", marker],
+				["A", "[paste #1 ", "+20 lines]"],
+			],
+			[
+				"splits consecutive oversized atomic segments",
+				[marker, "[paste #2 +30 lines]"],
+				["[paste #1 ", "+20 lines]", "[paste #2 ", "+30 lines]"],
+			],
+			[
+				"wraps normally after an oversized atomic segment",
+				[marker, ..." hello world"],
+				["[paste #1 ", "+20 lines]", " hello ", "world"],
+			],
 		];
 
-		for (const [name, parts, first, last] of atomicCases) {
+		for (const [name, parts, expectedChunks] of atomicCases) {
 			it(name, () => {
 				const { line, segments } = segmentsFor(parts);
-				const chunks = wordWrapLine(line, 10, segments);
-
-				for (const chunk of chunks) {
-					assert.ok(visibleWidth(chunk.text) <= 10, `chunk "${chunk.text}" is wider than 10 columns`);
+				assertWrappedLine(line, 10, expectedChunks, segments);
+				for (const chunk of expectedChunks) {
+					assert.ok(visibleWidth(chunk) <= 10, `chunk "${chunk}" is wider than 10 columns`);
 				}
-				const reconstructed = chunks.map((chunk) => line.slice(chunk.startIndex, chunk.endIndex)).join("");
-				assert.strictEqual(reconstructed, line);
-				if (first !== undefined) assert.strictEqual(chunks[0]?.text, first);
-				if (last !== undefined) assert.ok(chunks[chunks.length - 1]?.text.includes(last));
 			});
 		}
 
 		it("force-breaks when a wide char after a word-boundary wrap still overflows", () => {
 			const line = ` ${"a".repeat(186)}你`;
-			const chunks = wordWrapLine(line, 187);
-
-			for (const chunk of chunks) {
-				assert.ok(visibleWidth(chunk.text) <= 187, `visible width ${visibleWidth(chunk.text)}, expected <= 187`);
+			const expectedChunks = [line.slice(0, 187), "你"];
+			assertWrappedLine(line, 187, expectedChunks);
+			for (const chunk of expectedChunks) {
+				assert.ok(visibleWidth(chunk) <= 187, `visible width ${visibleWidth(chunk)}, expected <= 187`);
 			}
-			const reconstructed = chunks.map((chunk) => line.slice(chunk.startIndex, chunk.endIndex)).join("");
-			assert.strictEqual(reconstructed, line);
 		});
 	});
 
@@ -870,7 +902,8 @@ describe("Editor component", () => {
 			{ name: "@", typed: "@mai", item: { value: "@main.ts", label: "main.ts" } },
 			{ name: "#", typed: "#298", item: { value: "#2983", label: "#2983" } },
 		]) {
-			it(`debounces ${trigger.name} autocomplete while typing`, async () => {
+			it(`debounces ${trigger.name} autocomplete while typing`, async (t) => {
+				t.mock.timers.enable({ apis: ["setTimeout"] });
 				const editor = newEditor();
 				let suggestionCalls = 0;
 				editor.setAutocompleteProvider({
@@ -882,30 +915,34 @@ describe("Editor component", () => {
 				});
 
 				for (const char of trigger.typed) editor.handleInput(char);
+				t.mock.timers.tick(19);
+				await flushAutocomplete();
 				assert.strictEqual(suggestionCalls, 0);
 				assert.strictEqual(editor.isShowingAutocomplete(), false);
 
-				await new Promise((resolve) => setTimeout(resolve, 50));
+				t.mock.timers.tick(1);
 				await flushAutocomplete();
 				assert.strictEqual(suggestionCalls, 1);
 				assert.strictEqual(editor.isShowingAutocomplete(), true);
 			});
 		}
 
-		it("aborts active @ autocomplete when typing continues", async () => {
+		it("aborts active @ autocomplete when typing continues", async (t) => {
+			t.mock.timers.enable({ apis: ["setTimeout"] });
 			const editor = newEditor();
 			let aborts = 0;
+			let markProviderStarted!: () => void;
+			const providerStarted = new Promise<void>((resolve) => {
+				markProviderStarted = resolve;
+			});
 			editor.setAutocompleteProvider({
-				getSuggestions: async (_lines, _cursorLine, _cursorCol, options) =>
-					await new Promise((resolve) => {
-						const timeout = setTimeout(() => {
-							resolve({ items: [{ value: "@main.ts", label: "main.ts" }], prefix: "@main" });
-						}, 500);
+				getSuggestions: (_lines, _cursorLine, _cursorCol, options) =>
+					new Promise((resolve) => {
+						markProviderStarted();
 						options.signal.addEventListener(
 							"abort",
 							() => {
 								aborts += 1;
-								clearTimeout(timeout);
 								resolve(null);
 							},
 							{ once: true },
@@ -915,11 +952,13 @@ describe("Editor component", () => {
 			});
 
 			for (const char of "@mai") editor.handleInput(char);
-			await new Promise((resolve) => setTimeout(resolve, 250));
+			t.mock.timers.tick(20);
+			await providerStarted;
 			editor.handleInput("n");
-			await new Promise((resolve) => setTimeout(resolve, 50));
+			await flushAutocomplete();
 
 			assert.strictEqual(aborts, 1);
+			assert.strictEqual(editor.isShowingAutocomplete(), false);
 		});
 
 		it("does not trigger autocomplete during a bracketed paste", () => {

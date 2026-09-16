@@ -107,10 +107,10 @@ describe("process lifecycle", () => {
 
 		const child = spawn(process.execPath, ["--eval", "process.exit(0)"], { stdio: "ignore" });
 		await new Promise<void>((resolveExit) => child.once("exit", () => resolveExit()));
-		await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
 		expect(isProcessAlive(child.pid!)).toBe(false);
 	});
 
+	// test-policy: allow conditional-or-disabled-test -- Windows has no POSIX zombie or process-group semantics
 	it.skipIf(process.platform === "win32")(
 		"treats an unreaped zombie as dead and not a live group member",
 		async () => {
@@ -128,6 +128,7 @@ describe("process lifecycle", () => {
 		},
 	);
 
+	// test-policy: allow conditional-or-disabled-test -- Windows has no POSIX detached process-group signaling
 	it.skipIf(process.platform === "win32")("keeps a process group alive after its leader exits", async () => {
 		const childless = spawn("sh", ["-c", "exit 0"], { detached: true, stdio: "ignore" });
 		const childlessExited = new Promise<void>((resolveExit) => childless.once("exit", () => resolveExit()));
@@ -136,15 +137,11 @@ describe("process lifecycle", () => {
 			stdio: ["ignore", "pipe", "ignore"],
 		});
 		const leaderExited = new Promise<void>((resolveExit) => leader.once("exit", () => resolveExit()));
+		const leaderStdout = leader.stdout;
+		if (!leaderStdout) throw new Error("Expected piped stdout from the process-group leader");
 		const pgid = leader.pid!;
 		try {
-			await new Promise<void>((resolveStart, rejectStart) => {
-				const timer = setTimeout(() => rejectStart(new Error("Timed out waiting for the group member")), 5000);
-				leader.stdout?.once("data", () => {
-					clearTimeout(timer);
-					resolveStart();
-				});
-			});
+			await new Promise<void>((resolveStart) => leaderStdout.once("data", () => resolveStart()));
 			await leaderExited;
 			expect(isProcessAlive(pgid)).toBe(false);
 			expect(processGroupExists(pgid)).toBe(true);

@@ -1248,14 +1248,20 @@ describe("daemon mode helpers", () => {
 				broadcastToSession(state: ActiveSessionState, message: DaemonOutbound): void;
 			};
 			internals.sessions.set(state.activeSessionId, state);
+			let markSnapshotStarted!: () => void;
+			const snapshotStarted = new Promise<void>((resolve) => {
+				markSnapshotStarted = resolve;
+			});
 			internals.createAttachResult = vi.fn(async () => {
+				markSnapshotStarted();
 				await snapshotGate;
 				if (outcome === "chunked-failed") throw new Error("snapshot preparation failed");
 				return result;
 			});
 
 			const catchup = internals.drainBackpressuredClientCatchups(client);
-			await vi.waitFor(() => expect(internals.createAttachResult).toHaveBeenCalledOnce());
+			await snapshotStarted;
+			expect(internals.createAttachResult).toHaveBeenCalledOnce();
 			expect(client.snapshotStreaming).toBe(true);
 			if (outcome.endsWith("detached")) {
 				state.clients.delete(client);
@@ -3646,11 +3652,17 @@ describe("daemon snapshot transfers", () => {
 			const firstDrainBlocked = new Promise<void>((resolve) => {
 				releaseFirstDrain = resolve;
 			});
+			let markSecondDrainStarted!: () => void;
+			const secondDrainStarted = new Promise<void>((resolve) => {
+				markSecondDrainStarted = resolve;
+			});
 			const drain = vi.fn(async (target: DaemonSocketClient) => {
 				target.catchupActiveSessionIds?.clear();
 				target.catchupPurposes?.clear();
 				if (drain.mock.calls.length === 1) {
 					await firstDrainBlocked;
+				} else {
+					markSecondDrainStarted();
 				}
 			});
 			const { client, socket } = snapshotClient(`${channel}-coalesced`);
@@ -3664,10 +3676,7 @@ describe("daemon snapshot transfers", () => {
 			// A trigger that lands while the first drain is in flight must run exactly one follow-up drain.
 			queue(client, "replacement");
 			releaseFirstDrain();
-			await first;
-			for (let attempt = 0; attempt < 10 && drain.mock.calls.length < 2; attempt++) {
-				await new Promise<void>((resolve) => setImmediate(resolve));
-			}
+			await Promise.all([first, secondDrainStarted]);
 
 			expect(drain).toHaveBeenCalledTimes(2);
 			expect(client.catchupActiveSessionIds?.size).toBe(0);
@@ -3816,12 +3825,17 @@ describe("daemon snapshot transfers", () => {
 		const firstResult = snapshotResult(firstSnapshotId, 1, 1);
 		const worker = snapshotWorker(firstResult);
 		let resolveAttach!: (response: { success: true; data: DaemonAttachResult }) => void;
+		let markAttachRequested!: () => void;
+		const attachRequested = new Promise<void>((resolve) => {
+			markAttachRequested = resolve;
+		});
 		worker.client = {
 			close: vi.fn(),
 			request: vi.fn(
 				() =>
 					new Promise<{ success: true; data: DaemonAttachResult }>((resolve) => {
 						resolveAttach = resolve;
+						markAttachRequested();
 					}),
 			),
 		};
@@ -3845,7 +3859,7 @@ describe("daemon snapshot transfers", () => {
 			activeSessionId: snapshotSessionId,
 			capabilities: ["chunked_snapshot"],
 		});
-		await Promise.resolve();
+		await attachRequested;
 
 		for (const result of [firstResult, snapshotResult(replacementSnapshotId, 1, 2)]) {
 			const { messages: _messages, ...snapshot } = result.snapshot;
@@ -3965,7 +3979,10 @@ describe("daemon snapshot transfers", () => {
 			expect(client.snapshotStreaming).toBe(false);
 			expect(transcript.complete).toBe(false);
 			expect(markFailed.mock.invocationCallOrder[0]).toBeLessThan(dispose.mock.invocationCallOrder[0]!);
-			expect(worker.client?.close).not.toHaveBeenCalled();
+			if (channel === "public client") {
+				expect(worker.client).toBeDefined();
+				expect(worker.client!.close).not.toHaveBeenCalled();
+			}
 			socket.destroy();
 		},
 	);
@@ -4077,6 +4094,14 @@ describe("daemon snapshot transfers", () => {
 			if (message) written.push(message);
 			return message?.type !== "session_snapshot_chunk" || message.activeSessionId === siblingSessionId;
 		};
+		const drainWaitStarted = new Promise<void>((resolve) => {
+			const onNewListener = (event: string | symbol) => {
+				if (event !== "drain") return;
+				socket.off("newListener", onNewListener);
+				resolve();
+			};
+			socket.on("newListener", onNewListener);
+		});
 
 		const stream = internals.streamWorkerSnapshot(
 			client,
@@ -4100,9 +4125,8 @@ describe("daemon snapshot transfers", () => {
 			siblingSignal,
 			true,
 		);
-		for (let attempt = 0; attempt < 10 && socket.listenerCount("drain") === 0; attempt++) {
-			await Promise.resolve();
-		}
+		await drainWaitStarted;
+		expect(socket.listenerCount("drain")).toBeGreaterThan(0);
 		expect(produced).toEqual([0]);
 
 		internals.detachClientFromSession(client, state);

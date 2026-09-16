@@ -383,18 +383,20 @@ describe("InteractiveMode connection events", () => {
 	});
 
 	test("drops a resync superseded while its command catalog refreshes", async () => {
-		let releaseCatalog = () => {};
-		const catalog = new Promise<void>((resolve) => {
-			releaseCatalog = resolve;
-		});
+		const catalogStarted = createDeferred<void>();
+		const catalog = createDeferred<void>();
 		const { fakeThis, emit } = createSubscribeHarness({
-			refreshCommandCatalogForCurrentSession: vi.fn(() => catalog),
+			refreshCommandCatalogForCurrentSession: vi.fn(() => {
+				catalogStarted.resolve();
+				return catalog.promise;
+			}),
 		});
 
 		const resync = emit({ type: "session_resynced", snapshot: { state: createConnectionState(), messages: [] } });
-		await vi.waitFor(() => expect(fakeThis.refreshCommandCatalogForCurrentSession).toHaveBeenCalledOnce());
+		await catalogStarted.promise;
+		expect(fakeThis.refreshCommandCatalogForCurrentSession).toHaveBeenCalledOnce();
 		const replacement = emit({ type: "session_replaced", state: createConnectionState(), messages: [] });
-		releaseCatalog();
+		catalog.resolve();
 		await Promise.all([resync, replacement]);
 
 		expect(fakeThis.renderResyncedSession).not.toHaveBeenCalled();
@@ -916,8 +918,8 @@ describe("InteractiveMode model catalog staleness", () => {
 		expect(harness.agentConnection.getModelCatalog).toHaveBeenCalledTimes(1);
 	});
 
-	test.each([true, false])("keeps local fallback models out of the cached candidates (fetched: %s)", (fetched) => {
-		const harness = createCatalogHarness({ registryModels: [createModel("openai", "local-only")], fetched });
+	test("keeps local fallback models out of the cached candidates", () => {
+		const harness = createCatalogHarness({ registryModels: [createModel("openai", "local-only")] });
 
 		expect(harness.getCachedModelCandidates()).toEqual([]);
 	});
@@ -1066,18 +1068,26 @@ describe("InteractiveMode live context usage", () => {
 		return fakeThis;
 	}
 
-	test("refreshConnectionContextUsage drops stale stats after a session switch", async () => {
-		let fakeThis: ReturnType<typeof createRefreshHarness>;
-		fakeThis = createRefreshHarness(async () => {
-			// User switches sessions while the stats call is in flight.
-			fakeThis.connectionState = { sessionId: "session-B", contextUsage: undefined };
-			return { contextUsage: { contextWindow: 100_000, tokens: 50_000, percent: 50 } };
-		});
+	test("refreshConnectionContextUsage drops stale stats after a session switch and applies the next refresh", async () => {
+		const stale = createDeferred<{ contextUsage: unknown }>();
+		const freshContextUsage = { contextWindow: 200_000, tokens: 20_000, percent: 10 };
+		const getSessionStats = vi
+			.fn<RefreshHarness["agentConnection"]["getSessionStats"]>()
+			.mockImplementationOnce(() => stale.promise)
+			.mockResolvedValueOnce({ contextUsage: freshContextUsage });
+		const fakeThis = createRefreshHarness(getSessionStats);
 
+		const staleRefresh = refresh.call(fakeThis);
+		await Promise.resolve();
+		fakeThis.connectionState = { sessionId: "session-B", contextUsage: undefined };
+		stale.resolve({ contextUsage: { contextWindow: 100_000, tokens: 50_000, percent: 50 } });
+		await staleRefresh;
+
+		// Stats belonged to session-A; the next refresh for session-B must still apply normally.
+		expect(fakeThis.patched).toEqual([]);
 		await refresh.call(fakeThis);
-
-		// Stats belonged to session-A; must not overwrite session-B.
-		expect(fakeThis.patched).toHaveLength(0);
+		expect(fakeThis.patched).toEqual([{ contextUsage: freshContextUsage }]);
+		expect(getSessionStats).toHaveBeenCalledTimes(2);
 	});
 
 	test("refreshConnectionContextUsage keeps a newer successful same-session response", async () => {
@@ -1187,15 +1197,33 @@ describe("InteractiveMode Fast mode concurrency", () => {
 		return context;
 	}
 
-	test("serializes rapid toggles", async () => {
+	test("serializes rapid toggles and applies both results in order", async () => {
 		const context = makeFastContext();
+		const firstToggle = createDeferred<void>();
+		let toggleCall = 0;
+		context.agentConnection.setServiceTier = vi.fn(async (serviceTier) => {
+			toggleCall += 1;
+			if (toggleCall === 1) await firstToggle.promise;
+			context.connectionState = { ...context.connectionState!, serviceTier };
+		});
 
 		fastInteractiveModePrototype.handleFastCommand.call(context);
 		fastInteractiveModePrototype.handleFastCommand.call(context);
+		await Promise.resolve();
 
-		await vi.waitFor(() => expect(context.agentConnection.setServiceTier).toHaveBeenCalledTimes(2));
+		expect(context.agentConnection.setServiceTier).toHaveBeenCalledOnce();
+		expect(context.agentConnection.setServiceTier).toHaveBeenCalledWith("priority");
+
+		firstToggle.resolve();
+		await context.fastModeToggleQueue;
+
 		expect(context.agentConnection.setServiceTier).toHaveBeenNthCalledWith(1, "priority");
 		expect(context.agentConnection.setServiceTier).toHaveBeenNthCalledWith(2, "default");
+		expect(context.patchConnectionState).toHaveBeenNthCalledWith(1, { serviceTier: "priority" });
+		expect(context.patchConnectionState).toHaveBeenNthCalledWith(2, { serviceTier: "default" });
+		expect(context.showStatus).toHaveBeenNthCalledWith(1, "Fast mode: on");
+		expect(context.showStatus).toHaveBeenNthCalledWith(2, "Fast mode: off");
+		expect(context.connectionState?.serviceTier).toBe("default");
 	});
 	test("drops a queued toggle after switching sessions", async () => {
 		let releaseQueue!: () => void;
@@ -1223,18 +1251,18 @@ describe("InteractiveMode Fast mode concurrency", () => {
 		expect(context.agentConnection.setServiceTier).not.toHaveBeenCalled();
 	});
 	test("does not apply an in-flight toggle result to a replacement session", async () => {
-		let finishToggle!: () => void;
+		const toggleStarted = createDeferred<void>();
+		const finishToggle = createDeferred<void>();
 		const context = makeFastContext();
 		const originalConnection = context.agentConnection;
-		originalConnection.setServiceTier = vi.fn(
-			() =>
-				new Promise<void>((resolve) => {
-					finishToggle = resolve;
-				}),
-		);
+		originalConnection.setServiceTier = vi.fn(() => {
+			toggleStarted.resolve();
+			return finishToggle.promise;
+		});
 
 		fastInteractiveModePrototype.handleFastCommand.call(context);
-		await vi.waitFor(() => expect(originalConnection.setServiceTier).toHaveBeenCalledWith("priority"));
+		await toggleStarted.promise;
+		expect(originalConnection.setServiceTier).toHaveBeenCalledWith("priority");
 
 		context.agentConnection = {
 			setServiceTier: vi.fn(async () => {}),
@@ -1246,7 +1274,7 @@ describe("InteractiveMode Fast mode concurrency", () => {
 			),
 		};
 		context.connectionState = { sessionId: "session-2", serviceTier: "default", thinkingLevel: "high" };
-		finishToggle();
+		finishToggle.resolve();
 		await context.fastModeToggleQueue;
 
 		expect(context.patchConnectionState).not.toHaveBeenCalled();

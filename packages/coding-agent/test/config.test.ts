@@ -283,7 +283,13 @@ describe("session paths", () => {
 });
 
 describe("getDaemonLogPath", () => {
-	test.skipIf(process.platform === "win32")("normalizes socket path spellings to one log file", () => {
-		expect(getDaemonLogPath("/a//b.sock")).toBe(getDaemonLogPath("/a/b.sock"));
+	test("normalizes POSIX socket path spellings to one log file", () => {
+		const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+		Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+		try {
+			expect(getDaemonLogPath("/a//b.sock")).toBe(getDaemonLogPath("/a/b.sock"));
+		} finally {
+			if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
+		}
 	});
 });

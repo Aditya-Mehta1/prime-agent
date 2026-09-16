@@ -10,6 +10,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ENV_AGENT_DIR } from "../../src/config.js";
 import type { AgentSession } from "../../src/core/agent-session.js";
 import type { ExtensionFactory } from "../../src/core/extensions/types.js";
 import { convertToLlm } from "../../src/core/messages.js";
@@ -167,6 +168,7 @@ describe("AgentSession compaction", () => {
 	afterEach(() => {
 		vi.useRealTimers();
 		vi.restoreAllMocks();
+		vi.unstubAllEnvs();
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
 		}
@@ -272,6 +274,7 @@ describe("AgentSession compaction", () => {
 			persistSession: true,
 		});
 		harnesses.push(harness);
+		vi.stubEnv(ENV_AGENT_DIR, harness.tempDir);
 		const summarizerInputs: string[] = [];
 		harness.setResponses([
 			fauxAssistantMessage("one response"),
@@ -854,8 +857,8 @@ describe("AgentSession compaction", () => {
 		]);
 
 		await harness.session.prompt("run the tool then summarize");
-		await harness.session.waitForIdle();
-		await vi.waitFor(() => expect(harness.getPendingResponseCount()).toBe(0));
+		await harness.session.waitForHeadlessIdle();
+		expect(harness.getPendingResponseCount()).toBe(0);
 
 		expect(harness.eventsOfType("compaction_start").map((event) => event.reason)).toContain("threshold");
 		expect(harness.eventsOfType("compaction_end")[0]?.errorMessage).toContain("skipped");
@@ -906,17 +909,13 @@ describe("AgentSession compaction", () => {
 		]);
 
 		await harness.session.prompt("/goal finish the task");
-		await vi.waitFor(
-			() => {
-				const compactionReasons = harness.eventsOfType("compaction_start").map((event) => event.reason);
-				expect(compactionReasons).toContain("threshold");
-				expect(compactionReasons).not.toContain("overflow");
-				expect(harness.eventsOfType("compaction_end").find((event) => event.result)?.result).toBeDefined();
-				expect(harness.getPendingResponseCount()).toBe(0);
-				expect(harness.session.goalState.status).toBe("complete");
-			},
-			{ timeout: 5_000 },
-		);
+		await harness.session.waitForHeadlessIdle();
+		const compactionReasons = harness.eventsOfType("compaction_start").map((event) => event.reason);
+		expect(compactionReasons).toContain("threshold");
+		expect(compactionReasons).not.toContain("overflow");
+		expect(harness.eventsOfType("compaction_end").find((event) => event.result)?.result).toBeDefined();
+		expect(harness.getPendingResponseCount()).toBe(0);
+		expect(harness.session.goalState.status).toBe("complete");
 	});
 
 	it("queues only the goal continuation when a goal and autonomous mode are both active", async () => {

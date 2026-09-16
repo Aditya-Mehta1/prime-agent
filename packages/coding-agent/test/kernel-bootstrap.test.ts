@@ -454,6 +454,28 @@ dependencies = ["httpx"]
 			error: /current prime-agent-runtime with callable rlm\.spawn/,
 		},
 		{
+			name: "rejects an interpreter with a pre-progress-note rlm runtime",
+			write: (path: string) =>
+				writeExecutable(
+					path,
+					[
+						"#!/bin/sh",
+						'if [ "$1" = "-c" ]; then',
+						'  case "$2" in',
+						'    "import rlm") exit 0 ;;',
+						'    *"progress_note"*) exit 1 ;;',
+						'    *"_harness_methods"*) exit 0 ;;',
+						"    *) exit 1 ;;",
+						"  esac",
+						"fi",
+						"exit 0",
+						"",
+					].join("\n"),
+				),
+			withSkill: false,
+			error: /current prime-agent-runtime with callable rlm\.spawn, rlm\.create_session, rlm\.host_request, rlm\.progress_note/,
+		},
+		{
 			name: "rejects an interpreter missing the runtime, without bootstrapping a venv",
 			write: (path: string) => writeFakePython(path, []),
 			withSkill: false,
