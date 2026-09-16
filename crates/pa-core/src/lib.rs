@@ -40,4 +40,5 @@ pub mod kernel;
 pub mod models;
 pub mod prompts;
 pub mod settings;
+pub mod skills;
 pub use kernel::ReplKernelManager;
