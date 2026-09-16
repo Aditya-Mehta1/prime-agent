@@ -709,14 +709,20 @@ const WORKSPACE_PATH = /\$\{?(GITHUB_WORKSPACE|RUNNER_WORKSPACE)\}?\/(scripts|\.
 const SCRIPT_EXTENSION = /\.(m?[jt]s|c[jt]s|sh|bash|zsh|py|rb|pl)$/;
 const REDIRECTION = /^[0-9]*(<<<|<<-?|<>|>>|>\||>&|<&|&>>|&>|<|>)/;
 
-/** Joins backslash-continued lines so a command and its arguments are inspected together. */
+/**
+ * Joins backslash-continued lines so a command and its arguments are inspected together. Bash
+ * removes a trailing backslash-newline without inserting anything, so the halves join with NO
+ * character: `node node_mod\` over a line break is `node node_modules/...`, not `node node_mod
+ * ules/...` - anything else would let a word be spelled across the join unseen (review round 9,
+ * finding 1).
+ */
 function joinContinuations(script) {
 	const lines = [];
 	let pending = "";
 	for (const line of String(script).split("\n")) {
 		const trailing = line.match(/(\\+)$/);
 		if (trailing && trailing[1].length % 2 === 1) {
-			pending += `${line.slice(0, -1)} `;
+			pending += line.slice(0, -1);
 			continue;
 		}
 		lines.push(pending + line);
@@ -1359,7 +1365,7 @@ export function credentialStepReasons(run, { artifactDirectories = [], workingDi
 	for (const command of shellCommands(run)) {
 		for (let n = 0; n < (command.opens ?? 0); n += 1) stack.push(cwd);
 		for (const reason of repositoryCodeReasons(command, cwd)) reasons.push(`must not run repository code: ${reason}`);
-		reasons.push(...commandAllowlistReasons(command, { jobId, functions, artifactDirectories, values: state.values }));
+		reasons.push(...commandAllowlistReasons(command, { jobId, functions, artifactDirectories, values: state.values, cwd }));
 		reasons.push(...expansionReasons(command, state, { artifactDirectories, cwd }));
 		const index = commandIndex(command.words);
 		if (index !== -1) {
@@ -1772,12 +1778,12 @@ export function casePatternMatches(run, name) {
  * a call to a defined function is allowed). `jobId` selects the per-job allowlist; without one only
  * the `*` set applies.
  */
-export function commandAllowlistReasons(input, { jobId = null, functions = new Set(), artifactDirectories = [], values } = {}) {
+export function commandAllowlistReasons(input, { jobId = null, functions = new Set(), artifactDirectories = [], values, cwd = "" } = {}) {
 	const command = asCommand(input);
 	const reasons = [];
 	for (const substitution of command.substitutions) {
 		for (const inner of shellCommands(substitution)) {
-			for (const reason of commandAllowlistReasons(inner, { jobId, functions, artifactDirectories, values })) reasons.push(`inside a command substitution: ${reason}`);
+			for (const reason of commandAllowlistReasons(inner, { jobId, functions, artifactDirectories, values, cwd })) reasons.push(`inside a command substitution: ${reason}`);
 		}
 	}
 	const words = command.words;
@@ -2015,12 +2021,17 @@ export function commandAllowlistReasons(input, { jobId = null, functions = new S
 		for (const target of targets) {
 			// A literal target is the path it spells; an expanded one is resolved through the values
 			// the step has bound, so `cp /tmp/evil "$file"` after `for file in <artifact dir>/*`
-			// writes into the directory the job uploads (review round 8, finding 4). A target whose
-			// value the checker cannot pin is not provably an artifact, so only the provable case is
-			// an error here; a REDIRECTION to one is refused outright in expansionReasons.
-			const lands = writeTargetLands(target, values, { artifactDirectories });
+			// writes into the directory the job uploads (review round 8, finding 4). Both also resolve
+			// against the working directory the step has `cd`-ed into, exactly like a redirection
+			// target (review round 9, finding 5). A target whose value the checker cannot pin is not
+			// provably an artifact, so only the provable case is an error here; a REDIRECTION to one
+			// is refused outright in expansionReasons.
+			const lands = writeTargetLands(target, values, { artifactDirectories, cwd });
 			if (lands.class === "artifact") reasons.push(`${name} writes into a downloaded artifact directory (${dashArtifacts.join(", ")}), which the job uploads as verified: ${spelled}`);
-			if (writesOutsideScratch(target.text)) reasons.push(`${name} writes outside /tmp: a profile, a binary on PATH or a tool's configuration could be replaced: ${spelled}`);
+			// Round 9, finding 5: the scratch rule reads the RESOLVED landing - after the working
+			// directory and any binding - never the raw word, so `cp /tmp/evil "$target"` with
+			// target=/usr/local/bin/x writes outside /tmp exactly like the spelled-out path.
+			if (writesOutsideScratch(lands.resolved ?? target.text)) reasons.push(`${name} writes outside /tmp: a profile, a binary on PATH or a tool's configuration could be replaced: ${spelled}`);
 		}
 	}
 	return reasons;
@@ -2206,11 +2217,71 @@ export function expansionReasons(input, state, { artifactDirectories = [], cwd =
 }
 
 /**
+ * Where a `$(mktemp ...)` invocation's file lands (review round 9, finding 4). Scratch is provable
+ * only when the file is under /tmp or $RUNNER_TEMP: a bare `mktemp`, `--tmpdir`/`-t` without a
+ * directory, or a template (or `-p DIR`) that spells such a path. A template in a downloaded
+ * artifact directory is an artifact write; any other template, directory or option the helper does
+ * not recognise is `unknown`, which the target checks refuse.
+ */
+function mktempClass(inner, values, artifactDirectories) {
+	// Parse the invocation the way the shell would, so quoting does not hide the template.
+	const parsed = splitWords(`mktemp ${inner}`);
+	if (parsed.unterminated) return { class: "unknown", literal: null };
+	const command = parsed.commands.find((entry) => entry.words[0]?.text === "mktemp");
+	if (!command) return { class: "unknown", literal: null };
+	const words = command.words.slice(1).map((word) => word.text);
+	let directory = null; // null: no -p/--tmpdir/-t, so a bare template names a file in the working directory
+	let template = null;
+	for (let position = 0; position < words.length; position += 1) {
+		const word = words[position];
+		if (word === "--") {
+			template = words.slice(position + 1).at(-1) ?? template;
+			break;
+		}
+		if (word === "-p" || word === "--tempdir" || word === "--tmpdir") {
+			// The directory may be the next word; without one mktemp falls back to $TMPDIR (/tmp).
+			const next = words[position + 1];
+			if (word === "-p" && next !== undefined && !next.startsWith("-")) {
+				directory = next;
+				position += 1;
+			} else directory = "/tmp";
+			continue;
+		}
+		if (/^--(tempdir|tmpdir)=/.test(word)) {
+			directory = word.slice(word.indexOf("=") + 1);
+			continue;
+		}
+		if (word === "-t") {
+			directory = "/tmp"; // the template is interpreted relative to the temp directory
+			continue;
+		}
+		if (/^(-d|--directory|-q|--quiet)$/.test(word) || /^--suffix=/.test(word)) continue;
+		if (/^-[a-z]+$/.test(word) && /^[dq]*$/.test(word.slice(1))) continue;
+		if (word.startsWith("-")) return { class: "unknown", literal: null }; // an option this helper does not model
+		template = word;
+	}
+	// Where the file lands: scratch is provable only under /tmp or $RUNNER_TEMP; a template in a
+	// downloaded artifact directory is an artifact write; everything else the caller refuses.
+	const landing =
+		directory !== null
+			? valueClassOf(`${directory}/${template ?? "tmp.XXXXXXXXXX"}`, values, artifactDirectories)
+			: template === null
+				? { class: "scratch" } // a bare mktemp: /tmp/tmp.XXXXXXXXXX
+				: valueClassOf(template, values, artifactDirectories);
+	if (landing.class === "scratch" || landing.class === "artifact") return { class: landing.class, literal: null };
+	return { class: "unknown", literal: null };
+}
+
+/**
  * Where a value a command assigns provably lands, for the redirection and writing-coreutils target
  * checks (review round 8, finding 4): "artifact" (inside a downloaded artifact directory),
- * "scratch" (a literal /tmp path, under $RUNNER_TEMP, or what mktemp creates), "outside" (provably
- * not inside the artifact directories) or "unknown" (the checker cannot pin it). `literal` is the
- * value when it is spelled out in full, so an absolute path outside /tmp is still refused.
+ * "scratch" (a literal /tmp path, under $RUNNER_TEMP, or a mktemp the checker has proven stays
+ * under them - round 9, finding 4), "outside" (provably not inside the artifact directories) or
+ * "unknown" (the checker cannot pin it). `literal` is the value when it is spelled out in full,
+ * so an absolute path outside /tmp is still refused. A `$GITHUB_WORKSPACE` prefix is classified by
+ * its literal suffix: the workspace is the parent of the downloaded artifact directories, so
+ * `$GITHUB_WORKSPACE/<artifact dir>/...` is an artifact write; anything else the checker cannot
+ * pin stays "unknown", never "outside" (round 9, finding 3).
  */
 function valueClassOf(text, values, artifactDirectories) {
 	const value = String(text);
@@ -2221,12 +2292,25 @@ function valueClassOf(text, values, artifactDirectories) {
 	// "$RUNNER_TEMP/x": the runner's scratch directory, with a literal file name under it.
 	const temp = value.match(/^\$\{?RUNNER_TEMP\}?\/([^$/`]*)$/);
 	if (temp && temp[1] !== "" && !hasDotSegment(value)) return { class: "scratch", literal: null };
-	// "$(mktemp ...)": mktemp creates its file under /tmp.
-	if (/^\$\(\s*mktemp\b[\s\S]*\)\s*$/.test(value)) return { class: "scratch", literal: null };
+	// "$(mktemp ...)": mktemp creates its file where its template says, which is provable
+	// scratch only under /tmp or $RUNNER_TEMP (round 9, finding 4).
+	const mktemp = value.match(/^\$\(\s*mktemp\b([\s\S]*)\)\s*$/);
+	if (mktemp) return mktempClass(mktemp[1], values, artifactDirectories);
 	// A single variable, or a variable a literal suffix hangs on: wherever its binding lands.
 	const lead = value.match(/^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?(.*)$/s);
 	if (lead) {
-		if (GITHUB_DEFAULT_ENV.includes(lead[1])) return { class: lead[1] === "RUNNER_TEMP" ? "scratch" : "outside", literal: null };
+		if (GITHUB_DEFAULT_ENV.includes(lead[1])) {
+			// Round 9, finding 3: `$GITHUB_WORKSPACE` is the parent of the downloaded artifact
+			// directories, so its literal suffix decides; the suffix is never spelled more
+			// provably than the directories themselves, and anything else stays unknown.
+			if (lead[1] === "GITHUB_WORKSPACE") {
+				const suffix = lead[2].replace(/^\//, "");
+				if (lead[2] !== "" && !hasDotSegment(lead[2]) && (isArtifactPath(suffix, artifactDirectories) || isArtifactDirectory(suffix, artifactDirectories)))
+					return { class: "artifact", literal: null };
+				return { class: "unknown", literal: null };
+			}
+			return { class: lead[1] === "RUNNER_TEMP" ? "scratch" : "outside", literal: null };
+		}
 		const known = values?.get(lead[1]);
 		if (!known) return { class: "unknown", literal: null };
 		if (known.class === "artifact") return { class: "artifact", literal: null };
@@ -2242,8 +2326,11 @@ function valueClassOf(text, values, artifactDirectories) {
  * literal when there is one (review round 8, finding 4). A literal target also resolves against the
  * working directory the step has `cd`-ed into, so `cd artifacts && printf x > SHA256SUMS` writes
  * into the uploaded directory too. An expanded target is resolved through the values the step has
- * bound (`printf x > "$file"` after `for file in <artifact dir>/*`); `scratch` and `outside` are
- * provably not a verified artifact, `unknown` is not provably anything.
+ * bound (`printf x > "$file"` after `for file in <artifact dir>/*`) and its literal value - when
+ * the checker can read one - resolves against that same working directory (round 9, finding 3):
+ * `cd artifacts && printf x > "$file"` with file=SHA256SUMS writes into the uploaded directory
+ * too. `scratch` and `outside` are provably not a verified artifact, `unknown` is not provably
+ * anything.
  */
 function writeTargetLands(word, values, { artifactDirectories, cwd = "" } = {}) {
 	if (!word.expansion) {
@@ -2251,7 +2338,13 @@ function writeTargetLands(word, values, { artifactDirectories, cwd = "" } = {}) 
 		return { class: touchesArtifacts(resolved, artifactDirectories) ? "artifact" : "outside", resolved };
 	}
 	const value = valueClassOf(word.text, values, artifactDirectories);
-	return { class: value.class, resolved: value.class === "outside" ? value.literal : null };
+	if (value.literal === null) return { class: value.class, resolved: null };
+	// Round 9, finding 3: an expanded target with a literal value resolves against the working
+	// directory exactly like a literal one, so `cd <artifact dir> && printf x > "$file"` with
+	// file=SHA256SUMS is caught; the class stays what the value said unless the resolution makes
+	// the artifact write provable.
+	const resolved = resolveAgainst(cwd, { text: value.literal, expansion: false }) ?? value.literal;
+	return { class: touchesArtifacts(resolved, artifactDirectories) ? "artifact" : value.class, resolved };
 }
 
 /** Binds what a command assigns into `state.bound`, tracks which of those values provably begin with a literal that is not `-`, and where each value lands (review round 8, finding 4). */
@@ -2441,8 +2534,10 @@ function runnerVariablesOnly(text) {
  * node, sh and python3, so the rule is narrower than in credential-bearing jobs: the interpreter
  * must be a bare name (no `/usr/bin/node`), every option and the script it runs must be literal
  * (no `node "$dir"/publish.mjs`, `node -e "$CODE"`, `python3 -m "$MOD"`), the script must not be a
- * package manager's own entry point, and it may not read its program from a pipe or stdin. A literal
- * `sh -c '...'` string is re-parsed and held to the same rules.
+ * package manager's own entry point, and it may not read its program from a pipe or stdin. A
+ * literal `sh -c '...'` string is re-parsed and held to the same rules; every OTHER interpreter's
+ * inline code (`node -e`/`-p`/`--eval`/`--print`, `python3 -c`, ...) is refused outright, because
+ * the checker cannot re-parse it (review round 9, finding 2).
  */
 export function buildStepReasons(input, location = {}) {
 	const command = asCommand(input);
@@ -2493,13 +2588,21 @@ export function buildStepReasons(input, location = {}) {
 					for (const inner of shellCommands(code.text)) {
 						for (const reason of [...lifecycleReasons(inner, location), ...buildStepReasons(inner, location)]) reasons.push(`inside ${name} -c: ${reason}`);
 					}
+				} else if (!SHELLS.test(name)) {
+					// Round 9, finding 2: only a shell's -c body is re-parsed above. Any other
+					// interpreter's inline code - literal or runner-variable-only - is code this walk
+					// cannot inspect, so it is refused instead of trusted.
+					reasons.push(`${name} ${arg.text} runs inline code the checker cannot inspect: ${spelled}`);
 				}
 				break;
 			}
 			continue;
 		}
-		// The first positional argument is the script; what follows is its data.
-		if (arg.expansion) reasons.push(`${name} runs a script named by an expansion the checker cannot resolve: ${spelled}`);
+		// The first positional argument is the script; what follows is its data. `deno eval
+		// '<code>'` spells its inline code as a subcommand instead of a flag, so it is caught here
+		// too (round 9, finding 2).
+		if (name === "deno" && arg.text === "eval") reasons.push(`${name} eval runs inline code the checker cannot inspect: ${spelled}`);
+		else if (arg.expansion) reasons.push(`${name} runs a script named by an expansion the checker cannot resolve: ${spelled}`);
 		else if (PACKAGE_MANAGER_ENTRYPOINTS.test(arg.text)) reasons.push(`${name} runs a package manager's entry point, bypassing the package-manager rules: ${spelled}`);
 		else if (hasDotSegment(arg.text) && !arg.text.startsWith("./")) reasons.push(`${name} runs a script through a . or .. segment: ${spelled}`);
 		break;

@@ -106,7 +106,10 @@ jobs:
       - name: Assemble native archive
         working-directory: source
         run: |
-          version=$(node -p "require('./package.json').version")
+          # Read the version with sed alone: an interpreter's inline code is not
+          # readable by the release checker, and the archive names must come
+          # from this package.json either way.
+          version=$(sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*/\1/p' package.json)
           node scripts/assemble-release-archives.mjs packages/coding-agent/binaries "$RUNNER_TEMP/standalone" "$version"
           echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
           echo "RELEASE_ARCHIVE=$RUNNER_TEMP/standalone/prime-agent-$version-$TARGET_PLATFORM.tar.gz" >> "$GITHUB_ENV"
@@ -256,7 +259,7 @@ jobs:
         env:
           TARGET_PLATFORM: ${{ matrix.platform }}
         run: |
-          version=$(node -p "require('$RUNNER_TEMP/standalone-source/package.json').version")
+          version=$(sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*/\1/p' "$RUNNER_TEMP/standalone-source/package.json")
           docker run --rm --init \
             --volume "$RUNNER_TEMP/standalone:/archives:ro" \
             --env "ARCHIVE=prime-agent-$version-$TARGET_PLATFORM.tar.gz" \

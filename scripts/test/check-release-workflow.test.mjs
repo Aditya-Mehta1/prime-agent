@@ -314,9 +314,9 @@ test("the shell matcher understands continuations, heredocs, pipes and comments"
 	// Round 4, finding 6: the heredoc body is re-parsed and yielded too, whatever program reads it.
 	assert.deepEqual(
 		commands.map((command) => command.words.map((word) => word.text)),
-		[["digest=$(grep -E 'x'    \"$GITHUB_WORKSPACE/artifacts/SHA256SUMS\" | cut -d' ' -f1)"], ["python3", "-", "$formula"], ["import", "scripts/evil"], ["echo", "ok"]],
+		[["digest=$(grep -E 'x'   \"$GITHUB_WORKSPACE/artifacts/SHA256SUMS\" | cut -d' ' -f1)"], ["python3", "-", "$formula"], ["import", "scripts/evil"], ["echo", "ok"]],
 	);
-	assert.deepEqual(commands[0].substitutions, ["grep -E 'x'    \"$GITHUB_WORKSPACE/artifacts/SHA256SUMS\" | cut -d' ' -f1"]);
+	assert.deepEqual(commands[0].substitutions, ["grep -E 'x'   \"$GITHUB_WORKSPACE/artifacts/SHA256SUMS\" | cut -d' ' -f1"]);
 	assert.deepEqual(repositoryCodeReasons(commands[0]), []);
 	assert.match(repositoryCodeReasons(commands[1]).join("\n"), /python3 reads its script from a heredoc/);
 	assert.match(repositoryCodeReasons(commands[1]).join("\n"), /python3 reads its script from stdin/);
@@ -1943,7 +1943,6 @@ test("a path-qualified interpreter or an expanded script argument is refused in 
 	for (const fine of [
 		"node scripts/resolve-release-context.mjs",
 		'node scripts/validate-macos-release.mjs "$artifacts" "$TARGET_PLATFORM" "$RUNNER_TEMP/x"',
-		"node -p \"require('./package.json').version\"",
 		'python3 -m http.server 18188 --bind 127.0.0.1 --directory "$SMOKE_ROOT"',
 		'sh /tmp/prime-agent-npm12-install.sh "$SMOKE_VERSION"',
 		"node --version",
@@ -2825,14 +2824,22 @@ test("case patterns are read with POSIX character classes and negations, as bash
 	assert.ok(problems.some((problem) => /skips SHA256SUMS\.sigstore\.json/.test(problem)), problems.join("\n"));
 });
 
-test("build jobs may inline runner variables in interpreter code, but nothing else (merge of main's alpine step)", () => {
+test("a build job refuses every non-shell interpreter's inline code, runner variables included (round 9, finding 2)", () => {
 	const build = {};
 	const reasonsFor = (script) => [...shellCommands(script)].flatMap((command) => buildStepReasons(command, build));
-	assert.deepEqual(
-		reasonsFor(`node -p require('$RUNNER_TEMP/standalone-source/package.json').version`),
-		[],
-		"a runner-provided variable in inline code stays analyzable",
+	// The alpine step's old `node -p require(...)` version read inlined runner variables; the
+	// decision for this round: only a shell's -c body is re-parsed, every other interpreter's
+	// inline code is refused outright - the workflow reads the version with sed instead.
+	assert.match(
+		reasonsFor(`node -p require('$RUNNER_TEMP/standalone-source/package.json').version`).join("\n"),
+		/node -p runs inline code the checker cannot inspect/,
 	);
+	assert.match(reasonsFor("node -e \"npm ci\"").join("\n"), /inline code the checker cannot inspect/);
+	assert.match(reasonsFor("node --eval 'console.log(1)'").join("\n"), /inline code the checker cannot inspect/);
+	assert.match(reasonsFor("node --print '1 + 1'").join("\n"), /inline code the checker cannot inspect/);
+	assert.match(reasonsFor("python3 -c 'print(1)'").join("\n"), /inline code the checker cannot inspect/);
+	assert.match(reasonsFor("deno eval 'console.log(1)'").join("\n"), /inline code the checker cannot inspect/);
+	// From an expansion the reason stays the sharper one.
 	for (const script of [
 		`node -p "require('$HOME/evil.mjs').version"`,
 		`node -p "require('$DIR/evil.mjs').version"`,
@@ -2841,8 +2848,171 @@ test("build jobs may inline runner variables in interpreter code, but nothing el
 		assert.ok(reasons.length > 0, script);
 		assert.match(reasons.join("\n"), /cannot see/);
 	}
+	// A shell's literal -c body is still re-parsed and held to the build rules.
+	assert.match(reasonsFor("sh -c 'npm ci'").join("\n"), /inside sh -c: npm ci runs dependency lifecycle scripts/);
+	assert.deepEqual(reasonsFor("sh -c 'echo hi'"), []);
 	// A script FILE named by an expansion is still refused, runner variable or not.
 	const scriptReasons = reasonsFor(`node "$RUNNER_TEMP/x.mjs"`);
 	assert.ok(scriptReasons.length > 0, "an expanded script argument must be refused");
 	assert.match(scriptReasons.join("\n"), /expansion/);
+	// In the workflow: both build jobs refuse the inline forms, and the checked-in workflows
+	// read package.json with sed instead (no node -p remains anywhere).
+	for (const [path, jobId] of [[RELEASE, "build"], [STANDALONE, "build"]]) {
+		const broken = mutate(path, (text) => appendStep(text, jobId, runStep("Sneak in inline code", 'version=$(node -e "process.exit(1)")')));
+		const problems = checkWorkflows(reader({ [path]: broken }));
+		assert.ok(problems.some((problem) => problem.startsWith(`${path}: job '${jobId}'`) && /inline code the checker cannot inspect/.test(problem)), `${path} ${jobId}:\n${problems.join("\n")}`);
+	}
+	const workflowText = `${readFileSync(RELEASE, "utf8")}${readFileSync(STANDALONE, "utf8")}`;
+	assert.ok(!/node (-p|-e|--eval|--print) /.test(workflowText), "no workflow step may read values through node's inline code flags");
+	// The standalone job reads package.json with sed instead, on the checkout the assemble step
+	// runs in and on the moved-out tree the Alpine step runs against.
+	const sedRead = "sed -n 's/^[[:space:]]*\"version\":[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p'";
+	assert.ok(workflowText.includes(`version=$(${sedRead} package.json)`), "the assemble step reads the version with sed");
+	assert.ok(
+		workflowText.includes(`version=$(${sedRead} "$RUNNER_TEMP/standalone-source/package.json")`),
+		"the alpine step reads the version with sed",
+	);
+});
+
+test("a backslash continuation joins with nothing, the way bash does (round 9, finding 1)", () => {
+	// The exact evasion: the npm entry point is spelled across the line break, so joining the
+	// halves with a space read `node_mod ules/...` and hid the package-manager entry point.
+	const evasion = "version=$(node node_mod\\\nules/npm/bin/npm-cli.js ci)";
+	const commands = [...shellCommands(evasion)];
+	assert.deepEqual(commands[0].words.map((word) => word.text), ["version=$(node node_modules/npm/bin/npm-cli.js ci)"]);
+	const build = { workflow: RELEASE, jobId: "build" };
+	const reasons = commands.flatMap((command) => [...lifecycleReasons(command, build), ...buildStepReasons(command, build)]);
+	assert.match(reasons.join("\n"), /node runs a package manager's entry point, bypassing the package-manager rules/);
+	// The join is exactly bash's: a word split mid-token stays one word, and a legitimate
+	// trailing-space continuation still carries its arguments on the joined line.
+	assert.deepEqual([...shellCommands("printf a\\\nb")].map((command) => command.words.map((word) => word.text)), [["printf", "ab"]]);
+	assert.deepEqual(
+		[...shellCommands('aws s3 cp "$file" "s3://bucket/latest.json" \\\n  --endpoint-url "$R2_ENDPOINT_URL" \\\n  --quiet')].map((command) =>
+			command.words.map((word) => word.text),
+		),
+		[["aws", "s3", "cp", "$file", "s3://bucket/latest.json", "--endpoint-url", "$R2_ENDPOINT_URL", "--quiet"]],
+	);
+	// In the workflow: the entry point spelled across a line break is refused in the build job.
+	for (const [path, jobId] of [[RELEASE, "build"], [STANDALONE, "build"]]) {
+		const broken = mutate(path, (text) => appendStep(text, jobId, runStep("Sneak the entry point across a line break", "version=$(node node_mod\\\nules/npm/bin/npm-cli.js ci)")));
+		const problems = checkWorkflows(reader({ [path]: broken }));
+		assert.ok(
+			problems.some((problem) => problem.startsWith(`${path}: job '${jobId}'`) && /runs a package manager's entry point/.test(problem)),
+			`${path} ${jobId}:\n${problems.join("\n")}`,
+		);
+	}
+});
+
+test("$GITHUB_WORKSPACE write targets are classified by their literal suffix; every other workspace path fails closed (round 9, finding 3)", () => {
+	const options = { jobId: "publish-r2", artifactDirectories: ["artifacts"] };
+	// The reviewer's case: a redirection into the artifact directory through the workspace root.
+	assert.match(
+		credentialStepReasons('printf x > "$GITHUB_WORKSPACE/artifacts/SHA256SUMS"', options).join("\n"),
+		/writes into a downloaded artifact directory/,
+	);
+	// The writing coreutils land the same way, and the artifact directory itself is an artifact.
+	assert.match(credentialStepReasons('cp /tmp/evil "$GITHUB_WORKSPACE/artifacts/SHA256SUMS"', options).join("\n"), /writes into a downloaded artifact directory/);
+	assert.match(credentialStepReasons('mv /tmp/evil "$GITHUB_WORKSPACE/artifacts"', options).join("\n"), /writes into a downloaded artifact directory/);
+	// Every other workspace path - and a bare workspace, or one through a .. segment - is unknown,
+	// never "outside", so the write fails closed.
+	for (const script of [
+		'printf x > "$GITHUB_WORKSPACE/notes.txt"',
+		'printf x > "$GITHUB_WORKSPACE/../evil"',
+		'printf x > "$GITHUB_WORKSPACE"',
+	]) {
+		assert.match(credentialStepReasons(script, options).join("\n"), /cannot prove it stays out of the downloaded artifact directories/, script);
+	}
+	// A bound relative name resolves against the working directory exactly like a literal target.
+	assert.match(credentialStepReasons('file=SHA256SUMS\ncd artifacts && printf y > "$file"', options).join("\n"), /writes into a downloaded artifact directory/);
+	// Reading through the workspace stays fine, and the round-8 fine forms are unchanged.
+	assert.deepEqual(credentialStepReasons('grep -E "x" "$GITHUB_WORKSPACE/artifacts/SHA256SUMS"', options), []);
+	for (const fine of [
+		'file=notes/report.txt\nprintf x > "$file"',
+		'file=/tmp/report.txt\nprintf x > "$file"',
+	]) {
+		assert.deepEqual(credentialStepReasons(fine, options), [], fine);
+	}
+	// In the workflow: a step that carries the R2 credential cannot write through the workspace.
+	const broken = mutate(RELEASE, (text) => appendStep(text, "publish-beta-r2", runStep("Write through the workspace", 'set -euo pipefail\nprintf x > "$GITHUB_WORKSPACE/artifacts/SHA256SUMS"')));
+	const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+	assert.ok(problems.some((problem) => problem.includes("'publish-beta-r2'") && /writes into a downloaded artifact directory/.test(problem)), problems.join("\n"));
+});
+
+test("mktemp is scratch only under /tmp or $RUNNER_TEMP; every other template takes that path's class (round 9, finding 4)", () => {
+	const options = { jobId: "publish-r2", artifactDirectories: ["artifacts"] };
+	// The reviewer's case: a template (or -p directory) inside the artifact directory is an
+	// artifact write, both through a redirection and through a writing coreutils.
+	for (const script of [
+		'file=$(mktemp artifacts/x.XXXXXX)\nprintf y > "$file"',
+		'file=$(mktemp artifacts/x.XXXXXX)\nrm -f "$file"',
+		'file=$(mktemp -p artifacts)\nprintf y > "$file"',
+		'file=$(mktemp --tmpdir=artifacts)\nprintf y > "$file"',
+	]) {
+		assert.match(credentialStepReasons(script, options).join("\n"), /writes into a downloaded artifact directory/, script);
+	}
+	// An aws download destination built by the same mktemp is refused for the same reason.
+	const aws = r2StepReasons("publish-r2", 'file=$(mktemp artifacts/x.XXXXXX)\naws s3 cp "s3://${R2_BUCKET}/x" "$file" --endpoint-url "$R2_ENDPOINT_URL" --quiet', { artifactDirectories: ["artifacts"] });
+	assert.match(aws.reasons.join("\n"), /aws s3 cp downloads over a downloaded artifact/, aws.reasons.join("\n"));
+	// Any other template - an absolute path outside /tmp, or a bare name in the working
+	// directory - is unknown, so a redirection to it fails closed instead of passing as scratch.
+	for (const script of [
+		'file=$(mktemp /var/tmp/x.XXXXXX)\nprintf y > "$file"',
+		'file=$(mktemp x.XXXXXX)\nprintf y > "$file"',
+		'file=$(mktemp -p notes)\nprintf y > "$file"',
+	]) {
+		assert.match(credentialStepReasons(script, options).join("\n"), /cannot prove it stays out of the downloaded artifact directories/, script);
+	}
+	// The scratch forms a workflow may rely on keep passing: a bare mktemp, -d, and templates
+	// under /tmp or $RUNNER_TEMP, quoted or not. (`-p` and `--tmpdir` are refused by the tool's
+	// option allowlist in a credential job, but their VALUE still has to stay scratch.)
+	for (const fine of [
+		'file=$(mktemp)\nprintf y > "$file"',
+		'file=$(mktemp -d)\nprintf y > "$file"',
+		'file=$(mktemp /tmp/x.XXXXXX)\nprintf y > "$file"',
+		'file=$(mktemp "$RUNNER_TEMP/x.XXXXXX")\nprintf y > "$file"',
+	]) {
+		assert.deepEqual(credentialStepReasons(fine, options), [], fine);
+	}
+	for (const script of [
+		'file=$(mktemp -p /tmp)\nprintf y > "$file"',
+		'file=$(mktemp --tmpdir)\nprintf y > "$file"',
+		'file=$(mktemp -p "$RUNNER_TEMP")\nprintf y > "$file"',
+	]) {
+		const reasons = credentialStepReasons(script, options);
+		assert.deepEqual(reasons.filter((reason) => /writes into a downloaded artifact directory|cannot prove it stays out|writes outside \/tmp/.test(reason)), [], script);
+	}
+	// In the workflow: the exact evasion, in a step that carries the R2 credential.
+	const broken = mutate(RELEASE, (text) => appendStep(text, "publish-r2", runStep("Scratch into the artifact directory", 'set -euo pipefail\nfile=$(mktemp artifacts/x.XXXXXX)\nprintf y > "$file"')));
+	const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+	assert.ok(problems.some((problem) => problem.includes("'publish-r2'") && /writes into a downloaded artifact directory/.test(problem)), problems.join("\n"));
+});
+
+test("writing coreutils resolve their targets against the working directory, and the scratch rule reads the resolved landing (round 9, finding 5)", () => {
+	const options = { jobId: "publish-r2", artifactDirectories: ["artifacts"] };
+	// The reviewer's case: a relative target after `cd` is a write into the artifact directory,
+	// for every coreutils tool that writes its positionals.
+	for (const script of [
+		'cd artifacts\ncp /tmp/evil SHA256SUMS',
+		'cd artifacts\nmv /tmp/evil SHA256SUMS',
+		'cd artifacts\nrm -f SHA256SUMS',
+		'cd artifacts\ntee SHA256SUMS </dev/null',
+		'cd artifacts && cp /tmp/evil SHA256SUMS',
+	]) {
+		assert.match(credentialStepReasons(script, options).join("\n"), /writes into a downloaded artifact directory/, script);
+	}
+	// The scratch rule reads the landing the checker resolved, not the raw word.
+	assert.match(credentialStepReasons('path=/usr/local/bin/evil\ncp /tmp/evil "$path"', options).join("\n"), /cp writes outside \/tmp/);
+	// The fine shapes stay fine: a literal /tmp target (however the step moved), and a
+	// workspace-relative target without a cd into an artifact directory.
+	for (const fine of [
+		'cd artifacts\ncp /tmp/evil /tmp/fine.bin',
+		'cp /tmp/evil config.json',
+		'rm -f /tmp/existing.bin',
+	]) {
+		assert.deepEqual(credentialStepReasons(fine, options), [], fine);
+	}
+	// In the workflow: the exact evasion in a step that carries the R2 credential.
+	const broken = mutate(RELEASE, (text) => appendStep(text, "publish-r2", runStep("Overwrite through the working directory", 'set -euo pipefail\ncd artifacts\ncp /tmp/evil SHA256SUMS')));
+	const problems = checkWorkflows(reader({ [RELEASE]: broken }));
+	assert.ok(problems.some((problem) => problem.includes("'publish-r2'") && /writes into a downloaded artifact directory/.test(problem)), problems.join("\n"));
 });
