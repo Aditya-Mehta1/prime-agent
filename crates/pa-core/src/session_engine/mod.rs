@@ -8,7 +8,9 @@
 //! decides admission and persists what the loop produces.
 
 pub mod compaction;
+pub mod compaction_exec;
 pub mod compaction_utils;
+pub mod messages;
 pub mod slash_commands;
 
 use std::sync::Arc;
