@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import os
+import time
 import shutil
 import subprocess
 import sys
@@ -1111,6 +1112,100 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.exit_code, 0)
         result = await self._run("sh -c 'echo $x -R hi'")
         self.assertEqual(result.exit_code, 0)
+
+    async def test_script_inputs_follow_cd_relocations(self):
+        self._make_tree()
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        Path(outside.name, "evil.sh").write_text("chmod -R 755 /\n")
+        # A relocating cd changes where the wrapper reads its script: the
+        # script operand resolves against the relocated directory, and an
+        # unresolvable relocation refuses.
+        message = await self._refused(
+            f"cd {outside.name} && bash script.sh"
+        )
+        self.assertIn("outside the kernel workspace", message)
+        message = await self._refused("cd $(pwd) && bash /tmp/x.sh")
+        self.assertIn("Refusing to run this recursive chmod/chown command", message)
+        result = await self._run("cd sub && bash script.sh || true")
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_script_gate_covers_executors_and_payloads(self):
+        self._make_tree()
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        Path(outside.name, "evil.sh").write_text("chmod -R 755 /\n")
+        evil = str(Path(outside.name, "evil.sh"))
+        # The script-input gate applies behind command-executing wrappers
+        # and inside quoted wrapper payloads too.
+        for command in [
+            f"nice bash {evil}",
+            f"timeout 5 bash {evil}",
+            f"command bash {evil}",
+            f"eval 'bash {evil}'",
+            f"bash -c 'bash {evil}'",
+            f"bash -c 'source {evil}'",
+            f"time sh {evil}",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("outside the kernel workspace", message)
+        result = await self._run("bash -c 'echo hi'")
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_wrapper_option_values_do_not_hide_scripts(self):
+        self._make_tree()
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        Path(outside.name, "evil.sh").write_text("chmod -R 755 /\n")
+        evil = str(Path(outside.name, "evil.sh"))
+        # Options with arguments (-o, --rcfile) no longer hide the real
+        # script operand, and the read-write redirect form is covered.
+        for command in [
+            f"bash -o vi {evil}",
+            f"bash --rcfile /tmp/rc {evil}",
+            f"bash <> {evil}",
+            f"bash 2<> {evil}",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("outside the kernel workspace", message)
+        result = await self._run("bash -o vi ./script.sh || true")
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_source_resolves_via_path_and_allows_dot_paths(self):
+        self._make_tree()
+        Path(self.test_dir, ".env").write_text("X=1\n")
+        Path(self.test_dir, ".venv", "bin").mkdir(parents=True, exist_ok=True)
+        Path(self.test_dir, ".venv", "activate.sh").write_text("echo sourced\n")
+        # Slash-free source operands resolve through PATH like bash does;
+        # in-workspace dot paths are allowed (the chmod dotfile policy does
+        # not apply to script inputs), and an in-PATH outside file is
+        # refused.
+        result = await self._run("source .venv/activate.sh")
+        self.assertEqual(result.exit_code, 0)
+        outside_bin = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside_bin, ignore_errors=True)
+        Path(outside_bin, "pa-guard-in-path.sh").write_text("chmod -R 755 /\n")
+        with mock.patch.dict(
+            os.environ, {"PATH": os.environ["PATH"] + os.pathsep + outside_bin}
+        ):
+            message = await self._refused("source pa-guard-in-path.sh")
+        self.assertIn("outside the kernel workspace", message)
+        # Not in PATH: bash itself errors, so the guard stays out of the way.
+        result = await self._run("source definitely-not-in-path.sh")
+        self.assertNotEqual(result.exit_code, 0)
+
+    async def test_guard_scan_is_not_quadratic(self):
+        # _contained_in_later_word is answered from a flag computed at scan
+        # time, so commands with many separators stay linear (a generated
+        # command with thousands of separators must not stall the kernel).
+        command = "; ".join(["echo hi"] * 4000)
+        start = time.monotonic()
+        for _ in range(3):
+            bash_module._guard_destructive_chmod(command, False)
+        elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 1.5)
 
     async def test_xargs_false_positives_stay_allowed(self):
         # The xargs walk must stop at the command word: an operand named

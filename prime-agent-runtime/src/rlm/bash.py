@@ -20,7 +20,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Generator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, cast
 
@@ -1283,6 +1283,11 @@ class _ShellWord:
     start: int
     end: int
     starts_command: bool  # first word of a fresh (sub)command context
+    # True when the word is a command-substitution interior: its span sits
+    # inside the enclosing word, which the scanner appends after the
+    # interiors it recursed into. Computed at scan time so walkers answer
+    # containment in O(1) instead of rescanning every later word.
+    contained: bool = False
 
 
 def _matching_paren(command: str, open_index: int, end: int) -> int:
@@ -1431,6 +1436,22 @@ def _expand_ansi_c_payloads(text: str) -> str:
     return "".join(out)
 
 
+def _mark_contained_interiors(
+    words: list[_ShellWord],
+    scan_region: "Callable[[int, int], None]",
+    start: int,
+    end: int,
+) -> None:
+    """Scan a substitution interior and mark every word it produced as
+    contained: its span sits inside the enclosing word that follows, so
+    walkers answer containment in O(1) via the flag instead of rescanning
+    every later word."""
+    mark_from = len(words)
+    scan_region(start, end, starts_command=True)
+    for k in range(mark_from, len(words)):
+        words[k] = replace(words[k], contained=True)
+
+
 def _scan_shell_words(command: str) -> list[_ShellWord]:
     """Split `command` into shell words the way the shell builds argv.
 
@@ -1475,7 +1496,7 @@ def _scan_shell_words(command: str) -> list[_ShellWord]:
                     break
                 if inner == "$" and command[j + 1 : j + 2] == "(":
                     close = _matching_paren(command, j + 1, end)
-                    scan_region(j + 2, close, starts_command=True)
+                    _mark_contained_interiors(words, scan_region, j + 2, close)
                     value.append(command[j + 1 : close + 1])
                     j = close + 1
                     continue
@@ -1483,7 +1504,7 @@ def _scan_shell_words(command: str) -> list[_ShellWord]:
                     close = command.find("`", j + 1, end)
                     if close == -1:
                         close = end - 1
-                    scan_region(j + 1, close, starts_command=True)
+                    _mark_contained_interiors(words, scan_region, j + 1, close)
                     value.append(command[j + 1 : close + 1])
                     j = close + 1
                     continue
@@ -1538,7 +1559,7 @@ def _scan_shell_words(command: str) -> list[_ShellWord]:
                 continue
             if ch == "$" and command[i + 1 : i + 2] == "(":
                 close = _matching_paren(command, i + 1, end)
-                scan_region(i + 2, close, starts_command=True)
+                _mark_contained_interiors(words, scan_region, i + 2, close)
                 value.append(command[i + 1 : close + 1])
                 i = close + 1
                 continue
@@ -1546,7 +1567,7 @@ def _scan_shell_words(command: str) -> list[_ShellWord]:
                 close = command.find("`", i + 1, end)
                 if close == -1:
                     close = end - 1
-                scan_region(i + 1, close, starts_command=True)
+                _mark_contained_interiors(words, scan_region, i + 1, close)
                 value.append(command[i + 1 : close + 1])
                 i = close + 1
                 continue
@@ -1593,13 +1614,10 @@ def _is_recursive_chmod_chown_token_run(tokens: list[str]) -> bool:
 def _contained_in_later_word(words: list[_ShellWord], index: int) -> bool:
     """True when words[index] is a command-substitution interior: its span
     sits inside the enclosing word, which the scanner appends after the
-    interiors it recursed into. Interiors execute inside the substitution,
-    so walkers must look through them, not stop at them."""
-    word = words[index]
-    return any(
-        word.start >= later.start and word.end <= later.end
-        for later in words[index + 1 :]
-    )
+    interiors it recursed into, and the scan marks the flag at scan time.
+    Interiors execute inside the substitution, so walkers must look
+    through them, not stop at them."""
+    return words[index].contained
 
 
 def _find_recursive_chmod_chown_invocations(
@@ -1722,6 +1740,10 @@ def _payload_text_hides_shell_code(text: str, depth: int = 0) -> str | None:
         return "unresolvable_command"
     if _process_substitution_feeds_wrapper(normalized, words):
         return "process_substitution"
+    if any(
+        os.path.basename(w.value) in _SCRIPT_INPUT_WRAPPERS for w in words
+    ) and _unscanned_wrapper_script_reason(text, normalized, words, 0) is not None:
+        return "unscanned_script"
     for source in _wrapper_payload_sources(words, normalized, _WRAPPER_PAYLOAD_KINDS):
         payload = _unquote_one_level(_expand_ansi_c_payloads(source))
         reason = _payload_text_hides_shell_code(payload, depth + 1)
@@ -2503,19 +2525,56 @@ def _function_definition_could_recurse(
     return has_chmod_word and has_recursive_flag
 
 
-def _refuse_unscanned_wrapper_scripts(
-    raw: str, normalized: str, words: list[_ShellWord]
-) -> None:
-    """Refuse a bare shell wrapper whose script input lives outside the
-    kernel workspace (or cannot be resolved): the wrapper executes that
-    file's content as shell code, which the guard cannot scan statically.
-    Script arguments (`bash /tmp/x.sh`, `source ~/rc`) and stdin
-    redirections (`bash < /tmp/x.sh`) are resolved like chmod operands;
-    in-workspace inputs stay allowed, and a `-c` payload governs."""
+_WRAPPER_LONG_OPTIONS = (
+    "--posix",
+    "--restricted",
+    "--noprofile",
+    "--norc",
+    "--verbose",
+    "--debug",
+    "--login",
+    "--interactive",
+    "--help",
+    "--version",
+)
+_WRAPPER_LONG_OPTIONS_WITH_VALUE = ("--rcfile",)
+
+
+def _script_input_violation(
+    resolved: str | None, workspace: str, home_real: str | None
+) -> bool:
+    """True when a resolved script input must be refused. Script inputs
+    follow the location policy only (outside the workspace, the home
+    directory, the root, or unresolvable): dot-components inside the
+    workspace are legitimate scripts, so the chmod dotfile policy does
+    not apply here."""
+    if resolved is None:
+        return True
+    if resolved == os.sep:
+        return True
+    if home_real is not None and resolved == home_real:
+        return True
+    return resolved != workspace and not resolved.startswith(workspace + os.sep)
+
+
+def _unscanned_wrapper_script_reason(
+    raw: str,
+    normalized: str,
+    words: list[_ShellWord],
+    user_command_start: int,
+) -> str | None:
+    """Why a bare shell wrapper executes a script the guard cannot scan, or
+    None when it does not: a script argument or stdin redirection from a
+    path outside the kernel workspace (or one that cannot be resolved),
+    with the wrapper's cd relocations replayed so relative scripts resolve
+    where the wrapper will actually read them. Slash-free `source`
+    operands resolve through PATH like bash does. A `-c` payload governs
+    and stays fine, and a wrapper option whose value convention the
+    scanner cannot know fails closed."""
     try:
         kernel_cwd = os.getcwd()
     except OSError:
-        return  # the spawn itself will fail; the guard must not mask that error
+        return None  # the spawn itself will fail; the guard must not mask that error
     workspace = os.path.realpath(kernel_cwd)
     home_env = os.environ.get("HOME") or None
     home_real = None
@@ -2534,13 +2593,14 @@ def _refuse_unscanned_wrapper_scripts(
             head is not None
             and (
                 _ASSIGNMENT_WORD.match(head.value)
-                or os.path.basename(head.value) in _PROC_SUB_INTRODUCERS
+                or os.path.basename(head.value) in _UNRESOLVABLE_COMMAND_EXECUTORS
             )
         )
         if not introduced:
             continue
         script_word: _ShellWord | None = None
         governed = False
+        skip_next = False
         for follower_index in range(index + 1, len(words)):
             follower = words[follower_index]
             if follower.starts_command:
@@ -2548,11 +2608,27 @@ def _refuse_unscanned_wrapper_scripts(
                     continue
                 break
             token = follower.value
+            if skip_next:
+                skip_next = False
+                continue
             if token.startswith("-") and token != "-" and not token.startswith("--"):
                 if "c" in token[1:]:
                     governed = True
+                    break
+                # -o and -O take the shell option name as their value.
+                skip_next = bool(set(token[1:]) & {"o", "O"})
                 continue
             if token == "--":
+                continue
+            if token in _WRAPPER_LONG_OPTIONS_WITH_VALUE:
+                skip_next = True
+                continue
+            if token.startswith("--"):
+                if token not in _WRAPPER_LONG_OPTIONS:
+                    # An unknown long option's value convention is
+                    # unknowable: fail closed instead of guessing whether
+                    # the next word is its value or the script.
+                    return token
                 continue
             if _contained_in_later_word(words, follower_index):
                 continue  # substitution interior: the enclosing word follows
@@ -2565,17 +2641,48 @@ def _refuse_unscanned_wrapper_scripts(
             candidates.append(script_word.value)
         # A stdin redirection from a file: the text is masked in
         # `normalized`, so read the wrapper's raw command region instead
-        # (an ordinary `<`, not <<, <<<, or <( ...)).
+        # (an ordinary `<` or `<>`, not <<, <<<, or <( ...)).
         raw_end = script_word.end if script_word is not None else word.end
         region = re.split(r"[;&|\n]", raw[raw_end:], 1)[0]
-        for match in re.finditer(r"<(?![<(])\s*([^\s;&|)]+)", region):
+        for match in re.finditer(r"<>?\s*([^\s;&|<>()]+)", region):
             candidates.append(match.group(1))
+        if not candidates:
+            continue
+        # Replay cd relocations so relative scripts resolve where the
+        # wrapper will actually read them.
+        effective_cwd = _resolve_chmod_effective_cwd(
+            normalized[: word.start], user_command_start, workspace
+        )
+        if effective_cwd is _UNRESOLVABLE_CHMOD_CWD:
+            return "relocation"
+        base = workspace if effective_cwd is None else effective_cwd
+        reader = os.path.basename(word.value)
         for candidate in candidates:
-            resolved = _resolve_chmod_operand(candidate, workspace, home_env)
-            if _chmod_operand_violation(resolved, workspace, home_real) is not None:
-                raise DestructiveChmodRefusalError(
-                    _format_chmod_wrapper_script_refusal(candidate)
-                )
+            if candidate.startswith("-"):
+                continue
+            if reader in ("source", ".") and "/" not in candidate:
+                # Bash resolves slash-free source operands through PATH
+                # first, not the current directory (no execute bit needed:
+                # source reads the file, it does not exec it).
+                found = None
+                for path_dir in (os.environ.get("PATH") or "").split(os.pathsep):
+                    if not path_dir:
+                        continue
+                    hit = os.path.join(path_dir, candidate)
+                    try:
+                        if os.path.isfile(hit):
+                            found = hit
+                            break
+                    except OSError:
+                        continue
+                if found is None:
+                    continue  # bash errors on a missing PATH hit; harmless
+                resolved = found
+            else:
+                resolved = _resolve_chmod_operand(candidate, base, home_env)
+            if _script_input_violation(resolved, workspace, home_real):
+                return candidate
+    return None
 
 
 def _shell_wrapper_reads_pipe(normalized: str, words: list[_ShellWord]) -> bool:
@@ -2660,12 +2767,13 @@ def _format_chmod_definition_refusal() -> str:
     )
 
 
-def _format_chmod_wrapper_script_refusal(script: str) -> str:
+def _format_chmod_wrapper_script_refusal() -> str:
     return "\n".join(
         [
             "Refusing to run this command: a shell wrapper executes a script"
-            f' from outside the kernel workspace ("{script}"), and that'
-            " file's content cannot be scanned statically.",
+            " from outside the kernel workspace (or a path the guard"
+            " cannot resolve), and that file's content cannot be scanned"
+            " statically.",
             "",
             "Run it from inside the workspace, or retry with"
             " bash(command, allow_destructive_chmod=True), or start the"
@@ -2708,6 +2816,8 @@ def _payload_reason_message(reason: str) -> str:
         return _format_chmod_bash_env_refusal()
     if reason == "unresolvable_command":
         return _format_chmod_unresolvable_command_refusal()
+    if reason == "unscanned_script":
+        return _format_chmod_wrapper_script_refusal()
     return _format_chmod_process_substitution_refusal()
 
 
@@ -2837,6 +2947,16 @@ def _guard_destructive_chmod(command: str, allow_destructive_chmod: bool) -> Non
     resolved = _mask_shell_redirections(raw)
     normalized, index_map = _strip_shell_escapes(resolved)
     words = _scan_shell_words(normalized)
+    # `normalized` drops backslash escapes, so the prefix boundary maps
+    # through the strip index map instead of the raw prefix length.
+    if command_prefix:
+        prefix_end = len(command_prefix) + 1
+        user_command_start = next(
+            (i for i, orig in enumerate(index_map) if orig >= prefix_end),
+            len(normalized),
+        )
+    else:
+        user_command_start = 0
     # BASH_ENV: non-interactive bash runs that file before the command
     # text, so arming it is refused no matter how harmless the visible
     # command looks (an inherited BASH_ENV never reaches the child: it is
@@ -2898,7 +3018,13 @@ def _guard_destructive_chmod(command: str, allow_destructive_chmod: bool) -> Non
         # A bare shell wrapper executes a script file the guard cannot
         # scan: inputs from outside the workspace (or unresolvable paths)
         # are refused; in-workspace scripts and -c payloads stay fine.
-        _refuse_unscanned_wrapper_scripts(raw, normalized, words)
+        script_reason = _unscanned_wrapper_script_reason(
+            raw, normalized, words, user_command_start
+        )
+        if script_reason == "relocation":
+            raise DestructiveChmodRefusalError(_format_chmod_relocation_refusal())
+        if script_reason:
+            raise DestructiveChmodRefusalError(_format_chmod_wrapper_script_refusal())
     if eval_reason == "recursive_chmod":
         # An eval payload hides where the recursion runs; refuse rather than
         # resolve a command the guard cannot see.
@@ -2933,16 +3059,6 @@ def _guard_destructive_chmod(command: str, allow_destructive_chmod: bool) -> Non
     if command_prefix and re.search(r"\b(?:cd|pushd|popd)\b", command_prefix):
         raise DestructiveChmodRefusalError(_format_chmod_relocation_refusal())
     _warn_once_about_late_destructive_chmod_bypass()
-    # `normalized` drops backslash escapes, so the prefix boundary maps
-    # through the strip index map instead of the raw prefix length.
-    if command_prefix:
-        prefix_end = len(command_prefix) + 1
-        user_command_start = next(
-            (i for i, orig in enumerate(index_map) if orig >= prefix_end),
-            len(normalized),
-        )
-    else:
-        user_command_start = 0
     try:
         kernel_cwd = os.getcwd()
     except OSError:
