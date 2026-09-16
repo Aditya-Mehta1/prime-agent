@@ -13,6 +13,7 @@ pub mod framing;
 pub mod journal;
 pub mod lease;
 pub mod paths;
+pub mod platform;
 pub mod protocol;
 pub mod session_stats;
 pub mod session_store;

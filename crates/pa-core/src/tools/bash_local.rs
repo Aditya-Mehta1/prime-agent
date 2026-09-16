@@ -61,10 +61,7 @@ impl BashOperations for LocalBashOperations {
             }
             // Detached process group on POSIX so kill_process_tree can reach
             // descendants (node: `detached: process.platform !== "win32"`).
-            {
-                use std::os::unix::process::CommandExt;
-                process.process_group(0);
-            }
+            crate::platform::process::set_new_process_group(&mut process);
 
             let mut child = process.spawn()?;
 

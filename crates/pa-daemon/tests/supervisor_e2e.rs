@@ -1,6 +1,7 @@
 //! End-to-end supervisor tests against the real `pa-daemon` binary: spawn the
 //! supervisor on a temp socket, drive it with a JSONL socket client, verify
 //! session lifecycle and streamed events with the scripted engine.
+#![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;

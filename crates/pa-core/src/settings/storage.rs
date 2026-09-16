@@ -36,16 +36,7 @@ pub struct FileSettingsStorage {
     project_path: PathBuf,
 }
 
-struct LockGuard {
-    file: fs::File,
-}
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        use std::os::unix::io::AsRawFd;
-        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
-    }
-}
+use crate::platform::fs_lock::FileLock as LockGuard;
 
 impl FileSettingsStorage {
     pub fn new(cwd: impl Into<PathBuf>, agent_dir: impl Into<PathBuf>) -> Self {
@@ -64,26 +55,19 @@ impl FileSettingsStorage {
     }
 
     fn acquire_lock(&self, path: &Path) -> Result<LockGuard> {
-        use std::os::unix::io::AsRawFd;
         let lock_path = PathBuf::from(format!("{}.lock", path.display()));
         let max_attempts = 10;
         let mut last_error: Option<std::io::Error> = None;
         for _ in 1..=max_attempts {
-            let file = fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(&lock_path)?;
-            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if result == 0 {
-                return Ok(LockGuard { file });
-            }
-            if last_error.is_none() {
-                last_error = Some(
-                    file.metadata()
-                        .err()
-                        .unwrap_or_else(|| std::io::Error::other("lock busy")),
-                );
+            match LockGuard::acquire_exclusive_non_blocking(&lock_path) {
+                Ok(guard) => return Ok(guard),
+                // Only lock contention retries; open failures fail fast.
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if last_error.is_none() {
+                        last_error = Some(error);
+                    }
+                }
+                Err(error) => return Err(error.into()),
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
@@ -136,17 +120,14 @@ impl SettingsStorage for FileSettingsStorage {
     }
 }
 
-/// Atomic write: temp file + rename, 0o600 like `writeFileAtomicSync`.
+/// Atomic write: temp file + rename, private mode like `writeFileAtomicSync`.
 pub fn atomic_write(path: &Path, content: &str) -> Result<()> {
     let temp = PathBuf::from(format!("{}.tmp{}", path.display(), std::process::id()));
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&temp)?;
+        let mut options = fs::OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        crate::platform::perms::set_private_mode(&mut options);
+        let mut file = options.open(&temp)?;
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
     }
@@ -213,11 +194,8 @@ mod tests {
         let path = dir.path().join("agent").join("settings.json");
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains("prime-inference"));
-        // 0o600.
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        // Owner-only mode is a Unix guarantee; Windows inherits ACLs.
+        #[cfg(unix)]
+        assert_eq!(crate::platform::perms::file_mode(&path), Some(0o600));
     }
 }

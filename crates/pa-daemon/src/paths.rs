@@ -46,11 +46,7 @@ pub fn logs_dir(agent_dir: &Path) -> PathBuf {
 
 pub fn ensure_dir(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-    }
+    let _ = pa_core::platform::perms::restrict_dir(path);
     Ok(())
 }
 

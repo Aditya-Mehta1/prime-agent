@@ -180,11 +180,7 @@ pub fn write_private_prime_authorization_cache(
     });
     let path = private_prime_authorization_cache_path(models_json_path);
     let _ = std::fs::write(&path, serde_json::to_vec(&document).unwrap_or_default());
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
+    let _ = crate::platform::perms::restrict_file(&path);
 }
 
 /// PI_OFFLINE=1/true/yes disables network refreshes.

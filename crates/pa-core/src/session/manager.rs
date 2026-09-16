@@ -213,11 +213,7 @@ fn repair_jsonl_damage(file_path: &Path) {
         content.push('\n');
     }
     if std::fs::write(file_path, content.as_bytes()).is_ok() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(file_path, std::fs::Permissions::from_mode(0o600));
-        }
+        let _ = crate::platform::perms::restrict_file(file_path);
     }
     let _ = (repaired_tail, dropped_lines);
 }
@@ -968,13 +964,10 @@ fn resolve_session_rlm_depth(header: &SessionHeader, _session_path: &Path) -> u6
 fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
     let temp = PathBuf::from(format!("{}.tmp{}", path.display(), std::process::id()));
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&temp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        crate::platform::perms::set_private_mode(&mut options);
+        let mut file = options.open(&temp)?;
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
     }

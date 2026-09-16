@@ -8,6 +8,7 @@
 //! The scripted engine seam (`create` config `script`) is the same faux
 //! provider contract `pa-daemon/tests/supervisor_e2e.rs` uses; the product
 //! never sets it.
+#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};

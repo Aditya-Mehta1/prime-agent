@@ -13,6 +13,7 @@
 //! test is skipped (not failed) when it is not installed. Each binary runs in
 //! its own sandbox HOME + cwd so stateful cases (mcp add) behave identically.
 //! Version numbers are normalized before comparison.
+#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

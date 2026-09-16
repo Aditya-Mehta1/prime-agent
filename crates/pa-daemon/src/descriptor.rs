@@ -12,7 +12,9 @@ use serde_json::{json, Value};
 
 use pa_types::daemon::{DaemonWorkerDescriptor, DaemonWorkerLifecycle, DurableDaemonCreateCommand};
 
-pub const SUPERVISOR_CONFIG_FILE_NAME: &str = "supervisor-config.json";
+/// TS `daemon-supervisor.ts` names this file without a JSON extension
+/// (`supervisor-config`) so descriptor sweeps filtered on `.json` skip it.
+pub const SUPERVISOR_CONFIG_FILE_NAME: &str = "supervisor-config";
 
 pub type WorkerLifecycle = DaemonWorkerLifecycle;
 pub type WorkerDescriptor = DaemonWorkerDescriptor;
@@ -128,11 +130,7 @@ pub fn write_file_atomic(path: &Path, content: &str) -> Result<()> {
         writer.flush()?;
         writer.get_ref().sync_all()?;
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600));
-    }
+    let _ = pa_core::platform::perms::restrict_file(&temp);
     std::fs::rename(&temp, path).with_context(|| format!("persist {}", path.display()))?;
     Ok(())
 }

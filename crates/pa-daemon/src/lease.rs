@@ -63,30 +63,17 @@ pub fn canonical_session_path(path: &Path) -> PathBuf {
     }
 }
 
-/// `ps:${lstart}`-style start identity; on Linux read from /proc like the TS
-/// `getProcessStartId` fast path. Format: `proc:<starttime field>`.
+/// `proc:<starttime>` start identity (TS `getProcessStartId`); shared with
+/// pa-core through `pa_types::platform`.
 pub fn get_process_start_id(pid: u32) -> Option<String> {
-    if pid == 0 {
-        return None;
-    }
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let command_end = stat.rfind(')')?;
-    let fields = stat[command_end + 2..].split(' ').collect::<Vec<_>>();
-    fields.get(19).map(|start| format!("proc:{start}"))
+    pa_types::platform::process::process_start_id(pid)
 }
 
-pub fn is_process_alive(pid: u32) -> bool {
-    // kill(0) equivalent via /proc presence plus signal probe.
-    if !Path::new(&format!("/proc/{pid}")).exists() {
-        return false;
-    }
-    // A zombie still owns /proc; treat it as dead for lease purposes.
-    if let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) {
-        if let Some(state) = status.lines().find_map(|l| l.strip_prefix("State:")) {
-            return !state.trim_start().starts_with('Z');
-        }
-    }
-    true
+/// True only for a process that is actually running: zombies do not count.
+/// Errors when the platform cannot answer (the caller treats an unverifiable
+/// owner as alive rather than reclaiming its lease).
+pub fn is_process_alive(pid: u32) -> anyhow::Result<bool> {
+    pa_types::platform::process::is_process_alive(pid)
 }
 
 fn lease_directory(agent_dir: &Path, session_path: &Path) -> PathBuf {
@@ -122,8 +109,12 @@ fn read_owner(directory: &Path) -> Result<Option<LeaseOwner>> {
 }
 
 fn owner_alive(owner: &LeaseOwner) -> bool {
-    if !is_process_alive(owner.pid) {
-        return false;
+    match is_process_alive(owner.pid) {
+        Ok(true) => {}
+        // A provably-dead owner is stale; an unverifiable one counts as
+        // alive, like the TS lease (reclaiming a live owner is worse).
+        Ok(false) => return false,
+        Err(_) => return true,
     }
     match owner.process_start_id.as_deref() {
         None => true,

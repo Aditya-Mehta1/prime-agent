@@ -1,80 +1,12 @@
 //! Shell configuration and process helpers.
 //!
-//! Port of `packages/coding-agent/src/utils/shell.ts` (POSIX behavior) plus the
+//! Port of `packages/coding-agent/src/utils/shell.ts` plus the
 //! `waitForChildProcess` semantics of `utils/child-process.ts` that the bash
-//! tool relies on.
+//! tool relies on. Platform-specific resolution and kill semantics live in
+//! [`crate::platform`]; this module keeps the cross-platform shell environment
+//! and output sanitation.
 
-/// Shell program plus the fixed argument list used to run a command string.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShellConfig {
-    pub shell: String,
-    pub args: Vec<String>,
-}
-
-/// Resolve the shell to run commands with.
-///
-/// Order: explicit `custom_shell_path` (must exist), `/bin/bash`, bash on PATH,
-/// then `sh`.
-pub fn get_shell_config(custom_shell_path: Option<&str>) -> anyhow::Result<ShellConfig> {
-    if let Some(path) = custom_shell_path {
-        if std::path::Path::new(path).exists() {
-            return Ok(ShellConfig {
-                shell: path.to_string(),
-                args: vec!["-c".to_string()],
-            });
-        }
-        return Err(anyhow::anyhow!("Custom shell path not found: {path}"));
-    }
-
-    if std::path::Path::new("/bin/bash").exists() {
-        return Ok(ShellConfig {
-            shell: "/bin/bash".to_string(),
-            args: vec!["-c".to_string()],
-        });
-    }
-
-    if let Some(bash) = find_bash_on_path() {
-        return Ok(ShellConfig {
-            shell: bash,
-            args: vec!["-c".to_string()],
-        });
-    }
-
-    Ok(ShellConfig {
-        shell: "sh".to_string(),
-        args: vec!["-c".to_string()],
-    })
-}
-
-fn find_bash_on_path() -> Option<String> {
-    let out = std::process::Command::new("which")
-        .arg("bash")
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let first = text.trim().lines().next()?;
-    if first.is_empty() {
-        None
-    } else {
-        Some(first.to_string())
-    }
-}
-
-/// Absolute default shell for the kernel's `bash()`: explicit path wins;
-/// POSIX uses `/bin/bash` else `/bin/sh`.
-pub fn resolve_kernel_bash_shell(custom_shell_path: Option<&str>) -> Option<String> {
-    if let Some(explicit) = custom_shell_path.map(str::trim).filter(|s| !s.is_empty()) {
-        return Some(explicit.to_string());
-    }
-    if std::path::Path::new("/bin/bash").exists() {
-        Some("/bin/bash".to_string())
-    } else {
-        Some("/bin/sh".to_string())
-    }
-}
+pub use crate::platform::shell::get_shell_config;
 
 /// The agent config directory (`~/.prime/agent` unless overridden).
 pub fn get_agent_dir() -> String {
@@ -163,17 +95,10 @@ pub fn sanitize_binary_output(s: &str) -> String {
         .collect()
 }
 
-/// Kill a process and all its children.
-///
-/// POSIX: SIGKILL the process group (children run detached in a new group),
-/// falling back to the direct pid.
-pub fn kill_process_tree(pid: i32) {
-    unsafe {
-        if libc::kill(-pid, libc::SIGKILL) != 0 {
-            // Fallback to killing just the child if the group kill fails.
-            let _ = libc::kill(pid, libc::SIGKILL);
-        }
-    }
+/// Kill a process and all its children (process group first, then the bare
+/// pid). Returns true when a signal was delivered.
+pub fn kill_process_tree(pid: i32) -> bool {
+    crate::platform::process::kill_process_group_or_pid(pid)
 }
 
 #[cfg(test)]

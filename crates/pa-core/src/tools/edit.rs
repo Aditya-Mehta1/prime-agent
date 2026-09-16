@@ -88,13 +88,13 @@ impl EditOperations for LocalEditOperations {
     }
 
     fn access(&self, absolute_path: &str) -> std::io::Result<()> {
-        // Mirror Node fs.access(path, R_OK | W_OK) via access(2).
+        // Mirror Node fs.access(path, R_OK | W_OK).
         let path = std::path::Path::new(absolute_path);
-        nix::unistd::access(
-            path,
-            nix::unistd::AccessFlags::R_OK | nix::unistd::AccessFlags::W_OK,
-        )
-        .map_err(|_| std::io::Error::last_os_error())
+        if crate::platform::perms::is_readable_writable(path) {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
     }
 }
 

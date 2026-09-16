@@ -4,6 +4,8 @@
 //! faithful port of jsdiff v9 `diffLines` (Myers O(ND) with the diagonal-bounds
 //! optimization) so generated diffs match the TypeScript product byte for byte.
 
+use std::path::Path;
+
 use unicode_normalization::UnicodeNormalization;
 
 use crate::tools::jsdiff::diff_lines;
@@ -569,17 +571,5 @@ pub fn errno_name(err: &std::io::Error) -> String {
 
 #[allow(dead_code)]
 fn access_readable(path: &str) -> Result<(), String> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let metadata = std::fs::metadata(path).map_err(|err| errno_name(&err))?;
-    // Root on Linux can read files regardless of permission bits; mirror
-    // access(2)'s effective-uid check via the permission bits plus euid.
-    let mode = metadata.permissions().mode();
-    let readable = (mode & 0o004) != 0
-        || ((mode & 0o040) != 0 && metadata.uid() == nix::unistd::Uid::effective().as_raw())
-        || ((mode & 0o400) != 0 && metadata.uid() == nix::unistd::Uid::effective().as_raw());
-    if readable {
-        Ok(())
-    } else {
-        Err("EACCES".to_string())
-    }
+    crate::platform::perms::is_readable(Path::new(path)).map_err(|err| errno_name(&err))
 }

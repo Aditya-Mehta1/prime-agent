@@ -9,6 +9,7 @@
 //!   objects are dropped and reported;
 //! - the RLM surface (rlm, bash, harness) injected by the bootstrap exists
 //!   and host requests round-trip to the registered handler.
+#![cfg(unix)]
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -289,7 +290,7 @@ async fn kill9_then_restart_revives_snapshot_and_reports_unserializable() {
     let pid = manager.process_id().expect("kernel pid");
     assert!(pid > 0);
     // kill -9 the kernel process, like a host OOM/infra kill.
-    unsafe { libc::kill(pid, libc::SIGKILL) };
+    pa_core::platform::process::kill_pid(pid as i32, pa_core::platform::process::Signal::Kill);
     // The manager observes the death and goes defunct.
     for _ in 0..100 {
         if manager.is_defunct() {

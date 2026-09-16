@@ -12,8 +12,6 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use std::os::unix::fs::OpenOptionsExt;
-
 use serde_json::json;
 
 /// Environment variable naming the journal file.
@@ -38,19 +36,13 @@ fn journal_path() -> Option<std::path::PathBuf> {
     Some(PathBuf::from(path))
 }
 
-/// `/proc/<pid>/stat` field 22 (starttime), the pid-reuse identity the TS
-/// product records as `proc:<starttime>`.
+/// Pid-reuse identity (`proc:<starttime>`), shared with pa-daemon through
+/// `pa_types::platform::process`.
 pub fn get_process_start_id(pid: i32) -> Option<String> {
     if pid <= 0 {
         return None;
     }
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let command_end = stat.rfind(')')?;
-    let mut fields = stat[command_end + 2..].split(' ');
-    fields
-        .nth(19)
-        .filter(|s| !s.is_empty())
-        .map(|start| format!("proc:{start}"))
+    pa_types::platform::process::process_start_id(pid as u32)
 }
 
 /// Record a process as active/inactive in the journal. Best-effort: process
@@ -82,12 +74,10 @@ pub fn record_orphan_process_state(pid: i32, active: bool) {
         }
         None => record,
     };
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(&path)
-    else {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    crate::platform::perms::set_private_mode(&mut options);
+    let Ok(mut file) = options.open(&path) else {
         return;
     };
     let _ = writeln!(file, "{record}");
@@ -185,20 +175,7 @@ fn should_reap(orphan: &ActiveOrphanProcess) -> bool {
 /// Kill a journaled orphan: its process group first (bash() children are
 /// group-contained), then the bare pid.
 pub fn kill_orphan_process(pid: i32) -> bool {
-    #[cfg(unix)]
-    {
-        unsafe {
-            if libc::kill(-pid, libc::SIGKILL) == 0 {
-                return true;
-            }
-        }
-        unsafe { libc::kill(pid, libc::SIGKILL) == 0 }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
+    crate::platform::process::kill_process_group_or_pid(pid)
 }
 
 /// Kill still-active bash() children journaled by the given kernel pid;

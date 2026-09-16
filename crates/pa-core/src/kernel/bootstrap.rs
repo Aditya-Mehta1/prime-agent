@@ -429,28 +429,11 @@ fn find_executable(name: &str) -> Option<PathBuf> {
 }
 
 fn is_executable(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        path.is_file()
-    }
+    crate::platform::perms::is_executable(path)
 }
 
 fn is_process_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        unsafe { libc::kill(pid as i32, 0) == 0 }
-    }
-    #[cfg(not(unix))]
-    {
-        false
-    }
+    crate::platform::process::pid_exists(pid)
 }
 
 /// A `link(2)`-published lock file: born with owner content, EEXIST the only
@@ -480,13 +463,10 @@ fn try_acquire_dir_lock(lock_path: &Path) -> anyhow::Result<DirLockAttempt> {
         token
     ));
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&temp_path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        crate::platform::perms::set_private_mode(&mut options);
+        let mut file = options.open(&temp_path)?;
         writeln!(file, "{}", std::process::id())?;
     }
     // The primary signal: link() publishing the candidate under the lock path.

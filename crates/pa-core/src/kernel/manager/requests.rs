@@ -7,21 +7,7 @@ use super::*;
 // Request plumbing
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum Signal {
-    Term,
-    Kill,
-}
-
-impl Signal {
-    #[cfg(unix)]
-    pub(crate) fn as_libc(self) -> i32 {
-        match self {
-            Signal::Term => libc::SIGTERM,
-            Signal::Kill => libc::SIGKILL,
-        }
-    }
-}
+pub(crate) use crate::platform::process::Signal;
 
 /// Append stream text, capping the buffer at `max_chars` and flagging truncation.
 pub(crate) fn append_truncated(

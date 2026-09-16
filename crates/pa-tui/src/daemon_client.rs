@@ -19,7 +19,6 @@ use pa_types::daemon::{
 };
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 
 /// Default response timeout (TS `DEFAULT_DAEMON_REQUEST_TIMEOUT_MS`).
@@ -90,7 +89,7 @@ impl DaemonClient {
     ) -> Result<(Self, mpsc::UnboundedReceiver<DaemonClientEvent>)> {
         let connect = tokio::time::timeout(
             Duration::from_millis(CONNECT_TIMEOUT_MS),
-            UnixStream::connect(socket_path),
+            pa_types::platform::transport::connect_transport(socket_path),
         )
         .await
         .map_err(|_| {
@@ -106,7 +105,7 @@ impl DaemonClient {
             )
         })?;
 
-        let (reader_half, writer_half) = connect.into_split();
+        let (reader_half, writer_half) = connect.split();
         let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();
         let (event_tx, event_rx) = mpsc::unbounded_channel::<DaemonClientEvent>();
         let (hello_tx, hello_rx) = oneshot::channel::<Value>();
@@ -351,7 +350,7 @@ fn command_type_debug(command: &DaemonCommand) -> String {
         .unwrap_or_else(|| "command".to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use serde_json::json;

@@ -18,9 +18,9 @@ use pa_types::daemon::{
     DaemonCommand, DaemonOutbound, DaemonWorkerDescriptor, DaemonWorkerLifecycle,
     DurableDaemonCreateCommand, SnapshotPurpose,
 };
+use pa_types::platform::transport::{bind_transport, connect_transport, TransportStream};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 
@@ -172,12 +172,14 @@ impl Supervisor {
     /// Bind the client socket, adopt or relaunch persisted workers, serve.
     pub async fn run(self: Arc<Self>) -> Result<()> {
         socket::prepare_socket_path(&self.options.socket_path).await?;
-        let listener = UnixListener::bind(&self.options.socket_path).with_context(|| {
-            format!(
-                "bind supervisor socket {}",
-                self.options.socket_path.display()
-            )
-        })?;
+        let listener = bind_transport(&self.options.socket_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "bind supervisor socket {}",
+                    self.options.socket_path.display()
+                )
+            })?;
         socket::restrict_socket_path(&self.options.socket_path);
         self.log
             .append(&format!("supervisor started pid {}", std::process::id()));
@@ -185,7 +187,7 @@ impl Supervisor {
         self.adopt_persisted_workers().await;
 
         while !self.shutting_down.load(Ordering::SeqCst) {
-            let (stream, _addr) = tokio::select! {
+            let stream = tokio::select! {
                 accepted = listener.accept() => match accepted {
                     Ok(accepted) => accepted,
                     Err(error) => {
@@ -289,7 +291,7 @@ impl Supervisor {
                     {
                         return;
                     }
-                    if !is_process_alive(adopted_pid as u32) {
+                    if !matches!(is_process_alive(adopted_pid as u32), Ok(true)) {
                         break;
                     }
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -473,10 +475,10 @@ impl Supervisor {
                 descriptor.authentication_token.clone(),
             )
         };
-        let stream = UnixStream::connect(&socket_path)
+        let stream = connect_transport(&socket_path)
             .await
             .with_context(|| format!("connect worker socket {}", socket_path.display()))?;
-        let (reader, mut writer) = stream.into_split();
+        let (reader, mut writer) = stream.split();
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<WorkerRequest>();
         resident.pending.lock().await.clear();
         let events = self.events.clone();
@@ -792,8 +794,8 @@ impl Supervisor {
     // Client connections (JSONL transport)
     // ------------------------------------------------------------------
 
-    async fn handle_client(self: Arc<Self>, stream: UnixStream) -> Result<()> {
-        let (reader, mut writer) = stream.into_split();
+    async fn handle_client(self: Arc<Self>, stream: Box<dyn TransportStream>) -> Result<()> {
+        let (reader, mut writer) = stream.split();
         let client_id = util::new_display_id();
         let hello = DaemonOutbound::DaemonHello {
             socket_path: self.options.socket_path.to_string_lossy().to_string(),

@@ -12,7 +12,6 @@
 //! connect error is surfaced to the user.
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -20,6 +19,7 @@ use anyhow::{anyhow, Result};
 use pa_types::daemon::{
     DaemonCommand, DaemonProtocolInfo, DaemonResponse, DAEMON_PROTOCOL_VERSION,
 };
+use pa_types::platform::transport::{connect_blocking, BlockingTransportStream};
 use serde_json::json;
 
 use crate::config;
@@ -35,8 +35,8 @@ const READ_POLL: Duration = Duration::from_millis(50);
 #[derive(Debug)]
 pub(crate) struct DaemonClient {
     socket_path: PathBuf,
-    reader: BufReader<UnixStream>,
-    writer: UnixStream,
+    reader: BufReader<Box<dyn BlockingTransportStream>>,
+    writer: Box<dyn BlockingTransportStream>,
     hello: Option<serde_json::Value>,
     daemon_closing_reason: Option<String>,
     request_id: u64,
@@ -46,7 +46,7 @@ pub(crate) struct DaemonClient {
 impl DaemonClient {
     /// Connect to the daemon socket, ready for the hello handshake.
     pub(crate) fn connect(socket_path: &Path) -> Result<Self> {
-        let stream = UnixStream::connect(socket_path).map_err(|error| {
+        let stream = connect_blocking(socket_path).map_err(|error| {
             anyhow!(
                 "Failed to connect to the Prime Agent daemon: {}. {}",
                 node_connect_error(&error, socket_path),
@@ -54,7 +54,7 @@ impl DaemonClient {
             )
         })?;
         let writer = stream
-            .try_clone()
+            .try_clone_box()
             .map_err(|error| anyhow!("Failed to connect to the Prime Agent daemon: {error}"))?;
         Ok(DaemonClient {
             socket_path: socket_path.to_path_buf(),
@@ -160,7 +160,7 @@ impl DaemonClient {
         loop {
             self.reader
                 .get_mut()
-                .set_read_timeout(Some(READ_POLL))
+                .set_read_timeout(READ_POLL)
                 .map_err(|error| anyhow!("daemon socket error: {error}"))?;
             let mut line = String::new();
             let read = self.reader.read_line(&mut line);
@@ -257,7 +257,7 @@ fn node_connect_error(error: &std::io::Error, socket_path: &Path) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;

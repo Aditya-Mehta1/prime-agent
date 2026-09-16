@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
+use pa_types::platform::transport::{bind_transport, TransportStream};
 use serde_json::{json, Value};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, oneshot, Notify};
 
 use crate::agent_engine::{AgentEngineConfig, AgentSessionEngine};
@@ -257,11 +257,12 @@ impl Worker {
             &self.config.recovery_journal_path,
         )?);
         crate::socket::prepare_socket_path(&self.config.socket_path).await?;
-        let listener = UnixListener::bind(&self.config.socket_path)
+        let listener = bind_transport(&self.config.socket_path)
+            .await
             .with_context(|| format!("bind worker socket {}", self.config.socket_path.display()))?;
         crate::socket::restrict_socket_path(&self.config.socket_path);
         loop {
-            let (stream, _addr) = match listener.accept().await {
+            let stream = match listener.accept().await {
                 Ok(accepted) => {
                     if std::env::var("PA_DAEMON_DEBUG").is_ok() {
                         eprintln!("[worker {}] accepted connection", std::process::id());
@@ -279,8 +280,8 @@ impl Worker {
         }
     }
 
-    async fn handle_connection(self: Arc<Self>, stream: UnixStream) -> Result<()> {
-        let (reader, writer) = stream.into_split();
+    async fn handle_connection(self: Arc<Self>, stream: Box<dyn TransportStream>) -> Result<()> {
+        let (reader, writer) = stream.split();
         let writer = Arc::new(tokio::sync::Mutex::new(writer));
         // daemon_hello goes out immediately on every connection.
         let hello = DaemonOutbound::DaemonHello {
@@ -486,7 +487,7 @@ impl Worker {
 
     async fn write_frame(
         &self,
-        writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+        writer: &Arc<tokio::sync::Mutex<Box<dyn pa_types::platform::transport::AsyncWriteHalf>>>,
         header: &Value,
         payload: &[u8],
     ) -> Result<()> {
@@ -498,7 +499,7 @@ impl Worker {
 
     async fn write_response_frame(
         &self,
-        writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+        writer: &Arc<tokio::sync::Mutex<Box<dyn pa_types::platform::transport::AsyncWriteHalf>>>,
         request_id: &str,
         response: &DaemonResponse,
     ) {

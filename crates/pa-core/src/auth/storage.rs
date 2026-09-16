@@ -18,16 +18,7 @@ pub trait AuthStorageBackend: Send + Sync {
     ) -> Result<()>;
 }
 
-struct LockGuard {
-    file: fs::File,
-}
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        use std::os::unix::io::AsRawFd;
-        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
-    }
-}
+use crate::platform::fs_lock::FileLock as LockGuard;
 
 pub struct FileAuthStorageBackend {
     auth_path: PathBuf,
@@ -44,8 +35,7 @@ impl FileAuthStorageBackend {
         if let Some(dir) = self.auth_path.parent() {
             if !dir.exists() {
                 fs::create_dir_all(dir)?;
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+                crate::platform::perms::restrict_dir(dir)?;
             }
         }
         Ok(())
@@ -54,13 +44,10 @@ impl FileAuthStorageBackend {
     /// Exclusive create: a racing initializer must never replace saved
     /// credentials.
     fn ensure_file_exists(&self) -> Result<()> {
-        use std::os::unix::fs::OpenOptionsExt;
-        match fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&self.auth_path)
-        {
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        crate::platform::perms::set_private_mode(&mut options);
+        match options.open(&self.auth_path) {
             Ok(mut file) => {
                 // The TS initializer writes exactly "{}".
                 use std::io::Write;
@@ -73,24 +60,18 @@ impl FileAuthStorageBackend {
     }
 
     fn acquire_lock(&self) -> Result<LockGuard> {
-        use std::os::unix::io::AsRawFd;
         let lock_path = PathBuf::from(format!("{}.lock", self.auth_path.display()));
         let mut last_error: Option<std::io::Error> = None;
         for _ in 1..=10 {
-            let file = fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(&lock_path)?;
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                return Ok(LockGuard { file });
-            }
-            if last_error.is_none() {
-                last_error = Some(
-                    file.metadata()
-                        .err()
-                        .unwrap_or_else(|| std::io::Error::other("lock busy")),
-                );
+            match LockGuard::acquire_exclusive_non_blocking(&lock_path) {
+                Ok(guard) => return Ok(guard),
+                // Only lock contention retries; open failures fail fast.
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if last_error.is_none() {
+                        last_error = Some(error);
+                    }
+                }
+                Err(error) => return Err(error.into()),
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
@@ -175,11 +156,9 @@ mod tests {
             })
             .unwrap();
         let path = dir.path().join("auth.json");
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        // Owner-only mode is a Unix guarantee; Windows inherits ACLs.
+        #[cfg(unix)]
+        assert_eq!(crate::platform::perms::file_mode(&path), Some(0o600));
         let data = parse_storage_data(Some(&fs::read_to_string(&path).unwrap())).unwrap();
         assert!(data.credential("prime-inference").is_some());
     }

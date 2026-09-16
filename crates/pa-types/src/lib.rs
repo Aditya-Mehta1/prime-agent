@@ -15,6 +15,7 @@
 
 pub mod ai;
 pub mod daemon;
+pub mod platform;
 pub mod session;
 
 use serde::{Deserialize, Serialize};

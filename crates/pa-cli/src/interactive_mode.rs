@@ -267,12 +267,8 @@ fn spawn_supervisor_detached(socket_path: &Path, spawn_cwd: &Path, exe: &Path) -
         .env_remove(pa_daemon::worker::WORKER_SOCKET_ENV)
         .env_remove(pa_daemon::worker::WORKER_INSTANCE_ID_ENV)
         .env_remove(pa_daemon::worker::WORKER_SCRIPT_ENV);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // Detached: own process group, reaped by init, survives this CLI.
-        command.process_group(0);
-    }
+    // Detached: own process group, reaped by init, survives this CLI.
+    pa_core::platform::process::set_new_process_group(&mut command);
     command
         .spawn()
         .with_context(|| format!("spawn the Prime Agent daemon on {}", socket_path.display()))?;

@@ -182,17 +182,6 @@ impl Inner {
     }
 }
 
-#[cfg(unix)]
 fn kill_process(pid: i32, signal: Signal) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    let sig = signal.as_libc();
-    unsafe { libc::kill(pid, sig) == 0 }
-}
-
-#[cfg(not(unix))]
-fn kill_process(pid: i32, signal: Signal) -> bool {
-    let _ = (pid, signal);
-    false
+    crate::platform::process::kill_pid(pid, signal)
 }

@@ -248,13 +248,10 @@ pub fn parse_supervisor_command_line(
     parse_daemon_command_line(line)
 }
 
-/// `proc:<start_time>` identity of a process, read from `/proc/<pid>/stat`
-/// (field 22). `None` when the platform has no procfs.
+/// `proc:<start_time>` identity of a process (shared platform contract).
+/// `None` when the platform has no procfs identity.
 pub fn process_start_id(pid: u32) -> Option<String> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let command_end = stat.rfind(')')?;
-    let start_time = stat[command_end + 2..].split(' ').nth(19)?;
-    (!start_time.is_empty()).then(|| format!("proc:{start_time}"))
+    pa_types::platform::process::process_start_id(pid)
 }
 
 /// Port of `createDaemonEventMeta`.
