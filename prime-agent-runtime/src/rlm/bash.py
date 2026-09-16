@@ -943,23 +943,36 @@ class BashHandle:
 # logs that models and users read later. Two shapes leak secrets that way: a
 # bare environment dump, and a read of a known secret file under the user's
 # home. Detection is one masked scan of the command text -- two
-# length-preserving mask passes and a segment split -- with no filesystem
-# access and no operand resolution, so an ordinary command pays for that scan
-# and nothing else.
+# length-preserving mask passes, a segment split, and a shell-faithful word
+# split -- with no filesystem access and no operand resolution, so an
+# ordinary command pays for that scan and nothing else.
 #
 # Exact rule set:
 #   * a command segment whose command word is `env` or `printenv` with nothing
 #     but flags after it (`env`, `env -0`, `printenv -i`), or `export` with a
-#     `-p` flag and no variable name, is a full-environment dump; the same
-#     dump piped into `grep` is the targeted read the refusal message
-#     suggests, so that one filtered form is allowed;
+#     `-p` flag and no variable name, is a full-environment dump. Leading
+#     `FOO=1` assignment words are stripped first (`FOO=1 env` is a bare dump
+#     in disguise), redirection words are dropped because they never narrow
+#     what is printed (`env 2>/dev/null` still reaches the transcript), and
+#     the command word is read the way the shell builds words, so `"env"` and
+#     other quoted spellings still count;
+#   * the same dump piped into `grep` for one fixed string is the targeted
+#     read the refusal message suggests, so that one filtered form is allowed;
+#     an inverted (`-v`) or file-supplied (`-f`) pattern, a context-widening
+#     flag (`-A`, `-B`, `-C`), more than one operand, or a pattern with regex
+#     metacharacters (`grep .`) is not provably a bounded filter, so it is
+#     refused;
 #   * a `cat`/`echo` segment naming `~/.ssh`, `~/.gnupg`, or
 #     `~/.aws/credentials`, in the `~` spelling (expands only unquoted) or the
-#     `$HOME`/`${HOME}` spelling (expands unquoted and inside double quotes),
-#     is a secret-file read.
+#     `$HOME`/`${HOME}` spelling (expands unquoted and inside double quotes,
+#     and matches with a closing double quote between the two: `cat
+#     "$HOME"/.ssh/id_rsa`), is a secret-file read.
 # Single-quoted spans and comments are literal data, so they are masked before
-# the scan (see _mask_literals). Deliberately not matched: a `.env`-class file
-# in the workspace, a directory listing, a one-variable read, quoted data, and
+# the scan (see _mask_literals). Quoted command words still run the command,
+# so the word split builds them the shell's way (see _shell_words); quoted
+# operands stay single words (`env 'foo&bar'` is an executor form, `"env -0"`
+# is not a command name). Deliberately not matched: a `.env`-class file in
+# the workspace, a directory listing, a one-variable read, quoted data, and
 # every other command the patterns do not name. `env -u FOO` and `env FOO=1`
 # with no command word dump the environment too, but telling them apart from
 # the executor forms (`env -u FOO cmd`, `env FOO=1 cmd`) needs flag-arity
@@ -988,7 +1001,9 @@ class SecretEchoRefusalError(RuntimeError):
 # trailing lookahead keeps a longer name (`.sshfoo`) from matching.
 _SECRET_HOME_PATH = r"/(?:\.ssh|\.gnupg)(?![\w.-])|/\.aws/credentials(?![\w.-])"
 _TILDE_SECRET_PATH_RE = re.compile(r"~(?:" + _SECRET_HOME_PATH + r")")
-_HOME_VAR_SECRET_PATH_RE = re.compile(r"\$\{?HOME\}?(?:" + _SECRET_HOME_PATH + r")")
+# A double-quoted `$HOME` may close its quote before the path
+# (`cat "$HOME"/.ssh/id_rsa`), so one optional `"` may sit between the two.
+_HOME_VAR_SECRET_PATH_RE = re.compile(r"\$\{?HOME\}?\"?(?:" + _SECRET_HOME_PATH + r")")
 
 # Characters that end one command segment and start the next.
 _SEGMENT_SEPARATORS = ";|&()\n"
@@ -1001,6 +1016,36 @@ _SECRET_READ_COMMANDS = ("cat", "echo")
 
 # The pipe target that turns a bare dump into a targeted read.
 _TARGETED_READ_COMMAND = "grep"
+
+# POSIX `FOO=1` prefix words: the shell runs the rest of the command with
+# those variables bound, so `FOO=1 env` is a bare dump in disguise.
+_ASSIGNMENT_WORD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+# Redirection words: they change where output goes, never what is printed, so
+# they are dropped before the bare-dump check. The optional digits name the
+# redirected descriptor (`2>`), and `&>>`/`>&`/`&>` cover the both-stream
+# spellings.
+_REDIRECT_WORD_RE = re.compile(r"^(\d*)(&>>|>&|>>|<<|<>|<|>|&>)")
+
+# A grep pattern containing any of these is a regex, and a regex is not
+# provably a bounded filter (`grep .` passes every line).
+_GREP_PATTERN_METACHARS = set(".*[](){}^$\\|?+")
+
+# Short grep flag letters that make the output unbounded: `-v` inverts the
+# filter, `-f` loads patterns from a file, and `-A`/`-B`/`-C` widen every
+# match with context lines. Case matters: `-F` (fixed strings), `-V`
+# (version), and `-a`/`-b`/`-c` (text/byte-offset/count) stay bounded.
+_GREP_UNBOUNDED_FLAG_LETTERS = "vfABC"
+
+# Long grep flags with the same problem: inversion, patterns from a file,
+# and context lines around every match.
+_GREP_UNBOUNDED_FLAG_PREFIXES = (
+    "--invert",
+    "--file",
+    "--after-context",
+    "--before-context",
+    "--context",
+)
 
 
 def _mask_literals(command: str, *, double_quotes: bool) -> str:
@@ -1042,16 +1087,105 @@ def _command_segments(masked: str) -> list[tuple[int, int, str]]:
     Segments split on unquoted `;`, `&`, `|`, `(`, `)`, and newlines, so the
     scan never reads the command word of one segment together with an operand
     from another. The separating character is returned so the caller can tell
-    a bare dump piped into grep from a bare dump.
+    a bare dump piped into grep from a bare dump. An `&` glued to a `>` is a
+    redirect spelling (`2>&1`, `>&2`, `&>`), not a background operator, so it
+    does not split: `env 2>&1 | grep PATH` stays one dump piped into grep.
     """
     segments: list[tuple[int, int, str]] = []
     start = 0
     for index, char in enumerate(masked):
-        if char in _SEGMENT_SEPARATORS:
+        is_redirect_amp = char == "&" and (
+            (index > 0 and masked[index - 1] == ">")
+            or (index + 1 < len(masked) and masked[index + 1] == ">")
+        )
+        if char in _SEGMENT_SEPARATORS and not is_redirect_amp:
             segments.append((start, index, char))
             start = index + 1
     segments.append((start, len(masked), ""))
     return segments
+
+
+def _shell_words(command: str, start: int, end: int) -> list[str]:
+    """Split command[start:end] into words the way the shell builds them.
+
+    Whitespace separates words only outside quotes, quotes are removed from
+    the words they build (`"env"` runs env, `ca"t"` runs cat), and a backslash
+    makes the next character a literal part of the word. A `#` at a word
+    boundary starts a comment that runs to end of line -- a segment never
+    contains a newline, so the rest of the slice is comment. An unbalanced
+    quote ends at the segment end, and a quoted span still emits a word even
+    when it is empty (`grep ''` keeps its empty pattern word).
+    """
+    words: list[str] = []
+    chars: list[str] = []
+    in_word = False
+    quote = ""
+    index = start
+    while index < end:
+        char = command[index]
+        if quote == "'":
+            # Everything inside single quotes is literal.
+            if char == "'":
+                quote = ""
+            else:
+                chars.append(char)
+        elif quote == '"':
+            if char == '"':
+                quote = ""
+            elif char == "\\" and index + 1 < end:
+                index += 1
+                chars.append(command[index])
+            else:
+                chars.append(char)
+        elif char in " \t\n":
+            if in_word:
+                words.append("".join(chars))
+                chars = []
+                in_word = False
+        elif char == "#" and not in_word:
+            break
+        else:
+            in_word = True
+            if char == "'":
+                quote = "'"
+            elif char == '"':
+                quote = '"'
+            elif char == "\\" and index + 1 < end:
+                # A backslash always makes the next character a literal part
+                # of the word, quoted or not.
+                index += 1
+                chars.append(command[index])
+            else:
+                chars.append(char)
+        index += 1
+    if in_word:
+        words.append("".join(chars))
+    return words
+
+
+def _analysis_words(command: str, start: int, end: int) -> list[str]:
+    """Shell words for one segment, minus the words that narrow nothing.
+
+    Redirection words are dropped first: a bare operator (`2>` left over by
+    the `&` split of `2>&1`, or a lone `>`) also swallows its target word,
+    while a glued form (`2>/dev/null`) carries the target inside the word.
+    Leading `FOO=1` assignment words go next, because the shell runs the rest
+    of the command either way.
+    """
+    words: list[str] = []
+    skip_target = False
+    for word in _shell_words(command, start, end):
+        if skip_target:
+            skip_target = False
+            continue
+        match = _REDIRECT_WORD_RE.match(word)
+        if match:
+            skip_target = match.group(0) == word
+            continue
+        words.append(word)
+    while words and _ASSIGNMENT_WORD_RE.match(words[0]):
+        words.pop(0)
+    return words
 
 
 def _is_bare_dump(words: list[str]) -> bool:
@@ -1069,6 +1203,34 @@ def _is_bare_dump(words: list[str]) -> bool:
     return False
 
 
+def _is_bounded_grep_filter(words: list[str]) -> bool:
+    """Whether these words grep for exactly one fixed string.
+
+    Only a `grep` whose single pattern is a plain string filters a dump down
+    to one named key. `-v` inverts the filter (nearly the whole dump), `-f`
+    takes the patterns from a file, `-A`/`-B`/`-C` widen every match with
+    context lines, and a pattern with regex metacharacters can match every
+    line (`grep .`); a string-only scan cannot prove anything narrower about
+    those shapes, so they stay refused.
+    """
+    if not words or words[0] != _TARGETED_READ_COMMAND:
+        return False
+    operands: list[str] = []
+    for word in words[1:]:
+        if word.startswith("-"):
+            if word.startswith("--"):
+                # A lone `--` ends the options; the rest is a long flag.
+                if word.startswith(_GREP_UNBOUNDED_FLAG_PREFIXES):
+                    return False
+            elif any(char in _GREP_UNBOUNDED_FLAG_LETTERS for char in word[1:]):
+                return False
+            continue
+        operands.append(word)
+    if len(operands) != 1 or not operands[0]:
+        return False
+    return not any(char in _GREP_PATTERN_METACHARS for char in operands[0])
+
+
 def _secret_echo_violation(command: str) -> str | None:
     """Why `command` would echo secrets into the transcript, or None.
 
@@ -1079,7 +1241,7 @@ def _secret_echo_violation(command: str) -> str | None:
     expanded = _mask_literals(command, double_quotes=False)
     segments = _command_segments(literal)
     for index, (start, end, separator) in enumerate(segments):
-        words = literal[start:end].split()
+        words = _analysis_words(command, start, end)
         if not words:
             continue
         if _is_bare_dump(words):
@@ -1087,8 +1249,8 @@ def _secret_echo_violation(command: str) -> str | None:
             # suggests, so that one filtered form stays allowed.
             if separator == "|" and index + 1 < len(segments):
                 next_start, next_end, _next_separator = segments[index + 1]
-                follower = literal[next_start:next_end].split()
-                if follower[:1] == [_TARGETED_READ_COMMAND]:
+                follower = _analysis_words(command, next_start, next_end)
+                if _is_bounded_grep_filter(follower):
                     continue
             return "the full environment"
         if words[0] in _SECRET_READ_COMMANDS and (
@@ -1173,15 +1335,18 @@ def bash(command: str, *, allow_secret_echo: bool = False) -> BashHandle:
     Commands that echo secrets into the transcript are refused before any
     process starts, because that output persists in session logs that models
     and users read later: a bare environment dump (`env`, `printenv`,
-    `export -p`, and flags-only forms such as `env -0`), or a `cat`/`echo`
-    of a known secret file under the home directory (`~/.ssh`, `~/.gnupg`,
-    `~/.aws/credentials`, written with either the `~` or the `$HOME`
-    spelling). Read one value instead
-    (`printenv SAFE_VAR`), filter a dump through a grep for the key you need
-    (`env | grep SAFE_VAR`), and retry with allow_secret_echo=True (or start
-    the kernel with PI_BASH_ALLOW_SECRET_ECHO=1) only when the full output is
-    intentional; the env var is read once at kernel start, so writing it
-    mid-session never unlocks the guard.
+    `export -p`, and flags-only forms such as `env -0`, with leading `FOO=1`
+    assignments stripped, redirections such as `2>/dev/null` ignored, and
+    quoted command words such as `"env"` read the shell's way), or a
+    `cat`/`echo` of a known secret file under the home directory (`~/.ssh`,
+    `~/.gnupg`, `~/.aws/credentials`, written with either the `~` or the
+    `$HOME` spelling, which also matches when a closing double quote sits
+    between `$HOME` and the path). Read one value instead
+    (`printenv SAFE_VAR`), filter a dump through a grep for the single fixed
+    key you need (`env | grep SAFE_VAR`), and retry with allow_secret_echo=True
+    (or start the kernel with PI_BASH_ALLOW_SECRET_ECHO=1) only when the full
+    output is intentional; the env var is read once at kernel start, so
+    writing it mid-session never unlocks the guard.
     """
     if not isinstance(command, str) or not command:
         raise TypeError("command must be a non-empty str")

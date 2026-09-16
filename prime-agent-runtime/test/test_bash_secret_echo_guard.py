@@ -49,6 +49,38 @@ SECRET_ECHO_MATCHING_COMMANDS = [
     "cat $HOME/.aws/credentials",
     "cat ~/.gnupg/secring.gpg",
     "echo ~/.gnupg/secring.gpg",
+    # Assignment prefixes: the shell runs the dump with those bindings set.
+    "FOO=1 env",
+    "FOO=1 printenv",
+    "FOO=1 export -p",
+    "AWS_PROFILE=prod cat ~/.aws/credentials",
+    "FOO='bar baz' env",
+    # Redirections never narrow what the command prints.
+    "env 2>/dev/null",
+    "env 2> /dev/null",
+    "export -p 2>&1",
+    "env 1>&2",
+    "env > /tmp/env.txt",
+    "2> /dev/null env",
+    # Quoted command words and concatenations still run the command.
+    '"env"',
+    '"cat" ~/.ssh/id_rsa',
+    'ca"t" ~/.ssh/id_rsa',
+    # $HOME glued to the path across a closing double quote still reads it.
+    'cat "$HOME"/.ssh/id_rsa',
+    'cat $HOME"/.ssh/id_rsa"',
+    # A dump piped into an unbounded filter is still a dump.
+    "env | grep .",
+    "env | grep -v SAFE_VAR",
+    "env | grep ''",
+    "env | grep ^AWS_",
+    # Context flags widen every match with surrounding lines.
+    "env | grep -A5 SAFE_VAR",
+    "env | grep -B5 SAFE_VAR",
+    "env | grep -C5 SAFE_VAR",
+    "env | grep --after-context=5 SAFE_VAR",
+    # A `2>&1` redirect is part of the dump word, not a background operator.
+    "env 2>&1",
 ]
 
 SECRET_ECHO_NON_MATCHING_COMMANDS = [
@@ -87,6 +119,22 @@ SECRET_ECHO_NON_MATCHING_COMMANDS = [
     "echo $HOME",
     "git status",
     "npm run check",
+    # A quoted operand stays one word, so these are executor forms that fail
+    # to find a command, not dumps.
+    "env 'foo&bar'",
+    'echo "a & env"',
+    '"env -0"',
+    # A dump filtered by a fixed-string single-key grep stays bounded:
+    # `-F` matches `--fixed-strings`, `-i`/`-a`/`-b`/`-c` stay bounded, and a
+    # `2>&1` redirect before the pipe does not split the dump from its filter.
+    "env | grep -e SAFE_VAR",
+    "env | grep -- SAFE_VAR",
+    "env 2>/dev/null | grep PATH",
+    "env | grep -F SAFE_VAR",
+    "env | grep -i PATH",
+    "env | grep -a PATH",
+    "env 2>&1 | grep PATH",
+    "printenv 2>&1 | grep SAFE_VAR",
 ]
 
 
@@ -201,6 +249,42 @@ class SecretEchoGuardTest(unittest.IsolatedAsyncioTestCase):
     async def test_chained_dump_refused(self):
         message = self._refused("echo hi && env")
         self.assertIn("the full environment", message)
+
+    async def test_assignment_prefix_dump_refused(self):
+        # The shell runs `FOO=1 env` as a bare dump, so the guard reads the
+        # command word after the assignment and refuses before any spawn.
+        with mock.patch.object(
+            bash_module, "BashHandle", side_effect=AssertionError("spawned")
+        ):
+            message = self._refused("FOO=1 env")
+        self.assertIn("the full environment", message)
+
+    async def test_redirected_dump_refused(self):
+        # A redirection never narrows what reaches the transcript, so it is
+        # dropped before the bare-dump check.
+        with mock.patch.object(
+            bash_module, "BashHandle", side_effect=AssertionError("spawned")
+        ):
+            message = self._refused("env 2>/dev/null")
+        self.assertIn("the full environment", message)
+
+    async def test_unbounded_grep_filter_refused(self):
+        # `grep .` matches every line, so the follower filters nothing and
+        # the dump stays a dump.
+        with mock.patch.object(
+            bash_module, "BashHandle", side_effect=AssertionError("spawned")
+        ):
+            message = self._refused("env | grep .")
+        self.assertIn("the full environment", message)
+
+    async def test_redirected_dump_with_bounded_filter_allowed(self):
+        # The redirected dump piped through a bounded grep is the documented
+        # targeted read and must still run.
+        result = await self._run("env 2>/dev/null | grep PATH")
+        self.assertEqual(result.exit_code, 0)
+        lines = [line for line in result.output.splitlines() if line]
+        self.assertTrue(lines, result.output)
+        self.assertTrue(all("PATH" in line for line in lines), result.output)
 
     async def test_dotenv_read_allowed(self):
         Path(self.test_dir, ".env").write_text("SAFE_VAR=1\n")
