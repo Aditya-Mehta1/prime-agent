@@ -9168,6 +9168,14 @@ export class AgentSession {
 		} catch {
 			// Unpersisted session: context-only injection.
 		}
+		// The fresh digest is authoritative and older in-context copies are
+		// regenerable redundancy, so the append replaces them instead of stacking.
+		const withoutOlderDigests = this.agent.state.messages.filter(
+			(existing) => !(existing.role === "custom" && existing.customType === HARNESS_DIGEST_CUSTOM_TYPE),
+		);
+		if (withoutOlderDigests.length !== this.agent.state.messages.length) {
+			this.agent.state.messages = withoutOlderDigests;
+		}
 		this.agent.state.messages.push(message);
 	}
 
