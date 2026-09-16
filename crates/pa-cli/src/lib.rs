@@ -18,6 +18,8 @@ pub(crate) mod public_command;
 /// The runtime boundary: everything a mode-runner crate implements to plug
 /// into the `prime-agent` binary, plus the entry point that drives it.
 pub use mode::{AppMode, MissingSubsystem, RunOptions, Runtime, UnavailableRuntime};
+pub mod print_runtime;
+pub use print_runtime::PrintRuntime;
 
 /// Entry point shared by the binary and the integration tests. Returns the
 /// process exit code.

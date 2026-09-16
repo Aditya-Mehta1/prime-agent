@@ -1221,9 +1221,13 @@ name = "pa-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "pa-agent",
+ "pa-ai",
+ "pa-core",
  "pa-types",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
