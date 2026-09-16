@@ -4,7 +4,8 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { relative, resolve } from "node:path";
 
 const root = resolve(import.meta.dirname, "..");
-const testFilePattern = /(?:^|\/)(?:test|tests|__tests__)(?:\/|$)|\.(?:test|spec)\.[cm]?[jt]sx?$/;
+const testFilePattern =
+	/(?:^|\/)(?:test|tests|__tests__)(?:\/|$)|\.(?:test|spec)\.[cm]?[jt]sx?$|^prime-agent-runtime\/test\/.*\.py$/;
 
 function git(args, allowFailure = false) {
 	try {
@@ -44,9 +45,10 @@ function walkFiles(dir, out = []) {
 }
 
 function changedTestFiles(base) {
-	if (!base) return walkFiles(resolve(root, "packages"));
-	const tracked = git(["diff", "--name-only", "--diff-filter=ACMR", base, "--", "packages", "scripts"]);
-	const untracked = git(["ls-files", "--others", "--exclude-standard", "--", "packages", "scripts"], true);
+	if (!base) return [...walkFiles(resolve(root, "packages")), ...walkFiles(resolve(root, "prime-agent-runtime", "test"))];
+	const roots = ["packages", "prime-agent-runtime/test", "scripts"];
+	const tracked = git(["diff", "--name-only", "--diff-filter=ACMR", base, "--", ...roots]);
+	const untracked = git(["ls-files", "--others", "--exclude-standard", "--", ...roots], true);
 	return [...new Set(`${tracked}\n${untracked}`.split("\n"))].filter(
 		(path) => path && testFilePattern.test(path) && existsSync(resolve(root, path)),
 	);
@@ -58,7 +60,7 @@ function scan(content) {
 	let title = "<module>";
 	const add = (category, line, detail, explicitTitle = title) => {
 		const previous = lines[line - 2]?.trim() ?? "";
-		const suppression = previous.match(/^\/\/ test-policy: allow ([a-z-]+) -- (.+)$/);
+		const suppression = previous.match(/^(?:\/\/|#) test-policy: allow ([a-z-]+) -- (.+)$/);
 		if (suppression?.[1] === category && suppression[2].trim().length >= 12) return;
 		violations.push({ category, detail, identity: `${category}\0${explicitTitle}\0${detail}`, line, title: explicitTitle });
 	};
@@ -66,13 +68,26 @@ function scan(content) {
 	for (let index = 0; index < lines.length; index += 1) {
 		const line = lines[index];
 		const titleMatch = line.match(/\b(?:it|test)(?:\.[A-Za-z]+|\([^)]*\))*\(\s*["'`]([^"'`]+)/);
+		const pythonTitleMatch = line.match(/^\s*(?:async\s+)?def\s+(test_[A-Za-z0-9_]+)/);
 		if (titleMatch) title = titleMatch[1];
-		const modifier = line.match(/\b(?:it|test|describe|suite)\.(skipIf|runIf|skip|todo|only)\b|\b(xit|xtest|xdescribe)\s*\(/);
+		else if (pythonTitleMatch) title = pythonTitleMatch[1];
+		const modifier = line.match(
+			/\b(?:it|test|describe|suite)(?:\.[A-Za-z]+|\([^)]*\))*\.(skipIf|runIf|skip|todo|only)\b|\b(xit|xtest|xdescribe)\s*\(/,
+		);
 		if (modifier) {
 			const callStart = lines.slice(index, index + 4).join(" ");
 			const ownTitle = callStart.match(/["'`]([^"'`]+)["'`]/)?.[1] ?? title;
 			add("conditional-or-disabled-test", index + 1, `.${modifier[1] ?? modifier[2]}`, ownTitle);
 		}
+		const pythonModifier = line.match(/@(?:unittest\.)?(skipIf|skipUnless|skip)\b|@pytest\.mark\.(skipif|skip)\b/);
+		const pythonDecoratorTitle =
+			lines
+				.slice(index, index + 4)
+				.join(" ")
+				.match(/\bdef\s+(test_[A-Za-z0-9_]+)/)?.[1] ?? title;
+		if (pythonModifier) add("conditional-or-disabled-test", index + 1, pythonModifier[0], pythonDecoratorTitle);
+		if (/@pytest\.mark\.(?:flaky|repeat)\b/.test(line)) add("test-retry", index + 1, line.trim(), pythonDecoratorTitle);
+		if (/@pytest\.mark\.timeout\b/.test(line)) add("explicit-test-timeout", index + 1, "pytest timeout marker", pythonDecoratorTitle);
 		if (/\b(?:it|test)(?:\.[A-Za-z]+(?:\([^)]*\))?)*\s*\([^\n]{0,240}\bretry\s*:/.test(line)) {
 			add("test-retry", index + 1, "retry option");
 		}
@@ -83,9 +98,14 @@ function scan(content) {
 		if (/\b(?:setTimeout|setInterval)\s*\(/.test(line)) add("wall-clock-timer", index + 1, "setTimeout/setInterval");
 		if (/\bAtomics\.wait\s*\(/.test(line)) add("wall-clock-timer", index + 1, "Atomics.wait");
 		if (/\.(?:listen|bind)\s*\(\s*[1-9][0-9_]*\b/.test(line)) add("fixed-resource", index + 1, "fixed bind/listen port");
-		if (/\bif\s*\([^)]*(?:process\.env|apiKey|credential|token|process\.platform)/i.test(line) && /\b(?:return|continue)\b/.test(line)) {
+		const controlWindow = lines.slice(index, index + 4).join(" ");
+		if (
+			/\bif\s*\([^)]*(?:process\.env|apiKey|credential|token|process\.platform|os\.(?:environ|getenv)|sys\.platform)/i.test(line) &&
+			/\b(?:return|continue)\b/.test(controlWindow)
+		) {
 			add("environment-gated-path", index + 1, "conditional early exit");
 		}
+		if (/\b[A-Za-z_$][\w$.[\]]*\s*&&\s*expect\s*\(/.test(line)) add("optional-assertion", index + 1, "short-circuited assertion");
 		if (/\bexpect\s*\(\s*(?:true|false|[-+]?\d+(?:\.\d+)?|["'][^"']*["'])\s*\)/.test(line)) {
 			add("vacuous-assertion", index + 1, "literal expect");
 		}
