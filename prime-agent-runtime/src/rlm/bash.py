@@ -2061,14 +2061,20 @@ def _fp_is_unmodeled_wrapper(value: str) -> bool:
     return _fp_command_name(value) in _FP_UNMODELED_WRAPPERS
 
 
+_FP_ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
 def _fp_unresolvable_command_words(
     words: list[_FpShellWord], command: str
 ) -> set[int]:
     """Indices of command words the guard cannot resolve.
 
-    A command word is the first word of a run that is not an env assignment and
-    not a modeled wrapper (`GIT_DIR=... git push`), so the index points at what
-    the shell would really run."""
+    A command word is what the shell would run: the first word of a run that is
+    neither an env-assignment prefix nor a modeled wrapper. A prefix is skipped
+    (`X=$Y git push -f origin feature` runs git, and the rest of the guard
+    already treats such prefixes as benign: relocation, force, and target rules
+    still apply to the visible git word), while a command word the guard cannot
+    resolve -- an expansion or an unquoted brace expansion -- is recorded."""
     found: set[int] = set()
     index = 0
     total = len(words)
@@ -2077,13 +2083,24 @@ def _fp_unresolvable_command_words(
         if not word.starts_command or _fp_contained_in_later_word(words, index):
             index += 1
             continue
-        unquoted = _fp_unquoted_text(command[word.start : word.end])
+        probe = index
+        while probe < total and _FP_ENV_ASSIGNMENT.match(words[probe].value):
+            if _fp_contained_in_later_word(words, probe):
+                break
+            probe += 1
+        if probe >= total or (probe != index and words[probe].starts_command):
+            # The prefix had no command of its own (`X=1; git ...`): the next
+            # run is handled on its own.
+            index += 1
+            continue
+        candidate = words[probe]
+        unquoted = _fp_unquoted_text(command[candidate.start : candidate.end])
         if (
             _FP_DYNAMIC_COMMAND_WORD.search(unquoted)
             or _FP_BRACE_EXPANSION.search(unquoted)
             or _fp_is_unmodeled_wrapper(unquoted.strip())
         ):
-            found.add(index)
+            found.add(probe)
         index += 1
     return found
 
@@ -2144,15 +2161,9 @@ def _fp_unresolvable_command_word_hides_force_push(
     `--mirror`) the run is refused. The same word with no push pattern next to
     it stays inert: `$HOME/bin/tool args`, `$(which x) --version`,
     `cp {a,b}.txt /tmp`, and `ls '*.{ts,tsx}'` (quoted braces are data)."""
-    for index, word in enumerate(words):
-        if not word.starts_command or _fp_contained_in_later_word(words, index):
-            continue  # a substitution interior is not the command word
-        unquoted = _fp_unquoted_text(command[word.start : word.end])
-        if not (
-            _FP_DYNAMIC_COMMAND_WORD.search(unquoted)
-            or _FP_BRACE_EXPANSION.search(unquoted)
-        ):
-            continue
+    for index in sorted(_fp_unresolvable_command_words(words, command)):
+        if _fp_is_unmodeled_wrapper(words[index].value):
+            continue  # the family rule covers wrappers with P anywhere
         tokens = _fp_invocation_tokens(words, index)
         for push_index, token in enumerate(tokens[1:], start=1):
             if token != "push":

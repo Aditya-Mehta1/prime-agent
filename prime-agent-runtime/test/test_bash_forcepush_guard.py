@@ -1536,6 +1536,8 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         # main` is a git force push, but the word scans as the substitution.
         for command in [
             "$(printf git) push -f origin main",
+            "$(which git) push -f origin main",
+            "c='git push -f origin main'; X=1 $c",
             "{git,-c} user.email=x push -f origin main",
             "{git,-c,user.name=z} push -f origin main",
         ]:
@@ -1552,6 +1554,11 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
             "ls '*.{ts,tsx}'",
             "cp {a,b}.txt /tmp",
             "{ echo hi; } && git push origin feature",
+            # An env-assignment prefix is not the command word, so the visible
+            # git word decides and these run.
+            "X=$Y git push -f origin feature",
+            "GIT_TRACE=$DEBUG git push -f origin feature",
+            "X=1 git push -f origin feature",
         ]:
             with self.subTest(command=command):
                 self.assertIsNone(self._guard_verdict(command))
