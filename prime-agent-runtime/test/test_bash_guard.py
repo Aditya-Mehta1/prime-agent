@@ -147,6 +147,11 @@ class ChmodEvalPayloadDetectionTest(unittest.TestCase):
             'eval \'bash -c "chmod -R 755 ~"\'',
             'eval \'bash -c "chown -R user ~"\'',
             "eval $'chmod -R 755 ~'",
+            # Quote- and ANSI-C-encoded wrapper names still fold to the
+            # wrapper word, so their payloads must be inspected too.
+            'e"val" \'chmod -R 755 ~\'',
+            'ev"al" \'chmod -R 755 ~\'',
+            "$'eval' 'chmod -R 755 ~'",
         ]:
             with self.subTest(command=command):
                 self.assertTrue(
@@ -190,6 +195,8 @@ class ShellCPayloadDetectionTest(unittest.TestCase):
             "bash -c '$cmd -R 755 ~'",
             "bash -c 'BASH_ENV=/tmp/x echo hi'",
             'bash -c \'bash <(printf "chmod -R 755 ~")\'',
+            'b"ash" -c \'chmod -R 755 ~\'',
+            "$'bash' -c 'chmod -R 755 ~'",
         ]:
             with self.subTest(command=command):
                 self.assertTrue(
@@ -745,6 +752,184 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         result = await self._run("chmod --ref 755 sub || true")
         self.assertEqual(result.exit_code, 0)
         self.assertNotEqual(result.output.strip(), "")
+
+    async def test_refuses_encoded_wrapper_names(self):
+        self._make_tree()
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        # Quote- and ANSI-C-encoded wrapper names fold to the wrapper word
+        # in the scan, so their quoted payloads must be inspected even
+        # though no contiguous `eval`/`bash` text appears.
+        for command in [
+            'e"val" \'chmod -R 755 ~\'',
+            'ev"al" \'chmod -R 755 ~\'',
+            "$'eval' 'chmod -R 755 ~'",
+            'b"ash" -c \'chmod -R 755 ~\'',
+            "$'bash' -c 'chmod -R 755 ~'",
+            'b"ash" -c \'chown -R user ~\'',
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command, home=home.name)
+                self.assertIn("Refusing to run this recursive chmod/chown command", message)
+                self.assertTrue(Path(home.name, "keep.txt").exists())
+        # Encoded wrappers with harmless payloads stay fine.
+        result = await self._run('e"val" \'echo hi\'')
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("hi", result.output)
+
+    async def test_refuses_glob_and_brace_command_names(self):
+        self._make_tree()
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        # Pathname and brace expansion can turn an unrecognized command word
+        # into chmod/chown, so expandable command words are unresolvable and
+        # refused with a recursive flag in the run.
+        for command in [
+            "/usr/bin/chmo? -R 755 ~",
+            "{ch,}mod -R 755 ~",
+            "chmo[d] -R 755 ~",
+            "{chown,other} -R user ~",
+            "ch*mod -R 755 ~",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command, home=home.name)
+                self.assertIn("command name cannot be determined", message)
+                self.assertTrue(Path(home.name, "keep.txt").exists())
+        # Glob characters stay data outside command position.
+        result = await self._run("ls *.txt || true")
+        self.assertEqual(result.exit_code, 0)
+        result = await self._run("echo * -R || true")
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_refuses_heredoc_quote_hiding(self):
+        self._make_tree()
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        # A here-document body is data: an unmatched quote in it must not
+        # corrupt the scanner and hide a later real command, so the body is
+        # masked through its terminator before scanning shell syntax.
+        for command in [
+            "cat <<EOF\n'\nEOF\nchmod -R 755 ~",
+            'cat <<"EOF"\nx"\nEOF\nchmod -R 755 ~',
+            "cat <<'EOF'\n'\nEOF\nchmod -R 755 ~",
+            "cat <<-EOF\n\t'\n\tEOF\nchmod -R 755 ~",
+            "cat 2<<EOF\n'\nEOF\nchmod -R 755 ~",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command, home=home.name)
+                self.assertIn("Refusing to run this recursive chmod/chown command", message)
+                self.assertTrue(Path(home.name, "keep.txt").exists())
+        # Heredoc bodies that are plain data for their reader stay allowed.
+        result = await self._run("cat <<EOF\nchmod -R 755 ~\nEOF")
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("chmod -R 755 ~", result.output)
+
+    async def test_refuses_function_and_alias_indirection(self):
+        self._make_tree()
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        # A function forwards its call arguments into the definition, and
+        # an alias body is shell code: both can carry a recursive chmod the
+        # plain scan splits across definition and call, so the combination
+        # is refused.
+        for command in [
+            'f() { chmod "$@"; }; f -R 755 ~',
+            'function f { chmod "$@"; }; f -R 755 ~',
+            'alias x=\'chmod -R 755 ~\'; x',
+            'alias x=\'chmod -R 755 ~\'',
+            'alias x="chown -R user ~"; x',
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command, home=home.name)
+                self.assertIn("Refusing to run this recursive chmod/chown command", message)
+                self.assertTrue(Path(home.name, "keep.txt").exists())
+        # Definitions without a recursive chmod pattern stay fine.
+        result = await self._run('f() { echo hi; }; f')
+        self.assertEqual(result.exit_code, 0)
+        result = await self._run("alias ll='ls -la'")
+        self.assertEqual(result.exit_code, 0)
+        result = await self._run('f() { chmod 755 sub; }; f')
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_refuses_flagged_procsub_and_pipe_fed_wrappers(self):
+        self._make_tree()
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        # Wrapper options between the wrapper and the process substitution
+        # still end in the substitution's output as the wrapper's script,
+        # and a bare shell wrapper fed by a pipe runs the piped text as
+        # shell code: both are refused.
+        for command in [
+            "bash -- <(printf 'chmod -R 755 ~\\n')",
+            "bash -x <(printf 'chmod -R 755 ~\\n')",
+            "sh -- <(printf 'chmod -R 755 ~\\n')",
+            "bash < <(printf 'chmod -R 755 ~\\n')",
+            "bash <<< \"$(printf 'chmod -R 755 ~')\"",
+            "printf 'chmod -R 755 ~' | bash",
+            "printf 'chmod -R 755 ~' | sh",
+            "printf 'chmod -R 755 ~' | bash -s",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command, home=home.name)
+                self.assertIn("cannot be scanned statically", message)
+                self.assertTrue(Path(home.name, "keep.txt").exists())
+        # Wrappers governed by a -c payload or a script argument, and pipes
+        # into non-wrappers, stay fine.
+        result = await self._run("printf x | bash -c 'echo hi'")
+        self.assertEqual(result.exit_code, 0)
+        result = await self._run("printf hi | tee log.txt")
+        self.assertEqual(result.exit_code, 0)
+        result = await self._run("cat <(echo hi)")
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_refuses_cdpath_dot_named_targets(self):
+        self._make_tree()
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        Path(outside.name, ".config").mkdir()
+        Path(outside.name, ".config", "file.txt").write_text("keep\n")
+        with mock.patch.dict(os.environ, {"CDPATH": outside.name}):
+            # bash searches CDPATH before the current directory for any
+            # relative target whose first component is not `.` or `..`,
+            # so dot-named targets like `.config` are refused, not exempt.
+            message = await self._refused("cd .config && chmod -R 755 .")
+        self.assertIn("changes directory", message)
+        self.assertTrue(Path(outside.name, ".config", "file.txt").exists())
+        with mock.patch.dict(os.environ, {"CDPATH": outside.name}):
+            message = await self._refused("cd .config/../. && chmod -R 755 .")
+        self.assertIn("changes directory", message)
+        # Only `.`/`..` and `./`/`../`-prefixed targets are exempt: they
+        # never consult CDPATH (verified against bash).
+        with mock.patch.dict(os.environ, {"CDPATH": outside.name}):
+            result = await self._run("cd ./sub && chmod -R 755 .")
+            self.assertEqual(result.exit_code, 0)
+            result = await self._run("cd .. && echo ok")
+            self.assertEqual(result.exit_code, 0)
+
+    async def test_argument_position_chmod_words_stay_guarded(self):
+        # Deliberate fail-closed design: any word that scans as chmod/chown
+        # starts operand checking, because executors present the command in
+        # argument position (`sudo chmod`, `xargs chmod`, `find -exec chmod`,
+        # `FOO=1 chmod`, and unknown executors like `busybox chmod`). The
+        # accepted tradeoff: commands that merely print such text are
+        # refused with the documented bypass instead of being allowed.
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        for command in [
+            "sudo chmod -R 755 ~",
+            "busybox chmod -R 755 ~",
+            "printf '%s\\n' chmod -R ~",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command, home=home.name)
+                self.assertIn("Refusing to run this recursive chmod/chown command", message)
+                self.assertTrue(Path(home.name, "keep.txt").exists())
 
     async def test_xargs_false_positives_stay_allowed(self):
         # The xargs walk must stop at the command word: an operand named
