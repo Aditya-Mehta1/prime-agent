@@ -675,6 +675,33 @@ describe("worker pid attribution and anomalies", () => {
 		]);
 	});
 
+	it("classifies worker events for Windows named-pipe socket paths", () => {
+		const socketPath = "\\\\.\\pipe\\prime-agent-worker-98ed5cb228d2-5b1d3aeb91ee";
+		const entries = [
+			entry(
+				agentLogLine({
+					ts: "2026-09-10T20:00:00.000Z",
+					component: "coding-agent.daemon",
+					socketPath,
+					pid: 53615,
+					msg: `Prime Agent daemon listening on ${socketPath}`,
+				}),
+			),
+			entry(
+				agentLogLine({
+					ts: "2026-09-10T20:23:24.945Z",
+					component: "coding-agent.daemon",
+					socketPath,
+					pid: 53615,
+					msg: "uncaught exception: Error: write EPIPE",
+				}),
+			),
+		];
+		const events = collectIncidentEvents(entries, collectWorkerPidMap(entries));
+		expect(events.map((item) => item.eventClass)).toEqual(["worker-start", "worker-crash"]);
+		expect(events.every((item) => item.subject === "worker 5b1d3aeb91ee")).toBe(true);
+	});
+
 	it("flags error bursts that are not timeouts", () => {
 		const entries = [1, 2, 3].map((index) =>
 			entry(

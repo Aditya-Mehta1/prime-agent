@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import chalk from "chalk";
 import { getAgentLogPath, getLogsDir } from "../config.js";
 
@@ -79,7 +79,7 @@ const ERROR_BURST_THRESHOLD = 3;
 const ERROR_BURST_WINDOW_MS = 10 * 60 * 1000;
 const SUMMARY_TRUNCATION = 120;
 const RECOVERY_BREAKDOWN_LIMIT = 4;
-const WORKER_SOCKET_PATTERN = /^worker-[0-9a-f]+-([0-9a-f]{12})\.sock$/;
+const WORKER_SOCKET_PATTERN = /^(?:prime-agent-)?worker-[0-9a-f]+-([0-9a-f]{12})(?:\.sock)?$/;
 // Per-daemon logs are named `<socket basename>.<hash8>.log` (config.ts
 // getDaemonLogPath); the socket basename itself may lack `.sock` for custom
 // sockets and Windows named pipes, so key on the hash suffix instead.
@@ -246,7 +246,10 @@ function workerIdFromSocketPath(socketPath: string | undefined): string | undefi
 	if (!socketPath) {
 		return undefined;
 	}
-	return WORKER_SOCKET_PATTERN.exec(basename(socketPath))?.[1];
+	// Split on both separators so Windows named-pipe paths (`\\.\pipe\...`)
+	// resolve to their last segment on any platform, not only on win32.
+	const name = socketPath.split(/[\\/]/).pop()!;
+	return WORKER_SOCKET_PATTERN.exec(name)?.[1];
 }
 
 /** One log sighting of a worker id owning a pid at a timestamp. */
