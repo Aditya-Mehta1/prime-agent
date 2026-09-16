@@ -39,7 +39,7 @@ pub fn get_session_file_path(session_dir: &Path, session_id: &str) -> PathBuf {
     session_dir.join(format!("{session_id}.jsonl"))
 }
 
-fn iso_now() -> String {
+pub fn format_iso_now() -> String {
     // ISO-8601 with millisecond precision, like `new Date().toISOString()`.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -434,7 +434,7 @@ impl SessionManager {
         }
 
         self.session_id = session_id;
-        let timestamp = iso_now();
+        let timestamp = format_iso_now();
         let git = self
             .persist
             .then(|| capture_git_context(&self.cwd))
@@ -635,7 +635,7 @@ impl SessionManager {
         self.session_id = session_id.clone();
         self.session_file = Some(target.clone());
         self.persist = true;
-        let timestamp = iso_now();
+        let timestamp = format_iso_now();
         let git = capture_git_context(&self.cwd);
         let header = FileEntry::Header {
             header: SessionHeader {
@@ -750,7 +750,7 @@ impl SessionManager {
         EntryBase {
             id: Some(generate_id(&self.by_id.keys().cloned().collect())),
             parent_id: self.leaf_id.clone(),
-            timestamp: Some(iso_now()),
+            timestamp: Some(format_iso_now()),
             rest: pa_types::JsonMap::new(),
         }
     }
