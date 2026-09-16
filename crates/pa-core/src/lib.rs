@@ -36,6 +36,7 @@ pub use tools::ipython::{
 pub use tools::rlm_bootstrap::{build_rlm_bootstrap_code, PythonSkillRuntimeInfo};
 // RLM kernel subsystem: persistent IPython kernel lifecycle.
 pub mod auth;
+pub mod autonomous;
 pub mod goals;
 pub mod kernel;
 pub mod models;
