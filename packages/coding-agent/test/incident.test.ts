@@ -241,7 +241,7 @@ describe("incident timeline for a crash + recovery", () => {
 		);
 		expect(text).toContain("could not adopt worker 5b1d3aeb91ee: Session worker process is no longer running");
 		// Anomalies: a timeout stall, an auth failure, and provider failures attributed to the crashed worker.
-		expect(text).toContain("daemon: 5 command timeouts over 19m18s");
+		expect(text).toContain("/tmp/prime-agent-501/daemon.sock: 5 command timeouts over 19m18s");
 		expect(text).toContain("session 2339fb7da605: 3 command timeouts over 10m7s");
 		expect(text).toContain("provider stream failure (rate_limit 429) for worker 5b1d3aeb91ee (x24");
 		expect(text).toContain("provider stream failure (server_error 504) for worker 5b1d3aeb91ee (x6");
@@ -584,6 +584,32 @@ describe("worker pid attribution and anomalies", () => {
 		const anomalies = computeIncidentAnomalies(events);
 		const gap = anomalies.find((item) => item.summary.includes("event gap"));
 		expect(gap?.summary).toBe("session aabbccddeeff: 25m event gap (no logged events)");
+	});
+
+	it("keeps anomalies and aggregation per daemon socket instead of merging daemons", () => {
+		const daemonA = { component: "coding-agent.daemon-supervisor", socketPath: "/tmp/prime-agent-501/daemon.sock" };
+		const daemonB = { component: "coding-agent.daemon-supervisor", socketPath: "/tmp/other/daemon.sock" };
+		const times = [
+			[daemonA, "20:02"],
+			[daemonA, "20:08"],
+			[daemonA, "20:09"],
+			[daemonA, "20:21"],
+			[daemonB, "20:03"],
+			[daemonB, "20:10"],
+			[daemonB, "20:30"],
+		] as const;
+		const text = reportFor(
+			times.map(([daemon, time]) =>
+				agentLogLine({
+					...daemon,
+					ts: `2026-09-10T${time}:00.000Z`,
+					msg: "Supervisor command attach failed: Error: Timed out waiting for daemon worker response to attach",
+				}),
+			),
+		);
+		expect(text).toContain("/tmp/prime-agent-501/daemon.sock: 4 command timeouts over 19m");
+		expect(text).toContain("/tmp/other/daemon.sock: 3 command timeouts over 27m");
+		expect(text).toContain("command attach failed: timed out waiting for worker response (x4, until 09-10 20:21:00)");
 	});
 
 	it("flags error bursts that are not timeouts", () => {

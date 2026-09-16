@@ -447,6 +447,15 @@ function event(
 	return { timeMs: entry.timeMs, severity, category, eventClass, subject, summary, tokens };
 }
 
+/**
+ * Supervisor-level events are keyed per daemon socket so anomalies and
+ * aggregation never mix entries from two daemons sharing one agent.jsonl.
+ * The per-daemon fallback log carries no socket field, so it keys on `daemon`.
+ */
+function daemonSubject(entry: IncidentLogEntry): string {
+	return entry.socketPath ?? "daemon";
+}
+
 /** Classify a provider-failure entry into an aggregate-friendly anomaly event. */
 function providerFailureEvent(
 	entry: IncidentLogEntry,
@@ -501,7 +510,14 @@ export function classifyIncidentEntry(
 	}
 
 	if (/^Prime Agent daemon supervisor \S+ listening on \S+$/.test(msg)) {
-		return event(entry, "info", "supervisor", "supervisor-start", "daemon", "daemon supervisor listening");
+		return event(
+			entry,
+			"info",
+			"supervisor",
+			"supervisor-start",
+			daemonSubject(entry),
+			"daemon supervisor listening",
+		);
 	}
 	const startupFailed = /^Daemon supervisor startup failed: (.+)$/.exec(msg);
 	if (startupFailed) {
@@ -512,7 +528,7 @@ export function classifyIncidentEntry(
 				"warn",
 				"supervisor",
 				"supervisor-start",
-				"daemon",
+				daemonSubject(entry),
 				"supervisor startup blocked: another daemon holds the lock",
 			);
 		}
@@ -521,7 +537,7 @@ export function classifyIncidentEntry(
 			"error",
 			"supervisor",
 			"supervisor-start",
-			"daemon",
+			daemonSubject(entry),
 			`supervisor startup failed: ${truncateText(errorMessage(firstLine(err)), 100)}`,
 		);
 	}
@@ -533,7 +549,7 @@ export function classifyIncidentEntry(
 			classified.severity,
 			"supervisor",
 			classified.eventClass,
-			"daemon",
+			daemonSubject(entry),
 			classified.summary,
 			classified.tokens,
 		);
@@ -561,7 +577,7 @@ export function classifyIncidentEntry(
 			timedOut ? "error" : "warn",
 			"supervisor",
 			timedOut ? "timeout" : "command-failure",
-			sessionId ? `session ${sessionId}` : "daemon",
+			sessionId ? `session ${sessionId}` : daemonSubject(entry),
 			`client catch-up failed${sessionId ? ` for session ${sessionId}` : ""}: ${truncateText(errorMessage(firstLine(err)), 100)}`,
 			sessionId ? [sessionId] : [],
 		);
@@ -574,7 +590,7 @@ export function classifyIncidentEntry(
 			timedOut ? "error" : "warn",
 			"supervisor",
 			timedOut ? "timeout" : "command-failure",
-			"daemon",
+			daemonSubject(entry),
 			`worker heartbeat list failed: ${truncateText(errorMessage(firstLine(heartbeats[1]!)), 100)}`,
 		);
 	}
@@ -664,18 +680,18 @@ export function classifyIncidentEntry(
 			"info",
 			"recovery",
 			"recovery-action",
-			"daemon",
+			daemonSubject(entry),
 			`migrated ${migrated[1]} scheduled jobs into session artifacts`,
 		);
 	}
 	const replacement = /^launched replacement supervisor on \S+$/.exec(msg);
 	if (replacement) {
-		return event(entry, "info", "recovery", "recovery-action", "daemon", msg);
+		return event(entry, "info", "recovery", "recovery-action", daemonSubject(entry), msg);
 	}
 	const woke = /^Woke session worker for a due scheduled job: \S+$/.exec(msg);
 	if (woke) {
 		// A scheduled wake is a supervisor lifecycle action, not crash recovery.
-		return event(entry, "info", "supervisor", "supervisor-action", "daemon", msg);
+		return event(entry, "info", "supervisor", "supervisor-action", daemonSubject(entry), msg);
 	}
 
 	const evictedIdle = /^Evicted idle worker (\S+) root=\S* idleMinutes=(\d+) sessions=(\d+)$/.exec(msg);
@@ -733,7 +749,7 @@ export function classifyIncidentEntry(
 			entry.level === "error" ? "error" : "warn",
 			"supervisor",
 			"diagnostic",
-			"daemon",
+			daemonSubject(entry),
 			truncateText(msg, SUMMARY_TRUNCATION),
 		);
 	}
