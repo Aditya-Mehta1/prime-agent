@@ -1,1 +1,208 @@
-//! The prime-agent binary internals.
+//! pa-cli: the `prime-agent` binary. The argument surface, command routing,
+//! help output, and validation are faithful ports of the TypeScript product's
+//! `packages/coding-agent/src/main.ts` and `src/cli/*.ts`. Runtime execution
+//! lives behind the [`mode::Runtime`] boundary.
+
+pub mod args;
+pub mod command_registry;
+pub mod config;
+pub mod global_flags;
+pub mod initial_message;
+pub mod mcp_command;
+pub mod mode;
+pub mod package_command;
+pub mod public_command;
+
+pub use mode::{AppMode, RunOptions, Runtime, UnavailableRuntime};
+
+/// Entry point shared by the binary and the integration tests. Returns the
+/// process exit code.
+pub fn main_with_runtime(args: Vec<String>, runtime: &dyn mode::Runtime) -> i32 {
+    match main_impl(args, runtime) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            1
+        }
+    }
+}
+
+fn main_impl(args: Vec<String>, runtime: &dyn mode::Runtime) -> Result<i32, String> {
+    use std::io::IsTerminal;
+
+    let offline_mode = args.iter().any(|arg| arg == "--offline")
+        || crate::config::is_truthy_env_flag(
+            std::env::var(crate::config::ENV_OFFLINE).ok().as_deref(),
+        );
+    if offline_mode {
+        std::env::set_var(crate::config::ENV_OFFLINE, "1");
+    }
+
+    // Public command routing: help requests, removed commands, management
+    // commands, and the model/session rewrites.
+    let public_command = public_command::handle_public_command(&args);
+    if public_command.handled {
+        return Ok(public_command.exit_code.unwrap_or(0));
+    }
+    let args = public_command.args;
+
+    if args.first().map(String::as_str) == Some("config") {
+        return Err(
+            "the config command needs the interactive resource configuration UI (pa-tui), which is not linked into this build yet".to_string(),
+        );
+    }
+
+    let parsed = args::parse_args(&args);
+    if !parsed.diagnostics.is_empty() {
+        for diagnostic in &parsed.diagnostics {
+            let label = if diagnostic.is_error {
+                "Error"
+            } else {
+                "Warning"
+            };
+            eprintln!("{label}: {}", diagnostic.message);
+        }
+        if parsed.diagnostics.iter().any(|d| d.is_error) {
+            return Ok(1);
+        }
+    }
+
+    let app_mode = mode::AppMode::resolve(&parsed, std::io::stdin().is_terminal());
+
+    if public_command.attach_agent.is_some() && app_mode != mode::AppMode::Interactive {
+        return Err("attach requires an interactive terminal".to_string());
+    }
+    if parsed.resume_bare && app_mode != mode::AppMode::Interactive {
+        return Err(
+            "--resume without a session selector requires an interactive terminal".to_string(),
+        );
+    }
+
+    if parsed.version {
+        println!("{}", crate::config::VERSION);
+        return Ok(0);
+    }
+    if parsed.help {
+        println!("{}", command_registry::format_top_level_help());
+        return Ok(0);
+    }
+
+    if parsed.export.is_some() {
+        // The TS product only reaches the export subsystem through the
+        // `session export <file> [output]` rewrite; a standalone `--export`
+        // already exited as a removed-flag diagnostic above.
+        return Err(mode::MissingSubsystem::SessionExport.error_message());
+    }
+
+    if matches!(
+        parsed.mode,
+        Some(args::Mode::Rpc) | Some(args::Mode::Daemon)
+    ) && !parsed.file_args.is_empty()
+    {
+        return Err("@file arguments are not supported in RPC or daemon mode".to_string());
+    }
+
+    if let Some(fork) = &parsed.fork {
+        let mut conflicting_flags: Vec<&str> = Vec::new();
+        if parsed.continue_ {
+            conflicting_flags.push("--continue");
+        }
+        if parsed.has_resume() {
+            conflicting_flags.push("--resume");
+        }
+        if parsed.no_session {
+            conflicting_flags.push("--no-session");
+        }
+        if !conflicting_flags.is_empty() {
+            return Err(format!(
+                "--fork cannot be combined with {}",
+                conflicting_flags.join(", ")
+            ));
+        }
+        let _ = fork;
+    }
+
+    // cwd: chdir before anything cwd-bound runs.
+    let cwd = match &parsed.cwd {
+        Some(cwd) => {
+            let cwd = crate::config::expand_tilde_path(cwd);
+            let from = std::env::current_dir().map_err(|e| e.to_string())?;
+            if let Err(error) = std::env::set_current_dir(&cwd) {
+                return Err(format!(
+                    "Cannot use cwd {}: {}",
+                    cwd.display(),
+                    node_style_error(
+                        &error,
+                        "chdir",
+                        &from.display().to_string(),
+                        &cwd.display().to_string()
+                    )
+                ));
+            }
+            std::env::current_dir().map_err(|e| e.to_string())?
+        }
+        None => std::env::current_dir().map_err(|e| e.to_string())?,
+    };
+
+    let agent_dir = crate::config::get_agent_dir();
+    let session_dir = parsed
+        .session_dir
+        .as_deref()
+        .map(crate::config::expand_tilde_path)
+        .or_else(crate::config::get_session_dir_env_override);
+
+    let mut cli_messages = parsed.messages.clone();
+    let initial_message =
+        initial_message::build_initial_message(&mut cli_messages, None, None).initial_message;
+    let options = mode::RunOptions {
+        app_mode,
+        config: mode::runtime_config_from_args(
+            &parsed,
+            cwd,
+            agent_dir,
+            session_dir.clone(),
+            app_mode,
+            false,
+        ),
+        session: mode::SessionOptions {
+            continue_recent: parsed.continue_,
+            resume_bare: parsed.resume_bare,
+            resume: parsed.resume.clone(),
+            fork: parsed.fork.clone(),
+            no_session: parsed.no_session,
+            session_dir,
+        },
+        messages: cli_messages,
+        initial_message,
+        file_args: parsed.file_args.clone(),
+        daemon_socket: parsed.daemon_socket.clone(),
+        list_models: parsed.list_models,
+        export: parsed.export.clone(),
+        verbose: parsed.verbose,
+        offline: parsed.offline,
+        agents_view_requested: public_command.explicit_agents_view,
+        attach_agent: public_command.attach_agent.clone(),
+    };
+
+    match runtime.run(&options) {
+        Ok(exit_code) => Ok(exit_code),
+        Err(missing) => Err(missing.error_message()),
+    }
+}
+
+/// Format an io error the way Node.js prints it for the same syscall, so the
+/// `Error: Cannot use cwd <dir>: <message>` text matches the TS product.
+fn node_style_error(error: &std::io::Error, syscall: &str, from: &str, to: &str) -> String {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => {
+            format!("ENOENT: no such file or directory, {syscall} '{from}' -> '{to}'")
+        }
+        std::io::ErrorKind::NotADirectory => {
+            format!("ENOTDIR: not a directory, {syscall} '{from}' -> '{to}'")
+        }
+        std::io::ErrorKind::PermissionDenied => {
+            format!("EACCES: permission denied, {syscall} '{from}' -> '{to}'")
+        }
+        _ => error.to_string(),
+    }
+}

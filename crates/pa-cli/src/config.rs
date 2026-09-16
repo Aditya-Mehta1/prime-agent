@@ -1,0 +1,91 @@
+//! Product-wide constants and environment handling, ported from
+//! `packages/coding-agent/src/config.ts`.
+
+use std::path::{Path, PathBuf};
+
+/// The user-facing application name (`piConfig.name` in package.json).
+pub const APP_NAME: &str = "prime-agent";
+
+/// The agent state directory name (`piConfig.configDir` in package.json).
+pub const CONFIG_DIR_NAME: &str = ".prime/agent";
+
+/// `PRIME_AGENT_CODING_AGENT_DIR`: overrides the agent state directory.
+pub const ENV_AGENT_DIR: &str = "PRIME_AGENT_CODING_AGENT_DIR";
+
+/// `PRIME_AGENT_SESSION_DIR`: overrides the session directory.
+pub const ENV_SESSION_DIR: &str = "PRIME_AGENT_SESSION_DIR";
+
+/// `PRIME_AGENT_CODING_AGENT_SESSION_DIR`: legacy session-dir override.
+pub const ENV_LEGACY_SESSION_DIR: &str = "PRIME_AGENT_CODING_AGENT_SESSION_DIR";
+
+/// The product version reported by `--version`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// `PRIME_AGENT_OFFLINE`: truthy values enable offline mode.
+pub const ENV_OFFLINE: &str = "PI_OFFLINE";
+
+/// `PRIME_AGENT_STARTUP_BENCHMARK`: truthy values enable startup benchmarking.
+pub const ENV_STARTUP_BENCHMARK: &str = "PI_STARTUP_BENCHMARK";
+
+/// Expand a leading `~` or `~/` path segment against the home directory.
+pub fn expand_tilde_path(path: &str) -> PathBuf {
+    let Some(home) = std::env::var_os("HOME") else {
+        return PathBuf::from(path);
+    };
+    if path == "~" {
+        return PathBuf::from(home);
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return Path::new(&home).join(rest);
+    }
+    PathBuf::from(path)
+}
+
+/// The agent state directory, honoring `PRIME_AGENT_CODING_AGENT_DIR`.
+pub fn get_agent_dir() -> PathBuf {
+    match std::env::var(ENV_AGENT_DIR) {
+        Ok(dir) if !dir.is_empty() => expand_tilde_path(&dir),
+        _ => std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(CONFIG_DIR_NAME),
+    }
+}
+
+/// The session directory override from the environment, if any.
+pub fn get_session_dir_env_override() -> Option<PathBuf> {
+    std::env::var(ENV_SESSION_DIR)
+        .ok()
+        .or_else(|| std::env::var(ENV_LEGACY_SESSION_DIR).ok())
+        .filter(|value| !value.is_empty())
+        .map(|value| expand_tilde_path(&value))
+}
+
+/// Truthy environment flag check, matching `isTruthyEnvFlag` in main.ts:
+/// only `1`, `true`, and `yes` (case-insensitive) count.
+pub fn is_truthy_env_flag(value: Option<&str>) -> bool {
+    match value {
+        None => false,
+        Some(value) => {
+            let lower = value.to_ascii_lowercase();
+            value == "1" || lower == "true" || lower == "yes"
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expands_tilde() {
+        std::env::set_var("HOME", "/home/tester");
+        assert_eq!(expand_tilde_path("~"), PathBuf::from("/home/tester"));
+        assert_eq!(
+            expand_tilde_path("~/sessions"),
+            PathBuf::from("/home/tester/sessions")
+        );
+        assert_eq!(expand_tilde_path("/abs/path"), PathBuf::from("/abs/path"));
+        assert_eq!(expand_tilde_path("~foo"), PathBuf::from("~foo"));
+    }
+}

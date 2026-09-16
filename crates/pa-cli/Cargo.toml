@@ -6,6 +6,10 @@ license.workspace = true
 description = "The prime-agent binary."
 
 [dependencies]
+pa-types = { path = "../pa-types" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [[bin]]
 name = "prime-agent"

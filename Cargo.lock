@@ -410,6 +410,12 @@ version = "0.1.0"
 [[package]]
 name = "pa-cli"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "pa-types",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "pa-core"
