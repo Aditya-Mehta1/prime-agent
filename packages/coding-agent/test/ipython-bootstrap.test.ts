@@ -83,6 +83,18 @@ describe("RLM bootstrap", () => {
 		});
 	});
 
+	it("keeps a skill literally named __proto__ in the parsed report", () => {
+		// JSON.parse yields an own "__proto__" key; the report must keep it as an
+		// own entry instead of tripping Object.prototype's __proto__ setter.
+		const parsed = parseUnavailablePythonSkills(
+			`${PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER}{"__proto__":"boom","websearch":"No module named 'websearch'"}`,
+		);
+		expect(parsed).toEqual(JSON.parse(`{"__proto__":"boom","websearch":"No module named 'websearch'"}`));
+		expect(Object.hasOwn(parsed ?? {}, "__proto__")).toBe(true);
+		// A normal entry alongside still parses.
+		expect(parsed?.websearch).toBe("No module named 'websearch'");
+	});
+
 	it("treats missing or malformed reports as no unavailable skills", () => {
 		expect(parseUnavailablePythonSkills("")).toBeUndefined();
 		expect(parseUnavailablePythonSkills("some unrelated kernel output")).toBeUndefined();

@@ -157,6 +157,28 @@ describe("IpythonKernelProvisioner", () => {
 		}
 	});
 
+	it("reports a python skill literally named __proto__ as unavailable", async () => {
+		const marker = join(tempDir, "snapshot-flushed");
+		const python = writeFakeReplRuntime(marker, {
+			executeStdout: `${PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER}{"__proto__":"boom","websearch":"No module named 'websearch'"}`,
+		});
+		const onUnavailableSkills = vi.fn();
+		const provisioner = new IpythonKernelProvisioner(tempDir, { python, onUnavailableSkills });
+		try {
+			await provisioner.ensure();
+			expect(onUnavailableSkills).toHaveBeenCalledTimes(1);
+			// The expected report is built with JSON.parse: a literal with an own
+			// "__proto__" key cannot be expressed as an object literal.
+			expect(onUnavailableSkills).toHaveBeenCalledWith(
+				JSON.parse(`{"__proto__":"boom","websearch":"No module named 'websearch'"}`),
+			);
+			const reported = onUnavailableSkills.mock.calls[0]?.[0];
+			expect(Object.hasOwn(reported, "__proto__")).toBe(true);
+		} finally {
+			await provisioner.dispose();
+		}
+	}, 60_000);
+
 	it("does not report unavailable python skills after a clean bootstrap", async () => {
 		const marker = join(tempDir, "snapshot-flushed");
 		const python = writeFakeReplRuntime(marker, { executeStdout: "" });

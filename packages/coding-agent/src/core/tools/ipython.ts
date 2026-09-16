@@ -91,7 +91,9 @@ export function parseUnavailablePythonSkills(stdout: string): UnavailablePythonS
 		return undefined;
 	}
 	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
-	const errors: UnavailablePythonSkills = {};
+	// Null prototype: a skill literally named "__proto__" must land as an own
+	// key, not trip the inherited __proto__ setter.
+	const errors: UnavailablePythonSkills = Object.create(null) as UnavailablePythonSkills;
 	for (const [name, error] of Object.entries(parsed)) {
 		if (typeof error === "string" && error.length > 0) {
 			errors[name] = error;
