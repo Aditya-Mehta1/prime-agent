@@ -8,7 +8,7 @@ use crate::command_registry::{
     find_command_suggestion, format_command_help, format_top_level_help, get_child_command_specs,
     get_command_spec, is_help_command_request, public_command_names, REMOVED_COMMAND_NAMES,
 };
-use crate::config::{APP_NAME, VERSION};
+use crate::config::APP_NAME;
 use crate::global_flags::{extract_help_command_path, rotate_global_flags_before_command};
 use crate::mcp_command::run_mcp_management_command;
 use crate::package_command::handle_package_command;
@@ -677,9 +677,4 @@ fn require_operand_count(
         None,
     );
     false
-}
-
-/// The version string printed by `--version`.
-pub fn version_string() -> &'static str {
-    VERSION
 }

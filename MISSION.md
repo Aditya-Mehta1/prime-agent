@@ -60,6 +60,8 @@ Take as much time as you need, and use as many tokens as you need — we're self
 
 Before writing Rust, read Jarred Sumner's "Rewriting Bun in Rust" (https://bun.com/blog/bun-in-rust) and take what applies — the porting guide, parity-through-testing, and dozens of agents working in parallel across git worktrees (same workflow as the process above).
 
+Second reference for agent-specific implementation details: OpenAI Codex (https://github.com/openai/codex) — a mature Rust agent harness, cloned at ~/codex on the dev box. It has accurate implementations of the internals that are easy to get wrong: token counting, maintaining the KV-cacheable prefix across turns, streaming provider responses, context/compaction management, session persistence, and tool execution. When implementing these, cross-check your approach against codex's code (and against the TS reference, which stays the parity ground truth — remember cache-prefix stability is a first-class concern; never adopt a pattern without checking what it does to the cacheable prefix). Codex is Apache 2.0: study freely; if you port specific code, attribute it.
+
 ## Environment
 
 Dev work happens on the dev box (ubuntu@195.242.10.125 — 4 vCPU, 15 GB, 485 GB; Rust toolchain, gh and prime CLIs authenticated). The Rust code lives in ~/prime-agent-rs (this repo). Agent state (~/.prime: sessions, subagents, skills, memories) syncs to kevinjosethomas/prime-agent-state every 15 minutes — never commit credentials. The TS reference is at ~/prime-agent (read-only; do not modify).

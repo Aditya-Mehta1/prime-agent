@@ -3,17 +3,21 @@
 //! `packages/coding-agent/src/main.ts` and `src/cli/*.ts`. Runtime execution
 //! lives behind the [`mode::Runtime`] boundary.
 
-pub mod args;
-pub mod command_registry;
-pub mod config;
-pub mod global_flags;
-pub mod initial_message;
-pub mod mcp_command;
-pub mod mode;
-pub mod package_command;
-pub mod public_command;
+// Internal ported modules are crate-private: the only public API is the
+// runtime boundary below (see crates/pa-cli/README.md).
+pub(crate) mod args;
+pub(crate) mod command_registry;
+pub(crate) mod config;
+pub(crate) mod global_flags;
+pub(crate) mod initial_message;
+pub(crate) mod mcp_command;
+pub(crate) mod mode;
+pub(crate) mod package_command;
+pub(crate) mod public_command;
 
-pub use mode::{AppMode, RunOptions, Runtime, UnavailableRuntime};
+/// The runtime boundary: everything a mode-runner crate implements to plug
+/// into the `prime-agent` binary, plus the entry point that drives it.
+pub use mode::{AppMode, MissingSubsystem, RunOptions, Runtime, UnavailableRuntime};
 
 /// Entry point shared by the binary and the integration tests. Returns the
 /// process exit code.
@@ -143,6 +147,15 @@ fn main_impl(args: Vec<String>, runtime: &dyn mode::Runtime) -> Result<i32, Stri
         }
         None => std::env::current_dir().map_err(|e| e.to_string())?,
     };
+
+    if crate::config::is_truthy_env_flag(
+        std::env::var(crate::config::ENV_STARTUP_BENCHMARK)
+            .ok()
+            .as_deref(),
+    ) && app_mode != mode::AppMode::Interactive
+    {
+        return Err("PI_STARTUP_BENCHMARK only supports interactive mode".to_string());
+    }
 
     let agent_dir = crate::config::get_agent_dir();
     let session_dir = parsed

@@ -569,11 +569,6 @@ fn take_required_value(
     Some(next.clone())
 }
 
-/// Check a thinking level value against the supported levels.
-pub fn is_valid_thinking_level(level: &str) -> bool {
-    parse_thinking_level(level).is_some()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

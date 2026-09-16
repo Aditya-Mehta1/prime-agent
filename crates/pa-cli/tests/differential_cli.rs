@@ -387,3 +387,55 @@ fn differential_corpus_matches_ts_binary() {
         failures.join("\n---\n")
     );
 }
+
+fn run_with_env(
+    binary: &Path,
+    args: &[&str],
+    sandbox: &Path,
+    envs: &[(&str, &str)],
+) -> InvocationOutput {
+    let mut command = Command::new("timeout");
+    command
+        .arg("20")
+        .arg(binary)
+        .args(args)
+        .env("PRIME_AGENT_CODING_AGENT_DIR", sandbox.join("agent"))
+        .env("PI_OFFLINE", "1")
+        .current_dir(sandbox.join("cwd"));
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command.output().expect("failed to spawn binary under test");
+    InvocationOutput {
+        exit_code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+#[test]
+fn differential_env_flag_cases_match_ts_binary() {
+    let Some(ts) = ts_binary() else {
+        eprintln!("SKIPPED: TS prime-agent binary not found (set PA_TS_BINARY)");
+        return;
+    };
+    let rust = PathBuf::from(env!("CARGO_BIN_EXE_prime-agent"));
+    let ts_sandbox = sandbox("ts-env");
+    let rs_sandbox = sandbox("rs-env");
+    let sandbox_roots: Vec<&Path> = vec![&ts_sandbox, &rs_sandbox];
+
+    // PI_STARTUP_BENCHMARK is rejected outside interactive mode.
+    for case in [&["-p", "hi"][..], &["--print"][..], &["--mode", "json"][..]] {
+        let ts_out = run_with_env(&ts, case, &ts_sandbox, &[("PI_STARTUP_BENCHMARK", "1")]);
+        let rs_out = run_with_env(&rust, case, &rs_sandbox, &[("PI_STARTUP_BENCHMARK", "1")]);
+        assert_eq!(
+            ts_out.exit_code, rs_out.exit_code,
+            "case {case:?} exit code"
+        );
+        assert_eq!(
+            normalize(&ts_out.stderr, &sandbox_roots),
+            normalize(&rs_out.stderr, &sandbox_roots),
+            "case {case:?} stderr"
+        );
+    }
+}

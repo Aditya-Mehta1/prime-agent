@@ -13,14 +13,10 @@ use crate::public_command::{
 /// exit code is reported for the caller to propagate.
 #[derive(Debug, Clone)]
 pub struct PackageCommandOutcome {
-    pub handled: bool,
     pub exit_code: Option<i32>,
 }
 
-const HANDLED_OK: PackageCommandOutcome = PackageCommandOutcome {
-    handled: true,
-    exit_code: None,
-};
+const HANDLED_OK: PackageCommandOutcome = PackageCommandOutcome { exit_code: None };
 
 fn fail(message: &str, hint: Option<&str>) -> PackageCommandOutcome {
     // handlePackageCommand prints its errors without the "Error: " prefix.
@@ -28,10 +24,7 @@ fn fail(message: &str, hint: Option<&str>) -> PackageCommandOutcome {
     if let Some(hint) = hint {
         eprintln!("{hint}");
     }
-    PackageCommandOutcome {
-        handled: true,
-        exit_code: Some(1),
-    }
+    PackageCommandOutcome { exit_code: Some(1) }
 }
 
 fn is_self_update_source(source: &str) -> bool {
@@ -330,22 +323,14 @@ fn print_package_command_help(command: PackageCommand) {
 /// typed error instead.
 pub fn handle_package_command(args: &[String]) -> PackageCommandOutcome {
     let Some(options) = parse_package_command(args) else {
-        return PackageCommandOutcome {
-            handled: false,
-            exit_code: None,
-        };
+        return PackageCommandOutcome { exit_code: None };
     };
     let command = match args.first().map(String::as_str) {
         Some("uninstall") | Some("remove") => PackageCommand::Remove,
         Some("install") => PackageCommand::Install,
         Some("update") => PackageCommand::Update,
         Some("list") => PackageCommand::List,
-        _ => {
-            return PackageCommandOutcome {
-                handled: false,
-                exit_code: None,
-            }
-        }
+        _ => return PackageCommandOutcome { exit_code: None },
     };
     let command_name = match command {
         PackageCommand::Install => "install",
