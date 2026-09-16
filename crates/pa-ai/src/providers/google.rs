@@ -1,5 +1,5 @@
 //! Google Generative AI (Gemini API) streaming provider.
-//! Port of `packages/ai/src/providers/google-ai` `providers/google.ts`: REST
+//! Port of `packages/ai/src/providers/google.ts` (the `@google/genai` SDK): REST
 //! `streamGenerateContent` SSE streaming, thinking config (levels for Gemini 3,
 //! budgets for Gemini 2.5), tool config, and usage accounting.
 
