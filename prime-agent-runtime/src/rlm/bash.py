@@ -1052,9 +1052,11 @@ _WRAPPER_COMMANDS = (
 
 # Flags that consume the following word, per wrapper: only these take a value,
 # so `env -i sh` keeps `sh` as the command word while `stdbuf -i 0 sh` does
-# not (`-i` is boolean for env and a value flag for stdbuf).
+# not (`-i` is boolean for env and a value flag for stdbuf). `env -a NAME`
+# renames argv[0] of the command env runs, so the word it consumes is that
+# name, not the command.
 _WRAPPER_VALUE_FLAGS = {
-    "env": ("-u", "-C", "-S"),
+    "env": ("-u", "-C", "-S", "-a"),
     "nice": ("-n",),
     "timeout": ("-s", "-k"),
     "stdbuf": ("-i", "-o", "-e"),
@@ -1080,6 +1082,10 @@ _GROUPING_OPERATORS = ("(", ")")
 
 # Every character that ends a command stage.
 _PIPE_SHELL_SEPARATORS = "\n;|&()"
+
+# The stage separators that end one statement, not just one stage: a stage
+# behind one of them starts a new command, so no pipeline state carries over.
+_PIPE_SHELL_STATEMENT_SEPARATORS = (";", "\n", "&", "&&", "||")
 
 # Characters a redirection operator can reach for as its target word.
 _REDIRECT_OPERATOR_CHARS = "<>"
@@ -1551,22 +1557,27 @@ def _scan_pipe_shell_region(command: str, start: int, end: int) -> _PipeShellReg
                 # order their `<<` operators appeared, and each ends at its
                 # own delimiter line, where the stream resumes.
                 cursor = index
+                open_newline = index
                 for (
                     pending_delimiter,
                     pending_quoted,
                     pending_stage,
                 ) in pending_heredocs:
                     cursor, body = _scan_heredoc_body(
-                        command, cursor, end, pending_delimiter
+                        command, open_newline, end, pending_delimiter
                     )
                     if body is not None:
                         stage_heredoc_bodies.setdefault(pending_stage, []).append(
                             (*body, pending_quoted)
                         )
-                    cursor_next = command.find("\n", cursor)
-                    if cursor_next == -1 or cursor_next >= end:
+                    delimiter_newline = command.find("\n", cursor)
+                    if delimiter_newline == -1 or delimiter_newline >= end:
                         break
-                    cursor = cursor_next + 1
+                    # The next body starts below the delimiter line's
+                    # newline, which is the opening newline
+                    # _scan_heredoc_body expects.
+                    open_newline = delimiter_newline
+                    cursor = delimiter_newline + 1
                 # Each consumed body's delimiter line is here-document
                 # mechanics, not stages: the stream resumes past its newline.
                 resume = cursor
@@ -1929,7 +1940,10 @@ def _continuation_runs_shell(region: _PipeShellRegion, position: int) -> bool:
     whole region) run a shell: a here-document body is read as a script only
     when the pipe chain it feeds actually reaches an interpreter."""
     cursor = position + 1
-    previous_separator = region.stages[position].separator
+    # The caller walks only stages whose separator is a pipe, so the
+    # pipeline is open until its right-hand side arrives -- the same
+    # pipeline-open tracking _pipe_shell_stage_violation reads.
+    pipeline_open = True
     while cursor < len(region.stages):
         stage = region.stages[cursor]
         if stage.words:
@@ -1939,17 +1953,26 @@ def _continuation_runs_shell(region: _PipeShellRegion, position: int) -> bool:
                     return True
             elif _stage_runs_stdin_shell(stage.words):
                 return True
-        if not stage.words and previous_separator in _PIPE_OPERATORS:
-            # The empty stage is the newline after a pipe (`cat <<EOF |`
-            # newline ... body ... receiver): the chain continues to it.
-            previous_separator = stage.separator
-            cursor += 1
-            continue
-        if stage.separator not in _PIPE_OPERATORS and stage.separator not in _GROUPING_OPERATORS:
-            # A grouping separator continues the chain (`cat <<EOF | (sh)`
-            # pipes into the subshell's sh).
+            pipeline_open = stage.separator in _PIPE_OPERATORS
+            if (
+                stage.separator not in _PIPE_OPERATORS
+                and stage.separator not in _GROUPING_OPERATORS
+            ):
+                # A grouping separator continues the chain (`cat <<EOF | (sh)`
+                # pipes into the subshell's sh); the pipeline's right-hand
+                # side has arrived, so a statement after it is a new chain.
+                return False
+        elif (
+            stage.separator in _PIPE_SHELL_STATEMENT_SEPARATORS
+            and not pipeline_open
+        ):
+            # An empty stage is a statement separator or a blank line: it
+            # ends the chain only once the pipeline's right-hand side has
+            # arrived (`cat <<EOF | (wc)` body `EOF` blank `sh` hands the
+            # body to the group's wc, and the sh past the blank line is a
+            # fresh statement); until then the blanks still belong to the
+            # open pipeline and feed the receiver its body.
             return False
-        previous_separator = stage.separator
         cursor += 1
     return False
 
@@ -1998,7 +2021,10 @@ def _pipe_shell_stage_violation(
                 paren_depth += 1
             elif stage.separator == ")":
                 paren_depth = max(0, paren_depth - 1)
-            elif stage.separator in (";", "\n", "&", "&&", "||") and not pipeline_open:
+            elif (
+                stage.separator in _PIPE_SHELL_STATEMENT_SEPARATORS
+                and not pipeline_open
+            ):
                 piped_download = False
             continue
         if stage.words[0].value == "{" and not stage.words[0].quoted:
@@ -2011,6 +2037,16 @@ def _pipe_shell_stage_violation(
             stage.words
         ):
             return "a download piped into a shell"
+        if resolved is None and piped_download and any(
+            not word.resolvable for word in stage.words
+        ):
+            # A stage that resolves no command word at all (`env -a $(sh)`,
+            # `FOO=$(sh)`): a wrapper value flag or an assignment consumed the
+            # substitution as its operand, and that substitution runs with
+            # the pipeline on stdin, so the unreadable operand may be the
+            # receiver -- the same fail-closed rule as the unresolvable
+            # command word, applied to the only argv the stage has.
+            return "a download piped into a command the scan cannot resolve"
         if resolved is not None:
             word, command_index = resolved
             name = _command_name(word.value)
@@ -2020,6 +2056,17 @@ def _pipe_shell_stage_violation(
                 if not word.resolvable:
                     # Fail closed: the receiver cannot be read, so it cannot be
                     # cleared either.
+                    return "a download piped into a command the scan cannot resolve"
+                if any(
+                    not prefix.resolvable for prefix in stage.words[:command_index]
+                ):
+                    # A resolved command word can still be preceded by a
+                    # prefix word the scan cannot read (`env -a $(sh) cat`,
+                    # `FOO=$(sh) grep x`): the wrapper or assignment consumed
+                    # the substitution as its operand, and that substitution
+                    # runs with the pipeline on stdin, so the unreadable word
+                    # may execute the download before the command the scan
+                    # did resolve.
                     return "a download piped into a command the scan cannot resolve"
             if (
                 name in _DOWNLOAD_COMMANDS
@@ -2087,6 +2134,14 @@ def _pipe_shell_stage_violation(
             # statement separator (`{ curl URL; }; sh`) leaves no pipeline
             # state for the next statement.
             brace_depth -= 1
+        if stage.separator == "(":
+            paren_depth += 1
+        elif stage.separator == ")":
+            # A group usually closes on its last command's separator
+            # (`(echo start)`), not on an empty stage, so the word stages
+            # balance the depth the empty `(` opens: a depth left open pins
+            # one statement's pipeline state onto the next.
+            paren_depth = max(0, paren_depth - 1)
         if (
             stage.separator not in _PIPE_OPERATORS
             and stage.separator not in _GROUPING_OPERATORS
