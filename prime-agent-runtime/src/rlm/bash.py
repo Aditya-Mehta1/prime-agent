@@ -7,6 +7,7 @@ import atexit
 import functools
 import json
 import os
+import re
 import secrets
 import selectors
 import shutil
@@ -937,7 +938,455 @@ class BashHandle:
         return f"<BashHandle pid={self._pid} {state} command={self.command!r}>"
 
 
-def bash(command: str) -> BashHandle:
+# ---------------------------------------------------------------------------
+# Destructive-git dirty-tree guard. Ported from the coding-agent bash tool
+# (packages/coding-agent/src/core/tools/bash.ts); the command taxonomy and
+# bypass semantics must stay identical between the two tools.
+
+# Bypass env var for the destructive-git dirty-tree guard.
+BASH_DESTRUCTIVE_GIT_BYPASS_ENV = "PI_BASH_ALLOW_DESTRUCTIVE_GIT"
+
+GIT_STATUS_PORCELAIN_COMMAND = "git status --porcelain --untracked-files=all"
+
+# How many dirty paths the refusal lists before eliding the rest.
+MAX_DIRTY_PATHS_LISTED = 10
+
+# The probe is read-only, but a wedged git must not wedge the kernel.
+_PROBE_TIMEOUT_SECONDS = 10.0
+# Bound the parsed probe output; dirtiness beyond the cap still triggers the
+# refusal, so a huge tree cannot grow the message without limit.
+_PROBE_OUTPUT_CAP_BYTES = 64 * 1024
+
+
+class DestructiveGitRefusalError(RuntimeError):
+    """A destructive git discard was refused on a dirty working tree."""
+
+
+@dataclass(frozen=True)
+class _DiscardProbeTarget:
+    """Where a discard command's probe must run.
+
+    A `cd` chain earlier in the command and `git -C <dir>` on the discard
+    invocation both relocate the repository being discarded, so the probe
+    follows them instead of assuming the kernel cwd.
+    """
+
+    relocation_prefix: str | None = None
+    git_status_command: str = GIT_STATUS_PORCELAIN_COMMAND
+
+
+class _UnresolvableDiscardTarget:
+    """The probe cannot safely determine the repository the discard targets."""
+
+
+_UNRESOLVABLE_DISCARD_TARGET = _UnresolvableDiscardTarget()
+
+# Detection for git commands that discard uncommitted working-tree changes
+# (the "clean the worktree" discard idiom). Conservative by design: a false
+# positive costs one `git status` probe and an explicit-bypass retry; a false
+# negative silently loses work. Matching is best-effort shell-text
+# heuristics, not a parse.
+
+# Optional git global options between `git` and the subcommand, for example
+# `git -C dir reset --hard`, `git -c key=value checkout -- .`, or
+# `git --git-dir=dir/.git reset --hard`. Kept within one shell segment
+# (no ;&|) so it cannot swallow the rest of a chained command.
+_GIT_GLOBAL_OPTIONS = r'''(?:-{1,2}[^\s;&|]+(?:\s+(?:"[^"]*"|'[^']*'|[^\s;&|]+))?\s+)*'''
+
+_DISCARD_CHECKOUT_PATTERN = re.compile(
+    r"\bgit\s+"
+    + _GIT_GLOBAL_OPTIONS
+    + r"checkout\s+"
+    + r"""(?:(?:(?:-[fm]|--ours|--theirs|--conflict=\S+)\s+)*(?:--\s+)?(?:\./?|:/)"""
+    + r"""|[^\s;&|()]+\s+(?:--\s+)?(?:\./?|:/)"""
+    + r"""|(?:-f|--force)\s+[^\s;&|()]+)(?=\s|$|[;&|)])"""
+)
+_DISCARD_RESTORE_PATTERN = re.compile(
+    r"\bgit\s+"
+    + _GIT_GLOBAL_OPTIONS
+    + r"restore\s+"
+    + r"""(?:(?:--source|--worktree)(?:=\S+)?\s+|-s(?:\s+\S+|[^\s]+)\s+|-W\s+|--\s+)?"""
+    + r"""(?:\./?|:/)(?=\s|$|[;&|)])"""
+)
+_DISCARD_RESET_PATTERN = re.compile(
+    r"\bgit\s+" + _GIT_GLOBAL_OPTIONS + r"reset\s+(?:(?:-[^\s;&|]+)\s+)*--hard\b"
+)
+_DISCARD_CLEAN_PATTERN = re.compile(
+    r"\bgit\s+" + _GIT_GLOBAL_OPTIONS + r"clean\s+([^;&|]*)"
+)
+
+
+def _mask_quoted_spans(command: str) -> str:
+    """Blank out quoted data and comments, keeping character positions.
+
+    The discard matcher must not match quoted data (for example
+    `echo 'git reset --hard'`) or comments, but command substitution
+    (`$(...)`, backticks) stays live because it executes.
+    """
+    chars = list(command)
+    quote: str | None = None
+    i = 0
+    n = len(chars)
+    while i < n:
+        ch = chars[i]
+        if quote is None:
+            # An unquoted # at a word boundary starts a comment; mask to end of line.
+            prev = chars[i - 1] if i > 0 else None
+            if ch == "#" and (i == 0 or prev is None or re.match(r"[\s;&|(){}]", prev)):
+                j = i
+                while j < n and chars[j] != "\n":
+                    chars[j] = " "
+                    j += 1
+                i = j
+                continue
+            if ch in ('"', "'"):
+                quote = ch
+        elif quote == "'":
+            # No expansion happens inside single quotes; mask it all.
+            if ch == "'":
+                quote = None
+            else:
+                chars[i] = " "
+        elif ch == '"':
+            quote = None
+        elif ch == "\\" and i + 1 < n:
+            chars[i] = " "
+            chars[i + 1] = " "
+            i += 1
+        elif ch == "$" and i + 1 < n and chars[i + 1] == "(":
+            # Command substitution inside double quotes still executes; keep it live.
+            depth = 0
+            j = i
+            while j < n:
+                if chars[j] == "(":
+                    depth += 1
+                elif chars[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            i = j - 1
+        elif ch == "`":
+            # Backtick substitution inside double quotes still executes; keep it live.
+            j = i + 1
+            while j < n and chars[j] != "`":
+                j += 1
+            i = j - 1
+        else:
+            chars[i] = " "
+        i += 1
+    return "".join(chars)
+
+
+def _is_forced_clean_segment(args: str) -> bool:
+    tokens = [token for token in re.split(r"\s+", args) if token]
+    # Everything after -- is a pathspec, not options (git clean -f -- -n is forced).
+    if "--" in tokens:
+        option_tokens = tokens[: tokens.index("--")]
+    else:
+        option_tokens = tokens
+    forces = [
+        token
+        for token in option_tokens
+        if (
+            token.startswith("--force")
+            if token.startswith("--")
+            else token.startswith("-") and "f" in token
+        )
+    ]
+    if not forces:
+        return False
+    return not any(
+        token == "--dry-run"
+        or (token.startswith("-") and not token.startswith("--") and "n" in token)
+        for token in option_tokens
+    )
+
+
+def _find_destructive_git_discard_commands(command: str) -> list[int]:
+    """Find every destructive git discard command in `command`, returning the
+    character index where each `git` token starts (empty when none match)."""
+    masked = _mask_quoted_spans(command)
+    indices: list[int] = []
+    for pattern in (_DISCARD_CHECKOUT_PATTERN, _DISCARD_RESTORE_PATTERN, _DISCARD_RESET_PATTERN):
+        indices.extend(match.start() for match in pattern.finditer(masked))
+    for match in _DISCARD_CLEAN_PATTERN.finditer(masked):
+        if _is_forced_clean_segment(match.group(1)):
+            indices.append(match.start())
+    return sorted(indices)
+
+
+def is_destructive_git_discard_command(command: str) -> bool:
+    """True when `command` contains a git command that discards uncommitted
+    working-tree changes (`git checkout -- .`, `git restore .`,
+    `git reset --hard`, forced `git clean`)."""
+    return bool(_find_destructive_git_discard_commands(command))
+
+
+def _resolve_discard_probe_target(
+    command: str, discard_index: int, user_command_start: int = 0
+) -> "_DiscardProbeTarget | _UnresolvableDiscardTarget | None":
+    prefix = command[:discard_index]
+    invocation = command[discard_index:]
+    # A discard inside the configured command prefix would be replayed by the
+    # probe itself; refuse instead of executing it during probing.
+    if user_command_start > 0 and discard_index < user_command_start:
+        return _UNRESOLVABLE_DISCARD_TARGET
+    tokens = re.split(r"\s+", invocation)
+
+    # git -C <dir> (or repository-relocating global options) on the discard
+    # invocation itself.
+    dash_c_dir: str | None = None
+    subcommand_index = -1
+    for index, token in enumerate(tokens):
+        if index == 0:
+            continue  # "git"
+        if token in ("reset", "checkout", "clean", "restore"):
+            subcommand_index = index
+            break
+        if token == "-C":
+            directory = tokens[index + 1] if index + 1 < len(tokens) else None
+            # A quoted, escaped, or substituted path cannot be replayed as a
+            # single token; refuse rather than probe a truncated directory.
+            if not directory or re.search(r"""["'\\$`]""", directory):
+                return _UNRESOLVABLE_DISCARD_TARGET
+            # Repeated -C paths are relative to the preceding one, so replay
+            # the whole sequence instead of keeping only the last directory.
+            dash_c_dir = f"{dash_c_dir} -C {directory}" if dash_c_dir else directory
+        elif token.startswith(("--git-dir", "--work-tree", "--prefix")):
+            return _UNRESOLVABLE_DISCARD_TARGET
+        elif token == "-c":
+            config = tokens[index + 1] if index + 1 < len(tokens) else None
+            # core.worktree/core.bare relocate the repository the discard targets.
+            if config and re.match(r"core\.(worktree|bare)(=|$)", config):
+                return _UNRESOLVABLE_DISCARD_TARGET
+        # Other flags do not relocate.
+
+    # git clean -x/-X also deletes ignored files, so its probe must include them.
+    clean_removes_ignored = False
+    if subcommand_index != -1 and tokens[subcommand_index] == "clean":
+        for token in tokens[subcommand_index + 1 :]:
+            if token == "--":
+                break  # everything after -- is a pathspec
+            if token.startswith("--"):
+                continue
+            if token.startswith("-") and re.search(r"[xX]", token[1:]):
+                clean_removes_ignored = True
+                break
+
+    # Inline env assignments directly before the git invocation (for example
+    # GIT_DIR=.../GIT_WORK_TREE=... git reset --hard) relocate the target
+    # repository; replay them in the probe, or refuse when they cannot be.
+    env_prefix = ""
+    last_segment = re.split(r"&&|\|\||;|\||\n", prefix)[-1]
+    leading_tokens = [token for token in re.split(r"\s+", last_segment.strip()) if token]
+    for token in leading_tokens:
+        if re.fullmatch(r'''[A-Za-z_][A-Za-z0-9_]*=[^\s$`;&|()<>"]+''', token):
+            continue  # replayable assignment
+        # Wrappers that cannot change directory or select another repository.
+        if token in ("sudo", "env", "command", "builtin") or token.endswith("/"):
+            continue
+        return _UNRESOLVABLE_DISCARD_TARGET
+    assignments = [token for token in leading_tokens if "=" in token]
+    if assignments:
+        env_prefix = " ".join(assignments) + " "
+
+    # cd relocations earlier in the command. cds inside grouping parentheses
+    # do not persist: they only matter when the discard itself runs inside the
+    # still-open group, tracked via paren depth. Segments before
+    # userCommandStart belong to the configured command prefix, which the
+    # probe already replays verbatim, so their cds are not re-applied.
+    persistent_cd_args: list[str] = []
+    grouped_cd_args: list[str] = []
+    saw_cd = False
+    paren_depth = 0
+    cd_pending_separator = False
+    if re.search(r"\b(?:cd|pushd)\b", prefix) or "(" in prefix:
+        offset = 0
+        for part in re.split(r"(&&|\|\||;|\||\n)", prefix):
+            start = offset
+            offset += len(part)
+            if start < user_command_start:
+                continue  # command-prefix region: replayed as-is
+            if part in ("&&", "||", ";", "|", "\n"):
+                if cd_pending_separator and part in (";", "\n"):
+                    # The discard's directory depends on the cd succeeding; refuse
+                    # instead of probing only one of the two outcomes.
+                    return _UNRESOLVABLE_DISCARD_TARGET
+                if part in ("||", "|"):
+                    if saw_cd:
+                        return _UNRESOLVABLE_DISCARD_TARGET  # cd success no longer guaranteed
+                    continue
+                cd_pending_separator = False
+                continue
+            trimmed = part.strip()
+            opens = len(re.findall(r"\(", part))
+            closes = len(re.findall(r"\)", part))
+            inside_group = paren_depth > 0 or opens > 0
+            paren_depth = max(0, paren_depth + opens - closes)
+            if inside_group:
+                body = re.sub(r"[)\s]+$", "", re.sub(r"^[(\s]+", "", trimmed))
+                group_cd = re.match(r"cd\s*(.*)$", body)
+                if group_cd:
+                    arg = group_cd.group(1).strip()
+                    if not arg or re.search(r'''[$`;&|()<>#"]''', arg):
+                        return _UNRESOLVABLE_DISCARD_TARGET
+                    saw_cd = True
+                    cd_pending_separator = True
+                    grouped_cd_args.append(arg)
+                elif re.search(r"\b(?:cd|pushd)\b", trimmed):
+                    return _UNRESOLVABLE_DISCARD_TARGET  # group content we cannot replay
+                # A closed group's cds do not persist and must not leak into a
+                # later still-open group's chain.
+                if paren_depth == 0:
+                    grouped_cd_args.clear()
+                continue
+            if trimmed == "pushd" or trimmed.startswith("pushd "):
+                return _UNRESOLVABLE_DISCARD_TARGET
+            cd_match = re.match(r"cd\s*(.*)$", trimmed)
+            if not cd_match:
+                cd_pending_separator = False
+                continue  # not a cd: cannot change cwd
+            arg = cd_match.group(1).strip()
+            # An arg we cannot replay safely (substitution, redirection,
+            # backgrounding, comments, or quotes split by segmenting) leaves
+            # the target repository unknown; refuse rather than probe blindly.
+            balanced = arg.count('"') % 2 == 0 and arg.count("'") % 2 == 0
+            if not balanced or (arg and re.search(r'''[$`;&|()<>#"]''', arg)):
+                return _UNRESOLVABLE_DISCARD_TARGET
+            saw_cd = True
+            cd_pending_separator = True
+            persistent_cd_args.append(arg)
+
+    # When the discard runs inside a still-open group, its directory is the
+    # persistent cd chain inherited by the group plus the group's own cds.
+    cd_args = persistent_cd_args + grouped_cd_args if paren_depth > 0 else persistent_cd_args
+
+    if not cd_args and dash_c_dir is None and not clean_removes_ignored and not env_prefix:
+        return None
+    ignored = " --ignored=matching" if clean_removes_ignored else ""
+    cd_prefix = (
+        " && ".join(f"cd {arg}" if arg else "cd" for arg in cd_args) + " && " if cd_args else ""
+    )
+    if dash_c_dir:
+        git_status = f"git -C {dash_c_dir} status --porcelain --untracked-files=all{ignored}"
+    else:
+        git_status = f"git status --porcelain --untracked-files=all{ignored}"
+    return _DiscardProbeTarget(
+        relocation_prefix=(cd_prefix + env_prefix) or None,
+        git_status_command=git_status,
+    )
+
+
+def _is_truthy_env_value(value: str | None) -> bool:
+    return value is not None and value not in ("", "0")
+
+
+def _probe_uncommitted_changes(probe_command: str, cwd: str) -> list[str] | None:
+    """Probe at-risk files via `git status --porcelain --untracked-files=all`
+    (plus `--ignored=matching` when the discard deletes ignored files) in
+    `cwd`. Returns None when dirtiness cannot be determined (not a repo, git
+    missing, probe failure) so the guard fails open instead of blocking on a
+    guess."""
+    try:
+        completed = subprocess.run(
+            [_shell(), "-c", probe_command],
+            cwd=cwd,
+            env=_child_env(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=_PROBE_TIMEOUT_SECONDS,
+        )
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    output = completed.stdout[:_PROBE_OUTPUT_CAP_BYTES].decode("utf-8", errors="replace")
+    return [line.removesuffix("\r") for line in output.split("\n") if line.strip()]
+
+
+def _format_dirty_tree_refusal(dirty_paths: list[str], includes_ignored_files: bool = False) -> str:
+    listed = dirty_paths[:MAX_DIRTY_PATHS_LISTED]
+    elided = len(dirty_paths) - len(listed)
+    noun = "uncommitted or ignored file(s)" if includes_ignored_files else "uncommitted change(s)"
+    lines = [
+        "Refusing to run this destructive git command: the working tree has"
+        f" {len(dirty_paths)} {noun}.",
+        *(f"  {line}" for line in listed),
+    ]
+    if elided > 0:
+        lines.append(f"  ... and {elided} more")
+    lines.append("")
+    lines.append("Commit, stash, or stage your work first.")
+    lines.append(
+        "To discard these changes intentionally, retry with"
+        " bash(command, allow_destructive_git=True), or set"
+        f" {BASH_DESTRUCTIVE_GIT_BYPASS_ENV}=1."
+    )
+    return "\n".join(lines)
+
+
+def _format_relocation_refusal() -> str:
+    return "\n".join(
+        [
+            "Refusing to run this destructive git command: it changes directory (or"
+            " repository) first, and the uncommitted changes of the repository it"
+            " targets cannot be checked safely.",
+            "",
+            "Run the discard as its own command from the target directory, or retry"
+            " with bash(command, allow_destructive_git=True), or set"
+            f" {BASH_DESTRUCTIVE_GIT_BYPASS_ENV}=1.",
+        ]
+    )
+
+
+def _guard_destructive_git(command: str, allow_destructive_git: bool) -> None:
+    """Refuse destructive git discard commands while the tree they target is
+    dirty. The pattern check is string-only and the probe runs only on a
+    match, so clean runs pay nothing."""
+    if allow_destructive_git or _is_truthy_env_value(
+        os.environ.get(BASH_DESTRUCTIVE_GIT_BYPASS_ENV)
+    ):
+        return
+    # Match the prefixed command exactly as the shell will run it; the prefix
+    # is replayed in the probe, so hook-provided shell setup applies to both.
+    resolved = _with_prefix(command)
+    discard_indices = _find_destructive_git_discard_commands(resolved)
+    if not discard_indices:
+        return
+    prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
+    user_command_start = len(prefix) + 1 if prefix else 0
+    probes: list[tuple[str, bool]] = []
+    seen_probes: set[str] = set()
+    for index in discard_indices:
+        target = _resolve_discard_probe_target(resolved, index, user_command_start)
+        if target is _UNRESOLVABLE_DISCARD_TARGET:
+            raise DestructiveGitRefusalError(_format_relocation_refusal())
+        if target is None:
+            relocation_prefix = ""
+            git_status = GIT_STATUS_PORCELAIN_COMMAND
+        else:
+            relocation_prefix = target.relocation_prefix or ""
+            git_status = target.git_status_command
+        probe_command = _with_prefix(relocation_prefix + git_status)
+        if probe_command in seen_probes:
+            continue
+        seen_probes.add(probe_command)
+        probes.append((probe_command, "--ignored=matching" in git_status))
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        return  # the spawn itself will fail; the guard must not mask that error
+    for probe_command, includes_ignored_files in probes:
+        dirty_paths = _probe_uncommitted_changes(probe_command, cwd)
+        if dirty_paths:
+            raise DestructiveGitRefusalError(
+                _format_dirty_tree_refusal(dirty_paths, includes_ignored_files)
+            )
+
+
+def bash(command: str, *, allow_destructive_git: bool = False) -> BashHandle:
     """Start a shell command immediately; await the handle for the result.
 
     `await bash(cmd)` is a one-shot: cancelling the await (e.g. an interrupt)
@@ -951,10 +1400,16 @@ def bash(command: str) -> BashHandle:
     Output written after the completion fence (e.g. by an EXIT trap or a
     background job) is not in BashResult.output but stays visible via
     handle.output()/tail().
+
+    Destructive git discard commands (`git checkout -- .`, `git restore .`,
+    `git reset --hard`, forced `git clean`) are refused while the repository
+    they target has uncommitted changes; retry with allow_destructive_git=True
+    (or PI_BASH_ALLOW_DESTRUCTIVE_GIT=1) only when the discard is intentional.
     """
     if not isinstance(command, str) or not command:
         raise TypeError("command must be a non-empty str")
     _install_shutdown_hook()
+    _guard_destructive_git(command, allow_destructive_git)
     return BashHandle(command)
 
 
