@@ -17,6 +17,7 @@ pub mod goal_driver;
 pub mod host_requests;
 pub mod messages;
 pub mod refine;
+pub mod runtime;
 pub mod slash_commands;
 pub mod tool_bridge;
 
