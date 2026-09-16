@@ -11830,13 +11830,9 @@ export class AgentSession {
 			}
 			this._pendingRlmSubagentSessionNames.add(requestedSessionName);
 		}
-		// The reservation must outlast name checking: it stays held until the
-		// spawn admission settles, because nothing else tracks a checked but not
-		// yet admitted name. Releasing it in the model-resolution finally let a
-		// parallel same-name spawn race past the availability check before this
-		// spawn's durable admission existed anywhere. The detached runtime task
-		// below releases the reservation at admission completion (success or
-		// failure); every pre-admission failure path releases it here.
+		// The name stays reserved until the spawn admission settles: the
+		// detached runtime task releases it at admission completion (success
+		// or failure), and every pre-admission failure path releases it here.
 		const releaseReservedSessionName = () => {
 			if (requestedSessionName) this._pendingRlmSubagentSessionNames.delete(requestedSessionName);
 		};

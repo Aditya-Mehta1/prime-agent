@@ -2888,14 +2888,10 @@ export class AgentDaemon {
 		parentState: ActiveSessionState,
 		options: CreateRlmSubagentRuntimeOptions,
 	): Promise<AgentSessionRuntime> {
-		// The parent session checked this sibling name before admission started,
-		// but that check raced every other name consumer: the ledger edge — the
-		// only durable record of the name — lands only at the end of this method.
-		// Hold a daemon-wide reservation for the whole admission and re-assert
-		// availability at this boundary, so a same-name sibling (parallel spawn,
-		// rename, or hydration) that landed between the parent check and here
-		// fails closed instead of appending a duplicate durable edge that later
-		// selectors cannot disambiguate.
+		// The sibling name is held under a daemon-wide reservation for the
+		// whole admission and re-asserted at this boundary, so a same-name
+		// sibling that lands mid-admission fails closed before the durable
+		// ledger edge is appended.
 		const nameReservation = {
 			name: options.sessionName,
 			depth: options.rlmDepth,
