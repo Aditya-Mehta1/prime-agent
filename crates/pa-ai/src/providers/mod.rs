@@ -9,6 +9,7 @@ pub mod google_shared;
 pub mod google_stream;
 pub mod google_vertex;
 pub mod mistral;
+pub mod openai_codex_responses;
 pub mod openai_completions;
 pub mod openai_responses;
 pub mod openai_responses_hooks;

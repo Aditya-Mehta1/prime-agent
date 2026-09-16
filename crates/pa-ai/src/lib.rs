@@ -32,6 +32,17 @@ mod prime_inference_differential_test;
 
 pub use event_stream::{AssistantMessageEventExt, AssistantMessageEventStream};
 pub use providers::faux;
+
+/// Codex WebSocket session debugging and cleanup surface
+/// (`getOpenAICodexWebSocketDebugStats`,
+/// `resetOpenAICodexWebSocketDebugStats`,
+/// `closeOpenAICodexWebSocketSessions` in the TS reference).
+pub mod codex_debug {
+    pub use crate::providers::openai_codex_responses::session::{
+        close_websocket_sessions, get_debug_stats as get_websocket_debug_stats,
+        reset_debug_stats as reset_websocket_debug_stats, WebSocketDebugStats,
+    };
+}
 pub use registry::{Provider, ProviderRegistry};
 pub use stream::{complete, complete_simple, stream, stream_simple};
 
