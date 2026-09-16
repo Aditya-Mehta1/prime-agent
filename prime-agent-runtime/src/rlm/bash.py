@@ -1009,7 +1009,7 @@ _DISCARD_RESTORE_PATTERN = re.compile(
     r"\bgit\s+"
     + _GIT_GLOBAL_OPTIONS
     + r"restore\s+"
-    + r"""(?:(?:--source|--worktree)(?:=\S+)?\s+|-s(?:\s+\S+|[^\s]+)\s+|-W\s+|--\s+)?"""
+    + r"""(?:(?:--source|--worktree|--quiet)(?:=\S+)?\s+|-s(?:\s+\S+|[^\s]+)\s+|-q\s+|-W\s+|--\s+)*"""
     + r"""(?:\./?|:/)(?=\s|$|[;&|)])"""
 )
 _DISCARD_RESET_PATTERN = re.compile(
@@ -1066,7 +1066,7 @@ def _normalize_line_continuations(command: str) -> str:
 # for the `2> file` split form). Targets containing quotes, substitution, or
 # process-substitution syntax stay live: masking them could hide a command
 # substitution that executes.
-_REDIRECT_OPERATOR = re.compile(r"[0-9]*[<>]{1,3}(&[0-9]+)?")
+_REDIRECT_OPERATOR = re.compile(r"(?:&>{1,2}|>&|[0-9]*[<>]{1,3}(&[0-9]+)?)")
 _STATIC_REDIRECT_TARGET = re.compile(r"""[^\s;&|<>()$`"']*""")
 
 
@@ -1164,6 +1164,60 @@ def _mask_shell_redirections(command: str) -> str:
     return "".join(chars)
 
 
+def _strip_shell_escapes(command: str) -> tuple[str, list[int]]:
+    """Remove unquoted backslash escapes, mapping indices back to the input.
+
+    The shell treats an unquoted `\\X` as a literal X, so `g\\it reset
+    --ha\\rd` must scan as `git reset --hard`. Quoted and commented spans
+    keep their backslashes: those are data or syntax handled elsewhere.
+    """
+    chars: list[str] = []
+    index_map: list[int] = []
+    quote: str | None = None
+    comment = False
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if comment:
+            chars.append(ch)
+            index_map.append(i)
+            if ch == "\n":
+                comment = False
+            i += 1
+        elif quote is None:
+            if ch in ('"', "'"):
+                quote = ch
+                chars.append(ch)
+                index_map.append(i)
+            elif ch == "#" and (i == 0 or re.match(r"[\s;&|(){}]", command[i - 1])):
+                comment = True
+                chars.append(ch)
+                index_map.append(i)
+            elif ch == "\\" and i + 1 < n and command[i + 1] != "\n":
+                chars.append(command[i + 1])  # literal X: drop the backslash
+                index_map.append(i + 1)
+                i += 1
+            else:
+                chars.append(ch)
+                index_map.append(i)
+            i += 1
+        else:
+            chars.append(ch)
+            index_map.append(i)
+            if quote == "'":
+                if ch == "'":
+                    quote = None
+            elif ch == '"':
+                quote = None
+            elif ch == "\\" and i + 1 < n:
+                chars.append(command[i + 1])
+                index_map.append(i + 1)
+                i += 1
+            i += 1
+    return "".join(chars), index_map
+
+
 def _mask_quoted_spans(command: str) -> str:
     """Blank out quoted data and comments, keeping character positions.
 
@@ -1254,14 +1308,17 @@ def _is_forced_clean_segment(args: str) -> bool:
 def _find_destructive_git_discard_commands(command: str) -> list[int]:
     """Find every destructive git discard command in `command`, returning the
     character index where each `git` token starts (empty when none match)."""
-    masked = _mask_quoted_spans(_mask_shell_redirections(_normalize_line_continuations(command)))
+    normalized, index_map = _strip_shell_escapes(
+        _mask_shell_redirections(_normalize_line_continuations(command))
+    )
+    masked = _mask_quoted_spans(normalized)
     indices: list[int] = []
     for pattern in (_DISCARD_CHECKOUT_PATTERN, _DISCARD_RESTORE_PATTERN, _DISCARD_RESET_PATTERN):
         indices.extend(match.start() for match in pattern.finditer(masked))
     for match in _DISCARD_CLEAN_PATTERN.finditer(masked):
         if _is_forced_clean_segment(match.group(1)):
             indices.append(match.start())
-    return sorted(indices)
+    return sorted(index_map[index] for index in indices)
 
 
 def is_destructive_git_discard_command(command: str) -> bool:
@@ -1323,7 +1380,9 @@ def _eval_payloads_hide_destructive_git(command: str, depth: int = 0) -> bool:
     """
     if depth > _MAX_EVAL_SCAN_DEPTH:
         return True  # absurdly nested evals: refuse rather than risk a miss
-    command = _mask_shell_redirections(_normalize_line_continuations(command))
+    command = _strip_shell_escapes(
+        _mask_shell_redirections(_normalize_line_continuations(command))
+    )[0]
     masked = _mask_quoted_spans(command)
     for match in re.finditer(r"\beval\b", masked):
         # The payload runs from just after the eval token to the next
@@ -1416,7 +1475,8 @@ def _resolve_discard_probe_target(
     # GIT_DIR=.../GIT_WORK_TREE=... git reset --hard) relocate the target
     # repository; replay them in the probe, or refuse when they cannot be.
     env_prefix = ""
-    last_segment = re.split(r"&&|\|\||;|\||\n", prefix)[-1]
+    segments = re.split(r"&&|\|\||;|\||\n", prefix)
+    last_segment = segments[-1]
     leading_tokens = [token for token in re.split(r"\s+", last_segment.strip()) if token]
     for token in leading_tokens:
         if re.fullmatch(r'''[A-Za-z_][A-Za-z0-9_]*=[^\s$`;&|()<>"]+''', token):
@@ -1426,8 +1486,44 @@ def _resolve_discard_probe_target(
             continue
         return _UNRESOLVABLE_DISCARD_TARGET
     assignments = [token for token in leading_tokens if "=" in token]
-    if assignments:
-        env_prefix = " ".join(assignments) + " "
+    # Standalone assignments (with or without `export`) persist across
+    # separators in the same shell, so `GIT_DIR=...; git reset --hard` (or
+    # the export form) relocates the discard; replay them in the probe, or
+    # refuse when an export cannot be replayed verbatim. Assignments inside
+    # a mixed segment (for example `FOO=1 git status`) only apply to that
+    # command, and a piped segment runs in a subshell, so neither persists.
+    persistent_assignments: list[str] = []
+    assignment_pattern = r'''[A-Za-z_][A-Za-z0-9_]*=[^\s$`;&|()<>"]+'''
+    if len(segments) > 1:
+        parts = re.split(r"(&&|\|\||;|\||\n)", prefix)
+        seg_positions: list[int] = []
+        offset = 0
+        for index, part in enumerate(parts):
+            if index % 2 == 0:
+                seg_positions.append(offset)
+            offset += len(part)
+        for index in range(len(segments) - 1):
+            if seg_positions[index] < user_command_start:
+                continue  # command-prefix region: replayed verbatim
+            if parts[2 * index + 1] not in (";", "&&", "\n"):
+                continue  # pipe/subshell or short-circuit: the env does not persist
+            seg_tokens = [token for token in re.split(r"\s+", segments[index].strip()) if token]
+            if not seg_tokens:
+                continue
+            if seg_tokens[0] == "export":
+                seg_tokens = seg_tokens[1:]
+                if not seg_tokens or not all(
+                    re.fullmatch(assignment_pattern, token) for token in seg_tokens
+                ):
+                    return _UNRESOLVABLE_DISCARD_TARGET
+                persistent_assignments.extend(seg_tokens)
+            elif all(re.fullmatch(assignment_pattern, token) for token in seg_tokens):
+                persistent_assignments.extend(seg_tokens)
+    env_prefix = (
+        " ".join(persistent_assignments + assignments) + " "
+        if persistent_assignments or assignments
+        else ""
+    )
 
     # cd relocations earlier in the command. cds inside grouping parentheses
     # do not persist: they only matter when the discard itself runs inside the
@@ -1479,9 +1575,12 @@ def _resolve_discard_probe_target(
                 if paren_depth == 0:
                     grouped_cd_args.clear()
                 continue
-            if trimmed == "pushd" or trimmed.startswith("pushd "):
+            # Brace groups run in the current shell, so a `{ cd sub && git
+            # reset --hard; }` relocates the discard like a bare cd chain.
+            group_free = re.sub(r"^\{\s*", "", trimmed)
+            if group_free == "pushd" or group_free.startswith("pushd "):
                 return _UNRESOLVABLE_DISCARD_TARGET
-            cd_match = re.match(r"cd\s*(.*)$", trimmed)
+            cd_match = re.match(r"cd\s*(.*)$", group_free)
             if not cd_match:
                 cd_pending_separator = False
                 continue  # not a cd: cannot change cwd
