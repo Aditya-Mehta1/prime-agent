@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
@@ -24,6 +25,25 @@ bash_module = sys.modules["rlm.bash"]
 AWAIT_TIMEOUT = 10.0
 GIT_TIMEOUT = 60
 KERNEL_LAUNCH_TIMEOUT = 90
+
+# The guard classifies remote words on every guarded command that carries a git
+# word, so a pathological word must not wedge kernel bash(). These bounds are
+# wall-clock and generous: the work is a handful of linear passes.
+SCAN_BUDGET_SECONDS = 0.5
+SCAN_TIMEOUT_SECONDS = 20.0
+
+# Words shaped to trigger catastrophic backtracking in a pattern that nests a
+# `+` inside a `+` (`[^/@:]+(?:\.[^/@:]+)+:`, the py/redos finding): many
+# dot-separated groups, with and without the colon that makes the guard
+# classify the word, a long colon-free word, and a long dotted word.
+PATHOLOGICAL_REMOTE_WORDS = [
+    "a" + ".x" * 30,
+    "a" + ".x" * 30 + "/:p",
+    "a" + ".." * 200,
+    "a" + "./" * 200 + ":p",
+    "x" * 4096,
+    "a" + ".x" * 2000 + "/:p",
+]
 
 
 FORCE_PUSH_LEAF = "git push -f origin main"
@@ -401,6 +421,96 @@ class ForcePushShellCPayloadTest(unittest.TestCase):
                 self.assertFalse(
                     bash_module._fp_shell_c_payloads_hide_force_push(command)
                 )
+
+
+class ForcePushScanCostTest(unittest.TestCase):
+    """A pathological word must not wedge the scan (py/redos, CWE-1333).
+
+    Each measurement runs in its own interpreter so a wedged classification is
+    killed by the subprocess timeout instead of hanging the suite, and the
+    wall-clock bound is asserted on the reported elapsed time.
+    """
+
+    def _probe(self, body: str, argument: str) -> tuple[float, str]:
+        probe = (
+            "import sys, time\n"
+            "import rlm.bash\n"
+            "module = sys.modules['rlm.bash']\n"
+            "argument = sys.argv[1]\n"
+            "outcome = 'n/a'\n"
+            "started = time.monotonic()\n"
+            f"{body}\n"
+            "print('%.6f\\t%s' % (time.monotonic() - started, outcome))\n"
+        )
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-c", probe, argument],
+                capture_output=True,
+                text=True,
+                env=dict(os.environ),
+                timeout=SCAN_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail(
+                f"the guard did not finish a {len(argument)} character word in"
+                f" {SCAN_TIMEOUT_SECONDS}s"
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        elapsed_text, _separator, outcome = completed.stdout.strip().partition("\t")
+        return float(elapsed_text), outcome
+
+    def _time_classification(self, word: str) -> float:
+        """Seconds the guard needs to classify one remote word."""
+        elapsed, _outcome = self._probe(
+            "module._fp_parse_push_args(['git', 'push', '-f', argument], 1)",
+            word,
+        )
+        return elapsed
+
+    def _time_guard(self, command: str) -> tuple[float, str]:
+        """Seconds the guard needs for one command, plus its verdict."""
+        return self._probe(
+            "try:\n"
+            "    module._guard_force_push(argument, False)\n"
+            "    outcome = 'allowed'\n"
+            "except Exception as refusal:\n"
+            "    outcome = 'refused: ' + str(refusal).splitlines()[0]\n",
+            command,
+        )
+
+    def test_pathological_remote_words_are_classified_quickly(self):
+        for word in PATHOLOGICAL_REMOTE_WORDS:
+            with self.subTest(length=len(word)):
+                elapsed = self._time_classification(word)
+                self.assertLess(
+                    elapsed,
+                    SCAN_BUDGET_SECONDS,
+                    f"{elapsed:.3f}s to classify {len(word)} characters",
+                )
+
+    def test_guard_verdict_for_a_pathological_word_is_still_taken(self):
+        refused = 0
+        for command in [
+            "git push -f origin " + "a" + ".x" * 30,
+            "git push -f origin " + "a" + ".x" * 30 + "/:p",
+            "git push -f origin " + "a" + ".." * 200,
+            "git push -f origin main " + "x" * 4096,
+            "git push -f " + "a" + ".x" * 2000 + "/:p" + " main",
+        ]:
+            with self.subTest(length=len(command)):
+                elapsed, outcome = self._time_guard(command)
+                self.assertLess(
+                    elapsed,
+                    SCAN_BUDGET_SECONDS,
+                    f"{elapsed:.3f}s to decide {len(command)} characters",
+                )
+                # A verdict was reached (the guard either allowed or refused),
+                # and the one carrying a protected target was refused.
+                self.assertTrue(
+                    outcome.startswith(("allowed", "refused")), outcome
+                )
+                refused += outcome.startswith("refused")
+        self.assertGreaterEqual(refused, 1)
 
 
 @unittest.skipUnless(

@@ -1588,10 +1588,34 @@ _FP_GIT_GLOBAL_VALUE_LONG = {
 # A remote can be a URL or an scp-like path -- `https://host/x.git`,
 # `git@github.com:org/repo.git`, `host.name:path`, `C:\repo` -- and git reads
 # the first positional as the repository before it reads any refspec, so a
-# colon inside one is not a refspec separator.
-_FP_URL_OR_SCP_REMOTE = re.compile(
-    r"""^(?:[A-Za-z][A-Za-z0-9+.\-]*://|[^/@:]+@[^/:]+:|[A-Za-z]:[\\/]|[^/@:]+(?:\.[^/@:]+)+:)"""
-)
+# colon inside one is not a refspec separator. The classification is linear:
+# the single pattern that used to do this nested a `+` inside a `+`
+# (`[^/@:]+(?:\.[^/@:]+)+:`), which backtracked exponentially on a long word
+# with many dot-separated groups (py/redos, CWE-1333), and it runs on every
+# guarded command that carries a git word.
+_FP_URL_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
+_FP_SCP_USER_HOST = re.compile(r"^[^/@:]+@[^/:]+:")
+_FP_WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _fp_is_url_or_scp_remote(word: str) -> bool:
+    """True when `word` names a remote by URL or scp-like path.
+
+    git reads the first positional as the repository, so these are remotes even
+    though they carry a colon: `https://host/x.git`, `file:///srv/x.git`,
+    `ssh://...`, `git@github.com:org/repo.git`, `host.name:path`, and the
+    Windows `C:\repo` / `C:/repo` paths. A word that merely carries a colon is
+    not one (`main:main`, `HEAD:feature`, `refs/heads/x:refs/heads/y`)."""
+    if _FP_URL_SCHEME.match(word) or _FP_SCP_USER_HOST.match(word):
+        return True
+    if _FP_WINDOWS_DRIVE.match(word):
+        return True
+    # The remaining shape is `host.name:path`: the part before the first colon
+    # is a host with a dot in it, and holds no `/` or `@`.
+    host, separator, _path = word.partition(":")
+    if not separator or not host or "/" in host or "@" in host:
+        return False
+    return "." in host
 
 # git push options that take the next token as their value (space-separated
 # form); `--signed[=x]` and `--recurse-submodules[=x]` are attached-only, and
@@ -1996,7 +2020,7 @@ def _fp_parse_push_args(tokens: list[str], push_index: int) -> _FpPushArgs:
             or first.startswith("refs/")
             or re.search(r"[*?\[]", first)
         )
-        if not refspec_shaped or _FP_URL_OR_SCP_REMOTE.match(first):
+        if not refspec_shaped or _fp_is_url_or_scp_remote(first):
             # The first positional names the remote; git reads a URL or
             # scp-like word as the repository even though it carries a colon,
             # so an implicit refspec (push.default, remote.<name>.push,
