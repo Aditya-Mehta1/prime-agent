@@ -75,6 +75,8 @@ function createHomebrewInstall(): { packageDir: string } {
 	const prefix = mkdtempSync(join(tmpdir(), "pi-homebrew-"));
 	const packageDir = join(prefix, "Cellar", "prime-agent", "0.7.0", "libexec", "lib", "node_modules", "prime-agent");
 	mkdirSync(packageDir, { recursive: true });
+	// brew writes an INSTALL_RECEIPT.json into every keg; it is what marks a Cellar as Homebrew's.
+	writeFileSync(join(prefix, "Cellar", "prime-agent", "0.7.0", "INSTALL_RECEIPT.json"), "{}\n");
 	tempDir = prefix;
 	process.env.PI_PACKAGE_DIR = packageDir;
 	setExecPath(join(packageDir, "dist", "cli.js"));

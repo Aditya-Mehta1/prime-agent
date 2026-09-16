@@ -87,24 +87,40 @@ describe("version checks", () => {
 		});
 	});
 
-	it("rejects a manifest tarball on another origin", async () => {
-		const fetchMock = vi.fn(async () =>
-			Response.json({
-				package: "prime-agent",
-				tarball: "https://attacker.example/prime-agent-1.2.4.tgz",
-				version: "v1.2.4",
-			}),
+	it("uses the manifest's absolute https tarball URL, refusing only malformed or insecure ones", async () => {
+		// Release feeds may name a tarball on their own distribution host, so an absolute https URL
+		// is used as published (forward-compatible manifest parsing).
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () =>
+				Response.json({
+					package: "prime-agent",
+					tarball: "https://releases.example/releases/v1.2.4/prime-agent-1.2.4.tgz",
+					version: "v1.2.4",
+				}),
+			),
 		);
-		vi.stubGlobal("fetch", fetchMock);
-
-		await expect(getLatestPiRelease("1.2.3")).resolves.toEqual({
-			installSpec: undefined,
-			packageName: "prime-agent",
-			version: "1.2.4",
+		await expect(getLatestPiRelease("1.2.3")).resolves.toMatchObject({
+			installSpec: "https://releases.example/releases/v1.2.4/prime-agent-1.2.4.tgz",
 		});
+
+		for (const tarball of [
+			"http://releases.example/prime-agent-1.2.4.tgz",
+			"https://user:pw@releases.example/prime-agent-1.2.4.tgz",
+			"https://releases.example/prime-agent-1.2.4.tgz?token=x",
+			"https://releases.example/prime-agent-1.2.4.tgz#frag",
+			"//releases.example/prime-agent-1.2.4.tgz",
+		]) {
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async () => Response.json({ package: "prime-agent", tarball, version: "v1.2.4" })),
+			);
+			const release = await getLatestPiRelease("1.2.3");
+			expect(release?.installSpec, tarball).toBeUndefined();
+		}
 	});
 
-	it("rejects a manifest tarball that escapes the download prefix or carries a query", async () => {
+	it("rejects a relative tarball that escapes the download prefix, and any query or protocol-relative URL", async () => {
 		for (const tarball of [
 			"../elsewhere/prime-agent.tgz",
 			"releases/v1.2.4/prime-agent-1.2.4.tgz?token=x",

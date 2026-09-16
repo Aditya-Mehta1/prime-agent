@@ -159,13 +159,15 @@ function getReleaseManifestPath(currentVersion: string, channel?: UpdateChannel)
 }
 
 /**
- * Resolve a manifest-provided release location against the download origin. The manifest is
- * fetched from that origin, so it may only name assets on the same origin: an absolute URL that
- * points anywhere else is rejected rather than followed. Relative paths are joined with the URL API.
+ * Resolve a manifest-provided release location. An absolute https URL is used as published
+ * (release feeds may name a tarball on their own distribution host); it is still refused when it
+ * carries credentials, a query, or a fragment, or is protocol-relative. A relative path is joined
+ * with the URL API and must stay inside the download origin's prefix.
  */
 function resolveReleaseUrl(baseUrl: string, pathOrUrl: string): string | undefined {
 	const trimmed = pathOrUrl.trim();
 	if (!trimmed) return undefined;
+	if (trimmed.startsWith("//")) return undefined; // protocol-relative: scheme depends on context
 	const base = new URL(`${baseUrl}/`);
 	let resolved: URL;
 	try {
@@ -173,8 +175,13 @@ function resolveReleaseUrl(baseUrl: string, pathOrUrl: string): string | undefin
 	} catch {
 		return undefined;
 	}
-	if (resolved.origin !== base.origin || !resolved.pathname.startsWith(base.pathname)) return undefined;
+	if (resolved.protocol !== "https:") return undefined;
 	if (resolved.search || resolved.hash || resolved.username || resolved.password) return undefined;
+	if (trimmed.includes("://") && !/^https:/.test(trimmed)) return undefined;
+	if (!trimmed.includes("://")) {
+		// A relative location may not escape the origin or the configured prefix.
+		if (resolved.origin !== base.origin || !resolved.pathname.startsWith(base.pathname)) return undefined;
+	}
 	return resolved.toString();
 }
 
