@@ -292,6 +292,24 @@ describe("incident window and session filtering", () => {
 		expect(text).toContain('Agent name "Faerie" is unavailable');
 	});
 
+	it("does not let a passivation event with an empty session name match every filter", () => {
+		// daemon-mode logs `name=""` when the session has no name; that empty
+		// token must not prefix-match every --session value.
+		const text = reportFor(
+			[
+				agentLogLine({
+					ts: "2026-09-10T20:05:00.000Z",
+					component: "coding-agent.daemon",
+					socketPath: "/tmp/prime-agent-501/worker-98ed5cb228d2-5b1d3aeb91ee.sock",
+					pid: 53615,
+					msg: 'Passivated idle child sessionId=feedface1234 name="" idleMinutes=5',
+				}),
+			],
+			{ session: "aabbccddeeff" },
+		);
+		expect(text).toContain('reference session "aabbccddeeff"');
+	});
+
 	it("says clearly when nothing in the window references the session", () => {
 		const text = reportFor(incidentFixtureLines(), { session: "deadbeef1234" });
 		expect(text).toContain('reference session "deadbeef1234"');

@@ -438,12 +438,15 @@ function classifyWorkerStderrBody(
 	}
 	const passivated = /^Passivated idle child sessionId=(\S+) name=("[^"]*"|\S+) idleMinutes=(\d+)$/.exec(line);
 	if (passivated) {
+		// A missing session name logs as `name=""`; that empty token must not
+		// become a filter key.
+		const name = passivated[2].replace(/^"|"$/g, "");
 		return {
 			severity: "info",
 			eventClass: "worker-passivation",
 			subject: `session ${passivated[1]}`,
 			summary: `passivated idle child session ${passivated[1]} (idle ${passivated[3]}m)`,
-			tokens: [workerId, passivated[1]!, passivated[2].replace(/^"|"$/g, "")],
+			tokens: name ? [workerId, passivated[1]!, name] : [workerId, passivated[1]!],
 		};
 	}
 	if (!includeGeneric) {
@@ -972,7 +975,9 @@ function aggregateIncidentEvents(events: readonly IncidentEvent[]): AggregatedEv
 }
 
 function sessionMatches(incident: IncidentEvent, session: string): boolean {
-	return incident.tokens.some((token) => token.startsWith(session) || session.startsWith(token));
+	// An empty token (e.g. a missing session name) is a prefix of every value
+	// and must not match every session filter.
+	return incident.tokens.some((token) => token !== "" && (token.startsWith(session) || session.startsWith(token)));
 }
 
 /**
