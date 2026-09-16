@@ -21,6 +21,7 @@ pub mod messages;
 pub mod provider_adapter;
 pub mod refine;
 pub mod runtime;
+pub mod runtime_wiring;
 pub mod slash_commands;
 pub mod tool_bridge;
 
@@ -79,7 +80,21 @@ impl AgentSession {
         session: SessionManager,
         prompt_templates: Vec<PromptTemplate>,
     ) -> Self {
-        let session = Arc::new(tokio::sync::Mutex::new(session));
+        Self::from_session_arc(
+            agent,
+            Arc::new(tokio::sync::Mutex::new(session)),
+            prompt_templates,
+        )
+        .await
+    }
+
+    /// Build a session from an already-shared session manager handle, so the
+    /// kernel host-request handlers can reach the same persistence.
+    pub async fn from_session_arc(
+        agent: Arc<Agent>,
+        session: Arc<tokio::sync::Mutex<SessionManager>>,
+        prompt_templates: Vec<PromptTemplate>,
+    ) -> Self {
         let persistence = session.clone();
         agent
             .subscribe(move |event, _signal| {

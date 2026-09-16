@@ -97,24 +97,50 @@ pub async fn create_session(config: SessionEngineConfig) -> anyhow::Result<Sessi
         .stream_fn
         .ok_or_else(|| anyhow::anyhow!("a provider stream_fn is required"))?;
 
+    // Session persistence + the runtime wiring: goal/rlm-heartbeat host
+    // handlers ride the kernel provisioner, and the agent gains the
+    // `ipython` tool backed by that kernel (unless the caller supplied one).
+    let session_manager = config
+        .session_manager
+        .unwrap_or_else(|| SessionManager::in_memory(&cwd));
+    let wiring = super::runtime_wiring::wire_session_runtime(session_manager, &config.agent_dir);
+    let python_skills = super::runtime_wiring::kernel_python_skills(&resources.skills);
+    let session_id = wiring.session.lock().await.get_session_id().to_string();
+    let provisioner = super::runtime_wiring::kernel_provisioner(
+        session_id,
+        wiring.handlers.clone(),
+        python_skills,
+    );
+    let mut tools = config.tools.clone();
+    if !tools.iter().any(|tool| tool.name() == "ipython") {
+        let definition = crate::tools::ipython::create_ipython_tool_definition(
+            &cwd.to_string_lossy(),
+            super::runtime_wiring::ipython_tool_options(provisioner),
+        );
+        tools.push(Arc::new(
+            crate::session_engine::tool_bridge::ToolDefinitionBridge::new(definition),
+        ));
+    }
+
     let agent = Agent::new(AgentOptions {
         initial_state: AgentInitialState {
             system_prompt: Some(system_prompt.clone()),
             model: Some(model),
             thinking_level: config.thinking_level,
-            tools: Some(config.tools.clone()),
+            tools: Some(tools),
             messages: None,
         },
         stream_fn: Some(stream_fn),
         ..Default::default()
     });
 
-    let session_manager = config
-        .session_manager
-        .unwrap_or_else(|| SessionManager::in_memory(&cwd));
     Ok(SessionEngine {
-        session: AgentSession::new(Arc::new(agent), session_manager, resources.prompts.clone())
-            .await,
+        session: AgentSession::from_session_arc(
+            Arc::new(agent),
+            wiring.session.clone(),
+            resources.prompts.clone(),
+        )
+        .await,
         skills: resources.skills,
         prompt_templates: resources.prompts,
         agents_files: resources.agents_files,
@@ -252,4 +278,55 @@ mod tests {
         )));
         let _ = ToolDefinitionBridge::new;
     }
+}
+
+#[tokio::test]
+async fn create_session_registers_goal_and_heartbeat_handlers() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let registration =
+        pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
+            models: Some(vec![pa_ai::faux::FauxModelDefinition {
+                id: "faux-1".to_string(),
+                name: Some("Faux".to_string()),
+                reasoning: Some(false),
+                input: Some(vec![pa_types::ai::ModelInput::Text]),
+                cost: None,
+                context_window: Some(100_000),
+                max_tokens: Some(4_096),
+            }]),
+            ..Default::default()
+        });
+    registration.set_responses(vec![pa_ai::faux::FauxResponseStep::Message(
+        pa_ai::faux::faux_assistant_text_message(
+            "ok",
+            pa_ai::faux::FauxAssistantMessageOptions::default(),
+        ),
+    )]);
+    let model = registration.get_model();
+    let agent_model = crate::session_engine::provider_adapter::json_round_trip(&model).unwrap();
+    let stream_fn = crate::session_engine::provider_adapter::real_stream_fn(None, model.clone());
+    let engine = create_session(SessionEngineConfig {
+        cwd: dir.path().to_path_buf(),
+        agent_dir: dir.path().to_path_buf(),
+        model: Some(agent_model),
+        stream_fn: Some(stream_fn),
+        tools: Vec::new(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    // The agent loop gained the ipython tool backed by the kernel.
+    let names: Vec<String> = engine
+        .session
+        .agent()
+        .state()
+        .await
+        .tools
+        .iter()
+        .map(|tool| tool.name().to_string())
+        .collect();
+    assert!(
+        names.iter().any(|name| name == "ipython"),
+        "tools: {names:?}"
+    );
 }

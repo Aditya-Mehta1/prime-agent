@@ -17,6 +17,11 @@ impl AbortSignal {
         Self::default()
     }
 
+    /// Wrap a raw cancellation token.
+    pub fn from_token(token: tokio_util::sync::CancellationToken) -> Self {
+        Self { token }
+    }
+
     /// Signal wrapping an already aborted state.
     pub fn aborted() -> Self {
         let signal = Self::new();
