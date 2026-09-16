@@ -134,9 +134,29 @@ struct SessionCore {
     shutdown_requested: bool,
 }
 
-/// One outbound session-event frame: the fully sequenced JSON payload.
-struct OutboundFrame {
-    payload: Vec<u8>,
+/// One outbound frame: the serialized JSON payload plus its private-frame
+/// `outboundType` (`session_event` or `side_question_event`), mirroring the
+/// TS worker frame header. The supervisor fans frames out per its own
+/// routing (clients attached to the session).
+pub(crate) struct OutboundFrame {
+    pub(crate) payload: Vec<u8>,
+    pub(crate) outbound_type: &'static str,
+}
+
+impl OutboundFrame {
+    pub(crate) fn session_event(payload: Vec<u8>) -> Self {
+        OutboundFrame {
+            payload,
+            outbound_type: "session_event",
+        }
+    }
+
+    pub(crate) fn side_question_event(payload: Vec<u8>) -> Self {
+        OutboundFrame {
+            payload,
+            outbound_type: "side_question_event",
+        }
+    }
 }
 
 pub struct Worker {
@@ -147,6 +167,8 @@ pub struct Worker {
     idle_notify: Arc<Notify>,
     events: broadcast::Sender<Arc<OutboundFrame>>,
     recovery: Mutex<Option<WorkerRecoveryJournal>>,
+    /// Live side-question runs (registry, guards, event frames).
+    side_questions: crate::side_question::SideQuestionManager,
 }
 
 impl Worker {
@@ -212,6 +234,11 @@ impl Worker {
             });
             engine
         };
+        let side_questions = crate::side_question::SideQuestionManager::new(
+            std::sync::Arc::clone(&engine),
+            events.clone(),
+            config.active_session_id.clone(),
+        );
         Worker {
             config,
             core,
@@ -220,6 +247,7 @@ impl Worker {
             idle_notify,
             events,
             recovery: Mutex::new(None),
+            side_questions,
         }
     }
 
@@ -303,7 +331,7 @@ impl Worker {
                             let active_session_id = active_session_id_of(&frame.payload);
                             let header = json!({
                                 "kind": "outbound",
-                                "outboundType": "session_event",
+                                "outboundType": frame.outbound_type,
                                 "activeSessionId": active_session_id,
                             });
                             if worker
@@ -496,6 +524,18 @@ impl Worker {
             "steer" => self.handle_queue(payload, Lane::Steering),
             "follow_up" => self.handle_queue(payload, Lane::FollowUp),
             "abort" => self.handle_abort(),
+            "start_side_question" => {
+                if let Err(response) = self.require_created("start_side_question") {
+                    return response;
+                }
+                self.side_questions.start(payload)
+            }
+            "abort_side_question" => {
+                if let Err(response) = self.require_created("abort_side_question") {
+                    return response;
+                }
+                self.side_questions.abort(payload)
+            }
             "wait_for_idle" => self.handle_wait_for_idle().await,
             "get_state" => self.handle_get_state(),
             "get_messages" => self.handle_get_messages(),
@@ -849,6 +889,7 @@ impl Worker {
             .and_then(Value::as_str)
             .unwrap_or("anonymous")
             .to_string();
+        self.side_questions.abort_for_client(&client_id);
         let mut core = self.core.lock().unwrap();
         core.attached_client_ids.retain(|id| id != &client_id);
         response_success(None, "detach", None)
@@ -1089,6 +1130,7 @@ impl Worker {
     }
 
     fn handle_kill(&self) -> DaemonResponse {
+        self.side_questions.abort_all();
         let mut core = self.core.lock().unwrap();
         if let Some(store) = core.store.as_mut() {
             let _ = store.append_session_state("archived");
@@ -1220,7 +1262,9 @@ impl Worker {
         };
         let payload = serde_json::to_vec(&outbound)?;
         drop(core);
-        let _ = self.events.send(Arc::new(OutboundFrame { payload }));
+        let _ = self
+            .events
+            .send(Arc::new(OutboundFrame::session_event(payload)));
         Ok(())
     }
 
@@ -1246,7 +1290,9 @@ impl Worker {
         };
         let payload = serde_json::to_vec(&outbound)?;
         drop(core);
-        let _ = self.events.send(Arc::new(OutboundFrame { payload }));
+        let _ = self
+            .events
+            .send(Arc::new(OutboundFrame::session_event(payload)));
         Ok(())
     }
 }
@@ -1418,7 +1464,7 @@ impl TurnRunner {
                 };
                 drop(core);
                 let payload = serde_json::to_vec(&outbound).unwrap_or_default();
-                let _ = events.send(Arc::new(OutboundFrame { payload }));
+                let _ = events.send(Arc::new(OutboundFrame::session_event(payload)));
                 true
             };
             engine.run_prompt(prompt_index, request, &mut emit);
@@ -1460,7 +1506,9 @@ impl TurnRunner {
             };
             let payload = serde_json::to_vec(&outbound).unwrap_or_default();
             drop(core);
-            let _ = self.events.send(Arc::new(OutboundFrame { payload }));
+            let _ = self
+                .events
+                .send(Arc::new(OutboundFrame::session_event(payload)));
         }
         self.idle_notify.notify_waiters();
     }
@@ -1500,7 +1548,9 @@ impl TurnRunner {
         };
         let payload = serde_json::to_vec(&outbound).unwrap_or_default();
         drop(core);
-        let _ = self.events.send(Arc::new(OutboundFrame { payload }));
+        let _ = self
+            .events
+            .send(Arc::new(OutboundFrame::session_event(payload)));
     }
 }
 

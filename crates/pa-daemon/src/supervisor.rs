@@ -112,13 +112,21 @@ struct WorkerRequest {
     payload: Value,
 }
 
+/// Which clients a worker outbound frame reaches.
+#[derive(Debug, Clone)]
+enum ClientRouting {
+    /// Every connected client (e.g. `daemon_closing`).
+    Broadcast,
+    /// Clients attached to the session.
+    AttachedSession { active_session_id: String },
+}
+
 pub struct Supervisor {
     options: SupervisorOptions,
     descriptor_dir: PathBuf,
     workers: Mutex<HashMap<String, Arc<ResidentWorker>>>,
-    /// (Some(activeSessionId), outbound) routes to clients attached to that
-    /// session; (None, outbound) broadcasts to every client.
-    events: broadcast::Sender<(Option<String>, Value)>,
+    /// Worker outbound frames, with their client routing.
+    events: broadcast::Sender<(ClientRouting, Value)>,
     shutting_down: AtomicBool,
     log: paths::RotatingLog,
 }
@@ -538,7 +546,23 @@ impl Supervisor {
                             .get("activeSessionId")
                             .and_then(Value::as_str)
                             .map(str::to_string);
-                        let _ = events.send((active_session_id, payload));
+                        let routing = active_session_id
+                            .map(|active_session_id| ClientRouting::AttachedSession {
+                                active_session_id,
+                            })
+                            .unwrap_or(ClientRouting::Broadcast);
+                        let _ = events.send((routing, payload));
+                    } else if outbound_type == "side_question_event" {
+                        let active_session_id = payload
+                            .get("activeSessionId")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        let routing = active_session_id
+                            .map(|active_session_id| ClientRouting::AttachedSession {
+                                active_session_id,
+                            })
+                            .unwrap_or(ClientRouting::Broadcast);
+                        let _ = events.send((routing, payload));
                     }
                 }
             });
@@ -815,13 +839,16 @@ impl Supervisor {
                 }
                 event = events.recv() => {
                     match event {
-                        Ok((Some(active_session_id), payload)) => {
-                            if attached.iter().any(|id| id == &active_session_id) {
+                        Ok((routing, payload)) => {
+                            let deliver = match &routing {
+                                ClientRouting::Broadcast => true,
+                                ClientRouting::AttachedSession { active_session_id } => {
+                                    attached.iter().any(|id| id == active_session_id)
+                                }
+                            };
+                            if deliver {
                                 write_line(&mut writer, &payload).await?;
                             }
-                        }
-                        Ok((None, payload)) => {
-                            write_line(&mut writer, &payload).await?;
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(broadcast::error::RecvError::Closed) => break,
@@ -877,7 +904,9 @@ impl Supervisor {
                 let mut lines = vec![response_line(&response)];
                 // daemon_closing goes to every client before the exit.
                 let closing = json!({ "type": "daemon_closing", "reason": "shutdown" });
-                let _ = self.events.send((None, closing.clone()));
+                let _ = self
+                    .events
+                    .send((ClientRouting::Broadcast, closing.clone()));
                 lines.push(closing);
                 self.begin_shutdown().await;
                 (lines, true)

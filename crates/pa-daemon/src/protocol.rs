@@ -410,6 +410,12 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         | DaemonCommand::Abort {
             active_session_id, ..
         }
+        | DaemonCommand::StartSideQuestion {
+            active_session_id, ..
+        }
+        | DaemonCommand::AbortSideQuestion {
+            active_session_id, ..
+        }
         | DaemonCommand::WaitForIdle {
             active_session_id, ..
         }
@@ -463,6 +469,8 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::Steer { .. } => "steer",
         DaemonCommand::FollowUp { .. } => "follow_up",
         DaemonCommand::Abort { .. } => "abort",
+        DaemonCommand::StartSideQuestion { .. } => "start_side_question",
+        DaemonCommand::AbortSideQuestion { .. } => "abort_side_question",
         DaemonCommand::WaitForIdle { .. } => "wait_for_idle",
         DaemonCommand::GetState { .. } => "get_state",
         DaemonCommand::GetSessionHeader { .. } => "get_session_header",

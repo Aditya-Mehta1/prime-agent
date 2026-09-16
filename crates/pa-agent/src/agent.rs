@@ -855,6 +855,12 @@ impl Agent {
             || self.inner.follow_up_queue.lock().unwrap().has_items()
     }
 
+    /// The loop's provider stream function (the side-thread clone passes the
+    /// same function to its own loop, TS `parent.streamFn`).
+    pub fn stream_fn(&self) -> Option<&StreamFn> {
+        self.inner.stream_fn.as_ref()
+    }
+
     /// The active run's abort signal, if any (TS `get signal`).
     pub fn signal(&self) -> Option<AbortSignal> {
         self.inner.current_signal()

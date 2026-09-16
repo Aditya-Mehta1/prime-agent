@@ -109,26 +109,39 @@ tools, slash commands, keybindings). This is the largest remaining gap in
 the extensions area and blocks only extension-authored content, not the
 package install/remove flows landed here.
 
-## 3. Side questions (`side_question_transcript`) - missing
+## 3. Side questions (`side_question_transcript`) - done
 
 TS: `packages/coding-agent/src/core/side-question.ts` (startSideQuestion:
 second LLM turn over `previousTurns` with its own retry policy, events
 `side_question_event`), daemon handlers `daemon-mode.ts` L4730
 (`start_side_question`/`abort_side_question`).
 
-- missing: `crates/pa-types/src/daemon.rs` has the `StartSideQuestion` /
-  `AbortSideQuestion` command variants and `SideQuestionEvent`, and
-  `crates/pa-daemon/src/protocol.rs` advertises the `side_question_transcript`
-  server capability (golden-tested), but `KNOWN_COMMAND_TYPES` does not accept
-  the commands and no worker path runs them.
-- Risk noted: advertising the capability without the commands is a wire-shape
-  lie a client can detect. Keep the capability (goldens pin it) and land the
-  commands with the worker turn engine.
-
-Follow-up spec (turn-engine lane): port `side-question.ts` over the daemon
-engine trait - one extra engine call per run with prompt = question +
-serialized previous turns, abortable, results delivered as
-`side_question_event` with status running/completed/aborted.
+- done: `crates/pa-daemon/src/protocol.rs` `KNOWN_COMMAND_TYPES` accepts both
+  commands and routes them (`command_active_session_id` +
+  `command_type_name`); the worker runs them
+  (`crates/pa-daemon/src/worker.rs` `handle_start_side_question` /
+  `handle_abort_side_question`: TS error strings, one live run per client per
+  session, abort by owner, runs aborted on detach/kill). The turn behavior is
+  one extra `SessionEngine::run_side_question` call per run:
+  `crates/pa-daemon/src/engine.rs` (seam + `side_question_event` wire values),
+  `ScriptedEngine` (scripted side-question provider calls with a scriptable
+  retry policy), and `AgentSessionEngine` over
+  `pa-core::session_engine::side_question::run_side_question` (conversation
+  clone with the KV-cacheable prefix preserved, tool block, turn cap, retry
+  policy from `pa-core::session_engine::provider_retry`).
+- done: verifier. Unit: retry-policy decisions + driver
+  (`pa-core provider_retry`), side-thread clone/replay/retry/abort/tool-block
+  (`pa-core side_question`). E2e:
+  `crates/pa-daemon/tests/supervisor_e2e.rs`
+  `side_questions_start_abort_and_events_scripted` (scripted engine, asserts
+  TS error strings, event sequence running->complete, abort -> cancelled).
+  Differential against the live TS daemon (protocol 7): `start_side_question`
+  response shape, guard errors ("Side question already exists: <id>", "A side
+  question is already running for this client and session", "Unknown active
+  session: <id>"), `abort_side_question` `{aborted: false}` for unknown ids /
+  `{aborted: true}` for live runs, and the live event stream
+  (running empty answer -> running partial -> complete; abort -> cancelled with
+  the partial answer).
 
 ## 4. Chunked snapshot streaming - missing (wire types present)
 
@@ -232,7 +245,7 @@ Live-TS goldens (read-only captures, protocol 7):
   (`list`, `agents`, `attach`, `send`, `schedule`, `status`, ...). The TS
   binary on PATH answers all of them. Largest single user-visible gap.
 - Daemon command vocabulary: `crates/pa-daemon/src/protocol.rs`
-  `KNOWN_COMMAND_TYPES` accepts 24 command types; the TS supervisor accepts
+  `KNOWN_COMMAND_TYPES` accepts 26 command types; the TS supervisor accepts
   ~100 (`daemon-supervisor.ts` `DAEMON_COMMAND_TYPES`). `pa-types` already
   models all variants, so enabling them is per-command work in pa-daemon only.
 - Tool-result persistence: TS session files contain `toolResult` message

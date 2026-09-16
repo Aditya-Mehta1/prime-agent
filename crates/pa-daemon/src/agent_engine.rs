@@ -14,7 +14,9 @@ use pa_core::session_engine::engine::{SessionEngine as CoreSessionEngine, Sessio
 use pa_core::session_engine::provider_adapter::{json_round_trip, real_stream_fn};
 use pa_types::ai::Model;
 
-use crate::engine::{EngineEvent, PromptRequest, SessionEngine};
+use crate::engine::{
+    EngineEvent, PromptRequest, SessionEngine, SideQuestionOutcome, SideQuestionRequest,
+};
 
 /// Configuration for the real engine.
 #[derive(Debug, Clone)]
@@ -144,6 +146,65 @@ impl SessionEngine for AgentSessionEngine {
         self.resolve_model().ok().map(|model| model.context_window)
     }
 
+    fn run_side_question(
+        &self,
+        request: SideQuestionRequest,
+        signal: &pa_agent::abort::AbortSignal,
+        sink: &pa_core::session_engine::side_question::SideQuestionSink,
+    ) -> SideQuestionOutcome {
+        let model = match self.resolve_model() {
+            Ok(model) => model,
+            Err(error) => {
+                return SideQuestionOutcome::Failed {
+                    answer: String::new(),
+                    error: error.to_string(),
+                }
+            }
+        };
+        let agent = match self.session_agent(&model) {
+            Ok(agent) => agent,
+            Err(error) => {
+                return SideQuestionOutcome::Failed {
+                    answer: String::new(),
+                    error: error.to_string(),
+                }
+            }
+        };
+        let question = request.question.clone();
+        let previous_turns = request.previous_turns.clone();
+        let retry_policy = pa_core::session_engine::provider_retry::DEFAULT_PROVIDER_RETRY_POLICY;
+        let result =
+            self.runtime
+                .block_on(pa_core::session_engine::side_question::run_side_question(
+                    &agent,
+                    &question,
+                    &previous_turns,
+                    &retry_policy,
+                    signal,
+                    sink,
+                ));
+        match result.status {
+            pa_core::session_engine::side_question::SideQuestionStatus::Complete => {
+                SideQuestionOutcome::Complete {
+                    answer: result.answer,
+                }
+            }
+            pa_core::session_engine::side_question::SideQuestionStatus::Cancelled => {
+                SideQuestionOutcome::Aborted {
+                    answer: result.answer,
+                }
+            }
+            pa_core::session_engine::side_question::SideQuestionStatus::Error => {
+                SideQuestionOutcome::Failed {
+                    answer: result.answer,
+                    error: result
+                        .error_message
+                        .unwrap_or_else(|| "Side question failed".to_string()),
+                }
+            }
+        }
+    }
+
     fn run_prompt(
         &self,
         _prompt_index: usize,
@@ -178,6 +239,27 @@ impl SessionEngine for AgentSessionEngine {
 }
 
 impl AgentSessionEngine {
+    /// The hosted session's agent loop, building the session on first use.
+    fn session_agent(
+        &self,
+        model: &Model,
+    ) -> anyhow::Result<std::sync::Arc<pa_agent::agent::Agent>> {
+        // Build (once) without holding the lock across the await.
+        {
+            let guard = self.session.blocking_lock();
+            if guard.is_none() {
+                drop(guard);
+                let built = self
+                    .runtime
+                    .block_on(async { self.build_session(model).await })?;
+                self.session.blocking_lock().replace(built);
+            }
+        }
+        let guard = self.session.blocking_lock();
+        let engine = guard.as_ref().expect("session built");
+        Ok(std::sync::Arc::clone(engine.session.agent()))
+    }
+
     /// Run one turn, streaming assistant updates through `emit` as they
     /// arrive. Returns the final assistant message (Ok), or the turn error.
     fn run_turn(
@@ -186,23 +268,8 @@ impl AgentSessionEngine {
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) -> anyhow::Result<Option<Value>> {
         let model = self.resolve_model()?;
-        // Build (once) without holding the lock across the await.
-        {
-            let guard = self.session.blocking_lock();
-            if guard.is_none() {
-                drop(guard);
-                let built = self
-                    .runtime
-                    .block_on(async { self.build_session(&model).await })?;
-                self.session.blocking_lock().replace(built);
-            }
-        }
+        let agent = self.session_agent(&model)?;
         let (tx, rx) = std::sync::mpsc::channel::<EngineEvent>();
-        let agent = {
-            let guard = self.session.blocking_lock();
-            let engine = guard.as_ref().expect("session built");
-            engine.session.agent().clone()
-        };
         // Stream assistant events while the turn runs. The turn starts
         // asynchronously after admission, so the idle watcher must not fire
         // before the run has begun.

@@ -172,3 +172,46 @@ captures the pane, and asserts the structural contract + editor keys
   the only git transports the source parser accepts are https/ssh/git, so a
   local fixture needs the ssh shim (git daemon `git://` URLs are not
   parseable sources).
+
+## Side questions / provider-retry lane notes
+
+- Provider retry policy (TS `core/provider-retry.ts`) lives in
+  `pa-core::session_engine::provider_retry`: pure decision functions
+  (`provider_retry_delay`, `is_permanent_provider_failure_kind`, lifecycle /
+  faux-queue checks) plus the retryable one-shot driver
+  `complete_with_provider_retry` with an injectable wait future. The wait is
+  injectable so the scripted engine can drive it under a plain `futures`
+  executor while the real engine races it against an `AbortSignal` on tokio.
+- `start_side_question` / `abort_side_question` (TS daemon-mode L4730) map onto
+  the worker `SessionEngine` trait as one extra engine call
+  (`run_side_question`): the worker owns the run registry (one live run per
+  client per session, TS error strings), the abort controller, and the
+  `side_question_event` frames; the engine owns the turn behavior.
+- The side-thread clone (TS `core/side-question.ts`) is
+  `pa-core::session_engine::side_question::run_side_question`: it re-clones the
+  live conversation per turn (same system prompt, model, thinking level, and
+  tool declarations so the provider KV-cacheable prefix is preserved), replays
+  `previousTurns` after the clone, blocks tool execution via `before_tool_call`,
+  caps the run at 3 turns, and streams partial answers to a caller sink. The
+  retry loop is inlined there because streaming must interleave with attempts
+  (the generic driver stays available for one-shot consumers).
+- Statuses follow the TS `SideQuestionStatus` vocabulary:
+  `running` / `complete` / `cancelled` / `error` (not "completed"/"aborted").
+- Event delivery parity: the live TS supervisor (0.9.5) fans every worker
+  outbound - including `side_question_event` - out to the clients *attached*
+  to the session (`daemon-supervisor.ts` `handleWorkerFrame` skips clients
+  without the session in `attachedActiveSessionIds`). Verified live: an
+  unattached client gets the `start_side_question` success response but no
+  events; after attach the events arrive. The Rust supervisor reproduces this
+  (side-question frames ride the same attached-session routing as
+  session events).
+- Known deviations: (1) the real engine (`AgentSessionEngine`) uses the
+  default retry policy (settings `retry.*` wiring is a follow-up); (2) a
+  model-resolution failure surfaces as an `error` side-question event rather
+  than the TS synchronous "Select a model before asking a side question"
+  command failure (the TS worker returns the start response before the engine
+  call in the Rust redesign); (3) the worker keys runs by the client id the
+  supervisor injects into the routed command (the TS single-process daemon
+  compares socket objects; under the supervisor split its observable behavior
+  matches for the single-client flow).
+origin/main

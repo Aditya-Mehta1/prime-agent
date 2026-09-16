@@ -19,9 +19,11 @@ pub mod headless;
 pub mod host_requests;
 pub mod messages;
 pub mod provider_adapter;
+pub mod provider_retry;
 pub mod refine;
 pub mod runtime;
 pub mod runtime_wiring;
+pub mod side_question;
 pub mod slash_commands;
 pub mod tool_bridge;
 
