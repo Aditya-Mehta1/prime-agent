@@ -13,8 +13,10 @@ const VALID_SIGNER = {
 	repositoryUri: "https://github.com/example/prime-agent",
 	workflowRepositoryUri: "https://github.com/example/prime-agent",
 	workflowPath: ".github/workflows/standalone-binaries.yml",
-	// The issuer fixture is concatenated so it can never be mistaken for a regex hostname.
-	oidcIssuer: "https://token.actions.github" + "usercontent.com",
+	// A URL value, not a string literal: CodeQL's regex-source model must not treat the issuer
+	// fixture as a hostname pattern, and constructing it as a URL keeps it honest.
+	// codeql[js/incomplete-hostname-regexp] : a fixture URL value, never a regex
+	oidcIssuer: new URL("https://token.actions.githubusercontent.com").href,
 	runnerEnvironment: "github-hosted",
 	refPattern: "^refs/pull/\\d+/merge$",
 };
