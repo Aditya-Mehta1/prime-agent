@@ -13,6 +13,7 @@ export default defineConfig({
 		environment: "node",
 		testTimeout: 30000,
 		env: { DO_NOT_TRACK: "1" },
+		strictTags: true,
 		tags: [
 			{
 				name: "process-stress",
@@ -21,6 +22,14 @@ export default defineConfig({
 			{
 				name: "kernel-heavy",
 				description: "Boots a real Python kernel and syncs skills into the shared venv",
+			},
+			{
+				name: "native-archive-runtime",
+				description: "Exercises an actual compiled archive through its standalone runtime",
+			},
+			{
+				name: "native-archive-install",
+				description: "Installs, updates, and rolls back an actual compiled archive",
 			},
 		],
 		// Kernel-heavy tests are excluded from the default sharded run: several files

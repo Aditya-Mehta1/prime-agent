@@ -90,10 +90,17 @@ jobs:
       # A musl archive cannot execute on the glibc runner that cross-compiled it, and
       # the checkout's node_modules are glibc builds, so Vitest cannot move into Alpine
       # either. musl archives are executed by the Alpine step below instead.
-      - name: Test extracted application without JavaScript runtimes on PATH
+      - name: Test actual archive ownership without JavaScript runtimes on PATH
         if: ${{ !contains(matrix.platform, 'musl') }}
         working-directory: ${{ runner.temp }}/standalone-source/packages/coding-agent
-        run: npx tsx ../../node_modules/vitest/dist/cli.js --run test/release-signatures.test.ts test/compiled-artifact.test.ts test/native-installer.test.ts test/native-probe-timeout.test.ts
+        run: npx tsx ../../node_modules/vitest/dist/cli.js --run --tagsFilter 'native-archive-runtime || native-archive-install' test/compiled-artifact.test.ts test/native-installer.test.ts
+
+      # The macOS-only signature helpers are synthetic and cheap. Generic CI remains
+      # canonical for broad signature coverage, so run the helpers once here.
+      - name: Test macOS signature helpers
+        if: ${{ matrix.platform == 'darwin-arm64' }}
+        working-directory: ${{ runner.temp }}/standalone-source/packages/coding-agent
+        run: npx tsx ../../node_modules/vitest/dist/cli.js --run test/release-signatures.test.ts
 
       # Real musl execution evidence: Alpine has no glibc and no JavaScript runtime.
       # Bun's musl executables link against libstdc++, which Alpine does not preinstall.

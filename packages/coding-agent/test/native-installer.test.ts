@@ -1161,6 +1161,7 @@ exec /bin/${operation} "$@"
 	// built for another platform (a baseline or musl cross-build) cannot be installed here.
 	it.skipIf(!testArchive || archiveNativePlatform(testArchive) !== platform)(
 		"installs, updates, and rolls back actual compiled releases without Node",
+		{ tags: ["native-archive-install"], timeout: 120000 },
 		async () => {
 			const archive = testArchive!;
 			const name = basename(archive);
@@ -1255,7 +1256,6 @@ exec /bin/${operation} "$@"
 			expect((await run(command(), ["--version"])).output).toBe(`${version}\n`);
 			expect(readFileSync(join(home, "agent/auth.json"), "utf8")).toBe("{}\n");
 		},
-		120000,
 	);
 });
 

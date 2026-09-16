@@ -18,11 +18,11 @@ export function resolveMacosValidationMatrix(publishProduction, publishBeta) {
 	if (channels.length === 0) throw new Error("At least one release channel must be enabled");
 
 	return {
-		include: channels.flatMap((channel) =>
+		include: channels.flatMap((channel, channelIndex) =>
 			darwinReleasePlatforms.map((platform) => {
 				const runner = runnerByPlatform[platform];
 				if (!runner) throw new Error(`No macOS validation runner configured for ${platform}`);
-				return { channel, platform, runner };
+				return { channel, platform, runner, extendedRuntime: channelIndex === 0 };
 			}),
 		),
 	};

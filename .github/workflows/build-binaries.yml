@@ -281,7 +281,7 @@ jobs:
             PRIME_AGENT_INSTALLER_PLAIN=1 \
             sh /tmp/prime-agent-npm12-install.sh "$SMOKE_VERSION"
           test -x "$NPM_CONFIG_PREFIX/bin/prime-agent"
-          test "$("$NPM_CONFIG_PREFIX/bin/prime-agent" --version)" = "$SMOKE_VERSION"
+          "$NPM_CONFIG_PREFIX/bin/prime-agent" --version | grep -Fx "$SMOKE_VERSION"
 
       - name: Upload production artifacts
         if: env.PUBLISH_PRODUCTION == 'true'
@@ -350,6 +350,7 @@ jobs:
       - name: Verify and exercise exact final Mac archive
         working-directory: ${{ runner.temp }}/validation-source
         env:
+          EXTENDED_RUNTIME: ${{ matrix.extendedRuntime }}
           TARGET_PLATFORM: ${{ matrix.platform }}
         run: |
           export PRIME_AGENT_TEST_UV=$(command -v uv)
@@ -359,7 +360,11 @@ jobs:
             "$RUNNER_TEMP/macos-validation/$CHANNEL-$TARGET_PLATFORM.json"
           export PRIME_AGENT_TEST_ARCHIVE=$(find "$artifacts" -maxdepth 1 -name "*-$TARGET_PLATFORM.tar.gz")
           test -n "$PRIME_AGENT_TEST_ARCHIVE"
-          (cd packages/coding-agent && npx tsx ../../node_modules/vitest/dist/cli.js --run test/compiled-artifact.test.ts test/native-installer.test.ts)
+          if [ "$EXTENDED_RUNTIME" = true ]; then
+            (cd packages/coding-agent && npx tsx ../../node_modules/vitest/dist/cli.js --run --tagsFilter 'native-archive-runtime || native-archive-install' test/compiled-artifact.test.ts test/native-installer.test.ts)
+          else
+            (cd packages/coding-agent && npx tsx ../../node_modules/vitest/dist/cli.js --run --tagsFilter native-archive-install test/native-installer.test.ts)
+          fi
 
       - name: Upload native validation receipt
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

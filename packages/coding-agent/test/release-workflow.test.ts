@@ -17,7 +17,7 @@ interface Step {
 	with?: Record<string, string>;
 }
 interface Matrix {
-	include: { channel?: string; platform: string; runner: string }[];
+	include: { channel?: string; platform: string; runner: string; extendedRuntime?: boolean }[];
 }
 interface TestMatrix {
 	include: {
@@ -57,6 +57,15 @@ const release: Workflow = parse(readFileSync(join(repository, ".github/workflows
 const standalone: Workflow = parse(readFileSync(join(repository, ".github/workflows/standalone-binaries.yml"), "utf8"));
 const ci: Workflow = parse(readFileSync(join(repository, ".github/workflows/ci.yml"), "utf8"));
 const matrixResolver = join(repository, "scripts/release-macos-validation-matrix.mjs");
+const vitestConfigSource = readFileSync(join(repository, "packages/coding-agent/vitest.config.ts"), "utf8");
+const compiledArtifactSource = readFileSync(
+	join(repository, "packages/coding-agent/test/compiled-artifact.test.ts"),
+	"utf8",
+);
+const nativeInstallerSource = readFileSync(
+	join(repository, "packages/coding-agent/test/native-installer.test.ts"),
+	"utf8",
+);
 
 function step(job: Job, name: string): Step {
 	const found = job.steps.find((entry) => entry.name === name);
@@ -260,6 +269,33 @@ describe("CI test matrix setup pruning", () => {
 });
 
 describe("release workflow signature gates", () => {
+	it("defines strict actual-archive tags without excluding them from generic CI", () => {
+		expect(vitestConfigSource).toContain("strictTags: true");
+		expect(vitestConfigSource.match(/name: "native-archive-runtime"/g)).toHaveLength(1);
+		expect(vitestConfigSource.match(/name: "native-archive-install"/g)).toHaveLength(1);
+		const defaultFilter = vitestConfigSource.match(/tagsFilter: \[(.*?)\]/s)?.[1];
+		expect(defaultFilter).toBeDefined();
+		expect(defaultFilter).not.toContain("native-archive-runtime");
+		expect(defaultFilter).not.toContain("native-archive-install");
+
+		const codingAgentShards = (ci.jobs.test!.strategy!.matrix as TestMatrix).include.filter(
+			(entry) => entry.name.startsWith("coding-agent ") && entry.name.includes("/3"),
+		);
+		expect(codingAgentShards).toHaveLength(3);
+		for (const entry of codingAgentShards) expect(entry.command).not.toContain("--tagsFilter");
+	});
+
+	it("assigns actual archive ownership tags only to the intended runtime and installer cases", () => {
+		expect(compiledArtifactSource.match(/native-archive-runtime/g)).toHaveLength(1);
+		expect(compiledArtifactSource).toContain(
+			'describe.skipIf(!archive)("extracted standalone archive", { tags: ["native-archive-runtime"] }, () => {',
+		);
+		expect(nativeInstallerSource.match(/native-archive-install/g)).toHaveLength(1);
+		expect(nativeInstallerSource).toMatch(
+			/"installs, updates, and rolls back actual compiled releases without Node",\s*\{ tags: \["native-archive-install"\], timeout: 120000 \},\s*async \(\) => \{/,
+		);
+	});
+
 	it("keeps queued release runs non-cancelling for FIFO safety", () => {
 		expect(release.concurrency?.group).toBe(
 			`\${{ github.event_name == 'pull_request' && format('release-validation-pr-{0}', github.event.pull_request.number) || 'release-prime-agent' }}`,
@@ -289,7 +325,8 @@ describe("release workflow signature gates", () => {
 		expect(pack.run).toContain(`wait "\${pack_pids[$index]}"`);
 
 		const smoke = step(build, "Smoke test installer with npm 12");
-		expect(smoke.run).toContain('test "$("$NPM_CONFIG_PREFIX/bin/prime-agent" --version)" = "$SMOKE_VERSION"');
+		expect(smoke.run).toContain('"$NPM_CONFIG_PREFIX/bin/prime-agent" --version | grep -Fx "$SMOKE_VERSION"');
+		expect(smoke.run).not.toContain('test "$("$NPM_CONFIG_PREFIX/bin/prime-agent" --version)"');
 		for (const prerequisite of ["Install dependencies", "Build", "Check"]) {
 			expect(build.steps.indexOf(step(build, prerequisite))).toBeLessThan(build.steps.indexOf(pack));
 		}
@@ -391,10 +428,10 @@ describe("release workflow signature gates", () => {
 			publishProduction: true,
 			publishBeta: true,
 			include: [
-				{ channel: "production", platform: "darwin-arm64", runner: "macos-15" },
-				{ channel: "production", platform: "darwin-x64", runner: "macos-15-intel" },
-				{ channel: "beta", platform: "darwin-arm64", runner: "macos-15" },
-				{ channel: "beta", platform: "darwin-x64", runner: "macos-15-intel" },
+				{ channel: "production", platform: "darwin-arm64", runner: "macos-15", extendedRuntime: true },
+				{ channel: "production", platform: "darwin-x64", runner: "macos-15-intel", extendedRuntime: true },
+				{ channel: "beta", platform: "darwin-arm64", runner: "macos-15", extendedRuntime: false },
+				{ channel: "beta", platform: "darwin-x64", runner: "macos-15-intel", extendedRuntime: false },
 			],
 		},
 		{
@@ -402,8 +439,8 @@ describe("release workflow signature gates", () => {
 			publishProduction: false,
 			publishBeta: true,
 			include: [
-				{ channel: "beta", platform: "darwin-arm64", runner: "macos-15" },
-				{ channel: "beta", platform: "darwin-x64", runner: "macos-15-intel" },
+				{ channel: "beta", platform: "darwin-arm64", runner: "macos-15", extendedRuntime: true },
+				{ channel: "beta", platform: "darwin-x64", runner: "macos-15-intel", extendedRuntime: true },
 			],
 		},
 		{
@@ -411,14 +448,30 @@ describe("release workflow signature gates", () => {
 			publishProduction: true,
 			publishBeta: false,
 			include: [
-				{ channel: "production", platform: "darwin-arm64", runner: "macos-15" },
-				{ channel: "production", platform: "darwin-x64", runner: "macos-15-intel" },
+				{ channel: "production", platform: "darwin-arm64", runner: "macos-15", extendedRuntime: true },
+				{ channel: "production", platform: "darwin-x64", runner: "macos-15-intel", extendedRuntime: true },
 			],
 		},
 	])("resolves exactly the enabled macOS entries for $name", ({ publishProduction, publishBeta, include }) => {
 		const result = resolveValidationMatrix(publishProduction, publishBeta);
 		expect(result.status, result.stderr).toBe(0);
 		expect(JSON.parse(result.stdout)).toEqual({ include });
+	});
+
+	it.each([
+		{ publishProduction: true, publishBeta: true },
+		{ publishProduction: false, publishBeta: true },
+		{ publishProduction: true, publishBeta: false },
+	])("assigns exactly one extended runtime row per architecture", ({ publishProduction, publishBeta }) => {
+		const result = resolveValidationMatrix(publishProduction, publishBeta);
+		expect(result.status, result.stderr).toBe(0);
+		const rows = (JSON.parse(result.stdout) as Matrix).include;
+		for (const platform of ["darwin-arm64", "darwin-x64"]) {
+			const platformRows = rows.filter((row) => row.platform === platform);
+			expect(platformRows.length).toBe(publishProduction && publishBeta ? 2 : 1);
+			expect(platformRows.every((row) => typeof row.extendedRuntime === "boolean")).toBe(true);
+			expect(platformRows.filter((row) => row.extendedRuntime)).toEqual([platformRows[0]]);
+		}
 	});
 
 	it("fails closed when no release channel is enabled", () => {
@@ -433,7 +486,15 @@ describe("release workflow signature gates", () => {
 		expect(verify.run).not.toContain("for channel in production beta");
 		expect(verify.run).toContain("validate-macos-release.mjs");
 		expect(verify.run).toContain("standalone-reference/binaries.json");
-		expect(verify.run).toContain("test/compiled-artifact.test.ts");
+		expect(verify.env?.EXTENDED_RUNTIME).toBe(`\${{ matrix.extendedRuntime }}`);
+		const installerCommand = "--tagsFilter native-archive-install test/native-installer.test.ts";
+		const extendedCommand =
+			"--tagsFilter 'native-archive-runtime || native-archive-install' test/compiled-artifact.test.ts test/native-installer.test.ts";
+		expect(verify.run).toContain(installerCommand);
+		expect(verify.run).toContain(extendedCommand);
+		expect(verify.run).toContain('if [ "$EXTENDED_RUNTIME" = true ]; then');
+		expect(verify.run).toContain("else");
+		expect(verify.run).not.toContain("--run test/compiled-artifact.test.ts test/native-installer.test.ts");
 		expect(verify.run).not.toMatch(/\|\|\s*(?:true|:)|continue-on-error/);
 		expect(validation.steps.indexOf(verify)).toBeLessThan(
 			validation.steps.indexOf(step(validation, "Upload native validation receipt")),
@@ -479,9 +540,14 @@ describe("release workflow signature gates", () => {
 		});
 	});
 
-	it.each([{ channel: "production" }, { channel: "beta" }])(
-		"finds the downloaded manifest when validating $channel",
-		({ channel }) => {
+	it.each([
+		{ channel: "production", extendedRuntime: true },
+		{ channel: "production", extendedRuntime: false },
+		{ channel: "beta", extendedRuntime: true },
+		{ channel: "beta", extendedRuntime: false },
+	])(
+		"finds the downloaded $channel manifest and honors extendedRuntime=$extendedRuntime",
+		({ channel, extendedRuntime }) => {
 			const validation = release.jobs["validate-macos"]!;
 			const directory = mkdtempSync(join(tmpdir(), "prime-release-downloads-"));
 			try {
@@ -498,6 +564,7 @@ describe("release workflow signature gates", () => {
 				mkdirSync(destination, { recursive: true });
 				writeFileSync(join(destination, channel === "production" ? "latest.json" : "beta.json"), "{}");
 				writeFileSync(join(destination, "prime-agent-1.2.3-darwin-arm64.tar.gz"), "");
+				const npxLog = join(directory, "npx.log");
 				const result = spawnSync(
 					"bash",
 					[
@@ -506,7 +573,7 @@ describe("release workflow signature gates", () => {
 						"pipefail",
 						"-c",
 						`node() { test -f "$2/latest.json" || test -f "$2/beta.json"; }
-npx() { test -f "$PRIME_AGENT_TEST_ARCHIVE"; printf '%s\\n' "$PRIME_AGENT_TEST_ARCHIVE"; }
+npx() { test -f "$PRIME_AGENT_TEST_ARCHIVE"; printf '%s\\n' "$*" >> "$NPX_LOG"; }
 ${step(validation, "Verify and exercise exact final Mac archive").run}`,
 					],
 					{
@@ -516,14 +583,19 @@ ${step(validation, "Verify and exercise exact final Mac archive").run}`,
 							RUNNER_TEMP: directory,
 							TARGET_PLATFORM: "darwin-arm64",
 							CHANNEL: channel,
+							EXTENDED_RUNTIME: String(extendedRuntime),
+							NPX_LOG: npxLog,
 						},
 						encoding: "utf8",
 					},
 				);
 				expect(result.status, result.stderr).toBe(0);
-				expect(result.stdout.trim()).toBe(
-					join(directory, `final-artifacts/prime-agent-${channel}/prime-agent-1.2.3-darwin-arm64.tar.gz`),
-				);
+				const calls = readFileSync(npxLog, "utf8").trim().split("\n");
+				expect(calls).toEqual([
+					extendedRuntime
+						? "tsx ../../node_modules/vitest/dist/cli.js --run --tagsFilter native-archive-runtime || native-archive-install test/compiled-artifact.test.ts test/native-installer.test.ts"
+						: "tsx ../../node_modules/vitest/dist/cli.js --run --tagsFilter native-archive-install test/native-installer.test.ts",
+				]);
 			} finally {
 				rmSync(directory, { recursive: true, force: true });
 			}
@@ -535,19 +607,28 @@ ${step(validation, "Verify and exercise exact final Mac archive").run}`,
 		expect(matrix(build).include.map((entry) => entry.platform)).toEqual(releasePlatforms);
 		// Each target must be compiled explicitly; the host default cannot produce a cross-build.
 		expect(step(build, "Compile standalone application").run).toContain(`--platform \${{ matrix.platform }}`);
-		const test = step(build, "Test extracted application without JavaScript runtimes on PATH");
-		expect(test.run).toContain("test/compiled-artifact.test.ts");
-		expect(test.run).toContain("test/release-signatures.test.ts");
+		const archiveTest = step(build, "Test actual archive ownership without JavaScript runtimes on PATH");
+		expect(archiveTest.run).toBe(
+			"npx tsx ../../node_modules/vitest/dist/cli.js --run --tagsFilter 'native-archive-runtime || native-archive-install' test/compiled-artifact.test.ts test/native-installer.test.ts",
+		);
+		expect(archiveTest.run).not.toContain("release-signatures.test.ts");
+		expect(archiveTest.run).not.toContain("native-probe-timeout.test.ts");
+		const signatures = step(build, "Test macOS signature helpers");
+		expect(signatures.if).toBe(`\${{ matrix.platform == 'darwin-arm64' }}`);
+		expect(signatures.run).toBe(
+			"npx tsx ../../node_modules/vitest/dist/cli.js --run test/release-signatures.test.ts",
+		);
 		const upload = build.steps.find((entry) => entry.uses?.startsWith("actions/upload-artifact@"))!;
 		expect(upload.with?.path).toContain("binaries.json");
-		expect(build.steps.indexOf(test)).toBeLessThan(build.steps.indexOf(upload));
+		expect(build.steps.indexOf(archiveTest)).toBeLessThan(build.steps.indexOf(upload));
+		expect(build.steps.indexOf(signatures)).toBeLessThan(build.steps.indexOf(upload));
 		requiresSuccess(build);
 		expect(release.jobs.standalone!.with?.build_ref).toBe(`\${{ needs.release-context.outputs.build_ref }}`);
 	});
 
 	it("executes every archive on its own libc, musl archives inside Alpine", () => {
 		const build = standalone.jobs.build!;
-		const glibc = step(build, "Test extracted application without JavaScript runtimes on PATH");
+		const glibc = step(build, "Test actual archive ownership without JavaScript runtimes on PATH");
 		const musl = step(build, "Test extracted application on Alpine without JavaScript runtimes");
 		// A cross-compiled musl archive cannot run on the glibc runner that built it.
 		expect(glibc.if).toBe(`\${{ !contains(matrix.platform, 'musl') }}`);
@@ -608,10 +689,10 @@ ${step(validation, "Verify and exercise exact final Mac archive").run}`,
 				expect(values.beta_version).toBe(`${values.production_version}-beta.5.1.abcdef0`);
 				expect(JSON.parse(values.macos_validation_matrix)).toEqual({
 					include: [
-						{ channel: "production", platform: "darwin-arm64", runner: "macos-15" },
-						{ channel: "production", platform: "darwin-x64", runner: "macos-15-intel" },
-						{ channel: "beta", platform: "darwin-arm64", runner: "macos-15" },
-						{ channel: "beta", platform: "darwin-x64", runner: "macos-15-intel" },
+						{ channel: "production", platform: "darwin-arm64", runner: "macos-15", extendedRuntime: true },
+						{ channel: "production", platform: "darwin-x64", runner: "macos-15-intel", extendedRuntime: true },
+						{ channel: "beta", platform: "darwin-arm64", runner: "macos-15", extendedRuntime: false },
+						{ channel: "beta", platform: "darwin-x64", runner: "macos-15-intel", extendedRuntime: false },
 					],
 				});
 				const pack = step(release.jobs.build!, "Pack enabled release channels");

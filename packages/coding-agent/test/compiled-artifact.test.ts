@@ -97,7 +97,7 @@ function pngChunk(type: string, data: Buffer): Buffer {
 	return Buffer.concat([length, content, crc]);
 }
 
-describe.skipIf(!archive)("extracted standalone archive", () => {
+describe.skipIf(!archive)("extracted standalone archive", { tags: ["native-archive-runtime"] }, () => {
 	beforeAll(() => {
 		root = realpathSync(mkdtempSync(join(process.platform === "darwin" ? "/tmp" : tmpdir(), "pa-bin-")));
 		extracted = join(root, "extracted app");
