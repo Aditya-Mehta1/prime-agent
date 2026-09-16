@@ -12,6 +12,7 @@ pub mod compact_session;
 pub mod compaction;
 pub mod compaction_exec;
 pub mod compaction_utils;
+pub mod engine;
 pub mod messages;
 pub mod slash_commands;
 pub mod tool_bridge;
