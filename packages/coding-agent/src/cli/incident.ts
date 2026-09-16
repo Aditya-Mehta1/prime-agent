@@ -603,7 +603,8 @@ export function classifyIncidentEntry(entry: IncidentLogEntry, workerPids: Worke
 			classified.eventClass,
 			workerId ? `worker ${workerId}` : "worker",
 			classified.summary,
-			workerId ? [workerId] : [],
+			// Keep the session ids/names classified out of the error, not just the worker id.
+			workerId ? [workerId, ...classified.tokens] : classified.tokens,
 		);
 	}
 	const catchUp = /^(?:Failed|could not)(?: to)? catch up (?:snapshot )?client \S+(?: for (\S+))?: (.+)$/.exec(msg);
