@@ -142,6 +142,7 @@ struct OutboundFrame {
 pub struct Worker {
     config: WorkerConfig,
     core: Arc<Mutex<SessionCore>>,
+    engine: std::sync::Arc<dyn SessionEngine>,
     work_notify: Arc<Notify>,
     idle_notify: Arc<Notify>,
     events: broadcast::Sender<Arc<OutboundFrame>>,
@@ -170,8 +171,10 @@ impl Worker {
         let core = Arc::new(Mutex::new(core));
         let work_notify = Arc::new(Notify::new());
         let idle_notify = Arc::new(Notify::new());
-        // The turn runner runs for the whole process lifetime.
-        {
+        // The turn runner runs for the whole process lifetime. The command
+        // dispatcher keeps the engine handle too (model metadata for the
+        // stats commands).
+        let engine: std::sync::Arc<dyn SessionEngine> = {
             // Scripted sessions serve the integration harness; sessions
             // without a script run the real agent engine.
             let engine: std::sync::Arc<dyn SessionEngine> = match &script {
@@ -201,16 +204,18 @@ impl Worker {
                 work_notify: Arc::clone(&work_notify),
                 idle_notify: Arc::clone(&idle_notify),
                 events: events.clone(),
-                engine,
+                engine: std::sync::Arc::clone(&engine),
                 active_session_id,
             };
             tokio::spawn(async move {
                 runner.run().await;
             });
-        }
+            engine
+        };
         Worker {
             config,
             core,
+            engine,
             work_notify,
             idle_notify,
             events,
@@ -494,6 +499,8 @@ impl Worker {
             "wait_for_idle" => self.handle_wait_for_idle().await,
             "get_state" => self.handle_get_state(),
             "get_messages" => self.handle_get_messages(),
+            "get_session_header" => self.handle_get_session_header(),
+            "get_session_stats" => self.handle_get_session_stats(),
             "get_queue" => self.handle_get_queue(),
             "clear_queue" => self.handle_clear_queue(),
             "abort_and_clear_queue" => self.handle_abort_and_clear_queue(),
@@ -961,6 +968,47 @@ impl Worker {
             "get_state",
             Some(serde_json::to_value(&summary).unwrap_or(Value::Null)),
         )
+    }
+
+    /// `get_session_header`: the persisted session header line (TS wraps it
+    /// in `{ header: ... }`).
+    fn handle_get_session_header(&self) -> DaemonResponse {
+        if let Err(response) = self.require_created("get_session_header") {
+            return response;
+        }
+        let core = self.core.lock().unwrap();
+        let Some(store) = core.store.as_ref() else {
+            return response_failure(
+                None,
+                "get_session_header",
+                "Session is still initializing",
+                None,
+            );
+        };
+        response_success(
+            None,
+            "get_session_header",
+            Some(json!({ "header": crate::session_store::session_header_line(&store.header) })),
+        )
+    }
+
+    /// `get_session_stats`: counts, token totals, and the context-usage
+    /// estimate over the persisted branch (TS `getSessionStats`).
+    fn handle_get_session_stats(&self) -> DaemonResponse {
+        if let Err(response) = self.require_created("get_session_stats") {
+            return response;
+        }
+        let core = self.core.lock().unwrap();
+        let Some(store) = core.store.as_ref() else {
+            return response_failure(
+                None,
+                "get_session_stats",
+                "Session is still initializing",
+                None,
+            );
+        };
+        let stats = crate::session_stats::session_stats(store, self.engine.model_context_window());
+        response_success(None, "get_session_stats", Some(stats))
     }
 
     fn handle_get_messages(&self) -> DaemonResponse {

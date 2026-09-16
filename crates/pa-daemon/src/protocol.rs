@@ -39,6 +39,8 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "abort",
     "wait_for_idle",
     "get_state",
+    "get_session_header",
+    "get_session_stats",
     "get_messages",
     "get_queue",
     "clear_queue",
@@ -414,6 +416,12 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         | DaemonCommand::GetState {
             active_session_id, ..
         }
+        | DaemonCommand::GetSessionHeader {
+            active_session_id, ..
+        }
+        | DaemonCommand::GetSessionStats {
+            active_session_id, ..
+        }
         | DaemonCommand::GetMessages {
             active_session_id, ..
         }
@@ -457,6 +465,8 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::Abort { .. } => "abort",
         DaemonCommand::WaitForIdle { .. } => "wait_for_idle",
         DaemonCommand::GetState { .. } => "get_state",
+        DaemonCommand::GetSessionHeader { .. } => "get_session_header",
+        DaemonCommand::GetSessionStats { .. } => "get_session_stats",
         DaemonCommand::GetMessages { .. } => "get_messages",
         DaemonCommand::GetQueue { .. } => "get_queue",
         DaemonCommand::ClearQueue { .. } => "clear_queue",

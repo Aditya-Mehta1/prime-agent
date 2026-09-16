@@ -41,6 +41,13 @@ pub trait SessionEngine: Send + Sync {
         request: PromptRequest,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     );
+
+    /// Context window (tokens) of the engine's resolved model, when known.
+    /// Drives the `contextUsage` estimate in `get_session_stats`; engines
+    /// without model metadata report `None` and the field is omitted.
+    fn model_context_window(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// A scripted faux session: replays a deterministic sequence of assistant

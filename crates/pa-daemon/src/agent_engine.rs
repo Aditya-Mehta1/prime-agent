@@ -140,6 +140,10 @@ fn now_millis() -> u64 {
 }
 
 impl SessionEngine for AgentSessionEngine {
+    fn model_context_window(&self) -> Option<u64> {
+        self.resolve_model().ok().map(|model| model.context_window)
+    }
+
     fn run_prompt(
         &self,
         _prompt_index: usize,

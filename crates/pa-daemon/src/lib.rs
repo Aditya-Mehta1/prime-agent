@@ -14,6 +14,7 @@ pub mod journal;
 pub mod lease;
 pub mod paths;
 pub mod protocol;
+pub mod session_stats;
 pub mod session_store;
 pub mod socket;
 pub mod supervisor;
