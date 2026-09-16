@@ -347,7 +347,7 @@ impl Worker {
                     let failure = response_failure(
                         Some(&request_id),
                         "worker_auth",
-                        "supervisor_generation_stale",
+                        "Worker authentication failed",
                         None,
                     );
                     let _ = self
@@ -365,10 +365,17 @@ impl Worker {
                             eprintln!("[worker {}] auth ok", std::process::id());
                         }
                         authenticated = true;
+                        // The roster capability is always granted; the peer
+                        // transport capability rides on the worker instance
+                        // id, like the TS worker.
+                        let mut capabilities = vec!["agent_roster".to_string()];
+                        if !self.config.worker_instance_id.is_empty() {
+                            capabilities.push("direct_peer_transport".to_string());
+                        }
                         let success = response_success(
                             Some(&request_id),
                             "worker_auth",
-                            Some(json!({ "capabilities": ["agent_roster"] })),
+                            Some(json!({ "capabilities": capabilities })),
                         );
                         self.write_response_frame(&writer, &request_id, &success)
                             .await;
@@ -406,8 +413,40 @@ impl Worker {
             .get("token")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        // TS `worker_auth` validation: token, generation, pid, socket path are
+        // mandatory; instance and process-start ids only checked when present.
         if token.is_empty() || token != self.config.token {
             return Err(anyhow!("Worker authentication failed"));
+        }
+        if payload
+            .get("supervisorGeneration")
+            .and_then(Value::as_str)
+            .is_none()
+        {
+            return Err(anyhow!("Worker authentication failed"));
+        }
+        let pid = payload
+            .get("supervisorPid")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if pid == 0 {
+            return Err(anyhow!("Worker authentication failed"));
+        }
+        if payload
+            .get("supervisorSocketPath")
+            .and_then(Value::as_str)
+            .is_none()
+        {
+            return Err(anyhow!("Worker authentication failed"));
+        }
+        if let Some(instance) = payload.get("workerInstanceId") {
+            if !instance.is_null()
+                && instance.as_str() != Some("")
+                && instance.as_str().map(str::to_string)
+                    != Some(self.config.worker_instance_id.clone())
+            {
+                return Err(anyhow!("Worker authentication failed"));
+            }
         }
         Ok(())
     }

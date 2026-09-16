@@ -550,7 +550,14 @@ impl Supervisor {
             .route_command(
                 resident,
                 "worker_auth",
-                json!({ "token": token }),
+                json!({
+                    "token": token,
+                    "supervisorGeneration": format!("sup:{}", std::process::id()),
+                    "supervisorPid": std::process::id(),
+                    "supervisorProcessStartId": crate::protocol::process_start_id(std::process::id()),
+                    "supervisorSocketPath": self.options.socket_path.to_string_lossy(),
+                    "workerInstanceId": None::<String>,
+                }),
                 ROUTE_TIMEOUT_MS,
             )
             .await?;
