@@ -33,20 +33,22 @@ if child is not None:
   agent carries `sessionId`, optional `sessionName`, `relationship`
   (`parent`/`sibling`/`child`), `status`, `isSessionActive`, and the counts and
   message previews known for it: `latestMessage` for a live session,
-  `firstMessage` for an inactive child. A live row also carries `usage` with the
-  member's own spend (`inputTokens`, `outputTokens`, `cost`); `usage` is absent
-  for members with no live session. A member with no live session has
+  `firstMessage` for an inactive child. A live row carries `usage` with the
+  member's own spend (`inputTokens`, `outputTokens`, `cost`) once it has
+  recorded spend, so read `usage` as optional and check before dereferencing:
+  it is absent for members with no live session and for a live session that has
+  recorded no spend yet. A member with no live session has
   no `activeSessionId` and no live detail; address it with `agent_message.send`
   using its `relationship` plus its `sessionName`, or its `sessionId` when the
   member has no name. For direct children,
   `await rlm.list_subagents()` also exposes parent-owned lifecycle handles.
 - `await agent_observe.get_agent(target)` returns `agent`, where `agent`
-  contains one live agent summary that also carries the live-row `usage` field.
-  `target` is resolved like other live-session selectors: active id, session
-  id/name, or unambiguous suffix.
+  contains one live agent summary that carries `usage` under the same optional
+  rule as a `list_agents` live row. `target` is resolved like other live-session
+  selectors: active id, session id/name, or unambiguous suffix.
 - `await agent_observe.recent_messages(target, limit=8, max_chars=800)`
   returns up to `limit` recent bounded message previews for the target session,
-  and its `agent` summary carries the live-row `usage` field too.
+  and its `agent` summary carries `usage` under the same optional rule.
   `limit` must be 1-50, and `max_chars` must be 80-2000.
 
 ## Safety

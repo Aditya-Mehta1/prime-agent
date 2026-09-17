@@ -23,7 +23,10 @@ export interface AgentObserveAgentSummary {
 	isCompacting: boolean;
 	attachedClients: number;
 	messageCount?: number;
-	/** Own session usage for live sessions; absent for members with no live session in this daemon. */
+	/**
+	 * Own session usage. Absent for members with no live session in this daemon,
+	 * and for a live session that has recorded no spend yet.
+	 */
 	usage?: SessionUsageSummary;
 	queuedCount: number;
 	isSessionActive: boolean;
