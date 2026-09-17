@@ -361,6 +361,8 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         for command in [
             "chmod -R 755 sub",
             "chmod -R 755 ./sub",
+            # An absolute PATH cannot shadow the command word.
+            "PATH=/usr/bin:/bin chmod -R 755 sub",
             "chmod -R 755 sub/nested",
             'chmod -R 755 "my dir"',
             "chmod -R 755 $PWD/sub",
@@ -604,11 +606,15 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         with mock.patch.dict(os.environ, {"CDPATH": ""}):
             result = await self._run("cd sub && chmod -R 755 .")
             self.assertEqual(result.exit_code, 0)
-        # A CDPATH assignment in the command arms the same fail-closed path.
-        message = await self._refused(
-            f"CDPATH={outside.name}; cd sub && chmod -R 755 ."
-        )
-        self.assertIn("changes directory", message)
+        # A CDPATH assignment in the command arms the same fail-closed path,
+        # and the append form arms it exactly like the plain one.
+        for command in [
+            f"CDPATH={outside.name}; cd sub && chmod -R 755 .",
+            f"CDPATH+={outside.name}; cd sub && chmod -R 755 .",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("changes directory", message)
         self.assertTrue(Path(outside.name, "sub", "file.txt").exists())
 
     async def test_refuses_bash_env_arming(self):
@@ -616,7 +622,7 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         # bash runs $BASH_ENV before the command text, so arming it from
         # the command is refused: that file's shell code is unscannable.
         for command in [
-            "BASH_ENV=/tmp/x echo hi",
+            "BASH_ENV=/tmp/x echo hi", "BASH_ENV+=/tmp/x echo hi",
             "FOO=1 BASH_ENV=/tmp/x echo hi",
             "env BASH_ENV=/tmp/x echo hi",
             "sudo BASH_ENV=/tmp/x echo hi",
@@ -658,6 +664,16 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
             child_env = bash_module._child_env()
         self.assertNotIn("BASH_ENV", child_env)
         self.assertNotIn("ENV", child_env)
+        # An exported shell function imports the same way, so it is dropped too.
+        marker = Path(self.test_dir, "imported-ran")
+        with mock.patch.dict(
+            os.environ, {"BASH_FUNC_pa_probe%%": f"() {{ touch {marker}; }}"}
+        ):
+            child_env = bash_module._child_env()
+            result = await self._run("pa_probe")
+        self.assertNotIn("BASH_FUNC_pa_probe%%", child_env)
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertFalse(marker.exists())
 
     async def test_refuses_process_substitution_wrappers(self):
         self._make_tree()
@@ -1192,6 +1208,8 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
             "env --chdir / chmod -R 755 .",
             "env -C/ chmod -R 755 .", "env -iC / chmod -R 755 .",
             "env --chdir=/ chown -R user .", "env -C ~ chmod -R 755 .",
+            "env -iC/ chmod -R 755 .", "FOO=1 env -C / chmod -R 755 .",
+            "{ env -C / chmod -R 755 .; }",
             "find / -execdir chmod -R 755 . \\;", "find . -execdir chown -R user . +",
             # The wrapper chain is walked, not just its head.
             "nice env -C / chmod -R 755 .", "timeout 5 env -C / chmod -R 755 .",
@@ -1218,7 +1236,7 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
             "env --split-string='chmod -R 755 ~'",
             # Every `env -S` string counts, in every spelling, and one the guard
             # cannot read is refused rather than guessed at.
-            "env -S'chmod -R 755 ~'", "env -iS 'chown -R user ~'",
+            "env -S'chmod -R 755 ~'", "env -iS 'chown -R user ~'", "env -iS'chmod -R 755 ~'",
             "env -S 'echo hi' -S 'chmod -R 755 ~'", "eval 'env -S \"chmod -R 755 ~\"'",
             "env -S 'echo hi'; env -S 'chmod -R 755 ~'",
             "bash -c 'env -S \"chown -R user ~\"'",
@@ -1242,14 +1260,15 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         # command keeps that command, and one nobody uses changes nothing.
         for command in [
             "hash -p /bin/chmod safe; safe -R 755 ~", "hash -p /bin/chmod safe; echo hi; safe -R 755 ~",
+            "hash -p/bin/chmod safe; safe -R 755 ~",
             "hash -p /usr/bin/chown safe; safe -R user ~",
         ]:
             with self.subTest(command=command):
                 message = await self._refused(command, home=home.name)
                 self.assertIn("Refusing to run this recursive chmod/chown command", message)
                 self.assertTrue(Path(home.name, "keep.txt").exists())
-        message = await self._refused('hash -p "$DIR/chmod" safe; safe -R 755 sub')
-        self.assertIn("command-hash entry", message)
+        for command in ['hash -p "$DIR/chmod" safe; safe -R 755 sub', "hash -p /bin/chmo? safe; safe -R 755 sub"]:
+            self.assertIn("command-hash entry", await self._refused(command))
         for command in ["hash -p /bin/echo safe; safe -R 755 sub", "hash -p /bin/chmod safe"]:
             self.assertEqual((await self._run(command)).exit_code, 0)
 
@@ -1263,7 +1282,8 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
             "bash -l -c ':'", "bash --login -c ':'", "bash -lc ':'", "bash -i -c ':'",
             "bash --interactive -c ':'", "bash -ilc ':'", "sh -l -c ':'",
             "bash --rcfile /tmp/evilrc -i -c ':'", "bash --init-file /tmp/evilrc -i -c ':'",
-            "bash -c 'bash -l -c \":\"'",
+            "bash -c 'bash -l -c \":\"'", "{ bash -l -c ':'; }",
+            "if true; then bash -l -c ':'; fi",
         ]:
             with self.subTest(command=command):
                 self.assertIn("starts a login or interactive shell", await self._refused(command))
@@ -1404,7 +1424,8 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         Path(home.name, "keep.txt").write_text("keep\n")
         for command in [
             "chmod 2>/dev/null -R 755 ~",
-            "chmod -R \\\n755 ~",
+            "chmod -R \\\n755 ~", "ch\\\nmod -R 755 ~", 'ch"mo\\\nd" -R 755 ~',
+            "PATH=.:$PATH chmod -R 755 sub", "PATH=$PATH:. chmod -R 755 sub",
             "chmod -R 755 &>/dev/null ~",
             "\\chmod -R 755 ~",
             "/bin/chmod -R 755 ~",

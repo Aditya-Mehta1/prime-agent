@@ -973,13 +973,15 @@ class DestructiveChmodRefusalError(RuntimeError):
 
 
 def _normalize_line_continuations(command: str) -> str:
-    """Collapse unquoted backslash-newline line continuations to spaces.
+    """Collapse unquoted backslash-newline line continuations to `''`.
 
-    The shell runs `chmod -R \
-755 ~` (one backslash before the newline) as a single `chmod -R 755 ~`
-    command, so the chmod/chown scan must see through continuations. The
-    replacement is length-preserving so the scan's
-    character indices stay aligned with the original command. Single-quoted
+    The shell removes the pair before it builds words, so `chmod -R \
+755 ~` runs as `chmod -R 755 ~` and `chmo\
+d -R 755 ~` runs as `chmod -R 755 ~` (an in-word continuation joins the
+    word). The replacement is the two-character empty quoted string `''`,
+    which is length-preserving so the scan's character indices stay aligned
+    with the original command, and which the word scanner folds to nothing,
+    so it joins words exactly like the removal bash performs. Single-quoted
     backslash-newlines are literal data and a newline always ends a comment,
     so those are left untouched (both are still masked or live as before).
     """
@@ -999,8 +1001,8 @@ def _normalize_line_continuations(command: str) -> str:
             elif ch == "#" and (i == 0 or re.match(r"[\s;&|(){}]", chars[i - 1])):
                 comment = True
             elif ch == "\\" and i + 1 < n and chars[i + 1] == "\n":
-                chars[i] = " "
-                chars[i + 1] = " "
+                chars[i] = "'"
+                chars[i + 1] = "'"
                 i += 1
         elif quote == "'":
             if ch == "'":
@@ -1226,6 +1228,12 @@ def _strip_shell_escapes(command: str) -> tuple[str, list[int]]:
                     quote = None
             elif ch == '"':
                 quote = None
+            elif ch == "\\" and i + 1 < n and command[i + 1] == "\n":
+                # A line continuation is removed even inside double
+                # quotes, so the word it splits joins back together.
+                chars.pop()
+                index_map.pop()
+                i += 1
             elif ch == "\\" and i + 1 < n:
                 chars.append(command[i + 1])
                 index_map.append(i + 1)
@@ -1678,10 +1686,16 @@ def _hash_registered_command_names(
         if os.path.basename(word.value) != _HASH_BUILTIN:
             continue
         has_pathname_option = False
+        attached: str | None = None
         operands: list[str] = []
         for token in _run_tokens_from(words, index)[1:]:
             if token.startswith("-") and token != "-" and not token.startswith("--"):
-                has_pathname_option = has_pathname_option or "p" in token[1:]
+                position = token[1:].find("p")
+                if position != -1:
+                    has_pathname_option = True
+                    value = token[position + 2 :]
+                    if value:
+                        attached = value  # `hash -p/bin/chmod safe`
                 continue
             if token.startswith("--"):
                 continue
@@ -1690,10 +1704,19 @@ def _hash_registered_command_names(
             operands.append(token)
             if len(operands) == 2:
                 break
-        if not has_pathname_option or len(operands) < 2:
+        if not has_pathname_option:
             continue
-        pathname, name = operands
-        if any(ch in pathname + name for ch in "$`"):
+        if attached is not None and operands:
+            pathname, name = attached, operands[0]
+        elif len(operands) == 2:
+            pathname, name = operands
+        else:
+            continue
+        if _UNRESOLVED_EXPANSION.search(pathname + name) or (
+            _EXPANDABLE_GLOB_CHARS.search(pathname)
+        ):
+            # An expansion or glob builds the pathname the shell resolves, so
+            # the command this entry registers cannot be read statically.
             unreadable = True
         elif os.path.basename(pathname) in ("chmod", "chown"):
             aliased.add(name)
@@ -1849,7 +1872,8 @@ class _UnresolvableChmodCwd:
 _UNRESOLVABLE_CHMOD_CWD = _UnresolvableChmodCwd()
 
 
-_CDPATH_ASSIGNMENT = re.compile(r"(?<![A-Za-z0-9_])CDPATH=")
+# `CDPATH+=` arms the search path exactly like `CDPATH=`.
+_CDPATH_ASSIGNMENT = re.compile(r"(?<![A-Za-z0-9_])CDPATH\+?=")
 
 
 def _resolve_chmod_cd_target(
@@ -2263,7 +2287,11 @@ _EXPANDABLE_GLOB_CHARS = re.compile(r"[*?{\[]")
 # A plain assignment, or an append assignment (`PATH+=...`), which the shell
 # also applies to the command it prefixes rather than running as a command.
 _ASSIGNMENT_WORD = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
-_BASH_ENV_ASSIGNMENT = re.compile(r"^BASH_ENV=")
+# An append assignment arms the file just like a plain one (`BASH_ENV+=file`).
+_BASH_ENV_ASSIGNMENT = re.compile(r"^BASH_ENV\+?=")
+# The PATH assignments that decide where a bare command word resolves.
+_PATH_SET_ASSIGNMENT = re.compile(r"^PATH=")
+_PATH_APPEND_ASSIGNMENT = re.compile(r"^PATH\+?=")
 # Command words that hand their arguments to a program: an unresolvable word
 # inside one of these runs could still be chmod/chown.
 _UNRESOLVABLE_COMMAND_EXECUTORS = (
@@ -2284,6 +2312,10 @@ _UNRESOLVABLE_COMMAND_EXECUTORS = (
     "strace",
     "valgrind",
 )
+# Words that hold a run's command slot without being the command itself:
+# grouping tokens and the keywords that introduce the simple command inside a
+# group. A wrapper behind one of them still runs (`{ bash -l -c ...; }`).
+_COMMAND_SLOT_NOISE = ("{", "}", "(", ")", "then", "do", "else", "elif", "!")
 # Heads whose operand arming BASH_ENV executes before the command runs.
 _ENV_ARMING_HEADS = ("env", "export", "declare", "typeset", "sudo", "nohup")
 # Wrappers that execute a process substitution's output as shell code.
@@ -2380,6 +2412,48 @@ def _unresolvable_words_could_recurse(
         ):
             continue
         return True
+    return False
+
+
+def _path_can_shadow_command_lookup(words: list[_ShellWord], workspace: str) -> bool:
+    """True when the PATH this command runs under can resolve a bare command
+    word inside a directory the guard cannot trust.
+
+    An empty, `.`, `..`, or relative PATH entry makes the shell search a
+    directory that may hold a file named `chmod`/`chown` (the kernel
+    workspace is writable), so `PATH=.:$PATH chmod -R 755 sub` runs that file
+    instead of the real command and the operands the guard resolved are not
+    the ones that run. A PATH assignment in the command replaces or appends to
+    the inherited value, so the assigned values are read; without an
+    assignment the inherited PATH decides, and it is just as untrustworthy.
+    An absolute entry that resolves inside the workspace counts too: the
+    workspace is writable, so a file there shadows the real command."""
+    set_values = [
+        word.value.split("=", 1)[1]
+        for word in words
+        if _PATH_SET_ASSIGNMENT.match(word.value)
+    ]
+    appended = [
+        word.value.split("=", 1)[1]
+        for word in words
+        if _PATH_APPEND_ASSIGNMENT.match(word.value)
+    ]
+    checked = [set_values[-1]] if set_values else [os.environ.get("PATH") or ""]
+    checked.extend(appended)
+    for value in checked:
+        # HOME/PWD forms expand like the shell expands them; anything else
+        # still carrying `$` is not an absolute entry the guard can trust.
+        for entry in _expanded_command_word_value(value).split(os.pathsep):
+            if not entry or not os.path.isabs(entry):
+                return True
+            try:
+                resolved = os.path.realpath(entry)
+            except (OSError, RuntimeError, ValueError):
+                return True  # an entry the guard cannot read fails closed
+            if resolved == workspace or resolved.startswith(workspace + os.sep):
+                # The kernel workspace is writable, so a command file there
+                # can shadow the real one even through an absolute entry.
+                return True
     return False
 
 
@@ -2698,6 +2772,10 @@ def _unscanned_wrapper_script_reason(
             and (
                 _ASSIGNMENT_WORD.match(head.value)
                 or os.path.basename(head.value) in _UNRESOLVABLE_COMMAND_EXECUTORS
+                # A grouping token or keyword in the command slot is not the
+                # command: the wrapper behind it runs with the same options
+                # (`{ bash -l -c ...; }`, `then bash -l ...`).
+                or head.value in _COMMAND_SLOT_NOISE
             )
         )
         if not introduced:
@@ -2972,6 +3050,21 @@ def _format_chmod_hash_alias_refusal() -> str:
     )
 
 
+def _format_chmod_shadowed_command_refusal() -> str:
+    return "\n".join(
+        [
+            "Refusing to run this recursive chmod/chown command: a PATH"
+            " assignment here makes the shell search a relative directory for"
+            " the command word, so a file named chmod/chown in the workspace"
+            " could run instead and act on targets the guard never checked.",
+            "",
+            "Run it with an absolute command path and an absolute PATH, or"
+            " retry with bash(command, allow_destructive_chmod=True), or start"
+            f" the kernel with {BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV}=1.",
+        ]
+    )
+
+
 def _format_chmod_trap_refusal() -> str:
     return "\n".join(
         [
@@ -3106,29 +3199,38 @@ def _env_option_values(tokens: list[str], short: str, long: str) -> list[str]:
     command.
 
     GNU `env` accepts the short form with a detached or attached value
-    (`-C dir`, `-Cdir`), a bundled cluster whose last flag takes the value
-    (`-iC dir`), and the long form with an attached value (`--chdir=dir`).
-    Every occurrence is returned: the same option can repeat, and the guard
-    reads all of them rather than guessing which one the platform honors."""
+    (`-C dir`, `-Cdir`), a cluster where the option takes the rest of its own
+    word (`-iC/`) or the next word when it ends the cluster (`-iC dir`), and
+    the long form with an attached value (`--chdir=dir`). Every occurrence is
+    returned: the same option can repeat, and the guard reads all of them
+    rather than guessing which one the platform honors."""
     values: list[str] = []
     index = 0
     while index < len(tokens):
         token = tokens[index]
-        attached: str | None = None
-        detached = False
-        if token == f"-{short}" or token == f"--{long}":
-            detached = True
-        elif token.startswith(f"--{long}="):
-            attached = token.split("=", 1)[1]
-        elif token.startswith(f"-{short}"):
-            attached = token[len(short) + 1 :]
-        elif token.startswith("-") and not token.startswith("--") and short in token[1:]:
-            detached = True
-        if attached is not None:
-            values.append(attached)
-        elif detached and index + 1 < len(tokens):
-            values.append(tokens[index + 1])
+        if token.startswith("--"):
+            name, _, inline = token[2:].partition("=")
+            # GNU getopt accepts any unambiguous prefix of a long option, so
+            # `--chdi=dir` names `--chdir` on a GNU env even though a BSD env
+            # rejects it. Only the prefixes of this option count.
+            matches_long = bool(name) and long.startswith(name)
+            if matches_long and not inline and index + 1 < len(tokens):
+                values.append(tokens[index + 1])
+                index += 1
+            elif matches_long and inline:
+                values.append(inline)
             index += 1
+            continue
+        if token.startswith("-") and token != "-":
+            cluster = token[1:]
+            position = cluster.find(short)
+            if position != -1:
+                attached = cluster[position + 1 :]
+                if attached:
+                    values.append(attached)
+                elif index + 1 < len(tokens):
+                    values.append(tokens[index + 1])
+                    index += 1
         index += 1
     return values
 
@@ -3267,12 +3369,20 @@ def _wrapper_chain_groups(run_words: list[str]) -> list[tuple[str, list[str]]]:
     `nice env -C / chmod -R 755 .` is a two-link chain and a check that only
     looked at the run head would miss the relocation behind `nice`. The chain
     stops at the first word that is not an executor from
-    `_UNRESOLVABLE_COMMAND_EXECUTORS`: any other command word runs its
-    arguments itself, so a later `xargs` or an operand named `env` is not a
-    wrap."""
+    `_UNRESOLVABLE_COMMAND_EXECUTORS` once assignments, grouping tokens, and
+    group keywords are skipped: any other command word runs its arguments
+    itself, so a later `xargs` or an operand named `env` is not a wrap."""
     groups: list[tuple[str, list[str]]] = []
     index = 0
     while index < len(run_words):
+        if run_words[index] in _COMMAND_SLOT_NOISE or _ASSIGNMENT_WORD.match(
+            run_words[index]
+        ):
+            # An assignment prefix, a grouping token, or a group keyword holds
+            # the command slot without being the command: the wrapper after it
+            # is the one that runs (`FOO=1 env -C / chmod ...`, `{ env -C / ... }`).
+            index += 1
+            continue
         name = os.path.basename(run_words[index])
         if name not in _UNRESOLVABLE_COMMAND_EXECUTORS:
             break
@@ -3296,10 +3406,11 @@ def _guard_destructive_chmod(command: str, allow_destructive_chmod: bool) -> Non
     affected relocations, nested quoted wrappers, `env -S` split strings,
     login or interactive shell wrappers that would source startup files,
     executor chains that relocate or feed the invocation (xargs,
-    env -C/--chdir, find -execdir), unreadable `hash -p` registrations,
-    and abbreviated recursive flags. Pattern matching is string-only and
-    the operand resolver runs only on a match, so other commands pay
-    nothing."""
+    env -C/--chdir, find -execdir, in any spelling and behind assignments
+    and grouping tokens), unreadable `hash -p` registrations, a PATH
+    entry that can shadow a bare command word, and abbreviated
+    recursive flags. Pattern matching is string-only and the operand
+    resolver runs only on a match, so other commands pay nothing."""
     if allow_destructive_chmod or _DESTRUCTIVE_CHMOD_BYPASS_AT_KERNEL_START:
         return
     command_prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
@@ -3457,7 +3568,22 @@ def _guard_destructive_chmod(command: str, allow_destructive_chmod: bool) -> Non
             home_real = os.path.realpath(home_env)
         except (OSError, RuntimeError, ValueError):
             home_real = None
+    # A bare command word resolved through a relative PATH entry can be a
+    # workspace file, so the operands resolved here are not the ones that
+    # run. A slash-qualified word and a `hash -p` registration bypass PATH
+    # lookup and stay checked as before. The answer is command-wide, so it is
+    # computed once.
+    shadows_command_lookup = _path_can_shadow_command_lookup(words, workspace)
     for start, end, word_index in invocations:
+        invocation_word = words[word_index].value
+        if (
+            shadows_command_lookup
+            and _is_chmod_chown_word(invocation_word)
+            and "/" not in invocation_word
+        ):
+            raise DestructiveChmodRefusalError(
+                _format_chmod_shadowed_command_refusal()
+            )
         # xargs feeds paths on stdin the guard never sees, env -C/--chdir
         # relocates before executing, and find -execdir runs the command in
         # each searched directory: all three act outside the resolver's
@@ -3532,8 +3658,9 @@ def bash(command: str, *, allow_destructive_chmod: bool = False) -> BashHandle:
     arming, CDPATH-affected relocations, nested quoted wrappers,
     abbreviated recursive flags, executor chains that relocate or feed
     the invocation (xargs, env -C/--chdir, find -execdir), `env -S`
-    split strings, unreadable `hash -p` registrations, and login or
-    interactive shell wrappers that would source startup files);
+    split strings, unreadable `hash -p` registrations, a PATH entry that
+    can shadow the command word, and login or interactive shell
+    wrappers that would source startup files);
     retry with allow_destructive_chmod=True
     (or start the kernel with PI_BASH_ALLOW_DESTRUCTIVE_CHMOD=1) only when
     the recursion is intentional.
@@ -3618,7 +3745,10 @@ def _child_env() -> dict[str, str]:
     $BASH_ENV before every command, so an inherited value could execute
     shell code the chmod/chown guard never scanned (arming BASH_ENV from
     the command text is refused by the guard; this removes the inherited
-    form).
+    form). Exported shell functions (`BASH_FUNC_name%%`) are dropped for the
+    same reason: bash imports them before the command text runs, so a body
+    the guard never reads could run a recursive chmod/chown, and a command
+    word would then not be the program the guard checked.
     """
     env = {
         **os.environ,
@@ -3639,6 +3769,8 @@ def _child_env() -> dict[str, str]:
     }
     env.pop("BASH_ENV", None)
     env.pop("ENV", None)
+    for name in [name for name in env if name.startswith("BASH_FUNC_")]:
+        env.pop(name, None)
     return env
 
 
