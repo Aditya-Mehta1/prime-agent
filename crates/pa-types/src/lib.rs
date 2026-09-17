@@ -19,6 +19,7 @@ pub mod extension_rpc;
 pub mod platform;
 pub mod session;
 pub mod slash_commands;
+pub mod usage;
 
 use serde::{Deserialize, Serialize};
 

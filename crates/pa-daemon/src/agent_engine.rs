@@ -113,6 +113,10 @@ pub struct AgentSessionEngine {
     /// session cwd; deterministic harnesses replace it through
     /// [`AgentSessionEngine::set_autonomous_driver`].
     autonomous_driver: std::sync::RwLock<std::sync::Arc<dyn pa_core::autonomous::AutonomousDriver>>,
+    /// This session's RLM recursion depth (0 for top-level sessions),
+    /// stamped by `configure_rlm_identity`. Gates the kernel `refine.*`
+    /// host requests (TS `_autoRefineAllowedForSession` depth check).
+    rlm_depth: std::sync::atomic::AtomicU32,
     /// The resolved faux model, registered once per engine so scripted
     /// responses queue across turns instead of replaying per resolution.
     /// Verification harness only; never set by the product.
@@ -214,6 +218,7 @@ impl AgentSessionEngine {
             link,
             children,
             autonomous_driver,
+            rlm_depth: std::sync::atomic::AtomicU32::new(0),
             faux_model: std::sync::OnceLock::new(),
         })
     }
@@ -443,6 +448,8 @@ impl AgentSessionEngine {
             rlm_subagent_host: self.children.clone().map(|children| {
                 children as Arc<dyn pa_core::session_engine::rlm_host::RlmSubagentHost>
             }),
+            rlm_depth: Some(self.rlm_depth.load(std::sync::atomic::Ordering::Relaxed)),
+            model_info: Some(model.clone()),
             // The daemon worker has no CLI extension sources: sessions
             // load configured/discovered extensions only (the attached
             // TUI/ACP surfaces do not carry `-e` flags today).
@@ -622,6 +629,10 @@ impl SessionEngine for AgentSessionEngine {
         &self,
         identity: crate::engine::RlmSessionIdentity,
     ) -> anyhow::Result<()> {
+        // This session's own depth gates the kernel `refine.*` host requests
+        // (TS `_autoRefineAllowedForSession`: depth-0 sessions only).
+        self.rlm_depth
+            .store(identity.rlm_depth, std::sync::atomic::Ordering::Relaxed);
         // The inherited default the children registry seeds from (validated;
         // the children create command carries it onward). This session's own
         // effective level resolves through the shared path instead: the
@@ -860,17 +871,131 @@ impl AgentSessionEngine {
                         .filter(|error| !error.is_empty())
                         .unwrap_or_else(|| "Assistant response failed".to_string()),
                 ),
-                StopReason::Aborted => TurnResult::Error("No response produced.".to_string()),
+                StopReason::Aborted => TurnResult::Aborted,
                 _ => TurnResult::Message(Box::new(message)),
             },
             Err(error) => TurnResult::Error(error.to_string()),
         }
     }
 
-    /// The turn loop: run one model turn, then ask the autonomous driver
-    /// what follows. A continuation is injected as a durable user row and
-    /// drives the next turn; a stop surfaces its reason as a durable
-    /// `autonomous_status` row. The single trailing `Done` ends the run.
+    /// Drop pending turn-boundary requests (aborted turns; TS `_checkCompaction`
+    /// abort arm clears both the compaction and the refine request).
+    fn drop_turn_boundary_requests(&self) {
+        let guard = self.session.blocking_lock();
+        if let Some(engine) = guard.as_ref() {
+            self.runtime.block_on(engine.turn_boundary.clear_pending());
+        }
+    }
+
+    /// Consume pending `compact.run`/`refine.run` requests at the settled
+    /// turn boundary, in TS order (compaction, then refinement). The
+    /// compaction outcome reaches the transcript like `/compact` (the
+    /// worker persists the entry and broadcasts `compaction_end`); the
+    /// model-facing refinement notice reaches it like the `/refine` notice
+    /// row. A consumed compaction stops the run (TS: requested compaction
+    /// stops the loop on purpose; the model resumes on the next prompt or
+    /// queued continuation).
+    fn run_turn_boundary(&self, emit: &mut dyn FnMut(EngineEvent) -> bool) -> BoundaryRun {
+        // Fast path: nothing scheduled (the common turn).
+        let has_pending = {
+            let guard = self.session.blocking_lock();
+            match guard.as_ref() {
+                Some(engine) => self.runtime.block_on(async {
+                    engine.turn_boundary.compaction_scheduled().await
+                        || engine.turn_boundary.refine_pending().await
+                }),
+                None => false,
+            }
+        };
+        if !has_pending {
+            return BoundaryRun::Proceed;
+        }
+        let model = match self.resolve_model() {
+            Ok(model) => model,
+            Err(error) => {
+                eprintln!("pa-daemon: boundary request could not resolve a model: {error:#}");
+                return BoundaryRun::Proceed;
+            }
+        };
+        let api_key = self.resolve_request_api_key(&model);
+        let global_harness_dir = self.config.agent_dir.clone();
+        let consumption = {
+            let guard = self.session.blocking_lock();
+            let Some(engine) = guard.as_ref() else {
+                return BoundaryRun::Proceed;
+            };
+            self.runtime.block_on(async {
+                engine
+                    .consume_turn_boundary_requests(&model, api_key, global_harness_dir)
+                    .await
+            })
+        };
+        let mut stopped_for_compaction = false;
+        match consumption.compaction {
+            Some(Ok(pa_core::session_engine::compact_session::CompactOutcome::Ran(run))) => {
+                let entry = serde_json::to_value(&run.entry).unwrap_or(Value::Null);
+                // The wire result is the TS `CompactionResult` shape.
+                let result = serde_json::json!({
+                    "summary": run.result.summary,
+                    "firstKeptEntryId": run.result.first_kept_entry_id,
+                    "tokensBefore": run.result.tokens_before,
+                });
+                if !emit(EngineEvent::Compaction { entry, result }) {
+                    return BoundaryRun::Cancelled;
+                }
+                stopped_for_compaction = true;
+            }
+            // A skip consumed the request silently (the Rust `/compact`
+            // contract); failures land in the worker log (the TS wire
+            // carries `compaction_end` with an error payload; the Rust
+            // wire has no failed-compaction event yet).
+            Some(Ok(pa_core::session_engine::compact_session::CompactOutcome::Skipped(
+                message,
+            ))) => {
+                eprintln!("pa-daemon: requested compaction skipped: {message}");
+                stopped_for_compaction = true;
+            }
+            Some(Err(error)) => {
+                eprintln!("pa-daemon: requested compaction failed: {error:#}");
+                stopped_for_compaction = true;
+            }
+            None => {}
+        }
+        match consumption.refinement {
+            Some(Ok(refinement)) => {
+                // The model-facing notice row (durable, like the session
+                // persistence of TS `refine()`).
+                if refinement.applied_edits.iter().any(|edit| edit.applied) {
+                    let notice = pa_core::session_engine::refine::create_refinement_notice_message(
+                        &refinement,
+                        pa_core::session_engine::refine::RefinementSource::SelfRefine,
+                    );
+                    if !emit(EngineEvent::CustomMessage(
+                        crate::session_commands::custom_message_value(&notice),
+                    )) {
+                        return BoundaryRun::Cancelled;
+                    }
+                }
+            }
+            // TS emits `refine_failed` on the wire; the Rust daemon wire
+            // has no refine event yet — the worker log keeps the failure.
+            Some(Err(error)) => {
+                eprintln!("pa-daemon: requested refinement failed: {error:#}");
+            }
+            None => {}
+        }
+        if stopped_for_compaction {
+            BoundaryRun::StoppedForCompaction
+        } else {
+            BoundaryRun::Proceed
+        }
+    }
+
+    /// The turn loop: run one model turn, consume turn-boundary requests,
+    /// then ask the autonomous driver what follows. A continuation is
+    /// injected as a durable user row and drives the next turn; a stop
+    /// surfaces its reason as a durable `autonomous_status` row. The single
+    /// trailing `Done` ends the run.
     fn run_turns(
         &self,
         first_prompt: &str,
@@ -882,11 +1007,31 @@ impl AgentSessionEngine {
             let turn = self.run_model_turn(&prompt, aborted, emit);
             let assistant = match turn {
                 TurnResult::Message(assistant) => assistant,
+                // An aborted turn never services boundary requests (TS
+                // `_checkCompaction` abort arm): drop any pending ones so
+                // a stale request cannot leak into the next turn.
+                TurnResult::Aborted => {
+                    self.drop_turn_boundary_requests();
+                    emit(EngineEvent::Done(Err("No response produced.".to_string())));
+                    return;
+                }
                 TurnResult::Error(error) => {
                     emit(EngineEvent::Done(Err(error)));
                     return;
                 }
             };
+            // Turn-boundary consumption (TS `_checkCompaction` requested
+            // arm, then `_consumePendingRequestedRefine`): requests the
+            // kernel `compact.run`/`refine.run` host handlers scheduled
+            // during this turn run now, between turns.
+            match self.run_turn_boundary(emit) {
+                BoundaryRun::Cancelled => return,
+                BoundaryRun::StoppedForCompaction => {
+                    emit(EngineEvent::Done(Ok(())));
+                    return;
+                }
+                BoundaryRun::Proceed => {}
+            }
             match self.autonomous_follow_up(&assistant) {
                 AutonomousFollowUp::Inactive => {
                     emit(EngineEvent::Done(Ok(())));
@@ -1221,8 +1366,21 @@ enum TurnResult {
     /// The turn settled; the final assistant message (typed, boxed to
     /// keep the enum small).
     Message(Box<pa_agent::types::AssistantMessage>),
+    /// The turn was aborted before a settled message.
+    Aborted,
     /// The turn failed before or during the model call.
     Error(String),
+}
+
+/// What the turn-boundary consumption did to the run.
+enum BoundaryRun {
+    /// Nothing pending, or requests consumed without stopping the run.
+    Proceed,
+    /// A consumed compaction stops the loop (TS: requested compaction
+    /// stops the run on purpose).
+    StoppedForCompaction,
+    /// The emitter asked to stop.
+    Cancelled,
 }
 
 /// The outcome of one turn attempt.

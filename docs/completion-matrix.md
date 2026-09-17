@@ -25,11 +25,11 @@ below is evidence-based, not battery-based.
 | 3 | Slash commands | partial | registry/menu/autocomplete/session forwarding landed; almost all client command UIs report "not available" |
 | 4 | Agents view | in-flight | roster protocol + TUI mode + entry points on `lane/agents-view`, unmerged |
 | 5 | Daemon supervision & protocol | partial | 32 of ~106 TS command types; read commands, saved-session wake, reconnect missing |
-| 6 | Compaction | complete (daemon wire) | kernel `compact.run` host handler missing (model cannot compact itself) |
+| 6 | Compaction | complete (daemon wire) | kernel `compact.run` host handler lands with the family-10 lane (`lane/harness-handlers`): registered, registry-tested, and round-tripped through a real kernel |
 | 7 | Side questions | complete | - |
 | 8 | Agent-to-agent messaging | partial | peer transport done; saved-session wake, `custom` persistence, family-graph relations missing |
 | 9 | RLM recursion (`rlm.spawn`/`collect`/subagents) | partial | `rlm.*` handlers + supervisor-backed child sessions land with the `lane/rlm` PR; kernel-side dogfood (row 11) still untested |
-| 10 | Kernel host-request surface & continual harness | partial | only goal/heartbeat/messaging handlers registered; `refine.*`, `compact.run`, `harness.*`, `model.info` unregistered despite prompt advertising them |
+| 10 | Kernel host-request surface & continual harness | in-flight | `lane/harness-handlers` registers `model.info`/`compact.*`/`refine.*` (+ pending state, turn-boundary consumption in daemon worker and print mode, registry round-trip tests, real-kernel wire-contract test via `create_session`); remaining: daemon-level dogfood e2e (a daemon session's settled boundary consuming a kernel-scheduled refinement end to end) |
 | 11 | RLM dogfood (this harness, run by the Rust binary) | missing | mission-host dogfood untested; depends on rows 9-10 |
 | 12 | MCP | partial | CLI config/catalog/gating only; product-path wiring, OAuth/login UI, generic connector execution unproven |
 | 13 | Extensions | partial | package manager + resource resolution done; sidecar runner stages 1-6 pending |

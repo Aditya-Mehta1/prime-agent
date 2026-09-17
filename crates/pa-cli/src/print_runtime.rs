@@ -179,8 +179,14 @@ fn run_print_mode(options: &RunOptions) -> Result<i32, String> {
 }
 
 async fn print_mode_main(options: &RunOptions) -> Result<i32, String> {
-    let engine = build_headless_engine(options).await?;
-    run_prompts_and_emit(&engine, options).await
+    let headless = build_headless_engine(options).await?;
+    run_prompts_and_emit(
+        &headless.engine,
+        &headless.model,
+        headless.api_key.clone(),
+        options,
+    )
+    .await
 }
 
 /// Assemble the in-process session engine for a headless run: model
@@ -252,6 +258,8 @@ async fn build_headless_engine_parts(options: &RunOptions) -> Result<HeadlessEng
                 .collect(),
             extra_builtin_skill_overrides: vec![],
             rlm_subagent_host: None,
+            rlm_depth: None,
+            model_info: Some(model.clone()),
             cli_extension_sources: config
                 .extensions
                 .iter()
@@ -270,10 +278,8 @@ async fn build_headless_engine_parts(options: &RunOptions) -> Result<HeadlessEng
 }
 
 /// The engine alone (callers that do not drive session commands).
-async fn build_headless_engine(
-    options: &RunOptions,
-) -> Result<pa_core::session_engine::engine::SessionEngine, String> {
-    Ok(build_headless_engine_parts(options).await?.engine)
+async fn build_headless_engine(options: &RunOptions) -> Result<HeadlessEngine, String> {
+    build_headless_engine_parts(options).await
 }
 
 /// The session header line (TS `AgentConnectionSessionHeader` shape).
@@ -566,6 +572,8 @@ fn builtin_tools(_cwd: &std::path::Path) -> Vec<Arc<dyn pa_agent::types::AgentTo
 /// `message_end` event before the process exits.
 async fn run_prompts_and_emit(
     engine: &pa_core::session_engine::engine::SessionEngine,
+    model: &Model,
+    api_key: Option<String>,
     options: &RunOptions,
 ) -> Result<i32, String> {
     let json_mode = options.app_mode == AppMode::Json;
@@ -610,6 +618,25 @@ async fn run_prompts_and_emit(
             .await
             .map_err(|error| format!("{error:#}"))?;
         engine.session.agent().wait_for_idle().await;
+        // Turn-boundary requests the kernel scheduled mid-turn
+        // (`compact.run` / `refine.run`): consume them at the quiescent
+        // boundary between turns (TS serialized checkpoint order —
+        // compaction, then refine — before any continuation driving). The
+        // outcomes persist in the session entries the terminal result
+        // reads.
+        let consumption = engine
+            .consume_turn_boundary_requests(
+                model,
+                api_key.clone(),
+                pa_core::refinement::get_global_harness_state_dir(&options.config.agent_dir),
+            )
+            .await;
+        if let Some(Err(error)) = &consumption.compaction {
+            eprintln!("pa-cli: requested compaction failed: {error:#}");
+        }
+        if let Some(Err(error)) = &consumption.refinement {
+            eprintln!("pa-cli: requested refinement failed: {error:#}");
+        }
         if let Some(run) = &autonomous {
             if let Some(row) = run
                 .drive(engine)
@@ -797,6 +824,8 @@ async fn build_faux_engine_parts(
             additional_prompt_paths: vec![],
             extra_builtin_skill_overrides: vec![],
             rlm_subagent_host: None,
+            rlm_depth: None,
+            model_info: Some(model.clone()),
             cli_extension_sources: config
                 .extensions
                 .iter()

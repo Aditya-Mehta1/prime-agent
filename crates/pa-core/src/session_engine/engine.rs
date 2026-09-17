@@ -57,6 +57,13 @@ pub struct SessionEngineConfig {
     pub extra_builtin_skill_overrides: Vec<String>,
     /// Daemon child-session host backing the `rlm.*` recursion surface.
     pub rlm_subagent_host: Option<Arc<dyn super::rlm_host::RlmSubagentHost>>,
+    /// The session's depth in the RLM recursion tree (0 for top-level
+    /// sessions). Gates the `refine.*` host requests, like the TS
+    /// `_autoRefineAllowedForSession` depth check.
+    pub rlm_depth: Option<u32>,
+    /// The full registry model (input modalities for `model.info`); the
+    /// engine derives minimal facts from `model` when absent.
+    pub model_info: Option<pa_types::ai::Model>,
     /// CLI `--extension` sources (repeatable): resolved through the
     /// package manager into the session's extension paths (temporary
     /// scope, first-wins against configured/discovered extensions).
@@ -96,6 +103,10 @@ pub struct SessionEngine {
     /// node, per-path load errors, spawn failures). TS surfaces these in
     /// startup notices.
     pub extension_diagnostics: Vec<String>,
+    /// The turn-boundary request surface (`compact.*`/`refine.*`/
+    /// `model.info` host requests and the pending requests the turn loop
+    /// consumes after a settled turn).
+    pub turn_boundary: std::sync::Arc<super::turn_boundary::TurnBoundaryRequests>,
 }
 
 /// Resolve the MCP gating the resource loader and prompt need: skill
@@ -175,6 +186,9 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
 
     let settings = crate::settings::SettingsManager::create(&cwd, &config.agent_dir);
     let service_tier_preference = settings.get_default_service_tier();
+    // Captured before `settings` moves into the resource loader: the
+    // compaction scheduling budget (`compact.run` prepare check).
+    let compaction_settings = settings.settings().compaction.clone().unwrap_or_default();
     let (mcp_skill_overrides, mcp_generic_servers, built_manager) =
         mcp_gating(&settings, config.agent_dir.clone()).await?;
     let mcp_manager = config
@@ -211,6 +225,21 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     let stream_fn = config
         .stream_fn
         .ok_or_else(|| anyhow::anyhow!("a provider stream_fn is required"))?;
+    // `model.info` facts, captured before the model moves into the loop.
+    let model_info = match config.model_info.clone() {
+        Some(full) => super::turn_boundary::ModelInfo {
+            id: full.id,
+            provider: full.provider,
+            input: full.input,
+        },
+        None => super::turn_boundary::ModelInfo {
+            id: model.id.clone(),
+            provider: model.provider.clone(),
+            input: Vec::new(),
+        },
+    };
+    // The context window the usage estimate and status rows read.
+    let model_context_window = model.context_window;
 
     // The runtime wiring: goal/rlm-heartbeat host handlers ride the kernel
     // provisioner, and the agent gains the `ipython` tool backed by that
@@ -227,6 +256,32 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         .lock()
         .unwrap()
         .register_host_handlers(&mut handlers);
+    // The turn-boundary surface: `model.info` always; `compact.*` behind
+    // the compaction `agentCallable` setting; `refine.*` behind the TS
+    // `_autoRefineAllowedForSession` gate (depth 0 with a local harness
+    // state dir, i.e. exactly the sessions the refine skill targets).
+    let turn_boundary = Arc::new(super::turn_boundary::TurnBoundaryRequests::new());
+    turn_boundary.register_model_info_handler(&mut handlers, model_info.clone());
+    let keep_recent_tokens = compaction_settings
+        .keep_recent_tokens
+        .unwrap_or(super::compaction::DEFAULT_KEEP_RECENT_TOKENS);
+    if compaction_settings.agent_callable.unwrap_or(true) {
+        turn_boundary.register_compact_handlers(&mut handlers, keep_recent_tokens);
+    }
+    let local_harness_dir = wiring
+        .session
+        .lock()
+        .await
+        .get_session_artifact_dir()
+        .or_else(|| {
+            config
+                .conversation_log_path
+                .as_deref()
+                .and_then(super::harness_digest::local_harness_dir_for_log)
+        });
+    if config.rlm_depth.unwrap_or(0) == 0 && local_harness_dir.is_some() {
+        turn_boundary.register_refine_handlers(&mut handlers);
+    }
     let provisioner =
         super::runtime_wiring::kernel_provisioner(session_id, handlers, python_skills);
     let mut tools = config.tools.clone();
@@ -402,13 +457,23 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         ..Default::default()
     });
 
+    let agent = Arc::new(agent);
     let session = AgentSession::from_session_arc(
-        Arc::new(agent),
+        agent.clone(),
         wiring.session.clone(),
         resources.prompts.clone(),
         Some(digest_context),
     )
     .await?;
+
+    // Bind the turn-boundary runtime the `compact.*`/`refine.*` handlers
+    // probe (turn-active state, usage estimate, compaction preparation).
+    turn_boundary.bind(super::turn_boundary::TurnBoundaryRuntime {
+        agent,
+        session: wiring.session.clone(),
+        context_window: (model_context_window > 0).then_some(model_context_window),
+        model_info,
+    });
 
     let goal_driver = wiring.runtime.goal_driver().clone();
     Ok(SessionEngine {
@@ -421,6 +486,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         mcp_manager,
         extension_runner,
         extension_diagnostics,
+        turn_boundary,
     })
 }
 
@@ -509,6 +575,8 @@ mod tests {
             additional_prompt_paths: vec![],
             extra_builtin_skill_overrides: vec![],
             rlm_subagent_host: None,
+            rlm_depth: None,
+            model_info: None,
             cli_extension_sources: vec![],
             extension_tool_allow_list: None,
         })

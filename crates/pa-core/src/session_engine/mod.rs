@@ -30,6 +30,7 @@ pub mod session_commands;
 pub mod side_question;
 pub mod slash_commands;
 pub mod tool_bridge;
+pub mod turn_boundary;
 
 use std::sync::Arc;
 

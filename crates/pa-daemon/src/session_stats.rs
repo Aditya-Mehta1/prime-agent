@@ -2,10 +2,13 @@
 //! `AgentSession.getSessionStats` / `getContextUsage` (TS
 //! `core/agent-session.ts`, shapes from `core/session-stats.ts`) and the
 //! `estimateContextTokens` / `estimateTokens` heuristics from
-//! `core/compaction/compaction.ts`. Messages are read as raw JSON values so
-//! the same code serves scripted and real engine sessions.
+//! the same code serves scripted and real engine sessions. The token-estimate
+//! helpers live in `pa_types::usage` (shared with pa-core's `compact.status`
+//! host request).
 
 use serde_json::{json, Value};
+
+use pa_types::usage::{calculate_context_tokens, estimate_tokens, valid_assistant_usage};
 
 use crate::session_store::{SessionEntry, SessionFile};
 
@@ -167,103 +170,6 @@ fn context_usage(
 
 /// `totalTokens` when present, else the four-field sum (TS
 /// `calculateContextTokens` over the raw usage object).
-fn calculate_context_tokens(usage: &Value) -> u64 {
-    usage
-        .get("totalTokens")
-        .and_then(Value::as_u64)
-        .filter(|total| *total > 0)
-        .unwrap_or_else(|| {
-            usage
-                .get("input")
-                .and_then(Value::as_u64)
-                .unwrap_or_default()
-                + usage
-                    .get("output")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default()
-                + usage
-                    .get("cacheRead")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default()
-                + usage
-                    .get("cacheWrite")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default()
-        })
-}
-
-/// Assistant usage that is safe to read (TS `getAssistantUsage` skips aborted
-/// and error stops).
-fn valid_assistant_usage(message: &Value) -> Option<Value> {
-    if message.get("role").and_then(Value::as_str) != Some("assistant") {
-        return None;
-    }
-    match message.get("stopReason").and_then(Value::as_str) {
-        Some("aborted") | Some("error") => return None,
-        _ => {}
-    }
-    message
-        .get("usage")
-        .cloned()
-        .filter(|usage| !usage.is_null())
-}
-
-/// Chars/4 heuristic token estimate (TS `estimateTokens`): text and thinking
-/// content counts, tool calls count their serialized arguments, images count
-/// as 4800 chars.
-fn estimate_tokens(message: &Value) -> u64 {
-    let role = message
-        .get("role")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let mut chars = 0u64;
-    match message.get("content") {
-        Some(Value::String(text)) => {
-            if role == "user" || role == "custom" || role == "toolResult" {
-                chars += text.chars().count() as u64;
-            }
-        }
-        Some(Value::Array(blocks)) => {
-            for block in blocks {
-                match block.get("type").and_then(Value::as_str) {
-                    Some("text") => {
-                        chars += block
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .map(|text| text.chars().count() as u64)
-                            .unwrap_or_default();
-                    }
-                    Some("thinking") => {
-                        chars += block
-                            .get("thinking")
-                            .and_then(Value::as_str)
-                            .map(|text| text.chars().count() as u64)
-                            .unwrap_or_default();
-                    }
-                    Some("toolCall") => {
-                        chars += block
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .map(|name| name.chars().count() as u64)
-                            .unwrap_or_default();
-                        if let Some(arguments) = block.get("arguments") {
-                            chars += serde_json::to_string(arguments)
-                                .map(|text| text.chars().count() as u64)
-                                .unwrap_or_default();
-                        }
-                    }
-                    Some("image") => {
-                        chars += 4800;
-                    }
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
-    }
-    chars.div_ceil(4)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -110,6 +110,76 @@ pub enum CompactOutcome {
     Skipped(&'static str),
 }
 
+/// Why a compaction cannot prepare (TS `prepareCompaction` returning
+/// `undefined`). The two surfaces spell it differently: `/compact` raises
+/// the `CompactionSkippedError` message, the kernel `compact.run` host
+/// request returns the short reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactSkip {
+    AlreadyCompacted,
+    TooShort,
+}
+
+impl CompactSkip {
+    /// The `/compact` skip message (TS `CompactionSkippedError`).
+    pub fn user_message(self) -> &'static str {
+        match self {
+            CompactSkip::AlreadyCompacted => "Already compacted",
+            CompactSkip::TooShort => "Session is too short to compact — try again once it grows",
+        }
+    }
+
+    /// The `compact.run` host-request reason (TS `handleCompactHostRequest`).
+    pub fn request_reason(self) -> &'static str {
+        match self {
+            CompactSkip::AlreadyCompacted => "already compacted",
+            CompactSkip::TooShort => "session is too short to compact",
+        }
+    }
+}
+
+/// Resolve the compaction cut and the skip guards without a model call
+/// (TS `prepareCompaction`): a branch that already ends in a compaction has
+/// nothing new to summarize, and a branch with no summarizable history has
+/// no compaction to run.
+pub fn prepare_compaction(
+    entries: &[FileEntry],
+    keep_recent_tokens: u64,
+) -> Result<CutPointResult, CompactSkip> {
+    // The header is not a compact candidate.
+    let start = usize::from(matches!(entries.first(), Some(FileEntry::Header { .. })));
+    let cut = find_cut_point(entries, start, entries.len(), keep_recent_tokens);
+    // Skip guard (TS prepareCompaction): a branch that already ends in a
+    // compaction has nothing new to summarize.
+    if matches!(entries.last(), Some(FileEntry::Compaction { .. })) {
+        return Err(CompactSkip::AlreadyCompacted);
+    }
+    // Messages the summarizer would see (TS prepareCompaction): everything
+    // before the cut, plus the prefix of a split turn.
+    let history_end = if cut.is_split_turn {
+        cut.turn_start_index.unwrap_or(cut.first_kept_entry_index)
+    } else {
+        cut.first_kept_entry_index
+    };
+    let messages: Vec<AgentMessage> = entries[..history_end]
+        .iter()
+        .filter_map(message_from_entry)
+        .collect();
+    let turn_prefix_messages: Vec<AgentMessage> = entries[history_end..cut.first_kept_entry_index]
+        .iter()
+        .filter_map(message_from_entry)
+        .collect();
+    let has_previous_summary = entries[..cut.first_kept_entry_index]
+        .iter()
+        .rev()
+        .any(|entry| matches!(entry, FileEntry::Compaction { .. }));
+    // Avoid a compaction that would summarize no history (TS prepareCompaction).
+    if messages.is_empty() && turn_prefix_messages.is_empty() && !has_previous_summary {
+        return Err(CompactSkip::TooShort);
+    }
+    Ok(cut)
+}
+
 /// Run compaction over the session: summarize the pre-cut prefix, persist the
 /// entry, and return the rebuilt post-compaction context messages.
 pub async fn execute_compaction(
@@ -117,25 +187,15 @@ pub async fn execute_compaction(
     options: CompactOptions<'_>,
 ) -> anyhow::Result<CompactOutcome> {
     let entries = session.get_all_entries().to_vec();
-    // The header is not a compact candidate.
-    let start = usize::from(matches!(entries.first(), Some(FileEntry::Header { .. })));
-    let cut = find_cut_point(
-        &entries,
-        start,
-        entries.len(),
-        options.settings.keep_recent_tokens,
-    );
+    let cut = match prepare_compaction(&entries, options.settings.keep_recent_tokens) {
+        Ok(cut) => cut,
+        Err(skip) => return Ok(CompactOutcome::Skipped(skip.user_message())),
+    };
     let first_kept_entry = entries
         .get(cut.first_kept_entry_index)
         .and_then(|entry| entry.id())
         .unwrap_or_default()
         .to_string();
-
-    // Skip guard (TS prepareCompaction): a branch that already ends in a
-    // compaction has nothing new to summarize.
-    if matches!(entries.last(), Some(FileEntry::Compaction { .. })) {
-        return Ok(CompactOutcome::Skipped("Already compacted"));
-    }
 
     // Messages the summarizer sees (TS prepareCompaction): everything before
     // the cut, plus the prefix of a split turn (turnPrefixMessages).
@@ -156,16 +216,6 @@ pub async fn execute_compaction(
     let prev_compaction_index = entries[..cut.first_kept_entry_index]
         .iter()
         .rposition(|entry| matches!(entry, FileEntry::Compaction { .. }));
-    let previous_summary = prev_compaction_index.and_then(|index| match &entries[index] {
-        FileEntry::Compaction { payload, .. } => Some(payload.summary.clone()),
-        _ => None,
-    });
-    // Avoid a compaction that would summarize no history (TS prepareCompaction).
-    if messages.is_empty() && turn_prefix_messages.is_empty() && previous_summary.is_none() {
-        return Ok(CompactOutcome::Skipped(
-            "Session is too short to compact — try again once it grows",
-        ));
-    }
     messages.extend(turn_prefix_messages);
     let details: CompactionDetails = details_for(&messages, &entries, prev_compaction_index);
 
