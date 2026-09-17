@@ -99,6 +99,15 @@ pub struct IpythonKernelProvisionerOptions {
     pub on_restore: Option<RestoreCallback>,
 }
 
+/// Why and how long the last startup failed, kept so `ensure()` callers see
+/// the full cause instead of a bare "kernel startup failed".
+#[derive(Clone)]
+struct StartupFailure {
+    /// Full error chain (`{:#}` formatting).
+    message: String,
+    duration_ms: u64,
+}
+
 struct ProvisionerState {
     manager: Option<ReplKernelManager>,
     /// The memoized startup: a task that settles by setting `manager`
@@ -106,6 +115,9 @@ struct ProvisionerState {
     startup: Option<tokio::task::JoinHandle<()>>,
     startup_listeners: Vec<KernelBootstrapProgressHandler>,
     last_startup_message: Option<String>,
+    /// The most recent startup failure; surfaced by `ensure()` until a new
+    /// start succeeds, so joining callers get the real cause and duration.
+    last_startup_failure: Option<StartupFailure>,
     last_restore: Option<RestoreResult>,
     disposed: bool,
     /// Snapshot policy of the dispose that aborted a startup, honored by
@@ -141,6 +153,7 @@ impl IpythonKernelProvisioner {
                     startup: None,
                     startup_listeners: Vec::new(),
                     last_startup_message: None,
+                    last_startup_failure: None,
                     last_restore: None,
                     disposed: false,
                     dispose_snapshot: true,
@@ -218,7 +231,7 @@ impl IpythonKernelProvisioner {
         if decision {
             return self.settled_manager(signal).await;
         }
-        let (listeners, last_message) = {
+        {
             let mut state = self.lock_state();
             if let Some(progress) = &on_progress {
                 if let Some(message) = state.last_startup_message.as_deref() {
@@ -226,13 +239,8 @@ impl IpythonKernelProvisioner {
                 }
                 state.startup_listeners.push(progress.clone());
             }
-            (
-                state.startup_listeners.clone(),
-                state.last_startup_message.clone(),
-            )
-        };
-        let _ = last_message;
-        let task = tokio::spawn(run_startup(Arc::clone(&self.inner), on_progress, listeners));
+        }
+        let task = tokio::spawn(run_startup(Arc::clone(&self.inner), on_progress));
         self.lock_state().startup = Some(task);
         let _ = self.wait_for_startup_task(signal.clone()).await;
         self.settled_manager(signal).await
@@ -244,15 +252,7 @@ impl IpythonKernelProvisioner {
         let Some(task) = self.lock_state().startup.take() else {
             return Ok(());
         };
-        let result = race_startup(task, signal).await;
-        // Restore the handle if the task is still running: another caller may
-        // still be waiting on it.
-        if let Err(_aborted) = &result {
-            // The task keeps running; re-register it so later callers can join.
-            // (We lost ownership of the handle, so they will fall through to
-            // settled_manager instead — the memoized task still sets it.)
-        }
-        result
+        race_startup(task, signal).await
     }
 
     /// After the memoized startup settles, return the manager it produced —
@@ -269,31 +269,24 @@ impl IpythonKernelProvisioner {
         let state = self.lock_state();
         match state.manager.clone() {
             Some(manager) => Ok(manager),
-            None => Err(anyhow!(
-                "kernel startup failed{}",
-                state
-                    .last_startup_message
-                    .as_deref()
-                    .map(|m| format!(" after {m}"))
-                    .unwrap_or_default()
-            )),
+            None => match state.last_startup_failure.clone() {
+                Some(failure) => Err(anyhow!(
+                    "kernel startup failed after {}ms: {}",
+                    failure.duration_ms,
+                    failure.message
+                )),
+                None => Err(anyhow!("kernel startup failed")),
+            },
         }
     }
 
     /// Remove live variables above the snapshot's per-variable size limit.
     pub async fn prune_oversized_variables(&self) -> Option<Vec<String>> {
-        let manager = self
-            .manager()
-            .or_else(|| self.join_started_manager_sync())?;
+        let manager = self.manager()?;
         manager
             .prune_oversized_variables()
             .await
             .and_then(|r| r.pruned)
-    }
-
-    /// The manager a memoized startup already produced, without starting one.
-    fn join_started_manager_sync(&self) -> Option<ReplKernelManager> {
-        self.manager()
     }
 
     /// Live user-defined names in the kernel namespace, or `None` if listing
@@ -354,34 +347,118 @@ fn emit_startup_progress(
     }
 }
 
+/// Extra startup attempts beyond the first (one transient-failure retry by
+/// default). The promise here is resilience against a wedged boot — a venv
+/// python still settling, a slow fork under load — not masking a broken setup.
+const DEFAULT_STARTUP_RETRIES: u32 = 1;
+const DEFAULT_STARTUP_BUDGET_MS: u64 = 90_000;
+const RETRY_BACKOFF_MS: [u64; 4] = [250, 1_000, 2_500, 5_000];
+
+fn resolve_startup_retries() -> u32 {
+    match std::env::var("PRIME_AGENT_KERNEL_STARTUP_RETRIES") {
+        Ok(raw) => raw
+            .trim()
+            .parse::<u32>()
+            .map(|n| n.min(5))
+            .unwrap_or(DEFAULT_STARTUP_RETRIES),
+        Err(_) => DEFAULT_STARTUP_RETRIES,
+    }
+}
+
+fn resolve_startup_budget_ms() -> u64 {
+    match std::env::var("PRIME_AGENT_KERNEL_STARTUP_BUDGET_MS") {
+        Ok(raw) => raw
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_STARTUP_BUDGET_MS),
+        Err(_) => DEFAULT_STARTUP_BUDGET_MS,
+    }
+}
+
+/// A failed boot the provisioner may retry on its own: transient spawn or
+/// ready-handshake problems. Structural failures (disposed, aborts, a
+/// misconfigured interpreter, a protocol mismatch, a failed runtime
+/// bootstrap) never auto-retry — each needs either user action or a fresh
+/// attempt initiated by the caller.
+fn startup_failure_is_retryable(error: &anyhow::Error) -> bool {
+    const FATAL_MARKERS: [&str; 8] = [
+        "provisioner disposed",
+        "aborted",
+        "Failed to set up the Python kernel runtime",
+        "PRIME_AGENT_KERNEL_PYTHON points to a Python",
+        "Failed to initialize rlm runtime",
+        "Update prime-agent-runtime in the kernel Python",
+        "Kernel start superseded",
+        "Kernel was disposed during startup",
+    ];
+    let chain = format!("{error:#}");
+    !FATAL_MARKERS.iter().any(|marker| chain.contains(marker))
+}
+
+/// Boot the kernel, retrying transient failures with backoff until the
+/// retry allowance or the hard startup budget runs out.
 async fn run_startup(
     inner: Arc<ProvisionerInner>,
     on_progress: Option<KernelBootstrapProgressHandler>,
-    _listeners: Vec<KernelBootstrapProgressHandler>,
 ) {
-    let manager = match start_kernel(&inner, &on_progress).await {
-        Ok(manager) => Some(manager),
-        Err(error) => {
-            emit_diagnostic(&inner, &format!("kernel startup failed: {error:#}"));
-            None
+    let started = std::time::Instant::now();
+    let budget = std::time::Duration::from_millis(resolve_startup_budget_ms());
+    let mut remaining_retries = resolve_startup_retries();
+    let mut attempt: u32 = 0;
+    let outcome = loop {
+        attempt += 1;
+        match start_kernel(&inner, &on_progress).await {
+            Ok(manager) => break Ok(manager),
+            Err(error) => {
+                if inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .disposed
+                    || !startup_failure_is_retryable(&error)
+                    || remaining_retries == 0
+                    || started.elapsed() >= budget
+                {
+                    break Err(error);
+                }
+                remaining_retries -= 1;
+                let backoff_ms =
+                    RETRY_BACKOFF_MS[(attempt as usize - 1).min(RETRY_BACKOFF_MS.len() - 1)];
+                emit_startup_progress(
+                    &inner,
+                    &on_progress,
+                    &format!("Kernel start failed; retrying in {backoff_ms}ms…"),
+                );
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)) => {}
+                    () = inner.dispose_signal.cancelled() => break Err(error),
+                }
+            }
         }
     };
+    let duration_ms = started.elapsed().as_millis() as u64;
     let mut state = inner
         .state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     state.startup = None;
-    state.manager = manager;
     state.startup_listeners.clear();
     state.last_startup_message = None;
-}
-
-fn emit_diagnostic(inner: &Arc<ProvisionerInner>, message: &str) {
-    let mut state = inner
-        .state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    state.last_startup_message = Some(message.to_string());
+    match outcome {
+        Ok(manager) => {
+            state.last_startup_failure = None;
+            state.manager = Some(manager);
+        }
+        Err(error) => {
+            state.manager = None;
+            state.last_startup_failure = Some(StartupFailure {
+                message: format!("{error:#}"),
+                duration_ms,
+            });
+        }
+    }
 }
 
 async fn race_startup(
@@ -488,7 +565,25 @@ async fn start_kernel(
                 drain_host_requests: true,
             })
             .await;
-        return Err(error.context("kernel start"));
+        // The drained stderr tail is the only extra evidence a failed boot
+        // leaves behind; attach it to the cause so `ensure()` callers see it.
+        // Cap the tail: the in-memory buffer holds up to 8 KiB, but the
+        // surfaced error must stay readable.
+        let stderr_tail = {
+            let tail = manager.kernel_stderr();
+            let chars: Vec<char> = tail.chars().collect();
+            let start = chars.len().saturating_sub(2048);
+            chars[start..].iter().collect::<String>()
+        };
+        let error = if stderr_tail.trim().is_empty() {
+            error.context("kernel start")
+        } else {
+            error.context(format!(
+                "kernel start; kernel stderr tail:
+{stderr_tail}"
+            ))
+        };
+        return Err(error);
     }
 
     // Revive a prior session's namespace before the bootstrap, so the
@@ -599,6 +694,96 @@ mod tests {
             .await
             .expect_err("disposed provisioner");
         assert!(error.to_string().contains("disposed"));
+    }
+
+    #[test]
+    fn retryable_failure_classification() {
+        assert!(startup_failure_is_retryable(&anyhow!(
+            "failed to spawn kernel python /x"
+        )));
+        assert!(startup_failure_is_retryable(&anyhow!(
+            "Kernel did not become ready within 30000ms. stderr tail: ..."
+        )));
+        assert!(!startup_failure_is_retryable(&anyhow!(
+            "Kernel provisioner disposed before start"
+        )));
+        assert!(!startup_failure_is_retryable(&anyhow!(
+            "Python execution aborted"
+        )));
+        assert!(!startup_failure_is_retryable(&anyhow!(
+            "PRIME_AGENT_KERNEL_PYTHON points to a Python missing a current prime-agent-runtime: /bad"
+        )));
+        assert!(!startup_failure_is_retryable(&anyhow!(
+            "Kernel runtime speaks protocol 2, expected 3. \
+             Update prime-agent-runtime in the kernel Python (PRIME_AGENT_KERNEL_PYTHON) to match this prime-agent."
+        )));
+    }
+
+    #[tokio::test]
+    async fn startup_failure_surfaces_cause_and_duration() {
+        let options = IpythonKernelProvisionerOptions {
+            python: Some(PathBuf::from("/nonexistent/kernel-python-for-test")),
+            ..Default::default()
+        };
+        let provisioner = IpythonKernelProvisioner::new("/tmp", options);
+        let error = provisioner
+            .ensure(None, None)
+            .await
+            .expect_err("bogus python must fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("kernel startup failed after "),
+            "error must carry the duration: {message}"
+        );
+        assert!(
+            message.contains("ms: "),
+            "error must carry the duration unit: {message}"
+        );
+        assert!(
+            message.contains("failed to spawn"),
+            "error must carry the spawn cause: {message}"
+        );
+        // The next ensure() retries fresh rather than rethrowing the memo.
+        assert!(provisioner.ensure(None, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn startup_retries_transient_failure() {
+        // One retry (the default), so the bogus-python boot fails twice and
+        // the backoff (>= 250ms) shows up in the elapsed time.
+        let started = std::time::Instant::now();
+        let options = IpythonKernelProvisionerOptions {
+            python: Some(PathBuf::from("/nonexistent/kernel-python-for-test")),
+            ..Default::default()
+        };
+        let provisioner = IpythonKernelProvisioner::new("/tmp", options);
+        assert!(provisioner.ensure(None, None).await.is_err());
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(250),
+            "the retry backoff must elapse before the failure surfaces"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_retry_cancelled_by_dispose() {
+        let options = IpythonKernelProvisionerOptions {
+            python: Some(PathBuf::from("/nonexistent/kernel-python-for-test")),
+            ..Default::default()
+        };
+        let provisioner = IpythonKernelProvisioner::new("/tmp", options);
+        let p = provisioner.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            p.dispose(None).await;
+        });
+        // The boot fails; the dispose cancels any pending retry, so ensure()
+        // settles without hanging on the backoff chain.
+        let started = std::time::Instant::now();
+        let _ = provisioner.ensure(None, None).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(5_000),
+            "dispose during retry must cancel the backoff promptly"
+        );
     }
 
     #[tokio::test]

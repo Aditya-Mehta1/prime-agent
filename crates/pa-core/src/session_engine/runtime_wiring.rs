@@ -4,6 +4,7 @@
 //! provisioner receives the host-handler registry, and the agent loop gains
 //! the `ipython` tool backed by that kernel.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -105,16 +106,28 @@ pub fn kernel_python_skills(skills: &[Skill]) -> Vec<KernelPythonSkill> {
 
 /// Build the kernel provisioner for a session: host handlers for the
 /// goal/heartbeat bridge plus the pre-imported Python skills.
+///
+/// The session's agent dir is propagated explicitly into the kernel env
+/// (PRIME_AGENT_CODING_AGENT_DIR): ambient inheritance is correct for the
+/// product paths, but an embedding host whose ambient env differs from the
+/// session's agent dir must not leak its own paths into the kernel. Same
+/// discipline as the daemon worker env (#109).
 pub fn kernel_provisioner(
     session_id: String,
     handlers: HostRequestHandlers,
     python_skills: Vec<KernelPythonSkill>,
+    agent_dir: &std::path::Path,
 ) -> Arc<KernelProvisioner> {
+    let mut env = HashMap::with_capacity(1);
+    env.insert(
+        "PRIME_AGENT_CODING_AGENT_DIR".to_string(),
+        agent_dir.to_string_lossy().to_string(),
+    );
     Arc::new(KernelProvisioner::new(
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         IpythonKernelProvisionerOptions {
             python: None,
-            env: Default::default(),
+            env,
             command_prefix: None,
             shell_path: None,
             session_id: Some(session_id),

@@ -107,7 +107,7 @@ impl Inner {
             tokio::select! {
                 () = graceful_reply => {}
                 () = self.wait_for_kernel_exit() => {}
-                () = deadline => { eprintln!("DBG: select1 -> deadline");
+                () = deadline => {
                     failed = true;
                     self.append_diagnostic(&format!(
                         "graceful shutdown failed (killing instead): Kernel did not shut down within {KERNEL_SHUTDOWN_TIMEOUT_MS}ms"

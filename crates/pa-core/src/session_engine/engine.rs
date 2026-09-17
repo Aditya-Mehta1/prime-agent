@@ -282,8 +282,12 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     if config.rlm_depth.unwrap_or(0) == 0 && local_harness_dir.is_some() {
         turn_boundary.register_refine_handlers(&mut handlers);
     }
-    let provisioner =
-        super::runtime_wiring::kernel_provisioner(session_id, handlers, python_skills);
+    let provisioner = super::runtime_wiring::kernel_provisioner(
+        session_id,
+        handlers,
+        python_skills,
+        &config.agent_dir,
+    );
     let mut tools = config.tools.clone();
     // Extension loading (design doc §3.2, stage 2): discovery already
     // resolved the paths; the sidecar loads modules and lands the

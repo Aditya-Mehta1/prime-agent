@@ -102,7 +102,9 @@ impl KernelExecError {
     pub fn message(&self) -> String {
         match self {
             KernelExecError::BusyAfterInterrupt(err) => err.message.clone(),
-            KernelExecError::Other(err) => err.to_string(),
+            // The full context chain, not just the outermost layer: a bare
+            // top-level message hides the actual cause of kernel failures.
+            KernelExecError::Other(err) => format!("{err:#}"),
         }
     }
 }

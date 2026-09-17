@@ -1,17 +1,18 @@
-//! Kernel Python environment bootstrap: find or build the venv that runs
-//! `python -m rlm.repl`, syncing `prime-agent-runtime`, the default extra
-//! packages, and any editable Python skills.
-//!
-//! Ported from `core/kernel/bootstrap.ts`; `build_rlm_bootstrap_code` comes
-//! from `core/tools/ipython.ts` (the runtime surface injected into the kernel).
+//! Venv discovery, build, lock, and the shared `.bootstrap-version` cache:
+//! the machine state behind [`super::ensure_kernel_python`]. The version
+//! file is a cross-session cache, not a per-session manifest.
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context};
+use sha2::Digest;
+
+use super::{
+    default_rlm_extra_uv_args, EnsureKernelPythonOptions, KernelPythonSkill,
+    DEFAULT_RLM_EXTRA_PACKAGES,
+};
 
 /// Schema of `.bootstrap-version`; a mismatch rebuilds the venv.
 const BOOTSTRAP_SCHEMA: u64 = 9;
@@ -19,80 +20,14 @@ const PYTHON_VERSION: &str = "3.11";
 const RUNTIME_REQUIREMENT: &str = "prime-agent-runtime";
 const STATE_SNAPSHOT_REQUIREMENT: &str = "dill";
 const BOOTSTRAP_VERSION_FILE: &str = ".bootstrap-version";
-const BOOTSTRAP_LOCK_NAME: &str = ".bootstrap.lock";
-const BOOTSTRAP_LOCK_RETRY_MS: u64 = 100;
-const BOOTSTRAP_LOCK_STALE_WITHOUT_PID_MS: u64 = 30_000;
+pub(crate) const BOOTSTRAP_LOCK_NAME: &str = ".bootstrap.lock";
+pub(crate) const BOOTSTRAP_LOCK_RETRY_MS: u64 = 100;
+pub(crate) const BOOTSTRAP_LOCK_STALE_WITHOUT_PID_MS: u64 = 30_000;
 const UV_INSTALL_COMMAND: &str = "curl -LsSf https://astral.sh/uv/install.sh | sh";
-
-/// One Python skill the kernel should import at bootstrap.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KernelPythonSkill {
-    pub name: String,
-    pub import_name: String,
-    pub package_path: PathBuf,
-    pub pyproject_path: PathBuf,
-}
-
-/// The default extra packages pre-installed in the kernel venv and promised to
-/// the model in the system prompt.
-pub const DEFAULT_RLM_EXTRA_PACKAGES: [(&str, &str, &str); 12] = [
-    // (uvArg, importName, promptLabel)
-    ("requests", "requests", "requests"),
-    ("httpx", "httpx", "httpx"),
-    ("pyyaml", "yaml", "yaml (PyYAML)"),
-    ("tomli", "tomli", "tomli"),
-    ("python-dotenv", "dotenv", "dotenv (python-dotenv)"),
-    ("pandas", "pandas", "pandas"),
-    ("numpy", "numpy", "numpy"),
-    ("scipy", "scipy", "scipy"),
-    ("beautifulsoup4", "bs4", "bs4 (Beautiful Soup)"),
-    ("lxml", "lxml", "lxml"),
-    ("pydantic", "pydantic", "pydantic"),
-    ("tyro", "tyro", "tyro"),
-];
-
-pub fn default_rlm_extra_uv_args() -> Vec<&'static str> {
-    DEFAULT_RLM_EXTRA_PACKAGES
-        .iter()
-        .map(|(uv, _, _)| *uv)
-        .collect()
-}
-
-pub fn default_rlm_extra_import_names() -> Vec<&'static str> {
-    DEFAULT_RLM_EXTRA_PACKAGES
-        .iter()
-        .map(|(_, import, _)| *import)
-        .collect()
-}
-
-pub fn default_rlm_extra_import_labels() -> Vec<&'static str> {
-    DEFAULT_RLM_EXTRA_PACKAGES
-        .iter()
-        .map(|(_, _, label)| *label)
-        .collect()
-}
-
-/// Progress callback for the bootstrap (`ensure_kernel_python`).
-pub type KernelBootstrapProgressHandler = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
-
-#[derive(Default)]
-pub struct EnsureKernelPythonOptions {
-    pub python_skills: Vec<KernelPythonSkill>,
-    pub on_progress: Option<KernelBootstrapProgressHandler>,
-}
-
-impl EnsureKernelPythonOptions {
-    fn report(&self, message: &str) {
-        match &self.on_progress {
-            Some(handler) => handler(message),
-            None => eprintln!("{message}"),
-        }
-    }
-}
 
 /// One normalized skill as recorded in the bootstrap version file.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct BootstrapPythonSkill {
+pub(crate) struct BootstrapPythonSkill {
     import_name: String,
     package_path: String,
     pyproject_path: String,
@@ -100,7 +35,7 @@ struct BootstrapPythonSkill {
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-struct BootstrapVersion {
+pub(crate) struct BootstrapVersion {
     schema: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     runtime: Option<String>,
@@ -112,7 +47,7 @@ struct BootstrapVersion {
     python_skills: Option<Vec<BootstrapPythonSkill>>,
 }
 
-fn expand_home(path: &str) -> PathBuf {
+pub(crate) fn expand_home(path: &str) -> PathBuf {
     if path == "~" {
         return home_dir();
     }
@@ -134,8 +69,6 @@ fn file_content_hash(path: &Path) -> String {
         Err(_) => "unreadable".to_string(),
     }
 }
-
-use sha2::Digest;
 
 fn read_toml_project_section(pyproject_path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(pyproject_path).ok()?;
@@ -225,7 +158,7 @@ fn read_python_skill_dependency_names(skill: &BootstrapPythonSkill) -> Vec<Strin
     dependencies
 }
 
-fn to_bootstrap_skill(skill: &KernelPythonSkill) -> BootstrapPythonSkill {
+pub(crate) fn to_bootstrap_skill(skill: &KernelPythonSkill) -> BootstrapPythonSkill {
     BootstrapPythonSkill {
         import_name: skill.import_name.clone(),
         package_path: skill.package_path.to_string_lossy().to_string(),
@@ -236,7 +169,9 @@ fn to_bootstrap_skill(skill: &KernelPythonSkill) -> BootstrapPythonSkill {
 
 /// Deduplicate skills (by importName + packagePath), resolve sibling-local
 /// dependencies, and sort deterministically — matching `normalizePythonSkills`.
-fn normalize_python_skills(python_skills: &[KernelPythonSkill]) -> Vec<BootstrapPythonSkill> {
+pub(crate) fn normalize_python_skills(
+    python_skills: &[KernelPythonSkill],
+) -> Vec<BootstrapPythonSkill> {
     let mut by_key: Vec<(String, BootstrapPythonSkill)> = Vec::new();
     fn add_skill(by_key: &mut Vec<(String, BootstrapPythonSkill)>, skill: BootstrapPythonSkill) {
         let key = format!("{}\u{0}{}", skill.import_name, skill.package_path);
@@ -313,7 +248,7 @@ fn xdg_kernel_venv_dir() -> PathBuf {
     data_home.join("prime").join("agent").join("kernel-venv")
 }
 
-fn resolve_writable_kernel_venv_dir() -> anyhow::Result<PathBuf> {
+pub(crate) fn resolve_writable_kernel_venv_dir() -> anyhow::Result<PathBuf> {
     let primary = kernel_venv_dir();
     if std::fs::create_dir_all(primary.parent().unwrap_or(Path::new("/"))).is_ok() {
         return Ok(primary);
@@ -391,11 +326,11 @@ fn run_quiet(command: &str, args: &[&str]) -> bool {
 /// handles, and protocol version 3.
 const RUNTIME_READY_CHECK: &str = "import inspect; import rlm; from rlm import McpIntegration; import rlm.mcp as mcp; from rlm.harness import HarnessEntry; _harness_methods = ['create_memory', 'update_memory', 'delete_memory', 'create_skill', 'update_skill', 'delete_skill', 'create_subagent', 'update_subagent', 'delete_subagent', 'create_prompt_note', 'update_prompt_note', 'delete_prompt_note', 'record_refinement']; assert callable(mcp.list_tools); assert callable(mcp.call_tool); assert callable(rlm.spawn); assert hasattr(rlm, 'rlm'); assert callable(rlm.rlm.spawn); assert inspect.signature(rlm.spawn).parameters['name'].default is inspect.Parameter.empty; assert not hasattr(rlm, 'run'); assert not hasattr(rlm.rlm, 'run'); assert callable(rlm.host_request); assert callable(rlm.find_models); assert callable(rlm.rlm.find_models); assert callable(rlm.create_session); assert callable(rlm.rlm.create_session); assert callable(rlm.progress_note); assert callable(rlm.rlm.progress_note); assert hasattr(rlm, 'harness'); assert hasattr(rlm, 'get_harness_state'); assert hasattr(rlm.rlm, 'harness'); assert hasattr(rlm.rlm, 'get_harness_state'); assert all(callable(getattr(_harness, _method, None)) for _harness in (rlm.harness, rlm.rlm.harness) for _method in _harness_methods); assert 'reference' in HarnessEntry.__dataclass_fields__; assert 'scope' in HarnessEntry.__dataclass_fields__; assert 'reference' in inspect.signature(rlm.harness.create_skill).parameters; assert 'reference' in inspect.signature(rlm.harness.update_skill).parameters; assert 'global_' in inspect.signature(rlm.harness.create_memory).parameters; assert 'global_' in inspect.signature(rlm.get_harness_state).parameters; assert not hasattr(rlm, 'background'); assert not hasattr(rlm.rlm, 'background'); from rlm.bash import BashHandle, BashResult; assert callable(rlm.bash); assert all(callable(getattr(BashHandle, _m, None)) for _m in ('tail', 'output', 'poll', 'kill')); assert {'exit_code', 'output', 'duration'} <= set(BashResult.__dataclass_fields__); import rlm.repl as _repl; assert callable(_repl.main); assert callable(_repl.emit); assert callable(_repl.host_request); assert callable(_repl.is_active); assert _repl.PROTOCOL_VERSION == 3; assert callable(rlm.emit); assert not hasattr(rlm, 'HOST_COMM_TARGET'); assert not hasattr(mcp, 'install_shutdown_hook')";
 
-fn has_prime_agent_runtime(python: &str) -> bool {
+pub(crate) fn has_prime_agent_runtime(python: &str) -> bool {
     run_quiet(python, &["-c", RUNTIME_READY_CHECK])
 }
 
-fn missing_rlm_extra_import_labels(python: &str) -> Vec<&'static str> {
+pub(crate) fn missing_rlm_extra_import_labels(python: &str) -> Vec<&'static str> {
     DEFAULT_RLM_EXTRA_PACKAGES
         .iter()
         .filter(|(_, import, _)| !python_imports(python, import))
@@ -403,7 +338,7 @@ fn missing_rlm_extra_import_labels(python: &str) -> Vec<&'static str> {
         .collect()
 }
 
-fn missing_python_skill_import_labels(
+pub(crate) fn missing_python_skill_import_labels(
     python: &str,
     python_skills: &[KernelPythonSkill],
 ) -> Vec<String> {
@@ -432,132 +367,6 @@ fn is_executable(path: &Path) -> bool {
     crate::platform::perms::is_executable(path)
 }
 
-fn is_process_alive(pid: u32) -> bool {
-    crate::platform::process::pid_exists(pid)
-}
-
-/// A `link(2)`-published lock file: born with owner content, EEXIST the only
-/// collision signal; stale locks are renamed aside, verified, then reclaimed.
-/// Ported from `utils/dir-lock.ts`.
-enum DirLockAttempt {
-    Acquired,
-    Held,
-    Reclaimed,
-}
-
-fn strict_pid(raw: Option<&str>) -> Option<u32> {
-    let trimmed = raw?.trim();
-    if trimmed.is_empty() || !trimmed.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    let parsed: u32 = trimmed.parse().ok()?;
-    (parsed > 0).then_some(parsed)
-}
-
-fn try_acquire_dir_lock(lock_path: &Path) -> anyhow::Result<DirLockAttempt> {
-    std::fs::create_dir_all(lock_path.parent().unwrap_or(Path::new("/")))?;
-    let token = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4());
-    let temp_path = lock_path.with_file_name(format!(
-        "{}.candidate-{}",
-        lock_path.file_name().unwrap_or_default().to_string_lossy(),
-        token
-    ));
-    {
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).write(true).truncate(true);
-        crate::platform::perms::set_private_mode(&mut options);
-        let mut file = options.open(&temp_path)?;
-        writeln!(file, "{}", std::process::id())?;
-    }
-    // The primary signal: link() publishing the candidate under the lock path.
-    if std::fs::hard_link(&temp_path, lock_path).is_ok() {
-        let _ = std::fs::remove_file(&temp_path);
-        return Ok(DirLockAttempt::Acquired);
-    }
-    // Judge the incumbent: dead owner (or no owner readable) means stale.
-    let judge = match std::fs::read_to_string(lock_path) {
-        Ok(raw) => strict_pid(Some(&raw)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let _ = std::fs::remove_file(&temp_path);
-            return Ok(DirLockAttempt::Reclaimed);
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::IsADirectory => {
-            // Legacy directory lock from the old protocol.
-            let pid_file = lock_path.join("pid");
-            match std::fs::read_to_string(pid_file) {
-                Ok(raw) => strict_pid(Some(&raw)),
-                Err(_) => None,
-            }
-        }
-        Err(_) => None,
-    };
-    let stale = match judge {
-        None => lock_missing_pid_is_stale(lock_path),
-        Some(pid) => !is_process_alive(pid),
-    };
-    let result = if stale {
-        let aside_path = lock_path.with_file_name(format!(
-            "{}.stale-{}",
-            lock_path.file_name().unwrap_or_default().to_string_lossy(),
-            token
-        ));
-        match std::fs::rename(lock_path, &aside_path) {
-            Ok(()) => {
-                if std::fs::remove_file(&aside_path).is_ok() {
-                    DirLockAttempt::Reclaimed
-                } else {
-                    DirLockAttempt::Held
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => DirLockAttempt::Reclaimed,
-            Err(_) => DirLockAttempt::Held,
-        }
-    } else {
-        DirLockAttempt::Held
-    };
-    let _ = std::fs::remove_file(&temp_path);
-    Ok(result)
-}
-
-fn lock_missing_pid_is_stale(lock_path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(lock_path) else {
-        return false;
-    };
-    let Ok(modified) = meta.modified() else {
-        return false;
-    };
-    std::time::SystemTime::now()
-        .duration_since(modified)
-        .map(|age| age.as_millis() as u64 > BOOTSTRAP_LOCK_STALE_WITHOUT_PID_MS)
-        .unwrap_or(false)
-}
-
-/// Serialize concurrent bootstraps across processes on the same venv.
-async fn acquire_bootstrap_lock(venv: &Path) -> anyhow::Result<impl Drop> {
-    let lock_dir = venv.with_file_name(format!(
-        "{}{}",
-        venv.file_name().unwrap_or_default().to_string_lossy(),
-        BOOTSTRAP_LOCK_NAME
-    ));
-    std::fs::create_dir_all(lock_dir.parent().unwrap_or(Path::new("/")))?;
-    loop {
-        match try_acquire_dir_lock(&lock_dir)? {
-            DirLockAttempt::Acquired => {
-                struct Guard(PathBuf);
-                impl Drop for Guard {
-                    fn drop(&mut self) {
-                        let _ = std::fs::remove_file(&self.0);
-                    }
-                }
-                return Ok(Guard(lock_dir));
-            }
-            DirLockAttempt::Held | DirLockAttempt::Reclaimed => {
-                tokio::time::sleep(std::time::Duration::from_millis(BOOTSTRAP_LOCK_RETRY_MS)).await;
-            }
-        }
-    }
-}
-
 fn read_bootstrap_version(venv: &Path) -> Option<BootstrapVersion> {
     let raw = std::fs::read_to_string(venv.join(BOOTSTRAP_VERSION_FILE)).ok()?;
     let parsed: BootstrapVersion = serde_json::from_str(&raw).ok()?;
@@ -571,11 +380,33 @@ fn extra_uv_args_match(a: &Option<Vec<String>>, b: &[&str]) -> bool {
     }
 }
 
-fn python_skills_match(a: &Option<Vec<BootstrapPythonSkill>>, b: &[BootstrapPythonSkill]) -> bool {
-    let Some(a) = a else {
+/// Identity of one recorded skill: the install root is the package path, and
+/// the editable install follows that path.
+fn bootstrap_skill_key(skill: &BootstrapPythonSkill) -> String {
+    format!("{}\u{0}{}", skill.import_name, skill.package_path)
+}
+
+/// True when the recorded installs cover every current skill at the same
+/// path with the same pyproject hash. Extra recorded skills from other
+/// sessions are fine: the venv is a shared cache, not a per-session manifest,
+/// so a session whose skill set differs must not force reinstalls.
+fn recorded_skills_cover(
+    recorded: &Option<Vec<BootstrapPythonSkill>>,
+    current: &[BootstrapPythonSkill],
+) -> bool {
+    if current.is_empty() {
+        return true;
+    }
+    let Some(recorded) = recorded else {
         return false;
     };
-    a == b
+    current.iter().all(|skill| {
+        recorded.iter().any(|entry| {
+            bootstrap_skill_key(entry) == bootstrap_skill_key(skill)
+                && entry.pyproject_path == skill.pyproject_path
+                && entry.pyproject_hash == skill.pyproject_hash
+        })
+    })
 }
 
 fn bootstrap_base_version_current(
@@ -599,13 +430,13 @@ fn bootstrap_version_current(
     python_skills: &[BootstrapPythonSkill],
 ) -> bool {
     bootstrap_base_version_current(version.clone(), runtime_identity)
-        && version
-            .as_ref()
-            .and_then(|v| v.python_skills.clone())
-            .is_some_and(|skills| python_skills_match(&Some(skills), python_skills))
+        && recorded_skills_cover(
+            &version.as_ref().and_then(|v| v.python_skills.clone()),
+            python_skills,
+        )
 }
 
-fn write_bootstrap_version(
+pub(crate) fn write_bootstrap_version(
     venv: &Path,
     runtime_identity: &str,
     python_skills: &[BootstrapPythonSkill],
@@ -707,7 +538,7 @@ fn collect_python_files(dir: &Path, files: &mut Vec<PathBuf>) -> anyhow::Result<
 /// Find `uv` on PATH or at `~/.local/bin/uv`. Returns `Err` with install
 /// guidance when missing: the Rust binary never auto-installs (the TS
 /// interactive confirm belongs to the CLI layer).
-fn ensure_uv() -> anyhow::Result<String> {
+pub(crate) fn ensure_uv() -> anyhow::Result<String> {
     if let Some(from_path) = find_executable("uv") {
         return Ok(from_path.to_string_lossy().to_string());
     }
@@ -720,7 +551,7 @@ fn ensure_uv() -> anyhow::Result<String> {
     ))
 }
 
-async fn bootstrap_venv(
+pub(crate) async fn bootstrap_venv(
     venv: &Path,
     python_skills: &[BootstrapPythonSkill],
     options: &EnsureKernelPythonOptions,
@@ -782,8 +613,11 @@ async fn bootstrap_venv(
 }
 
 /// Install/refresh the editable Python skills recorded in the version file.
-/// Per-skill failures warn and continue: one broken skill must not cost the kernel.
-async fn sync_python_skills(
+/// The version file is a shared cache, not a per-session manifest: records
+/// from other sessions carry over, and only skills missing or changed are
+/// installed. Per-skill failures warn and continue: one broken skill must
+/// not cost the kernel.
+pub(crate) async fn sync_python_skills(
     uv: &str,
     venv: &Path,
     python: &Path,
@@ -792,23 +626,27 @@ async fn sync_python_skills(
     options: &EnsureKernelPythonOptions,
 ) -> anyhow::Result<()> {
     let version = read_bootstrap_version(venv);
-    let mut installed_python_skills: Vec<BootstrapPythonSkill> = Vec::new();
+    // Previously installed skills still present on disk: their records carry
+    // over so sessions with different skill sets share one venv cache
+    // instead of forcing reinstalls of each other's skills. Records for
+    // skills whose package path disappeared (a retired release dir, a
+    // deleted project) cannot serve a future install and are dropped.
     let current_python_skills: HashMap<String, BootstrapPythonSkill> = version
         .as_ref()
         .and_then(|v| v.python_skills.clone())
         .unwrap_or_default()
         .into_iter()
-        .map(|s| (format!("{}\u{0}{}", s.import_name, s.package_path), s))
+        .filter(|recorded| Path::new(&recorded.package_path).is_dir())
+        .map(|s| (bootstrap_skill_key(&s), s))
         .collect();
     let python_str = python.to_string_lossy().to_string();
+    let mut installed: HashMap<String, BootstrapPythonSkill> = current_python_skills;
     for skill in python_skills {
-        let existing =
-            current_python_skills.get(&format!("{}\u{0}{}", skill.import_name, skill.package_path));
-        if existing.is_some_and(|existing| {
+        let key = bootstrap_skill_key(skill);
+        if installed.get(&key).is_some_and(|existing| {
             existing.pyproject_path == skill.pyproject_path
                 && existing.pyproject_hash == skill.pyproject_hash
         }) {
-            installed_python_skills.push(skill.clone());
             continue;
         }
         let result = run_async(
@@ -824,22 +662,31 @@ async fn sync_python_skills(
         )
         .await;
         match result {
-            Ok(()) => installed_python_skills.push(skill.clone()),
+            // A changed pyproject (hash moved) replaces the stale record.
+            Ok(()) => {
+                installed.insert(key, skill.clone());
+            }
             Err(error) => options.report(&format!(
                 "Warning: Python skill {} failed to install and will be unavailable: {error}",
                 skill.import_name
             )),
         }
     }
-    write_bootstrap_version(venv, runtime_identity, &installed_python_skills)
+    let mut merged: Vec<BootstrapPythonSkill> = installed.into_values().collect();
+    merged.sort_by(|a, b| {
+        a.package_path
+            .cmp(&b.package_path)
+            .then(a.import_name.cmp(&b.import_name))
+    });
+    write_bootstrap_version(venv, runtime_identity, &merged)
 }
 
-fn kernel_base_ready(python: &str, venv: &Path, runtime_identity: &str) -> bool {
+pub(crate) fn kernel_base_ready(python: &str, venv: &Path, runtime_identity: &str) -> bool {
     has_prime_agent_runtime(python)
         && bootstrap_base_version_current(read_bootstrap_version(venv), runtime_identity)
 }
 
-fn kernel_ready(
+pub(crate) fn kernel_ready(
     python: &str,
     venv: &Path,
     runtime_identity: &str,
@@ -853,307 +700,9 @@ fn kernel_ready(
         )
 }
 
-fn format_bootstrap_failure(error: &anyhow::Error) -> anyhow::Error {
-    anyhow!(
-        "Failed to set up the Python kernel runtime. {error:#}\n\
-         First-time setup needs internet to install uv, Python, prime-agent-runtime, and default Python packages; once set up, prime-agent runs offline. \
-         An interrupted runtime upgrade needs network once more, so re-run this while online. \
-         Set PRIME_AGENT_KERNEL_PYTHON to a Python with a current prime-agent-runtime and default Python packages installed to skip auto-bootstrap."
-    )
-}
-
-/// One in-flight bootstrap per unique options set, joined by concurrent callers.
-type InFlightBootstrap = Option<(
-    String,
-    Arc<tokio::sync::Mutex<Option<anyhow::Result<PathBuf>>>>,
-)>;
-
-static IN_FLIGHT: Mutex<InFlightBootstrap> = Mutex::new(None);
-
-/// Resolve the Python interpreter for the kernel: the `PRIME_AGENT_KERNEL_PYTHON`
-/// override when valid, else the auto-bootstrapped venv python.
-pub async fn ensure_kernel_python(options: EnsureKernelPythonOptions) -> anyhow::Result<PathBuf> {
-    let python_skills = normalize_python_skills(&options.python_skills);
-    let key = [
-        std::env::var("PRIME_AGENT_KERNEL_PYTHON").unwrap_or_default(),
-        std::env::var("PRIME_AGENT_KERNEL_VENV").unwrap_or_default(),
-        std::env::var("HOME").unwrap_or_default(),
-        std::env::var("XDG_DATA_HOME").unwrap_or_default(),
-        serde_json::to_string(&python_skills).unwrap_or_default(),
-    ]
-    .join("\u{0}");
-
-    let shared = {
-        let mut in_flight = IN_FLIGHT
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match in_flight.as_ref() {
-            Some((existing_key, promise)) if *existing_key == key => promise.clone(),
-            _ => {
-                let promise = Arc::new(tokio::sync::Mutex::new(None));
-                *in_flight = Some((key, promise.clone()));
-                promise
-            }
-        }
-    };
-    let mut guard = shared.lock().await;
-    if guard.is_none() {
-        *guard = Some(ensure_kernel_python_uncached(&options, &python_skills).await);
-    }
-    let outcome = guard.take().expect("outcome was just stored");
-    // Drop the registry entry so a later call re-validates instead of reusing
-    // a cached rejection forever.
-    let mut in_flight = IN_FLIGHT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if matches!(in_flight.as_ref(), Some((_, promise)) if Arc::ptr_eq(promise, &shared)) {
-        *in_flight = None;
-    }
-    outcome
-}
-
-async fn ensure_kernel_python_uncached(
-    options: &EnsureKernelPythonOptions,
-    python_skills: &[BootstrapPythonSkill],
-) -> anyhow::Result<PathBuf> {
-    if let Ok(override_python) = std::env::var("PRIME_AGENT_KERNEL_PYTHON") {
-        if !override_python.is_empty() {
-            let python = expand_home(&override_python);
-            let python_str = python.to_string_lossy().to_string();
-            let mut missing = Vec::new();
-            if !has_prime_agent_runtime(&python_str) {
-                missing.push(
-                    "a current prime-agent-runtime with callable rlm.spawn, rlm.create_session, rlm.host_request, rlm.progress_note, and explicit harness CRUD methods".to_string(),
-                );
-            }
-            if missing.is_empty() {
-                let missing_extras = missing_rlm_extra_import_labels(&python_str);
-                if !missing_extras.is_empty() {
-                    missing.push(format!(
-                        "default Python packages ({})",
-                        missing_extras.join(", ")
-                    ));
-                }
-            }
-            if missing.is_empty() && !options.python_skills.is_empty() {
-                let missing_skills =
-                    missing_python_skill_import_labels(&python_str, &options.python_skills);
-                if !missing_skills.is_empty() {
-                    options.report(&format!(
-                        "Warning: Python skills unavailable in PRIME_AGENT_KERNEL_PYTHON and will be disabled: {}",
-                        missing_skills.join(", ")
-                    ));
-                }
-            }
-            if missing.is_empty() {
-                return Ok(python);
-            }
-            return Err(anyhow!(
-                "PRIME_AGENT_KERNEL_PYTHON points to a Python missing {}: {}",
-                missing.join(" and "),
-                python.display()
-            ));
-        }
-    }
-
-    let venv = resolve_writable_kernel_venv_dir()?;
-    let python = kernel_venv_python(&venv);
-    let python_str = python.to_string_lossy().to_string();
-    let runtime_identity = resolve_runtime_identity();
-    if kernel_ready(&python_str, &venv, &runtime_identity, python_skills) {
-        return Ok(python);
-    }
-
-    let release_lock = acquire_bootstrap_lock(&venv).await;
-    let result = async {
-        if kernel_ready(&python_str, &venv, &runtime_identity, python_skills) {
-            return Ok(python);
-        }
-        if kernel_base_ready(&python_str, &venv, &runtime_identity) {
-            let uv = ensure_uv()?;
-            sync_python_skills(
-                &uv,
-                &venv,
-                &python,
-                &runtime_identity,
-                python_skills,
-                options,
-            )
-            .await?;
-            return Ok(python);
-        }
-        let had_venv = venv.exists();
-        options.report("› setting up python kernel (one-time, ~30s)…");
-        if had_venv {
-            options.report("rebuilding kernel venv");
-            std::fs::remove_dir_all(&venv)
-                .with_context(|| format!("removing {}", venv.display()))?;
-        }
-        bootstrap_venv(&venv, python_skills, options).await?;
-        Ok(python)
-    }
-    .await;
-    drop(release_lock);
-    options.report("✓ ready");
-    result.map_err(|error| format_bootstrap_failure(&error))
-}
-
-// ---------------------------------------------------------------------------
-// Runtime bootstrap code (from core/tools/ipython.ts)
-// ---------------------------------------------------------------------------
-
-const RLM_BOOTSTRAP_HEADER_CODE: &str =
-    "import asyncio\nimport os as _prime_agent_os\n\n_prime_agent_os.environ[\"NO_COLOR\"] = \"1\"";
-
-const RLM_BOOTSTRAP_RUNTIME_CODE: &str = r#"
-try:
-    import rlm as _prime_agent_rlm_module
-    rlm = _prime_agent_rlm_module.rlm
-    bash = _prime_agent_rlm_module.bash
-    import rlm.mcp as mcp
-except Exception as _prime_agent_rlm_error:
-    _PRIME_AGENT_RLM_IMPORT_ERROR = str(_prime_agent_rlm_error)
-
-    class _PrimeAgentMissingRlm:
-        def _raise_missing(self):
-            raise RuntimeError(
-                "prime-agent-runtime is not installed in this kernel. "
-                "Remove ~/.prime/agent/kernel-venv so prime-agent can rebuild it, or set "
-                "PRIME_AGENT_KERNEL_PYTHON to a kernel environment with prime-agent-runtime installed. "
-                f"Import error: {_PRIME_AGENT_RLM_IMPORT_ERROR}"
-            )
-
-        async def spawn(self, prompt, **kwargs):
-            self._raise_missing()
-
-        async def find_models(self, query="", limit=8):
-            self._raise_missing()
-
-        async def create_session(self, prompt, **kwargs):
-            self._raise_missing()
-
-        async def list_subagents(self):
-            self._raise_missing()
-
-        async def delete_subagent(self, target):
-            self._raise_missing()
-
-    rlm = _PrimeAgentMissingRlm()
-
-    def bash(command):
-        rlm._raise_missing()
-"#;
-
-/// The code the session injects right after kernel start/restore: binds the
-/// `rlm`, `bash`, and MCP surfaces, imports every Python skill (wrapping
-/// callable ones, replacing broken imports with a stub that raises), matching
-/// the TS `buildRlmBootstrapCode`.
-pub fn build_rlm_bootstrap_code(python_skills: &[KernelPythonSkill]) -> String {
-    let base_code = format!("{RLM_BOOTSTRAP_HEADER_CODE}\n\n{RLM_BOOTSTRAP_RUNTIME_CODE}");
-    let mut import_names: Vec<&str> = python_skills
-        .iter()
-        .map(|s| s.import_name.as_str())
-        .collect();
-    import_names.sort_unstable();
-    import_names.dedup();
-    if import_names.is_empty() {
-        return base_code;
-    }
-    let imports_json = serde_json::to_string(&import_names).unwrap_or_else(|_| "[]".to_string());
-    format!(
-        r#"
-{base_code}
-
-import importlib as _prime_agent_importlib
-import inspect as _prime_agent_inspect
-import sys as _prime_agent_sys
-import types as _prime_agent_types
-
-class _PrimeAgentCallableSkillModule(_prime_agent_types.ModuleType):
-    async def __call__(self, *args, **kwargs):
-        result = self.run(*args, **kwargs)
-        if _prime_agent_inspect.isawaitable(result):
-            return await result
-        return result
-
-class _PrimeAgentUnavailableSkill:
-    def __init__(self, name, error):
-        self.__name__ = name
-        self._prime_agent_import_error = error
-        self.__doc__ = f"Python skill {{name}} is unavailable: {{error}}"
-
-    async def run(self, *args, **kwargs):
-        raise RuntimeError(
-            f"Python skill {{self.__name__}} is unavailable in this kernel. "
-            f"Import error: {{self._prime_agent_import_error}}"
-        )
-
-    async def __call__(self, *args, **kwargs):
-        return await self.run()
-
-    def __repr__(self):
-        return f"<unavailable Python skill {{self.__name__!r}}: {{self._prime_agent_import_error}}>"
-
-def _prime_agent_wrap_skill_module(module):
-    run = getattr(module, "run", None)
-    if not callable(run):
-        return module
-    if isinstance(module, _PrimeAgentCallableSkillModule):
-        return module
-    wrapped = _PrimeAgentCallableSkillModule(module.__name__)
-    wrapped.__dict__.update(module.__dict__)
-    try:
-        wrapped.__signature__ = _prime_agent_inspect.signature(run)
-    except Exception:
-        pass
-    doc = getattr(run, "__doc__", None)
-    if doc:
-        wrapped.__doc__ = doc
-    _prime_agent_sys.modules[module.__name__] = wrapped
-    return wrapped
-
-_PRIME_AGENT_SKILL_IMPORT_ERRORS = {{}}
-
-for _prime_agent_skill_name in {imports_json}:
-    try:
-        globals()[_prime_agent_skill_name] = _prime_agent_wrap_skill_module(
-            _prime_agent_importlib.import_module(_prime_agent_skill_name)
-        )
-    except Exception as _prime_agent_skill_error:
-        _PRIME_AGENT_SKILL_IMPORT_ERRORS[_prime_agent_skill_name] = str(_prime_agent_skill_error)
-        globals()[_prime_agent_skill_name] = _PrimeAgentUnavailableSkill(
-            _prime_agent_skill_name,
-            str(_prime_agent_skill_error),
-        )
-"#
-    )
-    .trim()
-    .to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn bootstrap_code_without_skills_binds_rlm() {
-        let code = build_rlm_bootstrap_code(&[]);
-        assert!(code.contains("import rlm as _prime_agent_rlm_module"));
-        assert!(!code.contains("_PrimeAgentUnavailableSkill"));
-    }
-
-    #[test]
-    fn bootstrap_code_imports_skills() {
-        let skills = vec![KernelPythonSkill {
-            name: "edit".into(),
-            import_name: "edit".into(),
-            package_path: PathBuf::from("/pkg/edit"),
-            pyproject_path: PathBuf::from("/pkg/edit/pyproject.toml"),
-        }];
-        let code = build_rlm_bootstrap_code(&skills);
-        assert!(code.contains(r#"for _prime_agent_skill_name in ["edit"]"#));
-        assert!(code.contains("_PrimeAgentUnavailableSkill"));
-    }
 
     #[test]
     fn venv_dir_honors_override() {
@@ -1184,6 +733,15 @@ mod tests {
         );
     }
 
+    fn skill(import_name: &str, path: &str, hash: &str) -> BootstrapPythonSkill {
+        BootstrapPythonSkill {
+            import_name: import_name.to_string(),
+            package_path: path.to_string(),
+            pyproject_path: format!("{path}/pyproject.toml"),
+            pyproject_hash: hash.to_string(),
+        }
+    }
+
     #[test]
     fn version_file_round_trips() {
         let dir = tempfile::tempdir().unwrap();
@@ -1196,5 +754,33 @@ mod tests {
             read_bootstrap_version(dir.path()),
             "sha256:other"
         ));
+    }
+
+    #[test]
+    fn extra_recorded_skills_do_not_force_reinstall() {
+        // A session's set ([edit]) must be served by a venv that also carries
+        // records from other sessions ([websearch]): the file is a cache.
+        let recorded = Some(vec![
+            skill("edit", "/skills/edit", "h1"),
+            skill("websearch", "/skills/websearch", "h2"),
+        ]);
+        let current = [skill("edit", "/skills/edit", "h1")];
+        assert!(recorded_skills_cover(&recorded, &current));
+        // A missing record (new session skill) does force a sync.
+        assert!(!recorded_skills_cover(
+            &recorded,
+            &[
+                skill("edit", "/skills/edit", "h1"),
+                skill("goal", "/skills/goal", "h3")
+            ],
+        ));
+        // A changed pyproject hash does force a sync.
+        assert!(!recorded_skills_cover(
+            &recorded,
+            &[skill("edit", "/skills/edit", "changed")],
+        ));
+        // No records at all: nothing is covered.
+        assert!(!recorded_skills_cover(&None, &current));
+        assert!(recorded_skills_cover(&None, &[]));
     }
 }
