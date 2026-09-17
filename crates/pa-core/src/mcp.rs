@@ -149,13 +149,35 @@ pub struct EnvRef {
     pub env: Option<String>,
 }
 
-/// Session-scoped server supplied by the active ACP client.
+/// Session-scoped server supplied by the active ACP client. This is the
+/// TS `AcpMcpServerConfig` wire shape (core/mcp/acp-mcp-types.ts): literal
+/// environment values and headers, no settings-only fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AcpMcpServerConfig {
-    pub name: String,
-    #[serde(flatten)]
-    pub config: McpServerConfig,
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum AcpMcpServerConfig {
+    Stdio {
+        name: String,
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        cwd: String,
+        #[serde(default)]
+        env: HashMap<String, String>,
+    },
+    Http {
+        name: String,
+        url: String,
+        #[serde(default)]
+        headers: HashMap<String, String>,
+    },
+}
+
+impl AcpMcpServerConfig {
+    pub fn name(&self) -> &str {
+        match self {
+            AcpMcpServerConfig::Stdio { name, .. } | AcpMcpServerConfig::Http { name, .. } => name,
+        }
+    }
 }
 
 /// A resolved integration: catalog/user entry plus auth state.
@@ -293,10 +315,10 @@ impl McpManager {
         }
         let mut next: HashMap<String, AcpMcpServerConfig> = HashMap::new();
         for server in servers {
-            if next.contains_key(&server.name) {
-                anyhow::bail!("Duplicate ACP MCP server: {}", server.name);
+            if next.contains_key(server.name()) {
+                anyhow::bail!("Duplicate ACP MCP server: {}", server.name());
             }
-            next.insert(server.name.clone(), server.clone());
+            next.insert(server.name().to_string(), server.clone());
         }
         let unchanged = next.len() == self.acp_servers.len()
             && next.iter().all(|(name, config)| {
@@ -424,7 +446,7 @@ impl McpManager {
                         return Err(anyhow::anyhow!("mcp.config requires a server"));
                     }
                     if let Some(acp) = acp_servers.get(&server) {
-                        let mut config = serde_json::to_value(&acp.config).unwrap_or(Value::Null);
+                        let mut config = serde_json::to_value(acp).unwrap_or(Value::Null);
                         if let Value::Object(map) = &mut config {
                             map.insert("credentialSource".to_string(), json!("acp"));
                         }
@@ -639,19 +661,12 @@ mod tests {
     fn acp_server_ownership() {
         let mut manager = manager_with(None);
         assert!(manager.can_release_acp_servers("client-a"));
-        let servers = vec![AcpMcpServerConfig {
+        let servers = vec![AcpMcpServerConfig::Stdio {
             name: "session-tool".to_string(),
-            config: McpServerConfig::Stdio {
-                command: "run".to_string(),
-                args: None,
-                cwd: None,
-                env: None,
-                enabled: None,
-                enabled_tools: None,
-                disabled_tools: None,
-                startup_timeout_ms: None,
-                call_timeout_ms: None,
-            },
+            command: "run".to_string(),
+            args: vec![],
+            cwd: "/tmp".to_string(),
+            env: HashMap::new(),
         }];
         assert!(manager.replace_acp_servers(&servers, "client-a").unwrap());
         // Same owner, identical servers -> no change reported.
@@ -685,20 +700,14 @@ mod tests {
         .unwrap();
         assert!(result.as_object().unwrap().is_empty());
         // ACP server -> config with credentialSource.
-        let servers = vec![AcpMcpServerConfig {
+        let servers = vec![AcpMcpServerConfig::Stdio {
             name: "session-tool".to_string(),
-            config: McpServerConfig::Stdio {
-                command: "run".to_string(),
-                args: None,
-                cwd: None,
-                env: None,
-                enabled: None,
-                enabled_tools: None,
-                disabled_tools: None,
-                startup_timeout_ms: None,
-                call_timeout_ms: None,
-            },
+            command: "run".to_string(),
+            args: vec![],
+            cwd: "/tmp".to_string(),
+            env: HashMap::new(),
         }];
+
         manager.replace_acp_servers(&servers, "client-a").unwrap();
         let mut handlers = HostRequestHandlers::default();
         manager.register_host_handlers(&mut handlers);

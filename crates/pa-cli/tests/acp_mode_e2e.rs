@@ -155,9 +155,9 @@ fn acp_initialize_matches_the_ts_golden() {
         json!({ "image": true, "embeddedContext": true })
     );
     assert_eq!(capabilities["sessionCapabilities"], json!({ "close": {} }));
-    // The in-process slice does not serve ACP MCP servers, so the TS
-    // daemon-path `mcpCapabilities` flag is intentionally absent.
-    assert!(capabilities.get("mcpCapabilities").is_none());
+    // ACP MCP server admission is served, so the TS `mcpCapabilities`
+    // flag (http support) is advertised.
+    assert_eq!(capabilities["mcpCapabilities"], json!({ "http": true }));
     let info = &result["agentInfo"];
     assert_eq!(info["name"], "prime-agent");
     assert_eq!(info["title"], "Prime Agent");
@@ -441,22 +441,187 @@ fn acp_cancel_without_an_active_turn_is_a_noop() {
 }
 
 #[test]
-fn acp_mcp_servers_are_rejected_until_the_slice_serves_them() {
+fn acp_initialize_advertises_mcp_capabilities() {
+    let script = json!({ "responses": ["unused"] });
+    let mut client = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);
+    let init = client.request("initialize", initialize_params());
+    let (response, _) = client.wait_response(init, TIMEOUT);
+    assert_eq!(
+        response["result"]["agentCapabilities"]["mcpCapabilities"],
+        json!({ "http": true })
+    );
+}
+
+#[test]
+fn acp_mcp_admission_accepts_valid_servers_and_close_releases() {
     let script = json!({ "responses": ["unused"] });
     let mut client = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);
     let init = client.request("initialize", initialize_params());
     let _ = client.wait_response(init, TIMEOUT);
     let new = client.request(
         "session/new",
-        json!({ "mcpServers": [{ "type": "stdio", "command": "echo", "args": [] }] }),
+        json!({ "mcpServers": [
+            { "name": "capture-stdio", "type": "stdio", "command": "cat", "args": [], "env": [{"name": "A", "value": "1"}] },
+            { "name": "capture-http", "type": "http", "url": "https://mcp.invalid/capture", "headers": [{"name": "X-A", "value": "yes"}] },
+        ]}),
     );
     let (response, _) = client.wait_response(new, TIMEOUT);
-    assert_eq!(response["error"]["code"], -32602);
+    let session_id = response["result"]["sessionId"]
+        .as_str()
+        .expect("admission succeeds")
+        .to_string();
+    let close = client.request("session/close", json!({ "sessionId": session_id }));
+    let (close_response, _) = client.wait_response(close, TIMEOUT);
+    assert_eq!(close_response["result"], json!({}));
+}
+
+#[test]
+fn acp_mcp_admission_rejects_a_second_session_only_when_open() {
+    let script = json!({ "responses": ["unused"] });
+    let mut client = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);
+    let init = client.request("initialize", initialize_params());
+    let _ = client.wait_response(init, TIMEOUT);
+    let new = client.request(
+        "session/new",
+        json!({ "mcpServers": [
+            { "name": "first", "type": "stdio", "command": "cat", "args": [], "env": [] },
+        ]}),
+    );
+    let (response, _) = client.wait_response(new, TIMEOUT);
+    let session_id = response["result"]["sessionId"]
+        .as_str()
+        .expect("admission succeeds")
+        .to_string();
+    // Rejected admission keeps serving: the single-session error is
+    // internal with the raw details, exactly like the TS host.
+    let second = client.request(
+        "session/new",
+        json!({ "mcpServers": [
+            { "name": "second", "type": "stdio", "command": "cat", "args": [], "env": [] },
+        ]}),
+    );
+    let (second_response, _) = client.wait_response(second, TIMEOUT);
+    assert_eq!(second_response["error"]["code"], -32603);
+    assert_eq!(second_response["error"]["message"], "Internal error");
     assert_eq!(
-        response["error"]["data"]["reason"],
-        "MCP servers are unavailable in this ACP host"
+        second_response["error"]["data"]["details"],
+        "prime-agent ACP mode hosts one session per connection; start another prime-agent process for a second session"
+    );
+    // Close, then a replacement admission with a different server list.
+    let close = client.request("session/close", json!({ "sessionId": session_id }));
+    let (close_response, _) = client.wait_response(close, TIMEOUT);
+    assert_eq!(close_response["result"], json!({}));
+    let replacement = client.request(
+        "session/new",
+        json!({ "mcpServers": [
+            { "name": "replacement", "type": "stdio", "command": "cat", "args": [], "env": [] },
+        ]}),
+    );
+    let (replacement_response, _) = client.wait_response(replacement, TIMEOUT);
+    assert!(
+        replacement_response["result"]["sessionId"].is_string(),
+        "replacement admission succeeds"
     );
 }
+
+#[test]
+fn acp_mcp_admission_rejects_invalid_params_with_the_ts_reasons() {
+    let script = json!({ "responses": ["unused"] });
+    let cases: &[(Value, &str)] = &[
+        (
+            json!([{ "name": "-bad", "type": "stdio", "command": "cat", "args": [], "env": [] }]),
+            "MCP server names must start with an alphanumeric character and contain at most 64 alphanumeric, underscore, or hyphen characters",
+        ),
+        (
+            json!([
+                { "name": "dup", "type": "stdio", "command": "cat", "args": [], "env": [] },
+                { "name": "dup", "type": "stdio", "command": "cat", "args": [], "env": [] },
+            ]),
+            "duplicate MCP server name: dup",
+        ),
+        (
+            json!([{ "name": "n", "type": "stdio", "command": "cat\u{0}", "args": [], "env": [] }]),
+            "MCP server n has an invalid stdio command",
+        ),
+        (
+            json!([{ "name": "e", "type": "stdio", "command": "cat", "args": [], "env": [
+                { "name": "A", "value": "1" }, { "name": "A", "value": "2" },
+            ]}]),
+            "MCP server e has duplicate environment A",
+        ),
+        (
+            json!([{ "name": "h", "type": "http", "url": "https://mcp.invalid/x", "headers": [
+                { "name": "X-A", "value": "1" }, { "name": "x-a", "value": "2" },
+            ]}]),
+            "MCP server h has duplicate header x-a",
+        ),
+        (
+            json!([{ "name": "s", "type": "sse", "url": "https://mcp.invalid/x", "headers": [] }]),
+            "MCP server s uses unsupported sse transport",
+        ),
+        (
+            json!([{ "name": "c", "type": "http", "url": "https://user:pw@mcp.invalid/x", "headers": [] }]),
+            "MCP server c must use an HTTP(S) URL without embedded credentials",
+        ),
+    ];
+    for (servers, reason) in cases {
+        let mut client = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);
+        let init = client.request("initialize", initialize_params());
+        let _ = client.wait_response(init, TIMEOUT);
+        let new = client.request("session/new", json!({ "mcpServers": servers }));
+        let (response, _) = client.wait_response(new, TIMEOUT);
+        assert_eq!(response["error"]["code"], -32602, "case {reason}");
+        assert_eq!(response["error"]["message"], "Invalid params");
+        assert_eq!(response["error"]["data"]["reason"], *reason);
+    }
+}
+
+#[test]
+fn acp_mcp_schema_invalid_entries_are_dropped_like_the_sdk() {
+    // The SDK zod filter (`vecSkipError(zMcpServer)`) silently drops
+    // entries that miss required fields; admission succeeds with the
+    // surviving list — the live TS behavior.
+    let script = json!({ "responses": ["unused"] });
+    let mut client = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);
+    let init = client.request("initialize", initialize_params());
+    let _ = client.wait_response(init, TIMEOUT);
+    let new = client.request(
+        "session/new",
+        // No `env` (required), invalid env item, http without headers.
+        json!({ "mcpServers": [
+            { "name": "no-env", "type": "stdio", "command": "cat", "args": [] },
+            { "name": "bad-item", "type": "stdio", "command": "cat", "args": [], "env": [{"name": 1, "value": "x"}] },
+            { "name": "no-headers", "type": "http", "url": "https://mcp.invalid/x" },
+        ]}),
+    );
+    let (response, _) = client.wait_response(new, TIMEOUT);
+    assert!(
+        response["result"]["sessionId"].is_string(),
+        "schema-invalid entries are dropped, not rejected"
+    );
+}
+
+#[test]
+fn acp_mcp_long_names_fail_at_tool_derivation_with_internal_error() {
+    let script = json!({ "responses": ["unused"] });
+    let mut client = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);
+    let init = client.request("initialize", initialize_params());
+    let _ = client.wait_response(init, TIMEOUT);
+    let long = format!("a{}", "b".repeat(50));
+    let new = client.request(
+        "session/new",
+        json!({ "mcpServers": [
+            { "name": long, "type": "stdio", "command": "cat", "args": [], "env": [] },
+        ]}),
+    );
+    let (response, _) = client.wait_response(new, TIMEOUT);
+    assert_eq!(response["error"]["code"], -32603);
+    assert_eq!(
+        response["error"]["data"]["details"],
+        format!("Invalid ACP MCP server name: {long}")
+    );
+}
+
 #[test]
 fn acp_compact_command_publishes_the_compaction_meta_and_end_turn() {
     // The faux session is short, so `/compact` skips (TS

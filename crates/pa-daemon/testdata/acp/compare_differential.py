@@ -7,8 +7,8 @@ normalizing the values that legitimately differ between the two binaries:
 
   - sessionId, toolCallId, messageId ids (random or provider-issued)
   - agentInfo.version (product version)
-  - mcpCapabilities (present only while the TS daemon path supports ACP
-    MCP servers; the in-process Rust slice does not serve them yet)
+  - mcpCapabilities is compared exactly (both binaries advertise
+    `{ "http": true }` since MCP admission landed)
   - model-generated content: chunk text, tool rawInput, error detail text
     from the provider, exit/error strings inside tool results
   - eventSequence: the number of chunks differs per model run; the
@@ -101,9 +101,7 @@ def normalize_frame(direction, frame, sequence_index):
                     shape["loadSession"] = caps.get("loadSession")
                     shape["promptCapabilities"] = caps.get("promptCapabilities")
                     shape["sessionCapabilities"] = caps.get("sessionCapabilities")
-                    # mcpCapabilities is normalized away: the TS capture ran
-                    # daemon-attached (MCP served); the Rust slice runs
-                    # in-process (no MCP yet).
+                    shape["mcpCapabilities"] = caps.get("mcpCapabilities")
                     shape["agentInfo"] = {
                         "name": result.get("agentInfo", {}).get("name"),
                         "title": result.get("agentInfo", {}).get("title"),

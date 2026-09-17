@@ -357,7 +357,7 @@ pub fn initialize_result(product_version: &str) -> InitializeResult {
                 image: true,
                 embedded_context: true,
             },
-            mcp_capabilities: None,
+            mcp_capabilities: Some(McpCapabilities { http: true }),
             session_capabilities: SessionCapabilities {
                 close: CloseCapability::default(),
             },
@@ -386,6 +386,7 @@ mod tests {
                 "agentCapabilities": {
                     "loadSession": false,
                     "promptCapabilities": { "image": true, "embeddedContext": true },
+                    "mcpCapabilities": { "http": true },
                     "sessionCapabilities": { "close": {} },
                 },
                 "agentInfo": { "name": "prime-agent", "title": "Prime Agent", "version": "9.9.9" },

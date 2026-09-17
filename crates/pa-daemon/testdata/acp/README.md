@@ -45,6 +45,23 @@ the process exit code and stderr.
 - `autonomous_limit`: `--autonomous --autonomous-max-tokens 1`. The token
   limit stops the run: the envelopes carry the final accounting and the
   stop reason is `max_tokens`.
+- `mcp_stdio`: `session/new` with two valid servers (one stdio with a
+  literal environment entry, one http with a header) plus one
+  schema-invalid entry (missing the required `env` array): the ACP SDK
+  zod filter (`vecSkipError(zMcpServer)`) silently drops it, admission
+  succeeds with the survivors, and close releases them.
+- `mcp_replace`: admission, close, then a replacement admission with a
+  different server list — the owner-scoped clear/re-release cycle.
+- `mcp_errors`: the full resolve-stage rejection matrix, every entry
+  schema-valid: bad name pattern, duplicate name, NUL in the stdio
+  command, duplicate environment entry (case-sensitive), duplicate HTTP
+  header (case-insensitive, the reason reports the second casing),
+  unsupported sse transport, embedded URL credentials (all `-32602` with
+  the exact TS `reason` payloads), then a name that passes the 64-char
+  admission pattern but fails the 48-char tool-name pattern
+  (`-32603` with `Invalid ACP MCP server name: ...` details), then a
+  valid admission and close. Failed admissions keep the connection
+  serving.
 
 ## The Rust captures in this directory
 
@@ -57,9 +74,9 @@ All six scenarios matched structurally at commit time.
 ## Comparing a Rust run
 
 `compare_differential.py` normalizes both captures (volatile ids, version,
-model-generated text, sequence numbers, and the `mcpCapabilities` flag the
-TS daemon path advertises but the in-process Rust slice does not serve
-yet) and compares the frame shape sequences field by field:
+model-generated text, sequence numbers) and compares the frame shape
+sequences field by field. `mcpCapabilities` is compared exactly: both
+binaries advertise `{ "http": true }`:
 
     python3 compare_differential.py ts-happy_path.jsonl rust-happy_path.jsonl
 
@@ -78,4 +95,5 @@ the essay with tool calls, the other without — both sequences are
 correct protocol behavior). The goal and autonomous frames themselves are
 locked field-by-field by the offline e2e tests. All other scenarios
 (happy_path, cwd_mismatch, errors, second_initialize, tool_call,
-compact_command, cancel, autonomous_gate) match in full mode.
+compact_command, cancel, autonomous_gate, mcp_stdio, mcp_replace,
+mcp_errors) match in full mode.

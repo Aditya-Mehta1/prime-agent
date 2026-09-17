@@ -10,6 +10,7 @@
 
 mod events;
 mod jsonrpc;
+mod mcp;
 mod meta;
 mod producer;
 mod prompt;
@@ -74,6 +75,12 @@ struct AcpModeState {
     api_key: Option<String>,
     agent_dir: Arc<PathBuf>,
     autonomous_config: Option<pa_core::autonomous::AgentAutonomousConfig>,
+    /// Session-scoped MCP servers live on the connection, exactly like the
+    /// TS process-lifetime manager: one owner id fences them and
+    /// `session/close` releases.
+    mcp: Arc<Mutex<pa_core::mcp::McpManager>>,
+    mcp_owner_id: Arc<String>,
+    mcp_server_names: Arc<Mutex<Vec<String>>>,
 }
 
 /// One hosted session and its in-flight prompt turn, if any.
@@ -102,6 +109,18 @@ pub async fn run_acp_mode(options: AcpOptions) -> Result<i32> {
     });
 
     let state = Arc::new(Mutex::new(ConnectionState::default()));
+    let agent_dir = options.agent_dir.clone();
+    let mcp_manager = tokio::task::spawn_blocking(move || {
+        pa_core::mcp::McpManager::new(pa_core::mcp::McpManagerOptions {
+            auth_storage: pa_core::auth::AuthStorage::create(&agent_dir),
+            get_user_servers: Box::new(|| None),
+            begin_login: None,
+        })
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("ACP MCP manager construction panicked");
+    });
     let mode = AcpModeState {
         engine: options.engine.clone(),
         actual_cwd: Arc::new(options.actual_cwd.clone()),
@@ -110,6 +129,9 @@ pub async fn run_acp_mode(options: AcpOptions) -> Result<i32> {
         api_key: options.api_key.clone(),
         agent_dir: Arc::new(options.agent_dir.clone()),
         autonomous_config: options.autonomous_config.clone(),
+        mcp: Arc::new(Mutex::new(mcp_manager)),
+        mcp_owner_id: Arc::new(uuid::Uuid::new_v4().to_string()),
+        mcp_server_names: Arc::new(Mutex::new(Vec::new())),
     };
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut line = String::new();
@@ -199,7 +221,7 @@ async fn handle_request(
             prompt::handle_session_prompt(id, params, state, mode, tx).await;
         }
         "session/close" => {
-            handle_session_close(id, params, state, tx).await;
+            handle_session_close(id, params, state, mode, tx).await;
         }
         other => {
             let _ = tx.send(jsonrpc::error_response(
@@ -314,13 +336,18 @@ async fn session_new(
     tx: producer::FrameSink,
 ) -> std::result::Result<SessionEntry, ()> {
     let params = NewSessionParams::parse(&params);
-    if !params.mcp_servers.is_empty() {
-        let _ = tx.send(jsonrpc::error_response(
-            id.clone(),
-            jsonrpc::INVALID_PARAMS,
-            "Invalid params",
-            Some(json!({ "reason": "MCP servers are unavailable in this ACP host" })),
-        ));
+    // MCP admission precedes everything else in the session identity: a
+    // rejected server list fails the request with the raw error payload.
+    // The zod-shaped filter drops schema-invalid entries silently (SDK
+    // `vecSkipError`); validation errors are `invalid params` with a
+    // `reason`, admission failures internal errors with `details`.
+    if let Err(mut response) = mcp::admit_session_servers(&params.mcp_servers, mode).await {
+        if let Value::Object(_) = &response {
+            if let Some(id_slot) = response.get_mut("id") {
+                *id_slot = id.clone();
+            }
+        }
+        let _ = tx.send(response);
         return Err(());
     }
     // The agent's cwd is fixed at startup; a client-supplied cwd is reported
@@ -377,6 +404,7 @@ async fn handle_session_close(
     id: Value,
     params: Value,
     state: Arc<Mutex<ConnectionState>>,
+    mode: AcpModeState,
     tx: producer::FrameSink,
 ) {
     let session_id = session_id_params(&params);
@@ -421,6 +449,7 @@ async fn handle_session_close(
     // Keep the backing session fenced until a replacement ACP session is
     // admitted.
     entry.session.close_producer().await;
+    mcp::release_session_servers(&mode).await;
     let _ = tx.send(jsonrpc::response(id, json!({})));
     let mut state = state.lock().await;
     state.session_close_in_flight = false;
@@ -438,6 +467,12 @@ fn internal_error(id: &Value, details: &str) -> Value {
         "Internal error",
         Some(json!({ "details": details })),
     )
+}
+
+/// The internal-error response with a null id, for handlers that apply the
+/// request id after an async admission decision.
+pub(super) fn internal_error_value(details: &str) -> Value {
+    internal_error(&Value::Null, details)
 }
 
 /// Two paths are the same cwd when their canonical forms match, or when they
