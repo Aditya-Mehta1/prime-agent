@@ -70,6 +70,11 @@ pub struct SessionEngine {
     /// host handlers reach, so `/goal` and `goal.complete()` in the kernel
     /// observe one state machine.
     pub goal_driver: std::sync::Arc<tokio::sync::Mutex<super::goal_driver::GoalDriver>>,
+    /// The session's MCP manager: host-side auth gating and the source the
+    /// `mcp.*` kernel host handlers (config/refresh) resolve against. The
+    /// daemon's `replace_acp_mcp_servers` wire command reaches it through
+    /// this field.
+    pub mcp_manager: crate::mcp::McpManager,
 }
 
 /// Resolve the MCP gating the resource loader and prompt need: skill
@@ -78,7 +83,7 @@ pub struct SessionEngine {
 async fn mcp_gating(
     settings: &crate::settings::SettingsManager,
     agent_dir: std::path::PathBuf,
-) -> (Vec<String>, Vec<String>) {
+) -> anyhow::Result<(Vec<String>, Vec<String>, crate::mcp::McpManager)> {
     let user_servers = settings
         .settings()
         .mcp_servers
@@ -92,16 +97,18 @@ async fn mcp_gating(
         })
         .collect::<std::collections::HashMap<String, crate::mcp::McpServerConfig>>();
     // The MCP manager snapshots auth with a blocking lock; run it off the
-    // async runtime (session construction is async).
+    // async runtime (session construction is async). The manager stays
+    // alive on the session: it is the source for the `mcp.*` host
+    // requests the kernel sends while serving generic MCP servers.
     tokio::task::spawn_blocking(move || mcp_gating_blocking(user_servers, &agent_dir))
         .await
-        .unwrap_or_default()
+        .map_err(|error| anyhow::anyhow!("MCP gating task failed: {error}"))
 }
 
 fn mcp_gating_blocking(
     user_servers: std::collections::HashMap<String, crate::mcp::McpServerConfig>,
     agent_dir: &std::path::Path,
-) -> (Vec<String>, Vec<String>) {
+) -> (Vec<String>, Vec<String>, crate::mcp::McpManager) {
     let manager = crate::mcp::McpManager::new(crate::mcp::McpManagerOptions {
         auth_storage: crate::auth::AuthStorage::create(agent_dir),
         get_user_servers: Box::new(move || Some(user_servers.clone())),
@@ -110,6 +117,7 @@ fn mcp_gating_blocking(
     (
         manager.get_disabled_builtin_skill_overrides(),
         manager.get_enabled_persistent_generic_servers(),
+        manager,
     )
 }
 
@@ -146,8 +154,8 @@ pub async fn create_session(config: SessionEngineConfig) -> anyhow::Result<Sessi
 
     let settings = crate::settings::SettingsManager::create(&cwd, &config.agent_dir);
     let service_tier_preference = settings.get_default_service_tier();
-    let (mcp_skill_overrides, mcp_generic_servers) =
-        mcp_gating(&settings, config.agent_dir.clone()).await;
+    let (mcp_skill_overrides, mcp_generic_servers, mcp_manager) =
+        mcp_gating(&settings, config.agent_dir.clone()).await?;
     let mut extra_builtin_skill_overrides = config.extra_builtin_skill_overrides.clone();
     extra_builtin_skill_overrides.extend(mcp_skill_overrides);
     let mut generic_mcp_servers = config.generic_mcp_servers.clone();
@@ -188,6 +196,9 @@ pub async fn create_session(config: SessionEngineConfig) -> anyhow::Result<Sessi
     if let Some(extra) = config.extra_host_handlers.clone() {
         handlers.merge(extra);
     }
+    // The `mcp.*` host requests (config/refresh/begin_login) the kernel's
+    // generic MCP registry sends while listing or calling generic servers.
+    mcp_manager.register_host_handlers(&mut handlers);
     let provisioner =
         super::runtime_wiring::kernel_provisioner(session_id, handlers, python_skills);
     let mut tools = config.tools.clone();
@@ -325,6 +336,7 @@ pub async fn create_session(config: SessionEngineConfig) -> anyhow::Result<Sessi
         agents_files: resources.agents_files,
         system_prompt,
         goal_driver,
+        mcp_manager,
     })
 }
 

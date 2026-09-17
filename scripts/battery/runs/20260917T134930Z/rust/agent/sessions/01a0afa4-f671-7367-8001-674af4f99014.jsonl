@@ -1,0 +1,5 @@
+{"cwd":"/home/ubuntu/lane-worktrees/mcp-execution/scripts/battery/runs/20260917T134930Z/rust/work","id":"01a0afa4-f671-7367-8001-674af4f99014","rlmDepth":0,"timestamp":"2026-09-17T13:53:38.929Z","type":"session","version":3}
+{"type":"model_change","id":"38c59d0f","parentId":null,"timestamp":"2026-09-17T13:53:38.934Z","modelId":"mock-1","provider":"prime-inference"}
+{"type":"thinking_level_change","id":"574270f9","parentId":"38c59d0f","timestamp":"2026-09-17T13:53:38.934Z","thinkingLevel":"off"}
+{"type":"service_tier_change","id":"2c489f7c","parentId":"574270f9","timestamp":"2026-09-17T13:53:38.934Z","serviceTier":"default"}
+{"type":"session_state","id":"6c7693dc","parentId":"2c489f7c","timestamp":"2026-09-17T13:53:38.934Z","state":{"status":"active"}}

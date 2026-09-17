@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "socketPath": "/home/ubuntu/lane-worktrees/mcp-execution/scripts/battery/runs/20260917T134930Z/rust/perf/sock-0.sock",
+  "defaultSessionDir": "/home/ubuntu/lane-worktrees/mcp-execution/scripts/battery/runs/20260917T134930Z/rust/agent/sessions"
+}

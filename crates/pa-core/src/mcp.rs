@@ -686,6 +686,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_host_handler_returns_user_stdio_server_config() {
+        // The product path for a settings-declared stdio server: gating
+        // enables it for the generic kernel API and `mcp.config` hands the
+        // kernel the exact command/args the user declared.
+        let mut user_servers = HashMap::new();
+        user_servers.insert(
+            "fixture-echo".to_string(),
+            McpServerConfig::Stdio {
+                command: "python3".to_string(),
+                args: Some(vec!["fixtures/mcp_echo_server.py".to_string()]),
+                cwd: None,
+                env: None,
+                enabled: None,
+                enabled_tools: Some(vec!["echo".to_string()]),
+                disabled_tools: None,
+                startup_timeout_ms: None,
+                call_timeout_ms: None,
+            },
+        );
+        let manager = manager_with(Some(user_servers));
+        assert_eq!(
+            manager.get_enabled_persistent_generic_servers(),
+            vec!["fixture-echo".to_string()]
+        );
+        let mut handlers = HostRequestHandlers::default();
+        manager.register_host_handlers(&mut handlers);
+        let config = handlers.get("mcp.config").unwrap().clone();
+        let result = config(crate::kernel::shared::HostRequestPayload {
+            data: json!({ "server": "fixture-echo" }),
+            cell_source_code: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(result["type"], "stdio");
+        assert_eq!(result["command"], "python3");
+        assert_eq!(result["args"], json!(["fixtures/mcp_echo_server.py"]));
+        assert_eq!(result["enabledTools"], json!(["echo"]));
+    }
+
+    #[tokio::test]
     async fn config_host_handler_resolves_user_and_acp_servers() {
         let mut manager = manager_with(None);
         let mut handlers = HostRequestHandlers::default();

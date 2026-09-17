@@ -59,6 +59,13 @@ for eval harnesses) — continuations are injected as durable user rows
 and gate pass/fail or limit stops surface as durable `autonomous_status`
 custom rows.
 
+Live MCP product-path verifier
+(`tests/mcp_product_path_e2e.rs`): a settings-declared stdio MCP server
+round-trips through a real worker session and kernel - the kernel cell's
+`mcp.list_tools`/`mcp.call_tool` resolve `mcp.config` through the
+session's host handlers, spawn the fixture
+(`tests/fixtures/mcp_echo_server.py`), and echo back.
+
 ## Non-goals
 No agent behavior inside workers beyond hosting a pa-core engine; no UI.
 
