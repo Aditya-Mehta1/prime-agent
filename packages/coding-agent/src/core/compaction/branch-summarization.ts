@@ -247,6 +247,40 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.`;
 
+/** Completion budget for the branch summary wire call. */
+const BRANCH_SUMMARY_MAX_TOKENS = 2048;
+
+/**
+ * Input-token budget the summarizer keeps: entries that do not fit the model's
+ * window after the reserve are dropped. Shared by `generateBranchSummary` and
+ * `estimateBranchSummaryRequestTokens` so both slice with the same budget.
+ */
+function branchSummaryTokenBudget(contextWindow: number | undefined, reserveTokens: number): number {
+	return (contextWindow || 128000) - reserveTokens;
+}
+
+/**
+ * Build the summarizer prompt for a serialized branch: the conversation in its
+ * `<conversation>` wrapper plus the selected instructions. Shared with
+ * `estimateBranchSummaryRequestTokens` so the estimate cannot drift from the
+ * request `generateBranchSummary` issues.
+ */
+function buildBranchSummaryPrompt(
+	conversationText: string,
+	customInstructions?: string,
+	replaceInstructions?: boolean,
+): string {
+	let instructions: string;
+	if (replaceInstructions && customInstructions) {
+		instructions = customInstructions;
+	} else if (customInstructions) {
+		instructions = `${BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: ${customInstructions}`;
+	} else {
+		instructions = BRANCH_SUMMARY_PROMPT;
+	}
+	return `<conversation>\n${conversationText}\n</conversation>\n\n${instructions}`;
+}
+
 /**
  * Generate a summary of abandoned branch entries.
  *
@@ -268,8 +302,7 @@ export async function generateBranchSummary(
 		retry,
 		reserveTokens = 16384,
 	} = options;
-	const contextWindow = model.contextWindow || 128000;
-	const tokenBudget = contextWindow - reserveTokens;
+	const tokenBudget = branchSummaryTokenBudget(model.contextWindow, reserveTokens);
 
 	const { messages, fileOps } = prepareBranchEntries(entries, tokenBudget);
 
@@ -278,17 +311,8 @@ export async function generateBranchSummary(
 		return { summary: "No content to summarize" };
 	}
 	// Serialize before the LLM call so it summarizes rather than continues this branch.
-	const llmMessages = convertToLlm(messages);
-	const conversationText = serializeConversation(llmMessages);
-	let instructions: string;
-	if (replaceInstructions && customInstructions) {
-		instructions = customInstructions;
-	} else if (customInstructions) {
-		instructions = `${BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: ${customInstructions}`;
-	} else {
-		instructions = BRANCH_SUMMARY_PROMPT;
-	}
-	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${instructions}`;
+	const conversationText = serializeConversation(convertToLlm(messages));
+	const promptText = buildBranchSummaryPrompt(conversationText, customInstructions, replaceInstructions);
 
 	const summarizationMessages = [
 		{
@@ -302,7 +326,7 @@ export async function generateBranchSummary(
 			completeSimple(
 				model,
 				{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-				{ apiKey, headers, sessionId, signal, maxTokens: 2048 },
+				{ apiKey, headers, sessionId, signal, maxTokens: BRANCH_SUMMARY_MAX_TOKENS },
 			),
 		{ policy: retry, signal },
 	);
@@ -327,4 +351,54 @@ export async function generateBranchSummary(
 		modifiedFiles,
 		usage: response.usage,
 	};
+}
+
+export interface EstimateBranchSummaryRequestTokensOptions {
+	/** Context window of the model that would run the summary (default 128000) */
+	contextWindow?: number;
+	/** Tokens reserved for prompt + LLM response (default 16384) */
+	reserveTokens?: number;
+	/** Optional custom instructions for summarization */
+	customInstructions?: string;
+	/** If true, customInstructions replaces the default prompt instead of being appended */
+	replaceInstructions?: boolean;
+}
+
+/**
+ * Estimate the context window the branch summary needs, using the chars/4
+ * heuristic this module already uses for pre-LLM token math. A model must hold
+ * two things: the request body `generateBranchSummary` builds
+ * (SUMMARIZATION_SYSTEM_PROMPT, the serialized branch inside its
+ * `<conversation>` wrapper, and the completion budget) and the reserve the
+ * branch call subtracts from its window via `branchSummaryTokenBudget`. The
+ * window also sizes the input slice, so a model that covers only the request
+ * body drops the oldest entries - or every entry, turning the summary into a
+ * "No content to summarize" stub - instead of running the request the session
+ * model would have run. 0 means the branch leaves nothing model-visible and no
+ * request is issued.
+ */
+export function estimateBranchSummaryRequestTokens(
+	entries: SessionEntry[],
+	options: EstimateBranchSummaryRequestTokensOptions = {},
+): number {
+	const { contextWindow, reserveTokens = 16384, customInstructions, replaceInstructions } = options;
+	// Mirrors generateBranchSummary: the same budget decides which entries fit.
+	const tokenBudget = branchSummaryTokenBudget(contextWindow, reserveTokens);
+	const { messages } = prepareBranchEntries(entries, tokenBudget);
+	// generateBranchSummary answers "No content to summarize" without a wire call.
+	if (messages.length === 0) {
+		return 0;
+	}
+	const promptText = buildBranchSummaryPrompt(
+		serializeConversation(convertToLlm(messages)),
+		customInstructions,
+		replaceInstructions,
+	);
+	const promptTokens = Math.ceil(promptText.length / 4);
+	// The completion budget and the input slice reserve are separate draws on the
+	// same window, so the larger of the two decides whether the model fits.
+	return Math.max(
+		Math.ceil(SUMMARIZATION_SYSTEM_PROMPT.length / 4) + promptTokens + BRANCH_SUMMARY_MAX_TOKENS,
+		promptTokens + reserveTokens,
+	);
 }

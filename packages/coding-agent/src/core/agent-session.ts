@@ -108,6 +108,7 @@ import {
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
+	estimateBranchSummaryRequestTokens,
 	estimateContextTokens,
 	estimateSummaryRequestTokens,
 	generateBranchSummary,
@@ -8999,11 +9000,12 @@ export class AgentSession {
 	}
 
 	/**
-	 * Background LLM passes (refinement review and planning, compaction summaries)
-	 * run with their own prompts, so issuing them on the session model evicts the
-	 * provider's prefix-cache entry for the session and forces a full context
-	 * re-read on the next session request. Route them to the configured auxiliary
-	 * model when it is set and usable; fall back to the session model otherwise.
+	 * Background LLM passes (refinement review and planning, compaction summaries,
+	 * branch summaries) run with their own prompts, so issuing them on the session
+	 * model evicts the provider's prefix-cache entry for the session and forces a
+	 * full context re-read on the next session request. Route them to the
+	 * configured auxiliary model when it is set and usable; fall back to the
+	 * session model otherwise.
 	 *
 	 * Callers that already resolved the session request auth pass it as
 	 * `fallback` so the fallback path reuses it instead of resolving again.
@@ -13373,10 +13375,34 @@ export class AgentSession {
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
 				const { apiKey, headers, requestModel: model } = await this._getRequiredRequestAuth(this.model!);
 				const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
-				const result = await generateBranchSummary(entriesToSummarize, {
+				// Branch summary fires at a tree-navigation context boundary, and the
+				// summarizer runs with its own prompt prefix (SUMMARIZATION_SYSTEM_PROMPT
+				// plus the <conversation> wrapper), so issuing it on the session model
+				// evicts the provider's prefix-cache entry for the session and re-reads
+				// the whole context at peak price. Route it to the auxiliary model when
+				// one is configured.
+				const summarization = (await this._resolveAuxiliaryModel(
+					"branch summary",
+					{ model, apiKey, headers },
+					// The estimator sizes the request the session model would issue for
+					// the branch being left. A smaller auxiliary window must fall back
+					// rather than truncate away branch context or fail over-limit and
+					// strand the navigation.
+					estimateBranchSummaryRequestTokens(entriesToSummarize, {
+						contextWindow: model.contextWindow,
+						reserveTokens: branchSummarySettings.reserveTokens,
+						customInstructions,
+						replaceInstructions,
+					}),
+				)) ?? {
 					model,
 					apiKey,
 					headers,
+				};
+				const result = await generateBranchSummary(entriesToSummarize, {
+					model: summarization.model,
+					apiKey: summarization.apiKey,
+					headers: summarization.headers,
 					signal: this._branchSummaryAbortController.signal,
 					sessionId: this.sessionId,
 					customInstructions,

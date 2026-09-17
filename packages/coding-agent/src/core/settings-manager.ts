@@ -185,9 +185,9 @@ export interface Settings {
 	updateChannel?: "stable" | "nightly"; // release channel for self-updates; unset follows the running version
 	recentModels?: string[]; // "provider/id" keys, most-recently-used first
 	// "provider/id" for background LLM passes (refinement review and planning,
-	// compaction summaries); unset falls back to the session model. Routing these
-	// to a different model keeps their different prompt prefixes from evicting
-	// the session's provider prefix-cache entry.
+	// compaction summaries, branch summaries); unset falls back to the session
+	// model. Routing these to a different model keeps their different prompt
+	// prefixes from evicting the session's provider prefix-cache entry.
 	auxiliaryModel?: string;
 	defaultThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	defaultServiceTier?: ServiceTier;
@@ -802,8 +802,8 @@ export class SettingsManager {
 
 	/**
 	 * "provider/id" of the model that runs background LLM passes (refinement
-	 * review and planning, compaction summaries). Falls back to the session model
-	 * when unset, equal to the session model, or unusable.
+	 * review and planning, compaction summaries, branch summaries). Falls back to
+	 * the session model when unset, equal to the session model, or unusable.
 	 */
 	getAuxiliaryModel(): string | undefined {
 		// Hand-edited or corrupt settings files can persist non-string values; treat
