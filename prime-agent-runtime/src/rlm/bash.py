@@ -988,6 +988,22 @@ class _UnresolvableDiscardTarget:
 
 _UNRESOLVABLE_DISCARD_TARGET = _UnresolvableDiscardTarget()
 
+
+@dataclass(frozen=True)
+class _DiscardSite:
+    """One destructive git discard found in a scanned command.
+
+    `index` is where the `git` word starts in the scanned text. `revealed`
+    marks a discard that shows up only after a command word was revealed to a
+    value holding more than a bare executable word (for example
+    `G='git -C sub reset --hard'; $G`): the shell runs that value as argv, but
+    the guard cannot name the repository it relocates to from the text, so it
+    refuses instead of probing a directory the text does not name.
+    """
+
+    index: int
+    revealed: bool
+
 # Detection for git commands that discard uncommitted working-tree changes
 # (the "clean the worktree" discard idiom). Conservative by design: a false
 # positive costs one `git status` probe and an explicit-bypass retry; a false
@@ -1122,13 +1138,66 @@ def _normalize_line_continuations(command: str) -> str:
     return "".join(chars)
 
 
-def _mask_heredoc_body(chars: list[str], command: str, start: int, end: int) -> None:
-    """Blank heredoc data in place, keeping substitution spans live.
+def _heredoc_delimiter(command: str, start: int) -> tuple[int, int, str, bool] | None:
+    """The delimiter word of a heredoc whose `<<` operator ends at `start`.
 
-    A heredoc body never executes as shell commands, but `$(...)` and
-    backtick spans inside it expand (and so can execute) before cat sees
-    the text; those stay live for the discard scan.
+    Returns `(word_start, word_end, delimiter, expands)`. A quoted or escaped
+    delimiter (`<<'EOF'`, `<<"EOF"`, `<<\\EOF`) turns expansion off, so
+    `expands` is False and the whole body is inert data. A delimiter the shell
+    would build from a variable or a substitution is unknowable and yields
+    None: its body then stays live for the scan.
     """
+    i = start
+    n = len(command)
+    while i < n and command[i].isspace():
+        i += 1  # the shell takes its delimiter word from the next word
+    word_start = i
+    while i < n and not command[i].isspace() and command[i] not in ";&|<>()":
+        i += 1
+    word = command[word_start:i]
+    if not word or "$" in word or "`" in word:
+        return None
+    if len(word) > 2 and word[0] in ("'", '"') and word[-1] == word[0]:
+        return word_start, i, word[1:-1], False
+    if word.startswith("\\"):
+        return word_start, i, word[1:], False
+    return word_start, i, word, True
+
+
+def _heredoc_body_end(command: str, line_end: int, delimiter: str) -> int | None:
+    """Just past the line that ends a heredoc body, or None when it never ends.
+
+    `line_end` is the newline that ends the line holding the `<<` operator:
+    the body starts on the line after it, so what a command line carries after
+    the delimiter (`cat <<EOF && git reset --hard`) still runs. A body without
+    its terminator keeps its text live: the shell would read the rest of the
+    command as heredoc data, which the scan cannot know.
+    """
+    pos = command.find("\n", line_end)
+    while pos != -1:
+        line_stop = command.find("\n", pos + 1)
+        line = command[pos + 1 :] if line_stop == -1 else command[pos + 1 : line_stop]
+        if line.rstrip() == delimiter:
+            return len(command) if line_stop == -1 else line_stop
+        pos = line_stop
+    return None
+
+
+def _mask_heredoc_body(
+    chars: list[str], command: str, start: int, end: int, expands: bool
+) -> None:
+    """Blank heredoc data in place.
+
+    A heredoc body never executes as shell commands. With an unquoted
+    delimiter the shell still expands `$(...)` and backtick spans before cat
+    sees the text, and those execute, so they stay live for the discard scan.
+    A quoted or escaped delimiter turns expansion off and the whole body,
+    substitutions included, is inert data.
+    """
+    if not expands:
+        for i in range(start, end):
+            chars[i] = " "
+        return
     i = start
     while i < end:
         ch = command[i]
@@ -1202,6 +1271,27 @@ def _mask_shell_redirections(command: str) -> str:
                 for j in range(operator.start(), operator.end()):
                     chars[j] = " "
                 i = operator.end()
+                if operator.group(0) == "<<":
+                    heredoc = _heredoc_delimiter(command, i)
+                    if heredoc is not None:
+                        # A heredoc body is inert data: blank it up to its
+                        # delimiter line. An unquoted delimiter still expands
+                        # command substitution (which executes), so those spans
+                        # stay live; a quoted one turns expansion off entirely.
+                        # Without a terminator, leave the text live (conservative).
+                        word_start, word_end, delimiter, expands = heredoc
+                        for j in range(word_start, word_end):
+                            chars[j] = " "
+                        line_end = command.find("\n", word_end)
+                        body_end = (
+                            _heredoc_body_end(command, line_end, delimiter)
+                            if line_end != -1
+                            else None
+                        )
+                        if body_end is not None:
+                            _mask_heredoc_body(chars, command, line_end + 1, body_end, expands)
+                        i = word_end
+                        continue
                 attached = _STATIC_REDIRECT_TARGET.match(command, i)
                 if attached.end() > i:
                     target_start, target_end = attached.start(), attached.end()
@@ -1221,26 +1311,6 @@ def _mask_shell_redirections(command: str) -> str:
                         target_start = target_end = i
                 for j in range(target_start, target_end):
                     chars[j] = " "
-                if operator.group(0) == "<<" and target_end > operator.end():
-                    # A heredoc body is inert data: blank it up to the
-                    # delimiter line, keeping command substitution live
-                    # (it executes even inside a heredoc). Without a
-                    # terminator, leave the text live (conservative).
-                    delimiter = command[target_start:target_end]
-                    pos = command.find("\n", target_end)
-                    while pos != -1:
-                        line_stop = command.find("\n", pos + 1)
-                        line = (
-                            command[pos + 1 :]
-                            if line_stop == -1
-                            else command[pos + 1 : line_stop]
-                        )
-                        if line.rstrip() == delimiter:
-                            _mask_heredoc_body(
-                                chars, command, target_end, len(command) if line_stop == -1 else line_stop
-                            )
-                            break
-                        pos = line_stop
                 i = target_end
                 continue
         elif quote == "'":
@@ -1407,22 +1477,61 @@ def _mask_quoted_spans(command: str) -> str:
 # and is left as written for the masking pass below.
 _PLAIN_WORD_RUN = re.compile(r"[A-Za-z0-9_./-]+")
 _VARIABLE_REFERENCE = re.compile(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)\b|\{([A-Za-z_][A-Za-z0-9_]*)\})")
-# A literal assignment the guard can replay: a bare word, or a quoted word
-# sequence with no expansion or substitution (`G=git`, `G=/usr/bin/git`,
-# `G='git reset --hard'`).
+# A literal assignment the shell would apply: only a word the shell reads at
+# command position, or an argument of `export` and its siblings, sets a name.
+# A bare word, or a quoted word sequence with no expansion or substitution
+# (`G=git`, `G=/usr/bin/git`, `G='git reset --hard'`).
 _LITERAL_ASSIGNMENT = re.compile(
     r"""([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"$`]*)"|'([^']*)'|([A-Za-z0-9_./-]+))"""
 )
+# A literal assignment the probe can replay verbatim: no quoting, expansion,
+# or substitution.
+_REPLAYABLE_ASSIGNMENT = re.compile(r'''[A-Za-z_][A-Za-z0-9_]*=[^\s$`;&|()<>"]+''')
+# A `NAME=value` shell word in front of a command word. Its value may be a
+# quoted word (`FOO="a b"`), which the shell applies but the probe cannot
+# replay as one token.
+_LEADING_ASSIGNMENT_WORD = re.compile(
+    r"""[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;&|()<>"']*)\s+"""
+)
+# The commands whose arguments the shell applies as assignments.
+_EXPORT_COMMANDS = frozenset({"export", "declare", "typeset", "local"})
+# Reserved words that introduce a command instead of being one, so the word
+# after them is still at command position (`then eval ...`, `{ cd sub; }`).
+_SHELL_KEYWORDS = frozenset(
+    {
+        "{", "}", "!", "if", "then", "elif", "else", "fi", "while", "until",
+        "do", "done", "for", "in", "case", "esac", "select", "time", "function",
+    }
+)
 
 
-def _shell_word_spans(command: str) -> list[tuple[int, int]]:
-    """Spans of the shell words in `command`; quotes never end a word and
-    braces stay inside one (`${G}` is a single word)."""
-    spans: list[tuple[int, int]] = []
+def _shell_word_positions(command: str) -> list[tuple[int, int, bool, bool]]:
+    """Spans of the shell words in `command`, with the position each one holds.
+
+    Quotes never end a word and braces stay inside one (`${G}` is a single
+    word), exactly as the discard patterns expect. Each span also carries
+    `assignment_slot` (the shell would read a `NAME=value` word there: the
+    start of a simple command, or an argument of `export` and friends) and
+    `command_word` (this is the word the shell would execute). Comment text is
+    not a shell word at all and is skipped, so neither an argument nor a
+    comment word can pass for the real assignment or the real command.
+    """
+    spans: list[tuple[int, int, bool, bool]] = []
+    assignment_slot = True
+    command_word = True
+    export_args = False
     i = 0
     n = len(command)
     while i < n:
-        if command[i].isspace() or command[i] in ";&|()<>":
+        ch = command[i]
+        if ch == "#" and (i == 0 or command[i - 1].isspace() or command[i - 1] in ";&|(){}"):
+            line_stop = command.find("\n", i)
+            i = n if line_stop == -1 else line_stop
+            continue
+        if ch.isspace() or ch in ";&|()<>":
+            if ch in ";&|\n()":
+                assignment_slot = command_word = True
+                export_args = False
             i += 1
             continue
         start = i
@@ -1437,7 +1546,19 @@ def _shell_word_spans(command: str) -> list[tuple[int, int]]:
             elif ch == quote:
                 quote = None
             i += 1
-        spans.append((start, i))
+        word = command[start:i]
+        spans.append((start, i, assignment_slot or export_args, command_word))
+        if command_word and word in _SHELL_KEYWORDS:
+            continue  # a keyword opens the next command position
+        if (assignment_slot or export_args) and _LITERAL_ASSIGNMENT.fullmatch(word):
+            continue  # an assignment prefix: the command word still follows
+        if command_word and word in _EXPORT_COMMANDS:
+            command_word = False
+            export_args = True
+            assignment_slot = True
+            continue  # the words after it are assignments
+        assignment_slot = command_word = False
+        export_args = False
     return spans
 
 
@@ -1476,7 +1597,7 @@ def _revealed_shell_word(word: str, assignments: dict[str, str]) -> str | None:
     return _plain_word_text(word)
 
 
-def _reveal_shell_command_words(command: str) -> tuple[str, list[int]]:
+def _reveal_shell_command_words(command: str) -> tuple[str, list[int], set[int]]:
     """Rebuild each shell word the way the shell executes it.
 
     Quoting is stripped before exec, so `"git"` and `g'it'` run `git`, and a
@@ -1484,24 +1605,31 @@ def _reveal_shell_command_words(command: str) -> tuple[str, list[int]]:
     or `G='git reset --hard'` as a word sequence). Revealing those words keeps
     the discard patterns shell-faithful. A word holding spaces, expansion, or
     substitution stays as written, so quoted data (`echo 'git reset --hard'`)
-    still masks as data. The walk is flat, so an assignment inside a command
-    substitution (`$(G=git; true); $G reset --hard`) stays visible and is
-    refused: that leaks an inner scope outward and so refuses more, not less.
-    The returned map points every emitted character back into `command`.
+    still masks as data. Only a word the shell reads as an assignment at
+    command position (or as an argument of `export` and friends) is recorded,
+    so a `G=other` argument or comment can never overwrite the real value. The
+    walk is flat, so an assignment inside a command substitution (`$(G=git;
+    true); $G reset --hard`) stays visible and is refused: that leaks an inner
+    scope outward and so refuses more, not less.
+
+    The returned map points every emitted character back into `command`, and
+    the returned set holds the words whose revealed value is more than a bare
+    executable word: the shell runs such a value as argv, but the probe cannot
+    name the repository it runs in, so a discard found through one is refused.
     """
     assignments: dict[str, str] = {}
     out: list[str] = []
     index_map: list[int] = []
+    unnameable: set[int] = set()
     cursor = 0
-    for start, end in _shell_word_spans(command):
+    for start, end, assignment_slot, _command_word in _shell_word_positions(command):
         out.append(command[cursor:start])
         index_map.extend(range(cursor, start))
         cursor = end
         word = command[start:end]
-        replacement = _revealed_shell_word(word, assignments)
-        if replacement is None:
-            replacement = word
-        else:
+        revealed = _revealed_shell_word(word, assignments)
+        replacement = word if revealed is None else revealed
+        if revealed is not None:
             # A revealed value is data the shell runs as a word, never shell
             # syntax: an unbalanced quote or a `#` in it would otherwise pair
             # with the text after it and hide a later discard from masking.
@@ -1515,20 +1643,24 @@ def _reveal_shell_command_words(command: str) -> tuple[str, list[int]]:
         else:
             # A revealed match starts at this word's first character.
             index_map.extend([start] * len(replacement))
-        assignment = _LITERAL_ASSIGNMENT.fullmatch(word)
-        if assignment:
-            # A later reference to this name execs this literal value, so the
-            # word walk reveals it verbatim; the discard patterns then judge
-            # the value exactly as they judge the bare spelling. The last
-            # literal assignment wins, so a reassignment replaces the value. A
-            # reassignment the guard cannot read (substitution or expansion)
-            # keeps the earlier value, which is the conservative direction.
-            assignments[assignment.group(1)] = next(
-                group for group in assignment.groups()[1:] if group is not None
-            )
+            if not _PLAIN_WORD_RUN.fullmatch(revealed):
+                unnameable.add(start)
+        if assignment_slot:
+            assignment = _LITERAL_ASSIGNMENT.fullmatch(word)
+            if assignment:
+                # A later reference to this name execs this literal value, so
+                # the word walk reveals it verbatim; the discard patterns then
+                # judge the value exactly as they judge the bare spelling. The
+                # last literal assignment wins, so a reassignment replaces the
+                # value. A reassignment the guard cannot read (substitution or
+                # expansion) keeps the earlier value, which is the
+                # conservative direction.
+                assignments[assignment.group(1)] = next(
+                    group for group in assignment.groups()[1:] if group is not None
+                )
     out.append(command[cursor:])
     index_map.extend(range(cursor, len(command)))
-    return "".join(out), index_map
+    return "".join(out), index_map, unnameable
 
 
 def _is_forced_clean_segment(args: str) -> bool:
@@ -1556,13 +1688,13 @@ def _is_forced_clean_segment(args: str) -> bool:
     )
 
 
-def _find_destructive_git_discard_commands(command: str) -> list[int]:
-    """Find every destructive git discard command in `command`, returning the
-    character index where each `git` token starts (empty when none match)."""
+def _find_destructive_git_discard_sites(command: str) -> list[_DiscardSite]:
+    """Find every destructive git discard command in `command`, returning
+    where each `git` token starts (empty when none match)."""
     normalized, index_map = _strip_shell_escapes(
         _mask_shell_redirections(_normalize_line_continuations(command))
     )
-    words, word_map = _reveal_shell_command_words(normalized)
+    words, word_map, unnameable = _reveal_shell_command_words(normalized)
     masked = _mask_quoted_spans(words)
     indices: list[int] = []
     for pattern in (_DISCARD_CHECKOUT_PATTERN, _DISCARD_RESET_PATTERN):
@@ -1573,14 +1705,17 @@ def _find_destructive_git_discard_commands(command: str) -> list[int]:
     for match in _DISCARD_CLEAN_PATTERN.finditer(masked):
         if _is_forced_clean_segment(match.group(1)):
             indices.append(match.start())
-    return sorted(index_map[word_map[index]] for index in indices)
+    return [
+        _DiscardSite(index_map[word_map[index]], word_map[index] in unnameable)
+        for index in sorted(indices)
+    ]
 
 
 def is_destructive_git_discard_command(command: str) -> bool:
     """True when `command` contains a git command that discards uncommitted
     working-tree changes (`git checkout -- .`, `git restore .`,
     `git reset --hard`, forced `git clean`)."""
-    return bool(_find_destructive_git_discard_commands(command))
+    return bool(_find_destructive_git_discard_sites(command))
 
 
 # `eval` re-parses its payload, so a quoted argument that the masking of the
@@ -1626,33 +1761,57 @@ def _unquote_one_level(text: str) -> str:
 def _eval_payloads_hide_destructive_git(command: str, depth: int = 0) -> bool:
     """True when a quoted `eval` payload hides a destructive git discard.
 
-    Only unquoted eval tokens are scanned (a masked eval cannot run), and
-    each payload is unquoted one layer at a time so nested evals and nested
-    quoting levels are handled without ever confusing quoted data with
-    executable text. Command substitution stays outside this check: its
-    output is unknowable statically, and the substitution itself already
-    runs (and is scanned) before eval sees the result.
+    Only a real eval is scanned: eval has to be the command word the shell
+    runs, so an `eval` argument (`echo eval 'git reset --hard'`) is inert
+    text. A quoted or referenced spelling of the word still runs the builtin,
+    so the words are revealed first. Each payload is unquoted one layer at a
+    time so nested evals and nested quoting levels are handled without ever
+    confusing quoted data with executable text. Command substitution stays
+    outside this check: its output is unknowable statically, and the
+    substitution itself already runs (and is scanned) before eval sees the
+    result.
     """
     if depth > _MAX_EVAL_SCAN_DEPTH:
         return True  # absurdly nested evals: refuse rather than risk a miss
     command = _strip_shell_escapes(
         _mask_shell_redirections(_normalize_line_continuations(command))
     )[0]
-    masked = _mask_quoted_spans(command)
-    for match in re.finditer(r"\beval\b", masked):
+    revealed, _word_map, _unnameable = _reveal_shell_command_words(command)
+    masked = _mask_quoted_spans(revealed)
+    for start, end, _slot, command_word in _shell_word_positions(revealed):
+        if not command_word or _plain_word_text(revealed[start:end]) != "eval":
+            continue
         # The payload runs from just after the eval token to the next
         # unquoted command separator (masked text keeps those live).
-        region_end = len(command)
-        for j in range(match.end(), len(masked)):
+        region_end = len(revealed)
+        for j in range(end, len(masked)):
             if masked[j] in ";&|\n":
                 region_end = j
                 break
-        payload = _unquote_one_level(command[match.end() : region_end])
-        if _find_destructive_git_discard_commands(payload):
+        payload = _unquote_one_level(revealed[end:region_end])
+        if _find_destructive_git_discard_sites(payload):
             return True
         if "eval" in payload and _eval_payloads_hide_destructive_git(payload, depth + 1):
             return True
     return False
+
+
+def _strip_leading_assignments(segment: str) -> tuple[str, bool]:
+    """Drop the command-scoped `NAME=value` words before a command word.
+
+    The shell applies them to the command that follows, so `FOO=1 cd sub`
+    still cds. Returns the remainder and whether every dropped assignment
+    could be replayed verbatim in the probe command.
+    """
+    remainder = segment
+    replayable = True
+    while True:
+        match = _LEADING_ASSIGNMENT_WORD.match(remainder)
+        if match is None:
+            return remainder, replayable
+        if not _REPLAYABLE_ASSIGNMENT.fullmatch(match.group(0).strip()):
+            replayable = False
+        remainder = remainder[match.end() :]
 
 
 def _resolve_discard_probe_target(
@@ -1734,7 +1893,7 @@ def _resolve_discard_probe_target(
     last_segment = segments[-1]
     leading_tokens = [token for token in re.split(r"\s+", last_segment.strip()) if token]
     for token in leading_tokens:
-        if re.fullmatch(r'''[A-Za-z_][A-Za-z0-9_]*=[^\s$`;&|()<>"]+''', token):
+        if _REPLAYABLE_ASSIGNMENT.fullmatch(token):
             continue  # replayable assignment
         # Wrappers that cannot change directory or select another repository.
         if token in ("sudo", "env", "command", "builtin") or token.endswith("/"):
@@ -1748,7 +1907,6 @@ def _resolve_discard_probe_target(
     # a mixed segment (for example `FOO=1 git status`) only apply to that
     # command, and a piped segment runs in a subshell, so neither persists.
     persistent_assignments: list[str] = []
-    assignment_pattern = r'''[A-Za-z_][A-Za-z0-9_]*=[^\s$`;&|()<>"]+'''
     if len(segments) > 1:
         parts = re.split(r"(&&|\|\||;|\||\n)", prefix)
         seg_positions: list[int] = []
@@ -1777,11 +1935,11 @@ def _resolve_discard_probe_target(
             if seg_tokens[0] == "export":
                 seg_tokens = seg_tokens[1:]
                 if not seg_tokens or not all(
-                    re.fullmatch(assignment_pattern, token) for token in seg_tokens
+                    _REPLAYABLE_ASSIGNMENT.fullmatch(token) for token in seg_tokens
                 ):
                     return _UNRESOLVABLE_DISCARD_TARGET
                 persistent_assignments.extend(seg_tokens)
-            elif all(re.fullmatch(assignment_pattern, token) for token in seg_tokens):
+            elif all(_REPLAYABLE_ASSIGNMENT.fullmatch(token) for token in seg_tokens):
                 persistent_assignments.extend(seg_tokens)
     env_prefix = (
         " ".join(persistent_assignments + assignments) + " "
@@ -1842,12 +2000,19 @@ def _resolve_discard_probe_target(
             # Brace groups run in the current shell, so a `{ cd sub && git
             # reset --hard; }` relocates the discard like a bare cd chain.
             group_free = re.sub(r"^\{\s*", "", trimmed)
-            if group_free == "pushd" or group_free.startswith("pushd "):
+            # A command-scoped assignment in front of the cd (`FOO=1 cd sub`)
+            # does not stop the cd from relocating, so only the words after it
+            # may decide the directory. An assignment the probe cannot replay
+            # verbatim leaves that directory unknowable, and is refused below.
+            body, replayable = _strip_leading_assignments(group_free)
+            if body == "pushd" or body.startswith("pushd "):
                 return _UNRESOLVABLE_DISCARD_TARGET
-            cd_match = re.match(r"cd\s*(.*)$", group_free)
+            cd_match = re.match(r"cd\s*(.*)$", body)
             if not cd_match:
                 cd_pending_separator = False
                 continue  # not a cd: cannot change cwd
+            if not replayable:
+                return _UNRESOLVABLE_DISCARD_TARGET
             arg = cd_match.group(1).strip()
             # An arg we cannot replay safely (substitution, redirection,
             # backgrounding, comments, or quotes split by segmenting) leaves
@@ -2005,15 +2170,21 @@ def _guard_destructive_git(command: str, allow_destructive_git: bool) -> None:
         # An eval payload hides where the discard runs; refuse rather than
         # probe a command the guard cannot replay.
         raise DestructiveGitRefusalError(_format_eval_refusal())
-    discard_indices = _find_destructive_git_discard_commands(resolved)
-    if not discard_indices:
+    sites = _find_destructive_git_discard_sites(resolved)
+    if not sites:
         return
     prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
     user_command_start = len(prefix) + 1 if prefix else 0
     probes: list[tuple[str, bool]] = []
     seen_probes: set[str] = set()
-    for index in discard_indices:
-        target = _resolve_discard_probe_target(resolved, index, user_command_start)
+    for site in sites:
+        if site.revealed:
+            # The shell runs the revealed value as argv, and that value holds
+            # more than the executable word: the repository it discards in
+            # cannot be named from the text, so refuse instead of probing a
+            # directory that may not be the one the discard targets.
+            raise DestructiveGitRefusalError(_format_relocation_refusal())
+        target = _resolve_discard_probe_target(resolved, site.index, user_command_start)
         if target is _UNRESOLVABLE_DISCARD_TARGET:
             raise DestructiveGitRefusalError(_format_relocation_refusal())
         if target is None:
