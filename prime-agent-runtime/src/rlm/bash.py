@@ -502,17 +502,13 @@ _LAUNCHER_OPERAND_OPTIONS: dict[str, frozenset[str]] = {
     "parallel": _PARALLEL_OPERAND_OPTIONS,
 }
 _LAUNCHER_OPERAND_LETTERS: dict[str, str] = {"xargs": _XARGS_OPERAND_LETTERS, "parallel": "jNnLSaI"}
-# Command words whose judgement depends on the word itself. Bash consults its
-# command hash table only after reserved words and builtins, and `hash -r`,
-# `hash -d`, or `set +h` can drop an entry again, so a `hash -p` registration
-# never hides one of these spellings.
-_MODELLED_COMMAND_NAMES = (
-    _LOOKUP_COMMANDS
-    | _WRAPPERS
-    | _PAYLOAD_RUNNERS
-    | frozenset(_EXEC_LAUNCHER_FLAGS)
-    | frozenset(_LAUNCHER_OPERAND_OPTIONS)
-    | {"command", "alias"}
+# Shell builtins the command hash table cannot shadow: bash consults the table
+# only after reserved words, functions, and builtins, so a `hash -p` entry never
+# changes what one of these words does. External launchers the walk models
+# (`env`, `timeout`, `strace`, `which`, `bash`, ...) are not builtins, so an
+# entry pointing at sudo/doas does change what they run.
+_SHADOWPROOF_BUILTINS = frozenset(
+    {"alias", "builtin", "command", "eval", "exec", "hash", "source", ".", "type"}
 )
 _BRACE_EXPANSION_CAP = 64
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
@@ -1570,16 +1566,27 @@ def _scan_interpreter(
     if name in _SHELL_RUNNERS:
         for offset, candidate in enumerate(following):
             word = words[candidate]
-            if word.is_data or word.is_redirect:
+            if word.is_data:
                 break
+            if word.is_redirect:
+                # A redirect between the flag and its operand is not the script:
+                # `bash -c >/tmp/out 'sudo id'` still runs the payload.
+                continue
             command_flag = _is_command_flag(word.value)
-            if command_flag and offset + 1 < len(following):
-                payload = words[following[offset + 1]]
-                violation = _scan_text(
-                    _strip_quotes(payload.value), depth + 1, parent_mentions_sudo
-                )
-                if violation:
-                    return violation
+            if command_flag:
+                payload_offset = offset + 1
+                while (
+                    payload_offset < len(following)
+                    and words[following[payload_offset]].is_redirect
+                ):
+                    payload_offset += 1
+                if payload_offset < len(following):
+                    payload = words[following[payload_offset]]
+                    violation = _scan_text(
+                        _strip_quotes(payload.value), depth + 1, parent_mentions_sudo
+                    )
+                    if violation:
+                        return violation
             glued = _glued_payload(word.value)
             if glued:
                 violation = _scan_text(glued, depth + 1, parent_mentions_sudo)
@@ -1731,6 +1738,12 @@ def _hash_registered_command_names(words: list[_Word]) -> tuple[dict[str, str], 
         if any(char in pathname + "".join(names) for char in "$`"):
             unreadable = True
             continue
+        if any(char in name for name in names for char in "*?[]{}"):
+            # A pattern name registers whatever it expands to (`hash -p
+            # /usr/bin/sudo elevat?` binds `elevate`), which the scan cannot
+            # resolve, so the entry is refused like any other unreadable one.
+            unreadable = True
+            continue
         for name in names:
             aliased[name] = pathname
     return aliased, unreadable
@@ -1746,7 +1759,7 @@ def _registered_command(value: str, hash_alias_names: dict[str, str] | None) -> 
     if not hash_alias_names:
         return value
     target = hash_alias_names.get(value)
-    if target is None or os.path.basename(value) in _MODELLED_COMMAND_NAMES:
+    if target is None or value in _SHADOWPROOF_BUILTINS:
         return value
     return target
 
