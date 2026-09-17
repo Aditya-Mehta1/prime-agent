@@ -1,0 +1,127 @@
+//! Namespaced `_meta` payloads for prime-agent capabilities that ACP has no
+//! native concept for (cwd reporting, quiescence observation, correlation).
+//!
+//! ACP reserves `_meta` on capability objects, notifications, and content
+//! blocks so agents can carry non-standard data. Vanilla ACP clients ignore
+//! these keys; a prime-agent-aware client reads them. Non-standard fields
+//! never appear at an ACP object root.
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+/// Reverse-domain namespace for every prime-agent `_meta` payload.
+pub const PRIME_AGENT_META_NAMESPACE: &str = "ai.primeintellect.prime-agent";
+
+/// A client-requested cwd that differs from the agent's actual startup cwd.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrimeAgentCwdMeta {
+    pub requested: String,
+    pub actual: String,
+}
+
+/// Observed subagent and autonomous-continuation counts at a completion point.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimeAgentQuiescenceMeta {
+    pub outstanding_subagents: u64,
+    pub remaining_autonomous_continuations: u64,
+}
+
+/// Producer-side ordering of an update inside its prompt turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PrimeAgentEventPhase {
+    /// Ordinary streamed work.
+    #[serde(rename = "event")]
+    Event,
+    /// The correlated boundary in front of a prompt response.
+    #[serde(rename = "responseBoundary")]
+    ResponseBoundary,
+    /// The final settled state after the response boundary.
+    #[serde(rename = "terminalQuiescence")]
+    TerminalQuiescence,
+}
+
+/// The outcome carried by a response boundary and terminal envelope. ACP
+/// transport stop reasons (including `end_turn`) are never a causal
+/// completion signal, so this is deliberately only `result` and `error`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PrimeAgentOutcome {
+    #[serde(rename = "result")]
+    Result,
+    #[serde(rename = "error")]
+    Error,
+}
+
+/// The prime-agent payload under the `_meta` namespace key.
+///
+/// `prompt_turn_id` is allocated when ACP accepts a prompt, never inferred
+/// from whichever prompt happens to be running when an update is delivered;
+/// `0` means a session-scoped event with no prompt origin. `event_sequence`
+/// is connection-wide and strictly increases for every published update.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimeAgentSessionMeta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_turn_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_sequence: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<PrimeAgentEventPhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<PrimeAgentOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_quiescence_expected: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PrimeAgentCwdMeta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quiescence: Option<PrimeAgentQuiescenceMeta>,
+    /// Rich kernel output reported by the ipython tool (attachments the cell
+    /// loaded into context, plus the number of diffs it displayed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ipython: Option<Value>,
+}
+
+/// Wrap a prime-agent payload in its reverse-domain `_meta` envelope.
+pub fn prime_agent_meta(payload: PrimeAgentSessionMeta) -> Value {
+    json!({ PRIME_AGENT_META_NAMESPACE: payload })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn meta_wraps_under_the_namespace_key() {
+        let wrapped = prime_agent_meta(PrimeAgentSessionMeta {
+            prompt_turn_id: Some(1),
+            event_sequence: Some(2),
+            phase: Some(PrimeAgentEventPhase::ResponseBoundary),
+            outcome: Some(PrimeAgentOutcome::Error),
+            ..Default::default()
+        });
+        assert_eq!(
+            wrapped,
+            json!({ "ai.primeintellect.prime-agent": {
+                "promptTurnId": 1,
+                "eventSequence": 2,
+                "phase": "responseBoundary",
+                "outcome": "error",
+            }})
+        );
+    }
+
+    #[test]
+    fn quiescence_serializes_camel_case() {
+        let wrapped = prime_agent_meta(PrimeAgentSessionMeta {
+            quiescence: Some(PrimeAgentQuiescenceMeta {
+                outstanding_subagents: 0,
+                remaining_autonomous_continuations: 0,
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            wrapped[PRIME_AGENT_META_NAMESPACE]["quiescence"],
+            json!({ "outstandingSubagents": 0, "remainingAutonomousContinuations": 0 })
+        );
+    }
+}

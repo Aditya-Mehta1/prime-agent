@@ -239,6 +239,18 @@ impl AgentSession {
         text: &str,
         options: PromptOptions,
     ) -> anyhow::Result<PromptOutcome> {
+        self.prompt_with_images(text, Vec::new(), options).await
+    }
+
+    /// Prompt with images attached (the ACP prompt-capability path). Busy
+    /// sessions queue the text and images together as one follow-up batch,
+    /// so an admitted prompt never loses its images to a queue race.
+    pub async fn prompt_with_images(
+        &self,
+        text: &str,
+        images: Vec<pa_agent::types::ImageContent>,
+        options: PromptOptions,
+    ) -> anyhow::Result<PromptOutcome> {
         let expand = options.expand_prompt_templates.unwrap_or(true);
         let normalized = if expand {
             crate::skills::expand_prompt_template(text, &self.prompt_templates)
@@ -266,9 +278,21 @@ impl AgentSession {
         // user prompts. Appending here as well would double-persist.
 
         if busy {
+            // Identical shape to the loop's own prompt normalization
+            // (text part first, image parts after), so the queued message
+            // matches a directly admitted one token for token.
+            let mut parts = vec![pa_agent::types::UserPart::Text(
+                pa_agent::types::TextContent {
+                    text: normalized,
+                    text_signature: None,
+                },
+            )];
+            for image in images {
+                parts.push(pa_agent::types::UserPart::Image(image));
+            }
             let message = AgentMessage::Standard(pa_agent::types::Message::User(
                 pa_agent::types::UserMessage {
-                    content: pa_agent::types::UserContent::Text(normalized),
+                    content: pa_agent::types::UserContent::Parts(parts),
                     timestamp: now_millis() as i64,
                 },
             ));
@@ -279,7 +303,10 @@ impl AgentSession {
             }
         } else {
             self.agent
-                .prompt(pa_agent::agent::AgentPromptInput::text(normalized))
+                .prompt(pa_agent::agent::AgentPromptInput::Text {
+                    text: normalized,
+                    images,
+                })
                 .await?;
         }
         Ok(PromptOutcome::Prompt)

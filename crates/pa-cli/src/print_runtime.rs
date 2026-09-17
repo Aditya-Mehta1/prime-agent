@@ -58,9 +58,42 @@ impl crate::mode::Runtime for PrintRuntime {
                     }
                 }
             }
-            AppMode::Rpc | AppMode::Acp => Err(MissingSubsystem::SessionEngine),
+            // ACP mode: a thin JSON-RPC stdio transport over the same
+            // in-process session engine the print mode uses.
+            AppMode::Acp => match run_acp_mode(options) {
+                Ok(code) => Ok(code),
+                Err(error) => {
+                    eprintln!("Error: {error:#}");
+                    Ok(1)
+                }
+            },
+            AppMode::Rpc => Err(MissingSubsystem::SessionEngine),
         }
     }
+}
+
+/// The ACP headless mode: build the in-process session engine the same way
+/// the print mode does, then serve the ACP JSON-RPC surface over stdio until
+/// the client disconnects.
+fn run_acp_mode(options: &RunOptions) -> Result<i32, String> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    rt.block_on(acp_mode_main(options))
+}
+
+async fn acp_mode_main(options: &RunOptions) -> Result<i32, String> {
+    let config = &options.config;
+    let engine = build_headless_engine(options).await?;
+    let exit_code = pa_daemon::acp::run_acp_mode(pa_daemon::acp::AcpOptions {
+        engine: std::sync::Arc::new(engine),
+        actual_cwd: config.cwd.clone(),
+        product_version: crate::config::VERSION.to_string(),
+    })
+    .await
+    .map_err(|error| format!("{error:#}"))?;
+    Ok(exit_code)
 }
 
 fn run_print_mode(options: &RunOptions) -> Result<i32, String> {
@@ -72,13 +105,20 @@ fn run_print_mode(options: &RunOptions) -> Result<i32, String> {
 }
 
 async fn print_mode_main(options: &RunOptions) -> Result<i32, String> {
-    let config = &options.config;
+    let engine = build_headless_engine(options).await?;
+    run_prompts_and_emit(&engine, options).await
+}
 
-    // Test seam: a scripted faux provider (`PRIME_AGENT_FAUX_SCRIPT` with
-    // `{"responses": ["text", ...]}`) drives the full print path without the
-    // network. Verification harness only; never set by the product.
+/// Assemble the in-process session engine for a headless run: model
+/// resolution, session persistence, and the engine facade. The faux-script
+/// seam (`PRIME_AGENT_FAUX_SCRIPT`) drives the same assembly without the
+/// network; verification harness only, never set by the product.
+async fn build_headless_engine(
+    options: &RunOptions,
+) -> Result<pa_core::session_engine::engine::SessionEngine, String> {
+    let config = &options.config;
     if let Ok(script) = std::env::var("PRIME_AGENT_FAUX_SCRIPT") {
-        return faux_print_mode(options, &script).await;
+        return build_faux_engine(options, &script).await;
     }
 
     // Model registry: composed catalog + models.json with real auth.
@@ -103,7 +143,7 @@ async fn print_mode_main(options: &RunOptions) -> Result<i32, String> {
         Some(build_session_manager(options)?)
     };
 
-    let engine = pa_core::session_engine::engine::create_session(
+    pa_core::session_engine::engine::create_session(
         pa_core::session_engine::engine::SessionEngineConfig {
             cwd: config.cwd.clone(),
             agent_dir: config.agent_dir.clone(),
@@ -133,9 +173,7 @@ async fn print_mode_main(options: &RunOptions) -> Result<i32, String> {
         },
     )
     .await
-    .map_err(|error| format!("{error:#}"))?;
-
-    run_prompts_and_emit(&engine, options).await
+    .map_err(|error| format!("{error:#}"))
 }
 
 /// The session header line (TS `AgentConnectionSessionHeader` shape).
@@ -501,8 +539,11 @@ async fn run_prompts_and_emit(
     Ok(exit_code)
 }
 
-/// The faux-script print path: identical pipeline, scripted provider.
-async fn faux_print_mode(options: &RunOptions, script: &str) -> Result<i32, String> {
+/// The faux-script engine: identical session assembly, scripted provider.
+async fn build_faux_engine(
+    options: &RunOptions,
+    script: &str,
+) -> Result<pa_core::session_engine::engine::SessionEngine, String> {
     let config = &options.config;
     let script: serde_json::Value = serde_json::from_str(script)
         .map_err(|error| format!("invalid PRIME_AGENT_FAUX_SCRIPT: {error}"))?;
@@ -588,7 +629,7 @@ async fn faux_print_mode(options: &RunOptions, script: &str) -> Result<i32, Stri
     } else {
         Some(build_session_manager(options)?)
     };
-    let engine = pa_core::session_engine::engine::create_session(
+    pa_core::session_engine::engine::create_session(
         pa_core::session_engine::engine::SessionEngineConfig {
             cwd: config.cwd.clone(),
             agent_dir: config.agent_dir.clone(),
@@ -610,7 +651,5 @@ async fn faux_print_mode(options: &RunOptions, script: &str) -> Result<i32, Stri
         },
     )
     .await
-    .map_err(|error| format!("{error:#}"))?;
-
-    run_prompts_and_emit(&engine, options).await
+    .map_err(|error| format!("{error:#}"))
 }

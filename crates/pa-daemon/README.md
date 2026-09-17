@@ -3,6 +3,11 @@
 Session supervision and wire serving.
 
 ## Scope
+ACP stdio transport (`acp`): the JSON-RPC serve surface for Agent
+Client Protocol clients - a thin transport over the pa-core session engine
+(initialize, session/new, session/prompt, session/close, session/cancel,
+and the outgoing session/update notification with namespaced `_meta`
+correlation), owned by this crate because wire-protocol serving is its area.
 Supervisor process (one worker process per active session), restart/backoff
 supervision, session registry/roster + worker self-registration (session
 identity survives supervisor restarts: workers re-register with backoff and
@@ -54,7 +59,8 @@ custom rows.
 No agent behavior inside workers beyond hosting a pa-core engine; no UI.
 
 ## Public API
-Supervisor entrypoint, worker entrypoint, client connection API for pa-tui/pa-cli. Supervision internals `pub(crate)`.
+Supervisor entrypoint, worker entrypoint, client connection API for pa-tui/pa-cli, `acp::{run_acp_mode, AcpOptions}` (pa-cli dispatches `--mode acp` through it). Supervision internals `pub(crate)`.
+
 
 ## Depends on
 pa-types, pa-core (one-way).
