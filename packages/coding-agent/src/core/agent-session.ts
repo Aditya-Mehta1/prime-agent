@@ -13236,6 +13236,15 @@ export class AgentSession {
 			if (jobId === "user-cancelled") {
 				return;
 			}
+			if (jobId !== undefined && jobId !== entry.data.jobId) {
+				// A rebuilt wake replaces the cancelled one: record it, so the next
+				// restore reuses this job instead of arming another one beside it.
+				this.sessionManager.appendCustomEntry(QUOTA_PARK_CUSTOM_ENTRY_TYPE, {
+					resumeAt: entry.data.resumeAt,
+					parkCount: entry.data.parkCount,
+					jobId,
+				});
+			}
 			this._quotaPark = {
 				parkCount: entry.data.parkCount,
 				resumeAtMs,
