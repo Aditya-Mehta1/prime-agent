@@ -1217,9 +1217,17 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         for command in [
             "env -C / chmod -R 755 .",
             "env --chdir / chmod -R 755 .",
+            "env -C/ chmod -R 755 .",
+            "env -iC / chmod -R 755 .",
+            "env --chdir=/ chown -R user .",
             "env -C ~ chmod -R 755 .",
             "find / -execdir chmod -R 755 . \\;",
             "find . -execdir chown -R user . +",
+            # The wrapper chain is walked, not just its head: a relocation
+            # behind another executor is the same relocation.
+            "nice env -C / chmod -R 755 .",
+            "timeout 5 env -C / chmod -R 755 .",
+            "nice xargs chmod -R 755",
         ]:
             with self.subTest(command=command):
                 message = await self._refused(command, home=home.name)
@@ -1240,12 +1248,78 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
             "env -S 'chmod -R 755 ~'",
             'env -S "chown -R user ~"',
             "env --split-string='chmod -R 755 ~'",
+            "env -S'chmod -R 755 ~'",
+            "env -iS 'chown -R user ~'",
+            # Every `env -S` string counts: a clean one does not make a later
+            # one safe, and a payload wrapper carries its own.
+            "env -S 'echo hi' -S 'chmod -R 755 ~'",
+            "env -S 'echo hi'; env -S 'chmod -R 755 ~'",
+            "eval 'env -S \"chmod -R 755 ~\"'",
+            "bash -c 'env -S \"chown -R user ~\"'",
+            # A string the guard cannot read is refused, not guessed at.
+            'env -S "$CMD -R 755 ~"',
         ]:
             with self.subTest(command=command):
                 message = await self._refused(command, home=home.name)
                 self.assertIn("Refusing to run this recursive chmod/chown command", message)
                 self.assertTrue(Path(home.name, "keep.txt").exists())
         result = await self._run("env -S 'echo hi'")
+        self.assertEqual(result.exit_code, 0)
+        result = await self._run("env -iS 'echo hi'")
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_refuses_hash_registered_command_names(self):
+        self._make_tree()
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        # `hash -p pathname name` installs a command-hash entry by hand, so
+        # the registered name runs that file whatever the word looks like.
+        for command in [
+            "hash -p /bin/chmod safe; safe -R 755 ~",
+            "hash -p /usr/bin/chown safe; safe -R user ~",
+            "hash -p /bin/chmod safe; echo hi; safe -R 755 ~",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command, home=home.name)
+                self.assertIn("Refusing to run this recursive chmod/chown command", message)
+                self.assertTrue(Path(home.name, "keep.txt").exists())
+        # A registration whose target the guard cannot read could point
+        # anywhere, so it is refused rather than guessed at.
+        message = await self._refused('hash -p "$DIR/chmod" safe; safe -R 755 sub')
+        self.assertIn("command-hash entry", message)
+        # A registration that names another command keeps that command, and a
+        # registration nobody uses changes nothing.
+        result = await self._run("hash -p /bin/echo safe; safe -R 755 sub")
+        self.assertEqual(result.exit_code, 0)
+        result = await self._run("hash -p /bin/chmod safe")
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_refuses_shell_startup_files(self):
+        # A login or interactive shell sources profile and rc files before
+        # it runs the payload it was given, so the wrapper cannot be treated
+        # as governed by its `-c` text.
+        Path(self.test_dir, "guard-ok.sh").write_text("echo ok\n")
+        for command in [
+            "bash -l -c ':'",
+            "bash --login -c ':'",
+            "bash -lc ':'",
+            "bash -i -c ':'",
+            "bash --interactive -c ':'",
+            "bash -ilc ':'",
+            "sh -l -c ':'",
+            "bash --rcfile /tmp/evilrc -i -c ':'",
+            "bash --init-file /tmp/evilrc -i -c ':'",
+            "bash -c 'bash -l -c \":\"'",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command)
+                self.assertIn("starts a login or interactive shell", message)
+        # A non-login, non-interactive wrapper stays governed by its payload,
+        # and an rcfile without -i is not read by bash at all.
+        result = await self._run("bash -xc 'echo hi'")
+        self.assertEqual(result.exit_code, 0)
+        result = await self._run("bash --rcfile /tmp/guard-rc ./guard-ok.sh")
         self.assertEqual(result.exit_code, 0)
 
     async def test_command_prefix_relocation_refuses_wrapper_scripts(self):
@@ -1259,6 +1333,15 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         ):
             message = await self._refused("bash safe-name.sh")
         self.assertIn("changes directory", message)
+        # A word that only shares a wrapper's name does not run a script, so
+        # the relocating prefix does not refuse the command.
+        with mock.patch.dict(
+            os.environ,
+            {"PRIME_AGENT_BASH_COMMAND_PREFIX": "cd /tmp"},
+        ):
+            for command in ["echo bash", "ls .", "echo source"]:
+                result = await self._run(command)
+                self.assertEqual(result.exit_code, 0)
 
     async def test_bundled_option_values_do_not_skip_scripts(self):
         self._make_tree()
@@ -1292,6 +1375,9 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
             message = await self._refused("source pa-guard-path.sh")
         self.assertIn("outside the kernel workspace", message)
         message = await self._refused("PATH=/nonexistent source x.sh")
+        self.assertIn("outside the kernel workspace", message)
+        # An append assignment changes the search path just like a plain one.
+        message = await self._refused("PATH+=/nonexistent source x.sh")
         self.assertIn("outside the kernel workspace", message)
 
     async def test_xargs_false_positives_stay_allowed(self):

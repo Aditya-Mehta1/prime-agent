@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Collection, Generator
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, cast
@@ -1621,19 +1621,25 @@ def _contained_in_later_word(words: list[_ShellWord], index: int) -> bool:
 
 
 def _find_recursive_chmod_chown_invocations(
-    command: str, words: list[_ShellWord] | None = None
+    command: str,
+    words: list[_ShellWord] | None = None,
+    hash_alias_names: Collection[str] | None = None,
 ) -> list[tuple[int, int, int]]:
     """Find every recursive chmod/chown invocation, returning each as a
     (start, end, word_index) span: from the command word to the last word of
     the invocation (before the next command). Words fold quotes and escapes
     into their values, so quoted command names (`"chmod" -R 755 ~`) and
     quoted flags (`chmod '-R' 755 ~`) scan exactly like their unquoted
-    forms."""
+    forms. `hash_alias_names` carries the names a `hash -p` registration in
+    the command points at chmod/chown (`hash -p /bin/chmod safe`), which run
+    that file whatever the command word looks like."""
     if words is None:
         words = _scan_shell_words(command)
     invocations: list[tuple[int, int, int]] = []
     for index, word in enumerate(words):
-        if not _is_chmod_chown_word(word.value):
+        if not _is_chmod_chown_word(word.value) and not (
+            hash_alias_names is not None and word.value in hash_alias_names
+        ):
             continue
         end = word.end
         tokens = [word.value]
@@ -1648,6 +1654,50 @@ def _find_recursive_chmod_chown_invocations(
         if _is_recursive_chmod_chown_token_run(tokens):
             invocations.append((word.start, end, index))
     return invocations
+
+
+_HASH_BUILTIN = "hash"
+
+
+def _hash_registered_command_names(
+    words: list[_ShellWord],
+) -> tuple[set[str], bool]:
+    """(names a `hash -p` registration points at chmod/chown, unreadable).
+
+    Bash's command hash table maps a name to the file it resolved to, and
+    `hash -p pathname name` installs such an entry by hand, so a later `name`
+    runs `pathname` however the name looks (`hash -p /bin/chmod safe; safe -R
+    755 /`). The guard resolves the entry, so the registered name scans like
+    the command it runs; a registration whose target or name is built from
+    expansion is reported as unreadable, because that entry could point
+    anywhere. `hash` without `-p` only reads or clears the table, which
+    cannot make a word run chmod/chown."""
+    aliased: set[str] = set()
+    unreadable = False
+    for index, word in enumerate(words):
+        if os.path.basename(word.value) != _HASH_BUILTIN:
+            continue
+        has_pathname_option = False
+        operands: list[str] = []
+        for token in _run_tokens_from(words, index)[1:]:
+            if token.startswith("-") and token != "-" and not token.startswith("--"):
+                has_pathname_option = has_pathname_option or "p" in token[1:]
+                continue
+            if token.startswith("--"):
+                continue
+            if not has_pathname_option:
+                break  # `hash name`/`hash -d name`: no registration
+            operands.append(token)
+            if len(operands) == 2:
+                break
+        if not has_pathname_option or len(operands) < 2:
+            continue
+        pathname, name = operands
+        if any(ch in pathname + name for ch in "$`"):
+            unreadable = True
+        elif os.path.basename(pathname) in ("chmod", "chown"):
+            aliased.add(name)
+    return aliased, unreadable
 
 
 _WRAPPER_PAYLOAD_KINDS = ("eval", "shell_c", "alias", "trap")
@@ -1719,19 +1769,23 @@ def _payload_text_hides_shell_code(text: str, depth: int = 0) -> str | None:
     """Why a one-level-unquoted wrapper payload hides shell code the guard
     must refuse, or None when it does not: a recursive chmod/chown
     (directly, or behind further quoted wrappers: mixed or nested eval and
-    `sh -c` forms), a command name a variable or substitution could expand
-    into a recursive chmod/chown, a BASH_ENV arming, or a process
-    substitution feeding a shell wrapper. Each layer is unquoted one shell
-    quoting level at a time, so quoted data stays inert while quoted code
-    is caught. Absurd nesting is refused outright."""
+    `sh -c` forms), the argv an `env -S` string splits into, a command name
+    a variable, substitution, or `hash -p` registration could point at, a
+    BASH_ENV arming, a shell wrapper that would source a startup file, or a
+    process substitution feeding a shell wrapper. Each layer is unquoted one
+    shell quoting level at a time, so quoted data stays inert while quoted
+    code is caught. Absurd nesting is refused outright."""
     if depth > _MAX_EVAL_SCAN_DEPTH:
         return "recursive_chmod"  # absurdly nested wrappers: refuse rather than risk a miss
     normalized, _index_map = _strip_shell_escapes(
         _mask_shell_redirections(_normalize_line_continuations(text))
     )
-    if _find_recursive_chmod_chown_invocations(normalized):
-        return "recursive_chmod"
     words = _scan_shell_words(normalized)
+    hash_alias_names, hash_unreadable = _hash_registered_command_names(words)
+    if hash_unreadable:
+        return "unresolvable_command"
+    if _find_recursive_chmod_chown_invocations(normalized, words, hash_alias_names):
+        return "recursive_chmod"
     if _bash_env_words_arm_shell_code(words):
         return "bash_env"
     if _unresolvable_words_could_recurse(
@@ -1740,10 +1794,19 @@ def _payload_text_hides_shell_code(text: str, depth: int = 0) -> str | None:
         return "unresolvable_command"
     if _process_substitution_feeds_wrapper(normalized, words):
         return "process_substitution"
-    if any(
-        os.path.basename(w.value) in _SCRIPT_INPUT_WRAPPERS for w in words
-    ) and _unscanned_wrapper_script_reason(text, normalized, words, 0) is not None:
-        return "unscanned_script"
+    env_split_feeds, env_split_reasons = _env_split_string_feeds(words)
+    for feed in env_split_feeds:
+        reason = _payload_text_hides_shell_code(feed, depth + 1)
+        if reason is not None:
+            return reason
+    if env_split_reasons:
+        return "env_split_expansion"
+    if any(os.path.basename(w.value) in _SCRIPT_INPUT_WRAPPERS for w in words):
+        script_reason = _unscanned_wrapper_script_reason(text, normalized, words, 0)
+        if script_reason == "startup":
+            return "shell_startup"
+        if script_reason is not None:
+            return "unscanned_script"
     for source in _wrapper_payload_sources(words, normalized, _WRAPPER_PAYLOAD_KINDS):
         payload = _unquote_one_level(_expand_ansi_c_payloads(source))
         reason = _payload_text_hides_shell_code(payload, depth + 1)
@@ -2197,7 +2260,9 @@ def _format_chmod_eval_refusal() -> str:
 # command, not expansion; `chmo?` and `{ch,}mod` can become chmod).
 _UNRESOLVED_EXPANSION = re.compile(r"[$`]")
 _EXPANDABLE_GLOB_CHARS = re.compile(r"[*?{\[]")
-_ASSIGNMENT_WORD = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# A plain assignment, or an append assignment (`PATH+=...`), which the shell
+# also applies to the command it prefixes rather than running as a command.
+_ASSIGNMENT_WORD = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
 _BASH_ENV_ASSIGNMENT = re.compile(r"^BASH_ENV=")
 # Command words that hand their arguments to a program: an unresolvable word
 # inside one of these runs could still be chmod/chown.
@@ -2505,7 +2570,7 @@ def _process_substitution_feeds_wrapper(
 # Wrappers that execute a named script file (argument or stdin redirect).
 _SCRIPT_INPUT_WRAPPERS = ("sh", "bash", "zsh", "dash", "ksh", "source", ".")
 # A PATH assignment changes where a slash-free `source` operand resolves.
-_PATH_ASSIGNMENT = re.compile(r"(?<![A-Za-z0-9_])PATH=")
+_PATH_ASSIGNMENT = re.compile(r"(?<![A-Za-z0-9_])PATH\+?=")
 
 _FUNCTION_DEFINITION = re.compile(r"\(\s*\)\s*[({]|function\s+[A-Za-z_]")
 
@@ -2527,6 +2592,35 @@ def _function_definition_could_recurse(
     return has_chmod_word and has_recursive_flag
 
 
+def _shell_short_option_flags(token: str) -> str:
+    """The short option letters a shell option cluster sets. `-o`/`-O` consume
+    the rest of their own cluster as the option name (`-ovi` sets `vi`, it
+    does not set `i`), so only the letters before them are flags."""
+    flags = token[1:]
+    cut = len(flags)
+    for value_option in ("o", "O"):
+        found = flags.find(value_option)
+        if found != -1:
+            cut = min(cut, found)
+    return flags[:cut]
+
+
+def _shell_startup_option(token: str) -> bool:
+    """True when a shell option word makes the shell read a startup file
+    before it runs the command it was given: a login shell (`-l`, `--login`)
+    sources the profile files and an interactive one (`-i`, `--interactive`)
+    sources the rc file (`--rcfile`/`--init-file` name the rc file to run
+    instead of the default). `--norc`/`--noprofile` do not exempt the
+    invocation: bash still reads the system-wide startup file for an
+    interactive shell on some platforms."""
+    if token in ("--login", "--interactive"):
+        return True
+    if token.startswith("-") and token != "-" and not token.startswith("--"):
+        flags = _shell_short_option_flags(token)
+        return "l" in flags or "i" in flags
+    return False
+
+
 _WRAPPER_LONG_OPTIONS = (
     "--posix",
     "--restricted",
@@ -2539,7 +2633,9 @@ _WRAPPER_LONG_OPTIONS = (
     "--help",
     "--version",
 )
-_WRAPPER_LONG_OPTIONS_WITH_VALUE = ("--rcfile",)
+# `--init-file` is bash's other name for `--rcfile` (both name the rc file an
+# interactive shell runs instead of ~/.bashrc).
+_WRAPPER_LONG_OPTIONS_WITH_VALUE = ("--rcfile", "--init-file")
 
 
 def _script_input_violation(
@@ -2572,7 +2668,9 @@ def _unscanned_wrapper_script_reason(
     where the wrapper will actually read them. Slash-free `source`
     operands resolve through PATH like bash does. A `-c` payload governs
     and stays fine, and a wrapper option whose value convention the
-    scanner cannot know fails closed."""
+    scanner cannot know fails closed. A login or interactive shell
+    (`-l`, `--login`, `-i`, `--interactive`) sources profile and rc files
+    the guard cannot scan, so that invocation is refused outright."""
     try:
         kernel_cwd = os.getcwd()
     except OSError:
@@ -2595,11 +2693,6 @@ def _unscanned_wrapper_script_reason(
             head = word
         if os.path.basename(word.value) not in _SCRIPT_INPUT_WRAPPERS:
             continue
-        if prefix_relocates:
-            # A relocating prefix moves the shell before every command,
-            # so the wrapper reads its script somewhere the resolver
-            # cannot replay.
-            return "relocation"
         introduced = word.starts_command or (
             head is not None
             and (
@@ -2608,7 +2701,18 @@ def _unscanned_wrapper_script_reason(
             )
         )
         if not introduced:
+            # A word that merely shares a wrapper's name (an argument, a
+            # file named `source`, a bare `.` operand) does not run a
+            # script, so none of the wrapper gates apply to it.
             continue
+        # Startup files belong to a shell interpreter, not to the `source`
+        # builtin: only the interpreter names carry -l/-i options at all.
+        reads_startup_files = os.path.basename(word.value) in _SHELL_C_INTERPRETERS
+        if prefix_relocates:
+            # A relocating prefix moves the shell before every command,
+            # so the wrapper reads its script somewhere the resolver
+            # cannot replay.
+            return "relocation"
         script_word: _ShellWord | None = None
         governed = False
         skip_next = False
@@ -2622,6 +2726,12 @@ def _unscanned_wrapper_script_reason(
             if skip_next:
                 skip_next = False
                 continue
+            if reads_startup_files and _shell_startup_option(token):
+                # A login or interactive shell sources profile and rc files
+                # before it runs the payload it was given, so that code
+                # executes whatever the payload says: the wrapper cannot be
+                # treated as governed by its `-c` text.
+                return "startup"
             if token.startswith("-") and token != "-" and not token.startswith("--"):
                 if "c" in token[1:]:
                     governed = True
@@ -2817,6 +2927,51 @@ def _format_chmod_env_split_string_refusal() -> str:
     )
 
 
+def _format_chmod_env_split_string_expansion_refusal() -> str:
+    return "\n".join(
+        [
+            "Refusing to run this recursive chmod/chown command: its `env -S`"
+            " string builds the argv env runs through shell expansion, which"
+            " the guard cannot resolve.",
+            "",
+            "Write the command literally, or retry with"
+            " bash(command, allow_destructive_chmod=True), or start the"
+            f" kernel with {BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV}=1.",
+        ]
+    )
+
+
+def _format_chmod_shell_startup_refusal() -> str:
+    return "\n".join(
+        [
+            "Refusing to run this command: it starts a login or interactive"
+            " shell, which sources profile and rc files before it runs the"
+            " command it was given, and startup code cannot be scanned",
+            "statically.",
+            "",
+            "Run the command in a non-interactive, non-login shell"
+            " (`bash -c ...`), or retry with"
+            " bash(command, allow_destructive_chmod=True), or start the"
+            f" kernel with {BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV}=1.",
+        ]
+    )
+
+
+def _format_chmod_hash_alias_refusal() -> str:
+    return "\n".join(
+        [
+            "Refusing to run this command: it installs a command-hash entry"
+            " (`hash -p`) whose target the guard cannot resolve, so a later"
+            " command word could run a recursive chmod/chown the scanner"
+            " never sees.",
+            "",
+            "Register the command with a literal path, or retry with"
+            " bash(command, allow_destructive_chmod=True), or start the"
+            f" kernel with {BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV}=1.",
+        ]
+    )
+
+
 def _format_chmod_trap_refusal() -> str:
     return "\n".join(
         [
@@ -2853,6 +3008,10 @@ def _payload_reason_message(reason: str) -> str:
         return _format_chmod_unresolvable_command_refusal()
     if reason == "unscanned_script":
         return _format_chmod_wrapper_script_refusal()
+    if reason == "shell_startup":
+        return _format_chmod_shell_startup_refusal()
+    if reason == "env_split_expansion":
+        return _format_chmod_env_split_string_expansion_refusal()
     return _format_chmod_process_substitution_refusal()
 
 
@@ -2938,40 +3097,136 @@ def _alias_payloads_hide_recursive_chmod(command: str) -> str | None:
     return None
 
 
-_ENV_SPLIT_INTERPRETERS = ("env",)
+_ENV_COMMAND = "env"
+
+
+def _env_option_values(tokens: list[str], short: str, long: str) -> list[str]:
+    """Every value `env` passes for one of its value options, in order.
+    `tokens` are the words after the `env` command word, up to the next
+    command.
+
+    GNU `env` accepts the short form with a detached or attached value
+    (`-C dir`, `-Cdir`), a bundled cluster whose last flag takes the value
+    (`-iC dir`), and the long form with an attached value (`--chdir=dir`).
+    Every occurrence is returned: the same option can repeat, and the guard
+    reads all of them rather than guessing which one the platform honors."""
+    values: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        attached: str | None = None
+        detached = False
+        if token == f"-{short}" or token == f"--{long}":
+            detached = True
+        elif token.startswith(f"--{long}="):
+            attached = token.split("=", 1)[1]
+        elif token.startswith(f"-{short}"):
+            attached = token[len(short) + 1 :]
+        elif token.startswith("-") and not token.startswith("--") and short in token[1:]:
+            detached = True
+        if attached is not None:
+            values.append(attached)
+        elif detached and index + 1 < len(tokens):
+            values.append(tokens[index + 1])
+            index += 1
+        index += 1
+    return values
+
+
+def _env_option_value(tokens: list[str], short: str, long: str) -> str | None:
+    """The first value `env` passes for one of its value options, or None
+    when the command does not use it."""
+    values = _env_option_values(tokens, short, long)
+    return values[0] if values else None
+
+
+def _split_env_string(value: str) -> str | None:
+    """The argv text `env -S` splits its string into, or None when the string
+    carries expansion.
+
+    GNU `env` splits the string on whitespace, honors single and double
+    quotes and backslash escapes, and expands variables; the guard reads the
+    literal words and refuses a string it cannot read statically rather than
+    guessing which argv `env` would run."""
+    if any(ch in value for ch in "$`"):
+        return None
+    parts: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    i = 0
+    while i < len(value):
+        ch = value[i]
+        if ch == "\\" and i + 1 < len(value):
+            current.append(value[i + 1])
+            i += 2
+            continue
+        if quote is None and ch in "'\"":
+            quote = ch
+            i += 1
+            continue
+        if quote is not None and ch == quote:
+            quote = None
+            i += 1
+            continue
+        if quote is None and ch.isspace():
+            if current:
+                parts.append("".join(current))
+                current = []
+            i += 1
+            continue
+        current.append(ch)
+        i += 1
+    if current:
+        parts.append("".join(current))
+    return " ".join(parts)
+
+
+def _env_split_string_feeds(words: list[_ShellWord]) -> tuple[list[str], list[str]]:
+    """(split argv texts, refusal reasons) for every `env -S/--split-string`
+    operand in already-scanned `words`.
+
+    GNU `env` splits that string into the argv it runs (`env -S 'chmod -R
+    755 /'`), so the split words are scanned like any other command text.
+    Every `env` word in the command counts, because a clean string does not
+    make a later one safe, and a string carrying expansion is reported
+    instead of scanned, because the argv `env` builds from it cannot be read
+    statically."""
+    feeds: list[str] = []
+    reasons: list[str] = []
+    for index, word in enumerate(words):
+        if os.path.basename(word.value) != _ENV_COMMAND:
+            continue
+        for value in _env_option_values(
+            _run_tokens_from(words, index)[1:], "S", "split-string"
+        ):
+            if not value.strip():
+                continue
+            split = _split_env_string(value)
+            if split is None:
+                reasons.append(
+                    f"{value!r}: names the argv env runs through shell"
+                    " expansion, which the guard cannot resolve"
+                )
+                continue
+            feeds.append(split)
+    return feeds, reasons
 
 
 def _env_split_string_payloads_hide_recursive_chmod(command: str) -> str | None:
     """Why a GNU env -S/--split-string payload hides shell code the guard
     must refuse (truthy), or None when it does not: env splits the string
-    into a command line and executes it, so the string is scanned like a
-    wrapper payload. env without -S executes only a literal command word
-    and is scanned by the plain invocation scan already."""
-    words = _scan_shell_words(command)
-    for index, word in enumerate(words):
-        if os.path.basename(word.value) not in _ENV_SPLIT_INTERPRETERS:
-            continue
-        s_pending = False
-        for follower_index in range(index + 1, len(words)):
-            follower = words[follower_index]
-            if follower.starts_command:
-                if _contained_in_later_word(words, follower_index):
-                    continue
-                break
-            token = follower.value
-            if s_pending:
-                payload_source = command[follower.start : follower.end]
-                if payload_source.startswith(("'", '"', "$'", '$"')):
-                    payload = _unquote_one_level(_expand_ansi_c_payloads(payload_source))
-                    return _payload_text_hides_shell_code(payload)
-                break
-            if token == "--":
-                break
-            if token.startswith("--split-string="):
-                # The inline form carries the payload after `=`.
-                return _payload_text_hides_shell_code(token.split("=", 1)[1])
-            if token == "-S" or token == "--split-string":
-                s_pending = True
+    into a command line and executes it, so every split argv is scanned like
+    a wrapper payload, in each spelling of the flag (detached, attached, or
+    bundled in a cluster) and for every `env` word. env without -S executes
+    only a literal command word and is scanned by the plain invocation scan
+    already."""
+    feeds, reasons = _env_split_string_feeds(_scan_shell_words(command))
+    for feed in feeds:
+        reason = _payload_text_hides_shell_code(feed)
+        if reason is not None:
+            return reason
+    if reasons:
+        return "env_split_expansion"
     return None
 
 
@@ -3003,15 +3258,48 @@ def _format_chmod_shell_c_refusal() -> str:
     )
 
 
+def _wrapper_chain_groups(run_words: list[str]) -> list[tuple[str, list[str]]]:
+    """The command-executing wrappers of one command run, in execution order,
+    with the tokens each one consumes before handing over to the next.
+
+    `run_words` holds the words before the invocation in shell order. Each
+    wrapper hands the rest of the run to the command it runs, so
+    `nice env -C / chmod -R 755 .` is a two-link chain and a check that only
+    looked at the run head would miss the relocation behind `nice`. The chain
+    stops at the first word that is not an executor from
+    `_UNRESOLVABLE_COMMAND_EXECUTORS`: any other command word runs its
+    arguments itself, so a later `xargs` or an operand named `env` is not a
+    wrap."""
+    groups: list[tuple[str, list[str]]] = []
+    index = 0
+    while index < len(run_words):
+        name = os.path.basename(run_words[index])
+        if name not in _UNRESOLVABLE_COMMAND_EXECUTORS:
+            break
+        tokens: list[str] = []
+        index += 1
+        while index < len(run_words) and (
+            os.path.basename(run_words[index]) not in _UNRESOLVABLE_COMMAND_EXECUTORS
+        ):
+            tokens.append(run_words[index])
+            index += 1
+        groups.append((name, tokens))
+    return groups
+
+
 def _guard_destructive_chmod(command: str, allow_destructive_chmod: bool) -> None:
     """Refuse recursive chmod/chown commands whose operands could escape the
     kernel workspace or hit the home directory, dot-directories, dotfiles, or
     the filesystem root, and fail closed on what the scanner cannot resolve:
     command names built from variables or substitutions, ANSI-C quoted forms,
     process substitutions feeding shell wrappers, BASH_ENV arming, CDPATH-
-    affected relocations, nested quoted wrappers, and abbreviated recursive
-    flags. Pattern matching is string-only and the operand resolver runs
-    only on a match, so other commands pay nothing."""
+    affected relocations, nested quoted wrappers, `env -S` split strings,
+    login or interactive shell wrappers that would source startup files,
+    executor chains that relocate or feed the invocation (xargs,
+    env -C/--chdir, find -execdir), unreadable `hash -p` registrations,
+    and abbreviated recursive flags. Pattern matching is string-only and
+    the operand resolver runs only on a match, so other commands pay
+    nothing."""
     if allow_destructive_chmod or _DESTRUCTIVE_CHMOD_BYPASS_AT_KERNEL_START:
         return
     command_prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
@@ -3035,6 +3323,13 @@ def _guard_destructive_chmod(command: str, allow_destructive_chmod: bool) -> Non
     # stripped from the kernel child environment).
     if _bash_env_words_arm_shell_code(words):
         raise DestructiveChmodRefusalError(_format_chmod_bash_env_refusal())
+    # `hash -p pathname name` installs a command-hash entry by hand, so a
+    # later `name` runs `pathname` whatever the word looks like: those names
+    # scan as the command they run, and a registration the guard cannot read
+    # is refused, because the command it hides cannot be resolved at all.
+    hash_alias_names, hash_unreadable = _hash_registered_command_names(words)
+    if hash_unreadable:
+        raise DestructiveChmodRefusalError(_format_chmod_hash_alias_refusal())
     # A process substitution feeding a shell wrapper executes content the
     # guard cannot scan, so that wrapper form is refused.
     if re.search(r"[<>]\(|<<<", normalized) and _process_substitution_feeds_wrapper(normalized, words):
@@ -3097,17 +3392,6 @@ def _guard_destructive_chmod(command: str, allow_destructive_chmod: bool) -> Non
         raise DestructiveChmodRefusalError(_format_chmod_trap_refusal())
     if trap_reason:
         raise DestructiveChmodRefusalError(_payload_reason_message(trap_reason))
-    if any(os.path.basename(word.value) in _SCRIPT_INPUT_WRAPPERS for word in words):
-        # A bare shell wrapper executes a script file the guard cannot
-        # scan: inputs from outside the workspace (or unresolvable paths)
-        # are refused; in-workspace scripts and -c payloads stay fine.
-        script_reason = _unscanned_wrapper_script_reason(
-            raw, normalized, words, user_command_start
-        )
-        if script_reason == "relocation":
-            raise DestructiveChmodRefusalError(_format_chmod_relocation_refusal())
-        if script_reason:
-            raise DestructiveChmodRefusalError(_format_chmod_wrapper_script_refusal())
     if eval_reason == "recursive_chmod":
         # An eval payload hides where the recursion runs; refuse rather than
         # resolve a command the guard cannot see.
@@ -3129,11 +3413,30 @@ def _guard_destructive_chmod(command: str, allow_destructive_chmod: bool) -> Non
         raise DestructiveChmodRefusalError(
             _payload_reason_message(eval_reason or shell_c_reason)
         )
+    if any(os.path.basename(word.value) in _SCRIPT_INPUT_WRAPPERS for word in words):
+        # A bare shell wrapper executes a script file, or sources startup
+        # files, that the guard cannot scan: inputs from outside the
+        # workspace (or unresolvable paths) and login/interactive shells are
+        # refused; in-workspace scripts and plain -c payloads stay fine.
+        # This gate runs after the payload gates so a payload that itself
+        # hides a recursive chmod is reported as that payload, not as the
+        # wrapper around it.
+        script_reason = _unscanned_wrapper_script_reason(
+            raw, normalized, words, user_command_start
+        )
+        if script_reason == "relocation":
+            raise DestructiveChmodRefusalError(_format_chmod_relocation_refusal())
+        if script_reason == "startup":
+            raise DestructiveChmodRefusalError(_format_chmod_shell_startup_refusal())
+        if script_reason:
+            raise DestructiveChmodRefusalError(_format_chmod_wrapper_script_refusal())
     if _unresolvable_words_could_recurse(words, normalized):
         # A variable or substitution could expand into chmod/chown itself;
         # with a recursive flag present the run is refused, not guessed at.
         raise DestructiveChmodRefusalError(_format_chmod_unresolvable_command_refusal())
-    invocations = _find_recursive_chmod_chown_invocations(normalized, words)
+    invocations = _find_recursive_chmod_chown_invocations(
+        normalized, words, hash_alias_names
+    )
     if not invocations:
         return
     # The command prefix is user-configured shell setup replayed before every
@@ -3168,17 +3471,25 @@ def _guard_destructive_chmod(command: str, allow_destructive_chmod: bool) -> Non
             run_words.append(earlier.value)
             if earlier.starts_command:
                 break
-        head_value = run_words[-1] if run_words else ""
-        head_name = os.path.basename(head_value)
-        if head_name == "xargs":
-            raise DestructiveChmodRefusalError(_format_chmod_relocation_refusal())
-        if head_name == "env" and any(
-            token == "-C" or token == "--chdir" or token.startswith("--chdir=")
-            for token in run_words[:-1]
-        ):
-            raise DestructiveChmodRefusalError(_format_chmod_relocation_refusal())
-        if head_name == "find" and "-execdir" in run_words[:-1]:
-            raise DestructiveChmodRefusalError(_format_chmod_relocation_refusal())
+        run_words.reverse()
+        # xargs feeds paths on stdin the guard never sees, env -C/--chdir
+        # relocates before executing, and find -execdir runs the command in
+        # each searched directory: all three act outside the resolver's
+        # reach, so they are refused rather than checked. The whole wrapper
+        # chain is walked, not just its head (a relocation behind `nice` or
+        # `timeout` is the same relocation), and the walk stops at the
+        # command word itself: when the chmod word is the first word (index
+        # 0) there is nothing before it, and operands or later commands must
+        # not be read as a wrap.
+        for wrapper, tokens in _wrapper_chain_groups(run_words):
+            if wrapper == "xargs":
+                raise DestructiveChmodRefusalError(_format_chmod_relocation_refusal())
+            if wrapper == "env" and (
+                _env_option_value(tokens, "C", "chdir") is not None
+            ):
+                raise DestructiveChmodRefusalError(_format_chmod_relocation_refusal())
+            if wrapper == "find" and "-execdir" in tokens:
+                raise DestructiveChmodRefusalError(_format_chmod_relocation_refusal())
         effective_cwd = _resolve_chmod_effective_cwd(normalized[:start], user_command_start, workspace)
         if effective_cwd is _UNRESOLVABLE_CHMOD_CWD:
             raise DestructiveChmodRefusalError(_format_chmod_relocation_refusal())
@@ -3219,7 +3530,11 @@ def bash(command: str, *, allow_destructive_chmod: bool = False) -> BashHandle:
     cannot resolve (variable- or substitution-built command names, ANSI-C
     quoting, process substitutions feeding shell wrappers, BASH_ENV
     arming, CDPATH-affected relocations, nested quoted wrappers,
-    abbreviated recursive flags); retry with allow_destructive_chmod=True
+    abbreviated recursive flags, executor chains that relocate or feed
+    the invocation (xargs, env -C/--chdir, find -execdir), `env -S`
+    split strings, unreadable `hash -p` registrations, and login or
+    interactive shell wrappers that would source startup files);
+    retry with allow_destructive_chmod=True
     (or start the kernel with PI_BASH_ALLOW_DESTRUCTIVE_CHMOD=1) only when
     the recursion is intentional.
     """
