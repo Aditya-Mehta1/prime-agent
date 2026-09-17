@@ -266,6 +266,9 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
             "chmod -R 755 $HOME",
             "chmod -R 755 $HOME/anything",
             "chmod -R 755 ${HOME}/anything",
+            # Quote provenance is not tracked, so a single-quoted $HOME
+            # scans as its expansion: a named fail-closed over-refusal.
+            "chmod -R 755 '$HOME'",
             "chown -R user ~",
             "chown -R user $HOME",
             "chmod -R 755 /",
@@ -1439,6 +1442,48 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
                 message = await self._refused(command, home=home.name)
                 self.assertIn("Refusing to run this recursive chmod/chown command", message)
                 self.assertTrue(Path(home.name, "keep.txt").exists())
+
+    async def test_continuation_split_wrappers_stay_refused(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        # An in-word continuation is removed by the escape stripper, and the
+        # payload scanners read that stripped text, so a wrapper name the
+        # pair splits still folds to the wrapper word and its quoted payload
+        # is scanned. Fail-pre-fix rows: the scanners read the pre-strip
+        # text, scanned `ba<cont>sh` as `ba\nsh`, and the payload stayed
+        # hidden (verified as a live outside-workspace chmod through kernel
+        # spawns before the fix).
+        for command in [
+            "ba\\\nsh -c 'chmod -R 755 ~'",
+            "ev\\\nal 'chmod -R 755 ~'",
+            "en\\\nv -S 'chmod -R 755 ~'",
+            "tr\\\nap 'chmod -R 755 ~' EXIT",
+            "ali\\\nas x='chmod -R 755 ~'",
+            "bash <<'EOF'\nba\\\nsh -c 'chmod -R 755 ~'\nEOF",
+            # Between-words continuations keep the refusals they already had.
+            "chmod -R \\\n755 ~",
+            "sh -c 'chmod -R \\\n755 ~'",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command, home=home.name)
+                self.assertIn("Refusing to run this recursive chmod/chown command", message)
+                self.assertTrue(Path(home.name, "keep.txt").exists())
+
+    async def test_deep_substitution_nesting_refuses_cleanly(self):
+        # Hostile nesting must refuse with the guard's own error instead of
+        # crashing bash() with RecursionError (fail-pre-fix: ~500 quoted or
+        # ~900 unquoted levels exhausted the scan stack).
+        for command in [
+            'echo "' + "$(" * 500 + "echo x" + ")" * 500 + '"',
+            "echo " + "$(" * 900 + "echo x" + ")" * 900,
+        ]:
+            with self.subTest(nesting=len(command)):
+                message = await self._refused(command)
+                self.assertIn("nests more than", message)
+        # Shallow nesting still scans like before.
+        result = await self._run("echo $(dirname $(basename $(pwd)))")
+        self.assertEqual(result.exit_code, 0)
 
     async def test_refuses_compound_when_any_invocation_escapes(self):
         self._make_tree()

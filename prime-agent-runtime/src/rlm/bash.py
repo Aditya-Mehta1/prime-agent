@@ -1077,7 +1077,29 @@ def _locate_heredoc(command: str, operator: re.Match) -> tuple[str | None, int, 
     return delim, j, None, heredoc_tabs
 
 
-def _mask_shell_redirections(command: str) -> str:
+# The deepest nesting of command substitutions (`$(...)`, backticks) any
+# scan will recurse into. Real commands nest a handful of levels, so this
+# never trips on legitimate text; deeper nesting is hostile input that
+# would otherwise exhaust the scan stack (Python frames per level), and
+# hostile input must refuse, not crash.
+_MAX_SUBSTITUTION_NESTING = 100
+
+
+def _format_chmod_nesting_refusal() -> str:
+    return "\n".join(
+        [
+            "Refusing to run this command: its command text nests more"
+            f" than {_MAX_SUBSTITUTION_NESTING} levels of command"
+            " substitution, too deep for the guard to scan.",
+            "",
+            "Simplify the command, or retry with"
+            " bash(command, allow_destructive_chmod=True), or start the"
+            f" kernel with {BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV}=1.",
+        ]
+    )
+
+
+def _mask_shell_redirections(command: str, depth: int = 0) -> str:
     """Blank out shell redirection words, keeping character positions.
 
     The shell consumes redirections (`2>/dev/null`, `> log`, `2>&1`,
@@ -1086,7 +1108,12 @@ def _mask_shell_redirections(command: str) -> str:
     Only the operator and a fully static attached or next-word target are
     masked (pure syntax); quoted data, comments, command substitution, and
     process substitution stay live so the guard keeps seeing what executes.
+    Redirections inside a substitution or backtick are masked recursively;
+    hostile nesting deeper than `_MAX_SUBSTITUTION_NESTING` refuses with
+    the guard's own error instead of exhausting the Python stack.
     """
+    if depth > _MAX_SUBSTITUTION_NESTING:
+        raise DestructiveChmodRefusalError(_format_chmod_nesting_refusal())
     chars = list(command)
     quote: str | None = None
     comment = False
@@ -1169,24 +1196,24 @@ def _mask_shell_redirections(command: str) -> str:
         elif ch == "$" and chars[i + 1 : i + 2] == "(":
             # Command substitution inside double quotes still executes; mask
             # redirections inside it too (its own redirects are syntax).
-            depth = 0
+            paren_depth = 0
             j = i + 1
             while j < n:
                 if chars[j] == "(":
-                    depth += 1
+                    paren_depth += 1
                 elif chars[j] == ")":
-                    depth -= 1
-                    if depth == 0:
+                    paren_depth -= 1
+                    if paren_depth == 0:
                         break
                 j += 1
-            interior = _mask_shell_redirections(command[i + 2 : j])
+            interior = _mask_shell_redirections(command[i + 2 : j], depth + 1)
             chars[i + 2 : j] = list(interior)
             i = j
         elif ch == "`":
             j = i + 1
             while j < n and chars[j] != "`":
                 j += 1
-            interior = _mask_shell_redirections(command[i + 1 : j])
+            interior = _mask_shell_redirections(command[i + 1 : j], depth + 1)
             chars[i + 1 : j] = list(interior)
             i = j
         i += 1
@@ -1461,16 +1488,17 @@ def _expand_ansi_c_payloads(text: str) -> str:
 
 def _mark_contained_interiors(
     words: list[_ShellWord],
-    scan_region: "Callable[[int, int], None]",
+    scan_region: "Callable[..., None]",
     start: int,
     end: int,
+    depth: int,
 ) -> None:
     """Scan a substitution interior and mark every word it produced as
     contained: its span sits inside the enclosing word that follows, so
     walkers answer containment in O(1) via the flag instead of rescanning
     every later word."""
     mark_from = len(words)
-    scan_region(start, end, starts_command=True)
+    scan_region(start, end, starts_command=True, depth=depth + 1)
     for k in range(mark_from, len(words)):
         words[k] = replace(words[k], contained=True)
 
@@ -1484,11 +1512,18 @@ def _scan_shell_words(command: str) -> list[_ShellWord]:
     result itself stays in the enclosing word, so an operand carrying it
     reads as unresolvable. Redirections are masked by the caller. This is
     a conservative approximation, not a parse: anything it cannot represent
-    exactly ends up refused, never silently allowed.
+    exactly ends up refused, never silently allowed. Substitution interiors
+    recurse one scan per nesting level, so hostile nesting deeper than
+    `_MAX_SUBSTITUTION_NESTING` refuses with the guard's own error instead
+    of exhausting the Python stack.
     """
     words: list[_ShellWord] = []
 
-    def scan_region(start: int, end: int, *, starts_command: bool) -> None:
+    def scan_region(
+        start: int, end: int, *, starts_command: bool, depth: int = 0
+    ) -> None:
+        if depth > _MAX_SUBSTITUTION_NESTING:
+            raise DestructiveChmodRefusalError(_format_chmod_nesting_refusal())
         i = start
         value: list[str] = []
         word_start = -1
@@ -1505,7 +1540,7 @@ def _scan_shell_words(command: str) -> list[_ShellWord]:
             else:
                 first_word_pending = first_word_pending or starts_next_command
 
-        def scan_double_quote(j: int) -> int:
+        def scan_double_quote(j: int, depth: int) -> int:
             """Scan a double-quoted region starting just after its opening
             quote, folding escapes and scanning substitution interiors."""
             while j < end:
@@ -1519,7 +1554,7 @@ def _scan_shell_words(command: str) -> list[_ShellWord]:
                     break
                 if inner == "$" and command[j + 1 : j + 2] == "(":
                     close = _matching_paren(command, j + 1, end)
-                    _mark_contained_interiors(words, scan_region, j + 2, close)
+                    _mark_contained_interiors(words, scan_region, j + 2, close, depth)
                     value.append(command[j + 1 : close + 1])
                     j = close + 1
                     continue
@@ -1527,7 +1562,7 @@ def _scan_shell_words(command: str) -> list[_ShellWord]:
                     close = command.find("`", j + 1, end)
                     if close == -1:
                         close = end - 1
-                    _mark_contained_interiors(words, scan_region, j + 1, close)
+                    _mark_contained_interiors(words, scan_region, j + 1, close, depth)
                     value.append(command[j + 1 : close + 1])
                     j = close + 1
                     continue
@@ -1565,7 +1600,7 @@ def _scan_shell_words(command: str) -> list[_ShellWord]:
                 i = j + 1
                 continue
             if ch == '"':
-                i = scan_double_quote(i + 1)
+                i = scan_double_quote(i + 1, depth)
                 continue
             if ch == "$" and command[i + 1 : i + 2] == "'":
                 # ANSI-C quoting: bash folds $'...' escapes into the word
@@ -1578,11 +1613,11 @@ def _scan_shell_words(command: str) -> list[_ShellWord]:
             if ch == "$" and command[i + 1 : i + 2] == '"':
                 # $"..." is locale double quoting: it scans like a double
                 # quote (the `$` adds nothing to the word value).
-                i = scan_double_quote(i + 2)
+                i = scan_double_quote(i + 2, depth)
                 continue
             if ch == "$" and command[i + 1 : i + 2] == "(":
                 close = _matching_paren(command, i + 1, end)
-                _mark_contained_interiors(words, scan_region, i + 2, close)
+                _mark_contained_interiors(words, scan_region, i + 2, close, depth)
                 value.append(command[i + 1 : close + 1])
                 i = close + 1
                 continue
@@ -1590,7 +1625,7 @@ def _scan_shell_words(command: str) -> list[_ShellWord]:
                 close = command.find("`", i + 1, end)
                 if close == -1:
                     close = end - 1
-                _mark_contained_interiors(words, scan_region, i + 1, close)
+                _mark_contained_interiors(words, scan_region, i + 1, close, depth)
                 value.append(command[i + 1 : close + 1])
                 i = close + 1
                 continue
@@ -3469,20 +3504,24 @@ def _guard_destructive_chmod(command: str, allow_destructive_chmod: bool) -> Non
     # ANSI-C-encoded wrapper names (`e"val"`, `$'bash'`) fold to the
     # wrapper word in the scan even though no contiguous `eval`/`bash` text
     # appears, so the parsed words decide whether to scan wrapper payloads.
+    # The payload scanners re-tokenize their input, so they get the
+    # escape-stripped text: an in-word line continuation left in the
+    # pre-strip text would fold into the wrapper word's value (`ba<cont>sh`
+    # scans as `ba\nsh`, not `bash`) and hide the wrapper payload entirely.
     eval_reason = (
-        _eval_payloads_hide_recursive_chmod(resolved)
+        _eval_payloads_hide_recursive_chmod(normalized)
         if any(word.value == "eval" for word in words)
         or re.search(r"\beval\b", normalized)
         else None
     )
     shell_c_reason = (
-        _shell_c_payloads_hide_recursive_chmod(resolved)
+        _shell_c_payloads_hide_recursive_chmod(normalized)
         if any(os.path.basename(word.value) in _SHELL_C_INTERPRETERS for word in words)
         or re.search(r"\b(?:sh|bash|zsh|dash|ksh)\b", normalized)
         else None
     )
     alias_reason = (
-        _alias_payloads_hide_recursive_chmod(resolved)
+        _alias_payloads_hide_recursive_chmod(normalized)
         if any(os.path.basename(word.value) == "alias" for word in words)
         or re.search(r"\balias\b", normalized)
         else None
@@ -3497,7 +3536,7 @@ def _guard_destructive_chmod(command: str, allow_destructive_chmod: bool) -> Non
         # shell code, which the guard cannot scan statically.
         raise DestructiveChmodRefusalError(_format_chmod_pipe_fed_wrapper_refusal())
     env_s_reason = (
-        _env_split_string_payloads_hide_recursive_chmod(resolved)
+        _env_split_string_payloads_hide_recursive_chmod(normalized)
         if any(os.path.basename(word.value) == "env" for word in words)
         or re.search(r"\benv\b", normalized)
         else None
@@ -3508,7 +3547,7 @@ def _guard_destructive_chmod(command: str, allow_destructive_chmod: bool) -> Non
     if env_s_reason:
         raise DestructiveChmodRefusalError(_payload_reason_message(env_s_reason))
     trap_reason = (
-        _trap_payloads_hide_recursive_chmod(resolved)
+        _trap_payloads_hide_recursive_chmod(normalized)
         if any(word.value == "trap" for word in words)
         else None
     )
