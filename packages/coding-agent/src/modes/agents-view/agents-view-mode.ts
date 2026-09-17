@@ -326,10 +326,10 @@ interface OpenedAgentsViewSession {
  * prepare + supervisor stop + 60s successor startup + session restore), the
  * same budget attached sessions get to reconnect after an update.
  */
-export const DAEMON_UPDATE_RESTART_OPEN_WAIT_MS = 240_000;
+const DAEMON_UPDATE_RESTART_OPEN_WAIT_MS = 240_000;
 const DAEMON_UPDATE_RESTART_OPEN_RETRY_MS = 500;
 
-export interface DaemonUpdateRestartWaitResult<T> {
+interface DaemonUpdateRestartWaitResult<T> {
 	result: T;
 	waitedForUpdateRestart: boolean;
 }
