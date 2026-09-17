@@ -43,67 +43,41 @@ def _invocations(command: str) -> list[tuple[int, int, int]]:
 # a chown without -R never match. Quoted command words and quoted flags fold
 # into their values, so they must match like the unquoted forms.
 CHMOD_MATCHING_COMMANDS = [
-    "chmod -R 755 sub",
-    "chmod --recursive 755 sub",
-    "chmod -vR 755 sub",
-    "chmod -R 755 sub --reference=/tmp/mode",
-    "chmod sub -R 755",
-    "chmod 755 -R sub",
-    "chown -R user sub",
-    "chown --recursive user:group sub",
-    "chown sub -R user",
-    "chmod -R 755",
-    "chmod -R 755 sub && chown -R user sub",
-    "chmod -R 755 sub; echo done",
-    "/bin/chmod -R 755 sub",
-    '"chmod" -R 755 sub',
-    "chmod '-R' 755 sub",
-    '"chown" "-R" user sub',
-    "\\chmod -R 755 sub",
-    "sudo chmod -R 755 sub",
-    "FOO=1 chmod -R 755 sub",
-    "chmod -R \\\n755 sub",
-    "chmod 2>/dev/null -R 755 sub",
-    "chmod -R 755 sub 2>/dev/null",
-    "chmod -R 755 &>/dev/null sub",
-    "chmod -R 755 -- sub",
-    "(chmod -R 755 sub)",
-    "{ chmod -R 755 sub; }",
-    "echo $(chmod -R 755 sub)",
-    "chmod -R 755 sub # cleanup",
+    "chmod -R 755 sub", "chmod --recursive 755 sub",
+    "chmod -vR 755 sub", "chmod -R 755 sub --reference=/tmp/mode",
+    "chmod sub -R 755", "chmod 755 -R sub",
+    "chown -R user sub", "chown --recursive user:group sub",
+    "chown sub -R user", "chmod -R 755",
+    "chmod -R 755 sub && chown -R user sub", "chmod -R 755 sub; echo done",
+    "/bin/chmod -R 755 sub", '"chmod" -R 755 sub',
+    "chmod '-R' 755 sub", '"chown" "-R" user sub',
+    "\\chmod -R 755 sub", "sudo chmod -R 755 sub",
+    "FOO=1 chmod -R 755 sub", "chmod -R \\\n755 sub",
+    "chmod 2>/dev/null -R 755 sub", "chmod -R 755 sub 2>/dev/null",
+    "chmod -R 755 &>/dev/null sub", "chmod -R 755 -- sub",
+    "(chmod -R 755 sub)", "{ chmod -R 755 sub; }",
+    "echo $(chmod -R 755 sub)", "chmod -R 755 sub # cleanup",
     "xargs chmod -R 755",
     # ANSI-C quoting folds into the word exactly like bash: $'chmod' scans
     # as chmod and $'-R' as -R, so both forms match like their unquoted
     # spellings, and $"..." (locale quoting) matches like double quotes.
-    "$'chmod' -R 755 sub",
-    "chmod $'-R' 755 sub",
-    '$"chmod" -R 755 sub',
-    "chmod -R 755 $'sub'",
+    "$'chmod' -R 755 sub", "chmod $'-R' 755 sub",
+    '$"chmod" -R 755 sub', "chmod -R 755 $'sub'",
     # GNU accepts every unambiguous prefix of --recursive: --rec through
     # --recursiv all run recursively.
-    "chmod --rec 755 sub",
-    "chmod --recur 755 sub",
-    "chmod --recursiv 755 sub",
-    "chown --recurs user sub",
+    "chmod --rec 755 sub", "chmod --recur 755 sub",
+    "chmod --recursiv 755 sub", "chown --recurs user sub",
 ]
 
 CHMOD_NON_MATCHING_COMMANDS = [
-    "chmod 755 sub",
-    "chmod -v 755 sub",
-    "chmod --changes 755 sub",
-    "chmod -r 755 sub",
-    "chmod +x sub",
-    "chmod 755 .git",
-    "chown user sub",
-    "chown -h user sub",
-    "chown user:group sub",
-    "chmod -- 755 sub",
-    "echo 'chmod -R 755 ~'",
-    'echo "chmod -R 755 ~"',
-    "# chmod -R 755 sub",
-    "echo one \\\n two",
-    "git status",
-    "echo hello world",
+    "chmod 755 sub", "chmod -v 755 sub",
+    "chmod --changes 755 sub", "chmod -r 755 sub",
+    "chmod +x sub", "chmod 755 .git",
+    "chown user sub", "chown -h user sub",
+    "chown user:group sub", "chmod -- 755 sub",
+    "echo 'chmod -R 755 ~'", 'echo "chmod -R 755 ~"',
+    "# chmod -R 755 sub", "echo one \\\n two",
+    "git status", "echo hello world",
     "npm run check",
     # ANSI-C quoting of plain data stays data: an echoed payload never
     # scans as a command.
@@ -111,8 +85,7 @@ CHMOD_NON_MATCHING_COMMANDS = [
     # --reference and --recursive share the --re prefix: the ambiguous
     # --ref is not a recursive flag (GNU rejects it as ambiguous), and
     # neither is any other long option.
-    "chmod --ref 755 sub",
-    "chmod --reference=/tmp/mode 755 sub",
+    "chmod --ref 755 sub", "chmod --reference=/tmp/mode 755 sub",
     "chmod --changes 755 sub",
 ]
 
@@ -1217,16 +1190,11 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         for command in [
             "env -C / chmod -R 755 .",
             "env --chdir / chmod -R 755 .",
-            "env -C/ chmod -R 755 .",
-            "env -iC / chmod -R 755 .",
-            "env --chdir=/ chown -R user .",
-            "env -C ~ chmod -R 755 .",
-            "find / -execdir chmod -R 755 . \\;",
-            "find . -execdir chown -R user . +",
-            # The wrapper chain is walked, not just its head: a relocation
-            # behind another executor is the same relocation.
-            "nice env -C / chmod -R 755 .",
-            "timeout 5 env -C / chmod -R 755 .",
+            "env -C/ chmod -R 755 .", "env -iC / chmod -R 755 .",
+            "env --chdir=/ chown -R user .", "env -C ~ chmod -R 755 .",
+            "find / -execdir chmod -R 755 . \\;", "find . -execdir chown -R user . +",
+            # The wrapper chain is walked, not just its head.
+            "nice env -C / chmod -R 755 .", "timeout 5 env -C / chmod -R 755 .",
             "nice xargs chmod -R 755",
         ]:
             with self.subTest(command=command):
@@ -1248,79 +1216,59 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
             "env -S 'chmod -R 755 ~'",
             'env -S "chown -R user ~"',
             "env --split-string='chmod -R 755 ~'",
-            "env -S'chmod -R 755 ~'",
-            "env -iS 'chown -R user ~'",
-            # Every `env -S` string counts: a clean one does not make a later
-            # one safe, and a payload wrapper carries its own.
-            "env -S 'echo hi' -S 'chmod -R 755 ~'",
+            # Every `env -S` string counts, in every spelling, and one the guard
+            # cannot read is refused rather than guessed at.
+            "env -S'chmod -R 755 ~'", "env -iS 'chown -R user ~'",
+            "env -S 'echo hi' -S 'chmod -R 755 ~'", "eval 'env -S \"chmod -R 755 ~\"'",
             "env -S 'echo hi'; env -S 'chmod -R 755 ~'",
-            "eval 'env -S \"chmod -R 755 ~\"'",
             "bash -c 'env -S \"chown -R user ~\"'",
-            # A string the guard cannot read is refused, not guessed at.
             'env -S "$CMD -R 755 ~"',
         ]:
             with self.subTest(command=command):
                 message = await self._refused(command, home=home.name)
                 self.assertIn("Refusing to run this recursive chmod/chown command", message)
                 self.assertTrue(Path(home.name, "keep.txt").exists())
-        result = await self._run("env -S 'echo hi'")
-        self.assertEqual(result.exit_code, 0)
-        result = await self._run("env -iS 'echo hi'")
-        self.assertEqual(result.exit_code, 0)
+        for command in ["env -S 'echo hi'", "env -iS 'echo hi'"]:
+            result = await self._run(command)
+            self.assertEqual(result.exit_code, 0)
 
     async def test_refuses_hash_registered_command_names(self):
-        self._make_tree()
         home = tempfile.TemporaryDirectory()
         self.addCleanup(home.cleanup)
         Path(home.name, "keep.txt").write_text("keep\n")
-        # `hash -p pathname name` installs a command-hash entry by hand, so
-        # the registered name runs that file whatever the word looks like.
+        # `hash -p pathname name` installs a command-hash entry by hand, so the
+        # registered name runs that file whatever the word looks like; a
+        # registration the guard cannot read is refused, one that names another
+        # command keeps that command, and one nobody uses changes nothing.
         for command in [
-            "hash -p /bin/chmod safe; safe -R 755 ~",
+            "hash -p /bin/chmod safe; safe -R 755 ~", "hash -p /bin/chmod safe; echo hi; safe -R 755 ~",
             "hash -p /usr/bin/chown safe; safe -R user ~",
-            "hash -p /bin/chmod safe; echo hi; safe -R 755 ~",
         ]:
             with self.subTest(command=command):
                 message = await self._refused(command, home=home.name)
                 self.assertIn("Refusing to run this recursive chmod/chown command", message)
                 self.assertTrue(Path(home.name, "keep.txt").exists())
-        # A registration whose target the guard cannot read could point
-        # anywhere, so it is refused rather than guessed at.
         message = await self._refused('hash -p "$DIR/chmod" safe; safe -R 755 sub')
         self.assertIn("command-hash entry", message)
-        # A registration that names another command keeps that command, and a
-        # registration nobody uses changes nothing.
-        result = await self._run("hash -p /bin/echo safe; safe -R 755 sub")
-        self.assertEqual(result.exit_code, 0)
-        result = await self._run("hash -p /bin/chmod safe")
-        self.assertEqual(result.exit_code, 0)
+        for command in ["hash -p /bin/echo safe; safe -R 755 sub", "hash -p /bin/chmod safe"]:
+            self.assertEqual((await self._run(command)).exit_code, 0)
 
     async def test_refuses_shell_startup_files(self):
-        # A login or interactive shell sources profile and rc files before
-        # it runs the payload it was given, so the wrapper cannot be treated
-        # as governed by its `-c` text.
+        # A login or interactive shell sources profile and rc files before it
+        # runs the payload it was given, so its `-c` text does not govern it; a
+        # non-login wrapper stays governed, and an rcfile without -i is not read
+        # by bash at all.
         Path(self.test_dir, "guard-ok.sh").write_text("echo ok\n")
         for command in [
-            "bash -l -c ':'",
-            "bash --login -c ':'",
-            "bash -lc ':'",
-            "bash -i -c ':'",
-            "bash --interactive -c ':'",
-            "bash -ilc ':'",
-            "sh -l -c ':'",
-            "bash --rcfile /tmp/evilrc -i -c ':'",
-            "bash --init-file /tmp/evilrc -i -c ':'",
+            "bash -l -c ':'", "bash --login -c ':'", "bash -lc ':'", "bash -i -c ':'",
+            "bash --interactive -c ':'", "bash -ilc ':'", "sh -l -c ':'",
+            "bash --rcfile /tmp/evilrc -i -c ':'", "bash --init-file /tmp/evilrc -i -c ':'",
             "bash -c 'bash -l -c \":\"'",
         ]:
             with self.subTest(command=command):
-                message = await self._refused(command)
-                self.assertIn("starts a login or interactive shell", message)
-        # A non-login, non-interactive wrapper stays governed by its payload,
-        # and an rcfile without -i is not read by bash at all.
-        result = await self._run("bash -xc 'echo hi'")
-        self.assertEqual(result.exit_code, 0)
-        result = await self._run("bash --rcfile /tmp/guard-rc ./guard-ok.sh")
-        self.assertEqual(result.exit_code, 0)
+                self.assertIn("starts a login or interactive shell", await self._refused(command))
+        for command in ["bash -xc 'echo hi'", "bash --rcfile /tmp/guard-rc ./guard-ok.sh"]:
+            self.assertEqual((await self._run(command)).exit_code, 0)
 
     async def test_command_prefix_relocation_refuses_wrapper_scripts(self):
         self._make_tree()
@@ -1335,13 +1283,9 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("changes directory", message)
         # A word that only shares a wrapper's name does not run a script, so
         # the relocating prefix does not refuse the command.
-        with mock.patch.dict(
-            os.environ,
-            {"PRIME_AGENT_BASH_COMMAND_PREFIX": "cd /tmp"},
-        ):
+        with mock.patch.dict(os.environ, {"PRIME_AGENT_BASH_COMMAND_PREFIX": "cd /tmp"}):
             for command in ["echo bash", "ls .", "echo source"]:
-                result = await self._run(command)
-                self.assertEqual(result.exit_code, 0)
+                self.assertEqual((await self._run(command)).exit_code, 0)
 
     async def test_bundled_option_values_do_not_skip_scripts(self):
         self._make_tree()
@@ -1376,9 +1320,8 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("outside the kernel workspace", message)
         message = await self._refused("PATH=/nonexistent source x.sh")
         self.assertIn("outside the kernel workspace", message)
-        # An append assignment changes the search path just like a plain one.
-        message = await self._refused("PATH+=/nonexistent source x.sh")
-        self.assertIn("outside the kernel workspace", message)
+        # An append assignment changes the search path like a plain one.
+        self.assertIn("outside the kernel workspace", await self._refused("PATH+=/nonexistent source x.sh"))
 
     async def test_xargs_false_positives_stay_allowed(self):
         # The xargs walk must stop at the command word: an operand named
