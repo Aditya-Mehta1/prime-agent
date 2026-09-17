@@ -210,6 +210,13 @@ pub async fn run_interactive(
                 UiInput::HeadlessDone => headless_done = true,
                 UiInput::WaitIdle { .. } => unreachable!("barrier handled above"),
             }
+            // Paint the handled input in this iteration: the select below can
+            // otherwise wait out its 50ms tick before the next draw, and
+            // that wait is felt directly as keystroke-to-render lag.
+            if let Some(renderer) = renderer.is_terminal_mut() {
+                crate::app::draw(renderer, &mut view)?;
+                session.dirty = false;
+            }
         }
         if headless_done
             && pending.is_empty()

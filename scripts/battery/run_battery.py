@@ -40,10 +40,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import batterylib as B  # noqa: E402
+import perf as P  # noqa: E402
 
 NL = chr(10)
 
-ALL_FLOWS = ["f1_launch", "f2_prompt", "f3_tool", "f4_commands", "f5_side_questions", "f6_attach", "f7_compaction", "f8_resume", "f9_agents_view"]
+ALL_FLOWS = ["f1_launch", "f2_prompt", "f3_tool", "f4_commands", "f5_side_questions", "f6_attach", "f7_compaction", "f8_resume", "f9_agents_view", "f10_perf"]
+
+# PERF row thresholds, measured on this box by scripts/battery/perf.py:
+# the invariant is that the Rust binary is never materially slower than
+# the TS binary on cold startup or keystroke-to-render latency.
+PERF_STARTUP_MAX_RATIO = 1.5
+PERF_TYPING_MAX_RATIO = 1.5
+PERF_RUNS = 3
 
 HELLO_TEXT = "battery hello from mock"
 # The dashboard status-line model the TS daemon asks after each turn (B-7).
@@ -954,6 +962,145 @@ class Battery:
                 flow,
                 "visual",
                 f"{side.name}: agents view frame captured (see evidence); frame-level diffing belongs to the visual-parity lane",
+                gap=False,
+            )
+
+    # -- perf -----------------------------------------------------------------
+
+    def perf_onboard(self, side: B.Side) -> None:
+        """Settle first-run dialogs (the TS trace notice) once before measuring,
+        so measured launches settle straight into the main screen."""
+        socket = side.root / "perf" / "onboard.sock"
+        socket.parent.mkdir(parents=True, exist_ok=True)
+        if socket.exists():
+            socket.unlink()
+        session = f"{self.runid}-perf-onboard-{side.name}"
+        argv = [side.binary, "--daemon-socket", str(socket), "--offline"]
+        B.tmux_launch(session, argv, side.env, side.work_dir)
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            frame = B.tmux_capture(session)
+            if "Share agent traces" in frame:
+                B.tmux_send(session, "Down")
+                time.sleep(0.5)
+                B.tmux_send(session, "Enter")
+                time.sleep(1.0)
+            elif P.is_ready(side.name, frame):
+                break
+            else:
+                time.sleep(0.5)
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if P.is_ready(side.name, B.tmux_capture(session)):
+                break
+            time.sleep(0.5)
+        B.tmux_kill(session)
+        P.stop_perf_daemon(socket)
+
+    def f10_perf(self) -> None:
+        """PERF row: cold startup + keystroke-to-render latency, Rust vs TS."""
+        flow = "f10_perf"
+        measurements: dict[str, dict] = {}
+        for side in (self.sides["ts"], self.sides["rust"]):
+            self.perf_onboard(side)
+            binary_path = shutil.which(side.binary) or side.binary
+            binary_bytes = None
+            if Path(binary_path).is_file():
+                binary_bytes = os.path.getsize(binary_path)
+            measurements[side.name] = {
+                "binary": side.binary,
+                "binary_bytes": binary_bytes,
+                "ready_s": [],
+                "first_frame_s": [],
+                "typing_ms": [],
+            }
+        # Interleave the measured launches (ts run i, rust run i, ts run i+1,
+        # ...) so background load on the box hits both sides evenly; a
+        # per-side block would let one side measure during a build and bias
+        # the differential.
+        for i in range(PERF_RUNS):
+            for side in (self.sides["ts"], self.sides["rust"]):
+                socket = side.root / "perf" / f"sock-{i}.sock"
+                rec = P.measure_launch(
+                    side, f"{self.runid}-perf-{side.name}-{i}", socket
+                )
+                side.evidence_json(flow, f"launch-{i}.json", rec)
+                P.stop_perf_daemon(socket)
+                if rec["ready_s"] is None:
+                    self.record(
+                        flow,
+                        "perf",
+                        f"{side.name}: measured launch {i} never reached an interactive-ready frame within 60s",
+                        evidence=side.root / flow / f"launch-{i}.json",
+                    )
+                    continue
+                bucket = measurements[side.name]
+                bucket["ready_s"].append(rec["ready_s"])
+                bucket["first_frame_s"].append(rec["first_frame_s"] or rec["ready_s"])
+                bucket["typing_ms"].extend(rec["typing_ms"])
+        for side in (self.sides["ts"], self.sides["rust"]):
+            bucket = measurements[side.name]
+            side.evidence_json(flow, "summary.json", bucket)
+            ready = P.median(bucket["ready_s"])
+            typing = P.summarize(bucket["typing_ms"])
+            if ready is not None:
+                self.record(
+                    flow,
+                    "perf",
+                    f"{side.name}: cold startup to interactive-ready median {ready:.3f}s "
+                    f"over {len(bucket['ready_s'])} launches (first frame median {P.median(bucket['first_frame_s']):.3f}s); "
+                    f"typing latency median {typing['median']}ms, p95 {typing['p95']}ms "
+                    f"over {typing['n']} keystrokes",
+                    gap=False,
+                )
+        ts = measurements["ts"]
+        rs = measurements["rust"]
+        # Startup threshold: rust median cold startup vs the TS binary.
+        ts_ready = P.median(ts["ready_s"])
+        rs_ready = P.median(rs["ready_s"])
+        if ts_ready is not None and rs_ready is not None:
+            ratio = rs_ready / ts_ready
+            detail = (
+                f"startup: rust {rs_ready:.3f}s vs ts {ts_ready:.3f}s cold-ready median "
+                f"(ratio {ratio:.2f}, threshold {PERF_STARTUP_MAX_RATIO})"
+            )
+            if ratio <= PERF_STARTUP_MAX_RATIO:
+                self.record(flow, "perf", detail, gap=False)
+            else:
+                self.record(flow, "perf", f"REGRESSION {detail}", evidence=rs["binary"])
+        else:
+            self.record(flow, "perf", "startup threshold not evaluable: a side never reached ready", gap=True)
+        # Typing threshold: rust p95 keystroke latency vs the TS binary.
+        ts_p95 = P.summarize(ts["typing_ms"]).get("p95")
+        rs_p95 = P.summarize(rs["typing_ms"]).get("p95")
+        if ts_p95 is not None and rs_p95 is not None:
+            ratio = rs_p95 / ts_p95
+            detail = (
+                f"typing: rust p95 {rs_p95}ms vs ts p95 {ts_p95}ms keystroke-to-render "
+                f"(ratio {ratio:.2f}, threshold {PERF_TYPING_MAX_RATIO})"
+            )
+            if ratio <= PERF_TYPING_MAX_RATIO:
+                self.record(flow, "perf", detail, gap=False)
+            else:
+                self.record(flow, "perf", f"REGRESSION {detail}", evidence=rs["binary"])
+        else:
+            self.record(flow, "perf", "typing threshold not evaluable: a side produced no keystroke samples", gap=True)
+        # Release-build note: the perf row is only meaningful against a
+        # release build; a debug binary is a finding, not a baseline.
+        size_mb = (rs["binary_bytes"] or 0) / 1_000_000
+        if "/debug/" in rs["binary"] or (rs["binary_bytes"] or 0) > 100_000_000:
+            self.record(
+                flow,
+                "perf",
+                f"rust binary measured is a debug build ({rs['binary']}, {size_mb:.0f}MB); "
+                "the perf posture is cargo build --release",
+                evidence=rs["binary"],
+            )
+        else:
+            self.record(
+                flow,
+                "perf",
+                f"rust binary measured: {rs['binary']} ({size_mb:.1f}MB, release posture)",
                 gap=False,
             )
 
