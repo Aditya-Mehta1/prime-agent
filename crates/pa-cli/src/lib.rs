@@ -15,6 +15,7 @@ pub(crate) mod daemon_discovery;
 pub(crate) mod daemon_mode;
 pub(crate) mod daemon_session_list;
 pub(crate) mod global_flags;
+pub(crate) mod headless_autonomous;
 pub(crate) mod initial_message;
 pub(crate) mod interactive_mode;
 pub(crate) mod list_models;

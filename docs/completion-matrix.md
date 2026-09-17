@@ -39,7 +39,7 @@ below is evidence-based, not battery-based.
 | 17 | Session persistence | partial | entry-set parity + `toolResult` entries landed; per-entry gaps remain elsewhere |
 | 18 | First-run onboarding | complete | - |
 | 19 | Trace sharing | missing | opt-in setting persists; no upload subsystem, `/traces` UI unavailable |
-| 20 | Eval / verifiers Prime flow | missing | not started |
+| 20 | Eval / verifiers Prime flow | partial | headless verifier gates (print/json) landed; `prime eval` hosted platform CLI is out of coding-agent scope; daemon RPC driving pending |
 | 21 | Native release / installer / CI | missing | binary does not ship the kernel runtime sidecar; `PI_PACKAGE_DIR` workaround |
 | 22 | Platform readiness (Windows) | in-flight | traits audited (`docs/windows-readiness.md`); no shipping support yet |
 
@@ -314,10 +314,35 @@ The opt-in setting persists (`set_agent_traces_enabled`,
 exist in Rust, and `/traces` (the command the onboarding note advertises) is a
 client command without a UI (family 3).
 
-## 20. Eval / verifiers Prime flow - missing
+## 20. Eval / verifiers Prime flow - partial
 
-The Prime Intellect evals/verifiers integration surface has no Rust
-implementation and no lane yet.
+Diagnosis (lane `eval-composition`): the TS coding-agent has no eval command.
+Verifier flows ride existing product seams - CLI autonomous flags
+(`--autonomous`, `--autonomous-gate <command>`, ...) driving a session
+headlessly, the configured gate command being the verifier (run in the
+session cwd with retries/timeouts, `pa-core/autonomous`, #98), completion
+observed through durable `autonomous_status` rows, the json event stream, or
+ACP `_meta.autonomous`.
+
+Landed with this lane: the headless print/json composition (pa-cli
+`headless_autonomous` module; no eval code in pa-core) - CLI flags build the
+autonomous run state, the gate loop runs after every settled turn,
+continuations are durable user rows, the stop surfaces as a durable
+`autonomous_status` row plus its `message_end` events, and the process exit
+code follows the TS print-mode contract (gate still failing after retries ->
+exit 1 with the stderr line; autonomous run without gates stopped by a limit
+-> exit 1 "stopped before terminal evidence"). Binary-level verifier:
+`crates/pa-cli/tests/eval_composition_e2e.rs` (fixture verifier scripts,
+faux provider, isolated HOME; no daemon sockets touched).
+
+Product boundary: `prime eval run/list/get/...` on this box is the Prime
+Intellect platform CLI (hosted evals over verifiers environments) - a separate
+product from `prime-agent`, not part of the TS coding-agent CLI and therefore
+outside this repo's parity surface. The coding agent's role is being the
+harness those environments drive headlessly.
+
+Remaining: verifier flows over the daemon RPC mode (unwired, family 16), and
+ACP autonomous-meta observation exercised by a live verifier harness.
 
 ## 21. Native release / installer / CI - missing
 

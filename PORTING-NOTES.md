@@ -499,3 +499,41 @@ HEAD
   `ScriptedEngine`, whose `run_prompt` does not parse session commands —
   use the `{"engine": "faux", "responses": [...]}` script form to drive the
   real agent engine (with session-command admission) in TUI e2e tests.
+
+
+## Eval/verifiers composition (eval-composition lane)
+
+- TS inventory: the coding-agent has no `eval` command. Verifier flows ride
+  the autonomous gate mechanism (TS `core/autonomous.ts`, ported in #98) plus
+  headless modes: print (`-p` / non-TTY) and `--mode json` stream
+  `session_event` frames on stdout; ACP carries `_meta.autonomous` per
+  completion. `prime eval ...` on PATH is the Prime Intellect platform CLI
+  (a separate product, hosted evals over verifiers environments) — outside the
+  coding-agent parity surface; recorded in docs/completion-matrix.md family 20.
+- Headless autonomous loop (pa-cli `headless_autonomous.rs`, port of
+  `modes/print-mode.ts` + the gate half of `headless-completion.ts`): CLI
+  autonomous flags build `AutonomousRuntimeState` (TS
+  `runtimeAutonomousConfigFromArgs`: any autonomous flag enables the run);
+  a subscription forwards every settled assistant message to the driver
+  (per-message accounting); after each settled prompt the driver decides —
+  gate-failure continuation injected as the next turn (a durable user row),
+  or stop, persisting the `autonomous_status` stop row into the session and
+  emitting it as `message_start`+`message_end` events (the daemon worker's
+  custom-row wire shape).
+- Exit-code contract (print-mode.ts): a configured gate still failing after
+  its retry window (with or without a limit) -> stderr
+  `Autonomous quality gate still failing after attempt N/M: <exit text>[;
+  autonomous limit reached: ...]` + exit 1; an autonomous run without gates
+  stopped by a limit -> stderr `Autonomous run stopped before terminal
+  evidence; <limit reached (used/cap)>` + exit 1; gate pass -> exit 0. The
+  contract applies to both text and json output modes; the stop row never
+  prints to stdout in text mode.
+- Scope cut vs TS: `waitForHeadlessCompletion`'s host-side gate-failure
+  re-injection after an errored model turn (TS retries failing gates even
+  when the turn ended `error`/`aborted`) is not ported yet; the per-turn
+  driver loop covers the gate-failed and limit paths. Same cut as the ACP
+  transport.
+- Verifier: `crates/pa-cli/tests/eval_composition_e2e.rs` drives the built
+  binary with fixture verifier scripts (counter-file verifier + always-fail
+  verifier) over the faux provider in isolated HOMEs — no network, no daemon
+  sockets.

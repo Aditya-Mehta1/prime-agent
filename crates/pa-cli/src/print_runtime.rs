@@ -10,6 +10,7 @@ use pa_core::session::discovery::{
 };
 use pa_types::ai::Model;
 
+use crate::headless_autonomous::{autonomous_runtime_config, HeadlessAutonomous};
 use crate::mode::{AppMode, MissingSubsystem, RunOptions};
 use pa_core::session_engine::provider_adapter::{
     json_round_trip, map_thinking_level, real_stream_fn,
@@ -114,29 +115,6 @@ async fn acp_mode_main(options: &RunOptions) -> Result<i32, String> {
     .await
     .map_err(|error| format!("{error:#}"))?;
     Ok(exit_code)
-}
-
-/// The autonomous runtime config from the typed CLI flags.
-fn autonomous_runtime_config(
-    config: &crate::args::AutonomousConfig,
-) -> pa_core::autonomous::AgentAutonomousConfig {
-    pa_core::autonomous::AgentAutonomousConfig {
-        enabled: Some(true),
-        max_continuations: config.max_continuations.map(u64::from),
-        max_turns: config.max_turns.map(u64::from),
-        max_tokens: config.max_tokens,
-        timeout_ms: config.timeout_ms,
-        continuation_prompt: None,
-        gates: config
-            .gates
-            .as_ref()
-            .map(|gates| pa_core::autonomous::AgentAutonomousGateConfig {
-                commands: Some(gates.commands.clone()),
-                max_retries: gates.max_retries.map(u64::from),
-                timeout_ms: gates.timeout_ms,
-            }),
-        subagent_keep_alive_ms: None,
-    }
 }
 
 fn run_print_mode(options: &RunOptions) -> Result<i32, String> {
@@ -521,13 +499,18 @@ fn builtin_tools(_cwd: &std::path::Path) -> Vec<Arc<dyn pa_agent::types::AgentTo
 }
 
 /// Admit prompts, stream json events when requested, and decide the exit code
-/// from the headless terminal result. Shared by the real and faux paths.
+/// from the headless terminal result plus the autonomous gate contract.
+/// Shared by the real and faux paths. When autonomous flags are present the
+/// gate loop runs after every settled prompt: continuations stream like any
+/// other turn, and a stop surfaces the durable `autonomous_status` row as a
+/// `message_end` event before the process exits.
 async fn run_prompts_and_emit(
     engine: &pa_core::session_engine::engine::SessionEngine,
     options: &RunOptions,
 ) -> Result<i32, String> {
+    let json_mode = options.app_mode == AppMode::Json;
     let mut unsubscribe: Option<pa_agent::agent::Subscription> = None;
-    if options.app_mode == AppMode::Json {
+    if json_mode {
         let header = session_header_json(engine, &options.config.cwd).await;
         println!("{header}");
         unsubscribe = Some(
@@ -545,6 +528,17 @@ async fn run_prompts_and_emit(
                 .await,
         );
     }
+    // The autonomous run from the CLI flags (the verifier/eval composition
+    // seam): per-message accounting plus the gate continuation loop.
+    let autonomous = options
+        .config
+        .autonomous
+        .as_ref()
+        .map(|config| HeadlessAutonomous::from_cli(config, &options.config.cwd));
+    let mut accounting: Option<pa_agent::agent::Subscription> = None;
+    if let Some(run) = &autonomous {
+        accounting = Some(run.wire_accounting(engine.session.agent()).await);
+    }
     for prompt in options
         .initial_message
         .iter()
@@ -556,6 +550,18 @@ async fn run_prompts_and_emit(
             .await
             .map_err(|error| format!("{error:#}"))?;
         engine.session.agent().wait_for_idle().await;
+        if let Some(run) = &autonomous {
+            if let Some(row) = run
+                .drive(engine)
+                .await
+                .map_err(|error| format!("{error:#}"))?
+            {
+                emit_stop_row_events(json_mode, &row);
+            }
+        }
+    }
+    if let Some(subscription) = accounting {
+        subscription.unsubscribe().await;
     }
     if let Some(subscription) = unsubscribe {
         subscription.unsubscribe().await;
@@ -565,7 +571,7 @@ async fn run_prompts_and_emit(
         state.messages.iter().filter_map(json_round_trip).collect();
     let result = pa_core::session_engine::headless::select_headless_terminal_result(&messages);
     let mut exit_code = 0;
-    if options.app_mode == AppMode::Json {
+    if json_mode {
         if let Some(primary) = &result.primary {
             primary.stderr_text(&mut exit_code);
         }
@@ -574,31 +580,51 @@ async fn run_prompts_and_emit(
                 exit_code = 1;
             }
         }
-        return Ok(exit_code);
-    }
-    match result.primary {
-        Some(primary) => {
-            if let Some(stderr) = primary.stderr_text(&mut exit_code) {
-                eprintln!("{stderr}");
-            }
-            if exit_code == 0 {
-                if let Some(text) = primary.stdout_text() {
-                    println!("{text}");
+    } else {
+        match result.primary {
+            Some(primary) => {
+                if let Some(stderr) = primary.stderr_text(&mut exit_code) {
+                    eprintln!("{stderr}");
+                }
+                if exit_code == 0 {
+                    if let Some(text) = primary.stdout_text() {
+                        println!("{text}");
+                    }
                 }
             }
+            None => {
+                eprintln!("No response produced.");
+                exit_code = 1;
+            }
         }
-        None => {
-            eprintln!("No response produced.");
-            exit_code = 1;
+        for outcome in result.compaction_outcomes {
+            eprintln!("{}", outcome.content);
+            if outcome.outcome == "failed" {
+                exit_code = 1;
+            }
         }
     }
-    for outcome in result.compaction_outcomes {
-        eprintln!("{}", outcome.content);
-        if outcome.outcome == "failed" {
+    // The TS print-mode autonomous contract applies to both output modes.
+    if let Some(run) = &autonomous {
+        if let Some(stderr) = run.exit_stderr().await {
+            eprintln!("{stderr}");
             exit_code = 1;
         }
     }
     Ok(exit_code)
+}
+
+/// The durable stop row as `message_start` + `message_end` events (the daemon
+/// worker's wire shape for custom rows). Text mode stays quiet.
+fn emit_stop_row_events(json_mode: bool, row: &pa_types::session::CustomMessage) {
+    if !json_mode {
+        return;
+    }
+    let message = crate::headless_autonomous::stop_row_wire_value(row);
+    for event_type in ["message_start", "message_end"] {
+        let event = serde_json::json!({ "type": event_type, "message": message });
+        println!("{event}");
+    }
 }
 
 /// The faux-script engine: identical session assembly, scripted provider.
