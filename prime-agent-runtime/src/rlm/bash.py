@@ -1527,7 +1527,6 @@ def _fp_matching_backtick(command: str, open_index: int, end: int) -> int:
             i += 2
             continue
         if ch == "`":
-            _fp_scan_charge(i - open_index)
             return i
         i += 1
     return end - 1
@@ -1782,6 +1781,47 @@ _FP_GIT_GLOBAL_VALUE_LONG = {
 # git push options that take the next token as their value (space-separated
 # form); `--signed[=x]` and `--recurse-submodules[=x]` are attached-only, and
 # `--force-with-lease[=x]`/`--force-if-includes` are never force flags.
+# git's own push long options (`git push -h`, git 2.55), resolved by unique
+# prefix the way parse-options resolves them: `git push --mir origin` really
+# mirrors every ref, so an abbreviation of an option the guard reads has to be
+# read too. parse-options accepts `--no-<name>` for every boolean it declares,
+# so both spellings are resolved. An ambiguous prefix (`--f` matches --force,
+# --force-with-lease, --force-if-includes and --follow-tags) is rejected by git
+# itself and refused here, because the guard cannot tell which option it names.
+_FP_PUSH_LONG_OPTIONS = (
+    "verbose", "quiet", "repo", "all", "branches", "mirror", "delete", "tags",
+    "dry-run", "porcelain", "force", "force-with-lease", "force-if-includes",
+    "recurse-submodules", "thin", "receive-pack", "exec", "set-upstream",
+    "progress", "prune", "verify", "no-verify", "follow-tags", "signed",
+    "atomic", "push-option", "ipv4", "ipv6",
+)
+# `--no-verify` is both a declared option and the negation of `verify`, so the
+# spellings are de-duplicated: a name that appears twice would look ambiguous.
+_FP_PUSH_LONG_SPELLINGS = tuple(
+    dict.fromkeys(
+        spelling
+        for option in _FP_PUSH_LONG_OPTIONS
+        for spelling in (option, "no-" + option)
+    )
+)
+
+
+def _fp_push_long_option(token: str) -> tuple[str | None, bool]:
+    """The push long option a `--word` token names, and whether that is
+    ambiguous: (option, False) for a unique prefix or an exact name, (None,
+    True) when more than one option matches, and (None, False) for a token that
+    names none of git's own push options at all."""
+    name = token[2:].partition("=")[0]
+    if name in _FP_PUSH_LONG_SPELLINGS:
+        return name, False  # parse-options prefers an exact name over a prefix
+    matches = [
+        option for option in _FP_PUSH_LONG_SPELLINGS if option.startswith(name)
+    ]
+    if len(matches) > 1:
+        return None, True
+    return (matches[0] if matches else None), False
+
+
 _FP_PUSH_VALUE_SHORT = {"o"}
 _FP_PUSH_VALUE_LONG = {"--receive-pack", "--exec", "--repo", "--push-option"}
 
@@ -2696,6 +2736,18 @@ def _fp_parse_push_args(tokens: list[str], push_index: int) -> _FpPushArgs:
             i += 1
             continue
         if token.startswith("--"):
+            # parse-options also takes an unambiguous abbreviation of any long
+            # option, so `--mir` is `--mirror` and a name is normalised before
+            # it is read; an ambiguous abbreviation is refused, because which
+            # option it would name cannot be told.
+            resolved, ambiguous = _fp_push_long_option(token)
+            if ambiguous:
+                unresolvable = token
+            elif resolved is not None:
+                attached = token[len(token[2:].partition("=")[0]) + 2 :]
+                # `--branches` is git's own alias of `--all`, which the
+                # wildcard rule below reads.
+                token = "--" + ("all" if resolved == "branches" else resolved) + attached
             # git's own parse-options accepts the `--no-` form of every
             # valueless boolean here, and the last one on the line wins, so
             # `-f --dry-run --no-dry-run` really forces and
@@ -3101,6 +3153,12 @@ def _fp_env_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
                     payload_source, token, depth
                 ):
                     return True
+                if not token.strip():
+                    # An empty split string contributes no argv, so env keeps
+                    # reading the options that follow it (`env -S '' -S 'git
+                    # push -f origin main'` really runs the second payload).
+                    payload_pending = False
+                    continue
                 break  # this env invocation is clean; check the next one
             if token == "--":
                 break
@@ -3112,6 +3170,8 @@ def _fp_env_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
                     if glued is None:
                         payload_pending = True
                         continue
+                    if not glued.strip():
+                        continue  # an empty payload leaves the options open
                     operand_at = payload_source.find("=") + 1
                     if _fp_env_payload_hides_force_push_source(
                         payload_source[operand_at:], glued, depth
@@ -3622,7 +3682,10 @@ def _fp_push_violation(
                 return _fp_format_refusal(
                     f'it would force-push "{target}"'
                 )
-            if target == "HEAD":
+            if target in ("HEAD", "@"):
+                # `@` is git's own synonym for HEAD, so `git push -f origin @`
+                # force-updates the current branch exactly like `... origin
+                # HEAD` does (verified: it reports `HEAD -> main`).
                 if run.relocated or in_prefix or relocating_prefix:
                     return _fp_format_relocation_refusal()
                 cwd = _fp_resolve_push_cwd(

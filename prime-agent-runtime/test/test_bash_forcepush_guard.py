@@ -544,11 +544,16 @@ class ForcePushScanCostTest(unittest.TestCase):
             + "\nEOF\n"
         )
         long_case = "\n".join("case $x in a) echo a;; esac" for _ in range(500))
+        # A long closed backtick substitution is one interior, not a nested
+        # re-scan: the budget charges nested work, never the text itself, so a
+        # 100 KB one is scanned in milliseconds instead of exhausting it.
+        long_backtick = "echo `printf '%s' " + "x" * 100_000 + "`"
         cases = [
             ("echo x2000", long_echo),
             ("loop x200", long_loop),
             ("heredoc 10.9KB", long_heredoc),
             ("case x500", long_case),
+            ("backtick 100KB", long_backtick),
         ]
         for name, command in cases:
             with self.subTest(shape=name, length=len(command)):
@@ -563,14 +568,7 @@ class ForcePushScanCostTest(unittest.TestCase):
         # The budget must be generous for anything a person would really write.
         for command in [
             'echo "$(git status)"', 'echo "$(date)"', "X=$(git rev-parse HEAD); echo $X",
-            'eval "$(echo hi)"',
-            'sh -c "$(echo hi)"',
-            "git log --oneline | head -3",
-            'echo "$(cat f.txt)"',
-            "for i in 1 2 3; do echo $i; done",
-            'echo "$(git status --short)" && ls',
-            "echo $(echo $(echo $(echo hi)))",
-            """eval "$(eval "$(eval 'echo hi')")" """,
+            'eval "$(echo hi)"', 'sh -c "$(echo hi)"', "git log --oneline | head -3", 'echo "$(cat f.txt)"', "for i in 1 2 3; do echo $i; done", 'echo "$(git status --short)" && ls', "echo $(echo $(echo $(echo hi)))", """eval "$(eval "$(eval 'echo hi')")" """,
             'git push -f origin $(git rev-parse --abbrev-ref HEAD) branch',
         ]:
             with self.subTest(command=command):
@@ -609,8 +607,7 @@ class ForcePushScanCostTest(unittest.TestCase):
         for command in [
             "git push -f origin " + "a" + ".x" * 30,
             "git push -f origin " + "a" + ".x" * 30 + "/:p",
-            "git push -f origin " + "a" + ".." * 200,
-            "git push -f origin main " + "x" * 4096,
+            "git push -f origin " + "a" + ".." * 200, "git push -f origin main " + "x" * 4096,
             "git push -f " + "a" + ".x" * 2000 + "/:p" + " main",
         ]:
             with self.subTest(length=len(command)):
@@ -647,7 +644,11 @@ class ForcePushEnvPayloadTest(unittest.TestCase):
                  "env --split 'git push -f origin main'",
                  "env -S 'eval \"git push -f origin main\"'",
                  "env -S 'sh -c \"git push -f origin main\"'",
-                 "env -S " + json.dumps(_sh_payload_chain(3))],
+                 "env -S " + json.dumps(_sh_payload_chain(3)),
+                 # An empty split string contributes no argv, so env keeps
+                 # reading the options that follow it.
+                 "env --split-string= -S 'git push -f origin main'",
+                 "env -S '' -S 'git push -f origin main'"],
             bash_module._fp_env_payloads_hide_force_push,
         )
 
@@ -657,9 +658,11 @@ class ForcePushEnvPayloadTest(unittest.TestCase):
                 ["env -S 'git status'", "env -S 'echo hi'",
                  "env -S 'git push --force-with-lease origin feature'",
                  "env --split-string 'git status'", "env --sp 'git status'",
-                 "env -C . git status",
-                 "env VERSION=1 git status", "echo env -S",
-                 "env -S " + json.dumps(_sh_payload_chain(2, "git status"))],
+                 "env -C . git status", "env VERSION=1 git status", "echo env -S",
+                 "env -S " + json.dumps(_sh_payload_chain(2, "git status")),
+                 # A non-empty payload ends option parsing, so the rest of the
+                 # line is that command's arguments, not another payload.
+                 "env -S 'echo hi' -S 'git push -f origin main'"],
             bash_module._fp_env_payloads_hide_force_push,
             expected=False,
         )
@@ -876,7 +879,12 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         # no force flag of its own; `--all` only fast-forwards.
         await self._refused_all(
             ["git push -f --all", "git push --force --mirror origin",
-             "git push --mirror origin", "git push --mirror"],
+             "git push --mirror origin", "git push --mirror",
+             # parse-options takes an unambiguous abbreviation, so `--mir` and
+             # `--mirr` really mirror every ref (`--mirror --no-mir` negates
+             # it again, and `--branch` is git's alias of `--all`).
+             "git push --mir origin", "git push --mirr origin", "git push --mir origin main",
+             "git push --branch --force origin"],
             ("every branch",),
         )
         # A dry run changes nothing, and `--all` alone is not force.
@@ -913,6 +921,11 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         message = await self._refused("git push -f origin HEAD")
         self.assertIn("HEAD", message)
         self.assertIn("main", message)
+        # `@` is git's own synonym for HEAD: `git push -f origin @` on main
+        # reports `HEAD -> main (forced update)`.
+        await self._refused_all(
+            ["git push -f origin @", "git push -f origin @:main"], ("main",)
+        )
         feature_repo, _fb = self._make_repo("repo-head-feature", branch="feature")
         os.chdir(feature_repo)
         result = await self._run("git push -f origin HEAD")
@@ -1411,12 +1424,10 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
                     "guard@example.com",
                 )
                 self.assertEqual(
-                    self._git("config", "user.name", cwd=path).stdout.strip(),
-                    "Guard Test",
+                    self._git("config", "user.name", cwd=path).stdout.strip(), "Guard Test",
                 )
                 self.assertEqual(
-                    self._git("config", "user.useConfigOnly", cwd=path).stdout.strip(),
-                    "true",
+                    self._git("config", "user.useConfigOnly", cwd=path).stdout.strip(), "true",
                 )
                 (path / "identity.txt").write_text("x\n")
                 self._git("add", ".", cwd=path)
@@ -1520,10 +1531,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         # test_refuses_backquote_substitutions_bash_ends_early, where bash
         # really force-pushes a protected branch with the S2 shape.
         cases = [
-            "`printf %s a`",
-            "`echo hi`",
-            '`printf %s "a b"`',
-            "`printf %s a; printf %s b`",
+            "`printf %s a`", "`echo hi`", '`printf %s "a b"`', "`printf %s a; printf %s b`",
         ]
         for command in cases:
             with self.subTest(command=command):
@@ -1574,8 +1582,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         # main` is a git force push, but the word scans as the substitution.
         await self._refused_all(
             ["$(printf git) push -f origin main", "$(which git) push -f origin main",
-             "c='git push -f origin main'; X=1 $c",
-             "{git,-c} user.email=x push -f origin main",
+             "c='git push -f origin main'; X=1 $c", "{git,-c} user.email=x push -f origin main",
              "{git,-c,user.name=z} push -f origin main"],
             ('command word is argv the guard cannot resolve',)
         )
@@ -1586,9 +1593,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         self._verdicts_clean(
             ["$HOME/bin/tool args", "$(which x) --version", "ls '*.{ts,tsx}'",
              "cp {a,b}.txt /tmp", "{ echo hi; } && git push origin feature",
-             "X=$Y git push -f origin feature",
-             "GIT_TRACE=$DEBUG git push -f origin feature",
-             "X=1 git push -f origin feature"]
+             "X=$Y git push -f origin feature", "GIT_TRACE=$DEBUG git push -f origin feature", "X=1 git push -f origin feature"]
         )
 
     async def test_refuses_the_unresolvable_argv_family(self):
@@ -1641,11 +1646,8 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
              "printf '%s\\n' 'git push -f origin main' | /bin/bash",
              "printf '%s\\n' 'git push -f origin main' | ./sh",
              'c=git; "$c" push -f origin main', '"$(printf git)" push -f origin main',
-             '"$(which git)" push -f origin main',
-             "c=git; command $c push -f origin main",
-             "c=git; command -p $c push -f origin main",
-             "c=git; env -i $c push -f origin main",
-             "c=git; env -u FOO $c push -f origin main",
+             '"$(which git)" push -f origin main', "c=git; command $c push -f origin main",
+             "c=git; command -p $c push -f origin main", "c=git; env -i $c push -f origin main", "c=git; env -u FOO $c push -f origin main",
              'echo a\\\n;ssh build-box "git push -f origin main"',
              '"ssh" build-box "git push -f origin main"']
         )
@@ -1817,8 +1819,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         self.assertIn("main", message)
         # `--no-force` after a force flag does not force, and the push runs.
         await self._allowed_all(
-            ["git push -f --no-force origin main",
-             "git push --force --no-force origin main",
+            ["git push -f --no-force origin main", "git push --force --no-force origin main",
              "git push --force --dry-run origin main"]
         )
 
@@ -1898,8 +1899,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         # be the reason they look inert).
         self._refusal_all(
             ["""git push origin @{u}$(printf " -f main")""",
-             'X="-f main"; git push origin @{u}$X',
-             "git push origin @{u}`printf ' -f main'`"],
+             'X="-f main"; git push origin @{u}$X', "git push origin @{u}`printf ' -f main'`"],
             'Refusing to run this force-push command'
         )
         self._refusal_all(
@@ -1960,8 +1960,7 @@ class ForcePushGitCommandNameTest(unittest.TestCase):
     def test_git_own_commands_run(self):
         self._outside_table(
             [
-                "git submodule status",
-                "git subtree --help",
+                "git submodule status", "git subtree --help",
                 "git send-email --help",
                 "git daemon --help",
                 "git request-pull origin main",
