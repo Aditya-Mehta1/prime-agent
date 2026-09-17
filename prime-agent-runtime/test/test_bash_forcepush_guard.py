@@ -119,8 +119,7 @@ FORCE_PUSH_MATCHING_COMMANDS = [
     "\\git push -f origin main", "sudo git push -f origin main",
     "FOO=1 git push -f origin main", "git -C repo push -f origin main",
     "git -c foo.bar=1 push -f origin main", "git --git-dir=.git push -f origin main",
-    "echo $(git push -f origin main)",
-    "git push -f origin \\\nmain", "git push 2>/dev/null -f origin main",
+    "echo $(git push -f origin main)", "git push -f origin \\\nmain", "git push 2>/dev/null -f origin main",
     "git push -f origin main 2>/dev/null", "(git push -f origin main)", "{ git push -f origin main; }",
     "git push -f origin main # ship it", "git push -f origin main && echo done",
     "echo git push -f origin main", "echo main | xargs git push -f origin",
@@ -308,9 +307,7 @@ class ForcePushEvalPayloadTest(unittest.TestCase):
                 ["eval 'git push -f origin main'", 'eval "git push -f origin main"',
                  "eval 'git push --force'", "eval 'git push origin +main'",
                  "eval 'cd repo && git push -f'", "eval 'echo x; git push -f origin main'",
-                 'eval \'eval "git push -f origin main"\'',
-                 'eval \'sh -c "git push -f origin main"\'',
-                 "eval " + json.dumps(_sh_payload_chain(3)),
+                 'eval \'eval "git push -f origin main"\'', 'eval \'sh -c "git push -f origin main"\'', "eval " + json.dumps(_sh_payload_chain(3)),
                  _alternating_payload_chain(5, "eval"),
                  _alternating_payload_chain(15, "eval")],
             bash_module._fp_eval_payloads_hide_force_push,
@@ -598,8 +595,7 @@ class ForcePushScanCostTest(unittest.TestCase):
     def test_guard_verdict_for_a_pathological_word_is_still_taken(self):
         refused = 0
         for command in [
-            "git push -f origin " + "a" + ".x" * 30,
-            "git push -f origin " + "a" + ".x" * 30 + "/:p",
+            "git push -f origin " + "a" + ".x" * 30, "git push -f origin " + "a" + ".x" * 30 + "/:p",
             "git push -f origin " + "a" + ".." * 200, "git push -f origin main " + "x" * 4096,
             "git push -f " + "a" + ".x" * 2000 + "/:p" + " main",
         ]:
@@ -631,16 +627,13 @@ class ForcePushEnvPayloadTest(unittest.TestCase):
                  # getopt_long resolves an unambiguous long-option prefix, so
                  # `--s`, `--split` and `--s=` carry the payload too.
                  "env --s 'git push -f origin main'", "env --s='git push -f origin main'",
-                 "env --split 'git push -f origin main'",
-                 "env -S 'eval \"git push -f origin main\"'",
-                 "env -S 'sh -c \"git push -f origin main\"'",
-                 "env -S " + json.dumps(_sh_payload_chain(3)),
+                 "env --split 'git push -f origin main'", "env -S 'eval \"git push -f origin main\"'",
+                 "env -S 'sh -c \"git push -f origin main\"'", "env -S " + json.dumps(_sh_payload_chain(3)),
                  # A payload with no command word leaves env's options open.
                  "env --split-string= -S 'git push -f origin main'",
                  "env -S '' -S 'git push -f origin main'",
                  "env -S'' -S 'git push -f origin main'", "env -S -S 'git push -f origin main'",
-                 "env -S'   ' -S 'git push -f origin main'",
-                 "env -S '-i' -S 'git push -f origin main'"],
+                 "env -S'   ' -S 'git push -f origin main'", "env -S '-i' -S 'git push -f origin main'"],
             bash_module._fp_env_payloads_hide_force_push,
         )
 
@@ -1153,8 +1146,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
              # guard cannot read is refused rather than trusted.
              "CFG='remote.origin.push=+main:main'; git -c $CFG push origin",
              "CFG='remote.origin.mirror=true'; git -c $CFG push origin",
-             "git -c $CFG push origin feature",
-             "git --config-env=remote.origin.push=CFG push origin",
+             "git -c $CFG push origin feature", "git --config-env=remote.origin.push=CFG push origin",
              # A --config-env value from an env var this command does not set
              # is unreadable whatever its key looks like, and a payload runs
              # the same commands a top-level line does.
@@ -1169,8 +1161,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         # decides which configuration is written).
         self._verdicts_clean(
             ["git config remote.origin.mirror true", "git push origin feature",
-             "git -c color.ui=always push origin feature",
-             "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=color.ui"
+             "git -c color.ui=always push origin feature", "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=color.ui"
              " GIT_CONFIG_VALUE_0=always git push origin feature",
              "CFG='color.ui=auto'; git -c $CFG push origin feature",
              'git -c "user.email=$USER" push origin feature',
@@ -1320,8 +1311,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         repo, _bare = self._make_repo("repo-env-ok")
         os.chdir(repo)
         await self._allowed_all(
-            ["env -S 'git status'",
-             "env -S 'git push --force-with-lease origin feature'", "env echo hi"],
+            ["env -S 'git status'", "env -S 'git push --force-with-lease origin feature'", "env echo hi"],
         )
 
     async def test_force_push_allowlist_still_runs(self):
@@ -1343,10 +1333,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         # `env -S` wrapping a three-layer chain.
         # Past the depth cap the guard refuses rather than guess.
         await self._refused_all(
-            ["""env -S 'sh -c "git push -f origin main"'""",
-             """eval 'sh -c "git push -f origin main"'""",
-             """sh -c "eval 'git push -f origin main'" """,
-             """env -S 'eval "git push -f origin main"'""",
+            ["""env -S 'sh -c "git push -f origin main"'""", """eval 'sh -c "git push -f origin main"'""", """sh -c "eval 'git push -f origin main'" """, """env -S 'eval "git push -f origin main"'""",
              """sh -c "env -S 'sh -c \\"git push -f origin main\\"'" """,
              _sh_payload_chain(3), _sh_payload_chain(4), _sh_payload_chain(5),
              "env -S " + json.dumps(_sh_payload_chain(3)),
@@ -1473,6 +1460,12 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
             [f"export HOME={diverged}; cd && git push -f origin HEAD"],
             ("HEAD names the current branch",),
         )
+        # `pushd` relocates like `cd`, so the snapshot boundary counts it: a
+        # HOME assigned after an earlier pushd cannot describe that pushd.
+        await self._refused_all(
+            [f"pushd ~ && export HOME={diverged}; pushd ~ && git push -f origin HEAD"],
+            ("changes directory",),
+        )
         # One snapshot cannot describe every cd, so a repeated or later
         # assignment, or a value the shell would tilde-expand, is refused.
         await self._refused_all(
@@ -1507,7 +1500,17 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         # A `)` or backtick inside quotes is data, not the end of the
         # substitution, so the interior (where the push runs) must be scanned.
         await self._refused_all(
-            ["""echo "$(printf ')'; git push -f origin main)" """],
+            ["""echo "$(printf ')'; git push -f origin main)" """,
+             # ANSI-C quoting: `\'` is an escaped quote, so the span runs past
+             # it and a `)` inside it is data (all three really force-updated
+             # main through kernel bash before this rule).
+             """echo "$(echo $'x\\'y)' ; git push -f origin main)" """,
+             """echo "$(echo $'a\\'b)c' ; git push -f origin main)" """,
+             """echo "$(echo $'a)b' ; ssh build-box "git push -f origin main")" """,
+             # A substitution interior is its own command text, so a command
+             # word the guard cannot resolve inside one counts too.
+             """echo "$(c=git; $c push -f origin main)" """,
+             """echo $(c=git; $c push -f origin main)""", """x=$(c=git; $c push -f origin main)"""],
             ('Refusing to run this force-push command',)
         )
         # The backtick analogue with a trailing backtick is not a bypass: bash
@@ -1810,9 +1813,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         # resolve and the shell cannot be replayed.
         await self._refused_all(
             ["eval '. move.sh' && git push -f origin HEAD",
-             "builtin source move.sh && git push -f origin HEAD",
-             ". move.sh && git push -f origin HEAD",
-             "command source move.sh && git push -f origin HEAD",
+             "builtin source move.sh && git push -f origin HEAD", ". move.sh && git push -f origin HEAD", "command source move.sh && git push -f origin HEAD",
              '"." ./move.sh && git push -f origin HEAD', "'.' ./move.sh && git push -f origin HEAD", '"." move.sh && git push -f origin HEAD',
              '"." ./move.sh; git push -f origin HEAD', '"." && git push -f origin HEAD'],
             ('changes directory',)

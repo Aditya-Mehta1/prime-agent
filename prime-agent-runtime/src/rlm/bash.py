@@ -1490,6 +1490,13 @@ def _fp_matching_paren(command: str, open_index: int, end: int) -> int:
             if ch == "\\" and i + 1 < end:
                 i += 2
                 continue
+            if ch == "$" and i + 1 < end and command[i + 1] == "'":
+                # ANSI-C quoting: `\'` inside `$'...'` is an escaped quote, so
+                # the span runs to the next unescaped `'` and a `)` inside it is
+                # data rather than the end of the substitution.
+                quote = "ansi"
+                i += 2
+                continue
             if ch in ("'", '"'):
                 quote = ch
             elif ch == "(":
@@ -1498,6 +1505,12 @@ def _fp_matching_paren(command: str, open_index: int, end: int) -> int:
                 depth -= 1
                 if depth == 0:
                     return i
+        elif quote == "ansi":
+            if ch == "\\" and i + 1 < end:
+                i += 2
+                continue
+            if ch == "'":
+                quote = None
         elif quote == "'":
             if ch == "'":
                 quote = None
@@ -1547,12 +1560,22 @@ def _fp_unquoted_paren_counts(text: str) -> tuple[int, int]:
             if ch == "\\" and i + 1 < end:
                 i += 2
                 continue
+            if ch == "$" and i + 1 < end and text[i + 1] == "'":
+                quote = "ansi"  # `$'...'`: `\'` is an escaped quote
+                i += 2
+                continue
             if ch in ("'", '"'):
                 quote = ch
             elif ch == "(":
                 opens += 1
             elif ch == ")":
                 closes += 1
+        elif quote == "ansi":
+            if ch == "\\" and i + 1 < end:
+                i += 2
+                continue
+            if ch == "'":
+                quote = None
         elif quote == "'":
             if ch == "'":
                 quote = None
@@ -2274,7 +2297,12 @@ def _fp_cd_environment(
     never assigns is absent, so the caller falls back to the environment the
     guard itself spawns with."""
     first_cd = next(
-        (index for index in range(limit) if words[index].value == "cd"), limit
+        (
+            index
+            for index in range(limit)
+            if words[index].value in ("cd", "pushd")
+        ),
+        limit,
     )
     tracked: dict[str, str | None] = {}
     for index, word in enumerate(words[:limit]):
@@ -2491,9 +2519,13 @@ def _fp_unresolvable_command_words(
     total = len(words)
     while index < total:
         word = words[index]
-        if not word.starts_command or _fp_contained_in_later_word(words, index):
+        if not word.starts_command:
             index += 1
             continue
+        # A substitution interior is its own command text (`echo "$(c=git; $c
+        # push -f origin main)"` really runs the push), so a command word that
+        # starts one is judged here too, even though the enclosing word is the
+        # one the enclosing command passes on.
         probe = index
         wrapper = ""
         while probe < total and not _fp_contained_in_later_word(words, probe):
