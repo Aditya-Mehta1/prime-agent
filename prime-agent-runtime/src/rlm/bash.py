@@ -2139,15 +2139,40 @@ def _fp_is_unmodeled_wrapper(value: str) -> bool:
 # remote.<name>.mirror and remote.<name>.push both turn a plain push into a
 # forced one: a mirror remote force-updates every ref (git treats
 # `git push <name>` with remote.<name>.mirror=true as `git push --mirror`),
-# and a configured push refspec can itself carry a `+`. Both keys are read
-# from the word itself, so the inline `-c` value and the `git config` argument
+# and a configured push refspec can itself carry a `+`. git reads the section
+# and the variable name case-insensitively (only the subsection is
+# case-sensitive), so the key is matched case-folded; both are read from the
+# word itself, so the inline `-c` value and the `git config` argument
 # spellings match alike.
-_FP_MIRROR_OR_PUSH_KEY = re.compile(r"^remote\.[^.]+\.(?:mirror|push)(?:=|$)")
+_FP_MIRROR_OR_PUSH_KEY = re.compile(r"^remote\.[^.]+\.(?:mirror|push)(?:=|$)", re.IGNORECASE)
+# The env spelling of the same write: git reads a GIT_CONFIG_COUNT=<n> header
+# plus GIT_CONFIG_KEY_<i>/GIT_CONFIG_VALUE_<i> pairs as command-scope
+# configuration, and GIT_CONFIG_PARAMETERS carries the same pairs serialized in
+# one word (it is the variable `git -c` itself sets). An env key word arms a
+# push exactly like an inline `-c` or a `git config` argument, and a key the
+# guard cannot read statically (an expansion) is refused like the rest of the
+# unresolvable family rather than trusted.
+_FP_ENV_CONFIG_KEY = re.compile(r"^GIT_CONFIG_KEY_\d+=(?P<key>.*)$", re.IGNORECASE)
+_FP_ENV_CONFIG_PARAMETERS = re.compile(r"^GIT_CONFIG_PARAMETERS=", re.IGNORECASE)
 
 
 def _fp_mirror_or_push_refspec_configured(words: list[_FpShellWord]) -> bool:
-    """True when a word sets remote.<name>.mirror or remote.<name>.push."""
-    return any(_FP_MIRROR_OR_PUSH_KEY.match(word.value) for word in words)
+    """True when a word sets remote.<name>.mirror or remote.<name>.push, in
+    any of the spellings git reads: the config key itself, an env-injected key
+    word, or the serialized GIT_CONFIG_PARAMETERS word."""
+    for word in words:
+        value = word.value
+        if _FP_MIRROR_OR_PUSH_KEY.match(value):
+            return True
+        if _FP_ENV_CONFIG_PARAMETERS.match(value):
+            return True  # the pairs inside are one shell-quoted blob
+        env_key = _FP_ENV_CONFIG_KEY.match(value)
+        if env_key is not None and (
+            _FP_MIRROR_OR_PUSH_KEY.match(env_key["key"])
+            or _FP_GLOB_OR_SUBSTITUTION.search(env_key["key"])
+        ):
+            return True
+    return False
 
 
 def _fp_mirror_config_refusal() -> str:
@@ -2759,8 +2784,15 @@ def _fp_shell_c_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
         return True  # nested too deep to follow: refuse
     words = _fp_scan_words(command)
     for index, word in enumerate(words):
-        if _fp_command_name(word.value) not in _FP_SHELL_C_INTERPRETERS:
+        shell_name = _fp_command_name(word.value)
+        if shell_name not in _FP_SHELL_C_INTERPRETERS:
             continue
+        # `c` is the payload letter for every interpreter here; `C` is fish's
+        # --init-command only. For the POSIX shells and the csh family `-C` is
+        # a valueless flag (bash/zsh/dash/ksh noclobber; tcsh and csh reject
+        # it), so reading it as a payload would hand the `-c` that follows to
+        # it as its operand and drop the real payload from the scan.
+        payload_letters = "cC" if shell_name == "fish" else "c"
         c_pending = False
         attach_offset = 0
         for follower_index in range(index + 1, len(words)):
@@ -2802,7 +2834,7 @@ def _fp_shell_c_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
                     # hands the shell its payload: glued on when the cluster
                     # does not end there, and otherwise the next word.
                     marker = next(
-                        (i for i, ch in enumerate(token[1:]) if ch in "cC"),
+                        (i for i, ch in enumerate(token[1:]) if ch in payload_letters),
                         None,
                     )
                     if marker is not None:
@@ -2839,6 +2871,12 @@ def _fp_shell_c_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
                     follower.value[attach_offset:], depth + 1
                 ):
                     return True
+                if shell_name == "fish":
+                    # fish runs every payload it is given (--init-command
+                    # pre-configuration and --command/`-c` alike), so a later
+                    # one is still a command the guard has to read.
+                    c_pending = False
+                    continue
                 break  # the payload word ends this shell invocation
     return False
 

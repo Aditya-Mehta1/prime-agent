@@ -103,24 +103,17 @@ def _guarded_runs(command: str) -> list[bash_module._FpPushArgs]:
 # same text matches too: conservative in the safe direction, exactly like the
 # other kernel bash guards.
 FORCE_PUSH_MATCHING_COMMANDS = [
-    "git push --force origin main",
-    "git push -f origin main",
-    "git push origin main -f",
-    "git push -f origin main:main",
-    "git push -f origin main:refs/heads/main",
-    "git push -f origin refs/heads/main",
-    "git push -f origin HEAD:main",
-    "git push -f origin HEAD:heads/main",
+    "git push --force origin main", "git push -f origin main",
+    "git push origin main -f", "git push -f origin main:main",
+    "git push -f origin main:refs/heads/main", "git push -f origin refs/heads/main",
+    "git push -f origin HEAD:main", "git push -f origin HEAD:heads/main",
     "git push -f origin main:heads/main",
     # `-oo` is `-o o`: the rest of that cluster is the option's value and the
     # next token is still a flag, so `-f` is a real force.
     "git push -oo -f origin main",
-    "git push -f origin :main",
-    "git push -f origin main:",
-    "git push -f origin @{u}",
-    "git push origin +main",
-    "git push origin +main:main",
-    "git push origin +feature",
+    "git push -f origin :main", "git push -f origin main:",
+    "git push -f origin @{u}", "git push origin +main",
+    "git push origin +main:main", "git push origin +feature",
     "git push --force",
     "git push -f",
     "git push -f origin",
@@ -130,10 +123,8 @@ FORCE_PUSH_MATCHING_COMMANDS = [
     # force without a force flag; `--all` alone stays non-force.
     "git push --mirror origin",
     "git push --mirror",
-    "git push -fv origin main",
-    "git push -f origin main --",
-    "git push --force --repo=origin main",
-    "git push -f --delete origin main",
+    "git push -fv origin main", "git push -f origin main --",
+    "git push --force --repo=origin main", "git push -f --delete origin main",
     "git push --force-with-lease -f origin main",
     "/usr/bin/git push -f origin main",
     '"git" push -f origin main',
@@ -145,17 +136,12 @@ FORCE_PUSH_MATCHING_COMMANDS = [
     "git -c foo.bar=1 push -f origin main",
     "git --git-dir=.git push -f origin main",
     "echo $(git push -f origin main)",
-    "git push -f origin \\\nmain",
-    "git push 2>/dev/null -f origin main",
-    "git push -f origin main 2>/dev/null",
-    "(git push -f origin main)",
+    "git push -f origin \\\nmain", "git push 2>/dev/null -f origin main",
+    "git push -f origin main 2>/dev/null", "(git push -f origin main)",
     "{ git push -f origin main; }",
-    "git push -f origin main # ship it",
-    "git push -f origin main && echo done",
-    "echo git push -f origin main",
-    "echo main | xargs git push -f origin",
-    "git push -f origin $BRANCH",
-    "git push -f origin HEAD",
+    "git push -f origin main # ship it", "git push -f origin main && echo done",
+    "echo git push -f origin main", "echo main | xargs git push -f origin",
+    "git push -f origin $BRANCH", "git push -f origin HEAD",
     # The shell joins a backslash-newline continuation into one token, decodes
     # ANSI-C (`$'...'`) escapes, and resolves `$"..."` as a double-quoted
     # string, so these reach git as the force pushes they spell out.
@@ -206,31 +192,21 @@ FORCE_PUSH_UNRESOLVABLE_ARGUMENT_COMMANDS = [
 ]
 
 FORCE_PUSH_NON_MATCHING_COMMANDS = [
-    "git push origin main",
-    "git push",
-    "git push origin",
-    "git push -u origin main",
-    "git push --all",
-    "git push --tags",
-    "git push origin --delete main",
-    "git push --force-with-lease origin main",
+    "git push origin main", "git push",
+    "git push origin", "git push -u origin main",
+    "git push --all", "git push --tags",
+    "git push origin --delete main", "git push --force-with-lease origin main",
     "git push --force-with-lease=main:expected origin main",
     "git push --force-if-includes origin main",
-    "git push --force-with-lease --force-if-includes origin main",
-    "git push -n origin main",
-    "git push -f -n origin main",
-    "git push -fn origin main",
-    "git push -nf origin main",
-    "git push --dry-run -f origin main",
+    "git push --force-with-lease --force-if-includes origin main", "git push -n origin main",
+    "git push -f -n origin main", "git push -fn origin main",
+    "git push -nf origin main", "git push --dry-run -f origin main",
     "git push -v -q origin main",
     # `-of` is `-o f`: the rest of the cluster is the option's value, so no
     # force flag is set.
-    "git push -of origin main",
-    "git checkout --force main",
-    "git config push.default matching",
-    "git status",
-    "echo hello",
-    "npm run check",
+    "git push -of origin main", "git checkout --force main",
+    "git config push.default matching", "git status",
+    "echo hello", "npm run check",
     "echo 'git push -f origin main'",
     'echo "git push -f origin main"',
     "# git push -f origin main",
@@ -1174,29 +1150,46 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         self._git("branch", "--unset-upstream", cwd=repo)
         os.chdir(repo)
         await self._refused_all(
-            [],
-            ('push.default',)
+            ["git push -f origin", "git push -f"], ('push.default',)
         )
 
     async def test_refuses_pushes_that_write_mirror_or_push_refspec_config(self):
         """remote.<name>.mirror and remote.<name>.push both turn a plain push
         into a forced one (git pushes a mirror remote like `push --mirror`,
         and a configured push refspec can carry a `+`), so a push whose own
-        command writes either key is refused whatever its argv looks like."""
+        command writes either key is refused whatever its argv looks like.
+        git reads the section and the variable name case-insensitively, and it
+        reads `GIT_CONFIG_KEY_<i>`/`GIT_CONFIG_VALUE_<i>` env pairs too."""
         repo, _bare = self._make_repo("repo-mirror", branch="main")
         os.chdir(repo)
         await self._refused_all(
             ["git -c remote.origin.mirror=true push origin",
              "git -c remote.origin.push=+main:main push origin",
              "git config remote.origin.mirror true && git push origin",
-             "git config --add remote.origin.push +main:main && git push -f"],
+             "git config --add remote.origin.push +main:main && git push -f",
+             # Case-folded spellings both really force-update main.
+             "git -c remote.origin.MIRROR=true push origin",
+             "git -c REMOTE.origin.mirror=true push origin",
+             "git config Remote.origin.mirror true && git push origin",
+             "git config remote.origin.PUSH +main:main && git push origin",
+             # The env spelling of the same write, and one whose key word is
+             # an expansion the guard cannot read.
+             "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push"
+             " GIT_CONFIG_VALUE_0=+refs/heads/main:refs/heads/main git push origin",
+             "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.mirror"
+             " GIT_CONFIG_VALUE_0=true git push origin",
+             'GIT_CONFIG_PARAMETERS="\'remote.origin.push=+main:main\'" git push origin',
+             "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=$K"
+             " GIT_CONFIG_VALUE_0=+main:main git push origin"],
             ("Refusing to run this force-push command",),
         )
-        # The config write alone pushes nothing, and pushes without either
-        # key keep their argv-only judgement.
+        # The config write alone pushes nothing, and pushes without either key
+        # keep their argv-only judgement (a benign env key is not a setting).
         self._verdicts_clean(
             ["git config remote.origin.mirror true", "git push origin feature",
-             "git -c color.ui=always push origin feature"],
+             "git -c color.ui=always push origin feature",
+             "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=color.ui"
+             " GIT_CONFIG_VALUE_0=always git push origin feature"],
         )
 
 
@@ -1397,8 +1390,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         self._git("checkout", "--detach", cwd=repo)
         os.chdir(repo)
         await self._refused_all(
-            [],
-            ('push.default',)
+            ["git push -f origin", "git push -f"], ('push.default',)
         )
         # A detached HEAD is not a blanket refusal: an explicit non-protected
         # refspec still runs.
@@ -1463,8 +1455,8 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         self._diverge(literal, bare, "main")
         os.chdir(self.test_dir)
         await self._refused_all(
-            [],
-            ('main',)
+            ['cd "~" && git push -f origin HEAD', "cd '~' && git push -f origin HEAD"],
+            ('main',),
         )
         # A bare `cd ~` still goes home, which is not a repository here, so the
         # guard falls open and git fails the push itself.
@@ -1509,7 +1501,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         # A `)` or backtick inside quotes is data, not the end of the
         # substitution, so the interior (where the push runs) must be scanned.
         await self._refused_all(
-            [],
+            ["""echo "$(printf ')'; git push -f origin main)" """],
             ('Refusing to run this force-push command',)
         )
         # The backtick analogue with a trailing backtick is not a bypass: bash
@@ -1699,8 +1691,15 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
              "fish --command 'git push -f origin main'",
              "fish --command='git push -f origin main'",
              "fish -C 'git push -f origin main' -c 'echo done'",
+             # fish runs every payload it is given, so a benign first one must
+             # not end the walk for the later `-c`.
+             "fish -C 'echo done' -c 'git push -f origin main'",
              "fish -C'git push -f origin main'", "tcsh -c 'git push -f origin main'",
              "csh -c 'git push -f origin main'",
+             # `-C` is a payload letter for fish only: the POSIX shells and the
+             # csh family treat it as noclobber, so `-c` still carries it.
+             "bash -C -c 'git push -f origin main'", "sh -C -c 'git push -f origin main'",
+             "bash -Cc 'git push -f origin main'", "zsh -C -c 'git push -f origin main'",
              "printf '%s\n' 'git push -f origin main' | fish",
              "printf '%s\n' 'git push -f origin main' | /bin/tcsh",
              "eval 'fish -c \"git push -f origin main\"'",
@@ -1708,7 +1707,10 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
             ("Refusing to run this force-push command",),
         )
         # A clean payload stays allowed, whatever interpreter runs it.
-        self._verdicts_clean(["fish -c 'echo hi'", "tcsh -c 'echo hi'", "echo fish"])
+        self._verdicts_clean(
+            ["fish -c 'echo hi'", "tcsh -c 'echo hi'", "echo fish",
+             "bash -C -c 'echo hi'", "bash -Cc 'git push --force-with-lease origin f'"],
+        )
 
     async def test_wrapper_value_options_follow_getopt(self):
         """The command-word walk steps over a wrapper's options the way
@@ -1766,9 +1768,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         # when the expansion looks harmless, because the expansion decides what
         # runs and the guard cannot see it. These two were allowed before this
         # rule and are asserted REFUSED on purpose.
-        await self._refused_all(
-            []
-        )
+        await self._refused_all(['eval "$(echo hi)"', 'sh -c "$(echo hi)"'])
         # A literal payload without an expansion is still scanned normally.
         self._verdicts_clean(
             ['eval "echo hi"', 'sh -c "echo hi"', """sh -c 'sh -c "git status"'""",
