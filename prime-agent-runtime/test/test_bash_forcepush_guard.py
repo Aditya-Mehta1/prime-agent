@@ -37,9 +37,7 @@ SCAN_TIMEOUT_SECONDS = 20.0
 # dot-separated groups, with and without the colon that makes the guard
 # classify the word, a long colon-free word, and a long dotted word.
 PATHOLOGICAL_REMOTE_WORDS = [
-    "a" + ".x" * 30, "a" + ".x" * 30 + "/:p",
-    "a" + ".." * 200, "a" + "./" * 200 + ":p",
-    "x" * 4096, "a" + ".x" * 2000 + "/:p",
+    "a" + ".x" * 30, "a" + ".x" * 30 + "/:p", "a" + ".." * 200, "a" + "./" * 200 + ":p", "x" * 4096, "a" + ".x" * 2000 + "/:p",
 ]
 
 
@@ -187,8 +185,7 @@ FORCE_PUSH_NON_MATCHING_COMMANDS = [
     # Wrappers and quoting that do not carry a push stay inert.
     "git -c alias.s=status s", "git -c alias.co=checkout co",
     "git -c alias.push='status' push --dry-run -f origin main", "env -C . echo hi",
-    "env -S 'git status'", "printf $'%s\\n' hi",
-    'echo $"hello"', "echo $'tab\\there'",
+    "env -S 'git status'", "printf $'%s\\n' hi", 'echo $"hello"', "echo $'tab\\there'",
 ]
 
 
@@ -296,10 +293,7 @@ class ForcePushScannerFidelityTest(unittest.TestCase):
         for first in [
             "https://example.invalid/x.git", "ssh://example.invalid/x.git",
             "git@github.com:org/repo.git", "example.invalid:org/repo.git",
-            "localhost:repo.git", "myhost:path",
-            "origin:main", "+main:main",
-            "refs/heads/main:refs/heads/main", "main:main",
-            ":main", "C:\\repo",
+            "localhost:repo.git", "myhost:path", "origin:main", "+main:main", "refs/heads/main:refs/heads/main", "main:main", ":main", "C:\\repo",
         ]:
             with self.subTest(first=first):
                 args = bash_module._fp_parse_push_args(["git", "push", "-f", first], 1)
@@ -568,9 +562,7 @@ class ForcePushScanCostTest(unittest.TestCase):
     def test_realistic_nesting_is_not_refused_by_the_budget(self):
         # The budget must be generous for anything a person would really write.
         for command in [
-            'echo "$(git status)"',
-            'echo "$(date)"',
-            "X=$(git rev-parse HEAD); echo $X",
+            'echo "$(git status)"', 'echo "$(date)"', "X=$(git rev-parse HEAD); echo $X",
             'eval "$(echo hi)"',
             'sh -c "$(echo hi)"',
             "git log --oneline | head -3",
@@ -1155,8 +1147,11 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
              "git -c $CFG push origin feature",
              "git --config-env=remote.origin.push=CFG push origin",
              # A --config-env value from an env var this command does not set
-             # is unreadable whatever its key looks like.
-             "git --config-env=color.ui=CFG push origin feature"],
+             # is unreadable whatever its key looks like, and a payload runs
+             # the same commands a top-level line does.
+             "git --config-env=color.ui=CFG push origin feature",
+             "sh -c 'git --config-env=remote.origin.push=CFG push origin'",
+             "eval 'git --config-env=remote.origin.push=CFG push origin'"],
             ("Refusing to run this force-push command",),
         )
         # The config write alone pushes nothing, and pushes without either key
@@ -1718,7 +1713,11 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
              "c=git; env --uns=FOO $c push -f origin main",
              "c=git; env --u FOO $c push -f origin main",
              "c=git; env --ch . $c push -f origin main",
-             "c=git; env --ignore-env $c push -f origin main"],
+             "c=git; env --ignore-env $c push -f origin main",
+             # An empty attached operand is still an operand (`env --argv0=`
+             # sets argv0 to the empty string), so the next word is the command.
+             "c=git; env --argv0= $c push -f origin main",
+             "c=git; env --split-string= $c push -f origin main"],
             ("cannot resolve",),
         )
         # An ambiguous prefix matches more than one of env's options, so

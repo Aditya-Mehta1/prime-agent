@@ -2348,7 +2348,7 @@ def _fp_env_long_option(value: str) -> tuple[str | None, str | None, bool]:
     it), and a prefix matching more than one option is reported ambiguous.
     Only a value-taking option hands back an operand; `--name=operand` glues it
     to the word, the space-separated form leaves it to the next word."""
-    name, _, glued = value[2:].partition("=")
+    name, separator, glued = value[2:].partition("=")
     if not name:
         return None, None, False  # the bare `--` terminator ends the options
     matches = [option for option in _FP_ENV_LONG_OPTIONS if option.startswith(name)]
@@ -2356,7 +2356,9 @@ def _fp_env_long_option(value: str) -> tuple[str | None, str | None, bool]:
         return None, None, True
     if not matches or matches[0] not in _FP_ENV_LONG_VALUE_OPTIONS:
         return None, None, False
-    return matches[0], glued or None, False
+    # An empty attached operand (`env --argv0=`) is an operand, not a missing
+    # one: it belongs to the option, so the next word is still the command.
+    return matches[0], (glued if separator else None), False
 
 
 def _fp_split_wrapper_option(value: str, wrapper: str) -> tuple[str | None, str | None]:
@@ -2812,12 +2814,16 @@ def _fp_payload_hides_force_push(payload: str, depth: int = 0) -> bool:
     words = _fp_scan_words(normalized)
     if _fp_family_violation(words, payload, normalized) is not None:
         return True  # the payload belongs to the unresolvable-argv family
-    if _fp_find_git_push_runs(words) and _fp_mirror_or_push_refspec_configured(
-        words
-    ):
-        # A payload runs the same commands a top-level line does, so the
-        # mirror/push-refspec config rule applies inside it too.
-        return True
+    runs = _fp_find_git_push_runs(words)
+    if runs:
+        for run in runs:
+            if _fp_unreadable_inline_config(run, words) is not None:
+                # A payload runs the same commands a top-level line does, so
+                # the inline-config rule applies inside it too.
+                return True
+        if _fp_mirror_or_push_refspec_configured(words):
+            # ... and so does the mirror/push-refspec config rule.
+            return True
     if _fp_unresolvable_command_word_hides_force_push(words, normalized):
         return True  # the payload's command word decides what runs
     if _fp_unresolvable_git_subcommand(words) is not None:
@@ -2826,7 +2832,7 @@ def _fp_payload_hides_force_push(payload: str, depth: int = 0) -> bool:
         # alias or an external `git-` program (`sh -c "git p"`) would otherwise
         # run unchecked inside the payload.
         return True
-    if any(_fp_run_is_guarded(run) for run in _fp_find_git_push_runs(words)):
+    if any(_fp_run_is_guarded(run) for run in runs):
         return True
     if re.search(r"\beval\b", normalized) and _fp_eval_payloads_hide_force_push(
         normalized, depth + 1
