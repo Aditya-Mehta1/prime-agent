@@ -1301,16 +1301,25 @@ def _installs_relocating_trap(prefix: str) -> bool:
         # options (`trap -- 'cd sub' DEBUG`), and it is read after unquoting,
         # so a quoted action (`trap 'cd sub' DEBUG`) is judged as the shell
         # runs it.
-        for candidate in _shell_word_positions(prefix[written[index].end : region_end]):
-            action = _unquote_one_level(
-                prefix[written[index].end + candidate.start : written[index].end + candidate.end]
-            )
-            if action.startswith("-") and action != "-":
-                continue  # one of trap's own options
+        start = written[index].end
+        for candidate in _shell_word_positions(prefix[start : region_end]):
+            raw = prefix[start + candidate.start : start + candidate.end]
+            # trap's own options come first, and their spelling is revealed so a
+            # quoted one counts (`trap '--' 'cd sub' DEBUG` really installs the
+            # trap: bash reads the quoted `--` as its option terminator).
+            option = _revealed_word_text(raw)
+            if option.startswith("-"):
+                if re.fullmatch(r"-[A-Za-z]*[pl][A-Za-z]*", option):
+                    break  # `trap -p`/`trap -l` prints or lists: nothing installed
+                continue
             # The whole action is read, because a trap action may be a command
             # list (`trap 'true; cd sub' DEBUG`) and the cd can come after a
-            # command that does not move the shell.
-            return _prefix_holds_directory_command(action)
+            # command that does not move the shell. A trap that does not
+            # relocate is not the end of the search: an earlier harmless trap
+            # must not hide a later relocating one.
+            if _prefix_holds_directory_command(_unquote_one_level(raw)):
+                return True
+            break  # the action is read: the words after it are signal names
     return False
 
 
