@@ -626,6 +626,9 @@ def _scan_text(text: str, depth: int, parent_mentions_sudo: bool = False) -> str
     words = _tokenize(text)
     _apply_heredocs(text, words)
     inner = parent_mentions_sudo or _mentions_sudo(words)
+    # Word indices the walk reaches as command words, so the heredoc gate below
+    # uses the same judgment as the refusals instead of guessing from the tokens.
+    command_words: set[int] = set()
     for word in words:
         if word.is_data or not word.has_expansion:
             continue
@@ -635,14 +638,12 @@ def _scan_text(text: str, depth: int, parent_mentions_sudo: bool = False) -> str
     for index, word in enumerate(words):
         if word.is_data or not word.starts_command:
             continue
-        violation = _scan_segment(words, index, depth, inner)
+        violation = _scan_segment(words, index, depth, inner, command_words)
         if violation:
             return violation
     # A heredoc body that the same text feeds to a runner is a script, not data.
     if depth < _MAX_PAYLOAD_DEPTH and any(
-        _is_command_position(words, index) and os.path.basename(word.value) in _PAYLOAD_RUNNERS
-        for index, word in enumerate(words)
-        if not word.is_data
+        os.path.basename(words[position].value) in _PAYLOAD_RUNNERS for position in command_words
     ):
         for word in words:
             if word.is_data or not word.heredoc_body:
@@ -653,19 +654,12 @@ def _scan_text(text: str, depth: int, parent_mentions_sudo: bool = False) -> str
     return None
 
 
-def _is_command_position(words: list[_Word], index: int) -> bool:
-    """True when the word at `index` sits where a command word is read."""
-    word = words[index]
-    if word.starts_command or index == 0:
-        return True
-    before = words[index - 1]
-    if before.is_operator or before.is_data or before.is_redirect:
-        return True
-    return before.value in _KEYWORDS or os.path.basename(before.value) in _WRAPPERS
-
-
 def _scan_segment(
-    words: list[_Word], start: int, depth: int, parent_mentions_sudo: bool = False
+    words: list[_Word],
+    start: int,
+    depth: int,
+    parent_mentions_sudo: bool = False,
+    command_words: set[int] | None = None,
 ) -> str | None:
     """Walk one command segment to its command word and judge that word."""
     while start < len(words):
@@ -698,12 +692,14 @@ def _scan_segment(
             if violation:
                 return violation
             continue
+        if command_words is not None:
+            command_words.add(start)
         if _word_names_sudo(word.value):
             return f"{name} would run this command as root or another user"
         if name == "alias":
             return _scan_alias_bodies(words, start + 1, depth)
         if name == "find":
-            return _scan_find_execs(words, start + 1, depth, parent_mentions_sudo)
+            return _scan_find_execs(words, start + 1, depth, parent_mentions_sudo, command_words)
         if word.has_expansion:
             if _mentions_sudo(words) or parent_mentions_sudo:
                 return (
@@ -711,7 +707,7 @@ def _scan_segment(
                     "text invokes sudo/doas"
                 )
             return None
-        return _scan_interpreter(words, start, depth, parent_mentions_sudo)
+        return _scan_interpreter(words, start, depth, parent_mentions_sudo, command_words)
     return None
 
 
@@ -933,7 +929,11 @@ def _glued_payload(value: str) -> str | None:
 
 
 def _scan_interpreter(
-    words: list[_Word], index: int, depth: int, parent_mentions_sudo: bool = False
+    words: list[_Word],
+    index: int,
+    depth: int,
+    parent_mentions_sudo: bool = False,
+    command_words: set[int] | None = None,
 ) -> str | None:
     """Judge payloads a runner executes: shell -c, eval, xargs operands, heredocs."""
     name = os.path.basename(words[index].value)
@@ -943,7 +943,7 @@ def _scan_interpreter(
         return _DEPTH_VIOLATION
     following = _segment_tail(words, index + 1)
     if name == "xargs":
-        return _scan_xargs(words, following, depth, parent_mentions_sudo)
+        return _scan_xargs(words, following, depth, parent_mentions_sudo, command_words)
     if name in _SHELL_RUNNERS:
         for offset, candidate in enumerate(following):
             word = words[candidate]
@@ -985,7 +985,11 @@ def _scan_interpreter(
 
 
 def _scan_xargs(
-    words: list[_Word], following: list[int], depth: int, parent_mentions_sudo: bool
+    words: list[_Word],
+    following: list[int],
+    depth: int,
+    parent_mentions_sudo: bool,
+    command_words: set[int] | None = None,
 ) -> str | None:
     """xargs runs its first non-flag word; option operands are judged fail-closed."""
     position = 0
@@ -994,7 +998,9 @@ def _scan_xargs(
         if word.is_data or word.is_redirect:
             return None
         if not _is_flag_word(word):
-            return _scan_segment(words, following[position], depth, parent_mentions_sudo)
+            return _scan_segment(
+                words, following[position], depth, parent_mentions_sudo, command_words
+            )
         option, glued = _split_option(word.value, _XARGS_OPERAND_OPTIONS, _XARGS_OPERAND_LETTERS)
         if option is not None and glued is None and position + 1 < len(following):
             # BSD and GNU disagree on which operands are optional, so the operand
@@ -1002,7 +1008,7 @@ def _scan_xargs(
             operand = words[following[position + 1]]
             if not operand.is_data and not operand.is_redirect:
                 violation = _scan_segment(
-                    words, following[position + 1], depth, parent_mentions_sudo
+                    words, following[position + 1], depth, parent_mentions_sudo, command_words
                 )
                 if violation:
                     return violation
@@ -1051,7 +1057,11 @@ def _scan_alias_bodies(words: list[_Word], start: int, depth: int) -> str | None
 
 
 def _scan_find_execs(
-    words: list[_Word], start: int, depth: int, parent_mentions_sudo: bool
+    words: list[_Word],
+    start: int,
+    depth: int,
+    parent_mentions_sudo: bool,
+    command_words: set[int] | None = None,
 ) -> str | None:
     """`find -exec cmd` runs cmd, so its operand is judged as a command word."""
     tail = _segment_tail(words, start)
@@ -1061,7 +1071,9 @@ def _scan_find_execs(
         operand = words[tail[offset + 1]]
         if operand.is_data or operand.is_redirect:
             continue
-        violation = _scan_segment(words, tail[offset + 1], depth, parent_mentions_sudo)
+        violation = _scan_segment(
+            words, tail[offset + 1], depth, parent_mentions_sudo, command_words
+        )
         if violation:
             return violation
     return None
