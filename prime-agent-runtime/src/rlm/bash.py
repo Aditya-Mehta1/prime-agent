@@ -1887,7 +1887,6 @@ class _FpPushArgs:
     dry_run: bool
     wildcard: bool  # --all / --mirror: every branch is a target
     refspecs: list[str]
-    repo_option: bool  # --repo named the remote: positionals are refspecs
     unresolvable: str | None = None  # argv word holding a variable/glob/...
 
 
@@ -2118,7 +2117,8 @@ def _fp_unquoted_text(text: str, *, keep_expansions: bool = False) -> str:
 _FP_PUSH_IN_TEXT = re.compile(r"(?<![A-Za-z0-9_])push(?![A-Za-z0-9_])")
 _FP_FORCE_IN_TEXT = re.compile(
     r"(?<![A-Za-z0-9_])"
-    r"(?:--force(?![A-Za-z0-9_-])|--mirror(?![A-Za-z0-9_-])|-[A-Za-z]*f(?![A-Za-z0-9_-])|\+[^\s;&|()])"
+    r"(?:--forc(?:e)?(?![A-Za-z0-9_-])|--m(?:ir(?:r(?:or)?)?)?(?![A-Za-z0-9_-])"
+    r"|-[A-Za-z]*f(?![A-Za-z0-9_-])|\+[^\s;&|()])"
 )
 # Wrappers that can change what or where the command runs (a child process, a
 # container, another host, another user, a changed root): the guard cannot model
@@ -2235,14 +2235,17 @@ _FP_ASSIGNMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _FP_EXPORT_BUILTINS = ("export", "declare", "typeset", "local", "readonly")
 
 
-def _fp_literal_assignments(words: list[_FpShellWord], before: int) -> dict[str, str]:
-    """NAME -> literal value for the assignments made before words[`before`].
+def _fp_literal_assignments(
+    words: list[_FpShellWord], before: int
+) -> dict[str, str | None]:
+    """NAME -> value for the assignments made before words[`before`].
 
     Only a word in assignment position counts: the first word of a command
     (`CFG='...'; git -c $CFG ...`) or the operand of an export-style builtin.
-    A value carrying an expansion or a glob is not literal and is left out, so
-    a name missing from the map is one the guard cannot read."""
-    assignments: dict[str, str] = {}
+    A value carrying an expansion or a glob is not the literal text the shell
+    passes, so it maps to None: a caller that needs the value refuses to guess
+    rather than fall back to an environment the shell does not use."""
+    assignments: dict[str, str | None] = {}
     for index, word in enumerate(words[:before]):
         name, separator, assigned = word.value.partition("=")
         if not separator or not _FP_ASSIGNMENT_NAME.fullmatch(name):
@@ -2250,9 +2253,9 @@ def _fp_literal_assignments(words: list[_FpShellWord], before: int) -> dict[str,
         previous = words[index - 1].value if index else ""
         if not word.starts_command and previous not in _FP_EXPORT_BUILTINS:
             continue
-        if _FP_GLOB_OR_SUBSTITUTION.search(assigned):
-            continue
-        assignments[name] = assigned
+        assignments[name] = (
+            None if _FP_GLOB_OR_SUBSTITUTION.search(assigned) else assigned
+        )
     return assignments
 
 
@@ -2262,7 +2265,7 @@ def _fp_config_variable_value(word: str, assignments: dict[str, str]) -> str | N
     variable = _FP_SIMPLE_VARIABLE.fullmatch(word)
     if variable is None:
         return None
-    return assignments.get(variable[1])
+    return assignments.get(variable[1])  # None: the command sets it unreadably
 
 
 def _fp_inline_config_key(word: str, assignments: dict[str, str]) -> str | None:
@@ -2335,7 +2338,7 @@ def _fp_unreadable_inline_config(
             _, _, variable = operand.partition("=")
             if not _FP_ASSIGNMENT_NAME.fullmatch(variable):
                 return _fp_format_config_option_refusal(operand)
-            if variable not in assignments:
+            if assignments.get(variable) is None:
                 # The value comes from an environment variable this command
                 # does not set to a literal, so the config it applies is
                 # unreadable.
@@ -2697,13 +2700,12 @@ def _fp_invocation_context(
 
 def _fp_parse_push_args(tokens: list[str], push_index: int) -> _FpPushArgs:
     """Parse the `git push` argv after the subcommand word: force flags,
-    dry-run, wildcard refspecs, --repo, and the positionals (remote and
-    refspecs) in the order git parses them."""
+    dry-run, wildcard refspecs, and the positionals (remote and refspecs) in
+    the order git parses them."""
     force = False
     dry_run = False
     all_refs = False
     mirror = False
-    repo_option = False
     unresolvable: str | None = None
     positionals: list[str] = []
     options_done = False
@@ -2771,10 +2773,7 @@ def _fp_parse_push_args(tokens: list[str], push_index: int) -> _FpPushArgs:
             elif token == "--no-mirror":
                 mirror = False
             elif token == "--repo":
-                repo_option = True
                 i += 1  # consume the space-separated repository value
-            elif token.startswith("--repo="):
-                repo_option = True
             elif token in _FP_PUSH_VALUE_LONG:
                 i += 1  # consume the space-separated value
             elif token.startswith(
@@ -2809,20 +2808,20 @@ def _fp_parse_push_args(tokens: list[str], push_index: int) -> _FpPushArgs:
     # `git push +main:main`, `git push refs/heads/main:refs/heads/main`, and
     # `git push :main` all try to reach a remote by that name (real git answers
     # with ssh host errors for the colon forms), so a lone positional never
-    # carries a refspec. Only `--repo` moves the remote out of the positionals.
-    # A remote named by a URL, an scp-like path, or a `name:path` leaves the
-    # refspec implicit, and the implicit path (upstream probe, or a refusal
-    # when there is nothing to verify against) decides what it would rewrite.
-    refspecs = positionals if repo_option else positionals[1:]
+    # carries a refspec. `--repo` does not change that: the option is
+    # equivalent to the positional and the positional wins (verified:
+    # `git push -f --repo=<bare> origin` force-updates origin's main through an
+    # implicit refspec, while `git push -f --repo=<bare> main` tries to reach a
+    # repository named `main`), so the refspecs are the positionals after the
+    # first one either way. A remote named by a URL, an scp-like path, or a
+    # `name:path` leaves the refspec implicit, and the implicit path (upstream
+    # probe, or a refusal when there is nothing to verify against) decides what
+    # it would rewrite.
+    refspecs = positionals[1:]
     # `--mirror` is `--all` plus a forced, prune-by-default push of every ref,
     # so it carries force with it; `--all` only fast-forwards and does not.
     return _FpPushArgs(
-        force or mirror,
-        dry_run,
-        all_refs or mirror,
-        refspecs,
-        repo_option,
-        unresolvable,
+        force or mirror, dry_run, all_refs or mirror, refspecs, unresolvable
     )
 
 
@@ -3099,6 +3098,40 @@ def _fp_shell_c_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
 _FP_ENV_COMMAND_NAMES = ("env", "env.exe")
 
 
+def _fp_env_payload_reopens_payload(payload: str) -> bool:
+    """True when a payload that contributes no command word ends in a bare
+    `-S`/`--split-string`, so the word after it is that option's payload.
+
+    env re-parses the split result as argv, so `env -S '' -S 'git push -f
+    origin main'` splits "" to nothing, then re-reads `-S` (the payload of the
+    first option is the second one, whose own word folds to `-S`) as the option
+    it is, and hands the next word to it: measured with GNU env,
+    `env -S'' -S 'echo hi'` prints `hi`."""
+    words, well_formed = _fp_literal_words(payload)
+    if not well_formed or not words or any(word is None for word in words):
+        return False
+    last = words[-1]
+    if last.startswith("--"):
+        option, glued, _ = _fp_env_long_option(last)
+        return option == "split-string" and glued is None
+    return last.startswith("-") and not last.startswith("--") and "S" in last[1:]
+
+
+def _fp_payload_leaves_env_options_open(payload: str) -> bool:
+    """True when a `-S` payload contributes no command word.
+
+    env re-parses the split result as argv, so a payload that is blank or holds
+    only option words leaves env parsing the options that follow it: measured
+    with GNU env, `env -S '' -S 'echo hi'`, `env -S'   ' -S 'echo hi'` and
+    `env -S -S 'echo hi'` all run `echo hi`, while a payload carrying a command
+    word (`env -S 'echo hi' -S 'echo bye'` prints `hi -S echo bye`) ends the
+    option parse and makes the rest that command's arguments."""
+    words, well_formed = _fp_literal_words(payload)
+    if not well_formed or any(word is None for word in words):
+        return False  # an unreadable split cannot be predicted: keep it closed
+    return all(word.startswith("-") for word in words)
+
+
 def _fp_env_payload_hides_force_push_source(
     payload_source: str, payload_value: str, depth: int
 ) -> bool:
@@ -3153,11 +3186,14 @@ def _fp_env_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
                     payload_source, token, depth
                 ):
                     return True
-                if not token.strip():
-                    # An empty split string contributes no argv, so env keeps
-                    # reading the options that follow it (`env -S '' -S 'git
-                    # push -f origin main'` really runs the second payload).
-                    payload_pending = False
+                if _fp_payload_leaves_env_options_open(token):
+                    # A split string that contributes no command word leaves
+                    # the option walk open: env re-parses the split result, so
+                    # `env -S'   ' -S '...'` and `env -S -S '...'` really run
+                    # the payload behind the second -S, which this payload may
+                    # itself end on. A payload with a command word ends the
+                    # option parse and makes the rest that command's arguments.
+                    payload_pending = _fp_env_payload_reopens_payload(token)
                     continue
                 break  # this env invocation is clean; check the next one
             if token == "--":
@@ -3170,13 +3206,14 @@ def _fp_env_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
                     if glued is None:
                         payload_pending = True
                         continue
-                    if not glued.strip():
-                        continue  # an empty payload leaves the options open
                     operand_at = payload_source.find("=") + 1
                     if _fp_env_payload_hides_force_push_source(
                         payload_source[operand_at:], glued, depth
                     ):
                         return True
+                    if _fp_payload_leaves_env_options_open(glued):
+                        payload_pending = _fp_env_payload_reopens_payload(glued)
+                        continue
                     break
                 continue
             if token.startswith("-") and not token.startswith("--"):
@@ -3191,6 +3228,14 @@ def _fp_env_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
                             depth,
                         ):
                             return True
+                        attached_payload = token[
+                            len("-" + short[: short.index("S") + 1]) :
+                        ]
+                        if _fp_payload_leaves_env_options_open(attached_payload):
+                            payload_pending = _fp_env_payload_reopens_payload(
+                                attached_payload
+                            )
+                            continue
                         break
                     payload_pending = True
     return False
@@ -3326,20 +3371,58 @@ def _fp_static_arg(raw: str) -> _FpStaticArg | None:
     return _FpStaticArg(words[0], raw.startswith("~"))
 
 
-def _fp_cdpath_redirects() -> bool:
+def _fp_command_env_value(
+    name: str, command_env: dict[str, str | None] | None
+) -> tuple[bool, str | None]:
+    """(set, value) for `name` in the environment the child's `cd` would read.
+
+    A command that assigns the name before the push decides the value: the
+    literal it assigns, or None when that value cannot be read. A name the
+    command does not assign reports (False, None), so the caller falls back to
+    the environment the guard itself would spawn with."""
+    if command_env is not None and name in command_env:
+        return True, command_env[name]
+    return False, None
+
+
+def _fp_cdpath_redirects(command_env: dict[str, str | None] | None = None) -> bool:
     """True when `CDPATH` could redirect a relative `cd` target.
 
     A non-empty CDPATH makes the shell search other directories first for a
     relative operand, so the directory the guard would replay is not the one
-    the shell enters."""
+    the shell enters. A command that sets CDPATH itself (`export CDPATH=/x;
+    cd repo && ...`) is read from the command, not from the guard's own
+    environment."""
+    set_in_command, assigned = _fp_command_env_value("CDPATH", command_env)
+    if set_in_command:
+        return assigned is None or bool(assigned)
     try:
         return bool(_child_env().get("CDPATH"))
     except (OSError, RuntimeError, ValueError):
         return True  # cannot read the environment: refuse rather than guess
 
 
+def _fp_home_directory(command_env: dict[str, str | None] | None) -> str | None:
+    """The home directory the child's `cd` would use, or None when the command
+    sets HOME to something the guard cannot read.
+
+    A bare `cd` and a `~`-relative operand go to the HOME the child exports:
+    `export HOME=/x; cd && git push -f origin HEAD` really enters /x, so the
+    replay has to use it rather than the HOME the guard itself runs with."""
+    set_in_command, assigned = _fp_command_env_value("HOME", command_env)
+    if set_in_command:
+        return assigned
+    try:
+        return os.path.expanduser("~")
+    except (OSError, RuntimeError):
+        return None
+
+
 def _fp_resolve_cd_target(
-    arg: _FpStaticArg, current: str | None, workspace: str
+    arg: _FpStaticArg,
+    current: str | None,
+    workspace: str,
+    command_env: dict[str, str | None] | None = None,
 ) -> str | None:
     """Resolve one statically-known `cd` argument against the running
     directory (None = the kernel workspace), logical like the shell's
@@ -3347,11 +3430,9 @@ def _fp_resolve_cd_target(
     statically (bare `cd` without a usable HOME, `cd -`/options, another
     user's home, a quoted `~`, or anything `CDPATH` could redirect)."""
     if not arg.value:
-        # A bare `cd` goes home; expanduser matches what the child shell sees.
-        try:
-            return os.path.expanduser("~")
-        except (OSError, RuntimeError):
-            return None
+        # A bare `cd` goes to the home the child shell has, which is the one
+        # the command exported when it sets HOME itself.
+        return _fp_home_directory(command_env)
     target = arg.value
     if target.startswith("-"):
         return None  # `cd -`, `cd -L`, `cd -- ...`: not statically resolvable
@@ -3361,14 +3442,14 @@ def _fp_resolve_cd_target(
             # enters `./~` rather than the home directory.
             return os.path.join(current or workspace, target)
         if target == "~" or target.startswith("~/"):
-            try:
-                return os.path.expanduser(target)
-            except (OSError, RuntimeError):
+            home = _fp_home_directory(command_env)
+            if home is None:
                 return None
+            return home if target == "~" else os.path.join(home, target[2:])
         return None  # ~otheruser: another user's home directory
     if os.path.isabs(target):
         return target
-    if not target.startswith(".") and _fp_cdpath_redirects():
+    if not target.startswith(".") and _fp_cdpath_redirects(command_env):
         # `CDPATH` is searched for a plain relative operand (a leading `/`,
         # `.`, or `..` opts out), so the target cannot be pinned down.
         return None
@@ -3402,7 +3483,10 @@ def _fp_part_sources_scripts(part: str) -> bool:
 
 
 def _fp_resolve_push_cwd(
-    prefix: str, user_command_start: int, workspace: str
+    prefix: str,
+    user_command_start: int,
+    workspace: str,
+    command_env: dict[str, str | None] | None = None,
 ) -> "str | None | _FpUnresolvableCwd":
     """Resolve the directory a push at the end of `prefix` runs in.
 
@@ -3415,7 +3499,9 @@ def _fp_resolve_push_cwd(
     repo-relocating GIT_* assignments, or a `;`/newline whose cd success is
     unknowable at a shell depth the push still runs in -- returns
     _FP_UNRESOLVABLE_CWD so the caller refuses. Returns None when no cd
-    moved the shell: the kernel workspace."""
+    moved the shell: the kernel workspace. `command_env` carries the HOME and
+    CDPATH the command itself assigns, because those are the values the
+    child's cd reads."""
     if not (
         re.search(r"\b(?:cd|pushd|popd|source)\b", prefix)
         or _fp_part_sources_scripts(prefix)
@@ -3497,7 +3583,9 @@ def _fp_resolve_push_cwd(
             )
             if arg is None:
                 return _FP_UNRESOLVABLE_CWD
-            resolved = _fp_resolve_cd_target(arg, current, workspace)
+            resolved = _fp_resolve_cd_target(
+                arg, current, workspace, command_env
+            )
             if resolved is None:
                 return _FP_UNRESOLVABLE_CWD
             current = resolved
@@ -3525,7 +3613,7 @@ def _fp_resolve_push_cwd(
         )
         if arg is None:
             return _FP_UNRESOLVABLE_CWD
-        resolved = _fp_resolve_cd_target(arg, current, workspace)
+        resolved = _fp_resolve_cd_target(arg, current, workspace, command_env)
         if resolved is None:
             return _FP_UNRESOLVABLE_CWD
         current = resolved
@@ -3622,6 +3710,18 @@ def _fp_push_violation(
     """Why this force push must be refused, or None when it may run."""
     if run.unresolvable_alias:
         return _fp_format_alias_refusal()
+    # The HOME and CDPATH the child's own `cd` commands would read: the
+    # assignments made before the command run the push is part of, because the
+    # push's own prefix assignments land after those cds ran.
+    env_limit = next(
+        (
+            index
+            for index in range(run.git_index - 1, -1, -1)
+            if words[index].starts_command
+        ),
+        run.git_index,
+    )
+    command_env = _fp_literal_assignments(words, env_limit)
     force = args.force or any(spec.startswith("+") for spec in args.refspecs)
     if args.dry_run:
         return None
@@ -3689,7 +3789,7 @@ def _fp_push_violation(
                 if run.relocated or in_prefix or relocating_prefix:
                     return _fp_format_relocation_refusal()
                 cwd = _fp_resolve_push_cwd(
-                    normalized[:git_start], user_command_start, kernel_cwd
+                    normalized[:git_start], user_command_start, kernel_cwd, command_env
                 )
                 if cwd is _FP_UNRESOLVABLE_CWD:
                     return _fp_format_relocation_refusal()
@@ -3711,7 +3811,9 @@ def _fp_push_violation(
         return _fp_format_relocation_refusal()
     if relocating_prefix:
         return _fp_format_relocation_refusal()
-    cwd = _fp_resolve_push_cwd(normalized[:git_start], user_command_start, kernel_cwd)
+    cwd = _fp_resolve_push_cwd(
+        normalized[:git_start], user_command_start, kernel_cwd, command_env
+    )
     if cwd is _FP_UNRESOLVABLE_CWD:
         return _fp_format_relocation_refusal()
     resolved_cwd = kernel_cwd if cwd is None else cwd

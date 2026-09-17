@@ -108,8 +108,7 @@ FORCE_PUSH_MATCHING_COMMANDS = [
     "git push -oo -f origin main", "git push -f origin :main", "git push -f origin main:",
     "git push -f origin @{u}", "git push origin +main",
     "git push origin +main:main", "git push origin +feature", "git push --force",
-    "git push -f", "git push -f origin",
-    "git push -f --all", "git push --force --mirror origin",
+    "git push -f", "git push -f origin", "git push -f --all", "git push --force --mirror origin",
     # `--mirror` is `--all` plus a forced push of every ref, so it carries
     # force without a force flag; `--all` alone stays non-force.
     "git push --mirror origin", "git push --mirror",
@@ -134,12 +133,10 @@ FORCE_PUSH_MATCHING_COMMANDS = [
     "gi\\\nt push -f origin main", 'git push -f origin "ma\\\nin"',
     "$'git' push -f origin main", "$'\\x67it' push -f origin main",
     "$'\\u0067it' push -f origin main", '$"git" push -f origin main',
-    "git $'push' -f origin main", "git push -$'f' origin main",
-    "git push $'--force' origin main",
+    "git $'push' -f origin main", "git push -$'f' origin main", "git push $'--force' origin main",
     # The kernel also runs on case-insensitive filesystems, where `GIT` and
     # `/usr/bin/GIT` resolve to the `git` binary.
-    "GIT push -f origin main", "Git.exe push -f origin main",
-    "/usr/bin/GIT push -f origin main",
+    "GIT push -f origin main", "Git.exe push -f origin main", "/usr/bin/GIT push -f origin main",
     # git rewrites argv with an inline alias body before it parses it.
     "git -c alias.p='push -f origin main' p",
     "git -c alias.a=p -c alias.p='push -f origin main' a",
@@ -174,8 +171,7 @@ FORCE_PUSH_NON_MATCHING_COMMANDS = [
     "git push --force-if-includes origin main",
     "git push --force-with-lease --force-if-includes origin main", "git push -n origin main",
     "git push -f -n origin main", "git push -fn origin main",
-    "git push -nf origin main", "git push --dry-run -f origin main",
-    "git push -v -q origin main",
+    "git push -nf origin main", "git push --dry-run -f origin main", "git push -v -q origin main",
     # `-of` is `-o f`: the rest of the cluster is the option's value, so no
     # force flag is set.
     "git push -of origin main", "git checkout --force main",
@@ -645,10 +641,12 @@ class ForcePushEnvPayloadTest(unittest.TestCase):
                  "env -S 'eval \"git push -f origin main\"'",
                  "env -S 'sh -c \"git push -f origin main\"'",
                  "env -S " + json.dumps(_sh_payload_chain(3)),
-                 # An empty split string contributes no argv, so env keeps
-                 # reading the options that follow it.
+                 # A payload with no command word leaves env's options open.
                  "env --split-string= -S 'git push -f origin main'",
-                 "env -S '' -S 'git push -f origin main'"],
+                 "env -S '' -S 'git push -f origin main'",
+                 "env -S'' -S 'git push -f origin main'", "env -S -S 'git push -f origin main'",
+                 "env -S'   ' -S 'git push -f origin main'",
+                 "env -S '-i' -S 'git push -f origin main'"],
             bash_module._fp_env_payloads_hide_force_push,
         )
 
@@ -660,9 +658,9 @@ class ForcePushEnvPayloadTest(unittest.TestCase):
                  "env --split-string 'git status'", "env --sp 'git status'",
                  "env -C . git status", "env VERSION=1 git status", "echo env -S",
                  "env -S " + json.dumps(_sh_payload_chain(2, "git status")),
-                 # A non-empty payload ends option parsing, so the rest of the
-                 # line is that command's arguments, not another payload.
-                 "env -S 'echo hi' -S 'git push -f origin main'"],
+                 # A payload with a command word ends the option parse.
+                 "env -S 'echo hi' -S 'git push -f origin main'",
+                 "env -S -S 'echo hi'", "env -S '' 'git push -f origin main'"],
             bash_module._fp_env_payloads_hide_force_push,
             expected=False,
         )
@@ -1190,7 +1188,10 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         # target from the current branch.
         await self._refused_all(
             [f"git push -f file://{bare}", "git push -f https://example.invalid/x.git",
-             "git push -f git@github.com:org/repo.git"],
+             "git push -f git@github.com:org/repo.git",
+             # A positional wins over `--repo`: `origin` is the remote.
+             "git push -f --repo=elsewhere origin", "git push -f --repo=elsewhere main",
+             "git push -f --rep=elsewhere origin"],
             ("upstream",),
         )
 
@@ -1248,8 +1249,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         # A shell-alias body, a body from the environment, and a chain longer
         # than the guard follows are refused rather than guessed at.
         await self._refused_all(
-            ["git -c alias.p='!git push -f origin main' p",
-             "git --config-env=alias.p=BODY p",
+            ["git -c alias.p='!git push -f origin main' p", "git --config-env=alias.p=BODY p",
              "git -c alias.a=b -c alias.b=c -c alias.c=d -c alias.d=e" " -c alias.e=f -c alias.f=g -c alias.g=h -c alias.h=i -c alias.i=j" " -c alias.j=k -c alias.k='push -f origin main' a"],
             ('alias',)
         )
@@ -1464,6 +1464,21 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
                 ["cd repo && git push -f origin HEAD", "cd repo && git push -f origin"],
                 ("changes directory",),
             )
+        # A CDPATH or HOME the command sets is the value its own `cd` reads:
+        # `export HOME=<repo on main>; cd && ...` really force-updated main.
+        await self._refused_all(
+            [f"export CDPATH={other}; cd repo && git push -f origin HEAD",
+             "export HOME=$UNKNOWN; cd && git push -f origin HEAD"],
+            ("changes directory",),
+        )
+        # HOME at a repository on main is replayed there.
+        await self._refused_all(
+            [f"export HOME={diverged}; cd && git push -f origin HEAD"],
+            ("HEAD names the current branch",),
+        )
+        self.assertIsNone(
+            self._guard_verdict(f"export HOME={diverged}; git push -f origin feature")
+        )
         # A target that opts out of CDPATH is still resolvable: `./repo` does
         # not exist here, so the guard replays the named directory.
         self.assertIsNone(
@@ -1649,7 +1664,10 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
              '"$(which git)" push -f origin main', "c=git; command $c push -f origin main",
              "c=git; command -p $c push -f origin main", "c=git; env -i $c push -f origin main", "c=git; env -u FOO $c push -f origin main",
              'echo a\\\n;ssh build-box "git push -f origin main"',
-             '"ssh" build-box "git push -f origin main"']
+             '"ssh" build-box "git push -f origin main"',
+             # A parse-options abbreviation is a force signal in the text too.
+             'ssh build-box "git push --mir origin"',
+             'ssh build-box "git push --mirr origin main"']
         )
         self._verdicts_clean(
             ["c=hello; echo \"$c\"", "c=git; '$c' push -f origin main",
@@ -1747,8 +1765,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
             ["X=1; git push origin feature", "echo $HOME && git push origin feature",
              "ls $(pwd) && git status", "X=$(date); echo $X",
              'echo "$(git rev-parse HEAD)" | cut -c1-7', "git status --short",
-             "git log --oneline -3", "git push origin feature",
-             'echo "git push -f origin main"']
+             "git log --oneline -3", "git push origin feature", 'echo "git push -f origin main"']
         )
         # Already refused before this round and still refused: an unresolvable
         # refspec.
@@ -1858,8 +1875,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         repo, _bare = self._make_repo("repo-upper-env")
         os.chdir(repo)
         await self._refused_all(
-            ["ENV -S 'git push -f origin main'",
-             "Env --split-string 'git push -f origin main'"],
+            ["ENV -S 'git push -f origin main'", "Env --split-string 'git push -f origin main'"],
             ('env -S',)
         )
         # The same names without a hidden push stay inert.
@@ -1960,17 +1976,7 @@ class ForcePushGitCommandNameTest(unittest.TestCase):
     def test_git_own_commands_run(self):
         self._outside_table(
             [
-                "git submodule status", "git subtree --help",
-                "git send-email --help",
-                "git daemon --help",
-                "git request-pull origin main",
-                "git filter-branch --help",
-                "git mergetool --help",
-                "git merge-octopus --help",
-                "git p4 --help",
-                "git status",
-                "git log --oneline -1",
-                "git push --dry-run -f origin main",
+                "git submodule status", "git subtree --help", "git send-email --help", "git daemon --help", "git request-pull origin main", "git filter-branch --help", "git mergetool --help", "git merge-octopus --help", "git p4 --help", "git status", "git log --oneline -1", "git push --dry-run -f origin main",
             ],
             refused=False,
         )
@@ -1982,13 +1988,7 @@ class ForcePushGitCommandNameTest(unittest.TestCase):
         # trusting a name the running git might not have.
         self._outside_table(
             [
-                "git history",
-                "git repo",
-                "git url-parse",
-                "git format-rev",
-                "git last-modified",
-                "git instaweb",
-                "git cvsserver --help",
+                "git history", "git repo", "git url-parse", "git format-rev", "git last-modified", "git instaweb", "git cvsserver --help",
             ],
             refused=True,
         )
