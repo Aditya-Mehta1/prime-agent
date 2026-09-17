@@ -175,24 +175,28 @@ _WRAPPER_VALUE_OPTIONS: dict[str, frozenset[str]] = {
     ),
     "nice": frozenset({"-n", "--adjustment"}),
     "exec": frozenset({"-a", "--argv0"}),
-    "strace": frozenset({"-o", "-e", "-p", "-s", "-a", "-u", "-b", "-I", "-P", "-D"}),
-    "ltrace": frozenset({"-o", "-e", "-p", "-s", "-l", "-L", "-u"}),
-    "watch": frozenset({"-n", "-d", "-t"}),
+    "strace": frozenset(
+        {"-e", "-o", "-p", "-s", "-a", "-u", "-P", "--trace", "--output", "--attach", "--columns"}
+    ),
+    "ltrace": frozenset({"-o", "-e", "-p", "-s", "-l", "-u", "-a", "-F", "--output"}),
+    # -d and -t are boolean in watch: only the interval takes a value.
+    "watch": frozenset({"-n", "--interval"}),
     "faketime": frozenset({"-f", "-m", "-p"}),
+    "chroot": frozenset({"--userspec", "--groups"}),
     "systemd-run": frozenset(
         {
             "-u",
             "-p",
             "-E",
             "-M",
-            "-C",
-            "-K",
             "--unit",
             "--property",
             "--setenv",
+            "--machine",
             "--working-directory",
             "--slice",
             "--description",
+            "--nice",
         }
     ),
 }
@@ -238,11 +242,12 @@ _WRAPPER_VALUE_LETTERS: dict[str, str] = {
     "ionice": "cnpPu",
     "nice": "n",
     "exec": "a",
-    "strace": "oepsaubIPD",
-    "ltrace": "oepslLu",
-    "watch": "ndt",
+    "strace": "oepsauP",
+    "ltrace": "oepsluaF",
+    "watch": "n",
     "faketime": "fmp",
-    "systemd-run": "upEMCK",
+    "chroot": "",
+    "systemd-run": "upEM",
 }
 _XARGS_OPERAND_LETTERS = "InadELPsJ"
 _PARALLEL_OPERAND_OPTIONS = frozenset(
@@ -531,11 +536,17 @@ def _tokenize(command: str) -> list[_Word]:
                 word_start = index
             operator, after = redirect
             target_end = after
-            while (
-                target_end < length
-                and not command[target_end].isspace()
-                and command[target_end] not in _BREAK_CHARS
-            ):
+            quote: str | None = None
+            while target_end < length:
+                char = command[target_end]
+                if quote is None:
+                    if char.isspace() or char in _BREAK_CHARS:
+                        break
+                    if char in "'\"":
+                        quote = char
+                elif char == quote:
+                    quote = None
+                # A quoted target is one word: `bash<<<"sh -c 'sudo id'"` is a script.
                 target_end += 1
             target = command[after:target_end]
             heredoc = operator.startswith("<<")
@@ -859,6 +870,7 @@ def _skip_wrapper_operands(
     """Index after a wrapper's own operands, plus any violation their text carries."""
     value_options = _WRAPPER_VALUE_OPTIONS.get(wrapper, frozenset())
     value_letters = _WRAPPER_VALUE_LETTERS.get(wrapper, "")
+    leading = _WRAPPER_LEADING_OPERANDS.get(wrapper, 0)
     while index < len(words):
         word = words[index]
         if word.is_operator or word.is_redirect or word.is_data:
@@ -891,10 +903,14 @@ def _skip_wrapper_operands(
         if wrapper in ("nice", "timeout") and _is_duration(word.value):
             index += 1
             continue
-        break
-    for _ in range(_WRAPPER_LEADING_OPERANDS.get(wrapper, 0)):
-        if index < len(words) and not _ends_segment(words[index]) and not words[index].is_assignment:
+        if leading:
+            # A positional operand such as chroot's NEWROOT or faketime's
+            # timestamp: consume it and keep walking, so later flags still cannot
+            # swallow the command.
+            leading -= 1
             index += 1
+            continue
+        break
     return index, None
 
 
