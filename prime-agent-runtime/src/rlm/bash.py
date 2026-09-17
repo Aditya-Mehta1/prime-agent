@@ -1017,7 +1017,22 @@ class _DiscardSite:
 # `git -C dir reset --hard`, `git -c key=value checkout -- .`, or
 # `git --git-dir=dir/.git reset --hard`. Kept within one shell segment
 # (no ;&|) so it cannot swallow the rest of a chained command.
-_GIT_GLOBAL_OPTIONS = r'''(?:-{1,2}[^\s;&|]+(?:\s+(?:"[^"]*"|'[^']*'|[^\s;&|]+))?\s+)*'''
+#
+# The option token and the separate value word that may follow it are written
+# as disjoint shapes, so each token has exactly one reading: a `-`-led token
+# is another option rather than the value of the one before it (git reads it
+# as an option too), a `--` token cannot also parse as a one-dash token, and
+# the value's unquoted run never starts with `-`. Two readings of the same
+# argv cost nothing while the command matches and everything when it does
+# not: the engine then tries every re-partitioning of `git -x -x ... -x
+# status` before rejecting it, and one model-supplied cell hangs the kernel.
+# Disjoint shapes leave exactly one way to consume each token, so the scan
+# stays linear.
+_GIT_OPTION_TOKEN = r'''-(?:-[^\s;&|]*|[^-\s;&|][^\s;&|]*)'''
+_GIT_OPTION_VALUE = r'''(?:"[^"]*"|'[^']*'|[^-\s;&|][^\s;&|]*)'''
+_GIT_GLOBAL_OPTIONS = (
+    r"(?:" + _GIT_OPTION_TOKEN + r"(?:\s+" + _GIT_OPTION_VALUE + r")?\s+)*"
+)
 # A pathspec read from a file (`--pathspec-from-file=X`, or `-` for stdin) can
 # name any path, `.` and `:/` included, so the option itself carries the same
 # weight as an inline pathspec: the discard matches and the dirtiness probe
@@ -1040,18 +1055,18 @@ _DISCARD_CHECKOUT_PATTERN = re.compile(
     + r"""|(?:-f|--force)\s+[^\s;&|()]+)(?=\s|$|[;&|)])"""
 )
 # Restore options accepted before the pathspec; the capture lets the finder
-# check whether staged (index-only) or worktree flags are in play. The
-# value-taking spellings come first because they must consume their tree-ish
-# (`-s HEAD`, `-sHEAD`, `--source HEAD`, `--source=HEAD`, and a short cluster
-# ending in `s` such as `-qs HEAD`); the trailing generic alternative then
-# accepts every other restore option, known or not, and leaves the decision
-# to `_restore_options_discard_worktree`, which must stay in step with the
-# getopt rule encoded here. Unknown options fall through to its default
-# (worktree restore), the fail-closed direction: patch mode (`-p`) is refused
-# too, because a non-interactive kernel shell cannot answer its prompts.
+# check whether staged (index-only) or worktree flags are in play. Every
+# option is one token (`-sHEAD`, `--source=HEAD`, `-qs`, `--worktree`), with an
+# optional separate value (`-s HEAD`, `--source HEAD`) that covers the tree-ish
+# of the value-taking spellings, so `_restore_options_discard_worktree` reads
+# exactly the tokens the shell would and stays in step with the getopt rule
+# encoded in it. Unknown options fall through to its default (worktree
+# restore), the fail-closed direction: patch mode (`-p`) is refused too,
+# because a non-interactive kernel shell cannot answer its prompts. The option
+# and value shapes are the ones the global options use, so a run of repeated
+# `--source` tokens cannot re-partition exponentially here either.
 _RESTORE_OPTION = re.compile(
-    r"""(?:--source(?:=\S+|\s+[^\s;&|]+)?|-[A-Za-z]*s(?:[^\s;&|]+|\s+[^\s;&|]+)?"""
-    r"""|-{1,2}[^\s;&|]+)\s+"""
+    _GIT_OPTION_TOKEN + r"(?:\s+" + _GIT_OPTION_VALUE + r")?\s+"
 )
 _DISCARD_RESTORE_PATTERN = re.compile(
     r"\bgit\s+"
@@ -1110,7 +1125,10 @@ _DISCARD_RESET_PATTERN = re.compile(
     r"\bgit\s+" + _GIT_GLOBAL_OPTIONS + r"reset\s+(?:(?:-[^\s;&|]+)\s+)*--hard\b"
 )
 _DISCARD_CLEAN_PATTERN = re.compile(
-    r"\bgit\s+" + _GIT_GLOBAL_OPTIONS + r"clean(?=\s|$|[;&|)])([^;&|]*)"
+    # The argument region ends at a newline: the shell ends the command there,
+    # so a `-n` on the following line (`git clean -f` + newline + `echo -n`) is
+    # not a dry-run flag for this segment.
+    r"\bgit\s+" + _GIT_GLOBAL_OPTIONS + r"clean(?=\s|$|[;&|)])([^;&|\n]*)"
 )
 
 
@@ -1164,8 +1182,10 @@ def _segment_separator(text: str, from_end: bool = True) -> str | None:
 # A function name may hold hyphens in both spellings (`function f-g { ... }`
 # and `f-g() { ... }` are definitions bash accepts), so the name class must
 # read them or the body below is never examined.
+# The function name is captured (either `function NAME` or the `NAME ()`
+# form) so the shadowing reader can read it through quoting and escapes.
 _FUNCTION_DEFINITION = re.compile(
-    r"(?:\bfunction\s+[A-Za-z_][A-Za-z0-9_-]*|\b[A-Za-z_][A-Za-z0-9_-]*\s*\(\s*\))\s*\{"
+    r"(?:\bfunction\s+([A-Za-z_][A-Za-z0-9_-]*)|\b([A-Za-z_][A-Za-z0-9_-]*)\s*\(\s*\))\s*\{"
 )
 
 
@@ -1206,6 +1226,28 @@ def _defines_directory_changing_function(prefix: str) -> bool:
                 revealed_body[word.start : word.end]
             ) in ("cd", "pushd"):
                 return True
+    return False
+
+
+def _defines_git_shadowing_function(prefix: str) -> bool:
+    """True when `prefix` defines a function named `git`.
+
+    The definition shadows the `git` the discard patterns matched, so every
+    later `git` word in the command runs the function instead
+    (`git() { command git -C sub "$@"; }; git reset --hard` discards the
+    nested repository while the resolver would probe the caller), and the
+    repository the discard targets is code the guard cannot replay. Like the
+    directory-changing bodies, a definition is treated as if it ran: the
+    guard does not model invocation or shell scope, so it refuses instead of
+    probing a repository the discard may never touch. A quoted name does
+    not shadow (`"git"()` is not a definition bash accepts), and a
+    differently named function never runs for a later bare `git` word.
+    """
+    masked_prefix = _mask_quoted_spans(prefix)
+    for match in _FUNCTION_DEFINITION.finditer(masked_prefix):
+        name = match.group(1) or match.group(2)
+        if _plain_word_text(_strip_shell_escapes(name)[0]) == "git":
+            return True
     return False
 
 
@@ -1654,8 +1696,8 @@ _REPLAYABLE_ASSIGNMENT = re.compile(r'''[A-Za-z_][A-Za-z0-9_]*=[^\s$`;&|()<>"]+'
 # A `NAME=value` shell word in front of a command word. Its value may be a
 # quoted word (`FOO="a b"`), which the shell applies but the probe cannot
 # replay as one token.
-_LEADING_ASSIGNMENT_WORD = re.compile(
-    r"""[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;&|()<>"']*)\s+"""
+_ASSIGNMENT_WORD = re.compile(
+    r"""[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;&|()<>"']*)"""
 )
 # The commands whose arguments the shell applies as assignments, so the names
 # stay set after the command (`readonly` and the declaration builtins included).
@@ -1790,7 +1832,9 @@ def _plain_word_text(word: str) -> str | None:
             if close == -1:
                 return None  # unterminated quoting: leave the text alone
             run = word[i + 1 : close]
-            if not _PLAIN_WORD_RUN.fullmatch(run):
+            # An empty quoted run contributes nothing (`g''it` is `git`),
+            # so it stays plain; only a non-empty run needs validating.
+            if run and not _PLAIN_WORD_RUN.fullmatch(run):
                 return None
             content.append(run)
             i = close + 1
@@ -2310,44 +2354,116 @@ def _payload_substitution_hides_a_discard(payload: str, aliases: dict[str, str])
     return False
 
 
-def _strip_leading_assignments(segment: str) -> tuple[str, bool]:
-    """Drop the command-scoped `NAME=value` words before a command word.
+def _revealed_word_text(word: str) -> str:
+    """The text the shell runs for one written word.
 
-    The shell applies them to the command that follows, so `FOO=1 cd sub`
-    still cds. Returns the remainder and whether every dropped assignment
-    could be replayed verbatim in the probe command.
+    Quoting and escapes are removed when the value can be read (`"cd"` runs
+    `cd`, `c\\d` runs `cd`). A shell keyword or a wrapper keeps its spelling,
+    because that is what makes the shell read syntax rather than a command
+    there. A `NAME=value` word keeps an assignment's shape, because its value
+    may hold characters the plain reader rejects (`HOME=~/x`) while the slot
+    it holds still decides where the command word is. Any other word the
+    reader cannot name (a substitution) becomes a placeholder: it holds the
+    command position the written text gives it without naming a builtin.
     """
-    remainder = segment
-    replayable = True
-    while True:
-        match = _LEADING_ASSIGNMENT_WORD.match(remainder)
-        if match is None:
-            return remainder, replayable
-        if not _REPLAYABLE_ASSIGNMENT.fullmatch(match.group(0).strip()):
-            replayable = False
-        remainder = remainder[match.end() :]
+    plain = _plain_word_text(_strip_shell_escapes(word)[0])
+    if plain is not None:
+        return plain
+    if word in _SHELL_KEYWORDS or word in _TRANSPARENT_BUILTINS:
+        return word  # syntax, not a value
+    if _ASSIGNMENT_WORD.fullmatch(word) is not None:
+        return "N=x"
+    return "x"
 
 
-def _revealed_directory_command(segment: str) -> str:
-    """`segment` with a quoted or escaped `cd`/`pushd` command word revealed.
+def _revealed_words(segment: str) -> "tuple[list[_ShellWord], list[str], str]":
+    """The written words of `segment`, their revealed text, and the text built
+    from them with separators, comments, and whitespace left in place.
 
-    Quoting does not stop a builtin, so `"cd" sub`, `c\\d sub` and `'cd' sub`
-    change directory exactly like the plain spelling, and a quoted `pushd`
-    is the pushd the resolver refuses to replay. The command word is read
-    with its escapes removed and quoting stripped, and the segment is
-    rewritten when that word spells one of the directory builtins; the
-    arguments keep their text as written so the replay below still sees
-    their quoting, and any other command word (or a `"cd"` in argument
-    position) leaves the segment exactly as it was.
+    Re-reading that text with `_shell_word_positions` gives the word the shell
+    executes by the shell's own rules, including spellings the written text
+    hides behind quoting or a wrapper (`"cd" sub`, `"command" "cd" sub`). No
+    revealed word holds quoting or a separator, so the rebuilt text has
+    exactly one word per written word, in the same order.
     """
-    for word in _shell_word_positions(segment):
+    written = _shell_word_positions(segment)
+    revealed: list[str] = []
+    parts: list[str] = []
+    cursor = 0
+    for word in written:
+        parts.append(segment[cursor : word.start])
+        revealed.append(_revealed_word_text(segment[word.start : word.end]))
+        parts.append(revealed[-1])
+        cursor = word.end
+    parts.append(segment[cursor:])
+    return written, revealed, "".join(parts)
+
+
+def _directory_command_parts(
+    segment: str,
+) -> "tuple[str, str, str] | _UnresolvableDiscardTarget | None":
+    """The directory builtin a segment's command word runs, with its prefix.
+
+    Returns `(prefix, name, arguments)`: `prefix` holds the words in front of
+    the builtin that the probe replays verbatim (command-scoped `NAME=value`
+    assignments and the `command`/`builtin` wrappers), `name` is `cd` or
+    `pushd` with its quoting and escapes removed, and `arguments` is the
+    segment's text after that word, kept as written so the caller still sees
+    its quoting. Quoting and escapes do not stop a builtin, and a keyword or a
+    wrapper in command position is syntax rather than the command, so the
+    reader follows the revealed words (`"command" "cd" sub` and `then cd sub`
+    both change directory) until a real command word ends the scan (`echo
+    "cd"` is an argument, not a cd). Returns
+    `_UNRESOLVABLE_DISCARD_TARGET` when a word the replay would need cannot be
+    replayed verbatim, and None for a segment that runs no directory builtin.
+    """
+    written, revealed, revealed_segment = _revealed_words(segment)
+    prefix: list[str] = []
+    for index, word in enumerate(_shell_word_positions(revealed_segment)):
         if not word.command:
-            continue  # an assignment or wrapper does not decide the command
-        plain = _plain_word_text(_strip_shell_escapes(segment[word.start : word.end])[0])
+            continue  # an argument never decides the command
+        raw = segment[written[index].start : written[index].end]
+        plain = revealed[index]
         if plain in ("cd", "pushd"):
-            return plain + segment[word.end :]
-        break  # the first command word decides; later words are its arguments
-    return segment
+            return " ".join(prefix), plain, segment[written[index].end :]
+        if plain in _TRANSPARENT_BUILTINS:
+            prefix.append(raw)  # `"command" cd` still runs the builtin
+        elif raw == plain and plain in _SHELL_KEYWORDS:
+            continue  # `then` and `{` are syntax: the command word still follows
+        elif _ASSIGNMENT_WORD.fullmatch(raw) is not None:
+            if _REPLAYABLE_ASSIGNMENT.fullmatch(raw) is None:
+                return _UNRESOLVABLE_DISCARD_TARGET
+            prefix.append(raw)
+        else:
+            return None  # a real command word: the words after it are arguments
+    return None
+
+
+def _prefix_holds_directory_command(prefix: str) -> bool:
+    """True when a word the shell executes in `prefix` could be a builtin.
+
+    The cd-chain reader only has to run when some word the shell would run
+    could be `cd` or `pushd`, and quoting and escapes do not stop a builtin
+    (`"c"d sub` changes directory), so this gate reads the same revealed words
+    the reader reads. A `cd` in argument position (`echo "cd"`) is not a
+    command word and does not open the gate by itself.
+    """
+    _, revealed, revealed_segment = _revealed_words(prefix)
+    return any(
+        word.command and plain in ("cd", "pushd")
+        for word, plain in zip(_shell_word_positions(revealed_segment), revealed)
+    )
+
+
+def _directory_replay(prefix: str, arguments: str) -> str:
+    """The `cd` command the probe replays for one entry of a cd chain.
+
+    The words in front of the builtin are part of the relocation: a
+    command-scoped `HOME=<dir> cd` lands in that directory while a plain `cd`
+    would land in the probe's own `HOME`. Keywords carry no directory and are
+    dropped by the reader, so what is left here is replayable verbatim.
+    """
+    return " ".join(part for part in (prefix, "cd", arguments) if part)
 
 
 def _resolve_discard_probe_target(
@@ -2464,6 +2580,20 @@ def _resolve_discard_probe_target(
                 # A sourced script runs in the current shell and may `cd`,
                 # so the discard's directory cannot be replayed safely.
                 return _UNRESOLVABLE_DISCARD_TARGET
+            # `unset` still applies when its segment short-circuits (`||
+            # true`), and removing a git-environment variable can change
+            # which repository the discard targets while the probe would
+            # keep inheriting the variable (`GIT_DIR=sub/.git; unset
+            # GIT_DIR; git reset --hard` really discards the caller). A
+            # removal cannot be replayed in the probe's assignment prefix,
+            # so refuse rather than probe a repository the discard may not
+            # touch; a piped unset runs in a subshell and never applies.
+            if seg_tokens and seg_tokens[0] == "unset" and parts[2 * index + 1] != "|":
+                if any(
+                    (plain := _plain_word_text(token)) is not None and plain.startswith("GIT_")
+                    for token in seg_tokens[1:]
+                ):
+                    return _UNRESOLVABLE_DISCARD_TARGET
             if parts[2 * index + 1] not in (";", "&&", "\n"):
                 continue  # pipe/subshell or short-circuit: the env does not persist
             if not seg_tokens:
@@ -2485,8 +2615,10 @@ def _resolve_discard_probe_target(
 
     # A function definition whose body can change directory relocates a later
     # discard whenever the function is called, and the guard does not model
-    # invocation or shell scope: refuse instead of replaying a guess.
-    if _defines_directory_changing_function(prefix):
+    # invocation or shell scope: refuse instead of replaying a guess. A
+    # function named `git` shadows the discard itself, so it refuses for the
+    # same reason: the repository the wrapped git targets is unknowable.
+    if _defines_directory_changing_function(prefix) or _defines_git_shadowing_function(prefix):
         return _UNRESOLVABLE_DISCARD_TARGET
 
     # cd relocations earlier in the command. cds inside grouping parentheses
@@ -2494,18 +2626,15 @@ def _resolve_discard_probe_target(
     # still-open group, tracked via paren depth. Segments before
     # userCommandStart belong to the configured command prefix, which the
     # probe already replays verbatim, so their cds are not re-applied.
-    persistent_cd_args: list[str] = []
-    grouped_cd_args: list[str] = []
+    persistent_cd_commands: list[str] = []
+    grouped_cd_commands: list[str] = []
     saw_cd = False
     paren_depth = 0
     cd_pending_separator = False
-    # The gate reads the escape-stripped text too: `c\d sub` is a cd the raw
-    # word regex cannot see, and the segment reader reveals it below.
-    if (
-        re.search(r"\b(?:cd|pushd)\b", prefix)
-        or re.search(r"\b(?:cd|pushd)\b", _strip_shell_escapes(prefix)[0])
-        or "(" in prefix
-    ):
+    # The gate reads the revealed command words: quoting and escapes do not
+    # stop a builtin (`"c"d sub`), and a keyword or wrapper in front of one does
+    # not hide it either (`then cd sub`, `"command" "cd" sub`).
+    if _prefix_holds_directory_command(prefix) or "(" in prefix:
         offset = 0
         for part in re.split(r"(&&|\|\||;|\||\n)", prefix):
             start = offset
@@ -2530,43 +2659,40 @@ def _resolve_discard_probe_target(
             paren_depth = max(0, paren_depth + opens - closes)
             if inside_group:
                 body = re.sub(r"[)\s]+$", "", re.sub(r"^[(\s]+", "", trimmed))
-                # The group's own cd may be quoted or escaped like any other.
-                body = _revealed_directory_command(body)
-                group_cd = re.match(r"cd\s*(.*)$", body)
-                if group_cd:
-                    arg = group_cd.group(1).strip()
+                directory_command = _directory_command_parts(body)
+                if directory_command is _UNRESOLVABLE_DISCARD_TARGET:
+                    return _UNRESOLVABLE_DISCARD_TARGET
+                if directory_command is not None:
+                    prefix_text, name, arguments = directory_command
+                    if name == "pushd":
+                        # pushd keeps a directory stack the probe cannot replay.
+                        return _UNRESOLVABLE_DISCARD_TARGET
+                    arg = arguments.strip()
                     if not arg or re.search(r'''[$`;&|()<>#"]''', arg):
                         return _UNRESOLVABLE_DISCARD_TARGET
                     saw_cd = True
                     cd_pending_separator = True
-                    grouped_cd_args.append(arg)
+                    grouped_cd_commands.append(_directory_replay(prefix_text, arg))
                 elif re.search(r"\b(?:cd|pushd)\b", trimmed):
                     return _UNRESOLVABLE_DISCARD_TARGET  # group content we cannot replay
                 # A closed group's cds do not persist and must not leak into a
                 # later still-open group's chain.
                 if paren_depth == 0:
-                    grouped_cd_args.clear()
+                    grouped_cd_commands.clear()
                 continue
             # Brace groups run in the current shell, so a `{ cd sub && git
             # reset --hard; }` relocates the discard like a bare cd chain.
             group_free = re.sub(r"^\{\s*", "", trimmed)
-            # A command-scoped assignment in front of the cd (`FOO=1 cd sub`)
-            # does not stop the cd from relocating, so only the words after it
-            # may decide the directory. An assignment the probe cannot replay
-            # verbatim leaves that directory unknowable, and is refused below.
-            body, replayable = _strip_leading_assignments(group_free)
-            # Quoting and escapes do not stop the builtin either (`"cd" sub`,
-            # `c\d sub`), so the command word is revealed before the match.
-            body = _revealed_directory_command(body)
-            if body == "pushd" or body.startswith("pushd "):
+            directory_command = _directory_command_parts(group_free)
+            if directory_command is _UNRESOLVABLE_DISCARD_TARGET:
                 return _UNRESOLVABLE_DISCARD_TARGET
-            cd_match = re.match(r"cd\s*(.*)$", body)
-            if not cd_match:
+            if directory_command is None:
                 cd_pending_separator = False
                 continue  # not a cd: cannot change cwd
-            if not replayable:
-                return _UNRESOLVABLE_DISCARD_TARGET
-            arg = cd_match.group(1).strip()
+            prefix_text, name, arguments = directory_command
+            if name == "pushd":
+                return _UNRESOLVABLE_DISCARD_TARGET  # pushd cannot be replayed as a cd
+            arg = arguments.strip()
             # An arg we cannot replay safely (substitution, redirection,
             # backgrounding, comments, or quotes split by segmenting) leaves
             # the target repository unknown; refuse rather than probe blindly.
@@ -2575,18 +2701,18 @@ def _resolve_discard_probe_target(
                 return _UNRESOLVABLE_DISCARD_TARGET
             saw_cd = True
             cd_pending_separator = True
-            persistent_cd_args.append(arg)
+            persistent_cd_commands.append(_directory_replay(prefix_text, arg))
 
     # When the discard runs inside a still-open group, its directory is the
     # persistent cd chain inherited by the group plus the group's own cds.
-    cd_args = persistent_cd_args + grouped_cd_args if paren_depth > 0 else persistent_cd_args
+    cd_commands = (
+        persistent_cd_commands + grouped_cd_commands if paren_depth > 0 else persistent_cd_commands
+    )
 
-    if not cd_args and dash_c_dir is None and not clean_removes_ignored and not env_prefix:
+    if not cd_commands and dash_c_dir is None and not clean_removes_ignored and not env_prefix:
         return None
     ignored = " --ignored=matching" if clean_removes_ignored else ""
-    cd_prefix = (
-        " && ".join(f"cd {arg}" if arg else "cd" for arg in cd_args) + " && " if cd_args else ""
-    )
+    cd_prefix = " && ".join(cd_commands) + " && " if cd_commands else ""
     if dash_c_dir:
         git_status = f"git -C {dash_c_dir} status --porcelain --untracked-files=all{ignored}"
     else:

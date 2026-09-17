@@ -75,8 +75,7 @@ MATCHING_COMMANDS = [
     'G=git; echo G=other; $G reset --hard', "G=git; printf '%s' G=other; $G reset --hard", 'G=git; # G=other\n$G reset --hard',
     'FOO=1 cd sub && git reset --hard', '/usr/bin/git reset --hard', './git reset --hard', "G='git reset --hard'; $G", 'G="git restore ."; $G',
     'G="it\'s # "; $G git reset --hard', "echo 'git' 'reset' '--hard'", 'git reset &>/dev/null --hard', 'git reset &> /dev/null --hard',
-    'git reset &>>/dev/null --hard', 'git reset >&/dev/null --hard', '{ cd sub && git reset --hard; }',
-    'export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard',
+    'git reset &>>/dev/null --hard', 'git reset >&/dev/null --hard', '{ cd sub && git reset --hard; }', 'export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard',
     'for i in 1; do export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard; done', 'GIT_DIR=sub/.git; git reset --hard',
     'git -Csub reset --hard', 'git -cfoo.bar=1 reset --hard', 'git reset \\\n--hard', 'git checkout -- \\\n.', 'git clean -f \\\n-d',
     'cat <<EOF ; git reset --hard\nEOF', 'cat <<EOF && git reset --hard\nEOF', 'declare -x G=git; $G reset --hard',
@@ -112,6 +111,17 @@ class DestructiveGitDetectionTest(unittest.TestCase):
         for command in NON_MATCHING_COMMANDS:
             with self.subTest(command=command):
                 self.assertFalse(is_destructive_git_discard_command(command))
+        # Repeated option tokens made the shared option and restore-option
+        # regexes re-partition exponentially; each row ran for tens of minutes
+        # before the fix.
+        for pathological in [
+            "git " + " ".join(["-x"] * 60) + " status",
+            "git " + " ".join(["--x"] * 60) + " status",
+            "git restore " + "-s " * 60 + "file.txt",
+        ]:
+            start = time.monotonic()
+            self.assertFalse(is_destructive_git_discard_command(pathological))
+            self.assertLess(time.monotonic() - start, 5.0)
 
 
 class EvalPayloadDetectionTest(unittest.TestCase):
@@ -168,10 +178,9 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
             'G=git; $G reset --hard', "G='git reset --hard'; $G", 'G=git; echo G=other; $G reset --hard',
             "G=git; printf '%s' G=other; $G reset --hard", 'G=git; # G=other\n$G reset --hard', 'declare -x G=git; $G reset --hard',
             'readonly G=git; $G reset --hard', 'export -n G=git; $G reset --hard', 'G=other; command export G=git; $G reset --hard',
-            'f() { local -r G=git; $G reset --hard; }; f', 'G=git; G=other git status; $G reset --hard', 'G=git; G=other git; $G reset --hard',
-            'echo "$(echo ")")"; git reset --hard', 'V="$(echo ")")"; git reset --hard',
+            'f() { local -r G=git; $G reset --hard; }; f', 'G=git; G=other git status; $G reset --hard', 'G=git; G=other git; $G reset --hard', 'echo "$(echo ")")"; git reset --hard', 'V="$(echo ")")"; git reset --hard',
             'git -c clean.requireForce=false clean', 'git config clean.requireForce false && git clean', 'git clean -d', 'git clean',
-            'printf \'.\\n\' > ps.txt && git checkout --pathspec-from-file=ps.txt', "G='echo hi'; G='git reset --hard' H=\"$G\"; $H",
+            'printf \'.\\n\' > ps.txt && git checkout --pathspec-from-file=ps.txt', "G='echo hi'; G='git reset --hard' H=\"$G\"; $H", "g''it reset --hard", 'g""it reset --hard', 'git clean -f\necho -n',
         ]):
             with self.subTest(command=command):
                 repo = str(self._tracked(f"repo-{index}"))
@@ -211,6 +220,12 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
         _run_git(self.test_dir, "commit", "-q", "-m", "second")
         result = await bash("git checkout -- .")
         self.assertEqual(result.exit_code, 0)
+        # A non-`git` function never runs for a bare `git` word, and a
+        # command-scoped HOME is replayed: both probe this clean tree.
+        for command in ['f() { echo hi; }; git reset --hard', f'HOME={self.test_dir} cd && git reset --hard']:
+            with self.subTest(command=command):
+                result = await bash(command)
+                self.assertEqual(result.exit_code, 0)
 
     async def test_bypass_kwarg_runs_discard(self):
         self._init_dirty_repo()
@@ -364,10 +379,10 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
         self._init_dirty_repo()
         for command in [
             'cd $(pwd)/sub && git reset --hard', 'git --git-dir=sub/.git reset --hard', 'cd sub || git reset --hard',
-            'pushd sub && git reset --hard', '"pushd" sub && git reset --hard', 'git -C "sub" reset --hard', 'git -ccore.worktree=sub reset --hard', 'git -ccore.bare=1 reset --hard',
+            'pushd sub && git reset --hard', '"pushd" sub && git reset --hard', 'git -C "sub" reset --hard', 'git -ccore.worktree=sub reset --hard', 'git -ccore.bare=1 reset --hard', '( "pu"shd sub && git reset --hard )',
             'git -pCsub reset --hard', 'git -qC sub reset --hard', 'source setup.sh && git reset --hard', '. setup.sh && git reset --hard',
             'export GIT_DIR=$(pwd)/sub; git reset --hard', 'FOO=1 cd sub; git reset --hard', 'FOO=$(pwd) cd sub && git reset --hard',
-            'function f { cd sub; }; f; git reset --hard', 'function f { pushd sub; }; f && git reset --hard',
+            'function f { cd sub; }; f; git reset --hard', 'function f { pushd sub; }; f && git reset --hard', 'git() { command git -C sub "$@"; }; git reset --hard', 'GIT_DIR=sub/.git; unset GIT_DIR; git reset --hard',
         ]:
             with self.subTest(command=command):
                 with self.assertRaises(DestructiveGitRefusalError) as caught:
@@ -606,12 +621,15 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
         _init_dirty_git_repo(str(self._tracked("sub")))
         # The parent tree stays clean: the group's cd must relocate the probe
         # like a bare cd chain, and a command-scoped assignment in front of
-        # the cd (`FOO=1 cd sub`) must not hide it.
+        # the cd (`FOO=1 cd sub`, `HOME=sub cd`) must not hide it. Quoting,
+        # escapes, wrappers, and keywords do not stop the builtin either.
         self._init_dirty_repo()
         _run_git(self.test_dir, "add", "-A")
         _run_git(self.test_dir, "commit", "-q", "-m", "second")
         for command in [
-            "{ cd sub && git reset --hard; }", "FOO=1 cd sub && git reset --hard",
+            "{ cd sub && git reset --hard; }", "FOO=1 cd sub && git reset --hard", "HOME=sub cd && git reset --hard",
+            '"c"d sub && git reset --hard', '"command" "cd" sub && git reset --hard',
+            "if true; then cd sub && git reset --hard; fi",
         ]:
             with self.subTest(command=command):
                 with self.assertRaises(DestructiveGitRefusalError) as caught:
@@ -644,9 +662,8 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
         _run_git(self.test_dir, "commit", "-q", "-m", "second")
         for command in [
             'export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard', 'GIT_DIR=sub/.git; git reset --hard',
-            'export GIT_DIR=sub/.git && git reset --hard', '{ export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard; }',
-            'if true; then export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard; fi',
-            'if true; then { export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard; }; fi',
+            'export GIT_DIR=sub/.git && git reset --hard', '{ export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard; }', 'if true; then export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard; fi',
+            'if true; then { export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard; }; fi', f'HOME={self._tracked("sub")} cd && git reset --hard',
         ]:
             with self.subTest(command=command):
                 with self.assertRaises(DestructiveGitRefusalError) as caught:
