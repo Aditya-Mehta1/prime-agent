@@ -53,80 +53,66 @@ def _init_dirty_git_repo(root: str) -> None:
 # `G=git; $G reset --hard`, `git restore --source HEAD .`, `-qs HEAD .`,
 # `git restore --staged --worktree .` and `git restore --quiet .`).
 MATCHING_COMMANDS = [
-    'git checkout -- .', 'git checkout .', 'git checkout HEAD -- .',
-    'git restore .', 'git restore --source=HEAD~1 .', 'git clean -f',
-    'git clean -fd', 'git clean -fdx', 'git clean --force',
-    'git reset --hard', 'git reset --hard HEAD~1',
+    'git checkout -- .', 'git checkout .', 'git checkout HEAD -- .', 'git restore .',
+    'git restore --source=HEAD~1 .', 'git clean -f', 'git clean -fd', 'git clean -fdx',
+    'git clean --force', 'git reset --hard', 'git reset --hard HEAD~1',
     'git checkout -b tmp 2>/dev/null; git checkout -- .',
-    'git checkout main && git reset --hard',
-    'echo start\ngit clean -fd', 'npm test & git clean -fd &',
-    'git checkout :/', 'git checkout -- :/', 'git checkout HEAD -- :/',
-    'git restore :/', 'git restore -s@ .', 'git restore -s@ :/',
-    'git restore --source=HEAD :/', 'git restore -s HEAD~1 :/',
-    'git restore -s STASH .', 'git restore -sSTASH .',
-    'git restore --source HEAD .', 'git restore -qs HEAD .',
-    'git restore -Ws HEAD .', 'git restore --no-overlay .',
-    'git restore --overlay .', 'git restore --ignore-unmerged .',
-    'git restore --recurse-submodules .', 'git restore -- .',
-    'git checkout -- ./', 'git checkout ./', 'git restore ./',
-    'git -C sub reset --hard', 'git --git-dir=sub/.git reset --hard',
-    'git reset -q --hard', 'git reset --no-refresh --hard',
-    'git -C repo -C nested reset --hard',
-    'GIT_DIR=sub/.git git reset --hard',
-    'GIT_DIR=sub/.git GIT_WORK_TREE=sub git reset --hard',
-    'git checkout -f -- .', 'git checkout --theirs -- .',
-    'git checkout -m .', 'git checkout --conflict=diff3 .',
-    'git checkout HEAD .', 'git checkout HEAD~1 -- .',
-    'git checkout origin/main .', 'git checkout -f main',
-    'git checkout --force main', 'git clean -f -- -n',
-    'git reset 2>/dev/null --hard', 'git reset 2> /dev/null --hard',
-    'git reset 2>&1 --hard', 'git 2>/dev/null reset --hard',
-    'git restore 2>/dev/null .', 'git clean -f 2>/dev/null',
-    'git checkout 2>/dev/null -- .',
+    'git checkout main && git reset --hard', 'echo start\ngit clean -fd',
+    'npm test & git clean -fd &', 'git checkout :/', 'git checkout -- :/',
+    'git checkout HEAD -- :/', 'git restore :/', 'git restore -s@ .', 'git restore -s@ :/',
+    'git restore --source=HEAD :/', 'git restore -s HEAD~1 :/', 'git restore -s STASH .',
+    'git restore -sSTASH .', 'git restore --source HEAD .', 'git restore -qs HEAD .',
+    'git restore -Ws HEAD .', 'git restore --no-overlay .', 'git restore --overlay .',
+    'git restore --ignore-unmerged .', 'git restore --recurse-submodules .',
+    'git restore -- .', 'git checkout -- ./', 'git checkout ./', 'git restore ./',
+    'git -C sub reset --hard', 'git --git-dir=sub/.git reset --hard', 'git reset -q --hard',
+    'git reset --no-refresh --hard', 'git -C repo -C nested reset --hard',
+    'GIT_DIR=sub/.git git reset --hard', 'GIT_DIR=sub/.git GIT_WORK_TREE=sub git reset --hard',
+    'git checkout -f -- .', 'git checkout --theirs -- .', 'git checkout -m .',
+    'git checkout --conflict=diff3 .', 'git checkout HEAD .', 'git checkout HEAD~1 -- .',
+    'git checkout origin/main .', 'git checkout -f main', 'git checkout --force main',
+    'git clean -f -- -n', 'git reset 2>/dev/null --hard', 'git reset 2> /dev/null --hard',
+    'git reset 2>&1 --hard', 'git 2>/dev/null reset --hard', 'git restore 2>/dev/null .',
+    'git clean -f 2>/dev/null', 'git checkout 2>/dev/null -- .',
     'git restore --staged --worktree .', 'git restore -SW .',
-    'source setup.sh && git reset --hard', 'git restore --quiet .',
-    'git restore -q .', 'git restore --quiet --source=HEAD .',
-    'g\\it reset --ha\\rd', 'git res\\et --hard', '"git" reset --hard',
-    "g'it' reset --hard", 'G=git; $G reset --hard',
+    'source setup.sh && git reset --hard', 'git restore --quiet .', 'git restore -q .',
+    'git restore --quiet --source=HEAD .', 'g\\it reset --ha\\rd', 'git res\\et --hard',
+    '"git" reset --hard', "g'it' reset --hard", 'G=git; $G reset --hard',
     'G=git; ${G} reset --hard', 'G=git; echo G=other; $G reset --hard',
-    "G=git; printf '%s' G=other; $G reset --hard",
-    'G=git; # G=other\n$G reset --hard',
-    'FOO=1 cd sub && git reset --hard', '/usr/bin/git reset --hard',
-    './git reset --hard', "G='git reset --hard'; $G",
-    'G="git restore ."; $G', 'G="it\'s # "; $G git reset --hard',
+    "G=git; printf '%s' G=other; $G reset --hard", 'G=git; # G=other\n$G reset --hard',
+    'FOO=1 cd sub && git reset --hard', '/usr/bin/git reset --hard', './git reset --hard',
+    "G='git reset --hard'; $G", 'G="git restore ."; $G', 'G="it\'s # "; $G git reset --hard',
     "echo 'git' 'reset' '--hard'", 'git reset &>/dev/null --hard',
     'git reset &> /dev/null --hard', 'git reset &>>/dev/null --hard',
     'git reset >&/dev/null --hard', '{ cd sub && git reset --hard; }',
     'export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard',
     'for i in 1; do export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard; done',
     'GIT_DIR=sub/.git; git reset --hard', 'git -Csub reset --hard',
-    'git -cfoo.bar=1 reset --hard', 'git reset \\\n--hard',
-    'git checkout -- \\\n.', 'git clean -f \\\n-d',
-    'cat <<EOF ; git reset --hard\nEOF',
-    'cat <<EOF && git reset --hard\nEOF',
+    'git -cfoo.bar=1 reset --hard', 'git reset \\\n--hard', 'git checkout -- \\\n.',
+    'git clean -f \\\n-d', 'cat <<EOF ; git reset --hard\nEOF',
+    'cat <<EOF && git reset --hard\nEOF', 'declare -x G=git; $G reset --hard',
+    'readonly G=git; $G reset --hard', 'export -n G=git; $G reset --hard',
+    'G=other; command export G=git; $G reset --hard', "X=git Y='-C sub reset --hard'; $X $Y",
+    "G=git; H='-C sub'; $G $H reset --hard", 'G=git; G=other git status; $G reset --hard',
+    'G=git; G=other git; $G reset --hard',
 ]
 
 NON_MATCHING_COMMANDS = [
-    'git status', 'git log --oneline', 'git checkout -b new-branch',
-    'git checkout main', 'git checkout -m main',
-    'git checkout -b newbranch .', 'git checkout -- single-file.txt',
-    "echo 'git reset --hard'", 'git commit -m "git reset --hard"',
-    'echo "git clean -fd"', 'echo preparing # git reset --hard',
-    'git checkout ./nested', 'git restore --staged .',
-    'git restore --staged :/', 'git restore single-file.txt',
-    'git clean -n', 'git clean -n -f .', 'git clean --dry-run',
-    'git clean -d', 'git reset', 'git reset --soft HEAD~1',
-    'git stash', 'git add .', 'echo hello world', 'npm run check',
-    'git status > status.txt',
-    'git log --oneline > log.txt 2>/dev/null', 'echo 2>/dev/null hi',
-    '{ echo hi; }', 'export FOO=1', 'git restore --staged --quiet .',
-    'echo \\# git reset --hard', 'cat <<EOF\\ngit reset --hard\\nEOF',
-    'echo one  two', 'git -Csub status', '# git reset --hard',
-    '$G reset --hard', 'G=git; echo x; G=other; $G reset --hard',
-    "cat <<'EOF'\n$(git reset --hard)\nEOF",
-    'cat <<"EOF"\n$(git reset --hard)\nEOF',
-    "echo eval 'git reset --hard'", "G='git clean -n'; $G",
-    "G='echo hi'; $G",
+    'git status', 'git log --oneline', 'git checkout -b new-branch', 'git checkout main',
+    'git checkout -m main', 'git checkout -b newbranch .', 'git checkout -- single-file.txt',
+    "echo 'git reset --hard'", 'git commit -m "git reset --hard"', 'echo "git clean -fd"',
+    'echo preparing # git reset --hard', 'git checkout ./nested', 'git restore --staged .',
+    'git restore --staged :/', 'git restore single-file.txt', 'git clean -n',
+    'git clean -n -f .', 'git clean --dry-run', 'git clean -d', 'git reset',
+    'git reset --soft HEAD~1', 'git stash', 'git add .', 'echo hello world', 'npm run check',
+    'git status > status.txt', 'git log --oneline > log.txt 2>/dev/null',
+    'echo 2>/dev/null hi', '{ echo hi; }', 'export FOO=1', 'git restore --staged --quiet .',
+    'echo \\# git reset --hard', 'cat <<EOF\\ngit reset --hard\\nEOF', 'echo one  two',
+    'git -Csub status', '# git reset --hard', '$G reset --hard',
+    'G=git; echo x; G=other; $G reset --hard', "cat <<'EOF'\n$(git reset --hard)\nEOF",
+    'cat <<"EOF"\n$(git reset --hard)\nEOF', "echo eval 'git reset --hard'",
+    "G='git clean -n'; $G", "G='echo hi'; $G",
+    'G=git; command export G=other; $G reset --hard',
     'if true; then export GIT_DIR=sub/.git GIT_WORK_TREE=sub; fi',
     'for i in 1; do echo hi; done', "# 'git' reset --hard",
 ]
@@ -197,17 +183,16 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_refuses_destructive_discards_on_dirty_tree(self):
         for index, command in enumerate([
-            "git checkout -- .",
-            "git checkout .",
-            "git clean -fd",
-            "git reset --hard",
-            "git restore .",
-            "\"git\" reset --hard",
-            "G=git; $G reset --hard",
-            "G='git reset --hard'; $G",
-            "G=git; echo G=other; $G reset --hard",
-            "G=git; printf '%s' G=other; $G reset --hard",
-            "G=git; # G=other\n$G reset --hard",
+            'git checkout -- .', 'git checkout .', 'git clean -fd', 'git reset --hard',
+            'git restore .', '"git" reset --hard', 'G=git; $G reset --hard',
+            "G='git reset --hard'; $G", 'G=git; echo G=other; $G reset --hard',
+            "G=git; printf '%s' G=other; $G reset --hard", 'G=git; # G=other\n$G reset --hard',
+            'declare -x G=git; $G reset --hard', 'readonly G=git; $G reset --hard',
+            'export -n G=git; $G reset --hard',
+            'G=other; command export G=git; $G reset --hard',
+            'f() { local -r G=git; $G reset --hard; }; f',
+            'G=git; G=other git status; $G reset --hard',
+            'G=git; G=other git; $G reset --hard',
         ]):
             with self.subTest(command=command):
                 repo = str(self._tracked(f"repo-{index}"))
@@ -396,20 +381,13 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
     async def test_refuses_relocations_it_cannot_replay_safely(self):
         self._init_dirty_repo()
         for command in [
-            "cd $(pwd)/sub && git reset --hard",
-            "git --git-dir=sub/.git reset --hard",
-            "cd sub || git reset --hard",
-            "pushd sub && git reset --hard",
-            'git -C "sub" reset --hard',
-            "git -ccore.worktree=sub reset --hard",
-            "git -ccore.bare=1 reset --hard",
-            "git -pCsub reset --hard",
-            "git -qC sub reset --hard",
-            "source setup.sh && git reset --hard",
-            ". setup.sh && git reset --hard",
-            "export GIT_DIR=$(pwd)/sub; git reset --hard",
-            "FOO=1 cd sub; git reset --hard",
-            "FOO=$(pwd) cd sub && git reset --hard",
+            'cd $(pwd)/sub && git reset --hard', 'git --git-dir=sub/.git reset --hard',
+            'cd sub || git reset --hard', 'pushd sub && git reset --hard',
+            'git -C "sub" reset --hard', 'git -ccore.worktree=sub reset --hard',
+            'git -ccore.bare=1 reset --hard', 'git -pCsub reset --hard',
+            'git -qC sub reset --hard', 'source setup.sh && git reset --hard',
+            '. setup.sh && git reset --hard', 'export GIT_DIR=$(pwd)/sub; git reset --hard',
+            'FOO=1 cd sub; git reset --hard', 'FOO=$(pwd) cd sub && git reset --hard',
         ]:
             with self.subTest(command=command):
                 with self.assertRaises(DestructiveGitRefusalError) as caught:
@@ -420,17 +398,25 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
         # A revealed value holding more than the executable word runs as
         # argv, so the `-C sub` inside it relocates the discard. The guard
         # cannot name that directory from the text, so it refuses instead of
-        # approving the clean parent the unexpanded `$G` appears to target.
+        # approving the clean parent the unexpanded reference appears to
+        # target, and says why instead of claiming a directory change.
         _init_dirty_git_repo(str(self._tracked("sub")))
         self._init_dirty_repo()
         self._tracked(".gitignore").write_text("sub/\n")
         _run_git(self.test_dir, "add", "-A")
         _run_git(self.test_dir, "commit", "-q", "-m", "second")
-        for command in ["G='git -C sub reset --hard'; $G", "G='git -C sub restore .'; $G"]:
+        for command in [
+            "G='git -C sub reset --hard'; $G",
+            "G='git -C sub restore .'; $G",
+            "X=git Y='-C sub reset --hard'; $X $Y",
+            "G=git; H='-C sub'; $G $H reset --hard",
+        ]:
             with self.subTest(command=command):
                 with self.assertRaises(DestructiveGitRefusalError) as caught:
                     bash(command)
-                self.assertIn("changes directory (or repository) first", str(caught.exception))
+                message = str(caught.exception)
+                self.assertIn("expanded value whose argv cannot be replayed", message)
+                self.assertNotIn("changes directory (or repository) first", message)
         self.assertEqual(self._tracked("sub", "tracked.txt").read_text(), "modified\n")
 
     async def test_refuses_eval_wrapped_discards(self):
@@ -631,6 +617,18 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
         result = await bash("FOO=1 git status")
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
+        # The shell keeps none of these names, so `$G` runs a command that is
+        # not git and the tree survives; a command-scoped prefix must not
+        # overwrite the value a later reference really expands.
+        for command in [
+            "G=git; echo x; G=other; $G reset --hard",
+            "G=git; export G=other; $G reset --hard",
+            "G=git; command export G=other; $G reset --hard",
+        ]:
+            with self.subTest(command=command):
+                result = await bash(command)
+                self.assertNotEqual(result.exit_code, 0)
+                self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
 
     async def test_refuses_discards_hidden_behind_shell_escapes(self):
         self._init_dirty_repo()

@@ -22,7 +22,7 @@ from collections import deque
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 from . import _winjob
 
@@ -1097,6 +1097,28 @@ _DISCARD_CLEAN_PATTERN = re.compile(
 )
 
 
+def _starts_comment(text: str, index: int) -> bool:
+    """True when the `#` at `index` opens a comment.
+
+    The shell starts a comment only at the beginning of a word, so a `#` inside
+    a word (`foo#bar`) is literal text and comments are judged the same way by
+    every pass that walks the command text.
+    """
+    return text[index] == "#" and (
+        index == 0 or text[index - 1].isspace() or text[index - 1] in ";&|(){}"
+    )
+
+
+def _separates_commands(text: str) -> bool:
+    """True when `text` holds an unquoted shell separator.
+
+    The text between two words can carry `;`, `&`, `|`, a newline, or a
+    grouping parenthesis, all of which end the simple command that ran before
+    them (redirections do not and are masked out before this runs).
+    """
+    return any(ch in ";&|\n()" for ch in text)
+
+
 def _normalize_line_continuations(command: str) -> str:
     """Collapse unquoted backslash-newline line continuations to spaces.
 
@@ -1121,7 +1143,7 @@ def _normalize_line_continuations(command: str) -> str:
         elif quote is None:
             if ch in ('"', "'"):
                 quote = ch
-            elif ch == "#" and (i == 0 or re.match(r"[\s;&|(){}]", chars[i - 1])):
+            elif _starts_comment(chars, i):
                 comment = True
             elif ch == "\\" and i + 1 < n and chars[i + 1] == "\n":
                 chars[i] = " "
@@ -1259,7 +1281,7 @@ def _mask_shell_redirections(command: str) -> str:
                 quote = ch
                 i += 1
                 continue
-            if ch == "#" and (i == 0 or re.match(r"[\s;&|(){}]", chars[i - 1])):
+            if _starts_comment(chars, i):
                 comment = True
                 i += 1
                 continue
@@ -1415,9 +1437,9 @@ def _mask_quoted_spans(command: str) -> str:
     while i < n:
         ch = chars[i]
         if quote is None:
-            # An unquoted # at a word boundary starts a comment; mask to end of line.
-            prev = chars[i - 1] if i > 0 else None
-            if ch == "#" and (i == 0 or prev is None or re.match(r"[\s;&|(){}]", prev)):
+            # An unquoted # at a word boundary starts a comment; mask to the
+            # end of the line.
+            if _starts_comment(chars, i):
                 j = i
                 while j < n and chars[j] != "\n":
                     chars[j] = " "
@@ -1493,8 +1515,12 @@ _REPLAYABLE_ASSIGNMENT = re.compile(r'''[A-Za-z_][A-Za-z0-9_]*=[^\s$`;&|()<>"]+'
 _LEADING_ASSIGNMENT_WORD = re.compile(
     r"""[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;&|()<>"']*)\s+"""
 )
-# The commands whose arguments the shell applies as assignments.
-_EXPORT_COMMANDS = frozenset({"export", "declare", "typeset", "local"})
+# The commands whose arguments the shell applies as assignments, so the names
+# stay set after the command (`readonly` and the declaration builtins included).
+_EXPORT_COMMANDS = frozenset({"export", "declare", "typeset", "local", "readonly"})
+# Builtins that run the next word as a command themselves: an assignment in
+# front of them (`G=other command export H=1`) is scoped to that one command.
+_TRANSPARENT_BUILTINS = frozenset({"command", "builtin"})
 # Reserved words that introduce a command instead of being one, so the word
 # after them is still at command position (`then eval ...`, `{ cd sub; }`).
 _SHELL_KEYWORDS = frozenset(
@@ -1505,32 +1531,53 @@ _SHELL_KEYWORDS = frozenset(
 )
 
 
-def _shell_word_positions(command: str) -> list[tuple[int, int, bool, bool]]:
+class _ShellWord(NamedTuple):
+    """One shell word and the position the shell gives it.
+
+    `assignment` is True when the shell reads a `NAME=value` word there and
+    `keeps` when it also leaves that name set after the command, which is what
+    `export G=git` and its siblings do. `command` marks the word the shell
+    would execute (an `eval` there runs its payload). `open_prefix` holds when
+    the simple command still has no command word after this word: only then
+    does a bare prefix assignment survive, because any command word scopes it
+    to that one command.
+    """
+
+    start: int
+    end: int
+    assignment: bool
+    keeps: bool
+    command: bool
+    open_prefix: bool
+
+
+def _shell_word_positions(command: str) -> list[_ShellWord]:
     """Spans of the shell words in `command`, with the position each one holds.
 
     Quotes never end a word and braces stay inside one (`${G}` is a single
-    word), exactly as the discard patterns expect. Each span also carries
-    `assignment_slot` (the shell would read a `NAME=value` word there: the
-    start of a simple command, or an argument of `export` and friends) and
-    `command_word` (this is the word the shell would execute). Comment text is
-    not a shell word at all and is skipped, so neither an argument nor a
-    comment word can pass for the real assignment or the real command.
+    word), exactly as the discard patterns expect. Comment text is not a shell
+    word at all and is skipped, so neither an argument nor a comment word can
+    pass for the real assignment or the real command. The family builtins keep
+    their own options (`declare -xi`, `local -r`, `declare --`) from ending the
+    run of assignments they apply, and `command`/`builtin` run the word after
+    them without taking the command word for themselves.
     """
-    spans: list[tuple[int, int, bool, bool]] = []
+    words: list[_ShellWord] = []
     assignment_slot = True
     command_word = True
     export_args = False
+    prefix_open = True
     i = 0
     n = len(command)
     while i < n:
         ch = command[i]
-        if ch == "#" and (i == 0 or command[i - 1].isspace() or command[i - 1] in ";&|(){}"):
+        if ch == "#" and _starts_comment(command, i):
             line_stop = command.find("\n", i)
             i = n if line_stop == -1 else line_stop
             continue
         if ch.isspace() or ch in ";&|()<>":
             if ch in ";&|\n()":
-                assignment_slot = command_word = True
+                assignment_slot = command_word = prefix_open = True
                 export_args = False
             i += 1
             continue
@@ -1547,19 +1594,37 @@ def _shell_word_positions(command: str) -> list[tuple[int, int, bool, bool]]:
                 quote = None
             i += 1
         word = command[start:i]
-        spans.append((start, i, assignment_slot or export_args, command_word))
+        # The flags describe this word's own position, so they are read before
+        # the word moves the parser on.
+        at_slot = assignment_slot or export_args
+        keeps_name = export_args
+        is_command_word = command_word and word not in _TRANSPARENT_BUILTINS
         if command_word and word in _SHELL_KEYWORDS:
-            continue  # a keyword opens the next command position
-        if (assignment_slot or export_args) and _LITERAL_ASSIGNMENT.fullmatch(word):
-            continue  # an assignment prefix: the command word still follows
-        if command_word and word in _EXPORT_COMMANDS:
-            command_word = False
+            pass  # a keyword opens the next command position
+        elif (assignment_slot or export_args) and _LITERAL_ASSIGNMENT.fullmatch(word):
+            pass  # an assignment prefix: the command word still follows
+        elif command_word and word in _TRANSPARENT_BUILTINS:
+            prefix_open = False  # it runs a command, but not as the command word
+        elif command_word and word in _EXPORT_COMMANDS:
+            command_word = prefix_open = False
             export_args = True
-            assignment_slot = True
-            continue  # the words after it are assignments
-        assignment_slot = command_word = False
-        export_args = False
-    return spans
+            assignment_slot = True  # the words after it are assignments
+        elif export_args and word.startswith("-"):
+            pass  # the family's own options (`declare -xi`, `local -r`)
+        else:
+            assignment_slot = command_word = prefix_open = False
+            export_args = False
+        words.append(
+            _ShellWord(
+                start,
+                i,
+                assignment=at_slot,
+                keeps=keeps_name,
+                command=is_command_word,
+                open_prefix=prefix_open,
+            )
+        )
+    return words
 
 
 def _plain_word_text(word: str) -> str | None:
@@ -1605,12 +1670,13 @@ def _reveal_shell_command_words(command: str) -> tuple[str, list[int], set[int]]
     or `G='git reset --hard'` as a word sequence). Revealing those words keeps
     the discard patterns shell-faithful. A word holding spaces, expansion, or
     substitution stays as written, so quoted data (`echo 'git reset --hard'`)
-    still masks as data. Only a word the shell reads as an assignment at
-    command position (or as an argument of `export` and friends) is recorded,
-    so a `G=other` argument or comment can never overwrite the real value. The
-    walk is flat, so an assignment inside a command substitution (`$(G=git;
-    true); $G reset --hard`) stays visible and is refused: that leaks an inner
-    scope outward and so refuses more, not less.
+    still masks as data. Only a word the shell reads as an assignment is
+    recorded, so a `G=other` argument or comment can never overwrite the real
+    value, and a command-scoped prefix (`G=other git status`) is dropped again
+    because the shell applies it to that one command. The walk is flat, so an
+    assignment inside a command substitution (`$(G=git; true); $G reset
+    --hard`) stays visible and is refused: that leaks an inner scope outward
+    and so refuses more, not less.
 
     The returned map points every emitted character back into `command`, and
     the returned set holds the words whose revealed value is more than a bare
@@ -1618,35 +1684,46 @@ def _reveal_shell_command_words(command: str) -> tuple[str, list[int], set[int]]
     name the repository it runs in, so a discard found through one is refused.
     """
     assignments: dict[str, str] = {}
+    pending: dict[str, str] = {}
     out: list[str] = []
     index_map: list[int] = []
     unnameable: set[int] = set()
     cursor = 0
-    for start, end, assignment_slot, _command_word in _shell_word_positions(command):
-        out.append(command[cursor:start])
-        index_map.extend(range(cursor, start))
-        cursor = end
-        word = command[start:end]
-        revealed = _revealed_shell_word(word, assignments)
-        replacement = word if revealed is None else revealed
+    prefix_open = True
+    for word in _shell_word_positions(command):
+        out.append(command[cursor : word.start])
+        index_map.extend(range(cursor, word.start))
+        if _separates_commands(command[cursor : word.start]):
+            # A new simple command: a bare prefix of the previous one survives
+            # only when that command held no other word, because the shell then
+            # applies the assignment to the shell itself. This mirrors the rule
+            # the probe resolver applies to its own segments, and the two must
+            # stay in step.
+            if prefix_open:
+                assignments.update(pending)
+            pending.clear()
+        cursor = word.end
+        text = command[word.start : word.end]
+        revealed = _revealed_shell_word(text, assignments)
+        replacement = text if revealed is None else revealed
         if revealed is not None:
             # A revealed value is data the shell runs as a word, never shell
             # syntax: an unbalanced quote or a `#` in it would otherwise pair
             # with the text after it and hide a later discard from masking.
             replacement = re.sub(r"""["'#\\]""", "_", replacement)
-            if len(replacement) < len(word):
+            if len(replacement) < len(text):
                 # Keep the revealed word from running into the next one.
-                replacement = replacement.ljust(len(word))
+                replacement = replacement.ljust(len(text))
         out.append(replacement)
-        if replacement == word:
-            index_map.extend(range(start, end))
+        if replacement == text:
+            index_map.extend(range(word.start, word.end))
         else:
             # A revealed match starts at this word's first character.
-            index_map.extend([start] * len(replacement))
+            index_map.extend([word.start] * len(replacement))
             if not _PLAIN_WORD_RUN.fullmatch(revealed):
-                unnameable.add(start)
-        if assignment_slot:
-            assignment = _LITERAL_ASSIGNMENT.fullmatch(word)
+                unnameable.add(word.start)
+        if word.assignment:
+            assignment = _LITERAL_ASSIGNMENT.fullmatch(text)
             if assignment:
                 # A later reference to this name execs this literal value, so
                 # the word walk reveals it verbatim; the discard patterns then
@@ -1655,9 +1732,16 @@ def _reveal_shell_command_words(command: str) -> tuple[str, list[int], set[int]]
                 # value. A reassignment the guard cannot read (substitution or
                 # expansion) keeps the earlier value, which is the
                 # conservative direction.
-                assignments[assignment.group(1)] = next(
+                name, value = assignment.group(1), next(
                     group for group in assignment.groups()[1:] if group is not None
                 )
+                if word.keeps:
+                    # `export G=git` and its siblings set the shell's own name.
+                    assignments[name] = value
+                    pending.pop(name, None)
+                else:
+                    pending[name] = value
+        prefix_open = word.open_prefix
     out.append(command[cursor:])
     index_map.extend(range(cursor, len(command)))
     return "".join(out), index_map, unnameable
@@ -1696,18 +1780,24 @@ def _find_destructive_git_discard_sites(command: str) -> list[_DiscardSite]:
     )
     words, word_map, unnameable = _reveal_shell_command_words(normalized)
     masked = _mask_quoted_spans(words)
-    indices: list[int] = []
+    matches: list[tuple[int, int]] = []
     for pattern in (_DISCARD_CHECKOUT_PATTERN, _DISCARD_RESET_PATTERN):
-        indices.extend(match.start() for match in pattern.finditer(masked))
+        matches.extend((match.start(), match.end()) for match in pattern.finditer(masked))
     for match in _DISCARD_RESTORE_PATTERN.finditer(masked):
         if _restore_options_discard_worktree(match.group(1)):
-            indices.append(match.start())
+            matches.append((match.start(), match.end()))
     for match in _DISCARD_CLEAN_PATTERN.finditer(masked):
         if _is_forced_clean_segment(match.group(1)):
-            indices.append(match.start())
+            matches.append((match.start(), match.end()))
     return [
-        _DiscardSite(index_map[word_map[index]], word_map[index] in unnameable)
-        for index in sorted(indices)
+        _DiscardSite(
+            index_map[word_map[start]],
+            # Any revealed word inside the match can carry part of the argv the
+            # shell runs (`X=git Y='-C sub reset --hard'; $X $Y`), so the whole
+            # span decides, not just where it starts.
+            any(word_map[index] in unnameable for index in range(start, end)),
+        )
+        for start, end in sorted(matches)
     ]
 
 
@@ -1778,17 +1868,17 @@ def _eval_payloads_hide_destructive_git(command: str, depth: int = 0) -> bool:
     )[0]
     revealed, _word_map, _unnameable = _reveal_shell_command_words(command)
     masked = _mask_quoted_spans(revealed)
-    for start, end, _slot, command_word in _shell_word_positions(revealed):
-        if not command_word or _plain_word_text(revealed[start:end]) != "eval":
+    for word in _shell_word_positions(revealed):
+        if not word.command or _plain_word_text(revealed[word.start : word.end]) != "eval":
             continue
         # The payload runs from just after the eval token to the next
         # unquoted command separator (masked text keeps those live).
         region_end = len(revealed)
-        for j in range(end, len(masked)):
+        for j in range(word.end, len(masked)):
             if masked[j] in ";&|\n":
                 region_end = j
                 break
-        payload = _unquote_one_level(revealed[end:region_end])
+        payload = _unquote_one_level(revealed[word.end : region_end])
         if _find_destructive_git_discard_sites(payload):
             return True
         if "eval" in payload and _eval_payloads_hide_destructive_git(payload, depth + 1):
@@ -2139,6 +2229,21 @@ def _format_eval_refusal() -> str:
     return "\n".join(lines)
 
 
+def _format_revealed_command_refusal() -> str:
+    lines = [
+        "Refusing to run this destructive git command: the command word is an"
+        " expanded value whose argv cannot be replayed, and the uncommitted"
+        " changes of the repository it targets cannot be checked safely.",
+        "",
+        "Run the discard directly, or retry with"
+        " bash(command, allow_destructive_git=True).",
+    ]
+    note = _format_late_bypass_env_note()
+    if note:
+        lines.extend(("", note))
+    return "\n".join(lines)
+
+
 def _format_relocation_refusal() -> str:
     lines = [
         "Refusing to run this destructive git command: it changes directory (or"
@@ -2183,7 +2288,7 @@ def _guard_destructive_git(command: str, allow_destructive_git: bool) -> None:
             # more than the executable word: the repository it discards in
             # cannot be named from the text, so refuse instead of probing a
             # directory that may not be the one the discard targets.
-            raise DestructiveGitRefusalError(_format_relocation_refusal())
+            raise DestructiveGitRefusalError(_format_revealed_command_refusal())
         target = _resolve_discard_probe_target(resolved, site.index, user_command_start)
         if target is _UNRESOLVABLE_DISCARD_TARGET:
             raise DestructiveGitRefusalError(_format_relocation_refusal())
