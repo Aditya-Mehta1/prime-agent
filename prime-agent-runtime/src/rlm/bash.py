@@ -974,7 +974,8 @@ def _scan_text(text: str, depth: int, parent_mentions_sudo: bool = False) -> str
     if depth < _MAX_PAYLOAD_DEPTH and (
         runner_alias
         or any(
-            os.path.basename(words[position].value) in _PAYLOAD_RUNNERS
+            os.path.basename(_registered_command(words[position].value, hash_alias_names))
+            in _PAYLOAD_RUNNERS
             for position in command_words
         )
     ):
@@ -1023,7 +1024,10 @@ def _scan_segment(
         if word.kind == "group" or word.value in _KEYWORDS:
             start += 1
             continue
-        name = os.path.basename(word.value)
+        # A `hash -p` registration makes the word run a file whatever the word
+        # looks like, so every judgement below reads that file's name.
+        registered = _registered_command(word.value, hash_alias_names)
+        name = os.path.basename(registered)
         if name in _LOOKUP_COMMANDS:
             return None  # `which sudo`, `type sudo`: operands are just names
         if name == "command":
@@ -1047,14 +1051,13 @@ def _scan_segment(
             continue
         if command_words is not None:
             command_words.add(start)
-        if _word_names_sudo(word.value):
+        if _word_names_sudo(registered):
+            if registered != word.value:
+                return (
+                    f"a `hash -p` entry makes {word.value} run {registered}, which "
+                    "would run this command as root or another user"
+                )
             return f"{name} would run this command as root or another user"
-        if hash_alias_names and word.value in hash_alias_names:
-            return (
-                f"a `hash -p` entry makes {word.value} run "
-                f"{hash_alias_names[word.value]}, which would run this command as "
-                "root or another user"
-            )
         if name == "alias":
             return _scan_alias_bodies(words, start + 1, depth, parent_mentions_sudo)
         if name in _EXEC_LAUNCHER_FLAGS:
@@ -1457,12 +1460,17 @@ def _body_reaches_runner(body: str) -> bool:
     """True when a runner is a command word of the body, wrapper chains included."""
     words = _tokenize(body)
     _apply_heredocs(body, words)
+    hash_alias_names, _ = _hash_registered_command_names(words)
     reached: set[int] = set()
     for index, word in enumerate(words):
         if word.is_data or not word.starts_command:
             continue
-        _scan_segment(words, index, 0, False, reached)
-    return any(os.path.basename(words[index].value) in _PAYLOAD_RUNNERS for index in reached)
+        _scan_segment(words, index, 0, False, reached, hash_alias_names)
+    return any(
+        os.path.basename(_registered_command(words[index].value, hash_alias_names))
+        in _PAYLOAD_RUNNERS
+        for index in reached
+    )
 
 
 def _alias_body_names_runner(words: list[_Word], command_words: set[int]) -> bool:
@@ -1532,7 +1540,9 @@ def _scan_interpreter(
     hash_alias_names: dict[str, str] | None = None,
 ) -> str | None:
     """Judge payloads a runner executes: shell -c, eval, xargs operands, heredocs."""
-    name = os.path.basename(words[index].value)
+    # A registered name runs its target, so the target's name decides whether
+    # this word is a payload runner (`hash -p /bin/bash safe; safe -c 'sudo id'`).
+    name = os.path.basename(_registered_command(words[index].value, hash_alias_names))
     if name not in _PAYLOAD_RUNNERS and name not in _LAUNCHER_OPERAND_OPTIONS:
         return None
     if depth >= _MAX_PAYLOAD_DEPTH:
@@ -1686,23 +1696,36 @@ def _hash_registered_command_names(words: list[_Word]) -> tuple[dict[str, str], 
             if words[candidate].is_data or words[candidate].is_redirect:
                 break
             if _is_flag_word(words[candidate]) and not token.startswith("--"):
-                has_pathname_option = has_pathname_option or "p" in token[1:]
+                if "p" in token[1:]:
+                    has_pathname_option = True
+                    # `hash -p/path name` glues the pathname to the flag.
+                    glued = token[token.index("p") + 1 :]
+                    if glued:
+                        operands.append(glued)
                 continue
             if token.startswith("--"):
                 continue
             if not has_pathname_option:
                 break  # `hash name`, `hash -d name`, `hash -t name`: no entry
             operands.append(token)
-            if len(operands) == 2:
-                break
         if not has_pathname_option or len(operands) < 2:
             continue
-        pathname, name = operands
-        if any(char in pathname + name for char in "$`"):
+        # Every operand after the pathname is a name bash binds to that file.
+        pathname = operands[0]
+        names = operands[1:]
+        if any(char in pathname + "".join(names) for char in "$`"):
             unreadable = True
-        elif _word_names_sudo(pathname):
+            continue
+        for name in names:
             aliased[name] = pathname
     return aliased, unreadable
+
+
+def _registered_command(value: str, hash_alias_names: dict[str, str] | None) -> str:
+    """The file a `hash -p` registration makes this word run, else the word."""
+    if hash_alias_names:
+        return hash_alias_names.get(value, value)
+    return value
 
 
 def _scan_alias_bodies(
