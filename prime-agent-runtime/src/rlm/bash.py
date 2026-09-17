@@ -1188,6 +1188,71 @@ def _word_names_sudo(value: str) -> bool:
     return False
 
 
+# POSIX character classes as the regex ranges bash matches: `[[:lower:]]udo`
+# expands like `[a-z]udo`, so the guard must read the class, not the first `]`.
+_POSIX_CLASS_RANGES: dict[str, str] = {
+    "alnum": "a-zA-Z0-9",
+    "alpha": "a-zA-Z",
+    "ascii": "\\x00-\\x7f",
+    "blank": " \\t",
+    "cntrl": "\\x00-\\x1f\\x7f",
+    "digit": "0-9",
+    "graph": "!-~",
+    "lower": "a-z",
+    "print": " -~",
+    "punct": "!-/:-@\\[-`{-~",
+    "space": " \\t\\r\\n\\v\\f",
+    "upper": "A-Z",
+    "word": "a-zA-Z0-9_",
+    "xdigit": "0-9A-Fa-f",
+}
+
+
+def _bracket_end(value: str, start: int) -> int:
+    """Index of the `]` closing the bracket expression at `start`, or -1.
+
+    A POSIX class (`[:lower:]`) nests its own brackets, so the closing bracket of
+    the enclosing expression is only the one after the class ends. A `]` in the
+    first position is a literal, as in bash.
+    """
+    index = start + 1
+    if index < len(value) and value[index] in "!^":
+        index += 1
+    if index < len(value) and value[index] == "]":
+        index += 1
+    while index < len(value):
+        if value.startswith("[:", index):
+            close = value.find(":]", index + 2)
+            if close >= 0:
+                index = close + 2
+                continue
+        if value[index] == "]":
+            return index
+        index += 1
+    return -1
+
+
+def _bracket_body(body: str) -> str:
+    """Regex ranges for a bracket body, expanding POSIX classes like `[:lower:]`.
+
+    A class the table does not name still matches one character in bash, so it
+    becomes `.`: refusing too much is the fail-closed direction.
+    """
+    out: list[str] = []
+    index = 0
+    while index < len(body):
+        if body.startswith("[:", index):
+            close = body.find(":]", index + 2)
+            if close >= 0:
+                name = body[index + 2 : close]
+                out.append(_POSIX_CLASS_RANGES.get(name, "."))
+                index = close + 2
+                continue
+        out.append(body[index])
+        index += 1
+    return "".join(out)
+
+
 def _matches_sudo_pattern(value: str) -> bool:
     """True when the glob pattern in a word matches the name sudo or doas."""
     if not any(char in value for char in "*?["):
@@ -1201,11 +1266,11 @@ def _matches_sudo_pattern(value: str) -> bool:
         elif char == "?":
             pattern.append(".")
         elif char == "[":
-            end = value.find("]", index + 1)
+            end = _bracket_end(value, index)
             if end < 0:
                 pattern.append("\\[")
             else:
-                body = value[index + 1 : end]
+                body = _bracket_body(value[index + 1 : end])
                 if body.startswith("!"):
                     body = "^" + body[1:]
                 pattern.append("[" + body + "]")

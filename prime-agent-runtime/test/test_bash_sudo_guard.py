@@ -142,6 +142,9 @@ SUDO_MATCHING_COMMANDS = [
     "sud[o] id",
     "[s]udo id",
     "su?do id",
+    "[[:lower:]]udo id",
+    "[[:alpha:]]udo id",
+    "[[:lower:]]oas id",
     "alias p='sudo id'",
     "alias p=$'sudo id'",
     "shopt -s expand_aliases\nalias p='sudo id'\np",
@@ -341,6 +344,8 @@ SUDO_NON_MATCHING_COMMANDS = [
     "watch -q 5 ls",
     "strace --color=always ls",
     "bash --rcfile /dev/null -c 'echo hi'",
+    "s[[:upper:]]do id",
+    "echo [[:lower:]]udo",
     "ltrace --indent 4 ls",
     "systemd-run -H host ls",
     # faketime parses options only up to the timestamp, so everything after the
