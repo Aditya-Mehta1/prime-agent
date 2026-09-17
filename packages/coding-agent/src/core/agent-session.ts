@@ -13170,6 +13170,18 @@ export class AgentSession {
 	}
 
 	/**
+	 * Durable wake for a restored park: reuse a job that can still fire and
+	 * recreate one that was cancelled (a navigation cancels the left-behind
+	 * leaf's wake) or removed, so a restored park never waits on a dead job.
+	 */
+	private _restoreQuotaWakeJob(jobId: string | undefined, resumeAtMs: number): string | undefined {
+		if (jobId !== undefined && this._findQuotaResumeJob(jobId)?.status !== "cancelled") {
+			return jobId;
+		}
+		return this._createQuotaResumeJob(resumeAtMs);
+	}
+
+	/**
 	 * Rebuild the park for the branch this navigation selected. The old leaf's
 	 * wake is cancelled with it, so a parked leaf that was left behind cannot
 	 * resume its task on the selected branch.
@@ -13204,10 +13216,11 @@ export class AgentSession {
 			if (!Number.isFinite(resumeAtMs) || resumeAtMs <= Date.now()) {
 				return;
 			}
+			const jobId = this._restoreQuotaWakeJob(entry.data.jobId, resumeAtMs);
 			this._quotaPark = {
 				parkCount: entry.data.parkCount,
 				resumeAtMs,
-				...(entry.data.jobId !== undefined ? { jobId: entry.data.jobId } : {}),
+				...(jobId !== undefined ? { jobId } : {}),
 				timer: this._scheduleQuotaResumeTimer(resumeAtMs),
 			};
 			return;

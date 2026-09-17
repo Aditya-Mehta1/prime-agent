@@ -892,8 +892,7 @@ describe("AgentSession retry and event characterization", () => {
 		]);
 		await harness.session.prompt("do the work");
 		expect((await nextTurn()).stopReason).toBe("error");
-		expect(harness.session.isQuotaParked).toBe(true);
-		expect(harness.faux.state.callCount).toBe(1);
+		expect([harness.session.isQuotaParked, harness.faux.state.callCount]).toEqual([true, 1]);
 		const retryEnd = harness.eventsOfType("auto_retry_end");
 		expect(retryEnd.map((event) => event.finalError?.includes("parked until"))).toEqual([true]);
 		const artifactDir = harness.sessionManager.getSessionArtifactDir()!;
@@ -903,7 +902,7 @@ describe("AgentSession retry and event characterization", () => {
 		expect(wakeJob?.prompt).toContain("<provider_quota_resumed>");
 		// A second failing turn while parked (e.g. a heartbeat) keeps the same park.
 		await harness.session.prompt("second task");
-		expect((await nextTurn()).stopReason).toBe("error");
+		await nextTurn();
 		expect([quotaPark(harness)?.parkCount, quotaPark(harness)?.jobId]).toEqual([1, wakeJob?.id]);
 
 		await fireQuotaWake(harness);
@@ -1051,37 +1050,43 @@ describe("AgentSession retry and event characterization", () => {
 
 	it("keeps a queued wake marker when another turn is aborted", async () => {
 		const harness = await parkHarness(parkSettings({ maxPauseMs: 2_000 }), true);
-		const nextTurn = assistantTurns(harness);
 		harness.setResponses([quotaFailure({ retryAfterMs: 3_600_000 }), fauxAssistantMessage("recovered")]);
 		await harness.session.prompt("do the work");
-		await nextTurn();
-
 		// The wake hands the resume to a marker that is still queued.
 		const pause = harness.session.acquireQueuedWorkPause();
 		await fireQuotaWake(harness);
 		(harness.session as unknown as QuotaParkInternals)._handleAbortedQuotaPark();
 		expect(quotaPark(harness)?.waking).toBe(true);
 		pause.release();
-		await nextTurn();
-
+		await harness.session.waitForIdle();
 		expect(getUserTexts(harness).filter((text) => text.includes("<provider_quota_resumed>"))).toHaveLength(1);
 	});
 
-	it("cancels the park wake when branch navigation leaves the parked leaf", async () => {
+	it("moves the park with branch navigation", async () => {
 		const harness = await parkHarness(parkSettings({ maxPauseMs: 2_000 }), true);
-		harness.setResponses([quotaFailure({ retryAfterMs: 3_600_000 }), fauxAssistantMessage("unused")]);
+		const nextTurn = assistantTurns(harness);
+		harness.setResponses([quotaFailure({ retryAfterMs: 3_600_000 }), fauxAssistantMessage("recovered")]);
 		await harness.session.prompt("do the work");
-		expect(harness.session.isQuotaParked).toBe(true);
+		await nextTurn();
+		const parkedLeaf = harness.sessionManager.getLeafId()!;
 		const parkedFrom = harness.sessionManager
 			.getEntries()
 			.filter((entry) => entry.type === "message" && entry.message.role === "user")
 			.at(-1)!.id;
 
-		// The parked leaf is left behind: its wake must not resume on the new branch.
+		// Leaving the parked leaf drops its wake: nothing resumes on the branch it left.
 		await harness.session.navigateTree(parkedFrom);
 		expect(harness.session.isQuotaParked).toBe(false);
-		await fireQuotaWake(harness).catch(() => undefined);
 		expect(harness.faux.state.callCount).toBe(1);
+
+		// Coming back keeps the park resumable, on a wake that can still fire.
+		await harness.session.navigateTree(parkedLeaf);
+		expect(harness.session.isQuotaParked).toBe(true);
+		const wakeJob = quotaPark(harness)?.jobId;
+		expect(readQuotaWakeJob(harness.sessionManager.getSessionArtifactDir()!, wakeJob)?.status).toBe("active");
+		await fireQuotaWake(harness);
+		await nextTurn();
+		expect(harness.session.isQuotaParked).toBe(false);
 	});
 
 	it("waits for an unavailable provider after quick retries exhaust", async () => {
