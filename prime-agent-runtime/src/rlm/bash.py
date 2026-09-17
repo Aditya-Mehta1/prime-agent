@@ -1029,12 +1029,33 @@ def _scan_segment(
             while start < len(words) and _is_flag_word(words[start]):
                 start += 1
             continue
+        if word.value == "coproc":
+            # `coproc [NAME] command`: bash takes the first plain word as the
+            # coprocess name only when the next word starts a compound command
+            # (`coproc worker if sudo id; then :; fi`), so that name is syntax
+            # rather than the command word.
+            start += 1
+            if (
+                start + 1 < len(words)
+                and words[start].kind == "word"
+                and (words[start + 1].value in _KEYWORDS or words[start + 1].kind == "group")
+            ):
+                start += 1
+            continue
         if word.kind == "group" or word.value in _KEYWORDS:
             start += 1
             continue
         # A `hash -p` registration makes the word run a file whatever the word
-        # looks like, so every judgement below reads that file's name.
+        # looks like, so every judgement below reads that file's name. The entry
+        # can be inert by run time (`hash -r`, `hash -d`, `set +h`), so the same
+        # segment is judged under the word's own spelling too.
         registered = _registered_command(word.value, hash_alias_names)
+        if registered != word.value:
+            own_reading = _scan_segment(
+                words, start, depth, parent_mentions_sudo, command_words, None
+            )
+            if own_reading:
+                return own_reading
         name = os.path.basename(registered)
         if name in _LOOKUP_COMMANDS:
             return None  # `which sudo`, `type sudo`: operands are just names
@@ -1467,8 +1488,9 @@ def _alias_body(word: _Word) -> str | None:
     return word.value.partition("=")[2].lstrip("+") or None
 
 
-def _body_reaches_runner(body: str) -> bool:
-    """True when a runner is a command word of the body, wrapper chains included."""
+def _body_reaches_runner(body: str, depth: int = 0) -> bool:
+    """True when a runner is a command word of the body, wrapper chains and the
+    aliases the body itself defines included."""
     words = _tokenize(body)
     _apply_heredocs(body, words)
     hash_alias_names, _ = _hash_registered_command_names(words)
@@ -1477,11 +1499,24 @@ def _body_reaches_runner(body: str) -> bool:
         if word.is_data or not word.starts_command:
             continue
         _scan_segment(words, index, 0, False, reached, hash_alias_names)
-    return any(
+    if any(
         os.path.basename(_registered_command(words[index].value, hash_alias_names))
         in _PAYLOAD_RUNNERS
         for index in reached
-    )
+    ):
+        return True
+    if depth >= _MAX_PAYLOAD_DEPTH:
+        return False
+    # `alias a='alias b=sh'` runs the payload through `b`, so the aliases a body
+    # defines are followed the way `_alias_body_names_runner` follows the text's.
+    for index in reached:
+        if os.path.basename(words[index].value) != "alias":
+            continue
+        for candidate in _segment_tail(words, index + 1):
+            nested = _alias_body(words[candidate])
+            if nested is not None and _body_reaches_runner(nested, depth + 1):
+                return True
+    return False
 
 
 def _alias_body_names_runner(words: list[_Word], command_words: set[int]) -> bool:
