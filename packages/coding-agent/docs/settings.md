@@ -219,7 +219,8 @@ the ChatGPT-plan "Try again in ~7272 min" 429 — the session does not die
 mid-task: it parks. The turn ends cleanly with a "parked until ..." status, the
 park/resume transitions are recorded in the session log, and one durable
 one-shot scheduled job (visible via `/cron`) wakes the session at the reset
-time. While parked the session itself makes no model calls. The wake delivers an
+time — or sooner when `maxPauseMs` caps the park. While parked the session
+itself makes no model calls. The wake delivers an
 in-context marker telling the model the pause happened and to continue the
 interrupted task; that turn's single model call probes the quota. If the quota
 is back, the task resumes with its context. If not, the session re-parks with

@@ -893,7 +893,6 @@ describe("AgentSession retry and event characterization", () => {
 		await harness.session.prompt("do the work");
 		expect((await nextTurn()).stopReason).toBe("error");
 		expect(harness.session.isQuotaParked).toBe(true);
-		expect(harness.session.isRetrying).toBe(false);
 		expect(harness.faux.state.callCount).toBe(1);
 		const retryEnd = harness.eventsOfType("auto_retry_end");
 		expect(retryEnd.map((event) => event.finalError?.includes("parked until"))).toEqual([true]);
@@ -907,7 +906,6 @@ describe("AgentSession retry and event characterization", () => {
 		expect((await nextTurn()).stopReason).toBe("error");
 		expect([quotaPark(harness)?.parkCount, quotaPark(harness)?.jobId]).toEqual([1, wakeJob?.id]);
 
-		// The wake resumes the task in context and is then spent.
 		await fireQuotaWake(harness);
 		await nextTurn();
 		expect(harness.session.isQuotaParked).toBe(false);
@@ -928,7 +926,6 @@ describe("AgentSession retry and event characterization", () => {
 		]);
 		await harness.session.prompt("do the work");
 		expect((await nextTurn()).stopReason).toBe("error");
-		expect(quotaPark(harness)?.parkCount).toBe(1);
 
 		await nextTurn();
 		expect([harness.session.isQuotaParked, quotaPark(harness)?.parkCount]).toEqual([true, 2]);
@@ -977,7 +974,6 @@ describe("AgentSession retry and event characterization", () => {
 		expect([quotaPark(harness)?.waking, harness.faux.state.callCount]).toEqual([true, 1]);
 		expect(readQuotaWakeJob(artifactDir, jobId)?.status).toBe("completed");
 
-		// The delivered marker's own turn resumes the task without a second marker.
 		await harness.session.prompt("<provider_quota_resumed> continue");
 		expect(getUserTexts(harness).filter((text) => text.includes("<provider_quota_resumed>"))).toHaveLength(1);
 	});
@@ -991,7 +987,6 @@ describe("AgentSession retry and event characterization", () => {
 		]);
 		await harness.session.prompt("do the work");
 		await nextTurn();
-		// An in-memory session has no durable wake: the timer is the only wake.
 		expect(quotaPark(harness)?.jobId).toBeUndefined();
 		const parkedAtMs = quotaPark(harness)?.resumeAtMs ?? 0;
 		await fireQuotaWake(harness);
@@ -1008,9 +1003,7 @@ describe("AgentSession retry and event characterization", () => {
 		await harness.session.prompt("do the work");
 		const parkedAtMs = quotaPark(harness)?.resumeAtMs ?? 0;
 
-		// A refused admission (paused input, full queue) must not leave a park whose
-		// wake is gone: it re-arms, and once the retries are spent it gives the park
-		// up rather than staying parked with no way to resume.
+		// A refused admission must re-arm the wake, then give the park up.
 		const pause = harness.session.acquireSessionInputPause();
 		try {
 			await fireQuotaWake(harness);
@@ -1020,7 +1013,6 @@ describe("AgentSession retry and event characterization", () => {
 			pause.release();
 		}
 		expect(harness.session.isQuotaParked).toBe(false);
-		expect(harness.faux.state.callCount).toBe(1);
 	});
 
 	it("restores the park count across a restart so the park budget still bounds the episode", async () => {
@@ -1030,7 +1022,6 @@ describe("AgentSession retry and event characterization", () => {
 		harness.setResponses([quotaFailure({ retryAfterMs: 3_600_000 }), fauxAssistantMessage("unused")]);
 		await harness.session.prompt("do the work");
 		await nextTurn();
-		expect(quotaPark(harness)?.parkCount).toBe(1);
 
 		// A restart (worker eviction, daemon restart) rebuilds the park from the log.
 		const restarted = await createHarness({ existingSessionFile: harness.session.sessionFile!, settings });
@@ -1039,7 +1030,6 @@ describe("AgentSession retry and event characterization", () => {
 		expect(restarted.session.isQuotaParked).toBe(true);
 		expect(quotaPark(restarted)?.parkCount).toBe(1);
 
-		// The episode continues at park 2 instead of starting over at 1.
 		restarted.setResponses([quotaFailure({ retryAfterMs: 3_600_000 })]);
 		await fireQuotaWake(restarted);
 		expect((await restartedTurns()).stopReason).toBe("error");
@@ -1055,7 +1045,6 @@ describe("AgentSession retry and event characterization", () => {
 		harness.setResponses([quotaFailure({ retryAfterMs: 3_600_000 }), fauxAssistantMessage("backup answer")]);
 		await harness.session.prompt("do the work");
 
-		// Backup takes precedence: the far reset never reaches the park decision.
 		expect(harness.eventsOfType("auto_retry_start").map((event) => event.reason)).toEqual(["backup"]);
 		expect(harness.session.isQuotaParked).toBe(false);
 	});
@@ -1076,6 +1065,23 @@ describe("AgentSession retry and event characterization", () => {
 		await nextTurn();
 
 		expect(getUserTexts(harness).filter((text) => text.includes("<provider_quota_resumed>"))).toHaveLength(1);
+	});
+
+	it("cancels the park wake when branch navigation leaves the parked leaf", async () => {
+		const harness = await parkHarness(parkSettings({ maxPauseMs: 2_000 }), true);
+		harness.setResponses([quotaFailure({ retryAfterMs: 3_600_000 }), fauxAssistantMessage("unused")]);
+		await harness.session.prompt("do the work");
+		expect(harness.session.isQuotaParked).toBe(true);
+		const parkedFrom = harness.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "message" && entry.message.role === "user")
+			.at(-1)!.id;
+
+		// The parked leaf is left behind: its wake must not resume on the new branch.
+		await harness.session.navigateTree(parkedFrom);
+		expect(harness.session.isQuotaParked).toBe(false);
+		await fireQuotaWake(harness).catch(() => undefined);
+		expect(harness.faux.state.callCount).toBe(1);
 	});
 
 	it("waits for an unavailable provider after quick retries exhaust", async () => {

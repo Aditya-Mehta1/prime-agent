@@ -13170,6 +13170,17 @@ export class AgentSession {
 	}
 
 	/**
+	 * Rebuild the park for the branch this navigation selected. The old leaf's
+	 * wake is cancelled with it, so a parked leaf that was left behind cannot
+	 * resume its task on the selected branch.
+	 */
+	private _reloadQuotaParkFromBranch(): void {
+		this._cancelQuotaParkWake(this._quotaPark);
+		this._quotaPark = undefined;
+		this._restoreQuotaPark();
+	}
+
+	/**
 	 * Restore the park this branch ended on: a restart (daemon or worker) leaves
 	 * waitForUsage.maxParks unbounded otherwise, because the park count would
 	 * start over at 1 each time. Parks recorded before the branch's last resume
@@ -13856,6 +13867,7 @@ export class AgentSession {
 			this._ensureHarnessDigestContext();
 			this._reloadGoalStateFromBranch({ monotonicTokens: Boolean(summaryText) });
 			this._reloadRlmMaxDepthFromBranch();
+			this._reloadQuotaParkFromBranch();
 			this._invalidateQueuedPromptPreparation();
 
 			await this._extensionRunner.emit({
