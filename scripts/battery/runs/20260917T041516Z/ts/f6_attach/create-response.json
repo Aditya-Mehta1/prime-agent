@@ -1,0 +1,58 @@
+{
+ "id": "c1",
+ "type": "response",
+ "command": "create",
+ "success": true,
+ "data": {
+  "id": "f1e622d65a4e",
+  "lifecycle": "draft",
+  "activity": "idle",
+  "isSessionActive": false,
+  "lastActivityAt": "2026-09-17T04:16:38.871Z",
+  "runtimeKind": "top-level",
+  "rlmDepth": 0,
+  "activeSessionId": "f1e622d65a4e",
+  "sessionId": "01a0ad94-b3b0-738d-b983-4f53278d3369",
+  "sessionFile": "/home/ubuntu/lane-worktrees/thin3/scripts/battery/runs/20260917T041516Z/ts/agent/sessions/01a0ad94-b3b0-738d-b983-4f53278d3369.jsonl",
+  "sessionName": "battery-attach",
+  "cwd": "/home/ubuntu/lane-worktrees/thin3/scripts/battery/runs/20260917T041516Z/ts/work",
+  "model": {
+   "id": "mock-1",
+   "name": "Mock 1",
+   "api": "openai-completions",
+   "provider": "prime-inference",
+   "baseUrl": "http://127.0.0.1:43227/v1",
+   "reasoning": false,
+   "input": [
+    "text"
+   ],
+   "cost": {
+    "input": 0,
+    "output": 0,
+    "cacheRead": 0,
+    "cacheWrite": 0
+   },
+   "contextWindow": 128000,
+   "maxTokens": 4096
+  },
+  "thinkingLevel": "off",
+  "isStreaming": false,
+  "isCompacting": false,
+  "isBashRunning": false,
+  "hasRunningRlmChildren": false,
+  "isRunningTools": false,
+  "attachedClients": 0,
+  "messageCount": 0,
+  "unfinishedActionCount": 0,
+  "created": "2026-09-17T04:16:38.832Z",
+  "modified": "2026-09-17T04:16:38.871Z",
+  "sessionActions": {
+   "queuedCount": 0,
+   "steering": [],
+   "followUps": []
+  },
+  "rosterStatus": "idle",
+  "workerState": "ready",
+  "workerPid": 2329634
+ }
+}

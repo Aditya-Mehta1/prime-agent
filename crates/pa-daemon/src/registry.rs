@@ -149,6 +149,18 @@ impl SessionRegistry {
         self.workers.lock().await.values().cloned().collect()
     }
 
+    /// The resident whose durable authentication token matches (worker-
+    /// authenticated supervisor requests, the TS `list_agent_peers`
+    /// requester lookup). `None` rejects with the TS auth error.
+    pub(crate) async fn find_by_token(&self, token: &str) -> Option<Arc<ResidentWorker>> {
+        for resident in self.list().await {
+            if resident.descriptor.lock().await.authentication_token == token {
+                return Some(resident);
+            }
+        }
+        None
+    }
+
     /// Record an accepted registration; bumps the epoch when the worker had
     /// already registered on this supervisor (re-registration).
     pub(crate) async fn record_registration(

@@ -43,6 +43,16 @@ pub(crate) const PEER_GRANT_INVALID: &str = "Peer transport grant is invalid";
 pub(crate) const PEER_COMMAND_NOT_ALLOWED: &str =
     "Command is not allowed on this direct peer transport";
 
+/// TS purposes plus the stage-3 extension: a `worker` grant admits a peer
+/// worker (agent-message delivery), not a session client.
+pub(crate) const PEER_PURPOSE_SESSION_CLIENT: &str = "session_client";
+pub(crate) const PEER_PURPOSE_WORKER: &str = "worker";
+
+/// Whether a grant purpose is one this worker accepts.
+pub(crate) fn peer_purpose_valid(purpose: &str) -> bool {
+    purpose == PEER_PURPOSE_SESSION_CLIENT || purpose == PEER_PURPOSE_WORKER
+}
+
 /// The authenticated role one worker-socket connection holds.
 #[derive(Debug, Clone)]
 pub(crate) enum ConnectionRole {
@@ -56,6 +66,12 @@ pub(crate) enum ConnectionRole {
     SessionClient {
         session: Arc<PeerSession>,
     },
+    /// A peer worker admitted through `peer_auth` with a single-use
+    /// `worker`-purpose grant: agent-message delivery only, no session
+    /// events (thin-supervisor stage 3).
+    PeerWorker {
+        session: Arc<PeerSession>,
+    },
 }
 
 impl ConnectionRole {
@@ -65,6 +81,7 @@ impl ConnectionRole {
             ConnectionRole::Unauthenticated => false,
             ConnectionRole::Supervisor { .. } => true,
             ConnectionRole::SessionClient { session } => session.is_attached(),
+            ConnectionRole::PeerWorker { .. } => false,
         }
     }
 }
@@ -140,7 +157,7 @@ impl PeerGrantStore {
         let valid_expiry = matches!(expires, Some(expires) if expires > now && expires - now <= PEER_GRANT_TTL_LIMIT_MS);
         let known_session =
             context.session_created && grant.active_session_id == context.active_session_id;
-        if grant.purpose != "session_client"
+        if !peer_purpose_valid(&grant.purpose)
             || grant.grant_id.is_empty()
             || grant.token.is_empty()
             || grant.worker_instance_id != context.worker_instance_id
@@ -186,7 +203,7 @@ impl PeerGrantStore {
         if token_ok
             && instance_ok
             && purpose.as_str() == grant.purpose.as_str()
-            && grant.purpose == "session_client"
+            && peer_purpose_valid(&grant.purpose)
             && expires_ok
         {
             return Ok(grant);
@@ -226,6 +243,18 @@ pub(crate) fn parse_grant_registration(
     payload: &Value,
 ) -> Result<DaemonWorkerCommand, &'static str> {
     serde_json::from_value::<DaemonWorkerCommand>(payload.clone()).map_err(|_| PEER_GRANT_INVALID)
+}
+
+/// Command gate for a peer-worker connection (stage 3): agent-message
+/// delivery only, addressed to the grant's session.
+pub(crate) fn worker_peer_command_allowed(
+    command_type: &str,
+    payload: &Value,
+    grant: &DaemonWorkerPeerGrant,
+) -> bool {
+    command_type == "worker_deliver_message"
+        && payload.get("targetActiveSessionId").and_then(Value::as_str)
+            == Some(grant.active_session_id.as_str())
 }
 
 /// Session-plane gate for a direct peer command (TS `peerClaims` branch):
@@ -277,8 +306,14 @@ impl Worker {
         {
             Ok(grant) => {
                 let session = Arc::new(PeerSession::new(grant.clone()));
-                *role.lock().unwrap() = ConnectionRole::SessionClient {
-                    session: Arc::clone(&session),
+                *role.lock().unwrap() = if grant.purpose == PEER_PURPOSE_WORKER {
+                    ConnectionRole::PeerWorker {
+                        session: Arc::clone(&session),
+                    }
+                } else {
+                    ConnectionRole::SessionClient {
+                        session: Arc::clone(&session),
+                    }
                 };
                 let success = response_success(
                     Some(request_id),
@@ -559,6 +594,56 @@ mod tests {
             &attach,
             &grant
         ));
+    }
+
+    #[test]
+    fn worker_purpose_grants_burn_and_gate_to_delivery() {
+        let store = PeerGrantStore::new();
+        let context = grant_context();
+        let mut grant = grant(&soon(NOW, 10_000));
+        grant.purpose = "worker".to_string();
+        store
+            .register(grant.clone(), &context, "sup:1", NOW)
+            .expect("worker grant registers");
+        let mut presentation = peer_auth("secret");
+        let DaemonPeerCommand::PeerAuth {
+            purpose: auth_purpose,
+            ..
+        } = &mut presentation;
+        *auth_purpose = "worker".to_string();
+        let admitted = store
+            .authenticate(&presentation, &context, NOW)
+            .expect("worker grant authenticates");
+        assert_eq!(admitted.purpose, "worker");
+        // Single use, like the session-client grant.
+        assert_eq!(
+            store
+                .authenticate(&presentation, &context, NOW)
+                .unwrap_err(),
+            PEER_AUTH_FAILED
+        );
+        // The peer-worker gate: only worker_deliver_message, only for the
+        // grant's session.
+        let delivery = serde_json::json!({ "targetActiveSessionId": "abc123" });
+        let wrong = serde_json::json!({ "targetActiveSessionId": "other" });
+        assert!(worker_peer_command_allowed(
+            "worker_deliver_message",
+            &delivery,
+            &grant
+        ));
+        assert!(!worker_peer_command_allowed(
+            "worker_deliver_message",
+            &wrong,
+            &grant
+        ));
+        assert!(!worker_peer_command_allowed("get_state", &delivery, &grant));
+        assert!(!worker_peer_command_allowed("list", &delivery, &grant));
+        assert!(!worker_peer_command_allowed("shutdown", &delivery, &grant));
+        // Worker connections never stream session events.
+        let role = ConnectionRole::PeerWorker {
+            session: Arc::new(PeerSession::new(grant)),
+        };
+        assert!(!role.streams_events());
     }
 
     #[test]

@@ -27,7 +27,10 @@ use crate::engine::{
 use crate::framing::{write_frame, DEFAULT_PRIVATE_FRAME_LIMITS};
 use crate::journal::WorkerRecoveryJournal;
 use crate::paths;
-use crate::peer::{peer_command_allowed, ConnectionRole, PeerGrantStore, PEER_COMMAND_NOT_ALLOWED};
+use crate::peer::{
+    peer_command_allowed, worker_peer_command_allowed, ConnectionRole, PeerGrantStore,
+    PEER_COMMAND_NOT_ALLOWED,
+};
 use crate::protocol::{
     create_daemon_event_meta, create_daemon_replay_info, current_protocol_info,
     default_client_capabilities, default_server_capabilities, normalize_client_capabilities,
@@ -276,6 +279,7 @@ fn supervisor_link_config(config: &WorkerConfig) -> SupervisorLinkConfig {
     SupervisorLinkConfig {
         socket_path: config.supervisor_socket_path.clone(),
         active_session_id: config.active_session_id.clone(),
+        worker_token: config.token.clone(),
     }
 }
 
@@ -633,6 +637,33 @@ impl Worker {
                                 _ => {}
                             }
                         }
+                        worker
+                            .write_response_frame(&writer, &request_id, &response)
+                            .await;
+                    });
+                }
+                ConnectionRole::PeerWorker { ref session } => {
+                    // A peer worker delivers agent messages only, for the
+                    // grant's session; everything else bounces with the TS
+                    // gate string.
+                    if !worker_peer_command_allowed(&command_type, &payload, &session.grant) {
+                        let failure = response_failure(
+                            Some(&request_id),
+                            &command_type,
+                            PEER_COMMAND_NOT_ALLOWED,
+                            None,
+                        );
+                        self.write_response_frame(&writer, &request_id, &failure)
+                            .await;
+                        continue;
+                    }
+                    // Delivery runs concurrently, like the other planes.
+                    let worker = Arc::clone(&self);
+                    let writer = Arc::clone(&writer);
+                    let request_id = request_id.clone();
+                    let command_type = command_type.clone();
+                    tokio::spawn(async move {
+                        let response = worker.dispatch(&command_type, &payload).await;
                         worker
                             .write_response_frame(&writer, &request_id, &response)
                             .await;
@@ -1001,6 +1032,11 @@ impl Worker {
         core.abort_requested = false;
         let summary = self.summary_locked(&core);
         drop(core);
+        // The engine renders this summary into the sender identity block
+        // of worker-to-worker agent messages.
+        if let Ok(summary_value) = serde_json::to_value(&summary) {
+            self.engine.set_session_summary(summary_value);
+        }
         // Seed the status line from the latest persisted verdict (a respawned
         // worker resumes with the pre-crash verdict).
         self.status_runner.seed_from_session();
@@ -1664,6 +1700,11 @@ impl Worker {
             let _ = store.rewrite();
         }
         let summary = self.summary_locked(&core);
+        drop(core);
+        // The sender identity follows the live name.
+        if let Ok(summary_value) = serde_json::to_value(&summary) {
+            self.engine.set_session_summary(summary_value);
+        }
         response_success(
             None,
             command,

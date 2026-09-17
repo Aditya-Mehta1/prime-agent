@@ -327,6 +327,41 @@ HEAD
   second scripted turn, and live grant expiry after the 10s TTL.
 
 
+## Thin-supervisor stage 3 (peer messaging) lane notes
+
+- TS has no worker-to-worker peer transport for agent messages: the TS worker
+  routes kernel sends supervisor-mediated (`sendRemoteAgentSessionMessage`
+  -> supervisor `send_message` -> `worker_deliver_message`). Stage 3 extends
+  the stage-2 ticket machinery with `worker`-purpose single-use grants so the
+  delivery bypasses the supervisor's route plane; TS parity holds for every
+  user-visible shape (sender identity, rendered prompt, receipt).
+- Kernel `agent_message.send` contract ported from TS
+  `createAgentMessageHostHandlers` (core/agent-messages.ts): the runtime
+  skill sends `{message, receiver_role, receiver_name}` (or `target:"all"`),
+  never a positional target - the old Rust handler expected `{target}` and
+  always failed against the installed runtime. Role/name resolution goes
+  through the family roster; the thin supervisor's family is the supervisor
+  `list` roster (every other resident session is a sibling). In-worker
+  parents/children and the TS family catalog (`selectAgentFamily`,
+  `awaitPendingChildPublication`) are deferred with the catalog itself.
+- Direct delivery semantics: the peer ticket burns on first use, so a send
+  is never retried once the `worker_deliver_message` command went out - a
+  failed/refused/lost delivery surfaces as the error; only pre-delivery
+  failures (no ticket, connect failure, failed grant burn) fall back to the
+  supervisor-routed `send_message` (the TS path, kept verbatim).
+- Sender identity: TS renders the sender from the sending session's live
+  summary; the worker pushes its summary to the engine at create/rename and
+  the direct path builds `{activeSessionId, sessionId, sessionName?,
+  runtimeKind, clientId: "agent"}` (the TS agent-origin sender shape when no
+  client id is in play). The supervisor-routed fallback keeps the supervisor
+  building the sender from the source worker's `get_state` (TS behavior).
+- Supervisor-link restart window: TS tears the link down through its
+  DaemonClient close listener, so the next request reconnects. The Rust link
+  discovers death lazily, so a write-phase failure (the command never reached
+  the supervisor) reconnects and retries exactly once; read-phase failures
+  never retry (the command may have been processed). Verified by the
+  supervisor kill -9 e2e in tests/peer_messaging_e2e.rs.
+
 ## Daemon model selection + status line (cli-flags-parity lane)
 
 - TS `main.ts` `runtimeConfigFromArgs` builds `AgentSessionRuntimeConfig`

@@ -27,6 +27,14 @@ use crate::protocol::{current_protocol_info, DaemonResponse};
 #[error("supervisor link request timed out")]
 struct LinkTimeout;
 
+/// Marker for write-phase failures: the command never reached the
+/// supervisor, so a transparent reconnect-and-retry is safe. The TS link
+/// gets the same property from its close listener (teardown before the
+/// next request reconnects); this link discovers death lazily instead.
+#[derive(Debug, thiserror::Error)]
+#[error("supervisor link write failed before the request was sent")]
+struct LinkWriteFailed;
+
 /// One request/response exchange over the supervisor client socket.
 struct LinkClient {
     reader: BufReader<Box<dyn AsyncReadHalf>>,
@@ -37,7 +45,9 @@ struct LinkClient {
 impl LinkClient {
     /// Send one command envelope and read the line that answers its id.
     /// Broadcast lines on the client socket are skipped; ids keep them
-    /// apart from the response this request waits for.
+    /// apart from the response this request waits for. A write failure is
+    /// tagged [`LinkWriteFailed`] (the command was not sent); everything
+    /// after the write is uncertain and surfaces as a plain error.
     async fn request(&mut self, command: Value, timeout: Duration) -> Result<DaemonResponse> {
         let id = format!("link-{}", self.next_id);
         self.next_id += 1;
@@ -52,8 +62,11 @@ impl LinkClient {
         self.writer
             .write_all(line.as_bytes())
             .await
-            .context("write link command")?;
-        self.writer.flush().await?;
+            .map_err(|error| anyhow::Error::new(LinkWriteFailed).context(error))?;
+        self.writer
+            .flush()
+            .await
+            .map_err(|error| anyhow::Error::new(LinkWriteFailed).context(error))?;
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let mut line = String::new();
@@ -92,15 +105,30 @@ impl SupervisorLink {
     }
 
     /// Send one request, connecting first when the link is down. Never
-    /// retries: daemon commands are not idempotent.
+    /// retries a delivered command: daemon commands are not idempotent. A
+    /// write-phase failure never delivered anything, so exactly one
+    /// transparent reconnect-and-retry covers the supervisor-restart
+    /// window (the TS link's close-listener teardown achieves the same).
     pub async fn request(&self, command: Value, timeout: Duration) -> Result<DaemonResponse> {
         let mut guard = self.client.lock().await;
         if guard.is_none() {
             *guard = Some(self.connect().await?);
         }
-        let client = guard.as_mut().expect("client was just connected");
-        match client.request(command, timeout).await {
+        let outcome = {
+            let client = guard.as_mut().expect("client was just connected");
+            client.request(command.clone(), timeout).await
+        };
+        match outcome {
             Ok(response) => Ok(response),
+            Err(error) if error.downcast_ref::<LinkWriteFailed>().is_some() => {
+                // The socket died before the request went out; a fresh
+                // connection gets exactly one retry and replaces the dead
+                // one for later requests.
+                let mut client = self.connect().await?;
+                let retried = client.request(command, timeout).await;
+                *guard = Some(client);
+                retried
+            }
             Err(error) => {
                 // Connection-level failures invalidate the shared socket;
                 // the next request reconnects. Timeouts keep the socket.

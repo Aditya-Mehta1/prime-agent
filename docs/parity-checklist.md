@@ -253,6 +253,15 @@ Follow-up spec (RLM lane, large): register `rlm.run` (spawn), `rlm.find_models`,
 machinery (child sessions, roster, collect) is the prerequisite for everything
 except `rlm.find_models`.
 
+`rlm.collect` fan-in (filed from the thin3 stage-3 lane): the runtime's
+`collect()` sends `host_request("rlm.collect", {"targets": [selectors],
+"timeout_ms": N})` and expects `{"results": [...]}` entries with
+`rlm_child_id`, terminal `status`, `settled`, and an answer preview. It is
+blocked on the same prerequisite (`rlm.run` + the child registry); once the
+registry exists, the snapshot handler is small and the parent-child
+follow-up messaging already rides the stage-3 roster/peer plumbing
+(`crates/pa-daemon/src/agent_messaging.rs`). Not implemented in stage 3.
+
 ## 7. Read-command surface (`get_session_stats` / `get_context_tree` / `get_commands` / `get_resource_snapshot`) - partial after this PR
 
 TS: `daemon-mode.ts` L183352+ delegates to `getSessionStats` (TS
@@ -438,7 +447,8 @@ TS binary on PATH and a built `target/debug/prime-agent`).
 
 TS: `modes/daemon/daemon-supervisor.ts` `send_message` block, `daemon-mode.ts`
 `worker_deliver_message` + `sendAgentSessionMessage`, `core/agent-messages.ts`
-(receipt/prompt/validation), `core/kernel/shared.ts` (sent-message bridge),
+(receipt/prompt/validation, `createAgentMessageHostHandlers`), TS
+`core/kernel/shared.ts` (sent-message bridge),
 `modes/daemon/supervisor-link.ts`.
 
 - done: supervisor `send_message` arm (`crates/pa-daemon/src/messaging.rs`):
@@ -450,20 +460,44 @@ TS: `modes/daemon/daemon-supervisor.ts` `send_message` block, `daemon-mode.ts`
   `[agent-message from ...]` prompt, steer lane by default / `follow_up` on
   request, pending-capacity guard, `createAgentSessionMessageReceipt`-shaped
   receipt. Worker->supervisor link (`crates/pa-daemon/src/supervisor_link.rs`,
-  TS supervisor-link.ts port) and the kernel `agent_message.send` /
-  `agent_observe.*` host controllers wired through the engine's
-  `extra_host_handlers` (`crates/pa-daemon/src/agent_engine.rs`).
-  Verifiers: unit tests per landed piece (`messaging.rs`,
-  `worker::agent_message_tests`, the `supervisor_link.rs` echo round-trip)
-  and the unknown-target e2e in `crates/pa-daemon/tests/supervisor_e2e.rs`.
-- known issue (superseded): the client-to-client `send_message` e2e (second
-  session created, `send_message` with `fromActiveSessionId` from the first)
-  hangs in flight - the client gets no reply within its 15s deadline;
-  suspected `route_command` deadlock on the supervisor's in-loop route. Do not
-  re-add that e2e as-is: the thin-supervisor Stage 3 peer-messaging work
-  removes the routed path (delivery over direct worker peer links), which
-  supersedes the bug. Worker-side delivery and the unknown-target path stay
-  covered by the unit tests above.
+  TS supervisor-link.ts port; a write-phase failure to a dead supervisor
+  transparently reconnects once, the TS close-listener teardown equivalent)
+  and the kernel `agent_message.send` / `agent_observe.*` host controllers
+  wired through the engine's `extra_host_handlers`
+  (`crates/pa-daemon/src/agent_messaging.rs`).
+- done: the kernel `agent_message.send` contract
+  (`crates/pa-core/src/session_engine/agent_messaging.rs`, TS
+  `createAgentMessageHostHandlers` port): role/name resolution through the
+  family roster with the exact TS error strings, `target: "all"` broadcast
+  with all-settled receipts, positional-target rejection, and the removed
+  `agent_message.list_agents` migration error. The daemon worker's family
+  roster is the supervisor `list` (every other resident session is a
+  sibling); receipts carry the TS target endpoint
+  (activeSessionId/sessionId/sessionName/runtimeKind) so the kernel
+  sent-message display bridge parses them.
+- done: worker-to-worker peer transport (thin-supervisor stage 3): the
+  supervisor mints single-use `worker`-purpose grants
+  (`get_worker_peer_transport`, `crates/pa-daemon/src/peer_tickets.rs`,
+  authenticated by the requester's worker token like TS `list_agent_peers`),
+  the target worker admits them over `peer_auth` into a `PeerWorker` role
+  (`crates/pa-daemon/src/peer.rs`, `worker_deliver_message` only, no event
+  streaming), and the source worker's kernel send delivers directly to the
+  target's socket (`crates/pa-daemon/src/peer_client.rs` +
+  `agent_messaging.rs`) with the TS sender identity block
+  (`createAgentSessionMessageSender` shape: endpoint fields from the
+  worker-pushed live summary + `clientId: "agent"`). The supervisor-routed
+  `send_message` stays as the fallback (only when the direct link cannot be
+  established; once the delivery command is sent the outcome is final).
+- done (was the superseded hang): the client-to-client `send_message` shape
+  completes - the direct path bypasses the supervisor's route plane by
+  design. Verified in `crates/pa-daemon/tests/peer_messaging_e2e.rs`:
+  (1) a kernel send over real spawned workers delivers through the peer
+  transport with the receipt shape and the prompt rendered once in the
+  target; (2) two attached clients, kernel send from A into B, receipt
+  observed, prompt rendered once in B, both clients still served promptly
+  afterwards (no route starvation); (3) supervisor `kill -9`
+  mid-conversation, workers re-register with the restarted supervisor, and
+  the next kernel send still delivers.
 - deferred gaps: the TS supervisor's saved-session wake-up for non-resident
   targets (catalog resolve + worker reuse) is not ported - an unknown target
   always answers `Unknown active session: <selector>` where the TS CLI would

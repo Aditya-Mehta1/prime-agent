@@ -1083,6 +1083,24 @@ impl Supervisor {
                     .await;
                 (vec![response_line(&response)], false)
             }
+            DaemonCommand::GetWorkerPeerTransport {
+                worker_token,
+                target_active_session_id,
+                ..
+            } => {
+                // Worker-to-worker peer ticket: a single-use `worker`
+                // grant pushed into the target worker's memory, so the
+                // delivery itself bypasses this route plane.
+                let response = self
+                    .handle_get_worker_peer_transport(
+                        &command_id,
+                        &type_name,
+                        worker_token,
+                        target_active_session_id,
+                    )
+                    .await;
+                (vec![response_line(&response)], false)
+            }
             DaemonCommand::WorkerRegister { .. } => {
                 // Worker self-registration: rebuilds the roster entry from
                 // the worker's own identity instead of routing to a session.

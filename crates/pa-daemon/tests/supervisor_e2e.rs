@@ -478,11 +478,10 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
     assert_eq!(rows[0], sessions[0]);
 
     // Agent-to-agent messaging: an unknown target is rejected with the TS
-    // supervisor's unknown-session error. Client-to-client delivery e2e is
-    // deferred (the supervisor route path hangs in flight; superseded by
-    // the thin-supervisor peer-messaging stage - see docs/parity-checklist.md);
-    // the worker-side delivery itself is unit-tested in
-    // `worker::agent_message_tests`.
+    // supervisor's unknown-session error. The full client-to-client shape
+    // (including the previously-hanging supervisor route) is verified in
+    // tests/peer_messaging_e2e.rs; the worker-side delivery itself is
+    // unit-tested in `worker::agent_message_tests`.
     client.send_command(
         "m1",
         serde_json::json!({

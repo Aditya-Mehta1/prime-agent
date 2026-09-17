@@ -7,6 +7,7 @@
 //! JSONL under `<agent-dir>/sessions/` using the same layout as the TS product.
 
 pub mod agent_engine;
+pub(crate) mod agent_messaging;
 pub mod compaction;
 pub mod descriptor;
 pub mod engine;
@@ -16,6 +17,7 @@ pub mod lease;
 pub(crate) mod messaging;
 pub mod paths;
 pub(crate) mod peer;
+pub(crate) mod peer_client;
 pub(crate) mod peer_tickets;
 pub mod platform;
 pub mod protocol;

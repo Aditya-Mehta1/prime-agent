@@ -131,6 +131,11 @@ pub trait SessionEngine: Send + Sync {
     fn model_metadata(&self) -> Option<Value> {
         None
     }
+
+    /// The worker's live session summary (the `create` response data). The
+    /// agent engine renders it into the sender identity block of
+    /// worker-to-worker agent messages; scripted engines ignore it.
+    fn set_session_summary(&self, _summary: Value) {}
 }
 
 /// One compaction request (the `compact` command fields).

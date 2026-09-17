@@ -133,6 +133,19 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    /// Worker-to-worker peer ticket (thin-supervisor stage 3): a worker
+    /// acting for its session asks the supervisor to mint a single-use
+    /// `worker`-purpose grant for a target worker's direct socket so the
+    /// delivery bypasses the supervisor's route plane. Authenticated by
+    /// the requester's worker token, like `list_agent_peers`.
+    GetWorkerPeerTransport {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        worker_token: String,
+        target_active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
     RosterSubscribe {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,

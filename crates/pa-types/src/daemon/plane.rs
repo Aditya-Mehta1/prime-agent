@@ -28,6 +28,7 @@ pub fn command_plane(command_type: &str) -> DaemonCommandPlane {
         | "list_saved_sessions"
         | "list_agent_peers"
         | "get_direct_worker_transport"
+        | "get_worker_peer_transport"
         | "create"
         | "reattach"
         | "complete_owned_session"

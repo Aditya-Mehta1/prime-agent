@@ -11,7 +11,11 @@ compaction-entry fold for compacted message reads), client attach/detach
 (full-snapshot and chunked `session_snapshot_begin`/`chunk`/`end`
 streaming), direct-attach transport (supervisor-issued single-use tickets
 with a 10s TTL, worker-side peer grants burned on first use, session-plane
-command gating on peer links), wire protocol serve/negotiation (including the
+command gating on peer links), worker-to-worker peer messaging (stage 3:
+`worker`-purpose single-use grants minted by `get_worker_peer_transport`
+for a source worker's kernel `agent_message.send`, direct
+`worker_deliver_message` on the target worker's socket with the supervisor
+routed `send_message` as the never-retried fallback), wire protocol serve/negotiation (including the
 `compact`/`abort_compaction`/`set_auto_compaction` commands and their
 `compaction_start`/`compaction_end` events), cloud sandbox attach, session
 leases (`core/session-lease.ts` port). Per-session model binding: the

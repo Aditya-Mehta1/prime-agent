@@ -26,6 +26,12 @@ pub enum AgentFamilyRelationship {
     Child,
 }
 
+impl std::fmt::Display for AgentFamilyRelationship {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 impl AgentFamilyRelationship {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -73,7 +79,12 @@ pub struct AgentMessageSendInput {
 #[derive(Debug, Clone)]
 pub struct AgentMessageReceipt {
     pub id: String,
+    /// The target's active session id (TS `target.activeSessionId`).
     pub target: String,
+    /// The target endpoint's session id (TS `target.sessionId`).
+    pub target_session_id: Option<String>,
+    pub target_session_name: Option<String>,
+    pub target_runtime_kind: Option<String>,
     pub message: String,
     pub delivery_status: AgentMessageDeliveryStatus,
     pub delivery_mode: Option<&'static str>,
@@ -82,8 +93,30 @@ pub struct AgentMessageReceipt {
     pub queued_at: Option<String>,
 }
 
+/// One addressable family member (TS `AgentFamilyMember`): a parent,
+/// sibling, or child of this session, keyed by a routable target selector.
+#[derive(Debug, Clone)]
+pub struct AgentFamilyMember {
+    pub relationship: AgentFamilyRelationship,
+    /// The target selector the controller can deliver to (session id for
+    /// local family members, the active session id for peers served by
+    /// another worker).
+    pub id: String,
+    pub name: Option<String>,
+}
+
+impl AgentFamilyMember {
+    /// TS `agentFamilyMemberName`: the name, else the id.
+    pub fn member_name(&self) -> &str {
+        self.name.as_deref().unwrap_or(&self.id)
+    }
+}
+
 /// The controller the daemon supplies for `agent_message.*` requests.
 pub trait AgentMessageController: Send + Sync {
+    /// The addressable family (TS `controller.family()`): the parent,
+    /// siblings, and children of this session, excluding the session itself.
+    fn family(&self) -> impl Future<Output = anyhow::Result<Vec<AgentFamilyMember>>> + Send;
     fn send_agent_message(
         &self,
         input: AgentMessageSendInput,
@@ -218,11 +251,34 @@ pub fn is_agent_session_message_prompt(text: &str) -> bool {
     parse_agent_session_message_prompt_id(text).is_some()
 }
 
+/// The TS `AgentSessionMessageEndpoint` the receipt carries as `target`.
+fn receipt_target_value(receipt: &AgentMessageReceipt) -> Value {
+    let mut target = json!({
+        "activeSessionId": receipt.target,
+        "sessionId": receipt.target_session_id.clone().unwrap_or_default(),
+    });
+    if let Some(name) = receipt
+        .target_session_name
+        .as_deref()
+        .filter(|name| !name.is_empty())
+    {
+        target["sessionName"] = json!(name);
+    }
+    if let Some(kind) = receipt
+        .target_runtime_kind
+        .as_deref()
+        .filter(|kind| !kind.is_empty())
+    {
+        target["runtimeKind"] = json!(kind);
+    }
+    target
+}
+
 fn receipt_value(receipt: &AgentMessageReceipt) -> Value {
     json!({
         "id": receipt.id,
         "source": AGENT_MESSAGE_SOURCE,
-        "target": receipt.target,
+        "target": receipt_target_value(receipt),
         "message": receipt.message,
         "deliveryStatus": receipt.delivery_status.as_str(),
         "deliveredAt": receipt.delivered_at,
@@ -232,39 +288,146 @@ fn receipt_value(receipt: &AgentMessageReceipt) -> Value {
     })
 }
 
-/// Register `agent_message.*` handlers onto a handler map.
+/// Register `agent_message.*` handlers onto a handler map. The `send`
+/// contract matches the kernel skill: role/addressed sends carry
+/// `receiver_role`/`receiver_name`, and `target: "all"` is the broadcast
+/// form. Positional targets other than `"all"` are rejected exactly like
+/// the TS handler.
 pub fn register_agent_message_host_handlers<C: AgentMessageController + 'static>(
     controller: std::sync::Arc<C>,
     handlers: &mut HostRequestHandlers,
 ) {
+    handlers.register(
+        "agent_message.list_agents",
+        host_handler(|_payload| {
+            Box::pin(async {
+                Err(anyhow::anyhow!(
+                    "agent_message.list_agents was removed; the family roster now lives in agent_observe.list_agents(). Restart the Python kernel to load the current skills, then call await agent_observe.list_agents()."
+                ))
+            })
+        }),
+    );
     handlers.register(
         "agent_message.send",
         host_handler(move |payload| {
             let controller = controller.clone();
             Box::pin(async move {
                 let data = payload.data;
-                let Some(target) = data.get("target").and_then(Value::as_str) else {
-                    return Err(anyhow::anyhow!(
-                        "agent_message.send target must be a string"
-                    ));
-                };
                 let Some(message) = data.get("message").and_then(Value::as_str) else {
                     return Err(anyhow::anyhow!(
                         "agent_message.send message must be a string"
                     ));
                 };
-                let target = assert_direct_agent_message_target(target)?;
+                // TS normalizes inside every send (broadcast included), so
+                // normalizing up front is behaviorally identical.
                 let message = normalize_agent_session_message(message)?;
-                let receiver_role = match data.get("receiver_role") {
-                    None | Some(Value::Null) => None,
-                    Some(Value::String(role)) => AgentFamilyRelationship::parse(role),
-                    _ => None,
+                // Broadcast form (`target: "all"`): one send per family
+                // member, all-settled into a receipts array.
+                if let Some(target) = data.get("target").and_then(Value::as_str) {
+                    if target != "all" {
+                        return Err(anyhow::anyhow!(
+                            "positional agent_message.send targets are not supported; use receiver_role and receiver_name"
+                        ));
+                    }
+                    if data.get("receiver_role").is_some() || data.get("receiver_name").is_some() {
+                        return Err(anyhow::anyhow!(
+                            "agent_message.send broadcast cannot be combined with receiver_role/receiver_name"
+                        ));
+                    }
+                    let family = controller.family().await?;
+                    let mut receipts = Vec::with_capacity(family.len());
+                    for member in family {
+                        let result = controller
+                            .send_agent_message(AgentMessageSendInput {
+                                target: member.id.clone(),
+                                message: message.clone(),
+                                receiver_role: Some(member.relationship),
+                            })
+                            .await;
+                        receipts.push(match result {
+                            Ok(receipt) => receipt_value(&receipt),
+                            Err(error) => json!({
+                                "target": member.id,
+                                "error": error.to_string(),
+                            }),
+                        });
+                    }
+                    return Ok(json!({ "receipts": receipts }));
+                }
+                // Role-addressed form: resolve the receiver through the
+                // family roster, then send once.
+                let role = match data.get("receiver_role").and_then(Value::as_str) {
+                    Some("parent") => AgentFamilyRelationship::Parent,
+                    Some("sibling") => AgentFamilyRelationship::Sibling,
+                    Some("child") => AgentFamilyRelationship::Child,
+                    _ => {
+                        return Err(anyhow::anyhow!(
+                            "agent_message.send receiver_role must be \"parent\", \"sibling\", or \"child\""
+                        ))
+                    }
+                };
+                let receiver_name = data.get("receiver_name").filter(|value| !value.is_null());
+                if role == AgentFamilyRelationship::Parent && receiver_name.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "agent_message.send receiver_name must be omitted for parent messages"
+                    ));
+                }
+                let selector: Option<&str> = if role == AgentFamilyRelationship::Parent {
+                    None
+                } else {
+                    match receiver_name
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                    {
+                        Some(name) => Some(name),
+                        None => {
+                            return Err(anyhow::anyhow!(
+                                "agent_message.send receiver_name is required for sibling and child messages"
+                            ))
+                        }
+                    }
+                };
+                // TS renders the receiver in errors via JSON.stringify.
+                let rendered_receiver = match receiver_name {
+                    Some(Value::String(name)) => format!("\"{name}\""),
+                    Some(other) => serde_json::to_string(other).unwrap_or_default(),
+                    None => "null".to_string(),
+                };
+                let family = controller.family().await?;
+                let matches: Vec<AgentFamilyMember> = family
+                    .into_iter()
+                    .filter(|member| {
+                        member.relationship == role
+                            && (role == AgentFamilyRelationship::Parent
+                                || member.member_name() == selector.unwrap_or_default()
+                                || selector.is_some_and(|selector| member.id == selector))
+                    })
+                    .collect();
+                // Exactly one match resolves; zero or many keep the TS
+                // error strings.
+                let member = match matches.as_slice() {
+                    [only] => only,
+                    [] => {
+                        return Err(anyhow::anyhow!(
+                            if role == AgentFamilyRelationship::Parent {
+                                "No parent matches the current agent".to_string()
+                            } else {
+                                format!("No {role} matches {rendered_receiver}")
+                            }
+                        ))
+                    }
+                    _ => {
+                        return Err(anyhow::anyhow!(
+                            format!("{role} selector {rendered_receiver} is ambiguous")
+                        ))
+                    }
                 };
                 let receipt = controller
                     .send_agent_message(AgentMessageSendInput {
-                        target,
-                        message,
-                        receiver_role,
+                        target: member.id.clone(),
+                        message: message.clone(),
+                        receiver_role: Some(role),
                     })
                     .await?;
                 Ok(receipt_value(&receipt))
@@ -675,16 +838,55 @@ mod tests {
         assert_eq!(clipped.text.chars().count(), 10);
     }
 
+    /// A family of one parent, two siblings (one named "scout"), and two
+    /// children both named "dual".
+    fn family() -> Vec<AgentFamilyMember> {
+        vec![
+            AgentFamilyMember {
+                relationship: AgentFamilyRelationship::Parent,
+                id: "parent-1".to_string(),
+                name: None,
+            },
+            AgentFamilyMember {
+                relationship: AgentFamilyRelationship::Sibling,
+                id: "sib-1".to_string(),
+                name: Some("scout".to_string()),
+            },
+            AgentFamilyMember {
+                relationship: AgentFamilyRelationship::Sibling,
+                id: "sib-2".to_string(),
+                name: None,
+            },
+            AgentFamilyMember {
+                relationship: AgentFamilyRelationship::Child,
+                id: "kid-1".to_string(),
+                name: Some("dual".to_string()),
+            },
+            AgentFamilyMember {
+                relationship: AgentFamilyRelationship::Child,
+                id: "kid-2".to_string(),
+                name: Some("dual".to_string()),
+            },
+        ]
+    }
+
     struct RecordingMessageController;
 
     impl AgentMessageController for RecordingMessageController {
+        async fn family(&self) -> anyhow::Result<Vec<AgentFamilyMember>> {
+            Ok(family())
+        }
+
         async fn send_agent_message(
             &self,
             input: AgentMessageSendInput,
         ) -> anyhow::Result<AgentMessageReceipt> {
             Ok(AgentMessageReceipt {
                 id: create_agent_session_message_id(),
+                target_session_id: Some(format!("{}-session", input.target)),
                 target: input.target,
+                target_session_name: None,
+                target_runtime_kind: Some("top-level".to_string()),
                 message: input.message,
                 delivery_status: AgentMessageDeliveryStatus::Delivered,
                 delivery_mode: Some("steer"),
@@ -695,6 +897,18 @@ mod tests {
         }
     }
 
+    fn send_request(
+        send: &crate::kernel::shared::HostHandlerFn,
+        data: Value,
+    ) -> anyhow::Result<Value> {
+        // The handler futures here are plain (no tokio IO), so driving
+        // them on the test executor is safe.
+        futures::executor::block_on(send(crate::kernel::shared::HostRequestPayload {
+            data,
+            cell_source_code: None,
+        }))
+    }
+
     #[tokio::test]
     async fn message_host_handler_round_trip() {
         let mut handlers = HostRequestHandlers::default();
@@ -703,41 +917,159 @@ mod tests {
             &mut handlers,
         );
         let send = handlers.get("agent_message.send").unwrap().clone();
-        let receipt = send(crate::kernel::shared::HostRequestPayload {
-            data: json!({
-                "target": "worker",
+
+        // Role-addressed send resolves the name through the family.
+        let receipt = send_request(
+            &send,
+            json!({
                 "message": "  proceed  ",
-                "receiver_role": "child"
+                "receiver_role": "sibling",
+                "receiver_name": " scout "
             }),
-            cell_source_code: None,
-        })
-        .await
+        )
         .unwrap();
-        assert_eq!(receipt["target"], "worker");
+        assert_eq!(receipt["target"]["activeSessionId"], "sib-1");
+        assert_eq!(receipt["target"]["sessionId"], "sib-1-session");
+        assert_eq!(receipt["target"]["runtimeKind"], "top-level");
         assert_eq!(receipt["message"], "proceed");
         assert_eq!(receipt["deliveryStatus"], "delivered");
-        assert_eq!(receipt["receiverRole"], "child");
+        assert_eq!(receipt["receiverRole"], "sibling");
         assert!(receipt["id"].as_str().unwrap().starts_with("agentmsg_"));
-        // Payload validation.
-        let error = send(crate::kernel::shared::HostRequestPayload {
-            data: json!({ "message": "hi" }),
-            cell_source_code: None,
-        })
-        .await
+
+        // Unnamed members resolve by id (TS agentFamilyMemberName).
+        let by_id = send_request(
+            &send,
+            json!({ "message": "hi", "receiver_role": "sibling", "receiver_name": "sib-2" }),
+        )
+        .unwrap();
+        assert_eq!(by_id["target"]["activeSessionId"], "sib-2");
+
+        // Parent sends need no name.
+        let parent = send_request(
+            &send,
+            json!({ "message": "reply to parent", "receiver_role": "parent" }),
+        )
+        .unwrap();
+        assert_eq!(parent["target"]["activeSessionId"], "parent-1");
+        let parent_named = send_request(
+            &send,
+            json!({ "message": "x", "receiver_role": "parent", "receiver_name": "p" }),
+        )
         .unwrap_err();
         assert_eq!(
-            error.to_string(),
-            "agent_message.send target must be a string"
+            parent_named.to_string(),
+            "agent_message.send receiver_name must be omitted for parent messages"
         );
-        let error = send(crate::kernel::shared::HostRequestPayload {
-            data: json!({ "target": "*", "message": "hi" }),
-            cell_source_code: None,
-        })
-        .await
+
+        // Contract errors carry the TS strings verbatim.
+        let positional =
+            send_request(&send, json!({ "target": "worker", "message": "hi" })).unwrap_err();
+        assert_eq!(
+            positional.to_string(),
+            "positional agent_message.send targets are not supported; use receiver_role and receiver_name"
+        );
+        let no_role = send_request(&send, json!({ "message": "hi" })).unwrap_err();
+        assert_eq!(
+            no_role.to_string(),
+            "agent_message.send receiver_role must be \"parent\", \"sibling\", or \"child\""
+        );
+        let missing_name =
+            send_request(&send, json!({ "message": "hi", "receiver_role": "child" })).unwrap_err();
+        assert_eq!(
+            missing_name.to_string(),
+            "agent_message.send receiver_name is required for sibling and child messages"
+        );
+
+        // Resolution failures keep the TS wording.
+        let no_match = send_request(
+            &send,
+            json!({ "message": "hi", "receiver_role": "child", "receiver_name": "ghost" }),
+        )
+        .unwrap_err();
+        assert_eq!(no_match.to_string(), "No child matches \"ghost\"");
+        let ambiguous = send_request(
+            &send,
+            json!({ "message": "hi", "receiver_role": "child", "receiver_name": "dual" }),
+        )
         .unwrap_err();
         assert_eq!(
-            error.to_string(),
-            "Broadcast agent messaging is not supported"
+            ambiguous.to_string(),
+            "child selector \"dual\" is ambiguous"
         );
+
+        // Broadcast sends to every family member, all-settled.
+        let broadcast =
+            send_request(&send, json!({ "target": "all", "message": "  everyone  " })).unwrap();
+        let receipts = broadcast["receipts"].as_array().expect("receipts");
+        assert_eq!(receipts.len(), 5, "{broadcast:?}");
+        assert!(receipts
+            .iter()
+            .all(|receipt| receipt["message"] == "everyone"));
+
+        // The removed roster request answers with the TS migration error.
+        let list_agents = handlers.get("agent_message.list_agents").unwrap().clone();
+        let removed = send_request(&list_agents, json!({})).unwrap_err();
+        assert!(removed.to_string().starts_with(
+            "agent_message.list_agents was removed; the family roster now lives in agent_observe.list_agents()"
+        ));
+    }
+
+    #[tokio::test]
+    async fn broadcast_without_family_is_empty_and_failures_settle() {
+        struct NoFamilyController;
+        impl AgentMessageController for NoFamilyController {
+            async fn family(&self) -> anyhow::Result<Vec<AgentFamilyMember>> {
+                Ok(Vec::new())
+            }
+            async fn send_agent_message(
+                &self,
+                _input: AgentMessageSendInput,
+            ) -> anyhow::Result<AgentMessageReceipt> {
+                anyhow::bail!("no route")
+            }
+        }
+        let mut handlers = HostRequestHandlers::default();
+        register_agent_message_host_handlers(
+            std::sync::Arc::new(NoFamilyController),
+            &mut handlers,
+        );
+        let send = handlers.get("agent_message.send").unwrap().clone();
+        let broadcast = send_request(&send, json!({ "target": "all", "message": "hi" })).unwrap();
+        assert_eq!(broadcast["receipts"].as_array().map(Vec::len), Some(0));
+
+        // A role send against an empty family: no parent matches.
+        let no_parent =
+            send_request(&send, json!({ "message": "hi", "receiver_role": "parent" })).unwrap_err();
+        assert_eq!(no_parent.to_string(), "No parent matches the current agent");
+
+        // One-member family with a failing send: the receipt records the
+        // error instead of aborting the broadcast.
+        struct LoneFamilyController;
+        impl AgentMessageController for LoneFamilyController {
+            async fn family(&self) -> anyhow::Result<Vec<AgentFamilyMember>> {
+                Ok(vec![AgentFamilyMember {
+                    relationship: AgentFamilyRelationship::Sibling,
+                    id: "sib-1".to_string(),
+                    name: None,
+                }])
+            }
+            async fn send_agent_message(
+                &self,
+                _input: AgentMessageSendInput,
+            ) -> anyhow::Result<AgentMessageReceipt> {
+                anyhow::bail!("peer unreachable")
+            }
+        }
+        let mut handlers = HostRequestHandlers::default();
+        register_agent_message_host_handlers(
+            std::sync::Arc::new(LoneFamilyController),
+            &mut handlers,
+        );
+        let send = handlers.get("agent_message.send").unwrap().clone();
+        let broadcast = send_request(&send, json!({ "target": "all", "message": "hi" })).unwrap();
+        let receipts = broadcast["receipts"].as_array().expect("receipts");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0]["target"], "sib-1");
+        assert_eq!(receipts[0]["error"], "peer unreachable");
     }
 }
