@@ -900,6 +900,18 @@ def _alias_body(word: _Word) -> str | None:
     return word.value.partition("=")[2].lstrip("+") or None
 
 
+def _body_reaches_runner(body: str) -> bool:
+    """True when a runner is a command word of the body, wrapper chains included."""
+    words = _tokenize(body)
+    _apply_heredocs(body, words)
+    reached: set[int] = set()
+    for index, word in enumerate(words):
+        if word.is_data or not word.starts_command:
+            continue
+        _scan_segment(words, index, 0, False, reached)
+    return any(os.path.basename(words[index].value) in _PAYLOAD_RUNNERS for index in reached)
+
+
 def _alias_body_names_runner(words: list[_Word], command_words: set[int]) -> bool:
     """True when an alias defined in this text runs a payload runner as its command."""
     for index in command_words:
@@ -907,10 +919,7 @@ def _alias_body_names_runner(words: list[_Word], command_words: set[int]) -> boo
             continue
         for candidate in _segment_tail(words, index + 1):
             body = _alias_body(words[candidate])
-            if body is None:
-                continue
-            first = next((word for word in _tokenize(body) if not word.is_operator), None)
-            if first is not None and os.path.basename(first.value) in _PAYLOAD_RUNNERS:
+            if body is not None and _body_reaches_runner(body):
                 return True
     return False
 
