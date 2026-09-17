@@ -721,7 +721,24 @@ impl Supervisor {
             .and_then(Value::as_str)
             .map(str::to_string);
         // Explicit model selection from the create config: carried into the
-        // durable create command so respawned workers resolve the same model.
+        // durable create command so respawned workers resolve the same model
+        // and thinking level.
+        let requested_thinking = match config_object.and_then(|config| config.get("thinking")) {
+            None => None,
+            Some(Value::String(level)) => match pa_ai::models::thinking_level_from_str(level) {
+                Some(level) => Some(level),
+                None => {
+                    return Err(anyhow!(
+                        "Invalid thinking level \"{level}\". Valid values: off, minimal, low, medium, high, xhigh, max"
+                    ))
+                }
+            },
+            Some(_) => {
+                return Err(anyhow!(
+                    "Invalid thinking level: expected a string"
+                ))
+            }
+        };
         let model_selection = EngineModelSelection {
             provider: config_object
                 .and_then(|config| config.get("provider"))
@@ -735,6 +752,7 @@ impl Supervisor {
                 .and_then(|config| config.get("apiKey"))
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            thinking: requested_thinking,
         };
         if *no_session == Some(true) && session_path.is_some() {
             return Err(anyhow!(
@@ -774,10 +792,15 @@ impl Supervisor {
         if let Some(api_key) = &model_selection.api_key {
             durable_rest.insert("apiKey".to_string(), json!(api_key));
         }
-        // RLM recursion identity and thinking level ride the durable create
-        // command so a respawned child keeps them (children of an RLM parent
-        // must not forget their depth).
-        for key in ["thinking", "rlmDepth", "rlmMaxDepth", "parentSessionPath"] {
+        if let Some(thinking) = model_selection.thinking {
+            durable_rest.insert("thinking".to_string(), json!(thinking.wire_name()));
+        }
+        // RLM recursion identity rides the durable create command so a
+        // respawned child keeps it (children of an RLM parent must not
+        // forget their depth). `thinking` is covered above: the validated
+        // wire name goes into the durable command, never the raw config
+        // value, so an invalid level cannot outlive the create check.
+        for key in ["rlmDepth", "rlmMaxDepth", "parentSessionPath"] {
             if let Some(value) = config_object.and_then(|config| config.get(key)) {
                 durable_rest.insert(key.to_string(), value.clone());
             }

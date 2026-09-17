@@ -39,15 +39,7 @@ impl ModelThinkingLevelExt for ModelThinkingLevel {
     }
 
     fn wire_name(self) -> &'static str {
-        match self {
-            ModelThinkingLevel::Off => "off",
-            ModelThinkingLevel::Minimal => "minimal",
-            ModelThinkingLevel::Low => "low",
-            ModelThinkingLevel::Medium => "medium",
-            ModelThinkingLevel::High => "high",
-            ModelThinkingLevel::Xhigh => "xhigh",
-            ModelThinkingLevel::Max => "max",
-        }
+        ModelThinkingLevel::wire_name(self)
     }
 }
 

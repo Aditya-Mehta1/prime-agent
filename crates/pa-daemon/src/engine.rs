@@ -21,13 +21,17 @@ pub struct PromptRequest {
 }
 
 /// Explicit model selection from a session's create config (the wire
-/// `provider`/`model`/`apiKey` fields). `None` fields keep the engine's
-/// current selection, mirroring the TS runtime-config merge semantics.
+/// `provider`/`model`/`apiKey`/`thinking` fields). `None` fields keep the
+/// engine's current selection, mirroring the TS runtime-config merge
+/// semantics.
 #[derive(Debug, Clone, Default)]
 pub struct EngineModelSelection {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub api_key: Option<String>,
+    /// The requested thinking level (`--thinking` on the wire). The engine
+    /// resolves the effective level against the model's supported levels.
+    pub thinking: Option<pa_types::ai::ModelThinkingLevel>,
 }
 
 /// Events an engine emits for one prompt, in order. The worker translates these
@@ -165,6 +169,17 @@ pub trait SessionEngine: Send + Sync {
     /// honor it instead of a process-wide fallback. Engines without a model
     /// (the scripted harness) ignore it.
     fn configure_model(&self, _selection: EngineModelSelection) {}
+
+    /// The effective thinking level for the session, as a wire name
+    /// (`"off"`, `"minimal"`, ...): the create-config flag (else the
+    /// settings default, else `"medium"`), clamped to the model's
+    /// supported levels. Fresh daemon sessions record it in the creation
+    /// prefix (`thinking_level_change`) and the session engine runs every
+    /// provider request with it. Engines without model resolution return
+    /// `None` and the prefix records `"off"` instead.
+    fn effective_thinking_level(&self) -> Option<String> {
+        None
+    }
 
     /// The engine's resolved model as connection-state wire data
     /// (`{ id, provider, reasoning }`), when known. Drives the interactive

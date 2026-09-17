@@ -245,22 +245,15 @@ fn resolve_thinking_level(
 ) -> pa_agent::types::ThinkingLevel {
     use pa_types::ai::ModelThinkingLevel;
     let settings = pa_core::settings::SettingsManager::create(&config.cwd, &config.agent_dir);
-    let requested = match config.thinking {
-        Some(level) => level,
-        None => match settings.get_default_thinking_level() {
-            Some(level) => match level {
-                pa_core::settings::ThinkingLevelSetting::Off => ModelThinkingLevel::Off,
-                pa_core::settings::ThinkingLevelSetting::Minimal => ModelThinkingLevel::Minimal,
-                pa_core::settings::ThinkingLevelSetting::Low => ModelThinkingLevel::Low,
-                pa_core::settings::ThinkingLevelSetting::Medium => ModelThinkingLevel::Medium,
-                pa_core::settings::ThinkingLevelSetting::High => ModelThinkingLevel::High,
-                pa_core::settings::ThinkingLevelSetting::Xhigh => ModelThinkingLevel::Xhigh,
-                pa_core::settings::ThinkingLevelSetting::Max => ModelThinkingLevel::Max,
-            },
-            // TS `DEFAULT_THINKING_LEVEL`.
-            None => ModelThinkingLevel::Medium,
-        },
-    };
+    let requested = config
+        .thinking
+        .or_else(|| {
+            settings
+                .get_default_thinking_level()
+                .map(pa_core::settings::ThinkingLevelSetting::model_level)
+        })
+        // TS `DEFAULT_THINKING_LEVEL`.
+        .unwrap_or(ModelThinkingLevel::Medium);
     let clamped = pa_ai::models::clamp_thinking_level(model, requested);
     map_thinking_level(clamped)
 }
@@ -563,12 +556,19 @@ async fn faux_print_mode(options: &RunOptions, script: &str) -> Result<i32, Stri
                 .collect()
         })
         .ok_or_else(|| "PRIME_AGENT_FAUX_SCRIPT requires a responses array".to_string())?;
+    // The same faux-script model contract as the daemon worker seam: a
+    // `reasoning` model makes the harness script thinking-capable turns so
+    // thinking-level resolution can be verified without the network.
+    let reasoning = script
+        .get("reasoning")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let registration =
         pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
             models: Some(vec![pa_ai::faux::FauxModelDefinition {
                 id: "faux-1".to_string(),
                 name: Some("Faux Model".to_string()),
-                reasoning: Some(false),
+                reasoning: Some(reasoning),
                 input: Some(vec![pa_types::ai::ModelInput::Text]),
                 cost: None,
                 context_window: Some(100_000),

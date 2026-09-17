@@ -116,6 +116,23 @@ pub enum ModelThinkingLevel {
     Max,
 }
 
+impl ModelThinkingLevel {
+    /// The wire name shared by the `thinkingLevelMap` keys, the CLI
+    /// `--thinking` values, and the daemon `create` config (`"off"`,
+    /// `"minimal"`, ...).
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            ModelThinkingLevel::Off => "off",
+            ModelThinkingLevel::Minimal => "minimal",
+            ModelThinkingLevel::Low => "low",
+            ModelThinkingLevel::Medium => "medium",
+            ModelThinkingLevel::High => "high",
+            ModelThinkingLevel::Xhigh => "xhigh",
+            ModelThinkingLevel::Max => "max",
+        }
+    }
+}
+
 /// Maps pi thinking levels to provider/model-specific values.
 /// `None` values mark a level as unsupported.
 pub type ThinkingLevelMap = std::collections::HashMap<ModelThinkingLevel, Option<String>>;

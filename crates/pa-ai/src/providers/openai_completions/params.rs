@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use serde_json::{json, Map, Value};
 
 use crate::env_api_keys::get_prime_team_id;
-use crate::models::ModelThinkingLevelExt;
 use crate::providers::openai_completions::convert::{convert_messages, convert_tools};
 use crate::providers::openai_completions::has_tool_history;
 use crate::providers::openai_completions::{

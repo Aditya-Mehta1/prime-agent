@@ -42,14 +42,17 @@ pub enum SessionSelection {
 }
 
 /// Explicit model selection carried into every `create` config: the CLI
-/// `--provider`/`--model`/`--api-key` flags. Explicit flags are
+/// `--provider`/`--model`/`--api-key`/`--thinking` flags. Explicit flags are
 /// authoritative end-to-end — the daemon worker resolves its session model
-/// from this selection instead of a process-wide fallback.
+/// and thinking level from this selection instead of a process-wide fallback.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModelSelection {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub api_key: Option<String>,
+    /// The requested thinking level (`--thinking`). The worker clamps it to
+    /// the model's supported levels and records the effective level.
+    pub thinking: Option<pa_types::ai::ModelThinkingLevel>,
 }
 
 /// Persistence for the first-run onboarding answers. The TUI crate owns
@@ -121,6 +124,9 @@ impl InteractiveOptions {
         }
         if let Some(api_key) = &self.model_selection.api_key {
             config["apiKey"] = json!(api_key);
+        }
+        if let Some(thinking) = self.model_selection.thinking {
+            config["thinking"] = json!(thinking.wire_name());
         }
         config
     }
@@ -577,5 +583,42 @@ impl Renderer {
             }
             Renderer::Headless { frames, .. } => frames,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(selection: ModelSelection) -> InteractiveOptions {
+        InteractiveOptions {
+            socket_path: PathBuf::from("/tmp/unused.sock"),
+            cwd: PathBuf::from("/tmp"),
+            session_dir: None,
+            script_path: None,
+            model_selection: selection,
+            no_session: false,
+            session: SessionSelection::New,
+            initial_message: None,
+            theme: "prime".to_string(),
+            version: "0.0.0".to_string(),
+            onboarding: None,
+        }
+    }
+
+    #[test]
+    fn create_config_carries_the_requested_thinking_level() {
+        let config = options(ModelSelection {
+            thinking: Some(pa_types::ai::ModelThinkingLevel::Max),
+            ..Default::default()
+        })
+        .create_config();
+        assert_eq!(config["thinking"], "max");
+    }
+
+    #[test]
+    fn create_config_omits_thinking_when_no_flag_was_given() {
+        let config = options(ModelSelection::default()).create_config();
+        assert!(config.get("thinking").is_none());
     }
 }

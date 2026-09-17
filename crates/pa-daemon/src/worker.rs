@@ -357,6 +357,7 @@ impl Worker {
                         provider: None,
                         model: None,
                         api_key: None,
+                        thinking: None,
                         session_dir: None,
                         session_file: None,
                         faux_script: Some(script.to_string()),
@@ -379,6 +380,7 @@ impl Worker {
                         provider: std::env::var("PRIME_AGENT_MODEL_PROVIDER").ok(),
                         model: std::env::var("PRIME_AGENT_MODEL").ok(),
                         api_key: None,
+                        thinking: None,
                         session_dir: None,
                         session_file: None,
                         faux_script: None,
@@ -915,6 +917,32 @@ impl Worker {
         // Explicit model flags from the create config are authoritative for
         // this session (TS runtime-config propagation): the engine rebinds
         // its selection instead of falling back to a process-wide model.
+        let requested_thinking = match payload.get("thinking") {
+            None => None,
+            Some(Value::String(level)) => {
+                match pa_ai::models::thinking_level_from_str(level) {
+                    Some(level) => Some(level),
+                    // The wire contract takes validated levels only: reject
+                    // the create loudly instead of silently dropping it.
+                    None => {
+                        return response_failure(
+                            None,
+                            "create",
+                            &format!("Invalid thinking level \"{level}\". Valid values: off, minimal, low, medium, high, xhigh, max"),
+                            None,
+                        );
+                    }
+                }
+            }
+            Some(_) => {
+                return response_failure(
+                    None,
+                    "create",
+                    "Invalid thinking level: expected a string",
+                    None,
+                );
+            }
+        };
         self.engine.configure_model(EngineModelSelection {
             provider: payload
                 .get("provider")
@@ -928,6 +956,7 @@ impl Worker {
                 .get("apiKey")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            thinking: requested_thinking,
         });
         let cwd = payload
             .get("cwd")
@@ -1187,7 +1216,11 @@ impl Worker {
             session_file: store.map(|s| s.path.to_string_lossy().to_string()),
             session_name: store.and_then(|s| s.session_name().map(str::to_string)),
             cwd: core.cwd.clone(),
-            thinking_level: Some("default".to_string()),
+            thinking_level: Some(
+                self.engine
+                    .effective_thinking_level()
+                    .unwrap_or_else(|| "default".to_string()),
+            ),
             is_streaming: streaming,
             is_compacting: compacting,
             is_bash_running: Some(false),
@@ -1776,7 +1809,10 @@ impl Worker {
             active_session_id: Some(core.active_session_id.clone()),
             cwd: core.cwd.clone(),
             model: self.engine.model_metadata(),
-            thinking_level: "default".to_string(),
+            thinking_level: self
+                .engine
+                .effective_thinking_level()
+                .unwrap_or_else(|| "default".to_string()),
             service_tier: "auto".to_string(),
             available_thinking_levels: vec!["default".to_string()],
             is_bash_running: false,
@@ -1940,8 +1976,10 @@ fn create_payload_rlm_depth(payload: &Value) -> Result<(u32, Option<u32>), Strin
 /// in the worker process): fresh files record `model_change` (when the engine
 /// resolves a model), `thinking_level_change`, and `service_tier_change`; a
 /// reopened session records the thinking level and service tier only when no
-/// earlier entry set them. The daemon engine runs with thinking off, matching
-/// the TS default for sessions created without explicit flags.
+/// earlier entry set them. The recorded thinking level is the engine's
+/// effective one — the create-config flag (else settings default/medium)
+/// clamped to the model's supported levels; engines without a model
+/// resolution (the scripted harness) record "off".
 fn append_creation_prefix(
     store: &mut SessionFile,
     engine: &dyn SessionEngine,
@@ -1957,13 +1995,16 @@ fn append_creation_prefix(
         .entries()
         .iter()
         .any(|entry| entry.type_ == "service_tier_change");
+    let thinking_level = engine
+        .effective_thinking_level()
+        .unwrap_or_else(|| "off".to_string());
     if fresh {
         if let Some((provider, model_id)) = engine.creation_model() {
             store.append_model_change(&provider, &model_id);
         }
-        store.append_thinking_level_change("off");
+        store.append_thinking_level_change(&thinking_level);
     } else if !has_thinking_entry {
-        store.append_thinking_level_change("off");
+        store.append_thinking_level_change(&thinking_level);
     }
     if fresh || !has_service_tier_entry {
         let settings = pa_core::settings::SettingsManager::create(cwd, agent_dir);

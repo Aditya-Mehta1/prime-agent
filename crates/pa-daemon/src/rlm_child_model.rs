@@ -6,9 +6,7 @@
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Result};
-use pa_ai::models::{
-    get_supported_thinking_levels, thinking_level_from_str, ModelThinkingLevelExt,
-};
+use pa_ai::models::{get_supported_thinking_levels, thinking_level_from_str};
 use pa_core::auth::AuthStorage;
 use pa_core::kernel::rlm_runtime::{find_rlm_model_matches, RlmModelInfo};
 use pa_core::models::ModelRegistry;

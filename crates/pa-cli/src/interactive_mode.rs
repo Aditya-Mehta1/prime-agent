@@ -119,6 +119,9 @@ fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<Inter
             provider: config.provider.clone(),
             model: config.model.clone(),
             api_key: config.api_key.clone(),
+            // The `--thinking` flag rides the same create-config path:
+            // the worker clamps it to the model's supported levels.
+            thinking: config.thinking,
         },
         no_session: options.session.no_session,
         session,

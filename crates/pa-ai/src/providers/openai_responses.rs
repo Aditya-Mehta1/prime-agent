@@ -10,7 +10,7 @@ use crate::event_stream::{
     create_assistant_message_event_stream, AssistantMessageEvent, AssistantMessageEventStream,
     AssistantMessageEventWriter,
 };
-use crate::models::{clamp_thinking_level, ModelThinkingLevelExt};
+use crate::models::clamp_thinking_level;
 use crate::providers::openai_responses_shared::{
     apply_service_tier_pricing, convert_responses_messages, convert_responses_tools,
     ConvertResponsesMessagesOptions, ConvertResponsesToolsOptions, ReasoningSummary,

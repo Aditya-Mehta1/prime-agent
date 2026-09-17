@@ -33,6 +33,23 @@ pub enum ThinkingLevelSetting {
     Max,
 }
 
+impl ThinkingLevelSetting {
+    /// The same level in the shared model vocabulary: the settings default
+    /// feeds session thinking-level resolution, so callers need the
+    /// pa-types value without re-matching this enum.
+    pub fn model_level(self) -> pa_types::ai::ModelThinkingLevel {
+        match self {
+            ThinkingLevelSetting::Off => pa_types::ai::ModelThinkingLevel::Off,
+            ThinkingLevelSetting::Minimal => pa_types::ai::ModelThinkingLevel::Minimal,
+            ThinkingLevelSetting::Low => pa_types::ai::ModelThinkingLevel::Low,
+            ThinkingLevelSetting::Medium => pa_types::ai::ModelThinkingLevel::Medium,
+            ThinkingLevelSetting::High => pa_types::ai::ModelThinkingLevel::High,
+            ThinkingLevelSetting::Xhigh => pa_types::ai::ModelThinkingLevel::Xhigh,
+            ThinkingLevelSetting::Max => pa_types::ai::ModelThinkingLevel::Max,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum QueueModeSetting {

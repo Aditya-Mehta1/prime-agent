@@ -268,3 +268,49 @@ fn print_mode_resume_unknown_selector_fails_with_browse_hint() {
         "stderr: {stderr}"
     );
 }
+
+/// Headless regression for thinking-level resolution: `--thinking max` on a
+/// reasoning faux model (supported levels `off`..`high`) must persist the
+/// clamped effective level in the session JSONL — the same clamp the
+/// interactive daemon path now applies.
+#[test]
+fn print_mode_thinking_max_persists_the_clamped_high_level() {
+    let home = isolated_home();
+    // `reasoning: true` without a thinkingLevelMap: supported levels are
+    // off/minimal/low/medium/high, so max clamps up-to-down to high.
+    let script = serde_json::json!({ "reasoning": true, "responses": ["clamped answer"] });
+    let (stdout, stderr, code) =
+        run_in_home(home.path(), &["-p", "--thinking", "max", "hello"], &script);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "clamped answer\n");
+
+    let files = session_files(home.path());
+    assert_eq!(files.len(), 1, "one session file, got {files:?}");
+    let entries = read_entries(&files[0]);
+    let level = entries
+        .iter()
+        .find(|entry| entry["type"] == "thinking_level_change")
+        .expect("thinking_level_change persisted");
+    assert_eq!(level["thinkingLevel"], "high");
+}
+
+/// The clamp also applies on the way down: a non-reasoning faux model maps
+/// any requested level to off.
+#[test]
+fn print_mode_thinking_clamps_to_off_for_non_reasoning_models() {
+    let home = isolated_home();
+    let script = serde_json::json!({ "responses": ["plain answer"] });
+    let (stdout, stderr, code) =
+        run_in_home(home.path(), &["-p", "--thinking", "high", "hello"], &script);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "plain answer\n");
+
+    let files = session_files(home.path());
+    assert_eq!(files.len(), 1, "one session file, got {files:?}");
+    let entries = read_entries(&files[0]);
+    let level = entries
+        .iter()
+        .find(|entry| entry["type"] == "thinking_level_change")
+        .expect("thinking_level_change persisted");
+    assert_eq!(level["thinkingLevel"], "off");
+}

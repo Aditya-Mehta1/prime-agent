@@ -18,7 +18,9 @@ use pa_core::session_engine::agent_messaging::{
     register_agent_message_host_handlers, register_agent_observe_host_handlers,
 };
 use pa_core::session_engine::engine::{SessionEngine as CoreSessionEngine, SessionEngineConfig};
-use pa_core::session_engine::provider_adapter::{json_round_trip, real_stream_fn};
+use pa_core::session_engine::provider_adapter::{
+    json_round_trip, map_thinking_level, real_stream_fn,
+};
 use pa_core::session_engine::session_commands::{
     execute_session_command, SessionCommandExecution, SessionCommandParams,
 };
@@ -38,6 +40,10 @@ pub struct AgentEngineConfig {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub api_key: Option<String>,
+    /// Requested thinking level from the process-level fallback. The
+    /// session's create command (`--thinking`) overrides it via
+    /// [`SessionEngine::configure_model`].
+    pub thinking: Option<pa_types::ai::ModelThinkingLevel>,
     /// Session persistence directory (JSONL sessions live under it).
     pub session_dir: Option<std::path::PathBuf>,
     /// Conversation-log path for the system prompt: the daemon worker owns
@@ -75,8 +81,13 @@ pub struct AgentSessionEngine {
     /// (create config or worker env) and is re-bound when a session's create
     /// command carries explicit wire flags.
     selection: std::sync::RwLock<EngineModelSelection>,
-    /// The default thinking level from the session's create command.
-    thinking: std::sync::RwLock<Option<String>>,
+    /// The session's resolved effective thinking level, computed once when
+    /// the create command adopts the selection and reused afterwards.
+    /// Resolution goes through `resolve_model`, which registers the faux
+    /// provider (seeding the scripted response queue), so it must never run
+    /// mid-turn: a `get_state` poll during a live turn would reset the queue
+    /// and the turn would never drain.
+    effective_thinking: std::sync::RwLock<Option<pa_types::ai::ModelThinkingLevel>>,
     /// Built once on the first prompt, reused across prompts.
     pub(crate) session: tokio::sync::Mutex<Option<CoreSessionEngine>>,
     /// One shared supervisor-link client for the worker: agent messaging
@@ -103,17 +114,20 @@ impl AgentSessionEngine {
         let session_file = std::sync::Mutex::new(config.session_file.clone());
         // Process-level fallback: the create config, else the worker env
         // pair. A create command with explicit wire flags overrides both.
+        let thinking = config.thinking;
         let selection = if config.provider.is_some() || config.model.is_some() {
             EngineModelSelection {
                 provider: config.provider.clone(),
                 model: config.model.clone(),
                 api_key: config.api_key.clone(),
+                thinking,
             }
         } else {
             EngineModelSelection {
                 provider: std::env::var("PRIME_AGENT_MODEL_PROVIDER").ok(),
                 model: std::env::var("PRIME_AGENT_MODEL").ok(),
                 api_key: None,
+                thinking,
             }
         };
         // One shared supervisor-link client for the worker: agent messaging
@@ -138,7 +152,7 @@ impl AgentSessionEngine {
             config,
             session_file,
             selection: std::sync::RwLock::new(selection),
-            thinking: std::sync::RwLock::new(None),
+            effective_thinking: std::sync::RwLock::new(None),
             session: tokio::sync::Mutex::new(None),
             own_summary: std::sync::Arc::new(std::sync::Mutex::new(None)),
             autonomous: std::sync::Mutex::new(
@@ -236,6 +250,45 @@ impl AgentSessionEngine {
         self.resolve_registry_model()
     }
 
+    /// The effective session thinking level (the sdk.ts `createAgentSession`
+    /// order): the create-config flag, then the settings default, then
+    /// "medium" — always clamped to what the model supports; a model that
+    /// cannot be resolved degrades to "off". Resolved once at create time
+    /// and cached: model resolution seeds the scripted faux provider, so
+    /// mid-turn recomputation would reset the response queue.
+    fn effective_thinking(&self) -> pa_types::ai::ModelThinkingLevel {
+        if let Some(level) = *self
+            .effective_thinking
+            .read()
+            .expect("effective thinking lock")
+        {
+            return level;
+        }
+        let requested = self
+            .current_selection()
+            .thinking
+            .or_else(|| {
+                let settings = pa_core::settings::SettingsManager::create(
+                    &self.config.cwd,
+                    &self.config.agent_dir,
+                );
+                settings
+                    .get_default_thinking_level()
+                    .map(pa_core::settings::ThinkingLevelSetting::model_level)
+            })
+            // TS `DEFAULT_THINKING_LEVEL`.
+            .unwrap_or(pa_types::ai::ModelThinkingLevel::Medium);
+        let resolved = match self.resolve_model() {
+            Ok(model) => pa_ai::models::clamp_thinking_level(&model, requested),
+            Err(_) => pa_types::ai::ModelThinkingLevel::Off,
+        };
+        *self
+            .effective_thinking
+            .write()
+            .expect("effective thinking lock") = Some(resolved);
+        resolved
+    }
+
     /// Resolve the request API key for `model`: the create-config key (the
     /// TS `setRuntimeApiKey` path), else the registry's auth resolution
     /// (auth storage, then the models.json provider `apiKey` — the same
@@ -294,7 +347,7 @@ impl AgentSessionEngine {
             cwd: self.config.cwd.clone(),
             agent_dir: self.config.agent_dir.clone(),
             model: Some(agent_model),
-            thinking_level: self.thinking_level(),
+            thinking_level: Some(map_thinking_level(self.effective_thinking())),
             stream_fn: Some(stream_fn),
             // Model tools: `ipython` only (kernel-resident bash/edit parity);
             // the engine adds the kernel-backed `ipython` tool itself.
@@ -314,22 +367,6 @@ impl AgentSessionEngine {
             }),
         })
         .await
-    }
-
-    /// The session's thinking level from the create command (validated at
-    /// `configure_rlm_identity` time), when set.
-    fn thinking_level(&self) -> Option<pa_agent::types::ThinkingLevel> {
-        let name = self.thinking.read().expect("thinking lock").clone()?;
-        match name.as_str() {
-            "off" => Some(pa_agent::types::ThinkingLevel::Off),
-            "minimal" => Some(pa_agent::types::ThinkingLevel::Minimal),
-            "low" => Some(pa_agent::types::ThinkingLevel::Low),
-            "medium" => Some(pa_agent::types::ThinkingLevel::Medium),
-            "high" => Some(pa_agent::types::ThinkingLevel::High),
-            "xhigh" => Some(pa_agent::types::ThinkingLevel::Xhigh),
-            "max" => Some(pa_agent::types::ThinkingLevel::Max),
-            _ => None,
-        }
     }
 }
 
@@ -370,19 +407,37 @@ impl SessionEngine for AgentSessionEngine {
     fn configure_model(&self, selection: EngineModelSelection) {
         // Merge like the TS runtime config: explicit wire flags replace the
         // current selection; absent fields keep it.
-        let mut current = self.selection.write().expect("model selection lock");
-        if selection.provider.is_some() {
-            current.provider = selection.provider;
+        {
+            let mut current = self.selection.write().expect("model selection lock");
+            if selection.provider.is_some() {
+                current.provider = selection.provider;
+            }
+            if selection.model.is_some() {
+                current.model = selection.model;
+            }
+            if selection.api_key.is_some() {
+                current.api_key = selection.api_key;
+            }
+            if selection.thinking.is_some() {
+                current.thinking = selection.thinking;
+            }
         }
-        if selection.model.is_some() {
-            current.model = selection.model;
-        }
-        if selection.api_key.is_some() {
-            current.api_key = selection.api_key;
-        }
+        // Resolve the effective thinking level now (create time, before any
+        // turn): the merge above may have changed the selection, so drop the
+        // cached value and recompute. `effective_thinking` caches it, so
+        // later summary/state calls stay side-effect-free while turns run.
+        *self
+            .effective_thinking
+            .write()
+            .expect("effective thinking lock") = None;
+        let _ = self.effective_thinking();
         // The first prompt after create builds the session against this
         // selection, so no invalidation is needed here: configure runs at
         // create time, before any turn.
+    }
+
+    fn effective_thinking_level(&self) -> Option<String> {
+        Some(self.effective_thinking().wire_name().to_string())
     }
 
     fn model_metadata(&self) -> Option<Value> {
@@ -478,11 +533,17 @@ impl SessionEngine for AgentSessionEngine {
         &self,
         identity: crate::engine::RlmSessionIdentity,
     ) -> anyhow::Result<()> {
+        // The inherited default the children registry seeds from (validated;
+        // the children create command carries it onward). This session's own
+        // effective level resolves through the shared path instead: the
+        // worker routes the same create-config `thinking` flag through
+        // `configure_model`, so it lands in `effective_thinking` already
+        // validated and clamped to the model (the TS `resolveRuntimeSessionOptions`
+        // -> sdk.ts `createAgentSession` order).
         if let Some(thinking) = &identity.thinking {
             pa_ai::models::thinking_level_from_str(thinking)
                 .ok_or_else(|| anyhow::anyhow!("unknown thinking level \"{thinking}\""))?;
         }
-        *self.thinking.write().expect("thinking lock") = identity.thinking.clone();
         if let Some(children) = &self.children {
             let parent = ParentIdentity {
                 rlm_depth: identity.rlm_depth,
@@ -1075,6 +1136,7 @@ mod tests {
             provider: None,
             model: None,
             api_key: None,
+            thinking: None,
             session_dir: None,
             session_file: None,
             faux_script: None,
@@ -1087,6 +1149,7 @@ mod tests {
             provider: Some("battery".to_string()),
             model: Some("mock-1".to_string()),
             api_key: None,
+            thinking: None,
         });
         let model = engine.resolve_registry_model().expect("resolved model");
         assert_eq!(model.provider, "battery");
@@ -1110,6 +1173,7 @@ mod tests {
             provider: Some("battery".to_string()),
             model: Some("mock-1".to_string()),
             api_key: Some("flag-key".to_string()),
+            thinking: None,
             session_dir: None,
             session_file: None,
             faux_script: None,
@@ -1121,6 +1185,7 @@ mod tests {
             provider: None,
             model: Some("mock-1".to_string()),
             api_key: None,
+            thinking: None,
         });
         let model = engine.resolve_registry_model().expect("resolved model");
         assert_eq!(model.provider, "battery");
@@ -1139,6 +1204,7 @@ mod tests {
             provider: Some("no-such-provider".to_string()),
             model: Some("some-model".to_string()),
             api_key: None,
+            thinking: None,
             session_dir: None,
             session_file: None,
             faux_script: None,
@@ -1167,6 +1233,67 @@ mod tests {
         };
         assert!(error.contains("Unknown provider"));
     }
+
+    /// A reasoning models.json model (no thinkingLevelMap): supported
+    /// levels are off..high, so a requested max clamps to high.
+    #[test]
+    fn configure_model_thinking_clamps_to_the_models_supported_levels() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("models.json"),
+            serde_json::json!({
+                "providers": {
+                    "battery": {
+                        "api": "openai-completions",
+                        "baseUrl": "http://127.0.0.1:9",
+                        "apiKey": "sk-battery",
+                        "models": [
+                            {
+                                "id": "mock-1",
+                                "reasoning": true,
+                                "contextWindow": 128000,
+                                "maxTokens": 4096
+                            }
+                        ]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let engine = AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir,
+            provider: Some("battery".to_string()),
+            model: Some("mock-1".to_string()),
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: None,
+            faux_script: None,
+            supervisor_link: None,
+        })
+        .unwrap();
+        // Without an explicit flag the TS default applies (medium, clamped).
+        assert_eq!(engine.effective_thinking_level().as_deref(), Some("medium"));
+        // The create-config flag is authoritative, clamped to model support.
+        engine.configure_model(EngineModelSelection {
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: Some(pa_types::ai::ModelThinkingLevel::Max),
+        });
+        assert_eq!(engine.effective_thinking_level().as_deref(), Some("high"));
+        engine.configure_model(EngineModelSelection {
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: Some(pa_types::ai::ModelThinkingLevel::Low),
+        });
+        assert_eq!(engine.effective_thinking_level().as_deref(), Some("low"));
+    }
 }
 
 /// Register the faux provider from a script and return its model. Scripts
@@ -1190,6 +1317,7 @@ fn agent_engine_streams_updates_and_final_message() {
         provider: None,
         model: None,
         api_key: None,
+        thinking: None,
         session_dir: None,
         session_file: None,
         faux_script: Some(serde_json::json!({ "responses": ["streamed answer"] }).to_string()),
