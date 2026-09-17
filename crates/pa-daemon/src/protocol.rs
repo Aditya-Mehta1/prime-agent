@@ -47,6 +47,9 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "clear_queue",
     "abort_and_clear_queue",
     "get_last_assistant_text",
+    "set_auto_compaction",
+    "compact",
+    "abort_compaction",
     "retry_worker",
     "restart",
     "shutdown",
@@ -444,6 +447,15 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         }
         | DaemonCommand::RetryWorker {
             active_session_id, ..
+        }
+        | DaemonCommand::Compact {
+            active_session_id, ..
+        }
+        | DaemonCommand::AbortCompaction {
+            active_session_id, ..
+        }
+        | DaemonCommand::SetAutoCompaction {
+            active_session_id, ..
         } => Some(active_session_id),
         DaemonCommand::Detach {
             active_session_id, ..
@@ -481,6 +493,9 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::AbortAndClearQueue { .. } => "abort_and_clear_queue",
         DaemonCommand::GetLastAssistantText { .. } => "get_last_assistant_text",
         DaemonCommand::RetryWorker { .. } => "retry_worker",
+        DaemonCommand::Compact { .. } => "compact",
+        DaemonCommand::AbortCompaction { .. } => "abort_compaction",
+        DaemonCommand::SetAutoCompaction { .. } => "set_auto_compaction",
         DaemonCommand::Restart { .. } => "restart",
         DaemonCommand::Shutdown { .. } => "shutdown",
         DaemonCommand::AckResult { .. } => "ack_result",

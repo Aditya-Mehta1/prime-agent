@@ -8,7 +8,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
@@ -238,15 +238,52 @@ impl SessionFile {
             .map(normalize_state_status)
     }
 
+    /// The branch's conversation, compacted view first (port of the TS
+    /// `buildSessionContext` fold): when the branch holds a compaction, the
+    /// read starts at a `compactionSummary` message, followed by the
+    /// retained messages from `firstKeptEntryId`, then everything appended
+    /// after the compaction. Without a compaction this is the plain
+    /// message list.
     pub fn messages(&self) -> Vec<Value> {
-        let mut messages = Vec::new();
-        for entry in self.branch() {
-            if entry.type_ == "message" {
+        let branch = self.branch();
+        let Some(compaction_position) =
+            branch.iter().rposition(|entry| entry.type_ == "compaction")
+        else {
+            return branch
+                .iter()
+                .filter(|entry| entry.type_ == "message")
+                .filter_map(|entry| entry.fields.get("message").cloned())
+                .collect();
+        };
+        let compaction = branch[compaction_position];
+        let first_kept_entry_id = compaction
+            .fields
+            .get("firstKeptEntryId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let mut retained: Vec<Value> = Vec::new();
+        let mut keeping = false;
+        for entry in &branch[..compaction_position] {
+            if entry.type_ != "message" {
+                continue;
+            }
+            if !keeping && entry.id == first_kept_entry_id {
+                keeping = true;
+            }
+            if keeping {
                 if let Some(message) = entry.fields.get("message") {
-                    messages.push(message.clone());
+                    retained.push(message.clone());
                 }
             }
         }
+        let mut messages = vec![compaction_summary_message(compaction, retained.len())];
+        messages.extend(retained);
+        messages.extend(
+            branch[compaction_position + 1..]
+                .iter()
+                .filter(|entry| entry.type_ == "message")
+                .filter_map(|entry| entry.fields.get("message").cloned()),
+        );
         messages
     }
 
@@ -401,6 +438,26 @@ fn write_line<T: Serialize>(writer: &mut impl Write, value: &T) -> Result<()> {
 
 fn message_role(message: &Value) -> Option<&str> {
     message.get("role").and_then(Value::as_str)
+}
+
+/// The `compactionSummary` message a compaction fold starts with (TS
+/// `createCompactionSummaryMessage`).
+fn compaction_summary_message(entry: &SessionEntry, retained_count: usize) -> Value {
+    let timestamp = crate::util::iso_to_unix_ms(&entry.timestamp).unwrap_or(0);
+    let mut message = json!({
+        "role": "compactionSummary",
+        "summary": entry.fields.get("summary").cloned().unwrap_or_default(),
+        "tokensBefore": entry.fields.get("tokensBefore").cloned().unwrap_or(json!(0)),
+        "retainedMessageCount": retained_count as u64,
+        "timestamp": timestamp,
+    });
+    if let Some(custom_instructions) = entry.fields.get("customInstructions") {
+        message["customInstructions"] = custom_instructions.clone();
+    }
+    if let Some(harness_digest) = entry.fields.get("harnessDigest") {
+        message["harnessDigest"] = harness_digest.clone();
+    }
+    message
 }
 
 fn message_text(message: &Value) -> String {

@@ -15,8 +15,8 @@ use pa_core::session_engine::provider_adapter::{json_round_trip, real_stream_fn}
 use pa_types::ai::Model;
 
 use crate::engine::{
-    EngineEvent, EngineModelSelection, PromptRequest, SessionEngine, SideQuestionOutcome,
-    SideQuestionRequest,
+    CompactionOutcome, CompactionRequest, CompactionRun, EngineEvent, EngineModelSelection,
+    PromptRequest, SessionEngine, SideQuestionOutcome, SideQuestionRequest,
 };
 
 /// Configuration for the real engine.
@@ -226,6 +226,75 @@ impl SessionEngine for AgentSessionEngine {
             "provider": model.provider,
             "reasoning": model.reasoning,
         }))
+    }
+
+    /// `compact` over the hosted pa-core session: the session summarizes
+    /// its own branch, persists the entry on its in-memory store, and
+    /// rebuilds the loop context; the worker persists the durable entry.
+    /// The abort races the run: the summarizer call is cancelled by
+    /// dropping the future (the entry write happens inside it).
+    fn run_compaction(
+        &self,
+        request: CompactionRequest,
+        signal: &pa_agent::abort::AbortSignal,
+    ) -> CompactionOutcome {
+        let model = match self.resolve_model() {
+            Ok(model) => model,
+            Err(error) => {
+                return CompactionOutcome::Failed {
+                    error: error.to_string(),
+                }
+            }
+        };
+        if let Err(error) = self.session_agent(&model) {
+            return CompactionOutcome::Failed {
+                error: error.to_string(),
+            };
+        }
+        let custom_instructions = request.custom_instructions.clone();
+        let api_key = self.config.api_key.clone();
+        let run = async {
+            let guard = self.session.lock().await;
+            let Some(engine) = guard.as_ref() else {
+                anyhow::bail!("session not built");
+            };
+            engine
+                .session
+                .compact(custom_instructions.as_deref(), &model, api_key)
+                .await
+        };
+        let result = self
+            .runtime
+            .block_on(pa_agent::abort::race_with_abort(run, signal));
+        let compaction = match result {
+            Ok(Ok(compaction)) => compaction,
+            Ok(Err(error)) => {
+                // Abort-marked errors and a lost abort race both surface as
+                // the TS "Compaction cancelled" outcome.
+                if pa_agent::abort::is_abort_error(&error) {
+                    return CompactionOutcome::Aborted;
+                }
+                return CompactionOutcome::Failed {
+                    error: format!("{error:#}"),
+                };
+            }
+            Err(_) => return CompactionOutcome::Aborted,
+        };
+        CompactionOutcome::Compacted {
+            run: CompactionRun {
+                // pa-core's result carries summary/cut/tokens plus the
+                // summarizer usage; file-op details are entry-side in
+                // pa-core and not exposed on the compact result yet.
+                result: json!({
+                    "summary": compaction.summary,
+                    "firstKeptEntryId": compaction.first_kept_entry_id,
+                    "tokensBefore": compaction.tokens_before,
+                }),
+                usage: compaction
+                    .usage
+                    .and_then(|usage| serde_json::to_value(usage).ok()),
+            },
+        }
     }
 
     fn run_side_question(

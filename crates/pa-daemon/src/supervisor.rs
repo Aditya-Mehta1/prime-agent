@@ -861,8 +861,19 @@ impl Supervisor {
         let mut reader = BufReader::new(reader);
         let mut line = String::new();
         let mut events = self.events.subscribe();
-        let mut attached: Vec<String> = Vec::new();
-        let mut effective_client_id = client_id.clone();
+        // Connection state shared with the per-command dispatch tasks: the
+        // envelope-overridden client id and the attached-session list (the
+        // event arm reads the latter to route session events).
+        let attached: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let effective_client_id: Arc<std::sync::Mutex<String>> =
+            Arc::new(std::sync::Mutex::new(client_id.clone()));
+        // Completed dispatches flow back through this channel so the loop
+        // keeps writing: a long command (a turn, a compaction) must not
+        // block this client's events or its other commands, like the TS
+        // daemon's async command handlers.
+        let (dispatch_tx, mut dispatch_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(Vec<Value>, bool)>();
         loop {
             line.clear();
             tokio::select! {
@@ -871,13 +882,23 @@ impl Supervisor {
                     if read == 0 {
                         break;
                     }
-                    let trimmed = line.trim();
+                    let trimmed = line.trim().to_string();
                     if trimmed.is_empty() {
                         continue;
                     }
-                    let (lines, stop) = self
-                        .dispatch_client(trimmed, &mut effective_client_id, &mut attached)
-                        .await;
+                    let supervisor = Arc::clone(&self);
+                    let effective_client_id = Arc::clone(&effective_client_id);
+                    let attached = Arc::clone(&attached);
+                    let dispatch_tx = dispatch_tx.clone();
+                    tokio::spawn(async move {
+                        let (lines, stop) = supervisor
+                            .dispatch_client(&trimmed, &effective_client_id, &attached)
+                            .await;
+                        let _ = dispatch_tx.send((lines, stop));
+                    });
+                }
+                dispatched = dispatch_rx.recv() => {
+                    let Some((lines, stop)) = dispatched else { break };
                     for outbound in lines {
                         write_line(&mut writer, &outbound).await?;
                     }
@@ -891,7 +912,7 @@ impl Supervisor {
                             let deliver = match &routing {
                                 ClientRouting::Broadcast => true,
                                 ClientRouting::AttachedSession { active_session_id } => {
-                                    attached.iter().any(|id| id == active_session_id)
+                                    attached.lock().unwrap().iter().any(|id| id == active_session_id)
                                 }
                             };
                             if deliver {
@@ -906,9 +927,10 @@ impl Supervisor {
         }
         // Detach from every attached session on disconnect (a TUI exit does
         // not stop the session; the worker keeps running).
-        for active_session_id in attached.iter() {
+        let attached_sessions = attached.lock().unwrap().clone();
+        for active_session_id in attached_sessions.iter() {
             if let Ok(resident) = self.registry.resolve(active_session_id).await {
-                let payload = json!({ "type": "detach", "clientId": effective_client_id });
+                let payload = json!({ "type": "detach", "clientId": effective_client_id.lock().unwrap().clone() });
                 let _ = self
                     .route_command(&resident, "detach", payload, ROUTE_TIMEOUT_MS)
                     .await;
@@ -922,8 +944,8 @@ impl Supervisor {
     async fn dispatch_client(
         self: &Arc<Self>,
         line: &str,
-        effective_client_id: &mut String,
-        attached: &mut Vec<String>,
+        effective_client_id: &Arc<std::sync::Mutex<String>>,
+        attached: &Arc<std::sync::Mutex<Vec<String>>>,
     ) -> (Vec<Value>, bool) {
         let envelope = match parse_supervisor_command_line(line) {
             Ok(envelope) => envelope,
@@ -942,7 +964,7 @@ impl Supervisor {
         };
         let command_id = envelope.id.clone();
         if let Some(client_id) = envelope.client_id.clone() {
-            *effective_client_id = client_id;
+            *effective_client_id.lock().unwrap() = client_id;
         }
         let type_name = command_type_name(&envelope.command).to_string();
         match &envelope.command {
@@ -983,10 +1005,8 @@ impl Supervisor {
                 (lines, false)
             }
             DaemonCommand::Create { .. } => {
-                match self
-                    .handle_create(&envelope.command, effective_client_id.clone())
-                    .await
-                {
+                let client_id = effective_client_id.lock().unwrap().clone();
+                match self.handle_create(&envelope.command, client_id).await {
                     Ok(summary) => (
                         vec![response_line(&response_success(
                             Some(&command_id),
@@ -1026,14 +1046,9 @@ impl Supervisor {
                 (vec![response_line(&response)], false)
             }
             command => {
-                self.route_client_command(
-                    command,
-                    effective_client_id,
-                    attached,
-                    command_id,
-                    type_name,
-                )
-                .await
+                let client_id = effective_client_id.lock().unwrap().clone();
+                self.route_client_command(command, &client_id, attached, command_id, type_name)
+                    .await
             }
         }
     }
@@ -1370,7 +1385,7 @@ impl Supervisor {
         self: &Arc<Self>,
         command: &DaemonCommand,
         client_id: &str,
-        attached: &mut Vec<String>,
+        attached: &Arc<std::sync::Mutex<Vec<String>>>,
         command_id: String,
         type_name: String,
     ) -> (Vec<Value>, bool) {
@@ -1390,7 +1405,10 @@ impl Supervisor {
         };
         let timeout = if matches!(
             command,
-            DaemonCommand::PromptAndWait { .. } | DaemonCommand::WaitForIdle { .. }
+            DaemonCommand::PromptAndWait { .. }
+                | DaemonCommand::WaitForIdle { .. }
+                // Compaction runs a summarizer model call, like a turn.
+                | DaemonCommand::Compact { .. }
         ) {
             LONG_ROUTE_TIMEOUT_MS
         } else {
@@ -1436,6 +1454,7 @@ impl Supervisor {
                                 .and_then(Value::as_str)
                                 .map(str::to_string)
                                 .unwrap_or_else(|| resident.worker_id.clone());
+                            let mut attached = attached.lock().unwrap();
                             if !attached.iter().any(|id| id == &active_id) {
                                 attached.push(active_id.clone());
                             }
@@ -1464,7 +1483,10 @@ impl Supervisor {
                 }
                 if let DaemonCommand::Detach { .. } = command {
                     if response.success {
-                        attached.retain(|id| id != &resident.worker_id);
+                        attached
+                            .lock()
+                            .unwrap()
+                            .retain(|id| id != &resident.worker_id);
                     }
                 }
                 if let DaemonCommand::Kill { .. } = command {

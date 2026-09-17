@@ -128,21 +128,26 @@ struct QueuedItem {
     done: Option<oneshot::Sender<Result<(), String>>>,
 }
 
-/// The live session: store, queue, sequencing. Shared by the connection tasks
-/// and the turn runner; every access is through the core mutex.
+/// The live session: store, queue, sequencing. Shared by the connection tasks,
+/// the turn runner, and the compaction manager; every access is through the
+/// core mutex.
 pub(crate) struct SessionCore {
-    active_session_id: String,
-    generation: String,
-    last_event_sequence: u64,
-    store: Option<SessionFile>,
-    cwd: String,
+    pub(crate) active_session_id: String,
+    pub(crate) generation: String,
+    pub(crate) last_event_sequence: u64,
+    pub(crate) store: Option<SessionFile>,
+    pub(crate) cwd: String,
     steering: VecDeque<QueuedItem>,
     follow_up: VecDeque<QueuedItem>,
-    busy: bool,
+    pub(crate) busy: bool,
     pub(crate) created: bool,
     attached_client_ids: Vec<String>,
-    abort_requested: bool,
+    pub(crate) abort_requested: bool,
     shutdown_requested: bool,
+    /// True while a compaction run is in flight (TS `isCompacting`).
+    pub(crate) compacting: bool,
+    /// TS `autoCompactionEnabled` (settings default: on).
+    pub(crate) auto_compaction_enabled: bool,
 }
 
 impl crate::status_line::StatusSession for SessionCore {
@@ -217,6 +222,8 @@ pub struct Worker {
     side_questions: crate::side_question::SideQuestionManager,
     /// Single-use peer-transport grants (worker memory only).
     pub(crate) peer_grants: PeerGrantStore,
+    /// Compaction runs: abort slot, events, durable entry persistence.
+    compaction: crate::compaction::CompactionManager,
 }
 
 impl Worker {
@@ -235,6 +242,8 @@ impl Worker {
             attached_client_ids: Vec::new(),
             abort_requested: false,
             shutdown_requested: false,
+            compacting: false,
+            auto_compaction_enabled: true,
         };
         let active_session_id = config.active_session_id.clone();
         let script = config.script.clone();
@@ -322,6 +331,12 @@ impl Worker {
             events.clone(),
             config.active_session_id.clone(),
         );
+        let compaction = crate::compaction::CompactionManager::new(
+            std::sync::Arc::clone(&engine),
+            events.clone(),
+            Arc::clone(&core),
+            config.active_session_id.clone(),
+        );
         Worker {
             config,
             registration,
@@ -333,6 +348,7 @@ impl Worker {
             recovery: Mutex::new(None),
             side_questions,
             peer_grants: PeerGrantStore::new(),
+            compaction,
         }
     }
 
@@ -496,16 +512,34 @@ impl Worker {
                             .await;
                         continue;
                     }
-                    let response = self.dispatch(&command_type, &payload).await;
-                    self.write_response_frame(&writer, &request_id, &response)
-                        .await;
-                    if command_type == "shutdown" && response.success {
-                        // Shutdown keeps the resume entry and exits the
-                        // process, like the TS close path
-                        // (`closeKeepsResumeEntry("shutdown")`).
-                        let _ = self.record_recovery(false, "shutdown");
-                        std::process::exit(0);
+                    // Shutdown stays sequential: the reply must precede the
+                    // exit. Every other command runs concurrently, like the
+                    // TS daemon's async handlers: a long-running command (a
+                    // turn, a compaction) must not block aborts or state
+                    // reads from other clients.
+                    if command_type == "shutdown" {
+                        let response = self.dispatch(&command_type, &payload).await;
+                        self.write_response_frame(&writer, &request_id, &response)
+                            .await;
+                        if response.success {
+                            // Shutdown keeps the resume entry and exits the
+                            // process, like the TS close path
+                            // (`closeKeepsResumeEntry("shutdown")`).
+                            let _ = self.record_recovery(false, "shutdown");
+                            std::process::exit(0);
+                        }
+                        continue;
                     }
+                    let worker = Arc::clone(&self);
+                    let writer = Arc::clone(&writer);
+                    let request_id = request_id.clone();
+                    let command_type = command_type.clone();
+                    tokio::spawn(async move {
+                        let response = worker.dispatch(&command_type, &payload).await;
+                        worker
+                            .write_response_frame(&writer, &request_id, &response)
+                            .await;
+                    });
                 }
                 ConnectionRole::SessionClient { ref session } => {
                     // A direct peer may only run session-plane commands for
@@ -521,16 +555,26 @@ impl Worker {
                             .await;
                         continue;
                     }
-                    let response = self.dispatch(&command_type, &payload).await;
-                    if response.success {
-                        match command_type.as_str() {
-                            "attach" => session.mark_attached(),
-                            "detach" => session.mark_detached(),
-                            _ => {}
+                    // Session-plane commands run concurrently for the same
+                    // reason as the supervisor arm above.
+                    let worker = Arc::clone(&self);
+                    let writer = Arc::clone(&writer);
+                    let request_id = request_id.clone();
+                    let command_type = command_type.clone();
+                    let session = Arc::clone(session);
+                    tokio::spawn(async move {
+                        let response = worker.dispatch(&command_type, &payload).await;
+                        if response.success {
+                            match command_type.as_str() {
+                                "attach" => session.mark_attached(),
+                                "detach" => session.mark_detached(),
+                                _ => {}
+                            }
                         }
-                    }
-                    self.write_response_frame(&writer, &request_id, &response)
-                        .await;
+                        worker
+                            .write_response_frame(&writer, &request_id, &response)
+                            .await;
+                    });
                 }
             }
         }
@@ -696,6 +740,12 @@ impl Worker {
                 }
                 self.side_questions.abort(payload)
             }
+            "compact" => self.handle_compaction(payload).await,
+            "abort_compaction" => {
+                self.compaction.abort();
+                response_success(None, "abort_compaction", None)
+            }
+            "set_auto_compaction" => self.handle_set_auto_compaction(payload),
             "wait_for_idle" => self.handle_wait_for_idle().await,
             "get_state" => self.handle_get_state(),
             "get_messages" => self.handle_get_messages(),
@@ -868,6 +918,7 @@ impl Worker {
     fn summary_locked(&self, core: &SessionCore) -> SessionSummary {
         let store = core.store.as_ref();
         let streaming = core.busy;
+        let compacting = core.compacting;
         let queued = core.steering.len() + core.follow_up.len();
         // `modified` is the session file mtime; `lastActivityAt` prefers the
         // newest message timestamp (port of `summaryForActiveSession`).
@@ -929,8 +980,13 @@ impl Worker {
         SessionSummary {
             id: core.active_session_id.clone(),
             lifecycle: "resident".to_string(),
-            activity: if streaming { "working" } else { "idle" }.to_string(),
-            is_session_active: streaming || queued > 0,
+            activity: if streaming || compacting {
+                "working"
+            } else {
+                "idle"
+            }
+            .to_string(),
+            is_session_active: streaming || compacting || queued > 0,
             has_registered_cron_job: Some(false),
             last_activity_at,
             rlm_depth: Some(0),
@@ -943,7 +999,7 @@ impl Worker {
             cwd: core.cwd.clone(),
             thinking_level: Some("default".to_string()),
             is_streaming: streaming,
-            is_compacting: false,
+            is_compacting: compacting,
             is_bash_running: Some(false),
             attached_clients: core.attached_client_ids.len() as u32,
             message_count: store.map(|s| s.message_count()).unwrap_or(0) as u32,
@@ -1172,6 +1228,51 @@ impl Worker {
         response_success(None, "abort", None)
     }
 
+    /// `compact` (TS handler): run one compaction and answer with the TS
+    /// `CompactionResult` wire shape; skips, aborts, and failures answer
+    /// with the session's error message exactly like the TS daemon catch.
+    async fn handle_compaction(&self, payload: &Value) -> DaemonResponse {
+        if let Err(response) = self.require_created("compact") {
+            return response;
+        }
+        let custom_instructions = payload
+            .get("customInstructions")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let outcome = self
+            .compaction
+            .run(custom_instructions, &self.idle_notify)
+            .await;
+        match outcome {
+            crate::engine::CompactionOutcome::Compacted { run } => {
+                response_success(None, "compact", Some(run.result))
+            }
+            crate::engine::CompactionOutcome::Skipped { message } => {
+                response_failure(None, "compact", &message, None)
+            }
+            crate::engine::CompactionOutcome::Aborted => {
+                response_failure(None, "compact", "Compaction cancelled", None)
+            }
+            crate::engine::CompactionOutcome::Failed { error } => {
+                response_failure(None, "compact", &error, None)
+            }
+        }
+    }
+
+    /// `set_auto_compaction` (TS handler): update the connection state and
+    /// answer success without data.
+    fn handle_set_auto_compaction(&self, payload: &Value) -> DaemonResponse {
+        if let Err(response) = self.require_created("set_auto_compaction") {
+            return response;
+        }
+        let enabled = payload
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        self.compaction.set_auto_compaction(enabled);
+        response_success(None, "set_auto_compaction", None)
+    }
+
     async fn handle_wait_for_idle(&self) -> DaemonResponse {
         loop {
             {
@@ -1354,14 +1455,14 @@ impl Worker {
     fn connection_state_locked(&self, core: &SessionCore) -> AgentConnectionState {
         let store = core.store.as_ref();
         AgentConnectionState {
+            is_streaming: core.busy,
+            is_compacting: core.compacting,
             active_session_id: Some(core.active_session_id.clone()),
             cwd: core.cwd.clone(),
             model: self.engine.model_metadata(),
             thinking_level: "default".to_string(),
             service_tier: "auto".to_string(),
             available_thinking_levels: vec!["default".to_string()],
-            is_streaming: core.busy,
-            is_compacting: false,
             is_bash_running: false,
             retry_attempt: 0,
             steering_mode: "all".to_string(),
@@ -1375,10 +1476,17 @@ impl Worker {
                 .and_then(|s| s.path.parent())
                 .map(|p| p.to_string_lossy().to_string()),
             leaf_id: store.and_then(|s| s.leaf_id().map(str::to_string)),
-            auto_compaction_enabled: false,
+            auto_compaction_enabled: core.auto_compaction_enabled,
             message_count: store.map(|s| s.message_count()).unwrap_or(0) as u32,
             session_actions: self.snapshot_locked(core),
-            compaction_count: 0,
+            compaction_count: store
+                .map(|s| {
+                    s.entries()
+                        .iter()
+                        .filter(|entry| entry.type_ == "compaction")
+                        .count() as u32
+                })
+                .unwrap_or(0),
             goal: Value::Null,
             scoped_models: Vec::new(),
             active_tool_names: Vec::new(),

@@ -164,6 +164,43 @@ impl Client {
             }
         }
     }
+
+    /// Read until the response for `id`, buffering the outbound lines seen
+    /// first: the daemon emits events before the command reply (TS order),
+    /// so a bare `read_response` would discard them.
+    fn read_response_and_lines(&mut self, id: &str) -> (Value, std::collections::VecDeque<Value>) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut lines = std::collections::VecDeque::new();
+        loop {
+            assert!(Instant::now() < deadline, "no response for id {id}");
+            let line = self.read_line();
+            if line.get("id").and_then(Value::as_str) == Some(id) {
+                return (line, lines);
+            }
+            lines.push_back(line);
+        }
+    }
+
+    /// The first buffered-or-live outbound line of `line_type`. Buffered
+    /// lines of other types stay buffered; live lines of other types are
+    /// skipped, like a filtering read loop.
+    fn next_line_of_type(
+        &mut self,
+        lines: &mut std::collections::VecDeque<Value>,
+        line_type: &str,
+    ) -> Value {
+        if let Some(index) = lines.iter().position(|l| l["type"] == line_type) {
+            return lines.remove(index).expect("indexed line");
+        }
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            assert!(Instant::now() < deadline, "no {line_type} line arrived");
+            let line = self.read_line();
+            if line["type"] == line_type {
+                return line;
+            }
+        }
+    }
 }
 
 /// A raw private-frame client for one session worker's own socket (the
@@ -384,6 +421,7 @@ fn supervisor_kill9_restart_sessions_re_register_and_survive() {
     assert_eq!(worker_pids.len(), 3, "one worker per session");
 
     // Start all three turns; they stream while the supervisor is killed.
+    let mut turn_lines: std::collections::VecDeque<Value> = std::collections::VecDeque::new();
     for (index, session_id) in sessions.iter().enumerate() {
         client.send_command(
             &format!("p{index}"),
@@ -393,15 +431,14 @@ fn supervisor_kill9_restart_sessions_re_register_and_survive() {
                 "message": "go",
             }),
         );
-        let ack = client.read_response(&format!("p{index}"));
+        let (ack, prompt_lines) = client.read_response_and_lines(&format!("p{index}"));
         assert_eq!(ack["success"], true, "prompt {index} failed: {ack}");
+        turn_lines.extend(prompt_lines);
     }
     let mut started_streams = 0;
     while started_streams < 3 {
-        let line = client.read_line();
-        if line["type"] == "session_event"
-            && line["event"]["type"].as_str() == Some("message_start")
-        {
+        let line = client.next_line_of_type(&mut turn_lines, "session_event");
+        if line["event"]["type"].as_str() == Some("message_start") {
             started_streams += 1;
         }
     }
@@ -510,12 +547,11 @@ fn supervisor_kill9_restart_sessions_re_register_and_survive() {
             "message": "second turn",
         }),
     );
-    let done = client2.read_response("p1");
+    let (done, mut second_turn_lines) = client2.read_response_and_lines("p1");
     assert_eq!(done["success"], true, "post-restart prompt failed: {done}");
     let answer = loop {
-        let line = client2.read_line();
-        if line["type"] == "session_event" && line["event"]["type"].as_str() == Some("message_end")
-        {
+        let line = client2.next_line_of_type(&mut second_turn_lines, "session_event");
+        if line["event"]["type"].as_str() == Some("message_end") {
             break line["event"]["message"]["content"]
                 .as_str()
                 .expect("final text")

@@ -89,6 +89,12 @@ pub trait SessionEngine: Send + Sync {
         sink: &SideQuestionSink,
     ) -> SideQuestionOutcome;
 
+    /// Run one compaction (`compact` command): summarize the pre-cut history.
+    /// The engine owns the model call; the worker owns persistence, events,
+    /// and the response. `signal` aborts the run.
+    fn run_compaction(&self, request: CompactionRequest, signal: &AbortSignal)
+        -> CompactionOutcome;
+
     /// Context window (tokens) of the engine's resolved model, when known.
     /// Drives the `contextUsage` estimate in `get_session_stats`; engines
     /// without model metadata report `None` and the field is omitted.
@@ -116,6 +122,40 @@ pub trait SessionEngine: Send + Sync {
     fn model_metadata(&self) -> Option<Value> {
         None
     }
+}
+
+/// One compaction request (the `compact` command fields).
+#[derive(Debug, Clone)]
+pub struct CompactionRequest {
+    /// `/compact <instructions>` guidance for the summary.
+    pub custom_instructions: Option<String>,
+}
+
+/// The completed compaction: the wire `CompactionResult` plus the
+/// summarizer usage (persisted on the compaction entry, never on the wire
+/// response, mirroring the TS `CompactionResult`/entry split).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactionRun {
+    /// TS `CompactionResult`: summary, firstKeptEntryId, tokensBefore,
+    /// details.
+    pub result: Value,
+    /// Usage billed by the summarizer call(s), for the persisted entry.
+    pub usage: Option<Value>,
+}
+
+/// How one compaction run ended (TS `compact` outcomes: result, skip,
+/// "Compaction cancelled", or failure).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompactionOutcome {
+    /// Compacted; the run carries the result and entry usage.
+    Compacted { run: CompactionRun },
+    /// Nothing to compact (TS `CompactionSkippedError`); the string is the
+    /// user-facing skip message.
+    Skipped { message: String },
+    /// Aborted mid-run (`abort_compaction`).
+    Aborted,
+    /// Failed; the string is the engine error message.
+    Failed { error: String },
 }
 
 /// One side-question request (the `start_side_question` command fields).
@@ -197,16 +237,33 @@ impl SideQuestionOutcome {
 /// `{"responses": ["text one", {"text": "two", "delayMs": 250}],
 /// "sideQuestion": {"responses": [...], "retry": {...}}}`.
 ///
+/// The `compaction` seam scripts compaction results, one scripted result
+/// per run (replayed from the top each run):
+/// `{"summary": "...", "firstKeptEntryId": "...", "tokensBefore": 123,
+/// "details": {"readFiles": [], "modifiedFiles": []}, "usage": {...},
+/// "delayMs": 250}` compacts; `{"error": "...", "skipped": true}` reports
+/// nothing-to-compact; `{"error": "..."}` fails the run; `delayMs` holds the
+/// run in flight so aborts and mid-run state reads are observable.
+///
 /// The `sideQuestion` seam scripts the side-question provider calls, one
 /// scripted result per attempt: `{"text": "...", "delayMs": 250}` answers,
 /// `{"error": "...", "kind": "server_error", "status": 500,
 /// "retryAfterMs": 100}` fails that attempt (retried per `retry`, which is
 /// the shared provider policy with test-friendly delays). Verification
 /// harness only; never set by the product.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct ScriptedEngine {
     responses: Vec<Value>,
     side_question: SideQuestionScript,
+    compaction: CompactionScript,
+}
+
+/// Scripted compaction results, consumed one per run in order; when the
+/// script runs out, runs replay from the top (like side questions).
+#[derive(Debug, Default)]
+struct CompactionScript {
+    responses: Vec<Value>,
+    next: std::sync::atomic::AtomicUsize,
 }
 
 /// Scripted side-question provider results, consumed one per attempt.
@@ -251,9 +308,21 @@ impl ScriptedEngine {
                 }),
             })
             .unwrap_or_default();
+        let compaction = script
+            .get("compaction")
+            .map(|compaction| CompactionScript {
+                responses: compaction
+                    .get("responses")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+                next: std::sync::atomic::AtomicUsize::new(0),
+            })
+            .unwrap_or_default();
         Ok(ScriptedEngine {
             responses,
             side_question,
+            compaction,
         })
     }
 
@@ -421,6 +490,77 @@ impl SessionEngine for ScriptedEngine {
                 }
             }
             Err(error) => failed(String::new(), error.to_string()),
+        }
+    }
+    fn run_compaction(
+        &self,
+        _request: CompactionRequest,
+        signal: &AbortSignal,
+    ) -> CompactionOutcome {
+        // Unscripted compactions produce a deterministic result, like the
+        // prompt echo fallback. Scripted runs consume entries in order and
+        // replay from the top once exhausted.
+        let Some(entry) = (|| {
+            let index = self
+                .compaction
+                .next
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |current| {
+                        Some(if current + 1 >= self.compaction.responses.len() {
+                            0
+                        } else {
+                            current + 1
+                        })
+                    },
+                )
+                .ok()?;
+            self.compaction.responses.get(index)
+        })() else {
+            return CompactionOutcome::Compacted {
+                run: CompactionRun {
+                    result: json!({
+                        "summary": "scripted compaction summary",
+                        "firstKeptEntryId": "",
+                        "tokensBefore": 0,
+                        "details": { "readFiles": [], "modifiedFiles": [] },
+                    }),
+                    usage: None,
+                },
+            };
+        };
+        if let Some(error) = entry.get("error").and_then(Value::as_str) {
+            return if entry.get("skipped").and_then(Value::as_bool) == Some(true) {
+                CompactionOutcome::Skipped {
+                    message: error.to_string(),
+                }
+            } else {
+                CompactionOutcome::Failed {
+                    error: error.to_string(),
+                }
+            };
+        }
+        let delay_ms = Self::response_delay_ms(entry);
+        if delay_ms > 0 && !abortable_sleep(std::time::Duration::from_millis(delay_ms), signal) {
+            return CompactionOutcome::Aborted;
+        }
+        if signal.is_aborted() {
+            return CompactionOutcome::Aborted;
+        }
+        let result = json!({
+            "summary": entry.get("summary").and_then(Value::as_str).unwrap_or_default(),
+            "firstKeptEntryId": entry.get("firstKeptEntryId").and_then(Value::as_str).unwrap_or_default(),
+            "tokensBefore": entry.get("tokensBefore").and_then(Value::as_u64).unwrap_or_default(),
+            "details": entry.get("details").cloned().unwrap_or_else(|| json!({
+                "readFiles": [], "modifiedFiles": [],
+            })),
+        });
+        CompactionOutcome::Compacted {
+            run: CompactionRun {
+                result,
+                usage: entry.get("usage").cloned().filter(|usage| !usage.is_null()),
+            },
         }
     }
 }
