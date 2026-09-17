@@ -7,6 +7,7 @@ import atexit
 import functools
 import json
 import os
+import re
 import secrets
 import selectors
 import shutil
@@ -138,11 +139,78 @@ _KEYWORDS = frozenset(
         "in",
         "case",
         "esac",
+        "coproc",
     }
 )
 _BREAK_CHARS = frozenset(";&|()<>")
-_REDIRECT_OPERATORS = ("<<-", "<<", ">>", "<>", ">&", "<&", ">|", ">", "<")
+_REDIRECT_OPERATORS = ("<<<", "<<-", "<<", ">>", "<>", ">&", "<&", ">|", ">", "<")
 _MAX_PAYLOAD_DEPTH = 6
+_DEPTH_VIOLATION = "the payload nests deeper than the sudo scan can follow"
+# Value-taking options of a wrapper: their operand is a value or (for env
+# -S/--split-string) a whole command line, never the command the wrapper runs.
+_WRAPPER_VALUE_OPTIONS: dict[str, frozenset[str]] = {
+    "env": frozenset(
+        {
+            "-u",
+            "--unset",
+            "-C",
+            "--chdir",
+            "-S",
+            "--split-string",
+            "--block-signal",
+            "--default-signal",
+            "--ignore-signal",
+        }
+    ),
+    "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
+    "stdbuf": frozenset({"-i", "--input", "-o", "--output", "-e", "--error"}),
+    "ionice": frozenset(
+        {"-c", "--class", "-n", "--classdata", "-p", "--pid", "-P", "--pgid", "-u", "--uid"}
+    ),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "exec": frozenset({"-a", "--argv0"}),
+}
+# xargs options whose operand is a value, not the command xargs runs.
+_XARGS_OPERAND_OPTIONS = frozenset(
+    {
+        "-I",
+        "--replace",
+        "-n",
+        "--max-args",
+        "-a",
+        "--arg-file",
+        "-d",
+        "--delimiter",
+        "-E",
+        "--eof",
+        "-L",
+        "--max-lines",
+        "-P",
+        "--max-procs",
+        "-s",
+        "--max-chars",
+        "-J",
+        "--process-slot-var",
+    }
+)
+_FIND_EXEC_FLAGS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+_BRACE_EXPANSION_CAP = 64
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_ANSI_C_ESCAPES = {
+    "a": "\a",
+    "b": "\b",
+    "e": "\x1b",
+    "E": "\x1b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "v": "\v",
+    "\\": "\\",
+    "'": "'",
+    '"': '"',
+    "?": "?",
+}
 
 
 def _join_line_continuations(command: str) -> str:
@@ -196,6 +264,62 @@ def _is_assignment(value: str) -> bool:
     if not name or not (name[0].isalpha() or name[0] == "_"):
         return False
     return all(char.isalnum() or char == "_" for char in name)
+
+
+def _read_ansi_c(command: str, quote_index: int) -> tuple[str, int]:
+    """Decode `$'...'` text from its opening quote; return the text and the next index."""
+    out: list[str] = []
+    index = quote_index + 1
+    length = len(command)
+    while index < length:
+        char = command[index]
+        if char == "'":
+            return "".join(out), index + 1
+        if char != "\\" or index + 1 >= length:
+            out.append(char)
+            index += 1
+            continue
+        code = command[index + 1]
+        if code in _ANSI_C_ESCAPES:
+            out.append(_ANSI_C_ESCAPES[code])
+            index += 2
+            continue
+        if code in "01234567":
+            digits = ""
+            cursor = index + 1
+            while cursor < length and len(digits) < 3 and command[cursor] in "01234567":
+                digits += command[cursor]
+                cursor += 1
+            out.append(chr(int(digits, 8) & 0xFF))
+            index = cursor
+            continue
+        if code == "x":
+            digits = ""
+            cursor = index + 2
+            while cursor < length and len(digits) < 2 and command[cursor] in _HEX_DIGITS:
+                digits += command[cursor]
+                cursor += 1
+            if digits:
+                out.append(chr(int(digits, 16)))
+                index = cursor
+                continue
+        if code in ("u", "U"):
+            width = 4 if code == "u" else 8
+            digits = command[index + 2 : index + 2 + width]
+            if len(digits) == width and all(digit in _HEX_DIGITS for digit in digits):
+                out.append(chr(int(digits, 16)))
+                index += 2 + width
+                continue
+        if code == "c":
+            control = command[index + 2 : index + 3]
+            if control and control != "\\":
+                out.append(chr(ord(control.upper()) ^ 0x40))
+                index += 3
+                continue
+        # Unknown escape: keep the backslash and the character, as bash does.
+        out.append(char)
+        index += 1
+    return "".join(out), index
 
 
 def _tokenize(command: str) -> list[_Word]:
@@ -277,13 +401,16 @@ def _tokenize(command: str) -> list[_Word]:
             index += 1
             continue
         if char == "$" and index + 1 < length and command[index + 1] in "'\"":
-            # $'...' folds like single quotes, $"..." like double quotes.
             note_character()
             if command[index + 1] == "'":
-                single = True
+                # $'...' is ANSI-C text: decode it so escapes cannot hide a name.
+                text, index = _read_ansi_c(command, index + 1)
+                buffer.append(text)
+                if any(escaped in "$`" for escaped in text):
+                    expansion = True
             else:
-                double = True
-            index += 2
+                double = True  # $"..." folds like double quotes
+                index += 2
             continue
         if char == "#" and not started:
             while index < length and command[index] != "\n":
@@ -384,12 +511,12 @@ def _classify_words(words: list[_Word]) -> None:
 def _apply_heredocs(text: str, words: list[_Word]) -> None:
     """Resolve heredoc delimiters and mark body words as data (not commands)."""
     for index, word in enumerate(words):
-        if not word.heredoc or word.heredoc_delim:
+        if not word.heredoc or word.heredoc == "<<<" or word.heredoc_delim:
             continue
         if index + 1 < len(words):
             word.heredoc_delim = _strip_quotes(words[index + 1].value)
     for word in words:
-        if not word.heredoc or not word.heredoc_delim:
+        if not word.heredoc or word.heredoc == "<<<" or not word.heredoc_delim:
             continue
         newline = text.find("\n", word.end)
         if newline < 0:
@@ -406,7 +533,8 @@ def _apply_heredocs(text: str, words: list[_Word]) -> None:
             cursor = len(text)
         word.heredoc_body = text[body_start:cursor]
         for other in words:
-            if word.end < other.start < cursor:
+            # Only the body itself is data; the rest of the command line still runs.
+            if body_start <= other.start < cursor:
                 other.is_data = True
 
 
@@ -415,14 +543,33 @@ def _is_flag_word(word: _Word) -> bool:
 
 
 def _matching_paren(value: str, open_index: int) -> int:
+    """Index of the `)` matching the `(` at `open_index`, skipping quoted spans."""
     depth = 0
-    for index in range(open_index, len(value)):
-        if value[index] == "(":
+    single = False
+    double = False
+    index = open_index
+    while index < len(value):
+        char = value[index]
+        if char == "\\" and not single and index + 1 < len(value):
+            index += 2  # an escaped character cannot open or close a quote
+            continue
+        if single:
+            if char == "'":
+                single = False
+        elif double:
+            if char == '"':
+                double = False
+        elif char == "'":
+            single = True
+        elif char == '"':
+            double = True
+        elif char == "(":
             depth += 1
-        elif value[index] == ")":
+        elif char == ")":
             depth -= 1
             if depth == 0:
                 return index
+        index += 1
     return len(value)
 
 
@@ -453,47 +600,59 @@ def _expansion_spans(value: str) -> list[str]:
     return spans
 
 
-def _scan_expansion(value: str, depth: int) -> str | None:
+def _scan_expansion(value: str, depth: int, parent_mentions_sudo: bool = False) -> str | None:
     """Scan substitution spans inside a word: they run as commands of their own."""
     if depth >= _MAX_PAYLOAD_DEPTH:
-        return None
+        return _DEPTH_VIOLATION
     for span in _expansion_spans(value):
-        violation = _scan_text(span, depth + 1)
+        violation = _scan_text(span, depth + 1, parent_mentions_sudo)
         if violation:
             return violation
     return None
 
 
-def _scan_text(text: str, depth: int) -> str | None:
+def _scan_text(text: str, depth: int, parent_mentions_sudo: bool = False) -> str | None:
     words = _tokenize(text)
     _apply_heredocs(text, words)
+    inner = parent_mentions_sudo or _mentions_sudo(words)
     for word in words:
         if word.is_data or not word.has_expansion:
             continue
-        violation = _scan_expansion(word.value, depth)
+        violation = _scan_expansion(word.value, depth, inner)
         if violation:
             return violation
     for index, word in enumerate(words):
         if word.is_data or not word.starts_command:
             continue
-        violation = _scan_segment(words, index, depth)
+        violation = _scan_segment(words, index, depth, inner)
         if violation:
             return violation
+    # A heredoc body that the same text feeds to a runner is a script, not data.
+    if depth < _MAX_PAYLOAD_DEPTH and any(
+        not word.is_data and os.path.basename(word.value) in _PAYLOAD_RUNNERS for word in words
+    ):
+        for word in words:
+            if word.is_data or not word.heredoc_body:
+                continue
+            violation = _scan_text(word.heredoc_body, depth + 1, inner)
+            if violation:
+                return violation
     return None
 
 
-def _scan_segment(words: list[_Word], start: int, depth: int) -> str | None:
+def _scan_segment(
+    words: list[_Word], start: int, depth: int, parent_mentions_sudo: bool = False
+) -> str | None:
     """Walk one command segment to its command word and judge that word."""
-    index = start
-    while index < len(words):
-        word = words[index]
+    while start < len(words):
+        word = words[start]
         if word.is_operator:
             return None
         if word.is_data or word.is_redirect or word.is_operand or word.is_assignment:
-            index += 1
+            start += 1
             continue
         if word.kind == "group" or word.value in _KEYWORDS:
-            index += 1
+            start += 1
             continue
         name = os.path.basename(word.value)
         if name in _LOOKUP_COMMANDS:
@@ -501,28 +660,34 @@ def _scan_segment(words: list[_Word], start: int, depth: int) -> str | None:
         if name == "command":
             # `command` only defeats functions and aliases; it is a lookup with
             # -v/-V, and otherwise it still runs the next word.
-            index += 1
+            start += 1
             lookup = False
-            while index < len(words) and _is_flag_word(words[index]):
-                if "v" in words[index].value or "V" in words[index].value:
+            while start < len(words) and _is_flag_word(words[start]):
+                if "v" in words[start].value or "V" in words[start].value:
                     lookup = True
-                index += 1
+                start += 1
             if lookup:
                 return None
             continue
         if name in _WRAPPERS:
-            index = _skip_wrapper_operands(words, index + 1, name)
+            start, violation = _skip_wrapper_operands(words, start + 1, name, depth)
+            if violation:
+                return violation
             continue
-        if name in _SUDO_COMMAND_WORDS:
+        if _word_names_sudo(word.value):
             return f"{name} would run this command as root or another user"
+        if name == "alias":
+            return _scan_alias_bodies(words, start + 1, depth)
+        if name == "find":
+            return _scan_find_execs(words, start + 1, depth, parent_mentions_sudo)
         if word.has_expansion:
-            if _mentions_sudo(words):
+            if _mentions_sudo(words) or parent_mentions_sudo:
                 return (
                     "the command position expands to an unknown program while the "
                     "text invokes sudo/doas"
                 )
             return None
-        return _scan_interpreter(words, index, depth)
+        return _scan_interpreter(words, start, depth, parent_mentions_sudo)
     return None
 
 
@@ -531,8 +696,15 @@ def _is_duration(value: str) -> bool:
     return bool(digits) and digits.isdigit()
 
 
-def _skip_wrapper_operands(words: list[_Word], index: int, wrapper: str) -> int:
-    """Index of the first word after a wrapper that is not one of its own operands."""
+def _ends_segment(word: _Word) -> bool:
+    return word.is_operator or word.is_redirect or word.is_data or word.is_operand
+
+
+def _skip_wrapper_operands(
+    words: list[_Word], index: int, wrapper: str, depth: int
+) -> tuple[int, str | None]:
+    """Index after a wrapper's own operands, plus any violation their text carries."""
+    value_options = _WRAPPER_VALUE_OPTIONS.get(wrapper, frozenset())
     while index < len(words):
         word = words[index]
         if word.is_operator or word.is_redirect or word.is_data:
@@ -541,19 +713,36 @@ def _skip_wrapper_operands(words: list[_Word], index: int, wrapper: str) -> int:
             index += 1
             continue
         if _is_flag_word(word):
+            option, glued = _split_option(word.value, value_options)
+            if option is None:
+                index += 1
+                continue
+            # env -S/--split-string takes a whole command line, so its operand is
+            # text a shell runs; every other value operand is just a value.
+            split_string = wrapper == "env" and option in ("-S", "--split-string")
+            if glued is None:
+                operand = index + 1
+                if split_string and operand < len(words) and not _ends_segment(words[operand]):
+                    violation = _scan_text(words[operand].value, depth + 1)
+                    if violation:
+                        return index, violation
+                index += 2
+                continue
+            if split_string:
+                violation = _scan_text(glued, depth + 1)
+                if violation:
+                    return index, violation
             index += 1
-            if wrapper in ("env", "exec") and word.value in ("-u", "-a"):
-                index += 1  # env -u NAME, exec -a NAME
             continue
         if wrapper in ("nice", "timeout") and _is_duration(word.value):
             index += 1
             continue
         break
-    return index
+    return index, None
 
 
 def _mentions_sudo(words: list[_Word]) -> bool:
-    """True when any word (or assignment value) names sudo/doas, expansions included."""
+    """True when any word (or assignment value) names sudo/doas, obfuscations included."""
     for word in words:
         if word.is_operator:
             continue
@@ -561,13 +750,128 @@ def _mentions_sudo(words: list[_Word]) -> bool:
         if word.is_assignment:
             candidates.append(word.value.partition("=")[2].lstrip("+"))
         for candidate in candidates:
-            if os.path.basename(candidate) in _SUDO_COMMAND_WORDS:
+            if _word_names_sudo(candidate):
                 return True
-            if word.has_expansion:
-                letters = "".join(char for char in candidate if char.isalpha()).lower()
-                if letters in _SUDO_COMMAND_WORDS:
-                    return True
     return False
+
+
+def _word_names_sudo(value: str) -> bool:
+    """True when a command word can name sudo/doas: braces, globs, and letters."""
+    alternatives = _brace_alternatives(value)
+    if alternatives is None:
+        return True  # too many alternatives to enumerate: fail closed
+    for candidate in alternatives:
+        if os.path.basename(candidate) in _SUDO_COMMAND_WORDS:
+            return True
+        if _matches_sudo_pattern(candidate):
+            return True
+        letters = "".join(char for char in candidate if char.isalpha()).lower()
+        if "sudo" in letters or "doas" in letters:
+            return True
+    return False
+
+
+def _matches_sudo_pattern(value: str) -> bool:
+    """True when the glob pattern in a word matches the name sudo or doas."""
+    if not any(char in value for char in "*?["):
+        return False
+    pattern: list[str] = []
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if char == "*":
+            pattern.append(".*")
+        elif char == "?":
+            pattern.append(".")
+        elif char == "[":
+            end = value.find("]", index + 1)
+            if end < 0:
+                pattern.append("\\[")
+            else:
+                body = value[index + 1 : end]
+                if body.startswith("!"):
+                    body = "^" + body[1:]
+                pattern.append("[" + body + "]")
+                index = end
+        else:
+            pattern.append(re.escape(char))
+        index += 1
+    try:
+        compiled = re.compile("".join(pattern))
+    except re.error:
+        return False
+    return any(compiled.fullmatch(name) for name in _SUDO_COMMAND_WORDS)
+
+
+def _brace_alternatives(value: str) -> list[str] | None:
+    """Brace-expansion candidates of a word, or None when they exceed the cap."""
+    group = _first_brace_group(value)
+    if group is None:
+        return [value]
+    prefix, alternatives, suffix = group
+    tails = _brace_alternatives(suffix)
+    if tails is None:
+        return None
+    expanded = [prefix + alternative + tail for alternative in alternatives for tail in tails]
+    return None if len(expanded) > _BRACE_EXPANSION_CAP else expanded
+
+
+def _first_brace_group(value: str) -> tuple[str, list[str], str] | None:
+    """First brace group with a top-level comma, as (prefix, alternatives, suffix)."""
+    start = value.find("{")
+    while start >= 0:
+        depth = 0
+        for index in range(start, len(value)):
+            if value[index] == "{":
+                depth += 1
+            elif value[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    alternatives = _top_level_split(value[start + 1 : index])
+                    if len(alternatives) > 1:
+                        return value[:start], alternatives, value[index + 1 :]
+                    break
+        start = value.find("{", start + 1)
+    return None
+
+
+def _top_level_split(body: str) -> list[str]:
+    """Split a brace group body on its top-level commas."""
+    parts: list[str] = []
+    current: list[str] = []
+    depth = 0
+    for char in body:
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+        if char == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    parts.append("".join(current))
+    return parts
+
+
+def _split_option(value: str, options: frozenset[str]) -> tuple[str | None, str | None]:
+    """Match a flag word against an option set: (option, glued operand) or (None, None)."""
+    if value in options:
+        return value, None
+    if value.startswith("--") and "=" in value:
+        option, _, glued = value.partition("=")
+        return (option, glued) if option in options else (None, None)
+    if len(value) > 2 and value[0] == "-" and value[1] != "-":
+        option = value[:2]
+        return (option, value[2:]) if option in options else (None, None)
+    return None, None
+
+
+def _process_substitution_body(value: str) -> str | None:
+    """Inner command text of a `<(cmd)` process substitution, else None."""
+    if not value.startswith("<("):
+        return None
+    return value[2 : _matching_paren(value, 1)]
 
 
 def _is_command_flag(value: str) -> bool:
@@ -584,53 +888,138 @@ def _glued_payload(value: str) -> str | None:
     return value[value.index("c") + 1 :] or None
 
 
-def _scan_interpreter(words: list[_Word], index: int, depth: int) -> str | None:
+def _scan_interpreter(
+    words: list[_Word], index: int, depth: int, parent_mentions_sudo: bool = False
+) -> str | None:
     """Judge payloads a runner executes: shell -c, eval, xargs operands, heredocs."""
     name = os.path.basename(words[index].value)
     if name not in _PAYLOAD_RUNNERS and name != "xargs":
         return None
     if depth >= _MAX_PAYLOAD_DEPTH:
-        return None
+        return _DEPTH_VIOLATION
     following = _segment_tail(words, index + 1)
     if name == "xargs":
-        # xargs runs its first non-flag operand, so hand it back to the walk.
-        for candidate in following:
-            if words[candidate].is_data:
-                return None
-            if _is_flag_word(words[candidate]):
-                continue
-            return _scan_segment(words, candidate, depth)
-        return None
+        return _scan_xargs(words, following, depth, parent_mentions_sudo)
     if name in _SHELL_RUNNERS:
         for offset, candidate in enumerate(following):
             word = words[candidate]
             if word.is_data or word.is_redirect:
                 break
+            command_flag = _is_command_flag(word.value)
+            if command_flag and offset + 1 < len(following):
+                payload = words[following[offset + 1]]
+                violation = _scan_text(
+                    _strip_quotes(payload.value), depth + 1, parent_mentions_sudo
+                )
+                if violation:
+                    return violation
             glued = _glued_payload(word.value)
             if glued:
-                violation = _scan_text(glued, depth + 1)
+                violation = _scan_text(glued, depth + 1, parent_mentions_sudo)
                 if violation:
                     return violation
                 break
-            if _is_command_flag(word.value) and offset + 1 < len(following):
-                payload = words[following[offset + 1]]
-                violation = _scan_text(_strip_quotes(payload.value), depth + 1)
-                if violation:
-                    return violation
+            if command_flag:
                 break
     if name == "eval":
         joined = " ".join(words[i].value for i in following if not words[i].is_data)
         if joined:
-            violation = _scan_text(joined, depth + 1)
+            violation = _scan_text(joined, depth + 1, parent_mentions_sudo)
             if violation:
                 return violation
+    violation = _scan_script_source(words, following, depth, parent_mentions_sudo)
+    if violation:
+        return violation
     # A heredoc body owned by a runner is a script, not data.
     for candidate in following:
         body = words[candidate].heredoc_body
         if body:
-            violation = _scan_text(body, depth + 1)
+            violation = _scan_text(body, depth + 1, parent_mentions_sudo)
             if violation:
                 return violation
+    return None
+
+
+def _scan_xargs(
+    words: list[_Word], following: list[int], depth: int, parent_mentions_sudo: bool
+) -> str | None:
+    """xargs runs its first non-flag word; option operands are judged fail-closed."""
+    position = 0
+    while position < len(following):
+        word = words[following[position]]
+        if word.is_data or word.is_redirect:
+            return None
+        if not _is_flag_word(word):
+            return _scan_segment(words, following[position], depth, parent_mentions_sudo)
+        option, glued = _split_option(word.value, _XARGS_OPERAND_OPTIONS)
+        if option is not None and glued is None and position + 1 < len(following):
+            # BSD and GNU disagree on which operands are optional, so the operand
+            # is judged as a command either way.
+            operand = words[following[position + 1]]
+            if not operand.is_data and not operand.is_redirect:
+                violation = _scan_segment(
+                    words, following[position + 1], depth, parent_mentions_sudo
+                )
+                if violation:
+                    return violation
+            position += 2
+            continue
+        position += 1
+    return None
+
+
+def _scan_script_source(
+    words: list[_Word], following: list[int], depth: int, parent_mentions_sudo: bool
+) -> str | None:
+    """Judge a runner's script given as a redirect: `<<<` text or `<(cmd)` output."""
+    for candidate in following:
+        word = words[candidate]
+        if word.heredoc == "<<<":
+            operand = candidate + 1
+            if operand < len(words) and not words[operand].is_data:
+                violation = _scan_text(
+                    _strip_quotes(words[operand].value), depth + 1, parent_mentions_sudo
+                )
+                if violation:
+                    return violation
+            continue
+        if word.is_data:
+            continue
+        body = _process_substitution_body(word.value)
+        if body and (parent_mentions_sudo or _mentions_sudo(_tokenize(body))):
+            return (
+                "the shell reads its script from a process substitution whose "
+                "text invokes sudo/doas"
+            )
+    return None
+
+
+def _scan_alias_bodies(words: list[_Word], start: int, depth: int) -> str | None:
+    """An alias body is text that a later use of the alias runs."""
+    for candidate in _segment_tail(words, start):
+        word = words[candidate]
+        if word.is_data or word.is_redirect or "=" not in word.value:
+            continue
+        violation = _scan_text(word.value.partition("=")[2].lstrip("+"), depth + 1)
+        if violation:
+            return violation
+    return None
+
+
+def _scan_find_execs(
+    words: list[_Word], start: int, depth: int, parent_mentions_sudo: bool
+) -> str | None:
+    """`find -exec cmd` runs cmd, so its operand is judged as a command word."""
+    tail = _segment_tail(words, start)
+    for offset, candidate in enumerate(tail):
+        if words[candidate].value not in _FIND_EXEC_FLAGS or offset + 1 >= len(tail):
+            continue
+        operand = words[tail[offset + 1]]
+        if operand.is_data or operand.is_redirect:
+            continue
+        violation = _scan_segment(words, tail[offset + 1], depth, parent_mentions_sudo)
+        if violation:
+            return violation
     return None
 
 
