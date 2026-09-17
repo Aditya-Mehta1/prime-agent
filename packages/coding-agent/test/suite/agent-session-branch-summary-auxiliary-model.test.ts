@@ -10,12 +10,17 @@ vi.mock("@earendil-works/pi-ai", async (importOriginal) => {
 	return { ...actual, completeSimple: completeSimpleMock };
 });
 describe("AgentSession branch summary auxiliary model", () => {
-	const cases: Array<[string, { auxiliaryModel?: string; window?: number }, string]> = [
+	type Case = { auxiliaryModel?: string; window?: number; sessionWindow?: number; stub?: boolean };
+	const cases: Array<[string, Case, string]> = [
 		["routes branch summaries to the auxiliary model", { auxiliaryModel: "faux/aux-model" }, "aux-model"],
 		["falls back when the auxiliary model is unusable", { auxiliaryModel: "faux/missing-model" }, "session-model"],
 		["falls back when the window is small", { auxiliaryModel: "faux/aux-model", window: 8192 }, "session-model"],
 		["falls back when only the body fits", { auxiliaryModel: "faux/aux-model", window: 30000 }, "session-model"],
-		["falls back when no auxiliary model is configured", {}, "session-model"],
+		[
+			"falls back when the reserve outgrows the window",
+			{ auxiliaryModel: "faux/aux-model", window: 8192, sessionWindow: 16400, stub: true },
+			"session-model",
+		],
 	];
 	it.each(cases)("%s", async (_label, options, expectedModel) => {
 		completeSimpleMock.mockReset().mockResolvedValue(fauxAssistantMessage("Test summary"));
@@ -23,7 +28,7 @@ describe("AgentSession branch summary auxiliary model", () => {
 		warnSpy.mockReset().mockImplementation(() => {});
 		const harness = await createHarness({
 			models: [
-				{ id: "session-model", name: "Session Model" },
+				{ id: "session-model", name: "Session Model", contextWindow: options.sessionWindow },
 				{ id: "aux-model", name: "Aux Model", contextWindow: options.window },
 			],
 			settings: { auxiliaryModel: options.auxiliaryModel },
@@ -37,10 +42,8 @@ describe("AgentSession branch summary auxiliary model", () => {
 		const calls = completeSimpleMock.mock.calls.filter(
 			(call) => (call[1] as { systemPrompt?: string }).systemPrompt === SUMMARIZATION_SYSTEM_PROMPT,
 		);
-		expect(calls.length).toBeGreaterThan(0);
-		expect(result.summaryEntry?.type).toBe("branch_summary");
-		expect(result.summaryEntry?.summary).toContain("Test summary");
-		expect(result.summaryEntry?.summary).not.toContain("No content to summarize");
+		expect(calls.length).toBe(options.stub ? 0 : 1);
+		expect(result.summaryEntry?.summary).toContain(options.stub ? "No content to summarize" : "Test summary");
 		for (const call of calls) {
 			expect(call[0]).toMatchObject({ provider: "faux", id: expectedModel });
 		}

@@ -374,8 +374,10 @@ export interface EstimateBranchSummaryRequestTokensOptions {
  * window also sizes the input slice, so a model that covers only the request
  * body drops the oldest entries - or every entry, turning the summary into a
  * "No content to summarize" stub - instead of running the request the session
- * model would have run. 0 means the branch leaves nothing model-visible and no
- * request is issued.
+ * model would have run. A branch whose newest entry alone overflows the budget
+ * slices to nothing, so no wire request is issued; the returned floor still
+ * requires a window above the reserve, because a smaller window would slice
+ * with a non-positive budget that prepareBranchEntries treats as unlimited.
  */
 export function estimateBranchSummaryRequestTokens(
 	entries: SessionEntry[],
@@ -385,9 +387,13 @@ export function estimateBranchSummaryRequestTokens(
 	// Mirrors generateBranchSummary: the same budget decides which entries fit.
 	const tokenBudget = branchSummaryTokenBudget(contextWindow, reserveTokens);
 	const { messages } = prepareBranchEntries(entries, tokenBudget);
-	// generateBranchSummary answers "No content to summarize" without a wire call.
 	if (messages.length === 0) {
-		return 0;
+		// No wire request is issued for this shape, but a resolved model whose
+		// window is at or below the reserve would slice with a non-positive
+		// budget, which prepareBranchEntries treats as unlimited and would send
+		// the whole branch over-limit. Require a window that keeps that budget
+		// positive; larger windows slice their own budget and stay bounded.
+		return reserveTokens + 1;
 	}
 	const promptText = buildBranchSummaryPrompt(
 		serializeConversation(convertToLlm(messages)),

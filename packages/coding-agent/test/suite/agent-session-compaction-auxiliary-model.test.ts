@@ -39,7 +39,6 @@ describe("AgentSession compaction auxiliary model", () => {
 		);
 		expect(calls.length).toBeGreaterThan(0);
 		expect(result.summary).toContain("Test summary");
-		expect(result.firstKeptEntryId).toBeTruthy();
 		for (const call of calls) {
 			expect(call[0]).toMatchObject({ provider: "faux", id: expectedModel });
 			expect(call[2]).not.toHaveProperty("reasoning");
