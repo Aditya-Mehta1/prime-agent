@@ -2328,6 +2328,28 @@ def _strip_leading_assignments(segment: str) -> tuple[str, bool]:
         remainder = remainder[match.end() :]
 
 
+def _revealed_directory_command(segment: str) -> str:
+    """`segment` with a quoted or escaped `cd`/`pushd` command word revealed.
+
+    Quoting does not stop a builtin, so `"cd" sub`, `c\\d sub` and `'cd' sub`
+    change directory exactly like the plain spelling, and a quoted `pushd`
+    is the pushd the resolver refuses to replay. The command word is read
+    with its escapes removed and quoting stripped, and the segment is
+    rewritten when that word spells one of the directory builtins; the
+    arguments keep their text as written so the replay below still sees
+    their quoting, and any other command word (or a `"cd"` in argument
+    position) leaves the segment exactly as it was.
+    """
+    for word in _shell_word_positions(segment):
+        if not word.command:
+            continue  # an assignment or wrapper does not decide the command
+        plain = _plain_word_text(_strip_shell_escapes(segment[word.start : word.end])[0])
+        if plain in ("cd", "pushd"):
+            return plain + segment[word.end :]
+        break  # the first command word decides; later words are its arguments
+    return segment
+
+
 def _resolve_discard_probe_target(
     command: str, discard_index: int, user_command_start: int = 0
 ) -> "_DiscardProbeTarget | _UnresolvableDiscardTarget | None":
@@ -2477,7 +2499,13 @@ def _resolve_discard_probe_target(
     saw_cd = False
     paren_depth = 0
     cd_pending_separator = False
-    if re.search(r"\b(?:cd|pushd)\b", prefix) or "(" in prefix:
+    # The gate reads the escape-stripped text too: `c\d sub` is a cd the raw
+    # word regex cannot see, and the segment reader reveals it below.
+    if (
+        re.search(r"\b(?:cd|pushd)\b", prefix)
+        or re.search(r"\b(?:cd|pushd)\b", _strip_shell_escapes(prefix)[0])
+        or "(" in prefix
+    ):
         offset = 0
         for part in re.split(r"(&&|\|\||;|\||\n)", prefix):
             start = offset
@@ -2502,6 +2530,8 @@ def _resolve_discard_probe_target(
             paren_depth = max(0, paren_depth + opens - closes)
             if inside_group:
                 body = re.sub(r"[)\s]+$", "", re.sub(r"^[(\s]+", "", trimmed))
+                # The group's own cd may be quoted or escaped like any other.
+                body = _revealed_directory_command(body)
                 group_cd = re.match(r"cd\s*(.*)$", body)
                 if group_cd:
                     arg = group_cd.group(1).strip()
@@ -2525,6 +2555,9 @@ def _resolve_discard_probe_target(
             # may decide the directory. An assignment the probe cannot replay
             # verbatim leaves that directory unknowable, and is refused below.
             body, replayable = _strip_leading_assignments(group_free)
+            # Quoting and escapes do not stop the builtin either (`"cd" sub`,
+            # `c\d sub`), so the command word is revealed before the match.
+            body = _revealed_directory_command(body)
             if body == "pushd" or body.startswith("pushd "):
                 return _UNRESOLVABLE_DISCARD_TARGET
             cd_match = re.match(r"cd\s*(.*)$", body)

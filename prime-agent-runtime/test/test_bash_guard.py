@@ -242,11 +242,8 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
         # kernel start disables the guard for that whole kernel; a falsy
         # launch value keeps it armed.
         probe = (
-            "import asyncio\n"
-            "from rlm import bash\n"
-            "async def main():\n"
-            "    result = await bash('git reset --hard')\n"
-            "    return result.exit_code\n"
+            "import asyncio\nfrom rlm import bash\nasync def main():\n"
+            "    result = await bash('git reset --hard')\n    return result.exit_code\n"
             "raise SystemExit(asyncio.run(main()))\n"
         )
         for launch_value, expect_refusal in [("1", False), ("0", True)]:
@@ -336,6 +333,7 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
         self._init_dirty_repo()
         for directory, command in [
             ("cd-sub", "cd cd-sub && git reset --hard"), ("c-sub", "git -C c-sub reset --hard"),
+            ("q-cd", '"cd" q-cd && git reset --hard'), ("e-cd", "c\\d e-cd && git reset --hard"), ("g-cd", "( c\\d g-cd && git reset --hard )"),
         ]:
             with self.subTest(command=command):
                 _init_dirty_git_repo(str(self._tracked(directory)))
@@ -366,7 +364,7 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
         self._init_dirty_repo()
         for command in [
             'cd $(pwd)/sub && git reset --hard', 'git --git-dir=sub/.git reset --hard', 'cd sub || git reset --hard',
-            'pushd sub && git reset --hard', 'git -C "sub" reset --hard', 'git -ccore.worktree=sub reset --hard', 'git -ccore.bare=1 reset --hard',
+            'pushd sub && git reset --hard', '"pushd" sub && git reset --hard', 'git -C "sub" reset --hard', 'git -ccore.worktree=sub reset --hard', 'git -ccore.bare=1 reset --hard',
             'git -pCsub reset --hard', 'git -qC sub reset --hard', 'source setup.sh && git reset --hard', '. setup.sh && git reset --hard',
             'export GIT_DIR=$(pwd)/sub; git reset --hard', 'FOO=1 cd sub; git reset --hard', 'FOO=$(pwd) cd sub && git reset --hard',
             'function f { cd sub; }; f; git reset --hard', 'function f { pushd sub; }; f && git reset --hard',
@@ -655,6 +653,12 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
                     bash(command)
                 self.assertIn("tracked.txt", str(caught.exception))
                 self.assertEqual(self._tracked("sub", "tracked.txt").read_text(), "modified\n")
+        # A quoted "cd" in argument position is inert data: the reveal reads
+        # command words only, so the discard probes the clean caller and sub
+        # survives untouched.
+        result = await bash('echo "cd" && git reset --hard')
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(self._tracked("sub", "tracked.txt").read_text(), "modified\n")
 
     async def test_command_scoped_assignments_do_not_persist(self):
         self._init_dirty_repo()
