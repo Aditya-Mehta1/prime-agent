@@ -67,13 +67,13 @@ MATCHING_COMMANDS = [
     'git checkout HEAD~1 -- .', 'git checkout origin/main .', 'git checkout -f main', 'git checkout --force main', 'git clean -f -- -n',
     'git reset 2>/dev/null --hard', 'git reset 2> /dev/null --hard', 'git reset 2>&1 --hard', 'git 2>/dev/null reset --hard',
     'git restore 2>/dev/null .', 'git clean -f 2>/dev/null', 'git checkout 2>/dev/null -- .', 'git restore --staged --worktree .',
-    'git restore -SW .', 'source setup.sh && git reset --hard', 'git restore --quiet .', 'git restore -q .',
-    'git restore --quiet --source=HEAD .', 'g\\it reset --ha\\rd', 'git res\\et --hard', '"git" reset --hard', "g'it' reset --hard",
-    'G=git; $G reset --hard', 'G=git; ${G} reset --hard', 'G=git; echo G=other; $G reset --hard', "G=git; printf '%s' G=other; $G reset --hard",
-    'G=git; # G=other\n$G reset --hard', 'FOO=1 cd sub && git reset --hard', '/usr/bin/git reset --hard', './git reset --hard',
-    "G='git reset --hard'; $G", 'G="git restore ."; $G', 'G="it\'s # "; $G git reset --hard', "echo 'git' 'reset' '--hard'",
-    'git reset &>/dev/null --hard', 'git reset &> /dev/null --hard', 'git reset &>>/dev/null --hard', 'git reset >&/dev/null --hard',
-    '{ cd sub && git reset --hard; }', 'export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard',
+    'git restore -SW .', 'source setup.sh && git reset --hard', 'git restore --quiet .', 'git restore -q .', 'git restore --quiet --source=HEAD .',
+    'g\\it reset --ha\\rd', 'git res\\et --hard', '"git" reset --hard', "g'it' reset --hard", 'G=git; $G reset --hard', 'G=git; ${G} reset --hard',
+    'G=git; echo G=other; $G reset --hard', "G=git; printf '%s' G=other; $G reset --hard", 'G=git; # G=other\n$G reset --hard',
+    'FOO=1 cd sub && git reset --hard', '/usr/bin/git reset --hard', './git reset --hard', "G='git reset --hard'; $G", 'G="git restore ."; $G',
+    'G="it\'s # "; $G git reset --hard', "echo 'git' 'reset' '--hard'", 'git reset &>/dev/null --hard', 'git reset &> /dev/null --hard',
+    'git reset &>>/dev/null --hard', 'git reset >&/dev/null --hard', '{ cd sub && git reset --hard; }',
+    'export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard',
     'for i in 1; do export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard; done', 'GIT_DIR=sub/.git; git reset --hard',
     'git -Csub reset --hard', 'git -cfoo.bar=1 reset --hard', 'git reset \\\n--hard', 'git checkout -- \\\n.', 'git clean -f \\\n-d',
     'cat <<EOF ; git reset --hard\nEOF', 'cat <<EOF && git reset --hard\nEOF', 'declare -x G=git; $G reset --hard',
@@ -87,12 +87,11 @@ MATCHING_COMMANDS = [
 NON_MATCHING_COMMANDS = [
     'git status', 'git log --oneline', 'git checkout -b new-branch', 'git checkout main', 'git checkout -m main', 'git checkout -b newbranch .',
     'git checkout -- single-file.txt', "echo 'git reset --hard'", 'git commit -m "git reset --hard"', 'echo "git clean -fd"',
-    'echo preparing # git reset --hard', 'git checkout ./nested', 'git restore --staged .', 'git restore --staged :/',
-    'git restore single-file.txt', 'git clean -n', 'git clean -n -f .', 'git clean --dry-run', 'git clean -d', 'git reset',
-    'git reset --soft HEAD~1', 'git stash', 'git add .', 'echo hello world', 'npm run check', 'git status > status.txt',
-    'git log --oneline > log.txt 2>/dev/null', 'echo 2>/dev/null hi', '{ echo hi; }', 'export FOO=1', 'git restore --staged --quiet .',
-    'echo \\# git reset --hard', 'cat <<EOF\\ngit reset --hard\\nEOF', 'echo one  two', 'git -Csub status', '# git reset --hard',
-    '$G reset --hard', 'G=git; echo x; G=other; $G reset --hard', "cat <<'EOF'\n$(git reset --hard)\nEOF",
+    'echo preparing # git reset --hard', 'git checkout ./nested', 'git restore --staged .', 'git restore --staged :/', 'git restore single-file.txt',
+    'git clean -n', 'git clean -n -f .', 'git clean --dry-run', 'git clean -d', 'git reset', 'git reset --soft HEAD~1', 'git stash', 'git add .',
+    'echo hello world', 'npm run check', 'git status > status.txt', 'git log --oneline > log.txt 2>/dev/null', 'echo 2>/dev/null hi', '{ echo hi; }',
+    'export FOO=1', 'git restore --staged --quiet .', 'echo \\# git reset --hard', 'cat <<EOF\\ngit reset --hard\\nEOF', 'echo one  two',
+    'git -Csub status', '# git reset --hard', '$G reset --hard', 'G=git; echo x; G=other; $G reset --hard', "cat <<'EOF'\n$(git reset --hard)\nEOF",
     'cat <<"EOF"\n$(git reset --hard)\nEOF', "echo eval 'git reset --hard'", "G='git clean -n'; $G", "G='echo hi'; $G",
     'G=git; command export G=other; $G reset --hard', 'shopt -s expand_aliases; alias g=git; g status', "alias g='echo hi'\ng reset --hard",
     'alias g=$X\ng reset --hard', 'if true; then export GIT_DIR=sub/.git GIT_WORK_TREE=sub; fi', 'for i in 1; do echo hi; done',
@@ -116,13 +115,13 @@ class EvalPayloadDetectionTest(unittest.TestCase):
     def test_eval_payloads_hiding_discards(self):
         for command in [
             "eval 'git reset --hard'", 'eval "git clean -f"', "eval 'cd sub && git reset --hard'", "eval 'git checkout -- .'",
-            'eval "git restore ."', 'eval \'eval "git reset --hard"\'', "GIT_DIR=sub/.git eval 'git reset --hard'",
-            "eval 'git reset \\\n--hard'", "'eval' 'git reset --hard'", "E=eval; $E 'git reset --hard'", "{ eval 'git reset --hard'; }",
+            'eval "git restore ."', 'eval \'eval "git reset --hard"\'', "GIT_DIR=sub/.git eval 'git reset --hard'", "eval 'git reset \\\n--hard'",
+            "'eval' 'git reset --hard'", "E=eval; $E 'git reset --hard'", "{ eval 'git reset --hard'; }",
             "shopt -s expand_aliases\nalias g='git reset --hard'\neval 'g'", "shopt -s expand_aliases\nalias g='git reset --hard'\neval g",
-            "shopt -s expand_aliases\nalias g=git\neval 'g reset --hard'",
             'shopt -s expand_aliases\nalias g=\'git reset --hard\'\neval "$(printf %s g)"',
             "shopt -s expand_aliases\nalias g='git reset --hard'\nunalias -n g\neval 'g'",
-            "shopt -s expand_aliases\nalias g='git reset --hard'\nunalias -a -n\neval 'g'",
+            "shopt -s expand_aliases\nalias g='git reset --hard'\nunalias -a -n\neval 'g'", 'eval "$(printf \'%s\' \'git reset --hard\')"',
+            'X=\'git reset --hard\'; X2="$X"; eval "$X2"',
         ]:
             with self.subTest(command=command):
                 self.assertTrue(bash_module._eval_payloads_hide_destructive_git(command))
@@ -355,10 +354,10 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
         self._init_dirty_repo()
         for command in [
             'cd $(pwd)/sub && git reset --hard', 'git --git-dir=sub/.git reset --hard', 'cd sub || git reset --hard',
-            'pushd sub && git reset --hard', 'git -C "sub" reset --hard', 'git -ccore.worktree=sub reset --hard',
-            'git -ccore.bare=1 reset --hard', 'git -pCsub reset --hard', 'git -qC sub reset --hard', 'source setup.sh && git reset --hard',
-            '. setup.sh && git reset --hard', 'export GIT_DIR=$(pwd)/sub; git reset --hard', 'FOO=1 cd sub; git reset --hard',
-            'FOO=$(pwd) cd sub && git reset --hard',
+            'pushd sub && git reset --hard', 'git -C "sub" reset --hard', 'git -ccore.worktree=sub reset --hard', 'git -ccore.bare=1 reset --hard',
+            'git -pCsub reset --hard', 'git -qC sub reset --hard', 'source setup.sh && git reset --hard', '. setup.sh && git reset --hard',
+            'export GIT_DIR=$(pwd)/sub; git reset --hard', 'FOO=1 cd sub; git reset --hard', 'FOO=$(pwd) cd sub && git reset --hard',
+            'function f { cd sub; }; f; git reset --hard', 'function f { pushd sub; }; f && git reset --hard',
         ]:
             with self.subTest(command=command):
                 with self.assertRaises(DestructiveGitRefusalError) as caught:
@@ -366,11 +365,10 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("changes directory (or repository) first", str(caught.exception))
 
     async def test_refuses_revealed_relocations_the_probe_cannot_name(self):
-        # A revealed value holding more than the executable word runs as
-        # argv, so the `-C sub` inside it relocates the discard. The guard
-        # cannot name that directory from the text, so it refuses instead of
-        # approving the clean parent the unexpanded reference appears to
-        # target, and says why instead of claiming a directory change.
+        # A revealed value holding more than the executable word runs as argv,
+        # so the `-C sub` inside it relocates the discard, and the guard cannot
+        # name that directory from the text: it refuses instead of approving the
+        # clean parent the unexpanded reference appears to target.
         _init_dirty_git_repo(str(self._tracked("sub")))
         self._init_dirty_repo()
         self._tracked(".gitignore").write_text("sub/\n")
@@ -389,11 +387,8 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._tracked("sub", "tracked.txt").read_text(), "modified\n")
 
     async def test_refuses_aliases_visible_in_the_command_text(self):
-        # The scan cannot see the shell's own options, so an `alias NAME=VALUE`
-        # in the text (or in the replayed prefix) is resolved and a discard it
-        # hides is refused; a value that discards nothing stays allowed, a value
-        # the walk cannot read registers nothing, a name `unalias` really drops
-        # is dropped, and an option bash rejects keeps it defined.
+        # An `alias NAME=VALUE` in the text (or the replayed prefix) is resolved:
+        # a discard it hides is refused, and `unalias` drops only what bash drops.
         self._init_dirty_repo()
         checked = 0
 
@@ -417,6 +412,7 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
             ('shopt -s expand_aliases\nalias g=git\ng reset --hard', True, None),
             ("g reset --hard", True, 'shopt -s expand_aliases\nalias g=git'),
             ("shopt -s expand_aliases\nalias g='git reset --hard'\neval 'g'", True, None),
+            ("shopt -s expand_aliases\nA=alias\n$A g='git reset --hard'\neval 'g'", True, None),
             ('alias g=git\ng reset --hard', True, None), ('alias git=echo\ngit reset --hard', True, None),
             ('shopt -s expand_aliases; alias g=git; g status', False, None),
             ("alias g='echo hi'\ng reset --hard", False, None),
@@ -426,22 +422,26 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
         ]:
             with self.subTest(command=command, prefix=prefix):
                 await check(command, refused, prefix)
-        # `unalias [-a] [--] NAME...` is read with getopt, so an option bash
-        # rejects removes nothing: the alias survives and `eval` discards.
+        # `unalias [-a] [--] NAME...` is read with getopt: an option bash rejects
+        # removes nothing, and neither does one a pipeline, `&` or `( ... )` runs
+        # in a subshell, so the alias survives and `eval` discards.
         for form, refused in [
             ("unalias g", False), ("unalias -- g", False), ("unalias -a g", False),
             ("unalias -n g", True), ("unalias -f g", True), ("unalias -A g", True),
             ("unalias -i g", True), ("unalias -an g", True), ("unalias --force g", True),
-            ("unalias -a -n", True), ("unalias -n -a", True), ("unalias -", True),
+            ("unalias -a -n", True), ("unalias -n -a", True),
+            ("unalias g | cat", True), ("( unalias g )", True),
+            ("unalias g &", True), ("true | unalias g", True),
+            ("unalias g;", False), ("unalias g || true", False),
+            ("unalias g && true", False), ("{ unalias g; }", False),
         ]:
             with self.subTest(unalias=form):
                 await check(f"shopt -s expand_aliases\nalias g='git reset --hard'\n{form}\neval 'g'", refused)
 
     def test_probe_reads_are_bounded_and_time_out(self):
-        # The timeout kills the probe's process group, so it covers a probe
-        # whose child exited while a descendant keeps stdout open, a hanging
-        # probe, and a listing that never ends: the caller returns in time and
-        # the bytes it reads stay inside the cap.
+        # The timeout kills the probe's process group: it covers a probe whose
+        # child exited while a descendant holds stdout, a hang, and an endless
+        # listing (the caller returns in time and the bytes read stay capped).
         self._init_dirty_repo()
 
         def timed(command: str):
@@ -613,11 +613,15 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
                     bash(command)
                 self.assertIn("tracked.txt", str(caught.exception))
                 self.assertEqual(self._tracked("sub", "tracked.txt").read_text(), "modified\n")
-        # A cd followed by `;` inside the group depends on the cd
-        # succeeding; the guard refuses it instead of probing one outcome.
+        # A cd followed by `;` in the group depends on the cd succeeding.
         with self.assertRaises(DestructiveGitRefusalError) as caught:
             bash("{ cd sub; git reset --hard; }")
         self.assertIn("changes directory (or repository) first", str(caught.exception))
+        # A function whose body cds is refused the same way (it discards sub).
+        with self.assertRaises(DestructiveGitRefusalError) as caught:
+            bash("function f { cd sub; }; f; git reset --hard")
+        self.assertIn("changes directory (or repository) first", str(caught.exception))
+        self.assertEqual(self._tracked("sub", "tracked.txt").read_text(), "modified\n")
 
     async def test_refuses_persistent_env_assignment_relocations(self):
         _init_dirty_git_repo(str(self._tracked("sub")))
@@ -648,8 +652,7 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
         # not git and the tree survives; a command-scoped prefix must not
         # overwrite the value a later reference really expands.
         for command in [
-            'G=git; echo x; G=other; $G reset --hard', 'G=git; export G=other; $G reset --hard',
-            'G=git; command export G=other; $G reset --hard',
+            'G=git; echo x; G=other; $G reset --hard', 'G=git; export G=other; $G reset --hard', 'G=git; command export G=other; $G reset --hard',
         ]:
             with self.subTest(command=command):
                 result = await bash(command)
@@ -676,8 +679,8 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
         _run_git(self.test_dir, "branch", "SRC")
         for command in [
             'git restore --staged --worktree .', 'git restore -SW .', 'git restore -WS .', 'git restore -s SRC .', 'git restore -sSRC .',
-            'git restore --source HEAD .', 'git restore -qs SRC .', 'git restore -Ws SRC .', 'git restore --no-overlay .',
-            'git restore --quiet .', 'git restore -q .', 'git restore --quiet --source=HEAD .',
+            'git restore --source HEAD .', 'git restore -qs SRC .', 'git restore -Ws SRC .', 'git restore --no-overlay .', 'git restore --quiet .',
+            'git restore -q .', 'git restore --quiet --source=HEAD .',
         ]:
             with self.subTest(command=command):
                 with self.assertRaises(DestructiveGitRefusalError):
@@ -693,8 +696,7 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
         result = await bash("cat <<EOF\ngit reset --hard\nEOF")
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
-        # A quoted delimiter turns expansion off, so a substitution in the
-        # body is inert data too and no git runs at all.
+        # A quoted delimiter turns expansion off: the body is inert data.
         result = await bash("cat <<'EOF'\n$(git reset --hard)\nEOF")
         self.assertEqual(result.exit_code, 0)
         self.assertIn("$(git reset --hard)", result.output)

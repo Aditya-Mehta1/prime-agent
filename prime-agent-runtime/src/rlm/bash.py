@@ -1122,6 +1122,77 @@ def _separates_commands(text: str) -> bool:
     return any(ch in ";&|\n()" for ch in text)
 
 
+def _segment_separator(text: str, from_end: bool = True) -> str | None:
+    """The separator nearest one end of `text`, or None when it has none.
+
+    `from_end` picks the separator that ends the command before the text, which
+    says whether that command was piped or backgrounded; otherwise it picks the
+    one that starts the command after it, which says whether that command runs
+    in the current shell.
+    """
+    indices = range(len(text) - 1, -1, -1) if from_end else range(len(text))
+    for index in indices:
+        ch = text[index]
+        if ch not in ";&|\n()":
+            continue
+        doubled = text[index - 1] if from_end and index else text[index + 1 : index + 2]
+        if ch == "&" and doubled == "&":
+            return "&&"
+        if ch == "|" and doubled == "|":
+            return "||"
+        return ch
+    return None
+
+
+# A function definition: `function NAME {` or `NAME() {`. The guard does not
+# model when a function is called or which shell it runs in, so a body that can
+# change directory leaves a later discard's directory unknowable.
+_FUNCTION_DEFINITION = re.compile(
+    r"(?:\bfunction\s+[A-Za-z_][A-Za-z0-9_]*|\b[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\))\s*\{"
+)
+
+
+def _brace_group_end(text: str, open_index: int) -> int:
+    """Index just past the `}` closing the `{` at `open_index`, or `len(text)`."""
+    depth = 0
+    for index in range(open_index, len(text)):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return len(text)
+
+
+def _defines_directory_changing_function(masked_prefix: str) -> bool:
+    """True when `masked_prefix` defines a function that can change directory.
+
+    Quoting and comments arrive masked, so `{`/`}` inside them cannot confuse
+    the body scan. The guard does not model invocation or shell scope, so a body
+    that cds (or pushds) is treated like the other relocations it cannot
+    replay: the probe refuses instead of replaying a directory the shell may
+    never choose.
+    """
+    for match in _FUNCTION_DEFINITION.finditer(masked_prefix):
+        body = masked_prefix[match.end() : _brace_group_end(masked_prefix, match.end() - 1) - 1]
+        if re.search(r"\b(?:cd|pushd)\b", body):
+            return True
+    return False
+
+
+def _runs_in_current_shell(opens_with: str | None, closes_with: str | None) -> bool:
+    """True when a command between those two separators changes this shell.
+
+    `unalias` only affects the shell that runs it, so a name is dropped only
+    for a command that runs in the current shell: a pipeline stage, a
+    background command, and a `( ... )` group all run in a subshell, while `;`,
+    a newline, `&&` and `||` do not.
+    """
+    subshell = ("|", "&", "(", ")")
+    return opens_with not in subshell and closes_with not in subshell
+
+
 def _normalize_line_continuations(command: str) -> str:
     """Collapse unquoted backslash-newline line continuations to spaces.
 
@@ -1544,6 +1615,11 @@ _VARIABLE_REFERENCE = re.compile(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)\b|\{([A-Za-z_][
 _LITERAL_ASSIGNMENT = re.compile(
     r"""([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"$`]*)"|'([^']*)'|([A-Za-z0-9_./-]+))"""
 )
+# An assignment whose whole value is a reference to a known name copies that
+# value into the new name (`H="$G"`), which the walk can follow one level.
+_COPIED_ASSIGNMENT = re.compile(
+    r"""([A-Za-z_][A-Za-z0-9_]*)=(?:"?\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})"?)"""
+)
 # A literal assignment the probe can replay verbatim: no quoting, expansion,
 # or substitution.
 _REPLAYABLE_ASSIGNMENT = re.compile(r'''[A-Za-z_][A-Za-z0-9_]*=[^\s$`;&|()<>"]+''')
@@ -1646,7 +1722,9 @@ def _shell_word_positions(command: str) -> list[_ShellWord]:
             is_command_word = False  # the name of a `function` definition
         elif command_word and word in _SHELL_KEYWORDS:
             pass  # a keyword opens the next command position
-        elif (assignment_slot or export_args) and _LITERAL_ASSIGNMENT.fullmatch(word):
+        elif (assignment_slot or export_args) and (
+            _LITERAL_ASSIGNMENT.fullmatch(word) or _COPIED_ASSIGNMENT.fullmatch(word)
+        ):
             pass  # an assignment prefix: the command word still follows
         elif command_word and word in _TRANSPARENT_BUILTINS:
             prefix_open = False  # it runs a command, but not as the command word
@@ -1741,7 +1819,8 @@ def _reveal_shell_command_words(
     command: str,
     resolve_aliases: bool = True,
     aliases: dict[str, str] | None = None,
-) -> tuple[str, list[int], set[int], dict[str, str]]:
+    assignments: dict[str, str] | None = None,
+) -> tuple[str, list[int], set[int], dict[str, str], dict[str, str]]:
     """Rebuild each shell word the way the shell executes it.
 
     Quoting is stripped before exec, so `"git"` and `g'it'` run `git`, and a
@@ -1767,11 +1846,11 @@ def _reveal_shell_command_words(
     the returned set holds the words whose revealed value is more than a bare
     executable word: the shell runs such a value as argv, but the probe cannot
     name the repository it runs in, so a discard found through one is refused.
-    The returned alias map is the one the walk ended with, so a caller that
-    re-reads text the shell parses later (an `eval` payload) starts from the
-    aliases this text defined.
+    The returned alias and assignment maps are the ones the walk ended with, so
+    a caller that re-reads text the shell parses later (an `eval` payload)
+    starts from the names this text defined.
     """
-    assignments: dict[str, str] = {}
+    assignments = dict(assignments) if assignments else {}
     pending: dict[str, str] = {}
     aliases = dict(aliases) if aliases else {}
     alias_args = False
@@ -1781,10 +1860,13 @@ def _reveal_shell_command_words(
     unnameable: set[int] = set()
     cursor = 0
     prefix_open = True
+    opened_with: str | None = None
     for word in _shell_word_positions(command):
         out.append(command[cursor : word.start])
         index_map.extend(range(cursor, word.start))
-        if _separates_commands(command[cursor : word.start]):
+        gap = command[cursor : word.start]
+        if _separates_commands(gap):
+            closes_with = _segment_separator(gap, from_end=False)
             # A new simple command: a bare prefix of the previous one survives
             # only when that command held no other word, because the shell then
             # applies the assignment to the shell itself. This mirrors the rule
@@ -1795,8 +1877,10 @@ def _reveal_shell_command_words(
             pending.clear()
             alias_args = False
             if unalias_words is not None:
-                _apply_unalias(aliases, unalias_words)
-                unalias_words = None
+                if _runs_in_current_shell(opened_with, closes_with):
+                    _apply_unalias(aliases, unalias_words)
+                unalias_words = None  # a subshell keeps its aliases to itself
+            opened_with = _segment_separator(gap)
         cursor = word.end
         text = command[word.start : word.end]
         plain = _plain_word_text(text)
@@ -1809,9 +1893,12 @@ def _reveal_shell_command_words(
             alias = aliases.get(plain)
             if alias is not None:
                 revealed = alias
-        if word.command and plain == "alias":
+        # The builtin can be spelled by a word that only reveals to it
+        # (`A=alias; $A g=git`), so the check reads the revealed text too.
+        spoken = _plain_word_text(revealed) if revealed is not None else plain
+        if word.command and spoken == "alias":
             alias_args = True  # the words after the builtin are definitions
-        elif word.command and plain == "unalias":
+        elif word.command and spoken == "unalias":
             if unalias_words is not None:
                 _apply_unalias(aliases, unalias_words)
             unalias_words = []  # the words after it are its operands
@@ -1861,10 +1948,19 @@ def _reveal_shell_command_words(
                     pending.pop(name, None)
                 else:
                     pending[name] = value
+            else:
+                copied = _COPIED_ASSIGNMENT.fullmatch(text)
+                source = copied and (copied.group(2) or copied.group(3))
+                inherited = source and (
+                    assignments.get(source) or pending.get(source)
+                )
+                if inherited:
+                    target = assignments if word.keeps else pending
+                    target[copied.group(1)] = inherited
         prefix_open = word.open_prefix
     out.append(command[cursor:])
     index_map.extend(range(cursor, len(command)))
-    return "".join(out), index_map, unnameable, aliases
+    return "".join(out), index_map, unnameable, aliases, assignments
 
 
 def _is_forced_clean_segment(args: str) -> bool:
@@ -1897,10 +1993,11 @@ def _scan_discard_sites(
     index_map: list[int],
     resolve_aliases: bool,
     aliases: dict[str, str] | None = None,
+    assignments: dict[str, str] | None = None,
 ) -> list[_DiscardSite]:
     """Find the discards in already-normalized text, mapped back to the input."""
-    words, word_map, unnameable, _aliases = _reveal_shell_command_words(
-        normalized, resolve_aliases=resolve_aliases, aliases=aliases
+    words, word_map, unnameable, _aliases, _assignments = _reveal_shell_command_words(
+        normalized, resolve_aliases=resolve_aliases, aliases=aliases, assignments=assignments
     )
     masked = _mask_quoted_spans(words)
     matches: list[tuple[int, int]] = []
@@ -1925,17 +2022,20 @@ def _scan_discard_sites(
 
 
 def _find_destructive_git_discard_sites(
-    command: str, aliases: dict[str, str] | None = None
+    command: str,
+    aliases: dict[str, str] | None = None,
+    assignments: dict[str, str] | None = None,
 ) -> list[_DiscardSite]:
     """Find every destructive git discard command in `command`, returning
-    where each `git` token starts (empty when none match). `aliases` seeds the
-    aliases a caller already knows about, so text the shell parses later (an
-    `eval` payload) resolves a name the outer text defined."""
+    where each `git` token starts (empty when none match). `aliases` and
+    `assignments` seed the names a caller already knows about, so text the
+    shell parses later (an `eval` payload) resolves a name the outer text
+    defined."""
     normalized, index_map = _strip_shell_escapes(
         _mask_shell_redirections(_normalize_line_continuations(command))
     )
     sites = _scan_discard_sites(
-        normalized, index_map, resolve_aliases=True, aliases=aliases
+        normalized, index_map, resolve_aliases=True, aliases=aliases, assignments=assignments
     )
     if "alias" in normalized:
         # A shell expands an alias defined in this text only when its own
@@ -1945,7 +2045,11 @@ def _find_destructive_git_discard_sites(
         # discard under either reading is refused.
         sites.extend(
             _scan_discard_sites(
-                normalized, index_map, resolve_aliases=False, aliases=aliases
+                normalized,
+                index_map,
+                resolve_aliases=False,
+                aliases=aliases,
+                assignments=assignments,
             )
         )
     unique: list[_DiscardSite] = []
@@ -2005,7 +2109,10 @@ def _unquote_one_level(text: str) -> str:
 
 
 def _eval_payloads_hide_destructive_git(
-    command: str, depth: int = 0, aliases: dict[str, str] | None = None
+    command: str,
+    depth: int = 0,
+    aliases: dict[str, str] | None = None,
+    assignments: dict[str, str] | None = None,
 ) -> bool:
     """True when a quoted `eval` payload hides a destructive git discard.
 
@@ -2026,31 +2133,31 @@ def _eval_payloads_hide_destructive_git(
     command = _strip_shell_escapes(
         _mask_shell_redirections(_normalize_line_continuations(command))
     )[0]
-    revealed, _word_map, _unnameable, visible = _reveal_shell_command_words(
-        command, aliases=aliases
+    revealed, _word_map, _unnameable, visible, known = _reveal_shell_command_words(
+        command, aliases=aliases, assignments=assignments
     )
-    if _revealed_eval_payloads_hide_destructive_git(revealed, depth, visible):
+    if _revealed_eval_payloads_hide_destructive_git(revealed, depth, visible, known):
         return True
     if "alias" in command:
         # Same both-ways reading as the discard scan: an alias may or may not
         # be expanded, so the text as written is scanned too.
-        as_written, _as_written_map, _as_written_un, _as_written_aliases = (
-            _reveal_shell_command_words(command, resolve_aliases=False, aliases=aliases)
+        as_written, _as_map, _as_un, _as_aliases, _as_known = _reveal_shell_command_words(
+            command, resolve_aliases=False, aliases=aliases, assignments=assignments
         )
-        if _revealed_eval_payloads_hide_destructive_git(as_written, depth, visible):
+        if _revealed_eval_payloads_hide_destructive_git(as_written, depth, visible, known):
             return True
     return False
 
 
 def _revealed_eval_payloads_hide_destructive_git(
-    revealed: str, depth: int, aliases: dict[str, str]
+    revealed: str, depth: int, aliases: dict[str, str], assignments: dict[str, str]
 ) -> bool:
     """True when a revealed command runs eval over a payload holding a discard.
 
-    `aliases` are the names the scanned text defined (and any a caller carried
-    in): the payload is re-parsed by eval at run time, where such a name runs
-    its value, so the payload is read with those aliases resolved as well as
-    exactly as written.
+    `aliases` and `assignments` are the names the scanned text defined (and any
+    a caller carried in): the payload is re-parsed by eval at run time, where
+    those names run their values, so the payload is read with them resolved as
+    well as exactly as written.
     """
     masked = _mask_quoted_spans(revealed)
     for word in _shell_word_positions(revealed):
@@ -2059,20 +2166,28 @@ def _revealed_eval_payloads_hide_destructive_git(
         # The payload runs from just after the eval token to the next
         # unquoted command separator (masked text keeps those live).
         region_end = len(revealed)
+        interior = [
+            (word.end + start, word.end + end)
+            for start, end in _substitution_interiors(revealed[word.end :])
+        ]
         for j in range(word.end, len(masked)):
-            if masked[j] in ";&|\n":
+            if masked[j] in ";&|\n" and not any(
+                start <= j < end for start, end in interior
+            ):
                 region_end = j
                 break
         payload = _unquote_one_level(revealed[word.end : region_end])
         if _find_destructive_git_discard_sites(payload):
             return True
-        if aliases:
-            if _find_destructive_git_discard_sites(payload, aliases=aliases):
-                return True
-            if _payload_substitution_names_a_discarding_alias(payload, aliases):
+        if _payload_substitution_hides_a_discard(payload, aliases):
+            return True
+        if aliases or assignments:
+            if _find_destructive_git_discard_sites(
+                payload, aliases=aliases, assignments=assignments
+            ):
                 return True
         if "eval" in payload and _eval_payloads_hide_destructive_git(
-            payload, depth + 1, aliases
+            payload, depth + 1, aliases, assignments
         ):
             return True
     return False
@@ -2097,26 +2212,26 @@ def _substitution_interiors(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _payload_substitution_names_a_discarding_alias(
-    payload: str, aliases: dict[str, str]
-) -> bool:
-    """True when an unrunnable payload still spells a discarding alias name.
+def _payload_substitution_hides_a_discard(payload: str, aliases: dict[str, str]) -> bool:
+    """True when a substitution in an unrunnable payload can deliver a discard.
 
-    A payload can build its command word at run time (`eval "$(printf %s g)"`),
-    and its position inside the substitution says nothing about where the
-    result lands, so a name whose value discards is refused rather than allowed
-    once eval would run it. A name whose value discards nothing is left alone,
-    and the text as written is scanned separately.
+    The payload is built at run time, so neither its command word nor the text a
+    substitution prints can be judged directly: a substitution whose own text
+    (with its quoting removed) holds a discard, or that spells a name whose
+    value discards, is refused instead of allowed. Text that discards nothing is
+    left alone, and the payload as written is scanned separately.
     """
     discarding = {
         name
         for name, value in aliases.items()
         if _find_destructive_git_discard_sites(value)
     }
-    if not discarding:
-        return False
     for inner_start, inner_end in _substitution_interiors(payload):
         inner = payload[inner_start:inner_end]
+        if _find_destructive_git_discard_sites(_unquote_one_level(inner)):
+            return True
+        if not discarding:
+            continue
         for word in _shell_word_positions(inner):
             spelled = _plain_word_text(inner[word.start : word.end])
             if spelled is not None and spelled in discarding:
@@ -2274,6 +2389,12 @@ def _resolve_discard_probe_target(
         if persistent_assignments or assignments
         else ""
     )
+
+    # A function definition whose body can change directory relocates a later
+    # discard whenever the function is called, and the guard does not model
+    # invocation or shell scope: refuse instead of replaying a guess.
+    if _defines_directory_changing_function(_mask_quoted_spans(prefix)):
+        return _UNRESOLVABLE_DISCARD_TARGET
 
     # cd relocations earlier in the command. cds inside grouping parentheses
     # do not persist: they only matter when the discard itself runs inside the
