@@ -13,6 +13,7 @@ import selectors
 import shutil
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -1154,6 +1155,63 @@ def _separates_commands(text: str) -> bool:
     return any(ch in ";&|\n()" for ch in text)
 
 
+def _join_line_continuations(command: str) -> str:
+    """Remove backslash-newline line continuations the way the shell does.
+
+    Bash deletes an unquoted or double-quoted backslash-newline pair
+    entirely, so `r\\\n`m -rf x` is the single token sequence `rm -rf x`;
+    the space-preserving rewrite below would see `r  m` and miss it.
+    Positions in the result no longer map back to the source, which is fine
+    for the rm guard: every downstream scan runs on this joined form.
+    Single-quoted pairs are literal data and stay; a newline always ends a
+    comment, so comments are passed through whole."""
+    out: list[str] = []
+    quote: str | None = None
+    comment = False
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if comment:
+            out.append(ch)
+            if ch == "\n":
+                comment = False
+        elif quote is None:
+            if ch in ('"', "'"):
+                quote = ch
+                out.append(ch)
+            elif ch == "#" and (i == 0 or command[i - 1] in " \t\r\n;&|(){}"):
+                comment = True
+                out.append(ch)
+            elif ch == "\\" and i + 1 < n:
+                if command[i + 1] == "\n":
+                    pass  # the shell removes the pair: tokens on both sides join
+                else:
+                    # The escape keeps the next character from opening a
+                    # quoted span (`\'` is a literal quote, not a span).
+                    out.append(ch)
+                    out.append(command[i + 1])
+                i += 1
+            else:
+                out.append(ch)
+        elif quote == "'":
+            out.append(ch)
+            if ch == "'":
+                quote = None
+        else:  # double quotes
+            if ch == "\\" and i + 1 < n and command[i + 1] == "\n":
+                i += 1  # removed inside double quotes too
+            else:
+                out.append(ch)
+                if ch == '"':
+                    quote = None
+                elif ch == "\\" and i + 1 < n:
+                    out.append(command[i + 1])
+                    i += 1
+        i += 1
+    return "".join(out)
+
+
 def _segment_separator(text: str, from_end: bool = True) -> str | None:
     """The separator nearest one end of `text`, or None when it has none.
 
@@ -1798,6 +1856,20 @@ _SHELL_KEYWORDS = frozenset(
         "do", "done", "for", "in", "case", "esac", "select", "time", "function",
     }
 )
+# Tokens that open a command context without being the command word, so the
+# shell still reads an assignment after them (`{ PWD=/x; }`,
+# `if true; then PWD=/x; fi`). The grouping parens never reach the word list as
+# words, but the shell reads an assignment after them the same way.
+_COMMAND_CONTEXT_TOKENS = _SHELL_KEYWORDS | frozenset({"(", ")"})
+# Reserved words after which the next word runs as a command, so an assigned
+# `$NAME` there is substituted like a command-boundary reference (`{ $X; }`,
+# `if $X; then ...; fi`); list and terminator positions (`for`, `in`, `case`,
+# `fi`, `done`) never execute their next word, so those stay unresolvable.
+_EXECUTING_KEYWORDS = frozenset(
+    {
+        "{", "!", "if", "elif", "else", "then", "while", "until", "do", "time",
+    }
+)
 
 
 class _ShellWord(NamedTuple):
@@ -2251,6 +2323,11 @@ _MAX_EVAL_SCAN_DEPTH = 10
 # The eval gate reads the command with quoting and escapes dropped, because a
 # split-spelled command word (`e\val`, `e'va'l`) still runs the builtin.
 _EVAL_GATE_STRIP = re.compile(r"""["'\\]""")
+
+# Alias expansion is iterated to a fixed point; each pass resolves at least one
+# link of an alias chain, and a definition is dropped once it has been used, so
+# a self-referential alias (`alias rm='rm -rf x'`) cannot grow without bound.
+_MAX_ALIAS_EXPANSION_PASSES = 8
 
 
 def _unquote_one_level(text: str) -> str:
@@ -3205,7 +3282,2506 @@ def _guard_destructive_git(command: str, allow_destructive_git: bool) -> None:
             )
 
 
-def bash(command: str, *, allow_destructive_git: bool = False) -> BashHandle:
+# ---------------------------------------------------------------------------
+# Recursive-force rm guard. The dirty-tree guard above protects uncommitted
+# git work; this one stops recursive-force rm invocations whose operands
+# escape the kernel workspace (HOME itself, /, parent directories, other
+# trees) or name protected dot paths (.., .git, .env-class files). Detection
+# is a word-level shell scan, conservative by design: a false positive costs
+# one explicit-bypass retry, a false negative silently deletes files.
+
+# Bypass env var for the recursive-force rm guard. Unlike the git guard's
+# bypass, the value is FROZEN at kernel start: this module is imported once
+# when the kernel boots and the guard consults only that frozen copy. A live
+# os.environ read would let one model-side os.environ write neuter the guard
+# mid-session (wave-1 safety audit, gap 1), so a mid-session change is
+# ignored and warned about loudly instead of honored.
+BASH_DESTRUCTIVE_RM_BYPASS_ENV = "PI_BASH_ALLOW_DESTRUCTIVE_RM"
+
+# The launch-time snapshot, read once at import (kernel bootstrap). Tests
+# simulate a different launch environment by patching this attribute.
+_BASH_RM_BYPASS_AT_KERNEL_START: str | None = os.environ.get(BASH_DESTRUCTIVE_RM_BYPASS_ENV)
+
+# How many refused rm operands the refusal lists before eliding the rest.
+_MAX_RM_REFUSALS_LISTED = 10
+
+
+class DestructiveRmRefusalError(RuntimeError):
+    """A recursive-force rm was refused: its targets escape the kernel
+    workspace or name protected dot paths."""
+
+
+@dataclass(frozen=True)
+class _RmShellWord:
+    """One shell word: its unquoted argv value plus the span it came from."""
+
+    value: str
+    start: int
+    end: int
+    starts_command: bool  # first word of a fresh (sub)command context
+    splittable: bool = False  # carries an unquoted expansion, so it can split
+
+
+def _quote_span_end(command: str, start: int, end: int) -> int:
+    """Index just past the quoted span starting at `command[start]` (a single
+    or double quote), skipping escaped characters inside double quotes."""
+    quote = command[start]
+    i = start + 1
+    while i < end:
+        ch = command[i]
+        if quote == '"' and ch == "\\":
+            i += 2
+            continue
+        if ch == quote:
+            return i + 1
+        i += 1
+    return end
+
+
+def _matching_paren(command: str, open_index: int, end: int) -> int:
+    """Index of the `)` matching the `(` at `open_index`, or `end - 1`.
+
+    Quote-aware: a `)` inside a single- or double-quoted span or after a
+    backslash escape never closes the substitution, mirroring how the shell
+    parses it. Unterminated quotes or an unmatched `(` scan to the end, so
+    the whole region stays live-command territory rather than a miss."""
+    depth = 0
+    i = open_index
+    while i < end:
+        ch = command[i]
+        if ch == "\\":
+            i += 2
+        elif ch in "'\"":
+            i = _quote_span_end(command, i, end)
+        elif ch == "(":
+            depth += 1
+            i += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+            i += 1
+        else:
+            i += 1
+    return end - 1  # unterminated: scan to the end
+
+
+# Quoted references the shell still splits into separate words: `"$@"`, `"$*"`,
+# the braced positional forms (`"${@}"`, `"${*}"`, `"${@:1:2}"`), and array
+# expansions (`"${name[@]}"`, `"${name[*]}"`).
+_SPLITTING_QUOTED_REFERENCE = re.compile(
+    r"\$(?:[@*]|\{[^{}]*\[[@*]\]\}|\{[@*](?::[^}]*)?\})"
+)
+
+
+_ANSI_C_ESCAPES = {
+    "a": "\a",
+    "b": "\b",
+    "e": "\x1b",
+    "E": "\x1b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "v": "\v",
+    "\\": "\\",
+    "'": "'",
+    '"': '"',
+    "?": "?",
+}
+
+
+def _decode_ansi_c_quotes(text: str) -> str:
+    """The literal text a `$'...'` word passes to the command.
+
+    The shell decodes the escapes and hands the result over as one literal
+    word (`$'rm'` runs `rm`, `$'\x2drf'` is `-rf`), so the guard must read the
+    decoded text rather than the quoted source. An escape the shell does not
+    know keeps its backslash, and an out-of-range code point keeps its source
+    text, both in the scanner's conservative direction."""
+    decoded: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch != "\\" or i + 1 >= n:
+            decoded.append(ch)
+            i += 1
+            continue
+        escape = text[i + 1]
+        if escape in _ANSI_C_ESCAPES:
+            decoded.append(_ANSI_C_ESCAPES[escape])
+            i += 2
+            continue
+        digits: str | None = None
+        base = width = 0
+        if escape in "01234567":
+            match = re.match(r"[0-7]{1,3}", text[i + 1 :])
+            base, width = 8, 0
+        elif escape == "x":
+            match = re.match(r"[0-9a-fA-F]{1,2}", text[i + 2 :])
+            base, width = 16, 1
+        elif escape in "uU":
+            match = re.match(rf"[0-9a-fA-F]{{1,{4 if escape == 'u' else 8}}}", text[i + 2 :])
+            base, width = 16, 2
+        else:
+            match = None
+        if match is not None:
+            digits = match.group(0)
+            try:
+                decoded.append(chr(int(digits, base) & 0x10FFFF))
+            except ValueError:
+                digits = None
+        if digits is not None:
+            i += 1 + (0 if base == 8 else width) + len(digits)
+            continue
+        decoded.append(ch)
+        decoded.append(escape)  # an escape the shell does not know keeps both
+        i += 2
+    return "".join(decoded)
+
+
+def _scan_shell_words(command: str) -> list[_RmShellWord]:
+    """Split `command` into shell words the way the shell builds argv.
+
+    Quotes and backslash escapes fold into the word value, comments are
+    skipped, and command substitution (`$(...)`, backticks) keeps its
+    interior scanned as live commands because it executes; the substituted
+    result itself stays in the enclosing word, so an operand carrying it
+    reads as unresolvable. `splittable` marks a word holding an unquoted
+    expansion, which the shell splits into whatever words the value carries.
+    Redirections are masked by the caller. This is a conservative
+    approximation, not a parse: anything it cannot represent exactly ends up
+    refused, never silently allowed.
+    """
+    words: list[_RmShellWord] = []
+
+    def scan_region(start: int, end: int, *, starts_command: bool) -> None:
+        i = start
+        value: list[str] = []
+        word_start = -1
+        word_starts_command = False
+        word_splittable = False
+        first_word_pending = starts_command
+
+        def flush(starts_next_command: bool) -> None:
+            nonlocal word_start, word_splittable, first_word_pending
+            if word_start != -1:
+                words.append(
+                    _RmShellWord(
+                        "".join(value),
+                        word_start,
+                        i,
+                        word_starts_command,
+                        word_splittable,
+                    )
+                )
+                value.clear()
+                word_start = -1
+                word_splittable = False
+                first_word_pending = starts_next_command
+            else:
+                first_word_pending = first_word_pending or starts_next_command
+
+        while i < end:
+            ch = command[i]
+            if ch in " \t\r":
+                flush(False)  # whitespace: the next word continues this command
+                i += 1
+                continue
+            if ch in "\n;|&()<>":
+                flush(True)  # command boundary: the next word starts a command
+                i += 1
+                continue
+            if ch == "#" and word_start == -1:
+                while i < end and command[i] != "\n":
+                    i += 1
+                continue
+            if word_start == -1:
+                word_start = i
+                word_starts_command = first_word_pending
+                first_word_pending = False
+            if ch == "\\" and i + 1 < end:
+                value.append(command[i + 1])
+                i += 2
+                continue
+            if ch == "'":
+                j = i + 1
+                while j < end and command[j] != "'":
+                    j += 1
+                value.append(command[i + 1 : j])
+                i = j + 1
+                continue
+            if ch == '"':
+                span_start = i
+                j = i + 1
+                while j < end:
+                    inner = command[j]
+                    if inner == "\\" and j + 1 < end:
+                        value.append(command[j + 1])
+                        j += 2
+                        continue
+                    if inner == '"':
+                        j += 1
+                        break
+                    if inner == "$" and command[j + 1 : j + 2] == "(":
+                        close = _matching_paren(command, j + 1, end)
+                        scan_region(j + 2, close, starts_command=True)
+                        value.append(command[j + 1 : close + 1])
+                        j = close + 1
+                        continue
+                    if inner == "`":
+                        close = command.find("`", j + 1, end)
+                        if close == -1:
+                            close = end - 1
+                        scan_region(j + 1, close, starts_command=True)
+                        value.append(command[j + 1 : close + 1])
+                        j = close + 1
+                        continue
+                    value.append(inner)
+                    j += 1
+                if _SPLITTING_QUOTED_REFERENCE.search(command[span_start:j]):
+                    word_splittable = True  # `"$@"` splits into separate words
+                i = j
+                continue
+            if ch == "$" and command[i + 1 : i + 2] == "'":
+                # ANSI-C quoting: the shell decodes the escapes and passes the
+                # result as one literal word, so reading the quoted source
+                # (`$rm`) would hide the command it runs.
+                j = i + 2
+                escaped = False
+                while j < end:
+                    inner = command[j]
+                    if escaped:
+                        escaped = False
+                    elif inner == "\\":
+                        escaped = True
+                    elif inner == "'":
+                        break
+                    j += 1
+                value.append(_decode_ansi_c_quotes(command[i + 2 : j]))
+                i = min(j + 1, end)
+                continue
+            if ch == "$" and command[i + 1 : i + 2] == '"':
+                # `$"..."` is a translated double-quoted string: drop the `$`
+                # and let the quoting path fold it (expansion still applies).
+                i += 1
+                continue
+            if ch == "$" and command[i + 1 : i + 2] == "(":
+                close = _matching_paren(command, i + 1, end)
+                scan_region(i + 2, close, starts_command=True)
+                value.append(command[i + 1 : close + 1])
+                word_splittable = True  # an unquoted substitution word-splits
+                i = close + 1
+                continue
+            if ch == "`":
+                close = command.find("`", i + 1, end)
+                if close == -1:
+                    close = end - 1
+                scan_region(i + 1, close, starts_command=True)
+                value.append(command[i + 1 : close + 1])
+                word_splittable = True  # an unquoted substitution word-splits
+                i = close + 1
+                continue
+            if ch in "$`{}":
+                word_splittable = True  # unquoted, so it splits into any words
+            value.append(ch)
+            i += 1
+        flush(False)
+
+    scan_region(0, len(command), starts_command=True)
+    return words
+
+
+def _is_rm_word(value: str) -> bool:
+    """True when the word invokes rm, including slash-qualified forms
+    (`/bin/rm`, `./rm`) that basename-match the real command."""
+    return os.path.basename(value) == "rm"
+
+
+def _find_rf_rm_invocations_in_words(
+    words: list[_RmShellWord],
+) -> list[tuple[int, list[str]]]:
+    """Find every rm invocation combining recursive and force flags
+    (-r/-R/--recursive plus -f, including combined -rf/-fr), returning the
+    rm word index and operand list of each matched invocation. Flags may sit
+    anywhere in the invocation (`rm sub -rf`); a lone -r or lone -f never
+    matches."""
+    invocations: list[tuple[int, list[str]]] = []
+    for index, word in enumerate(words):
+        if not _is_rm_word(word.value):
+            continue
+        recursive = False
+        force = False
+        operands: list[str] = []
+        end_of_options = False
+        for follower in words[index + 1 :]:
+            if follower.starts_command:
+                break
+            token = follower.value
+            if end_of_options or not token.startswith("-") or token == "-":
+                operands.append(token)
+                continue
+            if token == "--":
+                end_of_options = True
+                continue
+            if token.startswith("--"):
+                # GNU long options accept unambiguous abbreviations, so any
+                # prefix of --recursive/--force behaves like the full option.
+                name = token[2:].split("=", 1)[0]
+                recursive = recursive or "recursive".startswith(name)
+                force = force or "force".startswith(name)
+                continue
+            body = token[1:]
+            recursive = recursive or "r" in body or "R" in body
+            force = force or "f" in body
+        if recursive and force:
+            invocations.append((index, operands))
+    return invocations
+
+
+def _find_recursive_force_rm_invocations(command: str) -> list[list[str]]:
+    """The operand lists of every recursive-force rm invocation in `command`;
+    see _find_rf_rm_invocations_in_words for the matching rules."""
+    prepared = _mask_shell_redirections(_join_line_continuations(command))
+    return [
+        operands
+        for _, operands in _find_rf_rm_invocations_in_words(_scan_shell_words(prepared))
+    ]
+
+
+def is_recursive_force_rm_command(command: str) -> bool:
+    """True when `command` contains an rm invocation combining recursive and
+    force flags (`rm -rf x`, `-fr`, `-Rf`, `--recursive --force`), regardless
+    of its operands. Here-document bodies are masked consumer-agnostically in
+    this helper, so rm text inside them goes undetected; guard decisions use
+    the runner-aware scan path instead."""
+    return bool(_find_recursive_force_rm_invocations(command))
+
+
+# Expansion characters that can turn one scanned word into different shell
+# argv at run time. `$HOME`/`$PWD` prefixes are statically resolvable, so
+# they are stripped before a word counts as unresolvable.
+_UNRESOLVED_EXPANSION_CHARS = ("$", "`", "{", "}")
+
+
+_EXPANSION_NAME = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _expansion_is_resolvable(token: str) -> bool:
+    """True when every expansion in `token` is a statically resolvable
+    `$HOME`/`${HOME}`/`$PWD`/`${PWD}` reference, matched by full variable
+    name so `$HOMEFOO` (a different variable) stays unresolvable."""
+    rest = token
+    while rest:
+        match = _EXPANSION_NAME.search(rest)
+        if match is None:
+            return not any(ch in rest for ch in _UNRESOLVED_EXPANSION_CHARS)
+        if match.group(1) not in ("HOME", "PWD"):
+            return False
+        rest = rest[match.end() :]
+        if match.group(0).startswith("${"):
+            if rest.startswith("}"):
+                rest = rest[1:]
+            else:
+                return False  # unterminated ${NAME: treat as unresolvable
+    return True
+
+
+def _unresolvable_expansion_rm_reasons(words: list[_RmShellWord]) -> list[str]:
+    """Refusal reasons for rm-shaped invocations whose command word or
+    flags/operands hide behind expansion the shell performs after the guard
+    runs. A `R=rm; $R -rf x` command word and a `flags=-rf; rm $flags /`
+    follower cannot be resolved statically, so the invocation is refused as
+    unresolvable instead of guessed at. Fail closed."""
+    reasons: list[str] = []
+    for index, word in enumerate(words):
+        follower_words: list[_RmShellWord] = []
+        for follower in words[index + 1 :]:
+            if follower.starts_command:
+                break
+            follower_words.append(follower)
+        followers = [follower.value for follower in follower_words]
+        if not _rm_word_is_literal(word.value):
+            # The word expands at run time. In command position — first word,
+            # after an assignment prefix, env/sudo-style words, keywords, or
+            # grouping tokens — it could expand to rm, so if any follower
+            # could be an rm flag the pair could complete into
+            # recursive-force rm.
+            shows_rm_flag = False
+            for token in followers:
+                if token.startswith("--"):
+                    name = token[2:].split("=", 1)[0]
+                    shows_rm_flag = (
+                        shows_rm_flag
+                        or "recursive".startswith(name)
+                        or "force".startswith(name)
+                    )
+                elif token.startswith("-") and token != "-":
+                    body = token[1:]
+                    shows_rm_flag = (
+                        shows_rm_flag or "r" in body or "R" in body or "f" in body
+                    )
+            if shows_rm_flag:
+                reasons.append(
+                    f"{word.value!r}: names the command through shell"
+                    " expansion, which the guard cannot resolve"
+                )
+        elif _is_rm_word(word.value):
+            # An rm follower carrying unresolved expansion could expand to
+            # recursive-force flags or out-of-workspace paths. A follower the
+            # shell word-splits (`rm $flags /`) can supply those flags on its
+            # own, and a single-word expansion sharing the invocation with
+            # another operand (`rm "$flags" /outside`) can be that operand's
+            # flags, so both stay refused. A lone unresolvable operand with
+            # nothing but options around it (`rm "$file"`, `rm -f "$file"`,
+            # `rm -- "$file"`) cannot turn an rm into a recursive-force rm, so
+            # variable-based cleanup keeps running.
+            for follower in follower_words:
+                if _rm_word_is_literal(follower.value):
+                    continue
+                if follower.splittable or any(
+                    other is not follower and _could_be_operand(other)
+                    for other in follower_words
+                ):
+                    reasons.append(
+                        f"{follower.value!r}: expands inside an rm invocation,"
+                        " so the flags or paths it produces cannot be checked"
+                    )
+                    break
+    return reasons
+
+
+_GLOB_CHARS = "*?["
+
+
+def _rm_word_is_literal(value: str) -> bool:
+    """True when the rm guard can read the word as written: no expansion and no
+    glob. A glob in command or flag position expands before the command runs,
+    so `?m -rf /outside` becomes `rm -rf /outside` when a matching file exists,
+    and `-?f` becomes `-rf` the same way. `*` and `?` always glob; `[` only
+    opens a pattern when the word also closes it, so the `[` test builtin and
+    the `[[ ... ]]` conditional stay literal command and keyword words."""
+    if not _expansion_is_resolvable(value):
+        return False
+    if any(ch in value for ch in "*?"):
+        return False
+    if value.startswith("[[") and value.endswith("]]"):
+        return False
+    return re.search(r"\[[^]]*\]", value) is None
+
+
+def _could_be_operand(word: _RmShellWord) -> bool:
+    """True when rm could read the word as an operand: anything but an option
+    cluster or the `--` end-of-options marker (`-` alone is still an operand,
+    and rm reads the names from stdin for it)."""
+    return word.value == "-" or not word.value.startswith("-")
+
+
+# A quoted argument to `sh -c` (and friends) is a live command string, so
+# those payloads are scanned exactly like eval payloads. Only shell
+# interpreters are listed: non-shell `-c` payloads (python, awk, node) are
+# not shell syntax, and any shell command substitution in them already runs
+# before their own parser sees the text.
+_SHELL_DASH_C_INTERPRETERS = frozenset(
+    {"sh", "ash", "bash", "csh", "dash", "ksh", "tcsh", "zsh"}
+)
+
+
+def _alias_definitions(words: list[_RmShellWord]) -> dict[str, str]:
+    """Alias definitions made by the command (`alias name='command text'`),
+    applied in order so redefinitions and `unalias` win."""
+    aliases: dict[str, str] = {}
+    for index, word in enumerate(words):
+        if word.value not in ("alias", "unalias"):
+            continue
+        for follower in words[index + 1 :]:
+            if follower.starts_command:
+                break
+            token = follower.value
+            if word.value == "alias" and "=" in token:
+                name, _, value = token.partition("=")
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                    aliases[name] = value
+            elif word.value == "unalias":
+                aliases.pop(token, None)
+    return aliases
+
+
+def _wrapped_payloads_hide_recursive_force_rm(
+    command: str,
+    depth: int = 0,
+    words: list[_RmShellWord] | None = None,
+    aliases: dict[str, str] | None = None,
+) -> bool:
+    """True when a quoted `eval` or shell `-c` payload hides a
+    recursive-force rm.
+
+    Mirrors the git guard's eval scan: only unquoted wrapper tokens are
+    scanned, each payload uses the scanner's folded word values (so adjacent
+    quoted fragments like 'r''m stay one word, exactly as the shell passes
+    them), and a recursive-force rm in any layer is refused outright because
+    the payload can relocate or chain freely. Shell `-c` payloads are scanned
+    when the wrapper word names a shell interpreter or carries unresolvable
+    expansion (`$BASH -c ...`): literal non-shell wrappers (`python -c`) stay
+    unscanned because their payload is not shell syntax. `trap` action
+    strings are live commands the shell runs later (at signal/exit), so the
+    argument is scanned as a payload too."""
+    if depth > _MAX_EVAL_SCAN_DEPTH:
+        return True  # absurdly nested wrappers: refuse rather than risk a miss
+    if words is None:
+        words = _scan_shell_words(command)
+    if aliases is None:
+        aliases = _alias_definitions(words)
+    else:
+        aliases = {**aliases, **_alias_definitions(words)}
+    for index, word in enumerate(words):
+        payload_parts: list[str] = []
+        if word.value == "eval":
+            for follower in words[index + 1 :]:
+                if follower.starts_command:
+                    break
+                # Aliases expand at parse time in the same shell, so an
+                # eval payload word may be an alias defined earlier.
+                payload_parts.append(aliases.get(follower.value, follower.value))
+        elif word.value == "trap":
+            # The action string is the first argument after any -l/-p flags
+            # or a `--` end-of-options marker; the rest are signals.
+            action = None
+            for follower in words[index + 1 :]:
+                if follower.starts_command:
+                    break
+                if follower.value.startswith("-"):
+                    continue
+                action = follower
+                break
+            if action is None:
+                continue
+            # Trap actions run in the same shell, so aliases apply.
+            payload_parts.append(aliases.get(action.value, action.value))
+        elif "BASH_FUNC_" in word.value and "%%=" in word.value:
+            # An exported shell function travels in the environment
+            # (`env 'BASH_FUNC_rm%%=() { rm -rf /; }' bash -c 'rm x'`), where
+            # the child shell imports it and runs the body under a command name
+            # the literal scan reads as harmless: scan the body as its own
+            # command text, with the `() {...}` wrapper stripped.
+            body = word.value.split("%%=", 1)[1]
+            body = re.sub(r"^\s*\(\s*\)\s*(?:\{|\()", "", body)
+            payload_parts.append(re.sub(r"(?:\}|\))\s*$", "", body))
+        else:
+            is_shell = os.path.basename(word.value) in _SHELL_DASH_C_INTERPRETERS
+            if not is_shell and _expansion_is_resolvable(word.value):
+                continue  # python/node -c payloads are not shell syntax
+            # `-c` may sit anywhere in the option list (`bash -e -c ...`,
+            # bundled `-ce`/`-uc`, behind argument-taking options like
+            # `-o pipefail`); locate any short cluster containing `c` and
+            # take the word that follows it as the command string. Long
+            # options and non-option words are skipped so positional
+            # arguments do not end the search early (over-scanning a
+            # positional is only a conservative refusal).
+            payload_word = None
+            for offset, follower in enumerate(words[index + 1 :]):
+                if follower.starts_command:
+                    break
+                token = follower.value
+                if token == "-" or token.startswith("--"):
+                    continue
+                if token.startswith("-") and "c" in token[1:]:
+                    candidate = words[index + 2 + offset : index + 3 + offset]
+                    if candidate and not candidate[0].starts_command:
+                        payload_word = candidate[0]
+                    break
+            if payload_word is None:
+                continue  # no `-c` payload: nothing to scan
+            payload_parts.append(payload_word.value)
+        payload = " ".join(payload_parts)
+        # A payload word in command position that expands at run time
+        # (`sh -c "$SCRIPT"`, `sh -c "$HOME ..."`) could be any command,
+        # including rm — even $HOME/$PWD resolve to a path the environment
+        # controls, and brace expansion / backticks assemble commands the
+        # same way: refuse rather than scan the expansion text literally.
+        if any(
+            payload_word.starts_command
+            and any(ch in payload_word.value for ch in "$`{}")
+            for payload_word in _scan_shell_words(payload)
+        ):
+            return True
+        if _find_recursive_force_rm_invocations(payload):
+            return True
+        # Expansion inside the payload hides the same recursion the outer scan
+        # refuses (`sh -c 'flags=-rf; rm $flags /outside'`).
+        if _unresolvable_expansion_rm_reasons(_scan_shell_words(payload)):
+            return True
+        if _wrapped_payloads_hide_recursive_force_rm(payload, depth + 1, aliases=aliases):
+            return True
+        # The shell a payload runs in parses its own input one command at a
+        # time, so an alias the payload defines on an earlier line does expand
+        # there (`sh -c 'alias rm=...\nrm x'`), even though the enclosing
+        # command's parse unit never sees it.
+        expanded, complete = _expand_effective_aliases(payload)
+        if not complete:
+            return True  # an unexpanded alias chain: refuse rather than guess
+        if expanded is not None and (
+            _find_recursive_force_rm_invocations(expanded)
+            or _wrapped_payloads_hide_recursive_force_rm(expanded, depth + 1, aliases=aliases)
+        ):
+            return True
+    return False
+
+
+# cd and pushd relocate the spawned shell before later words run, so rm
+# operands must resolve against the tracked directory, not the kernel cwd.
+_CD_BUILTINS = ("cd", "pushd")
+
+# cd/pushd options that are not directory operands.
+_CD_OPTIONS = frozenset({"-L", "-P", "-LP", "-PL", "--"})
+
+
+def _strip_cd_options(targets: list[str]) -> list[str]:
+    """Drop leading cd/pushd options (-L/-P/--) from the target list."""
+    index = 0
+    while index < len(targets) and targets[index] in _CD_OPTIONS:
+        index += 1
+    return targets[index:]
+
+
+def _resolve_cd_target(
+    targets: list[str],
+    tracked: str | None,
+    builtin: str,
+    *,
+    home_untrackable: bool = False,
+    pwd_untrackable: bool = False,
+    cdpath_untrackable: bool = False,
+) -> str | None:
+    """The shell's directory after `cd`/`pushd` with the follower values
+    `targets`, or None when the destination cannot be established statically
+    (variable, glob, brace, substitution, stack-relative, CDPATH-redirected,
+    or reassigned-HOME/PWD targets). Fail closed: never guess."""
+    if tracked is None:
+        return None
+    targets = _strip_cd_options(targets)
+    if not targets:
+        if builtin == "pushd":
+            return None  # swaps with the directory stack: unknowable statically
+        home = os.environ.get("HOME")
+        if not home:
+            return None  # bare cd goes to HOME, which is unset here
+        try:
+            return os.path.realpath(home)
+        except (OSError, ValueError):
+            return None
+    if len(targets) > 1:
+        # cd errors on extra operands; refuse rather than guess which one
+        # wins in other shells.
+        return None
+    target = targets[0]
+    if target == "-":
+        return None  # $OLDPWD is unknowable statically
+    if builtin == "pushd" and re.fullmatch(r"[+-]\d+", target):
+        return None  # a stack rotation lands on another stack entry
+    if target == "":
+        return tracked  # cd '' errors; the shell stays put
+    home = os.environ.get("HOME")
+    expanded = target
+    if expanded.startswith("~"):
+        if home_untrackable:
+            return None  # HOME is reassigned in this command: untrackable
+        if not home:
+            return None
+        if expanded == "~":
+            expanded = home
+        elif expanded.startswith("~/"):
+            expanded = home + expanded[1:]
+        else:
+            return None  # ~otheruser homes cannot be checked statically
+    else:
+        for prefix in ("${HOME}", "$HOME"):
+            if expanded.startswith(prefix):
+                if home_untrackable or not home:
+                    return None
+                expanded = home + expanded[len(prefix) :]
+                break
+        else:
+            for prefix in ("${PWD}", "$PWD"):
+                if expanded.startswith(prefix):
+                    if pwd_untrackable:
+                        return None  # PWD is reassigned in this command
+                    expanded = tracked + expanded[len(prefix) :]
+                    break
+    if not _expansion_is_resolvable(expanded) or any(
+        ch in expanded for ch in "*?\\"
+    ):
+        return None
+    if cdpath_untrackable and not (
+        os.path.isabs(expanded) or expanded.startswith(".")
+    ):
+        # CDPATH can redirect a plain relative cd to any of its entries.
+        return None
+    try:
+        return os.path.realpath(
+            expanded if os.path.isabs(expanded) else os.path.join(tracked, expanded)
+        )
+    except (OSError, ValueError):
+        return None
+
+
+def _boundary_positions(command: str) -> list[tuple[int, str]]:
+    """Positions and kinds of unquoted control boundaries: `&&`, `||`, `;`,
+    `&`, `|`, `|&`, newlines, subshell parens, and word-position braces
+    (`{ cmd; }` groups); quoted spans and escapes are skipped. Used to model
+    which commands may be skipped at run time and where pipeline producers
+    start."""
+    positions: list[tuple[int, str]] = []
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "\\":
+            i += 2
+        elif ch in "'\"":
+            i = _quote_span_end(command, i, n)
+        elif ch in "();\n":
+            positions.append((i, ch))
+            i += 1
+        elif ch in "&|":
+            kind = ch
+            following = command[i + 1 : i + 2]
+            if following == ch:
+                kind = ch * 2
+                i += 1
+            elif ch == "|" and following == "&":
+                kind = "|&"
+                i += 1
+            positions.append((i, kind))
+            i += 1
+        elif ch in "{}" and (i == 0 or command[i - 1] in " \t\n;&|(){}"):
+            # A group brace at word position (not ${...} expansion or brace
+            # expansion attached to a word).
+            positions.append((i, ch))
+            i += 1
+        else:
+            i += 1
+    return positions
+
+
+def _tracked_cwd_at_words(
+    command: str,
+    words: list[_RmShellWord],
+    start_cwd: str | None,
+    *,
+    home_untrackable: bool = False,
+    pwd_untrackable: bool = False,
+    cdpath_untrackable: bool = False,
+) -> list[list[str | None]]:
+    """For each word, the set of directories the shell may be in when that
+    word runs (an over-approximation of the control flow).
+
+    `cd`/`pushd` relocations are resolved statically against every tracked
+    directory; unquoted parens scope those changes the way `(...)` isolates
+    them in the shell (command substitutions included), and a command that
+    may be skipped (after `||` or `&`) leaves the pre-command directories in
+    play alongside the relocated ones — `cd A && true || cd B && rm` can run
+    the rm in A even though B never executed. A None entry means the runtime
+    directory could not be established, so relative rm operands after it
+    must be refused."""
+    def dedupe(values: list[str | None]) -> list[str | None]:
+        return list(dict.fromkeys(values))
+
+    def apply_relocation(
+        current: list[str | None],
+        chain: list[str | None],
+        relocated: list[str | None],
+    ) -> tuple[list[str | None], list[str | None]]:
+        definite = all(
+            target is not None and os.path.isdir(target) for target in relocated
+        )
+        if may_skip or not definite:
+            # The relocation may be skipped (|| continuation) or may fail
+            # (missing target): the earlier directories stay in play
+            # alongside the relocated ones.
+            chain = dedupe(chain + current)
+            current = dedupe(current + relocated)
+        else:
+            # The relocation provably runs and succeeds, so no earlier
+            # directory can survive it inside this chain.
+            current = dedupe(relocated)
+        return current, dedupe(chain + current)
+
+    states: list[str | None] = [start_cwd]
+    # Directories from which the current chain can exit early: a failed
+    # command leaves the `&&` chain (and a `;` statement then runs in that
+    # directory), so every failing command's pre-state stays in play.
+    chain_states: list[str | None] = []
+    stack: list[tuple[list[str | None], list[str | None]]] = []
+    boundaries = _boundary_positions(command)
+    boundary_index = 0
+    result: list[list[str | None]] = []
+    may_skip = False
+    for index, word in enumerate(words):
+        while boundary_index < len(boundaries) and boundaries[boundary_index][0] < word.start:
+            position, kind = boundaries[boundary_index]
+            if kind == "(":
+                stack.append((states, chain_states))
+            elif kind == ")":
+                if stack:
+                    states, chain_states = stack.pop()
+            elif kind == "||" or kind == "&":
+                # The next command may be skipped: its failure/success
+                # predecessors also stay in play.
+                may_skip = True
+                states = dedupe(states + chain_states)
+            elif kind == "&&":
+                may_skip = False
+            else:  # ; | newline: a fresh statement
+                may_skip = False
+                states = dedupe(states + chain_states)
+            boundary_index += 1
+        if word.value in _CD_BUILTINS:
+            targets: list[str] = []
+            for follower in words[index + 1 :]:
+                if follower.starts_command:
+                    break
+                targets.append(follower.value)
+            relocated = [
+                _resolve_cd_target(
+                    targets,
+                    state,
+                    word.value,
+                    home_untrackable=home_untrackable,
+                    pwd_untrackable=pwd_untrackable,
+                    cdpath_untrackable=cdpath_untrackable,
+                )
+                for state in states
+            ]
+            states, chain_states = apply_relocation(states, chain_states, relocated)
+        elif os.path.basename(word.value) == "env" and (
+            chdir_target := _env_option_value(words, index, "C", "chdir")
+        ) is not None:
+            # GNU `env -C dir` relocates the command it runs, so operands after
+            # it resolve against that directory (an unresolvable one leaves the
+            # directory unknowable, which fails closed).
+            relocated = [
+                _resolve_cd_target(
+                    [chdir_target],
+                    state,
+                    "cd",
+                    home_untrackable=home_untrackable,
+                    pwd_untrackable=pwd_untrackable,
+                    cdpath_untrackable=cdpath_untrackable,
+                )
+                for state in states
+            ]
+            states, chain_states = apply_relocation(states, chain_states, relocated)
+        elif word.value == "popd":
+            # The stack top is whatever earlier pushd or stack subtraction left
+            # there, which the tracker does not model, so the runtime directory
+            # stays unknowable until a later cd/pushd pins it down (a failed
+            # popd leaves the current directory in play).
+            chain_states = dedupe(chain_states + states)
+            states = dedupe(states + [None])
+            chain_states = dedupe(chain_states + states)
+        elif word.starts_command:
+            chain_states = dedupe(chain_states + states)
+        result.append(list(states))
+    return result
+
+
+def _resolve_rm_operand(operand: str, workspace_root: str, cwd: str) -> str | None:
+    """Return why `operand` (one unquoted rm argv entry) must be refused from
+    inside `workspace_root`, or None when it is safe. `cwd` is the directory
+    the rm will actually run in (cd-relocated, not the kernel cwd), so $PWD
+    and relative operands resolve the way the spawned shell sees them; `~`
+    and `$HOME` expand from the environment the spawned shell inherits.
+    Fail closed: anything that cannot be resolved statically is refused,
+    including symlinked operands (their target can change between check and
+    run) and paths that do not exist yet (they can still be created as
+    symlinks)."""
+    if operand == "-":
+        return "reads the list of names from stdin, so its targets cannot be checked"
+    if "{}" in operand:
+        return "is a find -exec placeholder, so its targets cannot be checked"
+    if "{" in operand or "}" in operand:
+        return "uses brace expansion, which expands to multiple paths at run time"
+    home = os.environ.get("HOME")
+    expanded = operand
+    if expanded.startswith("~"):
+        if not home:
+            return "expands ~ with HOME unset, so its target cannot be checked"
+        if expanded == "~":
+            expanded = home
+        elif expanded.startswith("~/"):
+            expanded = home + expanded[1:]
+        else:
+            return "expands to another user's home directory, which cannot be checked"
+    else:
+        for prefix, name in (("${HOME}", "HOME"), ("$HOME", "HOME")):
+            if expanded.startswith(prefix):
+                if not home:
+                    return f"expands {prefix} with HOME unset, so its target cannot be checked"
+                expanded = home + expanded[len(prefix) :]
+                break
+        else:
+            for prefix in ("${PWD}", "$PWD"):
+                if expanded.startswith(prefix):
+                    # The spawned shell resets PWD to its own cwd at startup,
+                    # so $PWD here is the real kernel cwd, not the env copy.
+                    expanded = cwd + expanded[len(prefix) :]
+                    break
+    if re.search(r"""[$`"']""", expanded):
+        return "uses shell expansion the guard cannot resolve (variables, substitutions)"
+    if any(ch in expanded for ch in "*?["):
+        return "uses a glob pattern; list explicit paths instead"
+    components = [part for part in expanded.split("/") if part not in ("", ".")]
+    if any(part == ".." for part in components):
+        return "names a parent directory (..), which escapes the workspace"
+    if any(part == ".git" for part in components):
+        return "names .git, destroying repository history"
+    dot = next((part for part in components if part.startswith(".")), None)
+    if dot is not None:
+        return f"names the dot path {dot!r}; dot files and dot directories (.env-class, .git) are refused"
+    try:
+        raw = expanded if os.path.isabs(expanded) else os.path.join(cwd, expanded)
+    except (OSError, ValueError):
+        return "cannot be resolved on this filesystem"
+    try:
+        # A trailing slash makes lstat follow the link, so probe the link
+        # itself: `rm -rf alias/` deletes through the symlink.
+        st = os.lstat(raw.rstrip("/") or raw)
+    except FileNotFoundError:
+        return (
+            "does not exist yet, so its runtime target cannot be verified"
+            " (a command could still create or replace it as a symlink)"
+        )
+    except (OSError, ValueError):
+        return "cannot be checked on this filesystem"
+    if stat.S_ISLNK(st.st_mode):
+        return (
+            "names a symlink, whose target can change between the check and"
+            " the run; remove the link itself without -rf or list explicit paths"
+        )
+    try:
+        resolved = os.path.realpath(raw)
+    except (OSError, ValueError):
+        return "cannot be resolved on this filesystem"
+    if resolved == os.sep:
+        return "resolves to the filesystem root"
+    if home:
+        try:
+            if resolved == os.path.realpath(home):
+                return "resolves to HOME itself"
+        except (OSError, ValueError):
+            pass
+    if resolved == workspace_root:
+        return "resolves to the workspace root itself, including .git"
+    if not (resolved + os.sep).startswith(workspace_root + os.sep):
+        return f"resolves outside the workspace ({workspace_root})"
+    return None
+
+
+def _arithmetic_substitution_end(command: str, start: int) -> int:
+    """Index just past the `$((...))` arithmetic substitution starting at
+    `start` (quote- and escape-aware, so a quoted paren cannot keep the skip
+    open past a real heredoc); unterminated input scans to the end."""
+    depth = 2
+    i = start + 3
+    n = len(command)
+    while i < n and depth > 0:
+        ch = command[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch in "'\"":
+            i = _quote_span_end(command, i, n)
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        i += 1
+    return i
+
+
+def _heredoc_body_spans(command: str) -> list[tuple[int, int, bool]]:
+    """Body extents of every parsable here-document in `command`.
+
+    Each span is `(start, end, expands)`: `expands` is False for a quoted or
+    escaped delimiter, whose body is inert data, and True otherwise, because
+    the shell expands `$(...)` and backtick spans there before the consumer
+    sees the text. Structural and quote- and comment-aware: heredoc operators
+    inside quoted spans, comments, or other heredoc bodies are skipped, and an
+    unterminated or unparsable heredoc reports no span (its body stays live,
+    which is the conservative direction)."""
+    spans: list[tuple[int, int, bool]] = []
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if ch in "'\"":
+            i = _quote_span_end(command, i, n)
+            continue
+        if ch == "$" and command[i + 1 : i + 3] == "((":
+            # Arithmetic substitution: its `<<` is a shift, not a heredoc.
+            i = _arithmetic_substitution_end(command, i)
+            continue
+        if ch == "#" and (i == 0 or command[i - 1] in " \t\n;&|(){}"):
+            while i < n and command[i] != "\n":
+                i += 1
+            continue
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "<" and command[i + 1 : i + 2] == "<":
+            # The operator is valid attached to the command word too
+            # (`sh<<EOF`); arithmetic shifts never reach here because
+            # $((...)) spans are skipped above.
+            j = i + 2
+            strip_tabs = False
+            if command[j : j + 1] == "-":
+                strip_tabs = True
+                j += 1
+            while j < n and command[j] in " \t":
+                j += 1
+            expands = True
+            if command[j : j + 1] in ('"', "'"):
+                quote = command[j]
+                closing = command.find(quote, j + 1)
+                if closing == -1:
+                    i = j  # unterminated quote: not a parsable heredoc
+                    continue
+                delimiter = command[j + 1 : closing]
+                j = closing + 1
+                expands = False  # a quoted word turns expansion off
+            else:
+                k = j
+                while k < n and command[k] not in " \t\n;&|<>":
+                    k += 1
+                delimiter = command[j:k]
+                j = k
+            if not delimiter:
+                i = j
+                continue
+            body_start = command.find("\n", j)
+            if body_start == -1:
+                i = j  # unterminated: leave the whole thing live
+                continue
+            end = None
+            scan = body_start + 1
+            while scan <= n:
+                line_end = command.find("\n", scan)
+                if line_end == -1:
+                    line_end = n
+                line = command[scan:line_end]
+                candidate = line.lstrip("\t") if strip_tabs else line
+                if candidate == delimiter or candidate.rstrip("\r") == delimiter:
+                    end = scan
+                    break
+                if line_end >= n:
+                    break
+                scan = line_end + 1
+            if end is None:
+                i = j  # unterminated heredoc: leave live
+                continue
+            spans.append((body_start + 1, end, expands))
+            i = end
+            continue
+        i += 1
+    return spans
+
+
+# Words that run other commands: their followers are command-position too
+# (`exec ./s.sh`, `sudo ./s.sh`), so a slash-qualified word after them is a
+# script invocation even without starting one itself.
+_EXEC_STYLE_PREFIXES = frozenset(
+    {"exec", "sudo", "env", "nohup", "command", "builtin", "timeout", "nice", "time", "stdbuf"}
+)
+
+
+def _script_runner_word_indices(words: list[_RmShellWord]) -> list[int]:
+    """Indices of words that can run heredoc text: an interpreter feeding on
+    stdin (`sh <<EOF`), a pipeline consumer after the terminator
+    (`{ cat <<EOF ... } | sh`), a script invocation (`sh s.sh`, `./s.sh`,
+    `. s.sh`, `source s.sh`, `exec ./s.sh`), or an unresolvable-expansion
+    word that could be any of them. Exec-style prefixes reach through their
+    options and arguments (`sudo -E ./s.sh`, `env -i ./s.sh`), so the
+    prefix may sit several words back; cd/pushd targets are not runners."""
+    indices: list[int] = []
+    for index, word in enumerate(words):
+        value = word.value
+        if os.path.basename(value) in _SHELL_DASH_C_INTERPRETERS:
+            indices.append(index)
+        elif value == "source":
+            indices.append(index)
+        elif word.starts_command and ("/" in value or value == "."):
+            indices.append(index)
+        elif "/" in value:
+            for back in range(index - 1, -1, -1):
+                if words[back].starts_command:
+                    if words[back].value in _EXEC_STYLE_PREFIXES:
+                        indices.append(index)
+                    break
+        elif not _expansion_is_resolvable(value):
+            indices.append(index)
+    return indices
+
+
+def _heredoc_bodies_reach_script_runners(command_without_bodies: str) -> bool:
+    """True when any word in `command_without_bodies` (heredoc bodies already
+    blanked) can run heredoc text; see _script_runner_word_indices."""
+    return bool(_script_runner_word_indices(_scan_shell_words(command_without_bodies)))
+
+
+def _interpret_shell_escapes(text: str) -> str:
+    """Interpret the printf-style escapes a producer may emit (`\\n`, `\\t`,
+    `\\r`) so piped command text scans the way the consuming shell reads it."""
+    return re.sub(
+        r"\\([ntr])",
+        lambda match: {"n": "\n", "t": "\t", "r": "\r"}[match.group(1)],
+        text,
+    )
+
+
+def _producer_command_index(producer: list[_RmShellWord]) -> int | None:
+    """Index of the word that runs the producer's text generator.
+
+    Assignment words, grouping tokens (`{`, `(`, `!`), and exec-style prefixes
+    with their options sit in front of it (`X=1 printf ...`, `{ printf ...; }`,
+    `command printf ...`), so the caller must look past them before deciding
+    which producer it is looking at."""
+    index = 0
+    while index < len(producer):
+        value = producer[index].value
+        name, separator, _assigned = value.rpartition("=")
+        if separator and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\+?", name):
+            index += 1
+            continue
+        if value in ("{", "(", "!", "time") or value in _EXEC_STYLE_PREFIXES:
+            index += 1
+            while index < len(producer) and producer[index].value.startswith("-"):
+                index += 1
+            continue
+        return index
+    return None
+
+
+def _printf_output_text(producer: list[_RmShellWord]) -> str | None:
+    """The text a `printf` producer writes to its pipe, or None when the guard
+    cannot reconstruct it.
+
+    `printf '%s%s %s %s\n' r m -rf /outside` writes `rm -rf /outside`, so the
+    consumer runs commands the format string alone does not spell out. `%s`
+    conversions are substituted with their argument text in order, a missing
+    argument renders empty the way the builtin does, and arguments that outlast
+    the format reuse it (which the builtin also does), so every assembled line
+    is returned; any other conversion makes the output unreadable."""
+    arguments = [word for word in producer[1:] if word.value != "--"]
+    if not arguments:
+        return None
+    format_text = arguments[0].value
+    values = [word.value for word in arguments[1:]]
+    pieces: list[str] = []
+    index = 0
+    while True:
+        consumed = False
+        position = 0
+        while position < len(format_text):
+            ch = format_text[position]
+            if ch == "\\" and position + 1 < len(format_text):
+                pieces.append(format_text[position : position + 2])
+                position += 2
+                continue
+            if ch != "%":
+                pieces.append(ch)
+                position += 1
+                continue
+            conversion = format_text[position + 1 : position + 2]
+            if conversion == "%":
+                pieces.append("%")
+                position += 2
+                continue
+            if conversion != "s":
+                return None  # other conversions are not literal text
+            pieces.append(values[index] if index < len(values) else "")
+            index += 1
+            consumed = True
+            position += 2
+        if not consumed or index >= len(values):
+            return "".join(pieces)
+
+
+def _stdin_shell_feed_texts(prepared: str, words: list[_RmShellWord]) -> list[tuple[str, int]]:
+    """(producer text, interpreter word index) pairs for pipelines feeding a
+    bare stdin shell: `printf 'rm -rf x\\n' | sh` runs the producer's
+    output as commands, so that text must be scanned. Literal interpreters
+    read stdin when they carry no file/script argument and no `-c` payload
+    (`-s` keeps stdin live with positional arguments); an interpreter named
+    through unresolved expansion (`| $SHELL_BIN`) cannot be inspected, so it
+    is treated as a stdin shell. The producer window crosses `;`, newlines,
+    and other boundaries inside `{...}`/`(...)` groups, where the group's
+    whole output feeds the pipe; `|` and `|&` both count as the pipe."""
+    boundaries = _boundary_positions(prepared)
+    feeds: list[tuple[str, int]] = []
+    for index, word in enumerate(words):
+        is_shell = os.path.basename(word.value) in _SHELL_DASH_C_INTERPRETERS
+        is_expansion_shell = not _expansion_is_resolvable(word.value)
+        if not (is_shell or is_expansion_shell):
+            continue
+        if is_shell:
+            has_c, has_s, has_argument = _shell_option_words(words, index)
+            if has_c:
+                continue  # a -c payload is handled by the wrapper scan
+            if has_argument and not has_s:
+                continue  # runs a script file, not stdin
+        # Is a pipe feeding this word, and where does its producer start?
+        pipe_position = None
+        segment_start = 0
+        group_depth = 0
+        for position, kind in boundaries:
+            if position >= word.start:
+                break
+            if kind in ("(", "{"):
+                group_depth += 1
+            elif kind in (")", "}"):
+                group_depth = max(0, group_depth - 1)
+            elif kind in ("|", "|&"):
+                pipe_position = position
+            elif group_depth == 0:
+                segment_start = position
+        if pipe_position is None:
+            continue
+        producer_words = [
+            other for other in words if segment_start <= other.start < pipe_position
+        ]
+        if not producer_words:
+            continue
+        feeds.append((" ".join(other.value for other in producer_words), index))
+        command_index = _producer_command_index(producer_words)
+        if (
+            command_index is not None
+            and os.path.basename(producer_words[command_index].value) == "printf"
+        ):
+            written = _printf_output_text(producer_words[command_index:])
+            if written is not None:
+                # Scan what printf actually writes, not just the words that
+                # build it: a format string can assemble the command.
+                feeds.append((written, index))
+    return feeds
+
+
+def _env_option_value(
+    words: list[_RmShellWord], index: int, short: str, long: str
+) -> str | None:
+    """The value `env` passes for one of its options, or None when the command
+    does not use it.
+
+    GNU `env` accepts the short form with a detached or attached value
+    (`-C dir`, `-Cdir`), a bundled cluster with a detached value (`-iC dir`),
+    and the long form with an attached value (`--chdir=dir`)."""
+    followers: list[_RmShellWord] = []
+    for follower in words[index + 1 :]:
+        if follower.starts_command:
+            break
+        followers.append(follower)
+    for offset, follower in enumerate(followers):
+        token = follower.value
+        if token == f"-{short}" or token == f"--{long}":
+            return followers[offset + 1].value if offset + 1 < len(followers) else None
+        if token.startswith(f"--{long}="):
+            return token.split("=", 1)[1]
+        if token.startswith(f"-{short}"):
+            return token[len(short) + 1 :]
+        if token.startswith("-") and not token.startswith("--") and short in token[1:]:
+            return followers[offset + 1].value if offset + 1 < len(followers) else None
+    return None
+
+
+def _split_env_string(value: str) -> str | None:
+    """The argv text `env -S` splits its string into, or None when the string
+    carries expansion.
+
+    GNU `env` splits the string on whitespace, honors single and double quotes
+    and backslash escapes, and expands variables; the guard reads the literal
+    words and refuses a string it cannot read statically rather than guessing
+    what `env` would run."""
+    if any(ch in value for ch in "$`"):
+        return None
+    parts: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    i = 0
+    while i < len(value):
+        ch = value[i]
+        if ch == "\\" and i + 1 < len(value):
+            current.append(value[i + 1])
+            i += 2
+            continue
+        if quote is None and ch in "'\"":
+            quote = ch
+            i += 1
+            continue
+        if quote is not None and ch == quote:
+            quote = None
+            i += 1
+            continue
+        if quote is None and ch.isspace():
+            if current:
+                parts.append("".join(current))
+                current = []
+            i += 1
+            continue
+        current.append(ch)
+        i += 1
+    if current:
+        parts.append("".join(current))
+    return " ".join(parts)
+
+
+def _env_split_string_feeds(
+    words: list[_RmShellWord]
+) -> tuple[list[tuple[str, int]], list[str]]:
+    """(feed texts, refusal reasons) for `env -S <string>` argv text.
+
+    GNU `env` splits that string into the argv it runs (`env -S 'rm -rf x'`),
+    so the split words are scanned like any other command text; a string
+    carrying expansion is refused, because the words `env` builds cannot be
+    read statically."""
+    feeds: list[tuple[str, int]] = []
+    reasons: list[str] = []
+    for index, word in enumerate(words):
+        if os.path.basename(word.value) != "env":
+            continue
+        value = _env_option_value(words, index, "S", "split-string")
+        if value is None or not value.strip():
+            continue
+        split = _split_env_string(value)
+        if split is None:
+            reasons.append(
+                f"{value!r}: names the argv env runs through shell expansion,"
+                " which the guard cannot resolve"
+            )
+            continue
+        feeds.append((split, index))
+    return feeds, reasons
+
+
+def _shell_word_end(command: str, start: int) -> int:
+    """Index just past the shell word starting at `start`: quote- and
+    escape-aware, and stopping at whitespace and unquoted shell operators."""
+    i = start
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if ch in " \t\n;&|<>()":
+            break
+        if ch in "'\"":
+            i = _quote_span_end(command, i, n)
+            continue
+        if ch == "\\":
+            i += 2
+            continue
+        i += 1
+    return i
+
+
+def _inline_shell_text_spans(
+    command: str,
+) -> tuple[list[tuple[int, int, int]], list[tuple[int, int, int]]]:
+    """Spans of the shell text a command hands to another shell inline.
+
+    Returns `(here_strings, process_substitutions)`. A here-string span is
+    `(operator_start, operand_start, operand_end)`: `sh <<< 'rm -rf x'` feeds
+    the operand word to the interpreter's stdin. A process-substitution span is
+    `(word_start, interior_start, interior_end)`: `bash <(printf ...)` runs the
+    producer's output as a script file. Both are found outside quoted spans,
+    comments, and here-document bodies, so a command that only prints an
+    operator keeps it as data."""
+    here_strings: list[tuple[int, int, int]] = []
+    substitutions: list[tuple[int, int, int]] = []
+    bodies = _heredoc_body_spans(command)
+    body_index = 0
+    i = 0
+    n = len(command)
+    while i < n:
+        while body_index < len(bodies) and bodies[body_index][1] <= i:
+            body_index += 1
+        if body_index < len(bodies) and bodies[body_index][0] <= i:
+            i = bodies[body_index][1]  # a here-document body never runs inline
+            continue
+        ch = command[i]
+        if ch in "'\"":
+            i = _quote_span_end(command, i, n)
+            continue
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "#" and (i == 0 or command[i - 1] in " \t\n;&|(){}"):
+            while i < n and command[i] != "\n":
+                i += 1
+            continue
+        if ch == "$" and command[i + 1 : i + 3] == "((":
+            i = _arithmetic_substitution_end(command, i)
+            continue
+        if ch == "<" and command[i + 1 : i + 2] == "<":
+            if command[i + 2 : i + 3] == "<":
+                operand_start = i + 3
+                while operand_start < n and command[operand_start] in " \t":
+                    operand_start += 1
+                operand_end = _shell_word_end(command, operand_start)
+                if operand_end > operand_start:
+                    here_strings.append((i, operand_start, operand_end))
+                i = max(operand_end, i + 3)
+                continue
+            i += 2  # a here-document: its body spans were computed above
+            continue
+        if ch == "<" and command[i + 1 : i + 2] == "(":
+            close = _matching_paren(command, i + 1, n)
+            substitutions.append((i, i + 2, close))
+            i = close + 1
+            continue
+        i += 1
+    return here_strings, substitutions
+
+
+def _static_here_string_text(operand: str) -> str | None:
+    """The literal text a here-string feeds to a shell's stdin, or None when
+    the shell builds that text from expansion the guard cannot resolve."""
+    if len(operand) >= 2 and operand[0] == operand[-1] and operand[0] in "'\"":
+        inner = operand[1:-1]
+        if operand[0] == '"' and any(ch in inner for ch in "$`"):
+            return None  # double quotes still expand
+        return inner
+    if any(ch in operand for ch in "$`{}'\"\\"):
+        return None
+    return operand
+
+
+def _payload_reads_stdin(payload: str) -> bool:
+    """True when a `-c` command string can read its own stdin: it names a shell
+    interpreter that takes stdin (`sh -c 'exec sh'`), or a word that expands at
+    run time and could be one. A payload that only carries its own `-c` string
+    keeps stdin unused."""
+    payload_words = _scan_shell_words(payload)
+    for index, word in enumerate(payload_words):
+        if not _expansion_is_resolvable(word.value):
+            return True
+        if os.path.basename(word.value) not in _SHELL_DASH_C_INTERPRETERS:
+            continue
+        followers = [
+            follower.value
+            for follower in payload_words[index + 1 :]
+            if not follower.starts_command
+        ]
+        if not any(
+            token.startswith("-") and "c" in token[1:] and not token.startswith("--")
+            for token in followers
+        ):
+            return True  # a nested shell here reads the operand from stdin
+    return False
+
+
+def _shell_option_words(
+    words: list[_RmShellWord], index: int, skip: tuple[int, int] | None = None
+) -> tuple[bool, bool, bool]:
+    """How the shell word at `index` is invoked: `(has_c, has_s, has_argument)`.
+
+    Options are read the way the shell reads them, so `-o`/`-O`/`--option`
+    consume the following word (`bash -O extglob <<< ...` still takes its
+    command from stdin instead of running `extglob` as a script), and `-s`
+    keeps stdin live with positional arguments. `skip` is a (start, end) span
+    that already belongs to stdin, so its words do not count as arguments."""
+    has_c = has_s = has_argument = False
+    pending_option_value = False
+    for follower in words[index + 1 :]:
+        if follower.starts_command:
+            break
+        if skip is not None and skip[0] <= follower.start and follower.end <= skip[1]:
+            continue
+        token = follower.value
+        if pending_option_value:
+            pending_option_value = False  # the option's value, not a script
+            continue
+        if token.startswith("-") and token != "-":
+            if not token.startswith("--"):
+                has_c = has_c or "c" in token[1:]
+                has_s = has_s or "s" in token[1:]
+                pending_option_value = token[-1] in "oO"
+            elif token == "--option":
+                pending_option_value = True
+            continue
+        has_argument = True
+        break
+    return has_c, has_s, has_argument
+
+
+def _dash_c_payload(words: list[_RmShellWord], index: int) -> str | None:
+    """The command string a shell word runs through `-c`, or None when it
+    carries no such payload."""
+    for offset, follower in enumerate(words[index + 1 :]):
+        if follower.starts_command:
+            break
+        token = follower.value
+        if token.startswith("-") and not token.startswith("--") and "c" in token[1:]:
+            candidate = words[index + 2 + offset : index + 3 + offset]
+            if candidate and not candidate[0].starts_command:
+                return candidate[0].value
+            return None
+    return None
+
+
+def _stdin_shell_interpreter_index(
+    words: list[_RmShellWord],
+    operand_start: int,
+    operand_end: int,
+    candidates: list[int] | None = None,
+) -> int | None:
+    """Index of the word that reads a here-string operand from its stdin: a
+    shell interpreter with no `-c` payload and no script argument (`-s` keeps
+    stdin live with positional arguments), or a word that expands at run time
+    and could be one. `candidates` narrows the scan to the words that could be
+    one, so a command carrying many here-strings stays linear."""
+    for index in range(len(words)) if candidates is None else candidates:
+        word = words[index]
+        if operand_start <= word.start and word.end <= operand_end:
+            continue  # the operand word itself
+        is_shell = os.path.basename(word.value) in _SHELL_DASH_C_INTERPRETERS
+        if not (is_shell or not _expansion_is_resolvable(word.value)):
+            continue
+        has_c, has_s, has_argument = _shell_option_words(
+            words, index, (operand_start, operand_end)
+        )
+        if has_c:
+            # A `-c` payload ignores stdin, unless its own command reads it.
+            payload = _dash_c_payload(words, index)
+            if payload is None or not _payload_reads_stdin(payload):
+                continue
+            return index
+        if has_argument and not has_s:
+            continue  # runs a script file, not stdin
+        return index
+    return None
+
+
+def _here_string_shell_feed_texts(
+    command: str, words: list[_RmShellWord]
+) -> tuple[list[tuple[str, int]], list[str]]:
+    """(feed texts, refusal reasons) for here-strings a shell executes.
+
+    `sh <<< 'rm -rf x'` hands the operand to the interpreter's stdin exactly
+    like `printf ... | sh`, so a bare stdin shell's operand is scanned as
+    command text. A data consumer (`cat <<< ...`) keeps its operand as data.
+    An operand the shell builds from expansion (`sh <<< "$payload"`) runs text
+    the guard cannot check statically, so it is refused."""
+    feeds: list[tuple[str, int]] = []
+    reasons: list[str] = []
+    if "<<<" not in command:
+        return feeds, reasons  # cheap gate: no here-string to check
+    here_strings, _substitutions = _inline_shell_text_spans(command)
+    candidates = [
+        index
+        for index, word in enumerate(words)
+        if os.path.basename(word.value) in _SHELL_DASH_C_INTERPRETERS
+        or not _expansion_is_resolvable(word.value)
+    ]
+    for _operator, operand_start, operand_end in here_strings:
+        interpreter = _stdin_shell_interpreter_index(
+            words, operand_start, operand_end, candidates
+        )
+        if interpreter is None:
+            continue
+        operand = command[operand_start:operand_end]
+        literal = _static_here_string_text(operand)
+        if literal is None:
+            reasons.append(
+                f"{operand!r}: a here-string feeding a shell names the text it"
+                " runs through expansion, which the guard cannot resolve"
+            )
+            continue
+        if literal.strip():
+            feeds.append((literal, interpreter))
+    return feeds, reasons
+
+
+def _process_substitution_script_reasons(
+    command: str, words: list[_RmShellWord], runner_indices: list[int]
+) -> list[str]:
+    """Refusal reasons for process substitutions a script-running word consumes.
+
+    `bash <(printf 'rm -rf /\n')` runs the producer's output as a script file,
+    so the text the shell executes is built at run time and cannot be checked:
+    refuse it. A data argument (`cat <(...)`, `diff <(...) <(...)`) is not a
+    script, and a runner with its own `-c` payload or script argument keeps the
+    substitution as a positional argument, so both stay untouched."""
+    reasons: list[str] = []
+    if "<(" not in command:
+        return reasons  # cheap gate: no process substitution to check
+    _here_strings, substitutions = _inline_shell_text_spans(command)
+    for word_start, interior_start, interior_end in substitutions:
+        for index in runner_indices:
+            word = words[index]
+            if word.start >= word_start:
+                continue
+            has_c = has_argument = False
+            for follower in words[index + 1 :]:
+                if follower.starts_command:
+                    break
+                if word_start <= follower.start and follower.end <= interior_end:
+                    continue  # the substitution is the script argument itself
+                token = follower.value
+                if token.startswith("-") and token != "-":
+                    if not token.startswith("--"):
+                        has_c = has_c or "c" in token[1:]
+                    continue
+                has_argument = True
+                break
+            if has_c or has_argument:
+                continue
+            reasons.append(
+                f"{command[word_start : interior_end + 1]!r}: hands this shell a"
+                " process substitution whose produced script text the guard"
+                " cannot check"
+            )
+            break
+    return reasons
+
+
+def _rm_feed_reasons(
+    text: str,
+    prepared: str,
+    words: list[_RmShellWord],
+    *,
+    workspace_root: str,
+    starts_for: Callable[[int], list[str]],
+    reassigns_home: bool,
+    reassigns_pwd: bool,
+    cdpath_untrackable: bool,
+) -> list[str]:
+    """Refusal reasons for command text a shell is handed at run time.
+
+    Pipelines feeding a bare stdin shell run the producer's output as
+    commands, and a here-string operand is the same text for an interpreter's
+    stdin, so both are scanned against the interpreter's tracked directories
+    (`starts_for`). A process substitution consumed as a script argument is
+    refused instead: its produced script text cannot be checked. The fed shell
+    parses its input one command at a time, so alias definitions inside the fed
+    text substitute command words there too."""
+    reasons: list[str] = []
+    reasons.extend(
+        _process_substitution_script_reasons(
+            text, words, _script_runner_word_indices(words)
+        )
+    )
+    here_feeds, here_reasons = _here_string_shell_feed_texts(text, words)
+    reasons.extend(here_reasons)
+    env_feeds, env_reasons = _env_split_string_feeds(words)
+    reasons.extend(env_reasons)
+    for feed_text, interp_index in (
+        *_stdin_shell_feed_texts(prepared, words),
+        *here_feeds,
+        *env_feeds,
+    ):
+        for variant in (feed_text, _interpret_shell_escapes(feed_text)):
+            # A fed text can itself wrap commands in heredocs; split it
+            # with the runner-aware scanner before masking, so the
+            # blanket redirection masking cannot blank an interpreter-fed
+            # body here (the blanked outer still masks > redirects).
+            feed_stack = [variant]
+            while feed_stack:
+                fed = feed_stack.pop()
+                expanded_fed, complete = _expand_effective_aliases(fed)
+                if not complete:
+                    reasons.append(
+                        "the text fed to this shell carries an alias chain"
+                        " longer than the guard expands, so the commands it"
+                        " runs cannot be checked"
+                    )
+                elif expanded_fed is not None:
+                    feed_stack.append(expanded_fed)
+                fed_outer, inner_texts = _rm_guard_scan_texts(fed)
+                feed_stack.extend(inner_texts)
+                fed_prepared = _mask_shell_redirections(fed_outer)
+                fed_words = _scan_shell_words(fed_prepared)
+                if _wrapped_payloads_hide_recursive_force_rm(
+                    fed_prepared, words=fed_words
+                ):
+                    raise DestructiveRmRefusalError(_format_rm_wrapper_refusal())
+                if _script_runner_word_indices(fed_words):
+                    # The fed shell reads $BASH_ENV before it runs anything, so
+                    # an assignment inside the fed text hides a startup file
+                    # exactly like one in the outer command
+                    # (`env -S 'BASH_ENV=startup.sh bash -c true'`).
+                    reasons.extend(_shell_startup_env_reasons(fed_words))
+                reasons.extend(
+                    _process_substitution_script_reasons(
+                        fed_outer, fed_words, _script_runner_word_indices(fed_words)
+                    )
+                )
+                fed_invocations = _find_rf_rm_invocations_in_words(fed_words)
+                if fed_invocations:
+                    for start in starts_for(interp_index):
+                        fed_tracked_at = _tracked_cwd_at_words(
+                            fed_prepared,
+                            fed_words,
+                            start,
+                            home_untrackable=reassigns_home,
+                            pwd_untrackable=reassigns_pwd,
+                            cdpath_untrackable=cdpath_untrackable,
+                        )
+                        reasons.extend(
+                            _rm_invocation_reasons(
+                                fed_words,
+                                fed_invocations,
+                                workspace_root,
+                                fed_tracked_at,
+                                reassigns_home,
+                                reassigns_pwd,
+                            )
+                        )
+                reasons.extend(_unresolvable_expansion_rm_reasons(fed_words))
+    return reasons
+
+
+def _rm_guard_scan_texts(normalized: str) -> tuple[str, list[str]]:
+    """Scan texts for the rm guard: the command with here-document bodies
+    blanked, plus each body that can reach a script runner as its own
+    command text (returned as a pair).
+
+    A heredoc body is data for the command that reads it (`cat <<EOF`), so
+    blanking it avoids false refusals from data text. But a body can still
+    run through stdin (`sh <<EOF`), a pipeline consumer after the terminator
+    (`{ cat <<EOF ... } | sh`), or a script file written in the same command
+    and run through `sh s.sh`, `./s.sh`, `. s.sh`, or `source s.sh`; when
+    any word outside the bodies can run shell text, every body is scanned as
+    its own command, so its rm invocations are still seen and an unbalanced
+    quote inside one body cannot swallow the scan of later text. Bodies that
+    cannot reach a runner are never scanned as commands, but their command
+    substitution stays live in the outer text: the shell expands $(...) and
+    backticks in an unquoted body even when the consumer only prints it.
+    Unterminated heredocs report no span and stay part of the outer text
+    (conservative)."""
+    spans = _heredoc_body_spans(normalized)
+    if not spans:
+        return normalized, []
+    outer = list(normalized)
+    for start, end, _expands in spans:
+        for pos in range(start, end):
+            outer[pos] = " "
+    outer_text = "".join(outer)
+    if not _heredoc_bodies_reach_script_runners(outer_text):
+        # Data bodies are inert for the outer scan, but their command
+        # substitution stays live: the shell expands $(...) and backticks in
+        # an unquoted heredoc body even when the consumer (cat) only prints
+        # the result, so those spans still execute (same rule as the git
+        # guard's heredoc masking).
+        outer = list(normalized)
+        for start, end, expands in spans:
+            _mask_heredoc_body(outer, normalized, start, end, expands)
+        outer_text = "".join(outer)
+        return outer_text, []
+    return outer_text, [normalized[start:end] for start, end, _expands in spans]
+
+
+def _format_rm_operand_refusal(reasons: list[str], live_bypass_attempt: bool) -> str:
+    listed = reasons[:_MAX_RM_REFUSALS_LISTED]
+    elided = len(reasons) - len(listed)
+    lines = [
+        "Refusing to run this recursive-force rm command: it targets paths"
+        " outside the kernel workspace or protected dot paths.",
+        *(f"  {reason}" for reason in listed),
+    ]
+    if elided > 0:
+        lines.append(f"  ... and {elided} more")
+    lines += [
+        "",
+        "Delete inside the workspace with explicit subdirectories instead.",
+        "To delete these intentionally, retry with"
+        " bash(command, allow_destructive_rm=True), or set"
+        f" {BASH_DESTRUCTIVE_RM_BYPASS_ENV}=1 in the kernel's launch"
+        " environment (the value is frozen when the kernel starts).",
+    ]
+    if live_bypass_attempt:
+        lines += [
+            "",
+            f"WARNING: {BASH_DESTRUCTIVE_RM_BYPASS_ENV} was set in os.environ"
+            " after the kernel started. Mid-session writes are ignored by"
+            " design; set the variable before the kernel launches.",
+        ]
+    return "\n".join(lines)
+
+
+def _format_rm_wrapper_refusal() -> str:
+    return "\n".join(
+        [
+            "Refusing to run this recursive-force rm command: it wraps rm in"
+            " eval, a `sh -c`/`bash -c` payload, or a trap action, and the"
+            " paths it would delete cannot be checked safely.",
+            "",
+            "Run the deletion directly with explicit paths, or retry with"
+            " bash(command, allow_destructive_rm=True), or set"
+            f" {BASH_DESTRUCTIVE_RM_BYPASS_ENV}=1 in the kernel's launch"
+            " environment (the value is frozen when the kernel starts).",
+        ]
+    )
+
+
+def _command_reassigns_env(words: list[_RmShellWord], name: str) -> bool:
+    """True when the command assigns, appends to, exports, or unsets `name`,
+    so operands whose expansion depends on it cannot be taken from the
+    kernel environment.
+
+    Only words the shell reads as assignments count: an assignment prefix
+    (`PWD=/x cmd`), an argument to an assignment builtin (`export PWD=/x`), or
+    an assignment the shell applies after a keyword or grouping token
+    (`{ PWD=/x; }`, `if true; then PWD=/x; fi`, `for i in 1; do PWD=/x; done`).
+    An ordinary argument that merely looks like one (`echo PWD=/tmp`) leaves the
+    environment alone, so it must not make the expansion untrackable."""
+    assignment_slot = True
+    builtin_args = False
+    for word in words:
+        token = word.value
+        if token in _COMMAND_CONTEXT_TOKENS:
+            # A keyword or grouping token opens a command context without
+            # being the command word, so the assignment slot survives it.
+            assignment_slot = True
+            builtin_args = False
+            continue
+        if word.starts_command:
+            assignment_slot = True
+            builtin_args = False
+        if (assignment_slot or builtin_args) and re.match(rf"^{name}\+?=", token):
+            return True
+        if builtin_args:
+            if token == name:
+                return True  # `unset PWD`, `export PWD`
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\+?=", token) or token.startswith("-"):
+                continue  # another assignment or option keeps the argument list
+            assignment_slot = builtin_args = False
+            continue
+        if token in _EXPORT_COMMANDS or token == "unset":
+            builtin_args = True
+            continue
+        if assignment_slot and re.match(r"^[A-Za-z_][A-Za-z0-9_]*\+?=", token):
+            continue  # another assignment prefix: the command word still follows
+        assignment_slot = False
+    return False
+
+
+def _rm_invocation_reasons(
+    words: list[_RmShellWord],
+    invocations: list[tuple[int, list[str]]],
+    workspace_root: str,
+    tracked_at: list[list[str | None]],
+    reassigns_home: bool,
+    reassigns_pwd: bool,
+) -> list[str]:
+    """Refusal reasons for one scan text's recursive-force rm invocations,
+    resolving operands against every precomputed candidate directory (any
+    escape refuses)."""
+    reasons: list[str] = []
+    for word_index, operands in invocations:
+        candidates = tracked_at[word_index]
+        if not operands:
+            reasons.append(
+                "receives no explicit operand, so names could arrive from"
+                " xargs or stdin and cannot be checked"
+            )
+            continue
+        if any(candidate is None for candidate in candidates):
+            reasons.append(
+                "runs after a cd/pushd the guard cannot resolve, so its"
+                " relative targets cannot be checked"
+            )
+            continue
+        for operand in operands:
+            if reassigns_home and (
+                operand.startswith("~") or re.match(r"^\$\{?HOME", operand)
+            ):
+                reasons.append(
+                    f"{operand!r}: the command reassigns HOME, so the"
+                    " expansion the shell performs cannot be tracked"
+                )
+                continue
+            if reassigns_pwd and re.match(r"^\$\{?PWD", operand):
+                reasons.append(
+                    f"{operand!r}: the command reassigns PWD, so the"
+                    " expansion the shell performs cannot be tracked"
+                )
+                continue
+            reason = None
+            for candidate in candidates:
+                reason = _resolve_rm_operand(operand, workspace_root, candidate)
+                if reason:
+                    break
+            if reason:
+                reasons.append(f"{operand!r}: {reason}")
+    return reasons
+
+
+def _expand_effective_aliases(text: str) -> tuple[str | None, bool]:
+    """`(text with every command word an alias replaces substituted by its body
+    or None, complete)`.
+
+    Aliases substitute command text at parse time, so a later line can run a
+    command the source never names (`alias del='rm'` then `del -rf /outside`).
+    Only definitions the shell can still apply count: it reads one complete
+    command at a time, so a definition only reaches a command on a *later*
+    line, and a definition is dropped once its name has been substituted so a
+    self-referential alias cannot grow without bound. The substitution is
+    iterated (up to _MAX_ALIAS_EXPANSION_PASSES), so alias chains resolve;
+    `complete` is False when the pass limit was reached with substitutions
+    still pending, which the caller refuses instead of scanning a partial
+    expansion."""
+    current = text
+    for _pass in range(_MAX_ALIAS_EXPANSION_PASSES):
+        words = _scan_shell_words(current)
+        if not any(word.value in ("alias", "unalias") for word in words):
+            return (current if current != text else None), True
+        definitions: list[tuple[int, str, str, tuple[int, int]]] = []
+        edits: list[tuple[int, int, str]] = []
+        for index, word in enumerate(words):
+            if word.value in ("alias", "unalias"):
+                line_end = current.find("\n", word.end)
+                if line_end == -1:
+                    continue  # a same-line definition parses before it applies
+                for follower in words[index + 1 :]:
+                    if follower.starts_command:
+                        break
+                    if word.value == "unalias":
+                        definitions.append(
+                            (line_end, follower.value, "", (follower.start, follower.start))
+                        )
+                        continue
+                    name, separator, body = follower.value.partition("=")
+                    if separator and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                        definitions.append(
+                            (line_end, name, body, (follower.start, follower.end))
+                        )
+                continue
+            if not word.starts_command:
+                continue
+            chosen: tuple[int, str, str, tuple[int, int]] | None = None
+            for definition in definitions:
+                if definition[0] >= word.start:
+                    break
+                if definition[1] == word.value:
+                    chosen = definition
+            if chosen is None:
+                continue
+            if not chosen[2]:
+                continue  # unaliased (or an empty body): nothing to substitute
+            edits.append((word.start, word.end, chosen[2]))
+            start, end = chosen[3]
+            edits.append((start, end, " " * (end - start)))
+        if not edits:
+            return (current if current != text else None), True
+        for start, end, replacement in reversed(edits):
+            current = current[:start] + replacement + current[end:]
+    return current, False
+
+
+def _built_command_rm_reasons(
+    expanded: str,
+    *,
+    workspace_root: str,
+    starts: list[str],
+    reassigns_home: bool,
+    reassigns_pwd: bool,
+    cdpath_untrackable: bool,
+) -> list[str]:
+    """Refusal reasons for command text the shell builds at run time.
+
+    The text is scanned as its own command against every directory the
+    invocation may run in, because the shell runs it exactly as written here:
+    an alias can turn `del victim` into `rm -rf victim`, and a literal
+    assignment can turn `$X` into `rm -rf /outside`. Command text that wraps rm
+    (`alias wipe='sh -c "rm -rf x"'`) is refused like any other wrapper
+    payload."""
+    prepared = _mask_shell_redirections(expanded)
+    words = _scan_shell_words(prepared)
+    if _wrapped_payloads_hide_recursive_force_rm(prepared, words=words):
+        raise DestructiveRmRefusalError(_format_rm_wrapper_refusal())
+    reasons: list[str] = []
+    home = reassigns_home or _command_reassigns_env(words, "HOME")
+    pwd = reassigns_pwd or _command_reassigns_env(words, "PWD")
+    cdpath = cdpath_untrackable or _command_reassigns_env(words, "CDPATH")
+    invocations = _find_rf_rm_invocations_in_words(words)
+    for start in starts:
+        reasons.extend(
+            _rm_invocation_reasons(
+                words,
+                invocations,
+                workspace_root,
+                _tracked_cwd_at_words(
+                    prepared,
+                    words,
+                    start,
+                    home_untrackable=home,
+                    pwd_untrackable=pwd,
+                    cdpath_untrackable=cdpath,
+                ),
+                home,
+                pwd,
+            )
+        )
+    reasons.extend(_unresolvable_expansion_rm_reasons(words))
+    return reasons
+
+
+def _alias_expanded_rm_reasons(
+    text: str,
+    *,
+    workspace_root: str,
+    starts: list[str],
+    reassigns_home: bool,
+    reassigns_pwd: bool,
+    cdpath_untrackable: bool,
+) -> list[str]:
+    """Refusal reasons for the command text with effective aliases substituted.
+
+    A later line can invoke a command the source never names (`alias
+    del='rm'`), so the substituted text is scanned as its own command; see
+    _built_command_rm_reasons."""
+    expanded, complete = _expand_effective_aliases(text)
+    if not complete:
+        return [
+            "its alias chain is longer than the guard expands, so the command"
+            " it runs cannot be checked"
+        ]
+    if expanded is None:
+        return []
+    return _built_command_rm_reasons(
+        expanded,
+        workspace_root=workspace_root,
+        starts=starts,
+        reassigns_home=reassigns_home,
+        reassigns_pwd=reassigns_pwd,
+        cdpath_untrackable=cdpath_untrackable,
+    )
+
+
+def _assigned_command_rm_reasons(
+    text: str,
+    *,
+    workspace_root: str,
+    starts: list[str],
+    reassigns_home: bool,
+    reassigns_pwd: bool,
+    cdpath_untrackable: bool,
+) -> list[str]:
+    """Refusal reasons for command words the command builds through assignment.
+
+    `X='rm -rf /outside'; $X` runs exactly that invocation, so a command word
+    that is a plain `$NAME` reference is substituted with the literal value the
+    command assigned to NAME and rescanned; a word whose value the command
+    builds from expansion or substitution (`X=$(cat cmd); $X`) runs text the
+    guard cannot read, so it is refused. A reference the command never assigns
+    stays unresolvable, which the caller's refusal keeps covering.
+
+    An assignment is recorded only where the shell reads one, the same position
+    rule `_command_reassigns_env` applies for HOME/PWD: an assignment prefix, a
+    word after a keyword or grouping token, or an argument to `export`,
+    `declare`, `typeset`, `local`, or `readonly` when that builtin is the
+    command. An ordinary argument that merely looks like one (`echo a X=b`) is
+    data for its command, so it cannot overwrite a recorded assignment and hide
+    the text a later `$NAME` runs. `unset` removes only plain names in its own
+    argument list, and `-f` names functions, so neither can hide a variable.
+
+    The reference gate covers every position the shell runs a word from: a
+    command boundary, an assignment prefix (`FOO=1 $X`), the word after an
+    executing keyword (`{ $X; }`, `if $X; then ...; fi`), or after an
+    exec-style prefix (`env $X`, `command $X`); exec-style options and their
+    arguments keep the stated option-argument residual, and list positions
+    (`for i in $X`) stay unresolvable.
+
+    Redirections are masked before the word scan (character positions are
+    kept), so a redirection target the scanner would otherwise mark as the
+    first word of a fresh command (`cat > if X=b`) stays what the shell reads
+    it as: the target and the words after it belong to the running command,
+    never to a new command position."""
+    words = _scan_shell_words(_mask_shell_redirections(text))
+    assignments: dict[str, tuple[str, bool]] = {}
+    edits: list[tuple[int, int, str]] = []
+    reasons: list[str] = []
+    assignment_slot = True
+    builtin_args = ""
+    unset_functions = False
+    after_assignment = False
+    after_executing_keyword = False
+    after_exec_style = False
+    for word in words:
+        token = word.value
+        if token in _COMMAND_CONTEXT_TOKENS:
+            if builtin_args and not (word.starts_command or assignment_slot):
+                # A reserved word inside a builtin's argument list is one of
+                # its arguments (`export if` exports a variable named "if"),
+                # so the list keeps running.
+                continue
+            # A keyword or grouping token opens a command context without
+            # being the command word, so an assignment after it still counts
+            # (`{ PWD=/x; }`, `if true; then PWD=/x; fi`) — but only when the
+            # token itself is at command position: a reserved word in an
+            # argument position (`echo if X=b`) is data for its command and
+            # cannot reopen the slot.
+            builtin_args = ""
+            unset_functions = False
+            after_assignment = False
+            after_exec_style = False
+            if word.starts_command or assignment_slot:
+                assignment_slot = True
+                after_executing_keyword = token in _EXECUTING_KEYWORDS
+            else:
+                assignment_slot = False
+                after_executing_keyword = False
+            continue
+        if word.starts_command:
+            assignment_slot = True
+            builtin_args = ""
+            unset_functions = False
+            after_assignment = False
+            after_executing_keyword = False
+            after_exec_style = False
+        name, separator, assigned = token.partition("=")
+        appended = name.endswith("+")
+        base = name[:-1] if appended else name
+        is_assignment = separator and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", base)
+        if builtin_args:
+            # The builtin itself is the command word, and its argument list
+            # runs to the command boundary (a `starts_command` word or a
+            # context token ends it at the top of the loop), so a plain name
+            # or option never ends the list early the way the shell's parser
+            # does not: `export A X=1` assigns X.
+            if is_assignment and builtin_args != "unset":
+                # The shell expands the assigned word at run time, so a value
+                # built from an expansion or substitution cannot be read
+                # statically.
+                literal = not any(ch in text[word.start : word.end] for ch in "$`\\")
+                if appended and base not in assignments:
+                    assignments[base] = (assigned, False)
+                else:
+                    previous, previous_literal = assignments.get(base, ("", True))
+                    assignments[base] = (
+                        previous + assigned if appended else assigned,
+                        literal and previous_literal,
+                    )
+            elif builtin_args == "unset":
+                if token == "-f":
+                    # `unset -f` names functions, so the variables stay
+                    # recorded and a later reference still resolves.
+                    unset_functions = True
+                elif (
+                    not unset_functions
+                    and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", token)
+                ):
+                    assignments.pop(token, None)
+            # A plain name exports an existing value (no assignment to
+            # record), options belong to the builtin, and any other word is
+            # the builtin's own error: all keep the argument list.
+            continue
+        if is_assignment and assignment_slot:
+            # The shell expands the assigned word at run time, so a value built
+            # from an expansion or substitution cannot be read statically.
+            literal = not any(ch in text[word.start : word.end] for ch in "$`\\")
+            if appended and base not in assignments:
+                # The shell appends to a value this command never set (the
+                # environment, `read`, or another builtin), so the text a later
+                # `$NAME` runs cannot be read: keep the appended piece but mark
+                # the value untrackable, and refuse the reference.
+                assignments[base] = (assigned, False)
+            else:
+                previous, previous_literal = assignments.get(base, ("", True))
+                assignments[base] = (
+                    previous + assigned if appended else assigned,
+                    literal and previous_literal,
+                )
+            after_assignment = True
+            continue
+        if is_assignment:
+            # An ordinary argument that merely looks like an assignment is
+            # data for its command: it cannot overwrite a recorded assignment
+            # and hide the text a later `$NAME` runs.
+            continue
+        command_position = (
+            word.starts_command
+            or after_assignment
+            or after_executing_keyword
+            or after_exec_style
+        )
+        if command_position and (token in _EXPORT_COMMANDS or token == "unset"):
+            builtin_args = token
+            assignment_slot = False
+            after_assignment = False
+            after_executing_keyword = False
+            after_exec_style = False
+            continue
+        if command_position:
+            reference = _VARIABLE_REFERENCE.fullmatch(token)
+            if reference is not None:
+                assignment = assignments.get(reference.group(1) or reference.group(2))
+                if assignment is not None:
+                    assigned, literal = assignment
+                    if not literal:
+                        reasons.append(
+                            f"{token!r}: is assigned text the guard cannot read"
+                            " statically, so the command it runs cannot be"
+                            " checked"
+                        )
+                    else:
+                        edits.append((word.start, word.end, assigned))
+            # This word is the command word, so the prefix run ends here; an
+            # exec-style prefix runs its next word as the command, so a
+            # reference after it substitutes too.
+            after_exec_style = token in _EXEC_STYLE_PREFIXES
+            after_executing_keyword = False
+            after_assignment = False
+            assignment_slot = False
+            continue
+        assignment_slot = False
+        after_assignment = False
+        after_executing_keyword = False
+        after_exec_style = False
+    if not edits:
+        return reasons
+    resolved = text
+    for start, end, replacement in reversed(edits):
+        resolved = resolved[:start] + replacement + resolved[end:]
+    reasons.extend(
+        _built_command_rm_reasons(
+            resolved,
+            workspace_root=workspace_root,
+            starts=starts,
+            reassigns_home=reassigns_home,
+            reassigns_pwd=reassigns_pwd,
+            cdpath_untrackable=cdpath_untrackable,
+        )
+    )
+    return reasons
+
+
+def _shell_startup_env_reasons(words: list[_RmShellWord]) -> list[str]:
+    """Refusal reasons for assignments that point a child shell's startup at
+    text the guard cannot check.
+
+    Non-interactive bash sources `$BASH_ENV` before it runs a command, so
+    `BASH_ENV=file bash -c ...` executes a file the guard never sees (the spawn
+    already strips an inherited `BASH_ENV`). Exported shell functions travel
+    through the environment the same way; their bodies are scanned as wrapper
+    payloads by _wrapped_payloads_hide_recursive_force_rm."""
+    reasons: list[str] = []
+    for word in words:
+        name, separator, value = word.value.partition("=")
+        if separator and name == "BASH_ENV" and value:
+            reasons.append(
+                f"{word.value!r}: points a child shell's startup file at a path"
+                " whose commands the guard cannot check"
+            )
+    return reasons
+
+
+def _guard_destructive_rm(command: str, allow_destructive_rm: bool) -> None:
+    """Refuse recursive-force rm invocations whose operands escape the
+    workspace or name protected paths. The word scan is pure string work and
+    runs only when an rm invocation carries both flags, so other commands pay
+    nothing. The scan covers exactly what the spawned shell will run (spawn
+    prefix included) and refuses what it cannot resolve statically: quoted
+    shell `-c` and eval payloads, quote-blind substitution layouts,
+    expansion-hidden commands and flags, cd/pushd relocations, brace
+    expansion, HOME/PWD reassignments, symlinked operands, and paths that do
+    not exist yet."""
+    frozen_bypass = _is_truthy_env_value(_BASH_RM_BYPASS_AT_KERNEL_START)
+    if allow_destructive_rm or frozen_bypass:
+        return
+    # Scan what the shell will run: the spawn prepends
+    # PRIME_AGENT_BASH_COMMAND_PREFIX, and that env value is model-writable
+    # mid-session, so the guard must not assume it stays benign.
+    normalized = _join_line_continuations(_with_prefix(command))
+    outer_text, body_texts = _rm_guard_scan_texts(normalized)
+    reasons: list[str] = []
+    try:
+        cwd = os.getcwd()
+        workspace_root = os.path.realpath(cwd)
+    except OSError:
+        cwd = None  # the spawn itself will fail; the guard must not mask that error
+    # ---- outer pass ----
+    prepared = _mask_shell_redirections(outer_text)
+    # The wrapper scan matches parsed word values, so escaped names
+    # (`t\\rap`, `ev\\al`) cannot slip past a raw substring gate; it runs on
+    # the pre-scanned words, so other commands only pay a light pass.
+    words = _scan_shell_words(prepared)
+    if _wrapped_payloads_hide_recursive_force_rm(prepared, words=words):
+        raise DestructiveRmRefusalError(_format_rm_wrapper_refusal())
+    invocations = _find_rf_rm_invocations_in_words(words)
+    runner_indices = _script_runner_word_indices(words)
+    reassigns_home = _command_reassigns_env(words, "HOME")
+    reassigns_pwd = _command_reassigns_env(words, "PWD")
+    if cwd is None:
+        if invocations or body_texts:
+            return  # the spawn itself will fail; the guard must not mask that error
+        reasons.extend(_unresolvable_expansion_rm_reasons(words))
+    else:
+        cdpath_untrackable = bool(os.environ.get("CDPATH")) or _command_reassigns_env(
+            words, "CDPATH"
+        )
+        tracked_at = _tracked_cwd_at_words(
+            prepared,
+            words,
+            workspace_root,
+            home_untrackable=reassigns_home,
+            pwd_untrackable=reassigns_pwd,
+            cdpath_untrackable=cdpath_untrackable,
+        )
+        reasons.extend(
+            _rm_invocation_reasons(
+                words, invocations, workspace_root, tracked_at, reassigns_home, reassigns_pwd
+            )
+        )
+        reasons.extend(_unresolvable_expansion_rm_reasons(words))
+        if runner_indices:
+            # A command-level BASH_ENV points a child shell's startup file at a
+            # path whose commands the guard never sees (the spawn already
+            # strips an inherited value).
+            reasons.extend(_shell_startup_env_reasons(words))
+        # Aliases substitute command text at parse time, so a later line can
+        # run a command the source never names, and a literal assignment can
+        # hand a later `$NAME` command word a whole invocation.
+        for built_command_reasons in (
+            _alias_expanded_rm_reasons,
+            _assigned_command_rm_reasons,
+        ):
+            reasons.extend(
+                built_command_reasons(
+                    outer_text,
+                    workspace_root=workspace_root,
+                    starts=[workspace_root],
+                    reassigns_home=reassigns_home,
+                    reassigns_pwd=reassigns_pwd,
+                    cdpath_untrackable=cdpath_untrackable,
+                )
+            )
+        # The bodies run wherever the outer command has relocated to: resolve
+        # them against every script runner's tracked directory (any escape
+        # refuses), and inherit the outer HOME/PWD reassignments.
+        runner_starts = list(
+            dict.fromkeys(
+                candidate for word_index in runner_indices for candidate in tracked_at[word_index]
+            )
+        )
+        # Pipelines feeding a bare stdin shell run the producer's output as
+        # commands, and a here-string hands a bare stdin shell the text it
+        # runs: scan both against the interpreter's tracked state.
+        reasons.extend(
+            _rm_feed_reasons(
+                outer_text,
+                prepared,
+                words,
+                workspace_root=workspace_root,
+                starts_for=lambda index: tracked_at[index],
+                reassigns_home=reassigns_home,
+                reassigns_pwd=reassigns_pwd,
+                cdpath_untrackable=cdpath_untrackable,
+            )
+        )
+    # ---- body passes ----
+    # A body can itself wrap commands in heredocs; split it with the
+    # runner-aware scanner before masking, so the blanket redirection
+    # masking cannot blank an interpreter-fed body here either (the blanked
+    # outer still masks > redirects). Data bodies never come back from the
+    # splitter, so consumer-aware silencing survives. Each queued text
+    # carries the HOME/PWD/CDPATH reassignment context of everything above
+    # it: a reassignment made in an outer body keeps tracking the bodies it
+    # wraps, the way the pre-split whole-body scan saw it.
+    scan_queue = [
+        (text, reassigns_home, reassigns_pwd, cdpath_untrackable)
+        for text in body_texts
+    ]
+    while scan_queue:
+        body_text, body_home, body_pwd, body_cdpath_inherited = scan_queue.pop()
+        if "$(" in body_text or "`" in body_text:
+            # An unquoted heredoc body is expanded before the consuming
+            # interpreter sees it, and the child executes the substitution
+            # output either way: that text is unknowable at guard time.
+            reasons.append(
+                "its here-document body carries command substitution, whose"
+                " output the consuming shell executes and the guard cannot"
+                " check statically"
+            )
+        body_outer, inner_body_texts = _rm_guard_scan_texts(body_text)
+        body_prepared = _mask_shell_redirections(body_outer)
+        body_words = _scan_shell_words(body_prepared)
+        if _wrapped_payloads_hide_recursive_force_rm(body_prepared, words=body_words):
+            raise DestructiveRmRefusalError(_format_rm_wrapper_refusal())
+        body_reassigns_home = body_home or _command_reassigns_env(body_words, "HOME")
+        body_reassigns_pwd = body_pwd or _command_reassigns_env(body_words, "PWD")
+        body_cdpath = body_cdpath_inherited or bool(os.environ.get("CDPATH")) or _command_reassigns_env(
+            body_words, "CDPATH"
+        )
+        scan_queue.extend(
+            (text, body_reassigns_home, body_reassigns_pwd, body_cdpath)
+            for text in inner_body_texts
+        )
+        # A body can itself feed a shell inline: a pipeline producer or a
+        # here-string inside it hands that shell text to run.
+        reasons.extend(
+            _rm_feed_reasons(
+                body_outer,
+                body_prepared,
+                body_words,
+                workspace_root=workspace_root,
+                starts_for=lambda _index: runner_starts or [workspace_root],
+                reassigns_home=body_reassigns_home,
+                reassigns_pwd=body_reassigns_pwd,
+                cdpath_untrackable=body_cdpath,
+            )
+        )
+        # A body runs in its own shell, so aliases it defines and invokes on a
+        # later line, or a command word it builds by assignment, substitute
+        # command text the body never names.
+        for body_built_reasons in (
+            _alias_expanded_rm_reasons,
+            _assigned_command_rm_reasons,
+        ):
+            reasons.extend(
+                body_built_reasons(
+                    body_outer,
+                    workspace_root=workspace_root,
+                    starts=runner_starts or [workspace_root],
+                    reassigns_home=body_reassigns_home,
+                    reassigns_pwd=body_reassigns_pwd,
+                    cdpath_untrackable=body_cdpath,
+                )
+            )
+        body_invocations = _find_rf_rm_invocations_in_words(body_words)
+        if not body_invocations:
+            reasons.extend(_unresolvable_expansion_rm_reasons(body_words))
+            continue
+        for start in runner_starts or [workspace_root]:
+            body_tracked_at = _tracked_cwd_at_words(
+                body_prepared,
+                body_words,
+                start,
+                home_untrackable=body_reassigns_home,
+                pwd_untrackable=body_reassigns_pwd,
+                cdpath_untrackable=body_cdpath,
+            )
+            reasons.extend(
+                _rm_invocation_reasons(
+                    body_words,
+                    body_invocations,
+                    workspace_root,
+                    body_tracked_at,
+                    body_reassigns_home,
+                    body_reassigns_pwd,
+                )
+            )
+        reasons.extend(_unresolvable_expansion_rm_reasons(body_words))
+    if reasons:
+        live_bypass_attempt = _is_truthy_env_value(
+            os.environ.get(BASH_DESTRUCTIVE_RM_BYPASS_ENV)
+        )
+        raise DestructiveRmRefusalError(
+            _format_rm_operand_refusal(reasons, live_bypass_attempt)
+        )
+
+
+def bash(command: str, *, allow_destructive_git: bool = False, allow_destructive_rm: bool = False) -> BashHandle:
     """Start a shell command immediately; await the handle for the result.
 
     `await bash(cmd)` is a one-shot: cancelling the await (e.g. an interrupt)
@@ -3227,11 +5803,23 @@ def bash(command: str, *, allow_destructive_git: bool = False) -> BashHandle:
     only when the discard is intentional. PI_BASH_ALLOW_DESTRUCTIVE_GIT=1 in
     the launching environment disables the guard for the whole kernel; it is
     read once at kernel start, so writing it mid-session has no effect.
+
+    Recursive-force rm commands (`rm -rf`, `-fr`, `-Rf`,
+    `--recursive --force`) are refused when an operand resolves outside the
+    current workspace (HOME itself, /, parent directories, other trees,
+    relocations through cd/pushd), names a protected dot path (`..`, `.git`,
+    `.env`-class), or cannot be checked statically (globs, substitutions,
+    stdin lists, eval and `sh -c`/`bash -c` payloads, brace expansion,
+    symlinked operands, paths that do not exist yet); retry with
+    allow_destructive_rm=True (or
+    PI_BASH_ALLOW_DESTRUCTIVE_RM=1 frozen at kernel start) only when the
+    deletion is intentional.
     """
     if not isinstance(command, str) or not command:
         raise TypeError("command must be a non-empty str")
     _install_shutdown_hook()
     _guard_destructive_git(command, allow_destructive_git)
+    _guard_destructive_rm(command, allow_destructive_rm)
     return BashHandle(command)
 
 
@@ -3326,6 +5914,21 @@ def _child_env() -> dict[str, str]:
         # freeze their own launch-time copy, and an inherited forged value
         # would arm as if the user had authorized it at launch.
         env.pop(BASH_DESTRUCTIVE_GIT_BYPASS_ENV, None)
+    if not _is_truthy_env_value(_BASH_RM_BYPASS_AT_KERNEL_START):
+        # Same rationale for the rm bypass: strip it unless the launch-time
+        # snapshot authorizes it, so a mid-session write cannot arm a child
+        # kernel's frozen copy (a falsy launch value like "0" stays stripped).
+        env.pop(BASH_DESTRUCTIVE_RM_BYPASS_ENV, None)
+    # Non-interactive bash sources $BASH_ENV (and some shells $ENV) before
+    # the command; the env is model-writable mid-session, so never let it
+    # smuggle an unscanned startup file past the guards.
+    env.pop("BASH_ENV", None)
+    env.pop("ENV", None)
+    # Bash also imports exported shell functions from `BASH_FUNC_name%%`
+    # entries in its environment, which would run under a command name the
+    # guards read literally (`BASH_FUNC_rm%%=() { rm -rf /; }` shadows rm).
+    for name in [name for name in env if name.startswith("BASH_FUNC_")]:
+        env.pop(name, None)
     return env
 
 
