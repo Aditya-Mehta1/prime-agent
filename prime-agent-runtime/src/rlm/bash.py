@@ -1251,6 +1251,30 @@ def _defines_git_shadowing_function(prefix: str) -> bool:
     return False
 
 
+def _installs_relocating_trap(prefix: str) -> bool:
+    """True when `prefix` installs a `DEBUG` trap that can change directory.
+
+    A `DEBUG` trap runs before every command in the shell that installed it, so
+    a payload that cds moves the shell the following discard runs in, and the
+    guard does not model when the trap fires: refuse instead of probing the
+    caller. Only `DEBUG` is read, because the other traps run on exit, on a
+    signal, or on a function return, none of which relocates a later discard.
+    """
+    masked = _mask_quoted_spans(prefix)
+    for word in _shell_word_positions(prefix):
+        if not word.command or _plain_word_text(prefix[word.start : word.end]) != "trap":
+            continue
+        region_end = len(prefix)
+        for j in range(word.end, len(masked)):
+            if masked[j] in ";&|\n":
+                region_end = j
+                break
+        arguments = _unquote_one_level(prefix[word.end : region_end])
+        if re.search(r"(?i)\bDEBUG\b", arguments) and _prefix_holds_directory_command(arguments):
+            return True
+    return False
+
+
 def _runs_in_current_shell(opens_with: str | None, closes_with: str | None) -> bool:
     """True when a command between those two separators changes this shell.
 
@@ -2264,6 +2288,68 @@ def _eval_payloads_hide_destructive_git(
     return False
 
 
+def _eval_payloads(revealed: str) -> list[tuple[int, str]]:
+    """Each `(eval word position, payload)` that a revealed command runs.
+
+    A payload runs from just after the `eval` token to the next unquoted
+    command separator (the masked text keeps those live), and substitution
+    interiors are not separators because the outer command does not parse them.
+    The payload is unquoted one layer so nested quoting levels are read as the
+    text eval re-parses. Only a command word runs eval, so an `eval` argument
+    (`echo eval 'git reset --hard'`) is not a payload at all.
+    """
+    masked = _mask_quoted_spans(revealed)
+    payloads: list[tuple[int, str]] = []
+    for word in _shell_word_positions(revealed):
+        if not word.command or _plain_word_text(revealed[word.start : word.end]) != "eval":
+            continue
+        region_end = len(revealed)
+        interior = [
+            (word.end + start, word.end + end)
+            for start, end in _substitution_interiors(revealed[word.end :])
+        ]
+        for j in range(word.end, len(masked)):
+            if masked[j] in ";&|\n" and not any(
+                start <= j < end for start, end in interior
+            ):
+                region_end = j
+                break
+        payloads.append((word.start, _unquote_one_level(revealed[word.end : region_end])))
+    return payloads
+
+
+def _revealed_eval_payloads_relocate(revealed: str, aliases: dict[str, str]) -> bool:
+    """True when a revealed command runs eval over a payload that cds or pushds.
+
+    `eval` runs its payload in the current shell, so such a payload moves the
+    shell the later discard runs in, and the probe would check the caller. The
+    payload is read twice for the reason the discard scan reads the whole text
+    twice: eval re-parses it at run time, where an alias an earlier command
+    defined does expand (`alias c=cd`, then `eval 'c dirty'`) even though the
+    same spelling does not expand in the outer command, so a relocation under
+    either reading is refused.
+    """
+    for _start, payload in _eval_payloads(revealed):
+        if _prefix_holds_directory_command(payload):
+            return True
+        if aliases:
+            expanded = _reveal_shell_command_words(payload, aliases=aliases)[0]
+            if expanded != payload and _prefix_holds_directory_command(expanded):
+                return True
+    return False
+
+
+def _eval_payloads_relocate(command: str) -> bool:
+    """True when a quoted `eval` payload in `command` can change directory."""
+    normalized = _strip_shell_escapes(
+        _mask_shell_redirections(_normalize_line_continuations(command))
+    )[0]
+    revealed, _map, _unnameable, aliases, _assignments, _live = _reveal_shell_command_words(
+        normalized
+    )
+    return _revealed_eval_payloads_relocate(revealed, aliases)
+
+
 def _revealed_eval_payloads_hide_destructive_git(
     revealed: str,
     depth: int,
@@ -2281,25 +2367,8 @@ def _revealed_eval_payloads_hide_destructive_git(
     also read with: the final maps are the conservative reading for names
     defined later, but the live ones decide what the payload really expands.
     """
-    masked = _mask_quoted_spans(revealed)
-    for word in _shell_word_positions(revealed):
-        if not word.command or _plain_word_text(revealed[word.start : word.end]) != "eval":
-            continue
-        # The payload runs from just after the eval token to the next
-        # unquoted command separator (masked text keeps those live).
-        region_end = len(revealed)
-        interior = [
-            (word.end + start, word.end + end)
-            for start, end in _substitution_interiors(revealed[word.end :])
-        ]
-        for j in range(word.end, len(masked)):
-            if masked[j] in ";&|\n" and not any(
-                start <= j < end for start, end in interior
-            ):
-                region_end = j
-                break
-        payload = _unquote_one_level(revealed[word.end : region_end])
-        live = (eval_live or {}).get(word.start)
+    for start, payload in _eval_payloads(revealed):
+        live = (eval_live or {}).get(start)
         if live is not None and (live[0] or live[1]):
             if _find_destructive_git_discard_sites(payload, aliases=live[0], assignments=live[1]):
                 return True
@@ -2540,6 +2609,18 @@ def _resolve_discard_probe_target(
             # core.worktree/core.bare relocate the repository the discard targets.
             if config and re.match(r"core\.(worktree|bare)(=|$)", config):
                 return _UNRESOLVABLE_DISCARD_TARGET
+        elif token.startswith("--config-env"):
+            # `--config-env NAME=ENVVAR` (or `--config-env NAME`) sets a config
+            # value from the environment, so a `core.worktree`/`core.bare` name
+            # relocates the repository exactly like `-c core.worktree=...`, and
+            # the probe cannot replay the environment it reads.
+            config = (
+                token.split("=", 1)[1]
+                if token != "--config-env" and "=" in token
+                else tokens[index + 1] if index + 1 < len(tokens) else None
+            )
+            if config and re.match(r"core\.(worktree|bare)(=|$)", config):
+                return _UNRESOLVABLE_DISCARD_TARGET
         elif (
             token.startswith("-")
             and not token.startswith("--")
@@ -2619,8 +2700,17 @@ def _resolve_discard_probe_target(
             # and the `command` wrapper do not stop it (`"unset" GIT_DIR`,
             # `\unset GIT_DIR`, and `command unset GIT_DIR` all remove it).
             removal = seg_tokens
-            while removal and _revealed_word_text(removal[0]) in _TRANSPARENT_BUILTINS:
-                removal = removal[1:]
+            wrapper_options = False
+            while removal:
+                head = _revealed_word_text(removal[0])
+                if head in _TRANSPARENT_BUILTINS:
+                    wrapper_options = True  # its own options may follow (`command -p`)
+                    removal = removal[1:]
+                    continue
+                if wrapper_options and head.startswith("-") and head != "-":
+                    removal = removal[1:]
+                    continue
+                break
             if (
                 removal
                 and _revealed_word_text(removal[0]) == "unset"
@@ -2655,7 +2745,11 @@ def _resolve_discard_probe_target(
     # invocation or shell scope: refuse instead of replaying a guess. A
     # function named `git` shadows the discard itself, so it refuses for the
     # same reason: the repository the wrapped git targets is unknowable.
-    if _defines_directory_changing_function(prefix) or _defines_git_shadowing_function(prefix):
+    if (
+        _defines_directory_changing_function(prefix)
+        or _defines_git_shadowing_function(prefix)
+        or _installs_relocating_trap(prefix)
+    ):
         return _UNRESOLVABLE_DISCARD_TARGET
 
     # cd relocations earlier in the command. cds inside grouping parentheses
@@ -2754,8 +2848,11 @@ def _resolve_discard_probe_target(
         git_status = f"git -C {dash_c_dir} status --porcelain --untracked-files=all{ignored}"
     else:
         git_status = f"git status --porcelain --untracked-files=all{ignored}"
+    # The assignments come first: a persistent `CDPATH` (or `HOME`) decides
+    # where a later `cd` lands, so replaying the chain first would resolve a
+    # relative `cd` against the kernel's own directory instead.
     return _DiscardProbeTarget(
-        relocation_prefix=(cd_prefix + env_prefix) or None,
+        relocation_prefix=(env_prefix + cd_prefix) or None,
         git_status_command=git_status,
     )
 
@@ -2981,13 +3078,20 @@ def _guard_destructive_git(command: str, allow_destructive_git: bool) -> None:
     # runs the eval builtin, so the gate reads the text with quoting and
     # escapes dropped before the substring check; the scan itself still
     # judges the command exactly as written.
-    if "eval" in _EVAL_GATE_STRIP.sub("", resolved) and _eval_payloads_hide_destructive_git(resolved):
+    eval_present = "eval" in _EVAL_GATE_STRIP.sub("", resolved)
+    if eval_present and _eval_payloads_hide_destructive_git(resolved):
         # An eval payload hides where the discard runs; refuse rather than
         # probe a command the guard cannot replay.
         raise DestructiveGitRefusalError(_format_eval_refusal())
     sites = _find_destructive_git_discard_sites(resolved)
     if not sites:
         return
+    if eval_present and _eval_payloads_relocate(resolved):
+        # An eval payload that cds moves the shell the discard runs in, and the
+        # probe cannot replay that from the text: refuse instead of checking the
+        # caller's repository. Only reached when a discard is really present, so
+        # a harmless `eval 'cd /tmp'` on its own still runs.
+        raise DestructiveGitRefusalError(_format_relocation_refusal())
     prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
     user_command_start = len(prefix) + 1 if prefix else 0
     probes: list[tuple[str, bool]] = []

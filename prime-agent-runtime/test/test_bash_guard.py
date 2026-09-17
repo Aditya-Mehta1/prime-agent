@@ -382,7 +382,7 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
             'pushd sub && git reset --hard', '"pushd" sub && git reset --hard', 'git -C "sub" reset --hard', 'git -ccore.worktree=sub reset --hard', 'git -ccore.bare=1 reset --hard', '( "pu"shd sub && git reset --hard )',
             'git -pCsub reset --hard', 'git -qC sub reset --hard', 'source setup.sh && git reset --hard', '. setup.sh && git reset --hard',
             'export GIT_DIR=$(pwd)/sub; git reset --hard', 'FOO=1 cd sub; git reset --hard', 'FOO=$(pwd) cd sub && git reset --hard',
-            'function f { cd sub; }; f; git reset --hard', 'function f { pushd sub; }; f && git reset --hard', 'git() { command git -C sub "$@"; }; git reset --hard', 'GIT_DIR=sub/.git; unset GIT_DIR; git reset --hard', '"unset" GIT_DIR; git reset --hard', 'command unset GIT_DIR; git reset --hard', '! cd sub; git reset --hard', '! cd no-such-dir && git reset --hard',
+            'function f { cd sub; }; f; git reset --hard', 'function f { pushd sub; }; f && git reset --hard', 'git() { command git -C sub "$@"; }; git reset --hard', 'GIT_DIR=sub/.git; unset GIT_DIR; git reset --hard', '"unset" GIT_DIR; git reset --hard', 'command unset GIT_DIR; git reset --hard', '! cd sub; git reset --hard', '! cd no-such-dir && git reset --hard', 'WT=sub git --config-env=core.worktree=WT reset --hard', 'GIT_DIR=sub/.git GIT_WORK_TREE=sub; command -p unset GIT_DIR; git reset --hard', "eval 'cd sub'; git reset --hard", "trap 'cd sub' DEBUG; git reset --hard", "shopt -s expand_aliases\nalias c=cd\neval 'c sub'\ngit reset --hard",
         ]:
             with self.subTest(command=command):
                 with self.assertRaises(DestructiveGitRefusalError) as caught:
@@ -629,7 +629,7 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
         for command in [
             "{ cd sub && git reset --hard; }", "FOO=1 cd sub && git reset --hard", "HOME=sub cd && git reset --hard",
             '"c"d sub && git reset --hard', '"command" "cd" sub && git reset --hard',
-            "if true; then cd sub && git reset --hard; fi",
+            "if true; then cd sub && git reset --hard; fi", "HOME=sub; cd && git reset --hard",
         ]:
             with self.subTest(command=command):
                 with self.assertRaises(DestructiveGitRefusalError) as caught:
