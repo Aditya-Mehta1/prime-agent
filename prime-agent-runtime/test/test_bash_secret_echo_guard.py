@@ -47,6 +47,11 @@ SECRET_ECHO_MATCHING_COMMANDS = [
     "cat ~/\".ssh\"/id_rsa", "cat ~/'.ssh'/id_rsa", "cat ~/\".ssh/id_rsa\"", "echo ~/'.aws'/credentials",
     "cat ~/'/'.ssh/id_rsa", "cat ~/'/'.ssh/'id_rsa'", "cat ~/'/'/.ssh/id_rsa",
     "cat ~/.aws/credentials", "cat $HOME/.aws/credentials",
+# The rule names the directory, so a run of slashes, a `.` or `..` component, a
+# glob, and the file next to the key all refuse with the key spelling.
+    "cat ~/.aws//credentials", "cat ~/.aws///credentials", "cat $HOME/.aws//credentials",
+    "cat ~/.aws/./credentials", "cat ~/.aws/../.aws/credentials", "cat ~/.aws/cred*",
+    "cat ~/.aws/config",
     "cat ~/.gnupg/secring.gpg", "echo ~/.gnupg/secring.gpg",
 # Assignment prefixes: the shell runs the dump with those bindings set.
     "FOO=1 env", "FOO=1 printenv", "FOO=1 export -p",

@@ -996,8 +996,9 @@ class BashHandle:
 #     refused, and a `--` word ends the options the way grep reads it, so the
 #     `-v` of `grep -- -v` is the pattern rather than the inversion flag
 #     (`grep -- -v KEY` is two operands and stays refused);
-#   * a `cat`/`echo` segment naming `~/.ssh`, `~/.gnupg`, or
-#     `~/.aws/credentials`, in the `~` spelling (expands only unquoted) or the
+#   * a `cat`/`echo` segment naming `~/.ssh`, `~/.gnupg`, or `~/.aws` -- each a
+#     directory, so the rule holds on it however the file inside is spelled --
+#     in the `~` spelling (expands only unquoted) or the
 #     `$HOME`/`${HOME}` spelling (expands unquoted and inside double quotes,
 #     and matches with a closing double quote between the two: `cat
 #     "$HOME"/.ssh/id_rsa`), is a secret-file read. Both spellings are read from
@@ -1087,9 +1088,12 @@ class SecretEchoRefusalError(RuntimeError):
     """A command that would echo secrets into the transcript was refused."""
 
 
-# Secret paths under the user's home: private keys and credential stores. The
-# trailing lookahead keeps a longer name (`.sshfoo`) from matching.
-_SECRET_HOME_NAME = r"(?:\.ssh|\.gnupg)(?![\w.-])|\.aws/credentials(?![\w.-])"
+# Secret paths under the user's home: private keys and credential stores. Each
+# name is a directory, so the rule holds on it however the path to the file
+# inside is spelled (`~/.aws//credentials`, `~/.aws/./credentials`,
+# `~/.aws/cred*`), and the trailing lookahead keeps a longer name (`.sshfoo`,
+# `.awsrc`) from matching.
+_SECRET_HOME_NAME = r"(?:\.ssh|\.gnupg|\.aws)(?![\w.-])"
 _SECRET_HOME_PATH = r"/(?:" + _SECRET_HOME_NAME + r")"
 _TILDE_SECRET_PATH_RE = re.compile(r"~" + _SECRET_HOME_PATH)
 # A double-quoted `$HOME` may close its quote before the path
@@ -2567,9 +2571,9 @@ def bash(command: str, *, allow_secret_echo: bool = False) -> BashHandle:
     `export -p`, and flags-only forms such as `env -0`, with leading `FOO=1`
     assignments stripped, redirections such as `2>/dev/null` ignored, and
     quoted command words such as `"env"` read the shell's way), or a
-    `cat`/`echo` -- the only readers modeled -- of a known secret file under
-    the home directory (`~/.ssh`,
-    `~/.gnupg`, `~/.aws/credentials`, written with either the `~` or the
+    `cat`/`echo` -- the only readers modeled -- of a file under a known secret
+    directory in the home directory (`~/.ssh`,
+    `~/.gnupg`, `~/.aws`, written with either the `~` or the
     `$HOME` spelling, which also matches when a closing double quote sits
     between `$HOME` and the path). Read one value instead
     (`printenv SAFE_VAR`), filter a dump through a grep for the single fixed
