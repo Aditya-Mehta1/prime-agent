@@ -167,9 +167,36 @@ impl AgentSessionEngine {
         // The ACP MCP store (auth storage construction is blocking; the
         // engine construction paths are already off the hot async paths).
         let agent_dir = config.agent_dir.clone();
+        // Settings-declared user servers feed the store this worker owns
+        // (TS `session._mcpManager` resolves user settings; the
+        // `mcp.config` host request answers from them). Read per resolve
+        // so `mcp.refresh` - which re-resolves integrations - sees
+        // settings changes, mirroring the in-process engine's
+        // `mcp_gating` extraction (agentDir + project settings.json).
+        let mcp_cwd = config.cwd.clone();
+        let mcp_agent_dir = agent_dir.clone();
         let mcp = pa_core::mcp::McpManager::new(pa_core::mcp::McpManagerOptions {
             auth_storage: pa_core::auth::AuthStorage::create(&agent_dir),
-            get_user_servers: Box::new(|| None),
+            get_user_servers: Box::new(move || {
+                let settings = pa_core::settings::SettingsManager::create(&mcp_cwd, &mcp_agent_dir);
+                Some(
+                    settings
+                        .settings()
+                        .mcp_servers
+                        .clone()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|(server, server_config)| {
+                            serde_json::from_value(server_config)
+                                .ok()
+                                .map(|parsed| (server, parsed))
+                        })
+                        .collect::<std::collections::HashMap<
+                            String,
+                            pa_core::mcp::McpServerConfig,
+                        >>(),
+                )
+            }),
             begin_login: None,
         });
         Ok(Self {

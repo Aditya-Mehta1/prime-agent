@@ -338,7 +338,9 @@ pub struct ToolExecuteResult {
     pub content: Vec<ToolResultBlock>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
-    #[serde(default)]
+    /// Absent on the wire when false (TS `AgentToolResult.isError` is
+    /// optional); defaulting to false on read keeps both spellings valid.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_error: bool,
 }
 
@@ -455,9 +457,10 @@ mod tests {
             r#"{"toolCallId":"c1","toolName":"hello","args":{"name":"world"}}"#,
         );
         rt::<ToolExecuteResult>(
-            r#"{"content":[{"type":"text","text":"Hello, world!"}],"details":{"greeted":"world"},"isError":false}"#,
+            r#"{"content":[{"type":"text","text":"Hello, world!"}],"details":{"greeted":"world"},"isError":true}"#,
         );
         rt::<ToolExecuteResult>(r#"{"content":[]}"#);
+        rt::<ToolExecuteResult>(r#"{"content":[],"isError":true}"#);
         rt::<ToolUpdateNotification>(r#"{"toolCallId":"c1","result":{"content":[]}}"#);
     }
 

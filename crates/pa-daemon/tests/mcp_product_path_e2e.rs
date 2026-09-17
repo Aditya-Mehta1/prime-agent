@@ -64,7 +64,11 @@ fn spawn_supervisor(socket: &Path, agent_dir: &Path, kernel_python: &Path) -> Da
         .arg("--agent-dir")
         .arg(agent_dir)
         .env("PRIME_AGENT_KERNEL_PYTHON", kernel_python)
-        .env_remove("PRIME_AGENT_CODING_AGENT_DIR")
+        // Hermetic agent dir: the ambient environment exports this var
+        // globally; point it at the test agent dir so every fallback that
+        // reads it (supervisor, worker, kernel) resolves inside the test
+        // sandbox instead of the shared real agent dir.
+        .env("PRIME_AGENT_CODING_AGENT_DIR", agent_dir)
         .env_remove("PRIME_API_KEY")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
