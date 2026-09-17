@@ -25,6 +25,19 @@ update` verifies that signature before installing anything and fails closed if i
 To check a download yourself, and for the full release trust model, see
 [Release Security](packages/coding-agent/docs/release-security.md).
 
+## Behavioral release evaluation
+
+The `pre-release` label enables a trusted behavioral evaluation before release. Exact base
+and head revisions build only inside isolated Prime sandboxes. GitHub runners treat their
+packages as opaque bytes and never execute or extract them. Model and sandbox credentials
+stay behind trusted Verifiers interception and are removed from candidate process
+environments. Separate durable approval and evaluation statuses prevent an in-flight evaluation
+from restoring approval after the label is removed. Both statuses are revoked when either candidate
+revision changes, and repository rules must require both with strict up-to-date enforcement. See
+[`scripts/evals/short_swe/README.md`](scripts/evals/short_swe/README.md)
+for the full boundary.
+
+
 ## What to Expect
 
 Maintainers will assess the report, determine its scope, and coordinate remediation and disclosure when appropriate. Please allow time for investigation before publishing details that could put users at risk.
