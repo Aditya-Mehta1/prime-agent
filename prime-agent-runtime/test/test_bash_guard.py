@@ -1485,6 +1485,32 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         result = await self._run("echo $(dirname $(basename $(pwd)))")
         self.assertEqual(result.exit_code, 0)
 
+    async def test_quoted_parens_inside_substitutions_stay_scanned(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        # A quoted or escaped `)` inside a substitution is data, so the
+        # substitution closes at the real one. Fail-pre-fix: the blind
+        # paren match stopped early, the rest folded into the enclosing
+        # word as data, and the chmod ran (kernel spawns; real bash runs
+        # each shape).
+        for command in [
+            "echo \"$(echo ')'; chmod -R 755 ~)\"",
+            "echo $(echo ')'; chmod -R 755 ~)",
+            "echo $(echo \"a)\"; chmod -R 755 ~)",
+            "echo $(echo \\); chmod -R 755 ~)",
+            "echo \"$(echo $'\\)'; chmod -R 755 ~)\"",
+            "echo $(echo `echo )`; chmod -R 755 ~)",
+        ]:
+            with self.subTest(command=command):
+                message = await self._refused(command, home=home.name)
+                self.assertIn("Refusing to run this recursive chmod/chown command", message)
+                self.assertTrue(Path(home.name, "keep.txt").exists())
+        # Quoted-paren data without a hidden invocation still runs.
+        for command in ["echo \"$(echo ')')\"", "echo $(echo \"a)\")"]:
+            result = await self._run(command)
+            self.assertEqual(result.exit_code, 0)
+
     async def test_refuses_compound_when_any_invocation_escapes(self):
         self._make_tree()
         message = await self._refused("chmod -R 755 sub && chmod -R 755 ..")

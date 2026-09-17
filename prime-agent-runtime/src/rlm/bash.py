@@ -1341,16 +1341,48 @@ class _ShellWord:
 
 
 def _matching_paren(command: str, open_index: int, end: int) -> int:
-    """Index of the `)` matching the `(` at `open_index`, or `end - 1`."""
-    depth = 0
+    """Index of the `)` matching the `(` at `open_index`, or `end - 1`.
+
+    A command substitution is a full subshell context, so parens inside
+    quotes or behind a backslash are data, not syntax: `$(echo ')'; chmod
+    -R 755 /)` closes at the final `)`, and a blind paren count that stops
+    at the quoted one hides the chmod from the interior scan. Quote and
+    escape state are tracked while matching; inside double quotes and
+    backticks only a nested `$(` counts (its `)` closes it), and an
+    unbalanced open paren never matches, so the interior extends to
+    `end - 1` and stays scanned."""
+    depth = 0  # nesting of $() below the one whose close is being sought
+    quote: str | None = None
     i = open_index
     while i < end:
-        if command[i] == "(":
-            depth += 1
-        elif command[i] == ")":
-            depth -= 1
-            if depth == 0:
-                return i
+        ch = command[i]
+        if quote is None:
+            if ch == "\\" and i + 1 < end:
+                i += 2  # an escaped paren is a literal, never syntax
+                continue
+            if ch in ("'", '"', "`"):
+                quote = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+        elif quote == "'":
+            if ch == "'":
+                quote = None
+        elif quote in ('"', "`"):
+            if ch == "\\" and i + 1 < end:
+                i += 2  # a backslash still escapes inside these
+                continue
+            if ch == quote:
+                quote = None
+            elif ch == "$" and command[i + 1 : i + 2] == "(":
+                depth += 1  # $() still nests inside double quotes
+                i += 1
+            elif ch == ")" and depth > 1:
+                depth -= 1  # closes the nested $() it opened; a quoted
+                # `)` never closes the substitution itself
         i += 1
     return end - 1
 
