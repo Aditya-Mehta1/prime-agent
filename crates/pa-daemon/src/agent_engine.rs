@@ -287,8 +287,13 @@ impl AgentSessionEngine {
     /// Resolve the model through the composed registry.
     fn resolve_registry_model(&self) -> anyhow::Result<Model> {
         let auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
-        let registry =
+        let mut registry =
             pa_core::models::ModelRegistry::create(auth, self.config.agent_dir.join("models.json"));
+        // A fresh registry gates private Prime Inference models out until the
+        // async authorization refresh runs; adopt the on-disk authorization
+        // cache so create-time resolution can pick the session's private
+        // model (e.g. internal/glm-5.3-fast).
+        registry.load_private_authorization_from_cache();
         let available: Vec<Model> = registry.get_available().into_iter().cloned().collect();
         let selection = self.current_selection();
         let Some(model_name) = selection.model.as_deref() else {

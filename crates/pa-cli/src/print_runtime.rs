@@ -212,6 +212,7 @@ async fn build_headless_engine_parts(options: &RunOptions) -> Result<HeadlessEng
     let auth = pa_core::auth::AuthStorage::create(&config.agent_dir);
     let mut registry =
         pa_core::models::ModelRegistry::create(auth, config.agent_dir.join("models.json"));
+    registry.load_private_authorization_from_cache();
     let model = select_model(
         &mut registry,
         config.provider.as_deref(),

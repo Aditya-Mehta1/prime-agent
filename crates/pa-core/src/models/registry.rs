@@ -136,6 +136,45 @@ impl ModelRegistry {
     }
 
     /// Reload built-in + custom models and provider request configs from disk.
+    /// Adopt the on-disk private Prime Inference authorization cache without
+    /// any network access. Sync callers that resolve models on a fresh
+    /// registry (daemon create-path, headless print) must call this before
+    /// `get_available`; a fresh registry otherwise gates every private model
+    /// out because only the async refresh populates the authorized set.
+    pub fn load_private_authorization_from_cache(&mut self) {
+        let api_key = self.auth.get_api_key(PRIME_INFERENCE_PROVIDER_ID);
+        let team_headers = self.auth.get_provider_headers(PRIME_INFERENCE_PROVIDER_ID);
+        let team_id = team_headers
+            .as_ref()
+            .and_then(|headers| headers.get("X-Prime-Team-ID").cloned());
+        let (Some(api_key), Some(team_id)) = (api_key, team_id) else {
+            return;
+        };
+        let fingerprint = private_prime_authorization_fingerprint(&api_key, &team_id);
+        let Some(models_json_path) = self.models_json_path.clone() else {
+            return;
+        };
+        let Some(PrivatePrimeAuthorizationCache {
+            fingerprint: cached_fingerprint,
+            models,
+            refreshed_at: _,
+        }) = read_private_prime_authorization_cache(&models_json_path)
+        else {
+            return;
+        };
+        if cached_fingerprint != fingerprint {
+            return;
+        }
+        self.authorized_private_models = models;
+        self.authorized_private_ids = self
+            .authorized_private_models
+            .iter()
+            .map(|model| model.id.clone())
+            .collect();
+        self.authorized_team_id = Some(team_id);
+        self.load_models();
+    }
+
     pub fn refresh(&mut self) {
         self.provider_request_configs.clear();
         self.model_request_headers.clear();
