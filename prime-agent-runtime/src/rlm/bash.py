@@ -958,8 +958,11 @@ GIT_STATUS_PORCELAIN_COMMAND = "git status --porcelain --untracked-files=all"
 # How many dirty paths the refusal lists before eliding the rest.
 MAX_DIRTY_PATHS_LISTED = 10
 
-# The probe is read-only, but a wedged git must not wedge the kernel.
+# The probe is read-only, but a wedged git must not wedge the kernel. Killing
+# the probe's process group normally closes its output pipe at once; the grace
+# only bounds the wait for the reading thread to notice.
 _PROBE_TIMEOUT_SECONDS = 10.0
+_PROBE_KILL_GRACE_SECONDS = 1.0
 # Bound the parsed probe output; dirtiness beyond the cap still triggers the
 # refusal, so a huge tree cannot grow the message without limit.
 _PROBE_OUTPUT_CAP_BYTES = 64 * 1024
@@ -1706,8 +1709,10 @@ def _revealed_shell_word(word: str, assignments: dict[str, str]) -> str | None:
 
 
 def _reveal_shell_command_words(
-    command: str, resolve_aliases: bool = True
-) -> tuple[str, list[int], set[int]]:
+    command: str,
+    resolve_aliases: bool = True,
+    aliases: dict[str, str] | None = None,
+) -> tuple[str, list[int], set[int], dict[str, str]]:
     """Rebuild each shell word the way the shell executes it.
 
     Quoting is stripped before exec, so `"git"` and `g'it'` run `git`, and a
@@ -1733,11 +1738,15 @@ def _reveal_shell_command_words(
     the returned set holds the words whose revealed value is more than a bare
     executable word: the shell runs such a value as argv, but the probe cannot
     name the repository it runs in, so a discard found through one is refused.
+    The returned alias map is the one the walk ended with, so a caller that
+    re-reads text the shell parses later (an `eval` payload) starts from the
+    aliases this text defined.
     """
     assignments: dict[str, str] = {}
     pending: dict[str, str] = {}
-    aliases: dict[str, str] = {}
+    aliases = dict(aliases) if aliases else {}
     alias_args = False
+    unalias_args = False
     out: list[str] = []
     index_map: list[int] = []
     unnameable: set[int] = set()
@@ -1756,6 +1765,7 @@ def _reveal_shell_command_words(
                 assignments.update(pending)
             pending.clear()
             alias_args = False
+            unalias_args = False
         cursor = word.end
         text = command[word.start : word.end]
         plain = _plain_word_text(text)
@@ -1770,6 +1780,8 @@ def _reveal_shell_command_words(
                 revealed = alias
         if word.command and plain == "alias":
             alias_args = True  # the words after the builtin are definitions
+        elif word.command and plain == "unalias":
+            unalias_args = True  # the words after it are names to drop
         elif alias_args:
             definition = _LITERAL_ASSIGNMENT.fullmatch(text)
             if definition:
@@ -1778,6 +1790,10 @@ def _reveal_shell_command_words(
                 )
             else:
                 alias_args = False  # not a definition (`alias -p`, a bare name)
+        elif unalias_args and text.startswith("-a"):
+            aliases.clear()  # `unalias -a` drops every alias
+        elif unalias_args and plain is not None:
+            aliases.pop(plain, None)
         replacement = text if revealed is None else revealed
         if revealed is not None:
             # A revealed value is data the shell runs as a word, never shell
@@ -1817,7 +1833,7 @@ def _reveal_shell_command_words(
         prefix_open = word.open_prefix
     out.append(command[cursor:])
     index_map.extend(range(cursor, len(command)))
-    return "".join(out), index_map, unnameable
+    return "".join(out), index_map, unnameable, aliases
 
 
 def _is_forced_clean_segment(args: str) -> bool:
@@ -1846,11 +1862,14 @@ def _is_forced_clean_segment(args: str) -> bool:
 
 
 def _scan_discard_sites(
-    normalized: str, index_map: list[int], resolve_aliases: bool
+    normalized: str,
+    index_map: list[int],
+    resolve_aliases: bool,
+    aliases: dict[str, str] | None = None,
 ) -> list[_DiscardSite]:
     """Find the discards in already-normalized text, mapped back to the input."""
-    words, word_map, unnameable = _reveal_shell_command_words(
-        normalized, resolve_aliases=resolve_aliases
+    words, word_map, unnameable, _aliases = _reveal_shell_command_words(
+        normalized, resolve_aliases=resolve_aliases, aliases=aliases
     )
     masked = _mask_quoted_spans(words)
     matches: list[tuple[int, int]] = []
@@ -1874,20 +1893,30 @@ def _scan_discard_sites(
     ]
 
 
-def _find_destructive_git_discard_sites(command: str) -> list[_DiscardSite]:
+def _find_destructive_git_discard_sites(
+    command: str, aliases: dict[str, str] | None = None
+) -> list[_DiscardSite]:
     """Find every destructive git discard command in `command`, returning
-    where each `git` token starts (empty when none match)."""
+    where each `git` token starts (empty when none match). `aliases` seeds the
+    aliases a caller already knows about, so text the shell parses later (an
+    `eval` payload) resolves a name the outer text defined."""
     normalized, index_map = _strip_shell_escapes(
         _mask_shell_redirections(_normalize_line_continuations(command))
     )
-    sites = _scan_discard_sites(normalized, index_map, resolve_aliases=True)
+    sites = _scan_discard_sites(
+        normalized, index_map, resolve_aliases=True, aliases=aliases
+    )
     if "alias" in normalized:
         # A shell expands an alias defined in this text only when its own
         # options say so, and the scan cannot see them, so the text is read
         # both ways (`alias echo=git; echo reset --hard` discards expanded,
         # while `alias git=echo; git reset --hard` discards unexpanded): a
         # discard under either reading is refused.
-        sites.extend(_scan_discard_sites(normalized, index_map, resolve_aliases=False))
+        sites.extend(
+            _scan_discard_sites(
+                normalized, index_map, resolve_aliases=False, aliases=aliases
+            )
+        )
     unique: list[_DiscardSite] = []
     seen: set[tuple[int, bool]] = set()
     for site in sorted(sites, key=lambda site: site.index):
@@ -1944,7 +1973,9 @@ def _unquote_one_level(text: str) -> str:
     return "".join(chars)
 
 
-def _eval_payloads_hide_destructive_git(command: str, depth: int = 0) -> bool:
+def _eval_payloads_hide_destructive_git(
+    command: str, depth: int = 0, aliases: dict[str, str] | None = None
+) -> bool:
     """True when a quoted `eval` payload hides a destructive git discard.
 
     Only a real eval is scanned: eval has to be the command word the shell
@@ -1955,29 +1986,41 @@ def _eval_payloads_hide_destructive_git(command: str, depth: int = 0) -> bool:
     confusing quoted data with executable text. Command substitution stays
     outside this check: its output is unknowable statically, and the
     substitution itself already runs (and is scanned) before eval sees the
-    result.
+    result. The aliases a caller already knows about are carried in, because
+    `eval` re-parses its payload at run time, where an alias the outer text
+    defined does expand.
     """
     if depth > _MAX_EVAL_SCAN_DEPTH:
         return True  # absurdly nested evals: refuse rather than risk a miss
     command = _strip_shell_escapes(
         _mask_shell_redirections(_normalize_line_continuations(command))
     )[0]
-    revealed, _word_map, _unnameable = _reveal_shell_command_words(command)
-    if _revealed_eval_payloads_hide_destructive_git(revealed, depth):
+    revealed, _word_map, _unnameable, visible = _reveal_shell_command_words(
+        command, aliases=aliases
+    )
+    if _revealed_eval_payloads_hide_destructive_git(revealed, depth, visible):
         return True
     if "alias" in command:
         # Same both-ways reading as the discard scan: an alias may or may not
         # be expanded, so the text as written is scanned too.
-        as_written, _as_written_map, _as_written_un = _reveal_shell_command_words(
-            command, resolve_aliases=False
+        as_written, _as_written_map, _as_written_un, _as_written_aliases = (
+            _reveal_shell_command_words(command, resolve_aliases=False, aliases=aliases)
         )
-        if _revealed_eval_payloads_hide_destructive_git(as_written, depth):
+        if _revealed_eval_payloads_hide_destructive_git(as_written, depth, visible):
             return True
     return False
 
 
-def _revealed_eval_payloads_hide_destructive_git(revealed: str, depth: int) -> bool:
-    """True when a revealed command runs eval over a payload holding a discard."""
+def _revealed_eval_payloads_hide_destructive_git(
+    revealed: str, depth: int, aliases: dict[str, str]
+) -> bool:
+    """True when a revealed command runs eval over a payload holding a discard.
+
+    `aliases` are the names the scanned text defined (and any a caller carried
+    in): the payload is re-parsed by eval at run time, where such a name runs
+    its value, so the payload is read with those aliases resolved as well as
+    exactly as written.
+    """
     masked = _mask_quoted_spans(revealed)
     for word in _shell_word_positions(revealed):
         if not word.command or _plain_word_text(revealed[word.start : word.end]) != "eval":
@@ -1992,8 +2035,61 @@ def _revealed_eval_payloads_hide_destructive_git(revealed: str, depth: int) -> b
         payload = _unquote_one_level(revealed[word.end : region_end])
         if _find_destructive_git_discard_sites(payload):
             return True
-        if "eval" in payload and _eval_payloads_hide_destructive_git(payload, depth + 1):
+        if aliases:
+            if _find_destructive_git_discard_sites(payload, aliases=aliases):
+                return True
+            if _payload_substitution_names_a_discarding_alias(payload, aliases):
+                return True
+        if "eval" in payload and _eval_payloads_hide_destructive_git(
+            payload, depth + 1, aliases
+        ):
             return True
+    return False
+
+
+def _substitution_interiors(text: str) -> list[tuple[int, int]]:
+    """Spans of the text inside each `$(...)` and backtick substitution."""
+    spans: list[tuple[int, int]] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == "$" and text[i + 1 : i + 2] == "(":
+            close = _substitution_end(text, i + 1, n)
+            spans.append((i + 2, close))
+            i = close
+        elif text[i] == "`":
+            close = _backtick_end(text, i, n)
+            spans.append((i + 1, close - 1))
+            i = close
+        else:
+            i += 1
+    return spans
+
+
+def _payload_substitution_names_a_discarding_alias(
+    payload: str, aliases: dict[str, str]
+) -> bool:
+    """True when an unrunnable payload still spells a discarding alias name.
+
+    A payload can build its command word at run time (`eval "$(printf %s g)"`),
+    and its position inside the substitution says nothing about where the
+    result lands, so a name whose value discards is refused rather than allowed
+    once eval would run it. A name whose value discards nothing is left alone,
+    and the text as written is scanned separately.
+    """
+    discarding = {
+        name
+        for name, value in aliases.items()
+        if _find_destructive_git_discard_sites(value)
+    }
+    if not discarding:
+        return False
+    for inner_start, inner_end in _substitution_interiors(payload):
+        inner = payload[inner_start:inner_end]
+        for word in _shell_word_positions(inner):
+            spelled = _plain_word_text(inner[word.start : word.end])
+            if spelled is not None and spelled in discarding:
+                return True
     return False
 
 
@@ -2258,17 +2354,63 @@ _BASH_DESTRUCTIVE_GIT_BYPASS_AT_START = _is_truthy_env_value(
 )
 
 
+def _probe_group(process: subprocess.Popen) -> int | None:
+    """The probe's process-group id, while it is still the group leader.
+
+    `start_new_session=True` makes the probe the leader of a fresh group, so
+    its group survives the child itself: a descendant that keeps the output
+    pipe open is reached by a group kill. Read while the child is still a
+    zombie, because a reaped pid is free for reuse.
+    """
+    if not _IS_POSIX:
+        return None
+    try:
+        return os.getpgid(process.pid)
+    except (OSError, ValueError):
+        return None
+
+
+def _kill_probe(process: subprocess.Popen, pgid: int | None) -> None:
+    """Kill a probe and anything it left holding the output pipe."""
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (OSError, ValueError):
+            pass  # the group is already gone
+    try:
+        process.kill()
+    except (OSError, ValueError):
+        pass
+
+
+def _read_probe_output(process: subprocess.Popen, pgid: int | None, into: list[bytes]) -> None:
+    """Read at most the output cap from the probe, then stop the probe."""
+    try:
+        data = process.stdout.read(_PROBE_OUTPUT_CAP_BYTES + 1) if process.stdout else b""
+    except (OSError, ValueError):
+        data = b""
+    if len(data) > _PROBE_OUTPUT_CAP_BYTES:
+        # The listing is already long enough: do not wait for the rest of it.
+        _kill_probe(process, pgid)
+    into.append(data)
+
+
 def _probe_uncommitted_changes(probe_command: str, cwd: str) -> list[str] | None:
     """Probe at-risk files via `git status --porcelain --untracked-files=all`
     (plus `--ignored=matching` when the discard deletes ignored files) in
     `cwd`. Returns None when dirtiness cannot be determined (not a repo, git
-    missing, probe failure) so the guard fails open instead of blocking on a
-    guess.
+    missing, probe failure, timeout) so the guard fails open instead of
+    blocking on a guess.
 
-    The listing is read with the cap already in place: a repository with a very
-    large untracked or ignored listing must not buffer the whole `git status`
-    in the kernel. Once the cap is reached the tree is known to be dirty, so
-    the probe is stopped and the paths read so far are used.
+    The listing is read with the cap already in place on a thread of its own,
+    so a repository with a very large untracked or ignored listing never
+    buffers the whole `git status` in the kernel: once the cap is reached the
+    tree is known to be dirty, the probe's process group is killed, and the
+    paths read so far are used. The waiting thread is the real timeout: a probe
+    that hangs, or one whose descendant keeps the output pipe open after the
+    probe itself exited, is killed with its process group after
+    `_PROBE_TIMEOUT_SECONDS` and the caller fails open (returns None) instead of
+    waiting for the pipe.
     """
     try:
         process = subprocess.Popen(
@@ -2278,33 +2420,38 @@ def _probe_uncommitted_changes(probe_command: str, cwd: str) -> list[str] | None
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            start_new_session=True,
         )
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
         return None
-    # A wedged git must not wedge the kernel: kill the probe after the timeout.
-    watchdog = threading.Timer(_PROBE_TIMEOUT_SECONDS, process.kill)
-    watchdog.start()
+    pgid = _probe_group(process)
+    output: list[bytes] = []
+    reader = threading.Thread(
+        target=_read_probe_output, args=(process, pgid, output), daemon=True
+    )
+    reader.start()
+    reader.join(_PROBE_TIMEOUT_SECONDS)
+    if reader.is_alive():
+        # A wedged probe, or a descendant still holding the output pipe: kill
+        # the group (which closes the pipe) and give the reader a moment.
+        _kill_probe(process, pgid)
+        reader.join(_PROBE_KILL_GRACE_SECONDS)
     try:
-        output = (
-            process.stdout.read(_PROBE_OUTPUT_CAP_BYTES + 1) if process.stdout else b""
-        )
-        truncated = len(output) > _PROBE_OUTPUT_CAP_BYTES
-        if truncated:
-            process.kill()  # the listing is already long enough: do not wait for the rest
-        returncode = process.wait(timeout=_PROBE_TIMEOUT_SECONDS)
+        if reader.is_alive() or not output:
+            return None
+        raw = output[0]
+        truncated = len(raw) > _PROBE_OUTPUT_CAP_BYTES
+        returncode = process.wait(timeout=_PROBE_KILL_GRACE_SECONDS)
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
-        process.kill()
         return None
     finally:
-        watchdog.cancel()
-        if process.poll() is None:
-            process.kill()
-            process.wait()
+        if reader.is_alive() or process.poll() is None:
+            _kill_probe(process, pgid)
         if process.stdout is not None:
             process.stdout.close()
     if returncode != 0 and not truncated:
         return None
-    text = output[:_PROBE_OUTPUT_CAP_BYTES].decode("utf-8", errors="replace")
+    text = raw[:_PROBE_OUTPUT_CAP_BYTES].decode("utf-8", errors="replace")
     if truncated:
         # The cap can cut the last entry in half; it still proves dirtiness.
         text = text.rsplit("\n", 1)[0]
