@@ -502,6 +502,18 @@ _LAUNCHER_OPERAND_OPTIONS: dict[str, frozenset[str]] = {
     "parallel": _PARALLEL_OPERAND_OPTIONS,
 }
 _LAUNCHER_OPERAND_LETTERS: dict[str, str] = {"xargs": _XARGS_OPERAND_LETTERS, "parallel": "jNnLSaI"}
+# Command words whose judgement depends on the word itself. Bash consults its
+# command hash table only after reserved words and builtins, and `hash -r`,
+# `hash -d`, or `set +h` can drop an entry again, so a `hash -p` registration
+# never hides one of these spellings.
+_MODELLED_COMMAND_NAMES = (
+    _LOOKUP_COMMANDS
+    | _WRAPPERS
+    | _PAYLOAD_RUNNERS
+    | frozenset(_EXEC_LAUNCHER_FLAGS)
+    | frozenset(_LAUNCHER_OPERAND_OPTIONS)
+    | {"command", "alias"}
+)
 _BRACE_EXPANSION_CAP = 64
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 _ANSI_C_ESCAPES = {
@@ -1051,13 +1063,13 @@ def _scan_segment(
             continue
         if command_words is not None:
             command_words.add(start)
+        if _word_names_sudo(word.value):
+            return f"{os.path.basename(word.value)} would run this command as root or another user"
         if _word_names_sudo(registered):
-            if registered != word.value:
-                return (
-                    f"a `hash -p` entry makes {word.value} run {registered}, which "
-                    "would run this command as root or another user"
-                )
-            return f"{name} would run this command as root or another user"
+            return (
+                f"a `hash -p` entry makes {word.value} run {registered}, which "
+                "would run this command as root or another user"
+            )
         if name == "alias":
             return _scan_alias_bodies(words, start + 1, depth, parent_mentions_sudo)
         if name in _EXEC_LAUNCHER_FLAGS:
@@ -1084,8 +1096,11 @@ def _scan_segment(
 
 
 def _is_duration(value: str) -> bool:
+    # GNU timeout takes a floating-point NUMBER with an optional s/m/h/d suffix,
+    # and the kernel's own `timeout 0.1 sudo id` spelling must not read as the
+    # command word; an integer is the subset that `nice` accepts.
     digits = value[:-1] if value[-1:].isalpha() else value
-    return bool(digits) and digits.isdigit()
+    return bool(re.fullmatch(r"(?:\d+(?:\.\d*)?|\.\d+)", digits))
 
 
 def _skip_loop_header(words: list[_Word], start: int) -> int:
@@ -1722,10 +1737,18 @@ def _hash_registered_command_names(words: list[_Word]) -> tuple[dict[str, str], 
 
 
 def _registered_command(value: str, hash_alias_names: dict[str, str] | None) -> str:
-    """The file a `hash -p` registration makes this word run, else the word."""
-    if hash_alias_names:
-        return hash_alias_names.get(value, value)
-    return value
+    """The file a `hash -p` registration makes this word run, else the word.
+
+    A name the walk models by itself keeps its own meaning: `_MODELLED_COMMAND_NAMES`
+    covers the shell builtins the hash table cannot shadow (`eval`, `command`,
+    `exec`, `builtin`, `type`, `alias`, `source`).
+    """
+    if not hash_alias_names:
+        return value
+    target = hash_alias_names.get(value)
+    if target is None or os.path.basename(value) in _MODELLED_COMMAND_NAMES:
+        return value
+    return target
 
 
 def _scan_alias_bodies(
