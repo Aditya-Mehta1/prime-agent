@@ -131,6 +131,18 @@ const CORPUS: &[&[&str]] = &[
     &["uninstall"],
     &["manage"],
     &["manage", "update"],
+    // Daemon discovery against an empty sandbox state root: fully
+    // deterministic output for both binaries (the sandbox TMPDIR keeps the
+    // OS census out of either root; see docs/PORTING-NOTES.md containment).
+    &["status"],
+    &["status", "--json"],
+    &["doctor"],
+    &["doctor", "--json"],
+    &["doctor", "--fix"],
+    &["doctor", "--fix", "--json"],
+    &["shutdown"],
+    &["shutdown", "--json"],
+    &["shutdown", "--force", "--json"],
     // Public command routing and validation.
     &["--offline", "status"],
     &["--verbose", "status", "--json"],
@@ -296,6 +308,11 @@ fn run(binary: &Path, args: &[&str], sandbox: &Path) -> InvocationOutput {
         // through passwd rather than $HOME, so the env override is the only
         // reliable isolation for both binaries.
         .env("PRIME_AGENT_CODING_AGENT_DIR", sandbox.join("agent"))
+        // Isolate the socket dir the same way: daemon discovery (status,
+        // doctor, shutdown) must never see this box's real sockets under
+        // TMPDIR, and `shutdown --force` on the TS binary has no
+        // containment guard at all.
+        .env("TMPDIR", sandbox.join("tmp"))
         .env("PI_OFFLINE", "1")
         .current_dir(sandbox.join("cwd"))
         .current_dir(sandbox.join("cwd"))
@@ -359,7 +376,7 @@ fn sandbox(prefix: &str) -> PathBuf {
         "pa-cli-differential-{prefix}-{}",
         std::process::id()
     ));
-    for dir in ["home", "cwd", "agent"] {
+    for dir in ["home", "cwd", "agent", "tmp"] {
         std::fs::create_dir_all(base.join(dir)).expect("create sandbox directory");
     }
     base

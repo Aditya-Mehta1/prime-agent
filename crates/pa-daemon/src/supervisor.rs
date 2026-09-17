@@ -887,7 +887,7 @@ impl Supervisor {
             schema_revision: Some(DAEMON_SCHEMA_REVISION),
             app_version: Some(DAEMON_APP_VERSION.to_string()),
             runtime: Some(DaemonRuntimeIdentity {
-                build_id: DAEMON_APP_VERSION.to_string(),
+                build_id: concat!("pa-daemon-rs-", env!("CARGO_PKG_VERSION")).to_string(),
                 executable_path: std::env::current_exe()
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_default(),

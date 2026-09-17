@@ -1,5 +1,26 @@
 
 
+## Daemon discovery containment (operator directive, 2026-09-17)
+
+The OS-level daemon discovery (`pa-cli` `daemon_discovery`) was killing this box's live
+mission daemon: a test process that inherits the ambient `HOME`/`TMPDIR` resolves
+`current_state_root()` onto the mission daemon's real socket dirs (`/tmp/prime-agent-1000`,
+`/tmp/mission-tmp/prime-agent-1000`), so a scan or `--force` residual sweep found, probed,
+and SIGTERM'd the mission supervisor's workers. Two structural fixes, both deliberate
+divergences from the TS `cli/daemon-ps.ts` shape:
+
+- Every scan, probe, unlink, and kill is scoped to an explicit `DaemonStateRoot` handed in
+  by the caller (the CLI passes the env-resolved current root; tests pass only fixture
+  directories they created). The root filter runs inside the OS census, before any probe or
+  signal, so a daemon outside the given root is never even a candidate.
+- `NEVER_TOUCH_SOCKET_DIRS` is a hard exclusion list checked unconditionally in the scan,
+  probe, socket-dir sweep, and unlink paths, even when a state root deliberately points at
+  them. It lists this sandbox's mission paths, including `/tmp/prime-agent-1000` — which is
+  also the product-default socket dir for a uid-1000 Linux user with `TMPDIR=/tmp`. That
+  product-parity trade-off is accepted for this mission sandbox per the operator directive;
+  revisit before any release cut of the binary.
+
+
 ## Child-session stream hang (observed in production, 2026-09-16)
 
 Three child sessions hung mid-turn: `isStreaming=true` with zero progress for 20+ minutes,

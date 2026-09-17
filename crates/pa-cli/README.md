@@ -19,3 +19,13 @@ The daemon-backed public commands (`list`, `stop`, `rename`, `send`, `schedule`)
 pa-daemon supervisor over its JSONL Unix socket through the crate-private client module
 (`daemon_client.rs`). The client never spawns a daemon - the TS CLI only auto-starts one for
 the internal `daemon start`/`open` commands, which are not reachable from the public surface.
+
+## Daemon discovery
+The discovery commands (`status`, `doctor [--fix]`, `shutdown [--force]`, TS
+`cli/daemon-ps.ts`) live in the crate-private `daemon_discovery` module: an OS census of
+listening unix sockets owned by product processes, a socket-dir sweep, probing/classifying
+each discovered daemon, and the reap/shutdown planners and executors. Containment is part of
+the contract: every scan, probe, and stop is scoped to an explicit `DaemonStateRoot`
+(the env-resolved current root for the CLI), with a hard never-touch exclusion list for this
+sandbox's ambient mission daemons - see docs/PORTING-NOTES.md. All e2e daemons live in
+test-created fixture directories only.

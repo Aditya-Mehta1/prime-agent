@@ -46,16 +46,25 @@ pub(crate) struct DaemonClient {
 impl DaemonClient {
     /// Connect to the daemon socket, ready for the hello handshake.
     pub(crate) fn connect(socket_path: &Path) -> Result<Self> {
-        let stream = connect_blocking(socket_path).map_err(|error| {
+        Self::connect_raw(socket_path).map_err(|error| {
             anyhow!(
                 "Failed to connect to the Prime Agent daemon: {}. {}",
                 node_connect_error(&error, socket_path),
                 endpoint_details(socket_path)
             )
-        })?;
-        let writer = stream
-            .try_clone_box()
-            .map_err(|error| anyhow!("Failed to connect to the Prime Agent daemon: {error}"))?;
+        })
+    }
+
+    /// [`Self::connect`] without the user-facing error decoration: discovery
+    /// probes expect unreachable sockets and classify them instead of
+    /// surfacing the connect error.
+    pub(crate) fn connect_probe(socket_path: &Path) -> Result<Self> {
+        Self::connect_raw(socket_path).map_err(|error| anyhow!("connect: {error}"))
+    }
+
+    fn connect_raw(socket_path: &Path) -> std::io::Result<Self> {
+        let stream = connect_blocking(socket_path)?;
+        let writer = stream.try_clone_box()?;
         Ok(DaemonClient {
             socket_path: socket_path.to_path_buf(),
             reader: BufReader::new(stream),
@@ -67,12 +76,22 @@ impl DaemonClient {
         })
     }
 
-    /// Send one command envelope and wait for its response.
+    /// Send one command envelope and wait for its response with the default
+    /// timeout.
     ///
     /// Errors carry the exact TS client message text, including the socket and
     /// daemon-log path the TS product prints so users can self-diagnose.
     pub(crate) fn request(&mut self, command: DaemonCommand) -> Result<DaemonResponse> {
-        let timeout_ms = REQUEST_TIMEOUT_MS;
+        self.request_with_timeout(command, REQUEST_TIMEOUT_MS)
+    }
+
+    /// [`Self::request`] with an explicit response deadline (daemon
+    /// discovery probes use the TS probe timeouts, not the CLI default).
+    pub(crate) fn request_with_timeout(
+        &mut self,
+        command: DaemonCommand,
+        timeout_ms: u64,
+    ) -> Result<DaemonResponse> {
         let command_type = command_type_name(&command).to_string();
         let operation = Operation::Command(&command_type);
         let hello = self.wait_for_hello(HELLO_TIMEOUT_MS)?;
@@ -130,8 +149,9 @@ impl DaemonClient {
         }
     }
 
-    /// Wait for the greeting, reusing an already-observed hello.
-    fn wait_for_hello(&mut self, timeout_ms: u64) -> Result<serde_json::Value> {
+    /// Wait for the greeting, reusing an already-observed hello. Public to
+    /// the crate for discovery probes with their own deadline.
+    pub(crate) fn wait_for_hello(&mut self, timeout_ms: u64) -> Result<serde_json::Value> {
         if let Some(hello) = &self.hello {
             return Ok(hello.clone());
         }

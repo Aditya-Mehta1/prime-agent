@@ -19,7 +19,12 @@ use serde_json::Value;
 /// Minimum protocol version accepted in command envelopes (TS parity).
 pub const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION: u64 = DAEMON_PROTOCOL_VERSION;
 /// App version reported in `daemon_hello` for stale-daemon detection.
-pub const DAEMON_APP_VERSION: &str = concat!("pa-daemon-rs-", env!("CARGO_PKG_VERSION"));
+/// The product version the daemon reports in every `daemon_hello`
+/// (`appVersion`): the TS daemon reports its own `VERSION` constant, and the
+/// CLI's `doctor`/`status` "current" classification compares against the same
+/// value, so this must stay the bare product version (the build identity
+/// marker lives in `runtime.buildId`).
+pub const DAEMON_APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Command types the daemon recognizes (TS `DAEMON_COMMAND_TYPES`).
 pub const KNOWN_COMMAND_TYPES: &[&str] = &[

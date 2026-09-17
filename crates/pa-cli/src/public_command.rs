@@ -1,7 +1,7 @@
 //! Public command routing, ported from `cli/public-command.ts`.
 
+use crate::daemon_discovery;
 use std::collections::HashSet;
-use std::io::IsTerminal;
 
 use crate::args::{parse_args, INTERNAL_RUNTIME_COMMAND_MARKER};
 use crate::command_registry::{
@@ -52,12 +52,6 @@ fn continue_with(args: Vec<String>) -> PublicCommandResult {
 
 /// The error message used when a routed command needs a runtime subsystem that
 /// is not linked into this build yet.
-fn unavailable(subsystem: &str) -> String {
-    format!(
-        "{subsystem} is not available in this build yet; the {subsystem} crate has not been merged"
-    )
-}
-
 fn fail(message: impl AsRef<str>, hint: Option<String>) -> PublicCommandResult {
     eprintln!("Error: {}", message.as_ref());
     if let Some(hint) = hint {
@@ -74,6 +68,18 @@ fn fail(message: impl AsRef<str>, hint: Option<String>) -> PublicCommandResult {
 
 fn handled() -> PublicCommandResult {
     HANDLED()
+}
+
+/// A handled invocation whose driver already printed everything, with its own
+/// process exit code (shutdown failures exit 1).
+fn handled_with_exit(exit_code: i32) -> PublicCommandResult {
+    PublicCommandResult {
+        handled: true,
+        args: vec![],
+        explicit_agents_view: false,
+        attach_agent: None,
+        exit_code: Some(exit_code),
+    }
 }
 
 /// A handled invocation whose fail() branch already printed an error: the
@@ -349,18 +355,31 @@ fn run_status(args: &[String]) -> PublicCommandResult {
     let Some(options) = parse_boolean_options(args, &["--json"], "status") else {
         return handled_failed();
     };
-    run_ps(options.contains("--json"))
+    daemon_discovery::run_ps(
+        options.contains("--json"),
+        &daemon_discovery::current_state_root(),
+    );
+    handled()
 }
 
 fn run_doctor(args: &[String]) -> PublicCommandResult {
     let Some(options) = parse_boolean_options(args, &["--fix", "--json"], "doctor") else {
         return handled_failed();
     };
+    // `doctor` inspects; `doctor --fix` reaps clearly-safe services (TS
+    // runDoctor: runReap with force=false, else runPs).
     if options.contains("--fix") {
-        run_reap()
+        daemon_discovery::run_reap(
+            options.contains("--json"),
+            &daemon_discovery::current_state_root(),
+        );
     } else {
-        run_ps(options.contains("--json"))
+        daemon_discovery::run_ps(
+            options.contains("--json"),
+            &daemon_discovery::current_state_root(),
+        );
     }
+    handled()
 }
 
 fn run_shutdown(args: &[String]) -> PublicCommandResult {
@@ -369,33 +388,12 @@ fn run_shutdown(args: &[String]) -> PublicCommandResult {
     };
     let force = options.contains("--force");
     let json = options.contains("--json");
-    if !force {
-        if json {
-            return fail(
-                unavailable("daemon discovery and shutdown"),
-                Some(
-                    "The shutdown --json confirmation path needs daemon discovery (pa-daemon)."
-                        .to_string(),
-                ),
-            );
-        }
-        if !std::io::stdin().is_terminal() {
-            return fail(
-                "Shutdown requires confirmation in an interactive terminal. Use \"prime-agent shutdown --force\".",
-                None,
-            );
-        }
-        return fail(unavailable("daemon discovery and shutdown"), None);
-    }
-    fail(unavailable("daemon shutdown"), None)
-}
-
-fn run_ps(_json: bool) -> PublicCommandResult {
-    fail(unavailable("daemon discovery"), None)
-}
-
-fn run_reap() -> PublicCommandResult {
-    fail(unavailable("daemon process cleanup"), None)
+    // The confirmation decision (including the non-TTY failure, which TS
+    // only raises once there are daemons to stop) lives with the discovery
+    // driver, which knows the daemon count.
+    let exit_code =
+        daemon_discovery::run_shutdown_all(json, force, &daemon_discovery::current_state_root());
+    handled_with_exit(exit_code)
 }
 
 fn run_mcp(args: &[String]) -> PublicCommandResult {
