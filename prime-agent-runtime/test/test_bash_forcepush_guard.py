@@ -16,26 +16,24 @@ from unittest import mock
 from rlm import bash
 from rlm.bash import BASH_FORCE_PUSH_BYPASS_ENV, ForcePushRefusalError
 
-# The package re-exports the bash() function under the same name, so reach the
-# module through sys.modules for internals.
+# The package re-exports the bash() function under the same name, so reach the module through sys.modules for
+# internals.
 bash_module = sys.modules["rlm.bash"]
 
-# Every spawned command, probe, and repo operation in this suite carries an
-# explicit timeout.
+# Every spawned command, probe, and repo operation in this suite carries an explicit timeout.
 AWAIT_TIMEOUT = 10.0
 GIT_TIMEOUT = 60
 KERNEL_LAUNCH_TIMEOUT = 90
 
-# The guard classifies remote words on every guarded command that carries a git
-# word, so a pathological word must not wedge kernel bash(). These bounds are
-# wall-clock and generous: the work is a handful of linear passes.
+# The guard classifies remote words on every guarded command that carries a git word, so a pathological word
+# must not wedge kernel bash(). These bounds are wall-clock and generous: the work is a handful of linear
+# passes.
 SCAN_BUDGET_SECONDS = 0.5
 SCAN_TIMEOUT_SECONDS = 20.0
 
-# Words shaped to trigger catastrophic backtracking in a pattern that nests a
-# `+` inside a `+` (`[^/@:]+(?:\.[^/@:]+)+:`, the py/redos finding): many
-# dot-separated groups, with and without the colon that makes the guard
-# classify the word, a long colon-free word, and a long dotted word.
+# Words shaped to trigger catastrophic backtracking in a pattern that nests a `+` inside a `+`
+# (`[^/@:]+(?:\.[^/@:]+)+:`, the py/redos finding): many dot-separated groups, with and without the colon that
+# makes the guard classify the word, a long colon-free word, and a long dotted word.
 PATHOLOGICAL_REMOTE_WORDS = [
     "a" + ".x" * 30, "a" + ".x" * 30 + "/:p", "a" + ".." * 200, "a" + "./" * 200 + ":p", "x" * 4096, "a" + ".x" * 2000 + "/:p",
 ]
@@ -91,30 +89,23 @@ def _guarded_runs(command: str) -> list[bash_module._FpPushArgs]:
     return runs
 
 
-# Vectors for the force-push detector: an invocation must carry a force flag
-# (`--force`, `-f` bundled with other short options, a `+`-prefixed refspec)
-# and not be a dry run. Quoted command words and quoted flags fold into their
-# values, so they must match like the unquoted forms. An unquoted echo of the
-# same text matches too: conservative in the safe direction, exactly like the
-# other kernel bash guards.
+# Vectors for the force-push detector: a force flag (`--force`, a bundled `-f`, a `+`-refspec) and no dry run.
+# Quoted words and flags fold into their values, so they match like the unquoted forms, and an unquoted echo of
+# the same text matches too: conservative in the safe direction.
 FORCE_PUSH_MATCHING_COMMANDS = [
-    "git push --force origin main", "git push -f origin main",
-    "git push origin main -f", "git push -f origin main:main",
+    "git push --force origin main", "git push -f origin main", "git push origin main -f", "git push -f origin main:main",
     "git push -f origin main:refs/heads/main", "git push -f origin refs/heads/main",
     "git push -f origin HEAD:main", "git push -f origin HEAD:heads/main", "git push -f origin main:heads/main",
-    # `-oo` is `-o o`: the rest of that cluster is the option's value and the
-    # next token is still a flag, so `-f` is a real force.
+    # `-oo` is `-o o`, so the `-f` after it is still a flag.
     "git push -oo -f origin main", "git push -f origin :main", "git push -f origin main:",
     "git push -f origin @{u}", "git push origin +main",
     "git push origin +main:main", "git push origin +feature", "git push --force",
     "git push -f", "git push -f origin", "git push -f --all", "git push --force --mirror origin",
-    # `--mirror` is `--all` plus a forced push of every ref, so it carries
-    # force without a force flag; `--all` alone stays non-force.
+    # `--mirror` carries force (every ref, forced); `--all` alone does not.
     "git push --mirror origin", "git push --mirror", "git push -fv origin main", "git push -f origin main --",
     "git push --force --repo=origin main", "git push -f --delete origin main",
     "git push --force-with-lease -f origin main", "/usr/bin/git push -f origin main",
-    '"git" push -f origin main', "git 'push' -f origin main",
-    "\\git push -f origin main", "sudo git push -f origin main",
+    '"git" push -f origin main', "git 'push' -f origin main", "\\git push -f origin main", "sudo git push -f origin main",
     "FOO=1 git push -f origin main", "git -C repo push -f origin main",
     "git -c foo.bar=1 push -f origin main", "git --git-dir=.git push -f origin main",
     "echo $(git push -f origin main)", "git push -f origin \\\nmain", "git push 2>/dev/null -f origin main",
@@ -122,52 +113,41 @@ FORCE_PUSH_MATCHING_COMMANDS = [
     "git push -f origin main # ship it", "git push -f origin main && echo done",
     "echo git push -f origin main", "echo main | xargs git push -f origin",
     "git push -f origin $BRANCH", "git push -f origin HEAD",
-    # The shell joins a backslash-newline continuation into one token, decodes
-    # ANSI-C (`$'...'`) escapes, and resolves `$"..."` as a double-quoted
-    # string, so these reach git as the force pushes they spell out.
+    # Continuations join, ANSI-C escapes decode and `$"..."` is double-quoted: all reach git as force pushes.
     "git push -f origin ma\\\nin", "git push -\\\nf origin main",
     "gi\\\nt push -f origin main", 'git push -f origin "ma\\\nin"',
     "$'git' push -f origin main", "$'\\x67it' push -f origin main",
     "$'\\u0067it' push -f origin main", '$"git" push -f origin main',
     "git $'push' -f origin main", "git push -$'f' origin main", "git push $'--force' origin main",
-    # The kernel also runs on case-insensitive filesystems, where `GIT` and
-    # `/usr/bin/GIT` resolve to the `git` binary.
+    # Case-insensitive filesystems resolve `GIT` and `/usr/bin/GIT` to git.
     "GIT push -f origin main", "Git.exe push -f origin main", "/usr/bin/GIT push -f origin main",
     # git rewrites argv with an inline alias body before it parses it.
     "git -c alias.p='push -f origin main' p", "git -c alias.a=p -c alias.p='push -f origin main' a",
     "git -c alias.p='push -f origin main' -C repo p",
-    # An alias whose name shadows a builtin is never used by git, so the
-    # builtin push must still be found.
+    # An alias shadowing a builtin is never used, so the builtin push must be found.
     "git -c alias.push='status' push -f origin main",
 ]
 
-# Vectors whose push argument the shell expands. An unquoted `$f` can expand
-# into `-f`, and any dynamic refspec can be a `+`-refspec naming a protected
-# branch, so the scanner cannot prove these are not force pushes: they must be
-# treated as guarded rather than allowed as plain pushes.
+# Vectors whose push argument the shell expands: `$f` can become `-f` and a dynamic refspec can be a `+`-refspec
+# naming a protected branch, so these are guarded rather than allowed as plain pushes.
 FORCE_PUSH_UNRESOLVABLE_ARGUMENT_COMMANDS = [
     "f=-f; git push $f origin main", "f='-f origin'; git push $f",
     "git push $REMOTE origin main", "git push origin $BRANCH",
     "BRANCH=+main; git push origin $BRANCH", "git push origin 'main*'",
     "git push --repo=$REMOTE main", "git push --force-with-lease origin $BRANCH",
-    # `-f` cancels the lease compare-and-swap: measured on git 2.55 over a
-    # deliberately stale remote-tracking ref, a bare `--force-with-lease` is
-    # rejected as `stale info` while `--force-with-lease -f`,
-    # `--force-with-lease origin +main`, and `X=-f; git push --force-with-lease
-    # origin $X` all rewrite main.
+    # `-f` cancels the lease compare-and-swap: on git 2.55 over a stale remote-tracking ref a bare lease is
+    # rejected as `stale info`, while the lease plus `-f`, `+main` or `$X` all rewrite main.
     "X=-f; git push --force-with-lease origin $X",
 ]
 
 FORCE_PUSH_NON_MATCHING_COMMANDS = [
     "git push origin main", "git push", "git push origin", "git push -u origin main",
-    "git push --all", "git push --tags",
-    "git push origin --delete main", "git push --force-with-lease origin main",
+    "git push --all", "git push --tags", "git push origin --delete main", "git push --force-with-lease origin main",
     "git push --force-with-lease=main:expected origin main", "git push --force-if-includes origin main",
     "git push --force-with-lease --force-if-includes origin main", "git push -n origin main",
     "git push -f -n origin main", "git push -fn origin main",
     "git push -nf origin main", "git push --dry-run -f origin main", "git push -v -q origin main",
-    # `-of` is `-o f`: the rest of the cluster is the option's value, so no
-    # force flag is set.
+    # `-of` is `-o f`: no force flag is set.
     "git push -of origin main", "git checkout --force main",
     "git config push.default matching", "git status", "echo hello", "npm run check",
     "echo 'git push -f origin main'", 'echo "git push -f origin main"',
@@ -180,20 +160,17 @@ FORCE_PUSH_NON_MATCHING_COMMANDS = [
 
 
 class ForcePushDetectionTest(unittest.TestCase):
-    def test_matches_force_pushes(self):
-        for command in FORCE_PUSH_MATCHING_COMMANDS:
-            with self.subTest(command=command):
-                self.assertTrue(_guarded_runs(command))
-
-    def test_matches_unresolvable_push_arguments(self):
-        for command in FORCE_PUSH_UNRESOLVABLE_ARGUMENT_COMMANDS:
-            with self.subTest(command=command):
-                self.assertTrue(_guarded_runs(command))
-
-    def test_does_not_match_other_commands(self):
-        for command in FORCE_PUSH_NON_MATCHING_COMMANDS:
-            with self.subTest(command=command):
-                self.assertFalse(_guarded_runs(command))
+    def test_detection_tables(self):
+        """Each vector matches its table's verdict, one subTest per command."""
+        tables = (
+            (FORCE_PUSH_MATCHING_COMMANDS, True),
+            (FORCE_PUSH_UNRESOLVABLE_ARGUMENT_COMMANDS, True),
+            (FORCE_PUSH_NON_MATCHING_COMMANDS, False),
+        )
+        for commands, expected in tables:
+            for command in commands:
+                with self.subTest(command=command):
+                    self.assertEqual(bool(_guarded_runs(command)), expected)
 
     def test_force_with_lease_is_never_a_bare_force(self):
         args = bash_module._fp_parse_push_args(
@@ -224,8 +201,8 @@ class ForcePushScannerFidelityTest(unittest.TestCase):
                 self.assertEqual([word.value for word in words], [expected])
 
     def test_ansi_c_code_points_are_bounded(self):
-        # `$'\UFFFFFFFF'` is out of range: chr() must not raise, or every
-        # command text carrying it takes bash() down before it spawns.
+        # `$'\UFFFFFFFF'` is out of range: chr() must not raise, or every command text carrying it takes bash()
+        # down before it spawns.
         for source, expected in [
             ("$'\\UFFFFFFFF'", chr(0x10FFFF)),
             ("$'\\U0010FFFF'", chr(0x10FFFF)),
@@ -243,15 +220,13 @@ class ForcePushScannerFidelityTest(unittest.TestCase):
         self.assertEqual([word.value for word in words], ["echo", 'a " b'])
 
     def test_redirections_inside_double_quotes_stay_visible(self):
-        # The quoted span is data: masking it as a redirection would change the
-        # word the target check reads.
+        # The quoted span is data: masking it as a redirection would change the word the target check reads.
         command = 'git push -f origin " > x" main'
         self.assertIn('" > x"', _prepare(command))
 
     def test_deep_payload_chains_are_refused_by_the_depth_cap(self):
-        # The payload walk counts two levels per nesting layer and refuses once
-        # it passes _FP_MAX_PAYLOAD_DEPTH, so a chain it cannot follow is
-        # refused rather than missed: a benign chain past the cap is refused.
+        # The payload walk counts two levels per nesting layer and refuses once it passes _FP_MAX_PAYLOAD_DEPTH,
+        # so a chain it cannot follow is refused rather than missed: a benign chain past the cap is refused.
         self.assertLessEqual(
             getattr(bash_module, "_FP_MAX_PAYLOAD_DEPTH", 10),
             10,
@@ -276,10 +251,9 @@ class ForcePushScannerFidelityTest(unittest.TestCase):
                 )
 
     def test_url_and_scp_remotes_are_not_refspecs(self):
-        # git reads the first positional as the repository whatever it looks
-        # like, so none of these are refspecs; the push is implicit and the
-        # upstream rules decide. Real git answers `Could not resolve hostname`
-        # for the colon forms, which is how this list was verified.
+        # git reads the first positional as the repository whatever it looks like, so none of these are
+        # refspecs; the push is implicit and the upstream rules decide. Real git answers `Could not resolve
+        # hostname` for the colon forms, which is how this list was verified.
         for first in [
             "https://example.invalid/x.git", "ssh://example.invalid/x.git",
             "git@github.com:org/repo.git", "example.invalid:org/repo.git",
@@ -298,8 +272,8 @@ class ForcePushScannerFidelityTest(unittest.TestCase):
 
 class ForcePushEvalPayloadTest(unittest.TestCase):
     def test_eval_payloads_hiding_force_pushes(self):
-        # A payload holding another payload: the inner command only exists
-        # after the outer one runs, so each scanner must consult the others.
+        # A payload holding another payload: the inner command only exists after the outer one runs, so each
+        # scanner must consult the others.
         _scan_flags_all(
             self,
                 ["eval 'git push -f origin main'", 'eval "git push -f origin main"',
@@ -314,8 +288,7 @@ class ForcePushEvalPayloadTest(unittest.TestCase):
     def test_safe_eval_payloads_stay_unflagged(self):
         _scan_flags_all(
             self,
-                ["eval 'git push --force-with-lease origin main'",
-                 "eval 'git push origin main'", "eval 'echo hi'",
+                ["eval 'git push --force-with-lease origin main'", "eval 'git push origin main'", "eval 'echo hi'",
                  "eval \"echo 'git push -f origin main'\"", "eval 'git status'",
                  "eval " + json.dumps(_sh_payload_chain(3, "git status"))],
             bash_module._fp_eval_payloads_hide_force_push,
@@ -325,8 +298,8 @@ class ForcePushEvalPayloadTest(unittest.TestCase):
 
 class ForcePushShellCPayloadTest(unittest.TestCase):
     def test_shell_c_payloads_hiding_force_pushes(self):
-        # Deeper chains: every nesting level consumes one escaping layer,
-        # so these are only reachable through the folded-value look.
+        # Deeper chains: every nesting level consumes one escaping layer, so these are only reachable through
+        # the folded-value look.
         _scan_flags_all(
             self,
                 ["sh -c 'git push -f origin main'", "bash -c 'git push -f origin main'",
@@ -339,8 +312,7 @@ class ForcePushShellCPayloadTest(unittest.TestCase):
         )
 
     def test_safe_shell_c_payloads_stay_unflagged(self):
-        # Nested chains the guard can still follow stay unflagged, and so
-        # does a nested literal lease push.
+        # Nested chains the guard can still follow stay unflagged, and so does a nested literal lease push.
         _scan_flags_all(
             self,
                 ["bash -c 'git push --force-with-lease origin main'",
@@ -361,8 +333,7 @@ def _substitution_chain(
 
     Each layer wraps `fanout` copies of the previous text in a substitution and
     then in `eval "<...>"`, so the text and the scan work grow exponentially in
-    `depth` while the command stays a single payload.
-    """
+    `depth` while the command stays a single payload."""
     command = leaf
     for _ in range(depth):
         if delimiter == "$":
@@ -397,24 +368,16 @@ class ForcePushScanCostTest(unittest.TestCase):
 
     Each measurement runs in its own interpreter so a wedged classification is
     killed by the subprocess timeout instead of hanging the suite, and the
-    wall-clock bound is asserted on the reported elapsed time.
-    """
+    wall-clock bound is asserted on the reported elapsed time."""
 
     def _probe(self, body: str, argument: str) -> tuple[float, str]:
-        # The command travels on stdin, not in argv: Linux caps one argument at
-        # MAX_ARG_STRLEN (128 KB) and the deepest latency vector is 176 KB, so
-        # passing it as an argument fails there with
-        # "OSError: [Errno 7] Argument list too long" (it happened to work on
-        # macOS, which has no such cap).
+        # The command travels on stdin, not in argv: Linux caps one argument at MAX_ARG_STRLEN (128 KB) and the
+        # deepest latency vector is 176 KB, so passing it as an argument fails there with "OSError: [Errno 7]
+        # Argument list too long" (it happened to work on macOS, which has no such cap).
         probe = (
-            "import sys, time\n"
-            "import rlm.bash\n"
-            "module = sys.modules['rlm.bash']\n"
-            "argument = sys.stdin.read()\n"
-            "outcome = 'n/a'\n"
-            "started = time.monotonic()\n"
-            f"{body}\n"
-            "print('%.6f\\t%s' % (time.monotonic() - started, outcome))\n"
+            "import sys, time\n" "import rlm.bash\n" "module = sys.modules['rlm.bash']\n"
+            "argument = sys.stdin.read()\n" "outcome = 'n/a'\n" "started = time.monotonic()\n"
+            f"{body}\n" "print('%.6f\\t%s' % (time.monotonic() - started, outcome))\n"
         )
         try:
             completed = subprocess.run(
@@ -454,9 +417,8 @@ class ForcePushScanCostTest(unittest.TestCase):
         )
 
     def test_nested_substitutions_are_refused_quickly(self):
-        # The scan walks substitution interiors recursively, so these shapes
-        # used to cost 13.8s (depth 5) up to more than 30s (depth 6+) and could
-        # wedge kernel bash() before it spawned anything. The scan budget now
+        # The scan walks substitution interiors recursively, so these shapes used to cost 13.8s (depth 5) up to
+        # more than 30s (depth 6+) and could wedge kernel bash() before it spawned anything. The scan budget now
         # refuses them in milliseconds.
         for name, command in [
             ("sub depth4 fanout3", _substitution_chain(4, 3)),
@@ -474,9 +436,8 @@ class ForcePushScanCostTest(unittest.TestCase):
                     SCAN_BUDGET_SECONDS,
                     f"{elapsed:.3f}s for {name} ({len(command)} bytes)",
                 )
-                # Fail closed, and say why: these shapes are refused either by
-                # the scan budget or by the payload rule that a payload holding
-                # an expansion is unresolvable, both in milliseconds.
+                # Fail closed, and say why: these shapes are refused either by the scan budget or by the payload
+                # rule that a payload holding an expansion is unresolvable, both in milliseconds.
                 self.assertIn("refused", outcome, outcome)
                 self.assertTrue(
                     "scan budget" in outcome or "Refusing to run" in outcome, outcome
@@ -488,20 +449,18 @@ class ForcePushScanCostTest(unittest.TestCase):
                 elapsed, outcome = self._probe_guard(command)
                 self.assertLess(elapsed, SCAN_BUDGET_SECONDS)
                 self.assertIn("nest more than", outcome, outcome)
-        # The budget itself is a backstop for recursive blowup within the cap:
-        # thousands of sibling re-scans, which is not something an agent writes.
+        # The budget itself is a backstop for recursive blowup within the cap: thousands of sibling re-scans,
+        # which is not something an agent writes.
         wide = " ".join("$(a)" for _ in range(6000))
         elapsed, outcome = self._probe_guard(wide)
         self.assertLess(elapsed, SCAN_BUDGET_SECONDS)
         self.assertIn("scan budget", outcome)
 
     def test_large_benign_command_is_allowed_and_linear(self):
-        # The word scan used to test every word against every later word, so a
-        # multi-line command cost seconds of blocked kernel time (224 KB spent
-        # 16.4s). Each word's interior flag is recorded as the word is built
-        # now, so the cost is linear in the command length: the same shape must
-        # both run and stay well inside the bound, with the growth per doubling
-        # close to two rather than four.
+        # The word scan used to test every word against every later word, so a multi-line command cost seconds
+        # of blocked kernel time (224 KB spent 16.4s). Each word's interior flag is recorded as the word is
+        # built now, so the cost is linear in the command length: the same shape must both run and stay well
+        # inside the bound, with the growth per doubling close to two rather than four.
         timings = []
         for count in (1000, 2000, 4000, 8000):
             command = "\n".join("git log --oneline | head -3" for _ in range(count))
@@ -515,26 +474,21 @@ class ForcePushScanCostTest(unittest.TestCase):
                     f"{elapsed:.3f}s for {len(command)} bytes",
                 )
                 timings.append(elapsed)
-        # A linear scan roughly doubles per doubling; quadratic growth would
-        # quadruple. The bound is loose so the assertion is about the shape of
-        # the curve, not about this machine's speed.
+        # A linear scan roughly doubles per doubling; quadratic growth would quadruple. The bound is loose so
+        # the assertion is about the shape of the curve, not about this machine's speed.
         self.assertLess(timings[-1], max(timings[0], 0.01) * 16)
 
     def test_long_benign_text_is_never_refused_for_its_length(self):
-        # The budget counts nested re-scans, not characters: a long flat or
-        # multi-line command is ordinary text and must run. These shapes were
-        # refused for being a few KB long before the budget was reworked.
+        # The budget counts nested re-scans, not characters: a long flat or multi-line command is ordinary text
+        # and must run. These shapes were refused for being a few KB long before the budget was reworked.
         long_echo = "\n".join("echo hello world" for _ in range(2000))
         long_loop = "\n".join("for f in *.txt; do echo $f; done" for _ in range(200))
         long_heredoc = (
-            "python - <<'EOF'\n"
-            + "\n".join(f"print({index})" for index in range(1000))
-            + "\nEOF\n"
+            "python - <<'EOF'\n" + "\n".join(f"print({index})" for index in range(1000)) + "\nEOF\n"
         )
         long_case = "\n".join("case $x in a) echo a;; esac" for _ in range(500))
-        # A long closed backtick substitution is one interior, not a nested
-        # re-scan: the budget charges nested work, never the text itself, so a
-        # 100 KB one is scanned in milliseconds instead of exhausting it.
+        # A long closed backtick substitution is one interior, not a nested re-scan: the budget charges nested
+        # work, never the text itself, so a 100 KB one is scanned in milliseconds instead of exhausting it.
         long_backtick = "echo `printf '%s' " + "x" * 100_000 + "`"
         cases = [
             ("echo x2000", long_echo),
@@ -565,12 +519,9 @@ class ForcePushScanCostTest(unittest.TestCase):
                 self.assertNotIn("scan budget", outcome, outcome)
 
     def _probe_guard(self, command: str) -> tuple[float, str]:
-        """Wall-clock seconds and verdict for one command, in its own process.
-
-        A separate interpreter with an explicit timeout means a wedged scan
-        fails the test instead of hanging the suite, which is what the
-        pre-budget numbers (13.8s to more than 30s per shape) would do.
-        """
+        """Wall-clock seconds and verdict for one command, in its own process. A separate interpreter with an
+explicit timeout means a wedged scan fails the test instead of hanging the suite, which is what the
+pre-budget numbers (13.8s to more than 30s per shape) would do."""
         return self._probe(
             "try:\n"
             "    module._guard_force_push(argument, False)\n"
@@ -604,8 +555,8 @@ class ForcePushScanCostTest(unittest.TestCase):
                     SCAN_BUDGET_SECONDS,
                     f"{elapsed:.3f}s to decide {len(command)} characters",
                 )
-                # A verdict was reached (the guard either allowed or refused),
-                # and the one carrying a protected target was refused.
+                # A verdict was reached (the guard either allowed or refused), and the one carrying a protected
+                # target was refused.
                 self.assertTrue(
                     outcome.startswith(("allowed", "refused")), outcome
                 )
@@ -617,13 +568,13 @@ class ForcePushEnvPayloadTest(unittest.TestCase):
     """`env -S`/`--split-string` splits one word into the argv git receives."""
 
     def test_env_payloads_hiding_force_pushes(self):
-        # A payload holding another payload: the inner command exists only
-        # after env runs, so the scanners have to consult each other.
+        # A payload holding another payload: the inner command exists only after env runs, so the scanners have
+        # to consult each other.
         _scan_flags_all(
             self,
                 ["env -S 'git push -f origin main'", "env --split-string 'git push -f origin main'", "env -iS'git push -f origin main'", "env --split-string='git push -f origin main'",
-                 # getopt_long resolves an unambiguous long-option prefix, so
-                 # `--s`, `--split` and `--s=` carry the payload too.
+                 # getopt_long resolves an unambiguous long-option prefix, so `--s`, `--split` and `--s=` carry
+                 # the payload too.
                  "env --s 'git push -f origin main'", "env --s='git push -f origin main'",
                  "env --split 'git push -f origin main'", "env -S 'eval \"git push -f origin main\"'",
                  "env -S 'sh -c \"git push -f origin main\"'", "env -S " + json.dumps(_sh_payload_chain(3)),
@@ -637,8 +588,7 @@ class ForcePushEnvPayloadTest(unittest.TestCase):
     def test_env_payloads_without_a_force_push_stay_unflagged(self):
         _scan_flags_all(
             self,
-                ["env -S 'git status'", "env -S 'echo hi'",
-                 "env -S 'git push --force-with-lease origin feature'",
+                ["env -S 'git status'", "env -S 'echo hi'", "env -S 'git push --force-with-lease origin feature'",
                  "env --split-string 'git status'", "env --sp 'git status'",
                  "env -C . git status", "env VERSION=1 git status", "echo env -S",
                  "env -S " + json.dumps(_sh_payload_chain(2, "git status")),
@@ -658,8 +608,8 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         self._prev_env = dict(os.environ)
         os.environ.pop(BASH_FORCE_PUSH_BYPASS_ENV, None)
         os.environ.pop("PRIME_AGENT_BASH_COMMAND_PREFIX", None)
-        # The launch-time bypass snapshot is a module attribute frozen at
-        # import; pin it to "unset" so tests stay deterministic.
+        # The launch-time bypass snapshot is a module attribute frozen at import; pin it to "unset" so tests
+        # stay deterministic.
         frozen_patch = mock.patch.object(
             bash_module, "_FORCE_PUSH_BYPASS_AT_KERNEL_START", False
         )
@@ -678,6 +628,12 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         self.test_dir = Path(temp.name)
         os.chdir(self.test_dir)
 
+    def _enter(self, name: str, branch: str = "feature") -> Path:
+        """Make a repo with a bare remote, make it this test's cwd, return it."""
+        repo, _bare = self._make_repo(name, branch)
+        os.chdir(repo)
+        return repo
+
     def _restore_env(self):
         os.environ.clear()
         os.environ.update(self._prev_env)
@@ -695,13 +651,10 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         return completed
 
     def _configure_identity(self, path: Path) -> None:
-        """Give `path` the identity this suite commits with.
-
-        `user.useConfigOnly=true` is part of it on purpose: it forbids git's
-        fallback guess from the passwd entry or the host name, so a repository
-        missing the identity fails the test here instead of only on a CI runner
-        whose guess yields an empty `user.name` (fatal: empty ident name not
-        allowed)."""
+        """Give `path` the identity this suite commits with. `user.useConfigOnly=true` is part of it on purpose: it
+forbids git's fallback guess from the passwd entry or the host name, so a repository missing the
+identity fails the test here instead of only on a CI runner whose guess yields an empty `user.name`
+(fatal: empty ident name not allowed)."""
         for key, value in [
             ("user.email", "guard@example.com"),
             ("user.name", "Guard Test"),
@@ -712,8 +665,8 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
             self._git("config", key, value, cwd=path)
 
     def _make_repo(self, name: str, branch: str = "feature") -> tuple[Path, Path]:
-        """A local repo with a bare remote, main pushed, and `branch` checked
-        out tracking its own name (upstream: <remote>/<branch>)."""
+        """A local repo with a bare remote, main pushed, and `branch` checked out tracking its own name (upstream:
+<remote>/<branch>)."""
         repo = self.test_dir / name
         repo.mkdir()
         bare = self.test_dir / f"{name}-remote.git"
@@ -735,9 +688,8 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         clone = self.test_dir / f"{repo.name}-clone"
         self._git("clone", "-q", "-b", branch, str(bare), str(clone), cwd=self.test_dir)
         self._configure_identity(clone)
-        # The repo the caller handed in may itself be a fresh clone (the quoted
-        # tilde, CDPATH, and sourced-script tests pass one), so configure it
-        # too: the commits below run in it.
+        # The repo the caller handed in may itself be a fresh clone (the quoted tilde, CDPATH, and
+        # sourced-script tests pass one), so configure it too: the commits below run in it.
         self._configure_identity(repo)
         (clone / "file.txt").write_text("remote\n")
         self._git("commit", "-q", "-am", "remote change", cwd=clone)
@@ -765,8 +717,8 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
     async def _refused_all(
         self, commands: list[str], needles: tuple[str, ...] = ()
     ) -> None:
-        """Every command is refused (its message carrying every needle), each
-        with its own subTest so one miss names its vector."""
+        """Every command is refused (its message carrying every needle), each with its own subTest so one miss
+names its vector."""
         for command in commands:
             with self.subTest(command=command):
                 message = await self._refused(command)
@@ -793,14 +745,13 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
             handle = bash(command)
         except ForcePushRefusalError as refusal:
             return str(refusal)
-        # Only reachable while the guard is broken: the command was already
-        # spawned, so stop it before failing the test.
+        # Only reachable while the guard is broken: the command was already spawned, so stop it before failing
+        # the test.
         handle.kill()
         self.fail(f"expected a force-push refusal for {command!r}")
 
     async def test_refuses_force_push_to_main_and_master(self):
-        repo, _bare = self._make_repo("repo-main")
-        os.chdir(repo)
+        repo = self._enter("repo-main")
         # git accepts the short `heads/` spelling for the same destination.
         await self._refused_all(
             ["git push -f origin main", "git push --force origin main",
@@ -813,8 +764,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_refuses_implicit_force_push_to_upstream(self):
-        repo, _bare = self._make_repo("repo-upstream")
-        os.chdir(repo)
+        repo = self._enter("repo-upstream")
         # The probe identifies the real upstream: the bare remote.
         await self._refused_all(
             ["git push -f", "git push --force", "git push -f origin"],
@@ -826,11 +776,9 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         self.assertIn("origin/main", message)
 
     async def test_force_with_lease_and_plain_pushes_allowed(self):
-        repo, _bare = self._make_repo("repo-lease")
-        os.chdir(repo)
+        repo = self._enter("repo-lease")
         await self._allowed_all(
-            ["git push --force-with-lease origin feature",
-             "git push --force-with-lease=feature origin feature",
+            ["git push --force-with-lease origin feature", "git push --force-with-lease=feature origin feature",
              "git push --force-if-includes --force-with-lease origin feature",
              "git push origin feature", "git push", "echo hi"],
         )
@@ -848,23 +796,19 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_dry_run_force_pushes_allowed(self):
-        repo, _bare = self._make_repo("repo-dry")
-        os.chdir(repo)
+        repo = self._enter("repo-dry")
         await self._allowed_all(
             ["git push --dry-run -f origin main", "git push -n --force origin main"]
         )
 
     async def test_refuses_wildcard_force_pushes(self):
-        repo, _bare = self._make_repo("repo-wild")
-        os.chdir(repo)
-        # `--mirror` is `--all` plus a forced push of every ref, so it needs
-        # no force flag of its own; `--all` only fast-forwards.
+        repo = self._enter("repo-wild")
+        # `--mirror` is `--all` plus a forced push of every ref, so it needs no force flag of its own; `--all`
+        # only fast-forwards.
         await self._refused_all(
-            ["git push -f --all", "git push --force --mirror origin",
-             "git push --mirror origin", "git push --mirror",
-             # parse-options takes an unambiguous abbreviation, so `--mir` and
-             # `--mirr` really mirror every ref (`--mirror --no-mir` negates
-             # it again, and `--branch` is git's alias of `--all`).
+            ["git push -f --all", "git push --force --mirror origin", "git push --mirror origin", "git push --mirror",
+             # parse-options takes an unambiguous abbreviation, so `--mir` and `--mirr` really mirror every ref
+             # (`--mirror --no-mir` negates it again, and `--branch` is git's alias of `--all`).
              "git push --mir origin", "git push --mirr origin", "git push --mir origin main",
              "git push --branch --force origin"],
             ("every branch",),
@@ -876,39 +820,34 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.exit_code, 0, result.output)
 
     async def test_refuses_xargs_fed_force_push(self):
-        repo, _bare = self._make_repo("repo-xargs")
-        os.chdir(repo)
+        repo = self._enter("repo-xargs")
         message = await self._refused("echo main | xargs git push -f origin")
         self.assertIn("xargs", message)
 
     async def test_refuses_unresolvable_refspecs(self):
-        repo, _bare = self._make_repo("repo-unresolvable")
-        os.chdir(repo)
+        repo = self._enter("repo-unresolvable")
         await self._refused_all(
             ["git push -f origin $BRANCH", "git push -f origin 'main*'",
-             # An expansion can also add `--no-dry-run`, which turns a visible
-             # dry run back into a real push (`X='--no-dry-run -f origin main';
-             # git push --dry-run $X` really force-updated main).
+             # An expansion can also add `--no-dry-run`, which turns a visible dry run back into a real push
+             # (`X='--no-dry-run -f origin main'; git push --dry-run $X` really force-updated main).
              "git push --dry-run $X", "git push -n $REMOTE origin main"],
             ("cannot be verified statically",),
         )
 
     async def test_refuses_explicit_upstream_refspecs(self):
-        repo, _bare = self._make_repo("repo-at-u")
-        os.chdir(repo)
+        repo = self._enter("repo-at-u")
         await self._refused_all(
             ["git push -f origin @{u}", "git push -f origin @{upstream}"],
             ("upstream",),
         )
 
     async def test_head_target_refused_on_main_allowed_on_feature(self):
-        repo, _bare = self._make_repo("repo-head", branch="main")
-        os.chdir(repo)
+        repo = self._enter("repo-head", branch="main")
         message = await self._refused("git push -f origin HEAD")
         self.assertIn("HEAD", message)
         self.assertIn("main", message)
-        # `@` is git's own synonym for HEAD: `git push -f origin @` on main
-        # reports `HEAD -> main (forced update)`.
+        # `@` is git's own synonym for HEAD: `git push -f origin @` on main reports `HEAD -> main (forced
+        # update)`.
         await self._refused_all(
             ["git push -f origin @", "git push -f origin @:main"], ("main",)
         )
@@ -928,16 +867,14 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(before, after)
 
     async def test_refusal_lists_both_bypasses_and_the_safe_alternative(self):
-        repo, _bare = self._make_repo("repo-message")
-        os.chdir(repo)
+        repo = self._enter("repo-message")
         message = await self._refused("git push -f origin main")
         self.assertIn("--force-with-lease", message)
         self.assertIn("allow_force_push", message)
         self.assertIn(BASH_FORCE_PUSH_BYPASS_ENV, message)
 
     async def test_warns_once_about_late_bypass(self):
-        repo, _bare = self._make_repo("repo-warn")
-        os.chdir(repo)
+        repo = self._enter("repo-warn")
         stderr = io.StringIO()
         with (
             mock.patch.dict(os.environ, {BASH_FORCE_PUSH_BYPASS_ENV: "1"}),
@@ -958,8 +895,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.getvalue(), "")
 
     async def test_guard_probes_only_on_pattern_match(self):
-        repo, _bare = self._make_repo("repo-probe")
-        os.chdir(repo)
+        repo = self._enter("repo-probe")
         with mock.patch.object(
             bash_module, "_fp_probe_upstream", wraps=bash_module._fp_probe_upstream
         ) as probe:
@@ -993,20 +929,18 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         message = await self._refused(f"(cd {repo_b.name} && git push -f)")
         # The open subshell's cd is replayed, so the probe names repo_b's upstream.
         self.assertIn("origin/feature", message)
-        # A group that opens and closes before the push never relocates it:
-        # the probe runs at the workspace root, which is not a repository,
-        # so git fails open and the push errors out.
+        # A group that opens and closes before the push never relocates it: the probe runs at the workspace
+        # root, which is not a repository, so git fails open and the push errors out.
         result = await self._run(f"(cd {repo_b.name}; echo ok) && git push -f || echo no-upstream")
         self.assertEqual(result.exit_code, 0, result.output)
-        # A multi-statement subshell the resolver cannot replay stays
-        # refused: conservative in the safe direction.
+        # A multi-statement subshell the resolver cannot replay stays refused: conservative in the safe
+        # direction.
         with self.assertRaises(ForcePushRefusalError):
             bash(f"cd sub && (cd {repo_b.name}; ls; git push -f)")
 
     async def test_quoted_parens_do_not_open_replay_groups(self):
-        """A paren inside quotes is data (`echo "("`), so the cd replay
-        must not read it as a subshell frame: before this rule the push
-        after it force-updated a protected main."""
+        """A paren inside quotes is data (`echo "("`), so the cd replay must not read it as a subshell frame:
+before this rule the push after it force-updated a protected main."""
         _repo_feat, _bf = self._make_repo("repo-quoted-a")
         repo_main, _bm = self._make_repo("repo-quoted-b", branch="main")
         message = await self._refused(
@@ -1027,8 +961,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Refusing to run this force-push command", message)
 
     async def test_command_prefix_relocation_refused_for_implicit_force(self):
-        repo, _bare = self._make_repo("repo-prefix-rel")
-        os.chdir(repo)
+        repo = self._enter("repo-prefix-rel")
         with mock.patch.dict(
             os.environ, {"PRIME_AGENT_BASH_COMMAND_PREFIX": "cd somewhere-else"}
         ):
@@ -1036,8 +969,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Refusing to run this force-push command", message)
 
     async def test_command_prefix_relocation_allows_explicit_targets(self):
-        repo, _bare = self._make_repo("repo-prefix-ok")
-        os.chdir(repo)
+        repo = self._enter("repo-prefix-ok")
         with mock.patch.dict(
             os.environ, {"PRIME_AGENT_BASH_COMMAND_PREFIX": "cd somewhere-else"}
         ):
@@ -1045,13 +977,11 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.exit_code, 0, result.output)
 
     async def test_prefix_git_dir_export_relocates_like_a_cd(self):
-        """A GIT_DIR/GIT_WORK_TREE export in the command prefix relocates the
-        repository the spawned git runs in, so HEAD and implicit refspecs
-        cannot be probed in the kernel cwd and the push is refused like any
-        other relocating prefix. A separator command at the prefix's tail hid
-        the export from the invocation walk before this rule."""
-        repo, _bare = self._make_repo("repo-gitdir")
-        os.chdir(repo)
+        """A GIT_DIR/GIT_WORK_TREE export in the command prefix relocates the repository the spawned git runs in,
+so HEAD and implicit refspecs cannot be probed in the kernel cwd and the push is refused like any other
+relocating prefix. A separator command at the prefix's tail hid the export from the invocation walk
+before this rule."""
+        repo = self._enter("repo-gitdir")
         for prefix in [
             f"export GIT_DIR={repo}/.git; export GIT_WORK_TREE={repo}; true",
             f"export GIT_DIR={repo}/.git; true",
@@ -1072,26 +1002,23 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
             await self._allowed_all(["git push -f origin feature"])
 
     async def test_scan_and_spawn_share_one_prefix_read(self):
-        """`PRIME_AGENT_BASH_COMMAND_PREFIX` is read once per bash() call and
-        the same text feeds the scan and the spawn; the fake `get` flips the
-        prefix on its third read, which before this rule belonged to the
-        spawn while the guard had scanned a benign command (this test failed
-        on the pre-fix module, where the force push really ran)."""
+        """`PRIME_AGENT_BASH_COMMAND_PREFIX` is read once per bash() call and the same text feeds the scan and the
+spawn; the fake `get` flips the prefix on its third read, which before this rule belonged to the spawn
+while the guard had scanned a benign command (this test failed on the pre-fix module, where the force
+push really ran)."""
         repo, bare = self._make_repo("repo-prefix-race", branch="main")
         self._diverge(repo, bare, "main")
         os.chdir(repo)
         remote_tip = self._git("rev-parse", "refs/heads/main", cwd=bare).stdout.strip()
         reads = {"count": 0}
         real_get = os.environ.get
-
         def flipping_get(key, default=None):
             if key != "PRIME_AGENT_BASH_COMMAND_PREFIX":
                 return real_get(key, default)
             reads["count"] += 1
-            # The guard's reads see no prefix; a concurrent flip lands on
-            # the spawn's read with the pre-fix read order.
+            # The guard's reads see no prefix; a concurrent flip lands on the spawn's read with the pre-fix read
+            # order.
             return None if reads["count"] < 3 else "git push -f origin main"
-
         with mock.patch.object(os.environ, "get", side_effect=flipping_get):
             await self._allowed_all(["echo hi"])
         self.assertEqual(
@@ -1101,8 +1028,8 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
 
     async def test_refuses_implicit_force_push_without_upstream(self):
         repo, _bare = self._make_repo("repo-no-upstream")
-        # push.default=current maps the implicit refspec onto origin/main, and
-        # the branch has no upstream for the guard to probe.
+        # push.default=current maps the implicit refspec onto origin/main, and the branch has no upstream for
+        # the guard to probe.
         self._git("config", "push.default", "current", cwd=repo)
         self._git("branch", "--unset-upstream", cwd=repo)
         os.chdir(repo)
@@ -1111,26 +1038,21 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_refuses_pushes_that_write_mirror_or_push_refspec_config(self):
-        """remote.<name>.mirror and remote.<name>.push both turn a plain push
-        into a forced one (git pushes a mirror remote like `push --mirror`,
-        and a configured push refspec can carry a `+`), so a push whose own
-        command writes either key is refused whatever its argv looks like.
-        git reads the section and the variable name case-insensitively, and it
-        reads `GIT_CONFIG_KEY_<i>`/`GIT_CONFIG_VALUE_<i>` env pairs too."""
-        repo, _bare = self._make_repo("repo-mirror", branch="main")
-        os.chdir(repo)
+        """remote.<name>.mirror and remote.<name>.push both turn a plain push into a forced one (git pushes a
+mirror remote like `push --mirror`, and a configured push refspec can carry a `+`), so a push whose own
+command writes either key is refused whatever its argv looks like. git reads the section and the
+variable name case-insensitively, and it reads `GIT_CONFIG_KEY_<i>`/`GIT_CONFIG_VALUE_<i>` env pairs
+too."""
+        repo = self._enter("repo-mirror", branch="main")
         await self._refused_all(
-            ["git -c remote.origin.mirror=true push origin",
-             "git -c remote.origin.push=+main:main push origin",
+            ["git -c remote.origin.mirror=true push origin", "git -c remote.origin.push=+main:main push origin",
              "git config remote.origin.mirror true && git push origin",
              "git config --add remote.origin.push +main:main && git push -f",
              # Case-folded spellings both really force-update main.
-             "git -c remote.origin.MIRROR=true push origin",
-             "git -c REMOTE.origin.mirror=true push origin",
+             "git -c remote.origin.MIRROR=true push origin", "git -c REMOTE.origin.mirror=true push origin",
              "git config Remote.origin.mirror true && git push origin",
              "git config remote.origin.PUSH +main:main && git push origin",
-             # The env spelling of the same write, and one whose key word is
-             # an expansion the guard cannot read.
+             # The env spelling of the same write, and one whose key word is an expansion the guard cannot read.
              "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push"
              " GIT_CONFIG_VALUE_0=+refs/heads/main:refs/heads/main git push origin",
              "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.mirror"
@@ -1138,30 +1060,26 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
              'GIT_CONFIG_PARAMETERS="\'remote.origin.push=+main:main\'" git push origin',
              "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=$K"
              " GIT_CONFIG_VALUE_0=+main:main git push origin",
-             # The same write behind an inline config option: a literal value
-             # the command assigns to the variable is read, and a key the
-             # guard cannot read is refused rather than trusted.
+             # The same write behind an inline config option: a literal value the command assigns to the
+             # variable is read, and a key the guard cannot read is refused rather than trusted.
              "CFG='remote.origin.push=+main:main'; git -c $CFG push origin",
              "CFG='remote.origin.mirror=true'; git -c $CFG push origin",
              "git -c $CFG push origin feature", "git --config-env=remote.origin.push=CFG push origin",
-             # A --config-env value from an env var this command does not set
-             # is unreadable whatever its key looks like, and a payload runs
-             # the same commands a top-level line does.
+             # A --config-env value from an env var this command does not set is unreadable whatever its key
+             # looks like, and a payload runs the same commands a top-level line does.
              "git --config-env=color.ui=CFG push origin feature",
              "sh -c 'git --config-env=remote.origin.push=CFG push origin'",
              "eval 'git --config-env=remote.origin.push=CFG push origin'"],
             ("Refusing to run this force-push command",),
         )
-        # The config write alone pushes nothing, and pushes without either key
-        # keep their argv-only judgement (a benign env key is not a setting, a
-        # benign key stays readable whatever its value, and only the key
+        # The config write alone pushes nothing, and pushes without either key keep their argv-only judgement (a
+        # benign env key is not a setting, a benign key stays readable whatever its value, and only the key
         # decides which configuration is written).
         self._verdicts_clean(
             ["git config remote.origin.mirror true", "git push origin feature",
              "git -c color.ui=always push origin feature", "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=color.ui"
              " GIT_CONFIG_VALUE_0=always git push origin feature",
-             "CFG='color.ui=auto'; git -c $CFG push origin feature",
-             'git -c "user.email=$USER" push origin feature',
+             "CFG='color.ui=auto'; git -c $CFG push origin feature", 'git -c "user.email=$USER" push origin feature',
              "CFG='+main:main'; git --config-env=color.ui=CFG push origin feature"],
         )
 
@@ -1169,9 +1087,8 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
     async def test_refuses_url_and_scp_remote_force_pushes(self):
         repo, bare = self._make_repo("repo-url-remote")
         os.chdir(repo)
-        # git reads the first positional as the repository, so a colon inside a
-        # URL is not a refspec separator: the push is implicit and takes its
-        # target from the current branch.
+        # git reads the first positional as the repository, so a colon inside a URL is not a refspec separator:
+        # the push is implicit and takes its target from the current branch.
         await self._refused_all(
             [f"git push -f file://{bare}", "git push -f https://example.invalid/x.git",
              "git push -f git@github.com:org/repo.git",
@@ -1182,13 +1099,11 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_refuses_ansi_c_quoted_force_push(self):
-        repo, _bare = self._make_repo("repo-ansi-c")
-        os.chdir(repo)
+        repo = self._enter("repo-ansi-c")
         await self._refused_all(
             ["$'git' push -f origin main", "$'\\x67it' push -f origin main",
              "$'\\u0067it' push -f origin main", '$"git" push -f origin main',
-             "git $'push' -f origin main", "git push -$'f' origin main",
-             "git push $'--force' origin main"],
+             "git $'push' -f origin main", "git push -$'f' origin main", "git push $'--force' origin main"],
             ('main',)
         )
         # An ANSI-C payload hides a whole command; it is refused outright.
@@ -1197,13 +1112,11 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_ansi_c_quoting_without_a_push_stays_allowed(self):
-        repo, _bare = self._make_repo("repo-ansi-c-ok")
-        os.chdir(repo)
+        repo = self._enter("repo-ansi-c-ok")
         await self._allowed_all(["printf $'%s\\n' hi", "echo $'tab\\there'"])
 
     async def test_refuses_line_continuations_that_join_tokens(self):
-        repo, _bare = self._make_repo("repo-continuation")
-        os.chdir(repo)
+        repo = self._enter("repo-continuation")
         await self._refused_all(
             ["git push -f origin ma\\\nin", "git push -\\\nf origin main",
              "gi\\\nt push -f origin main", 'git push -f origin "ma\\\nin"'],
@@ -1214,8 +1127,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         self.assertIn("main", message)
 
     async def test_refuses_dynamic_push_arguments(self):
-        repo, _bare = self._make_repo("repo-dynamic")
-        os.chdir(repo)
+        repo = self._enter("repo-dynamic")
         await self._refused_all(
             ["f=-f; git push $f origin main", "f='-f origin'; git push $f",
              "BRANCH=+main; git push origin $BRANCH", "git push origin $BRANCH",
@@ -1224,15 +1136,14 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_refuses_aliased_force_push(self):
-        repo, _bare = self._make_repo("repo-alias")
-        os.chdir(repo)
+        repo = self._enter("repo-alias")
         await self._refused_all(
             ["git -c alias.p='push -f origin main' p", "git -c alias.a=p -c alias.p='push -f origin main' a",
              "git -c alias.p='push -f origin main' -C . p"],
             ("main",),
         )
-        # A shell-alias body, a body from the environment, and a chain longer
-        # than the guard follows are refused rather than guessed at.
+        # A shell-alias body, a body from the environment, and a chain longer than the guard follows are refused
+        # rather than guessed at.
         await self._refused_all(
             ["git -c alias.p='!git push -f origin main' p", "git --config-env=alias.p=BODY p",
              "git -c alias.a=b -c alias.b=c -c alias.c=d -c alias.d=e" " -c alias.e=f -c alias.f=g -c alias.g=h -c alias.h=i -c alias.i=j" " -c alias.j=k -c alias.k='push -f origin main' a"],
@@ -1240,20 +1151,19 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_inline_aliases_without_a_push_stay_allowed(self):
-        repo, _bare = self._make_repo("repo-alias-ok")
-        os.chdir(repo)
+        repo = self._enter("repo-alias-ok")
         await self._allowed_all(
             ["git -c alias.s=status s", "git -c alias.co=checkout co"]
         )
-        # An alias that shadows the builtin name is never used by git, so the
-        # builtin push is what runs and the guard still sees it.
+        # An alias that shadows the builtin name is never used by git, so the builtin push is what runs and the
+        # guard still sees it.
         message = await self._refused("git -c alias.push='status' push -f origin main")
         self.assertIn("main", message)
 
     async def test_refuses_subcommands_git_may_resolve_through_an_alias(self):
         repo, bare = self._make_repo("repo-repo-alias")
-        # A repo-local alias is invisible in the command text: `git p` looks
-        # like an unknown subcommand, and git rewrites it into a force push.
+        # A repo-local alias is invisible in the command text: `git p` looks like an unknown subcommand, and git
+        # rewrites it into a force push.
         self._git("config", "alias.p", "push -f origin main", cwd=repo)
         os.chdir(repo)
         before = self._git("rev-parse", "main", cwd=bare).stdout
@@ -1263,16 +1173,14 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         # A global alias is just as invisible.
         message = await self._refused("git -c alias.q='push -f origin main' q")
         self.assertIn("main", message)
-        # Built-in subcommands are never resolved through an alias, so they
-        # keep running.
+        # Built-in subcommands are never resolved through an alias, so they keep running.
         result = await self._run("git status")
         self.assertEqual(result.exit_code, 0, result.output)
 
     async def test_refuses_trailing_line_continuation(self):
-        repo, _bare = self._make_repo("repo-trailing-backslash")
-        os.chdir(repo)
-        # The kernel appends the command to a script, so a trailing backslash
-        # joins it with text the guard cannot see.
+        repo = self._enter("repo-trailing-backslash")
+        # The kernel appends the command to a script, so a trailing backslash joins it with text the guard
+        # cannot see.
         message = await self._refused("git push -f origin main\\")
         self.assertIn("line continuation", message)
         # An escaped backslash is not a continuation.
@@ -1280,8 +1188,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(result.exit_code, 0)  # git rejects the refspec
 
     async def test_refuses_case_insensitive_git_command_names(self):
-        repo, _bare = self._make_repo("repo-case")
-        os.chdir(repo)
+        repo = self._enter("repo-case")
         await self._refused_all(
             ["GIT push -f origin main", "Git.EXE push -f origin main",
              "/usr/bin/GIT push -f origin main", "SUDO git push -f origin main"],
@@ -1304,8 +1211,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_env_wrappers_without_a_hidden_push_stay_allowed(self):
-        repo, _bare = self._make_repo("repo-env-ok")
-        os.chdir(repo)
+        repo = self._enter("repo-env-ok")
         await self._allowed_all(
             ["env -S 'git status'", "env -S 'git push --force-with-lease origin feature'", "env echo hi"],
         )
@@ -1315,18 +1221,15 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         self._diverge(repo, bare, "feature")
         os.chdir(repo)
         await self._allowed_all(
-            ["git push -f origin feature", "git push origin +feature",
-             "git push --force-with-lease origin feature",
+            ["git push -f origin feature", "git push origin +feature", "git push --force-with-lease origin feature",
              "git push --force-if-includes --force-with-lease origin feature",
              "git push origin feature", "git push --tags"],
         )
 
 
     async def test_refuses_nested_payloads(self):
-        repo, _bare = self._make_repo("repo-nested-payload")
-        os.chdir(repo)
-        # Three or more re-parser layers, in both chain shapes, and an
-        # `env -S` wrapping a three-layer chain.
+        repo = self._enter("repo-nested-payload")
+        # Three or more re-parser layers, in both chain shapes, and an `env -S` wrapping a three-layer chain.
         # Past the depth cap the guard refuses rather than guess.
         await self._refused_all(
             ["""env -S 'sh -c "git push -f origin main"'""", """eval 'sh -c "git push -f origin main"'""", """sh -c "eval 'git push -f origin main'" """, """env -S 'eval "git push -f origin main"'""",
@@ -1338,10 +1241,8 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_nested_payloads_without_a_force_push_stay_allowed(self):
-        repo, _bare = self._make_repo("repo-nested-payload-ok")
-        os.chdir(repo)
-        # An echo of the payload text is not a push, at any level the guard
-        # can still follow.
+        repo = self._enter("repo-nested-payload-ok")
+        # An echo of the payload text is not a push, at any level the guard can still follow.
         await self._allowed_all(
             ["""env -S 'sh -c "git status"'""", """sh -c "eval 'echo hi'" """,
              """env -S 'sh -c "git push --force-with-lease origin feature"'""",
@@ -1353,8 +1254,8 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
 
     async def test_refuses_implicit_force_push_on_detached_head(self):
         repo, bare = self._make_repo("repo-detached", branch="main")
-        # push.default=matching ignores a detached HEAD and still force-pushes
-        # every branch whose name exists on the remote, main included.
+        # push.default=matching ignores a detached HEAD and still force-pushes every branch whose name exists on
+        # the remote, main included.
         self._git("config", "push.default", "matching", cwd=repo)
         self._diverge(repo, bare, "main")
         self._git("checkout", "--detach", cwd=repo)
@@ -1362,38 +1263,32 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         await self._refused_all(
             ["git push -f origin", "git push -f"], ('push.default',)
         )
-        # A detached HEAD is not a blanket refusal: an explicit non-protected
-        # refspec still runs.
+        # A detached HEAD is not a blanket refusal: an explicit non-protected refspec still runs.
         self._git("branch", "feature", cwd=repo)
         result = await self._run("git push -f origin feature")
         self.assertEqual(result.exit_code, 0, result.output)
 
     async def test_alias_named_after_a_git_command_is_inert(self):
-        repo, _bare = self._make_repo("repo-alias-inert")
-        os.chdir(repo)
-        # git runs its own command, never the alias, so these must not be
-        # refused (and must really run).
+        repo = self._enter("repo-alias-inert")
+        # git runs its own command, never the alias, so these must not be refused (and must really run).
         await self._allowed_all(
             ["git -c alias.status='push -f origin main' status --short",
              "git -c alias.log='push -f origin main' log --oneline -1",
              "git -c alias.submodule='push -f origin main' submodule status"]
         )
-        # `alias.push` is inert too: git runs the builtin `push` with no
-        # arguments at all, so the command carries no force flag and the guard
-        # allows it (git then does a plain implicit push).
+        # `alias.push` is inert too: git runs the builtin `push` with no arguments at all, so the command
+        # carries no force flag and the guard allows it (git then does a plain implicit push).
         result = await self._run("git -c alias.push='push -f origin main' push")
         self.assertEqual(result.exit_code, 0, result.output)
 
     async def test_every_repo_the_suite_commits_in_has_an_identity(self):
         """Commits must not depend on git guessing an identity.
-
         The CI runner's guess yields an empty `user.name` ("fatal: empty ident
         name not allowed"), so every repository this suite commits in carries
         the explicit identity from `_configure_identity` *and*
         `user.useConfigOnly=true`, which forbids the guess. The commits below
         run with the guess forbidden, which is the deterministic local
-        equivalent of that runner.
-        """
+        equivalent of that runner."""
         repo, bare = self._make_repo("repo-identity", branch="main")
         protected = self.test_dir / "identity-clone"
         self._git("clone", "-q", str(bare), str(protected), cwd=self.test_dir)
@@ -1415,8 +1310,8 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
 
     async def test_refuses_quoted_tilde_cd(self):
         repo, bare = self._make_repo("repo-tilde", branch="main")
-        # `cd "~"` enters a directory literally named `~`, while the guard used
-        # to expand the tilde to HOME and probe the wrong place.
+        # `cd "~"` enters a directory literally named `~`, while the guard used to expand the tilde to HOME and
+        # probe the wrong place.
         literal = self.test_dir / "~"
         self._git("clone", "-q", str(bare), str(literal), cwd=self.test_dir)
         self._diverge(literal, bare, "main")
@@ -1425,8 +1320,8 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
             ['cd "~" && git push -f origin HEAD', "cd '~' && git push -f origin HEAD"],
             ('main',),
         )
-        # A bare `cd ~` still goes home, which is not a repository here, so the
-        # guard falls open and git fails the push itself.
+        # A bare `cd ~` still goes home, which is not a repository here, so the guard falls open and git fails
+        # the push itself.
         self.assertIsNone(
             self._guard_verdict("cd ~ && git push -f origin HEAD")
         )
@@ -1444,8 +1339,8 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
                 ["cd repo && git push -f origin HEAD", "cd repo && git push -f origin"],
                 ("changes directory",),
             )
-        # A CDPATH or HOME the command sets is the value its own `cd` reads:
-        # `export HOME=<repo on main>; cd && ...` really force-updated main.
+        # A CDPATH or HOME the command sets is the value its own `cd` reads: `export HOME=<repo on main>; cd &&
+        # ...` really force-updated main.
         await self._refused_all(
             [f"export CDPATH={other}; cd repo && git push -f origin HEAD",
              "export HOME=$UNKNOWN; cd && git push -f origin HEAD"],
@@ -1456,14 +1351,14 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
             [f"export HOME={diverged}; cd && git push -f origin HEAD"],
             ("HEAD names the current branch",),
         )
-        # `pushd` relocates like `cd`, so the snapshot boundary counts it: a
-        # HOME assigned after an earlier pushd cannot describe that pushd.
+        # `pushd` relocates like `cd`, so the snapshot boundary counts it: a HOME assigned after an earlier
+        # pushd cannot describe that pushd.
         await self._refused_all(
             [f"pushd ~ && export HOME={diverged}; pushd ~ && git push -f origin HEAD"],
             ("changes directory",),
         )
-        # One snapshot cannot describe every cd, so a repeated or later
-        # assignment, or a value the shell would tilde-expand, is refused.
+        # One snapshot cannot describe every cd, so a repeated or later assignment, or a value the shell would
+        # tilde-expand, is refused.
         await self._refused_all(
             [f"cd . && export HOME={diverged}; cd && git push -f origin HEAD",
              "export HOME=~/repo; cd && git push -f origin HEAD"],
@@ -1472,18 +1367,16 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(
             self._guard_verdict(f"export HOME={diverged}; git push -f origin feature")
         )
-        # A target that opts out of CDPATH is still resolvable: `./repo` does
-        # not exist here, so the guard replays the named directory.
+        # A target that opts out of CDPATH is still resolvable: `./repo` does not exist here, so the guard
+        # replays the named directory.
         self.assertIsNone(
             self._guard_verdict("cd ./repo && git push -f origin HEAD")
         )
 
     async def test_out_of_range_ansi_c_escape_does_not_crash_the_guard(self):
-        repo, _bare = self._make_repo("repo-ansi-c-range")
-        os.chdir(repo)
-        # chr() used to raise ValueError on $'\UFFFFFFFF', so bash() failed
-        # before it spawned anything: any command text carrying the escape
-        # became unrunnable. The code point is bounded now, which leaves these
+        repo = self._enter("repo-ansi-c-range")
+        # chr() used to raise ValueError on $'\UFFFFFFFF', so bash() failed before it spawned anything: any
+        # command text carrying the escape became unrunnable. The code point is bounded now, which leaves these
         # commands to run normally.
         await self._allowed_all(
             ["echo $'\\UFFFFFFFF'", "echo $'\\UFFFFFFFF' && echo $'\\u0042'",
@@ -1491,38 +1384,30 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_refuses_substitutions_with_quoted_delimiters(self):
-        repo, _bare = self._make_repo("repo-quoted-delimiter", branch="main")
-        os.chdir(repo)
-        # A `)` or backtick inside quotes is data, not the end of the
-        # substitution, so the interior (where the push runs) must be scanned.
+        repo = self._enter("repo-quoted-delimiter", branch="main")
+        # A `)` or backtick inside quotes is data, not the end of the substitution, so the interior (where the
+        # push runs) must be scanned.
         await self._refused_all(
             ["""echo "$(printf ')'; git push -f origin main)" """,
-             # ANSI-C quoting: `\'` is an escaped quote, so the span runs past
-             # it and a `)` inside it is data (all three really force-updated
-             # main through kernel bash before this rule).
+             # ANSI-C quoting: `\'` is an escaped quote, so the span runs past it and a `)` inside it is data
+             # (all three really force-updated main through kernel bash before this rule).
              """echo "$(echo $'x\\'y)' ; git push -f origin main)" """,
              """echo "$(echo $'a\\'b)c' ; git push -f origin main)" """,
              """echo "$(echo $'a)b' ; ssh build-box "git push -f origin main")" """,
-             # A substitution interior is its own command text, so a command
-             # word the guard cannot resolve inside one counts too.
+             # A substitution interior is its own command text, so a command word the guard cannot resolve
+             # inside one counts too.
              """echo "$(c=git; $c push -f origin main)" """,
              """echo $(c=git; $c push -f origin main)""", """x=$(c=git; $c push -f origin main)""",
-             # The interior's own prefix walk steps over assignments and
-             # wrappers the way a top-level run does (each of these really ran
-             # the push with `c=git` set before this rule).
-             """echo $(FOO=1 $c push -f origin main)""",
-             """echo $(command $c push -f origin main)""",
-             """echo $(env -i $c push -f origin main)""",
-             """x=$(env -u FOO $c push -f origin main)"""],
+             # The interior's own prefix walk steps over assignments and wrappers the way a top-level run does
+             # (each of these really ran the push with `c=git` set before this rule).
+             """echo $(FOO=1 $c push -f origin main)""", """echo $(command $c push -f origin main)""", """echo $(env -i $c push -f origin main)""", """x=$(env -u FOO $c push -f origin main)"""],
             ('Refusing to run this force-push command',)
         )
         self.assertIsNone(self._guard_verdict("echo $(FOO=1 git status)"))
-        # The backtick analogue with a trailing backtick is not a bypass: bash
-        # ends the substitution at the first unescaped backtick, so the single
-        # quote inside it is unterminated and bash reports
-        # "unexpected EOF while looking for matching `'`" (rc=2) without running
-        # anything, measured with the same string. The guard therefore allows
-        # it, which is the fail-open case where git and bash fail on their own.
+        # The backtick analogue with a trailing backtick is not a bypass: bash ends the substitution at the
+        # first unescaped backtick, so the single quote inside it is unterminated and bash reports "unexpected
+        # EOF while looking for matching `'`" (rc=2) without running anything, measured with the same string.
+        # The guard therefore allows it, which is the fail-open case where git and bash fail on their own.
         self.assertIsNone(
             self._guard_verdict("echo \"`printf '`' ; git push -f origin main`\"")
         )
@@ -1533,11 +1418,10 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         os.chdir(repo)
         backtick = "`"
         quote = "'"
-        # Bash ends an old-style substitution at the first backtick a backslash
-        # does not escape, so the single quote inside does not hide the
-        # terminator: the substitution is `echo '` and the rest of the line is a
-        # new command, which is the force push. A quote-aware matcher instead
-        # swallowed the whole tail inside the substitution and found nothing.
+        # Bash ends an old-style substitution at the first backtick a backslash does not escape, so the single
+        # quote inside does not hide the terminator: the substitution is `echo '` and the rest of the line is a
+        # new command, which is the force push. A quote-aware matcher instead swallowed the whole tail inside
+        # the substitution and found nothing.
         await self._refused_all(
             [f"{backtick}{p}{quote}{backtick} git push -f origin main" for p in
              ["echo ", "ls ", "true ", "printf "]],
@@ -1549,13 +1433,11 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Refusing to run this force-push command", message)
 
     def test_backtick_matcher_follows_bash(self):
-        # Pin the matcher against bash's own parse: the interior it reports must
-        # be the command bash runs. `echo <string>` makes that observable (the
-        # substitution's output becomes the echo's argument), so the two runs
-        # must print the same thing. Only the well-formed strings are compared
-        # this way; the boundary-sensitive malformed ones are covered by
-        # test_refuses_backquote_substitutions_bash_ends_early, where bash
-        # really force-pushes a protected branch with the S2 shape.
+        # Pin the matcher against bash's own parse: the interior it reports must be the command bash runs. `echo
+        # <string>` makes that observable (the substitution's output becomes the echo's argument), so the two
+        # runs must print the same thing. Only the well-formed strings are compared this way; the
+        # boundary-sensitive malformed ones are covered by test_refuses_backquote_substitutions_bash_ends_early,
+        # where bash really force-pushes a protected branch with the S2 shape.
         cases = [
             "`printf %s a`", "`echo hi`", '`printf %s "a b"`', "`printf %s a; printf %s b`",
         ]
@@ -1582,9 +1464,8 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
                     mine.stdout.rstrip("\n"),
                     f"matcher interior {interior!r} does not match bash's parse",
                 )
-        # The rule itself: the first backtick a backslash does not escape ends
-        # the substitution, quotes do not hide one, and an escaped one does not
-        # end it (so the closer is the final backtick there).
+        # The rule itself: the first backtick a backslash does not escape ends the substitution, quotes do not
+        # hide one, and an escaped one does not end it (so the closer is the final backtick there).
         backtick = "`"
         quote = "'"
         first = f"a{backtick}b"
@@ -1602,20 +1483,17 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bash_module._fp_matching_backtick(s2, 0, len(s2)), 7)
 
     async def test_refuses_command_words_built_from_expansions(self):
-        repo, _bare = self._make_repo("repo-dynamic-command-word", branch="main")
-        os.chdir(repo)
-        # The command word decides what runs: `$(printf git) push -f origin
-        # main` is a git force push, but the word scans as the substitution.
+        repo = self._enter("repo-dynamic-command-word", branch="main")
+        # The command word decides what runs: `$(printf git) push -f origin main` is a git force push, but the
+        # word scans as the substitution.
         await self._refused_all(
             ["$(printf git) push -f origin main", "$(which git) push -f origin main",
              "c='git push -f origin main'; X=1 $c", "{git,-c} user.email=x push -f origin main",
              "{git,-c,user.name=z} push -f origin main"],
             ('command word is argv the guard cannot resolve',)
         )
-        # An unresolvable command word with no force-push pattern next to it
-        # stays inert, and a quoted brace is data.
-        # An env-assignment prefix is not the command word, so the visible
-        # git word decides and these run.
+        # An unresolvable command word with no force-push pattern next to it stays inert, and a quoted brace is
+        # data. An env-assignment prefix is not the command word, so the visible git word decides and these run.
         self._verdicts_clean(
             ["$HOME/bin/tool args", "$(which x) --version", "ls '*.{ts,tsx}'",
              "cp {a,b}.txt /tmp", "{ echo hi; } && git push origin feature",
@@ -1624,26 +1502,22 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
 
     async def test_refuses_the_unresolvable_argv_family(self):
         """P and U, P and E, and a wrapper carrying a force-push pattern.
-
         Each of these runs a force push that a text scan cannot follow to: the
         command word is decided at run time, a shell reads the command from a
         pipe, here-string, or redirect, or an unmodeled wrapper runs it
         somewhere the guard cannot see. They were all allowed before this round
-        and really force-updated a protected main.
-        """
+        and really force-updated a protected main."""
         repo, bare = self._make_repo("repo-family", branch="main")
         self._diverge(repo, bare, "main")
         os.chdir(self.test_dir)  # a non-repository workspace, as in the kernel
         quote = "'"
         here = self.test_dir / "payload.sh"
         here.write_text("git push -f origin main\n")
-        # P and U: a command word decided at run time.
-        # P and E: a shell that reads the command from stdin.
-        # An unmodeled wrapper carrying a force-push pattern.
+        # P and U: a command word decided at run time. P and E: a shell that reads the command from stdin. An
+        # unmodeled wrapper carrying a force-push pattern.
         await self._refused_all(
             [f"c={quote}git push -f origin main{quote}; $c",
-             f"X=git; Y={quote}push -f origin main{quote}; $X $Y",
-             "git${IFS}push -f origin main",
+             f"X=git; Y={quote}push -f origin main{quote}; $X $Y", "git${IFS}push -f origin main",
              f"$(printf {quote}git push -f origin main{quote})",
              f"echo {quote}git push -f origin main{quote} | sh",
              f"printf {quote}git push -f origin main{quote} | bash",
@@ -1651,9 +1525,8 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
              f"echo x | xargs -I{{}} sh -c {quote}git push -f origin main{quote}",
              f"sh < {here}", f"ssh build-box {quote}git push -f origin main{quote}"]
         )
-        # The implicit-refspec form behind each wrapper: the guard cannot know
-        # where the wrapper really ran, so it refuses instead of probing the
-        # kernel cwd (a non-repository, where it would fail open).
+        # The implicit-refspec form behind each wrapper: the guard cannot know where the wrapper really ran, so
+        # it refuses instead of probing the kernel cwd (a non-repository, where it would fail open).
         await self._refused_all(
             [f"{w} {repo} git push -f" for w in
              ["chroot", "timeout", "parallel", "ssh", "docker", "sudo", "nsenter"]],
@@ -1661,16 +1534,13 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_refuses_the_family_spellings_review_found_open(self):
-        """Spellings of the family that force-updated a protected main before
-        this round: a path-qualified shell, a quoted expansion, a modeled
-        wrapper, and word spans shifted by a folded line continuation."""
+        """Spellings of the family that force-updated a protected main before this round: a path-qualified shell, a
+quoted expansion, a modeled wrapper, and word spans shifted by a folded line continuation."""
         repo, bare = self._make_repo("repo-family-round14", branch="main")
         self._diverge(repo, bare, "main")
         os.chdir(self.test_dir)
         await self._refused_all(
-            ["printf '%s\\n' 'git push -f origin main' | /bin/sh",
-             "printf '%s\\n' 'git push -f origin main' | /bin/bash",
-             "printf '%s\\n' 'git push -f origin main' | ./sh",
+            ["printf '%s\\n' 'git push -f origin main' | /bin/sh", "printf '%s\\n' 'git push -f origin main' | /bin/bash", "printf '%s\\n' 'git push -f origin main' | ./sh",
              'c=git; "$c" push -f origin main', '"$(printf git)" push -f origin main',
              '"$(which git)" push -f origin main', "c=git; command $c push -f origin main",
              "c=git; command -p $c push -f origin main", "c=git; env -i $c push -f origin main", "c=git; env -u FOO $c push -f origin main",
@@ -1680,34 +1550,28 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         )
         self._verdicts_clean(
             ["c=hello; echo \"$c\"", "c=git; '$c' push -f origin main",
-             "env -i git push -f origin feature", "command git push -f origin feature",
-             "ls /bin/sh && git status"],
+             "env -i git push -f origin feature", "command git push -f origin feature", "ls /bin/sh && git status"],
         )
 
     async def test_refuses_fish_and_csh_interpreter_payloads(self):
-        """fish and the csh family run the same inline payloads the POSIX
-        five do, read a piped stdin as a script, and fish also spells them
-        --command/--init-command with getopt-glued values, so the payload and
-        conduit rules govern them too."""
-        repo, _bare = self._make_repo("repo-fish", branch="main")
-        os.chdir(repo)
+        """fish and the csh family run the same inline payloads the POSIX five do, read a piped stdin as a script,
+and fish also spells them --command/--init-command with getopt-glued values, so the payload and conduit
+rules govern them too."""
+        repo = self._enter("repo-fish", branch="main")
         await self._refused_all(
             ["fish -c 'git push -f origin main'", "fish -c'git push -f origin main'",
              "fish --command 'git push -f origin main'", "fish --command='git push -f origin main'",
              "fish -C 'git push -f origin main' -c 'echo done'",
-             # fish runs every payload it is given, so a benign first one must
-             # not end the walk for the later `-c`.
+             # fish runs every payload it is given, so a benign first one must not end the walk for the later
+             # `-c`.
              "fish -C 'echo done' -c 'git push -f origin main'",
-             "fish -C'git push -f origin main'", "tcsh -c 'git push -f origin main'",
-             "csh -c 'git push -f origin main'",
-             # `-C` is a payload letter for fish only: the POSIX shells and the
-             # csh family treat it as noclobber, so `-c` still carries it.
+             "fish -C'git push -f origin main'", "tcsh -c 'git push -f origin main'", "csh -c 'git push -f origin main'",
+             # `-C` is a payload letter for fish only: the POSIX shells and the csh family treat it as
+             # noclobber, so `-c` still carries it.
              "bash -C -c 'git push -f origin main'", "sh -C -c 'git push -f origin main'",
              "bash -Cc 'git push -f origin main'", "zsh -C -c 'git push -f origin main'",
-             "printf '%s\n' 'git push -f origin main' | fish",
-             "printf '%s\n' 'git push -f origin main' | /bin/tcsh",
-             "eval 'fish -c \"git push -f origin main\"'",
-             "sh -c 'fish -c \"git push -f origin main\"'"],
+             "printf '%s\n' 'git push -f origin main' | fish", "printf '%s\n' 'git push -f origin main' | /bin/tcsh",
+             "eval 'fish -c \"git push -f origin main\"'", "sh -c 'fish -c \"git push -f origin main\"'"],
             ("Refusing to run this force-push command",),
         )
         # A clean payload stays allowed, whatever interpreter runs it.
@@ -1717,85 +1581,64 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_wrapper_value_options_follow_getopt(self):
-        """The command-word walk steps over a wrapper's options the way
-        getopt parses them: a bundled value-taking letter (`env -vu NAME`) and
-        an unlisted value option (`env -P`, `-a`, `--argv0`) consume their
-        operand, so the expansion after them is still the command word and is
-        recorded; before this table the operand was read as the command. A long
-        option is resolved by prefix, the way getopt_long does."""
-        repo, _bare = self._make_repo("repo-wrap", branch="main")
-        os.chdir(repo)
+        """The command-word walk steps over a wrapper's options the way getopt parses them: a bundled value-taking
+letter (`env -vu NAME`) and an unlisted value option (`env -P`, `-a`, `--argv0`) consume their operand,
+so the expansion after them is still the command word and is recorded; before this table the operand was
+read as the command. A long option is resolved by prefix, the way getopt_long does."""
+        repo = self._enter("repo-wrap", branch="main")
         await self._refused_all(
-            ["c=git; env -vu NAME $c push -f origin main",
-             "c=git; env -iu FOO $c push -f origin main",
-             "c=git; env -P /usr/bin $c push -f origin main",
-             "c=git; env -a NAME $c push -f origin main",
-             "c=git; env --argv0 NAME $c push -f origin main",
-             "c=git; env --argv0=NAME $c push -f origin main",
-             "c=git; env -u=FOO $c push -f origin main",
-             # A unique prefix names the same value option (`--uns` is
-             # --unset, `--ch` is --chdir, `--ignore-env` is
-             # --ignore-environment), so the operand after it is still the
-             # option's value and the expansion is still the command word.
-             "c=git; env --uns FOO $c push -f origin main",
-             "c=git; env --uns=FOO $c push -f origin main",
-             "c=git; env --u FOO $c push -f origin main",
-             "c=git; env --ch . $c push -f origin main",
-             "c=git; env --ignore-env $c push -f origin main",
-             # An empty attached operand is still an operand (`env --argv0=`
-             # sets argv0 to the empty string), so the next word is the command.
-             "c=git; env --argv0= $c push -f origin main",
-             "c=git; env --split-string= $c push -f origin main"],
+            ["c=git; env -vu NAME $c push -f origin main", "c=git; env -iu FOO $c push -f origin main", "c=git; env -P /usr/bin $c push -f origin main", "c=git; env -a NAME $c push -f origin main", "c=git; env --argv0 NAME $c push -f origin main",
+             "c=git; env --argv0=NAME $c push -f origin main", "c=git; env -u=FOO $c push -f origin main",
+             # A unique prefix names the same value option (`--uns` is --unset, `--ch` is --chdir,
+             # `--ignore-env` is --ignore-environment), so the operand after it is still the option's value and
+             # the expansion is still the command word.
+             "c=git; env --uns FOO $c push -f origin main", "c=git; env --uns=FOO $c push -f origin main", "c=git; env --u FOO $c push -f origin main", "c=git; env --ch . $c push -f origin main", "c=git; env --ignore-env $c push -f origin main",
+             # An empty attached operand is still an operand (`env --argv0=` sets argv0 to the empty string), so
+             # the next word is the command.
+             "c=git; env --argv0= $c push -f origin main", "c=git; env --split-string= $c push -f origin main"],
             ("cannot resolve",),
         )
-        # An ambiguous prefix matches more than one of env's options, so
-        # whether it takes a value cannot be told: refused like env refuses it.
+        # An ambiguous prefix matches more than one of env's options, so whether it takes a value cannot be
+        # told: refused like env refuses it.
         await self._refused_all(
             ["env --i $c push -f origin main", "env --d $c push -f origin main"],
             ("abbreviation",),
         )
-        # The walk still resolves the visible git word after env's options,
-        # and a valueless prefix hands nothing to the next word.
+        # The walk still resolves the visible git word after env's options, and a valueless prefix hands nothing
+        # to the next word.
         self._verdicts_clean(
             ["env -u FOO git push -f origin feature",
              "env -uFOO git push -f origin feature", "env -i git push origin feature",
-             "env --ignore-env git push -f origin feature",
-             "env --n git push origin feature", "env --s 'git status'"],
+             "env --ignore-env git push -f origin feature", "env --n git push origin feature", "env --s 'git status'"],
         )
 
 
     async def test_family_scoping_controls_stay_allowed(self):
-        repo, _bare = self._make_repo("repo-family-ctl", branch="main")
-        os.chdir(repo)
-        # An echo of a force-push string with no conduit and no unmodeled
-        # wrapper stays inert.
+        repo = self._enter("repo-family-ctl", branch="main")
+        # An echo of a force-push string with no conduit and no unmodeled wrapper stays inert.
         self._verdicts_clean(
             ["X=1; git push origin feature", "echo $HOME && git push origin feature",
              "ls $(pwd) && git status", "X=$(date); echo $X",
              'echo "$(git rev-parse HEAD)" | cut -c1-7', "git status --short",
              "git log --oneline -3", "git push origin feature", 'echo "git push -f origin main"']
         )
-        # Already refused before this round and still refused: an unresolvable
-        # refspec.
+        # Already refused before this round and still refused: an unresolvable refspec.
         self.assertIsNotNone(self._guard_verdict("BR=feature; git push origin $BR"))
 
     async def test_refuses_payloads_that_hold_an_expansion(self):
-        repo, _bare = self._make_repo("repo-payload-expansion", branch="main")
-        os.chdir(repo)
-        # `cmd='git push -f origin main'; sh -c "$cmd"` runs the value of $cmd,
-        # not the literal text, so the payload cannot be scanned statically.
+        repo = self._enter("repo-payload-expansion", branch="main")
+        # `cmd='git push -f origin main'; sh -c "$cmd"` runs the value of $cmd, not the literal text, so the
+        # payload cannot be scanned statically.
         await self._refused_all(
             ['cmd=\'git push -f origin main\'; sh -c "$cmd"', 'cmd=\'git push -f origin main\'; eval "$cmd"', 'cmd=\'git push -f origin main\'; env -S "$cmd"', 'cmd=\'git push -f origin main\'; sh -c $cmd']
         )
-        # Declared consequence: a payload holding an expansion is refused even
-        # when the expansion looks harmless, because the expansion decides what
-        # runs and the guard cannot see it. These two were allowed before this
-        # rule and are asserted REFUSED on purpose.
+        # Declared consequence: a payload holding an expansion is refused even when the expansion looks
+        # harmless, because the expansion decides what runs and the guard cannot see it. These two were allowed
+        # before this rule and are asserted REFUSED on purpose.
         await self._refused_all(['eval "$(echo hi)"', 'sh -c "$(echo hi)"'])
         # A literal payload without an expansion is still scanned normally.
         self._verdicts_clean(
-            ['eval "echo hi"', 'sh -c "echo hi"', """sh -c 'sh -c "git status"'""",
-             """env -S 'git status'"""],
+            ['eval "echo hi"', 'sh -c "echo hi"', """sh -c 'sh -c "git status"'""", """env -S 'git status'"""],
         )
 
     async def test_refuses_sourced_script_relocation(self):
@@ -1806,11 +1649,9 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         script = repo / "move.sh"
         script.write_text(f"cd {protected}\n")
         os.chdir(repo)
-        # A quoted dot in command position is the same source builtin: the
-        # whitespace the pattern needs sits after the quote.
-        # A sourced dot with no operand is refused too: bash errors on it
-        # (".: usage: . [-p path] filename"), so there is nothing to
-        # resolve and the shell cannot be replayed.
+        # A quoted dot in command position is the same source builtin: the whitespace the pattern needs sits
+        # after the quote. A sourced dot with no operand is refused too: bash errors on it (".: usage: . [-p
+        # path] filename"), so there is nothing to resolve and the shell cannot be replayed.
         await self._refused_all(
             ["eval '. move.sh' && git push -f origin HEAD",
              "builtin source move.sh && git push -f origin HEAD", ". move.sh && git push -f origin HEAD", "command source move.sh && git push -f origin HEAD",
@@ -1818,8 +1659,8 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
              '"." ./move.sh; git push -f origin HEAD', '"." && git push -f origin HEAD'],
             ('changes directory',)
         )
-        # A child shell never relocates the parent, `cd .` is not a source, and
-        # a dot that is only an argument is not one either.
+        # A child shell never relocates the parent, `cd .` is not a source, and a dot that is only an argument
+        # is not one either.
         (repo / "move.sh").chmod(0o755)
         await self._allowed_all(
             ["sh move.sh && git push -f origin HEAD",
@@ -1828,8 +1669,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_boolean_negations_win_when_they_come_last(self):
-        repo, _bare = self._make_repo("repo-negations", branch="main")
-        os.chdir(repo)
+        repo = self._enter("repo-negations", branch="main")
         # `--no-dry-run` after `--dry-run` really forces.
         message = await self._refused("git push -f --dry-run --no-dry-run origin main")
         self.assertIn("main", message)
@@ -1858,11 +1698,9 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((args.force, args.dry_run, args.wildcard), expected)
 
     async def test_refuses_lone_positional_remote_spellings(self):
-        repo, _bare = self._make_repo("repo-lone-positional", branch="main")
-        os.chdir(repo)
-        # Real git reads the first positional as the repository for all of
-        # these and answers `Could not resolve hostname` for the colon forms,
-        # so none of them carries a refspec: the push is implicit and the
+        repo = self._enter("repo-lone-positional", branch="main")
+        # Real git reads the first positional as the repository for all of these and answers `Could not resolve
+        # hostname` for the colon forms, so none of them carries a refspec: the push is implicit and the
         # upstream rules decide.
         await self._refused_all(
             ["git push -f localhost:nonexistent.git", "git push -f myhost:path",
@@ -1873,8 +1711,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_refuses_env_gate_with_uppercase_names(self):
-        repo, _bare = self._make_repo("repo-upper-env")
-        os.chdir(repo)
+        repo = self._enter("repo-upper-env")
         await self._refused_all(
             ["ENV -S 'git push -f origin main'", "Env --split-string 'git push -f origin main'"],
             ('env -S',)
@@ -1883,51 +1720,42 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self._guard_verdict("ENV -S 'git status'"))
 
     async def test_refuses_unresolvable_subcommands_inside_payloads(self):
-        repo, _bare = self._make_repo("repo-payload-subcommand")
-        os.chdir(repo)
-        # A payload runs the same commands a top-level line does, so a git
-        # subcommand the guard cannot resolve is refused inside it too: a
-        # repository alias would otherwise run unchecked.
+        repo = self._enter("repo-payload-subcommand")
+        # A payload runs the same commands a top-level line does, so a git subcommand the guard cannot resolve
+        # is refused inside it too: a repository alias would otherwise run unchecked.
         self._git("config", "alias.p", "push -f origin main", cwd=repo)
         await self._refused_all(
-            ['sh -c "git p"', "eval 'git p'", 'sh -c "git lfs push"', "env -S 'git p'",
-             'sh -c "sh -c \\"git p\\"" ']
+            ['sh -c "git p"', "eval 'git p'", 'sh -c "git lfs push"', "env -S 'git p'", 'sh -c "sh -c \\"git p\\"" ']
         )
-        # Benign payloads keep working, including nested chains and commands
-        # git resolves itself.
+        # Benign payloads keep working, including nested chains and commands git resolves itself.
         self._verdicts_clean(
             ['sh -c "git status"', 'sh -c "sh -c \\"git status\\"" ', 'eval "git submodule status"']
         )
 
     async def test_at_brace_refspecs_are_not_unresolvable_words(self):
-        repo, _bare = self._make_repo("repo-at-brace", branch="main")
-        os.chdir(repo)
-        # `@{...}` is git syntax, not a shell expansion: a plain push that
-        # names it is left to git (which rejects the refspec itself), while a
-        # forced push that targets it is still refused.
+        repo = self._enter("repo-at-brace", branch="main")
+        # `@{...}` is git syntax, not a shell expansion: a plain push that names it is left to git (which
+        # rejects the refspec itself), while a forced push that targets it is still refused.
         self._verdicts_clean(
             ["git push origin @{u}", "git push --force-with-lease origin @{u}",
              "git push origin @{upstream}", "git push origin @{-1}"]
         )
-        # The exemption covers a word that is entirely `@{...}`: an expansion
-        # tail in the same word is unresolvable again (git rejects these as
-        # refspecs, so they cannot rewrite anything, but the guard should not
-        # be the reason they look inert).
+        # The exemption covers a word that is entirely `@{...}`: an expansion tail in the same word is
+        # unresolvable again (git rejects these as refspecs, so they cannot rewrite anything, but the guard
+        # should not be the reason they look inert).
         self._refusal_all(
             ["""git push origin @{u}$(printf " -f main")""",
              'X="-f main"; git push origin @{u}$X', "git push origin @{u}`printf ' -f main'`"],
             'Refusing to run this force-push command'
         )
         self._refusal_all(
-            ["git push -f origin @{u}", "git push -f origin HEAD:@{u}"],
-            'Refusing to run this force-push command'
+            ["git push -f origin @{u}", "git push -f origin HEAD:@{u}"], 'Refusing to run this force-push command'
         )
 
     async def test_self_referencing_alias_is_not_reported_as_unresolvable(self):
-        repo, _bare = self._make_repo("repo-alias-self")
-        os.chdir(repo)
-        # `alias.a=a` never expands (git refuses the loop), so the guard must
-        # report the unknown subcommand, not an unresolvable alias.
+        repo = self._enter("repo-alias-self")
+        # `alias.a=a` never expands (git refuses the loop), so the guard must report the unknown subcommand, not
+        # an unresolvable alias.
         message = await self._refused("git -c alias.a=a a")
         self.assertIn(
             "outside the git command set this guard was calibrated against",
@@ -1940,8 +1768,7 @@ class ForcePushGitCommandNameTest(unittest.TestCase):
 
     The guard cannot see what an alias or an external `git-<name>` program
     runs, so a name outside git's own command table is refused even when it
-    looks harmless. Calling the guard directly keeps these vectors spawn-free.
-    """
+    looks harmless. Calling the guard directly keeps these vectors spawn-free."""
 
     def setUp(self):
         frozen = mock.patch.object(
@@ -1961,8 +1788,8 @@ class ForcePushGitCommandNameTest(unittest.TestCase):
         return None
 
     def _outside_table(self, commands: list[str], refused: bool) -> None:
-        """Every command is (or is not) refused as outside git's own command
-        table, each with its own subTest."""
+        """Every command is (or is not) refused as outside git's own command table, each with its own subTest.
+        """
         for command in commands:
             with self.subTest(command=command):
                 message = self._refusal(command)
@@ -1982,10 +1809,9 @@ class ForcePushGitCommandNameTest(unittest.TestCase):
         )
 
     def test_commands_newer_git_knows_are_refused(self):
-        # history, repo, url-parse, format-rev, last-modified, and instaweb are
-        # commands only in newer git than the baseline this set is calibrated
-        # to (Apple git 2.50.1), so the guard refuses them by design rather than
-        # trusting a name the running git might not have.
+        # history, repo, url-parse, format-rev, last-modified, and instaweb are commands only in newer git than
+        # the baseline this set is calibrated to (Apple git 2.50.1), so the guard refuses them by design rather
+        # than trusting a name the running git might not have.
         self._outside_table(
             [
                 "git history", "git repo", "git url-parse", "git format-rev", "git last-modified", "git instaweb", "git cvsserver --help",
@@ -1994,9 +1820,8 @@ class ForcePushGitCommandNameTest(unittest.TestCase):
         )
 
     def test_names_git_does_not_own_are_refused(self):
-        # `lfs` is an external `git-lfs` program with no external program on
-        # PATH in every environment: `alias.lfs` hijacks it where git-lfs is
-        # absent, so it stays refused.
+        # `lfs` is an external `git-lfs` program with no external program on PATH in every environment:
+        # `alias.lfs` hijacks it where git-lfs is absent, so it stays refused.
         self._outside_table(["git lfs version", "git p", "git co", "git st"], refused=True)
 
     def test_refusal_points_at_the_real_subcommand_first(self):
@@ -2024,8 +1849,8 @@ class ForcePushFrozenBypassTest(unittest.TestCase):
             ("user.name", "Guard Test"),
             ("commit.gpgsign", "false"),
             ("tag.gpgsign", "false"),
-            # Never let git guess an identity: the CI runner's guess yields an
-            # empty user name, and the tests must not depend on that guess.
+            # Never let git guess an identity: the CI runner's guess yields an empty user name, and the tests
+            # must not depend on that guess.
             ("user.useConfigOnly", "true"),
         ]:
             self._git("config", key, value, cwd=self.workspace)
@@ -2068,15 +1893,9 @@ class ForcePushFrozenBypassTest(unittest.TestCase):
     ) -> subprocess.CompletedProcess:
         """Start a fresh kernel (import-time env freeze) and run one push."""
         probe = (
-            "import asyncio\n"
-            "import os\n"
-            "import sys\n"
-            "from rlm import bash\n"
-            f"{body}"
-            "async def main():\n"
-            "    result = await bash(sys.argv[1])\n"
-            "    return result.exit_code\n"
-            "raise SystemExit(asyncio.run(main()))\n"
+            "import asyncio\n" "import os\n" "import sys\n" "from rlm import bash\n" f"{body}"
+            "async def main():\n" "    result = await bash(sys.argv[1])\n"
+            "    return result.exit_code\n" "raise SystemExit(asyncio.run(main()))\n"
         )
         env = dict(os.environ)
         env.pop(BASH_FORCE_PUSH_BYPASS_ENV, None)
