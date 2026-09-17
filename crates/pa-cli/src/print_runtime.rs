@@ -116,6 +116,7 @@ async fn print_mode_main(options: &RunOptions) -> Result<i32, String> {
             generic_mcp_servers: vec![],
             allow_recursion: None,
             session_manager,
+            conversation_log_path: None,
             additional_skill_paths: config
                 .skills
                 .iter()
@@ -417,20 +418,11 @@ fn render_selector_error(error: SessionSelectorError) -> String {
     )
 }
 
-/// Bridge the loop tools (bash/edit/ipython) into the session.
-fn builtin_tools(cwd: &std::path::Path) -> Vec<Arc<dyn pa_agent::types::AgentTool>> {
-    let cwd = cwd.display().to_string();
-    let definitions = vec![
-        pa_core::create_bash_tool_definition(&cwd),
-        pa_core::create_edit_tool_definition(&cwd),
-    ];
-    definitions
-        .into_iter()
-        .map(|definition| {
-            Arc::new(pa_core::session_engine::tool_bridge::ToolDefinitionBridge::new(definition))
-                as Arc<dyn pa_agent::types::AgentTool>
-        })
-        .collect()
+/// Model tools for the print runtime: `ipython` only (the TS product exposes
+/// only the REPL tool to the model; `bash` and `edit` live in the kernel).
+/// The engine adds the kernel-backed `ipython` tool itself.
+fn builtin_tools(_cwd: &std::path::Path) -> Vec<Arc<dyn pa_agent::types::AgentTool>> {
+    Vec::new()
 }
 
 /// Admit prompts, stream json events when requested, and decide the exit code
@@ -607,6 +599,7 @@ async fn faux_print_mode(options: &RunOptions, script: &str) -> Result<i32, Stri
             generic_mcp_servers: vec![],
             allow_recursion: None,
             session_manager,
+            conversation_log_path: None,
             additional_skill_paths: vec![],
             additional_prompt_paths: vec![],
             extra_builtin_skill_overrides: vec![],

@@ -273,6 +273,7 @@ impl Worker {
                         model: None,
                         api_key: None,
                         session_dir: None,
+                        session_file: None,
                         faux_script: Some(script.to_string()),
                     }) {
                         Ok(engine) => std::sync::Arc::new(engine),
@@ -293,6 +294,7 @@ impl Worker {
                         model: std::env::var("PRIME_AGENT_MODEL").ok(),
                         api_key: None,
                         session_dir: None,
+                        session_file: None,
                         faux_script: None,
                     }) {
                         Ok(engine) => std::sync::Arc::new(engine),
@@ -834,6 +836,11 @@ impl Worker {
         }
         // Restore the persisted queue snapshot (crash/respawn recovery).
         let (steering, follow_up) = restore_queue_snapshot(&store);
+        // The worker owns the session file; the engine reads it for the
+        // system prompt's conversation-log path and the local harness dir.
+        if !store.path.as_os_str().is_empty() {
+            self.engine.set_session_file(store.path.clone());
+        }
         let mut core = self.core.lock().unwrap();
         core.cwd = cwd;
         core.steering = steering;

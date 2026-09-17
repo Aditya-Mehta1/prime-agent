@@ -31,6 +31,7 @@ import datetime
 import re
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -418,13 +419,52 @@ class Battery:
                 f.write(ts_sys[0] + NL)
                 f.write("--- RUST ---" + NL)
                 f.write(rs_sys[0] + NL)
-            if ts_sys[0] != rs_sys[0]:
+            ts_norm = self.normalize_system_prompt(self.sides["ts"], ts_sys[0])
+            rs_norm = self.normalize_system_prompt(self.sides["rust"], rs_sys[0])
+            if ts_norm != rs_norm:
                 self.record(
                     flow,
                     "protocol",
-                    f"system prompt text differs (ts {len(ts_sys[0])} chars vs rust {len(rs_sys[0])} chars); full texts in protocol-request-diff.txt",
+                    f"system prompt text differs (ts {len(ts_sys[0])} chars vs rust {len(rs_sys[0])} chars; normalized diff in protocol-request-diff.txt)",
                     evidence=diff_path,
                 )
+            else:
+                with open(diff_path, "a") as f:
+                    f.write(f"=== {flow} normalized system prompt === identical{NL}")
+
+    def normalize_system_prompt(self, side: B.Side, text: str) -> str:
+        """Normalize per-side and per-run values that can never match across
+        binaries: the side's run directory (cwd + conversation-log path),
+        session UUIDs, skill SKILL.md locations (each binary ships skills in
+        its own install/workspace directory), and directory-listing order
+        (both products list skills in raw readdir order, which differs
+        between the two skills directories)."""
+        text = text.replace(str(side.root), "<side-root>")
+        text = re.sub(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            "<session-id>",
+            text,
+        )
+        text = re.sub(r"(<location>)[^<]*(</location>)", r"\1<skills-dir>\2", text)
+        # Skill order is raw readdir order on both sides; compare as sets.
+        def sort_skill_block(match: "re.Match[str]") -> str:
+            header, block = match.group(1), match.group(2)
+            entries = sorted(re.findall(r"  <skill>.*?  </skill>", block, re.DOTALL))
+            return header + NL.join(entries) + "</available_skills>"
+
+        text = re.sub(
+            r"(The following skills provide specialized instructions.*?\n<available_skills>\n)(.*?)</available_skills>",
+            sort_skill_block,
+            text,
+            flags=re.DOTALL,
+        )
+        text = re.sub(
+            r"Installed Python skill modules \(pre-imported\): ([^\n]+)",
+            lambda m: "Installed Python skill modules (pre-imported): "
+            + ", ".join(sorted(re.findall(r"`([^`]+)`", m.group(0)))),
+            text,
+        )
+        return text
 
     def f3_tool(self) -> None:
         """Tool call turn: deterministic ipython tool call in both products."""

@@ -1,0 +1,20 @@
+{
+ "argv": [
+  "prime-agent",
+  "-p",
+  "--daemon-socket",
+  "/home/ubuntu/lane-worktrees/gap-model/scripts/battery/runs/20260916T224512Z/ts/daemon.sock",
+  "--provider",
+  "prime-inference",
+  "--model",
+  "mock-1",
+  "--offline",
+  "-c",
+  "Continue this session"
+ ],
+ "exit_code": 1,
+ "stdout": "",
+ "stderr": "Error: Session is already active in 5779fb523aa1: /home/ubuntu/lane-worktrees/gap-model/scripts/battery/runs/20260916T224512Z/ts/agent/sessions/01a0ac66-ba20-739a-965c-d97df0bbabf5.jsonl\n",
+ "duration_s": 0.49,
+ "timeout": false
+}

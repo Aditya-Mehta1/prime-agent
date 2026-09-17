@@ -56,7 +56,13 @@ in `runs/20260916T210320Z/extras/`. Latest run:
 `scripts/battery/runs/20260916T221725Z/` (10 gaps, 21 passed checks - the
 B-1/B-7/B-11 rows flipped to passed).
 
-## Gap table (first full run 20260916T210320Z; the *fixed* marks come from rerun 20260916T221725Z)
+Full battery after the model-surface lane (B-4/B-5/B-6 fixed):
+`scripts/battery/runs/20260916T224512Z/` (7 gaps, 18 passed checks; the
+system-prompt comparison now normalizes per-side paths, session UUIDs, skill
+locations, and skill enumeration order - see `normalize_system_prompt` in
+`run_battery.py`).
+
+## Gap table (first full run 20260916T210320Z; the *fixed* marks come from reruns 20260916T221725Z and 20260916T224512Z)
 
 Categories: visual / behavior / protocol / timing.
 
@@ -65,9 +71,9 @@ Categories: visual / behavior / protocol / timing.
 | B-1 | f1 | protocol | FIXED in 20260916T221725Z: `--provider`/`--model` reach the daemon session over the wire config; the interactive request carries the flagged model | FIXED: flags ride the TUI create config -> durable create -> worker engine (env fallback only when a create carries no flags); battery row "interactive model flags are authoritative" passes on both sides | `runs/20260916T221725Z/{ts,rust}/f1_launch/first-prompt-mock-requests.json` |
 | B-2 | f1 | visual | splash ASCII art + first-run "Share agent traces with Prime Intellect?" notice (Share / Not now, `/traces` hint) | straight into the TUI; no splash, no notice | `ts/f1_launch/01-launch.txt`, `rust/f1_launch/01-launch.txt` |
 | B-3 | f1 | timing | worker connect timeout 30s (`WORKER_CONNECT_TIMEOUT_MS`); survives long TMPDIR socket paths | supervisor waits only 15s (`WORKER_SPAWN_CONNECT_TIMEOUT_MS`), and worker socket bind fails outright when the AF_UNIX path exceeds 107 chars -> "session worker <id> did not come up in time", TUI exits 1 | `runs/20260916T203149Z/rust/` (failed creates), `crates/pa-daemon/src/supervisor.rs` L48 |
-| B-4 | f2 | protocol | model tool surface: `ipython` only (bash/edit live in the kernel) | exposes `bash`, `edit`, `ipython` as model tools | `ts/f2_prompt/mock-requests.json` vs `rust/f2_prompt/mock-requests.json` |
-| B-5 | f2 | protocol | sends a `[harness-digest]` user message before the prompt | no harness-digest message | same evidence as B-4 |
-| B-6 | f2 | protocol | system prompt carries conversation-log path, pre-installed packages, installed skill modules, available-skills inventory, refinement guidance (23119 chars in the capture) | system prompt omits those sections (13526 chars) | `runs/20260916T210320Z/protocol-request-diff.txt` |
+| B-4 | f2 | protocol | model tool surface: `ipython` only (bash/edit live in the kernel) | FIXED (run `20260916T224512Z`): `ipython` only, tool schemas byte-identical | `ts/f2_prompt/mock-requests.json` vs `rust/f2_prompt/mock-requests.json` |
+| B-5 | f2 | protocol | sends a `[harness-digest]` user message before the prompt | FIXED (same run): digest delivered at cold context boundaries, byte-identical to TS | same evidence as B-4 |
+| B-6 | f2 | protocol | system prompt carries conversation-log path, pre-installed packages, installed skill modules, available-skills inventory, refinement guidance (23119 chars in the capture) | FIXED (same run): normalized prompts identical; golden test `crates/pa-core/tests/golden/system_prompt.rs` | `runs/20260916T210320Z/protocol-request-diff.txt` |
 | B-7 | f2/f5 | protocol | FIXED in 20260916T221725Z: after each completed turn the daemon session issues a status-line request to a small model (`qwen/qwen3-30b-a3b-instruct-2507`) | FIXED: the worker's StatusLineRunner issues the same request (same trigger, model, system prompt, max_tokens 400) and broadcasts `session_status`; battery row "post-turn status-line request issued by both sides" passes | `runs/20260916T221725Z/{ts,rust}/f5_side_questions/statusline-requests.json` |
 | B-8 | f3/f8 | protocol | session entries: `custom_message` (harness_digest), `service_tier_change` per session, `compaction` entries | `custom` entries (`prime-agent-rs.queue_snapshot`), no `service_tier_change`, no `compaction` wiring | `f3_tool-session-shapes.json`, `f8_resume-session-shapes.json` |
 | B-9 | f4 | visual | `/` opens the slash-command menu (settings, model, new, compact, ...) | `/` is typed into the composer; no command menu | `rust/f4_commands/01-slash-menu.txt` |

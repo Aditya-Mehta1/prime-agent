@@ -29,6 +29,10 @@ pub struct AgentEngineConfig {
     pub api_key: Option<String>,
     /// Session persistence directory (JSONL sessions live under it).
     pub session_dir: Option<std::path::PathBuf>,
+    /// Conversation-log path for the system prompt: the daemon worker owns
+    /// the session file, so the in-session manager stays in-memory and the
+    /// prompt reads the path from here.
+    pub session_file: Option<std::path::PathBuf>,
     /// Verification seam: a scripted faux provider (`{"responses": [...]}`).
     /// Never set by the product.
     pub faux_script: Option<String>,
@@ -38,6 +42,8 @@ pub struct AgentEngineConfig {
 pub struct AgentSessionEngine {
     runtime: tokio::runtime::Runtime,
     config: AgentEngineConfig,
+    /// The worker-owned session file (conversation-log path), set at create.
+    session_file: std::sync::Mutex<Option<std::path::PathBuf>>,
     /// The authoritative model selection. Starts from the process fallback
     /// (create config or worker env) and is re-bound when a session's create
     /// command carries explicit wire flags.
@@ -51,6 +57,7 @@ impl AgentSessionEngine {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
+        let session_file = std::sync::Mutex::new(config.session_file.clone());
         // Process-level fallback: the create config, else the worker env
         // pair. A create command with explicit wire flags overrides both.
         let selection = if config.provider.is_some() || config.model.is_some() {
@@ -69,6 +76,7 @@ impl AgentSessionEngine {
         Ok(Self {
             runtime,
             config,
+            session_file,
             selection: std::sync::RwLock::new(selection),
             session: tokio::sync::Mutex::new(None),
         })
@@ -145,38 +153,32 @@ impl AgentSessionEngine {
         }
         let session_manager =
             pa_core::session::manager::SessionManager::in_memory(&self.config.cwd);
+        let session_file = self
+            .session_file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         pa_core::session_engine::engine::create_session(SessionEngineConfig {
             cwd: self.config.cwd.clone(),
             agent_dir: self.config.agent_dir.clone(),
             model: Some(agent_model),
             thinking_level: None,
             stream_fn: Some(stream_fn),
-            tools: builtin_tools(&self.config.cwd),
+            // Model tools: `ipython` only (kernel-resident bash/edit parity);
+            // the engine adds the kernel-backed `ipython` tool itself.
+            tools: vec![],
             custom_system_prompt: None,
             prompt_guidelines: vec![],
             generic_mcp_servers: vec![],
             allow_recursion: None,
             session_manager: Some(session_manager),
+            conversation_log_path: session_file,
             additional_skill_paths: vec![],
             additional_prompt_paths: vec![],
             extra_builtin_skill_overrides: vec![],
         })
         .await
     }
-}
-
-fn builtin_tools(cwd: &std::path::Path) -> Vec<Arc<dyn pa_agent::types::AgentTool>> {
-    let cwd = cwd.display().to_string();
-    vec![
-        pa_core::create_bash_tool_definition(&cwd),
-        pa_core::create_edit_tool_definition(&cwd),
-    ]
-    .into_iter()
-    .map(|definition| {
-        Arc::new(pa_core::session_engine::tool_bridge::ToolDefinitionBridge::new(definition))
-            as Arc<dyn pa_agent::types::AgentTool>
-    })
-    .collect()
 }
 
 fn now_millis() -> u64 {
@@ -189,6 +191,13 @@ fn now_millis() -> u64 {
 impl SessionEngine for AgentSessionEngine {
     fn model_context_window(&self) -> Option<u64> {
         self.resolve_model().ok().map(|model| model.context_window)
+    }
+
+    fn set_session_file(&self, path: std::path::PathBuf) {
+        *self
+            .session_file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path);
     }
 
     fn configure_model(&self, selection: EngineModelSelection) {
@@ -557,6 +566,7 @@ mod tests {
             model: None,
             api_key: None,
             session_dir: None,
+            session_file: None,
             faux_script: None,
         })
         .unwrap();
@@ -590,6 +600,7 @@ mod tests {
             model: Some("mock-1".to_string()),
             api_key: Some("flag-key".to_string()),
             session_dir: None,
+            session_file: None,
             faux_script: None,
         })
         .unwrap();
@@ -617,6 +628,7 @@ mod tests {
             model: Some("some-model".to_string()),
             api_key: None,
             session_dir: None,
+            session_file: None,
             faux_script: None,
         })
         .unwrap();
@@ -665,6 +677,7 @@ fn agent_engine_streams_updates_and_final_message() {
         model: None,
         api_key: None,
         session_dir: None,
+        session_file: None,
         faux_script: Some(serde_json::json!({ "responses": ["streamed answer"] }).to_string()),
     })
     .unwrap();

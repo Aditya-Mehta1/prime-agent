@@ -549,6 +549,19 @@ impl SessionManager {
         self.persist
     }
 
+    /// Session artifact directory (`dirname(sessionDir)/session-artifacts/<id>`,
+    /// TS `getSessionArtifactDir`); only persisted sessions have one.
+    pub fn get_session_artifact_dir(&self) -> Option<std::path::PathBuf> {
+        self.persist
+            .then(|| {
+                self.session_dir
+                    .parent()
+                    .map(|root| root.join("session-artifacts"))
+            })
+            .flatten()
+            .map(|root| root.join(&self.session_id))
+    }
+
     pub fn get_cwd(&self) -> &Path {
         &self.cwd
     }

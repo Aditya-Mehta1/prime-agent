@@ -96,6 +96,13 @@ pub trait SessionEngine: Send + Sync {
         None
     }
 
+    /// Tell the engine which session file the worker owns (the conversation-log
+    /// path for the system prompt and the session-local harness dir). The
+    /// worker owns persistence; scripted engines ignore it.
+    fn set_session_file(&self, path: std::path::PathBuf) {
+        let _ = path;
+    }
+
     /// Adopt the explicit model selection carried by the session's create
     /// config. Explicit CLI flags must be authoritative end-to-end: the
     /// selection reached the worker over the wire, so model resolution must

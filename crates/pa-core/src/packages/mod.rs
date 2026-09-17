@@ -47,13 +47,66 @@ pub(crate) fn is_offline_mode_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// The directory of built-in skills shipped with the package: `skills/`
-/// next to the executable (the packaged layout; TS `getBundledSkillsDir`).
-pub(crate) fn get_bundled_skills_dir() -> PathBuf {
+/// The package directory: `PI_PACKAGE_DIR` wins (matching the TS
+/// `getPackageDir` override), then the directory of the executable (the
+/// packaged bun-binary layout).
+pub(crate) fn package_dir() -> PathBuf {
+    if let Ok(env_dir) = std::env::var("PI_PACKAGE_DIR") {
+        if !env_dir.is_empty() {
+            return expand_tilde(&env_dir);
+        }
+    }
     std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("skills")))
-        .unwrap_or_else(|| PathBuf::from("skills"))
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn expand_tilde(path: &str) -> PathBuf {
+    if path == "~" {
+        return home_dir();
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return home_dir().join(rest);
+    }
+    PathBuf::from(path)
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/"))
+}
+
+/// The workspace root at compile time (source-checkout layout): pa-core
+/// lives at `<root>/crates/pa-core`.
+fn source_checkout_root() -> Option<&'static std::path::Path> {
+    static ROOT: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .map(std::path::Path::to_path_buf)
+    })
+    .as_deref()
+}
+
+/// The directory of built-in skills shipped with the package (TS
+/// `getBundledSkillsDir`): `skills/` next to the executable (the packaged
+/// layout), falling back to the workspace `skills/` for source checkouts
+/// (TS keeps built-in skills at the package root next to `src/`).
+pub(crate) fn get_bundled_skills_dir() -> PathBuf {
+    let packaged = package_dir().join("skills");
+    if packaged.is_dir() {
+        return packaged;
+    }
+    if let Some(root) = source_checkout_root() {
+        let source_checkout = root.join("skills");
+        if source_checkout.is_dir() {
+            return source_checkout;
+        }
+    }
+    packaged
 }
 
 /// Stable temporary directory for resolve-only package installs:

@@ -15,6 +15,7 @@ pub mod compaction_exec;
 pub mod compaction_utils;
 pub mod engine;
 pub mod goal_driver;
+pub mod harness_digest;
 pub mod headless;
 pub mod host_requests;
 pub mod messages;
@@ -73,6 +74,12 @@ pub struct AgentSession {
     session: Arc<tokio::sync::Mutex<SessionManager>>,
     prompt_templates: Vec<PromptTemplate>,
     slash_commands: SlashCommandRegistry,
+    /// Harness digest inputs; `None` in sessions without harness state
+    /// (verification harnesses building the loop directly).
+    harness_digest: Option<harness_digest::HarnessDigestContext>,
+    /// The first-turn digest rides the turn's admission (fresh sessions defer
+    /// delivery so untouched sessions stay empty, TS `_harnessDigestPending`).
+    digest_pending: std::sync::atomic::AtomicBool,
 }
 
 impl AgentSession {
@@ -81,22 +88,25 @@ impl AgentSession {
         agent: Arc<Agent>,
         session: SessionManager,
         prompt_templates: Vec<PromptTemplate>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         Self::from_session_arc(
             agent,
             Arc::new(tokio::sync::Mutex::new(session)),
             prompt_templates,
+            None,
         )
         .await
     }
 
     /// Build a session from an already-shared session manager handle, so the
     /// kernel host-request handlers can reach the same persistence.
+    #[allow(clippy::too_many_arguments)]
     pub async fn from_session_arc(
         agent: Arc<Agent>,
         session: Arc<tokio::sync::Mutex<SessionManager>>,
         prompt_templates: Vec<PromptTemplate>,
-    ) -> Self {
+        harness_digest: Option<harness_digest::HarnessDigestContext>,
+    ) -> anyhow::Result<Self> {
         let persistence = session.clone();
         agent
             .subscribe(move |event, _signal| {
@@ -107,12 +117,16 @@ impl AgentSession {
                 })
             })
             .await;
-        Self {
+        let this = Self {
             agent,
             session,
             prompt_templates,
             slash_commands: SlashCommandRegistry::builtin(),
-        }
+            harness_digest,
+            digest_pending: std::sync::atomic::AtomicBool::new(false),
+        };
+        this.ensure_harness_digest_context().await?;
+        Ok(this)
     }
 
     /// Execute `/compact`: summarize the pre-cut prefix, persist the
@@ -229,6 +243,9 @@ impl AgentSession {
                 "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."
             );
         }
+        // The deferred first-turn harness digest rides this admission, so the
+        // model sees it before the prompt (TS commit-time injection).
+        self.deliver_pending_harness_digest().await?;
         // User messages persist through the loop's `message_end` event (the
         // persistence subscription in `from_session_arc`), matching the TS
         // reference: `_processAgentEvent` is the only appendMessage path for
@@ -347,7 +364,9 @@ mod tests {
         let agent = Agent::new(options);
         let tmp = tempfile::tempdir().unwrap();
         let session = SessionManager::in_memory(tmp.path());
-        AgentSession::new(Arc::new(agent), session, vec![]).await
+        AgentSession::new(Arc::new(agent), session, vec![])
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -407,7 +426,9 @@ mod tests {
             ),
             file_path: "/p/fix.md".to_string(),
         };
-        let engine = AgentSession::new(Arc::new(agent), session, vec![template]).await;
+        let engine = AgentSession::new(Arc::new(agent), session, vec![template])
+            .await
+            .unwrap();
         engine
             .prompt("/fix lint", PromptOptions::default())
             .await
@@ -459,7 +480,9 @@ mod slash_session_tests {
         let agent = Agent::new(options);
         let tmp = tempfile::tempdir().unwrap();
         let session = SessionManager::in_memory(tmp.path());
-        let engine = AgentSession::new(Arc::new(agent), session, vec![]).await;
+        let engine = AgentSession::new(Arc::new(agent), session, vec![])
+            .await
+            .unwrap();
         let outcome = engine
             .prompt("/compact focus on tests", PromptOptions::default())
             .await

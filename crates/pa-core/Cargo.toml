@@ -32,3 +32,7 @@ ignore = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+
+[[test]]
+name = "golden_system_prompt"
+path = "tests/golden/system_prompt.rs"

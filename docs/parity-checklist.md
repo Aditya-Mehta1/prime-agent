@@ -335,17 +335,22 @@ Categories: visual/behavior/protocol/timing.
   come up in time", TUI exits 1). Evidence:
   `runs/20260916T203149Z/rust/` (failed worker boots), plus
   `crates/pa-daemon/src/supervisor.rs` L48.
-- B-4 (protocol, f2): model tool surface differs - TS exposes only
-  `ipython`; Rust exposes `bash`, `edit`, `ipython`. Evidence:
+- B-4 (protocol, f2) - RESOLVED: model tool surface differs - TS exposes only
+  `ipython`; Rust exposed `bash`, `edit`, `ipython`. Evidence:
   `runs/20260916T210320Z/{ts,rust}/f2_prompt/mock-requests.json`.
-- B-5 (protocol, f2): TS prepends a `[harness-digest]` user message; Rust
-  sends none. Evidence: same capture as B-4.
-- B-6 (protocol, f2): system prompt differs (23119 vs 13526 chars): Rust
-  omits the conversation-log path, pre-installed packages line, installed
-  skill modules line, available-skills inventory, and harness-refinement
-  guidance. Evidence:
-  `runs/20260916T210320Z/protocol-request-diff.txt`.
-- B-7 (protocol, f2/f5): FIXED. TS issues a post-turn status-line request
+  Fixed (run `runs/20260916T224512Z/`): both sides expose only `ipython`
+  (byte-identical tool schemas); `bash`/`edit` stay kernel-resident.
+- B-5 (protocol, f2) - RESOLVED: TS prepends a `[harness-digest]` user
+  message; Rust sent none. Fixed (same run): the Rust session engine composes
+  and delivers the digest at cold context boundaries; the captured digest
+  messages are byte-identical on both sides.
+- B-6 (protocol, f2) - RESOLVED: system prompt differed (23119 vs 13526
+  chars): Rust omitted the conversation-log path, installed skill modules
+  line, available-skills inventory, and harness-refinement guidance. Fixed
+  (same run): normalized prompts are identical; golden test
+  `crates/pa-core/tests/golden/system_prompt.rs` pins the assembly against
+  the TS `buildSystemPrompt` over the vendored skills.
+- B-7 (protocol, f2/f5) - RESOLVED: TS issues a post-turn status-line request
   to a small model (`qwen/qwen3-30b-a3b-instruct-2507`); Rust now issues the
   same request (daemon-session-summarizer port in
   `crates/pa-daemon/src/status_line.rs`: same trigger, model, system prompt,

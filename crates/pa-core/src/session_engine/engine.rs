@@ -41,6 +41,10 @@ pub struct SessionEngineConfig {
     pub allow_recursion: Option<bool>,
     /// Session persistence (in-memory when None).
     pub session_manager: Option<SessionManager>,
+    /// Conversation-log path for the system prompt when the caller owns
+    /// persistence outside the session manager (the daemon worker mirrors
+    /// entries into its own session file).
+    pub conversation_log_path: Option<PathBuf>,
     /// Extra skill paths.
     pub additional_skill_paths: Vec<String>,
     /// Extra prompt-template paths.
@@ -59,16 +63,88 @@ pub struct SessionEngine {
     pub system_prompt: String,
 }
 
+/// Resolve the MCP gating the resource loader and prompt need: skill
+/// overrides for built-in integrations the user is not logged into, plus the
+/// enabled persistent generic servers (prompt `mcp` guidance).
+async fn mcp_gating(
+    settings: &crate::settings::SettingsManager,
+    agent_dir: std::path::PathBuf,
+) -> (Vec<String>, Vec<String>) {
+    let user_servers = settings
+        .settings()
+        .mcp_servers
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(server, config)| {
+            serde_json::from_value(config)
+                .ok()
+                .map(|parsed| (server, parsed))
+        })
+        .collect::<std::collections::HashMap<String, crate::mcp::McpServerConfig>>();
+    // The MCP manager snapshots auth with a blocking lock; run it off the
+    // async runtime (session construction is async).
+    tokio::task::spawn_blocking(move || mcp_gating_blocking(user_servers, &agent_dir))
+        .await
+        .unwrap_or_default()
+}
+
+fn mcp_gating_blocking(
+    user_servers: std::collections::HashMap<String, crate::mcp::McpServerConfig>,
+    agent_dir: &std::path::Path,
+) -> (Vec<String>, Vec<String>) {
+    let manager = crate::mcp::McpManager::new(crate::mcp::McpManagerOptions {
+        auth_storage: crate::auth::AuthStorage::create(agent_dir),
+        get_user_servers: Box::new(move || Some(user_servers.clone())),
+        begin_login: None,
+    });
+    (
+        manager.get_disabled_builtin_skill_overrides(),
+        manager.get_enabled_persistent_generic_servers(),
+    )
+}
+
 /// Assemble a session: load resources, build the system prompt, and start the
 /// loop with persistence wiring.
 pub async fn create_session(config: SessionEngineConfig) -> anyhow::Result<SessionEngine> {
     let cwd = config.cwd.clone();
+    // Session persistence first: the conversation-log path and the resume
+    // context both come from the session manager (TS `_rebuildSystemPrompt`
+    // reads `sessionManager.getSessionFile()`).
+    let session_manager = config
+        .session_manager
+        .unwrap_or_else(|| SessionManager::in_memory(&cwd));
+    let conversation_log = {
+        let session = &session_manager;
+        session
+            .get_session_file()
+            .map(|path| path.display().to_string())
+            .or_else(|| {
+                config
+                    .conversation_log_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+            })
+    };
+    let wiring = super::runtime_wiring::wire_session_runtime(session_manager, &config.agent_dir);
+
+    let settings = crate::settings::SettingsManager::create(&cwd, &config.agent_dir);
+    let (mcp_skill_overrides, mcp_generic_servers) =
+        mcp_gating(&settings, config.agent_dir.clone()).await;
+    let mut extra_builtin_skill_overrides = config.extra_builtin_skill_overrides.clone();
+    extra_builtin_skill_overrides.extend(mcp_skill_overrides);
+    let mut generic_mcp_servers = config.generic_mcp_servers.clone();
+    for server in mcp_generic_servers {
+        if !generic_mcp_servers.contains(&server) {
+            generic_mcp_servers.push(server);
+        }
+    }
     let resources = load_resources(ResourceLoaderOptions {
         cwd: cwd.clone(),
         agent_dir: config.agent_dir.clone(),
-        settings: None,
+        settings: Some(settings),
         additional_extension_sources: Vec::new(),
-        extra_builtin_skill_overrides: config.extra_builtin_skill_overrides.clone(),
+        extra_builtin_skill_overrides,
         additional_skill_paths: config.additional_skill_paths.clone(),
         additional_prompt_paths: config.additional_prompt_paths.clone(),
         no_skills: false,
@@ -79,25 +155,6 @@ pub async fn create_session(config: SessionEngineConfig) -> anyhow::Result<Sessi
         ..Default::default()
     })?;
 
-    let system_prompt = crate::prompts::system_prompt::build_system_prompt(
-        &crate::prompts::system_prompt::BuildSystemPromptOptions {
-            custom_prompt: resources.system_prompt.clone(),
-            cwd: cwd.display().to_string(),
-            messages_path: None,
-            context_files: resources
-                .agents_files
-                .iter()
-                .map(|file| (file.path.display().to_string(), file.content.clone()))
-                .collect(),
-            skills: resources.skills.clone(),
-            allow_recursion: config.allow_recursion,
-            generic_mcp_servers: config.generic_mcp_servers.clone(),
-            prompt_guidelines: (config.prompt_guidelines.is_empty())
-                .then_some(config.prompt_guidelines.clone()),
-            ..Default::default()
-        },
-    );
-
     let model = config
         .model
         .ok_or_else(|| anyhow::anyhow!("a resolved model is required"))?;
@@ -105,13 +162,9 @@ pub async fn create_session(config: SessionEngineConfig) -> anyhow::Result<Sessi
         .stream_fn
         .ok_or_else(|| anyhow::anyhow!("a provider stream_fn is required"))?;
 
-    // Session persistence + the runtime wiring: goal/rlm-heartbeat host
-    // handlers ride the kernel provisioner, and the agent gains the
-    // `ipython` tool backed by that kernel (unless the caller supplied one).
-    let session_manager = config
-        .session_manager
-        .unwrap_or_else(|| SessionManager::in_memory(&cwd));
-    let wiring = super::runtime_wiring::wire_session_runtime(session_manager, &config.agent_dir);
+    // The runtime wiring: goal/rlm-heartbeat host handlers ride the kernel
+    // provisioner, and the agent gains the `ipython` tool backed by that
+    // kernel (unless the caller supplied one).
     let python_skills = super::runtime_wiring::kernel_python_skills(&resources.skills);
     let session_id = wiring.session.lock().await.get_session_id().to_string();
     let provisioner = super::runtime_wiring::kernel_provisioner(
@@ -129,7 +182,55 @@ pub async fn create_session(config: SessionEngineConfig) -> anyhow::Result<Sessi
             crate::session_engine::tool_bridge::ToolDefinitionBridge::new(definition),
         ));
     }
+    let active_tool_names: Vec<String> = tools.iter().map(|tool| tool.name().to_string()).collect();
 
+    let system_prompt = crate::prompts::system_prompt::build_system_prompt(
+        &crate::prompts::system_prompt::BuildSystemPromptOptions {
+            custom_prompt: resources.system_prompt.clone(),
+            cwd: cwd.display().to_string(),
+            messages_path: conversation_log.clone(),
+            context_files: resources
+                .agents_files
+                .iter()
+                .map(|file| (file.path.display().to_string(), file.content.clone()))
+                .collect(),
+            skills: resources.skills.clone(),
+            selected_tools: Some(
+                active_tool_names
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+            ),
+            allow_recursion: config.allow_recursion,
+            generic_mcp_servers,
+            prompt_guidelines: Some(config.prompt_guidelines.clone()),
+            ..Default::default()
+        },
+    );
+
+    // Harness digest inputs: global state from the agent dir, local state
+    // from the session artifacts (or the daemon-owned conversation log), and
+    // the interfaces the digest may reference.
+    let digest_context = super::harness_digest::HarnessDigestContext {
+        global_dir: crate::refinement::get_global_harness_state_dir(&config.agent_dir),
+        local_dir: wiring
+            .session
+            .lock()
+            .await
+            .get_session_artifact_dir()
+            .or_else(|| {
+                config
+                    .conversation_log_path
+                    .as_deref()
+                    .and_then(super::harness_digest::local_harness_dir_for_log)
+            }),
+        include_ipython: active_tool_names.iter().any(|name| name == "ipython"),
+        include_shell_examples: active_tool_names.iter().any(|name| name == "bash"),
+        include_refine: resources.skills.iter().any(|skill| {
+            !skill.disable_model_invocation
+                && skill.name == crate::prompts::system_prompt::REFINE_SKILL_NAME
+        }),
+    };
     // sdk.ts `createAgentSession` parity: a session manager that already
     // holds messages is a resume — the loop starts from the persisted
     // context. Fresh sessions record the creation prefix (model_change +
@@ -182,13 +283,16 @@ pub async fn create_session(config: SessionEngineConfig) -> anyhow::Result<Sessi
         ..Default::default()
     });
 
+    let session = AgentSession::from_session_arc(
+        Arc::new(agent),
+        wiring.session.clone(),
+        resources.prompts.clone(),
+        Some(digest_context),
+    )
+    .await?;
+
     Ok(SessionEngine {
-        session: AgentSession::from_session_arc(
-            Arc::new(agent),
-            wiring.session.clone(),
-            resources.prompts.clone(),
-        )
-        .await,
+        session,
         skills: resources.skills,
         prompt_templates: resources.prompts,
         agents_files: resources.agents_files,
@@ -274,6 +378,7 @@ mod tests {
             generic_mcp_servers: vec![],
             allow_recursion: None,
             session_manager: None,
+            conversation_log_path: None,
             additional_skill_paths: vec![],
             additional_prompt_paths: vec![],
             extra_builtin_skill_overrides: vec![],

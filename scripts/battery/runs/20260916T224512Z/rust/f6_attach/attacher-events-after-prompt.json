@@ -1,0 +1,415 @@
+[
+ {
+  "activeSessionId": "bf27059e8135",
+  "event": {
+   "actions": {
+    "followUps": [
+     "say something"
+    ],
+    "queuedCount": 1,
+    "steering": []
+   },
+   "type": "session_action_update"
+  },
+  "meta": {
+   "activeSessionId": "bf27059e8135",
+   "cursor": {
+    "generation": "977f820b176d",
+    "sequence": 1
+   },
+   "emittedAt": "2026-09-16T22:46:42.415Z",
+   "id": "bf27059e8135:1",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 1
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "bf27059e8135",
+  "event": {
+   "type": "agent_start"
+  },
+  "meta": {
+   "activeSessionId": "bf27059e8135",
+   "cursor": {
+    "generation": "977f820b176d",
+    "sequence": 2
+   },
+   "emittedAt": "2026-09-16T22:46:42.415Z",
+   "id": "bf27059e8135:2",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 2
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "bf27059e8135",
+  "event": {
+   "type": "turn_start"
+  },
+  "meta": {
+   "activeSessionId": "bf27059e8135",
+   "cursor": {
+    "generation": "977f820b176d",
+    "sequence": 3
+   },
+   "emittedAt": "2026-09-16T22:46:42.415Z",
+   "id": "bf27059e8135:3",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 3
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "bf27059e8135",
+  "event": {
+   "message": {
+    "content": [
+     {
+      "text": "say something",
+      "type": "text"
+     }
+    ],
+    "role": "user",
+    "timestamp": 1789598802423
+   },
+   "type": "message_start"
+  },
+  "meta": {
+   "activeSessionId": "bf27059e8135",
+   "cursor": {
+    "generation": "977f820b176d",
+    "sequence": 4
+   },
+   "emittedAt": "2026-09-16T22:46:42.424Z",
+   "id": "bf27059e8135:4",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 4
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "bf27059e8135",
+  "event": {
+   "message": {
+    "api": "openai-completions",
+    "content": [],
+    "model": "mock-1",
+    "provider": "prime-inference",
+    "role": "assistant",
+    "stopReason": "stop",
+    "timestamp": 1789598802466,
+    "usage": {
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "cost": {
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "input": 0,
+      "output": 0,
+      "total": 0
+     },
+     "input": 0,
+     "output": 0,
+     "totalTokens": 0
+    }
+   },
+   "type": "message_update"
+  },
+  "meta": {
+   "activeSessionId": "bf27059e8135",
+   "cursor": {
+    "generation": "977f820b176d",
+    "sequence": 5
+   },
+   "emittedAt": "2026-09-16T22:46:42.478Z",
+   "id": "bf27059e8135:5",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 5
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "bf27059e8135",
+  "event": {
+   "message": {
+    "api": "openai-completions",
+    "content": [
+     {
+      "text": "",
+      "type": "text"
+     }
+    ],
+    "model": "mock-1",
+    "provider": "prime-inference",
+    "responseId": "chatcmpl-battery",
+    "role": "assistant",
+    "stopReason": "stop",
+    "timestamp": 1789598802466,
+    "usage": {
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "cost": {
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "input": 0,
+      "output": 0,
+      "total": 0
+     },
+     "input": 0,
+     "output": 0,
+     "totalTokens": 0
+    }
+   },
+   "type": "message_update"
+  },
+  "meta": {
+   "activeSessionId": "bf27059e8135",
+   "cursor": {
+    "generation": "977f820b176d",
+    "sequence": 6
+   },
+   "emittedAt": "2026-09-16T22:46:42.478Z",
+   "id": "bf27059e8135:6",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 6
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "bf27059e8135",
+  "event": {
+   "message": {
+    "api": "openai-completions",
+    "content": [
+     {
+      "text": "attach stream reply",
+      "type": "text"
+     }
+    ],
+    "model": "mock-1",
+    "provider": "prime-inference",
+    "responseId": "chatcmpl-battery",
+    "role": "assistant",
+    "stopReason": "stop",
+    "timestamp": 1789598802466,
+    "usage": {
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "cost": {
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "input": 0,
+      "output": 0,
+      "total": 0
+     },
+     "input": 0,
+     "output": 0,
+     "totalTokens": 0
+    }
+   },
+   "type": "message_update"
+  },
+  "meta": {
+   "activeSessionId": "bf27059e8135",
+   "cursor": {
+    "generation": "977f820b176d",
+    "sequence": 7
+   },
+   "emittedAt": "2026-09-16T22:46:42.478Z",
+   "id": "bf27059e8135:7",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 7
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "bf27059e8135",
+  "event": {
+   "message": {
+    "api": "openai-completions",
+    "content": [
+     {
+      "text": "attach stream reply",
+      "type": "text"
+     }
+    ],
+    "model": "mock-1",
+    "provider": "prime-inference",
+    "responseId": "chatcmpl-battery",
+    "role": "assistant",
+    "stopReason": "stop",
+    "timestamp": 1789598802466,
+    "usage": {
+     "cacheRead": 80,
+     "cacheWrite": 0,
+     "cost": {
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "input": 0,
+      "output": 0,
+      "total": 0
+     },
+     "input": 20,
+     "output": 10,
+     "totalTokens": 110
+    }
+   },
+   "type": "message_update"
+  },
+  "meta": {
+   "activeSessionId": "bf27059e8135",
+   "cursor": {
+    "generation": "977f820b176d",
+    "sequence": 8
+   },
+   "emittedAt": "2026-09-16T22:46:42.478Z",
+   "id": "bf27059e8135:8",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 8
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "bf27059e8135",
+  "event": {
+   "message": {
+    "api": "openai-completions",
+    "content": [
+     {
+      "text": "attach stream reply",
+      "type": "text"
+     }
+    ],
+    "model": "mock-1",
+    "provider": "prime-inference",
+    "responseId": "chatcmpl-battery",
+    "role": "assistant",
+    "stopReason": "stop",
+    "timestamp": 1789598802466,
+    "usage": {
+     "cacheRead": 80,
+     "cacheWrite": 0,
+     "cost": {
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "input": 0,
+      "output": 0,
+      "total": 0
+     },
+     "input": 20,
+     "output": 10,
+     "totalTokens": 110
+    }
+   },
+   "type": "message_end"
+  },
+  "meta": {
+   "activeSessionId": "bf27059e8135",
+   "cursor": {
+    "generation": "977f820b176d",
+    "sequence": 9
+   },
+   "emittedAt": "2026-09-16T22:46:42.499Z",
+   "id": "bf27059e8135:9",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 9
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "bf27059e8135",
+  "event": {
+   "type": "turn_end"
+  },
+  "meta": {
+   "activeSessionId": "bf27059e8135",
+   "cursor": {
+    "generation": "977f820b176d",
+    "sequence": 10
+   },
+   "emittedAt": "2026-09-16T22:46:42.499Z",
+   "id": "bf27059e8135:10",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 10
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "bf27059e8135",
+  "event": {
+   "type": "agent_end"
+  },
+  "meta": {
+   "activeSessionId": "bf27059e8135",
+   "cursor": {
+    "generation": "977f820b176d",
+    "sequence": 11
+   },
+   "emittedAt": "2026-09-16T22:46:42.500Z",
+   "id": "bf27059e8135:11",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 11
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "bf27059e8135",
+  "event": {
+   "actions": {
+    "followUps": [],
+    "queuedCount": 0,
+    "steering": []
+   },
+   "type": "session_action_update"
+  },
+  "meta": {
+   "activeSessionId": "bf27059e8135",
+   "cursor": {
+    "generation": "977f820b176d",
+    "sequence": 12
+   },
+   "emittedAt": "2026-09-16T22:46:42.501Z",
+   "id": "bf27059e8135:12",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 12
+  },
+  "type": "session_event"
+ }
+]
