@@ -942,6 +942,16 @@ def _scan_text(text: str, depth: int, parent_mentions_sudo: bool = False) -> str
     words = _tokenize(text)
     _apply_heredocs(text, words)
     inner = parent_mentions_sudo or _mentions_sudo(words)
+    # `hash -p pathname name` installs a command-hash entry by hand, so a later
+    # `name` runs `pathname` whatever the name looks like: those names scan as
+    # the command they run, and an entry the guard cannot read is refused,
+    # because the command it hides cannot be resolved at all.
+    hash_alias_names, hash_unreadable = _hash_registered_command_names(words)
+    if hash_unreadable:
+        return (
+            "a `hash -p` registration builds the command it runs from expansion, "
+            "so that entry cannot be resolved"
+        )
     # Word indices the walk reaches as command words, so the heredoc gate below
     # uses the same judgment as the refusals instead of guessing from the tokens.
     command_words: set[int] = set()
@@ -954,7 +964,9 @@ def _scan_text(text: str, depth: int, parent_mentions_sudo: bool = False) -> str
     for index, word in enumerate(words):
         if word.is_data or not word.starts_command:
             continue
-        violation = _scan_segment(words, index, depth, inner, command_words)
+        violation = _scan_segment(
+            words, index, depth, inner, command_words, hash_alias_names
+        )
         if violation:
             return violation
     # A heredoc body that the same text feeds to a runner is a script, not data.
@@ -985,6 +997,7 @@ def _scan_segment(
     depth: int,
     parent_mentions_sudo: bool = False,
     command_words: set[int] | None = None,
+    hash_alias_names: dict[str, str] | None = None,
 ) -> str | None:
     """Walk one command segment to its command word and judge that word."""
     while start < len(words):
@@ -1036,6 +1049,12 @@ def _scan_segment(
             command_words.add(start)
         if _word_names_sudo(word.value):
             return f"{name} would run this command as root or another user"
+        if hash_alias_names and word.value in hash_alias_names:
+            return (
+                f"a `hash -p` entry makes {word.value} run "
+                f"{hash_alias_names[word.value]}, which would run this command as "
+                "root or another user"
+            )
         if name == "alias":
             return _scan_alias_bodies(words, start + 1, depth, parent_mentions_sudo)
         if name in _EXEC_LAUNCHER_FLAGS:
@@ -1046,6 +1065,7 @@ def _scan_segment(
                 parent_mentions_sudo,
                 command_words,
                 _EXEC_LAUNCHER_FLAGS[name],
+                hash_alias_names,
             )
         if word.has_expansion:
             if _mentions_sudo(words) or parent_mentions_sudo:
@@ -1054,7 +1074,9 @@ def _scan_segment(
                     "text invokes sudo/doas"
                 )
             return None
-        return _scan_interpreter(words, start, depth, parent_mentions_sudo, command_words)
+        return _scan_interpreter(
+            words, start, depth, parent_mentions_sudo, command_words, hash_alias_names
+        )
     return None
 
 
@@ -1507,6 +1529,7 @@ def _scan_interpreter(
     depth: int,
     parent_mentions_sudo: bool = False,
     command_words: set[int] | None = None,
+    hash_alias_names: dict[str, str] | None = None,
 ) -> str | None:
     """Judge payloads a runner executes: shell -c, eval, xargs operands, heredocs."""
     name = os.path.basename(words[index].value)
@@ -1516,7 +1539,9 @@ def _scan_interpreter(
         return _DEPTH_VIOLATION
     following = _segment_tail(words, index + 1)
     if name in _LAUNCHER_OPERAND_OPTIONS:
-        return _scan_xargs(words, following, depth, parent_mentions_sudo, command_words, name)
+        return _scan_xargs(
+            words, following, depth, parent_mentions_sudo, command_words, name, hash_alias_names
+        )
     if name in _SHELL_RUNNERS:
         for offset, candidate in enumerate(following):
             word = words[candidate]
@@ -1564,6 +1589,7 @@ def _scan_xargs(
     parent_mentions_sudo: bool,
     command_words: set[int] | None = None,
     launcher: str = "xargs",
+    hash_alias_names: dict[str, str] | None = None,
 ) -> str | None:
     """xargs/parallel run their first non-flag word; option operands are judged fail-closed."""
     operand_options = _LAUNCHER_OPERAND_OPTIONS.get(launcher, _XARGS_OPERAND_OPTIONS)
@@ -1575,7 +1601,12 @@ def _scan_xargs(
             return None
         if not _is_flag_word(word):
             return _scan_segment(
-                words, following[position], depth, parent_mentions_sudo, command_words
+                words,
+                following[position],
+                depth,
+                parent_mentions_sudo,
+                command_words,
+                hash_alias_names,
             )
         option, glued = _split_option(word.value, operand_options, operand_letters)
         if option is not None and glued is None and position + 1 < len(following):
@@ -1584,7 +1615,12 @@ def _scan_xargs(
             operand = words[following[position + 1]]
             if not operand.is_data and not operand.is_redirect:
                 violation = _scan_segment(
-                    words, following[position + 1], depth, parent_mentions_sudo, command_words
+                    words,
+                    following[position + 1],
+                    depth,
+                    parent_mentions_sudo,
+                    command_words,
+                    hash_alias_names,
                 )
                 if violation:
                     return violation
@@ -1623,6 +1659,52 @@ def _scan_script_source(
     return None
 
 
+_HASH_BUILTIN = "hash"
+
+
+def _hash_registered_command_names(words: list[_Word]) -> tuple[dict[str, str], bool]:
+    """(`hash -p pathname name` entries that run sudo/doas, unreadable).
+
+    Bash's command hash table maps a name to the file it resolved to, and
+    `hash -p pathname name` installs such an entry by hand, so a later `name`
+    runs `pathname` however the name looks (`hash -p /usr/bin/sudo safe; safe
+    id`). The guard resolves the entry, so the registered name scans as the
+    command it runs. A registration whose target or name is built from
+    expansion is reported as unreadable, because that entry could point
+    anywhere. `hash` without `-p` only reads or clears the table, which cannot
+    make a word run sudo/doas.
+    """
+    aliased: dict[str, str] = {}
+    unreadable = False
+    for index, word in enumerate(words):
+        if word.value != _HASH_BUILTIN:
+            continue
+        has_pathname_option = False
+        operands: list[str] = []
+        for candidate in _segment_tail(words, index + 1):
+            token = words[candidate].value
+            if words[candidate].is_data or words[candidate].is_redirect:
+                break
+            if _is_flag_word(words[candidate]) and not token.startswith("--"):
+                has_pathname_option = has_pathname_option or "p" in token[1:]
+                continue
+            if token.startswith("--"):
+                continue
+            if not has_pathname_option:
+                break  # `hash name`, `hash -d name`, `hash -t name`: no entry
+            operands.append(token)
+            if len(operands) == 2:
+                break
+        if not has_pathname_option or len(operands) < 2:
+            continue
+        pathname, name = operands
+        if any(char in pathname + name for char in "$`"):
+            unreadable = True
+        elif _word_names_sudo(pathname):
+            aliased[name] = pathname
+    return aliased, unreadable
+
+
 def _scan_alias_bodies(
     words: list[_Word], start: int, depth: int, parent_mentions_sudo: bool = False
 ) -> str | None:
@@ -1644,6 +1726,7 @@ def _scan_find_execs(
     parent_mentions_sudo: bool,
     command_words: set[int] | None = None,
     flags: frozenset[str] = _FIND_EXEC_FLAGS,
+    hash_alias_names: dict[str, str] | None = None,
 ) -> str | None:
     """`find -exec cmd` (and `fd -x cmd`) runs cmd, so its operand is judged as a command."""
     tail = _segment_tail(words, start)
@@ -1654,7 +1737,12 @@ def _scan_find_execs(
         if operand.is_data or operand.is_redirect:
             continue
         violation = _scan_segment(
-            words, tail[offset + 1], depth, parent_mentions_sudo, command_words
+            words,
+            tail[offset + 1],
+            depth,
+            parent_mentions_sudo,
+            command_words,
+            hash_alias_names,
         )
         if violation:
             return violation
