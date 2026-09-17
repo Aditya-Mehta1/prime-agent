@@ -1252,13 +1252,17 @@ def _defines_git_shadowing_function(prefix: str) -> bool:
 
 
 def _installs_relocating_trap(prefix: str) -> bool:
-    """True when `prefix` installs a `DEBUG` trap that can change directory.
+    """True when `prefix` installs a trap whose action can change directory.
 
-    A `DEBUG` trap runs before every command in the shell that installed it, so
-    a payload that cds moves the shell the following discard runs in, and the
-    guard does not model when the trap fires: refuse instead of probing the
-    caller. Only `DEBUG` is read, because the other traps run on exit, on a
-    signal, or on a function return, none of which relocates a later discard.
+    A trap action runs in the shell that installed it, so one that cds moves
+    the shell a following discard runs in, and the guard does not model when a
+    trap fires: refuse instead of probing the caller. The signal name is not
+    read, because each of them can run before the discard - `DEBUG` before
+    every command, `ERR` after a failing one, a signal trap when its signal
+    arrives - and the action is the part that relocates. Clearing a trap
+    (`trap - DEBUG`) has no action and is left alone, and an `EXIT` action is
+    refused with the rest rather than special-cased: the cost is one refused
+    command on a dirty tree, never lost work.
     """
     masked = _mask_quoted_spans(prefix)
     for word in _shell_word_positions(prefix):
@@ -1269,8 +1273,7 @@ def _installs_relocating_trap(prefix: str) -> bool:
             if masked[j] in ";&|\n":
                 region_end = j
                 break
-        arguments = _unquote_one_level(prefix[word.end : region_end])
-        if re.search(r"(?i)\bDEBUG\b", arguments) and _prefix_holds_directory_command(arguments):
+        if _prefix_holds_directory_command(_unquote_one_level(prefix[word.end : region_end])):
             return True
     return False
 
