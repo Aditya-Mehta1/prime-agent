@@ -1867,11 +1867,15 @@ def _is_bare_dump(words: list[str], *, depth: int = 0) -> bool:
         # operand dropped prints the whole environment minus that variable.
         return all(word.startswith("-") for word in rest)
     if words[0] == "export":
-        # Only the `-p` dump form prints values, and only when no variable
-        # name narrows the output.
+        # A named export prints no values, so only the flag-only forms are
+        # dumps -- and `export` with no names prints every exported name and
+        # value exactly like `export -p` (`export -n` and `export --` are the
+        # same dump). The one flag that prints definitions rather than values
+        # is `-f`, so a cluster of `f`s is not a value dump.
+        if [word for word in words[1:] if not word.startswith("-")]:
+            return False
         flags = [word for word in words[1:] if word.startswith("-")]
-        names = [word for word in words[1:] if not word.startswith("-")]
-        return not names and any("p" in flag for flag in flags)
+        return not flags or any(set(flag[1:]) != {"f"} for flag in flags)
     return False
 
 
@@ -2049,44 +2053,65 @@ def _paren_matches(command: str) -> dict[int, int]:
     opener's closer on its own would cost the square of it. Quoting is read the
     way the shell reads it -- a substitution's interior starts a fresh quoting
     context, so `$(echo "a)")` closes at the last `)` -- because that is what
-    decides whether a `)` inside quotes is a closer or a literal.
+    decides whether a `)` inside quotes is a closer or a literal. Comments are
+    read the way `_mask_literals` reads them, since a `)` inside a comment is
+    data too.
     """
     matches: dict[int, int] = {}
     stack: list[tuple[int, bool]] = []  # (open index, quoting of the caller)
     in_double_quotes = False
+    in_word = False
     index = 0
     n = len(command)
     while index < n:
         char = command[index]
         if char == "\\":
+            in_word = True
             index += 2
             continue
         if char == "'":
             # An unterminated span proves nothing, so the scan continues inside
             # it rather than treating the rest of the command as quoted.
+            in_word = True
             span_end = _quoted_span_end(command, index, n)
             index = span_end if span_end > 0 else index + 1
             continue
         if char == '"':
             in_double_quotes = not in_double_quotes
+            in_word = True
             index += 1
+            continue
+        if not in_double_quotes and char == "#" and not in_word:
+            # A `#` at the start of a word is a comment that runs to end of
+            # line, and a comment is data rather than source: the `)` in
+            # `echo "$( #)` -- with the dump on the next line -- is inside the
+            # comment, so the substitution closes at the later `)` the shell
+            # reads and its whole interior is scanned. Reading the comment's
+            # `)` as the closer would end the interior before the command that
+            # runs there, which is the one span no other pass reads.
+            while index < n and command[index] != "\n":
+                index += 1
             continue
         if char == "$" and command[index + 1 : index + 2] == "(":
             stack.append((index + 1, in_double_quotes))
             in_double_quotes = False
+            in_word = True
             index += 2
             continue
         if char == "(" and not in_double_quotes:
             stack.append((index, in_double_quotes))
             in_double_quotes = False
+            in_word = False
             index += 1
             continue
         if char == ")" and not in_double_quotes and stack:
             open_index, saved = stack.pop()
             matches[open_index] = index
             in_double_quotes = saved
+            in_word = False
             index += 1
             continue
+        in_word = char not in _WORD_BREAKERS
         index += 1
     for open_index, _saved in stack:
         matches[open_index] = -1

@@ -36,7 +36,8 @@ MANY_OPENERS_TIME_BOUND = 2.0
 SECRET_ECHO_MATCHING_COMMANDS = [
 # Bare dumps: zero operands means the whole environment goes to stdout.
     "env", "  env  ", "printenv", "env -0", "env -i", "env --", "printenv -0",
-    "export -p", "echo hi && env", "cd /tmp; printenv",
+    "export -p", "export", "export -n", "export --", "FOO=1 export",
+    "echo hi && env", "cd /tmp; printenv",
     "env # dump the environment",
 # Secret-file reads, both home spellings, quoted and unquoted.
     "cat ~/.ssh/id_rsa", "cat ~/.ssh/id_ed25519", "cat $HOME/.ssh/id_rsa",
@@ -125,6 +126,10 @@ SECRET_ECHO_MATCHING_COMMANDS = [
     "env -u PATH", "env -u PATH OTHER=1", "env FOO=1", "env printenv",
     "env -u PATH printenv", "env FOO=1 printenv", "env env",
     "env -S 'env'", "env -S env", "env -i printenv",
+# A `)` inside a comment is data, so the substitution closes at the `)` the
+# shell reads, and the command on the next line is still scanned.
+    'echo "$( #)\nenv )"', 'echo "$( #)\nprintenv )"',
+    'echo "$( : # )\ncat ~/.ssh/id_rsa )"',
 ]
 
 SECRET_ECHO_NON_MATCHING_COMMANDS = [
@@ -132,6 +137,7 @@ SECRET_ECHO_NON_MATCHING_COMMANDS = [
 # Targeted reads: one named variable, and the executor forms of env/export.
     "printenv HOME", "printenv PATH SAFE_VAR", "env FOO=1 cmd", "env -u FOO cmd",
     "printenv -0 FOO", "printenv -l FOO", "export FOO=1", "export -n FOO",
+    "export FOO", "export -f",
     "cat .env", "grep GITHUB_TOKEN .env",
 # A dump filtered down to one key by grep is the documented targeted read.
     "env | grep SAFE_VAR", "printenv | grep SAFE_VAR", "export -p | grep SAFE_VAR",
@@ -175,6 +181,7 @@ SECRET_ECHO_NON_MATCHING_COMMANDS = [
     "env>&1 | grep SAFE_VAR", "env >&1 | grep PATH",
     "env | grep --fixed-strings SAFE_VAR",
     "echo hi # $(env)", "echo hi # `env`", "echo \"x\" # $(env)",
+    'echo "$( #)\nprintf OK )"', 'echo "$( #)\ncat /etc/hosts )"',
     "env '>&2' | grep SAFE_VAR", "env \">&2\" | grep SAFE_VAR",
     "env | grep --contextual SAFE_VAR",
     # `let a=1<<2` is a real opener, and the spaced count bounds the output.
@@ -351,6 +358,20 @@ class SecretEchoGuardTest(unittest.IsolatedAsyncioTestCase):
         self._refuse_all(
             ["cat ~/.ssh/id_ed25519", 'cat "$HOME/.ssh/id_rsa"'], "a known secret file"
         )
+
+    async def test_bare_export_dump_refused(self):
+        # `export` with no names prints every exported name and value, exactly
+        # like `export -p`, while a named export prints no values.
+        self._refuse_all(["export", "export -n", "export --", "FOO=1 export"])
+        await self._expect_output([("export FOO", "")])
+
+    async def test_comment_before_the_closer_does_not_hide_the_dump(self):
+        # A `)` inside a comment is data, so the substitution closes at the `)`
+        # the shell reads, and the command on the next line is still scanned
+        # while the same shape reading a non-secret file stays allowed.
+        self._refuse_all(['echo "$( #)\nenv )"', 'echo "$( #)\nprintenv )"'])
+        self._refuse_all(['echo "$( : # )\ncat ~/.ssh/id_rsa )"'], "a known secret file")
+        await self._expect_output([('echo "$( #)\nprintf OK )"', "OK")])
 
     async def test_allowed_reads_and_listings_run(self):
         # The targeted read runs with only matching lines captured.
