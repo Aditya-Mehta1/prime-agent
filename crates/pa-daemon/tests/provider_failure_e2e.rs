@@ -495,17 +495,26 @@ impl DirectClient {
 
     fn read_frame(&mut self) -> (Value, Value) {
         let deadline = Instant::now() + Duration::from_secs(60);
+        let (header, payload) = self
+            .read_frame_soft(deadline)
+            .expect("worker frame read timed out");
+        (header, payload)
+    }
+
+    /// One frame read that returns `None` at `deadline` instead of panicking:
+    /// for bounded post-response drains whose end is "no more frames".
+    fn read_frame_soft(&mut self, deadline: Instant) -> Option<(Value, Value)> {
         let mut prefix = [0u8; 8];
-        read_exact_timeout(&mut self.stream, &mut prefix, deadline);
+        read_exact_soft(&mut self.stream, &mut prefix, deadline)?;
         let header_len = u32::from_be_bytes(prefix[0..4].try_into().unwrap()) as usize;
         let payload_len = u32::from_be_bytes(prefix[4..8].try_into().unwrap()) as usize;
         let mut header = vec![0u8; header_len];
-        read_exact_timeout(&mut self.stream, &mut header, deadline);
+        read_exact_soft(&mut self.stream, &mut header, deadline)?;
         let mut payload = vec![0u8; payload_len];
-        read_exact_timeout(&mut self.stream, &mut payload, deadline);
+        read_exact_soft(&mut self.stream, &mut payload, deadline)?;
         let header: Value = serde_json::from_slice(&header).expect("frame header");
         let payload: Value = serde_json::from_slice(&payload).expect("frame payload");
-        (header, payload)
+        Some((header, payload))
     }
 
     fn request(&mut self, command_type: &str, payload: &Value) -> Value {
@@ -526,14 +535,18 @@ impl DirectClient {
     }
 }
 
-fn read_exact_timeout(
+/// One frame read with a soft deadline: `None` when no complete
+/// frame arrives in time (a worker close still panics mid-frame).
+fn read_exact_soft(
     stream: &mut std::os::unix::net::UnixStream,
     buffer: &mut [u8],
     deadline: Instant,
-) {
+) -> Option<()> {
     let mut read = 0usize;
     while read < buffer.len() {
-        assert!(Instant::now() < deadline, "worker frame read timed out");
+        if Instant::now() >= deadline {
+            return None;
+        }
         match stream.read(&mut buffer[read..]) {
             Ok(0) => panic!("worker closed the connection mid-frame"),
             Ok(n) => read += n,
@@ -543,6 +556,7 @@ fn read_exact_timeout(
             Err(error) => panic!("worker read: {error}"),
         }
     }
+    Some(())
 }
 
 #[test]
@@ -591,8 +605,41 @@ fn provider_failure_surfaces_on_the_direct_transport_path() {
             _ => {}
         }
     }
-    // Every retry event arrived before the response: live streaming, not a
-    // post-response replay.
+    // The response and the per-connection event fan-out are separate writer
+    // tasks, so under load the trailing event frames can land just after the
+    // response. Drain with a bounded wait until the retry loop settled; the
+    // events themselves still prove live streaming (the worker has no
+    // post-response replay mechanism).
+    let settle = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut retry_starts = 0;
+        let mut retry_end = false;
+        let mut failed_message_end = false;
+        for event in &events {
+            match event.get("type").and_then(Value::as_str) {
+                Some("auto_retry_start") => retry_starts += 1,
+                Some("auto_retry_end") => retry_end = true,
+                Some("message_end")
+                    if event["message"]["role"] == "assistant"
+                        && event["message"]["stopReason"] == "error" =>
+                {
+                    failed_message_end = true;
+                }
+                _ => {}
+            }
+        }
+        if retry_starts == 2 && retry_end && failed_message_end {
+            break;
+        }
+        match direct.read_frame_soft(settle) {
+            Some((header, body)) => {
+                if header["outboundType"] == "session_event" {
+                    events.push(body["event"].clone());
+                }
+            }
+            None => break,
+        }
+    }
     let types = event_types(&events);
     assert_eq!(
         types.iter().filter(|t| *t == "auto_retry_start").count(),
@@ -603,7 +650,7 @@ fn provider_failure_surfaces_on_the_direct_transport_path() {
         .iter()
         .rev()
         .find(|event| event.get("type").and_then(Value::as_str) == Some("auto_retry_end"))
-        .expect("auto_retry_end before the response");
+        .expect("auto_retry_end observed on the direct socket");
     assert_eq!(end["success"], false);
     let failure = events
         .iter()
