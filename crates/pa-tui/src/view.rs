@@ -34,6 +34,9 @@ pub struct AgentView {
     pub pulse_frame: usize,
     /// When the current working loader started (elapsed label).
     pub working_since: Option<std::time::Instant>,
+    /// An active provider auto-retry (replaces the working loader while
+    /// the retry loop waits, TS `retryLoader`).
+    pub retry: Option<crate::chat::RetryState>,
     scroll_top: usize,
     following: bool,
     /// Rows of the terminal the editor should lay out against.
@@ -55,6 +58,7 @@ impl AgentView {
             working: None,
             pulse_frame: 0,
             working_since: None,
+            retry: None,
             scroll_top: 0,
             following: true,
             terminal_rows: 24,
@@ -112,11 +116,13 @@ impl AgentView {
         let mut first = true;
         for entry in &self.chat {
             match entry {
-                ChatEntry::Status { text, warning } => {
-                    let style = if *warning {
-                        self.theme.fg_style(ThemeColor::Warning)
-                    } else {
-                        self.theme.fg_style(ThemeColor::Dim)
+                ChatEntry::Status { text, kind } => {
+                    let style = match kind {
+                        crate::chat::StatusKind::Info => self.theme.fg_style(ThemeColor::Dim),
+                        crate::chat::StatusKind::Warning => {
+                            self.theme.fg_style(ThemeColor::Warning)
+                        }
+                        crate::chat::StatusKind::Error => self.theme.fg_style(ThemeColor::Error),
                     };
                     lines.push(Vec::new());
                     lines.extend(render_text_rows(text, style, width));
@@ -136,7 +142,16 @@ impl AgentView {
             }
             first = false;
         }
-        if let Some(working) = &self.working {
+        // While the provider retry loop waits, its countdown loader owns
+        // the status area (TS `stopWorkingLoader` + `retryLoader`).
+        if let Some(retry) = &self.retry {
+            lines.extend(crate::chat::render_retry(
+                retry,
+                self.pulse_frame,
+                &self.theme,
+                width,
+            ));
+        } else if let Some(working) = &self.working {
             lines.extend(render_loader(working, self.pulse_frame, &self.theme, width));
         }
         lines
@@ -320,7 +335,7 @@ fn item_to_entry(item: TranscriptItem) -> ChatEntry {
         TranscriptItem::UserMessage { text } => ChatEntry::User { text },
         TranscriptItem::SystemNote { text } => ChatEntry::Status {
             text,
-            warning: false,
+            kind: crate::chat::StatusKind::Info,
         },
         TranscriptItem::Assistant { text } => {
             ChatEntry::Assistant(Box::new(crate::chat::AssistantMessage {
@@ -369,11 +384,11 @@ fn item_to_entry(item: TranscriptItem) -> ChatEntry {
         })),
         TranscriptItem::AgentStatus { summary, .. } => ChatEntry::Status {
             text: summary,
-            warning: false,
+            kind: crate::chat::StatusKind::Info,
         },
         TranscriptItem::ModelChange { model_id, .. } => ChatEntry::Status {
             text: format!("\u{2699} {model_id}"),
-            warning: false,
+            kind: crate::chat::StatusKind::Info,
         },
     }
 }

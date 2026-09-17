@@ -6,11 +6,13 @@
 //! settles (the worker persists the final message); live per-chunk streaming to
 //! daemon clients is a follow-up wiring on top of the same subscription seam.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 
 use crate::agent_messaging::{LinkAgentMessageController, LinkAgentObserveController};
+use pa_agent::types::StopReason;
 use pa_core::kernel::shared::HostRequestHandlers;
 use pa_core::session_engine::agent_messaging::{
     register_agent_message_host_handlers, register_agent_observe_host_handlers,
@@ -422,6 +424,7 @@ impl SessionEngine for AgentSessionEngine {
         &self,
         _prompt_index: usize,
         request: PromptRequest,
+        aborted: &dyn Fn() -> bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) {
         // The accepted user message is recorded by the worker.
@@ -433,21 +436,113 @@ impl SessionEngine for AgentSessionEngine {
             return;
         }
         let prompt = request.message;
-        let result: anyhow::Result<Option<Value>> = self.run_turn(&prompt, emit);
-        match result {
-            Ok(Some(message)) => {
-                if !emit(EngineEvent::AssistantMessage(message)) {
-                    return;
-                }
-                emit(EngineEvent::Done(Ok(())));
-            }
-            Ok(None) => {
-                emit(EngineEvent::Done(Err("No response produced.".to_string())));
-            }
+        // Model resolution and session construction are hard failures: they
+        // never reach the provider, so the retry loop does not apply (the
+        // TS loop only classifies provider stream failures).
+        let model = match self.resolve_model() {
+            Ok(model) => model,
             Err(error) => {
                 emit(EngineEvent::Done(Err(error.to_string())));
+                return;
             }
-        }
+        };
+        let agent = match self.session_agent(&model) {
+            Ok(agent) => agent,
+            Err(error) => {
+                emit(EngineEvent::Done(Err(format!("{error:#}"))));
+                return;
+            }
+        };
+        let policy = self.retry_policy();
+        // The pa-core retry driver owns the attempt loop; this engine owns
+        // one turn. The driver awaits each attempt to completion before
+        // emitting retry events, so the single `emit` reference is handed
+        // through a RefCell slot to whichever closure is currently running.
+        let emit_cell = std::cell::RefCell::new(emit);
+        let first_attempt = std::cell::Cell::new(true);
+        let result = self.runtime.block_on(
+            pa_core::session_engine::auto_retry::run_turn_with_auto_retry(
+                &policy,
+                None,
+                || {
+                    let mut emit = emit_cell.borrow_mut();
+                    let first = first_attempt.get();
+                    first_attempt.set(false);
+                    let agent = agent.clone();
+                    let prompt = prompt.clone();
+                    let model = model.clone();
+                    async move {
+                        // A retry re-issues the failed turn: the failed
+                        // assistant message leaves the loop context first
+                        // (TS `messages.slice(0, -1)` keeps the retried
+                        // request free of the error turn), then `continue`.
+                        if !first {
+                            drop_trailing_assistant(&agent).await;
+                        }
+                        match self
+                            .run_turn_once(&agent, &prompt, first, &mut **emit)
+                            .await
+                        {
+                            Ok(TurnOnce::Message { assistant, value }) => {
+                                // The final message always reaches the
+                                // transcript — the failure included: TS
+                                // persists and renders it like any outcome.
+                                if !emit(EngineEvent::AssistantMessage(value)) {
+                                    return Ok(aborted_message(&model));
+                                }
+                                Ok(*assistant)
+                            }
+                            Ok(TurnOnce::None) => Err(anyhow::anyhow!("No response produced.")),
+                            Ok(TurnOnce::Aborted) => Ok(aborted_message(&model)),
+                            Err(error) => Err(error),
+                        }
+                    }
+                },
+                |event| {
+                    let mut emit = emit_cell.borrow_mut();
+                    async move {
+                        let engine_event = retry_event_to_engine_event(event);
+                        if !emit(engine_event) {
+                            anyhow::bail!("emit cancelled");
+                        }
+                        Ok(())
+                    }
+                },
+                |delay| {
+                    async move {
+                        // Abort-aware wait: the worker's cancel flag stops
+                        // the retry sleep early (TS `_retryAbortController`).
+                        let deadline = tokio::time::Instant::now() + delay;
+                        loop {
+                            if aborted() {
+                                return false;
+                            }
+                            if tokio::time::Instant::now() >= deadline {
+                                return true;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                    }
+                },
+            ),
+        );
+        let emit = emit_cell.into_inner();
+        let done = match result {
+            Ok(message) => match message.stop_reason {
+                // The failure already reached the transcript as the final
+                // assistant message; the turn error still travels to
+                // headless callers through the turn result.
+                StopReason::Error => Err(message
+                    .error_message
+                    .clone()
+                    .filter(|error| !error.is_empty())
+                    .unwrap_or_else(|| "Assistant response failed".to_string())),
+                StopReason::Aborted => Err("No response produced.".to_string()),
+                _ => Ok(()),
+            },
+            Err(error) => Err(error.to_string()),
+        };
+        emit(EngineEvent::Done(done));
     }
 }
 
@@ -473,22 +568,31 @@ impl AgentSessionEngine {
         Ok(std::sync::Arc::clone(engine.session.agent()))
     }
 
+    /// The provider retry policy from settings (TS `providerRetryPolicy`).
+    fn retry_policy(&self) -> pa_core::session_engine::provider_retry::ProviderRetryPolicy {
+        pa_core::settings::SettingsManager::create(&self.config.cwd, &self.config.agent_dir)
+            .get_provider_retry_policy()
+    }
+
     /// Run one turn, streaming assistant updates through `emit` as they
-    /// arrive. Returns the final assistant message (Ok), or the turn error.
-    fn run_turn(
+    /// arrive. The first attempt prompts the session; retries continue the
+    /// parked turn. Returns the turn outcome: the final assistant message
+    /// (provider failures included), `None` when no assistant message was
+    /// produced, or `Aborted` when the emit callback cancelled the run.
+    async fn run_turn_once(
         &self,
+        agent: &std::sync::Arc<pa_agent::agent::Agent>,
         prompt: &str,
+        first_attempt: bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
-    ) -> anyhow::Result<Option<Value>> {
-        let model = self.resolve_model()?;
-        let agent = self.session_agent(&model)?;
-        let (tx, rx) = std::sync::mpsc::channel::<EngineEvent>();
+    ) -> anyhow::Result<TurnOnce> {
         // Stream assistant events while the turn runs. The turn starts
         // asynchronously after admission, so the idle watcher must not fire
         // before the run has begun.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<EngineEvent>();
         let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let subscription = self.runtime.block_on(async {
-            let tx = std::sync::Arc::new(tx);
+        let subscription = {
+            let tx = tx.clone();
             let started_flag = started.clone();
             agent
                 .subscribe(move |event, _signal| {
@@ -497,7 +601,7 @@ impl AgentSessionEngine {
                     Box::pin(async move {
                         use pa_agent::types::AgentEvent;
                         if matches!(event, AgentEvent::AgentStart) {
-                            started_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                            started_flag.store(true, Ordering::SeqCst);
                         }
                         match &event {
                             AgentEvent::MessageStart {
@@ -574,23 +678,32 @@ impl AgentSessionEngine {
                     })
                 })
                 .await
-        });
-        // Admit the prompt.
-        {
-            let guard = self.session.blocking_lock();
+        };
+        // Admit the turn: the first attempt prompts the session; a retry
+        // continues the parked conversation.
+        let admitted: anyhow::Result<()> = if first_attempt {
+            let guard = self.session.lock().await;
             let engine = guard.as_ref().expect("session built");
-            self.runtime
-                .block_on(async { engine.session.prompt(prompt, Default::default()).await })
-                .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+            engine
+                .session
+                .prompt(prompt, Default::default())
+                .await
+                .map(|_| ())
+        } else {
+            agent.continue_run().await.map(|_| ())
+        };
+        if let Err(error) = admitted {
+            let _ = subscription.unsubscribe().await;
+            return Err(anyhow::anyhow!("{error:#}"));
         }
-        // Wait for the turn to settle, draining events into `emit` live.
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        // Wait for the turn to settle, forwarding events into `emit` live.
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
         let idle_agent = agent.clone();
         let started_flag = started.clone();
         self.runtime.spawn(async move {
             loop {
                 idle_agent.wait_for_idle().await;
-                if started_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                if started_flag.load(Ordering::SeqCst) {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -599,53 +712,144 @@ impl AgentSessionEngine {
         });
         let mut aborted = false;
         loop {
-            while let Ok(event) = rx.recv_timeout(std::time::Duration::from_millis(20)) {
-                if !emit(event) {
-                    aborted = true;
+            tokio::select! {
+                event = rx.recv() => {
+                    match event {
+                        Some(event) => {
+                            if !emit(event) {
+                                aborted = true;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = &mut done_rx => {
+                    // Idle: drain any events that raced the signal, then settle.
+                    while let Ok(event) = rx.try_recv() {
+                        if !emit(event) {
+                            aborted = true;
+                            break;
+                        }
+                    }
                     break;
                 }
             }
             if aborted {
                 break;
             }
-            if done_rx.try_recv().is_ok() {
-                break;
-            }
         }
-        self.runtime
-            .block_on(async { subscription.unsubscribe().await });
+        let _ = subscription.unsubscribe().await;
         if aborted {
-            return Ok(None);
+            return Ok(TurnOnce::Aborted);
         }
-        // The final assistant message decides the outcome.
-        let state = self.runtime.block_on(async { agent.state().await });
+        // The final assistant message decides the outcome (provider
+        // failures included: the retry driver classifies them).
+        let state = agent.state().await;
         for message in state.messages.iter().rev() {
             if let pa_agent::types::AgentMessage::Standard(pa_agent::types::Message::Assistant(
                 assistant,
             )) = message
             {
-                if assistant.stop_reason == pa_agent::types::StopReason::Error {
-                    let error = assistant
-                        .error_message
-                        .clone()
-                        .filter(|text| !text.is_empty())
-                        .unwrap_or_else(|| "Assistant response failed".to_string());
-                    return Err(anyhow::anyhow!(error));
-                }
-                // Serialize through the session wire shape so `role` is
-                // present (the store records session-shaped messages).
                 let Some(ai_message) =
                     json_round_trip::<_, pa_types::ai::AssistantMessage>(assistant)
                 else {
-                    return Ok(None);
+                    return Ok(TurnOnce::None);
                 };
                 let session_message = pa_types::session::AgentMessage::Assistant(ai_message);
-                return serde_json::to_value(&session_message)
-                    .map(Some)
-                    .map_err(|error| anyhow::anyhow!("{error}"));
+                let Ok(value) = serde_json::to_value(&session_message) else {
+                    return Ok(TurnOnce::None);
+                };
+                return Ok(TurnOnce::Message {
+                    assistant: Box::new(assistant.clone()),
+                    value,
+                });
             }
         }
-        Ok(None)
+        Ok(TurnOnce::None)
+    }
+}
+
+/// The outcome of one turn attempt.
+enum TurnOnce {
+    /// The emit callback cancelled the run.
+    Aborted,
+    /// The turn produced no assistant message.
+    None,
+    /// The turn's final assistant message: the typed message (retry
+    /// classification) plus its session wire value (transcript + store).
+    Message {
+        assistant: Box<pa_agent::types::AssistantMessage>,
+        value: Value,
+    },
+}
+
+/// Remove the trailing assistant message from the loop context (TS retry:
+/// `messages.slice(0, -1)`), so a retried request does not re-send the
+/// failed turn's error message.
+async fn drop_trailing_assistant(agent: &std::sync::Arc<pa_agent::agent::Agent>) {
+    let state = agent.state().await;
+    let mut messages = state.messages;
+    if matches!(
+        messages.last(),
+        Some(pa_agent::types::AgentMessage::Standard(
+            pa_agent::types::Message::Assistant(_)
+        ))
+    ) {
+        messages.pop();
+        agent.set_messages(messages).await;
+    }
+}
+
+/// The synthesized aborted assistant message (an abort racing the turn ends
+/// the loop without a provider failure).
+fn aborted_message(model: &Model) -> pa_agent::types::AssistantMessage {
+    pa_agent::types::AssistantMessage {
+        content: vec![pa_agent::types::AssistantContent::Text(
+            pa_agent::types::TextContent {
+                text: String::new(),
+                text_signature: None,
+            },
+        )],
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        model: model.id.clone(),
+        response_model: None,
+        response_id: None,
+        diagnostics: None,
+        usage: pa_agent::types::Usage::zero(),
+        stop_reason: StopReason::Aborted,
+        stop_reason_raw: None,
+        error_message: None,
+        timestamp: pa_agent::now_ms(),
+    }
+}
+
+/// Translate one retry-loop event to the engine event vocabulary.
+fn retry_event_to_engine_event(
+    event: pa_core::session_engine::auto_retry::AutoRetryEvent,
+) -> EngineEvent {
+    use pa_core::session_engine::auto_retry::AutoRetryEvent;
+    match event {
+        AutoRetryEvent::Start {
+            attempt,
+            max_attempts,
+            delay_ms,
+            error_message,
+        } => EngineEvent::AutoRetryStart {
+            attempt,
+            max_attempts,
+            delay_ms,
+            error_message,
+        },
+        AutoRetryEvent::End {
+            success,
+            attempt,
+            final_error,
+        } => EngineEvent::AutoRetryEnd {
+            success,
+            attempt,
+            final_error,
+        },
     }
 }
 
@@ -774,6 +978,7 @@ mod tests {
                 source: "user".to_string(),
                 agent_message_id: None,
             },
+            &|| false,
             &mut |event| {
                 events.push(event);
                 true
@@ -824,6 +1029,7 @@ fn agent_engine_streams_updates_and_final_message() {
             source: "user".to_string(),
             agent_message_id: None,
         },
+        &|| false,
         &mut |event| {
             events.push(event);
             true

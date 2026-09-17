@@ -151,6 +151,20 @@ pub enum TurnUpdate {
     },
     /// `turn_end`, with the turn error string when the turn failed.
     TurnEnded { error: Option<String> },
+    /// `auto_retry_start`: a provider failure is being retried after
+    /// `delay_ms` (TS retry loader countdown).
+    AutoRetryStart {
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u64,
+    },
+    /// `auto_retry_end`: the retry loop settled; `final_error` is set when
+    /// the retries were exhausted.
+    AutoRetryEnd {
+        success: bool,
+        attempt: u32,
+        final_error: Option<String>,
+    },
     /// `agent_end`: the prompt queue drained.
     Idle,
     /// `session_action_update` and other state churn: the footer status only.
@@ -219,6 +233,34 @@ pub fn event_to_update(event: &Value) -> Option<TurnUpdate> {
                 .get("isError")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+        }),
+        "auto_retry_start" => Some(TurnUpdate::AutoRetryStart {
+            attempt: event
+                .get("attempt")
+                .and_then(Value::as_u64)
+                .unwrap_or_default() as u32,
+            max_attempts: event
+                .get("maxAttempts")
+                .and_then(Value::as_u64)
+                .unwrap_or_default() as u32,
+            delay_ms: event
+                .get("delayMs")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+        }),
+        "auto_retry_end" => Some(TurnUpdate::AutoRetryEnd {
+            success: event
+                .get("success")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            attempt: event
+                .get("attempt")
+                .and_then(Value::as_u64)
+                .unwrap_or_default() as u32,
+            final_error: event
+                .get("finalError")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         }),
         // Queue churn and unknown events only affect the status line.
         _ => Some(TurnUpdate::StatusUpdate),
@@ -430,6 +472,78 @@ mod tests {
         assert_eq!(view.session_id, "0199-sess");
         assert_eq!(view.session_name.as_deref(), Some("my session"));
         assert_eq!(view.last_event_sequence, 9);
+    }
+
+    #[test]
+    fn decodes_auto_retry_events() {
+        let start = event_to_update(&json!({
+            "type": "auto_retry_start",
+            "attempt": 1,
+            "maxAttempts": 2,
+            "delayMs": 50,
+            "errorMessage": "provider down",
+        }))
+        .expect("retry start maps");
+        assert_eq!(
+            start,
+            TurnUpdate::AutoRetryStart {
+                attempt: 1,
+                max_attempts: 2,
+                delay_ms: 50,
+            }
+        );
+        let end = event_to_update(&json!({
+            "type": "auto_retry_end",
+            "success": false,
+            "attempt": 2,
+            "finalError": "provider down",
+        }))
+        .expect("retry end maps");
+        assert_eq!(
+            end,
+            TurnUpdate::AutoRetryEnd {
+                success: false,
+                attempt: 2,
+                final_error: Some("provider down".to_string()),
+            }
+        );
+        let settled = event_to_update(&json!({
+            "type": "auto_retry_end",
+            "success": true,
+            "attempt": 2,
+        }))
+        .expect("retry success maps");
+        assert_eq!(
+            settled,
+            TurnUpdate::AutoRetryEnd {
+                success: true,
+                attempt: 2,
+                final_error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn failed_assistant_message_end_maps_final() {
+        let update = event_to_update(&json!({
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "stopReason": "error",
+                "errorMessage": "Provider server error",
+                "content": [],
+            },
+        }))
+        .expect("failed message_end maps");
+        match update {
+            TurnUpdate::AssistantMessage {
+                streaming, message, ..
+            } => {
+                assert!(!streaming, "message_end is final");
+                assert_eq!(message["stopReason"], "error");
+            }
+            other => panic!("unexpected update: {other:?}"),
+        }
     }
 
     #[test]

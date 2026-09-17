@@ -24,9 +24,21 @@ pub enum Detail {
 
 /// One rendered chat component.
 #[derive(Debug, Clone, PartialEq)]
+/// The style tier of a status row (TS `showStatus`/`showWarning`/`showError`).
+pub enum StatusKind {
+    /// Muted informational note.
+    Info,
+    /// Warning highlight.
+    Warning,
+    /// Error highlight.
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChatEntry {
-    /// `showStatus` / `showWarning` rows (startup notices, client notes).
-    Status { text: String, warning: bool },
+    /// `showStatus` / `showWarning` / `showError` rows (startup notices,
+    /// client notes, turn errors).
+    Status { text: String, kind: StatusKind },
     /// The user's submitted prompt.
     User { text: String },
     /// One assistant message: ordered content blocks.
@@ -591,6 +603,43 @@ pub fn render_loader(
     vec![spacer(), pad_to(row, width, Style::default())]
 }
 
+/// An in-flight provider auto-retry (TS `retryLoader` + `CountdownTimer`):
+/// replaces the working loader until the retry loop settles.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetryState {
+    pub attempt: u32,
+    pub max_attempts: u32,
+    pub ends_at: std::time::Instant,
+}
+
+impl RetryState {
+    /// Whole seconds left in the countdown (never negative).
+    pub fn seconds_left(&self) -> u64 {
+        self.ends_at
+            .saturating_duration_since(std::time::Instant::now())
+            .as_secs()
+    }
+}
+
+/// The retry loader rows (TS auto_retry_start rendering: muted spinner +
+/// `Retrying (attempt/maxAttempts) in <seconds>s...`).
+pub fn render_retry(retry: &RetryState, frame: usize, theme: &Theme, width: usize) -> Vec<Line> {
+    let accent = theme.fg_style(ThemeColor::Accent);
+    let muted = theme.fg_style(ThemeColor::Muted);
+    let spinner = LOADER_FRAMES[frame % LOADER_FRAMES.len()];
+    let message = format!(
+        "Retrying ({}/{}) in {}s...",
+        retry.attempt,
+        retry.max_attempts,
+        retry.seconds_left()
+    );
+    let mut row: Line = vec![Span::styled(" ".to_string(), Style::default())];
+    row.push(Span::styled(spinner.to_string(), accent));
+    row.push(Span::styled(" ".to_string(), muted));
+    row.push(Span::styled(message, muted));
+    vec![spacer(), pad_to(row, width, Style::default())]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -598,6 +647,21 @@ mod tests {
 
     fn theme() -> Theme {
         Theme::builtin("prime", ColorMode::TrueColor)
+    }
+
+    #[test]
+    fn retry_loader_renders_countdown() {
+        let retry = RetryState {
+            attempt: 1,
+            max_attempts: 2,
+            ends_at: std::time::Instant::now() + std::time::Duration::from_millis(1500),
+        };
+        let rows = render_retry(&retry, 0, &theme(), 60);
+        let text = rows[1]
+            .iter()
+            .map(|s| s.content.as_str())
+            .collect::<String>();
+        assert!(text.contains("Retrying (1/2) in 1s..."), "got: {text}");
     }
 
     #[test]

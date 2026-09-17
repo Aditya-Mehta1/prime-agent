@@ -44,7 +44,7 @@ import perf as P  # noqa: E402
 
 NL = chr(10)
 
-ALL_FLOWS = ["f1_launch", "f2_prompt", "f3_tool", "f4_commands", "f5_side_questions", "f6_attach", "f7_compaction", "f8_resume", "f9_agents_view", "f10_perf"]
+ALL_FLOWS = ["f1_launch", "f2_prompt", "f3_tool", "f4_commands", "f5_side_questions", "f6_attach", "f7_compaction", "f8_resume", "f9_agents_view", "f10_perf", "f11_provider_failure"]
 
 # PERF row thresholds, measured on this box by scripts/battery/perf.py:
 # the invariant is that the Rust binary is never materially slower than
@@ -966,6 +966,145 @@ class Battery:
             )
 
     # -- perf -----------------------------------------------------------------
+
+    def f11_provider_failure(self) -> None:
+        """Kill the mock provider mid-session: the interactive transcript
+        must surface the provider failure (retry banner + error row(s))
+        exactly like the TS product, and the earlier exchange stays
+        rendered exactly once."""
+        flow = "f11_provider_failure"
+        # Bounded, fast retries so the flow settles in seconds instead of
+        # minutes. The provider recovery wait (TS retry.provider.waitForUsage)
+        # is disabled on both sides so exhaustion surfaces instead of
+        # pinging a dead provider for up to 15 minutes.
+        retry_settings = {
+            "retry": {
+                "enabled": True,
+                "maxRetries": 2,
+                "baseDelayMs": 200,
+                "provider": {"waitForUsage": {"enabled": False}},
+            }
+        }
+        for side in (self.sides["ts"], self.sides["rust"]):
+            session = f"{self.runid}-f11-{side.name}"
+            settings_path = side.agent_dir / "settings.json"
+            prior_settings = (
+                settings_path.read_text() if settings_path.exists() else None
+            )
+            settings_path.write_text(json.dumps(retry_settings))
+            try:
+                argv = [
+                    side.binary,
+                    "--daemon-socket",
+                    str(side.daemon_socket),
+                    "--provider",
+                    "prime-inference",
+                    "--model",
+                    "mock-1",
+                    "--offline",
+                ]
+                B.tmux_launch(session, argv, side.env, side.work_dir)
+                frame = ""
+                deadline = time.time() + 30
+                while time.time() < deadline:
+                    frame = B.tmux_capture(session)
+                    if "Share agent traces" in frame:
+                        break
+                    time.sleep(1.0)
+                if "Share agent traces" in frame:
+                    B.tmux_send(session, "Down")
+                    time.sleep(0.5)
+                    B.tmux_send(session, "Enter")
+                    time.sleep(2.0)
+                # A settled main screen before the exchange.
+                stable = False
+                deadline = time.time() + 30
+                while time.time() < deadline and not stable:
+                    first = B.tmux_capture(session)
+                    time.sleep(2.0)
+                    second = B.tmux_capture(session)
+                    stable = first == second and ("manage" in first or ">" in first)
+                # A healthy exchange first: the reply must render.
+                B.tmux_send(session, "hello")
+                healthy = B.tmux_wait_text(session, HELLO_TEXT, timeout=90)
+                side.evidence(flow, "01-healthy-exchange.txt", healthy)
+                # Kill the provider mid-session, then prompt again.
+                side.mock.stop()
+                B.tmux_send(session, "again")
+                settled = ""
+                deadline = time.time() + 120
+                while time.time() < deadline:
+                    settled = B.tmux_capture(session)
+                    if "Retry failed after" in settled:
+                        # Let the final frame settle (retry banner + rows).
+                        time.sleep(1.0)
+                        settled = B.tmux_capture(session)
+                        break
+                    time.sleep(1.0)
+                side.evidence(flow, "02-provider-failure.txt", settled)
+                retry_banner = "Retry failed after" in settled
+                error_rows = len(re.findall(r"Error: ", settled))
+                hello_rows = settled.count(HELLO_TEXT)
+                side.evidence_json(
+                    flow,
+                    "verdict.json",
+                    {
+                        "retryBanner": retry_banner,
+                        "errorRows": error_rows,
+                        "helloRenders": hello_rows,
+                    },
+                )
+                if not retry_banner or error_rows == 0:
+                    self.record(
+                        flow,
+                        "behavior",
+                        f"{side.name}: provider failure is silent in the interactive transcript (retry banner: {retry_banner}, error rows: {error_rows})",
+                        evidence=side.root / flow / "02-provider-failure.txt",
+                    )
+                else:
+                    self.record(
+                        flow,
+                        "behavior",
+                        f"{side.name}: provider failure surfaces (retry banner + {error_rows} error row(s))",
+                        gap=False,
+                    )
+                if hello_rows != 1:
+                    self.record(
+                        flow,
+                        "behavior",
+                        f"{side.name}: the healthy exchange renders {hello_rows} times (expected exactly 1)",
+                        evidence=side.root / flow / "02-provider-failure.txt",
+                    )
+            finally:
+                B.tmux_kill(session)
+                if prior_settings is None:
+                    settings_path.unlink(missing_ok=True)
+                else:
+                    settings_path.write_text(prior_settings)
+        # Cross-side parity: same number of failed-attempt error rows, same
+        # single render of the healthy exchange.
+        verdicts = {
+            name: json.loads(
+                (self.sides[name].root / flow / "verdict.json").read_text()
+            )
+            for name in ("ts", "rust")
+            if (self.sides[name].root / flow / "verdict.json").exists()
+        }
+        if len(verdicts) == 2:
+            if verdicts["ts"]["errorRows"] != verdicts["rust"]["errorRows"]:
+                self.record(
+                    flow,
+                    "visual",
+                    f"failed-attempt error rows differ: ts={verdicts['ts']['errorRows']} rust={verdicts['rust']['errorRows']}",
+                    evidence=self.run_dir / flow,
+                )
+            else:
+                self.record(
+                    flow,
+                    "visual",
+                    f"provider-failure rendering parity: {verdicts['rust']['errorRows']} error row(s) on both sides",
+                    gap=False,
+                )
 
     def perf_onboard(self, side: B.Side) -> None:
         """Settle first-run dialogs (the TS trace notice) once before measuring,

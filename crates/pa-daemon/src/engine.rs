@@ -65,15 +65,33 @@ pub enum EngineEvent {
     },
     /// The prompt completed (successfully or not).
     Done(std::result::Result<(), String>),
+    /// `auto_retry_start`: a provider failure is being retried (TS wire
+    /// event; the interactive transcript shows the retry countdown).
+    AutoRetryStart {
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u64,
+        error_message: String,
+    },
+    /// `auto_retry_end`: the retry loop settled.
+    AutoRetryEnd {
+        success: bool,
+        attempt: u32,
+        final_error: Option<String>,
+    },
 }
 
 /// The turn behavior a worker session runs.
 pub trait SessionEngine: Send + Sync {
-    /// Run one prompt. `prompt_index` counts accepted prompts for this session.
+    /// Run one prompt. `prompt_index` counts accepted prompts for this
+    /// session. `aborted` is the worker's cancel probe (checked between
+    /// retry waits, where no events flow to observe the flag through
+    /// `emit`); `emit` returning `false` cancels the prompt.
     fn run_prompt(
         &self,
         prompt_index: usize,
         request: PromptRequest,
+        aborted: &dyn Fn() -> bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     );
 
@@ -389,6 +407,7 @@ impl SessionEngine for ScriptedEngine {
         &self,
         prompt_index: usize,
         request: PromptRequest,
+        _aborted: &dyn Fn() -> bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) {
         let cancelled = || EngineEvent::Done(Err("prompt cancelled".to_string()));
@@ -689,7 +708,7 @@ mod tests {
         };
         let collect = |engine: &ScriptedEngine, index: usize, message: &str| {
             let mut final_message = None;
-            engine.run_prompt(index, request_for(message), &mut |event| {
+            engine.run_prompt(index, request_for(message), &|| false, &mut |event| {
                 if let EngineEvent::AssistantMessage(value) = event {
                     final_message = Some(value);
                 }
@@ -717,6 +736,7 @@ mod tests {
                 source: "test".into(),
                 agent_message_id: None,
             },
+            &|| false,
             &mut |event| {
                 seen_clone.fetch_add(1, Ordering::SeqCst);
                 match event {

@@ -9,7 +9,9 @@ use anyhow::{anyhow, Context, Result};
 use pa_types::daemon::DaemonCommand;
 use serde_json::Value;
 
-use crate::chat::{ChatEntry, MessageBlock, ToolCallCard, ToolResultView, WorkingState};
+use crate::chat::{
+    ChatEntry, MessageBlock, RetryState, StatusKind, ToolCallCard, ToolResultView, WorkingState,
+};
 use crate::daemon_client::{DaemonClient, DaemonClientEvent};
 use crate::interactive::{InteractiveOptions, ModelSelection, SessionSelection};
 use crate::keys::key_event_to_id;
@@ -45,6 +47,10 @@ pub(crate) struct SessionUi {
     streaming_index: Option<usize>,
     /// Streaming token estimate for the loader (activity tracker).
     working_tokens: u64,
+    /// The turn already surfaced its error (a failed assistant message or a
+    /// retry-exhausted banner); the turn_end error stays silent then (TS
+    /// renders the failure once, through the message or the retry banner).
+    turn_error_shown: bool,
     pub(crate) last_assistant_text: Option<String>,
     pub(crate) exit_requested: bool,
     pub(crate) dirty: bool,
@@ -80,6 +86,7 @@ impl SessionUi {
             turn_active: false,
             streaming_index: None,
             working_tokens: 0,
+            turn_error_shown: false,
             last_assistant_text: None,
             exit_requested: false,
             dirty: true,
@@ -239,7 +246,7 @@ impl SessionUi {
     pub(crate) fn note(&mut self, text: &str, view: &mut AgentView) {
         view.push_entry(ChatEntry::Status {
             text: text.to_string(),
-            warning: false,
+            kind: StatusKind::Info,
         });
         self.dirty = true;
     }
@@ -555,6 +562,7 @@ impl SessionUi {
         match update {
             TurnUpdate::TurnStarted => {
                 self.turn_active = true;
+                self.turn_error_shown = false;
                 self.start_loader(view);
             }
             TurnUpdate::UserMessage(text) => {
@@ -597,10 +605,43 @@ impl SessionUi {
                 self.turn_active = false;
                 view.working = None;
                 view.working_since = None;
-                if let Some(error) = error {
+                view.retry = None;
+                // A provider failure already surfaced through the failed
+                // assistant message and/or the retry-exhausted banner; the
+                // turn result error is only a silent-failure backstop.
+                if let (Some(error), false) = (error, self.turn_error_shown) {
                     view.push_entry(ChatEntry::Status {
                         text: format!("turn failed: {error}"),
-                        warning: true,
+                        kind: StatusKind::Warning,
+                    });
+                }
+            }
+            TurnUpdate::AutoRetryStart {
+                attempt,
+                max_attempts,
+                delay_ms,
+            } => {
+                // The retry countdown loader replaces the working loader
+                // until the loop settles (TS auto_retry_start).
+                view.retry = Some(RetryState {
+                    attempt,
+                    max_attempts,
+                    ends_at: std::time::Instant::now() + std::time::Duration::from_millis(delay_ms),
+                });
+            }
+            TurnUpdate::AutoRetryEnd {
+                success: _,
+                attempt,
+                final_error,
+            } => {
+                view.retry = None;
+                if let Some(final_error) = final_error {
+                    self.turn_error_shown = true;
+                    view.push_entry(ChatEntry::Status {
+                        text: format!(
+                            "\u{26a0} Error: Retry failed after {attempt} attempts: {final_error}"
+                        ),
+                        kind: StatusKind::Error,
                     });
                 }
             }
@@ -665,18 +706,18 @@ impl SessionUi {
                 }
             }
         }
-        for (id, name, args) in tool_calls {
+        for (id, name, args) in &tool_calls {
             // A streamed tool call first appears queued; the execution start
             // event flips it to running.
             if !view
                 .chat
                 .iter()
-                .any(|entry| matches!(entry, ChatEntry::Tool(card) if card.id == id))
+                .any(|entry| matches!(entry, ChatEntry::Tool(card) if card.id == *id))
             {
                 view.push_entry(ChatEntry::Tool(Box::new(ToolCallCard {
-                    id,
-                    name,
-                    args,
+                    id: id.clone(),
+                    name: name.clone(),
+                    args: args.clone(),
                     started: false,
                     result: None,
                     result_partial: false,
@@ -685,7 +726,48 @@ impl SessionUi {
         }
         if !streaming {
             self.streaming_index = None;
+            self.render_failed_assistant_message(message, &tool_calls, view);
         }
+    }
+
+    /// The final frame of a failed assistant message renders its error row
+    /// (TS `AssistantMessageComponent.rebuild`: `Error: <message>` for a
+    /// provider failure, the abort text for an abort). Tool-carrying
+    /// messages leave the error to their pending tool cards.
+    fn render_failed_assistant_message(
+        &mut self,
+        message: &Value,
+        tool_calls: &[(String, String, Value)],
+        view: &mut AgentView,
+    ) {
+        if !tool_calls.is_empty() {
+            return;
+        }
+        let stop_reason = message.get("stopReason").and_then(Value::as_str);
+        let text = match stop_reason {
+            Some("error") => {
+                let error = message
+                    .get("errorMessage")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or("Unknown error");
+                format!("Error: {error}")
+            }
+            Some("aborted") => {
+                let error = message
+                    .get("errorMessage")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty() && *text != "Request was aborted")
+                    .unwrap_or("Operation aborted");
+                error.to_string()
+            }
+            _ => return,
+        };
+        self.turn_error_shown = true;
+        view.push_entry(ChatEntry::Status {
+            text,
+            kind: StatusKind::Error,
+        });
     }
 
     /// `tool_execution_start`: mark the matching card running (or create it

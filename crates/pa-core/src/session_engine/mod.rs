@@ -8,6 +8,7 @@
 //! decides admission and persists what the loop produces.
 
 pub mod agent_messaging;
+pub mod auto_retry;
 pub mod branch_summarization;
 pub mod compact_session;
 pub mod compaction;

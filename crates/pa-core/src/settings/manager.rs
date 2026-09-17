@@ -355,6 +355,52 @@ impl SettingsManager {
         self.merged.default_thinking_level
     }
 
+    /// The shared provider retry policy from settings, combining the TS
+    /// `getRetrySettings` and `getProviderRetrySettings` reads: the
+    /// `retry.enabled`, `retry.maxRetries`, and `retry.baseDelayMs` knobs
+    /// plus the `retry.provider.maxRetryDelayMs` cap.
+    pub fn get_provider_retry_policy(
+        &self,
+    ) -> crate::session_engine::provider_retry::ProviderRetryPolicy {
+        crate::session_engine::provider_retry::ProviderRetryPolicy {
+            enabled: self
+                .merged
+                .retry
+                .as_ref()
+                .and_then(|retry| retry.enabled)
+                .unwrap_or(true),
+            max_retries: self
+                .merged
+                .retry
+                .as_ref()
+                .and_then(|retry| retry.max_retries)
+                .map(|retries| retries.min(u32::MAX as u64) as u32)
+                .unwrap_or(
+                    crate::session_engine::provider_retry::DEFAULT_PROVIDER_RETRY_POLICY
+                        .max_retries,
+                ),
+            base_delay_ms: self
+                .merged
+                .retry
+                .as_ref()
+                .and_then(|retry| retry.base_delay_ms)
+                .unwrap_or(
+                    crate::session_engine::provider_retry::DEFAULT_PROVIDER_RETRY_POLICY
+                        .base_delay_ms,
+                ),
+            max_retry_delay_ms: self
+                .merged
+                .retry
+                .as_ref()
+                .and_then(|retry| retry.provider.as_ref())
+                .and_then(|provider| provider.max_retry_delay_ms)
+                .unwrap_or(
+                    crate::session_engine::provider_retry::DEFAULT_PROVIDER_RETRY_POLICY
+                        .max_retry_delay_ms,
+                ),
+        }
+    }
+
     pub fn get_rlm_max_depth(&self) -> Option<u64> {
         self.global.rlm_max_depth
     }

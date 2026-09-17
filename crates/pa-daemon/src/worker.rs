@@ -2094,6 +2094,33 @@ impl TurnRunner {
                     EngineEvent::Done(Err(error)) => {
                         json!({ "type": "turn_end", "error": error })
                     }
+                    EngineEvent::AutoRetryStart {
+                        attempt,
+                        max_attempts,
+                        delay_ms,
+                        error_message,
+                    } => json!({
+                        "type": "auto_retry_start",
+                        "attempt": attempt,
+                        "maxAttempts": max_attempts,
+                        "delayMs": delay_ms,
+                        "errorMessage": error_message,
+                    }),
+                    EngineEvent::AutoRetryEnd {
+                        success,
+                        attempt,
+                        final_error,
+                    } => {
+                        let mut event = json!({
+                            "type": "auto_retry_end",
+                            "success": success,
+                            "attempt": attempt,
+                        });
+                        if let Some(final_error) = final_error {
+                            event["finalError"] = json!(final_error);
+                        }
+                        event
+                    }
                 };
                 // Take the sender only when the event is `Done`: the
                 // `if let` scrutinee runs before matching, so a combined
@@ -2126,7 +2153,11 @@ impl TurnRunner {
                 let _ = events.send(Arc::new(OutboundFrame::session_event(payload)));
                 true
             };
-            engine.run_prompt(prompt_index, request, &mut emit);
+            let aborted_probe = {
+                let abort_flag = Arc::clone(&abort_flag);
+                move || abort_flag.load(Ordering::SeqCst)
+            };
+            engine.run_prompt(prompt_index, request, &aborted_probe, &mut emit);
         });
         let _ = turn.await;
 

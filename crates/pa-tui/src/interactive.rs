@@ -165,7 +165,7 @@ pub async fn run_interactive(
     if let Some(notice) = check_tmux_keyboard_setup().await {
         view.push_entry(crate::chat::ChatEntry::Status {
             text: format!("\u{26a0} {notice}"),
-            warning: true,
+            kind: crate::chat::StatusKind::Warning,
         });
         session.dirty = true;
     }
