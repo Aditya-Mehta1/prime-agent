@@ -201,16 +201,7 @@ class Battery:
         for side in (self.sides["ts"], self.sides["rust"]):
             flow = "f1_launch"
             session = f"{self.runid}-f1-{side.name}"
-            argv = [
-                side.binary,
-                "--daemon-socket",
-                str(side.daemon_socket),
-                "--provider",
-                "prime-inference",
-                "--model",
-                "mock-1",
-                "--offline",
-            ]
+            argv = P.launch_argv(side, side.daemon_socket)
             B.tmux_launch(session, argv, side.env, side.work_dir)
             # The TS splash animation swallows keystrokes, and a fresh install
             # first shows a trace-sharing notice: wait for the notice (up to
@@ -1447,13 +1438,18 @@ class Battery:
 
     def perf_onboard(self, side: B.Side) -> None:
         """Settle first-run dialogs (the TS trace notice) once before measuring,
-        so measured launches settle straight into the main screen."""
+        so measured launches settle straight into the main screen. The settle
+        launch is the same flagged invocation `P.launch_argv` every measured
+        launch uses: the Rust onboarding gate fires only with explicit
+        provider/model flags (TS resolves the startup model from settings),
+        so a flagless settle run would answer nothing and the notice would
+        surface (and stall) the measured launches instead."""
         socket = side.root / "perf" / "onboard.sock"
         socket.parent.mkdir(parents=True, exist_ok=True)
         if socket.exists():
             socket.unlink()
         session = f"{self.runid}-perf-onboard-{side.name}"
-        argv = [side.binary, "--daemon-socket", str(socket), "--offline"]
+        argv = P.launch_argv(side, socket)
         B.tmux_launch(session, argv, side.env, side.work_dir)
         deadline = time.time() + 30
         while time.time() < deadline:

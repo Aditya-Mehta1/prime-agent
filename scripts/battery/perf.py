@@ -93,15 +93,15 @@ def _pids_referencing(needle: str) -> list[int]:
     return hits
 
 
-def measure_launch(side: B.Side, tag: str, daemon_socket: Path) -> dict:
-    """One cold interactive launch: startup numbers plus the typing
-    measurement taken in the same session. The record carries `session`,
-    `first_frame_s`, `ready_s`, `typing_ms`, and the ready frame."""
-    session = tag
-    daemon_socket.parent.mkdir(parents=True, exist_ok=True)
-    if daemon_socket.exists():
-        daemon_socket.unlink()
-    argv = [
+def launch_argv(side: B.Side, daemon_socket: Path) -> list[str]:
+    """The interactive launch invocation every perf launch uses, onboard
+    settle run included. The flagged provider/model resolve mock-1, which the
+    ready check needs in the frame; they also fire the Rust first-run
+    onboarding readiness gate (TS resolves the startup model from settings
+    and its auth, while the Rust port gates on the explicit flags), so the
+    flagless launch that used to run here never showed the trace notice and
+    left it to surface (and stall) the measured launches."""
+    return [
         side.binary,
         "--daemon-socket",
         str(daemon_socket),
@@ -111,6 +111,17 @@ def measure_launch(side: B.Side, tag: str, daemon_socket: Path) -> dict:
         "mock-1",
         "--offline",
     ]
+
+
+def measure_launch(side: B.Side, tag: str, daemon_socket: Path) -> dict:
+    """One cold interactive launch: startup numbers plus the typing
+    measurement taken in the same session. The record carries `session`,
+    `first_frame_s`, `ready_s`, `typing_ms`, and the ready frame."""
+    session = tag
+    daemon_socket.parent.mkdir(parents=True, exist_ok=True)
+    if daemon_socket.exists():
+        daemon_socket.unlink()
+    argv = launch_argv(side, daemon_socket)
     t0 = time.time()
     B.tmux_launch(session, argv, side.env, side.work_dir)
     first_frame_s = None
