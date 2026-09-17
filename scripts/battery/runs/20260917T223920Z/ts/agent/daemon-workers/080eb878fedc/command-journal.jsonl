@@ -1,0 +1,3 @@
+
+{"version":1,"type":"received","key":"[\"21eeb56c96ac\",\"sd\"]","clientId":"21eeb56c96ac","commandId":"sd","commandType":"shutdown","recordedAt":"2026-09-17T22:45:56.252Z"}
+{"version":1,"type":"result","key":"[\"21eeb56c96ac\",\"sd\"]","response":{"id":"sd","type":"response","command":"shutdown","success":true},"recordedAt":"2026-09-17T22:45:56.254Z"}

@@ -140,6 +140,17 @@ impl SessionRegistry {
         self.workers.lock().await.clear();
     }
 
+    /// Forget a worker's registration bookkeeping: its registration record
+    /// and adoption gate. Called when the worker is terminally gone (a kill
+    /// or the max-failure stop) so long-lived supervisors do not
+    /// accumulate one map entry per session ever created. A forgotten
+    /// worker cannot re-register: its descriptor is removed with it, so a
+    /// later `worker_register` fails with the TS unknown-worker error.
+    pub(crate) async fn forget(&self, worker_id: &str) {
+        self.registrations.lock().await.remove(worker_id);
+        self.adoption_locks.lock().await.remove(worker_id);
+    }
+
     pub(crate) async fn get(&self, worker_id: &str) -> Option<Arc<ResidentWorker>> {
         self.workers.lock().await.get(worker_id).cloned()
     }
@@ -330,6 +341,28 @@ mod tests {
         let by_name = registry.resolve("faux").await.expect("name matches");
         assert_eq!(by_name.worker_id, "aaa111bbb222");
         assert!(registry.resolve("zzz").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn forget_drops_registration_and_adoption_gate() {
+        let registry = SessionRegistry::new();
+        registry.insert(resident("abc123def456")).await;
+        let _guard = registry.adoption_guard("abc123def456").await;
+        drop(_guard);
+        registry
+            .record_registration(registration("abc123def456"))
+            .await;
+        registry.forget("abc123def456").await;
+        // Long-lived supervisors must not accumulate one map entry per
+        // session ever created: a terminal kill forgets the bookkeeping.
+        assert!(registry.registrations.lock().await.is_empty());
+        assert!(registry.adoption_locks.lock().await.is_empty());
+        // A forgotten worker re-registering is epoch 1 again: it is
+        // unknown to this supervisor until re-adopted.
+        let record = registry
+            .record_registration(registration("abc123def456"))
+            .await;
+        assert_eq!(record.epoch, 1);
     }
 
     #[tokio::test]

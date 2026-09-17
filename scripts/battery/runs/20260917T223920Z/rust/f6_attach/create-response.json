@@ -1,0 +1,37 @@
+{
+ "command": "create",
+ "data": {
+  "activeSessionId": "9ed9291a0512",
+  "activity": "idle",
+  "attachedClients": 0,
+  "created": "2026-09-17T22:42:13.639Z",
+  "cwd": "/home/ubuntu/lane-worktrees/fd-leak-audit/scripts/battery/runs/20260917T223920Z/rust/work",
+  "hasRegisteredCronJob": false,
+  "id": "9ed9291a0512",
+  "isBashRunning": false,
+  "isCompacting": false,
+  "isSessionActive": false,
+  "isStreaming": false,
+  "lastActivityAt": "2026-09-17T22:42:13.696Z",
+  "lifecycle": "resident",
+  "messageCount": 0,
+  "modified": "2026-09-17T22:42:13.696Z",
+  "rlmDepth": 0,
+  "runtimeKind": "top-level",
+  "sessionActions": {
+   "followUps": [],
+   "queuedCount": 0,
+   "steering": []
+  },
+  "sessionFile": "/home/ubuntu/lane-worktrees/fd-leak-audit/scripts/battery/runs/20260917T223920Z/rust/agent/sessions/01a0b188-e407-753a-9cc9-ff9222f34c94.jsonl",
+  "sessionId": "01a0b188-e407-753a-9cc9-ff9222f34c94",
+  "sessionName": "battery-attach",
+  "thinkingLevel": "off",
+  "unfinishedActionCount": 0,
+  "workerPid": 236928,
+  "workerState": "ready"
+ },
+ "id": "c1",
+ "success": true,
+ "type": "response"
+}

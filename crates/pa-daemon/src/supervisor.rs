@@ -293,8 +293,12 @@ impl Supervisor {
                     ));
                     return;
                 }
-            } else {
-                // Adopted worker: poll liveness (cannot wait on a foreign pid).
+            } else if adopted_pid != 0 {
+                // Adopted worker: poll liveness (cannot wait on a foreign
+                // pid). A previous relaunch that produced no worker leaves
+                // pid 0 here - there is nothing to watch, and polling pid 0
+                // would report a phantom exit; fall straight to the
+                // failure/backoff/relaunch arm instead.
                 loop {
                     if self.shutting_down.load(Ordering::SeqCst)
                         || resident.intentional_stop.load(Ordering::SeqCst)
@@ -320,6 +324,7 @@ impl Supervisor {
                 let _ = persist_worker(&resident.descriptor_path, &descriptor);
                 drop(descriptor);
                 self.registry.remove(&resident.worker_id).await;
+                self.registry.forget(&resident.worker_id).await;
                 self.remove_roster_worker(&resident.worker_id);
                 self.log_line(&format!(
                     "session worker {} failed after {failures} consecutive failures",
@@ -372,9 +377,21 @@ impl Supervisor {
             let descriptor = resident.descriptor.lock().await;
             create_command_payload(&descriptor.create_command)
         };
-        let response = self
+        let response = match self
             .route_command(resident, "create", payload, LONG_ROUTE_TIMEOUT_MS)
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            // The replay never answered: the freshly spawned worker is not
+            // supervised by the monitor path that produced it, so it must
+            // die with the relaunch attempt instead of orphaning (and
+            // holding its socket path against the next one).
+            Err(error) => {
+                let mut child = child;
+                let _ = child.start_kill();
+                return Err(error);
+            }
+        };
         if self.is_stopping(resident) {
             // A shutdown raced the relaunch: stop the freshly spawned worker
             // instead of leaving it running with nobody supervising it.
@@ -386,6 +403,10 @@ impl Supervisor {
             return Err(anyhow!("supervisor is shutting down"));
         }
         if !response.success {
+            // Same rule as the route error above: a worker whose create
+            // replay failed must not be left running.
+            let mut child = child;
+            let _ = child.start_kill();
             return Err(anyhow!(
                 "worker create failed on relaunch: {}",
                 response.error.unwrap_or_default()
@@ -1674,6 +1695,7 @@ impl Supervisor {
             .await;
         let _ = std::fs::remove_file(&resident.descriptor_path);
         self.registry.remove(&resident.worker_id).await;
+        self.registry.forget(&resident.worker_id).await;
         self.remove_roster_worker(&resident.worker_id);
     }
 

@@ -654,6 +654,14 @@ impl Worker {
         // fan-out task (streaming is gated on it).
         let role = Arc::new(std::sync::Mutex::new(ConnectionRole::Unauthenticated));
 
+        // Connection-closed signal: the read loop fires it when the peer is
+        // gone (EOF, auth failure) or drops it on return. The fan-out task
+        // must not outlive the connection - the shared-socket write half it
+        // holds keeps the socket fd open, and a per-connection fd leak here
+        // (probes, direct clients, peer deliveries) ends in EMFILE for a
+        // long-lived worker.
+        let (closed_tx, closed_rx) = tokio::sync::watch::channel(false);
+
         // Event fan-out: this connection's subscription to the shared pump.
         // Only authenticated roles stream: the supervisor always, a session
         // client only while it holds an attach on the session.
@@ -661,37 +669,50 @@ impl Worker {
             let worker = Arc::clone(&self);
             let sink = Arc::clone(&sink);
             let role = Arc::clone(&role);
+            let mut closed = closed_rx;
             tokio::spawn(async move {
                 let mut events = subscription;
                 loop {
-                    match events.recv().await {
-                        Ok(frame) => {
-                            // A frame this role does not stream still
-                            // advances the flush position: it cannot be
-                            // delivered later, so a gated response must not
-                            // wait for it.
-                            if role.lock().unwrap().streams_events() {
-                                let active_session_id = active_session_id_of(&frame.payload);
-                                let header = json!({
-                                    "kind": "outbound",
-                                    "outboundType": frame.outbound_type,
-                                    "activeSessionId": active_session_id,
-                                });
-                                if worker
-                                    .write_frame(&sink.writer, &header, &frame.payload)
-                                    .await
-                                    .is_err()
-                                {
+                    tokio::select! {
+                        // The read loop ended (or dropped its sender):
+                        // release the subscription and the write half so
+                        // the socket fd closes.
+                        changed = closed.changed() => {
+                            let _ = changed;
+                            sink.mark_closed();
+                            break;
+                        }
+                        received = events.recv() => {
+                            match received {
+                                Ok(frame) => {
+                                    // A frame this role does not stream still
+                                    // advances the flush position: it cannot be
+                                    // delivered later, so a gated response must not
+                                    // wait for it.
+                                    if role.lock().unwrap().streams_events() {
+                                        let active_session_id = active_session_id_of(&frame.payload);
+                                        let header = json!({
+                                            "kind": "outbound",
+                                            "outboundType": frame.outbound_type,
+                                            "activeSessionId": active_session_id,
+                                        });
+                                        if worker
+                                            .write_frame(&sink.writer, &header, &frame.payload)
+                                            .await
+                                            .is_err()
+                                        {
+                                            sink.mark_closed();
+                                            break;
+                                        }
+                                    }
+                                    sink.mark_flushed(frame.seq);
+                                }
+                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                Err(broadcast::error::RecvError::Closed) => {
                                     sink.mark_closed();
                                     break;
                                 }
                             }
-                            sink.mark_flushed(frame.seq);
-                        }
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => {
-                            sink.mark_closed();
-                            break;
                         }
                     }
                 }
@@ -703,6 +724,8 @@ impl Worker {
         loop {
             let frame: Option<crate::framing::PrivateFrame> = reader.read_frame().await?;
             let Some(frame) = frame else {
+                // Peer closed: wake the fan-out so it drops the write half.
+                let _ = closed_tx.send(true);
                 break;
             };
             let command_type = frame
@@ -732,6 +755,9 @@ impl Worker {
                         .authenticate_connection(&command_type, &payload, &request_id, &role, &sink)
                         .await;
                     if outcome == AuthOutcome::Failed {
+                        // Failed auth ends the connection: wake the fan-out
+                        // so it releases the write half (and the fd).
+                        let _ = closed_tx.send(true);
                         break;
                     }
                 }
@@ -757,6 +783,15 @@ impl Worker {
                             // process, like the TS close path
                             // (`closeKeepsResumeEntry("shutdown")`).
                             let _ = self.record_recovery(false, "shutdown");
+                            // A graceful exit owns its socket file: remove
+                            // it now so a respawn does not wait out the
+                            // stale-socket path (a killed worker cannot
+                            // clean up, but its killer relaunches through
+                            // `prepare_socket_path`).
+                            crate::socket::cleanup_socket_path(
+                                &self.config.socket_path,
+                                crate::socket::socket_identity(&self.config.socket_path),
+                            );
                             std::process::exit(0);
                         }
                         continue;
