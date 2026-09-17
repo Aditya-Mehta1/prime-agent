@@ -48,7 +48,10 @@ def _init_dirty_git_repo(root: str) -> None:
 
 
 # Vectors ported from packages/coding-agent/test/bash-destructive-git-guard.test.ts;
-# the kernel guard must keep the same command taxonomy as the coding-agent tool.
+# the kernel guard keeps at least that command taxonomy and is deliberately
+# stricter (the coding-agent guard still allows `"git" reset --hard`,
+# `G=git; $G reset --hard`, `git restore --source HEAD .`, `-qs HEAD .`,
+# `git restore --staged --worktree .` and `git restore --quiet .`).
 MATCHING_COMMANDS = [
     "git checkout -- .",
     "git checkout .",
@@ -73,6 +76,15 @@ MATCHING_COMMANDS = [
     "git restore -s@ :/",
     "git restore --source=HEAD :/",
     "git restore -s HEAD~1 :/",
+    "git restore -s STASH .",
+    "git restore -sSTASH .",
+    "git restore --source HEAD .",
+    "git restore -qs HEAD .",
+    "git restore -Ws HEAD .",
+    "git restore --no-overlay .",
+    "git restore --overlay .",
+    "git restore --ignore-unmerged .",
+    "git restore --recurse-submodules .",
     "git restore -- .",
     "git checkout -- ./",
     "git checkout ./",
@@ -109,12 +121,23 @@ MATCHING_COMMANDS = [
     "git restore --quiet --source=HEAD .",
     "g\\it reset --ha\\rd",
     "git res\\et --hard",
+    '"git" reset --hard',
+    "g'it' reset --hard",
+    "G=git; $G reset --hard",
+    "G=git; ${G} reset --hard",
+    "/usr/bin/git reset --hard",
+    "./git reset --hard",
+    "G='git reset --hard'; $G",
+    'G="git restore ."; $G',
+    'G="it\'s # "; $G git reset --hard',
+    "echo 'git' 'reset' '--hard'",
     "git reset &>/dev/null --hard",
     "git reset &> /dev/null --hard",
     "git reset &>>/dev/null --hard",
     "git reset >&/dev/null --hard",
     "{ cd sub && git reset --hard; }",
     "export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard",
+    "for i in 1; do export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard; done",
     "GIT_DIR=sub/.git; git reset --hard",
     "git -Csub reset --hard",
     "git -cfoo.bar=1 reset --hard",
@@ -160,11 +183,17 @@ NON_MATCHING_COMMANDS = [
     "git restore --staged --quiet .",
     "echo \\# git reset --hard",
     "cat <<EOF\\ngit reset --hard\\nEOF",
-    "git restore --staged .",
     "echo one \
  two",
     "git -Csub status",
     "# git reset --hard",
+    "$G reset --hard",
+    "G=git; echo x; G=other; $G reset --hard",
+    "G='git clean -n'; $G",
+    "G='echo hi'; $G",
+    "if true; then export GIT_DIR=sub/.git GIT_WORK_TREE=sub; fi",
+    "for i in 1; do echo hi; done",
+    "# 'git' reset --hard",
 ]
 
 
@@ -234,6 +263,9 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
             "git clean -fd",
             "git reset --hard",
             "git restore .",
+            "\"git\" reset --hard",
+            "G=git; $G reset --hard",
+            "G='git reset --hard'; $G",
         ]):
             with self.subTest(command=command):
                 repo = str(self._tracked(f"repo-{index}"))
@@ -388,30 +420,30 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(self._tracked("tracked.txt").read_text(), "committed\n")
 
-    async def test_refuses_cd_relocation_into_dirty_nested_repository(self):
-        _init_dirty_git_repo(str(self._tracked("sub")))
+    async def test_refuses_relocation_into_dirty_nested_repository(self):
         self._init_dirty_repo()
-        with self.assertRaises(DestructiveGitRefusalError) as caught:
-            bash("cd sub && git reset --hard")
-        self.assertIn("Refusing to run this destructive git command", str(caught.exception))
-        self.assertIn("tracked.txt", str(caught.exception))
-        self.assertEqual(self._tracked("sub", "tracked.txt").read_text(), "modified\n")
-
-    async def test_refuses_git_c_relocation_into_dirty_nested_repository(self):
-        _init_dirty_git_repo(str(self._tracked("sub")))
-        self._init_dirty_repo()
-        with self.assertRaises(DestructiveGitRefusalError) as caught:
-            bash("git -C sub reset --hard")
-        self.assertIn("tracked.txt", str(caught.exception))
-        self.assertEqual(self._tracked("sub", "tracked.txt").read_text(), "modified\n")
+        for directory, command in [
+            ("cd-sub", "cd cd-sub && git reset --hard"),
+            ("c-sub", "git -C c-sub reset --hard"),
+        ]:
+            with self.subTest(command=command):
+                _init_dirty_git_repo(str(self._tracked(directory)))
+                with self.assertRaises(DestructiveGitRefusalError) as caught:
+                    bash(command)
+                self.assertIn("Refusing to run this destructive git command", str(caught.exception))
+                self.assertIn("tracked.txt", str(caught.exception))
+                self.assertEqual(self._tracked(directory, "tracked.txt").read_text(), "modified\n")
 
     async def test_allows_relocated_discard_when_target_is_clean(self):
-        _init_dirty_git_repo(str(self._tracked("sub")))
-        _run_git(str(self._tracked("sub")), "add", "-A")
-        _run_git(str(self._tracked("sub")), "commit", "-q", "-m", "second")
-        self._init_dirty_repo()
-        result = await bash("cd sub && git reset --hard")
-        self.assertEqual(result.exit_code, 0)
+        self._init_dirty_repo()  # the outer tree stays dirty
+        for directory in ["sub", "my repo"]:
+            with self.subTest(directory=directory):
+                target = str(self._tracked(directory))
+                _init_dirty_git_repo(target)
+                _run_git(target, "add", "-A")
+                _run_git(target, "commit", "-q", "-m", "second")
+                result = await bash(f'cd "{directory}" && git reset --hard')
+                self.assertEqual(result.exit_code, 0)
 
     async def test_multi_discard_probes_every_target_repository(self):
         _init_dirty_git_repo(str(self._tracked("sub")))
@@ -427,6 +459,13 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
             "cd sub || git reset --hard",
             "pushd sub && git reset --hard",
             'git -C "sub" reset --hard',
+            "git -ccore.worktree=sub reset --hard",
+            "git -ccore.bare=1 reset --hard",
+            "git -pCsub reset --hard",
+            "git -qC sub reset --hard",
+            "source setup.sh && git reset --hard",
+            ". setup.sh && git reset --hard",
+            "export GIT_DIR=$(pwd)/sub; git reset --hard",
         ]:
             with self.subTest(command=command):
                 with self.assertRaises(DestructiveGitRefusalError) as caught:
@@ -474,15 +513,10 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("tracked.txt", str(caught.exception))
         self.assertEqual(self._tracked("my repo", "tracked.txt").read_text(), "modified\n")
 
-    async def test_allows_quoted_cd_discard_when_target_is_clean(self):
-        _init_dirty_git_repo(str(self._tracked("my repo")))
-        _run_git(str(self._tracked("my repo")), "add", "-A")
-        _run_git(str(self._tracked("my repo")), "commit", "-q", "-m", "second")
-        self._init_dirty_repo()
-        result = await bash('cd "my repo" && git reset --hard')
-        self.assertEqual(result.exit_code, 0)
-
     async def test_attached_dash_c_values_relocate_the_probe(self):
+        # Stock git rejects attached short options itself ("unknown option:
+        # -Csub"), so the form can never discard anything; the guard still
+        # resolves the attached value instead of probing the parent tree.
         _init_dirty_git_repo(str(self._tracked("sub")))
         # The parent tree stays clean: the probe must follow the attached
         # value, not probe the current directory.
@@ -493,32 +527,14 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
             bash("git -Csub reset --hard")
         self.assertIn("tracked.txt", str(caught.exception))
         self.assertEqual(self._tracked("sub", "tracked.txt").read_text(), "modified\n")
-
-    async def test_attached_dash_c_probe_follows_the_value_not_the_parent_tree(self):
-        # Stock git rejects attached short options itself ("unknown option:
-        # -Csub"), so the form can never discard anything; the guard still
-        # resolves the attached value the way the thread asks instead of
-        # silently probing the parent tree.
-        _init_dirty_git_repo(str(self._tracked("sub")))
+        # With the nested tree clean and the parent dirty, git still rejects
+        # the option itself rather than discarding the parent tree.
         _run_git(str(self._tracked("sub")), "add", "-A")
         _run_git(str(self._tracked("sub")), "commit", "-q", "-m", "second")
-        self._init_dirty_repo()  # the parent tree stays dirty
+        self._tracked("tracked.txt").write_text("modified\n")
         result = await bash("git -Csub reset --hard")
         self.assertNotEqual(result.exit_code, 0)
         self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
-
-    async def test_refuses_attached_and_bundled_relocations_it_cannot_replay(self):
-        self._init_dirty_repo()
-        for command in [
-            "git -ccore.worktree=sub reset --hard",
-            "git -ccore.bare=1 reset --hard",
-            "git -pCsub reset --hard",
-            "git -qC sub reset --hard",
-        ]:
-            with self.subTest(command=command):
-                with self.assertRaises(DestructiveGitRefusalError) as caught:
-                    bash(command)
-                self.assertIn("changes directory (or repository) first", str(caught.exception))
 
     async def test_attached_benign_dash_c_configs_do_not_relocate(self):
         self._init_dirty_repo()
@@ -540,13 +556,6 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
                 self.assertTrue(self._tracked("untracked.txt").exists())
 
-    async def test_line_continuations_in_safe_commands_still_run(self):
-        self._init_dirty_repo()
-        result = await bash("echo one \\\n two")
-        self.assertEqual(result.exit_code, 0)
-        self.assertIn("one", result.output)
-        self.assertIn("two", result.output)
-
     async def test_comment_newline_still_ends_the_line_before_a_discard(self):
         # A backslash-newline inside a comment does not join lines: the
         # newline ends the comment and the next line runs for real.
@@ -563,6 +572,10 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
             "git reset 2>&1 --hard",
             "git 2>/dev/null reset --hard",
             "git restore 2>/dev/null .",
+            "git reset &>/dev/null --hard",
+            "git reset &> /dev/null --hard",
+            "git reset &>>/dev/null --hard",
+            "git reset >&/dev/null --hard",
         ]:
             with self.subTest(command=command):
                 with self.assertRaises(DestructiveGitRefusalError):
@@ -576,6 +589,10 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.exit_code, 0)
         result = await bash("git log --oneline > log.txt 2>/dev/null")
         self.assertEqual(result.exit_code, 0)
+        result = await bash("echo one \\\n two")
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("one", result.output)
+        self.assertIn("two", result.output)
         self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
 
     async def test_redirect_targets_with_substitutions_stay_scannable(self):
@@ -620,12 +637,18 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
     async def test_refuses_persistent_env_assignment_relocations(self):
         _init_dirty_git_repo(str(self._tracked("sub")))
         self._init_dirty_repo()
+        # Ignore the nested repo: its submodule-shaped entry (" M sub") would
+        # otherwise make the outer tree look dirty and mask a missed relocation.
+        self._tracked(".gitignore").write_text("sub/\n")
         _run_git(self.test_dir, "add", "-A")
         _run_git(self.test_dir, "commit", "-q", "-m", "second")
         for command in [
             "export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard",
             "GIT_DIR=sub/.git; git reset --hard",
             "export GIT_DIR=sub/.git && git reset --hard",
+            "{ export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard; }",
+            "if true; then export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard; fi",
+            "if true; then { export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard; }; fi",
         ]:
             with self.subTest(command=command):
                 with self.assertRaises(DestructiveGitRefusalError) as caught:
@@ -633,28 +656,11 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("tracked.txt", str(caught.exception))
                 self.assertEqual(self._tracked("sub", "tracked.txt").read_text(), "modified\n")
 
-    async def test_refuses_env_assignments_it_cannot_replay(self):
+    async def test_command_scoped_assignments_do_not_persist(self):
         self._init_dirty_repo()
-        with self.assertRaises(DestructiveGitRefusalError) as caught:
-            bash("export GIT_DIR=$(pwd)/sub; git reset --hard")
-        self.assertIn("changes directory (or repository) first", str(caught.exception))
-        # Command-scoped assignments in a mixed segment do not persist.
         result = await bash("FOO=1 git status")
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
-
-    async def test_refuses_quiet_restore_discards(self):
-        self._init_dirty_repo()
-        for command in [
-            "git restore --quiet .",
-            "git restore -q .",
-            "git restore --quiet --source=HEAD .",
-        ]:
-            with self.subTest(command=command):
-                with self.assertRaises(DestructiveGitRefusalError):
-                    bash(command)
-                self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
-                self.assertTrue(self._tracked("untracked.txt").exists())
 
     async def test_refuses_discards_hidden_behind_shell_escapes(self):
         self._init_dirty_repo()
@@ -672,30 +678,24 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
 
-    async def test_refuses_discards_with_ampersand_redirects(self):
-        self._init_dirty_repo()
-        for command in [
-            "git reset &>/dev/null --hard",
-            "git reset &> /dev/null --hard",
-            "git reset &>>/dev/null --hard",
-            "git reset >&/dev/null --hard",
-        ]:
-            with self.subTest(command=command):
-                with self.assertRaises(DestructiveGitRefusalError):
-                    bash(command)
-                self.assertEqual(self._tracked("tracked.txt").read_text(), "modified\n")
-
-    async def test_refuses_source_relocations_as_unresolvable(self):
-        self._init_dirty_repo()
-        for command in ["source setup.sh && git reset --hard", ". setup.sh && git reset --hard"]:
-            with self.subTest(command=command):
-                with self.assertRaises(DestructiveGitRefusalError) as caught:
-                    bash(command)
-                self.assertIn("changes directory (or repository) first", str(caught.exception))
-
     async def test_refuses_staged_and_worktree_restore_discards(self):
         self._init_dirty_repo()
-        for command in ["git restore --staged --worktree .", "git restore -SW .", "git restore -WS ."]:
+        # A ref name containing S or W must not flip this to an index-only restore.
+        _run_git(self.test_dir, "branch", "SRC")
+        for command in [
+            "git restore --staged --worktree .",
+            "git restore -SW .",
+            "git restore -WS .",
+            "git restore -s SRC .",
+            "git restore -sSRC .",
+            "git restore --source HEAD .",
+            "git restore -qs SRC .",
+            "git restore -Ws SRC .",
+            "git restore --no-overlay .",
+            "git restore --quiet .",
+            "git restore -q .",
+            "git restore --quiet --source=HEAD .",
+        ]:
             with self.subTest(command=command):
                 with self.assertRaises(DestructiveGitRefusalError):
                     bash(command)

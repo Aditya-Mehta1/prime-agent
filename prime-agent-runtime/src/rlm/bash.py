@@ -1009,9 +1009,18 @@ _DISCARD_CHECKOUT_PATTERN = re.compile(
     + r"""|(?:-f|--force)\s+[^\s;&|()]+)(?=\s|$|[;&|)])"""
 )
 # Restore options accepted before the pathspec; the capture lets the finder
-# check whether staged (index-only) or worktree flags are in play.
+# check whether staged (index-only) or worktree flags are in play. The
+# value-taking spellings come first because they must consume their tree-ish
+# (`-s HEAD`, `-sHEAD`, `--source HEAD`, `--source=HEAD`, and a short cluster
+# ending in `s` such as `-qs HEAD`); the trailing generic alternative then
+# accepts every other restore option, known or not, and leaves the decision
+# to `_restore_options_discard_worktree`, which must stay in step with the
+# getopt rule encoded here. Unknown options fall through to its default
+# (worktree restore), the fail-closed direction: patch mode (`-p`) is refused
+# too, because a non-interactive kernel shell cannot answer its prompts.
 _RESTORE_OPTION = re.compile(
-    r"""(?:--source(?:=\S+)?|--worktree|--staged|--quiet|-s\s+\S+|-s[^\s;&|]+|-S[^\s;&|]*|-W[^\s;&|]*|-q[^\s;&|]*|--)\s+"""
+    r"""(?:--source(?:=\S+|\s+[^\s;&|]+)?|-[A-Za-z]*s(?:[^\s;&|]+|\s+[^\s;&|]+)?"""
+    r"""|-{1,2}[^\s;&|]+)\s+"""
 )
 _DISCARD_RESTORE_PATTERN = re.compile(
     r"\bgit\s+"
@@ -1026,25 +1035,43 @@ _DISCARD_RESTORE_PATTERN = re.compile(
 
 def _restore_options_discard_worktree(option_region: str) -> bool:
     """`git restore` targets the working tree by default; `--staged`/`-S`
-    alone restores only the index. Bundled shorts keep their meaning:
-    `-SW` restores both targets."""
-    tokens = [token for token in re.split(r"\s+", option_region) if token]
-    for token in tokens:
+    alone restores only the index. Bundled shorts keep their meaning
+    (`-SW` restores both targets), but the tree-ish value of `-s`/`--source`
+    is data: a source ref named `STASH` is not a cluster of short flags."""
+    worktree = False
+    staged = False
+    source_value_next = False
+    for token in re.split(r"\s+", option_region):
+        if not token:
+            continue
+        if source_value_next:
+            source_value_next = False
+            continue  # the tree-ish value, not a flag cluster
         if token == "--":
             break  # everything after -- is a pathspec
         if token.startswith("--"):
             if token.startswith("--worktree"):
-                return True
-        elif "W" in token:
-            return True
-    for token in tokens:
-        if token == "--":
-            break
-        if token.startswith("--"):
-            if token.startswith("--staged"):
-                return False
-        elif "S" in token:
-            return False
+                worktree = True
+            elif token.startswith("--staged"):
+                staged = True
+            elif token == "--source":
+                source_value_next = True  # `--source HEAD`
+            continue
+        flags = token[1:]
+        if "s" in flags:
+            # getopt: the first `s` in a cluster takes the rest of the token
+            # as its value (`-sHEAD`), or the next word when it ends there.
+            index = flags.index("s")
+            source_value_next = index == len(flags) - 1
+            flags = flags[:index]
+        if "W" in flags:
+            worktree = True
+        if "S" in flags:
+            staged = True
+    if worktree:
+        return True
+    if staged:
+        return False
     return True  # no flags: default worktree restore
 _DISCARD_RESET_PATTERN = re.compile(
     r"\bgit\s+" + _GIT_GLOBAL_OPTIONS + r"reset\s+(?:(?:-[^\s;&|]+)\s+)*--hard\b"
@@ -1373,6 +1400,137 @@ def _mask_quoted_spans(command: str) -> str:
     return "".join(chars)
 
 
+# The command word the shell would execute, when it can be rebuilt from the
+# text: plain character runs joined by quoting only, or a `$NAME`/`${NAME}`
+# reference to a literal assignment of the git executable earlier in the same
+# command. Anything holding spaces, expansion, or substitution stays unknown
+# and is left as written for the masking pass below.
+_PLAIN_WORD_RUN = re.compile(r"[A-Za-z0-9_./-]+")
+_VARIABLE_REFERENCE = re.compile(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)\b|\{([A-Za-z_][A-Za-z0-9_]*)\})")
+# A literal assignment the guard can replay: a bare word, or a quoted word
+# sequence with no expansion or substitution (`G=git`, `G=/usr/bin/git`,
+# `G='git reset --hard'`).
+_LITERAL_ASSIGNMENT = re.compile(
+    r"""([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"$`]*)"|'([^']*)'|([A-Za-z0-9_./-]+))"""
+)
+
+
+def _shell_word_spans(command: str) -> list[tuple[int, int]]:
+    """Spans of the shell words in `command`; quotes never end a word and
+    braces stay inside one (`${G}` is a single word)."""
+    spans: list[tuple[int, int]] = []
+    i = 0
+    n = len(command)
+    while i < n:
+        if command[i].isspace() or command[i] in ";&|()<>":
+            i += 1
+            continue
+        start = i
+        quote: str | None = None
+        while i < n:
+            ch = command[i]
+            if quote is None:
+                if ch in ('"', "'"):
+                    quote = ch
+                elif ch.isspace() or ch in ";&|()<>":
+                    break
+            elif ch == quote:
+                quote = None
+            i += 1
+        spans.append((start, i))
+    return spans
+
+
+def _plain_word_text(word: str) -> str | None:
+    """The word's text when quoting is its only shell syntax, else None."""
+    content: list[str] = []
+    i = 0
+    n = len(word)
+    while i < n:
+        if word[i] in ('"', "'"):
+            close = word.find(word[i], i + 1)
+            if close == -1:
+                return None  # unterminated quoting: leave the text alone
+            run = word[i + 1 : close]
+            if not _PLAIN_WORD_RUN.fullmatch(run):
+                return None
+            content.append(run)
+            i = close + 1
+            continue
+        run = _PLAIN_WORD_RUN.match(word, i)
+        if run is None:
+            return None
+        content.append(run.group(0))
+        i = run.end()
+    return "".join(content) or None
+
+
+def _revealed_shell_word(word: str, assignments: dict[str, str]) -> str | None:
+    """The command word the shell would execute for `word`, when knowable."""
+    reference = _VARIABLE_REFERENCE.fullmatch(word)
+    if reference is None and len(word) > 2 and word[0] == word[-1] == '"':
+        # Double quotes still expand; single quotes never do.
+        reference = _VARIABLE_REFERENCE.fullmatch(word[1:-1])
+    if reference is not None:
+        return assignments.get(reference.group(1) or reference.group(2))
+    return _plain_word_text(word)
+
+
+def _reveal_shell_command_words(command: str) -> tuple[str, list[int]]:
+    """Rebuild each shell word the way the shell executes it.
+
+    Quoting is stripped before exec, so `"git"` and `g'it'` run `git`, and a
+    `$G` reference to an earlier literal assignment runs that value (`G=git`,
+    or `G='git reset --hard'` as a word sequence). Revealing those words keeps
+    the discard patterns shell-faithful. A word holding spaces, expansion, or
+    substitution stays as written, so quoted data (`echo 'git reset --hard'`)
+    still masks as data. The walk is flat, so an assignment inside a command
+    substitution (`$(G=git; true); $G reset --hard`) stays visible and is
+    refused: that leaks an inner scope outward and so refuses more, not less.
+    The returned map points every emitted character back into `command`.
+    """
+    assignments: dict[str, str] = {}
+    out: list[str] = []
+    index_map: list[int] = []
+    cursor = 0
+    for start, end in _shell_word_spans(command):
+        out.append(command[cursor:start])
+        index_map.extend(range(cursor, start))
+        cursor = end
+        word = command[start:end]
+        replacement = _revealed_shell_word(word, assignments)
+        if replacement is None:
+            replacement = word
+        else:
+            # A revealed value is data the shell runs as a word, never shell
+            # syntax: an unbalanced quote or a `#` in it would otherwise pair
+            # with the text after it and hide a later discard from masking.
+            replacement = re.sub(r"""["'#\\]""", "_", replacement)
+            if len(replacement) < len(word):
+                # Keep the revealed word from running into the next one.
+                replacement = replacement.ljust(len(word))
+        out.append(replacement)
+        if replacement == word:
+            index_map.extend(range(start, end))
+        else:
+            # A revealed match starts at this word's first character.
+            index_map.extend([start] * len(replacement))
+        assignment = _LITERAL_ASSIGNMENT.fullmatch(word)
+        if assignment:
+            # A later reference to this name execs this literal value, so the
+            # word walk reveals it verbatim; the discard patterns then judge
+            # the value exactly as they judge the bare spelling. The last
+            # literal assignment wins, so a reassignment replaces the value. A
+            # reassignment the guard cannot read (substitution or expansion)
+            # keeps the earlier value, which is the conservative direction.
+            assignments[assignment.group(1)] = next(
+                group for group in assignment.groups()[1:] if group is not None
+            )
+    out.append(command[cursor:])
+    index_map.extend(range(cursor, len(command)))
+    return "".join(out), index_map
+
+
 def _is_forced_clean_segment(args: str) -> bool:
     tokens = [token for token in re.split(r"\s+", args) if token]
     # Everything after -- is a pathspec, not options (git clean -f -- -n is forced).
@@ -1404,7 +1562,8 @@ def _find_destructive_git_discard_commands(command: str) -> list[int]:
     normalized, index_map = _strip_shell_escapes(
         _mask_shell_redirections(_normalize_line_continuations(command))
     )
-    masked = _mask_quoted_spans(normalized)
+    words, word_map = _reveal_shell_command_words(normalized)
+    masked = _mask_quoted_spans(words)
     indices: list[int] = []
     for pattern in (_DISCARD_CHECKOUT_PATTERN, _DISCARD_RESET_PATTERN):
         indices.extend(match.start() for match in pattern.finditer(masked))
@@ -1414,7 +1573,7 @@ def _find_destructive_git_discard_commands(command: str) -> list[int]:
     for match in _DISCARD_CLEAN_PATTERN.finditer(masked):
         if _is_forced_clean_segment(match.group(1)):
             indices.append(match.start())
-    return sorted(index_map[index] for index in indices)
+    return sorted(index_map[word_map[index]] for index in indices)
 
 
 def is_destructive_git_discard_command(command: str) -> bool:
@@ -1601,7 +1760,12 @@ def _resolve_discard_probe_target(
         for index in range(len(segments) - 1):
             if seg_positions[index] < user_command_start:
                 continue  # command-prefix region: replayed verbatim
-            seg_tokens = [token for token in re.split(r"\s+", segments[index].strip()) if token]
+            # A brace group runs in the current shell, so `{ export GIT_DIR=...
+            # ; git reset --hard; }` persists its assignments like bare ones.
+            # The bodies a shell keyword introduces (`then`, `do`, `else`,
+            # including a `{` inside them) run in the current shell too.
+            segment = re.sub(r"^(?:\{\s*|(?:then|do|else)\s+)*", "", segments[index].strip())
+            seg_tokens = [token for token in re.split(r"\s+", segment) if token]
             if seg_tokens and seg_tokens[0] in ("source", "."):
                 # A sourced script runs in the current shell and may `cd`,
                 # so the discard's directory cannot be replayed safely.
