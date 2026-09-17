@@ -13,6 +13,7 @@ Daemon wire mechanics shared by the serving side (pa-daemon) and clients (pa-tui
   (the TUI dispatch + autocomplete, the session engine's command admission,
   CLI suggestion help) plus its pure parse/suggestion helpers — the TS
   product keeps the same single table in core and imports it from its TUI.
+- `extension_rpc`: the private, versioned NDJSON-over-stdio protocol between the pa-core extension host and the Node sidecar (handshake, RPC envelopes, registration payloads, `ExtensionError`). Both ends ship in the same release, so these types are strict (no catch-alls).
 
 Platform contracts (`platform`): the cross-crate transport, process-identity, and socket-identity helpers. pa-types is the only crate every transport consumer can depend on (pa-tui depends on pa-types alone), so the shared trait vocabulary and its cfg-gated Unix implementations live here. Windows support later means implementing these traits, not re-plumbing callers.
 
