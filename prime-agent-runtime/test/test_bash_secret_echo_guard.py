@@ -47,11 +47,9 @@ SECRET_ECHO_MATCHING_COMMANDS = [
     "cat ~/\".ssh\"/id_rsa", "cat ~/'.ssh'/id_rsa", "cat ~/\".ssh/id_rsa\"", "echo ~/'.aws'/credentials",
     "cat ~/'/'.ssh/id_rsa", "cat ~/'/'.ssh/'id_rsa'", "cat ~/'/'/.ssh/id_rsa",
     "cat ~/.aws/credentials", "cat $HOME/.aws/credentials",
-# The rule names the directory, so a run of slashes, a `.` or `..` component, a
-# glob, and the file next to the key all refuse with the key spelling.
+# The rule names the directory: a slash run, a `.`/`..` component, a glob, and the file next to the key refuse.
     "cat ~/.aws//credentials", "cat ~/.aws///credentials", "cat $HOME/.aws//credentials",
-    "cat ~/.aws/./credentials", "cat ~/.aws/../.aws/credentials", "cat ~/.aws/cred*",
-    "cat ~/.aws/config",
+    "cat ~/.aws/./credentials", "cat ~/.aws/../.aws/credentials", "cat ~/.aws/cred*", "cat ~/.aws/config",
     "cat ~/.gnupg/secring.gpg", "echo ~/.gnupg/secring.gpg",
 # Assignment prefixes: the shell runs the dump with those bindings set.
     "FOO=1 env", "FOO=1 printenv", "FOO=1 export -p",
@@ -69,8 +67,7 @@ SECRET_ECHO_MATCHING_COMMANDS = [
 # GNU grep reads a bare number as a context flag, like `-C2`.
     "env | grep -2 SAFE_VAR", "env | grep -10 SAFE_VAR", "env 2>&1 | grep -2 PATH",
     "env | grep --context=2 SAFE_VAR",
-# A redirect glued to the command word is still a redirect (`env>&2`), and a
-# `{name}` descriptor opens a new descriptor, so fd 1 keeps the dump.
+# A glued redirect is still a redirect (`env>&2`); `{name}` opens a new descriptor, so fd 1 keeps the dump.
     "env>&2", "env>&1", "env>/dev/null", "cat>&2 ~/.aws/credentials",
     "env {fd}>/tmp/log", "env {fd}>&2", "printenv {fd}>/tmp/log", "export -p {fd}>log",
     "env &>/dev/null", "env &>log", "env &>>log", "env -0 &>log",
@@ -620,8 +617,7 @@ class SecretEchoGuardTest(unittest.IsolatedAsyncioTestCase):
 
     def test_multibyte_control_escape_answers_a_verdict(self):
         # `\c` masks its operand's low five bits, and `'ß'.upper()` is two
-        # characters, so masking the code point keeps the scan answering a
-        # verdict instead of raising `ord`'s TypeError out of `bash()`.
+        # characters, so masking the code point answers instead of raising.
         self.assertIsNone(bash_module._secret_echo_violation("echo $'\\cß'"))
 
     def test_overlong_descriptor_returns_a_verdict(self):
