@@ -22,7 +22,20 @@ use crate::tools::ipython::{
 };
 
 use super::host_requests::SessionBinding;
+use super::rlm_host::{register_rlm_host_handlers, RlmHostBridge, RlmSubagentHost};
 use super::runtime::SessionRuntime;
+
+/// RLM inputs the session composition supplies: a shared model registry and
+/// the daemon child-session host. Both optional; defaults are derived from
+/// `agent_dir` (registry) or the no-children behavior (host).
+#[derive(Default)]
+pub struct RlmWiring {
+    /// Registry `rlm.find_models` searches. Defaults to the agent_dir catalog.
+    pub model_registry: Option<Arc<crate::models::registry::ModelRegistry>>,
+    /// Child-session machinery backing `rlm.spawn`/`rlm.create_session` and
+    /// the roster/collect/delete surface.
+    pub subagent_host: Option<Arc<dyn RlmSubagentHost>>,
+}
 
 /// Session-scoped runtime wiring: the shared session manager handle, the
 /// kernel host-handler registry, and the runtime itself.
@@ -30,13 +43,16 @@ pub struct SessionKernelWiring {
     pub session: Arc<tokio::sync::Mutex<SessionManager>>,
     pub handlers: HostRequestHandlers,
     pub runtime: Arc<SessionRuntime>,
+    /// The RLM bridge: progress-note state the daemon roster reads.
+    pub rlm: Arc<RlmHostBridge>,
 }
 
-/// Build the session runtime and register the `goal.*` / `rlm_heartbeat.*`
-/// host handlers the kernel reaches through its registry.
+/// Build the session runtime and register the `goal.*`, `rlm_heartbeat.*`,
+/// and `rlm.*` host handlers the kernel reaches through its registry.
 pub fn wire_session_runtime(
     session: SessionManager,
     agent_dir: &std::path::Path,
+    rlm: RlmWiring,
 ) -> SessionKernelWiring {
     let binding = SessionBinding {
         session_id: session.get_session_id().to_string(),
@@ -57,10 +73,20 @@ pub fn wire_session_runtime(
     let session = Arc::new(tokio::sync::Mutex::new(session));
     let mut handlers = HostRequestHandlers::default();
     runtime.register_host_handlers(session.clone(), &mut handlers);
+    let model_registry = rlm.model_registry.unwrap_or_else(|| {
+        let auth = crate::auth::AuthStorage::create(agent_dir);
+        Arc::new(crate::models::registry::ModelRegistry::create(
+            auth,
+            agent_dir.join("models.json"),
+        ))
+    });
+    let rlm_bridge = Arc::new(RlmHostBridge::new(model_registry, rlm.subagent_host));
+    register_rlm_host_handlers(&mut handlers, &rlm_bridge);
     SessionKernelWiring {
         session,
         handlers,
         runtime,
+        rlm: rlm_bridge,
     }
 }
 

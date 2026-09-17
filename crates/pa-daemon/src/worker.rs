@@ -22,7 +22,8 @@ use tokio::sync::{broadcast, oneshot, Notify};
 
 use crate::agent_engine::{AgentEngineConfig, AgentSessionEngine, SupervisorLinkConfig};
 use crate::engine::{
-    EngineEvent, EngineModelSelection, PromptRequest, ScriptedEngine, SessionEngine,
+    EngineEvent, EngineModelSelection, PromptRequest, RlmSessionIdentity, ScriptedEngine,
+    SessionEngine,
 };
 use crate::framing::{write_frame, DEFAULT_PRIVATE_FRAME_LIMITS};
 use crate::journal::WorkerRecoveryJournal;
@@ -156,6 +157,10 @@ pub(crate) struct SessionCore {
     /// The last broadcast queue snapshot (TS `_lastSessionActionSnapshot`):
     /// `session_action_update` fires only when the projection changed.
     last_action_snapshot: Option<SessionActionSnapshot>,
+    /// This session's RLM recursion depth (children run at depth + 1).
+    rlm_depth: u32,
+    /// `top-level` | `subagent` (summary `runtimeKind`).
+    runtime_kind: String,
 }
 
 impl crate::status_line::StatusSession for SessionCore {
@@ -308,6 +313,8 @@ impl Worker {
             // projection, so a fresh session's first empty snapshot is not
             // an update.
             last_action_snapshot: Some(SessionActionSnapshot::default()),
+            rlm_depth: 0,
+            runtime_kind: "top-level".to_string(),
         };
         let active_session_id = config.active_session_id.clone();
         let script = config.script.clone();
@@ -932,6 +939,20 @@ impl Worker {
             .and_then(Value::as_str)
             .map(paths::expand_tilde)
             .unwrap_or_else(|| paths::sessions_dir(&self.config.agent_dir));
+        // RLM recursion identity (children of an RLM parent run at depth+1):
+        // the durable create replays these so a respawned child keeps them.
+        let (rlm_depth, rlm_max_depth) = match create_payload_rlm_depth(payload) {
+            Ok(identity) => identity,
+            Err(error) => return response_failure(None, "create", &error, None),
+        };
+        let parent_session_path = payload
+            .get("parentSessionPath")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let thinking = payload
+            .get("thinking")
+            .and_then(Value::as_str)
+            .map(str::to_string);
 
         let mut store = match (&session_path, no_session) {
             (Some(path), false) if path.exists() => match SessionFile::open(path) {
@@ -952,7 +973,8 @@ impl Worker {
                 Err(error) => return response_failure(None, "create", &error.to_string(), None),
             },
             (Some(path), false) => {
-                let mut created = SessionFile::create(&cwd, None, 0);
+                let mut created =
+                    SessionFile::create(&cwd, parent_session_path.as_deref(), rlm_depth);
                 created.set_path(path.clone());
                 if let Err(error) = created.rewrite() {
                     return response_failure(None, "create", &error.to_string(), None);
@@ -972,7 +994,8 @@ impl Worker {
             }
             // In-memory session: no file, like the TS `noSession` create.
             (None, true) => {
-                let mut created = SessionFile::create(&cwd, None, 0);
+                let mut created =
+                    SessionFile::create(&cwd, parent_session_path.as_deref(), rlm_depth);
                 append_creation_prefix(
                     &mut created,
                     self.engine.as_ref(),
@@ -983,7 +1006,8 @@ impl Worker {
                 created
             }
             (None, false) => {
-                let mut created = SessionFile::create(&cwd, None, 0);
+                let mut created =
+                    SessionFile::create(&cwd, parent_session_path.as_deref(), rlm_depth);
                 let path = session_dir.join(session_file_name(created.session_id()));
                 created.set_path(path);
                 if let Err(error) = created.rewrite() {
@@ -1037,8 +1061,27 @@ impl Worker {
         core.store = Some(store);
         core.created = true;
         core.abort_requested = false;
+        core.rlm_depth = rlm_depth;
+        core.runtime_kind = if rlm_depth > 0 {
+            "subagent".to_string()
+        } else {
+            "top-level".to_string()
+        };
         let summary = self.summary_locked(&core);
         drop(core);
+        // Seed the engine's RLM identity: recursion depth and bound, this
+        // session's persistence ids, and the default thinking level its
+        // children inherit.
+        if let Err(error) = self.engine.configure_rlm_identity(RlmSessionIdentity {
+            rlm_depth,
+            rlm_max_depth,
+            cwd: Some(summary.cwd.clone()),
+            session_id: Some(summary.session_id.clone()),
+            session_file: summary.session_file.clone(),
+            thinking,
+        }) {
+            return response_failure(None, "create", &error.to_string(), None);
+        }
         // The engine renders this summary into the sender identity block
         // of worker-to-worker agent messages.
         if let Ok(summary_value) = serde_json::to_value(&summary) {
@@ -1136,7 +1179,7 @@ impl Worker {
             is_session_active: streaming || compacting || queued > 0,
             has_registered_cron_job: Some(false),
             last_activity_at,
-            rlm_depth: Some(0),
+            rlm_depth: Some(core.rlm_depth),
             active_session_id: Some(core.active_session_id.clone()),
             session_id: store
                 .map(|s| s.session_id().to_string())
@@ -1155,7 +1198,7 @@ impl Worker {
             created: store.map(|s| s.header.timestamp.clone()),
             modified,
             first_message: store.and_then(|s| s.first_message()),
-            parent_session_path: None,
+            parent_session_path: store.and_then(|store| store.header.parent_session.clone()),
             usage,
             worker_state: Some("ready".to_string()),
             worker_pid: Some(std::process::id()),
@@ -1163,7 +1206,7 @@ impl Worker {
             summary: None,
             task_state: None,
             model: None,
-            runtime_kind: Some("top-level".to_string()),
+            runtime_kind: Some(core.runtime_kind.clone()),
             unfinished_action_count: Some(0),
         }
     }
@@ -1872,6 +1915,25 @@ fn active_session_id_of(payload: &[u8]) -> String {
 
 fn worker_server_capabilities() -> Vec<String> {
     default_server_capabilities()
+}
+
+/// RLM depth fields of a create payload: `(depth, max_depth)`. Values must
+/// be non-negative integers that fit a u32; anything else fails the create
+/// instead of silently truncating.
+fn create_payload_rlm_depth(payload: &Value) -> Result<(u32, Option<u32>), String> {
+    fn parse(payload: &Value, key: &str) -> Result<Option<u32>, String> {
+        match payload.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .map(Some)
+                .ok_or_else(|| format!("create {key} must be a non-negative integer")),
+        }
+    }
+    let depth = parse(payload, "rlmDepth")?.unwrap_or(0);
+    let max_depth = parse(payload, "rlmMaxDepth")?;
+    Ok((depth, max_depth))
 }
 
 /// Creation prefix for a daemon-hosted session file (TS `createAgentSession`

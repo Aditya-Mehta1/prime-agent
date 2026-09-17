@@ -129,6 +129,7 @@ async fn print_mode_main(options: &RunOptions) -> Result<i32, String> {
                 .map(|path| path.display().to_string())
                 .collect(),
             extra_builtin_skill_overrides: vec![],
+            rlm_subagent_host: None,
         },
     )
     .await
@@ -605,6 +606,7 @@ async fn faux_print_mode(options: &RunOptions, script: &str) -> Result<i32, Stri
             additional_skill_paths: vec![],
             additional_prompt_paths: vec![],
             extra_builtin_skill_overrides: vec![],
+            rlm_subagent_host: None,
         },
     )
     .await

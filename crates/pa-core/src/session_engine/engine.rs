@@ -55,6 +55,8 @@ pub struct SessionEngineConfig {
     /// Force-exclude patterns for built-in skills (e.g. unauthenticated
     /// integrations); the MCP manager seam.
     pub extra_builtin_skill_overrides: Vec<String>,
+    /// Daemon child-session host backing the `rlm.*` recursion surface.
+    pub rlm_subagent_host: Option<Arc<dyn super::rlm_host::RlmSubagentHost>>,
 }
 
 /// An assembled, running session.
@@ -133,7 +135,14 @@ pub async fn create_session(config: SessionEngineConfig) -> anyhow::Result<Sessi
                     .map(|path| path.display().to_string())
             })
     };
-    let wiring = super::runtime_wiring::wire_session_runtime(session_manager, &config.agent_dir);
+    let wiring = super::runtime_wiring::wire_session_runtime(
+        session_manager,
+        &config.agent_dir,
+        super::runtime_wiring::RlmWiring {
+            model_registry: None,
+            subagent_host: config.rlm_subagent_host.clone(),
+        },
+    );
 
     let settings = crate::settings::SettingsManager::create(&cwd, &config.agent_dir);
     let service_tier_preference = settings.get_default_service_tier();
@@ -402,6 +411,7 @@ mod tests {
             additional_skill_paths: vec![],
             additional_prompt_paths: vec![],
             extra_builtin_skill_overrides: vec![],
+            rlm_subagent_host: None,
         })
         .await
         .unwrap();

@@ -238,41 +238,36 @@ returning `CompactionResult`; `abort_compaction`; `set_auto_compaction`.
   product-path handler, so the model cannot trigger compaction of its own
   session; see `docs/completion-matrix.md` family 6.
 
-## 6. `rlm.create_session` through the daemon - missing
+## 6. `rlm.create_session` through the daemon - implemented
 
 TS: kernel `prime-agent-runtime/src/rlm/__init__.py` `create_session` ->
 `host_request("rlm.create_session")`; daemon-mode `createRlmRootSession`
 (L2627) creates a depth-0 resident session over the supervisor link and
 prompts it.
 
-- missing: no host handler is registered for `rlm.create_session` (or
-  `rlm.run`/`rlm.find_models`) anywhere in the product path.
-  `crates/pa-core/src/session_engine/runtime_wiring.rs` registers only
-  `goal.*`, `rlm_heartbeat.*`, `agent_message.send`, `agent_observe.*`, and
-  `mcp.*`; `crates/pa-core/src/kernel/rlm_runtime.rs` holds the pure helpers
-  (name/thinking/model validation, model search) with handlers unbuilt.
-- The system prompt already documents the surface
-  (`crates/pa-core/src/prompts/mod.rs` L165), so the model believes it exists.
+- implemented: `crates/pa-core/src/session_engine/rlm_host.rs` registers the
+  `rlm.*` host handlers (`rlm.run`/spawn, `rlm.find_models`,
+  `rlm.create_session`, `rlm.progress_note`, `rlm.list_subagents`,
+  `rlm.delete_subagent`, `rlm.collect`) through the session runtime wiring
+  (`runtime_wiring.rs`); the no-children default keeps the handler surface
+  with TS-parity errors.
+- the daemon implements the `RlmSubagentHost` seam
+  (`crates/pa-daemon/src/rlm_children.rs`) over the worker's shared
+  supervisor link: one supervised worker process per child, created through
+  the supervisor like any other session; parent-side roster, collect
+  snapshots, and TS-verbatim selector errors. Mechanism note: the TS daemon
+  hosts children in-process; the redesign keeps the kernel-visible surface
+  (PORTING-NOTES).
+- verified: `crates/pa-daemon/tests/rlm_children_e2e.rs` (spawn/roster/
+  collect/delete/create_session/recursion bound against the real
+  supervisor, including the child session file's `parentSession`/`rlmDepth`
+  header parity).
 
-Status note (surface-audit refresh): still missing on `main`; the
-unmerged lane `lane/rlm` (commits `5d09e36`, `5426b3b`, `4c2254c`, `7ae53d0`)
-carries the `rlm.*` handlers and child-session machinery. The user-facing
-picture lives in `docs/completion-matrix.md` families 9-10.
-
-Follow-up spec (RLM lane, large): register `rlm.run` (spawn), `rlm.find_models`,
-`rlm.create_session`, `rlm.progress_note`, `rlm.list_subagents`,
-`rlm.delete_subagent` host handlers in `runtime_wiring.rs`; the subagent
-machinery (child sessions, roster, collect) is the prerequisite for everything
-except `rlm.find_models`.
-
-`rlm.collect` fan-in (filed from the thin3 stage-3 lane): the runtime's
-`collect()` sends `host_request("rlm.collect", {"targets": [selectors],
-"timeout_ms": N})` and expects `{"results": [...]}` entries with
-`rlm_child_id`, terminal `status`, `settled`, and an answer preview. It is
-blocked on the same prerequisite (`rlm.run` + the child registry); once the
-registry exists, the snapshot handler is small and the parent-child
-follow-up messaging already rides the stage-3 roster/peer plumbing
-(`crates/pa-daemon/src/agent_messaging.rs`). Not implemented in stage 3.
+The `rlm.collect` fan-in rides the same registry: the runtime's `collect()`
+sends `host_request("rlm.collect", {"targets": [selectors], "timeout_ms":
+N})`; the host resolves selectors (child ids, session ids, names) with the
+TS selector errors and returns `{"results": [...]}` entries with
+`rlm_child_id`, terminal `status`, `settled`, and an answer preview.
 
 ## 7. Read-command surface (`get_session_stats` / `get_context_tree` / `get_commands` / `get_resource_snapshot`) - partial
 

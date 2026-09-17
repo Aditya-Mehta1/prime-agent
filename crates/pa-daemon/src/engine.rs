@@ -89,6 +89,21 @@ pub enum EngineEvent {
     },
 }
 
+/// RLM recursion identity carried by a session's create command: the
+/// session's depth in the recursion tree, its bound, its working directory
+/// and persistence ids, and the default thinking level children inherit.
+/// Engines hosting RLM children seed their child registry from it; engines
+/// without children (the scripted harness) accept and ignore it.
+#[derive(Debug, Clone, Default)]
+pub struct RlmSessionIdentity {
+    pub rlm_depth: u32,
+    pub rlm_max_depth: Option<u32>,
+    pub cwd: Option<String>,
+    pub session_id: Option<String>,
+    pub session_file: Option<String>,
+    pub thinking: Option<String>,
+}
+
 /// The turn behavior a worker session runs.
 pub trait SessionEngine: Send + Sync {
     /// Run one prompt. `prompt_index` counts accepted prompts for this
@@ -162,6 +177,13 @@ pub trait SessionEngine: Send + Sync {
     /// agent engine renders it into the sender identity block of
     /// worker-to-worker agent messages; scripted engines ignore it.
     fn set_session_summary(&self, _summary: Value) {}
+
+    /// Adopt the RLM identity from the session's create command. Fails when a
+    /// carried value is invalid (an unknown thinking level), so the create
+    /// fails instead of a later turn.
+    fn configure_rlm_identity(&self, _identity: RlmSessionIdentity) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// One compaction request (the `compact` command fields).

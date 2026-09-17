@@ -774,6 +774,14 @@ impl Supervisor {
         if let Some(api_key) = &model_selection.api_key {
             durable_rest.insert("apiKey".to_string(), json!(api_key));
         }
+        // RLM recursion identity and thinking level ride the durable create
+        // command so a respawned child keeps them (children of an RLM parent
+        // must not forget their depth).
+        for key in ["thinking", "rlmDepth", "rlmMaxDepth", "parentSessionPath"] {
+            if let Some(value) = config_object.and_then(|config| config.get(key)) {
+                durable_rest.insert(key.to_string(), value.clone());
+            }
+        }
         let descriptor = DaemonWorkerDescriptor {
             version: 2,
             worker_id: worker_id.clone(),

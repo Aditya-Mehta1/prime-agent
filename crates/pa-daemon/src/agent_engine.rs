@@ -28,6 +28,7 @@ use crate::engine::{
     CompactionOutcome, CompactionRequest, CompactionRun, EngineEvent, EngineModelSelection,
     PromptRequest, SessionEngine, SideQuestionOutcome, SideQuestionRequest,
 };
+use crate::rlm_children::{ParentIdentity, SupervisorChildSessions, DEFAULT_RLM_MAX_DEPTH};
 
 /// Configuration for the real engine.
 #[derive(Debug, Clone)]
@@ -74,8 +75,17 @@ pub struct AgentSessionEngine {
     /// (create config or worker env) and is re-bound when a session's create
     /// command carries explicit wire flags.
     selection: std::sync::RwLock<EngineModelSelection>,
+    /// The default thinking level from the session's create command.
+    thinking: std::sync::RwLock<Option<String>>,
     /// Built once on the first prompt, reused across prompts.
     pub(crate) session: tokio::sync::Mutex<Option<CoreSessionEngine>>,
+    /// One shared supervisor-link client for the worker: agent messaging
+    /// and supervisor-backed RLM children multiplex the same connection
+    /// (the TS worker's single `SupervisorLink` socket). Unconnected until
+    /// the first request; standalone workers never use it.
+    link: Arc<crate::supervisor_link::SupervisorLink>,
+    /// Supervisor-backed RLM children; `None` for standalone workers.
+    children: Option<Arc<SupervisorChildSessions>>,
     /// This worker's own session summary (worker-pushed at create/rename),
     /// read by the kernel messaging controller to render sender identity.
     own_summary: std::sync::Arc<std::sync::Mutex<Option<Value>>>,
@@ -106,16 +116,36 @@ impl AgentSessionEngine {
                 api_key: None,
             }
         };
+        // One shared supervisor-link client for the worker: agent messaging
+        // and supervisor-backed RLM children multiplex the same connection
+        // (the TS worker's single `SupervisorLink` socket).
+        let link = Arc::new(crate::supervisor_link::SupervisorLink::new(
+            config
+                .supervisor_link
+                .as_ref()
+                .map(|link_config| link_config.socket_path.clone())
+                .unwrap_or_default(),
+        ));
+        let children = config.supervisor_link.as_ref().map(|link_config| {
+            Arc::new(SupervisorChildSessions::new(
+                Arc::clone(&link),
+                config.agent_dir.clone(),
+                link_config.active_session_id.clone(),
+            ))
+        });
         Ok(Self {
             runtime,
             config,
             session_file,
             selection: std::sync::RwLock::new(selection),
+            thinking: std::sync::RwLock::new(None),
             session: tokio::sync::Mutex::new(None),
             own_summary: std::sync::Arc::new(std::sync::Mutex::new(None)),
             autonomous: std::sync::Mutex::new(
                 pa_core::autonomous::create_autonomous_runtime_state(None, None),
             ),
+            link,
+            children,
         })
     }
 
@@ -227,16 +257,13 @@ impl AgentSessionEngine {
     /// worker: without a supervisor there is nobody to reach.
     fn extra_host_handlers(&self) -> Option<HostRequestHandlers> {
         let config = self.config.supervisor_link.as_ref()?;
-        let link = Arc::new(crate::supervisor_link::SupervisorLink::new(
-            config.socket_path.clone(),
-        ));
         let sender = Arc::new(LinkAgentMessageController::new(
-            Arc::clone(&link),
+            Arc::clone(&self.link),
             config.active_session_id.clone(),
             config.worker_token.clone(),
             Arc::clone(&self.own_summary),
         ));
-        let observer = Arc::new(LinkAgentObserveController::new(link));
+        let observer = Arc::new(LinkAgentObserveController::new(Arc::clone(&self.link)));
         let mut handlers = HostRequestHandlers::default();
         register_agent_message_host_handlers(sender, &mut handlers);
         register_agent_observe_host_handlers(observer, &mut handlers);
@@ -257,11 +284,17 @@ impl AgentSessionEngine {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        // Children inherit the parent model selector; the engine resolves
+        // the model here, after the create command set the rest of the
+        // parent identity.
+        if let Some(children) = &self.children {
+            children.set_model(format!("{}/{}", model.provider, model.id));
+        }
         pa_core::session_engine::engine::create_session(SessionEngineConfig {
             cwd: self.config.cwd.clone(),
             agent_dir: self.config.agent_dir.clone(),
             model: Some(agent_model),
-            thinking_level: None,
+            thinking_level: self.thinking_level(),
             stream_fn: Some(stream_fn),
             // Model tools: `ipython` only (kernel-resident bash/edit parity);
             // the engine adds the kernel-backed `ipython` tool itself.
@@ -276,8 +309,27 @@ impl AgentSessionEngine {
             additional_skill_paths: vec![],
             additional_prompt_paths: vec![],
             extra_builtin_skill_overrides: vec![],
+            rlm_subagent_host: self.children.clone().map(|children| {
+                children as Arc<dyn pa_core::session_engine::rlm_host::RlmSubagentHost>
+            }),
         })
         .await
+    }
+
+    /// The session's thinking level from the create command (validated at
+    /// `configure_rlm_identity` time), when set.
+    fn thinking_level(&self) -> Option<pa_agent::types::ThinkingLevel> {
+        let name = self.thinking.read().expect("thinking lock").clone()?;
+        match name.as_str() {
+            "off" => Some(pa_agent::types::ThinkingLevel::Off),
+            "minimal" => Some(pa_agent::types::ThinkingLevel::Minimal),
+            "low" => Some(pa_agent::types::ThinkingLevel::Low),
+            "medium" => Some(pa_agent::types::ThinkingLevel::Medium),
+            "high" => Some(pa_agent::types::ThinkingLevel::High),
+            "xhigh" => Some(pa_agent::types::ThinkingLevel::Xhigh),
+            "max" => Some(pa_agent::types::ThinkingLevel::Max),
+            _ => None,
+        }
     }
 }
 
@@ -420,6 +472,31 @@ impl SessionEngine for AgentSessionEngine {
                 }
             }
         }
+    }
+
+    fn configure_rlm_identity(
+        &self,
+        identity: crate::engine::RlmSessionIdentity,
+    ) -> anyhow::Result<()> {
+        if let Some(thinking) = &identity.thinking {
+            pa_ai::models::thinking_level_from_str(thinking)
+                .ok_or_else(|| anyhow::anyhow!("unknown thinking level \"{thinking}\""))?;
+        }
+        *self.thinking.write().expect("thinking lock") = identity.thinking.clone();
+        if let Some(children) = &self.children {
+            let parent = ParentIdentity {
+                rlm_depth: identity.rlm_depth,
+                rlm_max_depth: identity.rlm_max_depth.unwrap_or(DEFAULT_RLM_MAX_DEPTH),
+                model: None,
+                cwd: identity.cwd.clone(),
+                session_id: identity.session_id.clone(),
+                session_file: identity.session_file.clone(),
+                thinking: identity.thinking.clone(),
+                child_script: None,
+            };
+            children.set_identity(parent);
+        }
+        Ok(())
     }
 
     fn run_side_question(

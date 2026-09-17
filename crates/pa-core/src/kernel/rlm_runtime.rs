@@ -31,7 +31,7 @@ impl RlmModelInfo {
 }
 
 /// One search match returned to the kernel.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RlmModelMatch {
     pub provider: String,
     pub id: String,

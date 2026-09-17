@@ -28,7 +28,7 @@ below is evidence-based, not battery-based.
 | 6 | Compaction | complete (daemon wire) | kernel `compact.run` host handler missing (model cannot compact itself) |
 | 7 | Side questions | complete | - |
 | 8 | Agent-to-agent messaging | partial | peer transport done; saved-session wake, `custom` persistence, family-graph relations missing |
-| 9 | RLM recursion (`rlm.spawn`/`collect`/subagents) | in-flight | all `rlm.*` host handlers unregistered on `main`; `lane/rlm` in flight |
+| 9 | RLM recursion (`rlm.spawn`/`collect`/subagents) | partial | `rlm.*` handlers + supervisor-backed child sessions land with the `lane/rlm` PR; kernel-side dogfood (row 11) still untested |
 | 10 | Kernel host-request surface & continual harness | partial | only goal/heartbeat/messaging handlers registered; `refine.*`, `compact.run`, `harness.*`, `model.info` unregistered despite prompt advertising them |
 | 11 | RLM dogfood (this harness, run by the Rust binary) | missing | mission-host dogfood untested; depends on rows 9-10 |
 | 12 | MCP | partial | CLI config/catalog/gating only; product-path wiring, OAuth/login UI, generic connector execution unproven |
@@ -164,20 +164,18 @@ Remaining (checklist §10 "deferred gaps" stands): saved-session wake,
 `customType: "agent_message"` persistence, family-graph-derived sender
 relations.
 
-## 9. RLM recursion - in-flight
+## 9. RLM recursion - partial (in review)
 
-On `main`, no `rlm.*` host handler is registered anywhere in the product
-path: `pa-core/src/session_engine/runtime.rs` L54 registers only
-`goal.{get,create,complete}` and `rlm_heartbeat.{create,list,update,delete}`;
-the daemon worker adds only `agent_message.send` + `agent_observe.*`
-(`pa-daemon/src/agent_engine.rs` L228-256 `extra_host_handlers`). The TS
-equivalents are `agent-session.ts` L10375-10415 (`rlm.run`, `rlm.create_session`,
-`rlm.find_models`, `rlm.list_subagents`, `rlm.collect`, `rlm.progress.note`,
-`rlm.delete_subagent`). The pure kernel helpers exist
-(`pa-core/src/kernel/rlm_runtime.rs`), and the system prompt already advertises
-the whole surface (`pa-core/src/prompts/mod.rs` L165) - so the model believes
-`rlm.spawn` works when it does not. Lane `lane/rlm` (unmerged,
-`5d09e36`/`5426b3b`/`4c2254c`/`7ae53d0`) carries the child machinery.
+The `lane/rlm` PR registers every `rlm.*` host handler in the product path
+(`pa-core/src/session_engine/rlm_host.rs` via `runtime_wiring.rs`:
+`rlm.run`, `rlm.create_session`, `rlm.find_models`, `rlm.list_subagents`,
+`rlm.collect`, `rlm.progress_note`, `rlm.delete_subagent`) and lands the
+child machinery: supervisor-backed child sessions
+(`pa-daemon/src/rlm_children.rs` over the shared supervisor link), the
+parent-side roster/collect/delete surface with TS-verbatim selector
+errors, and the e2e verifier (`pa-daemon/tests/rlm_children_e2e.rs`).
+Remaining: end-to-end dogfood under a live provider (row 11) and live
+tool-activity introspection in roster rows.
 
 ## 10. Kernel host-request surface & continual harness - partial
 
@@ -204,7 +202,8 @@ Missing product-path handlers (all advertised by the system prompt,
 The mission's own success criterion - running Prime Agent sessions on the
 Rust binary as the harness (this very session's control loop) - is untested:
 it needs families 9 and 10 first (child spawn/collect, harness CRUD, refine).
-The handler/child machinery exists only on the unmerged `lane/rlm`.
+The child spawn/collect machinery lands with the `lane/rlm` PR; the
+continual-harness handler family (10) is still open.
 
 ## 12. MCP - partial
 

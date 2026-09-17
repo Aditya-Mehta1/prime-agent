@@ -100,6 +100,19 @@ impl ModelRegistry {
             .collect()
     }
 
+    /// Models `rlm.find_models` may search: auth-configured, and not on a
+    /// stale or expired provider credential.
+    pub fn get_rlm_searchable_models(&self) -> Vec<&Model> {
+        self.get_available()
+            .into_iter()
+            .filter(|model| {
+                let status = self.auth.get_auth_status(&model.provider);
+                status.source != Some(crate::auth::types::AuthSource::Stale)
+                    && status.label.as_deref() != Some("expired")
+            })
+            .collect()
+    }
+
     pub fn has_configured_auth(&self, model: &Model) -> bool {
         self.auth.has_auth(&model.provider)
             || self.has_configured_provider_request_auth(&model.provider)

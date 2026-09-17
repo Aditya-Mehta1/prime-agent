@@ -23,6 +23,7 @@ pub mod messages;
 pub mod provider_adapter;
 pub mod provider_retry;
 pub mod refine;
+pub mod rlm_host;
 pub mod runtime;
 pub mod runtime_wiring;
 pub mod session_commands;

@@ -18,7 +18,15 @@ for a source worker's kernel `agent_message.send`, direct
 routed `send_message` as the never-retried fallback), wire protocol serve/negotiation (including the
 `compact`/`abort_compaction`/`set_auto_compaction` commands and their
 `compaction_start`/`compaction_end` events), cloud sandbox attach, session
-leases (`core/session-lease.ts` port). Per-session model binding: the
+leases (`core/session-lease.ts` port). Supervisor-backed RLM child sessions
+(`rlm_children.rs`, the daemon side of the pa-core `RlmSubagentHost` seam):
+`rlm.spawn`/`rlm.create_session` create real daemon sessions through the
+worker's supervisor link - one supervised worker process per child - and the
+parent-side registry serves `rlm.list_subagents`/`rlm.collect`/
+`rlm.delete_subagent` with TS-parity selector errors; child model resolution
+and thinking-level validation live in `rlm_child_model.rs`; the create
+command carries the RLM recursion identity (`rlmDepth`/`rlmMaxDepth`/
+`parentSessionPath`/`thinking`) so respawned children keep their depth. Per-session model binding: the
 create-config `provider`/`model`/`apiKey` are authoritative for worker model
 resolution (explicit CLI flags reach the worker; env remains the no-flag
 fallback). Post-turn status-line requests (dashboard recap,
