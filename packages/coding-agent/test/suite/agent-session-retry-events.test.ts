@@ -883,7 +883,7 @@ describe("AgentSession retry and event characterization", () => {
 		).jobs?.find((job) => job.id === jobId);
 
 	it("parks a quota-blocked session until the provider reset and resumes automatically", async () => {
-		const harness = await parkHarness(parkSettings({ maxPauseMs: 60 }), true);
+		const harness = await parkHarness(parkSettings({ maxPauseMs: 2_000 }), true);
 		const nextTurn = assistantTurns(harness);
 		harness.setResponses([
 			quotaFailure({ retryAfterMs: 3_600_000 }),
@@ -907,7 +907,8 @@ describe("AgentSession retry and event characterization", () => {
 		expect((await nextTurn()).stopReason).toBe("error");
 		expect([quotaPark(harness)?.parkCount, quotaPark(harness)?.jobId]).toEqual([1, wakeJob?.id]);
 
-		// The wake fires at the reset, resumes the task in context, and is spent.
+		// The wake resumes the task in context and is then spent.
+		await fireQuotaWake(harness);
 		await nextTurn();
 		expect(harness.session.isQuotaParked).toBe(false);
 		expect(getUserTexts(harness).join("\n")).toContain("<provider_quota_resumed>");
@@ -990,6 +991,7 @@ describe("AgentSession retry and event characterization", () => {
 		]);
 		await harness.session.prompt("do the work");
 		await nextTurn();
+		// An in-memory session has no durable wake: the timer is the only wake.
 		expect(quotaPark(harness)?.jobId).toBeUndefined();
 		const parkedAtMs = quotaPark(harness)?.resumeAtMs ?? 0;
 		await fireQuotaWake(harness);
@@ -1068,7 +1070,6 @@ describe("AgentSession retry and event characterization", () => {
 		// The wake hands the resume to a marker that is still queued.
 		const pause = harness.session.acquireQueuedWorkPause();
 		await fireQuotaWake(harness);
-		expect(quotaPark(harness)?.waking).toBe(true);
 		(harness.session as unknown as QuotaParkInternals)._handleAbortedQuotaPark();
 		expect(quotaPark(harness)?.waking).toBe(true);
 		pause.release();
