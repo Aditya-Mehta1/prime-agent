@@ -169,6 +169,11 @@ SUDO_MATCHING_COMMANDS = [
     "cat <<EOF | find . -maxdepth 0 -execdir sh -s {} \\;\nsudo id\nEOF",
     "cat <<EOF | xargs -n1 sh\nsudo id\nEOF",
     "shopt -s expand_aliases; alias p='sudo id'; p",
+    "shopt -s expand_aliases\nalias p='sh'\ncat <<EOF | p\nsudo id\nEOF",
+    "shopt -s expand_aliases\nalias p='sh'\np <<EOF\nsudo id\nEOF",
+    "shopt -s expand_aliases\nalias p=$'sh'\ncat <<EOF | p\nsudo id\nEOF",
+    "shopt -s expand_aliases\nalias p='eval'\ncat <<EOF | p sh\nsudo id\nEOF",
+    "shopt -s expand_aliases\nalias p='sh'\np < <(printf 'sudo id')",
     "sudo",
 ]
 
@@ -216,6 +221,7 @@ SUDO_NON_MATCHING_COMMANDS = [
     "grep bash <<EOF\nsudo id\nEOF",
     "cat <<EOF | command -v sh\nsudo id\nEOF",
     "cat <<EOF | command -V sh\nsudo id\nEOF",
+    "shopt -s expand_aliases\nalias p='ls'\ncat <<EOF\nsudo id\nEOF",
     "bash <(echo hi)",
     "CMD=ls; eval \"$CMD\"",
     "echo {a,b}",

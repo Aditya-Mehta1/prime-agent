@@ -642,8 +642,13 @@ def _scan_text(text: str, depth: int, parent_mentions_sudo: bool = False) -> str
         if violation:
             return violation
     # A heredoc body that the same text feeds to a runner is a script, not data.
-    if depth < _MAX_PAYLOAD_DEPTH and any(
-        os.path.basename(words[position].value) in _PAYLOAD_RUNNERS for position in command_words
+    runner_alias = _alias_body_names_runner(words, command_words)
+    if depth < _MAX_PAYLOAD_DEPTH and (
+        runner_alias
+        or any(
+            os.path.basename(words[position].value) in _PAYLOAD_RUNNERS
+            for position in command_words
+        )
     ):
         for word in words:
             if word.is_data or not word.heredoc_body:
@@ -651,6 +656,10 @@ def _scan_text(text: str, depth: int, parent_mentions_sudo: bool = False) -> str
             violation = _scan_text(word.heredoc_body, depth + 1, inner)
             if violation:
                 return violation
+    if runner_alias and depth < _MAX_PAYLOAD_DEPTH:
+        # An alias whose body names a runner can still read a redirect as its
+        # script, so judge this text's redirects the way a runner's own are judged.
+        return _scan_script_source(words, list(range(len(words))), depth, inner)
     return None
 
 
@@ -884,6 +893,28 @@ def _top_level_split(body: str) -> list[str]:
     return parts
 
 
+def _alias_body(word: _Word) -> str | None:
+    """Value half of an `alias NAME=BODY` operand, else None."""
+    if word.is_data or word.is_redirect or "=" not in word.value:
+        return None
+    return word.value.partition("=")[2].lstrip("+") or None
+
+
+def _alias_body_names_runner(words: list[_Word], command_words: set[int]) -> bool:
+    """True when an alias defined in this text runs a payload runner as its command."""
+    for index in command_words:
+        if os.path.basename(words[index].value) != "alias":
+            continue
+        for candidate in _segment_tail(words, index + 1):
+            body = _alias_body(words[candidate])
+            if body is None:
+                continue
+            first = next((word for word in _tokenize(body) if not word.is_operator), None)
+            if first is not None and os.path.basename(first.value) in _PAYLOAD_RUNNERS:
+                return True
+    return False
+
+
 def _split_option(
     value: str, options: frozenset[str], value_letters: str = ""
 ) -> tuple[str | None, str | None]:
@@ -1047,10 +1078,10 @@ def _scan_script_source(
 def _scan_alias_bodies(words: list[_Word], start: int, depth: int) -> str | None:
     """An alias body is text that a later use of the alias runs."""
     for candidate in _segment_tail(words, start):
-        word = words[candidate]
-        if word.is_data or word.is_redirect or "=" not in word.value:
+        body = _alias_body(words[candidate])
+        if body is None:
             continue
-        violation = _scan_text(word.value.partition("=")[2].lstrip("+"), depth + 1)
+        violation = _scan_text(body, depth + 1)
         if violation:
             return violation
     return None
