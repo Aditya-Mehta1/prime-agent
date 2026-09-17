@@ -2525,10 +2525,27 @@ def _fp_unresolvable_command_words(
         # A substitution interior is its own command text (`echo "$(c=git; $c
         # push -f origin main)"` really runs the push), so a command word that
         # starts one is judged here too, even though the enclosing word is the
-        # one the enclosing command passes on.
+        # one the enclosing command passes on. Its run ends at the enclosing
+        # word, and the prefix walk below steps over the interior's own words
+        # the way it steps over a top-level run.
+        interior = _fp_contained_in_later_word(words, index)
+        run_end = (
+            next(
+                (
+                    probe
+                    for probe in range(index, total)
+                    if not _fp_contained_in_later_word(words, probe)
+                ),
+                total,
+            )
+            if interior
+            else total
+        )
         probe = index
         wrapper = ""
-        while probe < total and not _fp_contained_in_later_word(words, probe):
+        while probe < run_end and (
+            interior or not _fp_contained_in_later_word(words, probe)
+        ):
             value = words[probe].value
             if _FP_ENV_ASSIGNMENT.match(value) or value.startswith("-"):
                 # An env assignment or a wrapper option: the command word is
@@ -2538,8 +2555,8 @@ def _fp_unresolvable_command_words(
                 if (
                     option is not None
                     and glued is None
-                    and probe < total
-                    and not _fp_contained_in_later_word(words, probe)
+                    and probe < run_end
+                    and (interior or not _fp_contained_in_later_word(words, probe))
                 ):
                     probe += 1  # the option's value (`env -u NAME`) is not it
                 continue
@@ -2555,7 +2572,7 @@ def _fp_unresolvable_command_words(
                 probe += 1
                 continue
             break
-        if probe >= total or (probe != index and words[probe].starts_command):
+        if probe >= run_end or (probe != index and words[probe].starts_command):
             # The prefix had no command of its own (`X=1; git ...`): the next
             # run is handled on its own.
             index += 1

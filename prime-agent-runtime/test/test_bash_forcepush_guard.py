@@ -101,8 +101,7 @@ FORCE_PUSH_MATCHING_COMMANDS = [
     "git push --force origin main", "git push -f origin main",
     "git push origin main -f", "git push -f origin main:main",
     "git push -f origin main:refs/heads/main", "git push -f origin refs/heads/main",
-    "git push -f origin HEAD:main", "git push -f origin HEAD:heads/main",
-    "git push -f origin main:heads/main",
+    "git push -f origin HEAD:main", "git push -f origin HEAD:heads/main", "git push -f origin main:heads/main",
     # `-oo` is `-o o`: the rest of that cluster is the option's value and the
     # next token is still a flag, so `-f` is a real force.
     "git push -oo -f origin main", "git push -f origin :main", "git push -f origin main:",
@@ -111,8 +110,7 @@ FORCE_PUSH_MATCHING_COMMANDS = [
     "git push -f", "git push -f origin", "git push -f --all", "git push --force --mirror origin",
     # `--mirror` is `--all` plus a forced push of every ref, so it carries
     # force without a force flag; `--all` alone stays non-force.
-    "git push --mirror origin", "git push --mirror",
-    "git push -fv origin main", "git push -f origin main --",
+    "git push --mirror origin", "git push --mirror", "git push -fv origin main", "git push -f origin main --",
     "git push --force --repo=origin main", "git push -f --delete origin main",
     "git push --force-with-lease -f origin main", "/usr/bin/git push -f origin main",
     '"git" push -f origin main', "git 'push' -f origin main",
@@ -630,8 +628,7 @@ class ForcePushEnvPayloadTest(unittest.TestCase):
                  "env --split 'git push -f origin main'", "env -S 'eval \"git push -f origin main\"'",
                  "env -S 'sh -c \"git push -f origin main\"'", "env -S " + json.dumps(_sh_payload_chain(3)),
                  # A payload with no command word leaves env's options open.
-                 "env --split-string= -S 'git push -f origin main'",
-                 "env -S '' -S 'git push -f origin main'",
+                 "env --split-string= -S 'git push -f origin main'", "env -S '' -S 'git push -f origin main'",
                  "env -S'' -S 'git push -f origin main'", "env -S -S 'git push -f origin main'",
                  "env -S'   ' -S 'git push -f origin main'", "env -S '-i' -S 'git push -f origin main'"],
             bash_module._fp_env_payloads_hide_force_push,
@@ -1230,8 +1227,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         repo, _bare = self._make_repo("repo-alias")
         os.chdir(repo)
         await self._refused_all(
-            ["git -c alias.p='push -f origin main' p",
-             "git -c alias.a=p -c alias.p='push -f origin main' a",
+            ["git -c alias.p='push -f origin main' p", "git -c alias.a=p -c alias.p='push -f origin main' a",
              "git -c alias.p='push -f origin main' -C . p"],
             ("main",),
         )
@@ -1510,9 +1506,17 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
              # A substitution interior is its own command text, so a command
              # word the guard cannot resolve inside one counts too.
              """echo "$(c=git; $c push -f origin main)" """,
-             """echo $(c=git; $c push -f origin main)""", """x=$(c=git; $c push -f origin main)"""],
+             """echo $(c=git; $c push -f origin main)""", """x=$(c=git; $c push -f origin main)""",
+             # The interior's own prefix walk steps over assignments and
+             # wrappers the way a top-level run does (each of these really ran
+             # the push with `c=git` set before this rule).
+             """echo $(FOO=1 $c push -f origin main)""",
+             """echo $(command $c push -f origin main)""",
+             """echo $(env -i $c push -f origin main)""",
+             """x=$(env -u FOO $c push -f origin main)"""],
             ('Refusing to run this force-push command',)
         )
+        self.assertIsNone(self._guard_verdict("echo $(FOO=1 git status)"))
         # The backtick analogue with a trailing backtick is not a bypass: bash
         # ends the substitution at the first unescaped backtick, so the single
         # quote inside it is unterminated and bash reports
@@ -1670,8 +1674,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
              'c=git; "$c" push -f origin main', '"$(printf git)" push -f origin main',
              '"$(which git)" push -f origin main', "c=git; command $c push -f origin main",
              "c=git; command -p $c push -f origin main", "c=git; env -i $c push -f origin main", "c=git; env -u FOO $c push -f origin main",
-             'echo a\\\n;ssh build-box "git push -f origin main"',
-             '"ssh" build-box "git push -f origin main"',
+             'echo a\\\n;ssh build-box "git push -f origin main"', '"ssh" build-box "git push -f origin main"',
              # A parse-options abbreviation is a force signal in the text too.
              'ssh build-box "git push --mir origin"', 'ssh build-box "git push --mirr origin main"']
         )
@@ -1782,10 +1785,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         # `cmd='git push -f origin main'; sh -c "$cmd"` runs the value of $cmd,
         # not the literal text, so the payload cannot be scanned statically.
         await self._refused_all(
-            ['cmd=\'git push -f origin main\'; sh -c "$cmd"',
-             'cmd=\'git push -f origin main\'; eval "$cmd"',
-             'cmd=\'git push -f origin main\'; env -S "$cmd"',
-             'cmd=\'git push -f origin main\'; sh -c $cmd']
+            ['cmd=\'git push -f origin main\'; sh -c "$cmd"', 'cmd=\'git push -f origin main\'; eval "$cmd"', 'cmd=\'git push -f origin main\'; env -S "$cmd"', 'cmd=\'git push -f origin main\'; sh -c $cmd']
         )
         # Declared consequence: a payload holding an expansion is refused even
         # when the expansion looks harmless, because the expansion decides what
