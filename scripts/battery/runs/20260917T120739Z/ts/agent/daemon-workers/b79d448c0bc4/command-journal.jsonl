@@ -1,0 +1,3 @@
+
+{"version":1,"type":"received","key":"[\"5bc2ad2d650f\",\"sd\"]","clientId":"5bc2ad2d650f","commandId":"sd","commandType":"shutdown","recordedAt":"2026-09-17T12:10:40.487Z"}
+{"version":1,"type":"result","key":"[\"5bc2ad2d650f\",\"sd\"]","response":{"id":"sd","type":"response","command":"shutdown","success":true},"recordedAt":"2026-09-17T12:10:40.488Z"}

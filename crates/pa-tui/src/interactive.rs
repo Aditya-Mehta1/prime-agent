@@ -252,6 +252,10 @@ pub struct InteractiveOutcome {
     pub session_id: String,
     pub last_assistant_text: Option<String>,
     pub frames: Vec<String>,
+    /// `/resume` requested the agents view next (return-to-session flow).
+    pub return_to_agents_view: bool,
+    /// `/resume <selector>` requested this session next.
+    pub selection_request: Option<SessionSelection>,
 }
 
 /// Inputs consumed by the UI loop. Terminal keys arrive one event at a time;
@@ -305,6 +309,10 @@ pub async fn run_interactive(
                 session_id: session.session_id.clone(),
                 last_assistant_text: None,
                 frames: Vec::new(),
+                // Onboarding exit leaves no session open; no return-to-view
+                // or pending selection applies.
+                return_to_agents_view: false,
+                selection_request: None,
             });
         }
     }
@@ -414,6 +422,8 @@ pub async fn run_interactive(
         session_id: session.session_id.clone(),
         last_assistant_text: session.last_assistant_text.clone(),
         frames: renderer.finish(),
+        return_to_agents_view: session.open_agents_view,
+        selection_request: session.pending_selection,
     };
     session.client.close();
     Ok(outcome)

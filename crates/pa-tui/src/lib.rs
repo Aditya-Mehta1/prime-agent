@@ -4,6 +4,8 @@
 //! from `coding-agent/src/modes/interactive`. Components render styled lines;
 //! the terminal layer paints them with crossterm + ratatui diffing.
 
+pub mod agents_view;
+pub mod agents_view_state;
 pub mod ansi;
 pub mod app;
 pub mod autocomplete;

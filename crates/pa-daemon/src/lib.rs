@@ -9,6 +9,7 @@
 pub mod acp;
 pub mod agent_engine;
 pub(crate) mod agent_messaging;
+pub(crate) mod agent_roster;
 pub mod compaction;
 pub mod descriptor;
 pub mod engine;
@@ -35,6 +36,7 @@ pub mod socket;
 pub mod status_line;
 pub mod supervisor;
 pub mod supervisor_link;
+pub(crate) mod supervisor_roster;
 pub mod types;
 pub mod util;
 pub mod worker;

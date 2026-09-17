@@ -25,6 +25,7 @@ import json
 import os
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -111,6 +112,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": {"message": f"unknown path {self.path}"}})
             return
         entry = self.state.next_response()
+        # Optional scripted delay: the response starts streaming after
+        # `delayMs`, so a battery flow can hold a session mid-turn.
+        delay_ms = float(entry.get("delayMs") or 0)
+        if delay_ms > 0:
+            time.sleep(delay_ms / 1000.0)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")

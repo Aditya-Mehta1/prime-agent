@@ -11,14 +11,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
-use tokio::sync::broadcast;
 
 use crate::engine::{
     side_question_event_value, SessionEngine, SideQuestionOutcome, SideQuestionRequest,
     SIDE_QUESTION_STATUS_RUNNING,
 };
 use crate::protocol::{response_failure, response_success, DaemonOutbound, DaemonResponse};
-use crate::worker::OutboundFrame;
+use crate::worker::{EventPump, OutboundFrame};
 use pa_core::session_engine::side_question::{SideQuestionSink, SideQuestionTurn};
 
 /// A live run (TS `sideQuestionRuns` entries): which client owns it and how
@@ -31,7 +30,7 @@ struct SideQuestionRun {
 /// The worker's side-question machinery: registry plus the command handlers.
 pub(crate) struct SideQuestionManager {
     engine: Arc<dyn SessionEngine>,
-    events: broadcast::Sender<Arc<OutboundFrame>>,
+    events: Arc<EventPump>,
     active_session_id: String,
     runs: Arc<Mutex<HashMap<String, SideQuestionRun>>>,
 }
@@ -39,7 +38,7 @@ pub(crate) struct SideQuestionManager {
 impl SideQuestionManager {
     pub(crate) fn new(
         engine: Arc<dyn SessionEngine>,
-        events: broadcast::Sender<Arc<OutboundFrame>>,
+        events: Arc<EventPump>,
         active_session_id: String,
     ) -> Self {
         SideQuestionManager {
@@ -265,16 +264,12 @@ impl SideQuestionManager {
 }
 
 /// Broadcast one `side_question_event` frame for the worker's session.
-fn emit_side_question_frame(
-    events: &broadcast::Sender<Arc<OutboundFrame>>,
-    active_session_id: &str,
-    event: Value,
-) {
+fn emit_side_question_frame(events: &Arc<EventPump>, active_session_id: &str, event: Value) {
     let outbound = DaemonOutbound::SideQuestionEvent {
         active_session_id: active_session_id.to_string(),
         event,
         rest: Default::default(),
     };
     let payload = serde_json::to_vec(&outbound).unwrap_or_default();
-    let _ = events.send(Arc::new(OutboundFrame::side_question_event(payload)));
+    events.send(OutboundFrame::side_question_event(payload));
 }

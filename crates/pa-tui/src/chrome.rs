@@ -48,6 +48,9 @@ pub struct ChromeState {
     pub cwd: String,
     /// Current model id (splash `model` line; `None` hides the line).
     pub model_id: Option<String>,
+    /// One extra metadata line (`label value`, e.g. the agents view's
+    /// `agents N running, ...` count row; `None` hides the line).
+    pub extra_metadata: Option<(String, String)>,
     /// Top-bar chat name (session name or the cwd basename).
     pub chat_name: String,
     /// Session spend (USD) beside the chat name.
@@ -217,6 +220,15 @@ pub fn render_splash(state: &ChromeState, theme: &Theme, width: usize) -> Vec<Li
     } else {
         meta_lines.push(vec![Span::styled(title.to_string(), text)]);
         meta_lines.push(vec![Span::styled(version, muted)]);
+    }
+    if let Some((label_text, value_text)) = &state.extra_metadata {
+        let label = format!("{label_text} ");
+        let value = truncate_to_width(
+            value_text,
+            meta_width.saturating_sub(str_width(&label)).max(1),
+            "",
+        );
+        meta_lines.push(vec![Span::styled(label, dim), Span::styled(value, muted)]);
     }
     if let Some(model_id) = &state.model_id {
         let label = "model ";

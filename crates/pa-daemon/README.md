@@ -22,7 +22,11 @@ for a source worker's kernel `agent_message.send`, direct
 `worker_deliver_message` on the target worker's socket with the supervisor
 routed `send_message` as the never-retried fallback), wire protocol serve/negotiation (including the
 `compact`/`abort_compaction`/`set_auto_compaction` commands and their
-`compaction_start`/`compaction_end` events), cloud sandbox attach, session
+`compaction_start`/`compaction_end` events), the agent-roster arms
+(`roster_subscribe`/`roster_unsubscribe` with the full snapshot, live
+`roster_update` pushes keyed by the TS roster `agentId` = session id, and
+authenticated `worker_roster_delta` self-reports so live status reaches
+subscribers without polling), cloud sandbox attach, session
 leases (`core/session-lease.ts` port). Supervisor-backed RLM child sessions
 (`rlm_children.rs`, the daemon side of the pa-core `RlmSubagentHost` seam):
 `rlm.spawn`/`rlm.create_session` create real daemon sessions through the

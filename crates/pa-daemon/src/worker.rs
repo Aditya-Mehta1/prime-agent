@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
@@ -235,6 +235,9 @@ impl crate::status_line::StatusSession for SessionCore {
 pub(crate) struct OutboundFrame {
     pub(crate) payload: Vec<u8>,
     pub(crate) outbound_type: &'static str,
+    /// The pump-assigned broadcast sequence. Connection sinks use it as a
+    /// flush position so response frames cannot overtake event frames.
+    pub(crate) seq: u64,
 }
 
 impl OutboundFrame {
@@ -242,6 +245,7 @@ impl OutboundFrame {
         OutboundFrame {
             payload,
             outbound_type: "session_event",
+            seq: 0,
         }
     }
 
@@ -249,6 +253,7 @@ impl OutboundFrame {
         OutboundFrame {
             payload,
             outbound_type: "session_status",
+            seq: 0,
         }
     }
 
@@ -256,6 +261,118 @@ impl OutboundFrame {
         OutboundFrame {
             payload,
             outbound_type: "side_question_event",
+            seq: 0,
+        }
+    }
+}
+
+/// The worker's outbound event pump: one sequence-stamped broadcast stream
+/// shared by every frame-emitting path (turns, compaction, side questions,
+/// status lines). Sequences are assigned under a send guard so channel
+/// delivery order matches sequence order, which keeps per-connection flush
+/// positions monotonic.
+pub(crate) struct EventPump {
+    events: broadcast::Sender<Arc<OutboundFrame>>,
+    next_seq: AtomicU64,
+    send_guard: std::sync::Mutex<()>,
+}
+
+impl EventPump {
+    pub(crate) fn new() -> Self {
+        let (events, _) = broadcast::channel(4096);
+        EventPump {
+            events,
+            next_seq: AtomicU64::new(0),
+            send_guard: std::sync::Mutex::new(()),
+        }
+    }
+
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<Arc<OutboundFrame>> {
+        self.events.subscribe()
+    }
+
+    /// Stamp the frame with the next sequence and broadcast it.
+    pub(crate) fn send(&self, mut frame: OutboundFrame) {
+        let _guard = self.send_guard.lock().unwrap();
+        frame.seq = self.next_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = self.events.send(Arc::new(frame));
+    }
+
+    /// The current broadcast sequence: a response written now must wait for
+    /// every frame with a sequence up to this value to be flushed.
+    pub(crate) fn current_seq(&self) -> u64 {
+        self.next_seq.load(Ordering::SeqCst)
+    }
+}
+
+/// One connection's outbound state: the framed writer plus the fan-out's
+/// flush position. The TS worker writes session events synchronously while
+/// a command runs, so its command response always follows them; the Rust
+/// fan-out is a separate task, so response writes wait for the fan-out to
+/// catch up to the sequence they observed (`wait_flushed`), restoring the
+/// same ordering contract: events emitted during a command are written
+/// before the command's response, never after it.
+pub(crate) struct ConnectionSink {
+    pub(crate) writer:
+        Arc<tokio::sync::Mutex<Box<dyn pa_types::platform::transport::AsyncWriteHalf>>>,
+    /// The fan-out's flush position; `FLUSH_CLOSED` once the fan-out ended.
+    /// Watch semantics: a send with zero live receivers is dropped, so
+    /// the sink keeps a permanent receiver and every position update is
+    /// stored even while no response is waiting.
+    flushed: tokio::sync::watch::Sender<u64>,
+    _flushed_anchor: tokio::sync::watch::Receiver<u64>,
+    /// The first broadcast sequence this connection's fan-out can receive:
+    /// frames older than this were broadcast before the connection
+    /// subscribed and are never delivered to it, so a gate below `entry_seq`
+    /// is already satisfied.
+    entry_seq: u64,
+}
+
+/// The fan-out either wrote every frame or the connection ended; a waiting
+/// response proceeds on both paths.
+const FLUSH_CLOSED: u64 = u64::MAX;
+
+impl ConnectionSink {
+    pub(crate) fn new(
+        writer: Arc<tokio::sync::Mutex<Box<dyn pa_types::platform::transport::AsyncWriteHalf>>>,
+        entry_seq: u64,
+    ) -> Self {
+        let (flushed, _flushed_anchor) = tokio::sync::watch::channel(0);
+        ConnectionSink {
+            writer,
+            flushed,
+            _flushed_anchor,
+            entry_seq,
+        }
+    }
+
+    /// Record the fan-out's position after one processed frame (written or
+    /// skipped for role reasons: a skipped frame cannot arrive later).
+    pub(crate) fn mark_flushed(&self, seq: u64) {
+        let _ = self.flushed.send(seq);
+    }
+
+    /// The fan-out ended (write failure or closed stream); waiting
+    /// responses stop waiting.
+    pub(crate) fn mark_closed(&self) {
+        let _ = self.flushed.send(FLUSH_CLOSED);
+    }
+
+    /// Block until the fan-out flushed `gate` (or ended).
+    pub(crate) async fn wait_flushed(&self, gate: u64) {
+        // Frames older than `entry_seq` are never delivered to this
+        // connection, so a gate below them needs no wait.
+        if gate < self.entry_seq {
+            return;
+        }
+        let mut rx = self.flushed.subscribe();
+        loop {
+            if *rx.borrow_and_update() >= gate {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                return;
+            }
         }
     }
 }
@@ -268,7 +385,7 @@ pub struct Worker {
     engine: std::sync::Arc<dyn SessionEngine>,
     work_notify: Arc<Notify>,
     idle_notify: Arc<Notify>,
-    events: broadcast::Sender<Arc<OutboundFrame>>,
+    events: Arc<EventPump>,
     recovery: Arc<Mutex<Option<WorkerRecoveryJournal>>>,
     /// Post-turn status-line runner (seeded from persisted verdicts at
     /// session create).
@@ -293,7 +410,7 @@ fn supervisor_link_config(config: &WorkerConfig) -> SupervisorLinkConfig {
 
 impl Worker {
     pub fn new(config: WorkerConfig, registration: Option<RegistrationHandle>) -> Self {
-        let (events, _) = broadcast::channel(4096);
+        let events = Arc::new(EventPump::new());
         let core = SessionCore {
             active_session_id: config.active_session_id.clone(),
             generation: crate::util::new_display_id(),
@@ -401,6 +518,12 @@ impl Worker {
                 engine: std::sync::Arc::clone(&engine),
                 active_session_id,
                 status_notify: status_notify.clone(),
+                roster_link: std::sync::Arc::new(crate::supervisor_link::SupervisorLink::new(
+                    std::env::var_os(WORKER_SUPERVISOR_SOCKET_ENV)
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_default(),
+                )),
+                worker_token: std::env::var(WORKER_TOKEN_ENV).unwrap_or_default(),
             };
             tokio::spawn(async move {
                 runner.run().await;
@@ -466,6 +589,16 @@ impl Worker {
     async fn handle_connection(self: Arc<Self>, stream: Box<dyn TransportStream>) -> Result<()> {
         let (reader, writer) = stream.split();
         let writer = Arc::new(tokio::sync::Mutex::new(writer));
+        // The connection's event subscription and its entry sequence are
+        // captured together (before any awaited write): every frame the
+        // receiver can see has a sequence at or above `entry_seq`, which is
+        // what the sink's flush barrier gates on.
+        let subscription = self.events.subscribe();
+        let entry_seq = self.events.current_seq() + 1;
+        // The connection's outbound sink: the framed writer plus the
+        // fan-out flush position (response writes wait on it; see
+        // `ConnectionSink`).
+        let sink = Arc::new(ConnectionSink::new(Arc::clone(&writer), entry_seq));
         // daemon_hello goes out immediately on every connection.
         let hello = DaemonOutbound::DaemonHello {
             socket_path: self.config.socket_path.to_string_lossy().to_string(),
@@ -510,34 +643,42 @@ impl Worker {
         // Event fan-out: this connection's subscription to the shared pump.
         // Only authenticated roles stream: the supervisor always, a session
         // client only while it holds an attach on the session.
-        let mut events = self.events.subscribe();
         {
             let worker = Arc::clone(&self);
-            let writer = Arc::clone(&writer);
+            let sink = Arc::clone(&sink);
             let role = Arc::clone(&role);
             tokio::spawn(async move {
+                let mut events = subscription;
                 loop {
                     match events.recv().await {
                         Ok(frame) => {
-                            if !role.lock().unwrap().streams_events() {
-                                continue;
+                            // A frame this role does not stream still
+                            // advances the flush position: it cannot be
+                            // delivered later, so a gated response must not
+                            // wait for it.
+                            if role.lock().unwrap().streams_events() {
+                                let active_session_id = active_session_id_of(&frame.payload);
+                                let header = json!({
+                                    "kind": "outbound",
+                                    "outboundType": frame.outbound_type,
+                                    "activeSessionId": active_session_id,
+                                });
+                                if worker
+                                    .write_frame(&sink.writer, &header, &frame.payload)
+                                    .await
+                                    .is_err()
+                                {
+                                    sink.mark_closed();
+                                    break;
+                                }
                             }
-                            let active_session_id = active_session_id_of(&frame.payload);
-                            let header = json!({
-                                "kind": "outbound",
-                                "outboundType": frame.outbound_type,
-                                "activeSessionId": active_session_id,
-                            });
-                            if worker
-                                .write_frame(&writer, &header, &frame.payload)
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
+                            sink.mark_flushed(frame.seq);
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => break,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            sink.mark_closed();
+                            break;
+                        }
                     }
                 }
             });
@@ -574,13 +715,7 @@ impl Worker {
                     // The first command authenticates the connection; a
                     // failed authentication ends it (TS worker branch).
                     let outcome = self
-                        .authenticate_connection(
-                            &command_type,
-                            &payload,
-                            &request_id,
-                            &role,
-                            &writer,
-                        )
+                        .authenticate_connection(&command_type, &payload, &request_id, &role, &sink)
                         .await;
                     if outcome == AuthOutcome::Failed {
                         break;
@@ -590,7 +725,7 @@ impl Worker {
                     if command_type == "worker_register_peer_transport" {
                         let response =
                             self.handle_worker_register_peer_transport(&payload, generation);
-                        self.write_response_frame(&writer, &request_id, &response)
+                        self.write_response_frame(&sink, &request_id, &response)
                             .await;
                         continue;
                     }
@@ -601,7 +736,7 @@ impl Worker {
                     // reads from other clients.
                     if command_type == "shutdown" {
                         let response = self.dispatch(&command_type, &payload).await;
-                        self.write_response_frame(&writer, &request_id, &response)
+                        self.write_response_frame(&sink, &request_id, &response)
                             .await;
                         if response.success {
                             // Shutdown keeps the resume entry and exits the
@@ -613,13 +748,13 @@ impl Worker {
                         continue;
                     }
                     let worker = Arc::clone(&self);
-                    let writer = Arc::clone(&writer);
+                    let sink = Arc::clone(&sink);
                     let request_id = request_id.clone();
                     let command_type = command_type.clone();
                     tokio::spawn(async move {
                         let response = worker.dispatch(&command_type, &payload).await;
                         worker
-                            .write_response_frame(&writer, &request_id, &response)
+                            .write_response_frame(&sink, &request_id, &response)
                             .await;
                     });
                 }
@@ -633,14 +768,14 @@ impl Worker {
                             PEER_COMMAND_NOT_ALLOWED,
                             None,
                         );
-                        self.write_response_frame(&writer, &request_id, &failure)
+                        self.write_response_frame(&sink, &request_id, &failure)
                             .await;
                         continue;
                     }
                     // Session-plane commands run concurrently for the same
                     // reason as the supervisor arm above.
                     let worker = Arc::clone(&self);
-                    let writer = Arc::clone(&writer);
+                    let sink = Arc::clone(&sink);
                     let request_id = request_id.clone();
                     let command_type = command_type.clone();
                     let session = Arc::clone(session);
@@ -654,7 +789,7 @@ impl Worker {
                             }
                         }
                         worker
-                            .write_response_frame(&writer, &request_id, &response)
+                            .write_response_frame(&sink, &request_id, &response)
                             .await;
                     });
                 }
@@ -669,19 +804,19 @@ impl Worker {
                             PEER_COMMAND_NOT_ALLOWED,
                             None,
                         );
-                        self.write_response_frame(&writer, &request_id, &failure)
+                        self.write_response_frame(&sink, &request_id, &failure)
                             .await;
                         continue;
                     }
                     // Delivery runs concurrently, like the other planes.
                     let worker = Arc::clone(&self);
-                    let writer = Arc::clone(&writer);
+                    let sink = Arc::clone(&sink);
                     let request_id = request_id.clone();
                     let command_type = command_type.clone();
                     tokio::spawn(async move {
                         let response = worker.dispatch(&command_type, &payload).await;
                         worker
-                            .write_response_frame(&writer, &request_id, &response)
+                            .write_response_frame(&sink, &request_id, &response)
                             .await;
                     });
                 }
@@ -699,12 +834,10 @@ impl Worker {
         payload: &Value,
         request_id: &str,
         role: &Arc<std::sync::Mutex<ConnectionRole>>,
-        writer: &Arc<tokio::sync::Mutex<Box<dyn pa_types::platform::transport::AsyncWriteHalf>>>,
+        sink: &ConnectionSink,
     ) -> AuthOutcome {
         if command_type == "peer_auth" {
-            return self
-                .handle_peer_auth(payload, request_id, role, writer)
-                .await;
+            return self.handle_peer_auth(payload, request_id, role, sink).await;
         }
         if command_type != "worker_auth" {
             let failure = response_failure(
@@ -713,8 +846,7 @@ impl Worker {
                 "Worker authentication failed",
                 None,
             );
-            self.write_response_frame(writer, request_id, &failure)
-                .await;
+            self.write_response_frame(sink, request_id, &failure).await;
             return AuthOutcome::Failed;
         }
         match self.authenticate(payload) {
@@ -740,15 +872,13 @@ impl Worker {
                     Some(json!({ "capabilities": capabilities })),
                 );
                 *role.lock().unwrap() = ConnectionRole::Supervisor { generation };
-                self.write_response_frame(writer, request_id, &success)
-                    .await;
+                self.write_response_frame(sink, request_id, &success).await;
                 AuthOutcome::Authenticated
             }
             Err(error) => {
                 let failure =
                     response_failure(Some(request_id), "worker_auth", &error.to_string(), None);
-                self.write_response_frame(writer, request_id, &failure)
-                    .await;
+                self.write_response_frame(sink, request_id, &failure).await;
                 AuthOutcome::Failed
             }
         }
@@ -811,10 +941,15 @@ impl Worker {
 
     pub(crate) async fn write_response_frame(
         &self,
-        writer: &Arc<tokio::sync::Mutex<Box<dyn pa_types::platform::transport::AsyncWriteHalf>>>,
+        sink: &ConnectionSink,
         request_id: &str,
         response: &DaemonResponse,
     ) {
+        // Flush barrier: every event frame broadcast before this response
+        // reaches the connection's writer first, so a command response
+        // never overtakes the events its command emitted (the TS worker
+        // gets this ordering for free from synchronous writes).
+        sink.wait_flushed(self.events.current_seq()).await;
         let payload =
             serde_json::to_vec(&crate::protocol::response_line(response)).unwrap_or_default();
         let header = json!({
@@ -822,7 +957,7 @@ impl Worker {
             "requestId": request_id,
             "outboundType": "response",
         });
-        if let Err(error) = self.write_frame(writer, &header, &payload).await {
+        if let Err(error) = self.write_frame(&sink.writer, &header, &payload).await {
             eprintln!("pa-daemon worker response write failed: {error:#}");
         }
     }
@@ -1245,28 +1380,7 @@ impl Worker {
     }
 
     fn snapshot_locked(&self, core: &SessionCore) -> SessionActionSnapshot {
-        SessionActionSnapshot {
-            queued_count: (core.steering.len() + core.follow_up.len()) as u32,
-            steering: core
-                .steering
-                .iter()
-                .map(|item| item.message.clone())
-                .collect(),
-            follow_ups: core
-                .follow_up
-                .iter()
-                .map(|item| item.message.clone())
-                .collect(),
-            active: if core.busy {
-                Some(crate::types::SessionActionActive {
-                    kind: "turn".to_string(),
-                    phase: "running".to_string(),
-                    label: None,
-                })
-            } else {
-                None
-            },
-        }
+        session_snapshot(core)
     }
 
     fn handle_attach(&self, payload: &Value) -> DaemonResponse {
@@ -1830,7 +1944,7 @@ impl Worker {
             leaf_id: store.and_then(|s| s.leaf_id().map(str::to_string)),
             auto_compaction_enabled: core.auto_compaction_enabled,
             message_count: store.map(|s| s.message_count()).unwrap_or(0) as u32,
-            session_actions: self.snapshot_locked(core),
+            session_actions: session_snapshot(core),
             compaction_count: store
                 .map(|s| {
                     s.entries()
@@ -1902,9 +2016,7 @@ impl Worker {
         };
         let payload = serde_json::to_vec(&outbound)?;
         drop(core);
-        let _ = self
-            .events
-            .send(Arc::new(OutboundFrame::session_event(payload)));
+        self.events.send(OutboundFrame::session_event(payload));
         Ok(())
     }
 
@@ -1930,9 +2042,7 @@ impl Worker {
         };
         let payload = serde_json::to_vec(&outbound)?;
         drop(core);
-        let _ = self
-            .events
-            .send(Arc::new(OutboundFrame::session_event(payload)));
+        self.events.send(OutboundFrame::session_event(payload));
         Ok(())
     }
 }
@@ -2070,12 +2180,16 @@ struct TurnRunner {
     pub(crate) core: Arc<Mutex<SessionCore>>,
     work_notify: Arc<Notify>,
     idle_notify: Arc<Notify>,
-    events: broadcast::Sender<Arc<OutboundFrame>>,
+    events: Arc<EventPump>,
     engine: std::sync::Arc<dyn SessionEngine>,
     /// Shared worker recovery journal (queue snapshot persistence).
     recovery: Arc<Mutex<Option<WorkerRecoveryJournal>>>,
     active_session_id: String,
     status_notify: tokio::sync::mpsc::UnboundedSender<()>,
+    /// The supervisor link for roster pushes (lazy reconnect like the
+    /// agent-messaging link).
+    roster_link: std::sync::Arc<crate::supervisor_link::SupervisorLink>,
+    worker_token: String,
 }
 
 impl TurnRunner {
@@ -2101,12 +2215,52 @@ impl TurnRunner {
                 }
             };
             if let Some(item) = item {
+                // The busy flip reaches the supervisor's roster before the
+                // turn runs (TS pushes the same transition).
+                self.push_roster_delta();
                 self.run_turn(engine, item).await;
             } else {
                 self.idle_notify.notify_waiters();
                 self.work_notify.notified().await;
             }
         }
+    }
+
+    /// Push one roster delta to the supervisor (the Rust-native form of
+    /// the TS `roster_delta` worker frame): the worker's summary after a
+    /// busy flip, so subscribed clients see live status without polling.
+    /// Fire-and-forget: a dead link reconnects on the next flip, and a
+    /// supervisor restart re-seeds the entry from registration.
+    fn push_roster_delta(&self) {
+        if std::env::var_os("PA_WORKER_DISABLE_ROSTER_PUSH").is_some() {
+            return;
+        }
+        if self.worker_token.is_empty() || self.roster_link.socket_path().as_os_str().is_empty() {
+            return;
+        }
+        let summary = {
+            let core = self.core.lock().unwrap();
+            session_summary(
+                &core,
+                &self
+                    .engine
+                    .effective_thinking_level()
+                    .unwrap_or_else(|| "default".to_string()),
+            )
+        };
+        let summary = serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null);
+        let link = std::sync::Arc::clone(&self.roster_link);
+        let worker_token = self.worker_token.clone();
+        tokio::spawn(async move {
+            let command = serde_json::json!({
+                "type": "worker_roster_delta",
+                "workerToken": worker_token,
+                "summary": summary,
+            });
+            let _ = link
+                .request(command, std::time::Duration::from_secs(10))
+                .await;
+        });
     }
 
     async fn run_turn(&self, engine: std::sync::Arc<dyn SessionEngine>, item: QueuedItem) {
@@ -2274,14 +2428,6 @@ impl TurnRunner {
                         vec![event]
                     }
                 };
-                // Take the sender only when the event is `Done`: the
-                // `if let` scrutinee runs before matching, so a combined
-                // pattern would consume `done` on every event.
-                if let Some(result) = done_result {
-                    if let Some(done) = done.take() {
-                        let _ = done.send(result);
-                    }
-                }
                 // Verification seam: dump the emitted session events for
                 // harness debugging (PA_DAEMON_EVENT_LOG=<path>).
                 if let Ok(path) = std::env::var("PA_DAEMON_EVENT_LOG") {
@@ -2316,7 +2462,16 @@ impl TurnRunner {
                 }
                 drop(core);
                 for payload in payloads {
-                    let _ = events.send(Arc::new(OutboundFrame::session_event(payload)));
+                    events.send(OutboundFrame::session_event(payload));
+                }
+                // Resolve `done` only after the turn's final frames are on
+                // the pump: the waiting response must observe their
+                // sequences (see `ConnectionSink`), so the response cannot
+                // be written before the turn's own events.
+                if let Some(result) = done_result {
+                    if let Some(done) = done.take() {
+                        let _ = done.send(result);
+                    }
                 }
                 true
             };
@@ -2332,6 +2487,7 @@ impl TurnRunner {
             let mut core = self.core.lock().unwrap();
             core.busy = false;
         }
+        self.push_roster_delta();
         self.emit_turn_event(json!({ "type": "agent_end" }));
         let snapshot = {
             let core = self.core.lock().unwrap();
@@ -2382,9 +2538,7 @@ impl TurnRunner {
         };
         let payload = serde_json::to_vec(&outbound)?;
         drop(core);
-        let _ = self
-            .events
-            .send(Arc::new(OutboundFrame::session_event(payload)));
+        self.events.send(OutboundFrame::session_event(payload));
         Ok(())
     }
 
@@ -2423,9 +2577,7 @@ impl TurnRunner {
         };
         let payload = serde_json::to_vec(&outbound).unwrap_or_default();
         drop(core);
-        let _ = self
-            .events
-            .send(Arc::new(OutboundFrame::session_event(payload)));
+        self.events.send(OutboundFrame::session_event(payload));
     }
 }
 
@@ -2440,6 +2592,142 @@ pub async fn run_worker() -> Result<()> {
     let registration = crate::registration::start(&config);
     let worker = Arc::new(Worker::new(config, registration));
     worker.serve().await
+}
+
+/// The session summary for one core (TS `summaryForActiveSession`): the
+/// shared shape `get_state`, the roster, and list rows all serve. Free so
+/// the turn runner can push roster deltas without the worker handle; the
+/// thinking level rides in from the engine (the core has no engine access).
+fn session_summary(core: &SessionCore, thinking_level: &str) -> SessionSummary {
+    let store = core.store.as_ref();
+    let streaming = core.busy;
+    let compacting = core.compacting;
+    let queued = core.steering.len() + core.follow_up.len();
+    // `modified` is the session file mtime; `lastActivityAt` prefers the
+    // newest message timestamp (port of `summaryForActiveSession`).
+    let modified = store
+        .and_then(|store| std::fs::metadata(&store.path).ok())
+        .and_then(|metadata| metadata.modified().ok())
+        .map(|time| {
+            crate::util::iso_from_unix_ms(
+                time.duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or_default(),
+            )
+        });
+    let messages = store.map(|store| store.messages()).unwrap_or_default();
+    let last_activity_at = messages
+        .iter()
+        .rev()
+        .find_map(crate::types::message_timestamp_ms)
+        .map(crate::util::iso_from_unix_ms)
+        .or_else(|| modified.clone())
+        .or_else(|| store.map(|store| store.header.timestamp.clone()));
+    // Usage: summed assistant usage (`sessionUsageSummaryFrom`), absent
+    // when everything is zero.
+    let mut input_tokens = 0u64;
+    let mut output_tokens = 0u64;
+    let mut cost = 0.0f64;
+    for message in &messages {
+        if crate::types::message_role(message) != Some("assistant") {
+            continue;
+        }
+        let Some(usage) = message.get("usage") else {
+            continue;
+        };
+        input_tokens += usage
+            .get("input")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        input_tokens += usage
+            .get("cacheRead")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        input_tokens += usage
+            .get("cacheWrite")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        output_tokens += usage
+            .get("output")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        cost += usage
+            .get("cost")
+            .and_then(|cost| cost.get("total"))
+            .and_then(Value::as_f64)
+            .unwrap_or_default();
+    }
+    let usage = (input_tokens > 0 || output_tokens > 0 || cost > 0.0).then(
+        || json!({ "inputTokens": input_tokens, "outputTokens": output_tokens, "cost": cost }),
+    );
+    SessionSummary {
+        id: core.active_session_id.clone(),
+        lifecycle: "resident".to_string(),
+        activity: if streaming || compacting {
+            "working"
+        } else {
+            "idle"
+        }
+        .to_string(),
+        is_session_active: streaming || compacting || queued > 0,
+        has_registered_cron_job: Some(false),
+        last_activity_at,
+        rlm_depth: Some(0),
+        active_session_id: Some(core.active_session_id.clone()),
+        session_id: store
+            .map(|s| s.session_id().to_string())
+            .unwrap_or_default(),
+        session_file: store.map(|s| s.path.to_string_lossy().to_string()),
+        session_name: store.and_then(|s| s.session_name().map(str::to_string)),
+        cwd: core.cwd.clone(),
+        thinking_level: Some(thinking_level.to_string()),
+        is_streaming: streaming,
+        is_compacting: compacting,
+        is_bash_running: Some(false),
+        attached_clients: core.attached_client_ids.len() as u32,
+        message_count: store.map(|s| s.message_count()).unwrap_or(0) as u32,
+        session_actions: session_snapshot(core),
+        streaming_message: None,
+        created: store.map(|s| s.header.timestamp.clone()),
+        modified,
+        first_message: store.and_then(|s| s.first_message()),
+        parent_session_path: None,
+        usage,
+        worker_state: Some("ready".to_string()),
+        worker_pid: Some(std::process::id()),
+        status_label: None,
+        summary: None,
+        task_state: None,
+        model: None,
+        runtime_kind: Some("top-level".to_string()),
+        unfinished_action_count: Some(0),
+    }
+}
+
+/// The queue snapshot for one core (TS `sessionActions`).
+fn session_snapshot(core: &SessionCore) -> SessionActionSnapshot {
+    SessionActionSnapshot {
+        queued_count: (core.steering.len() + core.follow_up.len()) as u32,
+        steering: core
+            .steering
+            .iter()
+            .map(|item| item.message.clone())
+            .collect(),
+        follow_ups: core
+            .follow_up
+            .iter()
+            .map(|item| item.message.clone())
+            .collect(),
+        active: if core.busy {
+            Some(crate::types::SessionActionActive {
+                kind: "turn".to_string(),
+                phase: "running".to_string(),
+                label: None,
+            })
+        } else {
+            None
+        },
+    }
 }
 
 #[cfg(test)]

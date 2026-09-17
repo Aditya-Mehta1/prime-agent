@@ -11,11 +11,10 @@
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
-use tokio::sync::broadcast;
 
 use crate::engine::{CompactionOutcome, CompactionRequest, SessionEngine};
 use crate::protocol::DaemonOutbound;
-use crate::worker::{OutboundFrame, SessionCore};
+use crate::worker::{EventPump, OutboundFrame, SessionCore};
 use pa_agent::abort::AbortController;
 
 /// The worker's compaction machinery: the live-run abort slot plus the
@@ -23,7 +22,7 @@ use pa_agent::abort::AbortController;
 /// the TS `_compactionAbortController`.
 pub(crate) struct CompactionManager {
     engine: Arc<dyn SessionEngine>,
-    events: broadcast::Sender<Arc<OutboundFrame>>,
+    events: Arc<EventPump>,
     core: Arc<Mutex<SessionCore>>,
     active_session_id: String,
     abort: Mutex<Option<Arc<AbortController>>>,
@@ -32,7 +31,7 @@ pub(crate) struct CompactionManager {
 impl CompactionManager {
     pub(crate) fn new(
         engine: Arc<dyn SessionEngine>,
-        events: broadcast::Sender<Arc<OutboundFrame>>,
+        events: Arc<EventPump>,
         core: Arc<Mutex<SessionCore>>,
         active_session_id: String,
     ) -> Self {
@@ -213,9 +212,7 @@ impl CompactionManager {
         };
         let payload = serde_json::to_vec(&outbound)?;
         drop(core);
-        let _ = self
-            .events
-            .send(Arc::new(OutboundFrame::session_event(payload)));
+        self.events.send(OutboundFrame::session_event(payload));
         Ok(())
     }
 }

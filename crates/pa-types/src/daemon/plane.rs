@@ -45,6 +45,7 @@ pub fn command_plane(command_type: &str) -> DaemonCommandPlane {
         | "heartbeats_list"
         | "roster_subscribe"
         | "roster_unsubscribe"
+        | "worker_roster_delta"
         | "heartbeat_manage"
         | "cron_add"
         | "cron_cancel"

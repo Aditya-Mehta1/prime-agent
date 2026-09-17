@@ -103,6 +103,7 @@ pub struct DaemonEventMeta {
     pub replayed: Option<bool>,
 }
 
+pub mod agent_roster;
 mod command;
 pub mod framing;
 mod outbound;

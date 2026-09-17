@@ -1,0 +1,44 @@
+[
+ {
+  "flow": "f9_agents_view",
+  "category": "behavior",
+  "gap": false,
+  "summary": "ts: agents view groups the roster into Running/Idle/Inactive sections with the scripted sessions in place",
+  "evidence": ""
+ },
+ {
+  "flow": "f9_agents_view",
+  "category": "behavior",
+  "gap": false,
+  "summary": "ts: opening the Running row attached to the live session and its in-flight reply rendered",
+  "evidence": ""
+ },
+ {
+  "flow": "f9_agents_view",
+  "category": "behavior",
+  "gap": false,
+  "summary": "rust: agents view groups the roster into Running/Idle/Inactive sections with the scripted sessions in place",
+  "evidence": ""
+ },
+ {
+  "flow": "f9_agents_view",
+  "category": "behavior",
+  "gap": false,
+  "summary": "rust: opening the Running row attached to the live session and its in-flight reply rendered",
+  "evidence": ""
+ },
+ {
+  "flow": "f9_agents_view",
+  "category": "visual",
+  "gap": false,
+  "summary": "agents view frames identical at 120x36 (normalized: paths, ids, ages)",
+  "evidence": ""
+ },
+ {
+  "flow": "f9_agents_view",
+  "category": "visual",
+  "gap": false,
+  "summary": "agents view frames identical at 220x50 (normalized: paths, ids, ages)",
+  "evidence": ""
+ }
+]

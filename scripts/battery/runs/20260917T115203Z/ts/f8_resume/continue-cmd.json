@@ -1,0 +1,20 @@
+{
+ "argv": [
+  "prime-agent",
+  "-p",
+  "--daemon-socket",
+  "/home/ubuntu/lane-worktrees/agents-view/scripts/battery/runs/20260917T115203Z/ts/daemon.sock",
+  "--provider",
+  "prime-inference",
+  "--model",
+  "mock-1",
+  "--offline",
+  "-c",
+  "Continue this session"
+ ],
+ "exit_code": 1,
+ "stdout": "",
+ "stderr": "Error: Session is already active in 4005f3413e6e: /home/ubuntu/lane-worktrees/agents-view/scripts/battery/runs/20260917T115203Z/ts/agent/sessions/01a0af36-d83c-71fa-be18-70cec21fcc45.jsonl\n",
+ "duration_s": 0.22,
+ "timeout": false
+}

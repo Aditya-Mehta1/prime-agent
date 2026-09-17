@@ -13,7 +13,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::protocol::{create_daemon_event_meta, DaemonOutbound};
-use crate::worker::OutboundFrame;
+use crate::worker::{EventPump, OutboundFrame};
 use pa_types::ai::Model;
 
 /// Collapse a tool loop's rapid turn bursts into one summarization.
@@ -148,7 +148,7 @@ pub trait StatusSession: Send + Sync {
 pub struct StatusLineRunner<S: StatusSession> {
     core: Arc<std::sync::Mutex<S>>,
     agent_dir: PathBuf,
-    events: tokio::sync::broadcast::Sender<Arc<OutboundFrame>>,
+    events: Arc<EventPump>,
     state: std::sync::Mutex<Option<StatusState>>,
 }
 
@@ -171,7 +171,7 @@ impl<S: StatusSession> StatusLineRunner<S> {
     pub(crate) fn new(
         core: Arc<std::sync::Mutex<S>>,
         agent_dir: PathBuf,
-        events: tokio::sync::broadcast::Sender<Arc<OutboundFrame>>,
+        events: Arc<EventPump>,
     ) -> Self {
         StatusLineRunner {
             core,
@@ -393,9 +393,7 @@ impl<S: StatusSession> StatusLineRunner<S> {
             rest: Default::default(),
         };
         let payload = serde_json::to_vec(&outbound).unwrap_or_default();
-        let _ = self
-            .events
-            .send(Arc::new(OutboundFrame::session_status(payload)));
+        self.events.send(OutboundFrame::session_status(payload));
     }
 }
 
@@ -784,7 +782,7 @@ mod tests {
                 AgentTaskState::NeedsInput,
             )],
         }));
-        let (events, _) = tokio::sync::broadcast::channel(4);
+        let events = std::sync::Arc::new(EventPump::new());
         let runner = StatusLineRunner::new(
             std::sync::Arc::clone(&core),
             std::path::PathBuf::from("/nonexistent"),

@@ -47,7 +47,7 @@ Rust side no longer needs the env-var model workaround (gap B-1 fixed).
 | f6_attach | wire-level attach (snapshot + event stream) and CLI `attach` in tmux | attach response shape, events, frames |
 | f7_compaction | daemon `compact` on a grown session | compact response, session entries |
 | f8_resume | headless session persisted, then print `-c` + interactive `--resume` | stdout/exit (B-11 row: both sides refuse an active session), session shape diff |
-| f9_agents_view | interactive agents view | tmux frames (frame diffing: visual-parity lane) |
+| f9_agents_view | the agents view over a scripted roster (running + idle live sessions, one saved-catalog session): section grouping, open-to-attach on the running row, and a normalized TS-vs-Rust frame diff at 120x36 and 220x50 | tmux frames + wire responses |
 
 First full committed run: `scripts/battery/runs/20260916T210320Z/`
 (11 gaps, 18 passed checks). Worker-timeout/socket-path evidence:
@@ -61,6 +61,18 @@ Full battery after the model-surface lane (B-4/B-5/B-6 fixed):
 system-prompt comparison now normalizes per-side paths, session UUIDs, skill
 locations, and skill enumeration order - see `normalize_system_prompt` in
 `run_battery.py`).
+
+Full battery after the agents-view lane: `scripts/battery/runs/20260917T115203Z/`
+(2 gaps, 37 passed checks - only the pre-existing f1 splash/notice rows remain;
+the f3/f8 entry-type rows now match, f9 is fully green, and the f10/f11 rows
+pass). The agents-view frame parity: normalized frames are byte-identical
+between the products at 120x36 and 220x50 (paths, uuids, ages, versions, cost,
+and the animated running icon normalize away); see the f9 evidence in that run.
+The f9 flow resets each side's session universe (fresh daemon + wiped session
+files) so the view frames hold only the scripted roster, and settles the mock
+before swapping response scripts (a delayed response must only ever apply to
+the busy session's request; a status-line request hitting the delayed entry
+holds a settled session "running" for the delay).
 
 ## Gap table (first full run 20260916T210320Z; the *fixed* marks come from reruns 20260916T221725Z and 20260916T224512Z)
 

@@ -341,8 +341,10 @@ def tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     return proc
 
 
-def tmux_launch(session: str, command: list[str], env: dict, cwd: Path) -> None:
-    """Create a detached 120x36 session running `command` with `env`.
+def tmux_launch(
+    session: str, command: list[str], env: dict, cwd: Path, size: tuple[int, int] = TMUX_SIZE
+) -> None:
+    """Create a detached session of `size` running `command` with `env`.
 
     tmux panes inherit the tmux server's environment, not the client's, so
     the pane command is wrapped in `env KEY=VALUE ...` (and TMUX unset) to
@@ -379,9 +381,9 @@ def tmux_launch(session: str, command: list[str], env: dict, cwd: Path) -> None:
         "new-session",
         "-d",
         "-x",
-        str(TMUX_SIZE[0]),
+        str(size[0]),
         "-y",
-        str(TMUX_SIZE[1]),
+        str(size[1]),
         "-s",
         session,
         "-c",
@@ -390,6 +392,12 @@ def tmux_launch(session: str, command: list[str], env: dict, cwd: Path) -> None:
         "-c",
         shell_command,
     )
+
+
+def tmux_resize(session: str, size: tuple[int, int]) -> None:
+    """Resize a detached session's window (frame-parity captures at a
+    second terminal size)."""
+    tmux("resize-window", "-t", session, "-x", str(size[0]), "-y", str(size[1]), check=False)
 
 
 def tmux_capture(session: str, pane: str = "0") -> str:

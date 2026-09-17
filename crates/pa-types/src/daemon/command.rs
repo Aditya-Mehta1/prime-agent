@@ -152,6 +152,20 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    /// Worker -> supervisor roster delta (the Rust-native form of the TS
+    /// `roster_delta` worker frame): the worker pushes its slim session
+    /// summary so the supervisor's roster tracks live status without
+    /// polling. Authenticated by the worker token, like `worker_register`.
+    WorkerRosterDelta {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        worker_token: String,
+        summary: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        removed: Option<Vec<String>>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
     RosterUnsubscribe {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,

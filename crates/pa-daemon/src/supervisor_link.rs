@@ -104,6 +104,11 @@ impl SupervisorLink {
         }
     }
 
+    /// The supervisor socket this link dials.
+    pub fn socket_path(&self) -> &PathBuf {
+        &self.socket_path
+    }
+
     /// Send one request, connecting first when the link is down. Never
     /// retries a delivered command: daemon commands are not idempotent. A
     /// write-phase failure never delivered anything, so exactly one

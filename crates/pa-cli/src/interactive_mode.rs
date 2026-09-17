@@ -76,9 +76,62 @@ pub fn run_interactive_mode(options: &RunOptions) -> Result<i32> {
         .context("build the interactive runtime")?;
     runtime.block_on(async {
         ensure_daemon_running(&tui_options.socket_path, &tui_options.cwd).await?;
-        pa_tui::interactive::run_interactive(tui_options, UiMode::Terminal).await
+        // `prime-agent agents` and bare `--resume` open the agents view
+        // (TS `agentsViewRequested`); the view then opens sessions, and a
+        // session exits back into the view until the user exits it. TS gates
+        // the explicit `agents` request on completed onboarding (a fresh
+        // install shows the first-run notice first); bare `--resume` opens
+        // the view regardless.
+        let agents_view = options.session.resume_bare
+            || (options.agents_view_requested && tui_options.onboarding.is_none());
+        if agents_view {
+            run_agents_view_flow(tui_options).await
+        } else {
+            pa_tui::interactive::run_interactive(tui_options, UiMode::Terminal).await?;
+            Ok(())
+        }
     })?;
     Ok(0)
+}
+
+/// The agents-view loop: open the view, run the session it opens, return to
+/// the view when the session detaches (TS `isReturningToAgentsView`), and
+/// exit when the view itself exits or a `/resume` resolves elsewhere.
+async fn run_agents_view_flow(base: InteractiveOptions) -> Result<()> {
+    let mut anchor: Option<String> = None;
+    loop {
+        let view_options = pa_tui::agents_view::AgentsViewOptions {
+            socket_path: base.socket_path.clone(),
+            cwd: base.cwd.clone(),
+            session_dir: base.session_dir.clone(),
+            theme: base.theme.clone(),
+            version: base.version.clone(),
+            anchor_session_id: anchor.clone(),
+        };
+        let view = pa_tui::agents_view::run_agents_view(
+            view_options,
+            pa_tui::agents_view::AgentsViewUiMode::Terminal,
+        )
+        .await?;
+        let Some(selection) = view.selection else {
+            return Ok(());
+        };
+        let mut session_options = base.clone();
+        session_options.session = selection;
+        let outcome =
+            pa_tui::interactive::run_interactive(session_options, UiMode::Terminal).await?;
+        anchor = Some(outcome.session_id.clone());
+        // `/resume <selector>` routes straight to that session; `/resume`
+        // (bare) and every other exit return to the agents view.
+        let mut pending = outcome.selection_request;
+        while let Some(selection) = pending.take() {
+            let mut next = base.clone();
+            next.session = selection;
+            let outcome = pa_tui::interactive::run_interactive(next, UiMode::Terminal).await?;
+            anchor = Some(outcome.session_id.clone());
+            pending = outcome.selection_request;
+        }
+    }
 }
 
 /// `--daemon-socket` value or the per-user default socket path.

@@ -1032,23 +1032,275 @@ class Battery:
         self.session_shape_diff(flow)
 
     def f9_agents_view(self) -> None:
-        """Agents view: interactive session list pane states."""
+        """Agents view: section grouping over a scripted roster (running live
+        session, idle live session, saved-catalog session), the open action
+        attaching to the selected running session, and frame captures at two
+        terminal sizes for the cross-side frame diff."""
         flow = "f9_agents_view"
+        frames: dict[str, dict[str, str]] = {}
         for side in (self.sides["ts"], self.sides["rust"]):
-            session = f"{self.runid}-f9-{side.name}"
-            argv = [side.binary, "agents", "--daemon-socket", str(side.daemon_socket), "--offline"]
-            B.tmux_launch(session, argv, side.env, side.work_dir)
-            frame = B.tmux_wait_text(session, "agents|Agents|session|Session|No |error|Error", timeout=30)
-            side.evidence(flow, "agents-view.txt", frame)
-            B.tmux_kill(session)
-            self.record(
-                flow,
-                "visual",
-                f"{side.name}: agents view frame captured (see evidence); frame-level diffing belongs to the visual-parity lane",
-                gap=False,
+            self.ensure_daemon(side)
+            # The agents view lists the whole daemon universe, so f9 starts
+            # from a clean one: restart the side daemon and wipe its session
+            # files, leaving only the sessions f9 creates below.
+            self.reset_side_sessions(side)
+            frames[side.name] = {}
+            # Idle live session: one completed exchange.
+            side.mock.set_responses([{"text": "f9 idle reply"}])
+            wire = B.Wire(side.daemon_socket)
+            create = wire.request(
+                "c9i",
+                {"type": "create", "name": "battery-f9-idle", "config": self.session_config(side)},
+                timeout=120,
             )
+            if create.get("success") is not True:
+                self.record(flow, "protocol", f"{side.name}: daemon create failed: {json.dumps(create)[:300]}")
+                wire.close()
+                continue
+            idle_id = (create.get("data", {}).get("activeSessionId") or create.get("data", {}).get("id") or "")
+            idle_prompt = wire.request(
+                "p9i",
+                {"type": "prompt_and_wait", "activeSessionId": idle_id, "message": "f9 idle prompt"},
+                timeout=240,
+            )
+            side.evidence_json(flow, "idle-prompt-response.json", idle_prompt)
+            wire.close()
+            # A saved-catalog session: a headless print run whose file
+            # remains after the run (the Inactive section source).
+            print_rec = B.run_cmd(
+                [
+                    side.binary,
+                    "-p",
+                    "--daemon-socket",
+                    str(side.daemon_socket),
+                    "--provider",
+                    "prime-inference",
+                    "--model",
+                    "mock-1",
+                    "--offline",
+                    "f9 inactive prompt",
+                ],
+                side.env,
+                side.work_dir,
+                timeout=240,
+            )
+            side.evidence_json(flow, "inactive-print.json", print_rec)
+            # Busy live session: an in-flight delayed turn keeps the row
+            # Running while the view frames are captured. The idle turn's
+            # post-turn requests must settle first so the delayed script
+            # can only ever apply to the busy session's requests.
+            self.settle_mock(side)
+            side.mock.set_responses([{"text": "f9 busy reply", "delayMs": 25000}])
+            wire = B.Wire(side.daemon_socket)
+            create = wire.request(
+                "c9b",
+                {"type": "create", "name": "battery-f9-busy", "config": self.session_config(side)},
+                timeout=120,
+            )
+            if create.get("success") is not True:
+                self.record(flow, "protocol", f"{side.name}: busy create failed: {json.dumps(create)[:300]}")
+                wire.close()
+                continue
+            busy_id = (create.get("data", {}).get("activeSessionId") or create.get("data", {}).get("id") or "")
+            wire.send_command("p9b", {"type": "prompt_and_wait", "activeSessionId": busy_id, "message": "f9 busy prompt"})
+            wire.close()
+            if not self.wait_roster_status(side, busy_id, "running", timeout=15):
+                self.record(
+                    flow,
+                    "behavior",
+                    f"{side.name}: the busy session never reached Running on the roster",
+                )
+                continue
+            # TS suppresses the agents view while onboarding is pending
+            # (`shouldOpenAgentsViewForDaemonInteractive`); mark the side
+            # onboarded so both products open the view directly.
+            settings_path = side.agent_dir / "settings.json"
+            settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+            settings["onboardingShown"] = True
+            settings_path.write_text(json.dumps(settings))
+            # The view over the scripted roster, captured at both sizes.
+            view_session = f"{self.runid}-f9-{side.name}"
+            # No --offline: it disables telemetry for the invocation, and TS
+            # refuses to attach an active agent across that telemetry mismatch.
+            argv = [side.binary, "agents", "--daemon-socket", str(side.daemon_socket)]
+            B.tmux_launch(view_session, argv, side.env, side.work_dir)
+            frame120 = B.tmux_wait_text(view_session, "Running \(|Idle \(|Inactive \(|No sessions", timeout=30)
+            side.evidence(flow, "01-agents-view-120x36.txt", frame120)
+            frames[side.name]["120x36"] = frame120
+            B.tmux_resize(view_session, (220, 50))
+            time.sleep(1.0)
+            frame220 = B.tmux_capture(view_session)
+            side.evidence(flow, "02-agents-view-220x50.txt", frame220)
+            frames[side.name]["220x50"] = frame220
+            B.tmux_resize(view_session, (120, 36))
+            time.sleep(0.5)
+            # Section grouping: each scripted session sits under its section.
+            sections = self.parse_agents_view_sections(frame120)
+            section_ok = True
+            for section, marker in (
+                ("Running", "battery-f9-busy"),
+                ("Idle", "battery-f9-idle"),
+                ("Inactive", "f9 inactive prompt"),
+            ):
+                rows = sections.get(section, [])
+                if not any(marker in row for row in rows):
+                    section_ok = False
+                    self.record(
+                        flow,
+                        "behavior",
+                        f"{side.name}: '{marker}' is not grouped under the {section} section (sections: {json.dumps(sections)[:400]})",
+                        evidence=side.root / flow / "01-agents-view-120x36.txt",
+                    )
+            if section_ok:
+                self.record(
+                    flow,
+                    "behavior",
+                    f"{side.name}: agents view groups the roster into Running/Idle/Inactive sections with the scripted sessions in place",
+                    gap=False,
+                )
+            # Attach target: search down to the running row, open it, and the
+            # in-flight reply must render in the attached session UI.
+            B.tmux_send(view_session, "busy")
+            time.sleep(1.0)
+            B.tmux_send(view_session, "Enter", enter=False)
+            attached = B.tmux_wait_text(view_session, "f9 busy reply", timeout=60)
+            side.evidence(flow, "03-attached-session.txt", attached)
+            pane_state = B.tmux(
+                "list-panes", "-t", view_session, "-F", "#{pane_dead} #{pane_dead_status}", check=False
+            ).stdout.strip()
+            if pane_state.startswith("1"):
+                self.record(
+                    flow,
+                    "behavior",
+                    f"{side.name}: opening the Running row exited the view instead of attaching ({pane_state})",
+                    evidence=side.root / flow / "03-attached-session.txt",
+                )
+            else:
+                self.record(
+                    flow,
+                    "behavior",
+                    f"{side.name}: opening the Running row attached to the live session and its in-flight reply rendered",
+                    gap=False,
+                )
+            B.tmux_kill(view_session)
+            # Leave the mock script plain for the flows that follow (f11's
+            # healthy exchange expects the HELLO_TEXT response).
+            side.mock.set_responses([{"text": HELLO_TEXT}])
+        # Frame diff: same scripted roster, same size, TS vs Rust.
+        for size_label in ("120x36", "220x50"):
+            ts_frame = frames.get("ts", {}).get(size_label)
+            rs_frame = frames.get("rust", {}).get(size_label)
+            if ts_frame is None or rs_frame is None:
+                self.record(flow, "visual", f"missing frames for the {size_label} diff (ts={'y' if ts_frame else 'n'} rust={'y' if rs_frame else 'n'})")
+                continue
+            ts_norm = self.normalize_agents_view_frame(ts_frame, self.sides["ts"])
+            rs_norm = self.normalize_agents_view_frame(rs_frame, self.sides["rust"])
+            if ts_norm == rs_norm:
+                self.record(
+                    flow,
+                    "visual",
+                    f"agents view frames identical at {size_label} (normalized: paths, ids, ages)",
+                    gap=False,
+                )
+            else:
+                diff_path = self.sides["ts"].root / flow / f"frame-diff-{size_label}.txt"
+                diff_path.parent.mkdir(parents=True, exist_ok=True)
+                diff_path.write_text(
+                    f"--- ts ({size_label})\n{ts_frame}\n+++ rust ({size_label})\n{rs_frame}"
+                )
+                self.record(
+                    flow,
+                    "visual",
+                    f"agents view frames differ at {size_label} (see frame-diff-{size_label}.txt)",
+                    evidence=diff_path,
+                )
 
-    # -- perf -----------------------------------------------------------------
+    def parse_agents_view_sections(self, frame: str) -> dict[str, list[str]]:
+        """Map each rendered section heading to its row lines."""
+        sections: dict[str, list[str]] = {}
+        current = None
+        for line in frame.splitlines():
+            match = re.match(r"\s*(Running|Idle|Inactive) \(\d+\)", line)
+            if match:
+                current = match.group(1)
+                sections.setdefault(current, [])
+                continue
+            if current is not None and line.strip():
+                sections[current].append(line)
+        return sections
+
+    def normalize_agents_view_frame(self, frame: str, side: B.Side) -> str:
+        """Erase side-varying text (paths, ids, ages, versions) so equal
+        layout and content compare equal."""
+        text = frame.rstrip("\n")
+        # The splash ~-compresses paths; expand so the absolute side paths match.
+        text = text.replace("~/", str(Path.home()) + "/")
+        text = text.replace(str(side.root), "<run>")
+        text = text.replace(str(side.agent_dir), "<agent>")
+        text = text.replace(str(side.work_dir), "<work>")
+        text = re.sub(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", "<uuid>", text)
+        text = re.sub(r"(?<![a-zA-Z])\d+[smhd](?![a-zA-Z])", "<age>", text)
+        text = re.sub(r"\bv\d+\.\d+[^ ]*", "<version>", text)
+        text = re.sub(r"\$0\.\d\d", "<cost>", text)
+        # The animated running-row icon and the per-build version string.
+        text = re.sub("[\u25c7\u25c8\u25c6]", "<pulse>", text)
+        text = re.sub(r"v\d+\.\d+\.\d+", "<version>", text)
+        return text
+
+    def reset_side_sessions(self, side: B.Side) -> None:
+        """Restart the side daemon with no sessions: stop it, delete the
+        session files, start a fresh one on the same socket."""
+        try:
+            wire = B.Wire(side.daemon_socket)
+            wire.send_command("sd9", {"type": "shutdown"})
+            wire.close()
+        except (OSError, EOFError):
+            pass
+        side.stop_daemon()
+        time.sleep(1.0)
+        sessions = side.sessions_dir()
+        if sessions.exists():
+            shutil.rmtree(sessions)
+        side.start_daemon()
+
+    def settle_mock(self, side: B.Side, quiet_s: float = 2.0, timeout: float = 20.0) -> None:
+        """Wait until the side's mock has gone `quiet_s` seconds with no new
+        request, so post-turn status-line requests have landed before the
+        flow swaps the response script (a swapped script resets the mock's
+        response cursor, and a delayed response would hang a status-line
+        request and hold the session busy)."""
+        deadline = time.time() + timeout
+        last_count = len(side.mock.requests())
+        last_change = time.time()
+        while time.time() < deadline:
+            time.sleep(0.5)
+            count = len(side.mock.requests())
+            if count != last_count:
+                last_count = count
+                last_change = time.time()
+            elif time.time() - last_change >= quiet_s:
+                return
+
+    def wait_roster_status(self, side: B.Side, active_session_id: str, status: str, timeout: float = 15.0) -> bool:
+        """Poll the roster snapshot until the session reaches `status`."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                wire = B.Wire(side.daemon_socket)
+            except (OSError, EOFError):
+                time.sleep(0.5)
+                continue
+            try:
+                response = wire.request("rp", {"type": "roster_subscribe"}, timeout=10)
+            finally:
+                wire.close()
+            if response.get("success") is True:
+                for entry in (response.get("data", {}).get("roster") or []):
+                    if (entry.get("summary", {}).get("activeSessionId") == active_session_id
+                            and entry.get("status") == status):
+                        return True
+            time.sleep(0.5)
+        return False
 
     def f11_provider_failure(self) -> None:
         """Kill the mock provider mid-session: the interactive transcript

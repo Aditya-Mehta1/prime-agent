@@ -56,6 +56,14 @@ pub enum DaemonClientEvent {
     SessionListProgress { loaded: u64, total: u64 },
     /// `daemon_closing`: the supervisor is going down.
     DaemonClosing { reason: String },
+    /// `roster_update`: live roster deltas for subscribers (the agents
+    /// view): changed entries upsert by agent id, `removed` deletes, and
+    /// `resync` replaces the whole roster.
+    RosterUpdate {
+        changed: Vec<Value>,
+        removed: Vec<String>,
+        resync: bool,
+    },
 }
 
 /// One non-response frame, parsed from a supervisor JSONL line or a direct
@@ -99,6 +107,24 @@ pub(crate) fn client_event_from_value(value: &Value) -> Option<DaemonClientEvent
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+        }),
+        "roster_update" => Some(DaemonClientEvent::RosterUpdate {
+            changed: value
+                .get("changed")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            removed: value
+                .get("removed")
+                .and_then(Value::as_array)
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            resync: value.get("resync") == Some(&Value::Bool(true)),
         }),
         _ => None,
     }

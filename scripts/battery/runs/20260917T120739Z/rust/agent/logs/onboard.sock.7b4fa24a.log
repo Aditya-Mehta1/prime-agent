@@ -1,0 +1,3 @@
+supervisor started pid 3033024
+[2026-09-17T12:10:40.799Z] session worker 7503a15604ad registered (epoch 1, pid 3033029)
+[2026-09-17T12:10:40.840Z] session worker 7503a15604ad re-registered (epoch 2, pid 3033029)

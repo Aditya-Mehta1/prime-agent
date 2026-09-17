@@ -65,7 +65,7 @@ const WORKER_CONNECT_PROBE_MS: u64 = 2_000;
 const WORKER_CONNECT_BACKOFF_MS: u64 = 25;
 #[cfg(not(unix))]
 const WORKER_CONNECT_BACKOFF_MS: u64 = 2_000;
-const ROUTE_TIMEOUT_MS: u64 = 30_000;
+pub(crate) const ROUTE_TIMEOUT_MS: u64 = 30_000;
 const LONG_ROUTE_TIMEOUT_MS: u64 = 600_000;
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 const BASE_BACKOFF_MS: u64 = 250;
@@ -80,11 +80,13 @@ pub struct SupervisorOptions {
 
 /// Which clients a worker outbound frame reaches.
 #[derive(Debug, Clone)]
-enum ClientRouting {
+pub(crate) enum ClientRouting {
     /// Every connected client (e.g. `daemon_closing`).
     Broadcast,
     /// Clients attached to the session.
     AttachedSession { active_session_id: String },
+    /// Clients holding a roster subscription (`roster_subscribe`).
+    RosterSubscribers,
 }
 
 pub struct Supervisor {
@@ -92,7 +94,10 @@ pub struct Supervisor {
     descriptor_dir: PathBuf,
     pub(crate) registry: SessionRegistry,
     /// Worker outbound frames, with their client routing.
-    events: broadcast::Sender<(ClientRouting, Value)>,
+    pub(crate) events: broadcast::Sender<(ClientRouting, Value)>,
+    /// The supervisor's agent roster (classified entries; the roster arms
+    /// live in `supervisor_roster.rs`).
+    pub(crate) roster: std::sync::Mutex<crate::agent_roster::AgentRoster>,
     shutting_down: AtomicBool,
     /// Wakes the accept loop when [`Supervisor::begin_shutdown`] sets the
     /// flag: a listening socket blocks in `accept` until a client connects,
@@ -128,6 +133,7 @@ impl Supervisor {
             descriptor_dir,
             registry: SessionRegistry::new(),
             events,
+            roster: std::sync::Mutex::new(crate::agent_roster::AgentRoster::new()),
             shutting_down: AtomicBool::new(false),
             shutdown_notify: tokio::sync::Notify::new(),
             log,
@@ -243,6 +249,8 @@ impl Supervisor {
             Ok(()) => {
                 self.registry.insert(Arc::clone(&resident)).await;
                 self.spawn_monitor(Arc::clone(&resident), None, pid);
+                // The adopted worker joins the roster from its live state.
+                self.refresh_roster_entry(&resident).await;
                 self.log_line(&format!(
                     "adopted session worker {worker_id} (was alive: {alive})"
                 ));
@@ -312,6 +320,7 @@ impl Supervisor {
                 let _ = persist_worker(&resident.descriptor_path, &descriptor);
                 drop(descriptor);
                 self.registry.remove(&resident.worker_id).await;
+                self.remove_roster_worker(&resident.worker_id);
                 self.log_line(&format!(
                     "session worker {} failed after {failures} consecutive failures",
                     resident.worker_id
@@ -938,6 +947,10 @@ impl Supervisor {
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let effective_client_id: Arc<std::sync::Mutex<String>> =
             Arc::new(std::sync::Mutex::new(client_id.clone()));
+        // Roster subscription flag shared with the per-command dispatch
+        // tasks (`roster_subscribe` flips it; the event arm filters pushes).
+        let roster_subscribed: Arc<std::sync::atomic::AtomicBool> =
+            Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Completed dispatches flow back through this channel so the loop
         // keeps writing: a long command (a turn, a compaction) must not
         // block this client's events or its other commands, like the TS
@@ -959,10 +972,16 @@ impl Supervisor {
                     let supervisor = Arc::clone(&self);
                     let effective_client_id = Arc::clone(&effective_client_id);
                     let attached = Arc::clone(&attached);
+                    let roster_subscribed = Arc::clone(&roster_subscribed);
                     let dispatch_tx = dispatch_tx.clone();
                     tokio::spawn(async move {
                         let (lines, stop) = supervisor
-                            .dispatch_client(&trimmed, &effective_client_id, &attached)
+                            .dispatch_client(
+                                &trimmed,
+                                &effective_client_id,
+                                &attached,
+                                &roster_subscribed,
+                            )
                             .await;
                         let _ = dispatch_tx.send((lines, stop));
                     });
@@ -983,6 +1002,9 @@ impl Supervisor {
                                 ClientRouting::Broadcast => true,
                                 ClientRouting::AttachedSession { active_session_id } => {
                                     attached.lock().unwrap().iter().any(|id| id == active_session_id)
+                                }
+                                ClientRouting::RosterSubscribers => {
+                                    roster_subscribed.load(std::sync::atomic::Ordering::SeqCst)
                                 }
                             };
                             if deliver {
@@ -1016,6 +1038,7 @@ impl Supervisor {
         line: &str,
         effective_client_id: &Arc<std::sync::Mutex<String>>,
         attached: &Arc<std::sync::Mutex<Vec<String>>>,
+        roster_subscribed: &Arc<std::sync::atomic::AtomicBool>,
     ) -> (Vec<Value>, bool) {
         let envelope = match parse_supervisor_command_line(line) {
             Ok(envelope) => envelope,
@@ -1073,6 +1096,33 @@ impl Supervisor {
                     .handle_saved_session_list(&envelope.command, &command_id)
                     .await;
                 (lines, false)
+            }
+            DaemonCommand::RosterSubscribe { .. } => {
+                roster_subscribed.store(true, std::sync::atomic::Ordering::SeqCst);
+                let response = self.handle_roster_subscribe(&command_id, &type_name);
+                (vec![response_line(&response)], false)
+            }
+            DaemonCommand::RosterUnsubscribe { .. } => {
+                roster_subscribed.store(false, std::sync::atomic::Ordering::SeqCst);
+                let response = self.handle_roster_unsubscribe(&command_id, &type_name);
+                (vec![response_line(&response)], false)
+            }
+            DaemonCommand::WorkerRosterDelta {
+                worker_token,
+                summary,
+                removed,
+                ..
+            } => {
+                let response = self
+                    .handle_worker_roster_delta(
+                        &command_id,
+                        &type_name,
+                        worker_token,
+                        summary.clone(),
+                        removed.clone().unwrap_or_default(),
+                    )
+                    .await;
+                (vec![response_line(&response)], false)
             }
             DaemonCommand::Create { .. } => {
                 let client_id = effective_client_id.lock().unwrap().clone();
@@ -1224,6 +1274,9 @@ impl Supervisor {
             record.epoch
         ));
         drop(guard);
+        // Registration rebuilt the resident: refresh its roster entry from
+        // the live worker so the roster reflects the re-registered state.
+        self.refresh_roster_entry(&resident).await;
         response_success(
             Some(command_id),
             type_name,
@@ -1270,6 +1323,7 @@ impl Supervisor {
             .await?;
         self.registry.insert(Arc::clone(&resident)).await;
         self.spawn_monitor(Arc::clone(&resident), None, registration.pid);
+        self.refresh_roster_entry(&resident).await;
         self.log_line(&format!(
             "adopted session worker {worker_id} via self-registration"
         ));
@@ -1447,9 +1501,13 @@ impl Supervisor {
         let response = self
             .route_command(&resident, "get_state", json!({}), ROUTE_TIMEOUT_MS)
             .await?;
-        Ok(response
+        let summary = response
             .data
-            .unwrap_or_else(|| json!({ "id": resident.worker_id })))
+            .unwrap_or_else(|| json!({ "id": resident.worker_id }));
+        // The new session joins the agent roster immediately (subscribers
+        // see the roster_update before their next list).
+        self.write_roster_summary(&summary, Some(&resident.worker_id));
+        Ok(summary)
     }
 
     async fn assert_session_name_available(self: &Arc<Self>, name: &str) -> Result<()> {
@@ -1616,6 +1674,7 @@ impl Supervisor {
             .await;
         let _ = std::fs::remove_file(&resident.descriptor_path);
         self.registry.remove(&resident.worker_id).await;
+        self.remove_roster_worker(&resident.worker_id);
     }
 
     async fn begin_shutdown(self: &Arc<Self>) {

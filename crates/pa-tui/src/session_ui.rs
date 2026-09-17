@@ -54,6 +54,10 @@ pub(crate) struct SessionUi {
     turn_error_shown: bool,
     pub(crate) last_assistant_text: Option<String>,
     pub(crate) exit_requested: bool,
+    /// `/resume`: reopen the agents view after this session detaches.
+    pub(crate) open_agents_view: bool,
+    /// `/resume <selector>`: open this selection next (the run returns it).
+    pub(crate) pending_selection: Option<SessionSelection>,
     pub(crate) dirty: bool,
 }
 
@@ -90,6 +94,8 @@ impl SessionUi {
             turn_error_shown: false,
             last_assistant_text: None,
             exit_requested: false,
+            open_agents_view: false,
+            pending_selection: None,
             dirty: true,
         };
         session
@@ -437,6 +443,28 @@ impl SessionUi {
             "quit" => {
                 self.exit_requested = true;
             }
+            // `/resume` (TS: open the agents view, or resume a session by
+            // id or path). Both paths detach this session first; the CLI
+            // loop then opens the agents view or the resolved selection.
+            "resume" => {
+                if resolved.args.is_empty() {
+                    self.open_agents_view = true;
+                    self.exit_requested = true;
+                } else {
+                    match self.resolve_resume_selector(&resolved.args) {
+                        Some(selection) => {
+                            self.pending_selection = Some(selection);
+                            self.exit_requested = true;
+                        }
+                        None => {
+                            self.note(
+                                &format!("could not resolve session \"{}\"", resolved.args),
+                                view,
+                            );
+                        }
+                    }
+                }
+            }
             other => {
                 self.note(
                     &format!("/{other} is not available in this client yet"),
@@ -445,6 +473,27 @@ impl SessionUi {
             }
         }
         Ok(())
+    }
+
+    /// `/resume <selector>`: a session file path, an `<id>.jsonl` under the
+    /// sessions dir, or a live daemon session id (attach). Mirrors the CLI
+    /// selector resolution in `interactive_mode.rs`.
+    fn resolve_resume_selector(&self, selector: &str) -> Option<SessionSelection> {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return None;
+        }
+        let path = std::path::Path::new(selector);
+        if path.is_file() {
+            return Some(SessionSelection::Resume(path.to_path_buf()));
+        }
+        if let Some(dir) = &self.session_dir {
+            let candidate = dir.join(format!("{selector}.jsonl"));
+            if candidate.is_file() {
+                return Some(SessionSelection::Resume(candidate));
+            }
+        }
+        Some(SessionSelection::Attach(selector.to_string()))
     }
 
     /// Options for `/new`: same socket, cwd, persistence, and script seam as
@@ -626,9 +675,11 @@ impl SessionUi {
             DaemonClientEvent::DaemonClosing { reason } => {
                 self.note(&format!("the daemon is shutting down ({reason})"), view);
             }
-            // Saved-session list frames belong to the session picker UI.
+            // Saved-session list frames and roster pushes belong to the
+            // agents-view UI; the session view only reads its own session.
             DaemonClientEvent::SessionListItem { .. }
-            | DaemonClientEvent::SessionListProgress { .. } => {}
+            | DaemonClientEvent::SessionListProgress { .. }
+            | DaemonClientEvent::RosterUpdate { .. } => {}
         }
     }
 

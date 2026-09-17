@@ -1,0 +1,1068 @@
+//! The agents-view data layer: one reconcile of the daemon's live roster and
+//! the saved-session catalog into unified records, then section grouping,
+//! search, and the row/layout shapes the view renders. Pure functions on
+//! JSON summaries (the wire forms the supervisor serves), mirroring the TS
+//! agents-view state module; the view module owns input and painting.
+
+use std::collections::HashMap;
+
+use pa_types::daemon::agent_roster::AgentRosterStatus;
+use serde_json::Value;
+
+use crate::width::str_width;
+
+/// One of the three sections every unified record sorts into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Running,
+    Idle,
+    Inactive,
+}
+
+/// The display heading of a section.
+pub fn section_title(section: Section) -> &'static str {
+    match section {
+        Section::Running => "Running",
+        Section::Idle => "Idle",
+        Section::Inactive => "Inactive",
+    }
+}
+
+fn section_rank(section: Section) -> u8 {
+    match section {
+        Section::Running => 0,
+        Section::Idle => 1,
+        Section::Inactive => 2,
+    }
+}
+
+fn section_from_status(status: AgentRosterStatus) -> Section {
+    match status {
+        AgentRosterStatus::Running => Section::Running,
+        AgentRosterStatus::Idle => Section::Idle,
+        AgentRosterStatus::Inactive => Section::Inactive,
+    }
+}
+
+/// One merged row source: the live roster summary, the saved catalog row, or
+/// both. Daemon data stays authoritative; saved data only enriches the
+/// durable/search fields.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnifiedRecord {
+    /// The slim session summary of a roster entry (`summary` field).
+    pub daemon: Option<Value>,
+    /// One saved-session catalog row (`session_list_item.session`).
+    pub saved: Option<Value>,
+    /// The supervisor's classification of the roster entry.
+    pub status: Option<AgentRosterStatus>,
+    /// `queued` / `recovering` / `failed` (set only for exceptional states).
+    pub status_label: Option<String>,
+    /// The stable UI key (first alias).
+    pub identity: String,
+    /// Every key this record is reachable by (selection survival).
+    pub aliases: Vec<String>,
+    pub section: Section,
+    pub searchable: String,
+}
+
+fn get_str<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+}
+
+/// The canonical file identity (TS canonicalizes; the saved catalog already
+/// serves absolute paths, so lexical normalization is enough here).
+fn file_identity(path: &str) -> String {
+    format!("file:{path}")
+}
+
+/// The aliases of one roster entry summary, in TS order.
+fn daemon_aliases(summary: &Value) -> Vec<String> {
+    let mut aliases = Vec::new();
+    if get_str(summary, "runtimeKind") == Some("subagent") && summary.get("rlmChildId").is_some() {
+        // The roster entry's agentId is the parent-qualified child id.
+        if let Some(agent_id) = get_str(summary, "rosterAgentId") {
+            aliases.push(format!("agent:{agent_id}"));
+        }
+    }
+    if let Some(file) = get_str(summary, "sessionFile") {
+        aliases.push(file_identity(file));
+    }
+    if let Some(id) = get_str(summary, "sessionId") {
+        aliases.push(format!("session:{id}"));
+    }
+    if let Some(active) = get_str(summary, "activeSessionId") {
+        aliases.push(format!("active:{active}"));
+    }
+    if let Some(id) = get_str(summary, "id") {
+        aliases.push(format!("active:{id}"));
+    }
+    aliases
+}
+
+fn saved_aliases(saved: &Value) -> Vec<String> {
+    let mut aliases = Vec::new();
+    if let Some(path) = get_str(saved, "path") {
+        aliases.push(file_identity(path));
+    }
+    if let Some(id) = get_str(saved, "id") {
+        aliases.push(format!("session:{id}"));
+    }
+    aliases
+}
+
+fn join_search_text(parts: &[Option<&str>]) -> String {
+    parts
+        .iter()
+        .filter_map(|part| *part)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn daemon_search_text(summary: &Value) -> String {
+    join_search_text(&[
+        get_str(summary, "sessionId"),
+        get_str(summary, "activeSessionId"),
+        get_str(summary, "sessionName"),
+        get_str(summary, "firstMessage"),
+        get_str(summary, "cwd"),
+        get_str(summary, "sessionFile"),
+        get_str(summary, "summary"),
+    ])
+}
+
+fn saved_search_text(saved: &Value) -> String {
+    join_search_text(&[
+        get_str(saved, "id"),
+        get_str(saved, "name"),
+        get_str(saved, "firstMessage"),
+        get_str(saved, "cwd"),
+        get_str(saved, "path"),
+        get_str(saved, "parentSessionPath"),
+    ])
+}
+
+/// Merge the live roster entries and the saved catalog rows into unified
+/// records without inventing runtime ancestry: roster data wins, saved rows
+/// only join through a shared alias and enrich search text.
+pub fn reconcile_unified_sessions(roster: &[Value], saved: &[Value]) -> Vec<UnifiedRecord> {
+    let mut records: Vec<UnifiedRecord> = Vec::new();
+    let mut by_alias: HashMap<String, usize> = HashMap::new();
+
+    for entry in roster {
+        let summary = entry.get("summary").cloned().unwrap_or(Value::Null);
+        let status = entry
+            .get("status")
+            .and_then(Value::as_str)
+            .and_then(parse_status);
+        let status_label = get_str(entry, "statusLabel").map(str::to_string);
+        let aliases = daemon_aliases(&summary);
+        let Some(identity) = aliases.first().cloned() else {
+            continue;
+        };
+        let section = status.map(section_from_status).unwrap_or(Section::Idle);
+        let searchable = daemon_search_text(&summary);
+        let index = records.len();
+        for alias in &aliases {
+            by_alias.insert(alias.clone(), index);
+        }
+        records.push(UnifiedRecord {
+            daemon: Some(summary),
+            saved: None,
+            status,
+            status_label,
+            identity,
+            aliases,
+            section,
+            searchable,
+        });
+    }
+
+    for row in saved {
+        let aliases = saved_aliases(row);
+        let Some(identity) = aliases.first().cloned() else {
+            continue;
+        };
+        let joined = aliases
+            .iter()
+            .find_map(|alias| by_alias.get(alias))
+            .copied();
+        if let Some(index) = joined {
+            // Saved data enriches the live record's durable fields.
+            let record = &mut records[index];
+            record.saved = Some(row.clone());
+            for alias in &aliases {
+                if !record.aliases.contains(alias) {
+                    record.aliases.push(alias.clone());
+                }
+                by_alias.insert(alias.clone(), index);
+            }
+            let mut text = daemon_search_text(record.daemon.as_ref().unwrap_or(&Value::Null));
+            let saved_text = saved_search_text(row);
+            if !saved_text.is_empty() {
+                text = format!("{text} {saved_text}");
+            }
+            record.searchable = text;
+            continue;
+        }
+        let index = records.len();
+        let searchable = saved_search_text(row);
+        for alias in &aliases {
+            by_alias.insert(alias.clone(), index);
+        }
+        records.push(UnifiedRecord {
+            daemon: None,
+            saved: Some(row.clone()),
+            status: None,
+            status_label: None,
+            identity,
+            aliases,
+            section: Section::Inactive,
+            searchable,
+        });
+    }
+    records
+}
+
+fn parse_status(status: &str) -> Option<AgentRosterStatus> {
+    match status {
+        "running" => Some(AgentRosterStatus::Running),
+        "idle" => Some(AgentRosterStatus::Idle),
+        "inactive" => Some(AgentRosterStatus::Inactive),
+        _ => None,
+    }
+}
+
+/// The merged summary a row renders and acts on (TS `summaryForUnifiedRecord`):
+/// the live summary when one exists, with saved fields filling the gaps;
+/// saved-only records synthesize the archived shape.
+pub fn summary_for_record(record: &UnifiedRecord) -> Value {
+    let saved = record.saved.as_ref();
+    if let Some(daemon) = &record.daemon {
+        let mut merged = daemon.clone();
+        if let Some(saved) = saved {
+            // Saved fields only fill gaps in the live summary (TS
+            // `summaryForUnifiedRecord`); live data stays authoritative.
+            let enrich = |merged: &mut Value, field: &str, saved: &Value| {
+                if merged.get(field).is_none_or(Value::is_null) {
+                    if let Some(value) = saved.get(field).filter(|v| !v.is_null()) {
+                        merged[field] = value.clone();
+                    }
+                }
+            };
+            enrich(
+                &mut merged,
+                "sessionName",
+                &serde_json::json!({ "sessionName": saved.get("name") }),
+            );
+            enrich(&mut merged, "firstMessage", saved);
+            enrich(&mut merged, "usage", saved);
+            enrich(&mut merged, "sessionFile", saved);
+            enrich(&mut merged, "parentSessionPath", saved);
+            enrich(&mut merged, "created", saved);
+            enrich(&mut merged, "modified", saved);
+            enrich(
+                &mut merged,
+                "lastActivityAt",
+                &serde_json::json!({ "lastActivityAt": saved.get("modified") }),
+            );
+            if merged.get("model").is_none_or(Value::is_null) {
+                if let Some(model) = saved.get("model") {
+                    merged["model"] = json_model(model);
+                }
+            }
+        }
+        merged
+    } else {
+        let saved = saved.cloned().unwrap_or(Value::Null);
+        let id = get_str(&saved, "id").unwrap_or_default().to_string();
+        let modified = get_str(&saved, "modified").unwrap_or_default().to_string();
+        let created = get_str(&saved, "created").unwrap_or_default().to_string();
+        serde_json::json!({
+            "id": id,
+            "sessionId": id,
+            "lifecycle": "archived",
+            "activity": "idle",
+            "isSessionActive": false,
+            "cwd": saved.get("cwd").cloned().unwrap_or(Value::Null),
+            "sessionFile": saved.get("path").cloned().unwrap_or(Value::Null),
+            "parentSessionPath": saved.get("parentSessionPath").cloned().unwrap_or(Value::Null),
+            "rlmDepth": saved.get("rlmDepth").cloned().unwrap_or(Value::Null),
+            "sessionName": saved.get("name").cloned().unwrap_or(Value::Null),
+            "isStreaming": false,
+            "isCompacting": false,
+            "attachedClients": 0,
+            "messageCount": saved.get("messageCount").cloned().unwrap_or(Value::Null),
+            "created": created,
+            "modified": modified,
+            "lastActivityAt": modified,
+            "firstMessage": saved.get("firstMessage").cloned().unwrap_or(Value::Null),
+            "model": json_model(saved.get("model").unwrap_or(&Value::Null)),
+        })
+    }
+}
+
+fn json_model(model: &Value) -> Value {
+    let model_id = model.get("modelId").cloned().unwrap_or(Value::Null);
+    let provider = model.get("provider").cloned().unwrap_or(Value::Null);
+    serde_json::json!({ "id": model_id, "provider": provider })
+}
+
+/// Hide abandoned empty catalog rows (TS `filterEmptyAgentsViewSessions`):
+/// an inactive row with no messages, name, usage, or transcript stays out
+/// unless the session is the view's anchor.
+pub fn filter_empty_sessions(
+    records: &[UnifiedRecord],
+    anchor: Option<&str>,
+) -> Vec<UnifiedRecord> {
+    records
+        .iter()
+        .filter(|record| {
+            let summary = summary_for_record(record);
+            let keep = record.section != Section::Inactive
+                || get_str(&summary, "activeSessionId").is_some()
+                || summary.get("isSessionActive") == Some(&Value::Bool(true))
+                || summary
+                    .get("attachedClients")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    > 0
+                || summary
+                    .get("messageCount")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    > 0
+                || get_str(&summary, "sessionName").is_some()
+                || summary
+                    .get("firstMessage")
+                    .and_then(Value::as_str)
+                    .map(|text| !text.trim().is_empty() && text.trim() != "(no messages)")
+                    .unwrap_or(false)
+                || summary
+                    .get("usage")
+                    .and_then(|usage| usage.get("cost"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+                    > 0.0
+                || get_str(&summary, "sessionId").is_some_and(|id| Some(id) == anchor);
+            keep
+        })
+        .cloned()
+        .collect()
+}
+
+/// One parsed search query (TS `ParsedSearchQuery`): `re:` enters regex
+/// mode; otherwise whitespace tokens with `"quoted phrase"` support.
+pub struct ParsedSearchQuery {
+    regex: Option<fancy_regex::Regex>,
+    tokens: Vec<SearchToken>,
+    /// A query that cannot match anything (an invalid `re:` pattern).
+    matches_never: bool,
+}
+
+enum SearchToken {
+    Fuzzy(String),
+    Phrase(String),
+}
+
+/// Parse a query; invalid `re:` patterns parse to no matches.
+pub fn parse_search_query(query: &str) -> ParsedSearchQuery {
+    let trimmed = query.trim();
+    if let Some(pattern) = trimmed.strip_prefix("re:") {
+        let pattern = pattern.trim();
+        if pattern.is_empty() {
+            return ParsedSearchQuery {
+                regex: None,
+                tokens: Vec::new(),
+                matches_never: true,
+            };
+        }
+        let matches_never = match fancy_regex::Regex::new(&format!("(?i){pattern}")) {
+            Ok(regex) => {
+                return ParsedSearchQuery {
+                    regex: Some(regex),
+                    tokens: Vec::new(),
+                    matches_never: false,
+                };
+            }
+            Err(_) => true,
+        };
+        return ParsedSearchQuery {
+            regex: None,
+            tokens: Vec::new(),
+            matches_never,
+        };
+    }
+    ParsedSearchQuery {
+        regex: None,
+        tokens: tokenize(trimmed),
+        matches_never: false,
+    }
+}
+
+fn tokenize(trimmed: &str) -> Vec<SearchToken> {
+    let mut tokens = Vec::new();
+    let mut buffer = String::new();
+    let mut in_quote = false;
+    for ch in trimmed.chars() {
+        if ch == '"' {
+            if in_quote {
+                push_token(&mut tokens, &mut buffer, SearchToken::Phrase);
+            } else {
+                push_token(&mut tokens, &mut buffer, SearchToken::Fuzzy);
+            }
+            in_quote = !in_quote;
+            continue;
+        }
+        if !in_quote && ch.is_whitespace() {
+            push_token(&mut tokens, &mut buffer, SearchToken::Fuzzy);
+            continue;
+        }
+        buffer.push(ch);
+    }
+    if in_quote {
+        // Unbalanced quotes fall back to plain whitespace tokenization.
+        return trimmed
+            .split_whitespace()
+            .map(|token| SearchToken::Fuzzy(token.to_string()))
+            .collect();
+    }
+    // Whatever is left in the buffer belongs to the last quote state.
+    let kind = if in_quote {
+        SearchToken::Phrase
+    } else {
+        SearchToken::Fuzzy
+    };
+    push_token(&mut tokens, &mut buffer, kind);
+    tokens
+}
+
+fn push_token(tokens: &mut Vec<SearchToken>, buffer: &mut String, kind: fn(String) -> SearchToken) {
+    let value = buffer.trim().to_string();
+    buffer.clear();
+    if !value.is_empty() {
+        tokens.push(kind(value));
+    }
+}
+
+/// The strict fuzzy ceiling above which a token counts as unmatched (TS
+/// `STRICT_FUZZY_MAX_TOKEN_SCORE`).
+const STRICT_FUZZY_MAX_TOKEN_SCORE: f64 = 25.0;
+
+/// Whether the search corpus matches the query (TS `matchSearchText`).
+pub fn matches_query(text: &str, query: &ParsedSearchQuery) -> bool {
+    if query.matches_never {
+        return false;
+    }
+    if let Some(regex) = &query.regex {
+        return regex.is_match(text).unwrap_or(false);
+    }
+    if query.tokens.is_empty() {
+        return true;
+    }
+    let normalized = normalize(text);
+    for token in &query.tokens {
+        match token {
+            SearchToken::Phrase(value) => {
+                if !normalized.contains(&normalize(value)) {
+                    return false;
+                }
+            }
+            SearchToken::Fuzzy(value) => {
+                if !normalized.contains(&normalize(value)) {
+                    let Some(score) = crate::fuzzy::fuzzy_match(value, text) else {
+                        return false;
+                    };
+                    if score > STRICT_FUZZY_MAX_TOKEN_SCORE {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+fn normalize(text: &str) -> String {
+    text.to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Epoch milliseconds from an RFC 3339 timestamp (`YYYY-MM-DDTHH:MM:SS.sssZ`).
+fn iso_to_unix_ms(iso: &str) -> Option<i64> {
+    let bytes = iso.as_bytes();
+    if bytes.len() < 19
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || (bytes[10] != b'T' && bytes[10] != b' ')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+    let year: i64 = iso.get(0..4)?.parse().ok()?;
+    let month: i64 = iso.get(5..7)?.parse().ok()?;
+    let day: i64 = iso.get(8..10)?.parse().ok()?;
+    let hour: i64 = iso.get(11..13)?.parse().ok()?;
+    let minute: i64 = iso.get(14..16)?.parse().ok()?;
+    let second: i64 = iso.get(17..19)?.parse().ok()?;
+    let mut millis: i64 = 0;
+    if bytes.len() > 20 && bytes[19] == b'.' {
+        let digits: String = iso[20..].chars().take_while(char::is_ascii_digit).collect();
+        if !digits.is_empty() {
+            let fraction: f64 = format!("0.{digits}").parse().ok()?;
+            millis = (fraction * 1000.0) as i64;
+        }
+    }
+    // Days from civil (Howard Hinnant's algorithm, as in pa-daemon's util).
+    let years = if month <= 2 { year - 1 } else { year };
+    let era = years.div_euclid(400);
+    let year_of_era = years.rem_euclid(400);
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Some(((days * 86_400 + hour * 3_600 + minute * 60 + second) * 1000) + millis)
+}
+
+fn timestamp_ms(value: Option<&str>) -> i64 {
+    value.and_then(iso_to_unix_ms).unwrap_or(0)
+}
+
+/// Relative age (`s`/`m`/`h`/`d`, TS `formatAgentsViewRelativeTime`).
+pub fn relative_age(value: Option<&str>, now_ms: u64) -> String {
+    let Some(ms) = value.and_then(iso_to_unix_ms) else {
+        return String::new();
+    };
+    let seconds = ((now_ms as i64 - ms) / 1000).max(0) as u64;
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    if hours < 24 {
+        return format!("{hours}h");
+    }
+    format!("{}d", hours / 24)
+}
+
+/// One rendered list row (the PR-2 flat shape: agent rows only; subagent
+/// nesting rows arrive with the RLM ledger surface).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentsViewRow {
+    pub section: Section,
+    pub identity: String,
+    /// The merged summary the open action acts on.
+    pub summary: Value,
+    pub title: String,
+    pub status_label: String,
+    pub model: String,
+    /// The row's own activity text (`status · recap`).
+    pub activity: String,
+    pub cost: f64,
+    pub age: String,
+}
+
+/// The row title (TS `getAgentsViewSessionTitle`): name, first prompt, cwd
+/// basename, session id, id — first non-empty wins.
+pub fn session_title(summary: &Value) -> String {
+    let cwd_basename = get_str(summary, "cwd").map(|cwd| {
+        std::path::Path::new(cwd)
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default()
+    });
+    for candidate in [
+        get_str(summary, "sessionName"),
+        get_str(summary, "firstMessage"),
+        cwd_basename.as_deref(),
+        get_str(summary, "sessionId"),
+        get_str(summary, "id"),
+    ] {
+        let normalized = candidate
+            .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+            .unwrap_or_default();
+        if !normalized.is_empty() {
+            return normalized;
+        }
+    }
+    "Untitled agent".to_string()
+}
+
+/// The activity-side status label (TS `getSessionStatusLabel`, the fields
+/// the Rust summaries carry).
+fn session_status_label(summary: &Value) -> String {
+    if let Some(label) = get_str(summary, "statusLabel") {
+        return label.to_string();
+    }
+    if summary
+        .get("lastHeardFromAt")
+        .is_some_and(|value| !value.is_null())
+    {
+        return format!(
+            "last heard {}",
+            relative_age(get_str(summary, "lastHeardFromAt"), now_ms())
+        );
+    }
+    // A non-ready worker cannot report fresh runtime flags; its state is the row's story.
+    if let Some(state) = get_str(summary, "workerState") {
+        if state != "ready" {
+            return state.to_string();
+        }
+    }
+    if summary.get("isCompacting") == Some(&Value::Bool(true)) {
+        return "compacting".to_string();
+    }
+    if summary.get("isStreaming") == Some(&Value::Bool(true)) {
+        let running_tools = summary.get("isRunningTools") == Some(&Value::Bool(true));
+        return if running_tools {
+            "running tools".to_string()
+        } else {
+            "thinking".to_string()
+        };
+    }
+    if summary.get("isRunningTools") == Some(&Value::Bool(true)) {
+        return "running tools".to_string();
+    }
+    if summary.get("isBashRunning") == Some(&Value::Bool(true)) {
+        return "running bash".to_string();
+    }
+    if let Some(active) = summary
+        .get("sessionActions")
+        .and_then(|actions| actions.get("active"))
+        .filter(|active| !active.is_null())
+    {
+        if let Some(label) = active.get("label").and_then(Value::as_str) {
+            return label.to_string();
+        }
+        if let Some(kind) = active.get("kind").and_then(Value::as_str) {
+            return kind.replace('_', " ");
+        }
+    }
+    let queued = summary
+        .get("sessionActions")
+        .and_then(|actions| actions.get("queuedCount"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if queued > 0 {
+        return format!("{queued} queued");
+    }
+    if get_str(summary, "lifecycle") == Some("archived") {
+        return "archived".to_string();
+    }
+    if summary.get("hasActiveHeartbeat") == Some(&Value::Bool(true)) {
+        return "heartbeat active".to_string();
+    }
+    if get_str(summary, "runtimeKind") == Some("subagent")
+        && summary.get("repliedSinceTask") == Some(&Value::Bool(true))
+    {
+        return "replied".to_string();
+    }
+    if get_str(summary, "activity") == Some("working") {
+        return "classifying".to_string();
+    }
+    if get_str(summary, "taskState") == Some("error") {
+        return "error".to_string();
+    }
+    match get_str(summary, "taskState") {
+        Some("completed") => "completed".to_string(),
+        _ => "needs input".to_string(),
+    }
+}
+
+/// The model column text: the bare model id plus `:level` when a thinking
+/// level is active ("off" reads as noise and stays bare).
+fn session_model(summary: &Value) -> String {
+    let Some(id) = get_str(summary, "model").or_else(|| {
+        summary
+            .get("model")
+            .and_then(|model| model.get("id"))
+            .and_then(Value::as_str)
+    }) else {
+        return "-".to_string();
+    };
+    let bare = id.rsplit('/').next().unwrap_or(id).to_string();
+    match get_str(summary, "thinkingLevel") {
+        Some(level) if level != "off" => format!("{bare}:{level}"),
+        _ => bare,
+    }
+}
+
+/// Build the flat section-sorted rows (TS `buildAgentsViewRows` +
+/// `compareAgentsViewRows` without the subagent forest).
+pub fn build_rows(records: &[UnifiedRecord], anchor: Option<&str>) -> Vec<AgentsViewRow> {
+    let now = now_ms();
+    let mut rows: Vec<AgentsViewRow> = records
+        .iter()
+        .map(|record| {
+            let summary = summary_for_record(record);
+            let title = session_title(&summary);
+            // TS renderRow: the status label shows only when the summary
+            // carries `lastHeardFromAt` (live subagent contact) or its own
+            // `statusLabel`; roster rows with neither render no activity.
+            let has_status_source = summary.get("lastHeardFromAt").is_some_and(|v| !v.is_null())
+                || summary.get("statusLabel").is_some_and(|v| !v.is_null());
+            let status = if has_status_source {
+                session_status_label(&summary)
+            } else {
+                String::new()
+            };
+            let recap = get_str(&summary, "summary").unwrap_or_default();
+            let activity = if recap.is_empty() {
+                status.clone()
+            } else {
+                format!("{status} · {recap}")
+            };
+            let age = relative_age(
+                if get_str(&summary, "activeSessionId").is_some() {
+                    get_str(&summary, "created").or_else(|| get_str(&summary, "modified"))
+                } else {
+                    get_str(&summary, "modified").or_else(|| get_str(&summary, "created"))
+                },
+                now,
+            );
+            AgentsViewRow {
+                section: record.section,
+                identity: record.identity.clone(),
+                cost: summary
+                    .get("usage")
+                    .and_then(|usage| usage.get("cost"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0),
+                title,
+                status_label: status,
+                model: session_model(&summary),
+                activity,
+                age,
+                summary,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| compare_rows(a, b, anchor));
+    rows
+}
+
+fn compare_rows(a: &AgentsViewRow, b: &AgentsViewRow, anchor: Option<&str>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let section = section_rank(a.section).cmp(&section_rank(b.section));
+    if section != Ordering::Equal {
+        return section;
+    }
+    // Message-less rows sink to the bottom of their section (anchor exempt).
+    let empty = |row: &AgentsViewRow| {
+        row.summary
+            .get("messageCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            == 0
+            && Some(get_str(&row.summary, "sessionId").unwrap_or_default()) != anchor
+    };
+    let empty_rank = empty(a).cmp(&empty(b));
+    if empty_rank != Ordering::Equal {
+        return empty_rank;
+    }
+    if a.section != Section::Running {
+        let activity = timestamp_ms(get_str(&b.summary, "lastActivityAt"))
+            .cmp(&timestamp_ms(get_str(&a.summary, "lastActivityAt")));
+        if activity != Ordering::Equal {
+            return activity;
+        }
+    }
+    let created = timestamp_ms(get_str(&b.summary, "created"))
+        .cmp(&timestamp_ms(get_str(&a.summary, "created")));
+    if created != Ordering::Equal {
+        return created;
+    }
+    let title = a.title.cmp(&b.title);
+    if title != Ordering::Equal {
+        return title;
+    }
+    get_str(&a.summary, "sessionId")
+        .unwrap_or_default()
+        .cmp(get_str(&b.summary, "sessionId").unwrap_or_default())
+}
+
+/// The column layout of the list (TS `buildCompactAgentsViewLayout`).
+pub struct RowLayout {
+    pub legend: String,
+    pub name_width: usize,
+    pub model_width: usize,
+    pub activity_width: usize,
+    pub details: HashMap<String, String>,
+}
+
+fn table_cell(value: &str, width: usize) -> String {
+    let truncated = truncate_text(value, width);
+    format!(
+        "{truncated}{}",
+        " ".repeat(width.saturating_sub(str_width(&truncated)))
+    )
+}
+
+/// Hard-truncate to a display width (no ellipsis, TS `truncateToWidth(_, "")`).
+pub(crate) fn truncate_text(value: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in value.chars() {
+        let ch_width = crate::width::char_width(ch);
+        if used + ch_width > width {
+            break;
+        }
+        out.push(ch);
+        used += ch_width;
+    }
+    out
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn pad_start(value: &str, width: usize) -> String {
+    format!(
+        "{}{value}",
+        " ".repeat(width.saturating_sub(str_width(value)))
+    )
+}
+
+/// Compute the compact column layout for the rows at `width`.
+pub fn build_layout(rows: &[AgentsViewRow], width: usize) -> RowLayout {
+    let cost_width = rows
+        .iter()
+        .map(|row| str_width(&format!("${:.2}", row.cost)))
+        .max()
+        .unwrap_or(0)
+        .max(4);
+    let age_width = rows
+        .iter()
+        .map(|row| str_width(&row.age))
+        .max()
+        .unwrap_or(0)
+        .max(3);
+    let details_width = cost_width + 2 + age_width;
+    let available = width.saturating_sub(details_width + 4);
+    let desired_model = rows
+        .iter()
+        .map(|row| str_width(&row.model))
+        .max()
+        .unwrap_or(0)
+        .max(12);
+    let model_width = desired_model.min(32).min(available.saturating_sub(12));
+    let name_width = (available.saturating_sub(model_width)).min(28);
+    let activity_width = available.saturating_sub(model_width + name_width + 2);
+    let detail_line = |cost: &str, age: &str| {
+        format!(
+            "{}  {}",
+            pad_start(cost, cost_width),
+            pad_start(age, age_width)
+        )
+    };
+    let mut headings = vec![
+        table_cell("Session", name_width),
+        table_cell("Model", model_width),
+    ];
+    if activity_width > 0 {
+        headings.push(table_cell("Activity", activity_width));
+    }
+    headings.push(detail_line("Cost", "Age"));
+    let details = rows
+        .iter()
+        .map(|row| {
+            (
+                row.identity.clone(),
+                detail_line(&format!("${:.2}", row.cost), &row.age),
+            )
+        })
+        .collect();
+    RowLayout {
+        legend: table_cell(&headings.join("  "), width),
+        name_width,
+        model_width,
+        activity_width,
+        details,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn roster_entry(agent: &str, status: &str, summary: Value) -> Value {
+        json!({ "agentId": agent, "status": status, "summary": summary })
+    }
+
+    #[test]
+    fn reconcile_joins_live_and_saved_by_alias() {
+        let roster = vec![roster_entry(
+            "s1",
+            "idle",
+            json!({ "sessionId": "s1", "activeSessionId": "a1", "sessionFile": "/x/s1.jsonl", "firstMessage": "fix the bug" }),
+        )];
+        let saved = vec![json!({
+            "id": "s1",
+            "path": "/x/s1.jsonl",
+            "name": "Bug fix",
+            "messageCount": 4,
+        })];
+        let records = reconcile_unified_sessions(&roster, &saved);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].section, Section::Idle);
+        assert_eq!(records[0].identity, "file:/x/s1.jsonl");
+        assert!(records[0].searchable.contains("Bug fix"));
+        let summary = summary_for_record(&records[0]);
+        assert_eq!(summary["firstMessage"], "fix the bug");
+        assert_eq!(summary["sessionName"], "Bug fix");
+    }
+
+    #[test]
+    fn saved_only_rows_are_inactive_and_survive_the_empty_filter() {
+        let saved = vec![json!({
+            "id": "s2",
+            "path": "/x/s2.jsonl",
+            "firstMessage": "hello world",
+            "messageCount": 3,
+        })];
+        let records = reconcile_unified_sessions(&[], &saved);
+        assert_eq!(records[0].section, Section::Inactive);
+        let filtered = filter_empty_sessions(&records, None);
+        assert_eq!(filtered.len(), 1);
+        // An empty unnamed saved row hides unless it is the anchor.
+        let empty = vec![json!({ "id": "s3", "path": "/x/s3.jsonl", "messageCount": 0 })];
+        let records = reconcile_unified_sessions(&[], &empty);
+        assert!(filter_empty_sessions(&records, None).is_empty());
+        assert_eq!(filter_empty_sessions(&records, Some("s3")).len(), 1);
+    }
+
+    #[test]
+    fn rows_sort_by_section_then_recency() {
+        let roster = vec![
+            roster_entry(
+                "idle-old",
+                "idle",
+                json!({ "sessionId": "i", "created": "2024-01-01T00:00:00.000Z" }),
+            ),
+            roster_entry("run", "running", json!({ "sessionId": "r" })),
+        ];
+        let saved = vec![json!({
+            "id": "arch",
+            "path": "/x/arch.jsonl",
+            "firstMessage": "old chat",
+            "messageCount": 2,
+        })];
+        let records = reconcile_unified_sessions(&roster, &saved);
+        let rows = build_rows(&records, None);
+        assert_eq!(rows[0].section, Section::Running);
+        assert_eq!(rows[1].section, Section::Idle);
+        assert_eq!(rows[2].section, Section::Inactive);
+        // TS renderRow: no `lastHeardFromAt`/`statusLabel` on the summary
+        // means no activity text, even for an archived saved session.
+        assert_eq!(rows[2].status_label, "");
+        assert_eq!(rows[2].activity, "");
+        assert_eq!(rows[2].model, "-");
+    }
+
+    #[test]
+    fn search_tokens_phrases_and_regex() {
+        let text = "Fix the Node CVE in packages/tui";
+        let phrase = parse_search_query(r#""node cve" fix"#);
+        assert!(matches_query(text, &phrase));
+        let missing_phrase = parse_search_query(r#""node fix""#);
+        assert!(!matches_query(text, &missing_phrase));
+        let fuzzy = parse_search_query("fx");
+        assert!(matches_query(text, &fuzzy));
+        let unrelated = parse_search_query("zebra");
+        assert!(!matches_query(text, &unrelated));
+        let regex = parse_search_query("re:CVE in");
+        assert!(matches_query(text, &regex));
+        let bad = parse_search_query("re:[");
+        assert!(!matches_query(text, &bad));
+        // An unclosed quote falls back to whitespace tokens, and the raw
+        // quote character stays in the token (TS keeps it), so the first
+        // token no longer matches.
+        let unclosed = parse_search_query(r#""node cve"#);
+        assert!(!matches_query(text, &unclosed));
+        assert!(matches_query(
+            text,
+            &parse_search_query(r#""node cve"#.replace('"', "").as_str())
+        ));
+    }
+
+    #[test]
+    fn title_prefers_name_then_first_message() {
+        let named = json!({ "sessionId": "s1", "sessionName": "  My  session ", "cwd": "/a/b" });
+        assert_eq!(session_title(&named), "My session");
+        let from_cwd = json!({ "sessionId": "s1", "cwd": "/a/b" });
+        assert_eq!(session_title(&from_cwd), "b");
+        let bare = json!({ "sessionId": "s1" });
+        assert_eq!(session_title(&bare), "s1");
+    }
+
+    #[test]
+    fn relative_age_buckets() {
+        // Base: 2025-01-01T00:00:00Z.
+        let base = 1_735_689_600u64;
+        let iso = |seconds: i64, minutes: i64| {
+            // The days-from-civil algorithm in reverse: 2025-01-01 plus
+            // (seconds, minutes) offsets is still within January 2025.
+            let total = base as i64 + seconds + minutes * 60;
+            let days = total.div_euclid(86_400);
+            let secs_of_day = total.rem_euclid(86_400);
+            let (year, month, day) = civil_test(days);
+            format!(
+                "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.000Z",
+                secs_of_day / 3600,
+                (secs_of_day % 3600) / 60,
+                secs_of_day % 60
+            )
+        };
+        let now = base * 1000;
+        assert_eq!(relative_age(Some(&iso(-30, 0)), now), "30s");
+        assert_eq!(relative_age(Some(&iso(0, -5)), now), "5m");
+        assert_eq!(relative_age(Some(&iso(0, -3 * 60)), now), "3h");
+        assert_eq!(relative_age(Some(&iso(0, -30 * 60 * 24)), now), "30d");
+        assert_eq!(relative_age(None, now), "");
+    }
+
+    /// Civil date from days since epoch (test-side oracle: the same Hinnant
+    /// algorithm the parser uses, so a round-trip pins the bucketing).
+    fn civil_test(days: i64) -> (i64, u32, u32) {
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+        (if m <= 2 { y + 1 } else { y }, m, d)
+    }
+
+    #[test]
+    fn layout_legend_and_details() {
+        let roster = vec![roster_entry(
+            "s1",
+            "running",
+            json!({ "sessionId": "s1", "usage": { "cost": 1.5 } }),
+        )];
+        let records = reconcile_unified_sessions(&roster, &[]);
+        let rows = build_rows(&records, None);
+        let layout = build_layout(&rows, 120);
+        assert!(layout.legend.contains("Session"));
+        assert!(layout.legend.contains("Model"));
+        assert!(layout.legend.contains("Cost"));
+        assert_eq!(layout.details["session:s1"].trim_end(), "$1.50");
+    }
+}
