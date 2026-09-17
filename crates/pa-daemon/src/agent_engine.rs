@@ -416,6 +416,11 @@ impl AgentSessionEngine {
             rlm_subagent_host: self.children.clone().map(|children| {
                 children as Arc<dyn pa_core::session_engine::rlm_host::RlmSubagentHost>
             }),
+            // The daemon worker has no CLI extension sources: sessions
+            // load configured/discovered extensions only (the attached
+            // TUI/ACP surfaces do not carry `-e` flags today).
+            cli_extension_sources: vec![],
+            extension_tool_allow_list: None,
         })
         .await
     }

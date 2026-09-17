@@ -57,6 +57,13 @@ pub struct SessionEngineConfig {
     pub extra_builtin_skill_overrides: Vec<String>,
     /// Daemon child-session host backing the `rlm.*` recursion surface.
     pub rlm_subagent_host: Option<Arc<dyn super::rlm_host::RlmSubagentHost>>,
+    /// CLI `--extension` sources (repeatable): resolved through the
+    /// package manager into the session's extension paths (temporary
+    /// scope, first-wins against configured/discovered extensions).
+    pub cli_extension_sources: Vec<String>,
+    /// Optional name allow-list for extension tools (`--tools`, TS
+    /// `isAllowedTool`); an absent list allows every registered tool.
+    pub extension_tool_allow_list: Option<Vec<String>>,
     /// An externally owned MCP manager (the daemon worker's session store):
     /// the engine adopts it instead of building its own, so ACP-admitted
     /// servers reach the prompt's MCP gating through the same store the
@@ -81,6 +88,14 @@ pub struct SessionEngine {
     /// this field (shared handle: the daemon worker and the engine gate
     /// prompts through one store).
     pub mcp_manager: std::sync::Arc<std::sync::Mutex<crate::mcp::McpManager>>,
+    /// The extension runner when any extension loaded (sidecar host +
+    /// registration mirror); `None` keeps the no-extension fast path
+    /// byte-identical (cache-prefix stability).
+    pub extension_runner: Option<Arc<crate::extensions::ExtensionRunner>>,
+    /// Non-fatal startup diagnostics from extension loading (missing
+    /// node, per-path load errors, spawn failures). TS surfaces these in
+    /// startup notices.
+    pub extension_diagnostics: Vec<String>,
 }
 
 /// Resolve the MCP gating the resource loader and prompt need: skill
@@ -178,7 +193,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         cwd: cwd.clone(),
         agent_dir: config.agent_dir.clone(),
         settings: Some(settings),
-        additional_extension_sources: Vec::new(),
+        additional_extension_sources: config.cli_extension_sources.clone(),
         extra_builtin_skill_overrides,
         additional_skill_paths: config.additional_skill_paths.clone(),
         additional_prompt_paths: config.additional_prompt_paths.clone(),
@@ -215,6 +230,47 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     let provisioner =
         super::runtime_wiring::kernel_provisioner(session_id, handlers, python_skills);
     let mut tools = config.tools.clone();
+    // Extension loading (design doc §3.2, stage 2): discovery already
+    // resolved the paths; the sidecar loads modules and lands the
+    // registrations. A session with zero extension paths never spawns the
+    // sidecar (fast-path parity) and nothing below changes.
+    let mut extension_diagnostics = Vec::new();
+    let extension_runner = if resources.extension_paths.is_empty() {
+        None
+    } else {
+        let mut spec =
+            crate::extensions::ExtensionHostSpec::new(cwd.clone(), config.agent_dir.clone());
+        spec.extension_paths = resources.extension_paths.clone();
+        match crate::extensions::ExtensionRunner::start(spec).await {
+            Ok(runner) => {
+                for error in runner.load_errors() {
+                    extension_diagnostics.push(format!(
+                        "Failed to load extension {}: {}",
+                        error.path, error.error
+                    ));
+                }
+                let tools_to_bridge = runner
+                    .bridge_tools(config.extension_tool_allow_list.as_deref())
+                    .await;
+                // TS `_refreshToolRegistry`: extension tools replace
+                // same-named tools (an extension may override a built-in).
+                for tool in tools_to_bridge {
+                    if let Some(existing) = tools.iter().position(|t| t.name() == tool.name()) {
+                        tools[existing] = tool;
+                    } else {
+                        tools.push(tool);
+                    }
+                }
+                Some(std::sync::Arc::new(runner))
+            }
+            Err(error) => {
+                // A spawn/handshake failure degrades to no extensions
+                // (design doc §2.4 crash isolation); it is never fatal.
+                extension_diagnostics.push(format!("Extensions unavailable: {error:#}"));
+                None
+            }
+        }
+    };
     if !tools.iter().any(|tool| tool.name() == "ipython") {
         let definition = crate::tools::ipython::create_ipython_tool_definition(
             &cwd.to_string_lossy(),
@@ -225,6 +281,19 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         ));
     }
     let active_tool_names: Vec<String> = tools.iter().map(|tool| tool.name().to_string()).collect();
+
+    // Extension tool prompt guidelines flow into the prompt exactly like
+    // TS `_rebuildSystemPrompt` (agent-session.ts L5091+): normalized
+    // guidelines of the active tools append to the configured ones.
+    let mut prompt_guidelines = config.prompt_guidelines.clone();
+    if let Some(runner) = &extension_runner {
+        let guidelines = runner.registry().await.prompt_guidelines();
+        for guideline in guidelines {
+            if !prompt_guidelines.contains(&guideline) {
+                prompt_guidelines.push(guideline);
+            }
+        }
+    }
 
     let system_prompt = crate::prompts::system_prompt::build_system_prompt(
         &crate::prompts::system_prompt::BuildSystemPromptOptions {
@@ -245,7 +314,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             ),
             allow_recursion: config.allow_recursion,
             generic_mcp_servers,
-            prompt_guidelines: Some(config.prompt_guidelines.clone()),
+            prompt_guidelines: Some(prompt_guidelines),
             ..Default::default()
         },
     );
@@ -350,6 +419,8 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         system_prompt,
         goal_driver,
         mcp_manager,
+        extension_runner,
+        extension_diagnostics,
     })
 }
 
@@ -438,6 +509,8 @@ mod tests {
             additional_prompt_paths: vec![],
             extra_builtin_skill_overrides: vec![],
             rlm_subagent_host: None,
+            cli_extension_sources: vec![],
+            extension_tool_allow_list: None,
         })
         .await
         .unwrap();

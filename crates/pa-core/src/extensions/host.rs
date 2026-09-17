@@ -16,8 +16,9 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use pa_types::extension_rpc::{
-    EventParams, HelloParams, HelloResult, ShutdownParams, EXTENSION_HOST_NODE_MAJOR_FLOOR,
-    EXTENSION_RPC_PROTOCOL, METHOD_EVENT, METHOD_HELLO, METHOD_PING, METHOD_SHUTDOWN,
+    EventParams, HelloParams, HelloResult, ShutdownParams, ToolExecuteParams, ToolExecuteResult,
+    EXTENSION_HOST_NODE_MAJOR_FLOOR, EXTENSION_RPC_PROTOCOL, METHOD_EVENT, METHOD_HELLO,
+    METHOD_PING, METHOD_SHUTDOWN, METHOD_TOOL_EXECUTE,
 };
 use pa_types::JsonMap;
 use serde_json::Value;
@@ -106,8 +107,11 @@ pub struct ExtensionHost {
     /// Taken by [`ExtensionHost::shutdown`]; a host dropped while the child
     /// is still set kills the process group (§2.4 crash isolation).
     child: Option<Child>,
-    notifications: mpsc::Receiver<SidecarNotification>,
+    notifications: Option<mpsc::Receiver<SidecarNotification>>,
     timeouts: HostTimeouts,
+    /// The handshake result: the registrations the load produced, and the
+    /// per-path load errors (never fatal).
+    hello: HelloResult,
 }
 
 impl ExtensionHost {
@@ -214,9 +218,22 @@ impl ExtensionHost {
         Ok(ExtensionHost {
             client,
             child: Some(child),
-            notifications,
+            notifications: Some(notifications),
             timeouts: spec.timeouts,
+            hello,
         })
+    }
+
+    /// The `hello` handshake result: registrations as loaded, plus
+    /// per-path load errors (the stage-2 registration landing).
+    pub fn hello(&self) -> &HelloResult {
+        &self.hello
+    }
+
+    /// The RPC client half: shared so bridged extension tools can execute
+    /// over the same connection while the host owns the process.
+    pub(crate) fn client(&self) -> &Arc<RpcClient<ChildStdin>> {
+        &self.client
     }
 
     /// Whether the RPC side is still usable (§2.4: death never crashes the
@@ -232,8 +249,10 @@ impl ExtensionHost {
     /// Sidecar notifications (`extension_error`, registration changes) in
     /// arrival order. Dropping this receiver makes the sidecar's
     /// notifications fall on the floor; hold it for the session lifetime.
-    pub fn notifications(&mut self) -> &mut mpsc::Receiver<SidecarNotification> {
-        &mut self.notifications
+    pub fn take_notifications(&mut self) -> mpsc::Receiver<SidecarNotification> {
+        self.notifications
+            .take()
+            .expect("notifications are taken exactly once")
     }
 
     /// Liveness probe.
@@ -255,6 +274,29 @@ impl ExtensionHost {
         self.client
             .request(METHOD_EVENT, params, self.timeouts.rpc)
             .await
+    }
+
+    /// Execute one registered extension tool over the RPC (design doc §2.3
+    /// `tool_execute`); the sidecar streams `tool_update` notifications while
+    /// the tool runs, then replies with the final result.
+    pub async fn execute_tool(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        args: Value,
+    ) -> Result<ToolExecuteResult> {
+        let params = serde_json::to_value(ToolExecuteParams {
+            tool_call_id: tool_call_id.to_string(),
+            tool_name: tool_name.to_string(),
+            args,
+        })
+        .context("serializing extension tool execute params")?;
+        let result = self
+            .client
+            .request(METHOD_TOOL_EXECUTE, params, self.timeouts.rpc)
+            .await
+            .context("extension tool execution failed")?;
+        serde_json::from_value(result).context("parsing extension tool result")
     }
 
     /// Orderly shutdown (§2.4): send `shutdown`, wait briefly, then kill the

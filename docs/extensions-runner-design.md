@@ -1,6 +1,8 @@
 # Extension Runner Host Design
 
-Status: design (no product code). Lane `lane/ext-design`.
+Status: design; stages 1-2 landed (pa-core `extensions/` + `pa-types::extension_rpc`;
+verifiers in `crates/pa-core/tests/extension_host.rs` and
+`crates/pa-core/tests/extension_runner.rs`). Lane `lane/ext-design`.
 TS ground truth: `~/prime-agent` (read-only). All `packages/...` paths below are
 under that root. Rust paths are under `crates/`.
 

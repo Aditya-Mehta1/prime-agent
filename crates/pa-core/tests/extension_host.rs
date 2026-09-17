@@ -104,7 +104,7 @@ async fn fixture_ctx_roundtrip_notification_and_shutdown() -> Result<()> {
     let mut host = ExtensionHost::start(start_spec).await?;
 
     // The fixture reports an extension_error notification during hello.
-    match host.notifications().recv().await {
+    match host.take_notifications().recv().await {
         Some(SidecarNotification::ExtensionError(ExtensionError {
             extension_path,
             event,

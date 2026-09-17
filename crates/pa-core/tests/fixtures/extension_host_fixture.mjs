@@ -1,5 +1,5 @@
 // Fixture sidecar for the extension-host integration tests
-// (`crates/pa-core/tests/extension_host.rs`). A scripted protocol-1 peer
+// (`crates/pa-core/tests/extension_host.rs`). A scripted protocol-2 peer
 // with the modes the tests select through `extensionPaths[0]`:
 //
 //   "basic" - ping answers with the result of a ctx call to
@@ -18,7 +18,7 @@
 
 import readline from "node:readline";
 
-const PROTOCOL = 1;
+const PROTOCOL = 2;
 
 function write(value) {
   process.stdout.write(JSON.stringify(value) + "\n");

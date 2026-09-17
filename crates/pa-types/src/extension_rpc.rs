@@ -23,8 +23,12 @@ use serde_json::Value;
 use crate::JsonMap;
 
 /// Protocol version of the extension host RPC. Bumped on any wire change;
-/// both ends ship in the same release and reject mismatches in the handshake.
-pub const EXTENSION_RPC_PROTOCOL: u32 = 1;
+/// both ends ship in the same release and reject mismatches in the
+/// handshake. Protocol 2 = stage 2: the sidecar loads extension modules
+/// (vendored jiti), lands registrations, and executes tools
+/// (`tool_execute` + `tool_update`); protocol 1 was the stage-1 protocol
+/// peer (empty hello, no tool execution).
+pub const EXTENSION_RPC_PROTOCOL: u32 = 2;
 
 /// Hard floor for the Node runtime the sidecar requires (detected by the host
 /// script, surfaced as a handshake failure; jiti needs only the JS runtime).
@@ -46,6 +50,19 @@ pub const METHOD_CANCEL: &str = "cancel";
 /// Notification (sidecar -> Rust): an extension handler or registration threw
 /// inside the error boundary; never fatal (design doc §1.5, §2.4).
 pub const METHOD_EXTENSION_ERROR: &str = "extension_error";
+/// Request (Rust -> sidecar): execute one registered extension tool. The
+/// sidecar streams `tool_update` notifications, then replies with the final
+/// result (design doc §2.3 `tool_execute`).
+pub const METHOD_TOOL_EXECUTE: &str = "tool_execute";
+/// Notification (sidecar -> Rust): a partial result from a running
+/// extension tool (the `onUpdate` callback of `ToolDefinition.execute`).
+pub const METHOD_TOOL_UPDATE: &str = "tool_update";
+/// Request (Rust -> sidecar): dispatch a registered extension slash command
+/// by invocation name (design doc §2.3 `command_execute`).
+pub const METHOD_COMMAND_EXECUTE: &str = "command_execute";
+/// Request (Rust -> sidecar): dispatch a registered extension keybinding.
+pub const METHOD_SHORTCUT_EXECUTE: &str = "shortcut_execute";
+
 /// Notification (sidecar -> Rust): registrations changed after the handshake
 /// (post-bind `registerTool`/`registerCommand`/... from a handler).
 pub const METHOD_REGISTRATION: &str = "registration";
@@ -288,6 +305,71 @@ pub struct CancelParams {
     pub token: String,
 }
 
+// --- Tool execution (Rust -> sidecar `tool_execute`) -----------------------
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolExecuteParams {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    #[serde(default)]
+    pub args: Value,
+}
+
+/// A content block of an extension tool result (TS `AgentToolResult.content`;
+/// the text/image subset that crosses the wire).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum ToolResultBlock {
+    Text {
+        text: String,
+    },
+    Image {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolExecuteResult {
+    #[serde(default)]
+    pub content: Vec<ToolResultBlock>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+    #[serde(default)]
+    pub is_error: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandExecuteParams {
+    /// The collision-suffixed invocation name (registry output).
+    pub invocation_name: String,
+    /// The raw text after the command name.
+    #[serde(default)]
+    pub args: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShortcutExecuteParams {
+    /// The normalized key id.
+    pub key: String,
+}
+
+/// Notification payload for [`METHOD_TOOL_UPDATE`]: the partial result the
+/// extension tool passed to `onUpdate` (render-only in stage 2, like the
+/// tool bridge's update forwarding).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolUpdateNotification {
+    pub tool_call_id: String,
+    #[serde(default)]
+    pub result: Value,
+}
+
 // --- Notifications (sidecar -> Rust) ----------------------------------------
 
 /// Port of types.ts `ExtensionError` (L1441-1446): the error-boundary report
@@ -365,6 +447,24 @@ mod tests {
         );
         rt::<ShutdownParams>(r#"{"reason":"session_end"}"#);
         rt::<CancelParams>(r#"{"token":"e1"}"#);
+    }
+
+    #[test]
+    fn tool_execute_roundtrip() {
+        rt::<ToolExecuteParams>(
+            r#"{"toolCallId":"c1","toolName":"hello","args":{"name":"world"}}"#,
+        );
+        rt::<ToolExecuteResult>(
+            r#"{"content":[{"type":"text","text":"Hello, world!"}],"details":{"greeted":"world"},"isError":false}"#,
+        );
+        rt::<ToolExecuteResult>(r#"{"content":[]}"#);
+        rt::<ToolUpdateNotification>(r#"{"toolCallId":"c1","result":{"content":[]}}"#);
+    }
+
+    #[test]
+    fn command_and_shortcut_execute_roundtrip() {
+        rt::<CommandExecuteParams>(r#"{"invocationName":"greet:2","args":"hi there"}"#);
+        rt::<ShortcutExecuteParams>(r#"{"key":"ctrl+g"}"#);
     }
 
     #[test]

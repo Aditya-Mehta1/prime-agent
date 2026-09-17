@@ -252,6 +252,12 @@ async fn build_headless_engine_parts(options: &RunOptions) -> Result<HeadlessEng
                 .collect(),
             extra_builtin_skill_overrides: vec![],
             rlm_subagent_host: None,
+            cli_extension_sources: config
+                .extensions
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            extension_tool_allow_list: config.tools.clone(),
         },
     )
     .await
@@ -791,6 +797,12 @@ async fn build_faux_engine_parts(
             additional_prompt_paths: vec![],
             extra_builtin_skill_overrides: vec![],
             rlm_subagent_host: None,
+            cli_extension_sources: config
+                .extensions
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            extension_tool_allow_list: config.tools.clone(),
         },
     )
     .await
