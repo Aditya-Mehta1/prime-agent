@@ -1154,11 +1154,18 @@ _TARGETED_READ_COMMAND = "grep"
 # those variables bound, so `FOO=1 env` is a bare dump in disguise.
 _ASSIGNMENT_WORD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
+# The `{name}` spelling of a descriptor: the shell opens a new descriptor and
+# stores its number in the variable, so it never acts on fd 1.
+_BRACE_DESCRIPTOR_RE = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
+
 # Redirection words: they change where output goes, never what is printed, so
 # they are dropped before the bare-dump check. The optional digits name the
 # redirected descriptor (`2>`), and `&>>`/`>&`/`&>` cover the both-stream
-# spellings.
-_REDIRECT_WORD_RE = re.compile(r"^(\d*)(&>>|>&|>>|<<|<>|<|>|&>)")
+# spellings. A `{name}` descriptor takes the operators that name one and not
+# the both-stream spellings, where the shell reads `{name}` as an operand.
+_REDIRECT_WORD_RE = re.compile(
+    rf"^(\d*)(&>>|>&|>>|<<|<>|<|>|&>)|^({_BRACE_DESCRIPTOR_RE.pattern})(>&|>>|<<|<>|<|>)"
+)
 
 # Shell metacharacters: the only characters that may sit between a descriptor
 # and the operator that uses it. `2>&1` redirects fd 2, while the `2` of
@@ -1640,6 +1647,15 @@ def _descriptor_text(masked: str, operator_index: int) -> str:
     source = operator_index
     while source > 0 and masked[source - 1].isdigit():
         source -= 1
+    if source == operator_index and masked[source - 1 : source] == "}":
+        # `{name}>` names no digits, so it reads as another descriptor and fd 1
+        # keeps the pipe. It counts only where it starts its own token, the way
+        # the shell reads the form (`x{fd}>log` sends fd 1 to the file).
+        brace = masked.rfind("{", 0, source)
+        if brace >= 0 and _BRACE_DESCRIPTOR_RE.fullmatch(masked[brace:source]):
+            if brace == 0 or masked[brace - 1] in _SHELL_METACHARACTERS:
+                return masked[brace:source]
+        return ""
     if source > 0 and masked[source - 1] not in _SHELL_METACHARACTERS:
         return ""
     return masked[source:operator_index]

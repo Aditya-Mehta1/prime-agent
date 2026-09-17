@@ -64,8 +64,10 @@ SECRET_ECHO_MATCHING_COMMANDS = [
 # GNU grep reads a bare number as a context flag, like `-C2`.
     "env | grep -2 SAFE_VAR", "env | grep -10 SAFE_VAR", "env 2>&1 | grep -2 PATH",
     "env | grep --context=2 SAFE_VAR",
-# A redirect glued to the command word is still a redirect (`env>&2`).
+# A redirect glued to the command word is still a redirect (`env>&2`), and a
+# `{name}` descriptor opens a new descriptor, so fd 1 keeps the dump.
     "env>&2", "env>&1", "env>/dev/null", "cat>&2 ~/.aws/credentials",
+    "env {fd}>/tmp/log", "env {fd}>&2", "printenv {fd}>/tmp/log", "export -p {fd}>log",
     "env &>/dev/null", "env &>log", "env &>>log", "env -0 &>log",
     "printenv &>/dev/null", "&>log cat ~/.ssh/id_rsa",
 # ANSI-C (`$'env'`) and locale (`$"env"`) quoting build the same word.
@@ -448,7 +450,7 @@ class SecretEchoGuardTest(unittest.IsolatedAsyncioTestCase):
         # `env>&2` runs env with stdout on fd 2, which the kernel merges into
         # the transcript; the `&>` spellings belong with the file-redirect class
         # and the command word keeps its place.
-        self._refuse_all(["env>&2", "env>&1", "env>/dev/null"])
+        self._refuse_all(["env>&2", "env>&1", "env>/dev/null", "env {fd}>/tmp/log"])
         self._refuse_all([
             "env &>/dev/null", "env &> /dev/null", "env &>log",
             "env -0 &>log", "env &>>log", "printenv &>/dev/null",
