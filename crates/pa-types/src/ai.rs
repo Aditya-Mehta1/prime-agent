@@ -133,7 +133,7 @@ impl ModelThinkingLevel {
     }
 }
 
-/// Maps pi thinking levels to provider/model-specific values.
+/// Maps Prime Agent thinking levels to provider/model-specific values.
 /// `None` values mark a level as unsupported.
 pub type ThinkingLevelMap = std::collections::HashMap<ModelThinkingLevel, Option<String>>;
 

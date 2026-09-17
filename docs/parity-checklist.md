@@ -105,7 +105,14 @@ session resource resolution) plus the extension runner under
   skills) plus `crates/pa-cli/tests/package_resources_e2e.rs`: a
   settings-configured fixture package provides a skill that appears in a
   created session's skill list through the full binary pipeline.
-- missing (spec below): the extension runner.
+- descoped (operator decision 2026-09-17): the extension runner. Stages 1-2
+  of the sidecar host (`docs/extensions-runner-design.md`) landed harmlessly;
+  stages 3-6 (event surface, commands/keybindings/UI, reload, failure policy)
+  will not be built. Rationale: skills + the Python kernel packages are the
+  product extensibility story; models.json covers custom providers; only one
+  builtin extension exists (herdr-agent-state); the pi-ecosystem plugin
+  surface is not a product requirement. See `docs/completion-matrix.md`
+  family 13.
 
 Follow-up spec - resource resolution (LANDED in #75; kept for history):
 port `DefaultPackageManager.resolve()`: precedence-ranked resolution of
@@ -143,6 +150,10 @@ Update: the host design decision landed as `docs/extensions-runner-design.md`
 (sidecar node runtime with a typed RPC surface; discovery ports to Rust, the
 TS module surface is preserved by the sidecar host script, staged plan with
 per-stage verifiers inside).
+
+Update: stages 1-2 landed (verifiers in `crates/pa-core/tests/extension_host.rs`
+and `extension_runner.rs`); the rest was descoped by the operator decision
+above - the historical spec below no longer gates any lane.
 
 ## 3. Side questions (`side_question_transcript`) - done
 

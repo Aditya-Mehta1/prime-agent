@@ -34,7 +34,7 @@ pub enum ToolExecutionMode {
     Parallel,
 }
 
-/// Why an assistant response stopped, mirroring `StopReason` in pi-ai.
+/// Why an assistant response stopped, mirroring the TS `StopReason`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StopReason {
     #[serde(rename = "stop")]
@@ -176,7 +176,7 @@ pub struct AssistantMessageDiagnostic {
     pub details: Option<serde_json::Value>,
 }
 
-/// Mirrors `createAssistantMessageDiagnostic` in pi-ai.
+/// Mirrors the TS `createAssistantMessageDiagnostic`.
 pub fn assistant_message_diagnostic(
     kind: impl Into<String>,
     error: &anyhow::Error,

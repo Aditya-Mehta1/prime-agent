@@ -232,7 +232,7 @@ impl ModelRegistry {
             .map(|model| model.id.clone())
             .collect();
 
-        // Live PI catalog: disk cache first; stays None when unset.
+        // Live Prime Inference catalog: disk cache first; stays None when unset.
         if self.live_prime_inference_models.is_none() {
             if let Some(cache_path) = self.prime_inference_cache_path() {
                 self.live_prime_inference_models = read_cached_prime_inference_models(

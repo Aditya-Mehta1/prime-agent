@@ -2,13 +2,13 @@
 //!
 //! This is a *local* trait for the `pa-agent` loop, deliberately narrow and
 //! documented for later unification with the `pa-ai` provider layer. It
-//! mirrors the parts of pi-ai the loop actually consumes:
+//! mirrors the parts of the TS provider layer (packages/ai) the loop consumes:
 //!
 //! - `AssistantMessageEvent` protocol: `start`, content deltas/ends, then a
 //!   terminal `done` or `error` event carrying the final [`types::AssistantMessage`].
 //! - `AssistantMessageEventStream`: push events from a producer, iterate them
 //!   as a consumer, and resolve a final result once a terminal event arrives
-//!   (port of pi-ai's `EventStream`).
+//!   (the TS `EventStream` shape).
 //!
 //! Contract identical to the TS `StreamFn`: the provider must not throw for
 //! request/model/runtime failures - failures are encoded in the returned stream
@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, Notify};
 
 use crate::types::{AssistantMessage, Model, StopReason, ThinkingLevel, ToolCall};
 
-/// Event protocol for a model stream (pi-ai `AssistantMessageEvent`).
+/// Event protocol for a model stream (the TS `AssistantMessageEvent` shape).
 ///
 /// Streams emit `Start` before partial updates, then terminate with either
 /// `Done` carrying the final successful message or `Error` carrying the final
@@ -120,7 +120,7 @@ pub struct ToolDefinition {
     pub parameters: serde_json::Value,
 }
 
-/// LLM-bound context (pi-ai `Context`).
+/// LLM-bound context (the TS `Context` shape).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LlmContext {
     pub system_prompt: Option<String>,
@@ -128,7 +128,7 @@ pub struct LlmContext {
     pub tools: Vec<ToolDefinition>,
 }
 
-/// Stream request options (subset of pi-ai `SimpleStreamOptions` the loop uses).
+/// Stream request options (subset of the TS `SimpleStreamOptions` the loop uses).
 #[derive(Debug, Clone)]
 pub struct StreamRequestOptions {
     pub temperature: Option<f64>,
@@ -189,8 +189,8 @@ struct SharedStreamState {
     closed: std::sync::Mutex<bool>,
 }
 
-/// Producer handle of an [`AssistantMessageEventStream`] (port of pi-ai's
-/// `EventStream<AssistantMessageEvent, AssistantMessage>`).
+/// Producer handle of an [`AssistantMessageEventStream`] (the TS
+/// `EventStream<AssistantMessageEvent, AssistantMessage>` shape).
 #[derive(Clone)]
 pub struct AssistantMessageEventStreamHandle {
     tx: mpsc::UnboundedSender<AssistantMessageEvent>,

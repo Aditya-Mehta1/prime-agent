@@ -1,6 +1,6 @@
 //! Host side of MCP integrations. The protocol itself runs Python-side in the
 //! kernel; the host only gates integration skills by auth and serves `mcp.*`
-//! host requests. Port of core/mcp/mcp-manager.ts plus the pi-ai MCP catalog.
+//! host requests. Port of core/mcp/mcp-manager.ts plus the TS MCP catalog.
 
 use std::collections::HashMap;
 use std::future::Future;

@@ -9,6 +9,8 @@ taken from code on `main` at `7d67021` (through PR #93). Status vocabulary:
   missing or unverified.
 - **in-flight** - a lane branch carries the work; `main` does not have it yet.
 - **missing** - not implemented in the product path.
+- **descoped** - an operator decision cut the remaining scope; landed work stays,
+  the cut stages will not be built.
 
 **Battery greenness is not product parity.** The live A/B battery
 (`scripts/battery/`, `docs/parity-battery.md`) last ran `20260917T062810Z`
@@ -32,7 +34,7 @@ below is evidence-based, not battery-based.
 | 10 | Kernel host-request surface & continual harness | in-flight | `lane/harness-handlers` registers `model.info`/`compact.*`/`refine.*` (+ pending state, turn-boundary consumption in daemon worker and print mode, registry round-trip tests, real-kernel wire-contract test via `create_session`); remaining: daemon-level dogfood e2e (a daemon session's settled boundary consuming a kernel-scheduled refinement end to end) |
 | 11 | RLM dogfood (this harness, run by the Rust binary) | missing | mission-host dogfood untested; depends on rows 9-10 |
 | 12 | MCP | partial | CLI config/catalog/gating only; product-path wiring, OAuth/login UI, generic connector execution unproven |
-| 13 | Extensions | partial | package manager + resource resolution done; sidecar runner stages 1-6 pending |
+| 13 | Extensions | descoped (operator decision 2026-09-17) - stages 3-6 cut, stages 1-2 remain (harmless) | sidecar runner stages 3-6 will not be built |
 | 14 | Skills | partial | loading + prompt inventory done; skills-as-commands and attach-image product backing missing |
 | 15 | CLI command surface | partial | list/attach/stop/rename/send/schedule wired; model-list catalog + config UI landed; status/doctor/shutdown unavailable, self-update missing |
 | 16 | Headless modes | partial | print/json done; RPC and ACP modes missing |
@@ -220,17 +222,29 @@ L445-447), and generic connector execution (no MCP client protocol
 implementation). No end-to-end proof that a configured server's tools reach a
 session.
 
-## 13. Extensions - partial
+## 13. Extensions - descoped (operator decision 2026-09-17)
 
 Done (#66, #75): package install/remove/list/update (npm/git/local with the
 TS quirks) and full resource resolution (packages, settings arrays,
 auto-discovery, ignore rules, bundled skills, precedence) - checklist §2.
 
-Remaining: the sidecar extension runner per `docs/extensions-runner-design.md`
-(staged 0-6; stage 0 discovery is part of #75's resolution, stage 1 host
-lifecycle is in flight on `lane/extensions` `3df39c0`/`6638aa3`/`f6ad5b7`).
-Stages 2-6 (tool execution, events, commands/keybindings/UI, reload, failure
-policy) are unstarted on `main`.
+Landed and staying, harmless (no product-path surface depends on it): the
+sidecar extension runner stages 1-2 per `docs/extensions-runner-design.md`
+- stage 0 discovery rides #75's resolution, stage 1 is the host process
+lifecycle (spawn/handshake/backoff restart/orderly shutdown, NDJSON RPC),
+stage 2 is module loading with vendored jiti plus the registration mirror,
+tool execution, and prompt-guideline injection (`crates/pa-core/src/extensions/`
++ `pa-types::extension_rpc`; verifiers in
+`crates/pa-core/tests/extension_host.rs` and `extension_runner.rs`).
+
+Descoped: stages 3-6 of the runner (event surface at the session-engine seams,
+commands/keybindings/UI dialogs, reload/stale-ctx, failure-policy hardening)
+will not be built.
+
+Rationale (operator, 2026-09-17): skills + the Python kernel packages are
+the product extensibility story; models.json covers custom providers; only
+one builtin extension exists (herdr-agent-state); the pi-ecosystem plugin
+surface is not a product requirement.
 
 ## 14. Skills - partial
 

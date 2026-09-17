@@ -1,4 +1,4 @@
-//! Tool-argument validation, porting pi-ai's `validateToolArguments`
+//! Tool-argument validation, the TS `validateToolArguments` contract
 //! (`packages/ai/src/utils/validation.ts`).
 //!
 //! The TS reference validates against TypeBox schemas with `Value.Convert`

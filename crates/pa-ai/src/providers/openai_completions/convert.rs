@@ -420,7 +420,7 @@ pub(crate) fn parse_chunk_usage(
         .map(get_u64)
         .unwrap_or(0);
 
-    // Normalize to pi-ai semantics:
+    // Normalize to the provider-layer usage accounting semantics:
     // - cacheRead: hits from cache created by previous requests only
     // - cacheWrite: tokens written to cache in this request
     // Some OpenAI-compatible providers (observed on OpenRouter) report

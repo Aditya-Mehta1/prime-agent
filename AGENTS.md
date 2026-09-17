@@ -54,6 +54,18 @@ Every contributor (human or agent) must read this before working on this repo.
 - PRs must state ownership compliance (crate README scope/non-goals/public API, dependency
   direction).
 
+## Branding
+
+The product is Prime Agent - we are not a pi fork. Scrub "pi"/"pi-mono"/"pi-ai"/
+"Prime Intellect"-style naming from all user-visible surfaces (docs, READMEs,
+CLI help text, error messages, splash/onboarding strings, keybinding hints, TUI
+labels, and code comments that quote user-facing strings); brand everything
+Prime Agent. Audit with a repo-wide grep and classify every hit (user-visible
+vs wire-internal vs comment) before scrubbing, and list the preserved wire
+identifiers in the PR body so the reviewer can verify none were wrongly scrubbed.
+
+EXPLICIT EXCEPTION: wire-protocol identifiers that must stay byte-compatible with the TS product (e.g. the PI_PACKAGE_DIR env var, settings keys, provider IDs like prime-inference, harness _meta namespaces like ai.primeintellect.prime-agent, lockfile names) stay until/unless the TS side renames them — PARITY BEATS BRANDING ON THE WIRE.
+
 ## References
 
 - TS prime-agent at ~/prime-agent is the parity ground truth (read-only).

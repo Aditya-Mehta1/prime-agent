@@ -36,7 +36,7 @@ pub struct ImageDimensions {
 
 /// Decode base64 image bytes and read their pixel dimensions.
 ///
-/// Mirrors `getImageDimensions(data, mimeType)` from pi-tui: returns `None`
+/// Mirrors the TS `getImageDimensions(data, mimeType)`: returns `None`
 /// for unknown mime types or undecodable payloads.
 pub fn get_image_dimensions(data: &str, mime_type: &str) -> Option<ImageDimensions> {
     let bytes = base64::engine::general_purpose::STANDARD

@@ -1,5 +1,15 @@
 # Extension Runner Host Design
 
+> **DESCOPED - operator decision 2026-09-17.** Stages 3-6 of this design are
+> cut and will not be built. Stages 0-2 landed and stay as harmless machinery:
+> stage 0 discovery is the product-path resource resolution, and the sidecar
+> host stages 1-2 ship but no product surface depends on them. Rationale:
+> skills + the Python kernel packages are the product extensibility story;
+> models.json covers custom providers; only one builtin extension exists
+> (herdr-agent-state); the pi-ecosystem plugin surface is not a product
+> requirement. See `docs/completion-matrix.md` family 13. This document stays
+> as the design record for the landed stages 1-2.
+
 Status: design; stages 1-2 landed (pa-core `extensions/` + `pa-types::extension_rpc`;
 verifiers in `crates/pa-core/tests/extension_host.rs` and
 `crates/pa-core/tests/extension_runner.rs`). Lane `lane/ext-design`.

@@ -1,0 +1,19 @@
+{
+ "argv": [
+  "prime-agent",
+  "-p",
+  "--daemon-socket",
+  "/home/ubuntu/lane-worktrees/branding-scrub/scripts/battery/runs/20260917T224958Z/ts/daemon.sock",
+  "--provider",
+  "prime-inference",
+  "--model",
+  "mock-1",
+  "--offline",
+  "Say hello"
+ ],
+ "exit_code": 0,
+ "stdout": "battery hello from mock\n",
+ "stderr": "",
+ "duration_s": 2.2,
+ "timeout": false
+}

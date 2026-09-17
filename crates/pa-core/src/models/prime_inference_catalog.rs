@@ -443,7 +443,7 @@ mod tests {
     #[test]
     fn cache_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pi-cache.json");
+        let path = dir.path().join("models-cache.json");
         let payload = serde_json::json!({ "data": [
             { "id": "z-ai/glm-5.3", "pricing": { "input_usd_per_mtok": 0.6, "output_usd_per_mtok": 2.2,
                 "cache_read_usd_per_mtok": 0.06, "cache_write_usd_per_mtok": 0.75 } }

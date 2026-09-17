@@ -1,6 +1,6 @@
 //! Terminal UI for Prime Agent.
 //!
-//! Rust port of the TypeScript `pi-tui` package plus the interactive agent view
+//! Rust port of the TS reference TUI (packages/tui) plus the interactive agent view
 //! from `coding-agent/src/modes/interactive`. Components render styled lines;
 //! the terminal layer paints them with crossterm + ratatui diffing.
 

@@ -1,0 +1,33 @@
+{
+ "session": "vbat20260917T224958Z-perf-ts-2",
+ "first_frame_s": 4.005,
+ "ready_s": 4.046,
+ "typing_ms": [
+  113.3,
+  67.3,
+  133.4,
+  61.7,
+  50.1,
+  44.0,
+  47.6,
+  48.9,
+  41.7,
+  43.2,
+  73.8,
+  42.9,
+  57.6,
+  58.5,
+  33.4,
+  45.4,
+  69.1,
+  56.0,
+  57.2,
+  78.9,
+  57.8,
+  82.0,
+  31.4,
+  56.4,
+  44.8
+ ],
+ "ready_frame": "                                                          work\n\n                  \u2597\u2584\u2584\u2588\u2580\n    \u2588\u2588\u2588\u2584       \u2597\u2584\u2588\u2588\u2588\u2580\n   \u2597\u2588\u259b\u2590\u2588\u2599   \u2597\u2584\u2588\u2580\u2597\u2588\u2580       prime agent v0.9.5\n  \u2597\u2588\u259b \u259f\u2588\u2588\u2599\u2584\u2588\u2588\u259b \u259f\u259b         model mock-1\n  \u2597\u259f\u258c \u2590\u2588\u2588\u2588\u259b\u2598\u2597\u2584\u2588\u2596          cwd ~/lane-worktrees/branding-scrub/scripts/battery/runs/20260917T224958Z/ts/work\n \u259f\u2588\u2588\u2588\u2584  \u2584\u2584\u259f\u2588\u2588\u2588\u2580\n \u259c\u2588\u259b\u2580\u2598  \u259c\u2588\u259b\u2580\u2598\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n                                                                                      Collapsed mode (Ctrl+O to expand)\n\n >\n\n\u2190 manage                                                                                                 mock-1 \u00b7 0 (0%)\n"
+}

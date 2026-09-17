@@ -39,7 +39,7 @@ impl GoogleThinkingLevel {
     }
 }
 
-/// Budget-based thinking levels in the pi surface.
+/// Budget-based thinking levels in the model-facing thinking surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GoogleBudgetThinkingLevel {
     Minimal,
@@ -532,7 +532,7 @@ pub fn get_disabled_thinking_config(model_id: &str) -> Value {
     json!({ "thinkingBudget": 0 })
 }
 
-/// Map a pi effort level to a Gemini 3 thinking level.
+/// Map a Prime Agent thinking level to a Gemini 3 thinking level.
 pub fn get_thinking_level(
     effort: crate::types::ModelThinkingLevel,
     model_id: &str,
