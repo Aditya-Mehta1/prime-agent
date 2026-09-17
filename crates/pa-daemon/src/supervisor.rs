@@ -7,7 +7,7 @@
 //! restarted supervisor can adopt or relaunch live sessions, and routes
 //! commands and events between clients and workers (private-framed channel).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,7 +47,24 @@ use crate::worker::{
 };
 use crate::{socket, util};
 
-const WORKER_SPAWN_CONNECT_TIMEOUT_MS: u64 = 15_000;
+/// Worker connect budget: socket probes, connect, and the auth handshake
+/// all share this deadline from spawn time (TS `WORKER_CONNECT_TIMEOUT_MS`:
+/// 30s on Unix, 90s on Windows). A worker that never comes up fails the
+/// launch within this budget instead of hanging.
+#[cfg(unix)]
+const WORKER_CONNECT_TIMEOUT_MS: u64 = 30_000;
+#[cfg(not(unix))]
+const WORKER_CONNECT_TIMEOUT_MS: u64 = 90_000;
+/// One socket probe attempt (TS `WORKER_CONNECT_PROBE_MS`).
+#[cfg(unix)]
+const WORKER_CONNECT_PROBE_MS: u64 = 500;
+#[cfg(not(unix))]
+const WORKER_CONNECT_PROBE_MS: u64 = 2_000;
+/// Pause between probe attempts (TS backoff min = max on Unix).
+#[cfg(unix)]
+const WORKER_CONNECT_BACKOFF_MS: u64 = 25;
+#[cfg(not(unix))]
+const WORKER_CONNECT_BACKOFF_MS: u64 = 2_000;
 const ROUTE_TIMEOUT_MS: u64 = 30_000;
 const LONG_ROUTE_TIMEOUT_MS: u64 = 600_000;
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
@@ -214,7 +231,8 @@ impl Supervisor {
         let pid = descriptor.pid;
         let resident = ResidentWorker::new(worker_id.clone(), descriptor, path);
         let result = if alive {
-            self.connect_worker(&resident).await
+            self.connect_worker(&resident, worker_connect_deadline())
+                .await
         } else {
             // Dead worker: relaunch from the durable create command. The
             // worker rehydrates the session store, restoring history and
@@ -333,8 +351,9 @@ impl Supervisor {
         if self.is_stopping(resident) {
             return Err(anyhow!("supervisor is shutting down"));
         }
-        let child = self.spawn_worker_process(resident).await?;
-        if let Err(error) = self.connect_worker(resident).await {
+        let deadline = worker_connect_deadline();
+        let child = self.spawn_worker_process(resident, deadline).await?;
+        if let Err(error) = self.connect_worker(resident, deadline).await {
             // Never leave a spawned-but-unwired worker process behind.
             let mut child = child;
             let _ = child.start_kill();
@@ -373,6 +392,7 @@ impl Supervisor {
     async fn spawn_worker_process(
         self: &Arc<Self>,
         resident: &Arc<ResidentWorker>,
+        connect_deadline: tokio::time::Instant,
     ) -> Result<Child> {
         let descriptor = resident.descriptor.lock().await;
         let worker_socket = PathBuf::from(&descriptor.socket_path);
@@ -432,26 +452,28 @@ impl Supervisor {
             let _ = persist_worker(&resident.descriptor_path, &descriptor);
         }
 
-        // Wait for the worker socket to accept connections.
-        let deadline =
-            tokio::time::Instant::now() + Duration::from_millis(WORKER_SPAWN_CONNECT_TIMEOUT_MS);
-        loop {
-            if socket::can_connect(&worker_socket, Duration::from_millis(250)).await {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(anyhow!(
-                    "session worker {} did not come up in time",
-                    resident.worker_id
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        // Probe the worker socket until it accepts connections. A worker that
+        // never comes up inside the connect budget is killed here so a stuck
+        // child never outlives its failed launch (TS `connectWorker` throws
+        // `DaemonWorkerProbeTimeoutError` and the launch failure path stops
+        // the worker).
+        if let Err(error) =
+            probe_worker_socket(&resident.worker_id, &worker_socket, connect_deadline).await
+        {
+            let mut child = child;
+            let _ = child.start_kill();
+            return Err(error);
         }
         Ok(child)
     }
 
     /// Connect to the worker socket, authenticate, and wire the request pump.
-    async fn connect_worker(self: &Arc<Self>, resident: &Arc<ResidentWorker>) -> Result<()> {
+    /// The auth handshake must complete inside the remaining connect budget.
+    async fn connect_worker(
+        self: &Arc<Self>,
+        resident: &Arc<ResidentWorker>,
+        connect_deadline: tokio::time::Instant,
+    ) -> Result<()> {
         let (socket_path, token) = {
             let descriptor = resident.descriptor.lock().await;
             (
@@ -576,7 +598,18 @@ impl Supervisor {
         }
         *resident.cmd_tx.lock().await = Some(cmd_tx);
 
-        // Authenticate against the worker.
+        // Authenticate against the worker within the remaining connect
+        // budget (TS `handshakeBudgetMs`: probes, connect, and auth share one
+        // deadline).
+        let auth_budget_ms = connect_deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .as_millis() as u64;
+        if auth_budget_ms == 0 {
+            return Err(anyhow!(
+                "session worker {} did not come up in time",
+                resident.worker_id
+            ));
+        }
         let response = self
             .route_command(
                 resident,
@@ -589,7 +622,7 @@ impl Supervisor {
                     "supervisorSocketPath": self.options.socket_path.to_string_lossy(),
                     "workerInstanceId": None::<String>,
                 }),
-                ROUTE_TIMEOUT_MS,
+                auth_budget_ms,
             )
             .await?;
         if !response.success {
@@ -783,8 +816,14 @@ impl Supervisor {
         // self-registers on boot, and the registration handler must find its
         // identity in the registry (registration races the create replay).
         self.registry.insert(Arc::clone(&resident)).await;
-        let child = self.spawn_worker_process(&resident).await?;
-        self.connect_worker(&resident).await?;
+        let deadline = worker_connect_deadline();
+        let child = self.spawn_worker_process(&resident, deadline).await?;
+        if let Err(error) = self.connect_worker(&resident, deadline).await {
+            // Never leave a spawned-but-unwired worker process behind.
+            let mut child = child;
+            let _ = child.start_kill();
+            return Err(error);
+        }
         let create_payload = {
             let descriptor = resident.descriptor.lock().await;
             create_command_payload(&descriptor.create_command)
@@ -1178,7 +1217,8 @@ impl Supervisor {
             descriptor,
             descriptor_path,
         );
-        self.connect_worker(&resident).await?;
+        self.connect_worker(&resident, worker_connect_deadline())
+            .await?;
         self.registry.insert(Arc::clone(&resident)).await;
         self.spawn_monitor(Arc::clone(&resident), None, registration.pid);
         self.log_line(&format!(
@@ -1551,6 +1591,33 @@ impl Supervisor {
 /// `session_snapshot_chunk` / `session_snapshot_end` records. A snapshot
 /// that cannot be transferred after the response surfaces as
 /// `session_snapshot_failed` keyed by the same snapshot id.
+/// Probe a worker socket until it accepts connections or the connect budget
+/// runs out. The error names the worker so a stuck launch reports which
+/// session never came up.
+async fn probe_worker_socket(
+    worker_id: &str,
+    socket_path: &Path,
+    connect_deadline: tokio::time::Instant,
+) -> Result<()> {
+    loop {
+        if socket::can_connect(socket_path, Duration::from_millis(WORKER_CONNECT_PROBE_MS)).await {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= connect_deadline {
+            return Err(anyhow!(
+                "session worker {worker_id} did not come up in time"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(WORKER_CONNECT_BACKOFF_MS)).await;
+    }
+}
+
+/// The shared worker-connect deadline: probes, connect, and auth must all
+/// fit inside one [`WORKER_CONNECT_TIMEOUT_MS`] budget from spawn time.
+fn worker_connect_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + Duration::from_millis(WORKER_CONNECT_TIMEOUT_MS)
+}
+
 fn streamed_attach_lines(
     mut response: DaemonResponse,
     active_session_id: &str,
@@ -1700,4 +1767,42 @@ fn saved_session_row(info: &crate::session_store::SessionInfo) -> Value {
         );
     }
     row
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn worker_probe_fails_at_the_deadline_and_names_the_worker() {
+        let dir = std::env::temp_dir().join(format!("pa-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("never.sock");
+        let expired = tokio::time::Instant::now() - Duration::from_millis(1);
+        let error = probe_worker_socket("worker-abc", &socket, expired)
+            .await
+            .expect_err("expired budget errors");
+        assert_eq!(
+            error.to_string(),
+            "session worker worker-abc did not come up in time"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn worker_probe_accepts_a_live_socket() {
+        let dir = std::env::temp_dir().join(format!("pa-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("live.sock");
+        let listener = pa_types::platform::transport::bind_transport(&socket)
+            .await
+            .unwrap();
+        let deadline = worker_connect_deadline();
+        probe_worker_socket("worker-abc", &socket, deadline)
+            .await
+            .expect("a live worker socket satisfies the probe");
+        let _ = std::fs::remove_file(&socket);
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

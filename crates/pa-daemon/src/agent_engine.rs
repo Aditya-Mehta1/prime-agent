@@ -232,6 +232,11 @@ impl SessionEngine for AgentSessionEngine {
         self.resolve_model().ok().map(|model| model.context_window)
     }
 
+    fn creation_model(&self) -> Option<(String, String)> {
+        let model = self.resolve_registry_model().ok()?;
+        Some((model.provider.clone(), model.id.clone()))
+    }
+
     fn set_session_file(&self, path: std::path::PathBuf) {
         *self
             .session_file

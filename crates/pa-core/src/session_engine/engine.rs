@@ -132,6 +132,7 @@ pub async fn create_session(config: SessionEngineConfig) -> anyhow::Result<Sessi
     let wiring = super::runtime_wiring::wire_session_runtime(session_manager, &config.agent_dir);
 
     let settings = crate::settings::SettingsManager::create(&cwd, &config.agent_dir);
+    let service_tier_preference = settings.get_default_service_tier();
     let (mcp_skill_overrides, mcp_generic_servers) =
         mcp_gating(&settings, config.agent_dir.clone()).await;
     let mut extra_builtin_skill_overrides = config.extra_builtin_skill_overrides.clone();
@@ -238,16 +239,21 @@ pub async fn create_session(config: SessionEngineConfig) -> anyhow::Result<Sessi
     // sdk.ts `createAgentSession` parity: a session manager that already
     // holds messages is a resume — the loop starts from the persisted
     // context. Fresh sessions record the creation prefix (model_change +
-    // thinking_level_change); resumed sessions only record the thinking level
-    // when no earlier entry set it.
-    let (existing_messages, has_thinking_entry) = {
+    // thinking_level_change + service_tier_change); resumed sessions record
+    // the thinking level and service tier only when no earlier entry set
+    // them.
+    let (existing_messages, has_thinking_entry, has_service_tier_entry) = {
         let session = wiring.session.lock().await;
         let messages = super::compact_session::rebuilt_context_after_compaction(&session);
         let has_thinking_entry = session
             .get_all_entries()
             .iter()
             .any(|entry| matches!(entry, FileEntry::ThinkingLevelChange { .. }));
-        (messages, has_thinking_entry)
+        let has_service_tier_entry = session
+            .get_all_entries()
+            .iter()
+            .any(|entry| matches!(entry, FileEntry::ServiceTierChange { .. }));
+        (messages, has_thinking_entry, has_service_tier_entry)
     };
     let thinking_level = config.thinking_level.unwrap_or(ThinkingLevel::Off);
     {
@@ -257,6 +263,9 @@ pub async fn create_session(config: SessionEngineConfig) -> anyhow::Result<Sessi
             session.append_thinking_level_change(&format!("{thinking_level:?}").to_lowercase());
         } else if !has_thinking_entry {
             session.append_thinking_level_change(&format!("{thinking_level:?}").to_lowercase());
+        }
+        if existing_messages.is_empty() || !has_service_tier_entry {
+            session.append_service_tier_change(Some(service_tier_preference));
         }
     }
     // The loop consumes agent-side messages; session entries cross through

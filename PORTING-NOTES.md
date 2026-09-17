@@ -352,10 +352,13 @@ HEAD
   (prime-inference/qwen/qwen3-30b-a3b-instruct-2507) for a dashboard recap:
   fixed system prompt, `<agent-state>` + trailing-8-message conversation
   body, max_tokens 400; result broadcast as `session_status` with the recap
-  text. Ported in `pa-daemon/src/status_line.rs`. Not ported: the settled
-  idle verdict persistence to the session journal (`appendAgentStatus`) —
-  the Rust session store has no agent-status entry type yet (belongs to the
-  session-shapes lane, B-8).
+  text. Ported in `pa-daemon/src/status_line.rs`, including the settled
+  idle verdict persistence to the session journal (`appendAgentStatus`):
+  real model classifications and transcript error verdicts
+  (`terminalTurnError` -> `taskState: "error"`) persist as `agent_status`
+  entries, the needs_input fallback never grows the journal, and a
+  respawned worker seeds its in-memory verdict from the latest persisted
+  entry (`DaemonSessionSummarizer.seed`).
 - TS print-mode `-c`/`-r` active-session guard (`session-lease.ts`
   `SessionAlreadyActiveError` -> supervisor `assertWorkerCreateOwner` on the
   daemon create): a headless continue/resume refuses when the target session
@@ -366,3 +369,53 @@ HEAD
   reuse-vs-guard semantics of TS `createOrReuseWorker` (same owner reuses,
   different owner refuses) and interactive resume's pre-resolution to attach
   are not ported yet — a separate lane item.origin/main
+
+## Worker robustness + session entry parity (worker-robustness lane, B-3/B-8)
+
+- AF_UNIX over-limit paths: the installed TS product survives deep-TMPDIR
+  worker sockets because its runtime (Bun) transparently re-anchors long unix
+  socket paths through an O_PATH directory fd — an strace of the live worker
+  shows `bind(13, {sa_family=AF_UNIX,
+  sun_path="/proc/self/fd/12/worker-....sock"}, 110) = 0`, and the socket
+  file lands at the original deep path. No TS source references this; it is
+  purely runtime behavior (Node fails the same bind with `EINVAL`). The
+  Rust port puts the same rewrite in `pa_types::platform::transport`
+  (`UnixSocketAddress`): paths within the 107-byte `sun_path` limit pass
+  through; longer ones (Linux) open the parent directory with `O_PATH` and
+  bind/connect via `/proc/self/fd/<fd>/<file name>`, keeping the fd open for
+  the address lifetime. Non-Linux Unix platforms surface the natural
+  path-length error. Filesystem cleanup (unlink/chmod) always uses the
+  original path (no 108-byte limit there).
+- Worker connect budget: TS `WORKER_CONNECT_TIMEOUT_MS` is 30s on Unix
+  (90s Windows) and covers probes (500ms), connect, and the auth handshake
+  under one deadline (`connectWorker` + `handshakeBudgetMs`); a worker that
+  never comes up throws `DaemonWorkerProbeTimeoutError` and the failed
+  launch stops the child. The Rust supervisor uses the same 30s shared
+  deadline (`worker_connect_deadline`), probes every 25ms (TS backoff
+  min=max=25ms), kills the spawned child when the deadline trips, and
+  bounds the auth request to the remaining budget.
+- `service_tier_change` entries (TS `sdk.ts` `createAgentSession`): fresh
+  sessions append `model_change` + `thinking_level_change` +
+  `service_tier_change` (settings default, TS `getDefaultServiceTier`
+  fallback `"default"`); resumed sessions append thinking and service tier
+  only when no earlier entry set them. Ported in the pa-core engine
+  creation path (engine-owned session files) and mirrored onto the daemon
+  worker's own session file at create.
+- Queue snapshots: the Rust worker used to persist steering/follow-up lanes
+  as `custom` session-file entries (`prime-agent-rs.queue_snapshot`) —
+  a Rust-only entry type that broke the B-8 shape diff. TS keeps session
+  files free of daemon bookkeeping and journals worker-private state
+  separately, so the snapshot moved into the worker recovery journal
+  (`WorkerRecoveryJournal::record_queue_snapshot`, latest-wins per session,
+  survives journal compaction).
+- `agent_status` entries (TS `daemon-session-summarizer.ts`
+  `appendAgentStatus`): settled idle verdicts persist as `agent_status`
+  session entries — real model classifications and transcript error
+  verdicts (`terminalTurnError` → `taskState: "error"`, recap
+  "Model request failed: …") — never the needs_input fallback, sweeps, or
+  working refreshes (no verdict), and only when the verdict differs from
+  the latest persisted one. Respawned workers seed the in-memory status from
+  the latest persisted entry (`seed`) so a restart does not re-ask the
+  model. Persisted shapes match the live-session goldens
+  (`{"type":"agent_status",…,"status":{"summary","taskState",
+  "basedOnMessageCount"}}`).

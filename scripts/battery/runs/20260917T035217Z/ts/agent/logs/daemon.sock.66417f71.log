@@ -1,0 +1,12 @@
+[2026-09-17T03:52:18.308Z] supervisor: Prime Agent daemon supervisor e17622e0-8932-44a9-acc7-b2457b23826d listening on /home/ubuntu/lane-worktrees/gap-worker-2/scripts/battery/runs/20260917T035217Z/ts/daemon.sock
+[2026-09-17T03:52:18.638Z] supervisor: Session worker 8716bb3dd758 stderr: Prime Agent daemon listening on /tmp/vbat20260917T035217Z-ts/prime-agent-1000/worker-66417f71ec06-8716bb3dd758.sock
+[2026-09-17T03:52:18.833Z] supervisor: Session worker 8716bb3dd758 stderr: shutdown command received over socket; 1 active session(s) will be closed
+[2026-09-17T03:52:18.834Z] supervisor: Session worker 8716bb3dd758 stderr: shutting down (exit 0); closing 1 active session(s)
+[2026-09-17T03:52:19.575Z] supervisor: Session worker 2c522fe52149 stderr: Prime Agent daemon listening on /tmp/vbat20260917T035217Z-ts/prime-agent-1000/worker-66417f71ec06-2c522fe52149.sock
+[2026-09-17T03:52:20.537Z] supervisor: Session worker 2c522fe52149 stderr: shutdown command received over socket; 1 active session(s) will be closed
+[2026-09-17T03:52:20.538Z] supervisor: Session worker 2c522fe52149 stderr: shutting down (exit 0); closing 1 active session(s)
+[2026-09-17T03:52:22.501Z] supervisor: Session worker e6147b746af9 stderr: Prime Agent daemon listening on /tmp/vbat20260917T035217Z-ts/prime-agent-1000/worker-66417f71ec06-e6147b746af9.sock
+[2026-09-17T03:52:22.791Z] supervisor: Session worker e6147b746af9 stderr: shutdown command received over socket; 1 active session(s) will be closed
+[2026-09-17T03:52:22.791Z] supervisor: Session worker e6147b746af9 stderr: shutting down (exit 0); closing 1 active session(s)
+[2026-09-17T03:52:23.590Z] supervisor: Session worker 8803d77738f0 stderr: Prime Agent daemon listening on /tmp/vbat20260917T035217Z-ts/prime-agent-1000/worker-66417f71ec06-8803d77738f0.sock
+[2026-09-17T03:52:24.571Z] supervisor: Session worker 8803d77738f0 stderr: shutting down (exit 0); closing 0 active session(s)

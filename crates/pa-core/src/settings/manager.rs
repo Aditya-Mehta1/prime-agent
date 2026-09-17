@@ -307,6 +307,25 @@ impl SettingsManager {
         self.merged.auxiliary_model.as_deref()
     }
 
+    /// Service tier a fresh session records as its preference (TS
+    /// `getDefaultServiceTier`: the setting when present, else `default`).
+    /// An unrecognized setting value falls back to the same `default`.
+    pub fn get_default_service_tier(&self) -> pa_types::ai::ServiceTier {
+        use pa_types::ai::ServiceTier;
+        self.merged
+            .default_service_tier
+            .as_deref()
+            .and_then(|value| match value.trim().to_lowercase().as_str() {
+                "auto" => Some(ServiceTier::Auto),
+                "flex" => Some(ServiceTier::Flex),
+                "scale" => Some(ServiceTier::Scale),
+                "priority" => Some(ServiceTier::Priority),
+                "default" => Some(ServiceTier::Default),
+                _ => None,
+            })
+            .unwrap_or(ServiceTier::Default)
+    }
+
     pub fn get_recent_models(&self) -> Vec<String> {
         self.merged.recent_models.clone().unwrap_or_default()
     }

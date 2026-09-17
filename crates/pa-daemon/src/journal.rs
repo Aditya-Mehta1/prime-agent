@@ -265,10 +265,26 @@ fn parse_worker_records(path: &Path) -> Result<HashMap<String, WorkerRecoveryRec
     Ok(latest)
 }
 
-/// Port of `WorkerRecoveryJournal`: latest busy/operation per active session.
+/// A worker queue snapshot record: the pending steering/follow-up lanes so a
+/// respawned worker restores its queues. Lives in the worker recovery journal
+/// (TS keeps its session files free of daemon bookkeeping; queue recovery is
+/// worker-private state, so it rides the journal next to the busy records).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerQueueSnapshotRecord {
+    pub version: u32,
+    pub r#type: String,
+    pub active_session_id: String,
+    pub steering: Vec<String>,
+    pub follow_up: Vec<String>,
+    pub recorded_at: String,
+}
+
+/// Port of `WorkerRecoveryJournal`: latest busy/operation per active session,
+/// plus the latest queue snapshot per session.
 pub struct WorkerRecoveryJournal {
     path: std::path::PathBuf,
     latest: HashMap<String, WorkerRecoveryRecord>,
+    queue_snapshots: HashMap<String, WorkerQueueSnapshotRecord>,
 }
 
 impl WorkerRecoveryJournal {
@@ -276,9 +292,11 @@ impl WorkerRecoveryJournal {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        let queue_snapshots = parse_queue_snapshot_records(path)?;
         Ok(WorkerRecoveryJournal {
             path: path.to_path_buf(),
             latest: parse_worker_records(path)?,
+            queue_snapshots,
         })
     }
 
@@ -323,14 +341,85 @@ impl WorkerRecoveryJournal {
         self.latest.values().cloned().collect()
     }
 
+    /// Persist the pending queue lanes; latest record wins per session.
+    pub fn record_queue_snapshot(
+        &mut self,
+        active_session_id: &str,
+        steering: &[String],
+        follow_up: &[String],
+    ) -> Result<()> {
+        let record = WorkerQueueSnapshotRecord {
+            version: 1,
+            r#type: QUEUE_SNAPSHOT_RECORD_TYPE.to_string(),
+            active_session_id: active_session_id.to_string(),
+            steering: steering.to_vec(),
+            follow_up: follow_up.to_vec(),
+            recorded_at: crate::util::now_iso(),
+        };
+        append_record(&self.path, &serde_json::to_value(&record)?)?;
+        self.queue_snapshots
+            .insert(active_session_id.to_string(), record);
+        Ok(())
+    }
+
+    /// The latest persisted queue lanes for `active_session_id`.
+    pub fn latest_queue_snapshot(
+        &self,
+        active_session_id: &str,
+    ) -> Option<(Vec<String>, Vec<String>)> {
+        self.queue_snapshots
+            .get(active_session_id)
+            .map(|record| (record.steering.clone(), record.follow_up.clone()))
+    }
+
+    /// Read the latest queue snapshot for a session straight from a journal
+    /// file (worker restore on a fresh process).
+    pub fn read_queue_snapshot(
+        path: &Path,
+        active_session_id: &str,
+    ) -> Result<Option<(Vec<String>, Vec<String>)>> {
+        Ok(parse_queue_snapshot_records(path)?
+            .remove(active_session_id)
+            .map(|record| (record.steering, record.follow_up)))
+    }
+
     fn compact(&self) -> Result<()> {
-        let records: Vec<Value> = self
+        let mut records: Vec<Value> = self
             .latest
             .values()
             .map(serde_json::to_value)
             .collect::<std::result::Result<_, _>>()?;
+        let snapshots: Vec<Value> = self
+            .queue_snapshots
+            .values()
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<_, _>>()?;
+        records.extend(snapshots);
         rewrite_records(&self.path, &records)
     }
+}
+
+/// The record-type tag of a queue snapshot line.
+const QUEUE_SNAPSHOT_RECORD_TYPE: &str = "queue_snapshot";
+
+fn parse_queue_snapshot_records(path: &Path) -> Result<HashMap<String, WorkerQueueSnapshotRecord>> {
+    let mut latest: HashMap<String, WorkerQueueSnapshotRecord> = HashMap::new();
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(latest),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read journal {}", path.display()))
+        }
+    };
+    for line in contents.split('\n').filter(|line| !line.is_empty()) {
+        let Ok(record) = serde_json::from_str::<WorkerQueueSnapshotRecord>(line) else {
+            continue;
+        };
+        if record.version == 1 && record.r#type == QUEUE_SNAPSHOT_RECORD_TYPE {
+            latest.insert(record.active_session_id.clone(), record);
+        }
+    }
+    Ok(latest)
 }
 
 #[cfg(test)]

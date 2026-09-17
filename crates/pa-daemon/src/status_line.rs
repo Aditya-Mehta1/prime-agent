@@ -44,12 +44,13 @@ Example:
 <recap>Refactoring the auth middleware and updating its tests</recap>
 <status>NEEDS_INPUT</status>";
 
-/// Idle verdict: did the turn fully complete the request or is more input
-/// needed (TS `AgentTaskState`, wire strings).
+/// Idle verdict: did the turn fully complete the request, wait for more
+/// input, or end in an error (TS `AgentTaskState`, wire strings).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentTaskState {
     NeedsInput,
     Completed,
+    Error,
 }
 
 impl AgentTaskState {
@@ -57,8 +58,66 @@ impl AgentTaskState {
         match self {
             AgentTaskState::NeedsInput => "needs_input",
             AgentTaskState::Completed => "completed",
+            AgentTaskState::Error => "error",
         }
     }
+
+    /// The wire/persisted form (TS `session-manager` snake_case).
+    pub(crate) fn persisted(self) -> pa_types::session::AgentTaskState {
+        match self {
+            AgentTaskState::NeedsInput => pa_types::session::AgentTaskState::NeedsInput,
+            AgentTaskState::Completed => pa_types::session::AgentTaskState::Completed,
+            AgentTaskState::Error => pa_types::session::AgentTaskState::Error,
+        }
+    }
+
+    pub(crate) fn from_persisted(state: pa_types::session::AgentTaskState) -> Self {
+        match state {
+            pa_types::session::AgentTaskState::NeedsInput => AgentTaskState::NeedsInput,
+            pa_types::session::AgentTaskState::Completed => AgentTaskState::Completed,
+            pa_types::session::AgentTaskState::Error => AgentTaskState::Error,
+        }
+    }
+}
+
+/// A settled verdict as it persists (the `agent_status` session entry).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedAgentStatus {
+    pub summary: String,
+    pub task_state: Option<AgentTaskState>,
+    pub based_on_message_count: usize,
+}
+
+const ERROR_RECAP_PREFIX: &str = "Model request failed";
+const ERROR_RECAP_MAX_CHARS: usize = 160;
+
+/// The error text of a turn that ended in a provider failure, when the last
+/// assistant message stopped with `stopReason: "error"` (TS
+/// `terminalTurnError`): the classifier would invent work for a failed turn,
+/// so the verdict settles straight from the transcript.
+fn terminal_turn_error(messages: &[Value]) -> Option<String> {
+    for message in messages.iter().rev() {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if message.get("stopReason").and_then(Value::as_str) != Some("error") {
+            return None;
+        }
+        let detail = message
+            .get("errorMessage")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        return Some(if detail.is_empty() {
+            ERROR_RECAP_PREFIX.to_string()
+        } else {
+            format!(
+                "{ERROR_RECAP_PREFIX}: {}",
+                clamp(detail, ERROR_RECAP_MAX_CHARS)
+            )
+        });
+    }
+    None
 }
 
 /// Read/write access to the live session state the runner summarizes. The
@@ -75,6 +134,11 @@ pub trait StatusSession: Send + Sync {
     fn status_generation(&self) -> String;
     /// Allocate the next event sequence number.
     fn status_next_sequence(&mut self) -> u64;
+    /// Persist a settled verdict as an `agent_status` session entry (TS
+    /// `sessionManager.appendAgentStatus`).
+    fn status_append_agent_status(&mut self, status: &PersistedAgentStatus) -> anyhow::Result<()>;
+    /// The latest persisted verdict, if the session ever recorded one.
+    fn status_latest_agent_status(&self) -> Option<PersistedAgentStatus>;
 }
 
 /// The daemon worker's status-line runner: turn-end notifications (debounced)
@@ -114,6 +178,23 @@ impl<S: StatusSession> StatusLineRunner<S> {
             agent_dir,
             events,
             state: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Seed the in-memory status from the latest persisted verdict (TS
+    /// `DaemonSessionSummarizer.seed`): a respawned worker resumes with the
+    /// pre-crash verdict instead of re-asking the model.
+    pub(crate) fn seed_from_session(&self) {
+        if self.state.lock().expect("status state lock").is_some() {
+            return;
+        }
+        let core = self.core.lock().expect("session core lock");
+        if let Some(persisted) = core.status_latest_agent_status() {
+            *self.state.lock().expect("status state lock") = Some(StatusState {
+                summary: persisted.summary,
+                task_state: persisted.task_state,
+                based_on_message_count: persisted.based_on_message_count,
+            });
         }
     }
 
@@ -190,39 +271,79 @@ impl<S: StatusSession> StatusLineRunner<S> {
             && previous
                 .as_ref()
                 .is_none_or(|state| state.summary.is_empty());
-        if content_unchanged && !is_working && !owes_idle_verdict && !owes_summary {
-            return;
-        }
-        let generated = generate_agent_status(&self.agent_dir, &messages, is_working).await;
-        // A failed classification on an idle session would sit unjudged
-        // forever, so settle it to needs_input.
-        let settled = match generated {
-            Some(generated) => Some(StatusState {
-                summary: generated.summary,
-                task_state: generated.task_state,
-                based_on_message_count: message_count,
-            }),
-            None if !is_working && (owes_idle_verdict || owes_summary) => Some(StatusState {
-                summary: previous
-                    .as_ref()
-                    .map(|state| state.summary.clone())
-                    .unwrap_or_default(),
-                task_state: Some(AgentTaskState::NeedsInput),
-                based_on_message_count: message_count,
-            }),
-            None => None,
+        // A turn that errored produced no final answer; the verdict settles
+        // from the transcript itself, never the classifier.
+        let turn_error = if is_working {
+            None
+        } else {
+            terminal_turn_error(&messages)
         };
-        let Some(mut status) = settled else {
-            return;
-        };
-        // A working refresh carries no verdict; keep the prior one at the
-        // same message count so a still-valid needs_input is not dropped.
-        if status.task_state.is_none() {
-            status.task_state = previous
+        let owes_error_verdict = turn_error.is_some()
+            && previous
                 .as_ref()
-                .filter(|state| state.based_on_message_count == message_count)
-                .and_then(|state| state.task_state);
+                .is_none_or(|state| state.task_state != Some(AgentTaskState::Error));
+        if content_unchanged
+            && !is_working
+            && !owes_idle_verdict
+            && !owes_summary
+            && !owes_error_verdict
+        {
+            return;
         }
+        // The settled status plus whether it is a real verdict (model
+        // classification or transcript error) as opposed to the
+        // needs_input fallback (TS `persist: generated !== undefined`).
+        let (status, real_verdict) = if let Some(turn_error) = turn_error {
+            (
+                StatusState {
+                    summary: turn_error,
+                    task_state: Some(AgentTaskState::Error),
+                    based_on_message_count: message_count,
+                },
+                true,
+            )
+        } else {
+            let generated = generate_agent_status(&self.agent_dir, &messages, is_working).await;
+            // A failed classification on an idle session would sit unjudged
+            // forever, so settle it to needs_input.
+            let settled = match generated {
+                Some(generated) => Some((
+                    StatusState {
+                        summary: generated.summary,
+                        task_state: generated.task_state,
+                        based_on_message_count: message_count,
+                    },
+                    true,
+                )),
+                None if !is_working && (owes_idle_verdict || owes_summary) => Some((
+                    StatusState {
+                        summary: previous
+                            .as_ref()
+                            .map(|state| state.summary.clone())
+                            .unwrap_or_default(),
+                        task_state: Some(AgentTaskState::NeedsInput),
+                        based_on_message_count: message_count,
+                    },
+                    false,
+                )),
+                None => None,
+            };
+            let Some((mut status, real_verdict)) = settled else {
+                return;
+            };
+            // A working refresh carries no verdict; keep the prior one at the
+            // same message count so a still-valid needs_input is not dropped.
+            if status.task_state.is_none() {
+                status.task_state = previous
+                    .as_ref()
+                    .filter(|state| state.based_on_message_count == message_count)
+                    .and_then(|state| state.task_state);
+            }
+            (status, real_verdict)
+        };
+        // Settled idle verdicts persist; sweeps and fallbacks never grow the
+        // session journal (TS `commitStatus`).
+        let persist = !is_working && real_verdict;
         let changed = previous
             .as_ref()
             .map(|state| {
@@ -233,6 +354,25 @@ impl<S: StatusSession> StatusLineRunner<S> {
             })
             .unwrap_or(true);
         *self.state.lock().expect("status state lock") = Some(status.clone());
+        if persist {
+            let persisted = {
+                let core = self.core.lock().expect("session core lock");
+                core.status_latest_agent_status()
+            };
+            let differs = persisted.as_ref().is_none_or(|persisted| {
+                persisted.summary != status.summary
+                    || persisted.task_state != status.task_state
+                    || persisted.based_on_message_count != status.based_on_message_count
+            });
+            if differs {
+                let mut core = self.core.lock().expect("session core lock");
+                let _ = core.status_append_agent_status(&PersistedAgentStatus {
+                    summary: status.summary.clone(),
+                    task_state: status.task_state,
+                    based_on_message_count: status.based_on_message_count,
+                });
+            }
+        }
         if changed {
             self.broadcast(&status.summary, &active_session_id, &generation);
         }
@@ -521,6 +661,205 @@ fn clean_recap(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A recording stand-in for the worker session: captures persisted
+    /// verdicts and answers the runner's reads.
+    struct RecordingSession {
+        persisted: Vec<PersistedAgentStatus>,
+    }
+
+    impl StatusSession for RecordingSession {
+        fn status_messages(&self) -> Vec<Value> {
+            serde_json::json!([
+                { "role": "user", "content": [{ "type": "text", "text": "please add tests" }] },
+            ])
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        }
+
+        fn status_busy(&self) -> bool {
+            false
+        }
+
+        fn status_active_session_id(&self) -> String {
+            "session-1".to_string()
+        }
+
+        fn status_generation(&self) -> String {
+            "gen-1".to_string()
+        }
+
+        fn status_next_sequence(&mut self) -> u64 {
+            1
+        }
+
+        fn status_append_agent_status(
+            &mut self,
+            status: &PersistedAgentStatus,
+        ) -> anyhow::Result<()> {
+            self.persisted.push(status.clone());
+            Ok(())
+        }
+
+        fn status_latest_agent_status(&self) -> Option<PersistedAgentStatus> {
+            self.persisted.last().cloned()
+        }
+    }
+
+    fn persisted_status(summary: &str, task_state: AgentTaskState) -> PersistedAgentStatus {
+        PersistedAgentStatus {
+            summary: summary.to_string(),
+            task_state: Some(task_state),
+            based_on_message_count: 1,
+        }
+    }
+
+    #[test]
+    fn agent_status_entry_serializes_like_the_ts_golden() {
+        // Golden shape from a live TS session file:
+        // {"type":"agent_status","id":..,"parentId":..,"timestamp":..,
+        //  "status":{"summary":"..","taskState":"needs_input","basedOnMessageCount":848}}
+        let status = persisted_status("Monitoring system health", AgentTaskState::NeedsInput);
+        let wire = pa_types::session::AgentStatus {
+            summary: status.summary,
+            task_state: status.task_state.map(AgentTaskState::persisted),
+            based_on_message_count: status.based_on_message_count as u64,
+        };
+        let value = serde_json::to_value(&wire).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "summary": "Monitoring system health",
+                "taskState": "needs_input",
+                "basedOnMessageCount": 1,
+            })
+        );
+        // A working refresh (no verdict) omits the task state entirely.
+        let mut without_state = wire.clone();
+        without_state.task_state = None;
+        let value = serde_json::to_value(&without_state).unwrap();
+        assert!(value.get("taskState").is_none());
+    }
+
+    #[test]
+    fn error_verdicts_settle_from_the_terminal_turn() {
+        let mut turn = messages();
+        turn.push(serde_json::json!({
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "trying" }],
+            "stopReason": "toolUse",
+        }));
+        assert_eq!(terminal_turn_error(&turn), None);
+        let long_detail = "x".repeat(400);
+        turn.push(serde_json::json!({
+            "role": "assistant",
+            "content": [],
+            "stopReason": "error",
+            "errorMessage": format!("  {long_detail}  "),
+        }));
+        let summary = terminal_turn_error(&turn).unwrap();
+        assert!(summary.starts_with("Model request failed: "));
+        // Whitespace is normalized and the detail clamped with the TS ellipsis.
+        assert!(summary.contains(&"x".repeat(160)));
+        assert!(summary.ends_with('\u{2026}'));
+        turn.push(serde_json::json!({ "role": "toolResult", "content": [] }));
+        // A trailing tool result does not mask the failed assistant turn.
+        assert!(terminal_turn_error(&turn).is_some());
+        // Only the LAST assistant turn decides; an older error is ignored.
+        let mut older = turn.clone();
+        older.push(serde_json::json!({
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "all done" }],
+            "stopReason": "stop",
+        }));
+        assert_eq!(terminal_turn_error(&older), None);
+    }
+
+    #[test]
+    fn seed_restores_the_persisted_verdict() {
+        let core = std::sync::Arc::new(std::sync::Mutex::new(RecordingSession {
+            persisted: vec![persisted_status(
+                "Refactoring the pipeline",
+                AgentTaskState::NeedsInput,
+            )],
+        }));
+        let (events, _) = tokio::sync::broadcast::channel(4);
+        let runner = StatusLineRunner::new(
+            std::sync::Arc::clone(&core),
+            std::path::PathBuf::from("/nonexistent"),
+            events,
+        );
+        assert!(runner.state.lock().unwrap().is_none());
+        runner.seed_from_session();
+        assert_eq!(
+            runner
+                .state
+                .lock()
+                .unwrap()
+                .clone()
+                .map(|state| (state.summary, state.task_state)),
+            Some((
+                "Refactoring the pipeline".to_string(),
+                Some(AgentTaskState::NeedsInput)
+            ))
+        );
+        // A second seed never overwrites live state.
+        core.lock().unwrap().persisted.push(persisted_status(
+            "A newer verdict that must not win",
+            AgentTaskState::Completed,
+        ));
+        runner.seed_from_session();
+        assert_eq!(
+            runner
+                .state
+                .lock()
+                .unwrap()
+                .clone()
+                .map(|state| state.summary),
+            Some("Refactoring the pipeline".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_error_verdicts_persist_and_do_not_duplicate() {
+        let mut session = RecordingSession {
+            persisted: Vec::new(),
+        };
+        // Simulate a settled turn that ended in a provider error.
+        let turn = serde_json::json!([
+            { "role": "user", "content": "run the build" },
+            { "role": "assistant", "content": [], "stopReason": "error", "errorMessage": "500 boom" },
+        ])
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+        let status = StatusState {
+            summary: terminal_turn_error(&turn).expect("error summary"),
+            task_state: Some(AgentTaskState::Error),
+            based_on_message_count: turn.len(),
+        };
+        StatusSession::status_append_agent_status(
+            &mut session,
+            &PersistedAgentStatus {
+                summary: status.summary.clone(),
+                task_state: status.task_state,
+                based_on_message_count: status.based_on_message_count,
+            },
+        )
+        .unwrap();
+        let persisted = session.persisted.clone();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].task_state, Some(AgentTaskState::Error));
+        assert_eq!(
+            persisted[0].summary,
+            "Model request failed: 500 boom".to_string()
+        );
+        // The latest-verdict read is what the runner's duplicate guard
+        // compares against before appending again.
+        let latest = StatusSession::status_latest_agent_status(&session).unwrap();
+        assert_eq!(latest, persisted[0]);
+    }
 
     fn messages() -> Vec<Value> {
         serde_json::json!([

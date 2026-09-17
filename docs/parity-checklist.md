@@ -328,13 +328,17 @@ Categories: visual/behavior/protocol/timing.
   with Prime Intellect?" notice (Share / Not now, `/traces` hint); Rust
   launches straight into the TUI with neither. Evidence:
   `runs/20260916T210320Z/{ts,rust}/f1_launch/01-launch.txt`.
-- B-3 (timing, f1): Rust supervisor `WORKER_SPAWN_CONNECT_TIMEOUT_MS` is
-  15s (TS `WORKER_CONNECT_TIMEOUT_MS` is 30s), and the worker socket bind
-  fails when the AF_UNIX path exceeds 107 chars, so fresh installs on long
-  TMPDIR paths kill the interactive session ("session worker <id> did not
-  come up in time", TUI exits 1). Evidence:
-  `runs/20260916T203149Z/rust/` (failed worker boots), plus
-  `crates/pa-daemon/src/supervisor.rs` L48.
+- B-3 (timing, f1): FIXED (run `runs/20260917T041145Z/`). The worker connect
+  budget is 30s (TS `WORKER_CONNECT_TIMEOUT_MS`): socket probes, connect,
+  and the auth handshake share one deadline and a stuck child is killed at
+  timeout. Over-limit AF_UNIX paths (107-byte `sun_path`) now re-anchor
+  through an O_PATH directory fd (`/proc/self/fd/<fd>/<name>`), the same
+  mechanism the TS runtime applies transparently (strace of the installed
+  product shows `bind(13, {sun_path="/proc/self/fd/12/worker-...sock"}) = 0`),
+  so worker sockets bind at arbitrary TMPDIR depth. Evidence:
+  `runs/20260917T041145Z/extras/b3-deep-tmpdir/` (worker socket bound at a
+  159-char path, full interactive turn over it; per-file session prefix now
+  matches TS). Historical evidence: `runs/20260916T203149Z/rust/`.
 - B-4 (protocol, f2) - RESOLVED: model tool surface differs - TS exposes only
   `ipython`; Rust exposed `bash`, `edit`, `ipython`. Evidence:
   `runs/20260916T210320Z/{ts,rust}/f2_prompt/mock-requests.json`.
@@ -357,11 +361,17 @@ Categories: visual/behavior/protocol/timing.
   and max_tokens; recap broadcast as `session_status`). Verified by run
   `runs/20260916T221725Z/{ts,rust}/f5_side_questions/statusline-requests.json`.
   Historical evidence: `runs/20260916T210320Z/extras/ts-statusline-request.json`.
-- B-8 (protocol, f3/f8): session-file entry shapes differ - TS writes
-  `custom_message` (harness_digest), `service_tier_change`, and
-  `compaction` entries; Rust writes `custom` entries
-  (`prime-agent-rs.queue_snapshot`) and never `service_tier_change` or
-  `compaction`. Evidence: `runs/20260916T210320Z/f3_tool-session-shapes.json`,
+- B-8 (protocol, f3/f8): FIXED (run `runs/20260917T041145Z/`). Session
+  entry sets now match on both sides: `service_tier_change` is emitted in
+  the creation prefix (fresh + resume, settings default, engine and daemon
+  store), `custom_message` (harness_digest) and `compaction` landed in
+  #83/#85, and the queue snapshot moved from session-file `custom` entries
+  into the worker recovery journal. Settled status verdicts now persist as
+  `agent_status` entries (real model classifications and transcript error
+  verdicts only; the needs_input fallback and sweeps never grow the journal;
+  respawned workers seed the in-memory verdict from the persisted entry).
+  Differential evidence: `runs/20260917T041145Z/extras/b8-agent-status/`.
+  Historical evidence: `runs/20260916T210320Z/f3_tool-session-shapes.json`,
   `f8_resume-session-shapes.json`.
 - B-9 (visual, f4): TS `/` opens the slash-command menu; Rust `/` types into
   the composer. Evidence:

@@ -1,0 +1,111 @@
+{
+ "command": "attach",
+ "data": {
+  "activeSessionId": "b98aaa4ae5f3",
+  "client": {
+   "capabilities": [
+    "attach_snapshot",
+    "event_sequence"
+   ],
+   "id": "8dcf700f28f5"
+  },
+  "lastEventCursor": {
+   "generation": "c1fd9012d1d6",
+   "sequence": 0
+  },
+  "lastEventSequence": 0,
+  "protocol": {
+   "name": "prime-agent.daemon",
+   "version": 7
+  },
+  "replay": {
+   "status": "complete",
+   "toCursor": {
+    "generation": "c1fd9012d1d6",
+    "sequence": 0
+   },
+   "toSequence": 0
+  },
+  "snapshot": {
+   "activeSessionId": "b98aaa4ae5f3",
+   "children": [],
+   "lastEventCursor": {
+    "generation": "c1fd9012d1d6",
+    "sequence": 0
+   },
+   "lastEventSequence": 0,
+   "messages": [],
+   "state": {
+    "activeSessionId": "b98aaa4ae5f3",
+    "activeToolNames": [],
+    "autoCompactionEnabled": true,
+    "availableThinkingLevels": [
+     "default"
+    ],
+    "compactionCount": 0,
+    "cwd": "/home/ubuntu/lane-worktrees/gap-worker-2/scripts/battery/runs/20260917T041145Z/rust/work",
+    "followUpMode": "all",
+    "goal": null,
+    "isBashRunning": false,
+    "isCompacting": false,
+    "isStreaming": false,
+    "leafId": "a402d29f",
+    "messageCount": 0,
+    "model": {
+     "id": "mock-1",
+     "name": "Mock 1",
+     "provider": "prime-inference",
+     "reasoning": false
+    },
+    "retryAttempt": 0,
+    "scopedModels": [],
+    "serviceTier": "auto",
+    "sessionActions": {
+     "followUps": [],
+     "queuedCount": 0,
+     "steering": []
+    },
+    "sessionDir": "/home/ubuntu/lane-worktrees/gap-worker-2/scripts/battery/runs/20260917T041145Z/rust/agent/sessions",
+    "sessionFile": "/home/ubuntu/lane-worktrees/gap-worker-2/scripts/battery/runs/20260917T041145Z/rust/agent/sessions/01a0ad91-50dc-7151-8f1c-3fe6d24a2bf2.jsonl",
+    "sessionId": "01a0ad91-50dc-7151-8f1c-3fe6d24a2bf2",
+    "sessionName": "battery-side-questions",
+    "steeringMode": "all",
+    "thinkingLevel": "default"
+   },
+   "summary": {
+    "activeSessionId": "b98aaa4ae5f3",
+    "activity": "idle",
+    "attachedClients": 1,
+    "created": "2026-09-17T04:12:56.924Z",
+    "cwd": "/home/ubuntu/lane-worktrees/gap-worker-2/scripts/battery/runs/20260917T041145Z/rust/work",
+    "hasRegisteredCronJob": false,
+    "id": "b98aaa4ae5f3",
+    "isBashRunning": false,
+    "isCompacting": false,
+    "isSessionActive": false,
+    "isStreaming": false,
+    "lastActivityAt": "2026-09-17T04:12:56.946Z",
+    "lifecycle": "resident",
+    "messageCount": 0,
+    "modified": "2026-09-17T04:12:56.946Z",
+    "rlmDepth": 0,
+    "runtimeKind": "top-level",
+    "sessionActions": {
+     "followUps": [],
+     "queuedCount": 0,
+     "steering": []
+    },
+    "sessionFile": "/home/ubuntu/lane-worktrees/gap-worker-2/scripts/battery/runs/20260917T041145Z/rust/agent/sessions/01a0ad91-50dc-7151-8f1c-3fe6d24a2bf2.jsonl",
+    "sessionId": "01a0ad91-50dc-7151-8f1c-3fe6d24a2bf2",
+    "sessionName": "battery-side-questions",
+    "thinkingLevel": "default",
+    "unfinishedActionCount": 0,
+    "workerPid": 2320694,
+    "workerState": "ready"
+   }
+  }
+ },
+ "id": "a0",
+ "success": true,
+ "type": "response"
+}

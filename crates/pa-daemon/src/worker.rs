@@ -51,8 +51,6 @@ pub const WORKER_SCRIPT_ENV: &str = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_SCRIPT";
 /// Worker socket path (supervisor passes it explicitly).
 pub const WORKER_SOCKET_ENV: &str = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_SOCKET";
 
-const QUEUE_SNAPSHOT_CUSTOM_TYPE: &str = "prime-agent-rs.queue_snapshot";
-
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
     pub socket_path: PathBuf,
@@ -178,6 +176,45 @@ impl crate::status_line::StatusSession for SessionCore {
         self.last_event_sequence += 1;
         self.last_event_sequence
     }
+
+    fn status_append_agent_status(
+        &mut self,
+        status: &crate::status_line::PersistedAgentStatus,
+    ) -> Result<()> {
+        let Some(store) = self.store.as_mut() else {
+            return Ok(());
+        };
+        let persisted = pa_types::session::AgentStatus {
+            summary: status.summary.clone(),
+            task_state: status
+                .task_state
+                .map(crate::status_line::AgentTaskState::persisted),
+            based_on_message_count: status.based_on_message_count as u64,
+        };
+        store.persist_entry(
+            "agent_status",
+            json!({ "status": serde_json::to_value(&persisted)? }),
+        )?;
+        Ok(())
+    }
+
+    fn status_latest_agent_status(&self) -> Option<crate::status_line::PersistedAgentStatus> {
+        let store = self.store.as_ref()?;
+        let entry = store
+            .entries()
+            .iter()
+            .rev()
+            .find(|entry| entry.type_ == "agent_status")?;
+        let status: pa_types::session::AgentStatus =
+            serde_json::from_value(entry.fields.get("status")?.clone()).ok()?;
+        Some(crate::status_line::PersistedAgentStatus {
+            summary: status.summary,
+            task_state: status
+                .task_state
+                .map(crate::status_line::AgentTaskState::from_persisted),
+            based_on_message_count: status.based_on_message_count as usize,
+        })
+    }
 }
 
 /// One outbound frame: the serialized JSON payload plus its private-frame
@@ -221,7 +258,10 @@ pub struct Worker {
     work_notify: Arc<Notify>,
     idle_notify: Arc<Notify>,
     events: broadcast::Sender<Arc<OutboundFrame>>,
-    recovery: Mutex<Option<WorkerRecoveryJournal>>,
+    recovery: Arc<Mutex<Option<WorkerRecoveryJournal>>>,
+    /// Post-turn status-line runner (seeded from persisted verdicts at
+    /// session create).
+    status_runner: std::sync::Arc<crate::status_line::StatusLineRunner<SessionCore>>,
     /// Live side-question runs (registry, guards, event frames).
     side_questions: crate::side_question::SideQuestionManager,
     /// Single-use peer-transport grants (worker memory only).
@@ -261,6 +301,10 @@ impl Worker {
         let active_session_id = config.active_session_id.clone();
         let script = config.script.clone();
         let core = Arc::new(Mutex::new(core));
+        // Shared worker recovery journal: the turn runner persists queue
+        // snapshots into it, `serve` opens the file, and command handlers
+        // record busy/operation state.
+        let recovery = Arc::new(Mutex::new(None));
         let work_notify = Arc::new(Notify::new());
         let idle_notify = Arc::new(Notify::new());
         // The post-turn status line: turn-end notifications (debounced) and
@@ -271,6 +315,7 @@ impl Worker {
             events.clone(),
         ));
         let (status_notify, status_rx) = tokio::sync::mpsc::unbounded_channel();
+        let status_runner_handle = std::sync::Arc::clone(&status_runner);
         tokio::spawn(async move {
             status_runner.run(status_rx).await;
         });
@@ -328,6 +373,7 @@ impl Worker {
                 }
             };
             let runner = TurnRunner {
+                recovery: Arc::clone(&recovery),
                 core: Arc::clone(&core),
                 work_notify: Arc::clone(&work_notify),
                 idle_notify: Arc::clone(&idle_notify),
@@ -360,7 +406,8 @@ impl Worker {
             work_notify,
             idle_notify,
             events,
-            recovery: Mutex::new(None),
+            recovery,
+            status_runner: status_runner_handle,
             side_questions,
             peer_grants: PeerGrantStore::new(),
             compaction,
@@ -851,6 +898,13 @@ impl Worker {
         let mut store = match (&session_path, no_session) {
             (Some(path), false) if path.exists() => match SessionFile::open(path) {
                 Ok(mut opened) => {
+                    append_creation_prefix(
+                        &mut opened,
+                        self.engine.as_ref(),
+                        &self.config.agent_dir,
+                        &cwd,
+                        false,
+                    );
                     let _ = opened.append_session_state("active");
                     if let Err(error) = opened.rewrite() {
                         return response_failure(None, "create", &error.to_string(), None);
@@ -865,6 +919,13 @@ impl Worker {
                 if let Err(error) = created.rewrite() {
                     return response_failure(None, "create", &error.to_string(), None);
                 }
+                append_creation_prefix(
+                    &mut created,
+                    self.engine.as_ref(),
+                    &self.config.agent_dir,
+                    &cwd,
+                    true,
+                );
                 let _ = created.append_session_state("active");
                 if let Err(error) = created.rewrite() {
                     return response_failure(None, "create", &error.to_string(), None);
@@ -872,7 +933,17 @@ impl Worker {
                 created
             }
             // In-memory session: no file, like the TS `noSession` create.
-            (None, true) => SessionFile::create(&cwd, None, 0),
+            (None, true) => {
+                let mut created = SessionFile::create(&cwd, None, 0);
+                append_creation_prefix(
+                    &mut created,
+                    self.engine.as_ref(),
+                    &self.config.agent_dir,
+                    &cwd,
+                    true,
+                );
+                created
+            }
             (None, false) => {
                 let mut created = SessionFile::create(&cwd, None, 0);
                 let path = session_dir.join(session_file_name(created.session_id()));
@@ -880,6 +951,13 @@ impl Worker {
                 if let Err(error) = created.rewrite() {
                     return response_failure(None, "create", &error.to_string(), None);
                 }
+                append_creation_prefix(
+                    &mut created,
+                    self.engine.as_ref(),
+                    &self.config.agent_dir,
+                    &cwd,
+                    true,
+                );
                 let _ = created.append_session_state("active");
                 if let Err(error) = created.rewrite() {
                     return response_failure(None, "create", &error.to_string(), None);
@@ -900,8 +978,15 @@ impl Worker {
             let _ = store.append_session_info(name);
             let _ = store.rewrite();
         }
-        // Restore the persisted queue snapshot (crash/respawn recovery).
-        let (steering, follow_up) = restore_queue_snapshot(&store);
+        // Restore the persisted queue snapshot (crash/respawn recovery) from
+        // the worker recovery journal.
+        let (steering, follow_up) = {
+            let guard = self.recovery.lock().unwrap();
+            match guard.as_ref() {
+                Some(journal) => restore_queue_snapshot(journal, &self.config.active_session_id),
+                None => (VecDeque::new(), VecDeque::new()),
+            }
+        };
         // The worker owns the session file; the engine reads it for the
         // system prompt's conversation-log path and the local harness dir.
         if !store.path.as_os_str().is_empty() {
@@ -916,6 +1001,9 @@ impl Worker {
         core.abort_requested = false;
         let summary = self.summary_locked(&core);
         drop(core);
+        // Seed the status line from the latest persisted verdict (a respawned
+        // worker resumes with the pre-crash verdict).
+        self.status_runner.seed_from_session();
         // Recovery journal writes must not happen while holding the core
         // lock: record_recovery locks the core to read the store.
         let _ = self.record_recovery(true, "create");
@@ -1182,7 +1270,10 @@ impl Worker {
                 }),
             }
             let snapshot = self.snapshot_locked(&core);
-            self.persist_queue_snapshot_locked(&mut core);
+            let lanes = queue_lanes(&core);
+            let active_session_id = core.active_session_id.clone();
+            drop(core);
+            self.persist_queue_snapshot(&active_session_id, &lanes);
             snapshot
         };
         let _ = self.emit_action_update(&snapshot);
@@ -1215,8 +1306,10 @@ impl Worker {
             done: None,
         });
         let snapshot = self.snapshot_locked(&core);
-        self.persist_queue_snapshot_locked(&mut core);
+        let lanes = queue_lanes(&core);
+        let active_session_id = core.active_session_id.clone();
         drop(core);
+        self.persist_queue_snapshot(&active_session_id, &lanes);
         let _ = self.emit_action_update(&snapshot);
         self.work_notify.notify_one();
         let command = if lane == Lane::Steering {
@@ -1270,7 +1363,7 @@ impl Worker {
         } else {
             Lane::Steering
         };
-        let (id, summary, queued, snapshot) = {
+        let (id, summary, queued, snapshot, lanes, active_session_id) = {
             let mut core = self.core.lock().unwrap();
             let pending = core.steering.len() + core.follow_up.len();
             if let Err(error) =
@@ -1294,9 +1387,11 @@ impl Worker {
             let queued = core.busy;
             let summary = self.summary_locked(&core);
             let snapshot = self.snapshot_locked(&core);
-            self.persist_queue_snapshot_locked(&mut core);
-            (id, summary, queued, snapshot)
+            let lanes = queue_lanes(&core);
+            let active_session_id = core.active_session_id.clone();
+            (id, summary, queued, snapshot, lanes, active_session_id)
         };
+        self.persist_queue_snapshot(&active_session_id, &lanes);
         let _ = self.emit_action_update(&snapshot);
         self.work_notify.notify_one();
         let mut target = json!({
@@ -1497,8 +1592,10 @@ impl Worker {
         let steering: Vec<String> = core.steering.drain(..).map(|item| item.message).collect();
         let follow_up: Vec<String> = core.follow_up.drain(..).map(|item| item.message).collect();
         let snapshot = self.snapshot_locked(&core);
-        self.persist_queue_snapshot_locked(&mut core);
+        let lanes = queue_lanes(&core);
+        let active_session_id = core.active_session_id.clone();
         drop(core);
+        self.persist_queue_snapshot(&active_session_id, &lanes);
         let _ = self.emit_action_update(&snapshot);
         response_success(
             None,
@@ -1617,28 +1714,16 @@ impl Worker {
         }
     }
 
-    /// Append the queue snapshot to the store (crash-safe queue persistence).
-    fn persist_queue_snapshot_locked(&self, core: &mut SessionCore) {
-        let steering: Vec<String> = core
-            .steering
-            .iter()
-            .map(|item| item.message.clone())
-            .collect();
-        let follow_up: Vec<String> = core
-            .follow_up
-            .iter()
-            .map(|item| item.message.clone())
-            .collect();
-        if let Some(store) = core.store.as_mut() {
-            let _ = store.persist_entry(
-                "custom",
-                json!({
-                    "customType": QUEUE_SNAPSHOT_CUSTOM_TYPE,
-                    "steering": steering,
-                    "followUp": follow_up,
-                }),
-            );
-        }
+    /// Persist the queue lanes to the worker recovery journal (crash-safe
+    /// queue recovery; TS keeps session files free of daemon bookkeeping).
+    /// Call after releasing the core lock: `record_recovery` takes the locks
+    /// in the opposite order.
+    fn persist_queue_snapshot(&self, active_session_id: &str, lanes: &QueueLanes) {
+        let mut guard = self.recovery.lock().unwrap();
+        let Some(journal) = guard.as_mut() else {
+            return;
+        };
+        let _ = journal.record_queue_snapshot(active_session_id, &lanes.steering, &lanes.follow_up);
     }
 
     fn record_recovery(&self, busy: bool, operation: &str) -> Result<()> {
@@ -1729,33 +1814,89 @@ fn worker_server_capabilities() -> Vec<String> {
     default_server_capabilities()
 }
 
-/// Queue snapshot restore from the latest persisted entry.
-fn restore_queue_snapshot(store: &SessionFile) -> (VecDeque<QueuedItem>, VecDeque<QueuedItem>) {
+/// Creation prefix for a daemon-hosted session file (TS `createAgentSession`
+/// in the worker process): fresh files record `model_change` (when the engine
+/// resolves a model), `thinking_level_change`, and `service_tier_change`; a
+/// reopened session records the thinking level and service tier only when no
+/// earlier entry set them. The daemon engine runs with thinking off, matching
+/// the TS default for sessions created without explicit flags.
+fn append_creation_prefix(
+    store: &mut SessionFile,
+    engine: &dyn SessionEngine,
+    agent_dir: &std::path::Path,
+    cwd: &str,
+    fresh: bool,
+) {
+    let has_thinking_entry = store
+        .entries()
+        .iter()
+        .any(|entry| entry.type_ == "thinking_level_change");
+    let has_service_tier_entry = store
+        .entries()
+        .iter()
+        .any(|entry| entry.type_ == "service_tier_change");
+    if fresh {
+        if let Some((provider, model_id)) = engine.creation_model() {
+            store.append_model_change(&provider, &model_id);
+        }
+        store.append_thinking_level_change("off");
+    } else if !has_thinking_entry {
+        store.append_thinking_level_change("off");
+    }
+    if fresh || !has_service_tier_entry {
+        let settings = pa_core::settings::SettingsManager::create(cwd, agent_dir);
+        let service_tier = settings.get_default_service_tier();
+        store.append_entry(
+            "service_tier_change",
+            json!({ "serviceTier": service_tier }),
+        );
+    }
+}
+
+/// The pending queue lanes of a session (journal persistence payload).
+struct QueueLanes {
+    steering: Vec<String>,
+    follow_up: Vec<String>,
+}
+
+/// Read the pending lanes off a locked core.
+fn queue_lanes(core: &SessionCore) -> QueueLanes {
+    QueueLanes {
+        steering: core
+            .steering
+            .iter()
+            .map(|item| item.message.clone())
+            .collect(),
+        follow_up: core
+            .follow_up
+            .iter()
+            .map(|item| item.message.clone())
+            .collect(),
+    }
+}
+
+/// Queue snapshot restore from the worker recovery journal (crash/respawn
+/// recovery): the latest persisted lanes for this session.
+fn restore_queue_snapshot(
+    journal: &WorkerRecoveryJournal,
+    active_session_id: &str,
+) -> (VecDeque<QueuedItem>, VecDeque<QueuedItem>) {
     let mut steering = VecDeque::new();
     let mut follow_up = VecDeque::new();
-    let snapshot = store.entries().iter().rev().find(|entry| {
-        entry.type_ == "custom"
-            && entry.fields.get("customType").and_then(Value::as_str)
-                == Some(QUEUE_SNAPSHOT_CUSTOM_TYPE)
-    });
-    if let Some(entry) = snapshot {
-        let fields = &entry.fields;
-        if let Some(list) = fields.get("steering").and_then(Value::as_array) {
-            for message in list.iter().filter_map(Value::as_str) {
-                steering.push_back(QueuedItem {
-                    message: message.to_string(),
-                    done: None,
-                });
-            }
-        }
-        if let Some(list) = fields.get("followUp").and_then(Value::as_array) {
-            for message in list.iter().filter_map(Value::as_str) {
-                follow_up.push_back(QueuedItem {
-                    message: message.to_string(),
-                    done: None,
-                });
-            }
-        }
+    fn pending(lanes: Vec<String>) -> VecDeque<QueuedItem> {
+        lanes
+            .into_iter()
+            .map(|message| QueuedItem {
+                message,
+                done: None,
+            })
+            .collect()
+    }
+    if let Some((steering_lanes, follow_up_lanes)) =
+        journal.latest_queue_snapshot(active_session_id)
+    {
+        steering = pending(steering_lanes);
+        follow_up = pending(follow_up_lanes);
     }
     (steering, follow_up)
 }
@@ -1768,6 +1909,8 @@ struct TurnRunner {
     idle_notify: Arc<Notify>,
     events: broadcast::Sender<Arc<OutboundFrame>>,
     engine: std::sync::Arc<dyn SessionEngine>,
+    /// Shared worker recovery journal (queue snapshot persistence).
+    recovery: Arc<Mutex<Option<WorkerRecoveryJournal>>>,
     active_session_id: String,
     status_notify: tokio::sync::mpsc::UnboundedSender<()>,
 }
@@ -1955,16 +2098,22 @@ impl TurnRunner {
             let core = self.core.lock().unwrap();
             self.snapshot_from(&core)
         };
+        let (lanes, lane_session_id) = {
+            let core = self.core.lock().unwrap();
+            (queue_lanes(&core), core.active_session_id.clone())
+        };
+        {
+            let mut guard = self.recovery.lock().unwrap();
+            if let Some(journal) = guard.as_mut() {
+                let _ = journal.record_queue_snapshot(
+                    &lane_session_id,
+                    &lanes.steering,
+                    &lanes.follow_up,
+                );
+            }
+        }
         {
             let mut core = self.core.lock().unwrap();
-            let snapshot_entry = json!({
-                "customType": QUEUE_SNAPSHOT_CUSTOM_TYPE,
-                "steering": core.steering.iter().map(|item| item.message.clone()).collect::<Vec<_>>(),
-                "followUp": core.follow_up.iter().map(|item| item.message.clone()).collect::<Vec<_>>(),
-            });
-            if let Some(store) = core.store.as_mut() {
-                let _ = store.persist_entry("custom", snapshot_entry);
-            }
             let sequence = core.last_event_sequence + 1;
             core.last_event_sequence = sequence;
             let meta = create_daemon_event_meta(
@@ -2246,27 +2395,33 @@ mod tests {
     }
 
     #[test]
-    fn queue_snapshot_round_trips_through_store() {
+    fn queue_snapshot_round_trips_through_the_recovery_journal() {
         let dir = std::env::temp_dir().join(format!("pa-worker-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut store = SessionFile::create("/tmp", None, 0);
-        store.set_path(dir.join("s.jsonl"));
-        store
-            .persist_entry(
-                "custom",
-                json!({
-                    "customType": QUEUE_SNAPSHOT_CUSTOM_TYPE,
-                    "steering": ["steer-me"],
-                    "followUp": ["follow-me"],
-                }),
+        let journal_path = dir.join("recovery.jsonl");
+        let mut journal = WorkerRecoveryJournal::open(&journal_path).unwrap();
+        journal
+            .record_queue_snapshot(
+                "session-a",
+                &["steer-me".to_string()],
+                &["follow-me".to_string()],
             )
             .unwrap();
-        let reloaded = SessionFile::open(&dir.join("s.jsonl")).unwrap();
-        let (steering, follow_up) = restore_queue_snapshot(&reloaded);
+        // A reopen (respawned worker) reads the latest snapshot per session.
+        let reloaded = WorkerRecoveryJournal::open(&journal_path).unwrap();
+        let (steering, follow_up) = restore_queue_snapshot(&reloaded, "session-a");
         assert_eq!(steering.len(), 1);
         assert_eq!(steering[0].message, "steer-me");
         assert_eq!(follow_up.len(), 1);
         assert_eq!(follow_up[0].message, "follow-me");
+        // Compaction (triggered by an all-idle record) keeps the snapshot.
+        let mut compacting = WorkerRecoveryJournal::open(&journal_path).unwrap();
+        compacting
+            .record("session-a", "s1", None, false, "idle")
+            .unwrap();
+        let compacted = WorkerRecoveryJournal::open(&journal_path).unwrap();
+        let (steering, _) = restore_queue_snapshot(&compacted, "session-a");
+        assert_eq!(steering.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

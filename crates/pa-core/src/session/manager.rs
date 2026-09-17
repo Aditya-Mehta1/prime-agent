@@ -784,6 +784,19 @@ impl SessionManager {
         id
     }
 
+    pub fn append_service_tier_change(
+        &mut self,
+        service_tier: Option<pa_types::ai::ServiceTier>,
+    ) -> String {
+        let base = self.next_base();
+        let id = base.id.clone().unwrap_or_default();
+        self.append_entry(FileEntry::ServiceTierChange {
+            payload: pa_types::session::ServiceTierChangeEntry { service_tier },
+            base,
+        });
+        id
+    }
+
     pub fn append_model_change(&mut self, provider: &str, model_id: &str) -> String {
         let base = self.next_base();
         let id = base.id.clone().unwrap_or_default();

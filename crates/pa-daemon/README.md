@@ -18,7 +18,12 @@ leases (`core/session-lease.ts` port). Per-session model binding: the
 create-config `provider`/`model`/`apiKey` are authoritative for worker model
 resolution (explicit CLI flags reach the worker; env remains the no-flag
 fallback). Post-turn status-line requests (dashboard recap,
-`daemon-session-summarizer.ts` port) issued by workers. Platform wall
+`daemon-session-summarizer.ts` port) issued by workers, with settled idle
+verdicts persisted as `agent_status` session entries (real classifications
+and transcript error verdicts only; respawns seed from the persisted
+verdict). Worker session files carry the TS creation prefix
+(`model_change`/`thinking_level_change`/`service_tier_change`), and queue
+snapshots persist to the worker recovery journal, not the session file. Platform wall
 (`platform`): per-OS endpoint naming and socket identity; the transport itself
 is the shared trait in `pa_types::platform::transport`, and the private-frame
 codec plus command planes are the shared wire contract in

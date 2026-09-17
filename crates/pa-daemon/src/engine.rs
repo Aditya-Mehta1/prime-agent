@@ -102,6 +102,15 @@ pub trait SessionEngine: Send + Sync {
         None
     }
 
+    /// The `(provider, model id)` pair the session will run on, when the
+    /// engine can resolve one; fresh daemon sessions record it in their
+    /// creation prefix (`model_change`). Engines without a model return
+    /// `None` and the prefix entry is skipped, like the TS
+    /// `if (model) appendModelChange(...)`.
+    fn creation_model(&self) -> Option<(String, String)> {
+        None
+    }
+
     /// Tell the engine which session file the worker owns (the conversation-log
     /// path for the system prompt and the session-local harness dir). The
     /// worker owns persistence; scripted engines ignore it.
