@@ -1264,8 +1264,8 @@ def _builtin_words(words: list[str]) -> list[str]:
         head = _revealed_word_text(words[index])
         if head in _TRANSPARENT_BUILTINS:
             index += 1
-            while index < len(words) and words[index].startswith("-") and words[index] != "-":
-                index += 1
+            while index < len(words) and _revealed_word_text(words[index]).startswith("-"):
+                index += 1  # `command "-p" unset GIT_DIR` removes the name too
             continue
         break
     return words[index:]
@@ -1301,13 +1301,16 @@ def _installs_relocating_trap(prefix: str) -> bool:
         # options (`trap -- 'cd sub' DEBUG`), and it is read after unquoting,
         # so a quoted action (`trap 'cd sub' DEBUG`) is judged as the shell
         # runs it.
-        arguments = prefix[written[index].end : region_end]
-        for token in re.findall(r"""\S+""", _unquote_one_level(arguments.strip())):
-            if token.startswith("-") and token != "-":
-                continue
-            if _prefix_holds_directory_command(_unquote_one_level(token)):
-                return True
-            break
+        for candidate in _shell_word_positions(prefix[written[index].end : region_end]):
+            action = _unquote_one_level(
+                prefix[written[index].end + candidate.start : written[index].end + candidate.end]
+            )
+            if action.startswith("-") and action != "-":
+                continue  # one of trap's own options
+            # The whole action is read, because a trap action may be a command
+            # list (`trap 'true; cd sub' DEBUG`) and the cd can come after a
+            # command that does not move the shell.
+            return _prefix_holds_directory_command(action)
     return False
 
 
@@ -2355,7 +2358,10 @@ def _eval_payloads(revealed: str) -> list[tuple[int, str]]:
 
 
 def _revealed_eval_payloads_relocate(
-    revealed: str, aliases: dict[str, str], assignments: dict[str, str]
+    revealed: str,
+    aliases: dict[str, str],
+    assignments: dict[str, str],
+    eval_live: dict[int, tuple[dict[str, str], dict[str, str]]] | None = None,
 ) -> bool:
     """True when a revealed command runs eval over a payload that cds or pushds.
 
@@ -2367,12 +2373,21 @@ def _revealed_eval_payloads_relocate(
     dirty'`) even though the same spelling does not expand in the outer command,
     so a relocation under either reading is refused.
     """
-    for _start, payload in _eval_payloads(revealed):
+    for start, payload in _eval_payloads(revealed):
         if _prefix_holds_directory_command(payload):
             return True
-        if aliases or assignments:
+        # The names live at this eval decide what its payload expands, and the
+        # maps the walk ended with are the conservative reading for names it
+        # changed later (a reassignment after the eval must not replace the
+        # value the payload ran), so both are read.
+        readings = [(aliases, assignments)]
+        if eval_live and start in eval_live:
+            readings.append(eval_live[start])
+        for read_aliases, read_assignments in readings:
+            if not (read_aliases or read_assignments):
+                continue
             expanded = _reveal_shell_command_words(
-                payload, aliases=aliases, assignments=assignments
+                payload, aliases=read_aliases, assignments=read_assignments
             )[0]
             if expanded != payload and _prefix_holds_directory_command(expanded):
                 return True
@@ -2384,10 +2399,10 @@ def _eval_payloads_relocate(command: str) -> bool:
     normalized = _strip_shell_escapes(
         _mask_shell_redirections(_normalize_line_continuations(command))
     )[0]
-    revealed, _map, _unnameable, aliases, assignments, _live = _reveal_shell_command_words(
+    revealed, _map, _unnameable, aliases, assignments, eval_live = _reveal_shell_command_words(
         normalized
     )
-    return _revealed_eval_payloads_relocate(revealed, aliases, assignments)
+    return _revealed_eval_payloads_relocate(revealed, aliases, assignments, eval_live)
 
 
 def _revealed_eval_payloads_hide_destructive_git(
@@ -2498,6 +2513,8 @@ def _revealed_word_text(word: str, assignments: dict[str, str] | None = None) ->
         # words the revealed text holds, which the caller's position mapping
         # relies on.
         reference = _VARIABLE_REFERENCE.fullmatch(word)
+        if reference is None and len(word) > 2 and word[0] == word[-1] == '"':
+            reference = _VARIABLE_REFERENCE.fullmatch(word[1:-1])  # `"$A"` still expands
         value = reference and assignments.get(reference.group(1) or reference.group(2))
         if value is not None and _PLAIN_WORD_RUN.fullmatch(value):
             return value
