@@ -68,6 +68,12 @@ pub struct SessionCommandExecution {
     /// The command failed: the TS error message. The failure result row
     /// (`Command failed: ...`) is already appended to `messages`.
     pub error: Option<String>,
+    /// A refinement run's structured outcome (host transports surface it as
+    /// a completion event; the result row in `messages` stays display-only).
+    pub refinement: Option<crate::refinement::RefinementResult>,
+    /// A refinement run failed: the raw run error (option-parse failures
+    /// leave this `None`; they are command failures, not refinement events).
+    pub refinement_failed: Option<String>,
 }
 
 impl SessionCommandExecution {
@@ -226,7 +232,7 @@ async fn execute_refine(
         instructions: options.instructions,
         rollback_id: options.rollback_id,
     };
-    let result = engine
+    let result = match engine
         .session
         .refine(
             &refine_options,
@@ -236,7 +242,16 @@ async fn execute_refine(
             params.global_harness_dir.clone(),
         )
         .await
-        .map_err(|error| format!("{error:#}"))?;
+    {
+        Ok(result) => result,
+        Err(error) => {
+            // The refinement run itself failed: a host transport surfaces
+            // this as a refinement event, distinct from the command failure.
+            execution.refinement_failed = Some(format!("{error:#}"));
+            return Err(format!("{error:#}"));
+        }
+    };
+    execution.refinement = Some(result.clone());
     let applied = result
         .applied_edits
         .iter()

@@ -85,15 +85,46 @@ fn run_acp_mode(options: &RunOptions) -> Result<i32, String> {
 
 async fn acp_mode_main(options: &RunOptions) -> Result<i32, String> {
     let config = &options.config;
-    let engine = build_headless_engine(options).await?;
+    let engine = build_headless_engine_parts(options).await?;
     let exit_code = pa_daemon::acp::run_acp_mode(pa_daemon::acp::AcpOptions {
-        engine: std::sync::Arc::new(engine),
+        engine: std::sync::Arc::new(engine.engine),
         actual_cwd: config.cwd.clone(),
         product_version: crate::config::VERSION.to_string(),
+        model: Some(engine.model),
+        api_key: engine.api_key,
+        agent_dir: config.agent_dir.clone(),
+        autonomous_config: options
+            .config
+            .autonomous
+            .as_ref()
+            .map(autonomous_runtime_config),
     })
     .await
     .map_err(|error| format!("{error:#}"))?;
     Ok(exit_code)
+}
+
+/// The autonomous runtime config from the typed CLI flags.
+fn autonomous_runtime_config(
+    config: &crate::args::AutonomousConfig,
+) -> pa_core::autonomous::AgentAutonomousConfig {
+    pa_core::autonomous::AgentAutonomousConfig {
+        enabled: Some(true),
+        max_continuations: config.max_continuations.map(u64::from),
+        max_turns: config.max_turns.map(u64::from),
+        max_tokens: config.max_tokens,
+        timeout_ms: config.timeout_ms,
+        continuation_prompt: None,
+        gates: config
+            .gates
+            .as_ref()
+            .map(|gates| pa_core::autonomous::AgentAutonomousGateConfig {
+                commands: Some(gates.commands.clone()),
+                max_retries: gates.max_retries.map(u64::from),
+                timeout_ms: gates.timeout_ms,
+            }),
+        subagent_keep_alive_ms: None,
+    }
 }
 
 fn run_print_mode(options: &RunOptions) -> Result<i32, String> {
@@ -113,12 +144,19 @@ async fn print_mode_main(options: &RunOptions) -> Result<i32, String> {
 /// resolution, session persistence, and the engine facade. The faux-script
 /// seam (`PRIME_AGENT_FAUX_SCRIPT`) drives the same assembly without the
 /// network; verification harness only, never set by the product.
-async fn build_headless_engine(
-    options: &RunOptions,
-) -> Result<pa_core::session_engine::engine::SessionEngine, String> {
+/// The assembled headless engine plus the model and request auth it runs
+/// on, so host transports can drive session-command executors
+/// (compact/refine) with the session's own model.
+struct HeadlessEngine {
+    engine: pa_core::session_engine::engine::SessionEngine,
+    model: Model,
+    api_key: Option<String>,
+}
+
+async fn build_headless_engine_parts(options: &RunOptions) -> Result<HeadlessEngine, String> {
     let config = &options.config;
     if let Ok(script) = std::env::var("PRIME_AGENT_FAUX_SCRIPT") {
-        return build_faux_engine(options, &script).await;
+        return build_faux_engine_parts(options, &script).await;
     }
 
     // Model registry: composed catalog + models.json with real auth.
@@ -134,7 +172,7 @@ async fn build_headless_engine(
     // Resolve request auth once (single-shot mode).
     let resolved = registry.get_api_key_and_headers(&model, model.headers.as_ref());
 
-    let stream_fn = real_stream_fn(resolved.api_key, model.clone());
+    let stream_fn = real_stream_fn(resolved.api_key.clone(), model.clone());
     let agent_model: AgentModel = json_round_trip(&model).ok_or("model conversion failed")?;
 
     let session_manager = if options.session.no_session {
@@ -143,7 +181,7 @@ async fn build_headless_engine(
         Some(build_session_manager(options)?)
     };
 
-    pa_core::session_engine::engine::create_session(
+    let engine = pa_core::session_engine::engine::create_session(
         pa_core::session_engine::engine::SessionEngineConfig {
             cwd: config.cwd.clone(),
             agent_dir: config.agent_dir.clone(),
@@ -173,7 +211,19 @@ async fn build_headless_engine(
         },
     )
     .await
-    .map_err(|error| format!("{error:#}"))
+    .map_err(|error| format!("{error:#}"))?;
+    Ok(HeadlessEngine {
+        engine,
+        model,
+        api_key: resolved.api_key,
+    })
+}
+
+/// The engine alone (callers that do not drive session commands).
+async fn build_headless_engine(
+    options: &RunOptions,
+) -> Result<pa_core::session_engine::engine::SessionEngine, String> {
+    Ok(build_headless_engine_parts(options).await?.engine)
 }
 
 /// The session header line (TS `AgentConnectionSessionHeader` shape).
@@ -540,10 +590,10 @@ async fn run_prompts_and_emit(
 }
 
 /// The faux-script engine: identical session assembly, scripted provider.
-async fn build_faux_engine(
+async fn build_faux_engine_parts(
     options: &RunOptions,
     script: &str,
-) -> Result<pa_core::session_engine::engine::SessionEngine, String> {
+) -> Result<HeadlessEngine, String> {
     let config = &options.config;
     let script: serde_json::Value = serde_json::from_str(script)
         .map_err(|error| format!("invalid PRIME_AGENT_FAUX_SCRIPT: {error}"))?;
@@ -629,7 +679,7 @@ async fn build_faux_engine(
     } else {
         Some(build_session_manager(options)?)
     };
-    pa_core::session_engine::engine::create_session(
+    let engine = pa_core::session_engine::engine::create_session(
         pa_core::session_engine::engine::SessionEngineConfig {
             cwd: config.cwd.clone(),
             agent_dir: config.agent_dir.clone(),
@@ -651,5 +701,10 @@ async fn build_faux_engine(
         },
     )
     .await
-    .map_err(|error| format!("{error:#}"))
+    .map_err(|error| format!("{error:#}"))?;
+    Ok(HeadlessEngine {
+        engine,
+        model,
+        api_key: None,
+    })
 }

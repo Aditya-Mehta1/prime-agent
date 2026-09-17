@@ -232,6 +232,13 @@ impl AgentSession {
         &self.session
     }
 
+    /// The shared persistence handle for host runtimes in other crates (the
+    /// daemon's ACP transport records goal usage into the same session
+    /// state as the loop).
+    pub fn shared_persistence(&self) -> Arc<tokio::sync::Mutex<SessionManager>> {
+        self.session.clone()
+    }
+
     /// Submit a prompt. Session commands (compact/refine/goal/autonomous)
     /// are recognized before admission and never reach the model.
     pub async fn prompt(

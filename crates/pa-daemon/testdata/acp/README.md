@@ -31,6 +31,20 @@ the process exit code and stderr.
 - `tool_call`: a turn that calls the ipython tool (`6*7`). Shows the
   `tool_call` / `tool_call_update` shapes including the `content` wrapper
   and the ipython rich-output `_meta` on results that carry attachments.
+- `compact_command`: two turns, then `/compact`. The session is too short
+  to compact, so the observable parity is the namespaced `compaction: {}`
+  update (the TS `compaction_end` with an undefined result) followed by the
+  normal completion envelope and `end_turn`.
+- `goal_command`: `/goal <objective>` then `/goal status`. Shows the
+  goal-start `_meta.goal` frame, mid-turn usage updates after each settled
+  message, the completion observation, and the status-prompt frame.
+- `autonomous_gate`: `--autonomous --autonomous-gate true`. The gate passes
+  after the first turn: the completion and terminal envelopes carry the
+  `_meta.autonomous` accounting and `remainingAutonomousContinuations`
+  reflects the configured budget; the stop reason is `end_turn`.
+- `autonomous_limit`: `--autonomous --autonomous-max-tokens 1`. The token
+  limit stops the run: the envelopes carry the final accounting and the
+  stop reason is `max_tokens`.
 
 ## The Rust captures in this directory
 
@@ -54,3 +68,14 @@ request order. `crates/pa-cli/tests/acp_mode_e2e.rs` locks the deterministic
 scenarios offline against the scripted faux provider; the
 network-dependent scenarios (tool_call, cancel mid-turn) are verified by
 running the scenario client against both binaries on a networked box.
+
+`--landmarks` drops model-behavior-dependent work frames (tool calls,
+chunk streams, and mid-turn goal-usage updates) and compares the protocol
+envelopes only. Use it for scenarios where the two model runs legally
+diverge in their tool usage (`goal_command`: one run answered directly,
+the other ran several ipython cells; `autonomous_limit`: one run wrote
+the essay with tool calls, the other without — both sequences are
+correct protocol behavior). The goal and autonomous frames themselves are
+locked field-by-field by the offline e2e tests. All other scenarios
+(happy_path, cwd_mismatch, errors, second_initialize, tool_call,
+compact_command, cancel, autonomous_gate) match in full mode.

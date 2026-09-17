@@ -7,7 +7,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use pa_agent::abort::AbortSignal;
 use pa_agent::agent::{Agent, Subscription};
 use pa_agent::stream::AssistantMessageEvent;
 use pa_agent::types::{AgentEvent, AgentMessage, Message, StopReason};
@@ -17,34 +16,64 @@ use tokio::sync::Mutex;
 use super::events::{acp_updates_for_event, AcpEngineEvent, MappingState};
 use super::jsonrpc;
 use super::meta::{
-    PrimeAgentEventPhase, PrimeAgentOutcome, PrimeAgentQuiescenceMeta, PrimeAgentSessionMeta,
+    PrimeAgentAutonomousMeta, PrimeAgentEventPhase, PrimeAgentOutcome, PrimeAgentQuiescenceMeta,
+    PrimeAgentSessionMeta,
 };
 use super::producer::UpdateProducer;
 use super::types::{parse_prompt_blocks, AcpSessionUpdate, ImageBlock, PromptBlockError};
 
-/// One hosted ACP session: the producer, the engine event subscription, and
-/// the prompt-lifecycle bookkeeping. The engine itself stays owned by the
-/// mode entry; the session handle is shared with the turn tasks.
+/// One hosted ACP session: the producer, the engine event subscription, the
+/// autonomous run state, and the prompt-lifecycle bookkeeping.
 pub struct AcpSession {
     pub id: String,
     producer: Arc<UpdateProducer>,
     subscription: Mutex<Option<Subscription>>,
     agent: Arc<Agent>,
     cancel_requested: AtomicBool,
+    /// The autonomous run state (`/autonomous` flags and commands mutate it).
+    pub autonomous: Arc<Mutex<pa_core::autonomous::AutonomousRuntimeState>>,
+    /// The autonomous continuation policy (shell gates in the session cwd).
+    autonomous_driver: Arc<dyn pa_core::autonomous::AutonomousDriver>,
+    /// The engine handle for goal usage recording on settled messages.
+    engine: Arc<pa_core::session_engine::engine::SessionEngine>,
+    /// The last goal state published as `_meta.goal`, to detect changes.
+    /// Shared with the event subscription so mid-turn changes publish too.
+    last_published_goal: Arc<Mutex<pa_core::goals::GoalState>>,
 }
 
 impl AcpSession {
-    /// Admit a session: subscribe the engine event feed before anything can
+    /// Admit a session: subscribe the engine event feed (with the
+    /// autonomous accounting and goal usage hooks) before anything can
     /// publish, so no update is lost between admission and the response.
-    pub async fn new(id: String, agent: Arc<Agent>, producer: Arc<UpdateProducer>) -> AcpSession {
+    pub async fn new(
+        id: String,
+        engine: Arc<pa_core::session_engine::engine::SessionEngine>,
+        producer: Arc<UpdateProducer>,
+        autonomous: Arc<Mutex<pa_core::autonomous::AutonomousRuntimeState>>,
+        autonomous_driver: Arc<dyn pa_core::autonomous::AutonomousDriver>,
+    ) -> AcpSession {
         let mapping = Arc::new(Mutex::new(MappingState::default()));
-        let subscription = subscribe_engine_events(&agent, producer.clone(), mapping).await;
+        let last_published_goal =
+            Arc::new(Mutex::new(engine.goal_driver.lock().await.state().clone()));
+        let subscription = subscribe_engine_events(
+            &engine,
+            producer.clone(),
+            mapping,
+            autonomous.clone(),
+            autonomous_driver.clone(),
+            last_published_goal.clone(),
+        )
+        .await;
         AcpSession {
             id,
             producer,
             subscription: Mutex::new(Some(subscription)),
-            agent,
+            agent: engine.session.agent().clone(),
             cancel_requested: AtomicBool::new(false),
+            autonomous,
+            autonomous_driver,
+            engine,
+            last_published_goal,
         }
     }
 
@@ -77,27 +106,147 @@ impl AcpSession {
     pub fn agent(&self) -> &Arc<Agent> {
         &self.agent
     }
+
+    /// Consult the autonomous driver for one settled turn (gate evaluation
+    /// runs inside the driver).
+    pub async fn autonomous_follow_up(
+        &self,
+        message: &pa_types::ai::AssistantMessage,
+    ) -> pa_core::autonomous::AutonomousFollowUp {
+        let mut state = self.autonomous.lock().await;
+        self.autonomous_driver.after_turn(&mut state, message).await
+    }
+
+    /// The current autonomous status snapshot (the completion envelope
+    /// publishes it while a run is enabled).
+    pub async fn autonomous_status(&self) -> pa_core::autonomous::AgentAutonomousStatus {
+        let state = self.autonomous.lock().await;
+        pa_core::autonomous::autonomous_status(&state)
+    }
+
+    /// Publish the current goal state as a `_meta.goal` update when it
+    /// differs from the last one published on this connection.
+    pub async fn publish_goal_update(&self) {
+        let goal = self.engine.goal_driver.lock().await.state().clone();
+        let changed = {
+            let mut last = self.last_published_goal.lock().await;
+            if *last == goal {
+                return;
+            }
+            *last = goal.clone();
+            true
+        };
+        if !changed {
+            return;
+        }
+        self.publish_engine_event(&AcpEngineEvent::GoalUpdate {
+            status: goal.status.slug().to_string(),
+            objective: goal.objective.clone(),
+            token_budget: goal.token_budget,
+            tokens_used: Some(goal.tokens_used),
+        })
+        .await;
+    }
+
+    /// Publish one adapter event at the active turn (namespaced metas).
+    pub async fn publish_engine_event(&self, event: &AcpEngineEvent) {
+        let turn_id = self.producer.active_prompt_turn().await;
+        let mut mapping = MappingState::default();
+        let updates = acp_updates_for_event(event, &mut mapping);
+        for update in updates {
+            self.producer
+                .publish(&update, turn_id, PrimeAgentEventPhase::Event, None)
+                .await;
+        }
+    }
 }
 
 /// Map the engine loop events onto ACP updates for the session lifetime.
+///
+/// Message-end hooks mirror the TS session's message_end listeners:
+/// per-message autonomous usage accounting, and goal usage recording with a
+/// `_meta.goal` update whenever the goal state changes mid-turn.
 async fn subscribe_engine_events(
-    agent: &Arc<Agent>,
+    engine: &Arc<pa_core::session_engine::engine::SessionEngine>,
     producer: Arc<UpdateProducer>,
     mapping: Arc<Mutex<MappingState>>,
+    autonomous: Arc<Mutex<pa_core::autonomous::AutonomousRuntimeState>>,
+    autonomous_driver: Arc<dyn pa_core::autonomous::AutonomousDriver>,
+    last_published_goal: Arc<Mutex<pa_core::goals::GoalState>>,
 ) -> Subscription {
+    let agent = engine.session.agent().clone();
+    let goal_driver = engine.goal_driver.clone();
+    let session = engine.session.shared_persistence();
     agent
-        .subscribe(move |event: AgentEvent, _signal: AbortSignal| {
+        .subscribe(move |event, _signal| {
             let producer = producer.clone();
             let mapping = mapping.clone();
+            let autonomous = autonomous.clone();
+            let autonomous_driver = autonomous_driver.clone();
+            let goal_driver = goal_driver.clone();
+            let session = session.clone();
+            let last_published_goal = last_published_goal.clone();
             Box::pin(async move {
                 let turn_id = producer.active_prompt_turn().await;
-                let events: Vec<AcpEngineEvent> = project_event(&event);
-                for engine_event in events {
+                let engine_events: Vec<AcpEngineEvent> = project_event(&event);
+                for engine_event in engine_events {
                     let updates = {
                         let mut mapping = mapping.lock().await;
                         acp_updates_for_event(&engine_event, &mut mapping)
                     };
                     for update in updates {
+                        producer
+                            .publish(&update, turn_id, PrimeAgentEventPhase::Event, None)
+                            .await;
+                    }
+                }
+                if let pa_agent::types::AgentEvent::MessageEnd {
+                    message:
+                        pa_agent::types::AgentMessage::Standard(pa_agent::types::Message::Assistant(
+                            assistant,
+                        )),
+                } = &event
+                {
+                    if let Some(wire) = serde_json::to_value(assistant).ok().and_then(|value| {
+                        serde_json::from_value::<pa_types::ai::AssistantMessage>(value).ok()
+                    }) {
+                        // Autonomous per-message accounting (non-error turns).
+                        {
+                            let mut state = autonomous.lock().await;
+                            autonomous_driver.account_message(&mut state, &wire);
+                        }
+                        // Goal usage recording while the goal is active; a
+                        // state change publishes a `_meta.goal` update.
+                        let mut driver = goal_driver.lock().await;
+                        let mut persistence = session.lock().await;
+                        // Timestamp is the message identity for the
+                        // double-counting guard: the loop does not assign
+                        // message ids in-process.
+                        let message_id = format!("a-{}", wire.timestamp);
+                        driver.record_assistant_usage(&mut persistence, &message_id, &wire.usage);
+                    }
+                }
+                // A goal state change (usage recorded, budget reached, or a
+                // kernel-side complete) publishes a `_meta.goal` update.
+                let goal_now = goal_driver.lock().await.state().clone();
+                let changed = {
+                    let mut last = last_published_goal.lock().await;
+                    if *last == goal_now {
+                        false
+                    } else {
+                        *last = goal_now.clone();
+                        true
+                    }
+                };
+                if changed {
+                    let mut mapping = MappingState::default();
+                    let event = AcpEngineEvent::GoalUpdate {
+                        status: goal_now.status.slug().to_string(),
+                        objective: goal_now.objective.clone(),
+                        token_budget: goal_now.token_budget,
+                        tokens_used: Some(goal_now.tokens_used),
+                    };
+                    for update in acp_updates_for_event(&event, &mut mapping) {
                         producer
                             .publish(&update, turn_id, PrimeAgentEventPhase::Event, None)
                             .await;
@@ -232,24 +381,43 @@ pub async fn turn_failure(agent: &Agent, boundary: &TurnBoundary) -> Option<Stri
     None
 }
 
+/// The newest assistant message of the transcript, when one exists (the
+/// autonomous driver consults it for the settled turn).
+pub async fn latest_assistant_message(agent: &Agent) -> Option<pa_types::ai::AssistantMessage> {
+    let state = agent.state().await;
+    state.messages.iter().rev().find_map(|message| {
+        let AgentMessage::Standard(Message::Assistant(assistant)) = message else {
+            return None;
+        };
+        serde_json::to_value(assistant)
+            .ok()
+            .and_then(|value| serde_json::from_value::<pa_types::ai::AssistantMessage>(value).ok())
+    })
+}
+
 /// The frame pair that brackets every settled turn: the completion event and
 /// the terminal quiescence envelope. In-process sessions have no RLM
-/// children and no autonomous continuation slots, so quiescence is trivially
-/// reached at the moment of settlement.
+/// children, so quiescence is trivially reached at settlement; the
+/// autonomous accounting rides the completion update while a run is
+/// enabled.
 pub async fn publish_completion_envelope(
     session: &AcpSession,
     turn_id: u64,
     outcome: PrimeAgentOutcome,
+    autonomous: Option<&PrimeAgentAutonomousMeta>,
+    remaining_autonomous_continuations: u64,
 ) -> anyhow::Result<()> {
     let quiescence = PrimeAgentQuiescenceMeta {
         outstanding_subagents: 0,
-        remaining_autonomous_continuations: 0,
+        remaining_autonomous_continuations,
+    };
+    let info_meta = PrimeAgentSessionMeta {
+        quiescence: Some(quiescence),
+        autonomous: autonomous.cloned(),
+        ..Default::default()
     };
     let completion = AcpSessionUpdate::SessionInfoUpdate {
-        meta: super::meta::prime_agent_meta(PrimeAgentSessionMeta {
-            quiescence: Some(quiescence.clone()),
-            ..Default::default()
-        }),
+        meta: super::meta::prime_agent_meta(info_meta.clone()),
     };
     if !session
         .producer()
@@ -259,10 +427,7 @@ pub async fn publish_completion_envelope(
         anyhow::bail!("Failed to publish ACP completion update");
     }
     let terminal = AcpSessionUpdate::SessionInfoUpdate {
-        meta: super::meta::prime_agent_meta(PrimeAgentSessionMeta {
-            quiescence: Some(quiescence),
-            ..Default::default()
-        }),
+        meta: super::meta::prime_agent_meta(info_meta),
     };
     if !session
         .producer()

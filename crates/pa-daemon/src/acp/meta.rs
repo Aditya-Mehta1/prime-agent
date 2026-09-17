@@ -79,6 +79,102 @@ pub struct PrimeAgentSessionMeta {
     /// loaded into context, plus the number of diffs it displayed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ipython: Option<Value>,
+    /// Set when the session's heartbeat or cron schedule changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heartbeats_changed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal: Option<PrimeAgentGoalMeta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refinement: Option<PrimeAgentRefinementMeta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_message: Option<PrimeAgentAgentMessageMeta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<PrimeAgentCompactionMeta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagents: Option<Vec<PrimeAgentSubagentMeta>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub autonomous: Option<PrimeAgentAutonomousMeta>,
+}
+
+/// A goal's live state, surfaced after `/goal` commands and driver turns.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimeAgentGoalMeta {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_used: Option<u64>,
+}
+
+/// The outcome of one continual-harness refinement run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimeAgentRefinementMeta {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changes: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// An agent-to-agent message sent from inside a kernel cell.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimeAgentAgentMessageMeta {
+    pub tool_call_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_status: Option<String>,
+}
+
+/// One compaction that ran during the session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimeAgentCompactionMeta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_before: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+/// One RLM subagent roster row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimeAgentSubagentMeta {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Autonomous-mode accounting surfaced with a turn's completion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimeAgentAutonomousMeta {
+    pub enabled: bool,
+    pub continuations_used: u64,
+    pub turns_used: u64,
+    pub tokens_used: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_attempt: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_failure: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_reason: Option<String>,
 }
 
 /// Wrap a prime-agent payload in its reverse-domain `_meta` envelope.

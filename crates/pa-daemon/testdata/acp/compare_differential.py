@@ -60,6 +60,23 @@ def normalize_frame(direction, frame, sequence_index):
                 shape["status"] = update.get("status")
                 shape["has_content"] = "content" in update
                 shape["has_ipython_meta"] = "ipython" in meta
+            elif kind == "session_info_update":
+                # Compaction, goal, and refinement payloads: presence and
+                # status are structural; usage counts and summary text are
+                # run-dependent values.
+                if "compaction" in meta:
+                    shape["has_compaction"] = True
+                if "goal" in meta:
+                    shape["has_goal"] = True
+                    shape["goal_status"] = meta["goal"].get("status")
+                if "refinement" in meta:
+                    shape["has_refinement"] = True
+                    shape["refinement_status"] = meta["refinement"].get("status")
+                if "autonomous" in meta:
+                    shape["has_autonomous"] = True
+                    shape["autonomous_enabled"] = meta["autonomous"].get("enabled")
+                if "heartbeatsChanged" in meta:
+                    shape["heartbeatsChanged"] = meta["heartbeatsChanged"]
             shape["phase"] = meta.get("phase")
             shape["outcome"] = meta.get("outcome")
             shape["terminalQuiescenceExpected"] = meta.get("terminalQuiescenceExpected")
@@ -122,7 +139,33 @@ def load_capture(path):
     return frames
 
 
-def normalize_capture(frames):
+def landmark_frame(frame_shape):
+    """Whether a frame is a structural landmark.
+
+    `--landmarks` mode drops model-behavior-dependent work frames (tool
+    calls, streamed chunks, and mid-turn goal-usage updates) and keeps the
+    protocol envelopes: requests, responses, boundaries, completion and
+    terminal envelopes, compaction/refinement/autonomous metas, and stop
+    reasons.
+    """
+    if frame_shape.get("method") != "session/update":
+        return True
+    kind = frame_shape.get("sessionUpdate")
+    if kind in ("tool_call", "tool_call_update", "chunk-stream"):
+        return False
+    if (
+        kind == "session_info_update"
+        and frame_shape.get("phase") == "event"
+        and frame_shape.get("has_goal")
+        and not frame_shape.get("has_compaction")
+        and not frame_shape.get("has_refinement")
+        and not frame_shape.get("has_autonomous")
+    ):
+        return False
+    return True
+
+
+def normalize_capture(frames, landmarks=False):
     """The shape sequence, with outgoing requests matched by scenario order."""
     shapes = []
     request_index = 0
@@ -134,7 +177,10 @@ def normalize_capture(frames):
             if "id" in frame:
                 request_index += 1
             continue
-        shapes.append(normalize_frame(direction, frame, request_index))
+        shape = normalize_frame(direction, frame, request_index)
+        if landmarks and not landmark_frame(shape):
+            continue
+        shapes.append(shape)
     return shapes
 
 
@@ -148,27 +194,54 @@ def collapse(shapes):
     fields. A run of identical shapes is therefore one entry, annotated
     with its length.
     """
-    collapsed = []
+    # Streamed reasoning and message chunks are model-nondeterministic in
+    # their interleaving; a run of either is one "chunk stream" entry.
+    mapped = []
     for shape in shapes:
-        # Streamed reasoning and message chunks are model-nondeterministic
-        # in their interleaving; a run of either is one "chunk stream" entry.
         if shape.get("sessionUpdate") in ("agent_message_chunk", "agent_thought_chunk"):
             shape = {"method": "session/update", "sessionUpdate": "chunk-stream"}
+        mapped.append(shape)
+    # Whether the model thinks before or between tool calls is
+    # run-dependent: chunk streams adjacent to tool frames merge into the
+    # tool's work block instead of standing as separate entries.
+    collapsed = []
+    for shape in mapped:
         if collapsed and collapsed[-1][0] == shape:
             collapsed[-1] = (shape, collapsed[-1][1] + 1)
         else:
             collapsed.append((shape, 1))
-    return collapsed
+    # A chunk stream next to a tool frame merges into that tool's work
+    # block (whether the model thinks before or between tool calls is
+    # run-dependent).
+    filtered = []
+    for index, (shape, count) in enumerate(collapsed):
+        if shape.get("sessionUpdate") == "chunk-stream":
+            prev_is_tool = index > 0 and collapsed[index - 1][0].get("sessionUpdate") in (
+                "tool_call",
+                "tool_call_update",
+            )
+            next_is_tool = (
+                index + 1 < len(collapsed)
+                and collapsed[index + 1][0].get("sessionUpdate") in ("tool_call", "tool_call_update")
+            )
+            if prev_is_tool or next_is_tool:
+                continue
+        filtered.append((shape, count))
+    return filtered
 
 
 def main():
-    ts_path, rust_path = sys.argv[1], sys.argv[2]
-    ts = collapse(normalize_capture(load_capture(ts_path)))
-    rust = collapse(normalize_capture(load_capture(rust_path)))
+    arguments = sys.argv[1:]
+    landmarks = "--landmarks" in arguments
+    paths = [argument for argument in arguments if argument != "--landmarks"]
+    ts_path, rust_path = paths[0], paths[1]
+    ts = collapse(normalize_capture(load_capture(ts_path), landmarks))
+    rust = collapse(normalize_capture(load_capture(rust_path), landmarks))
     ts_shapes = [shape for shape, _ in ts]
     rust_shapes = [shape for shape, _ in rust]
     if ts_shapes == rust_shapes:
-        print(f"MATCH: {ts_path} vs {rust_path} ({len(ts)} structural frames)")
+        mode = "landmarks" if landmarks else "full"
+        print(f"MATCH ({mode}): {ts_path} vs {rust_path} ({len(ts)} structural frames)")
         return 0
     print(f"MISMATCH: {ts_path} vs {rust_path}")
     for index in range(max(len(ts_shapes), len(rust_shapes))):

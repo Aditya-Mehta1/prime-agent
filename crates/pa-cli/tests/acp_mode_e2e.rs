@@ -457,3 +457,184 @@ fn acp_mcp_servers_are_rejected_until_the_slice_serves_them() {
         "MCP servers are unavailable in this ACP host"
     );
 }
+#[test]
+fn acp_compact_command_publishes_the_compaction_meta_and_end_turn() {
+    // The faux session is short, so `/compact` skips (TS
+    // `CompactionSkippedError`): the observable parity is the
+    // `compaction: {}` namespaced update and the normal end_turn response.
+    let script = json!({ "responses": ["one answer"] });
+    let mut client = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);
+    let init = client.request("initialize", initialize_params());
+    let _ = client.wait_response(init, TIMEOUT);
+    let new = client.request("session/new", json!({ "mcpServers": [] }));
+    let (new_response, _) = client.wait_response(new, TIMEOUT);
+    let session_id = new_response["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let prompt = client.request(
+        "session/prompt",
+        json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "/compact" }] }),
+    );
+    let (prompt_response, updates) = client.wait_response(prompt, TIMEOUT);
+
+    let compaction = updates
+        .iter()
+        .find(|update| {
+            let meta = &update["params"]["update"]["_meta"]["ai.primeintellect.prime-agent"];
+            meta.get("compaction").is_some_and(|value| !value.is_null())
+        })
+        .expect("a compaction meta frame");
+    let meta = &compaction["params"]["update"]["_meta"]["ai.primeintellect.prime-agent"];
+    assert_eq!(
+        meta["compaction"],
+        json!({}),
+        "a skipped compaction publishes the empty payload"
+    );
+    assert_eq!(meta["phase"], "event");
+
+    // The turn settles normally: boundary, completion, terminal, end_turn.
+    let boundary = updates.iter().any(|update| {
+        let meta = &update["params"]["update"]["_meta"]["ai.primeintellect.prime-agent"];
+        meta["phase"] == "responseBoundary" && meta["terminalQuiescenceExpected"] == true
+    });
+    assert!(boundary, "updates: {updates:?}");
+    assert_eq!(
+        prompt_response["result"],
+        json!({ "stopReason": "end_turn" })
+    );
+}
+
+#[test]
+fn acp_goal_command_publishes_goal_meta_and_runs_the_continuation() {
+    // `/goal` start schedules its continuation as the turn's model segment:
+    // the goal meta frame precedes the streamed answer, and the usage
+    // accounting publishes a second goal frame after the message settles.
+    let script = json!({ "responses": ["GOAL-PROGRESS"] });
+    let mut client = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);
+    let init = client.request("initialize", initialize_params());
+    let _ = client.wait_response(init, TIMEOUT);
+    let new = client.request("session/new", json!({ "mcpServers": [] }));
+    let (new_response, _) = client.wait_response(new, TIMEOUT);
+    let session_id = new_response["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let prompt = client.request(
+        "session/prompt",
+        json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "/goal reply with exactly: GOAL-DONE" }] }),
+    );
+    let (prompt_response, updates) = client.wait_response(prompt, TIMEOUT);
+
+    let goal_frames: Vec<&Value> = updates
+        .iter()
+        .filter(|update| {
+            let meta = &update["params"]["update"]["_meta"]["ai.primeintellect.prime-agent"];
+            meta.get("goal").is_some_and(|value| !value.is_null())
+        })
+        .collect();
+    assert!(!goal_frames.is_empty(), "updates: {updates:?}");
+    let first =
+        &goal_frames[0]["params"]["update"]["_meta"]["ai.primeintellect.prime-agent"]["goal"];
+    assert_eq!(first["status"], "active");
+    assert_eq!(first["objective"], "reply with exactly: GOAL-DONE");
+    assert_eq!(first["tokensUsed"], 0);
+    // A usage update follows the settled message.
+    assert!(goal_frames.len() >= 2, "goal frames: {goal_frames:?}");
+    let second =
+        &goal_frames[1]["params"]["update"]["_meta"]["ai.primeintellect.prime-agent"]["goal"];
+    assert_eq!(second["status"], "active");
+    assert!(second["tokensUsed"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(
+        prompt_response["result"],
+        json!({ "stopReason": "end_turn" })
+    );
+}
+
+#[test]
+fn acp_autonomous_token_limit_maps_to_max_tokens_stop_reason() {
+    // A one-token budget is exhausted by the first turn: the driver stops
+    // with the token limit, the completion envelope carries the autonomous
+    // accounting, and the stop reason is `max_tokens`.
+    let script = json!({ "responses": ["an answer"] });
+    let mut client = AcpChild::spawn(
+        &[
+            "--mode",
+            "acp",
+            "--no-session",
+            "--autonomous",
+            "--autonomous-max-tokens",
+            "1",
+        ],
+        &script,
+    );
+    let init = client.request("initialize", initialize_params());
+    let _ = client.wait_response(init, TIMEOUT);
+    let new = client.request("session/new", json!({ "mcpServers": [] }));
+    let (new_response, _) = client.wait_response(new, TIMEOUT);
+    let session_id = new_response["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let prompt = client.request(
+        "session/prompt",
+        json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "do the thing" }] }),
+    );
+    let (prompt_response, updates) = client.wait_response(prompt, TIMEOUT);
+
+    let completion = updates
+        .iter()
+        .find(|update| {
+            let meta = &update["params"]["update"]["_meta"]["ai.primeintellect.prime-agent"];
+            meta["phase"] == "event" && meta.get("autonomous").is_some_and(|v| !v.is_null())
+        })
+        .expect("an autonomous completion meta");
+    let autonomous =
+        &completion["params"]["update"]["_meta"]["ai.primeintellect.prime-agent"]["autonomous"];
+    assert_eq!(autonomous["enabled"], true);
+    assert_eq!(autonomous["turnsUsed"], 1);
+    let quiescence =
+        &completion["params"]["update"]["_meta"]["ai.primeintellect.prime-agent"]["quiescence"];
+    assert_eq!(quiescence["outstandingSubagents"], 0);
+
+    assert_eq!(
+        prompt_response["result"],
+        json!({ "stopReason": "max_tokens" })
+    );
+}
+
+#[test]
+fn acp_autonomous_disabled_reports_end_turn_without_accounting() {
+    // Without autonomous flags the completion envelope carries no autonomous
+    // meta and the stop reason is end_turn.
+    let script = json!({ "responses": ["an answer"] });
+    let mut client = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);
+    let init = client.request("initialize", initialize_params());
+    let _ = client.wait_response(init, TIMEOUT);
+    let new = client.request("session/new", json!({ "mcpServers": [] }));
+    let (new_response, _) = client.wait_response(new, TIMEOUT);
+    let session_id = new_response["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let prompt = client.request(
+        "session/prompt",
+        json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "hi" }] }),
+    );
+    let (prompt_response, updates) = client.wait_response(prompt, TIMEOUT);
+    for update in &updates {
+        let meta = &update["params"]["update"]["_meta"]["ai.primeintellect.prime-agent"];
+        assert!(
+            meta.get("autonomous").is_none_or(|v| v.is_null()),
+            "no autonomous meta"
+        );
+    }
+    assert_eq!(
+        prompt_response["result"],
+        json!({ "stopReason": "end_turn" })
+    );
+}

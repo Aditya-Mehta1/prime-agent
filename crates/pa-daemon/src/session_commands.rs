@@ -38,6 +38,8 @@ pub(crate) fn run_session_command(
                 compaction: None,
                 continuation_prompt: None,
                 error: Some(error),
+                refinement: None,
+                refinement_failed: None,
             }
         }
     };

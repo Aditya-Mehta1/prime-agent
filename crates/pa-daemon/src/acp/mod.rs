@@ -12,6 +12,7 @@ mod events;
 mod jsonrpc;
 mod meta;
 mod producer;
+mod prompt;
 mod session;
 mod types;
 
@@ -23,16 +24,15 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
+use pa_core::autonomous::create_autonomous_runtime_state;
 use pa_core::session_engine::engine::SessionEngine;
-use pa_core::session_engine::{PromptOptions, PromptOutcome, StreamingBehavior};
 
 use jsonrpc::Incoming;
-use meta::{PrimeAgentOutcome, PrimeAgentSessionMeta};
+use meta::PrimeAgentSessionMeta;
 use producer::UpdateProducer;
-use session::{AcpSession, TurnBoundary};
+use session::AcpSession;
 use types::{
     initialize_result, session_id_params, AcpStopReason, AcpStopReasonResponse, NewSessionParams,
-    PromptParams,
 };
 
 /// Everything the mode needs from the composition root.
@@ -43,6 +43,15 @@ pub struct AcpOptions {
     pub actual_cwd: PathBuf,
     /// The product version reported in `initialize`.
     pub product_version: String,
+    /// The session's resolved model, for session-command executors
+    /// (`/compact`, `/refine`) that run their own provider calls.
+    pub model: Option<pa_types::ai::Model>,
+    /// Resolved request API key for those executors.
+    pub api_key: Option<String>,
+    /// The agent dir: the global harness directory for refinement history.
+    pub agent_dir: PathBuf,
+    /// The autonomous runtime configuration from the CLI flags.
+    pub autonomous_config: Option<pa_core::autonomous::AgentAutonomousConfig>,
 }
 
 /// The hosted-session slot plus the in-flight admission bookkeeping.
@@ -51,6 +60,20 @@ struct ConnectionState {
     session: Option<SessionEntry>,
     session_new_in_flight: bool,
     session_close_in_flight: bool,
+}
+
+/// Composition-root inputs shared by every handler: the engine plus the
+/// fixed process identity (cwd, version) and the session-command inputs
+/// (resolved model, api key, agent dir, autonomous config).
+#[derive(Clone)]
+struct AcpModeState {
+    engine: Arc<SessionEngine>,
+    actual_cwd: Arc<PathBuf>,
+    product_version: Arc<String>,
+    model: Option<pa_types::ai::Model>,
+    api_key: Option<String>,
+    agent_dir: Arc<PathBuf>,
+    autonomous_config: Option<pa_core::autonomous::AgentAutonomousConfig>,
 }
 
 /// One hosted session and its in-flight prompt turn, if any.
@@ -79,6 +102,15 @@ pub async fn run_acp_mode(options: AcpOptions) -> Result<i32> {
     });
 
     let state = Arc::new(Mutex::new(ConnectionState::default()));
+    let mode = AcpModeState {
+        engine: options.engine.clone(),
+        actual_cwd: Arc::new(options.actual_cwd.clone()),
+        product_version: Arc::new(options.product_version.clone()),
+        model: options.model.clone(),
+        api_key: options.api_key.clone(),
+        agent_dir: Arc::new(options.agent_dir.clone()),
+        autonomous_config: options.autonomous_config.clone(),
+    };
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut line = String::new();
     loop {
@@ -98,14 +130,7 @@ pub async fn run_acp_mode(options: AcpOptions) -> Result<i32> {
                 continue;
             }
         };
-        let handler = spawn_handler(
-            request,
-            state.clone(),
-            options.engine.clone(),
-            options.actual_cwd.clone(),
-            options.product_version.clone(),
-            tx.clone(),
-        );
+        let handler = spawn_handler(request, state.clone(), mode.clone(), tx.clone());
         handler.await.ok();
     }
 
@@ -141,25 +166,13 @@ async fn teardown(state: &Arc<Mutex<ConnectionState>>) {
 fn spawn_handler(
     request: Incoming,
     state: Arc<Mutex<ConnectionState>>,
-    engine: Arc<SessionEngine>,
-    actual_cwd: PathBuf,
-    product_version: String,
+    mode: AcpModeState,
     tx: producer::FrameSink,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         match request {
             Incoming::Request { id, method, params } => {
-                handle_request(
-                    id,
-                    method,
-                    params,
-                    state,
-                    engine,
-                    actual_cwd,
-                    product_version,
-                    tx,
-                )
-                .await;
+                handle_request(id, method, params, state, mode, tx).await;
             }
             Incoming::Notification { method, params } => {
                 handle_notification(method, params, state).await;
@@ -174,25 +187,21 @@ async fn handle_request(
     method: String,
     params: Value,
     state: Arc<Mutex<ConnectionState>>,
-    engine: Arc<SessionEngine>,
-    actual_cwd: PathBuf,
-    product_version: String,
+    mode: AcpModeState,
     tx: producer::FrameSink,
 ) {
     match method.as_str() {
-        "initialize" => handle_initialize(id, params, product_version, tx),
+        "initialize" => handle_initialize(id, params, &mode.product_version, tx),
         "session/new" => {
-            handle_session_new(id, params, state, engine, actual_cwd, tx).await;
+            handle_session_new(id, params, state, mode, tx).await;
         }
         "session/prompt" => {
-            handle_session_prompt(id, params, state, engine, tx).await;
+            prompt::handle_session_prompt(id, params, state, mode, tx).await;
         }
         "session/close" => {
-            handle_session_close(id, params, state, engine, tx).await;
+            handle_session_close(id, params, state, tx).await;
         }
         other => {
-            // The observed TS response: the message quotes the constant, and
-            // the method name rides under `data.method`.
             let _ = tx.send(jsonrpc::error_response(
                 id,
                 jsonrpc::METHOD_NOT_FOUND,
@@ -203,12 +212,12 @@ async fn handle_request(
     }
 }
 
-fn handle_initialize(id: Value, params: Value, product_version: String, tx: producer::FrameSink) {
+fn handle_initialize(id: Value, params: Value, product_version: &str, tx: producer::FrameSink) {
     if let Err(error_response) = validate_initialize(&id, &params) {
         let _ = tx.send(error_response);
         return;
     }
-    let result = serde_json::to_value(initialize_result(&product_version)).expect("serializes");
+    let result = serde_json::to_value(initialize_result(product_version)).expect("serializes");
     let _ = tx.send(jsonrpc::response(id, result));
 }
 
@@ -270,8 +279,7 @@ async fn handle_session_new(
     id: Value,
     params: Value,
     state: Arc<Mutex<ConnectionState>>,
-    engine: Arc<SessionEngine>,
-    actual_cwd: PathBuf,
+    mode: AcpModeState,
     tx: producer::FrameSink,
 ) {
     // Reserve the single-session slot before the first await: two
@@ -289,7 +297,7 @@ async fn handle_session_new(
         state.session_new_in_flight = true;
     }
 
-    let result = session_new(&id, params, &engine, &actual_cwd, tx.clone()).await;
+    let result = session_new(&id, params, &mode, tx.clone()).await;
 
     let mut state = state.lock().await;
     state.session_new_in_flight = false;
@@ -302,8 +310,7 @@ async fn handle_session_new(
 async fn session_new(
     id: &Value,
     params: Value,
-    engine: &Arc<SessionEngine>,
-    actual_cwd: &Path,
+    mode: &AcpModeState,
     tx: producer::FrameSink,
 ) -> std::result::Result<SessionEntry, ()> {
     let params = NewSessionParams::parse(&params);
@@ -320,18 +327,33 @@ async fn session_new(
     // back in `_meta` when it differs, never adopted.
     let mut cwd_mismatch = None;
     if let Some(requested) = params.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
-        if !same_cwd(Path::new(requested), actual_cwd) {
+        if !same_cwd(Path::new(requested), &mode.actual_cwd) {
             cwd_mismatch = Some(meta::PrimeAgentCwdMeta {
                 requested: requested.to_string(),
-                actual: actual_cwd.display().to_string(),
+                actual: mode.actual_cwd.display().to_string(),
             });
         }
     }
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let producer = UpdateProducer::new(session_id.clone(), tx.clone());
+    // Autonomous state is session-scoped, like the TS session it backs.
+    let autonomous = Arc::new(tokio::sync::Mutex::new(create_autonomous_runtime_state(
+        mode.autonomous_config.as_ref(),
+        None,
+    )));
+    let driver: Arc<dyn pa_core::autonomous::AutonomousDriver> = Arc::new(
+        pa_core::autonomous::ShellAutonomousDriver::new(mode.actual_cwd.as_path()),
+    );
     let session = Arc::new(
-        AcpSession::new(session_id.clone(), engine.session.agent().clone(), producer).await,
+        AcpSession::new(
+            session_id.clone(),
+            mode.engine.clone(),
+            producer,
+            autonomous,
+            driver,
+        )
+        .await,
     );
 
     let mut result = json!({ "sessionId": session_id });
@@ -351,212 +373,10 @@ async fn session_new(
     })
 }
 
-async fn handle_session_prompt(
-    id: Value,
-    params: Value,
-    state: Arc<Mutex<ConnectionState>>,
-    engine: Arc<SessionEngine>,
-    tx: producer::FrameSink,
-) {
-    let params = PromptParams::parse(&params);
-    // Admission: one prompt turn at a time, behind any started cancellation.
-    let (session, turn_id) = {
-        let mut state = state.lock().await;
-        let closing = state.session_close_in_flight;
-        let Some(entry) = state.session.as_mut() else {
-            let _ = tx.send(internal_error(
-                &id,
-                &format!("Unknown ACP session: {}", params.session_id),
-            ));
-            return;
-        };
-        if closing {
-            let _ = tx.send(internal_error(
-                &id,
-                &format!("ACP session is closing: {}", params.session_id),
-            ));
-            return;
-        }
-        if entry.prompt_task.is_some() {
-            let _ = tx.send(internal_error(
-                &id,
-                "A prompt turn is already running for this ACP session",
-            ));
-            return;
-        }
-        let turn_id = entry.session.producer().begin_prompt().await;
-        (entry.session.clone(), turn_id)
-    };
-    if session.cancel_requested() {
-        // This prompt was admitted after a cancellation started; it is
-        // dropped by the cancel, so report the protocol stop reason instead
-        // of a request error.
-        session.producer().finish_prompt(turn_id).await;
-        let _ = tx.send(jsonrpc::response(
-            id,
-            stop_reason_response(AcpStopReason::Cancelled),
-        ));
-        return;
-    }
-
-    let admitted_prompt = match session::AdmittedPrompt::parse(&params.prompt) {
-        Ok(prompt) => prompt,
-        Err(error) => {
-            session.producer().finish_prompt(turn_id).await;
-            let _ = tx.send(session::prompt_block_error(&id, error));
-            return;
-        }
-    };
-
-    // The turn runs as its own task so the reader loop can keep serving
-    // session/cancel and session/close while it settles.
-    let task = tokio::spawn(run_prompt_turn(
-        id,
-        params.session_id.clone(),
-        turn_id,
-        admitted_prompt,
-        session,
-        state.clone(),
-        engine.clone(),
-        tx.clone(),
-    ));
-    let mut state = state.lock().await;
-    if let Some(entry) = state.session.as_mut() {
-        if entry.session.id == params.session_id {
-            entry.prompt_task = Some(task);
-        }
-    }
-}
-
-/// One prompt turn: admission into the engine, streaming, and the
-/// correlated boundary / completion envelope in front of the response.
-#[allow(clippy::too_many_arguments)]
-async fn run_prompt_turn(
-    id: Value,
-    session_id: String,
-    turn_id: u64,
-    admitted_prompt: session::AdmittedPrompt,
-    session: Arc<AcpSession>,
-    state: Arc<Mutex<ConnectionState>>,
-    engine: Arc<SessionEngine>,
-    tx: producer::FrameSink,
-) {
-    let boundary = TurnBoundary::capture(engine.session.agent()).await;
-    let prompt_result = engine
-        .session
-        .prompt_with_images(
-            &admitted_prompt.text,
-            admitted_prompt
-                .images
-                .into_iter()
-                .map(|image| pa_agent::types::ImageContent {
-                    data: image.data,
-                    mime_type: image.mime_type,
-                })
-                .collect(),
-            PromptOptions {
-                streaming_behavior: Some(StreamingBehavior::FollowUp),
-                queue_if_busy: true,
-                ..Default::default()
-            },
-        )
-        .await;
-
-    let admitted = match prompt_result {
-        // Session commands are admitted as text in this slice; the engine
-        // command path is not driven in-process, and the turn settles with
-        // no new assistant message.
-        Ok(PromptOutcome::Prompt) | Ok(PromptOutcome::SessionCommand(_)) => true,
-        Err(error) => {
-            // Failed prompt admission gets one correlated error boundary; it
-            // never gets an invented terminal-quiescence update.
-            let _ = session::publish_response_boundary(
-                &session,
-                turn_id,
-                false,
-                PrimeAgentOutcome::Error,
-            )
-            .await;
-            session.producer().finish_prompt(turn_id).await;
-            let _ = tx.send(internal_error(&id, &format!("{error:#}")));
-            return;
-        }
-    };
-    let _ = admitted;
-
-    engine.session.agent().wait_for_idle().await;
-    let cancelled = session.cancel_requested();
-    let failure = session::turn_failure(engine.session.agent(), &boundary).await;
-
-    if cancelled {
-        // A cancellation before the response boundary resolves the request
-        // with the protocol stop reason and no boundary frames.
-        session.producer().finish_prompt(turn_id).await;
-        let _ = tx.send(jsonrpc::response(
-            id,
-            stop_reason_response(AcpStopReason::Cancelled),
-        ));
-        clear_prompt_slot(&state, &session_id).await;
-        return;
-    }
-
-    let outcome = if failure.is_some() {
-        PrimeAgentOutcome::Error
-    } else {
-        PrimeAgentOutcome::Result
-    };
-    // The response boundary precedes the correlated response; the completion
-    // event and the terminal quiescence envelope follow it in publication
-    // order.
-    if session::publish_response_boundary(&session, turn_id, true, outcome)
-        .await
-        .is_err()
-    {
-        session.producer().finish_prompt(turn_id).await;
-        let _ = tx.send(internal_error(
-            &id,
-            "Failed to publish ACP response boundary",
-        ));
-        clear_prompt_slot(&state, &session_id).await;
-        return;
-    }
-    if session::publish_completion_envelope(&session, turn_id, outcome)
-        .await
-        .is_err()
-    {
-        session.producer().finish_prompt(turn_id).await;
-        let _ = tx.send(internal_error(
-            &id,
-            "Failed to publish ACP completion update",
-        ));
-        clear_prompt_slot(&state, &session_id).await;
-        return;
-    }
-
-    session.producer().finish_prompt(turn_id).await;
-    let response = match failure {
-        Some(failure) => internal_error(&id, &format!("prime-agent turn failed: {failure}")),
-        None => jsonrpc::response(id, stop_reason_response(AcpStopReason::EndTurn)),
-    };
-    let _ = tx.send(response);
-    clear_prompt_slot(&state, &session_id).await;
-}
-
-/// The running turn released the prompt slot; close/EOF no longer awaits it.
-async fn clear_prompt_slot(state: &Arc<Mutex<ConnectionState>>, session_id: &str) {
-    let mut state = state.lock().await;
-    if let Some(entry) = state.session.as_mut() {
-        if entry.session.id == session_id {
-            entry.prompt_task = None;
-        }
-    }
-}
-
 async fn handle_session_close(
     id: Value,
     params: Value,
     state: Arc<Mutex<ConnectionState>>,
-    engine: Arc<SessionEngine>,
     tx: producer::FrameSink,
 ) {
     let session_id = session_id_params(&params);
@@ -589,9 +409,9 @@ async fn handle_session_close(
         ));
         return;
     };
-    engine.session.agent().abort();
-    engine.session.agent().clear_all_queues();
-    engine.session.agent().wait_for_idle().await;
+    entry.session.agent().abort();
+    entry.session.agent().clear_all_queues();
+    entry.session.agent().wait_for_idle().await;
     // The cancelled prompt resolves before the close response: the turn task
     // is awaited first and its frames already sit in the write queue.
     if let Some(task) = entry.prompt_task.take() {
