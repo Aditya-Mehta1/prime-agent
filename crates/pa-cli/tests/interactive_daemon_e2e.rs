@@ -467,3 +467,130 @@ async fn ensure_daemon_running_spawns_supervisor_and_tui_attaches() {
     // stays as the panic backstop; this call asserts the clean stop).
     assert_daemon_stops_clean(&socket);
 }
+
+/// Slash-command dispatch over a live scripted session: the session command
+/// executes in the worker (durable echo + result rows reach the transcript
+/// and the session file), client commands without a UI report
+/// unavailability, unknown commands get the TS suggestion error, and the
+/// autocomplete menu renders from the shared registry.
+#[tokio::test]
+async fn tui_dispatches_slash_commands_menu_and_suggestions() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let session_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let supervisor = spawn_supervisor(dir.path());
+
+    // The faux engine (`engine: "faux"`) drives the real agent engine over
+    // the scripted faux provider, so the worker's session-command admission
+    // path runs exactly as in the product.
+    let script = serde_json::json!({ "engine": "faux", "responses": [
+        { "text": "scripted reply" },
+    ] });
+    std::fs::write(dir.path().join("script.json"), script.to_string()).expect("write script");
+    let options = pa_tui::interactive::InteractiveOptions {
+        socket_path: supervisor.socket.clone(),
+        cwd: dir.path().to_path_buf(),
+        session_dir: Some(session_dir.clone()),
+        script_path: Some(dir.path().join("script.json")),
+        model_selection: Default::default(),
+        no_session: false,
+        session: pa_tui::interactive::SessionSelection::New,
+        initial_message: None,
+        theme: "prime".to_string(),
+        version: "0.0.0".to_string(),
+    };
+    let plan = pa_tui::interactive::HeadlessPlan {
+        steps: vec![
+            // A session command runs in the worker and its durable rows
+            // render (echo + result).
+            pa_tui::interactive::HeadlessStep::Submit("/goal status".to_string()),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+            // Unknown command: the exact TS suggestion error.
+            pa_tui::interactive::HeadlessStep::Submit("/modle".to_string()),
+            // A builtin client command whose UI does not exist yet.
+            pa_tui::interactive::HeadlessStep::Submit("/model".to_string()),
+            // The autocomplete menu: typed input like a user keystroke by
+            // keystroke, completed with Enter, then submitted.
+            pa_tui::interactive::HeadlessStep::Type("/".to_string()),
+            pa_tui::interactive::HeadlessStep::Type("goa".to_string()),
+            pa_tui::interactive::HeadlessStep::Type("\n".to_string()),
+            pa_tui::interactive::HeadlessStep::Type("\n".to_string()),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+        ],
+        width: 120,
+        height: 36,
+    };
+    let outcome =
+        pa_tui::interactive::run_interactive(options, pa_tui::interactive::UiMode::Headless(plan))
+            .await
+            .expect("interactive run");
+
+    // Verification seam: dump the captured frames for manual frame-diffing
+    // against the TS product (PA_TUI_DUMP_FRAMES=<dir>).
+    if let Ok(dir) = std::env::var("PA_TUI_DUMP_FRAMES") {
+        for (index, frame) in outcome.frames.iter().enumerate() {
+            let _ = std::fs::write(
+                std::path::Path::new(&dir).join(format!("frame-{index:03}.txt")),
+                frame,
+            );
+        }
+    }
+    let rendered = outcome.frames.join("\n");
+    assert!(
+        rendered.contains("/goal status"),
+        "the session-command echo row rendered:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("No active goal."),
+        "the session-command result row rendered:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Unknown command: /modle. Did you mean /model?"),
+        "the unknown-command suggestion matched the TS string:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("/model is not available in this client yet"),
+        "the unavailable client command reported itself:\n{rendered}"
+    );
+    // The menu: the first registry entry is selected at `/`, and `/goa`
+    // fuzzy-matches to the goal command.
+    assert!(
+        rendered.contains("\u{203a} settings"),
+        "the slash menu rendered with the selected first entry:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Open settings menu"),
+        "the selected item's description rendered:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("\u{203a} goal"),
+        "the fuzzy best match for /goa rendered selected:\n{rendered}"
+    );
+
+    // The durable rows persisted: the session file carries the echo and
+    // result custom entries for both executions.
+    let mut saw_echo = false;
+    let mut saw_result = false;
+    for entry in std::fs::read_dir(&session_dir)
+        .expect("read session dir")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        saw_echo |= content.contains("\"session_slash_command\"");
+        saw_result |= content.contains("\"session_slash_command_result\"");
+    }
+    assert!(
+        saw_echo,
+        "the session file persisted the session_slash_command rows"
+    );
+    assert!(
+        saw_result,
+        "the session file persisted the session_slash_command_result rows"
+    );
+    drop(supervisor);
+}

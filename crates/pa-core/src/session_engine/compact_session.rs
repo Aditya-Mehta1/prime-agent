@@ -94,12 +94,28 @@ fn to_llm_messages(messages: &[AgentMessage]) -> Vec<Message> {
         .collect()
 }
 
+/// One completed compaction run: the result plus the entry to persist.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactRun {
+    pub result: CompactionResult,
+    pub entry: pa_types::session::CompactionEntry,
+}
+
+/// What `/compact` did. `Skipped` carries the TS `CompactionSkippedError`
+/// message; the caller treats a skip as a silent no-op (TS
+/// `_executeQueuedSessionCommand` returns without a result row).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompactOutcome {
+    Ran(Box<CompactRun>),
+    Skipped(&'static str),
+}
+
 /// Run compaction over the session: summarize the pre-cut prefix, persist the
 /// entry, and return the rebuilt post-compaction context messages.
 pub async fn execute_compaction(
     session: &mut SessionManager,
     options: CompactOptions<'_>,
-) -> anyhow::Result<CompactionResult> {
+) -> anyhow::Result<CompactOutcome> {
     let entries = session.get_all_entries().to_vec();
     // The header is not a compact candidate.
     let start = usize::from(matches!(entries.first(), Some(FileEntry::Header { .. })));
@@ -115,8 +131,24 @@ pub async fn execute_compaction(
         .unwrap_or_default()
         .to_string();
 
-    // Messages the summarizer sees: everything before the cut.
-    let messages: Vec<AgentMessage> = entries[..cut.first_kept_entry_index]
+    // Skip guard (TS prepareCompaction): a branch that already ends in a
+    // compaction has nothing new to summarize.
+    if matches!(entries.last(), Some(FileEntry::Compaction { .. })) {
+        return Ok(CompactOutcome::Skipped("Already compacted"));
+    }
+
+    // Messages the summarizer sees (TS prepareCompaction): everything before
+    // the cut, plus the prefix of a split turn (turnPrefixMessages).
+    let history_end = if cut.is_split_turn {
+        cut.turn_start_index.unwrap_or(cut.first_kept_entry_index)
+    } else {
+        cut.first_kept_entry_index
+    };
+    let mut messages: Vec<AgentMessage> = entries[..history_end]
+        .iter()
+        .filter_map(message_from_entry)
+        .collect();
+    let turn_prefix_messages: Vec<AgentMessage> = entries[history_end..cut.first_kept_entry_index]
         .iter()
         .filter_map(message_from_entry)
         .collect();
@@ -124,6 +156,17 @@ pub async fn execute_compaction(
     let prev_compaction_index = entries[..cut.first_kept_entry_index]
         .iter()
         .rposition(|entry| matches!(entry, FileEntry::Compaction { .. }));
+    let previous_summary = prev_compaction_index.and_then(|index| match &entries[index] {
+        FileEntry::Compaction { payload, .. } => Some(payload.summary.clone()),
+        _ => None,
+    });
+    // Avoid a compaction that would summarize no history (TS prepareCompaction).
+    if messages.is_empty() && turn_prefix_messages.is_empty() && previous_summary.is_none() {
+        return Ok(CompactOutcome::Skipped(
+            "Session is too short to compact — try again once it grows",
+        ));
+    }
+    messages.extend(turn_prefix_messages);
     let details: CompactionDetails = details_for(&messages, &entries, prev_compaction_index);
 
     // The summarization request (conversation + prompt).
@@ -177,7 +220,7 @@ pub async fn execute_compaction(
         &entry.first_kept_entry_id,
         entry.tokens_before,
     );
-    Ok(result)
+    Ok(CompactOutcome::Ran(Box::new(CompactRun { result, entry })))
 }
 
 /// Rebuild the agent's message list after compaction (summary-first context).
@@ -293,8 +336,9 @@ mod tests {
         assert!(message_from_entry(&tool_result).is_none());
     }
 
-    #[tokio::test]
-    async fn execute_compaction_persists_and_rebuilds() {
+    /// The faux provider with one scripted summarizer response. The faux
+    /// seam is process-global, so every registration unregisters on drop.
+    fn faux_registration() -> pa_ai::faux::FauxProviderRegistration {
         let registration =
             pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
                 models: Some(vec![pa_ai::faux::FauxModelDefinition {
@@ -314,6 +358,12 @@ mod tests {
                 pa_ai::faux::FauxAssistantMessageOptions::default(),
             ),
         )]);
+        registration
+    }
+
+    #[tokio::test]
+    async fn execute_compaction_persists_and_rebuilds() {
+        let registration = faux_registration();
         let model = registration.get_model();
         let tmp = tempfile::tempdir().unwrap();
         let mut session = session_with_turns(tmp.path(), 3);
@@ -323,13 +373,20 @@ mod tests {
                 model,
                 api_key: None,
                 custom_instructions: Some("focus on the goal"),
-                settings: super::super::compaction::CompactionSettings::default(),
+                settings: super::super::compaction::CompactionSettings {
+                    keep_recent_tokens: 20,
+                    ..Default::default()
+                },
             },
         )
         .await
         .unwrap();
-        assert!(result.summary.contains("summarized goal"));
-        assert!(result.usage.is_some());
+        let CompactOutcome::Ran(run) = result else {
+            panic!("expected the compaction to run");
+        };
+        assert!(run.result.summary.contains("summarized goal"));
+        assert!(run.result.usage.is_some());
+        assert_eq!(run.entry.summary, run.result.summary);
         // The compaction entry persisted on the session.
         assert!(session
             .get_entries()
@@ -342,6 +399,61 @@ mod tests {
             Message::User(user) => assert!(user.content.text().contains("[compaction-summary]")),
             other => panic!("expected summary user message, got {other:?}"),
         }
+        registration.unregister();
+    }
+
+    #[tokio::test]
+    async fn execute_compaction_skips_short_sessions() {
+        let registration = faux_registration();
+        let model = registration.get_model();
+        let tmp = tempfile::tempdir().unwrap();
+        // Three small turns fit inside the keep-recent budget: nothing to
+        // summarize, so compaction skips (TS prepareCompaction).
+        let mut session = session_with_turns(tmp.path(), 3);
+        let outcome = execute_compaction(
+            &mut session,
+            CompactOptions {
+                model,
+                api_key: None,
+                custom_instructions: None,
+                settings: super::super::compaction::CompactionSettings::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            CompactOutcome::Skipped("Session is too short to compact — try again once it grows")
+        );
+        assert!(session
+            .get_entries()
+            .iter()
+            .all(|entry| !matches!(entry, FileEntry::Compaction { .. })));
+        registration.unregister();
+    }
+
+    #[tokio::test]
+    async fn execute_compaction_skips_when_already_compacted() {
+        let registration = faux_registration();
+        let model = registration.get_model();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut session = session_with_turns(tmp.path(), 3);
+        session.append_compaction("summary", "e1", 100);
+        let outcome = execute_compaction(
+            &mut session,
+            CompactOptions {
+                model,
+                api_key: None,
+                custom_instructions: None,
+                settings: super::super::compaction::CompactionSettings {
+                    keep_recent_tokens: 200,
+                    ..Default::default()
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, CompactOutcome::Skipped("Already compacted"));
         registration.unregister();
     }
 }

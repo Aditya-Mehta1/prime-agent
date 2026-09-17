@@ -245,14 +245,34 @@ impl SessionFile {
     /// after the compaction. Without a compaction this is the plain
     /// message list.
     pub fn messages(&self) -> Vec<Value> {
+        // The transcript form of one entry: `message` rows contribute their
+        // persisted message; custom rows rejoin as their wire message form
+        // (`role: "custom"`), the shape TS sessions keep in
+        // `agent.state.messages`.
+        let entry_message = |entry: &SessionEntry| -> Option<Value> {
+            match entry.type_.as_str() {
+                "message" => entry.fields.get("message").cloned(),
+                "custom_message" => {
+                    let mut message = entry.fields.clone();
+                    if let Some(object) = message.as_object_mut() {
+                        object.insert("role".to_string(), Value::String("custom".to_string()));
+                        object.insert(
+                            "timestamp".to_string(),
+                            Value::String(entry.timestamp.clone()),
+                        );
+                    }
+                    Some(message)
+                }
+                _ => None,
+            }
+        };
         let branch = self.branch();
         let Some(compaction_position) =
             branch.iter().rposition(|entry| entry.type_ == "compaction")
         else {
             return branch
                 .iter()
-                .filter(|entry| entry.type_ == "message")
-                .filter_map(|entry| entry.fields.get("message").cloned())
+                .filter_map(|entry| entry_message(entry))
                 .collect();
         };
         let compaction = branch[compaction_position];
@@ -264,15 +284,15 @@ impl SessionFile {
         let mut retained: Vec<Value> = Vec::new();
         let mut keeping = false;
         for entry in &branch[..compaction_position] {
-            if entry.type_ != "message" {
+            if entry_message(entry).is_none() {
                 continue;
             }
             if !keeping && entry.id == first_kept_entry_id {
                 keeping = true;
             }
             if keeping {
-                if let Some(message) = entry.fields.get("message") {
-                    retained.push(message.clone());
+                if let Some(message) = entry_message(entry) {
+                    retained.push(message);
                 }
             }
         }
@@ -281,8 +301,7 @@ impl SessionFile {
         messages.extend(
             branch[compaction_position + 1..]
                 .iter()
-                .filter(|entry| entry.type_ == "message")
-                .filter_map(|entry| entry.fields.get("message").cloned()),
+                .filter_map(|entry| entry_message(entry)),
         );
         messages
     }

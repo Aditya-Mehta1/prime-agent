@@ -64,6 +64,10 @@ pub struct SessionEngine {
     pub prompt_templates: Vec<PromptTemplate>,
     pub agents_files: Vec<crate::resources::ContextFile>,
     pub system_prompt: String,
+    /// The session's goal driver: the same instance the kernel `goal.*`
+    /// host handlers reach, so `/goal` and `goal.complete()` in the kernel
+    /// observe one state machine.
+    pub goal_driver: std::sync::Arc<tokio::sync::Mutex<super::goal_driver::GoalDriver>>,
 }
 
 /// Resolve the MCP gating the resource loader and prompt need: skill
@@ -304,12 +308,14 @@ pub async fn create_session(config: SessionEngineConfig) -> anyhow::Result<Sessi
     )
     .await?;
 
+    let goal_driver = wiring.runtime.goal_driver().clone();
     Ok(SessionEngine {
         session,
         skills: resources.skills,
         prompt_templates: resources.prompts,
         agents_files: resources.agents_files,
         system_prompt,
+        goal_driver,
     })
 }
 

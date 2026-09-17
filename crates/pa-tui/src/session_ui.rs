@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 use pa_types::daemon::DaemonCommand;
+use pa_types::slash_commands::{SlashCommandExecution, SlashCommandRegistry};
 use serde_json::Value;
 
 use crate::chat::{
@@ -273,6 +274,13 @@ impl SessionUi {
         if text.starts_with('/') {
             return self.handle_slash(text, view).await;
         }
+        self.send_prompt(text, view).await
+    }
+
+    /// Send a prompt to the session and start the working loader. Session
+    /// commands travel the same path — the session engine parses and
+    /// executes them instead of admitting a model turn.
+    async fn send_prompt(&mut self, text: &str, view: &mut AgentView) -> Result<()> {
         self.client
             .request_ok(DaemonCommand::Prompt {
                 id: None,
@@ -336,39 +344,104 @@ impl SessionUi {
         }
     }
 
-    /// Slash commands: session management without a full command palette.
+    /// Slash-command dispatch (the TS interactive submission ladder reduced
+    /// to this client's surface): local client commands run here, builtin
+    /// client commands without a UI yet report unavailability, session
+    /// commands (`compact`/`refine`/`goal`/`autonomous`) forward to the
+    /// session, and unknown commands get the TS suggestion error — anything
+    /// without a suggestion passes through as a prompt.
     async fn handle_slash(&mut self, text: &str, view: &mut AgentView) -> Result<()> {
-        let mut parts = text.splitn(2, ' ');
-        let command = parts.next().unwrap_or_default();
-        let argument = parts.next().unwrap_or_default().trim();
-        match command {
-            "/help" => {
+        let registry = SlashCommandRegistry::builtin();
+        let (name, args) = pa_types::slash_commands::parse_slash_command(text)
+            .unwrap_or_else(|| (String::new(), String::new()));
+
+        // Client-local commands this build implements (not TS builtins).
+        match name.as_str() {
+            "help" => {
                 self.note(
                     "/help           this list\n/list           live sessions\n/switch <n|id>  switch to a session from /list\n/new            start a new session\n/exit           detach and exit",
                     view,
                 );
+                return Ok(());
             }
-            "/list" => {
+            "list" => {
                 self.refresh_list(view).await?;
+                return Ok(());
             }
-            "/switch" => {
-                if argument.is_empty() {
+            "switch" => {
+                if args.is_empty() {
                     self.note("usage: /switch <n|id> (run /list first)", view);
                 } else {
-                    self.switch_to(argument, view).await?;
+                    self.switch_to(&args, view).await?;
                 }
+                return Ok(());
             }
-            "/new" => {
+            "exit" => {
+                self.exit_requested = true;
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        let Some(resolved) = registry.parse(text) else {
+            // Oversized names are prompts (TS `_throwIfUnknownSlashCommand`
+            // bails out before fuzzy matching). Close typos get the exact TS
+            // error; everything else passes through to the model.
+            if name.chars().count() > 64 {
+                return self.send_prompt(text, view).await;
+            }
+            let candidates = registry.suggestion_candidates();
+            return match pa_types::slash_commands::find_slash_command_suggestion(&name, &candidates)
+            {
+                Some(suggestion) => {
+                    self.note(
+                        &format!("Unknown command: /{name}. Did you mean /{suggestion}?"),
+                        view,
+                    );
+                    Ok(())
+                }
+                None => self.send_prompt(text, view).await,
+            };
+        };
+
+        let command = registry
+            .get(resolved.name)
+            .expect("resolved name is builtin");
+        match command.execution {
+            SlashCommandExecution::Session => self.send_prompt(text, view).await,
+            SlashCommandExecution::Client => self.dispatch_client_command(&resolved, view).await,
+        }
+    }
+
+    /// A builtin client command. Only the implemented subset runs locally;
+    /// commands whose UI does not exist yet report unavailability.
+    async fn dispatch_client_command(
+        &mut self,
+        resolved: &pa_types::slash_commands::ResolvedSlashCommand,
+        view: &mut AgentView,
+    ) -> Result<()> {
+        match resolved.name {
+            // `/clear` stays the no-argument compatibility alias of `/new`
+            // (TS refuses arguments to it).
+            "new" if resolved.original_name == "clear" && !resolved.args.is_empty() => {
+                self.note("Usage: /clear", view);
+            }
+            "new" => {
                 let id = create_session(&self.client, &self.create_options(), None).await?;
                 self.attach_session(&id).await?;
                 self.rebuild_view(view);
                 self.note(&format!("started session {id}"), view);
             }
-            "/exit" => {
+            // TS `/quit` shuts the client down; this build's exit detaches
+            // and exits (the session keeps running in the daemon).
+            "quit" => {
                 self.exit_requested = true;
             }
             other => {
-                self.note(&format!("unknown command: {other} (try /help)"), view);
+                self.note(
+                    &format!("/{other} is not available in this client yet"),
+                    view,
+                );
             }
         }
         Ok(())
@@ -567,6 +640,9 @@ impl SessionUi {
             }
             TurnUpdate::UserMessage(text) => {
                 view.push_entry(ChatEntry::User { text });
+            }
+            TurnUpdate::CustomRow(entry) => {
+                view.push_entry(entry);
             }
             TurnUpdate::AssistantMessage {
                 message,

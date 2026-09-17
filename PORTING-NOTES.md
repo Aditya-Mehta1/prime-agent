@@ -454,3 +454,48 @@ HEAD
   model. Persisted shapes match the live-session goldens
   (`{"type":"agent_status",…,"status":{"summary","taskState",
   "basedOnMessageCount"}}`).
+
+- Slash-command dispatch (PR: registry + dispatch + autocomplete): the
+  builtin command table is pure data in `pa-types::slash_commands` (the TUI
+  cannot import pa-core; pa-core re-exports it for the session engine, and
+  pa-daemon consumes it through pa-core). The TUI client dispatch runs
+  local handlers first (`/help` `/list` `/switch` `/exit` are Rust-client
+  dev commands, not TS builtins), then the registry: `SlashCommandExecution`
+  splits client commands (locally implemented subset: `/new` incl. the
+  no-argument `/clear` alias, `/quit` → detach-and-exit; everything else
+  reports `/{name} is not available in this client yet` — there is no exact
+  TS string for an unimplemented client command, so the repo's
+  `not available in this build yet` convention is used) from session
+  commands (`/compact` `/refine` `/goal` `/autonomous` forward verbatim as
+  prompts; the worker parses them before admission and never runs a model
+  turn). Unknown names reproduce the TS suggestion error exactly
+  (`Unknown command: /x. Did you mean /y?` via the shared
+  `find_slash_command_suggestion`); names over 64 chars and names without a
+  suggestion pass through as prompts, like the TS product.
+- Slash autocomplete (port of `packages/tui/src/autocomplete.ts` +
+  `select-list.ts` + `fuzzy.ts`): the editor installs a
+  `CombinedAutocompleteProvider` (registry commands via the fuzzy filter,
+  plus the readdir-based file/path completion with TS `extractPathPrefix`
+  trigger rules) in `Editor::new`. The TS product's `@`-attachment
+  completion is fd-backed; this build has no fd dependency, so `@` tokens
+  yield no suggestions — the same behavior as the TS product without fd on
+  PATH. `getSlashCommandContext` is a full port (prompt-start command vs
+  argument position, mid-line `/token` contexts). The dropdown renders
+  above the editor on the toolPanel popup background with the TS slash
+  layout (primary column clamped 12–32, argument-hint column, directional
+  scroll info, selected-item description below the list).
+- Slash echo/result rows (port of `slash-command-message.ts` +
+  `slash-command-result-message.ts`): the durable `session_slash_command` /
+  `session_slash_command_result` custom rows render as user-message blocks
+  (`Box(2,1)` on `userMessageBg`), the echo with the `/name` token in
+  `accent` and `@path`/`--flag` argument tokens highlighted (`success` /
+  `mdLink`), a leading spacer when the chat is non-empty; non-display rows
+  (the `/refine` result) and unknown custom types render nothing; a
+  session-command custom row with an invalid payload renders the
+  `[Malformed session command message]` notice. The OSC 133 prompt markers
+  the TS components emit are not ported (the Rust TUI draws no OSC zone
+  markers yet).
+- Verification seam: a plain `{"responses": [...]}` script uses the echo
+  `ScriptedEngine`, whose `run_prompt` does not parse session commands —
+  use the `{"engine": "faux", "responses": [...]}` script form to drive the
+  real agent engine (with session-command admission) in TUI e2e tests.

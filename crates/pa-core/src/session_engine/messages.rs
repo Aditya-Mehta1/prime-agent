@@ -13,8 +13,9 @@ pub const BRANCH_SUMMARY_SUFFIX: &str = "\n</summary>";
 pub const HARNESS_DIGEST_PREFIX: &str = "[harness-digest]\n\nThe persistent memories produced across this session so far:\n\n<harness_state>\n";
 pub const HARNESS_DIGEST_SUFFIX: &str = "\n</harness_state>";
 
-pub const SESSION_SLASH_COMMAND_CUSTOM_TYPE: &str = "session_slash_command";
-pub const SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE: &str = "session_slash_command_result";
+pub use pa_types::slash_commands::{
+    SESSION_SLASH_COMMAND_CUSTOM_TYPE, SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
+};
 pub const COMPACTION_OUTCOME_CUSTOM_TYPE: &str = "compaction_outcome";
 pub const REFINEMENT_OUTCOME_CUSTOM_TYPE: &str = "refinement_outcome";
 pub const REFINEMENT_NOTICE_CUSTOM_TYPE: &str = "refinement_notice";

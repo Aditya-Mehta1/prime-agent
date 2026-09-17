@@ -14,7 +14,7 @@ use crate::chrome::{
 };
 use crate::editor::Editor;
 use crate::session::TranscriptItem;
-use crate::theme::{Theme, ThemeColor};
+use crate::theme::{Theme, ThemeBg, ThemeColor};
 use crate::width::str_width;
 use crate::{Line, Span};
 use ratatui::style::{Modifier, Style};
@@ -133,6 +133,31 @@ impl AgentView {
                     }
                     lines.extend(render_user_block(text, &self.theme, width));
                 }
+                ChatEntry::SlashCommand { text } => {
+                    // The echo row leads with a spacer when the chat is not
+                    // empty (TS adds `Spacer(1)` before the component).
+                    if !first {
+                        lines.push(Vec::new());
+                    }
+                    let typed = pa_types::slash_commands::parse_slash_command(text)
+                        .map(|(name, _)| name)
+                        .unwrap_or_default();
+                    let takes_argument = pa_types::slash_commands::SlashCommandRegistry::builtin()
+                        .takes_argument(&typed);
+                    lines.extend(crate::chat_slash::render_slash_command(
+                        text,
+                        takes_argument,
+                        &self.theme,
+                        width,
+                    ));
+                }
+                ChatEntry::SlashCommandResult { content } => {
+                    lines.extend(crate::chat_slash::render_slash_command_result(
+                        content,
+                        &self.theme,
+                        width,
+                    ));
+                }
                 ChatEntry::Assistant(message) => {
                     lines.extend(render_assistant(message, self.detail, &self.theme, width));
                 }
@@ -157,15 +182,60 @@ impl AgentView {
         lines
     }
 
-    /// Render the dock: prompt-context row(s), the editor surface, the tray.
+    /// Render the dock: prompt-context row(s), the autocomplete overlay
+    /// (when showing), the editor surface, the tray.
     pub fn render_dock(&mut self, width: usize) -> Vec<Line> {
         let mut lines = render_prompt_context(&self.detail_label(), &self.theme, width);
         let context_rows = lines.len();
+        let overlay_rows = self.render_autocomplete_overlay(width);
+        lines.extend(overlay_rows);
         let (editor_rows, cursor) = self.render_editor_surface(width);
-        self.dock_cursor = cursor.map(|(row, col)| (context_rows + row, col));
+        let overlay_count = lines.len() - context_rows;
+        self.dock_cursor = cursor.map(|(row, col)| (context_rows + overlay_count + row, col));
         lines.extend(editor_rows);
         lines.push(render_tray(&self.chrome, &self.theme, width));
         lines
+    }
+
+    /// The autocomplete dropdown, mounted just above the editor surface (TS
+    /// anchors the overlay immediately above the cursor row; the editor's
+    /// first content row carries the cursor in the common single-line
+    /// case). Each row pads to the input width and floats on the popup
+    /// background between the editor's left padding and prompt prefix.
+    fn render_autocomplete_overlay(&mut self, width: usize) -> Vec<Line> {
+        let Some(state) = self.editor.autocomplete_state() else {
+            return Vec::new();
+        };
+        let styles = crate::autocomplete::SelectListStyles {
+            selected_prefix: self.theme.fg_style(ThemeColor::Accent),
+            selected_text: self.theme.fg_style(ThemeColor::Accent),
+            description: self.theme.fg_style(ThemeColor::Muted),
+            argument_hint: self.theme.fg_style(ThemeColor::MdCode),
+            scroll_info: self.theme.fg_style(ThemeColor::Muted),
+            no_match: self.theme.fg_style(ThemeColor::Muted),
+        };
+        let bg = self.theme.bg_style(ThemeBg::ToolPanelBg);
+        let padding_x = 2usize;
+        let prompt_width = str_width("> ");
+        let content_width = width.saturating_sub(padding_x * 2).max(1);
+        let input_width = content_width.saturating_sub(prompt_width).max(1);
+        let mut rows: Vec<Line> = Vec::new();
+        let mut overlay = Vec::new();
+        overlay.push(Vec::new());
+        overlay.extend(state.render(input_width, &styles));
+        overlay.push(Vec::new());
+        for line in overlay {
+            let used: usize = line.iter().map(|s| str_width(&s.content)).sum();
+            let mut row: Line = vec![Span::styled(" ".repeat(padding_x + prompt_width), bg)];
+            row.extend(line);
+            row.push(Span::styled(
+                " ".repeat(input_width.saturating_sub(used)),
+                bg,
+            ));
+            row.push(Span::styled(" ".repeat(padding_x), bg));
+            rows.push(pad_row(row, width));
+        }
+        rows
     }
 
     /// The editor surface (TS `Editor.render` with a background): a blank

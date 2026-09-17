@@ -7,6 +7,7 @@ use serde::Serialize;
 
 use super::frontmatter::parse_frontmatter;
 use super::{create_synthetic_source_info, SourceInfo, SourceScope};
+pub use pa_types::slash_commands::parse_slash_command;
 
 /// A prompt template loaded from a markdown file.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -328,17 +329,8 @@ pub fn expand_prompt_template(text: &str, templates: &[PromptTemplate]) -> Strin
     text.to_string()
 }
 
-/// `parseSlashCommand`: (name, args) for `/name args...`.
-pub fn parse_slash_command(text: &str) -> Option<(String, String)> {
-    if !text.starts_with('/') {
-        return None;
-    }
-    let rest = &text[1..];
-    match rest.split_once(char::is_whitespace) {
-        Some((name, args)) => Some((name.to_string(), args.trim().to_string())),
-        None => Some((rest.to_string(), String::new())),
-    }
-}
+// `parseSlashCommand` (name, args for `/name args...`) is shared vocabulary:
+// `pa_types::slash_commands::parse_slash_command`, re-exported above.
 
 #[cfg(test)]
 mod tests {

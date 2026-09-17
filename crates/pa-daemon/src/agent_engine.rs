@@ -19,6 +19,9 @@ use pa_core::session_engine::agent_messaging::{
 };
 use pa_core::session_engine::engine::{SessionEngine as CoreSessionEngine, SessionEngineConfig};
 use pa_core::session_engine::provider_adapter::{json_round_trip, real_stream_fn};
+use pa_core::session_engine::session_commands::{
+    execute_session_command, SessionCommandExecution, SessionCommandParams,
+};
 use pa_types::ai::Model;
 
 use crate::engine::{
@@ -63,8 +66,8 @@ pub struct SupervisorLinkConfig {
 
 /// A [`SessionEngine`] running real agent turns.
 pub struct AgentSessionEngine {
-    runtime: tokio::runtime::Runtime,
-    config: AgentEngineConfig,
+    pub(crate) runtime: tokio::runtime::Runtime,
+    pub(crate) config: AgentEngineConfig,
     /// The worker-owned session file (conversation-log path), set at create.
     session_file: std::sync::Mutex<Option<std::path::PathBuf>>,
     /// The authoritative model selection. Starts from the process fallback
@@ -72,10 +75,14 @@ pub struct AgentSessionEngine {
     /// command carries explicit wire flags.
     selection: std::sync::RwLock<EngineModelSelection>,
     /// Built once on the first prompt, reused across prompts.
-    session: tokio::sync::Mutex<Option<CoreSessionEngine>>,
+    pub(crate) session: tokio::sync::Mutex<Option<CoreSessionEngine>>,
     /// This worker's own session summary (worker-pushed at create/rename),
     /// read by the kernel messaging controller to render sender identity.
     own_summary: std::sync::Arc<std::sync::Mutex<Option<Value>>>,
+    /// The session's autonomous runtime state (limits, usage accounting).
+    /// The continuation driver that consults it is future work; `/autonomous`
+    /// status, on, and off operate on this state today.
+    pub(crate) autonomous: std::sync::Mutex<pa_core::autonomous::AutonomousRuntimeState>,
 }
 
 impl AgentSessionEngine {
@@ -106,7 +113,51 @@ impl AgentSessionEngine {
             selection: std::sync::RwLock::new(selection),
             session: tokio::sync::Mutex::new(None),
             own_summary: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            autonomous: std::sync::Mutex::new(
+                pa_core::autonomous::create_autonomous_runtime_state(None, None),
+            ),
         })
+    }
+
+    /// Build the core session once (same once-only rule as `session_agent`).
+    pub(crate) fn ensure_core_session(&self, model: &Model) -> anyhow::Result<()> {
+        {
+            let guard = self.session.blocking_lock();
+            if guard.is_some() {
+                return Ok(());
+            }
+        }
+        let built = self
+            .runtime
+            .block_on(async { self.build_session(model).await })?;
+        self.session.blocking_lock().replace(built);
+        Ok(())
+    }
+
+    /// Execute one session slash command against the built session: resolve
+    /// the model, build the core session on first use, then run the pa-core
+    /// executor (durable rows, compaction, goal continuation).
+    pub(crate) fn execute_session_command(
+        &self,
+        command: &pa_core::session_engine::slash_commands::SessionSlashCommand,
+    ) -> anyhow::Result<SessionCommandExecution> {
+        let model = self.resolve_model()?;
+        self.ensure_core_session(&model)?;
+        let api_key = self.resolve_request_api_key(&model);
+        let mut autonomous = self.autonomous.lock().expect("autonomous state lock");
+        let mut params = SessionCommandParams {
+            model: &model,
+            api_key,
+            global_harness_dir: self.config.agent_dir.clone(),
+            autonomous: &mut autonomous,
+        };
+        let guard = self.session.blocking_lock();
+        let core = guard
+            .as_ref()
+            .expect("session built by ensure_core_session");
+        Ok(self
+            .runtime
+            .block_on(async { execute_session_command(core, &mut params, command).await }))
     }
 
     /// The current explicit selection (create-config flags merged over the
@@ -331,7 +382,7 @@ impl SessionEngine for AgentSessionEngine {
             .runtime
             .block_on(pa_agent::abort::race_with_abort(run, signal));
         let compaction = match result {
-            Ok(Ok(compaction)) => compaction,
+            Ok(Ok(outcome)) => outcome,
             Ok(Err(error)) => {
                 // Abort-marked errors and a lost abort race both surface as
                 // the TS "Compaction cancelled" outcome.
@@ -344,20 +395,30 @@ impl SessionEngine for AgentSessionEngine {
             }
             Err(_) => return CompactionOutcome::Aborted,
         };
-        CompactionOutcome::Compacted {
-            run: CompactionRun {
-                // pa-core's result carries summary/cut/tokens plus the
-                // summarizer usage; file-op details are entry-side in
-                // pa-core and not exposed on the compact result yet.
-                result: json!({
-                    "summary": compaction.summary,
-                    "firstKeptEntryId": compaction.first_kept_entry_id,
-                    "tokensBefore": compaction.tokens_before,
-                }),
-                usage: compaction
-                    .usage
-                    .and_then(|usage| serde_json::to_value(usage).ok()),
-            },
+        match compaction {
+            pa_core::session_engine::compact_session::CompactOutcome::Skipped(message) => {
+                CompactionOutcome::Skipped {
+                    message: message.to_string(),
+                }
+            }
+            pa_core::session_engine::compact_session::CompactOutcome::Ran(run) => {
+                CompactionOutcome::Compacted {
+                    run: CompactionRun {
+                        // The wire result is the TS `CompactionResult` shape:
+                        // summary, firstKeptEntryId, tokensBefore. Usage and
+                        // file-op details live on the persisted entry.
+                        result: json!({
+                            "summary": run.result.summary,
+                            "firstKeptEntryId": run.result.first_kept_entry_id,
+                            "tokensBefore": run.result.tokens_before,
+                        }),
+                        usage: run
+                            .result
+                            .usage
+                            .and_then(|usage| serde_json::to_value(usage).ok()),
+                    },
+                }
+            }
         }
     }
 
@@ -427,6 +488,30 @@ impl SessionEngine for AgentSessionEngine {
         aborted: &dyn Fn() -> bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) {
+        // Session commands (compact/refine/goal/autonomous) never admit a
+        // model turn and never record a user-message row: the durable echo
+        // row replaces it. Execute before admission so the idle-wait loop
+        // below stays reachable only for real turns.
+        if let Some(command) =
+            crate::session_commands::parse_prompt_session_command(&request.message)
+        {
+            let Some(execution) = crate::session_commands::run_session_command(self, command, emit)
+            else {
+                return;
+            };
+            if let Some(error) = &execution.error {
+                emit(EngineEvent::Done(Err(error.clone())));
+                return;
+            }
+            // A goal start/resume schedules its continuation context as
+            // the turn; the durable goal-context row is already emitted.
+            if let Some(continuation) = execution.continuation_prompt {
+                self.run_model_turn(&continuation, aborted, emit);
+            } else {
+                emit(EngineEvent::Done(Ok(())));
+            }
+            return;
+        }
         // The accepted user message is recorded by the worker.
         if !emit(EngineEvent::UserMessage(json!({
             "role": "user",
@@ -435,7 +520,22 @@ impl SessionEngine for AgentSessionEngine {
         }))) {
             return;
         }
-        let prompt = request.message;
+        self.run_model_turn(&request.message, aborted, emit);
+    }
+}
+
+impl AgentSessionEngine {
+    /// Drive one admitted prompt through the retry-driver model loop and
+    /// emit the turn outcome (provider-failure retries + final-row
+    /// surfacing). The user row — or a goal continuation's durable context
+    /// row — precedes this, so this starts at the model turn.
+    fn run_model_turn(
+        &self,
+        prompt: &str,
+        aborted: &dyn Fn() -> bool,
+        emit: &mut dyn FnMut(EngineEvent) -> bool,
+    ) {
+        let prompt = prompt.to_string();
         // Model resolution and session construction are hard failures: they
         // never reach the provider, so the retry loop does not apply (the
         // TS loop only classifies provider stream failures).
@@ -544,9 +644,7 @@ impl SessionEngine for AgentSessionEngine {
         };
         emit(EngineEvent::Done(done));
     }
-}
 
-impl AgentSessionEngine {
     /// The hosted session's agent loop, building the session on first use.
     fn session_agent(
         &self,

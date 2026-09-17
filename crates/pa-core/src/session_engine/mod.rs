@@ -25,6 +25,7 @@ pub mod provider_retry;
 pub mod refine;
 pub mod runtime;
 pub mod runtime_wiring;
+pub mod session_commands;
 pub mod side_question;
 pub mod slash_commands;
 pub mod tool_bridge;
@@ -37,7 +38,7 @@ use pa_types::session::AgentMessage as SessionAgentMessage;
 use pa_types::session::FileEntry;
 
 use crate::session::manager::SessionManager;
-use crate::session_engine::compaction_exec::CompactionResult;
+use crate::session_engine::compact_session::CompactOutcome;
 use crate::skills::PromptTemplate;
 use slash_commands::{parse_session_command, SessionSlashCommand, SlashCommandRegistry};
 
@@ -131,14 +132,16 @@ impl AgentSession {
     }
 
     /// Execute `/compact`: summarize the pre-cut prefix, persist the
-    /// compaction entry, and rebuild the loop context summary-first.
+    /// compaction entry, and rebuild the loop context summary-first. A skip
+    /// (already compacted, or nothing to summarize) leaves the session
+    /// untouched, matching the TS `CompactionSkippedError` flow.
     pub async fn compact(
         &self,
         custom_instructions: Option<&str>,
         model: &pa_types::ai::Model,
         api_key: Option<String>,
-    ) -> anyhow::Result<CompactionResult> {
-        let result = {
+    ) -> anyhow::Result<CompactOutcome> {
+        let outcome = {
             let mut session = self.session.lock().await;
             crate::session_engine::compact_session::execute_compaction(
                 &mut session,
@@ -151,6 +154,9 @@ impl AgentSession {
             )
             .await?
         };
+        if matches!(outcome, CompactOutcome::Skipped(_)) {
+            return Ok(outcome);
+        }
         // Rebuild the loop context from the post-compaction session.
         let rebuilt = {
             let session = self.session.lock().await;
@@ -164,7 +170,7 @@ impl AgentSession {
             })
             .collect();
         self.agent.set_messages(loop_messages).await;
-        Ok(result)
+        Ok(outcome)
     }
 
     /// Execute `/refine`: plan, re-read, apply, and persist the continual
@@ -217,6 +223,12 @@ impl AgentSession {
     /// The underlying agent loop (steering, state, subscriptions).
     pub fn agent(&self) -> &Arc<Agent> {
         &self.agent
+    }
+
+    /// The shared persistence handle: the kernel host handlers and the
+    /// session-command executor reach the same session state as the loop.
+    pub(crate) fn session_handle(&self) -> &Arc<tokio::sync::Mutex<SessionManager>> {
+        &self.session
     }
 
     /// Submit a prompt. Session commands (compact/refine/goal/autonomous)

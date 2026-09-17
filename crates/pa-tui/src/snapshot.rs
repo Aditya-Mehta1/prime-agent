@@ -151,6 +151,9 @@ pub enum TurnUpdate {
     },
     /// `turn_end`, with the turn error string when the turn failed.
     TurnEnded { error: Option<String> },
+    /// A `custom`-role message the transcript renders (session-command
+    /// echo/result rows, or the malformed-notice fallback).
+    CustomRow(ChatEntry),
     /// `auto_retry_start`: a provider failure is being retried after
     /// `delay_ms` (TS retry loader countdown).
     AutoRetryStart {
@@ -198,6 +201,12 @@ pub fn event_to_update(event: &Value) -> Option<TurnUpdate> {
                     streaming,
                     stream_event: event.get("assistantMessageEvent").cloned(),
                 }),
+                // Custom rows arrive as a message_start + message_end pair
+                // carrying the same payload; only the start adds the row.
+                Some("custom") if event_type == Some("message_start") => {
+                    custom_row_update(&message)
+                }
+                Some("custom") => Some(TurnUpdate::StatusUpdate),
                 _ => Some(TurnUpdate::StatusUpdate),
             }
         }
@@ -267,6 +276,75 @@ pub fn event_to_update(event: &Value) -> Option<TurnUpdate> {
     }
 }
 
+/// Decode one `custom`-role wire message into its transcript update: the
+/// session-command echo and result rows render as slash rows; a custom type
+/// matching either shape with an invalid payload renders the malformed
+/// notice; everything else (and non-display rows) renders nothing.
+fn custom_row_update(message: &Value) -> Option<TurnUpdate> {
+    let entries = custom_message_entries(message);
+    match entries.first() {
+        Some(entry) => Some(TurnUpdate::CustomRow(entry.clone())),
+        None => Some(TurnUpdate::StatusUpdate),
+    }
+}
+
+/// The transcript entries for one `custom`-role message (`display` rows
+/// only; non-display and unrelated custom types render nothing).
+pub fn custom_message_entries(message: &Value) -> Vec<ChatEntry> {
+    use pa_types::slash_commands::{
+        SESSION_SLASH_COMMAND_CUSTOM_TYPE, SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
+    };
+    let custom_type = message
+        .get("customType")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let content = message_text(message);
+    let display = message
+        .get("display")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if !display {
+        return Vec::new();
+    }
+    let is_command_row = custom_type == SESSION_SLASH_COMMAND_CUSTOM_TYPE;
+    let is_result_row = custom_type == SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE;
+    if !is_command_row && !is_result_row {
+        return Vec::new();
+    }
+    // The content must be a text payload and (echo rows) the command details
+    // must parse (TS `isSessionSlashCommandMessage`); otherwise the row
+    // renders the malformed notice.
+    let content_is_text = match message.get("content") {
+        Some(Value::String(_)) => true,
+        Some(Value::Array(blocks)) => {
+            blocks.len() == 1
+                && matches!(
+                    blocks[0].get("type").and_then(Value::as_str),
+                    Some("text") | None
+                )
+        }
+        _ => false,
+    };
+    let command_details_valid = message
+        .get("details")
+        .and_then(|details| details.get("command"))
+        .is_some_and(|command| {
+            command.get("name").is_some()
+                && command.get("args").is_some()
+                && command.get("text").is_some()
+        });
+    if !content_is_text || (is_command_row && !command_details_valid) {
+        return vec![ChatEntry::User {
+            text: "[Malformed session command message]".to_string(),
+        }];
+    }
+    if is_command_row {
+        vec![ChatEntry::SlashCommand { text: content }]
+    } else {
+        vec![ChatEntry::SlashCommandResult { content }]
+    }
+}
+
 /// Concatenated text of a raw daemon message (string or block content).
 pub fn message_text(message: &Value) -> String {
     match message.get("content") {
@@ -307,6 +385,7 @@ pub fn message_value_to_entries(message: &Value) -> Vec<ChatEntry> {
             text: content_to_text(message.get("content").unwrap_or(&Value::Null)),
         }],
         "assistant" => assistant_value_to_entries(message),
+        "custom" => custom_message_entries(message),
         // Other roles (tool results, bookkeeping) have no rendering here:
         // live tool results arrive as tool_execution events instead.
         _ => Vec::new(),
@@ -612,6 +691,87 @@ mod tests {
         assert_eq!(
             event_to_update(&json!({ "type": "agent_end" })),
             Some(TurnUpdate::Idle)
+        );
+    }
+
+    #[test]
+    fn session_command_rows_decode_once() {
+        let echo = json!({
+            "type": "message_start",
+            "message": {
+                "role": "custom",
+                "customType": "session_slash_command",
+                "content": "/goal ship it",
+                "display": true,
+                "details": { "command": { "name": "goal", "args": "ship it", "text": "/goal ship it" } },
+            },
+        });
+        assert_eq!(
+            event_to_update(&echo),
+            Some(TurnUpdate::CustomRow(ChatEntry::SlashCommand {
+                text: "/goal ship it".to_string()
+            }))
+        );
+        // The closing frame of the pair must not duplicate the row.
+        let end = json!({
+            "type": "message_end",
+            "message": echo["message"].clone(),
+        });
+        assert_eq!(event_to_update(&end), Some(TurnUpdate::StatusUpdate));
+
+        let result = json!({
+            "type": "message_start",
+            "message": {
+                "role": "custom",
+                "customType": "session_slash_command_result",
+                "content": "Goal active: ship it",
+                "display": true,
+                "details": {
+                    "command": { "name": "goal", "args": "ship it", "text": "/goal ship it" },
+                    "success": true, "severity": "info",
+                },
+            },
+        });
+        assert_eq!(
+            event_to_update(&result),
+            Some(TurnUpdate::CustomRow(ChatEntry::SlashCommandResult {
+                content: "Goal active: ship it".to_string()
+            }))
+        );
+    }
+
+    #[test]
+    fn session_command_rows_respect_display_and_shape() {
+        // Non-display rows (the refine result) render nothing.
+        let hidden = json!({
+            "role": "custom",
+            "customType": "session_slash_command_result",
+            "content": "Refined continual harness state: 1 edit applied.",
+            "display": false,
+        });
+        assert!(custom_message_entries(&hidden).is_empty());
+        // Unknown custom types render nothing.
+        let other = json!({
+            "role": "custom",
+            "customType": "harness_digest",
+            "content": "digest",
+            "display": true,
+        });
+        assert!(custom_message_entries(&other).is_empty());
+        // A command row without command details renders the malformed
+        // notice (TS `isSessionSlashCommandMessage` fallback).
+        let malformed = json!({
+            "role": "custom",
+            "customType": "session_slash_command",
+            "content": "/goal",
+            "display": true,
+            "details": {},
+        });
+        assert_eq!(
+            custom_message_entries(&malformed),
+            vec![ChatEntry::User {
+                text: "[Malformed session command message]".to_string()
+            }]
         );
     }
 }

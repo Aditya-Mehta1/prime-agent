@@ -2019,24 +2019,39 @@ impl TurnRunner {
                             let _ = store.persist_entry("message", json!({ "message": message }));
                         }
                     }
+                    // The session-file form of a custom row (TS
+                    // `appendCustomMessageEntry`: customType/content/display/
+                    // details fields on a `custom_message` entry).
+                    EngineEvent::CustomMessage(message) => {
+                        if let Some(store) = core.store.as_mut() {
+                            let _ = store.persist_entry(
+                                "custom_message",
+                                json!({
+                                    "customType": message.get("customType").cloned().unwrap_or(Value::Null),
+                                    "content": message.get("content").cloned().unwrap_or(Value::Null),
+                                    "display": message.get("display").cloned().unwrap_or(Value::Bool(true)),
+                                    "details": message.get("details").cloned().unwrap_or(Value::Null),
+                                }),
+                            );
+                        }
+                    }
+                    EngineEvent::Compaction { entry, .. } => {
+                        if let Some(store) = core.store.as_mut() {
+                            let _ = store.persist_entry("compaction", entry.clone());
+                        }
+                    }
                     _ => {}
                 }
-                let sequence = core.last_event_sequence + 1;
-                core.last_event_sequence = sequence;
-                let meta = create_daemon_event_meta(
-                    &core.active_session_id,
-                    sequence,
-                    None,
-                    Some(&core.generation),
-                );
                 let done_result = if let EngineEvent::Done(result) = &event {
                     Some(result.clone())
                 } else {
                     None
                 };
-                let event_json = match event {
+                // One event may map to several wire frames (a custom row
+                // is a message_start + message_end pair).
+                let frames: Vec<Value> = match event {
                     EngineEvent::UserMessage(message) => {
-                        json!({ "type": "message_start", "message": message })
+                        vec![json!({ "type": "message_start", "message": message })]
                     }
                     EngineEvent::AssistantUpdate {
                         message,
@@ -2057,55 +2072,64 @@ impl TurnRunner {
                         if let Some(stream_event) = stream_event {
                             event["assistantMessageEvent"] = stream_event;
                         }
-                        event
+                        vec![event]
                     }
                     EngineEvent::AssistantMessage(message) => {
-                        json!({ "type": "message_end", "message": message })
+                        vec![json!({ "type": "message_end", "message": message })]
                     }
                     EngineEvent::ToolExecutionStart {
                         tool_call_id,
                         tool_name,
                         args,
-                    } => json!({
+                    } => vec![json!({
                         "type": "tool_execution_start",
                         "toolCallId": tool_call_id,
                         "toolName": tool_name,
                         "args": args,
-                    }),
+                    })],
                     EngineEvent::ToolExecutionUpdate {
                         tool_call_id,
                         partial_result,
-                    } => json!({
+                    } => vec![json!({
                         "type": "tool_execution_update",
                         "toolCallId": tool_call_id,
                         "partialResult": partial_result,
-                    }),
+                    })],
                     EngineEvent::ToolExecutionEnd {
                         tool_call_id,
                         result,
                         is_error,
-                    } => json!({
+                    } => vec![json!({
                         "type": "tool_execution_end",
                         "toolCallId": tool_call_id,
                         "result": result,
                         "isError": is_error,
-                    }),
-                    EngineEvent::Done(Ok(())) => json!({ "type": "turn_end" }),
+                    })],
+                    EngineEvent::CustomMessage(message) => vec![
+                        json!({ "type": "message_start", "message": message }),
+                        json!({ "type": "message_end", "message": message }),
+                    ],
+                    EngineEvent::Compaction { result, .. } => vec![json!({
+                        "type": "compaction_end",
+                        "reason": "manual",
+                        "result": result,
+                    })],
+                    EngineEvent::Done(Ok(())) => vec![json!({ "type": "turn_end" })],
                     EngineEvent::Done(Err(error)) => {
-                        json!({ "type": "turn_end", "error": error })
+                        vec![json!({ "type": "turn_end", "error": error })]
                     }
                     EngineEvent::AutoRetryStart {
                         attempt,
                         max_attempts,
                         delay_ms,
                         error_message,
-                    } => json!({
+                    } => vec![json!({
                         "type": "auto_retry_start",
                         "attempt": attempt,
                         "maxAttempts": max_attempts,
                         "delayMs": delay_ms,
                         "errorMessage": error_message,
-                    }),
+                    })],
                     EngineEvent::AutoRetryEnd {
                         success,
                         attempt,
@@ -2119,7 +2143,7 @@ impl TurnRunner {
                         if let Some(final_error) = final_error {
                             event["finalError"] = json!(final_error);
                         }
-                        event
+                        vec![event]
                     }
                 };
                 // Take the sender only when the event is `Done`: the
@@ -2139,18 +2163,33 @@ impl TurnRunner {
                         .append(true)
                         .open(&path)
                     {
-                        let _ = writeln!(file, "{}", event_json);
+                        for frame in &frames {
+                            let _ = writeln!(file, "{}", frame);
+                        }
                     }
                 }
-                let outbound = DaemonOutbound::SessionEvent {
-                    active_session_id: core.active_session_id.clone(),
-                    event: event_json,
-                    meta: Some(meta),
-                    rest: Default::default(),
-                };
+                let mut payloads = Vec::new();
+                for event_json in frames {
+                    let sequence = core.last_event_sequence + 1;
+                    core.last_event_sequence = sequence;
+                    let meta = create_daemon_event_meta(
+                        &core.active_session_id,
+                        sequence,
+                        None,
+                        Some(&core.generation),
+                    );
+                    let outbound = DaemonOutbound::SessionEvent {
+                        active_session_id: core.active_session_id.clone(),
+                        event: event_json,
+                        meta: Some(meta),
+                        rest: Default::default(),
+                    };
+                    payloads.push(serde_json::to_vec(&outbound).unwrap_or_default());
+                }
                 drop(core);
-                let payload = serde_json::to_vec(&outbound).unwrap_or_default();
-                let _ = events.send(Arc::new(OutboundFrame::session_event(payload)));
+                for payload in payloads {
+                    let _ = events.send(Arc::new(OutboundFrame::session_event(payload)));
+                }
                 true
             };
             let aborted_probe = {

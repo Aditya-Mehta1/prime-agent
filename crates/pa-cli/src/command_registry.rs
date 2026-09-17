@@ -398,42 +398,11 @@ pub fn is_help_command_request(path: &[&str]) -> bool {
     find_command_suggestion(path[path.len() - 1], &candidates).is_some()
 }
 
-/// Suggest the closest candidate command name, mirroring
-/// `findSlashCommandSuggestion` in core/slash-commands.ts.
+/// Suggest the closest candidate command name. The edit-distance heuristic
+/// (`findSlashCommandSuggestion` in core/slash-commands.ts) is shared
+/// vocabulary: `pa_types::slash_commands`.
 pub fn find_command_suggestion<'a>(input: &str, candidates: &[&'a str]) -> Option<&'a str> {
-    let mut closest: Option<(&str, usize)> = None;
-    for &candidate in candidates {
-        let distance = slash_command_edit_distance(input, candidate);
-        if closest.is_none() || distance < closest.unwrap().1 {
-            closest = Some((candidate, distance));
-        }
-    }
-    let threshold = if input.len() <= 3 {
-        1
-    } else {
-        std::cmp::max(2, input.len() / 3)
-    };
-    match closest {
-        Some((candidate, distance)) if distance <= threshold => Some(candidate),
-        _ => None,
-    }
-}
-
-/// Levenshtein edit distance (`slashCommandEditDistance`).
-fn slash_command_edit_distance(left: &str, right: &str) -> usize {
-    let left: Vec<char> = left.chars().collect();
-    let right: Vec<char> = right.chars().collect();
-    let mut previous: Vec<usize> = (0..=right.len()).collect();
-    let mut current = vec![0usize; right.len() + 1];
-    for i in 1..=left.len() {
-        current[0] = i;
-        for j in 1..=right.len() {
-            let substitution = previous[j - 1] + usize::from(left[i - 1] != right[j - 1]);
-            current[j] = (previous[j] + 1).min(current[j - 1] + 1).min(substitution);
-        }
-        std::mem::swap(&mut previous, &mut current);
-    }
-    previous[right.len()]
+    pa_types::slash_commands::find_slash_command_suggestion(input, candidates)
 }
 
 fn pad_end(value: &str, width: usize) -> String {

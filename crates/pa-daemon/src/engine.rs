@@ -63,6 +63,14 @@ pub enum EngineEvent {
         result: Value,
         is_error: bool,
     },
+    /// A durable custom message (wire `role: "custom"`): recorded into the
+    /// session store and shown to attached clients. Emitted as a
+    /// `message_start` + `message_end` pair, matching the TS session's
+    /// `_emit` for custom rows.
+    CustomMessage(Value),
+    /// A compaction ran: `entry` is the `compaction` record to persist,
+    /// `result` the client-facing compaction result (TS `compaction_end`).
+    Compaction { entry: Value, result: Value },
     /// The prompt completed (successfully or not).
     Done(std::result::Result<(), String>),
     /// `auto_retry_start`: a provider failure is being retried (TS wire

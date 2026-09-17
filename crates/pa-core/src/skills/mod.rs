@@ -18,9 +18,10 @@ pub const MAX_DESCRIPTION_LENGTH: usize = 1024;
 pub use diagnostics::{ResourceCollision, ResourceDiagnostic};
 pub use discovery::load_skills_from_dir;
 pub use loader::{load_skills, LoadSkillsOptions, LoadSkillsResult};
+pub use pa_types::slash_commands::parse_slash_command;
 pub use prompt_templates::{
-    expand_prompt_template, load_prompt_templates, parse_command_args, parse_slash_command,
-    substitute_args, LoadPromptTemplatesOptions, PromptTemplate,
+    expand_prompt_template, load_prompt_templates, parse_command_args, substitute_args,
+    LoadPromptTemplatesOptions, PromptTemplate,
 };
 
 /// Source provenance for a resource (port of source-info.ts, synthetic form).

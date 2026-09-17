@@ -19,7 +19,7 @@ pub struct CompactionDetails {
 }
 
 /// The result of running a compaction.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CompactionResult {
     pub summary: String,
     pub first_kept_entry_id: String,

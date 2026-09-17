@@ -22,6 +22,21 @@ pub enum GoalStatus {
     Error,
 }
 
+impl GoalStatus {
+    /// The wire/persisted slug (`"active"`, `"budget_limited"`, ...), the
+    /// same string the TS `GoalStatus` union uses in status lines.
+    pub fn slug(self) -> &'static str {
+        match self {
+            GoalStatus::Idle => "idle",
+            GoalStatus::Active => "active",
+            GoalStatus::Paused => "paused",
+            GoalStatus::BudgetLimited => "budget_limited",
+            GoalStatus::Complete => "complete",
+            GoalStatus::Error => "error",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GoalContextKind {

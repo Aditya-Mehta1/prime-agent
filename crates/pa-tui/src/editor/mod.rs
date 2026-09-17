@@ -136,7 +136,11 @@ impl Editor {
             disable_submit: false,
             keybindings: KeybindingsManager::new(),
             terminal_rows: 24,
-            autocomplete_provider: None,
+            autocomplete_provider: Some(Box::new(
+                crate::autocomplete::CombinedAutocompleteProvider::from_registry(
+                    std::env::current_dir().unwrap_or_default(),
+                ),
+            )),
             autocomplete: None,
             events: Vec::new(),
         }

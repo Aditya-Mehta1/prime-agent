@@ -382,9 +382,22 @@ Categories: visual/behavior/protocol/timing.
   Differential evidence: `runs/20260917T041145Z/extras/b8-agent-status/`.
   Historical evidence: `runs/20260916T210320Z/f3_tool-session-shapes.json`,
   `f8_resume-session-shapes.json`.
-- B-9 (visual, f4): TS `/` opens the slash-command menu; Rust `/` types into
-  the composer. Evidence:
-  `runs/20260916T210320Z/rust/f4_commands/01-slash-menu.txt`.
+- B-9 (visual, f4): FIXED. `/` opens the slash-command menu, driven by the
+  shared pa-types registry (fuzzy filter, argument-hint column, directional
+  scroll info, selected description, popup background above the editor).
+  Frame-diff vs the TS product at 120x36 (2026-09-17): same row structure;
+  remaining deltas are the ambient skill/template commands the TS daemon
+  lists (a separate surface), the dynamic `/effort` argument hint
+  (`[low/high/max]` from the model's thinking levels vs the static
+  registry hint), and `/fast` not being filtered by model eligibility
+  (needs model/auth knowledge pa-tui does not hold yet). Dispatch parity
+  lives in `pa-tui/src/session_ui.rs` (session commands forward to the
+  worker, client commands without UIs report unavailability, unknown
+  commands reproduce the TS `Unknown command: /x. Did you mean /y?`).
+  Verifier: `pa-cli` `tui_dispatches_slash_commands_menu_and_suggestions`
+  (headless TUI over a live faux-engine session: echo/result rows, menu,
+  suggestion, unavailable note, persisted session rows). Historical
+  evidence: `runs/20260916T210320Z/rust/f4_commands/01-slash-menu.txt`.
 - B-10 (protocol, f7): TS daemon `compact` works and returns
   `{summary, firstKeptEntryId, tokensBefore, details{readFiles, modifiedFiles}}`;
   Rust answers `{"command":"unknown"}`. Evidence:

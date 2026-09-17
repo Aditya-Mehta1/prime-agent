@@ -5,9 +5,9 @@
 
 use pa_types::session::{AgentMessage, FileEntry};
 
+use super::messages::SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE;
 use crate::autonomous::{AgentAutonomousStatus, AutonomousLimitReason};
 
-pub const SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE: &str = "session_slash_command_result";
 pub const COMPACTION_OUTCOME_CUSTOM_TYPE: &str = "compaction_outcome";
 pub const HARNESS_DIGEST_CUSTOM_TYPE: &str = "harness_digest";
 pub const REFINEMENT_OUTCOME_CUSTOM_TYPE: &str = "refinement_outcome";

@@ -119,8 +119,32 @@ pub struct HeadlessPlan {
 pub enum HeadlessStep {
     /// Submit text (the same editor submit path as a user typing it).
     Submit(String),
+    /// Type text character by character (raw editor input, so autocomplete
+    /// and editor state react exactly as to a keystroke).
+    Type(String),
     /// Hold until the current turn finishes (bounded by `timeout_ms`).
     WaitIdle { timeout_ms: u64 },
+}
+
+/// One typed string as key events: characters become `Char` presses, `\n`
+/// becomes Enter, and `\t` becomes Tab (the keys autocomplete reacts to).
+fn typed_keys(text: &str) -> Vec<KeyEvent> {
+    text.chars()
+        .map(|c| match c {
+            '\n' | '\r' => KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            '\t' => KeyEvent::new(
+                crossterm::event::KeyCode::Tab,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            other => KeyEvent::new(
+                crossterm::event::KeyCode::Char(other),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        })
+        .collect()
 }
 
 /// Result of an interactive run: session identity plus, in headless mode, the
@@ -378,6 +402,13 @@ impl Renderer {
                             HeadlessStep::Submit(text) => {
                                 if ui_tx.send(UiInput::Submit(text)).is_err() {
                                     return;
+                                }
+                            }
+                            HeadlessStep::Type(text) => {
+                                for key in typed_keys(&text) {
+                                    if ui_tx.send(UiInput::Key(key)).is_err() {
+                                        return;
+                                    }
                                 }
                             }
                             HeadlessStep::WaitIdle { timeout_ms } => {

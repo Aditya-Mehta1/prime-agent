@@ -41,6 +41,11 @@ pub enum ChatEntry {
     Status { text: String, kind: StatusKind },
     /// The user's submitted prompt.
     User { text: String },
+    /// A durable session-command echo row (`session_slash_command`):
+    /// the command as typed, laid out like a user message.
+    SlashCommand { text: String },
+    /// A durable session-command outcome row (`session_slash_command_result`).
+    SlashCommandResult { content: String },
     /// One assistant message: ordered content blocks.
     Assistant(Box<AssistantMessage>),
     /// One tool call and its execution state.

@@ -23,6 +23,7 @@ pub mod platform;
 pub mod protocol;
 pub mod registration;
 pub(crate) mod registry;
+pub(crate) mod session_commands;
 pub mod session_stats;
 pub mod session_store;
 pub mod side_question;
