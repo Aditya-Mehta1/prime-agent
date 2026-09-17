@@ -101,6 +101,12 @@ class _Word:
 
 
 _SUDO_COMMAND_WORDS = frozenset({"sudo", "doas"})
+# A word that is itself a plausible program name: letters, digits, and the
+# punctuation real executable names use. Such a word is judged by its basename
+# alone, so `sudoku` and `sudo-report` stay runnable; the letters fallback below
+# then only covers words that carry quoting or expansion (`${SUDO_CMD:-sudo}`,
+# `su do`, `\"sudo\"`), where the folded value is not a literal program name.
+_PLAIN_COMMAND_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*")
 _WRAPPERS = frozenset(
     {
         "env",
@@ -158,8 +164,10 @@ _DEPTH_VIOLATION = "the payload nests deeper than the sudo scan can follow"
 # value option and a wrongly value-taking boolean stop the walk (it then reads the
 # operand as the command, or the command as an operand), so the boolean options are
 # listed beside their tool for review:
-#   env: -i/--ignore-environment, -0/--null, -v/--debug boolean; -u, -C, -S and the
-#     *signal* options take a value.
+#   env: -i/--ignore-environment, -0/--null, -v/--debug boolean; -u, -C, -S, and
+#     the GNU -a/--argv0 (9.5+) and --env0-from (9.12+) take a value, as does BSD
+#     -P ALTPATH. The --block/--default/--ignore-signal options are
+#     optional-argument (written --opt=SIG), so they must not eat the next word.
 #   timeout: -s/--signal, -k/--kill-after take a value; --preserve-status,
 #     --foreground, -v/--verbose boolean.
 #   stdbuf: -i, -o, -e take a value; no boolean options.
@@ -167,23 +175,39 @@ _DEPTH_VIOLATION = "the payload nests deeper than the sudo scan can follow"
 #     -t/--ignore boolean.
 #   nice: -n/--adjustment takes a value; -h, -V are help/version.
 #   exec: -a NAME takes a value; -l and -c boolean.
-#   strace: -a -b -e -E -I -o -O -p -P -s -S -u -U -X (and --columns, --env,
-#     --output, --trace, --attach) take a value; -c -C -D -f -i -k -n -q -t -T -v
-#     -V -w -x -y -z boolean, including -DDD.
-#   ltrace: -A -a -d -D -e -F -l -n -o -p -s -u -w -x (and --output) take a value;
-#     -c -f -i -L -q -S -T -r -t boolean.
-#   watch: -n/--interval takes a value; -d/--differences, -b, -e, -g, -p, -t,
-#     -w, -c, -x boolean.
-#   faketime [options] timestamp program [args...]: -f and -p take a value; -m
-#     ("use multithreading") is boolean; the timestamp is positional.
+#   strace: the short -a -b -e -E -I -o -O -p -P -s -S -u -U -X and the long
+#     forms taking a required argument (src/strace.c longopts: --abbrev, --argv0,
+#     --attach, --color, --columns, --const-print-style, --decode-pids,
+#     --detach-on, --env, --fault, --inject, --interruptible, --kvm, --output,
+#     --raw, --read, --signals, --stack-trace-frame-limit, --status,
+#     --string-limit, --summary-columns, --summary-sort-by,
+#     --summary-syscall-overhead, --syscall-limit, --trace, --trace-fds,
+#     --trace-path, --user, --verbose, --write) take a value; -c -C -D -f -i -k
+#     -n -q -t -T -v -V -w -x -y -z boolean, including -DDD. strace's other long
+#     options are boolean or optional-argument.
+#   ltrace: -A -a -d -D -e -F -l -n -o -p -s -u -w -x take a value, and so do the
+#     longs with a required argument in options.c: --align --config --debug
+#     --indent --library --output --where. -c -C -f -i -L -q -S -T -r -t boolean;
+#     `-d` is not in ltrace's own optstring, so it is kept only because the walk
+#     then treats its operand as a value (fail closed) and ltrace rejects it.
+#   watch: -n/--interval, -q/--equexit (procps 4.0+), and -s/--shotsdir (4.0.6+)
+#     take a value; -d/--differences, -b, -e, -g, -p, -t, -w, -c, -x boolean.
+#   faketime [options] timestamp program [args...]: -p PID and --date-prog PROG
+#     take a value; -m (multi-threading) and -f (advanced timestamp format) are
+#     boolean, and the timestamp after the options is positional.
 #   chroot NEWROOT [COMMAND [ARG]...]: --userspec and --groups take a value;
 #     --skip-chdir boolean; NEWROOT is positional.
 #   systemd-run: -u/--unit, -p/--property, -E/--setenv, -M/--machine, -C/--capsule,
-#     --uid, --gid, --host, --working-directory, --slice, --description, --nice,
-#     --drop-in, --kill-who, --job-mode, --service-type, --wait-timeout take a
-#     value; --user, --system, --scope, --pty, -t, --pipe, -P, -q, --no-block,
-#     --collect, --remain-after-exit, --same-dir, --wait, --shell,
-#     --no-ask-password boolean.
+#     -H/--host, --uid, --gid, --host, --working-directory, --root-directory,
+#     --slice, --description, --nice, --job-mode, --service-type, --output,
+#     --json, --background, --expand-environment, --path-property,
+#     --socket-property, --timer-property, and the timer options --on-active,
+#     --on-boot, --on-startup, --on-unit-active, --on-unit-inactive, --on-calendar
+#     take a value; --user, --system, --scope, --pty, -t, --pipe, -P, -q,
+#     --no-block, --collect, --remain-after-exit, --same-dir, --wait, --shell,
+#     --no-ask-password boolean. systemd-run has no --drop-in, --kill-who, or
+#     --wait-timeout, so those entries are gone: an entry for an option the tool
+#     does not have swallows the command word, which is what a guard must not do.
 _WRAPPER_VALUE_OPTIONS: dict[str, frozenset[str]] = {
     "env": frozenset(
         {
@@ -193,9 +217,10 @@ _WRAPPER_VALUE_OPTIONS: dict[str, frozenset[str]] = {
             "--chdir",
             "-S",
             "--split-string",
-            "--block-signal",
-            "--default-signal",
-            "--ignore-signal",
+            "-a",
+            "--argv0",
+            "-P",
+            "--env0-from",
         }
     ),
     "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
@@ -222,11 +247,36 @@ _WRAPPER_VALUE_OPTIONS: dict[str, frozenset[str]] = {
             "-u",
             "-U",
             "-X",
+            "--abbrev",
+            "--argv0",
             "--attach",
+            "--color",
             "--columns",
+            "--const-print-style",
+            "--decode-pids",
+            "--detach-on",
             "--env",
+            "--fault",
+            "--inject",
+            "--interruptible",
+            "--kvm",
             "--output",
+            "--raw",
+            "--read",
+            "--signals",
+            "--stack-trace-frame-limit",
+            "--status",
+            "--string-limit",
+            "--summary-columns",
+            "--summary-sort-by",
+            "--summary-syscall-overhead",
+            "--syscall-limit",
             "--trace",
+            "--trace-fds",
+            "--trace-path",
+            "--user",
+            "--verbose",
+            "--write",
         }
     ),
     # -L, -i, -q, -f, -c, -S, -T are boolean in ltrace; -n takes a value here.
@@ -246,12 +296,18 @@ _WRAPPER_VALUE_OPTIONS: dict[str, frozenset[str]] = {
             "-u",
             "-w",
             "-x",
+            "--align",
+            "--config",
+            "--debug",
+            "--indent",
+            "--library",
             "--output",
+            "--where",
         }
     ),
-    # -d and -t are boolean in watch: only the interval takes a value.
-    "watch": frozenset({"-n", "--interval"}),
-    "faketime": frozenset({"-f", "-p"}),
+    # -d and -t are boolean in watch: only the interval and the newer -q/-s do.
+    "watch": frozenset({"-n", "--interval", "-q", "--equexit", "-s", "--shotsdir"}),
+    "faketime": frozenset({"-p", "--date-prog"}),
     "chroot": frozenset({"--userspec", "--groups"}),
     "systemd-run": frozenset(
         {
@@ -260,6 +316,7 @@ _WRAPPER_VALUE_OPTIONS: dict[str, frozenset[str]] = {
             "-E",
             "-C",
             "-M",
+            "-H",
             "--capsule",
             "--unit",
             "--property",
@@ -268,15 +325,26 @@ _WRAPPER_VALUE_OPTIONS: dict[str, frozenset[str]] = {
             "--uid",
             "--gid",
             "--host",
-            "--drop-in",
-            "--kill-who",
             "--job-mode",
             "--service-type",
-            "--wait-timeout",
             "--working-directory",
             "--slice",
             "--description",
             "--nice",
+            "--background",
+            "--expand-environment",
+            "--json",
+            "--on-active",
+            "--on-boot",
+            "--on-calendar",
+            "--on-startup",
+            "--on-unit-active",
+            "--on-unit-inactive",
+            "--output",
+            "--path-property",
+            "--root-directory",
+            "--socket-property",
+            "--timer-property",
         }
     ),
 }
@@ -322,29 +390,32 @@ _EXEC_LAUNCHER_FLAGS: dict[str, frozenset[str]] = {
 # Letters of the short flags above: a bundle such as `env -vu NAME` still starts
 # with a value-taking letter, so the walk must consume its operand there too.
 _WRAPPER_VALUE_LETTERS: dict[str, str] = {
-    "env": "uCS",
+    "env": "uCSaP",
     "timeout": "sk",
     "stdbuf": "ioe",
     "ionice": "cnpPu",
     "nice": "n",
     "exec": "a",
-    "strace": "oepsaubIPOUXS",
-    "ltrace": "oepsluaFAwnDxd",
-    "watch": "n",
-    "faketime": "fmp",
+    "strace": "oepsaubIPOUXSE",
+    "ltrace": "oepsluaFAwnDx",
+    "watch": "nqs",
+    "faketime": "p",
     "chroot": "",
-    "systemd-run": "upEMC",
+    "systemd-run": "upEMCH",
 }
 _XARGS_OPERAND_LETTERS = "InadELPsJ"
 # xargs: -I/--replace, -n/--max-args, -a/--arg-file, -d/--delimiter, -E/--eof,
 #   -L/--max-lines, -P/--max-procs, -s/--max-chars, -J/--process-slot-var take a
 #   value; -0, -p, -r, -t, -x boolean; -e and -i are BSD/GNU optional-argument
 #   forms, so the walk keeps treating their next word as the command (fail closed).
-# GNU parallel: -j/--jobs, -N, -n/--max-args, -L/--max-lines, -S/--sshlogin,
-#   -a/--arg-file, -I/--replace, --delay, --timeout, --retries, --load, --memfree,
-#   --tagstring, --rpl, --ssh, --joblog, --results, --tmpdir, --colsep,
-#   --arg-file take a value; -k/--keep-order, --eta, --bar, --dry-run,
-#   --line-buffer boolean.
+# GNU parallel, from the GetOptions specs in src/parallel: -a/--arg-file,
+#   -C/--colsep, -d/--delimiter, -D/--debug, -E, -I, -J/--profile, -L,
+#   -N/--max-replace-args, -P/--max-procs, -S/--sshlogin, -j/--jobs,
+#   -n/--max-args, -s/--max-chars, and the long options in the table take a
+#   value; -k/--keep-order, --eta, --bar, --dry-run, --line-buffer boolean. The
+#   optional-argument specs -i/--replace, -l/--max-lines, and -e/--eof are
+#   deliberately absent: their operand is optional, so the next word is the
+#   command and stays judged. There is no bare --ssh in the spec.
 _PARALLEL_OPERAND_OPTIONS = frozenset(
     {
         "-j",
@@ -354,14 +425,21 @@ _PARALLEL_OPERAND_OPTIONS = frozenset(
         "-S",
         "-a",
         "-I",
+        "-C",
+        "-d",
+        "-D",
+        "-E",
+        "-J",
+        "-P",
+        "-s",
         "--jobs",
         "--max-args",
-        "--max-lines",
+        "--max-replace-args",
         "--sshlogin",
-        "--ssh",
         "--joblog",
         "--results",
         "--tmpdir",
+        "--tempdir",
         "--colsep",
         "--arg-file",
         "--delay",
@@ -371,6 +449,51 @@ _PARALLEL_OPERAND_OPTIONS = frozenset(
         "--memfree",
         "--tagstring",
         "--rpl",
+        "--debug",
+        "--delimiter",
+        "--profile",
+        "--max-procs",
+        "--max-chars",
+        "--halt",
+        "--halt-on-error",
+        "--nice",
+        "--env",
+        "--workdir",
+        "--work-dir",
+        "--wd",
+        "--sshdelay",
+        "--sshloginfile",
+        "--slf",
+        "--recstart",
+        "--recend",
+        "--block",
+        "--block-size",
+        "--basefile",
+        "--bf",
+        "--arg-sep",
+        "--arg-file-sep",
+        "--header",
+        "--minversion",
+        "--min-version",
+        "--return",
+        "--trc",
+        "--trim",
+        "--compress-program",
+        "--decompress-program",
+        "--semaphorename",
+        "--id",
+        "--semaphoretimeout",
+        "--seqreplace",
+        "--slotreplace",
+        "--dirnamereplace",
+        "--dnr",
+        "--basenamereplace",
+        "--bnr",
+        "--basenameextensionreplace",
+        "--bner",
+        "--extensionreplace",
+        "--er",
+        "--parens",
     }
 )
 # Launchers that run their first non-flag word as a command, like xargs.
@@ -1031,17 +1154,29 @@ def _mentions_sudo(words: list[_Word]) -> bool:
 
 
 def _word_names_sudo(value: str) -> bool:
-    """True when a command word can name sudo/doas: braces, globs, and letters."""
+    """True when a command word can name sudo/doas: braces, globs, and letters.
+
+    Every test reads the basename, because that is the name the shell resolves:
+    a directory prefix does not change which program runs, so `/usr/bin/sudoku`
+    is the sudoku binary while `/usr/bin/sudo` is the tool. A plain program name
+    is judged by that basename alone, so `sudoku`, `sudo-report`, and `s-u-d-o`
+    run, while globs (`/usr/bin/su*`) and every word that carries quoting or
+    expansion (`${SUDO_CMD:-sudo}`, `su do`) still fall back to their surviving
+    letters and fail closed.
+    """
     alternatives = _brace_alternatives(value)
     if alternatives is None:
         return True  # too many alternatives to enumerate: fail closed
     for candidate in alternatives:
-        if os.path.basename(candidate) in _SUDO_COMMAND_WORDS:
+        name = os.path.basename(candidate)
+        # Folded case: on a case-insensitive filesystem (`SUDO`, `Sudo`) the
+        # name is the same program, so the basename test cannot be exact.
+        if name.lower() in _SUDO_COMMAND_WORDS:
             return True
-        if _matches_sudo_pattern(candidate):
+        if _matches_sudo_pattern(name):
             return True
         letters = "".join(char for char in candidate if char.isalpha()).lower()
-        if "sudo" in letters or "doas" in letters:
+        if ("sudo" in letters or "doas" in letters) and not _PLAIN_COMMAND_NAME.fullmatch(name):
             return True
     return False
 
