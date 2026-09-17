@@ -234,6 +234,15 @@ SUDO_MATCHING_COMMANDS = [
     "ltrace -D mask sudo id",
     "ltrace -x pat sudo id",
     "ltrace -d 2 sudo id",
+    "faketime -m now sudo id",
+    "faketime -m now -f x sudo id",
+    "systemd-run --uid=0 sudo id",
+    "systemd-run --gid=0 sudo id",
+    "systemd-run --host=h sudo id",
+    "strace -E VAR=1 sudo id",
+    "strace --env=VAR=1 sudo id",
+    "parallel --delay 1 sudo id",
+    "parallel --timeout 5 sudo id",
     "sudo",
 ]
 
@@ -297,6 +306,9 @@ SUDO_NON_MATCHING_COMMANDS = [
     "parallel -j 2 echo hi",
     "chroot / ls",
     "faketime now ls",
+    "systemd-run --uid=0 ls",
+    "strace -E VAR=1 ls",
+    "parallel --delay 1 echo hi",
     "systemd-run -u x ls",
     "watch -d ls",
     "watch -t ls",
@@ -367,6 +379,10 @@ class BraceFloodTest(unittest.TestCase):
         self.assertIsNone(
             bash_module._sudo_violation("echo {0," + ",".join(map(str, range(20000))) + "}")
         )
+        # A range CPython cannot even convert must not raise: it fails closed.
+        huge = "{" + "1" * 5000 + "..2}"
+        self.assertIsNotNone(bash_module._sudo_violation(huge))
+        self.assertIsNone(bash_module._sudo_violation("echo " + huge))
         self.assertLess(time.monotonic() - started, 5.0)
 
     def test_brace_flood_operand_word_is_still_judged(self):

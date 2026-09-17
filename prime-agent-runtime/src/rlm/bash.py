@@ -154,6 +154,36 @@ _MAX_PAYLOAD_DEPTH = 6
 _DEPTH_VIOLATION = "the payload nests deeper than the sudo scan can follow"
 # Value-taking options of a wrapper: their operand is a value or (for env
 # -S/--split-string) a whole command line, never the command the wrapper runs.
+# Value-taking options per wrapper, from each tool's usage synopsis. Both a missing
+# value option and a wrongly value-taking boolean stop the walk (it then reads the
+# operand as the command, or the command as an operand), so the boolean options are
+# listed beside their tool for review:
+#   env: -i/--ignore-environment, -0/--null, -v/--debug boolean; -u, -C, -S and the
+#     *signal* options take a value.
+#   timeout: -s/--signal, -k/--kill-after take a value; --preserve-status,
+#     --foreground, -v/--verbose boolean.
+#   stdbuf: -i, -o, -e take a value; no boolean options.
+#   ionice: -c/--class, -n/--classdata, -p/--pid, -P/--pgid, -u/--uid take a value;
+#     -t/--ignore boolean.
+#   nice: -n/--adjustment takes a value; -h, -V are help/version.
+#   exec: -a NAME takes a value; -l and -c boolean.
+#   strace: -a -b -e -E -I -o -O -p -P -s -S -u -U -X (and --columns, --env,
+#     --output, --trace, --attach) take a value; -c -C -D -f -i -k -n -q -t -T -v
+#     -V -w -x -y -z boolean, including -DDD.
+#   ltrace: -A -a -d -D -e -F -l -n -o -p -s -u -w -x (and --output) take a value;
+#     -c -f -i -L -q -S -T -r -t boolean.
+#   watch: -n/--interval takes a value; -d/--differences, -b, -e, -g, -p, -t,
+#     -w, -c, -x boolean.
+#   faketime [options] timestamp program [args...]: -f and -p take a value; -m
+#     ("use multithreading") is boolean; the timestamp is positional.
+#   chroot NEWROOT [COMMAND [ARG]...]: --userspec and --groups take a value;
+#     --skip-chdir boolean; NEWROOT is positional.
+#   systemd-run: -u/--unit, -p/--property, -E/--setenv, -M/--machine, -C/--capsule,
+#     --uid, --gid, --host, --working-directory, --slice, --description, --nice,
+#     --drop-in, --kill-who, --job-mode, --service-type, --wait-timeout take a
+#     value; --user, --system, --scope, --pty, -t, --pipe, -P, -q, --no-block,
+#     --collect, --remain-after-exit, --same-dir, --wait, --shell,
+#     --no-ask-password boolean.
 _WRAPPER_VALUE_OPTIONS: dict[str, frozenset[str]] = {
     "env": frozenset(
         {
@@ -181,6 +211,7 @@ _WRAPPER_VALUE_OPTIONS: dict[str, frozenset[str]] = {
             "-a",
             "-b",
             "-e",
+            "-E",
             "-I",
             "-o",
             "-O",
@@ -193,6 +224,7 @@ _WRAPPER_VALUE_OPTIONS: dict[str, frozenset[str]] = {
             "-X",
             "--attach",
             "--columns",
+            "--env",
             "--output",
             "--trace",
         }
@@ -219,7 +251,7 @@ _WRAPPER_VALUE_OPTIONS: dict[str, frozenset[str]] = {
     ),
     # -d and -t are boolean in watch: only the interval takes a value.
     "watch": frozenset({"-n", "--interval"}),
-    "faketime": frozenset({"-f", "-m", "-p"}),
+    "faketime": frozenset({"-f", "-p"}),
     "chroot": frozenset({"--userspec", "--groups"}),
     "systemd-run": frozenset(
         {
@@ -233,6 +265,14 @@ _WRAPPER_VALUE_OPTIONS: dict[str, frozenset[str]] = {
             "--property",
             "--setenv",
             "--machine",
+            "--uid",
+            "--gid",
+            "--host",
+            "--drop-in",
+            "--kill-who",
+            "--job-mode",
+            "--service-type",
+            "--wait-timeout",
             "--working-directory",
             "--slice",
             "--description",
@@ -265,6 +305,12 @@ _XARGS_OPERAND_OPTIONS = frozenset(
         "--process-slot-var",
     }
 )
+# find [path...] -exec|-execdir|-ok|-okdir COMMAND ;|+ : the command follows the flag.
+# fd [OPTIONS] [pattern] [path]...: -x/--exec and -X/--exec-batch take the command
+#   line, and fd treats everything after them as that command line (a flag there is
+#   the command name), so fd's own value options (-e/--extension, -E/--exclude,
+#   -d/--max-depth, -t/--type, -S/--size, -j/--threads, -c/--color, --min-depth,
+#   --max-results, --owner, ...) are deliberately not consulted after the flag.
 _FIND_EXEC_FLAGS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
 _FD_EXEC_FLAGS = frozenset({"-x", "--exec", "-X", "--exec-batch"})
 # Launchers whose `exec` flag hands the following words to a command.
@@ -290,6 +336,15 @@ _WRAPPER_VALUE_LETTERS: dict[str, str] = {
     "systemd-run": "upEMC",
 }
 _XARGS_OPERAND_LETTERS = "InadELPsJ"
+# xargs: -I/--replace, -n/--max-args, -a/--arg-file, -d/--delimiter, -E/--eof,
+#   -L/--max-lines, -P/--max-procs, -s/--max-chars, -J/--process-slot-var take a
+#   value; -0, -p, -r, -t, -x boolean; -e and -i are BSD/GNU optional-argument
+#   forms, so the walk keeps treating their next word as the command (fail closed).
+# GNU parallel: -j/--jobs, -N, -n/--max-args, -L/--max-lines, -S/--sshlogin,
+#   -a/--arg-file, -I/--replace, --delay, --timeout, --retries, --load, --memfree,
+#   --tagstring, --rpl, --ssh, --joblog, --results, --tmpdir, --colsep,
+#   --arg-file take a value; -k/--keep-order, --eta, --bar, --dry-run,
+#   --line-buffer boolean.
 _PARALLEL_OPERAND_OPTIONS = frozenset(
     {
         "-j",
@@ -309,6 +364,13 @@ _PARALLEL_OPERAND_OPTIONS = frozenset(
         "--tmpdir",
         "--colsep",
         "--arg-file",
+        "--delay",
+        "--timeout",
+        "--retries",
+        "--load",
+        "--memfree",
+        "--tagstring",
+        "--rpl",
     }
 )
 # Launchers that run their first non-flag word as a command, like xargs.
@@ -1031,16 +1093,23 @@ def _sequence_elements(body: str) -> tuple[int, list[str] | None] | None:
         return None
     start_text, end_text = parts[0], parts[1]
     step_text = parts[2].strip() if len(parts) == 3 else "1"
-    if not _is_integer(step_text) or int(step_text) == 0:
+    if not _is_integer(step_text):
         return None
-    step = abs(int(step_text))
     numeric = _is_integer(start_text) and _is_integer(end_text)
-    if numeric:
-        low, high = int(start_text), int(end_text)
-    elif len(start_text) == 1 and len(end_text) == 1:
-        low, high = ord(start_text), ord(end_text)
-    else:
+    if not numeric and not (len(start_text) == 1 and len(end_text) == 1):
         return None
+    try:
+        step = abs(int(step_text))
+        if step == 0:
+            return None  # `{1..9..0}` does not expand in bash
+        if numeric:
+            low, high = int(start_text), int(end_text)
+        else:
+            low, high = ord(start_text), ord(end_text)
+    except ValueError:
+        # A range too large for CPython's integer conversion limit: fail closed the
+        # same way an over-cap range does, and never raise out of the guard.
+        return 0, None
     if low > high:
         step = -step
     count = (high - low) // step + 1
