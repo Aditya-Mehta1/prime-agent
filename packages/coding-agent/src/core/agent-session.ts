@@ -13190,8 +13190,12 @@ export class AgentSession {
 	private _completeQuotaParkResume(): void {
 		const park = this._quotaPark;
 		if (!park) return;
+		// A wake the daemon already delivered owns the resume even when the timer
+		// never observed it: the job's marker prompt is the continuation, so this
+		// success must not queue a second one.
+		const delivered = park.jobId !== undefined && this._resolveQuotaResumeJob(park.jobId) === "delivered";
 		this._cancelQuotaParkWake(park);
-		const wasWaking = park.waking === true;
+		const wasWaking = park.waking === true || delivered;
 		const restoredModel = this._restorePrimaryModelAfterBackup();
 		this._quotaPark = undefined;
 		this.sessionManager.appendCustomEntry(QUOTA_RESUME_CUSTOM_ENTRY_TYPE, {
