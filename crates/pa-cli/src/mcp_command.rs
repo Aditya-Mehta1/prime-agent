@@ -8,6 +8,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::get_agent_dir;
+use pa_core::auth::AuthStorageBackend;
+use pa_core::settings::SettingsStorage;
 
 /// Built-in MCP integrations that reserve their server name
 /// (`BUILTIN_MCP_CATALOG` in packages/ai/src/mcp/catalog.ts).
@@ -84,14 +86,44 @@ fn read_settings() -> serde_json::Value {
         .unwrap_or_else(|| serde_json::json!({}))
 }
 
-fn write_settings(settings: &serde_json::Value) -> Result<()> {
-    let path = settings_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating agent directory {}", parent.display()))?;
+/// Locked read/modify/write of the global settings document. The TS `mcp`
+/// command flushes through the settings manager, whose writes hold the
+/// proper-lockfile directory lock on `settings.json` (`acquireLockSyncWithRetry`);
+/// writes here must hold the same cross-process lock so TS and Rust never
+/// race on the same document. `mutate` returns whether the document changed
+/// (an unchanged document is not rewritten); a `mutate` error leaves the
+/// file unchanged and surfaces. The storage re-invokes the mutator when a
+/// racing first writer lands mid-acquisition, so the mutator must be
+/// idempotent for the same input document.
+fn mutate_global_settings(
+    mut mutate: impl FnMut(&mut serde_json::Value) -> Result<bool>,
+) -> Result<()> {
+    let storage = pa_core::settings::FileSettingsStorage::new(
+        std::env::current_dir().context("resolving the current directory")?,
+        get_agent_dir(),
+    );
+    let mut failure: Option<anyhow::Error> = None;
+    storage
+        .with_lock(pa_core::settings::SettingsScope::Global, &mut |current| {
+            let mut settings = current
+                .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            match mutate(&mut settings).and_then(|changed| {
+                changed
+                    .then(|| serde_json::to_string_pretty(&settings).map_err(Into::into))
+                    .transpose()
+            }) {
+                Ok(next) => next,
+                Err(error) => {
+                    failure = Some(error);
+                    None
+                }
+            }
+        })
+        .context("updating settings.json")?;
+    if let Some(error) = failure {
+        return Err(error);
     }
-    let content = serde_json::to_string_pretty(settings)?;
-    std::fs::write(&path, content).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -104,58 +136,65 @@ fn get_global_mcp_servers() -> BTreeMap<String, McpServerConfig> {
 }
 
 fn set_global_mcp_server(name: &str, config: McpServerConfig) -> Result<()> {
-    let mut settings = read_settings();
-    let servers = settings
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("settings.json must contain a JSON object"))?
-        .entry("mcpServers".to_string())
-        .or_insert_with(|| serde_json::json!({}));
-    if !servers.is_object() {
-        bail!("the mcpServers setting must be a JSON object");
-    }
-    servers
-        .as_object_mut()
-        .unwrap()
-        .insert(name.to_string(), serde_json::to_value(&config)?);
-    write_settings(&settings)
+    let value = serde_json::to_value(&config)?;
+    mutate_global_settings(|settings| {
+        let servers = settings
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("settings.json must contain a JSON object"))?
+            .entry("mcpServers".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if !servers.is_object() {
+            bail!("the mcpServers setting must be a JSON object");
+        }
+        servers
+            .as_object_mut()
+            .unwrap()
+            .insert(name.to_string(), value.clone());
+        Ok(true)
+    })
 }
 
 fn remove_global_mcp_server(name: &str) -> Result<bool> {
-    let mut settings = read_settings();
-    let Some(servers) = settings
-        .get_mut("mcpServers")
-        .and_then(|v| v.as_object_mut())
-    else {
-        return Ok(false);
-    };
-    if servers.remove(name).is_none() {
-        return Ok(false);
-    }
-    write_settings(&settings)?;
-    Ok(true)
+    let mut removed = false;
+    mutate_global_settings(|settings| {
+        let Some(servers) = settings
+            .get_mut("mcpServers")
+            .and_then(|value| value.as_object_mut())
+        else {
+            return Ok(false);
+        };
+        removed = servers.remove(name).is_some();
+        Ok(removed)
+    })?;
+    Ok(removed)
 }
 
-/// Drop the `mcp:<name>` credential from auth.json, mirroring
-/// `AuthStorage.removeVerified`.
+/// Drop the `mcp:<name>` credential from auth.json under the auth storage
+/// lock, mirroring `AuthStorage.removeVerified`: the TS product serializes the
+/// current document and writes it back inside `withLock`, so a concurrent TS
+/// credential refresh and a Rust credential drop never race on the file.
 fn drop_server_credentials(name: &str) -> Result<()> {
     if BUILTIN_MCP_CATALOG.contains(&name) {
         return Ok(());
     }
-    let auth_path = get_agent_dir().join("auth.json");
-    let Ok(content) = std::fs::read_to_string(&auth_path) else {
-        return Ok(());
-    };
-    let mut auth: serde_json::Value = serde_json::from_str(&content)
-        .with_context(|| format!("parsing {}", auth_path.display()))?;
-    let Some(object) = auth.as_object_mut() else {
-        bail!("{} must contain a JSON object", auth_path.display());
-    };
-    if object.remove(&format!("mcp:{name}")).is_none() {
-        return Ok(());
-    }
-    let updated = serde_json::to_string_pretty(&auth)?;
-    std::fs::write(&auth_path, updated)
-        .with_context(|| format!("writing {}", auth_path.display()))?;
+    let backend = pa_core::auth::FileAuthStorageBackend::new(get_agent_dir().join("auth.json"));
+    backend
+        .with_lock(&mut |current| {
+            let mut auth: serde_json::Value =
+                serde_json::from_str(current.as_deref().unwrap_or("{}"))
+                    .context("parsing auth.json")?;
+            let Some(object) = auth.as_object_mut() else {
+                bail!("auth.json must contain a JSON object");
+            };
+            if object.remove(&format!("mcp:{name}")).is_none() {
+                return Ok(((), None));
+            }
+            Ok((
+                (),
+                Some(serde_json::to_string_pretty(&auth).context("serializing auth.json")?),
+            ))
+        })
+        .context("updating auth.json")?;
     Ok(())
 }
 

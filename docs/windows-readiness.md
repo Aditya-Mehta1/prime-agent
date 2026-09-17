@@ -18,7 +18,7 @@ Markers: **[D]** daemon-redesign-critical (fixed in this lane),
 | `pa-types::platform::transport` | `TransportListener` / `TransportStream` (async, dyn-compatible) + `BlockingTransportStream`; `bind_transport` / `connect_transport` / `connect_blocking` | AF_UNIX socket files | `Err("Windows transport (named pipes) is not yet implemented")` |
 | `pa-types::platform::process` | `process_start_id` (pid-reuse identity), `is_process_alive` | `/proc/<pid>/stat` + `/proc/<pid>/status` | `None` / `Err(...)` |
 | `pa-core::platform::process` | `Signal`, `kill_pid`, `kill_process_group_or_pid`, `pid_exists`, `set_new_process_group`, `termination_signal` | libc `kill(2)`, `process_group(0)`, `ExitStatusExt` | false-returning (unproven-kill semantics) + no-op group set; real impl = taskkill/Job objects |
-| `pa-core::platform::fs_lock` | `FileLock::acquire_exclusive_non_blocking` | `flock(LOCK_EX\|LOCK_NB)`, unlocked on Drop | `Err("Windows file locking (LockFileEx) is not yet implemented")` |
+| `pa-core::platform::lock_dir` | `LockDir::acquire` | mkdir `{file}.lock` + `utimensat` mtime bump, rmdir on Drop (proper-lockfile protocol) | `create_dir` works; mtime probe no-op until a Windows port lands |
 | `pa-core::platform::perms` | `restrict_file` (0o600), `restrict_dir` (0o700), `set_private_mode`, `file_mode`, `is_executable`, `is_readable_writable` | chmod/mode bits, `access(2)` | inherited-ACL no-ops (documented degradation), open-probe readability |
 | `pa-core::platform::shell` | `get_shell_config`, `resolve_kernel_bash_shell` | `/bin/bash` -> `which bash` -> `sh` | `Err(...)`; real impl = TS Git-Bash candidate order (never PATH) |
 | `pa-daemon::platform` (paths) | per-OS endpoint naming: `socket_dir`, `default_daemon_socket_path`, `worker_socket_path`, `socket_identity` | `<TMPDIR>/prime-agent-<uid>/*.sock`, dev/ino identity | `\\.\pipe\prime-agent-daemon`, `\\.\pipe\prime-agent-worker-<key>-<id>`, identity `None` |
@@ -52,8 +52,8 @@ No platform coupling found (loop policy only; no process/socket code).
 
 | file:line | coupling | category | disposition |
 |---|---|---|---|
-| `auth/storage.rs` (flock lock sidecar, 0o600/0o700, retry) | flock + chmod | **[D]** | fixed: `platform::fs_lock` + `platform::perms` |
-| `settings/storage.rs` (flock lock sidecar, atomic write 0o600) | flock + chmod | **[D]** | fixed: same |
+| `auth/storage.rs` (directory lock sidecar, 0o600/0o700, retry) | mkdir/utimensat + chmod | **[D]** | fixed: `platform::lock_dir` + `platform::perms` |
+| `settings/storage.rs` (directory lock sidecar, atomic write 0o600) | mkdir/utimensat + chmod | **[D]** | fixed: same |
 | `kernel/orphan_journal.rs` (`/proc/<pid>/stat` starttime, group SIGKILL, 0o600 append) | /proc + process control + chmod | **[D]** | fixed: `pa_types::platform::process::process_start_id` + `platform::process` + `platform::perms` |
 | `kernel/manager/teardown.rs` (`kill_process`, cfg split) | signals | **[D]** | fixed: `platform::process::kill_pid` |
 | `kernel/manager/requests.rs` (`Signal::as_libc`) | signals | **[D]** | fixed: enum moved to `platform::process` |
@@ -154,8 +154,8 @@ No platform coupling found (loop policy only; no process/socket code).
    path (TS precedent) or Job objects for the bash tool; spawn flags
    `CREATE_NO_WINDOW` (TS `windowsHide`) on the daemon worker and detached
    supervisor spawns.
-4. `pa-core::platform::fs_lock`: `LockFileEx` with `LOCKFILE_EXCLUSIVE_LOCK`
-   + immediate fail; keep the `.lock` sidecar layout.
+4. `pa-core::platform::lock_dir`: the mkdir/rmdir protocol is portable as-is;
+   port the `utimensat` mtime probe (`SetFileTime` on the directory).
 5. `pa-core::platform::perms`: decide the ACL story (TS: none - files inherit
    ACLs; document or add an explicit-ACL helper).
 6. `pa-core::platform::shell`: TS Git-Bash candidate order; kernel `bash()`

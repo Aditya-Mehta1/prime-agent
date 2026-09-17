@@ -29,14 +29,18 @@ pub trait SettingsStorage: Send + Sync {
     ) -> Result<()>;
 }
 
-/// File-backed storage with `.lock` sidecar files (flock), retrying briefly on
-/// contention like the TS `acquireLockSyncWithRetry` (10 x 20ms).
+/// File-backed storage with proper-lockfile directory locks (`{file}.lock`
+/// empty directory), retrying briefly on contention like the TS
+/// `acquireLockSyncWithRetry` (10 x 20ms).
 pub struct FileSettingsStorage {
     global_path: PathBuf,
     project_path: PathBuf,
 }
 
-use crate::platform::fs_lock::FileLock as LockGuard;
+use crate::platform::lock_dir::LockDir as LockGuard;
+
+/// Staleness for the sync settings lock (TS proper-lockfile default: 10s).
+const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl FileSettingsStorage {
     pub fn new(cwd: impl Into<PathBuf>, agent_dir: impl Into<PathBuf>) -> Self {
@@ -55,11 +59,10 @@ impl FileSettingsStorage {
     }
 
     fn acquire_lock(&self, path: &Path) -> Result<LockGuard> {
-        let lock_path = PathBuf::from(format!("{}.lock", path.display()));
         let max_attempts = 10;
         let mut last_error: Option<std::io::Error> = None;
         for _ in 1..=max_attempts {
-            match LockGuard::acquire_exclusive_non_blocking(&lock_path) {
+            match LockGuard::acquire(path, STALE_AFTER) {
                 Ok(guard) => return Ok(guard),
                 // Only lock contention retries; open failures fail fast.
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {

@@ -5,12 +5,12 @@
 //! same signatures later (see docs/windows-readiness.md for the plan). Call
 //! sites in the session engine never branch on `cfg` themselves.
 
-pub mod fs_lock;
+pub mod lock_dir;
 pub mod perms;
 pub mod process;
 pub mod shell;
 
-pub use fs_lock::FileLock;
+pub use lock_dir::LockDir;
 pub use perms::{
     file_mode, is_executable, is_readable_writable, restrict_dir, restrict_file, set_private_mode,
 };

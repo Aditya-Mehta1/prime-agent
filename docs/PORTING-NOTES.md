@@ -66,3 +66,24 @@ Two TS wire behaviors are deliberately out of that row's scope and still open:
 Both are wire-projection only (no request/cache-prefix effect). The battery
 filter that excludes them is annotated in `run_battery.py` and must be removed
 when the model-surface lane lands custom-message wire parity.
+
+## Lock convention: proper-lockfile directory locks (2026-09-17)
+
+TS ground truth (`proper-lockfile` 4.1.2, used by auth.json / settings.json /
+cron state): a lock is an EMPTY DIRECTORY at `<file>.lock`, mtime probed to
+"next second + 5ms", judged stale from mtime alone (10s default, 30s cron),
+reclaimed by rmdir + retry (one fresh attempt; a reappearing rival is
+ELOCKED). Release rmdirs it. A regular FILE at the lock path is fatal to the
+TS release path (ENOTDIR): pre-compat Rust flock files wedged real installs
+by making `AuthStorage.reload()` fail, silently losing auth. `pa-core
+platform::lock_dir` implements the convention; the Rust binary additionally
+heals stale or unheld legacy lock FILES (a held legacy flock reads as
+contention), which the TS binary cannot do.
+
+Deliberate divergences (candidates for the lock-audit follow-up unit):
+Rust does not refresh the held lock's mtime (TS updates every stale/2) and
+does not detect compromise (TS `onCompromised`); Rust lock holds are short
+read-modify-write cycles, so staleness takeover only sees genuinely crashed
+holders. The cron `with_state_locks` still runs its action unlocked when
+acquisition fails (pre-existing shape; now logged at warn) because the store
+API has no failure channel; TS throws there.

@@ -18,7 +18,10 @@ pub trait AuthStorageBackend: Send + Sync {
     ) -> Result<()>;
 }
 
-use crate::platform::fs_lock::FileLock as LockGuard;
+use crate::platform::lock_dir::LockDir as LockGuard;
+
+/// Staleness for the sync auth lock (TS proper-lockfile default: 10s).
+const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub struct FileAuthStorageBackend {
     auth_path: PathBuf,
@@ -59,11 +62,12 @@ impl FileAuthStorageBackend {
         Ok(())
     }
 
+    /// TS `acquireLockSyncWithRetry`: 10 attempts, 20ms apart, retrying only
+    /// contention (ELOCKED); other errors fail fast.
     fn acquire_lock(&self) -> Result<LockGuard> {
-        let lock_path = PathBuf::from(format!("{}.lock", self.auth_path.display()));
         let mut last_error: Option<std::io::Error> = None;
         for _ in 1..=10 {
-            match LockGuard::acquire_exclusive_non_blocking(&lock_path) {
+            match LockGuard::acquire(&self.auth_path, STALE_AFTER) {
                 Ok(guard) => return Ok(guard),
                 // Only lock contention retries; open failures fail fast.
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {

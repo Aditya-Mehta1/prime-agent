@@ -260,54 +260,51 @@ pub(crate) fn with_state_locks<T>(paths: &[PathBuf], action: impl FnOnce() -> T)
     let mut unique: Vec<PathBuf> = paths.to_vec();
     unique.sort();
     unique.dedup();
-    let mut releases: Vec<PathBuf> = Vec::new();
+    let mut guards: Vec<crate::platform::lock_dir::LockDir> = Vec::new();
     for path in &unique {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let lock_path = lock_path_for(path);
+        // TS `withCronJobsStateLocks`: proper-lockfile on the state file,
+        // 100 attempts x 10ms, 30s staleness takeover.
+        let stale = std::time::Duration::from_millis(LOCK_STALE_MS);
         let mut acquired = false;
+        let mut failure: Option<std::io::Error> = None;
         for _ in 0..100 {
-            match std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&lock_path)
-            {
-                Ok(_) => {
+            match crate::platform::lock_dir::LockDir::acquire(path, stale) {
+                Ok(guard) => {
+                    guards.push(guard);
                     acquired = true;
                     break;
                 }
-                Err(_) => {
-                    // Take over stale locks (holder crashed).
-                    if let Ok(metadata) = std::fs::metadata(&lock_path) {
-                        let stale = metadata
-                            .modified()
-                            .ok()
-                            .and_then(|modified| modified.elapsed().ok())
-                            .is_some_and(|age| age.as_millis() as u64 > LOCK_STALE_MS);
-                        if stale {
-                            let _ = std::fs::remove_file(&lock_path);
-                        }
-                    }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    break;
                 }
             }
         }
-        if acquired {
-            releases.push(lock_path);
+        if !acquired {
+            // TS `withCronJobsStateLocks` throws when the lock is not
+            // acquired. The action still runs (as it did before this
+            // logging) because the store API has no failure channel, but the
+            // unlocked write is never silent: a concurrent writer may be
+            // mutating the same state file.
+            tracing::warn!(
+                error = failure.as_ref().map(ToString::to_string).unwrap_or_else(
+                    || "lock still held after retries".to_string()
+                ),
+                path = %path.display(),
+                "cron jobs state lock not acquired; running unlocked"
+            );
+            break;
         }
     }
     let result = action();
-    for lock_path in releases.iter().rev() {
-        let _ = std::fs::remove_file(lock_path);
-    }
+    drop(guards);
     result
-}
-
-fn lock_path_for(path: &Path) -> PathBuf {
-    let mut lock_path = path.as_os_str().to_os_string();
-    lock_path.push(".lock");
-    PathBuf::from(lock_path)
 }
 
 pub(crate) fn read_jobs_state(path: &Path) -> CronJobsState {
