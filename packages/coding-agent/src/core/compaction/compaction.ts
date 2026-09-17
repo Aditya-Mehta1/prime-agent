@@ -772,8 +772,10 @@ export async function compact(
 
 	if (isSplitTurn && turnPrefixMessages.length > 0) {
 		// Split turns make two wire calls with different bodies; each needs its own identity.
+		// An empty history still merges the prior summary and the tail anchor, mirroring the
+		// non-split path; the placeholder is only for a history that truly has nothing to carry.
 		const [historyResult, turnPrefixResult] = await Promise.all([
-			messagesToSummarize.length > 0
+			messagesToSummarize.length > 0 || previousSummary
 				? summaryCall((callHeaders) =>
 						generateSummary(
 							messagesToSummarize,

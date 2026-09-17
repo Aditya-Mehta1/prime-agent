@@ -94,22 +94,6 @@ describe("generateSummary recency anchor", () => {
 		expect(prompt.indexOf("</previous-summary>")).toBeLessThan(prompt.indexOf("<recent-state-anchor>"));
 		expect(prompt.indexOf("</recent-state-anchor>")).toBeLessThan(prompt.indexOf("Use this EXACT format"));
 	});
-
-	it("omits the anchor block when no anchor is provided", async () => {
-		await generateSummary(
-			conversationMessages,
-			createModel(),
-			2000,
-			"test-key",
-			undefined,
-			undefined,
-			undefined,
-			"## Goal\nprevious summary",
-		);
-
-		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
-		expect(promptOfCall(0)).not.toContain("<recent-state-anchor>");
-	});
 });
 
 describe("compact recency anchor wiring", () => {
@@ -173,6 +157,17 @@ describe("compact recency anchor wiring", () => {
 		expect(result.summary).toBe(
 			"## Goal\nTest summary\n\n---\n\n**Turn Context (split turn):**\n\n## Goal\nTest summary\n\n<modified-files>\npkg/fix.ts\n</modified-files>",
 		);
+
+		// With no history to summarize, the prior summary and anchor still reach the update call.
+		completeSimpleMock.mockClear();
+		await compact(
+			createPreparation({ isSplitTurn: true, messagesToSummarize: [], turnPrefixMessages: conversationMessages }),
+			createModel(),
+			"test-key",
+		);
+		expect(completeSimpleMock).toHaveBeenCalledTimes(2);
+		expect(promptOfCall(0)).toContain("<previous-summary>\n## Goal\nship the widget");
+		expect(promptOfCall(0)).toContain("<recent-state-anchor>");
 	});
 
 	it("compacts without an anchor and without file operations", async () => {
