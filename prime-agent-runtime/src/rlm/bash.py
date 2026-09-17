@@ -1270,10 +1270,12 @@ def _matches_sudo_pattern(value: str) -> bool:
             if end < 0:
                 pattern.append("\\[")
             else:
-                body = _bracket_body(value[index + 1 : end])
-                if body.startswith("!"):
-                    body = "^" + body[1:]
-                pattern.append("[" + body + "]")
+                # Negation is the literal first character of the body, tested
+                # before classes expand: `[:graph:]` and `[:punct:]` ranges start
+                # with `!` themselves and must not be read as negation.
+                negated = value[index + 1] == "!"
+                body = _bracket_body(value[index + 2 if negated else index + 1 : end])
+                pattern.append("[" + ("^" if negated else "") + body + "]")
                 index = end
         else:
             pattern.append(re.escape(char))
