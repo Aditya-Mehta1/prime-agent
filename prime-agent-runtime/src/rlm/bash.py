@@ -2259,6 +2259,43 @@ def _fp_literal_assignments(
     return assignments
 
 
+def _fp_cd_environment(
+    words: list[_FpShellWord], limit: int
+) -> dict[str, str | None]:
+    """The HOME and CDPATH the command's own `cd` commands read.
+
+    The replay uses one snapshot for every cd in the prefix, so it is only
+    trusted for a command that is simple enough for that to be exact: HOME and
+    CDPATH assigned at most once each, both before the first cd, and with a
+    value that needs no tilde expansion (an unquoted `~` in an assignment is
+    expanded against the HOME in effect at that point, which the guard does not
+    track). Anything else marks both names unreadable, and the replay refuses
+    rather than probing a directory the shell did not enter. A name the command
+    never assigns is absent, so the caller falls back to the environment the
+    guard itself spawns with."""
+    first_cd = next(
+        (index for index in range(limit) if words[index].value == "cd"), limit
+    )
+    tracked: dict[str, str | None] = {}
+    for index, word in enumerate(words[:limit]):
+        name, separator, assigned = word.value.partition("=")
+        if not separator or name not in ("HOME", "CDPATH"):
+            continue
+        previous = words[index - 1].value if index else ""
+        if not word.starts_command and previous not in _FP_EXPORT_BUILTINS:
+            continue
+        if index >= first_cd or name in tracked or assigned.startswith("~"):
+            # A later assignment, a repeated one, or a value the shell would
+            # tilde-expand: one snapshot cannot describe every cd.
+            tracked["HOME"] = None
+            tracked["CDPATH"] = None
+            break
+        tracked[name] = (
+            None if _FP_GLOB_OR_SUBSTITUTION.search(assigned) else assigned
+        )
+    return tracked
+
+
 def _fp_config_variable_value(word: str, assignments: dict[str, str]) -> str | None:
     """The literal value this command assigns to `word`, when `word` is exactly
     one variable (`$CFG` or `${CFG}`); None otherwise."""
@@ -2829,12 +2866,15 @@ def _fp_is_guarded_push(args: _FpPushArgs) -> bool:
     """True when the invocation carries force and is not a dry run.
 
     A word the scanner cannot resolve counts as force: the shell may expand it
-    into a force flag or into a `+`-refspec before git reads argv."""
-    return (
-        args.force
-        or args.unresolvable is not None
-        or any(spec.startswith("+") for spec in args.refspecs)
-    ) and not args.dry_run
+    into a force flag or into a `+`-refspec before git reads argv, and it can
+    also expand into `--no-dry-run`, which turns a visible dry run back into a
+    real push, so an unresolvable argument is guarded even alongside
+    `--dry-run`."""
+    if args.unresolvable is not None:
+        return True
+    if args.dry_run:
+        return False
+    return args.force or any(spec.startswith("+") for spec in args.refspecs)
 
 
 def _fp_run_is_guarded(run: _FpPushRun) -> bool:
@@ -3721,16 +3761,18 @@ def _fp_push_violation(
         ),
         run.git_index,
     )
-    command_env = _fp_literal_assignments(words, env_limit)
+    command_env = _fp_cd_environment(words, env_limit)
     force = args.force or any(spec.startswith("+") for spec in args.refspecs)
-    if args.dry_run:
-        return None
     if args.unresolvable is not None:
+        # Before the dry-run check: an expansion can add `--no-dry-run`, so a
+        # visible dry run does not defang an argument the guard cannot read.
         return _fp_format_refusal(
             f'the push argument "{args.unresolvable}" cannot be verified'
             " statically: the shell may expand it into a force flag or into a"
             " refspec naming a protected branch before git reads argv"
         )
+    if args.dry_run:
+        return None  # a visible dry run changes nothing
     if not force:
         return None
     git_start = words[run.git_index].start

@@ -121,8 +121,7 @@ FORCE_PUSH_MATCHING_COMMANDS = [
     "git -c foo.bar=1 push -f origin main", "git --git-dir=.git push -f origin main",
     "echo $(git push -f origin main)",
     "git push -f origin \\\nmain", "git push 2>/dev/null -f origin main",
-    "git push -f origin main 2>/dev/null", "(git push -f origin main)",
-    "{ git push -f origin main; }",
+    "git push -f origin main 2>/dev/null", "(git push -f origin main)", "{ git push -f origin main; }",
     "git push -f origin main # ship it", "git push -f origin main && echo done",
     "echo git push -f origin main", "echo main | xargs git push -f origin",
     "git push -f origin $BRANCH", "git push -f origin HEAD",
@@ -138,8 +137,7 @@ FORCE_PUSH_MATCHING_COMMANDS = [
     # `/usr/bin/GIT` resolve to the `git` binary.
     "GIT push -f origin main", "Git.exe push -f origin main", "/usr/bin/GIT push -f origin main",
     # git rewrites argv with an inline alias body before it parses it.
-    "git -c alias.p='push -f origin main' p",
-    "git -c alias.a=p -c alias.p='push -f origin main' a",
+    "git -c alias.p='push -f origin main' p", "git -c alias.a=p -c alias.p='push -f origin main' a",
     "git -c alias.p='push -f origin main' -C repo p",
     # An alias whose name shadows a builtin is never used by git, so the
     # builtin push must still be found.
@@ -167,8 +165,7 @@ FORCE_PUSH_NON_MATCHING_COMMANDS = [
     "git push origin main", "git push", "git push origin", "git push -u origin main",
     "git push --all", "git push --tags",
     "git push origin --delete main", "git push --force-with-lease origin main",
-    "git push --force-with-lease=main:expected origin main",
-    "git push --force-if-includes origin main",
+    "git push --force-with-lease=main:expected origin main", "git push --force-if-includes origin main",
     "git push --force-with-lease --force-if-includes origin main", "git push -n origin main",
     "git push -f -n origin main", "git push -fn origin main",
     "git push -nf origin main", "git push --dry-run -f origin main", "git push -v -q origin main",
@@ -630,10 +627,7 @@ class ForcePushEnvPayloadTest(unittest.TestCase):
         # after env runs, so the scanners have to consult each other.
         _scan_flags_all(
             self,
-                ["env -S 'git push -f origin main'",
-                 "env --split-string 'git push -f origin main'",
-                 "env -iS'git push -f origin main'",
-                 "env --split-string='git push -f origin main'",
+                ["env -S 'git push -f origin main'", "env --split-string 'git push -f origin main'", "env -iS'git push -f origin main'", "env --split-string='git push -f origin main'",
                  # getopt_long resolves an unambiguous long-option prefix, so
                  # `--s`, `--split` and `--s=` carry the payload too.
                  "env --s 'git push -f origin main'", "env --s='git push -f origin main'",
@@ -901,7 +895,11 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         repo, _bare = self._make_repo("repo-unresolvable")
         os.chdir(repo)
         await self._refused_all(
-            ["git push -f origin $BRANCH", "git push -f origin 'main*'"],
+            ["git push -f origin $BRANCH", "git push -f origin 'main*'",
+             # An expansion can also add `--no-dry-run`, which turns a visible
+             # dry run back into a real push (`X='--no-dry-run -f origin main';
+             # git push --dry-run $X` really force-updated main).
+             "git push --dry-run $X", "git push -n $REMOTE origin main"],
             ("cannot be verified statically",),
         )
 
@@ -1420,8 +1418,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         for path in (repo, protected, self.test_dir / f"{protected.name}-clone"):
             with self.subTest(repo=str(path.name)):
                 self.assertEqual(
-                    self._git("config", "user.email", cwd=path).stdout.strip(),
-                    "guard@example.com",
+                    self._git("config", "user.email", cwd=path).stdout.strip(), "guard@example.com",
                 )
                 self.assertEqual(
                     self._git("config", "user.name", cwd=path).stdout.strip(), "Guard Test",
@@ -1475,6 +1472,13 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         await self._refused_all(
             [f"export HOME={diverged}; cd && git push -f origin HEAD"],
             ("HEAD names the current branch",),
+        )
+        # One snapshot cannot describe every cd, so a repeated or later
+        # assignment, or a value the shell would tilde-expand, is refused.
+        await self._refused_all(
+            [f"cd . && export HOME={diverged}; cd && git push -f origin HEAD",
+             "export HOME=~/repo; cd && git push -f origin HEAD"],
+            ("changes directory",),
         )
         self.assertIsNone(
             self._guard_verdict(f"export HOME={diverged}; git push -f origin feature")
@@ -1666,8 +1670,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
              'echo a\\\n;ssh build-box "git push -f origin main"',
              '"ssh" build-box "git push -f origin main"',
              # A parse-options abbreviation is a force signal in the text too.
-             'ssh build-box "git push --mir origin"',
-             'ssh build-box "git push --mirr origin main"']
+             'ssh build-box "git push --mir origin"', 'ssh build-box "git push --mirr origin main"']
         )
         self._verdicts_clean(
             ["c=hello; echo \"$c\"", "c=git; '$c' push -f origin main",
@@ -1684,8 +1687,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         os.chdir(repo)
         await self._refused_all(
             ["fish -c 'git push -f origin main'", "fish -c'git push -f origin main'",
-             "fish --command 'git push -f origin main'",
-             "fish --command='git push -f origin main'",
+             "fish --command 'git push -f origin main'", "fish --command='git push -f origin main'",
              "fish -C 'git push -f origin main' -c 'echo done'",
              # fish runs every payload it is given, so a benign first one must
              # not end the walk for the later `-c`.
@@ -1811,9 +1813,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
              "builtin source move.sh && git push -f origin HEAD",
              ". move.sh && git push -f origin HEAD",
              "command source move.sh && git push -f origin HEAD",
-             '"." ./move.sh && git push -f origin HEAD',
-             "'.' ./move.sh && git push -f origin HEAD",
-             '"." move.sh && git push -f origin HEAD',
+             '"." ./move.sh && git push -f origin HEAD', "'.' ./move.sh && git push -f origin HEAD", '"." move.sh && git push -f origin HEAD',
              '"." ./move.sh; git push -f origin HEAD', '"." && git push -f origin HEAD'],
             ('changes directory',)
         )
@@ -1895,8 +1895,7 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         # Benign payloads keep working, including nested chains and commands
         # git resolves itself.
         self._verdicts_clean(
-            ['sh -c "git status"', 'sh -c "sh -c \\"git status\\"" ',
-             'eval "git submodule status"']
+            ['sh -c "git status"', 'sh -c "sh -c \\"git status\\"" ', 'eval "git submodule status"']
         )
 
     async def test_at_brace_refspecs_are_not_unresolvable_words(self):
