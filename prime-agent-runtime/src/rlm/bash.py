@@ -1984,11 +1984,16 @@ _FP_DYNAMIC_COMMAND_WORD = re.compile(r"""[$`]""")
 _FP_BRACE_EXPANSION = re.compile(r"\{[^{}\s]*(?:,|\.\.)[^{}\s]*\}")
 
 
-def _fp_unquoted_text(text: str) -> str:
+def _fp_unquoted_text(text: str, *, keep_expansions: bool = False) -> str:
     """`text` with every quoted or backslash-escaped span blanked out.
 
     Only what the shell expands unquoted matters here, and inside quotes a
-    brace or a `$` is data."""
+    brace is data. `keep_expansions` keeps the content of a DOUBLE-quoted span
+    instead, because the shell still expands `$` and backticks there -- a quoted
+    command word (`"$c" push -f origin main`, `"$(printf git)" ...`) runs what
+    the expansion produces just like an unquoted one, so the dynamic-word test
+    reads this view. A backslash escape is folded in both views (an escaped
+    `$` is a literal), and single-quoted spans stay data."""
     chars = list(text)
     quote: str | None = None
     i = 0
@@ -2011,6 +2016,10 @@ def _fp_unquoted_text(text: str) -> str:
             chars[i] = " "
             chars[i + 1] = " "
             i += 1
+        elif keep_expansions:
+            if ch == '"':
+                quote = None
+                chars[i] = " "
         else:
             if ch == '"':
                 quote = None
@@ -2065,9 +2074,12 @@ _FP_UNMODELED_WRAPPERS = (
     "nice",
     "xargs",
 )
-# Shells that read a script from their stdin when given a conduit.
+# Shells that read a script from their stdin when given a conduit. A leading
+# slash is allowed (and a preceding dot is not), so a path-qualified or
+# relative interpreter (`/bin/sh`, `/bin/bash`, `./sh`) counts while a script
+# file whose name merely ends in one (`payload.sh`) stays data.
 _FP_SHELL_INTERPRETER_IN_TEXT = re.compile(
-    r"(?<![A-Za-z0-9_./-])(?:sh|bash|zsh|dash|ksh)(?:\.exe)?(?![A-Za-z0-9_.-])",
+    r"(?<![A-Za-z0-9_.-])(?:sh|bash|zsh|dash|ksh)(?:\.exe)?(?![A-Za-z0-9_.-])",
     re.IGNORECASE,
 )
 
@@ -2092,6 +2104,12 @@ def _fp_is_unmodeled_wrapper(value: str) -> bool:
 
 
 _FP_ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# Options of the wrappers the command-word walk steps over that take the NEXT
+# word as their value (`env -u NAME $c ...`, `env -C DIR $c ...`): the value is
+# not a command word either, so the walk steps over both.
+_FP_WRAPPER_VALUE_OPTIONS = frozenset(
+    {"-u", "--unset", "-C", "--chdir", "-S", "--split-string", "--argv0"}
+)
 
 
 def _fp_unresolvable_command_words(
@@ -2100,11 +2118,14 @@ def _fp_unresolvable_command_words(
     """Indices of command words the guard cannot resolve.
 
     A command word is what the shell would run: the first word of a run that is
-    neither an env-assignment prefix nor a modeled wrapper. A prefix is skipped
-    (`X=$Y git push -f origin feature` runs git, and the rest of the guard
+    neither an env-assignment prefix, a wrapper the guard models (`env`,
+    `command`, `builtin`, ...), nor an option word such a wrapper takes. A
+    prefix is skipped (`X=$Y git push -f origin feature` and `env -i git push -f
+    origin feature` both run the visible git word, and the rest of the guard
     already treats such prefixes as benign: relocation, force, and target rules
-    still apply to the visible git word), while a command word the guard cannot
-    resolve -- an expansion or an unquoted brace expansion -- is recorded."""
+    still apply to it), while a command word the guard cannot resolve -- an
+    expansion (quoted or not: a double-quoted `$c` expands), an unquoted brace
+    expansion, or an unmodeled wrapper -- is recorded."""
     found: set[int] = set()
     index = 0
     total = len(words)
@@ -2114,21 +2135,44 @@ def _fp_unresolvable_command_words(
             index += 1
             continue
         probe = index
-        while probe < total and _FP_ENV_ASSIGNMENT.match(words[probe].value):
-            if _fp_contained_in_later_word(words, probe):
-                break
-            probe += 1
+        while probe < total and not _fp_contained_in_later_word(words, probe):
+            value = words[probe].value
+            if _FP_ENV_ASSIGNMENT.match(value) or value.startswith("-"):
+                # An env assignment or a wrapper option: the command word is
+                # still ahead (`env -i $c push -f origin main` really runs $c).
+                probe += 1
+                if (
+                    value in _FP_WRAPPER_VALUE_OPTIONS
+                    and probe < total
+                    and not _fp_contained_in_later_word(words, probe)
+                ):
+                    probe += 1  # the option's value (`env -u NAME`) is not it
+                continue
+            if (
+                _fp_command_name(value) in _FP_COMMAND_WRAPPERS
+                and not _fp_is_unmodeled_wrapper(value)
+            ):
+                # A modeled wrapper runs the word that follows it, so that word
+                # is the command word the guard has to resolve. An unmodeled
+                # wrapper is the command word instead: it is recorded below and
+                # refused as a wrapper.
+                probe += 1
+                continue
+            break
         if probe >= total or (probe != index and words[probe].starts_command):
             # The prefix had no command of its own (`X=1; git ...`): the next
             # run is handled on its own.
             index += 1
             continue
         candidate = words[probe]
-        unquoted = _fp_unquoted_text(command[candidate.start : candidate.end])
+        span = command[candidate.start : candidate.end]
+        unquoted = _fp_unquoted_text(span)
         if (
-            _FP_DYNAMIC_COMMAND_WORD.search(unquoted)
+            _FP_DYNAMIC_COMMAND_WORD.search(
+                _fp_unquoted_text(span, keep_expansions=True)
+            )
             or _FP_BRACE_EXPANSION.search(unquoted)
-            or _fp_is_unmodeled_wrapper(unquoted.strip())
+            or _fp_is_unmodeled_wrapper(candidate.value.strip(_FP_WORD_EDGE_NOISE))
         ):
             found.add(probe)
         index += 1
@@ -2150,12 +2194,19 @@ def _fp_execution_conduit(words: list[_FpShellWord], text: str) -> bool:
     return any(_fp_command_name(word.value) == "xargs" for word in words)
 
 
-def _fp_family_violation(words: list[_FpShellWord], text: str) -> str | None:
+def _fp_family_violation(
+    words: list[_FpShellWord], text: str, scan_text: str | None = None
+) -> str | None:
     """Why this command belongs to the unresolvable-argv family, or None.
 
     `text` is the command as written (before redirection masking), because a
-    conduit is made of the redirection characters the masker removes."""
-    command = _fp_mask_redirections(text)
+    conduit is made of the redirection characters the masker removes.
+    `scan_text` is the text `words` were scanned from, which is the same string
+    unless a line continuation or an escape was folded away before the scan:
+    the word spans index into `scan_text`, so slicing `text` with them would
+    read the wrong word (`echo a\\<newline>; ssh build-box "git push -f origin
+    main"` slipped past the wrapper check that way)."""
+    command = _fp_mask_redirections(text if scan_text is None else scan_text)
     if _fp_execution_conduit(words, text):
         return (
             "a shell reads the command it runs from a pipe, a here-string, or a"
@@ -2477,7 +2528,7 @@ def _fp_payload_hides_force_push(payload: str, depth: int = 0) -> bool:
         _fp_mask_redirections(_fp_normalize_continuations(payload))
     )
     words = _fp_scan_words(normalized)
-    if _fp_family_violation(words, payload) is not None:
+    if _fp_family_violation(words, payload, normalized) is not None:
         return True  # the payload belongs to the unresolvable-argv family
     if _fp_unresolvable_command_word_hides_force_push(words, normalized):
         return True  # the payload's command word decides what runs
@@ -3458,7 +3509,7 @@ def _fp_guard_force_push(command: str) -> None:
     words = _fp_scan_words(normalized)
     # The conduit scan reads the text before redirection masking: `<<<` and
     # `<` are exactly what a masker removes, and they are the point here.
-    family_reason = _fp_family_violation(words, command_text)
+    family_reason = _fp_family_violation(words, command_text, normalized)
     if family_reason is not None:
         raise ForcePushRefusalError(_fp_format_refusal(family_reason))
     if _fp_unresolvable_command_word_hides_force_push(words, normalized):

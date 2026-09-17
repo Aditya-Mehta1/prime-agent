@@ -1661,6 +1661,39 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
                 message = await self._refused(command)
                 self.assertIn("wrapper", message)
 
+    async def test_refuses_the_family_spellings_review_found_open(self):
+        """Spellings of the family that force-updated a protected main before
+        this round: a path-qualified shell, a quoted expansion, a modeled
+        wrapper, and word spans shifted by a folded line continuation."""
+        repo, bare = self._make_repo("repo-family-round14", branch="main")
+        self._diverge(repo, bare, "main")
+        os.chdir(self.test_dir)
+        for command in [
+            "printf '%s\\n' 'git push -f origin main' | /bin/sh",
+            "printf '%s\\n' 'git push -f origin main' | /bin/bash",
+            "printf '%s\\n' 'git push -f origin main' | ./sh",
+            'c=git; "$c" push -f origin main',
+            '"$(printf git)" push -f origin main',
+            '"$(which git)" push -f origin main',
+            "c=git; command $c push -f origin main",
+            "c=git; command -p $c push -f origin main",
+            "c=git; env -i $c push -f origin main",
+            "c=git; env -u FOO $c push -f origin main",
+            'echo a\\\n;ssh build-box "git push -f origin main"',
+            '"ssh" build-box "git push -f origin main"',
+        ]:
+            with self.subTest(command=command):
+                await self._refused(command)
+        for command in [
+            "c=hello; echo \"$c\"",
+            "c=git; '$c' push -f origin main",
+            "env -i git push -f origin feature",
+            "command git push -f origin feature",
+            "ls /bin/sh && git status",
+        ]:
+            with self.subTest(command=command):
+                self.assertIsNone(self._guard_verdict(command))
+
     async def test_family_scoping_controls_stay_allowed(self):
         repo, _bare = self._make_repo("repo-family-ctl", branch="main")
         os.chdir(repo)
