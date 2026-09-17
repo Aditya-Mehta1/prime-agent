@@ -3101,6 +3101,11 @@ export class AgentDaemon {
 			this.log(
 				`Passivated idle child sessionId=${state.runtime.session.sessionId} name=${JSON.stringify(state.runtime.session.sessionName ?? "")} idleMinutes=${idleMinutes}`,
 			);
+			// The passivated child's durable schedules (e.g. a quota-resume wake)
+			// now live only in its artifact store. The worker stays their owner,
+			// so re-arm the scheduler instead of waiting for the next cron-store
+			// mutation to notice them.
+			this.cronScheduler.wake();
 		});
 		this.passivatingSessions.set(sessionKey, passivation);
 		try {

@@ -1108,6 +1108,34 @@ const QUOTA_RESUME_MARKER_TEXT =
 	"</provider_quota_resumed>";
 /** Node caps timers at 2^31-1 ms; longer delays overflow setTimeout and fire after ~1ms. */
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+/**
+ * Retry delay when a wake cannot deliver its resume marker (e.g. the admission
+ * queue is paused or full) or when a hydrated session finds its durable wake
+ * already dispatched: the resume re-arms instead of stranding the park.
+ */
+const QUOTA_WAKE_RETRY_MS = 30_000;
+
+/** Persisted shape of a provider_quota_park session-log entry (see _parkForQuotaReset). */
+type PersistedQuotaPark = {
+	resumeAt: string;
+	parkCount: number;
+	jobId?: string;
+	provider?: string;
+};
+
+function isPersistedQuotaPark(value: unknown): value is PersistedQuotaPark {
+	if (value === null || typeof value !== "object") {
+		return false;
+	}
+	const data = value as { resumeAt?: unknown; parkCount?: unknown; jobId?: unknown; provider?: unknown };
+	return (
+		typeof data.resumeAt === "string" &&
+		typeof data.parkCount === "number" &&
+		Number.isFinite(data.parkCount) &&
+		(data.jobId === undefined || typeof data.jobId === "string") &&
+		(data.provider === undefined || typeof data.provider === "string")
+	);
+}
 
 function noopRlmChildAbort(): void {}
 function noopRlmChildEventUnsubscribe(): void {}
@@ -1725,6 +1753,7 @@ export class AgentSession {
 			this._pendingNextTurnMessages.push(createGoalContextMessage(this._goalState, "continuation"));
 		}
 		this._restoreLateIpythonSentAgentMessages();
+		this._rehydratePersistedQuotaPark();
 		if (this._goalState.status === "active") {
 			this._goalAccountingStartedAt = Date.now();
 		}
@@ -4429,7 +4458,18 @@ export class AgentSession {
 				}
 				// A parked session that completes a model call has its quota back:
 				// clear the park (cancelling the pending wake) and resume the task.
-				if (assistantMsg.stopReason !== "error" && this._quotaPark) {
+				// An aborted turn is not evidence of recovery: keep the park and
+				// its scheduled wake. Aborting the wake probe itself cancels the
+				// resume, so drop the park like a cancelled durable wake.
+				if (this._quotaPark && assistantMsg.stopReason === "aborted") {
+					if (this._quotaPark.waking === true) {
+						this._cancelQuotaParkWake(this._quotaPark);
+						this._quotaPark = undefined;
+						this.sessionManager.appendCustomEntry(QUOTA_RESUME_CUSTOM_ENTRY_TYPE, {
+							outcome: "aborted",
+						});
+					}
+				} else if (assistantMsg.stopReason !== "error" && this._quotaPark) {
 					this._completeQuotaParkResume();
 				}
 				if (this._accountGoalUsageForAssistantMessage(assistantMsg)) {
@@ -6342,6 +6382,14 @@ export class AgentSession {
 			acceptedBeforeCompletion?: boolean;
 		},
 	): QueuedSessionAction {
+		// The resume marker admitted to a parked session IS the wake: whoever
+		// delivers it (the in-process timer, a durable-job dispatch, or a
+		// hydrated restart) owns the probe that follows. Marking here lets the
+		// probe's success read as the wake instead of an early recovery, so the
+		// interrupted task is not resumed twice.
+		if (this._quotaPark !== undefined && this._quotaPark.waking !== true && text === QUOTA_RESUME_MARKER_TEXT) {
+			this._quotaPark.waking = true;
+		}
 		const id = randomUUID();
 		const content = options.content ?? this._buildPromptContent(text, images);
 		const message =
@@ -13018,25 +13066,40 @@ export class AgentSession {
 			return;
 		}
 		if (park.jobId !== undefined && this._quotaResumeJobStore) {
+			// Read the durable job's status before cancelling it: cancel()
+			// rewrites a completed job to cancelled, which would erase the
+			// evidence that the daemon already dispatched this wake.
+			const job = this._findQuotaResumeJob(park.jobId);
+			if (job?.status === "completed") {
+				// The daemon dispatched the durable wake; its prompt drives the resume.
+				park.waking = true;
+				return;
+			}
+			if (job?.status === "cancelled") {
+				// The user cancelled the wake: honor it and drop the park.
+				this._quotaPark = undefined;
+				return;
+			}
+			// Unreadable or gone: fall through, the timer owns the resume.
 			let cancelled: AgentCronJob | undefined;
 			try {
 				cancelled = this._quotaResumeJobStore.cancel(park.jobId);
 			} catch {
 				cancelled = undefined;
 			}
-			if (cancelled === undefined) {
-				const job = this._findQuotaResumeJob(park.jobId);
-				if (job?.status === "completed") {
-					// The daemon dispatched the durable wake; its prompt drives the resume.
+			if (cancelled === undefined && job !== undefined) {
+				// The job could not be cancelled (it completed or was cancelled
+				// between the status read and now): re-read so a dispatched wake
+				// stands down instead of delivering a second marker.
+				const refreshed = this._findQuotaResumeJob(park.jobId);
+				if (refreshed?.status === "completed") {
 					park.waking = true;
 					return;
 				}
-				if (job?.status === "cancelled") {
-					// The user cancelled the wake: honor it and drop the park.
+				if (refreshed?.status === "cancelled") {
 					this._quotaPark = undefined;
 					return;
 				}
-				// Unreadable or gone: fall through, the timer owns the resume.
 			}
 		}
 		park.waking = true;
@@ -13047,9 +13110,14 @@ export class AgentSession {
 				resumeIfIdle: true,
 			});
 		} catch {
-			// A failed admission must not claim a wake: un-mark so a later quota
-			// failure can re-park with a fresh schedule.
+			// A failed admission must not claim the wake or strand the park:
+			// re-arm both wakes so the resume still happens (retry timer now,
+			// durable job again) and un-mark so a later quota failure can
+			// re-park with a fresh schedule.
 			park.waking = false;
+			const retryAtMs = Date.now() + QUOTA_WAKE_RETRY_MS;
+			park.jobId = this._createQuotaResumeJob(retryAtMs);
+			park.timer = this._scheduleQuotaResumeTimer(retryAtMs);
 		}
 	}
 
@@ -13061,6 +13129,68 @@ export class AgentSession {
 			return this._quotaResumeJobStore.list().find((job) => job.id === jobId);
 		} catch {
 			return undefined;
+		}
+	}
+
+	/**
+	 * Restore an open quota park across a restart: the session log's last
+	 * provider_quota_park entry (with no provider_quota_resume after it) names
+	 * the pending durable wake, and its job status tells whether the episode is
+	 * still open. Without this, every daemon restart would restart the park
+	 * count at zero and let a still-blocked session exceed maxParks forever.
+	 */
+	private _rehydratePersistedQuotaPark(): void {
+		const artifactDir = this.sessionManager.getSessionArtifactDir();
+		if (!this.sessionFile || !artifactDir) {
+			return;
+		}
+		const branch = this.sessionManager.getBranch();
+		for (let index = branch.length - 1; index >= 0; index -= 1) {
+			const entry = branch[index];
+			if (entry.type !== "custom") {
+				continue;
+			}
+			if (entry.customType === QUOTA_RESUME_CUSTOM_ENTRY_TYPE) {
+				// The last transition ended the episode (wake, early recovery, or
+				// a user-aborted wake probe): a fresh episode parks from zero.
+				return;
+			}
+			if (entry.customType !== QUOTA_PARK_CUSTOM_ENTRY_TYPE || !isPersistedQuotaPark(entry.data)) {
+				continue;
+			}
+			const data = entry.data;
+			const resumeAtMs = Date.parse(data.resumeAt);
+			if (data.jobId === undefined || !Number.isFinite(resumeAtMs)) {
+				return;
+			}
+			try {
+				const store = this._quotaResumeJobStore ?? AgentCronJobStore.forSessionArtifacts();
+				store.registerSessionArtifact(this.sessionId, artifactDir);
+				this._quotaResumeJobStore = store;
+				const job = this._findQuotaResumeJob(data.jobId);
+				if (job === undefined || job.status === "cancelled") {
+					// No pending wake: the episode ended (park budget abort or a
+					// user-cancelled wake).
+					return;
+				}
+				this._quotaPark = {
+					parkCount: data.parkCount,
+					resumeAtMs,
+					jobId: data.jobId,
+				};
+				if (job.status === "completed") {
+					// The durable wake was dispatched, but its marker may never have
+					// been delivered (a crash mid-dispatch): re-arm so the resume
+					// retries instead of stranding the parked session.
+					this._quotaPark.timer = this._scheduleQuotaResumeTimer(Date.now() + QUOTA_WAKE_RETRY_MS);
+				} else if (resumeAtMs > Date.now()) {
+					this._quotaPark.timer = this._scheduleQuotaResumeTimer(resumeAtMs);
+				}
+			} catch {
+				// An unreadable artifact store must not break session construction:
+				// the episode restarts at the next quota failure.
+			}
+			return;
 		}
 	}
 
