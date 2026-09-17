@@ -114,6 +114,17 @@ pub struct RlmSessionIdentity {
 
 /// The turn behavior a worker session runs.
 pub trait SessionEngine: Send + Sync {
+    /// The session's shared MCP manager, when the engine owns one (the
+    /// real agent engine does; scripted harness engines do not). The
+    /// `replace_acp_mcp_servers` command writes through it so
+    /// ACP-admitted servers reach the prompt's MCP gating — the same
+    /// store the core engine gates with.
+    fn acp_mcp_manager(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<pa_core::mcp::McpManager>>> {
+        None
+    }
+
     /// Run one prompt. `prompt_index` counts accepted prompts for this
     /// session. `aborted` is the worker's cancel probe (checked between
     /// retry waits, where no events flow to observe the flag through

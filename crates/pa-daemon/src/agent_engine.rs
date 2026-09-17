@@ -76,6 +76,10 @@ pub struct SupervisorLinkConfig {
 pub struct AgentSessionEngine {
     pub(crate) runtime: tokio::runtime::Runtime,
     pub(crate) config: AgentEngineConfig,
+    /// The session-scoped ACP MCP store (TS `session._mcpManager`): shared
+    /// with the core engine's prompt gating, so admitted servers are one
+    /// store for admission and execution.
+    pub(crate) mcp: std::sync::Arc<std::sync::Mutex<pa_core::mcp::McpManager>>,
     /// The worker-owned session file (conversation-log path), set at create.
     session_file: std::sync::Mutex<Option<std::path::PathBuf>>,
     /// The authoritative model selection. Starts from the process fallback
@@ -160,9 +164,18 @@ impl AgentSessionEngine {
             pa_core::autonomous::ShellAutonomousDriver::new(config.cwd.clone()),
         )
             as std::sync::Arc<dyn pa_core::autonomous::AutonomousDriver>);
+        // The ACP MCP store (auth storage construction is blocking; the
+        // engine construction paths are already off the hot async paths).
+        let agent_dir = config.agent_dir.clone();
+        let mcp = pa_core::mcp::McpManager::new(pa_core::mcp::McpManagerOptions {
+            auth_storage: pa_core::auth::AuthStorage::create(&agent_dir),
+            get_user_servers: Box::new(|| None),
+            begin_login: None,
+        });
         Ok(Self {
             runtime,
             config,
+            mcp: std::sync::Arc::new(std::sync::Mutex::new(mcp)),
             session_file,
             selection: std::sync::RwLock::new(selection),
             effective_thinking: std::sync::RwLock::new(None),
@@ -383,6 +396,7 @@ impl AgentSessionEngine {
         pa_core::session_engine::engine::create_session(SessionEngineConfig {
             cwd: self.config.cwd.clone(),
             agent_dir: self.config.agent_dir.clone(),
+            mcp_manager: Some(std::sync::Arc::clone(&self.mcp)),
             model: Some(agent_model),
             thinking_level: Some(map_thinking_level(self.effective_thinking())),
             stream_fn: Some(stream_fn),
@@ -415,6 +429,12 @@ fn now_millis() -> u64 {
 }
 
 impl SessionEngine for AgentSessionEngine {
+    fn acp_mcp_manager(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<pa_core::mcp::McpManager>>> {
+        Some(std::sync::Arc::clone(&self.mcp))
+    }
+
     fn model_context_window(&self) -> Option<u64> {
         self.resolve_model().ok().map(|model| model.context_window)
     }

@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
@@ -396,6 +396,10 @@ pub struct Worker {
     pub(crate) peer_grants: PeerGrantStore,
     /// Compaction runs: abort slot, events, durable entry persistence.
     compaction: crate::compaction::CompactionManager,
+    /// Session-scoped ACP MCP servers for engines without their own store
+    /// (the scripted harness); the real engine's manager serves the
+    /// product path.
+    acp_mcp: std::sync::Arc<std::sync::Mutex<pa_core::mcp::McpManager>>,
 }
 
 /// Supervisor-link coordinates for a worker's agent engine: where the
@@ -541,6 +545,15 @@ impl Worker {
             Arc::clone(&core),
             config.active_session_id.clone(),
         );
+        // The session-scoped ACP MCP manager: auth storage construction is
+        // blocking, so the builder runs off the async runtime (the same
+        // pattern as the session engine's MCP gating).
+        let agent_dir = config.agent_dir.clone();
+        let acp_mcp = pa_core::mcp::McpManager::new(pa_core::mcp::McpManagerOptions {
+            auth_storage: pa_core::auth::AuthStorage::create(&agent_dir),
+            get_user_servers: Box::new(|| None),
+            begin_login: None,
+        });
         Worker {
             config,
             registration,
@@ -554,6 +567,7 @@ impl Worker {
             side_questions,
             peer_grants: PeerGrantStore::new(),
             compaction,
+            acp_mcp: std::sync::Arc::new(std::sync::Mutex::new(acp_mcp)),
         }
     }
 
@@ -1004,6 +1018,7 @@ impl Worker {
             "shutdown" => self.handle_shutdown(),
             "rename" => self.handle_rename("rename", payload),
             "set_session_name" => self.handle_rename("set_session_name", payload),
+            "replace_acp_mcp_servers" => self.handle_replace_acp_mcp_servers(payload),
             other => response_failure(
                 None,
                 command_type,
@@ -1025,6 +1040,62 @@ impl Worker {
             ));
         }
         Ok(())
+    }
+
+    /// `replace_acp_mcp_servers` (TS daemon-mode.ts case): the session's
+    /// owner-fenced ACP MCP store. The ACP transport resolves and validates
+    /// the servers before sending them; the worker only fences ownership,
+    /// guards the busy turn, and rolls back a failed replacement.
+    fn handle_replace_acp_mcp_servers(&self, payload: &Value) -> DaemonResponse {
+        let owner_id = payload
+            .get("ownerId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if owner_id.is_empty() {
+            return response_failure(
+                None,
+                "replace_acp_mcp_servers",
+                "ACP MCP owner id is required",
+                None,
+            );
+        }
+        let servers: Vec<pa_core::mcp::AcpMcpServerConfig> = payload
+            .get("servers")
+            .cloned()
+            .map(|servers| serde_json::from_value(servers).unwrap_or_default())
+            .unwrap_or_default();
+        // The agent cannot adopt a different MCP tool list mid-turn (TS
+        // `session.isStreaming` guard).
+        if !servers.is_empty() && self.core.lock().unwrap().busy {
+            return response_failure(
+                None,
+                "replace_acp_mcp_servers",
+                "Cannot replace ACP MCP servers while the agent is running",
+                None,
+            );
+        }
+        // The real agent engine owns the session's MCP store (one store
+        // for admission and prompt gating); scripted harness engines fall
+        // back to the worker-level store.
+        let manager = self
+            .engine
+            .acp_mcp_manager()
+            .unwrap_or_else(|| std::sync::Arc::clone(&self.acp_mcp));
+        let manager = manager.lock().unwrap();
+        match manager.replace_acp_servers(&servers, owner_id) {
+            // An unchanged list (same owner, identical servers) is a no-op
+            // success, like the TS manager's unchanged short-circuit.
+            Ok(_) => response_success(None, "replace_acp_mcp_servers", None),
+            Err(error) => {
+                // Roll back any partially applied configuration with the
+                // owner-scoped clear, exactly like the TS rollback, before
+                // surfacing the failure.
+                if manager.can_release_acp_servers(owner_id) {
+                    let _ = manager.replace_acp_servers(&[], owner_id);
+                }
+                response_failure(None, "replace_acp_mcp_servers", &error.to_string(), None)
+            }
+        }
     }
 
     fn handle_create(&self, payload: &Value) -> DaemonResponse {
@@ -2276,7 +2347,6 @@ impl TurnRunner {
             source: "user".to_string(),
             agent_message_id: None,
         };
-        let abort_flag = Arc::new(AtomicBool::new(false));
         let engine = engine.clone();
         let core = Arc::clone(&self.core);
         let events = self.events.clone();
@@ -2284,11 +2354,13 @@ impl TurnRunner {
         let turn = tokio::task::spawn_blocking(move || {
             let mut done = done;
             let mut emit = |event: EngineEvent| -> bool {
-                if abort_flag.load(Ordering::SeqCst) {
+                // Sequence + persist under the core lock, then broadcast.
+                // The abort flag lives on the session core (`abort` command):
+                // a cancelled turn stops consuming its own events.
+                let mut core = core.lock().unwrap();
+                if core.abort_requested {
                     return false;
                 }
-                // Sequence + persist under the core lock, then broadcast.
-                let mut core = core.lock().unwrap();
                 match &event {
                     EngineEvent::UserMessage(message) | EngineEvent::AssistantMessage(message) => {
                         if let Some(store) = core.store.as_mut() {
@@ -2320,7 +2392,9 @@ impl TurnRunner {
                         }
                     }
                     EngineEvent::Compaction { entry, .. } => {
-                        if let Some(store) = core.store.as_mut() {
+                        // A skipped compaction carries a null entry (the
+                        // skip shape): publish the event, never persist it.
+                        if let Some(store) = core.store.as_mut().filter(|_| !entry.is_null()) {
                             let _ = store.persist_entry("compaction", entry.clone());
                         }
                     }
@@ -2488,8 +2562,8 @@ impl TurnRunner {
                 true
             };
             let aborted_probe = {
-                let abort_flag = Arc::clone(&abort_flag);
-                move || abort_flag.load(Ordering::SeqCst)
+                let core = Arc::clone(&core);
+                move || core.lock().unwrap().abort_requested
             };
             engine.run_prompt(prompt_index, request, &aborted_probe, &mut emit);
         });

@@ -339,15 +339,24 @@ pub async fn admit_session_servers(
     if previous_names.is_empty() && resolved.is_empty() {
         return Ok(());
     }
-    let mut manager = mode.mcp.lock().await;
-    if let Err(error) = manager.replace_acp_servers(&resolved, &mode.mcp_owner_id) {
-        // The daemon may have applied the configuration before its
-        // acknowledgement was lost: always attempt owner-scoped cleanup
-        // before rejecting admission.
-        if manager.can_release_acp_servers(&mode.mcp_owner_id) {
-            let _ = manager.replace_acp_servers(&[], &mode.mcp_owner_id);
-        }
-        return Err(super::internal_error_value(&error.to_string()));
+    // The manager guard must not cross an await: scope it tightly.
+    let failure = {
+        let manager = mode.mcp.lock().unwrap();
+        manager
+            .replace_acp_servers(&resolved, &mode.mcp_owner_id)
+            .err()
+            .map(|error| {
+                // The daemon may have applied the configuration before its
+                // acknowledgement was lost: always attempt owner-scoped
+                // cleanup before rejecting admission.
+                if manager.can_release_acp_servers(&mode.mcp_owner_id) {
+                    let _ = manager.replace_acp_servers(&[], &mode.mcp_owner_id);
+                }
+                error.to_string()
+            })
+    };
+    if let Some(failure) = failure {
+        return Err(super::internal_error_value(&failure));
     }
     if !resolved.is_empty() {
         *mode.mcp_server_names.lock().await = resolved
@@ -366,7 +375,7 @@ pub async fn release_session_servers(mode: &super::AcpModeState) {
     if names.is_empty() {
         return;
     }
-    let mut manager = mode.mcp.lock().await;
+    let manager = mode.mcp.lock().unwrap();
     if manager.can_release_acp_servers(&mode.mcp_owner_id) {
         let _ = manager.replace_acp_servers(&[], &mode.mcp_owner_id);
     }

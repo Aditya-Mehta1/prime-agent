@@ -57,6 +57,11 @@ pub struct SessionEngineConfig {
     pub extra_builtin_skill_overrides: Vec<String>,
     /// Daemon child-session host backing the `rlm.*` recursion surface.
     pub rlm_subagent_host: Option<Arc<dyn super::rlm_host::RlmSubagentHost>>,
+    /// An externally owned MCP manager (the daemon worker's session store):
+    /// the engine adopts it instead of building its own, so ACP-admitted
+    /// servers reach the prompt's MCP gating through the same store the
+    /// `replace_acp_mcp_servers` command writes.
+    pub mcp_manager: Option<std::sync::Arc<std::sync::Mutex<crate::mcp::McpManager>>>,
 }
 
 /// An assembled, running session.
@@ -73,8 +78,9 @@ pub struct SessionEngine {
     /// The session's MCP manager: host-side auth gating and the source the
     /// `mcp.*` kernel host handlers (config/refresh) resolve against. The
     /// daemon's `replace_acp_mcp_servers` wire command reaches it through
-    /// this field.
-    pub mcp_manager: crate::mcp::McpManager,
+    /// this field (shared handle: the daemon worker and the engine gate
+    /// prompts through one store).
+    pub mcp_manager: std::sync::Arc<std::sync::Mutex<crate::mcp::McpManager>>,
 }
 
 /// Resolve the MCP gating the resource loader and prompt need: skill
@@ -123,7 +129,7 @@ fn mcp_gating_blocking(
 
 /// Assemble a session: load resources, build the system prompt, and start the
 /// loop with persistence wiring.
-pub async fn create_session(config: SessionEngineConfig) -> anyhow::Result<SessionEngine> {
+pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<SessionEngine> {
     let cwd = config.cwd.clone();
     // Session persistence first: the conversation-log path and the resume
     // context both come from the session manager (TS `_rebuildSystemPrompt`
@@ -154,8 +160,12 @@ pub async fn create_session(config: SessionEngineConfig) -> anyhow::Result<Sessi
 
     let settings = crate::settings::SettingsManager::create(&cwd, &config.agent_dir);
     let service_tier_preference = settings.get_default_service_tier();
-    let (mcp_skill_overrides, mcp_generic_servers, mcp_manager) =
+    let (mcp_skill_overrides, mcp_generic_servers, built_manager) =
         mcp_gating(&settings, config.agent_dir.clone()).await?;
+    let mcp_manager = config
+        .mcp_manager
+        .take()
+        .unwrap_or_else(|| std::sync::Arc::new(std::sync::Mutex::new(built_manager)));
     let mut extra_builtin_skill_overrides = config.extra_builtin_skill_overrides.clone();
     extra_builtin_skill_overrides.extend(mcp_skill_overrides);
     let mut generic_mcp_servers = config.generic_mcp_servers.clone();
@@ -198,7 +208,10 @@ pub async fn create_session(config: SessionEngineConfig) -> anyhow::Result<Sessi
     }
     // The `mcp.*` host requests (config/refresh/begin_login) the kernel's
     // generic MCP registry sends while listing or calling generic servers.
-    mcp_manager.register_host_handlers(&mut handlers);
+    mcp_manager
+        .lock()
+        .unwrap()
+        .register_host_handlers(&mut handlers);
     let provisioner =
         super::runtime_wiring::kernel_provisioner(session_id, handlers, python_skills);
     let mut tools = config.tools.clone();
@@ -409,6 +422,7 @@ mod tests {
         let engine = create_session(SessionEngineConfig {
             cwd: cwd.clone(),
             agent_dir: tmp.path().join("agent"),
+            mcp_manager: None,
             model: Some(model),
             thinking_level: None,
             stream_fn: Some(provider.stream_fn()),

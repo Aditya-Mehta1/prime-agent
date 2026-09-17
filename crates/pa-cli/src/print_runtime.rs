@@ -97,6 +97,12 @@ fn run_acp_mode(options: &RunOptions) -> Result<i32, String> {
 }
 
 async fn acp_mode_main(options: &RunOptions) -> Result<i32, String> {
+    // TS `shouldUseDaemonClient` is true for the ACP mode: the daemon is
+    // the preferred transport, and the in-process engine stays the
+    // fallback when no daemon can be reached or served.
+    if let Some(exit_code) = try_daemon_attached_acp(options).await {
+        return Ok(exit_code);
+    }
     let config = &options.config;
     let engine = build_headless_engine_parts(options).await?;
     let exit_code = pa_daemon::acp::run_acp_mode(pa_daemon::acp::AcpOptions {
@@ -115,6 +121,53 @@ async fn acp_mode_main(options: &RunOptions) -> Result<i32, String> {
     .await
     .map_err(|error| format!("{error:#}"))?;
     Ok(exit_code)
+}
+
+/// Try the daemon-attached ACP transport: ensure a supervisor is
+/// listening (spawning one detached, TS daemon-launch semantics), then
+/// serve the ACP surface over a client-owned daemon session. `None` means
+/// the daemon path is unavailable and the in-process engine serves the
+/// connection instead (the failure is logged to stderr, never stdout).
+async fn try_daemon_attached_acp(options: &RunOptions) -> Option<i32> {
+    if std::env::var_os("PRIME_AGENT_FAUX_SCRIPT").is_some() {
+        return None;
+    }
+    let socket_path = options
+        .daemon_socket
+        .clone()
+        .map(|socket| crate::config::expand_tilde_path(&socket))
+        .unwrap_or_else(pa_daemon::socket::default_daemon_socket_path);
+    let cwd = options.config.cwd.clone();
+    let result = async {
+        crate::interactive_mode::ensure_daemon_running(&socket_path, &cwd)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        let config = &options.config;
+        // The daemon worker resolves model auth from its own agent dir;
+        // the composition only carries the selection flags.
+        pa_daemon::acp::daemon::run_daemon_attached_acp_mode(
+            pa_daemon::acp::daemon::DaemonAcpOptions {
+                socket_path,
+                actual_cwd: config.cwd.clone(),
+                product_version: crate::config::VERSION.to_string(),
+                provider: config.provider.clone(),
+                model: config.model.clone(),
+                api_key: None,
+            },
+        )
+        .await
+        .map_err(|error| format!("{error:#}"))
+    }
+    .await;
+    match result {
+        Ok(code) => Some(code),
+        Err(error) => {
+            eprintln!(
+                "prime-agent: daemon-attached ACP unavailable, using in-process mode: {error}"
+            );
+            None
+        }
+    }
 }
 
 fn run_print_mode(options: &RunOptions) -> Result<i32, String> {
@@ -175,6 +228,7 @@ async fn build_headless_engine_parts(options: &RunOptions) -> Result<HeadlessEng
         pa_core::session_engine::engine::SessionEngineConfig {
             cwd: config.cwd.clone(),
             agent_dir: config.agent_dir.clone(),
+            mcp_manager: None,
             model: Some(agent_model),
             thinking_level: Some(resolve_thinking_level(config, &model)),
             stream_fn: Some(stream_fn),
@@ -721,6 +775,7 @@ async fn build_faux_engine_parts(
         pa_core::session_engine::engine::SessionEngineConfig {
             cwd: config.cwd.clone(),
             agent_dir: config.agent_dir.clone(),
+            mcp_manager: None,
             model: Some(agent_model),
             thinking_level: Some(resolve_thinking_level(config, &model)),
             stream_fn: Some(stream_fn),

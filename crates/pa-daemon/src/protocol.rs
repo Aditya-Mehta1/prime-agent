@@ -61,6 +61,7 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "shutdown",
     "ack_result",
     "worker_register",
+    "replace_acp_mcp_servers",
 ];
 
 /// Parsed client command envelope.
@@ -460,6 +461,9 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         | DaemonCommand::AbortCompaction {
             active_session_id, ..
         }
+        | DaemonCommand::ReplaceAcpMcpServers {
+            active_session_id, ..
+        }
         | DaemonCommand::SetAutoCompaction {
             active_session_id, ..
         } => Some(active_session_id),
@@ -506,6 +510,7 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::Shutdown { .. } => "shutdown",
         DaemonCommand::AckResult { .. } => "ack_result",
         DaemonCommand::WorkerRegister { .. } => "worker_register",
+        DaemonCommand::ReplaceAcpMcpServers { .. } => "replace_acp_mcp_servers",
         _ => "unknown",
     }
 }

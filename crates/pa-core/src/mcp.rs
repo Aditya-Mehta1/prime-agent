@@ -210,8 +210,8 @@ pub struct McpManager {
     get_user_servers: Box<dyn Fn() -> Option<HashMap<String, McpServerConfig>> + Send + Sync>,
     begin_login: Option<BeginLoginFn>,
     integrations: HashMap<String, ResolvedIntegration>,
-    acp_servers: HashMap<String, AcpMcpServerConfig>,
-    acp_owner_id: Option<String>,
+    acp_servers: std::sync::Arc<std::sync::Mutex<HashMap<String, AcpMcpServerConfig>>>,
+    acp_owner_id: std::sync::Mutex<Option<String>>,
 }
 
 fn provider_id(server: &str) -> String {
@@ -235,8 +235,8 @@ impl McpManager {
             get_user_servers: options.get_user_servers,
             begin_login: options.begin_login,
             integrations: HashMap::new(),
-            acp_servers: HashMap::new(),
-            acp_owner_id: None,
+            acp_servers: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            acp_owner_id: std::sync::Mutex::new(None),
         };
         manager.resolve_integrations();
         manager
@@ -290,24 +290,26 @@ impl McpManager {
 
     pub fn can_release_acp_servers(&self, owner_id: &str) -> bool {
         self.acp_owner_id
+            .lock()
+            .unwrap()
             .as_deref()
             .is_none_or(|owner| owner == owner_id)
     }
 
     pub fn replace_acp_servers(
-        &mut self,
+        &self,
         servers: &[AcpMcpServerConfig],
         owner_id: &str,
     ) -> anyhow::Result<bool> {
         if owner_id.is_empty() {
             anyhow::bail!("ACP MCP owner id is required");
         }
-        if servers.is_empty() && self.acp_owner_id.as_deref() != Some(owner_id) {
+        let owner_fence = self.acp_owner_id.lock().unwrap().clone();
+        if servers.is_empty() && owner_fence.as_deref() != Some(owner_id) {
             return Ok(false);
         }
         if !servers.is_empty()
-            && self
-                .acp_owner_id
+            && owner_fence
                 .as_deref()
                 .is_some_and(|owner| owner != owner_id)
         {
@@ -320,17 +322,18 @@ impl McpManager {
             }
             next.insert(server.name().to_string(), server.clone());
         }
-        let unchanged = next.len() == self.acp_servers.len()
+        let mut acp_servers = self.acp_servers.lock().unwrap();
+        let unchanged = next.len() == acp_servers.len()
             && next.iter().all(|(name, config)| {
-                self.acp_servers.get(name).is_some_and(|current| {
+                acp_servers.get(name).is_some_and(|current| {
                     serde_json::to_value(current).ok() == serde_json::to_value(config).ok()
                 })
             });
         if unchanged {
             return Ok(false);
         }
-        self.acp_servers = next;
-        self.acp_owner_id = (!servers.is_empty()).then(|| owner_id.to_string());
+        *acp_servers = next;
+        *self.acp_owner_id.lock().unwrap() = (!servers.is_empty()).then(|| owner_id.to_string());
         Ok(true)
     }
 
@@ -404,6 +407,7 @@ impl McpManager {
     /// Register the `mcp.*` host-request handlers onto a handler map.
     pub fn register_host_handlers(&self, handlers: &mut HostRequestHandlers) {
         let auth = self.auth_storage.clone();
+        let acp_servers = self.acp_servers.clone();
         handlers.register(
             "mcp.refresh",
             host_handler(move |payload| {
@@ -429,7 +433,6 @@ impl McpManager {
             }),
         );
         let integrations = self.integrations.clone();
-        let acp_servers = self.acp_servers.clone();
         handlers.register(
             "mcp.config",
             host_handler(move |payload| {
@@ -445,7 +448,8 @@ impl McpManager {
                     if server.is_empty() {
                         return Err(anyhow::anyhow!("mcp.config requires a server"));
                     }
-                    if let Some(acp) = acp_servers.get(&server) {
+                    let acp = acp_servers.lock().unwrap().get(&server).cloned();
+                    if let Some(acp) = acp {
                         let mut config = serde_json::to_value(acp).unwrap_or(Value::Null);
                         if let Value::Object(map) = &mut config {
                             map.insert("credentialSource".to_string(), json!("acp"));
@@ -489,7 +493,7 @@ impl McpManager {
 
     /// Session-scoped servers supplied by the active ACP client.
     pub fn get_acp_servers(&self) -> Vec<AcpMcpServerConfig> {
-        self.acp_servers.values().cloned().collect()
+        self.acp_servers.lock().unwrap().values().cloned().collect()
     }
 
     /// Enabled user-declared servers available through the generic kernel API.
@@ -659,7 +663,7 @@ mod tests {
 
     #[test]
     fn acp_server_ownership() {
-        let mut manager = manager_with(None);
+        let manager = manager_with(None);
         assert!(manager.can_release_acp_servers("client-a"));
         let servers = vec![AcpMcpServerConfig::Stdio {
             name: "session-tool".to_string(),
@@ -727,7 +731,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_host_handler_resolves_user_and_acp_servers() {
-        let mut manager = manager_with(None);
+        let manager = manager_with(None);
         let mut handlers = HostRequestHandlers::default();
         manager.register_host_handlers(&mut handlers);
         let config = handlers.get("mcp.config").unwrap().clone();

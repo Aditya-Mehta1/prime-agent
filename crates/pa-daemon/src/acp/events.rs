@@ -7,7 +7,8 @@
 use serde_json::{json, Value};
 
 use super::meta::PrimeAgentSessionMeta;
-use super::types::{AcpSessionUpdate, AcpToolKind, AcpToolStatus, TextBlock, ToolCallContent};
+use super::types::{AcpSessionUpdate, TextBlock, ToolCallContent};
+pub use super::types::{AcpToolKind, AcpToolStatus};
 
 /// The model-facing Python REPL tool.
 pub const IPYTHON_TOOL_NAME: &str = "ipython";

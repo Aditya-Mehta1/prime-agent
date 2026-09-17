@@ -24,6 +24,36 @@ struct AcpChild {
 }
 
 impl AcpChild {
+    fn adopt(mut child: std::process::Child) -> AcpChild {
+        let home = tempfile::TempDir::new().unwrap();
+        let _ = &home;
+        let stdin = child.stdin.take().expect("stdin piped");
+        let stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take().expect("stderr piped");
+        let (tx, lines) = channel();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => {
+                        if tx.send(line).is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        AcpChild {
+            child,
+            stdin,
+            lines,
+            next_id: 0,
+            _home: home,
+            spawn_stderr: Some(stderr),
+        }
+    }
+
     fn spawn(args: &[&str], script: &serde_json::Value) -> AcpChild {
         let home = tempfile::TempDir::new().unwrap();
         let bin = env!("CARGO_BIN_EXE_prime-agent");
@@ -620,6 +650,195 @@ fn acp_mcp_long_names_fail_at_tool_derivation_with_internal_error() {
         response["error"]["data"]["details"],
         format!("Invalid ACP MCP server name: {long}")
     );
+}
+
+#[test]
+fn acp_daemon_attached_serves_a_client_owned_session() {
+    // The daemon-attached transport: the binary spawns a supervisor on
+    // the sandboxed socket, hosts a client-owned scripted session, and
+    // serves the same ACP surface (chunk + settle envelope + end_turn).
+    let home = tempfile::TempDir::new().unwrap();
+    let socket = home.path().join("daemon.sock");
+    let script_path = home.path().join("worker-script.json");
+    let script = json!({ "engine": "faux", "responses": ["The Thames flows through London."] });
+    std::fs::write(&script_path, script.to_string()).unwrap();
+    let bin = env!("CARGO_BIN_EXE_prime-agent");
+    let child = Command::new(bin)
+        .args([
+            "--mode",
+            "acp",
+            "--no-session",
+            "--daemon-socket",
+            socket.to_str().unwrap(),
+        ])
+        .env("HOME", home.path())
+        .env("PRIME_AGENT_AGENT_DIR", home.path().join("agent"))
+        .env("PRIME_AGENT_ACP_DAEMON_SCRIPT", &script_path)
+        .current_dir(home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary present");
+    let mut client = AcpChild::adopt(child);
+    let init = client.request("initialize", initialize_params());
+    let _ = client.wait_response(init, TIMEOUT);
+    let new = client.request("session/new", json!({ "mcpServers": [] }));
+    let (new_response, _) = client.wait_response(new, Duration::from_secs(60));
+    assert!(
+        new_response["result"]["sessionId"].is_string(),
+        "daemon-attached admission succeeds: {}",
+        new_response
+    );
+    let session_id = new_response["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let prompt = client.request(
+        "session/prompt",
+        json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "Name a river." }] }),
+    );
+    let (prompt_response, updates) = client.wait_response(prompt, Duration::from_secs(120));
+    assert_eq!(prompt_response["result"]["stopReason"], "end_turn");
+    let chunk = updates
+        .iter()
+        .find(|update| update["params"]["update"]["sessionUpdate"] == "agent_message_chunk");
+    assert!(chunk.is_some(), "the daemon stream maps to ACP chunks");
+    let close = client.request("session/close", json!({ "sessionId": session_id }));
+    let (close_response, _) = client.wait_response(close, Duration::from_secs(60));
+    assert_eq!(close_response["result"], json!({}));
+    drop(client);
+    shutdown_sandboxed_daemon(&socket);
+}
+
+#[test]
+fn acp_daemon_attached_admits_mcp_servers_through_the_wire() {
+    let home = tempfile::TempDir::new().unwrap();
+    let socket = home.path().join("daemon.sock");
+    let script_path = home.path().join("worker-script.json");
+    std::fs::write(&script_path, json!({ "responses": ["unused"] }).to_string()).unwrap();
+    let bin = env!("CARGO_BIN_EXE_prime-agent");
+    let child = Command::new(bin)
+        .args([
+            "--mode",
+            "acp",
+            "--no-session",
+            "--daemon-socket",
+            socket.to_str().unwrap(),
+        ])
+        .env("HOME", home.path())
+        .env("PRIME_AGENT_AGENT_DIR", home.path().join("agent"))
+        .env("PRIME_AGENT_ACP_DAEMON_SCRIPT", &script_path)
+        .current_dir(home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary present");
+    let mut client = AcpChild::adopt(child);
+    let init = client.request("initialize", initialize_params());
+    let _ = client.wait_response(init, TIMEOUT);
+    // The admission validation runs in the transport; the servers ride
+    // the replace_acp_mcp_servers wire command to the worker.
+    let new = client.request(
+        "session/new",
+        json!({ "mcpServers": [
+            { "name": "capture-stdio", "type": "stdio", "command": "cat", "args": [], "env": [] },
+        ]}),
+    );
+    let (new_response, _) = client.wait_response(new, Duration::from_secs(60));
+    assert!(
+        new_response["result"]["sessionId"].is_string(),
+        "{}",
+        new_response
+    );
+    // A schema-invalid entry is dropped before the wire, exactly like
+    // the in-process path.
+    let close_id = new_response["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let close = client.request("session/close", json!({ "sessionId": close_id }));
+    let (close_response, _) = client.wait_response(close, Duration::from_secs(60));
+    assert_eq!(close_response["result"], json!({}));
+    drop(client);
+    shutdown_sandboxed_daemon(&socket);
+}
+
+#[test]
+fn acp_daemon_attached_cancels_mid_turn() {
+    // A scripted worker with a slow turn: the cancel lands while the
+    // turn runs, and the prompt resolves `{stopReason: "cancelled"}`
+    // with no boundary frames — the TS daemon-attached cancel shape.
+    let home = tempfile::TempDir::new().unwrap();
+    let socket = home.path().join("daemon.sock");
+    let script_path = home.path().join("worker-script.json");
+    std::fs::write(
+        &script_path,
+        json!({ "responses": [{ "text": "a slow answer", "delayMs": 8000 }] }).to_string(),
+    )
+    .unwrap();
+    let bin = env!("CARGO_BIN_EXE_prime-agent");
+    let child = Command::new(bin)
+        .args([
+            "--mode",
+            "acp",
+            "--no-session",
+            "--daemon-socket",
+            socket.to_str().unwrap(),
+        ])
+        .env("HOME", home.path())
+        .env("PRIME_AGENT_AGENT_DIR", home.path().join("agent"))
+        .env("PRIME_AGENT_ACP_DAEMON_SCRIPT", &script_path)
+        .current_dir(home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary present");
+    let mut client = AcpChild::adopt(child);
+    let init = client.request("initialize", initialize_params());
+    let _ = client.wait_response(init, TIMEOUT);
+    let new = client.request("session/new", json!({ "mcpServers": [] }));
+    let (new_response, _) = client.wait_response(new, Duration::from_secs(60));
+    let session_id = new_response["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let prompt = client.request(
+            "session/prompt",
+            json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "a slow question" }] }),
+        );
+    // The turn is mid-delay: cancel, then wait for the prompt response.
+    client.notify("session/cancel", json!({ "sessionId": session_id }));
+    let (prompt_response, updates) = client.wait_response(prompt, Duration::from_secs(60));
+    assert_eq!(prompt_response["result"]["stopReason"], "cancelled");
+    assert!(
+        updates.is_empty(),
+        "a cancelled turn publishes no boundary frames after the cancel"
+    );
+    let close = client.request("session/close", json!({ "sessionId": session_id }));
+    let (close_response, _) = client.wait_response(close, Duration::from_secs(60));
+    assert_eq!(close_response["result"], json!({}));
+    drop(client);
+    shutdown_sandboxed_daemon(&socket);
+}
+
+/// Stop the sandboxed supervisor a test spawned (the shared-daemon
+/// product behavior leaves it running; a test owns its sandbox).
+fn shutdown_sandboxed_daemon(socket: &std::path::Path) {
+    let Ok(mut stream) = pa_types::platform::transport::connect_blocking(socket) else {
+        return;
+    };
+    use std::io::Write as _;
+    let frame = format!(
+            "{{\"type\":\"command\",\"id\":\"shutdown-test\",\"protocol\":{{\"name\":\"prime-agent.daemon\",\"version\":{}}},\"command\":{{\"type\":\"shutdown\"}}}}\n",
+            pa_types::daemon::DAEMON_PROTOCOL_VERSION
+        );
+    let _ = stream.write_all(frame.as_bytes());
+    let _ = stream.flush();
+    // The supervisor exits after the shutdown response.
+    std::thread::sleep(Duration::from_millis(300));
 }
 
 #[test]

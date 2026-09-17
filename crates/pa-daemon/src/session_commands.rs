@@ -59,6 +59,16 @@ pub(crate) fn run_session_command(
         if !emit(EngineEvent::Compaction { entry, result }) {
             return None;
         }
+    } else if command.name == "compact" && execution.error.is_none() {
+        // A skipped compaction still publishes the TS `compaction_end`
+        // event with an undefined result: the attached surfaces surface
+        // `compaction: {}` for skips (the session is too short to compact).
+        if !emit(EngineEvent::Compaction {
+            entry: serde_json::Value::Null,
+            result: serde_json::Value::Null,
+        }) {
+            return None;
+        }
     }
     Some(execution)
 }

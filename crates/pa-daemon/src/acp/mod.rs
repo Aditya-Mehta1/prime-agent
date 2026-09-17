@@ -8,6 +8,7 @@
 //! interleave exactly in publication order. The process exits when stdin
 //! closes.
 
+pub mod daemon;
 mod events;
 mod jsonrpc;
 mod mcp;
@@ -16,6 +17,7 @@ mod producer;
 mod prompt;
 mod session;
 mod types;
+mod wire_events;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -77,8 +79,8 @@ struct AcpModeState {
     autonomous_config: Option<pa_core::autonomous::AgentAutonomousConfig>,
     /// Session-scoped MCP servers live on the connection, exactly like the
     /// TS process-lifetime manager: one owner id fences them and
-    /// `session/close` releases.
-    mcp: Arc<Mutex<pa_core::mcp::McpManager>>,
+    /// `session/close` releases. Shared with the engine's prompt gating.
+    mcp: Arc<std::sync::Mutex<pa_core::mcp::McpManager>>,
     mcp_owner_id: Arc<String>,
     mcp_server_names: Arc<Mutex<Vec<String>>>,
 }
@@ -109,18 +111,6 @@ pub async fn run_acp_mode(options: AcpOptions) -> Result<i32> {
     });
 
     let state = Arc::new(Mutex::new(ConnectionState::default()));
-    let agent_dir = options.agent_dir.clone();
-    let mcp_manager = tokio::task::spawn_blocking(move || {
-        pa_core::mcp::McpManager::new(pa_core::mcp::McpManagerOptions {
-            auth_storage: pa_core::auth::AuthStorage::create(&agent_dir),
-            get_user_servers: Box::new(|| None),
-            begin_login: None,
-        })
-    })
-    .await
-    .unwrap_or_else(|_| {
-        panic!("ACP MCP manager construction panicked");
-    });
     let mode = AcpModeState {
         engine: options.engine.clone(),
         actual_cwd: Arc::new(options.actual_cwd.clone()),
@@ -129,7 +119,10 @@ pub async fn run_acp_mode(options: AcpOptions) -> Result<i32> {
         api_key: options.api_key.clone(),
         agent_dir: Arc::new(options.agent_dir.clone()),
         autonomous_config: options.autonomous_config.clone(),
-        mcp: Arc::new(Mutex::new(mcp_manager)),
+        // One MCP store with the engine's prompt gating (the core engine
+        // builds it at session assembly): admitted servers reach the model
+        // through the same manager the kernel `mcp.*` handlers resolve.
+        mcp: options.engine.mcp_manager.clone(),
         mcp_owner_id: Arc::new(uuid::Uuid::new_v4().to_string()),
         mcp_server_names: Arc::new(Mutex::new(Vec::new())),
     };
