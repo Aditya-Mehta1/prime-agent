@@ -512,9 +512,11 @@ export function buildSessionContext(
 
 	const compactionIdx = compaction ? path.findIndex((e) => e.type === "compaction" && e.id === compaction.id) : -1;
 	// True when the compaction snapshot is the newest digest in context, so every
-	// digest custom message is older and skipped entirely.
+	// digest custom message is older and skipped entirely. A blank snapshot counts as
+	// absent because the summary renderer drops a falsy digest, so the older entry is
+	// the only digest the model would otherwise see.
 	const snapshotOutranksDigest =
-		compaction?.harnessDigest !== undefined && (newestDigestIdx === -1 || newestDigestIdx < compactionIdx);
+		Boolean(compaction?.harnessDigest) && (newestDigestIdx === -1 || newestDigestIdx < compactionIdx);
 	const keepDigestEntryId = snapshotOutranksDigest ? undefined : newestDigestEntryId;
 	const summaryHarnessDigest = newestDigestIdx > compactionIdx ? undefined : compaction?.harnessDigest;
 
