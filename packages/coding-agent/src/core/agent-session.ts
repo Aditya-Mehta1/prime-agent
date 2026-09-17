@@ -13199,12 +13199,19 @@ export class AgentSession {
 	 * resume its task on the selected branch.
 	 */
 	private _reloadQuotaParkFromBranch(): void {
-		const cancelledJobId = this._quotaPark?.jobId;
-		if (cancelledJobId !== undefined) {
-			this._navigationCancelledWakeJobs.add(cancelledJobId);
-		}
-		this._cancelQuotaParkWake(this._quotaPark);
+		const previous = this._quotaPark;
 		this._quotaPark = undefined;
+		if (previous?.timer) {
+			clearTimeout(previous.timer);
+			previous.timer = undefined;
+		}
+		if (previous?.jobId !== undefined) {
+			// Only a wake this navigation actually cancels may be rebuilt on the way
+			// back; a wake the user cancelled in /cron stays cancelled.
+			if (this._resolveQuotaResumeJob(previous.jobId) === "cancelled") {
+				this._navigationCancelledWakeJobs.add(previous.jobId);
+			}
+		}
 		this._restoreQuotaPark();
 	}
 

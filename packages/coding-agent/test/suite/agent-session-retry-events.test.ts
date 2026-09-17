@@ -1025,42 +1025,43 @@ describe("AgentSession retry and event characterization", () => {
 		expect(refusedHarness.session.isQuotaParked).toBe(false);
 	});
 
-	it("restores the park count across a restart so the park budget still bounds the episode", async () => {
+	it("restores a park across a restart, and honours a cancelled wake", async () => {
 		const settings = parkSettings({ maxPauseMs: 60_000 });
 		const harness = await parkHarness(settings, true);
 		harness.setResponses([quotaFailure({ retryAfterMs: 3_600_000 })]);
 		const parked = waitForRetryEnds(harness, 1);
 		await harness.session.prompt("do the work");
 		await parked;
+		const sessionFile = harness.session.sessionFile!;
 
-		const restarted = await createHarness({ existingSessionFile: harness.session.sessionFile!, settings });
+		// A restart rebuilds the park, and the wake still bounds the episode.
+		const restarted = await createHarness({ existingSessionFile: sessionFile, settings });
 		harnesses.push(restarted);
 		expect([restarted.session.isQuotaParked, quotaPark(restarted)?.parkCount]).toEqual([true, 1]);
-
 		restarted.setResponses([quotaFailure({ retryAfterMs: 3_600_000 })]);
 		const reparked = waitForRetryEnds(restarted, 1);
 		await fireQuotaWake(restarted);
 		await reparked;
 		expect(quotaPark(restarted)?.parkCount).toBe(2);
-	});
 
-	it("honours a cancelled wake when restoring a park", async () => {
-		const settings = parkSettings({ maxPauseMs: 60_000 });
-		const harness = await parkHarness(settings, true);
-		harness.setResponses([quotaFailure({ retryAfterMs: 3_600_000 })]);
-		const parked = waitForRetryEnds(harness, 1);
-		await harness.session.prompt("do the work");
-		await parked;
+		// A wake the user cancelled stays cancelled, through a navigation and a restart.
 		const store = AgentCronJobStore.forSessionArtifacts();
 		store.registerSessionArtifact(
-			harness.sessionManager.getSessionId(),
-			harness.sessionManager.getSessionArtifactDir()!,
+			restarted.sessionManager.getSessionId(),
+			restarted.sessionManager.getSessionArtifactDir()!,
 		);
-		store.cancel(quotaPark(harness)!.jobId!);
-
-		const restarted = await createHarness({ existingSessionFile: harness.session.sessionFile!, settings });
-		harnesses.push(restarted);
+		store.cancel(quotaPark(restarted)!.jobId!);
+		const parkedLeaf = restarted.sessionManager.getLeafId()!;
+		const parkedPrompt = restarted.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "message" && entry.message.role === "user")
+			.at(-1)!.id;
+		await restarted.session.navigateTree(parkedPrompt);
+		await restarted.session.navigateTree(parkedLeaf);
 		expect(restarted.session.isQuotaParked).toBe(false);
+		const afterCancel = await createHarness({ existingSessionFile: sessionFile, settings });
+		harnesses.push(afterCancel);
+		expect(afterCancel.session.isQuotaParked).toBe(false);
 	});
 
 	it("moves the park with branch navigation", async () => {
