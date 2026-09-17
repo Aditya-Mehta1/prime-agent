@@ -294,13 +294,13 @@ class BashHandle:
                 _COMPLETION_PREFIX + completion_token.encode("ascii") + _COMPLETION_SUFFIX
             )
             script = _status_script(
-                _with_prefix(command),
+                command,
                 completion_token[:token_midpoint],
                 completion_token[token_midpoint:],
             )
         else:
             # Windows lacks a foreground-status channel, so its exit drain stays best-effort.
-            script = _with_prefix(command)
+            script = command
             self._job = _winjob.create_job()
             if self._job is None:
                 # Nothing spawned yet, so nothing can leak: refuse to start.
@@ -1533,6 +1533,39 @@ def _fp_matching_backtick(command: str, open_index: int, end: int) -> int:
     return end - 1
 
 
+def _fp_unquoted_paren_counts(text: str) -> tuple[int, int]:
+    """Open and close parens outside quotes and escapes, the shell's own rule
+    (the same quoting `_fp_matching_paren` follows): `echo "("` opens no
+    group, so a cd chain around one still replays instead of dying with a
+    spurious frame."""
+    opens = closes = 0
+    quote: str | None = None
+    i = 0
+    end = len(text)
+    while i < end:
+        ch = text[i]
+        if quote is None:
+            if ch == "\\" and i + 1 < end:
+                i += 2
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+            elif ch == "(":
+                opens += 1
+            elif ch == ")":
+                closes += 1
+        elif quote == "'":
+            if ch == "'":
+                quote = None
+        elif ch == "\\" and i + 1 < end:
+            i += 2
+            continue
+        elif ch == '"':
+            quote = None
+        i += 1
+    return opens, closes
+
+
 def _fp_scan_words(command: str) -> list[_FpShellWord]:
     """Split `command` into shell words the way the shell builds argv.
 
@@ -2079,7 +2112,7 @@ _FP_UNMODELED_WRAPPERS = (
 # relative interpreter (`/bin/sh`, `/bin/bash`, `./sh`) counts while a script
 # file whose name merely ends in one (`payload.sh`) stays data.
 _FP_SHELL_INTERPRETER_IN_TEXT = re.compile(
-    r"(?<![A-Za-z0-9_.-])(?:sh|bash|zsh|dash|ksh)(?:\.exe)?(?![A-Za-z0-9_.-])",
+    r"(?<![A-Za-z0-9_.-])(?:sh|bash|zsh|dash|ksh|fish|tcsh|csh)(?:\.exe)?(?![A-Za-z0-9_.-])",
     re.IGNORECASE,
 )
 
@@ -2103,13 +2136,76 @@ def _fp_is_unmodeled_wrapper(value: str) -> bool:
     return _fp_command_name(value) in _FP_UNMODELED_WRAPPERS
 
 
+# remote.<name>.mirror and remote.<name>.push both turn a plain push into a
+# forced one: a mirror remote force-updates every ref (git treats
+# `git push <name>` with remote.<name>.mirror=true as `git push --mirror`),
+# and a configured push refspec can itself carry a `+`. Both keys are read
+# from the word itself, so the inline `-c` value and the `git config` argument
+# spellings match alike.
+_FP_MIRROR_OR_PUSH_KEY = re.compile(r"^remote\.[^.]+\.(?:mirror|push)(?:=|$)")
+
+
+def _fp_mirror_or_push_refspec_configured(words: list[_FpShellWord]) -> bool:
+    """True when a word sets remote.<name>.mirror or remote.<name>.push."""
+    return any(_FP_MIRROR_OR_PUSH_KEY.match(word.value) for word in words)
+
+
+def _fp_mirror_config_refusal() -> str:
+    return _fp_format_refusal(
+        "a remote.<name>.mirror or remote.<name>.push setting in this command"
+        " can turn the push into a forced one the guard cannot verify (a"
+        " mirror remote force-updates every ref; a configured push refspec"
+        " can carry a +)"
+    )
+
+
 _FP_ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-# Options of the wrappers the command-word walk steps over that take the NEXT
-# word as their value (`env -u NAME $c ...`, `env -C DIR $c ...`): the value is
-# not a command word either, so the walk steps over both.
-_FP_WRAPPER_VALUE_OPTIONS = frozenset(
-    {"-u", "--unset", "-C", "--chdir", "-S", "--split-string", "--argv0"}
-)
+# Value-taking options per wrapper the command-word walk steps over (from each
+# tool's synopsis, as the sudo guard's audited table records them): env alone
+# has them, and a wrongly listed boolean would swallow the command word while
+# a missing value option reads the operand as the command (`env -vu NAME $c
+# push -f ...` loses $c entirely), so both directions fail closed here.
+# Optional-argument options (env's --block-signal family) are deliberately
+# absent: their separate operand is the command itself.
+_FP_WRAPPER_VALUE_OPTIONS: dict[str, frozenset[str]] = {
+    "env": frozenset(
+        {"-u", "--unset", "-C", "--chdir", "-S", "--split-string", "-a", "--argv0", "-P", "--env0-from"}
+    ),
+    "command": frozenset(),
+    "builtin": frozenset(),
+}
+# Short letters of the value options above: a bundle such as `env -vu NAME`
+# ends on a value-taking letter, so the walk must consume its operand there.
+_FP_WRAPPER_VALUE_LETTERS: dict[str, str] = {
+    "env": "uCSaP",
+    "command": "",
+    "builtin": "",
+}
+
+
+def _fp_split_wrapper_option(value: str, wrapper: str) -> tuple[str | None, str | None]:
+    """(option, glued operand) when a wrapper flag word takes a value, else
+    (None, None). A flag that is an exact match, a `--long=value` word, or a
+    short bundle whose first value-taking letter hands it the rest of the
+    bundle as its operand (`env -vu NAME` -> -u with the next word, `env
+    -uFOO $c ...` -> -u with FOO glued) consumes the operand the same way
+    getopt does."""
+    options = _FP_WRAPPER_VALUE_OPTIONS.get(wrapper, frozenset())
+    if value in options:
+        return value, None
+    if value.startswith("--") and "=" in value:
+        option, _, glued = value.partition("=")
+        return (option, glued) if option in options else (None, None)
+    letters = _FP_WRAPPER_VALUE_LETTERS.get(wrapper, "")
+    if letters and len(value) > 2 and value[0] == "-" and value[1] != "-":
+        offset = next(
+            (index for index, char in enumerate(value[1:]) if char in letters),
+            None,
+        )
+        if offset is None:
+            return None, None
+        return "-" + value[1 + offset], value[2 + offset :] or None
+    return None, None
 
 
 def _fp_unresolvable_command_words(
@@ -2135,14 +2231,17 @@ def _fp_unresolvable_command_words(
             index += 1
             continue
         probe = index
+        wrapper = ""
         while probe < total and not _fp_contained_in_later_word(words, probe):
             value = words[probe].value
             if _FP_ENV_ASSIGNMENT.match(value) or value.startswith("-"):
                 # An env assignment or a wrapper option: the command word is
                 # still ahead (`env -i $c push -f origin main` really runs $c).
                 probe += 1
+                option, glued = _fp_split_wrapper_option(value, wrapper)
                 if (
-                    value in _FP_WRAPPER_VALUE_OPTIONS
+                    option is not None
+                    and glued is None
                     and probe < total
                     and not _fp_contained_in_later_word(words, probe)
                 ):
@@ -2156,6 +2255,7 @@ def _fp_unresolvable_command_words(
                 # is the command word the guard has to resolve. An unmodeled
                 # wrapper is the command word instead: it is recorded below and
                 # refused as a wrapper.
+                wrapper = _fp_command_name(value)
                 probe += 1
                 continue
             break
@@ -2530,6 +2630,12 @@ def _fp_payload_hides_force_push(payload: str, depth: int = 0) -> bool:
     words = _fp_scan_words(normalized)
     if _fp_family_violation(words, payload, normalized) is not None:
         return True  # the payload belongs to the unresolvable-argv family
+    if _fp_find_git_push_runs(words) and _fp_mirror_or_push_refspec_configured(
+        words
+    ):
+        # A payload runs the same commands a top-level line does, so the
+        # mirror/push-refspec config rule applies inside it too.
+        return True
     if _fp_unresolvable_command_word_hides_force_push(words, normalized):
         return True  # the payload's command word decides what runs
     if _fp_unresolvable_git_subcommand(words) is not None:
@@ -2544,9 +2650,9 @@ def _fp_payload_hides_force_push(payload: str, depth: int = 0) -> bool:
         normalized, depth + 1
     ):
         return True
-    if re.search(
-        r"\b(?:sh|bash|zsh|dash|ksh)\b", normalized, re.IGNORECASE
-    ) and _fp_shell_c_payloads_hide_force_push(normalized, depth + 1):
+    if _FP_SHELL_INTERPRETER_GATE.search(normalized) and (
+        _fp_shell_c_payloads_hide_force_push(normalized, depth + 1)
+    ):
         return True
     # The command-name checks fold case (`ENV`, `ENV.EXE`, `SH`), so the cheap
     # gate has to match them the same way or the scan never runs.
@@ -2623,7 +2729,17 @@ def _fp_eval_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
     return False
 
 
-_FP_SHELL_C_INTERPRETERS = ("sh", "bash", "zsh", "dash", "ksh")
+# fish carries `-c`/`--command` and `-C`/`--init-command` payloads, and the
+# csh family carries `-c`; both also read a piped stdin as a script, so they
+# are governed like the POSIX set (a plain push payload in any of them is
+# caught by the same word scan).
+_FP_SHELL_C_INTERPRETERS = ("sh", "bash", "zsh", "dash", "ksh", "fish", "tcsh", "csh")
+# The cheap gate that decides whether the payload scan is worth running: the
+# same names as above, spelled case-insensitively (`SH` on a case-insensitive
+# filesystem) and boundary-guarded.
+_FP_SHELL_INTERPRETER_GATE = re.compile(
+    r"\b(?:sh|bash|zsh|dash|ksh|fish|tcsh|csh)\b", re.IGNORECASE
+)
 
 
 def _fp_shell_c_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
@@ -2632,9 +2748,13 @@ def _fp_shell_c_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
     A quoted `-c` payload executes exactly like an eval payload, but the
     plain scan cannot see into it (the quoted payload folds into one word).
     Short flags may be bundled, so any short-option cluster carrying `c`
-    hands the shell its payload. Doubly-quoted data stays inert: `sh -c
-    'echo "git push -f origin main"'` must not trigger. Unquoted payloads
-    are scanned as plain invocations already and are skipped here."""
+    hands the shell its payload. fish spells the same idea three more ways
+    (`-C`/`--init-command` pre-configuration, `--command`, and getopt-glued
+    values such as `fish -c'git push -f origin main'`, which only fish
+    accepts), so all of them hand the shell a payload too. Doubly-quoted
+    data stays inert: `sh -c 'echo "git push -f origin main"'` must not
+    trigger. Unquoted payloads are scanned as plain invocations already and
+    are skipped here."""
     if depth > _FP_MAX_PAYLOAD_DEPTH:
         return True  # nested too deep to follow: refuse
     words = _fp_scan_words(command)
@@ -2642,6 +2762,7 @@ def _fp_shell_c_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
         if _fp_command_name(word.value) not in _FP_SHELL_C_INTERPRETERS:
             continue
         c_pending = False
+        attach_offset = 0
         for follower_index in range(index + 1, len(words)):
             follower = words[follower_index]
             if _fp_contained_in_later_word(words, follower_index):
@@ -2652,8 +2773,48 @@ def _fp_shell_c_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
             if follower.starts_command:
                 break
             token = follower.value
+            if not c_pending:
+                attach_offset = 0
+                if token == "--":
+                    break
+                # fish spells `-c`/`-C` long as --command/--init-command, and
+                # getopt allows the payload glued on
+                # (`fish --command='git push ...'`, `fish -c'git push ...'`).
+                attached = next(
+                    (
+                        flag
+                        for flag in ("--command=", "--init-command=")
+                        if token.startswith(flag)
+                    ),
+                    None,
+                )
+                if attached is not None:
+                    c_pending = True
+                    attach_offset = len(attached)
+                elif token in ("--command", "--init-command"):
+                    c_pending = True
+                elif (
+                    token.startswith("-")
+                    and token != "-"
+                    and not token.startswith("--")
+                ):
+                    # Short flags may be bundled, and a `c` (or fish's `C`)
+                    # hands the shell its payload: glued on when the cluster
+                    # does not end there, and otherwise the next word.
+                    marker = next(
+                        (i for i, ch in enumerate(token[1:]) if ch in "cC"),
+                        None,
+                    )
+                    if marker is not None:
+                        c_pending = True
+                        glued = token[2 + marker :]
+                        attach_offset = 2 + marker if glued else 0
+                if c_pending and attach_offset == 0:
+                    continue
             if c_pending:
-                payload_source = command[follower.start : follower.end]
+                payload_source = command[
+                    follower.start + attach_offset : follower.end
+                ]
                 if _fp_payload_is_ansi_c(payload_source):
                     return True  # the guard does not reproduce an ANSI-C payload
                 if _fp_payload_has_expansion(payload_source):
@@ -2674,18 +2835,11 @@ def _fp_shell_c_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
                 # third. Both looks are needed -- the value alone misses an
                 # alternating eval/sh chain, whose layers consume the escaping
                 # differently.
-                if _fp_payload_hides_force_push(follower.value, depth + 1):
+                if _fp_payload_hides_force_push(
+                    follower.value[attach_offset:], depth + 1
+                ):
                     return True
                 break  # the payload word ends this shell invocation
-            if token == "--":
-                break
-            if (
-                token.startswith("-")
-                and token != "-"
-                and not token.startswith("--")
-                and "c" in token[1:]
-            ):
-                c_pending = True
     return False
 
 
@@ -3014,8 +3168,9 @@ def _fp_resolve_push_cwd(
             return _FP_UNRESOLVABLE_CWD
         if re.search(r"(^|\s)GIT_[A-Z_]+=", trimmed):
             return _FP_UNRESOLVABLE_CWD  # the assignment selects another repository
-        opens = len(re.findall(r"\(", trimmed))
-        closes = len(re.findall(r"\)", trimmed))
+        # A paren inside quotes is data (`echo "("`), so only the unquoted
+        # ones open or close a replay frame.
+        opens, closes = _fp_unquoted_paren_counts(trimmed)
         if opens > 0:
             for _ in range(opens):
                 # A subshell starts from a copy and tracks its own cds.
@@ -3441,7 +3596,9 @@ def _fp_warn_once_about_late_force_push_bypass() -> None:
     )
 
 
-def _guard_force_push(command: str, allow_force_push: bool) -> None:
+def _guard_force_push(
+    command: str, allow_force_push: bool, command_prefix: str | None = None
+) -> None:
     """Refuse force-pushes (`git push --force`, `-f`, `+`-refspecs) whose
     target is protected: a refspec naming main/master or `@{u}`, or the
     current upstream (probed with `git rev-parse @{u}`) when the refspec is
@@ -3453,14 +3610,21 @@ def _guard_force_push(command: str, allow_force_push: bool) -> None:
     lease compare-and-swap (measured on git 2.55: a bare `--force-with-lease`
     over a stale remote-tracking ref is rejected as `stale info`, while
     `--force-with-lease -f` and `--force-with-lease origin +main` rewrite the
-    ref)."""
+    ref).
+
+    `command` is the full script text the spawn runs unless `command_prefix`
+    is None, in which case the prefix is read and joined here; bash() pins
+    both so one environment read is shared between the scan and the spawn."""
     if allow_force_push or _FORCE_PUSH_BYPASS_AT_KERNEL_START:
         return
+    if command_prefix is None:
+        command_prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
+        command = _with_prefix(command, command_prefix)
     global _active_scan_budget
     previous_budget = _active_scan_budget
     _active_scan_budget = _FpScanBudget(len(command))
     try:
-        _fp_guard_force_push(command)
+        _fp_guard_force_push(command, command_prefix)
     except _FpNestingTooDeep:
         raise ForcePushRefusalError(_fp_format_nesting_refusal()) from None
     except _FpScanLimitExceeded:
@@ -3471,10 +3635,13 @@ def _guard_force_push(command: str, allow_force_push: bool) -> None:
         _active_scan_budget = previous_budget
 
 
-def _fp_guard_force_push(command: str) -> None:
-    """The scan behind `_guard_force_push`, run under its work budget."""
-    command_prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
-    command_text = _with_prefix(command)
+def _fp_guard_force_push(command: str, command_prefix: str | None = None) -> None:
+    """The scan behind `_guard_force_push`, run under its work budget.
+
+    `command` is the full script text (prefix included) the spawn runs, and
+    `command_prefix` is the prefix the caller already read for it, so the
+    guard never re-reads the environment the spawn could disagree with."""
+    command_text = command
     resolved = _fp_mask_redirections(_fp_normalize_continuations(command_text))
     normalized, index_map = _fp_strip_escapes(resolved)
     # The cheap gates scan `normalized` with quotes intact: a quoted command
@@ -3484,9 +3651,9 @@ def _fp_guard_force_push(command: str) -> None:
         # An eval payload hides where the push runs; refuse rather than
         # resolve a command the guard cannot see.
         raise ForcePushRefusalError(_fp_format_eval_refusal())
-    if re.search(
-        r"\b(?:sh|bash|zsh|dash|ksh)\b", normalized, re.IGNORECASE
-    ) and _fp_shell_c_payloads_hide_force_push(resolved):
+    if _FP_SHELL_INTERPRETER_GATE.search(normalized) and (
+        _fp_shell_c_payloads_hide_force_push(resolved)
+    ):
         # `SH -c '...'` runs a real shell on a case-insensitive filesystem.
         raise ForcePushRefusalError(_fp_format_shell_c_refusal())
     if re.search(r"\benv\b", normalized, re.IGNORECASE) and (
@@ -3527,8 +3694,13 @@ def _fp_guard_force_push(command: str) -> None:
         raise ForcePushRefusalError(
             _fp_format_git_subcommand_refusal(unresolvable_subcommand)
         )
+    runs = _fp_find_git_push_runs(words)
+    if runs and _fp_mirror_or_push_refspec_configured(words):
+        # The push looks plain in argv, but the same command writes config
+        # that makes git force it, so argv alone cannot judge the push.
+        raise ForcePushRefusalError(_fp_mirror_config_refusal())
     guarded: list[tuple[_FpPushRun, _FpPushArgs]] = []
-    for run in _fp_find_git_push_runs(words):
+    for run in runs:
         args = _fp_parse_push_args(run.tokens, run.push_index)
         if run.unresolvable_alias or _fp_is_guarded_push(args):
             guarded.append((run, args))
@@ -3547,8 +3719,15 @@ def _fp_guard_force_push(command: str) -> None:
         )
     else:
         user_command_start = 0
+    # A GIT_DIR/GIT_WORK_TREE/... assignment in the prefix relocates the
+    # repository every later command runs in, exactly like a cd relocates the
+    # directory, so both count (the adjacent-`export` shape is already caught
+    # by the invocation walk; this covers the rest of the prefix).
     relocating_prefix = bool(
-        command_prefix and re.search(r"\b(?:cd|pushd|popd)\b", command_prefix)
+        command_prefix
+        and re.search(
+            r"\b(?:cd|pushd|popd)\b|GIT_[A-Z_]+=", command_prefix
+        )
     )
     probe_cache: dict[str, "_FpUpstreamInfo | None"] = {}
     for run, args in guarded:
@@ -3599,8 +3778,15 @@ def bash(command: str, *, allow_force_push: bool = False) -> BashHandle:
     if not isinstance(command, str) or not command:
         raise TypeError("command must be a non-empty str")
     _install_shutdown_hook()
-    _guard_force_push(command, allow_force_push)
-    return BashHandle(command)
+    # One read of the prefix feeds both the scan and the spawn, so a change of
+    # the environment mid-call can no longer make the spawned script differ
+    # from the text the guard scanned.
+    prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
+    # `_with_prefix` re-reads the environment for an unset value, so only a
+    # set prefix is joined here: the pinned read above is the only one.
+    command_text = _with_prefix(command, prefix) if prefix else command
+    _guard_force_push(command_text, allow_force_push, prefix or "")
+    return BashHandle(command_text)
 
 
 def _shell() -> str:
@@ -3624,8 +3810,12 @@ def _shell() -> str:
     return shell or "/bin/sh"
 
 
-def _with_prefix(command: str) -> str:
-    prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
+def _with_prefix(command: str, prefix: str | None = None) -> str:
+    """The command as the kernel runs it: the setup prefix on its own line,
+    when one is set. `prefix` pins the value so one caller can share a single
+    environment read between the guard and the spawn."""
+    if prefix is None:
+        prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
     return f"{prefix}\n{command}" if prefix else command
 
 
