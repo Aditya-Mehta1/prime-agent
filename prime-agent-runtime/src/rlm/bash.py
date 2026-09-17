@@ -1018,13 +1018,25 @@ class _DiscardSite:
 # `git --git-dir=dir/.git reset --hard`. Kept within one shell segment
 # (no ;&|) so it cannot swallow the rest of a chained command.
 _GIT_GLOBAL_OPTIONS = r'''(?:-{1,2}[^\s;&|]+(?:\s+(?:"[^"]*"|'[^']*'|[^\s;&|]+))?\s+)*'''
+# A pathspec read from a file (`--pathspec-from-file=X`, or `-` for stdin) can
+# name any path, `.` and `:/` included, so the option itself carries the same
+# weight as an inline pathspec: the discard matches and the dirtiness probe
+# decides. The value is read with its quoting masked, exactly like the tokens
+# around it; a `--`-terminated checkout that repeats the token as a literal
+# pathspec names a file git cannot find, so matching it is only the same
+# conservative refusal the plain pathspec forms already take.
+_PATHSPEC_FROM_FILE = r"""--pathspec-from-file(?:=\S+|\s+\S+)"""
 
 _DISCARD_CHECKOUT_PATTERN = re.compile(
     r"\bgit\s+"
     + _GIT_GLOBAL_OPTIONS
     + r"checkout\s+"
-    + r"""(?:(?:(?:-[fm]|--ours|--theirs|--conflict=\S+)\s+)*(?:--\s+)?(?:\./?|:/)"""
-    + r"""|[^\s;&|()]+\s+(?:--\s+)?(?:\./?|:/)"""
+    + r"""(?:(?:(?:-[fm]|--ours|--theirs|--conflict=\S+)\s+)*(?:(?:--\s+)?(?:\./?|:/)|"""
+    + _PATHSPEC_FROM_FILE
+    + r""")"""
+    + r"""|[^\s;&|()]+\s+(?:(?:--\s+)?(?:\./?|:/)|"""
+    + _PATHSPEC_FROM_FILE
+    + r""")"""
     + r"""|(?:-f|--force)\s+[^\s;&|()]+)(?=\s|$|[;&|)])"""
 )
 # Restore options accepted before the pathspec; the capture lets the finder
@@ -1048,7 +1060,9 @@ _DISCARD_RESTORE_PATTERN = re.compile(
     + r"((?:"""
     + _RESTORE_OPTION.pattern
     + r""")*)"""
-    + r"""(?:\./?|:/)(?=\s|$|[;&|)])"""
+    + r"""(?:"""
+    + _PATHSPEC_FROM_FILE
+    + r"""|\./?|:/)(?=\s|$|[;&|)])"""
 )
 
 
@@ -1096,7 +1110,7 @@ _DISCARD_RESET_PATTERN = re.compile(
     r"\bgit\s+" + _GIT_GLOBAL_OPTIONS + r"reset\s+(?:(?:-[^\s;&|]+)\s+)*--hard\b"
 )
 _DISCARD_CLEAN_PATTERN = re.compile(
-    r"\bgit\s+" + _GIT_GLOBAL_OPTIONS + r"clean\s+([^;&|]*)"
+    r"\bgit\s+" + _GIT_GLOBAL_OPTIONS + r"clean(?=\s|$|[;&|)])([^;&|]*)"
 )
 
 
@@ -1147,8 +1161,11 @@ def _segment_separator(text: str, from_end: bool = True) -> str | None:
 # A function definition: `function NAME {` or `NAME() {`. The guard does not
 # model when a function is called or which shell it runs in, so a body that can
 # change directory leaves a later discard's directory unknowable.
+# A function name may hold hyphens in both spellings (`function f-g { ... }`
+# and `f-g() { ... }` are definitions bash accepts), so the name class must
+# read them or the body below is never examined.
 _FUNCTION_DEFINITION = re.compile(
-    r"(?:\bfunction\s+[A-Za-z_][A-Za-z0-9_]*|\b[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\))\s*\{"
+    r"(?:\bfunction\s+[A-Za-z_][A-Za-z0-9_-]*|\b[A-Za-z_][A-Za-z0-9_-]*\s*\(\s*\))\s*\{"
 )
 
 
@@ -1165,19 +1182,30 @@ def _brace_group_end(text: str, open_index: int) -> int:
     return len(text)
 
 
-def _defines_directory_changing_function(masked_prefix: str) -> bool:
-    """True when `masked_prefix` defines a function that can change directory.
+def _defines_directory_changing_function(prefix: str) -> bool:
+    """True when `prefix` defines a function that can change directory.
 
-    Quoting and comments arrive masked, so `{`/`}` inside them cannot confuse
-    the body scan. The guard does not model invocation or shell scope, so a body
-    that cds (or pushds) is treated like the other relocations it cannot
-    replay: the probe refuses instead of replaying a directory the shell may
-    never choose.
+    The definition and its body extent are read on masked text, so quoting
+    and comments cannot confuse the brace scan, and the guard does not model
+    invocation or shell scope: a body that cds (or pushds) is treated like
+    the other relocations it cannot replay, refusing instead of replaying a
+    directory the shell may never choose. The body itself is then read the
+    way the shell runs it, because quoting does not stop a builtin: `"cd"
+    sub`, `c\\d sub` and `'cd' sub` change directory like the plain
+    spelling, so its command words are read with escapes removed and quoting
+    stripped, while a quoted argument (`echo "cd"`) stays inert data.
     """
+    masked_prefix = _mask_quoted_spans(prefix)
     for match in _FUNCTION_DEFINITION.finditer(masked_prefix):
-        body = masked_prefix[match.end() : _brace_group_end(masked_prefix, match.end() - 1) - 1]
-        if re.search(r"\b(?:cd|pushd)\b", body):
+        body_end = _brace_group_end(masked_prefix, match.end() - 1) - 1
+        if re.search(r"\b(?:cd|pushd)\b", masked_prefix[match.end() : body_end]):
             return True
+        revealed_body = _strip_shell_escapes(prefix[match.end() : body_end])[0]
+        for word in _shell_word_positions(revealed_body):
+            if word.command and _plain_word_text(
+                revealed_body[word.start : word.end]
+            ) in ("cd", "pushd"):
+                return True
     return False
 
 
@@ -1848,13 +1876,17 @@ def _reveal_shell_command_words(
     name the repository it runs in, so a discard found through one is refused.
     The returned alias and assignment maps are the ones the walk ended with, so
     a caller that re-reads text the shell parses later (an `eval` payload)
-    starts from the names this text defined.
+    starts from the names this text defined. The returned eval map holds, for
+    each `eval` command word's position in the revealed text, the names live
+    at that eval, because a reassignment after the eval must not replace the
+    value its payload expands.
     """
     assignments = dict(assignments) if assignments else {}
     pending: dict[str, str] = {}
     aliases = dict(aliases) if aliases else {}
     alias_args = False
     unalias_words: list[str] | None = None
+    eval_live: dict[int, tuple[dict[str, str], dict[str, str]]] = {}
     out: list[str] = []
     index_map: list[int] = []
     unnameable: set[int] = set()
@@ -1896,7 +1928,14 @@ def _reveal_shell_command_words(
         # The builtin can be spelled by a word that only reveals to it
         # (`A=alias; $A g=git`), so the check reads the revealed text too.
         spoken = _plain_word_text(revealed) if revealed is not None else plain
-        if word.command and spoken == "alias":
+        if word.command and spoken == "eval":
+            # The names live at this eval are the ones its payload expands,
+            # so they are recorded at the eval's revealed position: an
+            # assignment or alias redefined after the eval must not hide the
+            # value the payload runs. `pending` joins the snapshot because a
+            # command-scoped prefix applies to the eval it precedes.
+            eval_live[len(index_map)] = (dict(aliases), {**assignments, **pending})
+        elif word.command and spoken == "alias":
             alias_args = True  # the words after the builtin are definitions
         elif word.command and spoken == "unalias":
             if unalias_words is not None:
@@ -1951,8 +1990,14 @@ def _reveal_shell_command_words(
             else:
                 copied = _COPIED_ASSIGNMENT.fullmatch(text)
                 source = copied and (copied.group(2) or copied.group(3))
+                # The shell applies the assignments of one command left to
+                # right, so a value set earlier in this command (pending) is
+                # the one the copy expands; only a name this command has not
+                # reassigned falls back to the value an earlier segment left
+                # (assignments). Reading them the other way kept the older
+                # value and hid the discard the copy carried.
                 inherited = source and (
-                    assignments.get(source) or pending.get(source)
+                    pending.get(source) or assignments.get(source)
                 )
                 if inherited:
                     target = assignments if word.keeps else pending
@@ -1960,27 +2005,27 @@ def _reveal_shell_command_words(
         prefix_open = word.open_prefix
     out.append(command[cursor:])
     index_map.extend(range(cursor, len(command)))
-    return "".join(out), index_map, unnameable, aliases, assignments
+    return "".join(out), index_map, unnameable, aliases, assignments, eval_live
 
 
-def _is_forced_clean_segment(args: str) -> bool:
+def _is_destructive_clean_segment(args: str) -> bool:
+    """True when a `git clean` segment can delete untracked files.
+
+    A force flag is one route but not the only one: without one, git still
+    deletes whenever `clean.requireForce` is false in any config the command
+    reads (`-c`, the `GIT_CONFIG_*` environment, the repository, or the
+    user), and a static scan cannot see those settings. So every segment
+    but a dry run matches and the dirtiness probe decides: on a tree the
+    probe finds dirty the refusal is required when the config disables the
+    force requirement and harmless otherwise (git refuses the unforced
+    clean itself), and a clean tree has nothing untracked to delete.
+    """
     tokens = [token for token in re.split(r"\s+", args) if token]
     # Everything after -- is a pathspec, not options (git clean -f -- -n is forced).
     if "--" in tokens:
         option_tokens = tokens[: tokens.index("--")]
     else:
         option_tokens = tokens
-    forces = [
-        token
-        for token in option_tokens
-        if (
-            token.startswith("--force")
-            if token.startswith("--")
-            else token.startswith("-") and "f" in token
-        )
-    ]
-    if not forces:
-        return False
     return not any(
         token == "--dry-run"
         or (token.startswith("-") and not token.startswith("--") and "n" in token)
@@ -1996,7 +2041,7 @@ def _scan_discard_sites(
     assignments: dict[str, str] | None = None,
 ) -> list[_DiscardSite]:
     """Find the discards in already-normalized text, mapped back to the input."""
-    words, word_map, unnameable, _aliases, _assignments = _reveal_shell_command_words(
+    words, word_map, unnameable, _aliases, _assignments, _eval_live = _reveal_shell_command_words(
         normalized, resolve_aliases=resolve_aliases, aliases=aliases, assignments=assignments
     )
     masked = _mask_quoted_spans(words)
@@ -2007,7 +2052,7 @@ def _scan_discard_sites(
         if _restore_options_discard_worktree(match.group(1)):
             matches.append((match.start(), match.end()))
     for match in _DISCARD_CLEAN_PATTERN.finditer(masked):
-        if _is_forced_clean_segment(match.group(1)):
+        if _is_destructive_clean_segment(match.group(1)):
             matches.append((match.start(), match.end()))
     return [
         _DiscardSite(
@@ -2064,7 +2109,8 @@ def _find_destructive_git_discard_sites(
 def is_destructive_git_discard_command(command: str) -> bool:
     """True when `command` contains a git command that discards uncommitted
     working-tree changes (`git checkout -- .`, `git restore .`,
-    `git reset --hard`, forced `git clean`)."""
+    `git reset --hard`, `git clean` that is not a dry run: the force
+    requirement can be turned off in a config the text cannot see)."""
     return bool(_find_destructive_git_discard_sites(command))
 
 
@@ -2073,6 +2119,9 @@ def is_destructive_git_discard_command(command: str) -> bool:
 # shell quoting layer at a time and rescan; a discard found in any layer is
 # refused outright because the payload can relocate or chain freely.
 _MAX_EVAL_SCAN_DEPTH = 10
+# The eval gate reads the command with quoting and escapes dropped, because a
+# split-spelled command word (`e\val`, `e'va'l`) still runs the builtin.
+_EVAL_GATE_STRIP = re.compile(r"""["'\\]""")
 
 
 def _unquote_one_level(text: str) -> str:
@@ -2133,31 +2182,47 @@ def _eval_payloads_hide_destructive_git(
     command = _strip_shell_escapes(
         _mask_shell_redirections(_normalize_line_continuations(command))
     )[0]
-    revealed, _word_map, _unnameable, visible, known = _reveal_shell_command_words(
+    revealed, _word_map, _unnameable, visible, known, eval_live = _reveal_shell_command_words(
         command, aliases=aliases, assignments=assignments
     )
-    if _revealed_eval_payloads_hide_destructive_git(revealed, depth, visible, known):
+    if _revealed_eval_payloads_hide_destructive_git(revealed, depth, visible, known, eval_live):
         return True
     if "alias" in command:
         # Same both-ways reading as the discard scan: an alias may or may not
         # be expanded, so the text as written is scanned too.
-        as_written, _as_map, _as_un, _as_aliases, _as_known = _reveal_shell_command_words(
+        (
+            as_written,
+            _as_map,
+            _as_un,
+            _as_aliases,
+            _as_known,
+            as_eval_live,
+        ) = _reveal_shell_command_words(
             command, resolve_aliases=False, aliases=aliases, assignments=assignments
         )
-        if _revealed_eval_payloads_hide_destructive_git(as_written, depth, visible, known):
+        if _revealed_eval_payloads_hide_destructive_git(
+            as_written, depth, visible, known, as_eval_live
+        ):
             return True
     return False
 
 
 def _revealed_eval_payloads_hide_destructive_git(
-    revealed: str, depth: int, aliases: dict[str, str], assignments: dict[str, str]
+    revealed: str,
+    depth: int,
+    aliases: dict[str, str],
+    assignments: dict[str, str],
+    eval_live: dict[int, tuple[dict[str, str], dict[str, str]]] | None = None,
 ) -> bool:
     """True when a revealed command runs eval over a payload holding a discard.
 
     `aliases` and `assignments` are the names the scanned text defined (and any
     a caller carried in): the payload is re-parsed by eval at run time, where
     those names run their values, so the payload is read with them resolved as
-    well as exactly as written.
+    well as exactly as written. `eval_live` holds the names live at each eval
+    (keyed by the eval word's position in `revealed`), which the payload is
+    also read with: the final maps are the conservative reading for names
+    defined later, but the live ones decide what the payload really expands.
     """
     masked = _mask_quoted_spans(revealed)
     for word in _shell_word_positions(revealed):
@@ -2177,6 +2242,12 @@ def _revealed_eval_payloads_hide_destructive_git(
                 region_end = j
                 break
         payload = _unquote_one_level(revealed[word.end : region_end])
+        live = (eval_live or {}).get(word.start)
+        if live is not None and (live[0] or live[1]):
+            if _find_destructive_git_discard_sites(payload, aliases=live[0], assignments=live[1]):
+                return True
+            if _payload_substitution_hides_a_discard(payload, live[0]):
+                return True
         if _find_destructive_git_discard_sites(payload):
             return True
         if _payload_substitution_hides_a_discard(payload, aliases):
@@ -2393,7 +2464,7 @@ def _resolve_discard_probe_target(
     # A function definition whose body can change directory relocates a later
     # discard whenever the function is called, and the guard does not model
     # invocation or shell scope: refuse instead of replaying a guess.
-    if _defines_directory_changing_function(_mask_quoted_spans(prefix)):
+    if _defines_directory_changing_function(prefix):
         return _UNRESOLVABLE_DISCARD_TARGET
 
     # cd relocations earlier in the command. cds inside grouping parentheses
@@ -2710,7 +2781,11 @@ def _guard_destructive_git(command: str, allow_destructive_git: bool) -> None:
     # length-preserving) so the patterns and the probe resolution see the
     # same argv the shell will hand to git.
     resolved = _mask_shell_redirections(_normalize_line_continuations(_with_prefix(command)))
-    if "eval" in resolved and _eval_payloads_hide_destructive_git(resolved):
+    # An escaped or split-spelled command word (`e\val`, `e'va'l`) still
+    # runs the eval builtin, so the gate reads the text with quoting and
+    # escapes dropped before the substring check; the scan itself still
+    # judges the command exactly as written.
+    if "eval" in _EVAL_GATE_STRIP.sub("", resolved) and _eval_payloads_hide_destructive_git(resolved):
         # An eval payload hides where the discard runs; refuse rather than
         # probe a command the guard cannot replay.
         raise DestructiveGitRefusalError(_format_eval_refusal())
@@ -2770,8 +2845,9 @@ def bash(command: str, *, allow_destructive_git: bool = False) -> BashHandle:
     handle.output()/tail().
 
     Destructive git discard commands (`git checkout -- .`, `git restore .`,
-    `git reset --hard`, forced `git clean`) are refused while the repository
-    they target has uncommitted changes; retry with allow_destructive_git=True
+    `git reset --hard`, `git clean` that is not a dry run) are refused while
+    the repository they target has uncommitted changes; retry with
+    allow_destructive_git=True
     only when the discard is intentional. PI_BASH_ALLOW_DESTRUCTIVE_GIT=1 in
     the launching environment disables the guard for the whole kernel; it is
     read once at kernel start, so writing it mid-session has no effect.
