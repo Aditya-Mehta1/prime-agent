@@ -1251,6 +1251,26 @@ def _defines_git_shadowing_function(prefix: str) -> bool:
     return False
 
 
+def _builtin_words(words: list[str]) -> list[str]:
+    """`words` with the wrapper words and their own options dropped.
+
+    `command` and `builtin` run the word after them, and their own options come
+    before that word (`command -p unset GIT_DIR`), so a builtin is only found by
+    reading past both. The wrapper's spelling is revealed, because quoting and
+    escapes do not stop it (`"command" -p unset GIT_DIR` removes the name).
+    """
+    index = 0
+    while index < len(words):
+        head = _revealed_word_text(words[index])
+        if head in _TRANSPARENT_BUILTINS:
+            index += 1
+            while index < len(words) and words[index].startswith("-") and words[index] != "-":
+                index += 1
+            continue
+        break
+    return words[index:]
+
+
 def _installs_relocating_trap(prefix: str) -> bool:
     """True when `prefix` installs a trap whose action can change directory.
 
@@ -1265,16 +1285,29 @@ def _installs_relocating_trap(prefix: str) -> bool:
     command on a dirty tree, never lost work.
     """
     masked = _mask_quoted_spans(prefix)
-    for word in _shell_word_positions(prefix):
-        if not word.command or _plain_word_text(prefix[word.start : word.end]) != "trap":
+    # The names the text set are read too: `A=trap; $A 'cd sub' DEBUG` installs
+    # the same trap with a revealed builtin.
+    known = _reveal_shell_command_words(prefix)[4]
+    written, revealed, revealed_segment = _revealed_words(prefix, known)
+    for index, word in enumerate(_shell_word_positions(revealed_segment)):
+        if not word.command or revealed[index] != "trap":
             continue
         region_end = len(prefix)
-        for j in range(word.end, len(masked)):
+        for j in range(written[index].end, len(masked)):
             if masked[j] in ";&|\n":
                 region_end = j
                 break
-        if _prefix_holds_directory_command(_unquote_one_level(prefix[word.end : region_end])):
-            return True
+        # The action is the first argument that is not one of trap's own
+        # options (`trap -- 'cd sub' DEBUG`), and it is read after unquoting,
+        # so a quoted action (`trap 'cd sub' DEBUG`) is judged as the shell
+        # runs it.
+        arguments = prefix[written[index].end : region_end]
+        for token in re.findall(r"""\S+""", _unquote_one_level(arguments.strip())):
+            if token.startswith("-") and token != "-":
+                continue
+            if _prefix_holds_directory_command(_unquote_one_level(token)):
+                return True
+            break
     return False
 
 
@@ -2321,22 +2354,26 @@ def _eval_payloads(revealed: str) -> list[tuple[int, str]]:
     return payloads
 
 
-def _revealed_eval_payloads_relocate(revealed: str, aliases: dict[str, str]) -> bool:
+def _revealed_eval_payloads_relocate(
+    revealed: str, aliases: dict[str, str], assignments: dict[str, str]
+) -> bool:
     """True when a revealed command runs eval over a payload that cds or pushds.
 
     `eval` runs its payload in the current shell, so such a payload moves the
     shell the later discard runs in, and the probe would check the caller. The
     payload is read twice for the reason the discard scan reads the whole text
-    twice: eval re-parses it at run time, where an alias an earlier command
-    defined does expand (`alias c=cd`, then `eval 'c dirty'`) even though the
-    same spelling does not expand in the outer command, so a relocation under
-    either reading is refused.
+    twice: eval re-parses it at run time, where a name an earlier command set
+    does expand (`alias c=cd`, or `X=cd`, then `eval 'c dirty'` / `eval '$X
+    dirty'`) even though the same spelling does not expand in the outer command,
+    so a relocation under either reading is refused.
     """
     for _start, payload in _eval_payloads(revealed):
         if _prefix_holds_directory_command(payload):
             return True
-        if aliases:
-            expanded = _reveal_shell_command_words(payload, aliases=aliases)[0]
+        if aliases or assignments:
+            expanded = _reveal_shell_command_words(
+                payload, aliases=aliases, assignments=assignments
+            )[0]
             if expanded != payload and _prefix_holds_directory_command(expanded):
                 return True
     return False
@@ -2347,10 +2384,10 @@ def _eval_payloads_relocate(command: str) -> bool:
     normalized = _strip_shell_escapes(
         _mask_shell_redirections(_normalize_line_continuations(command))
     )[0]
-    revealed, _map, _unnameable, aliases, _assignments, _live = _reveal_shell_command_words(
+    revealed, _map, _unnameable, aliases, assignments, _live = _reveal_shell_command_words(
         normalized
     )
-    return _revealed_eval_payloads_relocate(revealed, aliases)
+    return _revealed_eval_payloads_relocate(revealed, aliases, assignments)
 
 
 def _revealed_eval_payloads_hide_destructive_git(
@@ -2439,7 +2476,7 @@ def _payload_substitution_hides_a_discard(payload: str, aliases: dict[str, str])
     return False
 
 
-def _revealed_word_text(word: str) -> str:
+def _revealed_word_text(word: str, assignments: dict[str, str] | None = None) -> str:
     """The text the shell runs for one written word.
 
     Quoting and escapes are removed when the value can be read (`"cd"` runs
@@ -2454,6 +2491,16 @@ def _revealed_word_text(word: str) -> str:
     plain = _plain_word_text(_strip_shell_escapes(word)[0])
     if plain is not None:
         return plain
+    if assignments:
+        # A name the text set can spell the word the shell runs (`A=trap; $A
+        # 'cd sub' DEBUG` installs the trap), and only a value that is one
+        # plain word is substituted: anything longer would change how many
+        # words the revealed text holds, which the caller's position mapping
+        # relies on.
+        reference = _VARIABLE_REFERENCE.fullmatch(word)
+        value = reference and assignments.get(reference.group(1) or reference.group(2))
+        if value is not None and _PLAIN_WORD_RUN.fullmatch(value):
+            return value
     if word in _SHELL_KEYWORDS or word in _TRANSPARENT_BUILTINS:
         return word  # syntax, not a value
     if _ASSIGNMENT_WORD.fullmatch(word) is not None:
@@ -2461,7 +2508,9 @@ def _revealed_word_text(word: str) -> str:
     return "x"
 
 
-def _revealed_words(segment: str) -> "tuple[list[_ShellWord], list[str], str]":
+def _revealed_words(
+    segment: str, assignments: dict[str, str] | None = None
+) -> "tuple[list[_ShellWord], list[str], str]":
     """The written words of `segment`, their revealed text, and the text built
     from them with separators, comments, and whitespace left in place.
 
@@ -2477,7 +2526,7 @@ def _revealed_words(segment: str) -> "tuple[list[_ShellWord], list[str], str]":
     cursor = 0
     for word in written:
         parts.append(segment[cursor : word.start])
-        revealed.append(_revealed_word_text(segment[word.start : word.end]))
+        revealed.append(_revealed_word_text(segment[word.start : word.end], assignments))
         parts.append(revealed[-1])
         cursor = word.end
     parts.append(segment[cursor:])
@@ -2702,18 +2751,7 @@ def _resolve_discard_probe_target(
             # builtin is read from the revealed word, because quoting, escapes,
             # and the `command` wrapper do not stop it (`"unset" GIT_DIR`,
             # `\unset GIT_DIR`, and `command unset GIT_DIR` all remove it).
-            removal = seg_tokens
-            wrapper_options = False
-            while removal:
-                head = _revealed_word_text(removal[0])
-                if head in _TRANSPARENT_BUILTINS:
-                    wrapper_options = True  # its own options may follow (`command -p`)
-                    removal = removal[1:]
-                    continue
-                if wrapper_options and head.startswith("-") and head != "-":
-                    removal = removal[1:]
-                    continue
-                break
+            removal = _builtin_words(seg_tokens)
             if (
                 removal
                 and _revealed_word_text(removal[0]) == "unset"
@@ -2851,11 +2889,20 @@ def _resolve_discard_probe_target(
         git_status = f"git -C {dash_c_dir} status --porcelain --untracked-files=all{ignored}"
     else:
         git_status = f"git status --porcelain --untracked-files=all{ignored}"
-    # The assignments come first: a persistent `CDPATH` (or `HOME`) decides
-    # where a later `cd` lands, so replaying the chain first would resolve a
-    # relative `cd` against the kernel's own directory instead.
+    # The persistent assignments are replayed twice on purpose. Before the
+    # chain they are statements, because a shell variable decides where a later
+    # `cd` lands (`CDPATH=<dir>; cd sub` lands in <dir>/sub and a persistent
+    # `HOME` decides a bare `cd`); an inline prefix there would scope them to
+    # that one `cd` and leave the probe command without them. As the inline
+    # prefix of the probe command they are what the command's own environment
+    # reads (`GIT_DIR`/`GIT_WORK_TREE`), which is the replay the discard
+    # patterns have always used and which an unexported statement does not
+    # carry into a child process.
+    statement_prefix = (
+        " && ".join(persistent_assignments) + " && " if persistent_assignments and cd_commands else ""
+    )
     return _DiscardProbeTarget(
-        relocation_prefix=(env_prefix + cd_prefix) or None,
+        relocation_prefix=(statement_prefix + cd_prefix + env_prefix) or None,
         git_status_command=git_status,
     )
 

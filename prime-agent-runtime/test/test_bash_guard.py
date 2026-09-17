@@ -663,7 +663,7 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
         for command in [
             'export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard', 'GIT_DIR=sub/.git; git reset --hard',
             'export GIT_DIR=sub/.git && git reset --hard', '{ export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard; }', 'if true; then export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard; fi',
-            'if true; then { export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard; }; fi', f'HOME={self._tracked("sub")} cd && git reset --hard',
+            'if true; then { export GIT_DIR=sub/.git GIT_WORK_TREE=sub; git reset --hard; }; fi', f'HOME={self._tracked("sub")} cd && git reset --hard', 'GIT_DIR=sub/.git GIT_WORK_TREE=sub; cd . && git reset --hard',
         ]:
             with self.subTest(command=command):
                 with self.assertRaises(DestructiveGitRefusalError) as caught:
