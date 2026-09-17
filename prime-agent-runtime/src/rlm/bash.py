@@ -2426,28 +2426,37 @@ def _directory_command_parts(
     wrapper in command position is syntax rather than the command, so the
     reader follows the revealed words (`"command" "cd" sub` and `then cd sub`
     both change directory) until a real command word ends the scan (`echo
-    "cd"` is an argument, not a cd). Returns
+    "cd"` is an argument, not a cd). A directory command behind `!` is
+    `_UNRESOLVABLE_DISCARD_TARGET`, because the negation decides which branch
+    the discard runs in without deciding where the shell ends up. Returns
     `_UNRESOLVABLE_DISCARD_TARGET` when a word the replay would need cannot be
     replayed verbatim, and None for a segment that runs no directory builtin.
     """
     written, revealed, revealed_segment = _revealed_words(segment)
     prefix: list[str] = []
+    negated = False
     for index, word in enumerate(_shell_word_positions(revealed_segment)):
         if not word.command:
             continue  # an argument never decides the command
         raw = segment[written[index].start : written[index].end]
         plain = revealed[index]
         if plain in ("cd", "pushd"):
+            if negated:
+                return _UNRESOLVABLE_DISCARD_TARGET  # `! cd`: see below
             return " ".join(prefix), plain, segment[written[index].end :]
         if plain in _TRANSPARENT_BUILTINS:
             prefix.append(raw)  # `"command" cd` still runs the builtin
-        elif raw == plain and plain in _SHELL_KEYWORDS and plain != "!":
-            # `then` and `{` are syntax: the command word still follows them.
-            # `!` is the exception, because it inverts the builtin's status:
-            # `! cd missing && git reset --hard` runs the discard exactly when
-            # the cd fails, so the repository the cd names is not the one the
-            # discard needs, and the segment is read like any other non-cd.
-            continue
+        elif plain == "!":
+            # `then` and `{` are syntax the command word still follows, but `!`
+            # inverts the status of what follows without undoing a relocation:
+            # `! cd sub && git reset --hard` discards in the directory the cd
+            # reached only when the cd failed (so the caller's), while `! cd
+            # sub; git reset --hard` discards in sub itself. Which shell the
+            # discard runs in cannot be read from the segment, so a directory
+            # command behind `!` is refused rather than replayed as one.
+            negated = True
+        elif raw == plain and plain in _SHELL_KEYWORDS:
+            continue  # shell syntax: the command word still follows
         elif _ASSIGNMENT_WORD.fullmatch(raw) is not None:
             if _REPLAYABLE_ASSIGNMENT.fullmatch(raw) is None:
                 return _UNRESOLVABLE_DISCARD_TARGET
