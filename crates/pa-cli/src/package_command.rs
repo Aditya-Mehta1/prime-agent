@@ -573,7 +573,10 @@ fn print_configured_package(package: &pa_core::packages::ConfiguredPackage) {
 
 /// Print settings-load warnings exactly once (`Warning (<context>, <scope>
 /// settings): <message>`).
-fn report_settings_errors(settings: &mut pa_core::settings::SettingsManager, context: &str) {
+pub(crate) fn report_settings_errors(
+    settings: &mut pa_core::settings::SettingsManager,
+    context: &str,
+) {
     for error in settings.drain_errors() {
         let scope = match error.scope {
             pa_core::settings::SettingsScope::Global => "global",

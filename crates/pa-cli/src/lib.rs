@@ -8,6 +8,7 @@
 pub(crate) mod args;
 pub(crate) mod command_registry;
 pub(crate) mod config;
+pub(crate) mod config_command;
 pub(crate) mod daemon_client;
 pub(crate) mod daemon_command;
 pub(crate) mod daemon_discovery;
@@ -16,6 +17,7 @@ pub(crate) mod daemon_session_list;
 pub(crate) mod global_flags;
 pub(crate) mod initial_message;
 pub(crate) mod interactive_mode;
+pub(crate) mod list_models;
 pub(crate) mod mcp_command;
 pub(crate) mod mode;
 pub(crate) mod package_command;
@@ -65,9 +67,7 @@ fn main_impl(args: Vec<String>, runtime: &dyn mode::Runtime) -> Result<i32, Stri
     let args = public_command.args;
 
     if args.first().map(String::as_str) == Some("config") {
-        return Err(
-            "the config command needs the interactive resource configuration UI (pa-tui), which is not linked into this build yet".to_string(),
-        );
+        return Ok(crate::config_command::run());
     }
 
     let parsed = args::parse_args(&args);

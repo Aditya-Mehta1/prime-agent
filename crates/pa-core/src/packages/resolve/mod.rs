@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use super::SourceScope;
 
 /// The four session resource kinds a package can provide.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ResourceType {
     Extensions,
     Skills,
@@ -39,7 +39,7 @@ pub(crate) const RESOURCE_TYPES: [ResourceType; 4] = [
 ];
 
 /// Where a resource came from: a package, or a top-level settings/auto slot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ResourceOrigin {
     Package,
     TopLevel,

@@ -753,13 +753,13 @@ impl AgentSessionEngine {
                             .run_turn_once(&agent, &prompt, first, &mut **emit)
                             .await
                         {
-                            Ok(TurnOnce::Message { assistant, value }) => {
-                                // The final message always reaches the
-                                // transcript — the failure included: TS
-                                // persists and renders it like any outcome.
-                                if !emit(EngineEvent::AssistantMessage(value)) {
-                                    return Ok(aborted_message(&model));
-                                }
+                            Ok(TurnOnce::Message { assistant }) => {
+                                // The settled messages already reached the
+                                // transcript through their message_end
+                                // events (the failure included: TS persists
+                                // and renders it like any outcome); this
+                                // arm only carries the final message to the
+                                // retry classifier.
                                 Ok(*assistant)
                             }
                             Ok(TurnOnce::None) => Err(anyhow::anyhow!("No response produced.")),
@@ -1005,6 +1005,39 @@ impl AgentSessionEngine {
                                     }
                                 }
                             }
+                            AgentEvent::MessageEnd {
+                                message: agent_message,
+                            } => {
+                                // Settled messages persist as session entries
+                                // and reach clients: every assistant message
+                                // (the TS `message_end` hook appends each
+                                // one, mid-run tool-call turns included) and
+                                // every tool-result message (framed as a
+                                // message pair).
+                                match agent_message {
+                                    pa_agent::types::AgentMessage::Standard(
+                                        pa_agent::types::Message::Assistant(_),
+                                    )
+                                    | pa_agent::types::AgentMessage::Standard(
+                                        pa_agent::types::Message::ToolResult(_),
+                                    ) => {
+                                        if let Some(value) = session_wire_value(agent_message) {
+                                            let event = if matches!(
+                                                agent_message,
+                                                pa_agent::types::AgentMessage::Standard(
+                                                    pa_agent::types::Message::ToolResult(_)
+                                                )
+                                            ) {
+                                                EngineEvent::ToolResultMessage(value)
+                                            } else {
+                                                EngineEvent::AssistantMessage(value)
+                                            };
+                                            let _ = tx.send(event);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
                             AgentEvent::ToolExecutionStart {
                                 tool_call_id,
                                 tool_name,
@@ -1116,18 +1149,14 @@ impl AgentSessionEngine {
                 assistant,
             )) = message
             {
-                let Some(ai_message) =
-                    json_round_trip::<_, pa_types::ai::AssistantMessage>(assistant)
-                else {
+                // The message must carry the session wire shape (the
+                // transcript already received it through message_end); a
+                // round-trip failure means no usable turn outcome.
+                if json_round_trip::<_, pa_types::ai::AssistantMessage>(assistant).is_none() {
                     return Ok(TurnOnce::None);
-                };
-                let session_message = pa_types::session::AgentMessage::Assistant(ai_message);
-                let Ok(value) = serde_json::to_value(&session_message) else {
-                    return Ok(TurnOnce::None);
-                };
+                }
                 return Ok(TurnOnce::Message {
                     assistant: Box::new(assistant.clone()),
-                    value,
                 });
             }
         }
@@ -1150,11 +1179,9 @@ enum TurnOnce {
     Aborted,
     /// The turn produced no assistant message.
     None,
-    /// The turn's final assistant message: the typed message (retry
-    /// classification) plus its session wire value (transcript + store).
+    /// The turn's final assistant message (retry classification).
     Message {
         assistant: Box<pa_agent::types::AssistantMessage>,
-        value: Value,
     },
 }
 
@@ -1882,6 +1909,9 @@ fn session_wire_value(agent_message: &pa_agent::types::AgentMessage) -> Option<V
         }
         pa_agent::types::AgentMessage::Standard(LoopMessage::Assistant(assistant)) => {
             pa_types::session::AgentMessage::Assistant(json_round_trip(assistant)?)
+        }
+        pa_agent::types::AgentMessage::Standard(LoopMessage::ToolResult(tool_result)) => {
+            pa_types::session::AgentMessage::ToolResult(json_round_trip(tool_result)?)
         }
         _ => return None,
     };

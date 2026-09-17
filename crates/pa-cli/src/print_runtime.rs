@@ -21,6 +21,18 @@ pub struct PrintRuntime;
 
 impl crate::mode::Runtime for PrintRuntime {
     fn run(&self, options: &RunOptions) -> Result<i32, MissingSubsystem> {
+        // `model list` takes the full runtime path in every mode and exits
+        // (TS main: listModels runs after session assembly, before any mode
+        // transport, and exits 0).
+        if options.list_models.is_some() {
+            return match crate::list_models::run(options) {
+                Ok(code) => Ok(code),
+                Err(message) => {
+                    eprintln!("Error: {message}");
+                    Ok(1)
+                }
+            };
+        }
         match options.app_mode {
             // Runtime failures print themselves and exit non-zero; the typed
             // MissingSubsystem channel stays reserved for unwired subsystems.

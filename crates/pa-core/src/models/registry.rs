@@ -92,11 +92,16 @@ impl ModelRegistry {
         &self.models
     }
 
-    /// Models whose provider has configured auth (fast; no refresh).
+    /// Models whose provider has configured auth, with unauthorized private
+    /// Prime Inference models gated out (TS `getAvailable`).
     pub fn get_available(&self) -> Vec<&Model> {
         self.models
             .iter()
-            .filter(|model| self.has_configured_auth(model))
+            .filter(|model| {
+                (!is_private_prime_inference_model(model)
+                    || self.is_authorized_private_model(model))
+                    && self.has_configured_auth(model)
+            })
             .collect()
     }
 
@@ -371,7 +376,7 @@ impl ModelRegistry {
             previous_models,
         )
         .await;
-        self.models.clone()
+        self.get_available().into_iter().cloned().collect()
     }
 
     #[allow(clippy::too_many_lines)]

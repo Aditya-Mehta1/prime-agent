@@ -13,6 +13,7 @@ pub mod chat;
 pub mod chat_slash;
 pub mod chrome;
 pub mod code_preview;
+pub mod config_selector;
 pub mod daemon_client;
 pub mod direct_transport;
 pub mod editor;

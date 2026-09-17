@@ -34,9 +34,9 @@ below is evidence-based, not battery-based.
 | 12 | MCP | partial | CLI config/catalog/gating only; product-path wiring, OAuth/login UI, generic connector execution unproven |
 | 13 | Extensions | partial | package manager + resource resolution done; sidecar runner stages 1-6 pending |
 | 14 | Skills | partial | loading + prompt inventory done; skills-as-commands and attach-image product backing missing |
-| 15 | CLI command surface | partial | list/attach/stop/rename/send/schedule wired; status/doctor/shutdown unavailable, self-update missing, model-list catalog + config UI missing |
+| 15 | CLI command surface | partial | list/attach/stop/rename/send/schedule wired; model-list catalog + config UI landed; status/doctor/shutdown unavailable, self-update missing |
 | 16 | Headless modes | partial | print/json done; RPC and ACP modes missing |
-| 17 | Session persistence | partial | entry-set parity landed; `toolResult` entries missing |
+| 17 | Session persistence | partial | entry-set parity + `toolResult` entries landed; per-entry gaps remain elsewhere |
 | 18 | First-run onboarding | complete | - |
 | 19 | Trace sharing | missing | opt-in setting persists; no upload subsystem, `/traces` UI unavailable |
 | 20 | Eval / verifiers Prime flow | missing | not started |
@@ -254,15 +254,15 @@ rows are differential-tested (`pa-cli/tests/differential_cli.rs`).
 
 Missing:
 
-- `model list` (found by this audit): the TS binary prints the model catalog
-  table (`cli/list-models.ts`); the Rust binary falls through to print mode
-  and answers "No response produced." - `RunOptions.list_models` is parsed
-  (`pa-cli/src/mode.rs` L128) but no runtime consumes it
-  (`pa-cli/src/print_runtime.rs` has no arm; only the dead
-  `UnavailableRuntime` in `pa-cli/src/mode.rs` L188 checks it).
-- `config`: "the config command needs the interactive resource configuration
-  UI (pa-tui), which is not linked into this build yet"
-  (`pa-cli/src/lib.rs` L66-69).
+- `model list`: DONE - the runtime renders the TS catalog table
+  (`pa-cli/src/list_models.rs`, registry availability now gates unauthorized
+  private models like TS `getAvailable`); differential corpus rows compare
+  the table and search/no-match paths against the TS binary.
+- `config`: DONE - the interactive resource-configuration view
+  (`pa-cli/src/config_command.rs` + `pa-tui/src/config_selector.rs`),
+  frame-identical to the TS view at 100 columns and producing the same
+  settings writes (`+`/`-` patterns) for the same key sequence
+  (tmux-verified).
 - `status`/`doctor`/`shutdown`: typed "daemon discovery ... is not available
   in this build yet" (`pa-cli/src/public_command.rs` L375-398; drivers exist on
   the unmerged `lane/cli-discovery-2` `c4c285c`).
@@ -289,10 +289,14 @@ session_state, message, model_change, service_tier_change,
 thinking_level_change, custom_message, compaction, agent_status),
 checkpoint/restart recovery journal, status-line request parity (#81/#83).
 
-Remaining: `toolResult` entries are never written - the persistence listener
-records user/assistant messages only (`pa-core/src/session_engine/mod.rs`
-L325-331 `persist_event`); affects `get_session_stats.toolResults`,
-transcripts, and external tooling (checklist §8).
+Remaining: none for `toolResult` entries - the pa-core persisted-session
+listener writes them (hermetic scripted-tool test), the daemon worker
+persists them plus every mid-run assistant message (TS `message_end`
+append semantics, `supervisor_e2e.rs` verifier), a live-TS golden entry
+round-trips through the Rust session types
+(`tests/golden/corpus/toolresult-entry-live-ts.json`), and the TUI attach
+replay folds tool-result messages onto their pending tool cards
+(`pa-tui/src/snapshot.rs`).
 
 ## 18. First-run onboarding - complete
 

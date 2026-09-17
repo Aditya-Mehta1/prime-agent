@@ -447,6 +447,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prompt_persists_tool_results() {
+        struct EchoTool;
+        impl pa_agent::types::AgentTool for EchoTool {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn description(&self) -> &str {
+                "echo the call"
+            }
+            fn parameters(&self) -> &serde_json::Value {
+                static PARAMETERS: std::sync::OnceLock<serde_json::Value> =
+                    std::sync::OnceLock::new();
+                PARAMETERS.get_or_init(|| serde_json::json!({ "type": "object" }))
+            }
+            fn execute(
+                self: Arc<Self>,
+                _tool_call_id: String,
+                _params: serde_json::Value,
+                _signal: pa_agent::abort::AbortSignal,
+                _on_update: pa_agent::types::AgentToolUpdateCallback,
+            ) -> pa_agent::BoxFut<'static, anyhow::Result<pa_agent::types::AgentToolResult>>
+            {
+                Box::pin(async { Ok(pa_agent::types::AgentToolResult::text("tool output")) })
+            }
+        }
+        let provider = Arc::new(ScriptedProvider::new(test_model()));
+        provider.push_tool_call_turn(
+            Some("calling"),
+            vec![("call-1", "echo", serde_json::json!({}))],
+        );
+        provider.push_text_turn("done");
+        let options = AgentOptions {
+            initial_state: AgentInitialState {
+                model: Some(test_model()),
+                ..Default::default()
+            },
+            stream_fn: Some(provider.stream_fn()),
+            ..Default::default()
+        };
+        let agent = Agent::new(options);
+        agent.set_tools(vec![Arc::new(EchoTool)]).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let session = SessionManager::persisted(std::path::Path::new("/w"), tmp.path());
+        let engine = AgentSession::new(Arc::new(agent), session, vec![])
+            .await
+            .unwrap();
+        engine.prompt("hi", PromptOptions::default()).await.unwrap();
+        engine.agent().wait_for_idle().await;
+        let entries = engine.entries().await;
+        let roles: Vec<&str> = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                FileEntry::Message { message, .. } => Some(match message {
+                    SessionAgentMessage::User(_) => "user",
+                    SessionAgentMessage::Assistant(_) => "assistant",
+                    SessionAgentMessage::ToolResult(_) => "toolResult",
+                    _ => "other",
+                }),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant", "toolResult", "assistant"],
+            "entries: {entries:?}"
+        );
+        let tool_result = entries
+            .iter()
+            .find_map(|entry| match entry {
+                FileEntry::Message {
+                    message: SessionAgentMessage::ToolResult(result),
+                    ..
+                } => Some(result.clone()),
+                _ => None,
+            })
+            .expect("toolResult entry persisted");
+        // Whole-object compare through the TS wire shape (timestamp is
+        // turn-dependent and asserted only by type).
+        let value = serde_json::to_value(SessionAgentMessage::ToolResult(tool_result)).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "role": "toolResult",
+                "toolCallId": "call-1",
+                "toolName": "echo",
+                "content": [{ "type": "text", "text": "tool output" }],
+                "isError": false,
+                "timestamp": value["timestamp"],
+            })
+        );
+        // The persisted file line carries the live-TS entry envelope: the
+        // message under `message`, chained to its assistant parent.
+        let file = tmp
+            .path()
+            .join(format!("{}.jsonl", engine.session_id().await))
+            .to_string_lossy()
+            .to_string();
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(file)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let entry = lines
+            .iter()
+            .find(|entry| {
+                entry.get("message").and_then(|m| m.get("role"))
+                    == Some(&serde_json::json!("toolResult"))
+            })
+            .expect("toolResult entry on disk");
+        assert_eq!(entry["type"], "message");
+        assert_eq!(entry["message"]["toolCallId"], "call-1");
+        assert_eq!(entry["message"]["content"][0]["text"], "tool output");
+        assert_eq!(entry["message"]["isError"], false);
+        assert!(entry["id"].as_str().is_some_and(|id| id.len() == 8));
+        assert!(entry["parentId"].as_str().is_some());
+        assert!(entry["timestamp"].as_str().is_some());
+    }
+
+    /// A `toolResult` entry captured from a live TS session (read-only, from
+    /// the installed product's own session store) parses into the Rust
+    /// session types and re-serializes to the identical wire shape.
+    #[test]
+    fn ts_toolresult_entry_round_trips() {
+        let golden: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/golden/corpus/toolresult-entry-live-ts.json"
+        ))
+        .unwrap();
+        let entry: FileEntry = serde_json::from_value(golden.clone()).unwrap();
+        let FileEntry::Message {
+            message: SessionAgentMessage::ToolResult(tool_result),
+            base,
+        } = &entry
+        else {
+            panic!("golden entry is not a toolResult message: {entry:?}");
+        };
+        assert_eq!(tool_result.tool_name, "ipython");
+        assert_eq!(
+            tool_result.tool_call_id,
+            "c2425715-419e-4d06-a101-a78da1969b96"
+        );
+        assert!(!tool_result.is_error);
+        assert_eq!(base.id.clone().unwrap_or_default().len(), 8);
+        assert_eq!(base.parent_id.as_deref(), Some("8902561b"));
+        // The ipython `details` block survives the round trip intact.
+        assert_eq!(
+            tool_result.details,
+            Some(serde_json::json!({
+                "durationMs": 10,
+                "status": "ok",
+                "stdout": "/root/prime-agent-rs\n['.git', 'MISSION.md', 'README.md', 'WATCHDOG.md']\nTrue\n",
+                "stderr": "",
+                "kernelRestarted": false
+            }))
+        );
+        // Re-serialization is byte-identical (stable wire shape).
+        let serialized = serde_json::to_value(&entry).unwrap();
+        assert_eq!(serialized, golden);
+    }
+
+    #[tokio::test]
     async fn template_expansion_applies() {
         let provider = Arc::new(ScriptedProvider::new(test_model()));
         provider.push_text_turn("ok");

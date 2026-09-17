@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 /// Scope a package source belongs to: user settings, project settings, or an
 /// ephemeral resolve-only scope (temporary sources are never persisted).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SourceScope {
     User,
     Project,

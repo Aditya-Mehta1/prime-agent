@@ -14,6 +14,7 @@ mod manager;
 mod npm;
 mod process;
 pub(crate) mod resolve;
+pub mod resource_config;
 mod source;
 mod update;
 
@@ -60,6 +61,11 @@ pub(crate) fn package_dir() -> PathBuf {
         .ok()
         .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The bundled docs directory (TS `getDocsPath`): `<package dir>/docs`.
+pub fn docs_path() -> PathBuf {
+    package_dir().join("docs")
 }
 
 fn expand_tilde(path: &str) -> PathBuf {

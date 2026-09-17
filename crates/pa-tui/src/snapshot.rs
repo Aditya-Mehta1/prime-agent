@@ -53,10 +53,86 @@ pub struct Reconstructed {
 }
 
 impl Reconstructed {
-    /// Fold one raw message into the chat entries.
+    /// Fold one raw message into the chat entries. A `toolResult` message
+    /// does not add a row: it completes the pending tool card its
+    /// `toolCallId` refers to (the TS transcript replay updates the pending
+    /// tool component instead of rendering a new row).
     pub fn push_message(&mut self, message: &Value) {
+        if let Some(result) = tool_result_message_view(message) {
+            apply_tool_result(&mut self.chat, result);
+            return;
+        }
         self.chat.extend(message_value_to_entries(message));
     }
+}
+
+/// A decoded `toolResult` transcript message: the id of the tool call it
+/// completes plus the result view rendered on the matching card.
+struct ToolResultReplay {
+    tool_call_id: String,
+    view: crate::chat::ToolResultView,
+}
+
+/// Decode a `role: "toolResult"` message into its replay view; `None` for
+/// any other message.
+fn tool_result_message_view(message: &Value) -> Option<ToolResultReplay> {
+    if message.get("role").and_then(Value::as_str) != Some("toolResult") {
+        return None;
+    }
+    Some(ToolResultReplay {
+        tool_call_id: message
+            .get("toolCallId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        view: crate::chat::ToolResultView {
+            content: message
+                .get("content")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            details: message.get("details").cloned().unwrap_or(Value::Null),
+            is_error: message
+                .get("isError")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        },
+    })
+}
+
+/// Complete the first pending tool card matching `result`'s tool call id
+/// (the TS `renderedPendingTools` replay: results land on the card, never
+/// as a new transcript row).
+fn apply_tool_result(chat: &mut [ChatEntry], result: ToolResultReplay) {
+    let ToolResultReplay { tool_call_id, view } = result;
+    for entry in chat.iter_mut() {
+        if let ChatEntry::Tool(card) = entry {
+            if card.id == tool_call_id && card.result.is_none() {
+                card.started = true;
+                card.result = Some(view);
+                card.result_partial = false;
+                return;
+            }
+        }
+    }
+}
+
+/// Replay a whole transcript: map every message to its rows, then fold
+/// `toolResult` messages onto the pending tool cards their ids refer to.
+pub fn transcript_to_entries(messages: &[Value]) -> Vec<ChatEntry> {
+    let mut chat: Vec<ChatEntry> = Vec::new();
+    let mut tool_results: Vec<ToolResultReplay> = Vec::new();
+    for message in messages {
+        if let Some(result) = tool_result_message_view(message) {
+            tool_results.push(result);
+            continue;
+        }
+        chat.extend(message_value_to_entries(message));
+    }
+    for result in tool_results {
+        apply_tool_result(&mut chat, result);
+    }
+    chat
 }
 
 /// Reconstruct the view state from slim attach data.
@@ -65,12 +141,7 @@ pub fn reconstruct(attach: &AttachData) -> Reconstructed {
     let messages = snapshot
         .get("messages")
         .and_then(Value::as_array)
-        .map(|messages| {
-            messages
-                .iter()
-                .flat_map(message_value_to_entries)
-                .collect::<Vec<_>>()
-        })
+        .map(|messages| transcript_to_entries(messages))
         .unwrap_or_default();
     let state = snapshot.get("state");
     let model_id = state
@@ -777,6 +848,124 @@ mod tests {
             vec![ChatEntry::User {
                 text: "[Malformed session command message]".to_string()
             }]
+        );
+    }
+
+    /// A transcript with tool calls replays the way the TS attach does: the
+    /// assistant's tool card stays pending until the matching
+    /// `role: "toolResult"` message completes it; orphan results render
+    /// nothing.
+    #[test]
+    fn transcript_replay_completes_tool_cards() {
+        let transcript = [
+            json!({ "role": "user", "content": "run it", "timestamp": 1 }),
+            json!({
+                "role": "assistant",
+                "content": [
+                    { "type": "text", "text": "calling" },
+                    { "type": "toolCall", "id": "call-1", "name": "ipython", "arguments": {"code": "1"} },
+                ],
+                "provider": "faux", "model": "faux-1",
+                "usage": { "input": 10, "output": 2 }, "stopReason": "toolUse",
+                "timestamp": 2,
+            }),
+            json!({
+                "role": "toolResult",
+                "toolCallId": "call-1",
+                "toolName": "ipython",
+                "content": [{ "type": "text", "text": "42" }],
+                "details": { "durationMs": 3, "status": "ok" },
+                "isError": false,
+                "timestamp": 3,
+            }),
+            json!({
+                "role": "toolResult",
+                "toolCallId": "orphan",
+                "toolName": "ipython",
+                "content": [{ "type": "text", "text": "no card" }],
+                "isError": false,
+                "timestamp": 4,
+            }),
+            json!({
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "done" }],
+                "provider": "faux", "model": "faux-1",
+                "usage": { "input": 10, "output": 2 }, "stopReason": "stop",
+                "timestamp": 5,
+            }),
+        ];
+        let chat = transcript_to_entries(&transcript);
+        // user row, assistant text, tool card, final assistant text.
+        assert_eq!(chat.len(), 4, "chat: {chat:?}");
+        let Some(ChatEntry::Tool(card)) = chat.get(2) else {
+            panic!("tool card at index 2: {chat:?}");
+        };
+        assert!(card.started);
+        assert!(!card.result_partial);
+        let result = card.result.as_ref().expect("result replayed");
+        assert_eq!(
+            result.content,
+            vec![json!({ "type": "text", "text": "42" })]
+        );
+        assert_eq!(result.details, json!({ "durationMs": 3, "status": "ok" }));
+        assert!(!result.is_error);
+    }
+
+    /// A pending card (result absent) replays with no result, like a turn
+    /// still in flight when the session was last persisted.
+    #[test]
+    fn transcript_replay_keeps_pending_cards_without_results() {
+        let transcript = [
+            json!({ "role": "user", "content": "run it", "timestamp": 1 }),
+            json!({
+                "role": "assistant",
+                "content": [
+                    { "type": "toolCall", "id": "call-1", "name": "ipython", "arguments": {} },
+                ],
+                "provider": "faux", "model": "faux-1",
+                "usage": { "input": 10, "output": 2 }, "stopReason": "toolUse",
+                "timestamp": 2,
+            }),
+        ];
+        let chat = transcript_to_entries(&transcript);
+        let Some(ChatEntry::Tool(card)) = chat.get(1) else {
+            panic!("tool card at index 1: {chat:?}");
+        };
+        assert!(!card.started);
+        assert!(card.result.is_none());
+    }
+
+    /// `Reconstructed::push_message` folds a late `toolResult` message onto
+    /// the card an earlier chunk added (streamed snapshot reassembly).
+    #[test]
+    fn push_message_completes_pending_tool_card() {
+        let mut reconstructed = Reconstructed::default();
+        reconstructed.push_message(&json!({
+            "role": "assistant",
+            "content": [
+                { "type": "toolCall", "id": "call-1", "name": "ipython", "arguments": {} },
+            ],
+            "provider": "faux", "model": "faux-1",
+            "usage": { "input": 10, "output": 2 }, "stopReason": "toolUse",
+            "timestamp": 2,
+        }));
+        reconstructed.push_message(&json!({
+            "role": "toolResult",
+            "toolCallId": "call-1",
+            "toolName": "ipython",
+            "content": [{ "type": "text", "text": "out" }],
+            "isError": true,
+            "timestamp": 3,
+        }));
+        assert_eq!(reconstructed.chat.len(), 1);
+        let Some(ChatEntry::Tool(card)) = reconstructed.chat.first() else {
+            panic!("single tool card: {:?}", reconstructed.chat);
+        };
+        let result = card.result.as_ref().expect("result applied");
+        assert!(result.is_error);
+        assert_eq!(
+            result.content,
+            vec![json!({ "type": "text", "text": "out" })]
         );
     }
 }

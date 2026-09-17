@@ -2295,6 +2295,14 @@ impl TurnRunner {
                             let _ = store.persist_entry("message", json!({ "message": message }));
                         }
                     }
+                    // The session-file form of a tool result: a `message`
+                    // entry with the `role: "toolResult"` payload (TS
+                    // `_processAgentEvent` appendMessage path).
+                    EngineEvent::ToolResultMessage(message) => {
+                        if let Some(store) = core.store.as_mut() {
+                            let _ = store.persist_entry("message", json!({ "message": message }));
+                        }
+                    }
                     // The session-file form of a custom row (TS
                     // `appendCustomMessageEntry`: customType/content/display/
                     // details fields on a `custom_message` entry).
@@ -2387,6 +2395,10 @@ impl TurnRunner {
                         "result": result,
                         "isError": is_error,
                     })],
+                    EngineEvent::ToolResultMessage(message) => vec![
+                        json!({ "type": "message_start", "message": message }),
+                        json!({ "type": "message_end", "message": message }),
+                    ],
                     EngineEvent::CustomMessage(message) => vec![
                         json!({ "type": "message_start", "message": message }),
                         json!({ "type": "message_end", "message": message }),

@@ -67,6 +67,10 @@ pub enum EngineEvent {
         result: Value,
         is_error: bool,
     },
+    /// A tool-result message (wire `role: "toolResult"`): recorded into the
+    /// session store and framed to clients as a `message_start` +
+    /// `message_end` pair, matching the TS session's loop-event forwarding.
+    ToolResultMessage(Value),
     /// A durable custom message (wire `role: "custom"`): recorded into the
     /// session store and shown to attached clients. Emitted as a
     /// `message_start` + `message_end` pair, matching the TS session's

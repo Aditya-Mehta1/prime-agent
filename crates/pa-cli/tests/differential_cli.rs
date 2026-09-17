@@ -173,11 +173,26 @@ const CORPUS: &[&[&str]] = &[
     &["model"],
     &["model", "bogus"],
     &["model", "list", "x", "y"],
+    // Model catalog rows (`model list`): the full table plus search and
+    // no-match paths. These rows need provider auth visible to both
+    // binaries (PRIME_API_KEY on this box) so the catalog, not the
+    // no-models guidance, is what prints; PI_OFFLINE keeps the catalog
+    // deterministic (bundled, no network refresh).
+    &["model", "list"],
+    &["model", "list", "gpt"],
+    &["model", "list", "claude"],
+    &["model", "list", "z-ai"],
+    &["model", "list", "z-ai", "glm"],
+    &["model", "list", "zzz-nomatch-xyz"],
+    &["model", "list", "--json"],
     &["session"],
     &["session", "bogus"],
     &["session", "export"],
     &["session", "export", "a", "b", "c"],
     &["session", "export", "--x"],
+    // config command validation (the interactive view itself is excluded:
+    // it needs a terminal).
+    &["config", "x"],
     // update command validation.
     &["update", "--self"],
     &["update", "package"],
@@ -334,7 +349,26 @@ fn normalize(text: &str, sandbox_roots: &[&Path]) -> String {
     for root in sandbox_roots {
         text = text.replace(&root.display().to_string(), "<SANDBOX>");
     }
+    // Docs paths in login guidance resolve to each binary's own install dir
+    // (package dir); compare the shape, not the installation location.
+    text = normalize_docs_paths(&text);
     normalize_versions(&text)
+}
+
+/// Replace `<any dir>/docs/providers.md|models.md` lines with a placeholder.
+fn normalize_docs_paths(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            for doc in ["/docs/providers.md", "/docs/models.md"] {
+                if trimmed.contains(doc) {
+                    return line.replace(trimmed.trim_end(), &format!("<PACKAGE_DOCS>{doc}"));
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn normalize_versions(text: &str) -> String {

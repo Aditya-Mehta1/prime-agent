@@ -1,0 +1,111 @@
+{
+ "command": "attach",
+ "data": {
+  "activeSessionId": "309b357ae6c4",
+  "client": {
+   "capabilities": [
+    "attach_snapshot",
+    "event_sequence"
+   ],
+   "id": "47d36cf66516"
+  },
+  "lastEventCursor": {
+   "generation": "c143297885ac",
+   "sequence": 0
+  },
+  "lastEventSequence": 0,
+  "protocol": {
+   "name": "prime-agent.daemon",
+   "version": 7
+  },
+  "replay": {
+   "status": "complete",
+   "toCursor": {
+    "generation": "c143297885ac",
+    "sequence": 0
+   },
+   "toSequence": 0
+  },
+  "snapshot": {
+   "activeSessionId": "309b357ae6c4",
+   "children": [],
+   "lastEventCursor": {
+    "generation": "c143297885ac",
+    "sequence": 0
+   },
+   "lastEventSequence": 0,
+   "messages": [],
+   "state": {
+    "activeSessionId": "309b357ae6c4",
+    "activeToolNames": [],
+    "autoCompactionEnabled": true,
+    "availableThinkingLevels": [
+     "default"
+    ],
+    "compactionCount": 0,
+    "cwd": "/home/ubuntu/lane-worktrees/cli-gaps/scripts/battery/runs/20260917T131535Z/rust/work",
+    "followUpMode": "all",
+    "goal": null,
+    "isBashRunning": false,
+    "isCompacting": false,
+    "isStreaming": false,
+    "leafId": "9581cfb5",
+    "messageCount": 0,
+    "model": {
+     "id": "mock-1",
+     "name": "Mock 1",
+     "provider": "prime-inference",
+     "reasoning": false
+    },
+    "retryAttempt": 0,
+    "scopedModels": [],
+    "serviceTier": "auto",
+    "sessionActions": {
+     "followUps": [],
+     "queuedCount": 0,
+     "steering": []
+    },
+    "sessionDir": "/home/ubuntu/lane-worktrees/cli-gaps/scripts/battery/runs/20260917T131535Z/rust/agent/sessions",
+    "sessionFile": "/home/ubuntu/lane-worktrees/cli-gaps/scripts/battery/runs/20260917T131535Z/rust/agent/sessions/01a0af82-d456-7759-8f92-5b21600753d2.jsonl",
+    "sessionId": "01a0af82-d456-7759-8f92-5b21600753d2",
+    "sessionName": "battery-attach",
+    "steeringMode": "all",
+    "thinkingLevel": "off"
+   },
+   "summary": {
+    "activeSessionId": "309b357ae6c4",
+    "activity": "idle",
+    "attachedClients": 1,
+    "created": "2026-09-17T13:16:21.974Z",
+    "cwd": "/home/ubuntu/lane-worktrees/cli-gaps/scripts/battery/runs/20260917T131535Z/rust/work",
+    "hasRegisteredCronJob": false,
+    "id": "309b357ae6c4",
+    "isBashRunning": false,
+    "isCompacting": false,
+    "isSessionActive": false,
+    "isStreaming": false,
+    "lastActivityAt": "2026-09-17T13:16:21.978Z",
+    "lifecycle": "resident",
+    "messageCount": 0,
+    "modified": "2026-09-17T13:16:21.978Z",
+    "rlmDepth": 0,
+    "runtimeKind": "top-level",
+    "sessionActions": {
+     "followUps": [],
+     "queuedCount": 0,
+     "steering": []
+    },
+    "sessionFile": "/home/ubuntu/lane-worktrees/cli-gaps/scripts/battery/runs/20260917T131535Z/rust/agent/sessions/01a0af82-d456-7759-8f92-5b21600753d2.jsonl",
+    "sessionId": "01a0af82-d456-7759-8f92-5b21600753d2",
+    "sessionName": "battery-attach",
+    "thinkingLevel": "off",
+    "unfinishedActionCount": 0,
+    "workerPid": 3262075,
+    "workerState": "ready"
+   }
+  }
+ },
+ "id": "a1",
+ "success": true,
+ "type": "response"
+}
