@@ -31,8 +31,7 @@ use super::messages::{
 use super::refine::{RefineOptions, RefinementSource};
 use super::slash_commands::{parse_refine_command_options, SessionSlashCommand};
 
-/// The autonomous status custom type (TS `_emitAutonomousStatus`).
-pub const AUTONOMOUS_STATUS_CUSTOM_TYPE: &str = "autonomous_status";
+pub use crate::autonomous::AUTONOMOUS_STATUS_CUSTOM_TYPE;
 
 /// Inputs the host runtime supplies to one execution.
 pub struct SessionCommandParams<'a> {

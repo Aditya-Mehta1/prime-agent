@@ -1,11 +1,25 @@
-//! Autonomous mode: run-state accounting, continuation decisions, and
-//! shell-based quality gates. Port of core/autonomous.ts.
+//! Autonomous mode: run-state accounting, limits, continuation text, gate
+//! evaluation, and the per-turn continuation driver.
+//!
+//! The runtime state (`AutonomousRuntimeState`) tracks usage and limits for
+//! one autonomous run. The [`AutonomousDriver`] trait (in [`driver`]) is the
+//! policy seam the session turn loop consults after every settled turn; the
+//! engine never inspects autonomous state itself.
+
+mod driver;
+mod gates;
+
+pub use driver::{
+    autonomous_stop_row, AutonomousDriver, AutonomousFollowUp, AutonomousFollowUpFuture,
+    AutonomousStopReason, ShellAutonomousDriver,
+};
+pub use gates::{
+    should_autonomously_continue, ChildProcessResult, GateCommandRunner, ShellGateRunner,
+};
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 pub const DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT: &str = "No human input is available in autonomous mode. Continue working until the host evaluator, verifier, or configured autonomous limits stop the run. If you were asking the user a question, make a reasonable assumption and verify it. If you believe you are blocked, prove it with host-observable evidence, preserve that evidence, and keep looking for safe progress while budget remains. Do not end the session yourself; the verifier/evaluator decides completion when configured gates pass.";
 
@@ -23,8 +37,9 @@ pub const MAX_SUBAGENT_KEEP_ALIVE_MS: u64 = 2_147_483_647;
 /// JSON-safe sentinel meaning "no cap".
 pub const UNLIMITED_AUTONOMOUS_LIMIT: u64 = 9_007_199_254_740_991;
 
-const MAX_GATE_OUTPUT_CHARS: usize = 6000;
-const MAX_CHILD_PROCESS_OUTPUT_CHARS: usize = 1024 * 1024;
+/// The durable autonomous status row's custom type (`/autonomous` output and
+/// the driver's stop rows share it).
+pub const AUTONOMOUS_STATUS_CUSTOM_TYPE: &str = "autonomous_status";
 
 /// User-facing configuration (`/autonomous` options).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -306,7 +321,7 @@ pub fn autonomous_status(state: &AutonomousRuntimeState) -> AgentAutonomousStatu
     }
 }
 
-/// Account one assistant turn's usage.
+/// Account one settled assistant message (per-message usage accounting).
 pub fn add_autonomous_usage(
     state: &mut AutonomousRuntimeState,
     usage: Option<&pa_types::ai::Usage>,
@@ -356,156 +371,6 @@ pub fn autonomous_limit_reason(
     None
 }
 
-/// Decide whether an assistant turn should be followed by a continuation.
-pub async fn should_autonomously_continue(
-    state: &mut AutonomousRuntimeState,
-    stop_reason: Option<pa_types::ai::StopReason>,
-    gates: &dyn Fn(&str) -> anyhow::Result<ChildProcessResult>,
-) -> AutonomousDecision {
-    use pa_types::ai::StopReason;
-    if !state.enabled
-        || stop_reason == Some(StopReason::Error)
-        || stop_reason == Some(StopReason::Aborted)
-    {
-        return AutonomousDecision {
-            should_continue: false,
-            reason: AutonomousDecisionReason::NotNeeded,
-        };
-    }
-    let gate_result = refresh_autonomous_quality_gates(state, gates).await;
-    let limit_reason = autonomous_limit_reason(state, now_millis());
-    match gate_result {
-        Some(AutonomousGateResult::Passed) => AutonomousDecision {
-            should_continue: false,
-            reason: AutonomousDecisionReason::NotNeeded,
-        },
-        Some(AutonomousGateResult::RetryExhausted) => AutonomousDecision {
-            should_continue: false,
-            reason: AutonomousDecisionReason::LimitReached,
-        },
-        None if limit_reason.is_some() => AutonomousDecision {
-            should_continue: false,
-            reason: AutonomousDecisionReason::LimitReached,
-        },
-        Some(AutonomousGateResult::Failed) => {
-            if limit_reason.is_some() {
-                AutonomousDecision {
-                    should_continue: false,
-                    reason: AutonomousDecisionReason::LimitReached,
-                }
-            } else {
-                AutonomousDecision {
-                    should_continue: true,
-                    reason: AutonomousDecisionReason::GateFailed,
-                }
-            }
-        }
-        None => AutonomousDecision {
-            should_continue: true,
-            reason: AutonomousDecisionReason::MissingTerminalEvidence,
-        },
-    }
-}
-
-async fn refresh_autonomous_quality_gates(
-    state: &mut AutonomousRuntimeState,
-    gates: &dyn Fn(&str) -> anyhow::Result<ChildProcessResult>,
-) -> Option<AutonomousGateResult> {
-    if !state.enabled || state.gates.commands.is_empty() {
-        return None;
-    }
-    Some(run_autonomous_quality_gates(state, gates).await)
-}
-
-async fn run_autonomous_quality_gates(
-    state: &mut AutonomousRuntimeState,
-    gates: &dyn Fn(&str) -> anyhow::Result<ChildProcessResult>,
-) -> AutonomousGateResult {
-    let commands = state.gates.commands.clone();
-    let max_retries = state.gates.max_retries;
-    for command in &commands {
-        let same_failure = state
-            .last_gate_failure
-            .as_ref()
-            .is_some_and(|failure| &failure.command == command)
-            && state.last_gate_failure_snapshot.is_some();
-        if same_failure {
-            let attempt = state.gate_attempts.get(command).copied().unwrap_or(
-                state
-                    .last_gate_failure
-                    .as_ref()
-                    .map(|failure| failure.attempt)
-                    .unwrap_or(0),
-            ) + 1;
-            state.gate_attempts.insert(command.clone(), attempt);
-            let mut failure = state.last_gate_failure.clone().unwrap();
-            failure.attempt = attempt;
-            failure.exit_text =
-                "not rerun: workspace unchanged since previous failed gate".to_string();
-            failure.output = "The autonomous gate was not rerun because the workspace has not changed since this failure. Edit source files, tests, or a blocker artifact before attempting to finish again.".to_string();
-            state.last_gate_failure = Some(failure);
-            return if attempt > max_retries {
-                AutonomousGateResult::RetryExhausted
-            } else {
-                AutonomousGateResult::Failed
-            };
-        }
-        let Ok(result) = gates(command) else {
-            // A spawn/IO failure counts as a failed attempt.
-            let attempt = state.gate_attempts.get(command).copied().unwrap_or(0) + 1;
-            state.gate_attempts.insert(command.clone(), attempt);
-            state.last_gate_failure = Some(AgentAutonomousGateFailure {
-                command: command.clone(),
-                attempt,
-                exit_text: "failed to run".to_string(),
-                output: String::new(),
-            });
-            state.last_gate_failure_snapshot = None;
-            return if attempt > max_retries {
-                AutonomousGateResult::RetryExhausted
-            } else {
-                AutonomousGateResult::Failed
-            };
-        };
-        if result.status == Some(0) && result.error.is_none() && !result.timed_out {
-            state.gate_attempts.insert(command.clone(), 0);
-            if state
-                .last_gate_failure
-                .as_ref()
-                .is_some_and(|failure| &failure.command == command)
-            {
-                state.last_gate_failure = None;
-                state.last_gate_failure_snapshot = None;
-            }
-            continue;
-        }
-        let attempt = state.gate_attempts.get(command).copied().unwrap_or(0) + 1;
-        state.gate_attempts.insert(command.clone(), attempt);
-        let output = [result.stdout.clone(), result.stderr.clone()]
-            .into_iter()
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n")
-            .trim()
-            .to_string();
-        state.last_gate_failure = Some(AgentAutonomousGateFailure {
-            command: command.clone(),
-            attempt,
-            exit_text: format_process_exit(&result),
-            output: truncate_gate_output(&output, result.output_truncated),
-        });
-        state.last_gate_failure_snapshot = None;
-        return if attempt > max_retries {
-            AutonomousGateResult::RetryExhausted
-        } else {
-            AutonomousGateResult::Failed
-        };
-    }
-    state.last_gate_failure = None;
-    state.last_gate_failure_snapshot = None;
-    AutonomousGateResult::Passed
-}
-
 /// Continuation prompt for a failed gate.
 pub fn build_autonomous_gate_failure_continuation(
     failure: &AgentAutonomousGateFailure,
@@ -523,7 +388,7 @@ pub fn build_autonomous_gate_failure_continuation(
         } else {
             format!("\nOutput:\n{}\n", failure.output)
         },
-        iso_timestamp(timestamp),
+        crate::session::manager::format_iso(timestamp as i64),
     )
 }
 
@@ -541,130 +406,52 @@ pub fn create_autonomous_subagent_keep_alive_text(state: &AutonomousRuntimeState
     )
 }
 
-fn truncate_gate_output(output: &str, was_truncated: bool) -> String {
-    if output.chars().count() <= MAX_GATE_OUTPUT_CHARS {
-        return output.to_string();
+/// Highest recorded gate attempt (across the failure record and per-command
+/// counts): the terminal-gate headline a headless client prints.
+pub fn latest_autonomous_gate_attempt(status: &AgentAutonomousStatus) -> u64 {
+    let from_failure = status
+        .last_gate_failure
+        .as_ref()
+        .map(|failure| failure.attempt)
+        .unwrap_or(0);
+    let from_attempts = status.gate_attempts.values().copied().max().unwrap_or(0);
+    from_failure.max(from_attempts)
+}
+
+/// Human description of an autonomous limit (`<limit> reached (used/cap)`).
+pub fn describe_autonomous_limit(
+    status: &AgentAutonomousStatus,
+    reason: AutonomousLimitReason,
+    now: u64,
+) -> String {
+    match reason {
+        AutonomousLimitReason::MaxContinuations => format!(
+            "maxContinuations reached ({}/{})",
+            status.continuations_used, status.limits.max_continuations
+        ),
+        AutonomousLimitReason::MaxTurns => format!(
+            "maxTurns reached ({}/{})",
+            status.turns_used, status.limits.max_turns
+        ),
+        AutonomousLimitReason::MaxTokens => format!(
+            "maxTokens reached ({}/{})",
+            status.tokens_used, status.limits.max_tokens
+        ),
+        AutonomousLimitReason::TimeoutMs => {
+            let elapsed = status
+                .started_at
+                .map(|started_at| now.saturating_sub(started_at))
+                .unwrap_or(0);
+            format!("timeoutMs reached ({elapsed}/{})", status.limits.timeout_ms)
+        }
     }
-    let prefix: String = output.chars().take(MAX_GATE_OUTPUT_CHARS - 1).collect();
-    format!("{prefix}\u{2026}")
-        .replace('\u{2026}', if was_truncated { " (truncated)" } else { "" })
-        .trim()
-        .to_string()
 }
 
-fn format_process_exit(result: &ChildProcessResult) -> String {
-    if let Some(error) = &result.error {
-        return error.clone();
-    }
-    if result.timed_out {
-        return "timed out".to_string();
-    }
-    match result.status {
-        Some(code) => format!("exited with code {code}"),
-        None => "killed by signal".to_string(),
-    }
-}
-
-/// Result of a gate child process.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ChildProcessResult {
-    pub status: Option<i32>,
-    pub stdout: String,
-    pub stderr: String,
-    pub error: Option<String>,
-    pub timed_out: bool,
-    pub output_truncated: bool,
-}
-
-/// Run a shell command with a timeout and output caps (the real gate runner).
-pub async fn run_gate_command(
-    command: &str,
-    cwd: &Path,
-    timeout_ms: u64,
-) -> anyhow::Result<ChildProcessResult> {
-    let mut child = tokio::process::Command::new("bash")
-        .arg("-c")
-        .arg(command)
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
-    let timeout = tokio::time::Duration::from_millis(timeout_ms.max(1));
-    let status = tokio::select! {
-        _ = tokio::time::sleep(timeout) => None,
-        status = child.wait() => status.ok(),
-    };
-    let Some(status) = status else {
-        child.kill().await.ok();
-        return Ok(ChildProcessResult {
-            timed_out: true,
-            ..Default::default()
-        });
-    };
-    let (stdout, stdout_truncated) =
-        read_pipe_capped(child.stdout.take(), MAX_CHILD_PROCESS_OUTPUT_CHARS).await;
-    let (stderr, stderr_truncated) =
-        read_pipe_capped_stderr(child.stderr.take(), MAX_CHILD_PROCESS_OUTPUT_CHARS).await;
-    Ok(ChildProcessResult {
-        status: status.code(),
-        output_truncated: stdout_truncated || stderr_truncated,
-        stdout,
-        stderr,
-        ..Default::default()
-    })
-}
-
-async fn read_pipe_capped(
-    mut pipe: Option<tokio::process::ChildStdout>,
-    cap: usize,
-) -> (String, bool) {
-    use tokio::io::AsyncReadExt;
-    let mut buffer = Vec::new();
-    if let Some(pipe) = pipe.as_mut() {
-        pipe.read_to_end(&mut buffer).await.ok();
-    }
-    capped_text(&buffer, cap)
-}
-
-async fn read_pipe_capped_stderr(
-    mut pipe: Option<tokio::process::ChildStderr>,
-    cap: usize,
-) -> (String, bool) {
-    use tokio::io::AsyncReadExt;
-    let mut buffer = Vec::new();
-    if let Some(pipe) = pipe.as_mut() {
-        pipe.read_to_end(&mut buffer).await.ok();
-    }
-    capped_text(&buffer, cap)
-}
-
-fn capped_text(buffer: &[u8], cap: usize) -> (String, bool) {
-    let text = String::from_utf8_lossy(buffer);
-    if text.len() <= cap {
-        return (text.to_string(), false);
-    }
-    let truncated: String = text.chars().take(cap).collect();
-    (truncated, true)
-}
-
-fn iso_timestamp(millis: u64) -> String {
-    crate::session::manager::format_iso(millis as i64)
-}
-
-fn now_millis() -> u64 {
+pub fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default()
-}
-
-#[allow(unused)]
-fn unused_hash() -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"");
-    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(test)]
@@ -678,20 +465,14 @@ mod tests {
         }
     }
 
-    fn ok_gates(_command: &str) -> anyhow::Result<ChildProcessResult> {
-        Ok(ChildProcessResult {
-            status: Some(0),
+    fn usage(input: u64, output: u64) -> pa_types::ai::Usage {
+        pa_types::ai::Usage {
+            input,
+            output,
+            cache_read: 0,
+            cache_write: input,
             ..Default::default()
-        })
-    }
-
-    fn failing_gates(_command: &str) -> anyhow::Result<ChildProcessResult> {
-        Ok(ChildProcessResult {
-            status: Some(1),
-            stdout: "boom\n".to_string(),
-            stderr: String::new(),
-            ..Default::default()
-        })
+        }
     }
 
     #[test]
@@ -750,16 +531,6 @@ mod tests {
         assert!(state.started_at.is_some());
     }
 
-    fn usage(input: u64, output: u64) -> pa_types::ai::Usage {
-        pa_types::ai::Usage {
-            input,
-            output,
-            cache_read: 0,
-            cache_write: input,
-            ..Default::default()
-        }
-    }
-
     #[test]
     fn usage_accounting_excludes_cache_reads() {
         let mut state = create_autonomous_runtime_state(Some(&config(true)), None);
@@ -807,74 +578,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn decisions_without_gates() {
-        use pa_types::ai::StopReason;
-        let mut state = create_autonomous_runtime_state(Some(&config(true)), None);
-        let decision =
-            should_autonomously_continue(&mut state, Some(StopReason::Stop), &ok_gates).await;
-        assert!(decision.should_continue);
-        assert_eq!(
-            decision.reason,
-            AutonomousDecisionReason::MissingTerminalEvidence
-        );
-        // Error and aborted turns never continue.
-        let stopped =
-            should_autonomously_continue(&mut state, Some(StopReason::Error), &ok_gates).await;
-        assert!(!stopped.should_continue);
-        let aborted =
-            should_autonomously_continue(&mut state, Some(StopReason::Aborted), &ok_gates).await;
-        assert!(!aborted.should_continue);
-        // Disabled state never continues.
-        state.enabled = false;
-        let disabled =
-            should_autonomously_continue(&mut state, Some(StopReason::Stop), &ok_gates).await;
-        assert!(!disabled.should_continue);
-    }
-
-    #[tokio::test]
-    async fn gate_results_drive_decisions() {
-        use pa_types::ai::StopReason;
-        let mut state = create_autonomous_runtime_state(
-            Some(&AgentAutonomousConfig {
-                enabled: Some(true),
-                gates: Some(AgentAutonomousGateConfig {
-                    commands: Some(vec!["make check".to_string()]),
-                    max_retries: Some(1),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            None,
-        );
-        // Failing gate -> continue with gate_failed.
-        let failed =
-            should_autonomously_continue(&mut state, Some(StopReason::Stop), &failing_gates).await;
-        assert!(failed.should_continue);
-        assert_eq!(failed.reason, AutonomousDecisionReason::GateFailed);
-        let failure = state.last_gate_failure.clone().unwrap();
-        assert_eq!(failure.command, "make check");
-        assert_eq!(failure.attempt, 1);
-        assert_eq!(failure.exit_text, "exited with code 1");
-        assert_eq!(failure.output, "boom");
-        // Passing gate -> stop with not_needed.
-        let passed =
-            should_autonomously_continue(&mut state, Some(StopReason::Stop), &ok_gates).await;
-        assert!(!passed.should_continue);
-        assert_eq!(passed.reason, AutonomousDecisionReason::NotNeeded);
-        // The pass reset the retry counter, so this failure starts a fresh
-        // retry window (TS resets gateAttempts on pass).
-        let failed_again =
-            should_autonomously_continue(&mut state, Some(StopReason::Stop), &failing_gates).await;
-        assert!(failed_again.should_continue);
-        assert_eq!(failed_again.reason, AutonomousDecisionReason::GateFailed);
-        // Without a pass in between, the next failure exhausts the window.
-        let exhausted =
-            should_autonomously_continue(&mut state, Some(StopReason::Stop), &failing_gates).await;
-        assert!(!exhausted.should_continue);
-        assert_eq!(exhausted.reason, AutonomousDecisionReason::LimitReached);
-    }
-
     #[test]
     fn continuation_texts() {
         let state = create_autonomous_runtime_state(Some(&config(true)), None);
@@ -904,5 +607,26 @@ mod tests {
     fn unlimited_sentinel() {
         assert!(is_unlimited_autonomous_limit(UNLIMITED_AUTONOMOUS_LIMIT));
         assert!(!is_unlimited_autonomous_limit(80_000));
+    }
+
+    #[test]
+    fn limit_descriptions() {
+        let mut state = create_autonomous_runtime_state(Some(&config(true)), None);
+        state.turns_used = 3;
+        state.limits.max_turns = 3;
+        let status = autonomous_status(&state);
+        assert_eq!(
+            describe_autonomous_limit(&status, AutonomousLimitReason::MaxTurns, 0),
+            "maxTurns reached (3/3)"
+        );
+        assert_eq!(
+            describe_autonomous_limit(&status, AutonomousLimitReason::MaxTokens, 0),
+            "maxTokens reached (0/80000)"
+        );
+        let started = status.started_at.unwrap_or(0);
+        assert_eq!(
+            describe_autonomous_limit(&status, AutonomousLimitReason::TimeoutMs, started + 5_000),
+            format!("timeoutMs reached (5000/{})", state.limits.timeout_ms)
+        );
     }
 }

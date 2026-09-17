@@ -41,6 +41,15 @@ is the shared trait in `pa_types::platform::transport`, and the private-frame
 codec plus command planes are the shared wire contract in
 `pa_types::daemon` (clients in pa-tui/pa-cli speak them).
 
+Autonomous
+continuation driving in the worker's engine: per-message usage accounting
+runs in the agent-loop subscription, and after every settled turn the
+engine consults the pa-core `AutonomousDriver` policy (product default:
+shell quality gates in the session cwd; deterministic drivers injectable
+for eval harnesses) — continuations are injected as durable user rows
+and gate pass/fail or limit stops surface as durable `autonomous_status`
+custom rows.
+
 ## Non-goals
 No agent behavior inside workers beyond hosting a pa-core engine; no UI.
 

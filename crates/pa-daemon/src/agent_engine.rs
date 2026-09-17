@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 
 use crate::agent_messaging::{LinkAgentMessageController, LinkAgentObserveController};
 use pa_agent::types::StopReason;
+use pa_core::autonomous::AutonomousFollowUp;
 use pa_core::kernel::shared::HostRequestHandlers;
 use pa_core::session_engine::agent_messaging::{
     register_agent_message_host_handlers, register_agent_observe_host_handlers,
@@ -83,10 +84,8 @@ pub struct AgentSessionEngine {
     selection: std::sync::RwLock<EngineModelSelection>,
     /// The session's resolved effective thinking level, computed once when
     /// the create command adopts the selection and reused afterwards.
-    /// Resolution goes through `resolve_model`, which registers the faux
-    /// provider (seeding the scripted response queue), so it must never run
-    /// mid-turn: a `get_state` poll during a live turn would reset the queue
-    /// and the turn would never drain.
+    /// Resolved at create time (before any turn) so summary/state polls
+    /// during a live turn stay side-effect-free.
     effective_thinking: std::sync::RwLock<Option<pa_types::ai::ModelThinkingLevel>>,
     /// Built once on the first prompt, reused across prompts.
     pub(crate) session: tokio::sync::Mutex<Option<CoreSessionEngine>>,
@@ -101,9 +100,19 @@ pub struct AgentSessionEngine {
     /// read by the kernel messaging controller to render sender identity.
     own_summary: std::sync::Arc<std::sync::Mutex<Option<Value>>>,
     /// The session's autonomous runtime state (limits, usage accounting).
-    /// The continuation driver that consults it is future work; `/autonomous`
-    /// status, on, and off operate on this state today.
-    pub(crate) autonomous: std::sync::Mutex<pa_core::autonomous::AutonomousRuntimeState>,
+    /// Shared with the agent-loop subscription so per-message accounting can
+    /// run on every settled assistant message.
+    pub(crate) autonomous:
+        std::sync::Arc<tokio::sync::Mutex<pa_core::autonomous::AutonomousRuntimeState>>,
+    /// The autonomous continuation policy the turn loop consults after
+    /// every settled turn. Product default: the shell-gate driver in the
+    /// session cwd; deterministic harnesses replace it through
+    /// [`AgentSessionEngine::set_autonomous_driver`].
+    autonomous_driver: std::sync::RwLock<std::sync::Arc<dyn pa_core::autonomous::AutonomousDriver>>,
+    /// The resolved faux model, registered once per engine so scripted
+    /// responses queue across turns instead of replaying per resolution.
+    /// Verification harness only; never set by the product.
+    faux_model: std::sync::OnceLock<Model>,
 }
 
 impl AgentSessionEngine {
@@ -147,6 +156,10 @@ impl AgentSessionEngine {
                 link_config.active_session_id.clone(),
             ))
         });
+        let autonomous_driver = std::sync::RwLock::new(std::sync::Arc::new(
+            pa_core::autonomous::ShellAutonomousDriver::new(config.cwd.clone()),
+        )
+            as std::sync::Arc<dyn pa_core::autonomous::AutonomousDriver>);
         Ok(Self {
             runtime,
             config,
@@ -155,12 +168,28 @@ impl AgentSessionEngine {
             effective_thinking: std::sync::RwLock::new(None),
             session: tokio::sync::Mutex::new(None),
             own_summary: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            autonomous: std::sync::Mutex::new(
+            autonomous: std::sync::Arc::new(tokio::sync::Mutex::new(
                 pa_core::autonomous::create_autonomous_runtime_state(None, None),
-            ),
+            )),
             link,
             children,
+            autonomous_driver,
+            faux_model: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Replace the autonomous continuation policy. Deterministic eval
+    /// harnesses inject a scripted driver here; the product keeps the
+    /// default shell-gate driver in the session cwd. Call before the
+    /// first admitted turn.
+    pub fn set_autonomous_driver(
+        &self,
+        driver: std::sync::Arc<dyn pa_core::autonomous::AutonomousDriver>,
+    ) {
+        *self
+            .autonomous_driver
+            .write()
+            .expect("autonomous driver lock") = driver;
     }
 
     /// Build the core session once (same once-only rule as `session_agent`).
@@ -188,7 +217,7 @@ impl AgentSessionEngine {
         let model = self.resolve_model()?;
         self.ensure_core_session(&model)?;
         let api_key = self.resolve_request_api_key(&model);
-        let mut autonomous = self.autonomous.lock().expect("autonomous state lock");
+        let mut autonomous = self.autonomous.blocking_lock();
         let mut params = SessionCommandParams {
             model: &model,
             api_key,
@@ -242,10 +271,18 @@ impl AgentSessionEngine {
     }
 
     /// Test seam: a scripted faux provider (same script contract as pa-cli's
-    /// print runtime) drives the engine without the network.
+    /// print runtime) drives the engine without the network. The provider
+    /// registers once per engine: its queued responses then span the whole
+    /// session (multi-turn scripts), instead of replaying from the top on
+    /// every model resolution.
     fn resolve_model(&self) -> anyhow::Result<Model> {
         if let Some(script) = &self.config.faux_script {
-            return faux_model_from_script(script);
+            if let Some(model) = self.faux_model.get() {
+                return Ok(model.clone());
+            }
+            let model = faux_model_from_script(script)?;
+            let _ = self.faux_model.set(model.clone());
+            return Ok(model);
         }
         self.resolve_registry_model()
     }
@@ -254,8 +291,8 @@ impl AgentSessionEngine {
     /// order): the create-config flag, then the settings default, then
     /// "medium" — always clamped to what the model supports; a model that
     /// cannot be resolved degrades to "off". Resolved once at create time
-    /// and cached: model resolution seeds the scripted faux provider, so
-    /// mid-turn recomputation would reset the response queue.
+    /// and cached so summary/state calls stay side-effect-free while turns
+    /// run.
     fn effective_thinking(&self) -> pa_types::ai::ModelThinkingLevel {
         if let Some(level) = *self
             .effective_thinking
@@ -644,7 +681,7 @@ impl SessionEngine for AgentSessionEngine {
             // A goal start/resume schedules its continuation context as
             // the turn; the durable goal-context row is already emitted.
             if let Some(continuation) = execution.continuation_prompt {
-                self.run_model_turn(&continuation, aborted, emit);
+                self.run_turns(&continuation, aborted, emit);
             } else {
                 emit(EngineEvent::Done(Ok(())));
             }
@@ -658,7 +695,7 @@ impl SessionEngine for AgentSessionEngine {
         }))) {
             return;
         }
-        self.run_model_turn(&request.message, aborted, emit);
+        self.run_turns(&request.message, aborted, emit);
     }
 }
 
@@ -666,30 +703,25 @@ impl AgentSessionEngine {
     /// Drive one admitted prompt through the retry-driver model loop and
     /// emit the turn outcome (provider-failure retries + final-row
     /// surfacing). The user row — or a goal continuation's durable context
-    /// row — precedes this, so this starts at the model turn.
+    /// row — precedes this, so this starts at the model turn. The trailing
+    /// `Done` is owned by the caller (`run_turns`).
     fn run_model_turn(
         &self,
         prompt: &str,
         aborted: &dyn Fn() -> bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
-    ) {
+    ) -> TurnResult {
         let prompt = prompt.to_string();
         // Model resolution and session construction are hard failures: they
         // never reach the provider, so the retry loop does not apply (the
         // TS loop only classifies provider stream failures).
         let model = match self.resolve_model() {
             Ok(model) => model,
-            Err(error) => {
-                emit(EngineEvent::Done(Err(error.to_string())));
-                return;
-            }
+            Err(error) => return TurnResult::Error(error.to_string()),
         };
         let agent = match self.session_agent(&model) {
             Ok(agent) => agent,
-            Err(error) => {
-                emit(EngineEvent::Done(Err(format!("{error:#}"))));
-                return;
-            }
+            Err(error) => return TurnResult::Error(format!("{error:#}")),
         };
         let policy = self.retry_policy();
         // The pa-core retry driver owns the attempt loop; this engine owns
@@ -764,23 +796,94 @@ impl AgentSessionEngine {
                 },
             ),
         );
-        let emit = emit_cell.into_inner();
-        let done = match result {
+        match result {
             Ok(message) => match message.stop_reason {
                 // The failure already reached the transcript as the final
                 // assistant message; the turn error still travels to
                 // headless callers through the turn result.
-                StopReason::Error => Err(message
-                    .error_message
-                    .clone()
-                    .filter(|error| !error.is_empty())
-                    .unwrap_or_else(|| "Assistant response failed".to_string())),
-                StopReason::Aborted => Err("No response produced.".to_string()),
-                _ => Ok(()),
+                StopReason::Error => TurnResult::Error(
+                    message
+                        .error_message
+                        .clone()
+                        .filter(|error| !error.is_empty())
+                        .unwrap_or_else(|| "Assistant response failed".to_string()),
+                ),
+                StopReason::Aborted => TurnResult::Error("No response produced.".to_string()),
+                _ => TurnResult::Message(Box::new(message)),
             },
-            Err(error) => Err(error.to_string()),
+            Err(error) => TurnResult::Error(error.to_string()),
+        }
+    }
+
+    /// The turn loop: run one model turn, then ask the autonomous driver
+    /// what follows. A continuation is injected as a durable user row and
+    /// drives the next turn; a stop surfaces its reason as a durable
+    /// `autonomous_status` row. The single trailing `Done` ends the run.
+    fn run_turns(
+        &self,
+        first_prompt: &str,
+        aborted: &dyn Fn() -> bool,
+        emit: &mut dyn FnMut(EngineEvent) -> bool,
+    ) {
+        let mut prompt = first_prompt.to_string();
+        loop {
+            let turn = self.run_model_turn(&prompt, aborted, emit);
+            let assistant = match turn {
+                TurnResult::Message(assistant) => assistant,
+                TurnResult::Error(error) => {
+                    emit(EngineEvent::Done(Err(error)));
+                    return;
+                }
+            };
+            match self.autonomous_follow_up(&assistant) {
+                AutonomousFollowUp::Inactive => {
+                    emit(EngineEvent::Done(Ok(())));
+                    return;
+                }
+                AutonomousFollowUp::Continue { text } => {
+                    if aborted()
+                        || !emit(EngineEvent::UserMessage(json!({
+                            "role": "user",
+                            "content": [{ "type": "text", "text": text }],
+                            "timestamp": now_millis(),
+                        })))
+                    {
+                        emit(EngineEvent::Done(Err("No response produced.".to_string())));
+                        return;
+                    }
+                    prompt = text;
+                }
+                AutonomousFollowUp::Stop { reason, status } => {
+                    let row = pa_core::autonomous::autonomous_stop_row(&reason, &status);
+                    emit(EngineEvent::CustomMessage(
+                        crate::session_commands::custom_message_value(&row),
+                    ));
+                    emit(EngineEvent::Done(Ok(())));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Consult the autonomous driver for one settled turn: gate evaluation
+    /// (a shell command per configured gate) runs on the engine runtime.
+    fn autonomous_follow_up(
+        &self,
+        assistant: &pa_agent::types::AssistantMessage,
+    ) -> pa_core::autonomous::AutonomousFollowUp {
+        let Some(message) = json_round_trip::<_, pa_types::ai::AssistantMessage>(assistant) else {
+            return pa_core::autonomous::AutonomousFollowUp::Inactive;
         };
-        emit(EngineEvent::Done(done));
+        let driver = std::sync::Arc::clone(
+            &*self
+                .autonomous_driver
+                .read()
+                .expect("autonomous driver lock"),
+        );
+        self.runtime.block_on(async {
+            let mut state = self.autonomous.lock().await;
+            driver.after_turn(&mut state, &message).await
+        })
     }
 
     /// The hosted session's agent loop, building the session on first use.
@@ -830,14 +933,41 @@ impl AgentSessionEngine {
         let subscription = {
             let tx = tx.clone();
             let started_flag = started.clone();
+            // Per-message usage accounting runs on every settled assistant
+            // message (whatever the stop reason except errors), matching the
+            // TS message_end hook. The driver owns the policy; this loop
+            // only forwards the message to it.
+            let autonomous_state = std::sync::Arc::clone(&self.autonomous);
+            let autonomous_driver = std::sync::Arc::clone(
+                &*self
+                    .autonomous_driver
+                    .read()
+                    .expect("autonomous driver lock"),
+            );
             agent
                 .subscribe(move |event, _signal| {
                     let tx = tx.clone();
                     let started_flag = started_flag.clone();
+                    let autonomous_state = std::sync::Arc::clone(&autonomous_state);
+                    let autonomous_driver = std::sync::Arc::clone(&autonomous_driver);
                     Box::pin(async move {
                         use pa_agent::types::AgentEvent;
                         if matches!(event, AgentEvent::AgentStart) {
                             started_flag.store(true, Ordering::SeqCst);
+                        }
+                        if let AgentEvent::MessageEnd {
+                            message:
+                                pa_agent::types::AgentMessage::Standard(
+                                    pa_agent::types::Message::Assistant(assistant),
+                                ),
+                        } = &event
+                        {
+                            if let Some(message) =
+                                json_round_trip::<_, pa_types::ai::AssistantMessage>(assistant)
+                            {
+                                let mut state = autonomous_state.lock().await;
+                                autonomous_driver.account_message(&mut state, &message);
+                            }
                         }
                         match &event {
                             AgentEvent::MessageStart {
@@ -1003,6 +1133,15 @@ impl AgentSessionEngine {
         }
         Ok(TurnOnce::None)
     }
+}
+
+/// The outcome of one admitted turn.
+enum TurnResult {
+    /// The turn settled; the final assistant message (typed, boxed to
+    /// keep the enum small).
+    Message(Box<pa_agent::types::AssistantMessage>),
+    /// The turn failed before or during the model call.
+    Error(String),
 }
 
 /// The outcome of one turn attempt.
@@ -1307,8 +1446,349 @@ fn faux_model_from_script(script: &str) -> anyhow::Result<Model> {
     Ok(registration.get_model())
 }
 
+#[cfg(test)]
+/// The faux provider registry is process-global; faux-driven tests must
+/// not register concurrently (each registration replaces the queue).
+static FAUX_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A driver loop test harness: faux script + collected events. Holds the
+/// faux lock while the engine runs.
+#[cfg(test)]
+fn run_prompts(
+    script: serde_json::Value,
+    prompts: &[&str],
+) -> (AgentSessionEngine, Vec<EngineEvent>) {
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = AgentSessionEngine::new(AgentEngineConfig {
+        cwd: dir.path().to_path_buf(),
+        agent_dir: dir.path().join("agent"),
+        provider: None,
+        model: None,
+        api_key: None,
+        thinking: None,
+        session_dir: None,
+        session_file: None,
+        faux_script: Some(script.to_string()),
+        supervisor_link: None,
+    })
+    .unwrap();
+    let mut events: Vec<EngineEvent> = Vec::new();
+    for prompt in prompts {
+        engine.run_prompt(
+            0,
+            PromptRequest {
+                message: prompt.to_string(),
+                source: "user".to_string(),
+                agent_message_id: None,
+            },
+            &|| false,
+            &mut |event| {
+                events.push(event);
+                true
+            },
+        );
+    }
+    (engine, events)
+}
+
+/// The user rows emitted by one run (message texts in order).
+#[cfg(test)]
+fn user_texts(events: &[EngineEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            EngineEvent::UserMessage(value) => Some(
+                value["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn assistant_texts(events: &[EngineEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            EngineEvent::AssistantMessage(value) => Some(
+                value["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn custom_rows(events: &[EngineEvent]) -> Vec<serde_json::Value> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            EngineEvent::CustomMessage(value) => Some(value.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn autonomous_on_enables_the_driver_loop() {
+    let (engine, events) = run_prompts(
+        serde_json::json!({ "responses": ["unused"] }),
+        &["/autonomous on --max-continuations 1 --max-turns 5"],
+    );
+    // The enable prompt runs the session command (echo + status rows) and
+    // never admits a model turn.
+    let status = custom_rows(&events);
+    assert!(status
+        .iter()
+        .any(|row| row["customType"] == "autonomous_status"
+            && row["content"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("[autonomous-status: on]")));
+    assert_eq!(assistant_texts(&events), Vec::<String>::new());
+    let state = engine.autonomous.blocking_lock();
+    assert!(state.enabled);
+    assert_eq!(state.limits.max_continuations, 1);
+    assert_eq!(state.limits.max_turns, 5);
+}
+
+#[test]
+fn autonomous_limit_stops_the_run_with_durable_stop_row() {
+    let (engine, events) = run_prompts(
+        serde_json::json!({ "responses": ["first", "second"] }),
+        &["/autonomous on --max-continuations 1 --max-turns 5", "go"],
+    );
+    // Turn 1 continues (missing terminal evidence), turn 2 hits the
+    // continuation cap: one injected continuation, then the stop row.
+    assert_eq!(assistant_texts(&events), vec!["first", "second"]);
+    let texts = user_texts(&events);
+    assert_eq!(
+        texts,
+        vec![
+            "go".to_string(),
+            "[autonomous-continuation]\n\nNo human input is available in autonomous mode. Continue working until the host evaluator, verifier, or configured autonomous limits stop the run. If you were asking the user a question, make a reasonable assumption and verify it. If you believe you are blocked, prove it with host-observable evidence, preserve that evidence, and keep looking for safe progress while budget remains. Do not end the session yourself; the verifier/evaluator decides completion when configured gates pass.".to_string()
+        ]
+    );
+    let stop = custom_rows(&events)
+        .into_iter()
+        .find(|row| {
+            row["content"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("[autonomous-stop:")
+        })
+        .expect("durable stop row");
+    assert!(stop["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("[autonomous-stop: limit-reached] maxContinuations reached (1/1)"));
+    assert_eq!(stop["details"]["stopReason"], "maxContinuations");
+    assert_eq!(stop["details"]["enabled"], true);
+    assert_eq!(events.last(), Some(&EngineEvent::Done(Ok(()))));
+    // Per-turn usage accounting: two settled turns.
+    let state = engine.autonomous.blocking_lock();
+    assert_eq!(state.turns_used, 2);
+    assert_eq!(state.continuations_used, 1);
+}
+
+#[test]
+fn autonomous_gate_pass_and_failure_drive_the_loop() {
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // The gate passes only on its second run (a counter file in the cwd).
+    let dir = tempfile::TempDir::new().unwrap();
+    let gate = format!(
+        "n=$(cat {0}/cnt 2>/dev/null || echo 0); echo $((n+1)) > {0}/cnt; [ $n -ge 1 ]",
+        dir.path().display()
+    );
+    let engine = AgentSessionEngine::new(AgentEngineConfig {
+        cwd: dir.path().to_path_buf(),
+        agent_dir: dir.path().join("agent"),
+        provider: None,
+        model: None,
+        api_key: None,
+        thinking: None,
+        session_dir: None,
+        session_file: None,
+        faux_script: Some(
+            serde_json::json!({ "responses": ["first attempt", "fixed it"] }).to_string(),
+        ),
+        supervisor_link: None,
+    })
+    .unwrap();
+    let on = format!("/autonomous on --gate {gate:?}");
+    let mut events: Vec<EngineEvent> = Vec::new();
+    for prompt in [on.as_str(), "go"] {
+        engine.run_prompt(
+            0,
+            PromptRequest {
+                message: prompt.to_string(),
+                source: "user".to_string(),
+                agent_message_id: None,
+            },
+            &|| false,
+            &mut |event| {
+                events.push(event);
+                true
+            },
+        );
+    }
+    // Turn 1 fails the gate -> gate-failure continuation; turn 2 passes ->
+    // gate-passed stop row.
+    assert_eq!(assistant_texts(&events), vec!["first attempt", "fixed it"]);
+    let texts = user_texts(&events);
+    assert_eq!(texts.len(), 2);
+    assert!(texts[1].starts_with("[autonomous-continuation: gate-failed]"));
+    assert!(texts[1].contains("exited with code 1"));
+    let stop = custom_rows(&events)
+        .into_iter()
+        .find(|row| {
+            row["content"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("[autonomous-stop: gate-passed]")
+        })
+        .expect("gate-passed stop row");
+    assert_eq!(stop["details"]["stopReason"], "gate_passed");
+    assert_eq!(
+        stop["details"]["gates"]["commands"][0],
+        serde_json::json!(gate)
+    );
+    assert_eq!(events.last(), Some(&EngineEvent::Done(Ok(()))));
+}
+
+/// A scripted policy driver: the engine must inject exactly what the trait
+/// returns, consult it after every turn, and account every settled message.
+#[cfg(test)]
+struct ScriptedDriver {
+    /// Pops from the end, so reverse the desired order when building.
+    follow_ups: std::sync::Mutex<Vec<pa_core::autonomous::AutonomousFollowUp>>,
+    accounted: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl pa_core::autonomous::AutonomousDriver for ScriptedDriver {
+    fn account_message(
+        &self,
+        _state: &mut pa_core::autonomous::AutonomousRuntimeState,
+        message: &pa_types::ai::AssistantMessage,
+    ) {
+        assert_ne!(message.stop_reason, pa_types::ai::StopReason::Error);
+        self.accounted
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn after_turn<'a>(
+        &'a self,
+        _state: &'a mut pa_core::autonomous::AutonomousRuntimeState,
+        _message: &'a pa_types::ai::AssistantMessage,
+    ) -> pa_core::autonomous::AutonomousFollowUpFuture<'a> {
+        let next = self
+            .follow_ups
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or(pa_core::autonomous::AutonomousFollowUp::Inactive);
+        Box::pin(async move { next })
+    }
+}
+
+#[test]
+fn the_turn_loop_is_driven_by_the_driver_trait() {
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = AgentSessionEngine::new(AgentEngineConfig {
+        cwd: dir.path().to_path_buf(),
+        agent_dir: dir.path().join("agent"),
+        provider: None,
+        model: None,
+        api_key: None,
+        thinking: None,
+        session_dir: None,
+        session_file: None,
+        faux_script: Some(serde_json::json!({ "responses": ["one", "two"] }).to_string()),
+        supervisor_link: None,
+    })
+    .unwrap();
+    let status = pa_core::autonomous::autonomous_status(&engine.autonomous.blocking_lock());
+    // The queue pops from the end: the continuation is consulted first,
+    // the stop on the second settled turn.
+    let driver = std::sync::Arc::new(ScriptedDriver {
+        follow_ups: std::sync::Mutex::new(vec![
+            pa_core::autonomous::AutonomousFollowUp::Stop {
+                reason: pa_core::autonomous::AutonomousStopReason::Limit(
+                    pa_core::autonomous::AutonomousLimitReason::MaxTurns,
+                ),
+                status: Box::new(status),
+            },
+            pa_core::autonomous::AutonomousFollowUp::Continue {
+                text: "scripted continuation".to_string(),
+            },
+        ]),
+        accounted: std::sync::atomic::AtomicUsize::new(0),
+    });
+    engine
+        .set_autonomous_driver(std::sync::Arc::clone(&driver)
+            as std::sync::Arc<dyn pa_core::autonomous::AutonomousDriver>);
+    let mut events: Vec<EngineEvent> = Vec::new();
+    engine.run_prompt(
+        0,
+        PromptRequest {
+            message: "go".to_string(),
+            source: "user".to_string(),
+            agent_message_id: None,
+        },
+        &|| false,
+        &mut |event| {
+            events.push(event);
+            true
+        },
+    );
+    // The engine holds no autonomous logic of its own: the injected text,
+    // the stop row, and the turn count come straight from the trait.
+    assert_eq!(
+        user_texts(&events),
+        vec!["go".to_string(), "scripted continuation".to_string()]
+    );
+    assert_eq!(
+        assistant_texts(&events),
+        vec!["one".to_string(), "two".to_string()]
+    );
+    let stop = custom_rows(&events)
+        .into_iter()
+        .find(|row| {
+            row["content"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("[autonomous-stop:")
+        })
+        .expect("durable stop row");
+    assert_eq!(stop["details"]["stopReason"], "maxTurns");
+    assert_eq!(events.last(), Some(&EngineEvent::Done(Ok(()))));
+    // Per-message accounting ran through the trait for both settled turns.
+    assert_eq!(
+        driver.accounted.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+}
+
 #[test]
 fn agent_engine_streams_updates_and_final_message() {
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = tempfile::TempDir::new().unwrap();
     // Scoped env: the faux seam is process-global; keep the test isolated.
     let engine = AgentSessionEngine::new(AgentEngineConfig {

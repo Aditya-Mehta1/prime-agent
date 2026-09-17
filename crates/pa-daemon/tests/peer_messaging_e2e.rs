@@ -296,9 +296,18 @@ fn read_receipt(messaging: &Messaging, index: usize) -> Value {
 /// its receipt at `receipts/0.json`), followed by a closing text turn. The
 /// worker's faux engine re-registers the response queue per turn, so every
 /// prompted turn replays this pair.
+/// Two full turns of alpha script (a send tool call plus the closing text
+/// each): the faux provider queues its responses across the whole session,
+/// so the second post-restart turn consumes the second pair.
 fn alpha_responses(receipts_dir: &Path) -> Value {
     let receipt_path = receipts_dir.join("0.json");
     json!([
+        { "content": [
+            { "type": "toolCall", "name": "ipython", "arguments": {
+                "code": send_cell("hello from alpha", "beta", &receipt_path),
+            } },
+        ] },
+        { "text": "alpha turn done" },
         { "content": [
             { "type": "toolCall", "name": "ipython", "arguments": {
                 "code": send_cell("hello from alpha", "beta", &receipt_path),
@@ -319,7 +328,12 @@ fn setup_messaging() -> Option<Messaging> {
     let receipts_dir = dir.path().join("receipts");
     std::fs::create_dir_all(&receipts_dir).expect("receipts dir");
     let alpha_path = write_faux_script(dir.path(), "alpha", alpha_responses(&receipts_dir));
-    let beta_path = write_faux_script(dir.path(), "beta", json!([ { "text": "beta reply" } ]));
+    // One reply per delivered prompt (two turns arrive over the session).
+    let beta_path = write_faux_script(
+        dir.path(),
+        "beta",
+        json!([ { "text": "beta reply" }, { "text": "beta reply" } ]),
+    );
 
     let receipts = receipts_dir;
     let daemon = spawn_supervisor(&socket, &agent_dir, &kernel_python);
@@ -582,8 +596,8 @@ fn supervisor_death_mid_conversation_still_delivers_after_re_registration() {
     wait_idle(&mut client, "w3", &alpha_id);
     wait_idle(&mut client, "w4", &beta_id);
 
-    // The post-restart send observed its own receipt (the same scripted
-    // pair replays; the file is rewritten by the second turn).
+    // The post-restart send observed its own receipt (the script's second
+    // turn rewrites the receipt file).
     let receipt = read_receipt(&messaging, 0);
     assert_eq!(
         receipt["target"]["activeSessionId"], beta_id,

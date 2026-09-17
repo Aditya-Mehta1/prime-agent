@@ -6,7 +6,6 @@
 use pa_types::session::{AgentMessage, FileEntry};
 
 use super::messages::SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE;
-use crate::autonomous::{AgentAutonomousStatus, AutonomousLimitReason};
 
 pub const COMPACTION_OUTCOME_CUSTOM_TYPE: &str = "compaction_outcome";
 pub const HARNESS_DIGEST_CUSTOM_TYPE: &str = "harness_digest";
@@ -172,45 +171,6 @@ pub fn select_headless_terminal_result(messages: &[AgentMessage]) -> HeadlessTer
     }
 }
 
-/// Highest recorded gate attempt (across failure record and per-command counts).
-pub fn latest_autonomous_gate_attempt(status: &AgentAutonomousStatus) -> u64 {
-    let from_failure = status
-        .last_gate_failure
-        .as_ref()
-        .map(|failure| failure.attempt)
-        .unwrap_or(0);
-    let from_attempts = status.gate_attempts.values().copied().max().unwrap_or(0);
-    from_failure.max(from_attempts)
-}
-
-/// Human description of an autonomous limit.
-pub fn describe_autonomous_limit(
-    status: &AgentAutonomousStatus,
-    reason: AutonomousLimitReason,
-) -> String {
-    match reason {
-        AutonomousLimitReason::MaxContinuations => format!(
-            "maxContinuations reached ({}/{})",
-            status.continuations_used, status.limits.max_continuations
-        ),
-        AutonomousLimitReason::MaxTurns => format!(
-            "maxTurns reached ({}/{})",
-            status.turns_used, status.limits.max_turns
-        ),
-        AutonomousLimitReason::MaxTokens => format!(
-            "maxTokens reached ({}/{})",
-            status.tokens_used, status.limits.max_tokens
-        ),
-        AutonomousLimitReason::TimeoutMs => {
-            let elapsed = status
-                .started_at
-                .map(|started| started.saturating_sub(0))
-                .unwrap_or(0);
-            format!("timeoutMs reached ({elapsed}/{})", status.limits.timeout_ms)
-        }
-    }
-}
-
 /// Terminal-selection over session entries (rebuilds the message list).
 pub fn select_from_entries(entries: &[FileEntry]) -> HeadlessTerminalResult {
     let messages: Vec<AgentMessage> = entries
@@ -226,6 +186,7 @@ pub fn select_from_entries(entries: &[FileEntry]) -> HeadlessTerminalResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::autonomous::{AgentAutonomousStatus, AutonomousLimitReason};
     use pa_types::ai::{
         AssistantContentBlock, AssistantMessage, StopReason, TextContent, UserContent, UserMessage,
     };
@@ -415,24 +376,42 @@ mod tests {
             last_gate_failure: None,
             subagent_keep_alive_ms: None,
         };
-        assert_eq!(latest_autonomous_gate_attempt(&status), 2);
+        assert_eq!(
+            crate::autonomous::latest_autonomous_gate_attempt(&status),
+            2
+        );
         status.last_gate_failure = Some(crate::autonomous::AgentAutonomousGateFailure {
             command: "make check".to_string(),
             attempt: 3,
             exit_text: "exited with code 1".to_string(),
             output: String::new(),
         });
-        assert_eq!(latest_autonomous_gate_attempt(&status), 3);
         assert_eq!(
-            describe_autonomous_limit(&status, AutonomousLimitReason::MaxTurns),
+            crate::autonomous::latest_autonomous_gate_attempt(&status),
+            3
+        );
+        assert_eq!(
+            crate::autonomous::describe_autonomous_limit(
+                &status,
+                AutonomousLimitReason::MaxTurns,
+                0,
+            ),
             "maxTurns reached (5/12)"
         );
         assert_eq!(
-            describe_autonomous_limit(&status, AutonomousLimitReason::MaxTokens),
+            crate::autonomous::describe_autonomous_limit(
+                &status,
+                AutonomousLimitReason::MaxTokens,
+                0
+            ),
             "maxTokens reached (1000/80000)"
         );
         assert_eq!(
-            describe_autonomous_limit(&status, AutonomousLimitReason::MaxContinuations),
+            crate::autonomous::describe_autonomous_limit(
+                &status,
+                AutonomousLimitReason::MaxContinuations,
+                0
+            ),
             "maxContinuations reached (2/3)"
         );
     }

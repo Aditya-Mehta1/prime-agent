@@ -3,7 +3,12 @@
 The session engine.
 
 ## Scope
-Tools (bash, edit, ipython + internal rename/stdout), file mutation queue, truncation and rendering rules, RLM kernel lifecycle (IPython spawn/execute/revive), skills loading, system prompt assembly, compaction, harness refinement, settings/config, package manager (npm/git/local source install/remove/list/update against settings), session manager (persist/resume). The RLM recursion host seam
+Tools (bash, edit, ipython + internal rename/stdout), file mutation queue, truncation and rendering rules, RLM kernel lifecycle (IPython spawn/execute/revive), skills loading, system prompt assembly, compaction, harness refinement, settings/config, package manager (npm/git/local source install/remove/list/update against settings), session manager (persist/resume). Autonomous mode
+(`autonomous`): runtime state with limit normalization, continuation and
+gate-failure texts, shell quality gates with retry windows and git
+worktree snapshotting, and the `AutonomousDriver` policy trait a turn
+loop consults after every settled turn (the engine holds no autonomous
+logic of its own). The RLM recursion host seam
 (`session_engine::rlm_host`): the trait the kernel's `rlm.spawn`/
 `rlm.create_session`/`rlm.list_subagents`/`rlm.collect`/
 `rlm.delete_subagent` host requests call into, with the roster/collect/

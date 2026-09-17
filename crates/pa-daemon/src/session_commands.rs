@@ -70,7 +70,9 @@ pub(crate) fn parse_prompt_session_command(text: &str) -> Option<SessionSlashCom
 /// One durable row in its wire message form (`role: "custom"`): the shape
 /// `message_start`/`message_end` pairs carry and TS sessions keep in
 /// `agent.state.messages`.
-fn custom_message_value(message: &pa_types::session::CustomMessage) -> serde_json::Value {
+pub(crate) fn custom_message_value(
+    message: &pa_types::session::CustomMessage,
+) -> serde_json::Value {
     serde_json::to_value(AgentMessage::Custom(message.clone())).unwrap_or(serde_json::Value::Null)
 }
 
