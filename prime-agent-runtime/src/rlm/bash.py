@@ -2184,6 +2184,125 @@ def _fp_mirror_config_refusal() -> str:
     )
 
 
+# git's inline config options (verified against git 2.55, which accepts
+# `-c <name>=<value>` and `--config-env <name>=<envvar>` in both the spaced and
+# the attached form, and rejects `--config` and a glued `-c<name>=<value>`
+# with `unknown option`). A literal operand is already read by the word-level
+# remote.<name>.mirror/push rule; the helpers below read the operands that
+# hide the key or the value from that rule.
+_FP_SIMPLE_VARIABLE = re.compile(r"^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$")
+_FP_ASSIGNMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_FP_EXPORT_BUILTINS = ("export", "declare", "typeset", "local", "readonly")
+
+
+def _fp_literal_assignments(words: list[_FpShellWord], before: int) -> dict[str, str]:
+    """NAME -> literal value for the assignments made before words[`before`].
+
+    Only a word in assignment position counts: the first word of a command
+    (`CFG='...'; git -c $CFG ...`) or the operand of an export-style builtin.
+    A value carrying an expansion or a glob is not literal and is left out, so
+    a name missing from the map is one the guard cannot read."""
+    assignments: dict[str, str] = {}
+    for index, word in enumerate(words[:before]):
+        name, separator, assigned = word.value.partition("=")
+        if not separator or not _FP_ASSIGNMENT_NAME.fullmatch(name):
+            continue
+        previous = words[index - 1].value if index else ""
+        if not word.starts_command and previous not in _FP_EXPORT_BUILTINS:
+            continue
+        if _FP_GLOB_OR_SUBSTITUTION.search(assigned):
+            continue
+        assignments[name] = assigned
+    return assignments
+
+
+def _fp_config_variable_value(word: str, assignments: dict[str, str]) -> str | None:
+    """The literal value this command assigns to `word`, when `word` is exactly
+    one variable (`$CFG` or `${CFG}`); None otherwise."""
+    variable = _FP_SIMPLE_VARIABLE.fullmatch(word)
+    if variable is None:
+        return None
+    return assignments.get(variable[1])
+
+
+def _fp_inline_config_key(word: str, assignments: dict[str, str]) -> str | None:
+    """The config key a `-c`/`--config-env` operand writes, or None when the
+    guard cannot read it.
+
+    A literal `name=value` word writes `name`; a word that is exactly one
+    variable is the literal assignment this command makes to it (so
+    `CFG='remote.origin.push=+main:main'; git -c $CFG ...` is read); a dynamic
+    key part is resolved the same way; and a substitution, a longer expansion,
+    or a variable the command does not set is unreadable, which the caller
+    refuses rather than trusts. Only the key decides which configuration is
+    written, so a dynamic value under a literal key stays readable."""
+    key, separator, _ = word.partition("=")
+    if separator and key and not _FP_GLOB_OR_SUBSTITUTION.search(key):
+        return key
+    if separator and key:
+        resolved = _fp_config_variable_value(key, assignments)
+        return None if resolved is None else _fp_inline_config_key(
+            resolved + "=", assignments
+        )
+    resolved = _fp_config_variable_value(word, assignments)
+    return None if resolved is None else _fp_inline_config_key(resolved, assignments)
+
+
+def _fp_unreadable_inline_config(
+    run: _FpPushRun, words: list[_FpShellWord]
+) -> str | None:
+    """Why this invocation carries inline config the guard cannot read, or None.
+
+    Walks the git global-option region of the run, pairing each `-c` with its
+    operand and each `--config-env` with its `name=envvar` word the way git
+    parses them. A key naming remote.<name>.mirror or remote.<name>.push is
+    refused as the config write it is, a key the guard cannot read is refused
+    because the configuration it writes is unknown, and a `--config-env` value
+    whose env var this command does not set literally is refused for the same
+    reason."""
+    assignments = _fp_literal_assignments(words, run.git_index)
+    tokens = run.tokens
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--" or not token.startswith("-") or token == "-":
+            return None  # the subcommand ends the global-option region
+        operand: str | None = None
+        from_environment = False
+        if token in ("-c", "--config-env"):
+            operand = tokens[index + 1] if index + 1 < len(tokens) else None
+            from_environment = token == "--config-env"
+            index += 2
+        elif token.startswith("--config-env="):
+            operand = token[len("--config-env=") :]
+            from_environment = True
+            index += 1
+        elif token.startswith("-c") and len(token) > 2:
+            operand = token[2:]  # the glued -c<name>=<value> form
+            index += 1
+        elif token in _FP_GIT_GLOBAL_VALUE_SHORT or token in _FP_GIT_GLOBAL_VALUE_LONG:
+            index += 2  # an option with a space-separated value
+        else:
+            index += 1  # an attached-value or valueless global option
+        if operand is None:
+            continue
+        key = _fp_inline_config_key(operand, assignments)
+        if key is None:
+            return _fp_format_config_option_refusal(operand)
+        if _FP_MIRROR_OR_PUSH_KEY.match(key):
+            return _fp_mirror_config_refusal()
+        if from_environment:
+            _, _, variable = operand.partition("=")
+            if not _FP_ASSIGNMENT_NAME.fullmatch(variable):
+                return _fp_format_config_option_refusal(operand)
+            if variable not in assignments:
+                # The value comes from an environment variable this command
+                # does not set to a literal, so the config it applies is
+                # unreadable.
+                return _fp_format_config_option_refusal(operand)
+    return None
+
+
 _FP_ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # Value-taking options per wrapper the command-word walk steps over (from each
 # tool's synopsis, as the sudo guard's audited table records them): env alone
@@ -2206,6 +2325,38 @@ _FP_WRAPPER_VALUE_LETTERS: dict[str, str] = {
     "command": "",
     "builtin": "",
 }
+# GNU env's long options (`env --help`, coreutils 9.11). getopt_long resolves
+# an unambiguous prefix (`--s` and `--split` are --split-string, `--uns` is
+# --unset, `--ignore-env` is --ignore-environment) and refuses an ambiguous one
+# (`--i` is both --ignore-environment and --ignore-signal), so a prefix has to
+# be resolved, not compared exactly. --block-signal, --default-signal and
+# --ignore-signal take an optional argument, which is why their separate
+# operand is the command itself and they are not value options here.
+_FP_ENV_LONG_OPTIONS = (
+    "argv0", "unset", "chdir", "split-string", "ignore-environment", "null",
+    "debug", "block-signal", "default-signal", "ignore-signal",
+    "list-signal-handling", "help", "version",
+)
+_FP_ENV_LONG_VALUE_OPTIONS = frozenset({"argv0", "unset", "chdir", "split-string"})
+
+
+def _fp_env_long_option(value: str) -> tuple[str | None, str | None, bool]:
+    """Resolve a `--name[=operand]` env word: (option, glued operand, ambiguous).
+
+    An unambiguous prefix names its option, an exact name names itself, a word
+    that is no env option at all leaves the option None (env itself errors on
+    it), and a prefix matching more than one option is reported ambiguous.
+    Only a value-taking option hands back an operand; `--name=operand` glues it
+    to the word, the space-separated form leaves it to the next word."""
+    name, _, glued = value[2:].partition("=")
+    if not name:
+        return None, None, False  # the bare `--` terminator ends the options
+    matches = [option for option in _FP_ENV_LONG_OPTIONS if option.startswith(name)]
+    if len(matches) > 1:
+        return None, None, True
+    if not matches or matches[0] not in _FP_ENV_LONG_VALUE_OPTIONS:
+        return None, None, False
+    return matches[0], glued or None, False
 
 
 def _fp_split_wrapper_option(value: str, wrapper: str) -> tuple[str | None, str | None]:
@@ -2218,6 +2369,12 @@ def _fp_split_wrapper_option(value: str, wrapper: str) -> tuple[str | None, str 
     options = _FP_WRAPPER_VALUE_OPTIONS.get(wrapper, frozenset())
     if value in options:
         return value, None
+    if wrapper == "env" and value.startswith("--"):
+        # A long option is resolved by prefix, like getopt_long: `env --uns
+        # FOO $c push -f ...` hands the operand to --unset, so the expansion
+        # after it is the command word rather than the option's operand.
+        option, glued, _ = _fp_env_long_option(value)
+        return (value, glued) if option is not None else (None, None)
     if value.startswith("--") and "=" in value:
         option, _, glued = value.partition("=")
         return (option, glued) if option in options else (None, None)
@@ -2941,17 +3098,21 @@ def _fp_env_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
                 break  # this env invocation is clean; check the next one
             if token == "--":
                 break
-            if token == "--split-string":
-                payload_pending = True
+            if token.startswith("--"):
+                # getopt_long resolves a prefix, so `--s` and `--split` are
+                # --split-string and carry the payload too.
+                option, glued, _ = _fp_env_long_option(token)
+                if option == "split-string":
+                    if glued is None:
+                        payload_pending = True
+                        continue
+                    operand_at = payload_source.find("=") + 1
+                    if _fp_env_payload_hides_force_push_source(
+                        payload_source[operand_at:], glued, depth
+                    ):
+                        return True
+                    break
                 continue
-            if token.startswith("--split-string="):
-                if _fp_env_payload_hides_force_push_source(
-                    payload_source[len("--split-string=") :],
-                    token[len("--split-string=") :],
-                    depth,
-                ):
-                    return True
-                break
             if token.startswith("-") and not token.startswith("--"):
                 short = token[1:]
                 if "S" in short:
@@ -2967,6 +3128,30 @@ def _fp_env_payloads_hide_force_push(command: str, depth: int = 0) -> bool:
                         break
                     payload_pending = True
     return False
+
+
+def _fp_ambiguous_env_option(words: list[_FpShellWord]) -> str | None:
+    """The first ambiguous GNU env long-option abbreviation, or None.
+
+    getopt_long resolves an unambiguous prefix but rejects an ambiguous one
+    (`--i` is both --ignore-environment and --ignore-signal), and the guard
+    cannot tell whether the option such a word names takes a value, so a
+    command that carries one is refused rather than read with the wrong arity.
+    Only env invocations are walked, and the walk stops at the next command."""
+    for index, word in enumerate(words):
+        if os.path.basename(word.value).casefold() not in _FP_ENV_COMMAND_NAMES:
+            continue
+        for follower_index in range(index + 1, len(words)):
+            follower = words[follower_index]
+            if _fp_contained_in_later_word(words, follower_index):
+                continue  # substitution interior: the enclosing word follows
+            if follower.starts_command or follower.value == "--":
+                break
+            if follower.value.startswith("--") and _fp_env_long_option(
+                follower.value
+            )[2]:
+                return follower.value
+    return None
 
 
 class _FpUnresolvableCwd:
@@ -3597,6 +3782,22 @@ def _fp_format_git_subcommand_refusal(subcommand: str) -> str:
     )
 
 
+def _fp_format_env_option_refusal(option: str) -> str:
+    return _fp_format_refusal(
+        f'the env option "{option}" is an abbreviation that matches more than'
+        " one of env's long options, so the guard cannot tell whether it takes"
+        " a value and which word it hands env"
+    )
+
+
+def _fp_format_config_option_refusal(operand: str) -> str:
+    return _fp_format_refusal(
+        f'its inline config operand "{operand}" cannot be read statically, so'
+        " the configuration it applies -- which can arm a force push through"
+        " remote.<name>.push or remote.<name>.mirror -- cannot be checked"
+    )
+
+
 def _fp_format_env_refusal() -> str:
     return "\n".join(
         [
@@ -3712,6 +3913,16 @@ def _fp_guard_force_push(command: str, command_prefix: str | None = None) -> Non
             )
         )
     words = _fp_scan_words(normalized)
+    ambiguous_env_option = _fp_ambiguous_env_option(words)
+    if ambiguous_env_option is not None and _fp_force_push_pattern_in_text(
+        _fp_flattened_text(words)
+    ):
+        # An ambiguous env long option is refused the way env refuses it, and
+        # only next to a force-push pattern: the guard cannot tell whether the
+        # option takes a value, so it cannot read the invocation either.
+        raise ForcePushRefusalError(
+            _fp_format_env_option_refusal(ambiguous_env_option)
+        )
     # The conduit scan reads the text before redirection masking: `<<<` and
     # `<` are exactly what a masker removes, and they are the point here.
     family_reason = _fp_family_violation(words, command_text, normalized)
@@ -3733,10 +3944,15 @@ def _fp_guard_force_push(command: str, command_prefix: str | None = None) -> Non
             _fp_format_git_subcommand_refusal(unresolvable_subcommand)
         )
     runs = _fp_find_git_push_runs(words)
-    if runs and _fp_mirror_or_push_refspec_configured(words):
-        # The push looks plain in argv, but the same command writes config
-        # that makes git force it, so argv alone cannot judge the push.
-        raise ForcePushRefusalError(_fp_mirror_config_refusal())
+    if runs:
+        for run in runs:
+            unreadable_config = _fp_unreadable_inline_config(run, words)
+            if unreadable_config is not None:
+                raise ForcePushRefusalError(unreadable_config)
+        if _fp_mirror_or_push_refspec_configured(words):
+            # The push looks plain in argv, but the same command writes config
+            # that makes git force it, so argv alone cannot judge the push.
+            raise ForcePushRefusalError(_fp_mirror_config_refusal())
     guarded: list[tuple[_FpPushRun, _FpPushArgs]] = []
     for run in runs:
         args = _fp_parse_push_args(run.tokens, run.push_index)

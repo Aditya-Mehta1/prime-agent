@@ -37,12 +37,9 @@ SCAN_TIMEOUT_SECONDS = 20.0
 # dot-separated groups, with and without the colon that makes the guard
 # classify the word, a long colon-free word, and a long dotted word.
 PATHOLOGICAL_REMOTE_WORDS = [
-    "a" + ".x" * 30,
-    "a" + ".x" * 30 + "/:p",
-    "a" + ".." * 200,
-    "a" + "./" * 200 + ":p",
-    "x" * 4096,
-    "a" + ".x" * 2000 + "/:p",
+    "a" + ".x" * 30, "a" + ".x" * 30 + "/:p",
+    "a" + ".." * 200, "a" + "./" * 200 + ":p",
+    "x" * 4096, "a" + ".x" * 2000 + "/:p",
 ]
 
 
@@ -110,31 +107,21 @@ FORCE_PUSH_MATCHING_COMMANDS = [
     "git push -f origin main:heads/main",
     # `-oo` is `-o o`: the rest of that cluster is the option's value and the
     # next token is still a flag, so `-f` is a real force.
-    "git push -oo -f origin main",
-    "git push -f origin :main", "git push -f origin main:",
+    "git push -oo -f origin main", "git push -f origin :main", "git push -f origin main:",
     "git push -f origin @{u}", "git push origin +main",
-    "git push origin +main:main", "git push origin +feature",
-    "git push --force",
-    "git push -f",
-    "git push -f origin",
-    "git push -f --all",
-    "git push --force --mirror origin",
+    "git push origin +main:main", "git push origin +feature", "git push --force",
+    "git push -f", "git push -f origin",
+    "git push -f --all", "git push --force --mirror origin",
     # `--mirror` is `--all` plus a forced push of every ref, so it carries
     # force without a force flag; `--all` alone stays non-force.
-    "git push --mirror origin",
-    "git push --mirror",
+    "git push --mirror origin", "git push --mirror",
     "git push -fv origin main", "git push -f origin main --",
     "git push --force --repo=origin main", "git push -f --delete origin main",
-    "git push --force-with-lease -f origin main",
-    "/usr/bin/git push -f origin main",
-    '"git" push -f origin main',
-    "git 'push' -f origin main",
-    "\\git push -f origin main",
-    "sudo git push -f origin main",
-    "FOO=1 git push -f origin main",
-    "git -C repo push -f origin main",
-    "git -c foo.bar=1 push -f origin main",
-    "git --git-dir=.git push -f origin main",
+    "git push --force-with-lease -f origin main", "/usr/bin/git push -f origin main",
+    '"git" push -f origin main', "git 'push' -f origin main",
+    "\\git push -f origin main", "sudo git push -f origin main",
+    "FOO=1 git push -f origin main", "git -C repo push -f origin main",
+    "git -c foo.bar=1 push -f origin main", "git --git-dir=.git push -f origin main",
     "echo $(git push -f origin main)",
     "git push -f origin \\\nmain", "git push 2>/dev/null -f origin main",
     "git push -f origin main 2>/dev/null", "(git push -f origin main)",
@@ -145,21 +132,15 @@ FORCE_PUSH_MATCHING_COMMANDS = [
     # The shell joins a backslash-newline continuation into one token, decodes
     # ANSI-C (`$'...'`) escapes, and resolves `$"..."` as a double-quoted
     # string, so these reach git as the force pushes they spell out.
-    "git push -f origin ma\\\nin",
-    "git push -\\\nf origin main",
-    "gi\\\nt push -f origin main",
-    'git push -f origin "ma\\\nin"',
-    "$'git' push -f origin main",
-    "$'\\x67it' push -f origin main",
-    "$'\\u0067it' push -f origin main",
-    '$"git" push -f origin main',
-    "git $'push' -f origin main",
-    "git push -$'f' origin main",
+    "git push -f origin ma\\\nin", "git push -\\\nf origin main",
+    "gi\\\nt push -f origin main", 'git push -f origin "ma\\\nin"',
+    "$'git' push -f origin main", "$'\\x67it' push -f origin main",
+    "$'\\u0067it' push -f origin main", '$"git" push -f origin main',
+    "git $'push' -f origin main", "git push -$'f' origin main",
     "git push $'--force' origin main",
     # The kernel also runs on case-insensitive filesystems, where `GIT` and
     # `/usr/bin/GIT` resolve to the `git` binary.
-    "GIT push -f origin main",
-    "Git.exe push -f origin main",
+    "GIT push -f origin main", "Git.exe push -f origin main",
     "/usr/bin/GIT push -f origin main",
     # git rewrites argv with an inline alias body before it parses it.
     "git -c alias.p='push -f origin main' p",
@@ -175,14 +156,10 @@ FORCE_PUSH_MATCHING_COMMANDS = [
 # branch, so the scanner cannot prove these are not force pushes: they must be
 # treated as guarded rather than allowed as plain pushes.
 FORCE_PUSH_UNRESOLVABLE_ARGUMENT_COMMANDS = [
-    "f=-f; git push $f origin main",
-    "f='-f origin'; git push $f",
-    "git push $REMOTE origin main",
-    "git push origin $BRANCH",
-    "BRANCH=+main; git push origin $BRANCH",
-    "git push origin 'main*'",
-    "git push --repo=$REMOTE main",
-    "git push --force-with-lease origin $BRANCH",
+    "f=-f; git push $f origin main", "f='-f origin'; git push $f",
+    "git push $REMOTE origin main", "git push origin $BRANCH",
+    "BRANCH=+main; git push origin $BRANCH", "git push origin 'main*'",
+    "git push --repo=$REMOTE main", "git push --force-with-lease origin $BRANCH",
     # `-f` cancels the lease compare-and-swap: measured on git 2.55 over a
     # deliberately stale remote-tracking ref, a bare `--force-with-lease` is
     # rejected as `stale info` while `--force-with-lease -f`,
@@ -192,8 +169,7 @@ FORCE_PUSH_UNRESOLVABLE_ARGUMENT_COMMANDS = [
 ]
 
 FORCE_PUSH_NON_MATCHING_COMMANDS = [
-    "git push origin main", "git push",
-    "git push origin", "git push -u origin main",
+    "git push origin main", "git push", "git push origin", "git push -u origin main",
     "git push --all", "git push --tags",
     "git push origin --delete main", "git push --force-with-lease origin main",
     "git push --force-with-lease=main:expected origin main",
@@ -205,21 +181,14 @@ FORCE_PUSH_NON_MATCHING_COMMANDS = [
     # `-of` is `-o f`: the rest of the cluster is the option's value, so no
     # force flag is set.
     "git push -of origin main", "git checkout --force main",
-    "git config push.default matching", "git status",
-    "echo hello", "npm run check",
-    "echo 'git push -f origin main'",
-    'echo "git push -f origin main"',
-    "# git push -f origin main",
-    "git --exec-path push -f origin main",
+    "git config push.default matching", "git status", "echo hello", "npm run check",
+    "echo 'git push -f origin main'", 'echo "git push -f origin main"',
+    "# git push -f origin main", "git --exec-path push -f origin main",
     # Wrappers and quoting that do not carry a push stay inert.
-    "git -c alias.s=status s",
-    "git -c alias.co=checkout co",
-    "git -c alias.push='status' push --dry-run -f origin main",
-    "env -C . echo hi",
-    "env -S 'git status'",
-    "printf $'%s\\n' hi",
-    'echo $"hello"',
-    "echo $'tab\\there'",
+    "git -c alias.s=status s", "git -c alias.co=checkout co",
+    "git -c alias.push='status' push --dry-run -f origin main", "env -C . echo hi",
+    "env -S 'git status'", "printf $'%s\\n' hi",
+    'echo $"hello"', "echo $'tab\\there'",
 ]
 
 
@@ -325,18 +294,12 @@ class ForcePushScannerFidelityTest(unittest.TestCase):
         # upstream rules decide. Real git answers `Could not resolve hostname`
         # for the colon forms, which is how this list was verified.
         for first in [
-            "https://example.invalid/x.git",
-            "ssh://example.invalid/x.git",
-            "git@github.com:org/repo.git",
-            "example.invalid:org/repo.git",
-            "localhost:repo.git",
-            "myhost:path",
-            "origin:main",
-            "+main:main",
-            "refs/heads/main:refs/heads/main",
-            "main:main",
-            ":main",
-            "C:\\repo",
+            "https://example.invalid/x.git", "ssh://example.invalid/x.git",
+            "git@github.com:org/repo.git", "example.invalid:org/repo.git",
+            "localhost:repo.git", "myhost:path",
+            "origin:main", "+main:main",
+            "refs/heads/main:refs/heads/main", "main:main",
+            ":main", "C:\\repo",
         ]:
             with self.subTest(first=first):
                 args = bash_module._fp_parse_push_args(["git", "push", "-f", first], 1)
@@ -357,8 +320,7 @@ class ForcePushEvalPayloadTest(unittest.TestCase):
             self,
                 ["eval 'git push -f origin main'", 'eval "git push -f origin main"',
                  "eval 'git push --force'", "eval 'git push origin +main'",
-                 "eval 'cd repo && git push -f'",
-                 "eval 'echo x; git push -f origin main'",
+                 "eval 'cd repo && git push -f'", "eval 'echo x; git push -f origin main'",
                  'eval \'eval "git push -f origin main"\'',
                  'eval \'sh -c "git push -f origin main"\'',
                  "eval " + json.dumps(_sh_payload_chain(3)),
@@ -386,8 +348,7 @@ class ForcePushShellCPayloadTest(unittest.TestCase):
         _scan_flags_all(
             self,
                 ["sh -c 'git push -f origin main'", "bash -c 'git push -f origin main'",
-                 "bash -lc 'git push --force origin main'",
-                 "sh -c 'cd repo && git push -f'",
+                 "bash -lc 'git push --force origin main'", "sh -c 'cd repo && git push -f'",
                  'sh -c "eval \'git push -f origin main\'"',
                  'sh -c "env -S \'git push -f origin main\'"', _sh_payload_chain(3),
                  _sh_payload_chain(4), _sh_payload_chain(5),
@@ -688,6 +649,10 @@ class ForcePushEnvPayloadTest(unittest.TestCase):
                  "env --split-string 'git push -f origin main'",
                  "env -iS'git push -f origin main'",
                  "env --split-string='git push -f origin main'",
+                 # getopt_long resolves an unambiguous long-option prefix, so
+                 # `--s`, `--split` and `--s=` carry the payload too.
+                 "env --s 'git push -f origin main'", "env --s='git push -f origin main'",
+                 "env --split 'git push -f origin main'",
                  "env -S 'eval \"git push -f origin main\"'",
                  "env -S 'sh -c \"git push -f origin main\"'",
                  "env -S " + json.dumps(_sh_payload_chain(3))],
@@ -699,7 +664,8 @@ class ForcePushEnvPayloadTest(unittest.TestCase):
             self,
                 ["env -S 'git status'", "env -S 'echo hi'",
                  "env -S 'git push --force-with-lease origin feature'",
-                 "env --split-string 'git status'", "env -C . git status",
+                 "env --split-string 'git status'", "env --sp 'git status'",
+                 "env -C . git status",
                  "env VERSION=1 git status", "echo env -S",
                  "env -S " + json.dumps(_sh_payload_chain(2, "git status"))],
             bash_module._fp_env_payloads_hide_force_push,
@@ -1180,16 +1146,31 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
              " GIT_CONFIG_VALUE_0=true git push origin",
              'GIT_CONFIG_PARAMETERS="\'remote.origin.push=+main:main\'" git push origin',
              "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=$K"
-             " GIT_CONFIG_VALUE_0=+main:main git push origin"],
+             " GIT_CONFIG_VALUE_0=+main:main git push origin",
+             # The same write behind an inline config option: a literal value
+             # the command assigns to the variable is read, and a key the
+             # guard cannot read is refused rather than trusted.
+             "CFG='remote.origin.push=+main:main'; git -c $CFG push origin",
+             "CFG='remote.origin.mirror=true'; git -c $CFG push origin",
+             "git -c $CFG push origin feature",
+             "git --config-env=remote.origin.push=CFG push origin",
+             # A --config-env value from an env var this command does not set
+             # is unreadable whatever its key looks like.
+             "git --config-env=color.ui=CFG push origin feature"],
             ("Refusing to run this force-push command",),
         )
         # The config write alone pushes nothing, and pushes without either key
-        # keep their argv-only judgement (a benign env key is not a setting).
+        # keep their argv-only judgement (a benign env key is not a setting, a
+        # benign key stays readable whatever its value, and only the key
+        # decides which configuration is written).
         self._verdicts_clean(
             ["git config remote.origin.mirror true", "git push origin feature",
              "git -c color.ui=always push origin feature",
              "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=color.ui"
-             " GIT_CONFIG_VALUE_0=always git push origin feature"],
+             " GIT_CONFIG_VALUE_0=always git push origin feature",
+             "CFG='color.ui=auto'; git -c $CFG push origin feature",
+             'git -c "user.email=$USER" push origin feature',
+             "CFG='+main:main'; git --config-env=color.ui=CFG push origin feature"],
         )
 
 
@@ -1717,7 +1698,8 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         getopt parses them: a bundled value-taking letter (`env -vu NAME`) and
         an unlisted value option (`env -P`, `-a`, `--argv0`) consume their
         operand, so the expansion after them is still the command word and is
-        recorded; before this table the operand was read as the command."""
+        recorded; before this table the operand was read as the command. A long
+        option is resolved by prefix, the way getopt_long does."""
         repo, _bare = self._make_repo("repo-wrap", branch="main")
         os.chdir(repo)
         await self._refused_all(
@@ -1727,13 +1709,31 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
              "c=git; env -a NAME $c push -f origin main",
              "c=git; env --argv0 NAME $c push -f origin main",
              "c=git; env --argv0=NAME $c push -f origin main",
-             "c=git; env -u=FOO $c push -f origin main"],
+             "c=git; env -u=FOO $c push -f origin main",
+             # A unique prefix names the same value option (`--uns` is
+             # --unset, `--ch` is --chdir, `--ignore-env` is
+             # --ignore-environment), so the operand after it is still the
+             # option's value and the expansion is still the command word.
+             "c=git; env --uns FOO $c push -f origin main",
+             "c=git; env --uns=FOO $c push -f origin main",
+             "c=git; env --u FOO $c push -f origin main",
+             "c=git; env --ch . $c push -f origin main",
+             "c=git; env --ignore-env $c push -f origin main"],
             ("cannot resolve",),
         )
-        # The walk still resolves the visible git word after env's options.
+        # An ambiguous prefix matches more than one of env's options, so
+        # whether it takes a value cannot be told: refused like env refuses it.
+        await self._refused_all(
+            ["env --i $c push -f origin main", "env --d $c push -f origin main"],
+            ("abbreviation",),
+        )
+        # The walk still resolves the visible git word after env's options,
+        # and a valueless prefix hands nothing to the next word.
         self._verdicts_clean(
             ["env -u FOO git push -f origin feature",
-             "env -uFOO git push -f origin feature", "env -i git push origin feature"],
+             "env -uFOO git push -f origin feature", "env -i git push origin feature",
+             "env --ignore-env git push -f origin feature",
+             "env --n git push origin feature", "env --s 'git status'"],
         )
 
 
