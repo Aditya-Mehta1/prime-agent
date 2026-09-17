@@ -127,9 +127,10 @@ SECRET_ECHO_MATCHING_COMMANDS = [
     "env -u PATH printenv", "env FOO=1 printenv", "env env",
     "env -S 'env'", "env -S env", "env -i printenv",
 # A `)` inside a comment is data, so the substitution closes at the `)` the
-# shell reads, and the command on the next line is still scanned.
-    'echo "$( #)\nenv )"', 'echo "$( #)\nprintenv )"',
-    'echo "$( : # )\ncat ~/.ssh/id_rsa )"',
+# shell reads, and the command on the next line is still scanned. A `#` glued
+# to the opener opens the substitution's first word, so it comments the same way.
+    'echo "$( #)\nenv )"', 'echo "$( #)\nprintenv )"', 'echo "$(#)\nenv )"',
+    'echo "$( : # )\ncat ~/.ssh/id_rsa )"', 'echo "$(# )\ncat ~/.ssh/id_rsa )"',
 ]
 
 SECRET_ECHO_NON_MATCHING_COMMANDS = [
@@ -172,7 +173,7 @@ SECRET_ECHO_NON_MATCHING_COMMANDS = [
     "cat <<'$(env)'\nhello\n$(env)", "cat <<-'$(env)'\n\thello\n\t$(env)",
     "cat <<EOF\nenv\nEOF", "cat <<EOF\ncat ~/.ssh/id_rsa\nEOF",
     "cat <<EOF\nexport -p\nEOF",
-    "echo $'env'", "echo \"$'env'\"",
+    "echo $'env'", "echo \"$'env'\"", "echo $'\\cß'",
     "echo \"$(env | grep SAFE_VAR)\"", "echo \"$(printenv HOME)\"", "echo '$(env)'",
     "echo \"$(cat /etc/passwd)\"",
 # A backslash escapes the next character: an escaped `~`, `$`, or `;` is text.
@@ -369,7 +370,9 @@ class SecretEchoGuardTest(unittest.IsolatedAsyncioTestCase):
         # A `)` inside a comment is data, so the substitution closes at the `)`
         # the shell reads, and the command on the next line is still scanned
         # while the same shape reading a non-secret file stays allowed.
-        self._refuse_all(['echo "$( #)\nenv )"', 'echo "$( #)\nprintenv )"'])
+        self._refuse_all(
+            ['echo "$( #)\nenv )"', 'echo "$( #)\nprintenv )"', 'echo "$(#)\nenv )"']
+        )
         self._refuse_all(['echo "$( : # )\ncat ~/.ssh/id_rsa )"'], "a known secret file")
         await self._expect_output([('echo "$( #)\nprintf OK )"', "OK")])
 
@@ -607,6 +610,12 @@ class SecretEchoGuardTest(unittest.IsolatedAsyncioTestCase):
         exit_code, lines = await self._captured("printf 'A=1\nB=2\nC=3\n' | grep -m0 B")
         self.assertNotEqual(exit_code, 0)
         self.assertNotEqual(lines, ["B=2"])
+
+    def test_multibyte_control_escape_answers_a_verdict(self):
+        # `\c` masks its operand's low five bits, and `'ß'.upper()` is two
+        # characters, so masking the code point keeps the scan answering a
+        # verdict instead of raising `ord`'s TypeError out of `bash()`.
+        self.assertIsNone(bash_module._secret_echo_violation("echo $'\\cß'"))
 
     def test_overlong_descriptor_returns_a_verdict(self):
         # A descriptor run past Python's digit limit must not escape as a

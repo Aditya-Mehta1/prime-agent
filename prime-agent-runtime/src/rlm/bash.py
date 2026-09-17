@@ -1350,7 +1350,14 @@ def _ansi_c_escape(command: str, index: int, end: int) -> tuple[str, int]:
     if simple is not None:
         return simple, index + 2
     if following == "c" and index + 2 < end:
-        return chr(ord(command[index + 2].upper()) & 0x1F), index + 3
+        # `\cX` masks X's low five bits, and bash masks the first byte when X is
+        # multi-byte, so `$'\cß'` prints two bytes: no one-character model is
+        # exact there, and a word-level scan needs only a character that is not
+        # a word. Masking the code point keeps one character for every X, while
+        # `.upper()` changed nothing for X in ASCII (`\ca` and `\cA` print the
+        # same control character) but is two characters for 90 others, and
+        # `ord` takes one, so `$'\cß'` raised its TypeError out of `bash()`.
+        return chr(ord(command[index + 2]) & 0x1F), index + 3
     if following in "01234567":
         cursor = index + 1
         if command[cursor] == "0":
@@ -2093,9 +2100,14 @@ def _paren_matches(command: str) -> dict[int, int]:
                 index += 1
             continue
         if char == "$" and command[index + 1 : index + 2] == "(":
+            # A substitution opens a command, so a word starts fresh against the
+            # opener rather than continuing the word before it: a `#` glued to
+            # `$(` is that command's first word, and the comment it begins runs
+            # to end of line. `echo "$(#)` with `env )"` on the next line runs
+            # env, so the `)` that comment hides must not close the span.
             stack.append((index + 1, in_double_quotes))
             in_double_quotes = False
-            in_word = True
+            in_word = False
             index += 2
             continue
         if char == "(" and not in_double_quotes:
