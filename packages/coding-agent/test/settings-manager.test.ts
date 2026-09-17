@@ -214,21 +214,16 @@ describe("SettingsManager", () => {
 	// Park bounds are clamped like the other wait bounds: one week per park at most.
 	describe("provider park bounds", () => {
 		it("clamps very large park bounds to the maximum park duration", () => {
-			const manager = SettingsManager.inMemory({
+			const wait = SettingsManager.inMemory({
 				retry: { provider: { waitForUsage: { maxPauseMs: 365 * 86_400_000, maxParks: 99 } } },
-			});
-
-			const wait = manager.getProviderWaitSettings();
-			expect(wait.pauseUntilReset).toBe(true);
-			expect(wait.maxPauseMs).toBe(7 * 86_400_000);
-			expect(wait.maxParks).toBe(99);
+			}).getProviderWaitSettings();
+			expect([wait.pauseUntilReset, wait.maxPauseMs, wait.maxParks]).toEqual([true, 7 * 86_400_000, 99]);
 
 			// Non-finite park settings fall back to the defaults, like the wait bounds.
 			const invalid = SettingsManager.inMemory({
 				retry: { provider: { waitForUsage: { maxPauseMs: Number.NaN, maxParks: -1 } } },
 			}).getProviderWaitSettings();
-			expect(invalid.maxPauseMs).toBe(86_400_000);
-			expect(invalid.maxParks).toBe(0);
+			expect([invalid.maxPauseMs, invalid.maxParks]).toEqual([86_400_000, 0]);
 		});
 	});
 });

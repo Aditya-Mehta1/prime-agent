@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
 	completeWithProviderRetry,
 	DEFAULT_PROVIDER_WAIT_POLICY,
+	type ProviderParkDecision,
 	type ProviderWaitPolicy,
 	parseProviderResetMs,
 	providerParkDecision,
@@ -205,41 +206,17 @@ describe("providerWaitDecision", () => {
 });
 
 describe("providerParkDecision", () => {
-	it("parks until the reported reset plus a grace when the bounded wait cannot cover it", () => {
-		// Subscription windows reported in hours ("Try again in 2 hours").
-		const decision = providerParkDecision(0, 2 * 3_600_000, TEST_WAIT_POLICY);
-		expect(decision).toEqual({
-			kind: "park",
-			delayMs: 2 * 3_600_000 + 30_000,
-		});
-	});
-
-	it("caps the park at maxPauseMs so long-horizon resets still get probed", () => {
-		const decision = providerParkDecision(0, 10 * 86_400_000, TEST_WAIT_POLICY);
-		expect(decision).toEqual({ kind: "park", delayMs: 86_400_000 });
-	});
-
-	it("never parks when the pause setting is disabled", () => {
-		const decision = providerParkDecision(0, 3_600_000, { ...TEST_WAIT_POLICY, pauseUntilReset: false });
-		expect(decision).toEqual({ kind: "none", reason: "disabled" });
-	});
-
-	it("refuses to park once the park budget is spent", () => {
-		const decision = providerParkDecision(8, 3_600_000, TEST_WAIT_POLICY);
-		expect(decision).toEqual({ kind: "none", reason: "park-budget" });
-		// maxParks 0 disables parking outright, including the first park.
-		expect(providerParkDecision(0, 3_600_000, { ...TEST_WAIT_POLICY, maxParks: 0 })).toEqual({
-			kind: "none",
-			reason: "park-budget",
-		});
-	});
-
-	it("never parks without a provider-reported reset time", () => {
-		// Blind parks would guess a wake time; the bounded wait keeps its abort.
-		expect(providerParkDecision(0, undefined, TEST_WAIT_POLICY)).toEqual({
-			kind: "none",
-			reason: "no-reset",
-		});
+	// maxParks 0 disables parking outright, including the first park, and a park
+	// is never guessed without a provider-reported reset.
+	it.each<[number, number | undefined, Partial<ProviderWaitPolicy>, ProviderParkDecision]>([
+		[0, 2 * 3_600_000, {}, { kind: "park", delayMs: 7_230_000 }],
+		[0, 10 * 86_400_000, {}, { kind: "park", delayMs: 86_400_000 }],
+		[0, 3_600_000, { pauseUntilReset: false }, { kind: "none", reason: "disabled" }],
+		[8, 3_600_000, {}, { kind: "none", reason: "park-budget" }],
+		[0, 3_600_000, { maxParks: 0 }, { kind: "none", reason: "park-budget" }],
+		[0, undefined, {}, { kind: "none", reason: "no-reset" }],
+	])("uses %i parks at a reported reset of %s", (parksUsed, resetMs, overrides, expected) => {
+		expect(providerParkDecision(parksUsed, resetMs, { ...TEST_WAIT_POLICY, ...overrides })).toEqual(expected);
 	});
 });
 
