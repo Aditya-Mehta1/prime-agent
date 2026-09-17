@@ -1160,6 +1160,64 @@ def _normalize_line_continuations(command: str) -> str:
     return "".join(chars)
 
 
+def _backtick_end(text: str, start: int, limit: int) -> int:
+    """Index one past the backtick that closes the one at `start`.
+
+    A backslash escapes the next character inside backticks, and a span
+    without its closing backtick runs to `limit`.
+    """
+    i = start + 1
+    while i < limit:
+        if text[i] == "\\" and i + 1 < limit:
+            i += 2
+            continue
+        if text[i] == "`":
+            return i + 1
+        i += 1
+    return limit
+
+
+def _substitution_end(text: str, start: int, limit: int) -> int:
+    """Index of the `)` that closes the `$(` whose `(` is at `start`.
+
+    Only an unquoted `)` closes the substitution, quoting inside it starts
+    fresh, and parentheses nest, so `"$(echo ")")"` ends at its last `)`
+    instead of the one inside the quoted argument. Returns `limit` when the
+    substitution never closes.
+    """
+    depth = 0
+    quote: str | None = None
+    i = start
+    while i < limit:
+        ch = text[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+        elif quote == '"':
+            if ch == '"':
+                quote = None
+            elif ch == "\\" and i + 1 < limit:
+                i += 1
+            elif ch == "$" and text[i + 1 : i + 2] == "(":
+                i = _substitution_end(text, i + 1, limit) - 1
+            elif ch == "`":
+                i = _backtick_end(text, i, limit) - 1
+        elif ch in ('"', "'"):
+            quote = ch
+        elif ch == "\\" and i + 1 < limit:
+            i += 1
+        elif ch == "`":
+            i = _backtick_end(text, i, limit) - 1
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return limit
+
+
 def _heredoc_delimiter(command: str, start: int) -> tuple[int, int, str, bool] | None:
     """The delimiter word of a heredoc whose `<<` operator ends at `start`.
 
@@ -1224,22 +1282,9 @@ def _mask_heredoc_body(
     while i < end:
         ch = command[i]
         if ch == "$" and command[i + 1 : i + 2] == "(":
-            depth = 0
-            j = i
-            while j < end:
-                if command[j] == "(":
-                    depth += 1
-                elif command[j] == ")":
-                    depth -= 1
-                    if depth == 0:
-                        break
-                j += 1
-            i = j + 1
+            i = _substitution_end(command, i + 1, end) + 1
         elif ch == "`":
-            j = i + 1
-            while j < end and command[j] != "`":
-                j += 1
-            i = j + 1
+            i = _backtick_end(command, i, end)
         else:
             chars[i] = " "
             i += 1
@@ -1344,27 +1389,20 @@ def _mask_shell_redirections(command: str) -> str:
             i += 1  # escaped character inside double quotes stays
         elif ch == "$" and chars[i + 1 : i + 2] == "(":
             # Command substitution inside double quotes still executes; mask
-            # redirections inside it too (its own redirects are syntax).
-            depth = 0
-            j = i + 1
-            while j < n:
-                if chars[j] == "(":
-                    depth += 1
-                elif chars[j] == ")":
-                    depth -= 1
-                    if depth == 0:
-                        break
-                j += 1
-            interior = _mask_shell_redirections(command[i + 2 : j])
-            chars[i + 2 : j] = list(interior)
-            i = j
+            # redirections inside it too (its own redirects are syntax). An
+            # unclosed substitution is a shell error: the text after it stays
+            # live instead of being scanned as its interior.
+            close = _substitution_end(command, i + 1, n)
+            if close < n:
+                interior = _mask_shell_redirections(command[i + 2 : close])
+                chars[i + 2 : close] = list(interior)
+                i = close
         elif ch == "`":
-            j = i + 1
-            while j < n and chars[j] != "`":
-                j += 1
-            interior = _mask_shell_redirections(command[i + 1 : j])
-            chars[i + 1 : j] = list(interior)
-            i = j
+            close = _backtick_end(command, i, n)
+            if close < n:
+                interior = _mask_shell_redirections(command[i + 1 : close - 1])
+                chars[i + 1 : close - 1] = list(interior)
+                i = close - 1
         i += 1
     return "".join(chars)
 
@@ -1463,29 +1501,26 @@ def _mask_quoted_spans(command: str) -> str:
         elif ch == "$" and i + 1 < n and chars[i + 1] == "(":
             # Command substitution inside double quotes still executes; keep
             # it live, but its interior is a fresh shell context: quoted data
-            # inside it must stay data (recursively masked).
-            depth = 0
-            j = i
-            while j < n:
-                if chars[j] == "(":
-                    depth += 1
-                elif chars[j] == ")":
-                    depth -= 1
-                    if depth == 0:
-                        break
-                j += 1
-            interior = _mask_quoted_spans(command[i + 2 : j])
-            chars[i + 2 : j] = list(interior)
-            i = j - 1
+            # inside it must stay data (recursively masked). A substitution
+            # that never closes is a shell error, and the text after it is
+            # left live rather than masked as quoted data.
+            close = _substitution_end(command, i + 1, n)
+            if close < n:
+                interior = _mask_quoted_spans(command[i + 2 : close])
+                chars[i + 2 : close] = list(interior)
+                i = close - 1
         elif ch == "`":
             # Backtick substitution inside double quotes still executes; keep
-            # it live, masking quoted data in its interior like $().
-            j = i + 1
-            while j < n and chars[j] != "`":
-                j += 1
-            interior = _mask_quoted_spans(command[i + 1 : j])
-            chars[i + 1 : j] = list(interior)
-            i = j - 1
+            # it live, masking quoted data in its interior like $(). An
+            # unclosed backtick is a shell error, and the text after it stays
+            # live: masking it as data would hide a later discard
+            # (`cat <<EOF` with `$(echo "`")` in its body still runs the
+            # command that follows the heredoc).
+            close = _backtick_end(command, i, n)
+            if close < n:
+                interior = _mask_quoted_spans(command[i + 1 : close - 1])
+                chars[i + 1 : close - 1] = list(interior)
+                i = close - 1
         else:
             chars[i] = " "
         i += 1
@@ -1567,6 +1602,7 @@ def _shell_word_positions(command: str) -> list[_ShellWord]:
     command_word = True
     export_args = False
     prefix_open = True
+    function_name = False
     i = 0
     n = len(command)
     while i < n:
@@ -1579,6 +1615,7 @@ def _shell_word_positions(command: str) -> list[_ShellWord]:
             if ch in ";&|\n()":
                 assignment_slot = command_word = prefix_open = True
                 export_args = False
+                function_name = False
             i += 1
             continue
         start = i
@@ -1599,7 +1636,12 @@ def _shell_word_positions(command: str) -> list[_ShellWord]:
         at_slot = assignment_slot or export_args
         keeps_name = export_args
         is_command_word = command_word and word not in _TRANSPARENT_BUILTINS
-        if command_word and word in _SHELL_KEYWORDS:
+        is_function_word = command_word and word == "function"
+        if is_function_word:
+            pass  # `function NAME { ... }`: the name is no command word
+        elif function_name:
+            is_command_word = False  # the name of a `function` definition
+        elif command_word and word in _SHELL_KEYWORDS:
             pass  # a keyword opens the next command position
         elif (assignment_slot or export_args) and _LITERAL_ASSIGNMENT.fullmatch(word):
             pass  # an assignment prefix: the command word still follows
@@ -1614,6 +1656,7 @@ def _shell_word_positions(command: str) -> list[_ShellWord]:
         else:
             assignment_slot = command_word = prefix_open = False
             export_args = False
+        function_name = is_function_word
         words.append(
             _ShellWord(
                 start,
@@ -1662,7 +1705,9 @@ def _revealed_shell_word(word: str, assignments: dict[str, str]) -> str | None:
     return _plain_word_text(word)
 
 
-def _reveal_shell_command_words(command: str) -> tuple[str, list[int], set[int]]:
+def _reveal_shell_command_words(
+    command: str, resolve_aliases: bool = True
+) -> tuple[str, list[int], set[int]]:
     """Rebuild each shell word the way the shell executes it.
 
     Quoting is stripped before exec, so `"git"` and `g'it'` run `git`, and a
@@ -1673,10 +1718,16 @@ def _reveal_shell_command_words(command: str) -> tuple[str, list[int], set[int]]
     still masks as data. Only a word the shell reads as an assignment is
     recorded, so a `G=other` argument or comment can never overwrite the real
     value, and a command-scoped prefix (`G=other git status`) is dropped again
-    because the shell applies it to that one command. The walk is flat, so an
-    assignment inside a command substitution (`$(G=git; true); $G reset
-    --hard`) stays visible and is refused: that leaks an inner scope outward
-    and so refuses more, not less.
+    because the shell applies it to that one command. An `alias NAME=VALUE`
+    command word in the scanned text (the replayed prefix included) is
+    resolved the same way: a later command word spelled NAME runs VALUE. The
+    shell's own options are not visible to a static scan, so a visible alias
+    is resolved even in a shell that would not expand it, and an alias value
+    the walk cannot read verbatim registers nothing, so the word stays as
+    written instead of vanishing. The walk is flat, so an assignment inside a
+    command substitution (`$(G=git; true); $G reset --hard`) stays visible and
+    is refused: that leaks an inner scope outward and so refuses more, not
+    less.
 
     The returned map points every emitted character back into `command`, and
     the returned set holds the words whose revealed value is more than a bare
@@ -1685,6 +1736,8 @@ def _reveal_shell_command_words(command: str) -> tuple[str, list[int], set[int]]
     """
     assignments: dict[str, str] = {}
     pending: dict[str, str] = {}
+    aliases: dict[str, str] = {}
+    alias_args = False
     out: list[str] = []
     index_map: list[int] = []
     unnameable: set[int] = set()
@@ -1702,9 +1755,29 @@ def _reveal_shell_command_words(command: str) -> tuple[str, list[int], set[int]]
             if prefix_open:
                 assignments.update(pending)
             pending.clear()
+            alias_args = False
         cursor = word.end
         text = command[word.start : word.end]
+        plain = _plain_word_text(text)
         revealed = _revealed_shell_word(text, assignments)
+        if resolve_aliases and word.command and plain is not None and text == plain:
+            # A command word spelled like an alias this text defined runs the
+            # alias value, so reveal it exactly as a `$NAME` reference is
+            # revealed. An unquoted word only: the shell does not expand a
+            # quoted alias name.
+            alias = aliases.get(plain)
+            if alias is not None:
+                revealed = alias
+        if word.command and plain == "alias":
+            alias_args = True  # the words after the builtin are definitions
+        elif alias_args:
+            definition = _LITERAL_ASSIGNMENT.fullmatch(text)
+            if definition:
+                aliases[definition.group(1)] = next(
+                    group for group in definition.groups()[1:] if group is not None
+                )
+            else:
+                alias_args = False  # not a definition (`alias -p`, a bare name)
         replacement = text if revealed is None else revealed
         if revealed is not None:
             # A revealed value is data the shell runs as a word, never shell
@@ -1772,13 +1845,13 @@ def _is_forced_clean_segment(args: str) -> bool:
     )
 
 
-def _find_destructive_git_discard_sites(command: str) -> list[_DiscardSite]:
-    """Find every destructive git discard command in `command`, returning
-    where each `git` token starts (empty when none match)."""
-    normalized, index_map = _strip_shell_escapes(
-        _mask_shell_redirections(_normalize_line_continuations(command))
+def _scan_discard_sites(
+    normalized: str, index_map: list[int], resolve_aliases: bool
+) -> list[_DiscardSite]:
+    """Find the discards in already-normalized text, mapped back to the input."""
+    words, word_map, unnameable = _reveal_shell_command_words(
+        normalized, resolve_aliases=resolve_aliases
     )
-    words, word_map, unnameable = _reveal_shell_command_words(normalized)
     masked = _mask_quoted_spans(words)
     matches: list[tuple[int, int]] = []
     for pattern in (_DISCARD_CHECKOUT_PATTERN, _DISCARD_RESET_PATTERN):
@@ -1799,6 +1872,29 @@ def _find_destructive_git_discard_sites(command: str) -> list[_DiscardSite]:
         )
         for start, end in sorted(matches)
     ]
+
+
+def _find_destructive_git_discard_sites(command: str) -> list[_DiscardSite]:
+    """Find every destructive git discard command in `command`, returning
+    where each `git` token starts (empty when none match)."""
+    normalized, index_map = _strip_shell_escapes(
+        _mask_shell_redirections(_normalize_line_continuations(command))
+    )
+    sites = _scan_discard_sites(normalized, index_map, resolve_aliases=True)
+    if "alias" in normalized:
+        # A shell expands an alias defined in this text only when its own
+        # options say so, and the scan cannot see them, so the text is read
+        # both ways (`alias echo=git; echo reset --hard` discards expanded,
+        # while `alias git=echo; git reset --hard` discards unexpanded): a
+        # discard under either reading is refused.
+        sites.extend(_scan_discard_sites(normalized, index_map, resolve_aliases=False))
+    unique: list[_DiscardSite] = []
+    seen: set[tuple[int, bool]] = set()
+    for site in sorted(sites, key=lambda site: site.index):
+        if (site.index, site.revealed) not in seen:
+            seen.add((site.index, site.revealed))
+            unique.append(site)
+    return unique
 
 
 def is_destructive_git_discard_command(command: str) -> bool:
@@ -1867,6 +1963,21 @@ def _eval_payloads_hide_destructive_git(command: str, depth: int = 0) -> bool:
         _mask_shell_redirections(_normalize_line_continuations(command))
     )[0]
     revealed, _word_map, _unnameable = _reveal_shell_command_words(command)
+    if _revealed_eval_payloads_hide_destructive_git(revealed, depth):
+        return True
+    if "alias" in command:
+        # Same both-ways reading as the discard scan: an alias may or may not
+        # be expanded, so the text as written is scanned too.
+        as_written, _as_written_map, _as_written_un = _reveal_shell_command_words(
+            command, resolve_aliases=False
+        )
+        if _revealed_eval_payloads_hide_destructive_git(as_written, depth):
+            return True
+    return False
+
+
+def _revealed_eval_payloads_hide_destructive_git(revealed: str, depth: int) -> bool:
+    """True when a revealed command runs eval over a payload holding a discard."""
     masked = _mask_quoted_spans(revealed)
     for word in _shell_word_positions(revealed):
         if not word.command or _plain_word_text(revealed[word.start : word.end]) != "eval":
@@ -2152,23 +2263,52 @@ def _probe_uncommitted_changes(probe_command: str, cwd: str) -> list[str] | None
     (plus `--ignored=matching` when the discard deletes ignored files) in
     `cwd`. Returns None when dirtiness cannot be determined (not a repo, git
     missing, probe failure) so the guard fails open instead of blocking on a
-    guess."""
+    guess.
+
+    The listing is read with the cap already in place: a repository with a very
+    large untracked or ignored listing must not buffer the whole `git status`
+    in the kernel. Once the cap is reached the tree is known to be dirty, so
+    the probe is stopped and the paths read so far are used.
+    """
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             [_shell(), "-c", probe_command],
             cwd=cwd,
             env=_child_env(),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            timeout=_PROBE_TIMEOUT_SECONDS,
         )
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
         return None
-    if completed.returncode != 0:
+    # A wedged git must not wedge the kernel: kill the probe after the timeout.
+    watchdog = threading.Timer(_PROBE_TIMEOUT_SECONDS, process.kill)
+    watchdog.start()
+    try:
+        output = (
+            process.stdout.read(_PROBE_OUTPUT_CAP_BYTES + 1) if process.stdout else b""
+        )
+        truncated = len(output) > _PROBE_OUTPUT_CAP_BYTES
+        if truncated:
+            process.kill()  # the listing is already long enough: do not wait for the rest
+        returncode = process.wait(timeout=_PROBE_TIMEOUT_SECONDS)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+        process.kill()
         return None
-    output = completed.stdout[:_PROBE_OUTPUT_CAP_BYTES].decode("utf-8", errors="replace")
-    return [line.removesuffix("\r") for line in output.split("\n") if line.strip()]
+    finally:
+        watchdog.cancel()
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        if process.stdout is not None:
+            process.stdout.close()
+    if returncode != 0 and not truncated:
+        return None
+    text = output[:_PROBE_OUTPUT_CAP_BYTES].decode("utf-8", errors="replace")
+    if truncated:
+        # The cap can cut the last entry in half; it still proves dirtiness.
+        text = text.rsplit("\n", 1)[0]
+    return [line.removesuffix("\r") for line in text.split("\n") if line.strip()]
 
 
 def _format_dirty_tree_refusal(dirty_paths: list[str], includes_ignored_files: bool = False) -> str:
