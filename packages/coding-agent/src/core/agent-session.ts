@@ -1533,6 +1533,8 @@ export class AgentSession {
 		| undefined = undefined;
 	/** Lazily built session-artifact store for durable quota-resume wake jobs. */
 	private _quotaResumeJobStore: AgentCronJobStore | undefined = undefined;
+	/** Wake jobs branch navigation cancelled, so returning to the parked branch can rebuild one. */
+	private readonly _navigationCancelledWakeJobs = new Set<string>();
 	/** Set while turns are routed to the user-configured backup model. */
 	private _backupModel:
 		| {
@@ -13174,11 +13176,21 @@ export class AgentSession {
 	 * recreate one that was cancelled (a navigation cancels the left-behind
 	 * leaf's wake) or removed, so a restored park never waits on a dead job.
 	 */
-	private _restoreQuotaWakeJob(jobId: string | undefined, resumeAtMs: number): string | undefined {
-		if (jobId !== undefined && this._findQuotaResumeJob(jobId)?.status !== "cancelled") {
+	private _restoreQuotaWakeJob(jobId: string | undefined, resumeAtMs: number): string | undefined | "user-cancelled" {
+		if (jobId === undefined) {
+			return this._createQuotaResumeJob(resumeAtMs);
+		}
+		const job = this._findQuotaResumeJob(jobId);
+		if (job === undefined || job.status !== "cancelled") {
+			// Not cancelled: still scheduled, or already delivered by the daemon.
 			return jobId;
 		}
-		return this._createQuotaResumeJob(resumeAtMs);
+		// A cancelled wake stays cancelled unless navigation cancelled it, which
+		// frees the wake so returning to the parked branch can rebuild it.
+		if (this._navigationCancelledWakeJobs.has(jobId)) {
+			return this._createQuotaResumeJob(resumeAtMs);
+		}
+		return "user-cancelled";
 	}
 
 	/**
@@ -13187,6 +13199,10 @@ export class AgentSession {
 	 * resume its task on the selected branch.
 	 */
 	private _reloadQuotaParkFromBranch(): void {
+		const cancelledJobId = this._quotaPark?.jobId;
+		if (cancelledJobId !== undefined) {
+			this._navigationCancelledWakeJobs.add(cancelledJobId);
+		}
 		this._cancelQuotaParkWake(this._quotaPark);
 		this._quotaPark = undefined;
 		this._restoreQuotaPark();
@@ -13217,6 +13233,9 @@ export class AgentSession {
 				return;
 			}
 			const jobId = this._restoreQuotaWakeJob(entry.data.jobId, resumeAtMs);
+			if (jobId === "user-cancelled") {
+				return;
+			}
 			this._quotaPark = {
 				parkCount: entry.data.parkCount,
 				resumeAtMs,
