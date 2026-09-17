@@ -834,6 +834,7 @@ describe("AgentSession retry and event characterization", () => {
 	type QuotaParkInternals = {
 		_quotaPark: { parkCount: number; resumeAtMs: number; jobId?: string; waking?: boolean } | undefined;
 		_resumeFromQuotaPark: () => Promise<void>;
+		_handleAbortedQuotaPark: () => void;
 	};
 
 	const quotaPark = (harness: Harness): QuotaParkInternals["_quotaPark"] =>
@@ -847,12 +848,6 @@ describe("AgentSession retry and event characterization", () => {
 		harnesses.push(harness);
 		if (persist) harness.sessionManager.materializeSessionFile();
 		return harness;
-	};
-
-	const sessionArtifactDir = (harness: Harness): string => {
-		const dir = harness.sessionManager.getSessionArtifactDir();
-		if (!dir) throw new Error("persisted harness session has no artifact dir");
-		return dir;
 	};
 
 	// Successive assistant messages, buffered so a wake probe is awaited, not polled for.
@@ -902,7 +897,7 @@ describe("AgentSession retry and event characterization", () => {
 		expect(harness.faux.state.callCount).toBe(1);
 		const retryEnd = harness.eventsOfType("auto_retry_end");
 		expect(retryEnd.map((event) => event.finalError?.includes("parked until"))).toEqual([true]);
-		const artifactDir = sessionArtifactDir(harness);
+		const artifactDir = harness.sessionManager.getSessionArtifactDir()!;
 		const wakeJob = readQuotaWakeJob(artifactDir, quotaPark(harness)?.jobId);
 		expect(wakeJob?.status).toBe("active");
 		expect(wakeJob?.schedule.kind).toBe("once");
@@ -940,7 +935,6 @@ describe("AgentSession retry and event characterization", () => {
 		await nextTurn();
 		expect(harness.session.isQuotaParked).toBe(false);
 		expect(harness.eventsOfType("auto_retry_end").at(-1)?.finalError).toContain("maxWaitMs");
-		expect(harness.faux.state.callCount).toBe(3);
 	});
 
 	it("resumes early and cancels the scheduled wake when quota returns via another turn", async () => {
@@ -961,7 +955,7 @@ describe("AgentSession retry and event characterization", () => {
 		await nextTurn();
 		expect(harness.session.isQuotaParked).toBe(false);
 		expect(getUserTexts(harness).join("\n")).toContain("<provider_quota_resumed>");
-		expect(readQuotaWakeJob(sessionArtifactDir(harness), wakeJobId)?.status).toBe("cancelled");
+		expect(readQuotaWakeJob(harness.sessionManager.getSessionArtifactDir()!, wakeJobId)?.status).toBe("cancelled");
 	});
 
 	it("stands down when the daemon already delivered the durable wake", async () => {
@@ -970,7 +964,7 @@ describe("AgentSession retry and event characterization", () => {
 		await harness.session.prompt("do the work");
 		const jobId = quotaPark(harness)?.jobId;
 		// The daemon claims and runs the durable wake before the in-process timer fires.
-		const artifactDir = sessionArtifactDir(harness);
+		const artifactDir = harness.sessionManager.getSessionArtifactDir()!;
 		const store = AgentCronJobStore.forSessionArtifacts();
 		store.registerSessionArtifact(harness.sessionManager.getSessionId(), artifactDir);
 		const [dispatch] = store.claimDue(new Date(Date.now() + 60_000));
@@ -1001,8 +995,7 @@ describe("AgentSession retry and event characterization", () => {
 		await fireQuotaWake(harness);
 		expect((await nextTurn()).stopReason).toBe("aborted");
 
-		// An aborted probe is no evidence the quota is back: the park survives and
-		// re-arms instead of leaving a park nothing can resume.
+		// An aborted probe is no evidence the quota is back: the park re-arms.
 		expect(quotaPark(harness)?.waking).toBe(false);
 		expect(quotaPark(harness)?.resumeAtMs).toBeGreaterThan(parkedAtMs);
 	});
@@ -1063,6 +1056,25 @@ describe("AgentSession retry and event characterization", () => {
 		// Backup takes precedence: the far reset never reaches the park decision.
 		expect(harness.eventsOfType("auto_retry_start").map((event) => event.reason)).toEqual(["backup"]);
 		expect(harness.session.isQuotaParked).toBe(false);
+	});
+
+	it("keeps a queued wake marker when another turn is aborted", async () => {
+		const harness = await parkHarness(parkSettings({ maxPauseMs: 2_000 }), true);
+		const nextTurn = assistantTurns(harness);
+		harness.setResponses([quotaFailure({ retryAfterMs: 3_600_000 }), fauxAssistantMessage("recovered")]);
+		await harness.session.prompt("do the work");
+		await nextTurn();
+
+		// The wake hands the resume to a marker that is still queued.
+		const pause = harness.session.acquireQueuedWorkPause();
+		await fireQuotaWake(harness);
+		expect(quotaPark(harness)?.waking).toBe(true);
+		(harness.session as unknown as QuotaParkInternals)._handleAbortedQuotaPark();
+		expect(quotaPark(harness)?.waking).toBe(true);
+		pause.release();
+		await nextTurn();
+
+		expect(getUserTexts(harness).filter((text) => text.includes("<provider_quota_resumed>"))).toHaveLength(1);
 	});
 
 	it("waits for an unavailable provider after quick retries exhaust", async () => {

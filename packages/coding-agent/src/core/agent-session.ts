@@ -4454,11 +4454,8 @@ export class AgentSession {
 					this._providerWait = undefined;
 					this._retryAuthFailureSources = [];
 				}
-				if (assistantMsg.stopReason === "aborted" && this._quotaPark) {
-					// An aborted turn is not evidence the quota is back: keep the park
-					// and re-arm the wake this turn consumed.
-					this._quotaPark.waking = false;
-					this._recoverQuotaParkWake("wake-aborted");
+				if (assistantMsg.stopReason === "aborted") {
+					this._handleAbortedQuotaPark();
 				} else if (assistantMsg.stopReason !== "error" && this._quotaPark) {
 					// A parked session that completes a model call has its quota back:
 					// clear the park (cancelling the pending wake) and resume the task.
@@ -13110,6 +13107,31 @@ export class AgentSession {
 			park.waking = false;
 			this._recoverQuotaParkWake("wake-failed");
 		}
+	}
+
+	/**
+	 * An aborted turn is not evidence the quota is back. A wake whose resume
+	 * marker is still queued owns the resume, so an abort of some other turn must
+	 * not re-arm the wake under it; a wake this turn consumed re-arms instead.
+	 */
+	private _handleAbortedQuotaPark(): void {
+		const park = this._quotaPark;
+		if (!park || (park.waking === true && this._hasQueuedQuotaResumeMarker())) {
+			return;
+		}
+		park.waking = false;
+		this._recoverQuotaParkWake("wake-aborted");
+	}
+
+	/** Whether the park wake's resume marker is still waiting in the session input queue. */
+	private _hasQueuedQuotaResumeMarker(): boolean {
+		return this._actionStore.unfinishedActions().some((action) => {
+			if (action.payload.kind !== "turn" || action.lifecycle.state !== "queued") {
+				return false;
+			}
+			const { text } = normalizeMessageContent(primaryDeliveryRecord(action).message.content);
+			return text.includes(QUOTA_RESUME_MARKER_TEXT);
+		});
 	}
 
 	/**
