@@ -730,7 +730,8 @@ describe("agents view incident notices", () => {
 		useTempAgentDir();
 		const base = Date.now();
 		writeAgentLog([workerCrashLine(base, "5b1d3aeb91ee", 120)]);
-		const view = newView();
+		const persistentState: AgentsViewPersistentState = { savedCatalogLoaded: true };
+		const view = newView(persistentState);
 		try {
 			invoke("refreshIncidentNotices", view);
 			expect(renderedIncidentLines(view)[0]).toContain("worker 5b1d3aeb91ee crashed at");
@@ -743,6 +744,15 @@ describe("agents view incident notices", () => {
 			const lines = renderedIncidentLines(view);
 			expect(lines).toHaveLength(1);
 			expect(lines[0]).toContain("worker aaaaaaaaaaaa crashed at");
+
+			// A crash the view never read rotates into agent.jsonl.old: it must
+			// still surface, exactly once, now that the new generation is empty.
+			appendAgentLog([workerCrashLine(base, "cccccccccccc", 30)]);
+			renameSync(getAgentLogPath(), `${getAgentLogPath()}.old`);
+			writeAgentLog([]);
+			invoke("refreshIncidentNotices", view);
+			expect(renderedIncidentLines(view)[0]).toContain("worker cccccccccccc crashed at");
+			expect(persistentState.incidentNoticeState?.entries).toHaveLength(3);
 		} finally {
 			stopThemeWatcher();
 		}

@@ -22,7 +22,8 @@ import { theme } from "../interactive/theme/theme.js";
  * update restart (a supervisor replacement), so the operator sees the
  * incident without running the CLI by hand. On the initial read the view
  * matches the CLI's [agent.jsonl.old, agent.jsonl] source with the same
- * bounded tail, so incidents spanning a log rotation surface too.
+ * bounded tail, so incidents spanning a log rotation surface too, and a
+ * rotation between polls still consumes the previous generation's unread tail.
  */
 
 /** Recent-log window, matching the `prime-agent incident` default. */
@@ -274,12 +275,15 @@ interface IncidentLogChunk {
  * only appended bytes (every read stays bounded). A trailing partial line is
  * held back (the offset stops at its newline), so a mid-write line parses only
  * once complete, on a later poll. A missing or unreadable file returns
- * undefined; offsets beyond the file size are never re-processed.
+ * undefined; offsets beyond the file size are never re-processed. floorOffset
+ * raises the floor of a re-tail — a rotation remainder read passes the consumed
+ * offset — so no already-consumed line is ever parsed twice.
  */
 function readIncidentLogLines(
 	logPath: string,
 	previousOffset: number | undefined,
 	previousFileId: string | undefined,
+	floorOffset = 0,
 ): IncidentLogChunk | undefined {
 	let fd: number;
 	try {
@@ -300,7 +304,8 @@ function readIncidentLogLines(
 			rotated ||
 			previousOffset > stats.size ||
 			stats.size - previousOffset > INCIDENT_NOTICE_TAIL_BYTES;
-		const start = retailed ? Math.max(0, stats.size - INCIDENT_NOTICE_TAIL_BYTES) : previousOffset;
+		const tailStart = Math.max(floorOffset, stats.size - INCIDENT_NOTICE_TAIL_BYTES);
+		const start = retailed ? tailStart : Math.max(floorOffset, previousOffset ?? 0);
 		if (start >= stats.size) {
 			return { lines: [], nextOffset: stats.size, fileId };
 		}
@@ -383,9 +388,11 @@ function mergeIncidentWindowedEntries(
  * single collapsed line worth showing. The first successful read also tails
  * the rotated agent.jsonl.old — matching the CLI's [agent.jsonl.old,
  * agent.jsonl] source with the same bounded tail — so incidents spanning a
- * rotation still surface in a fresh view; later polls read only appended
- * agent.jsonl bytes (re-reading .old would duplicate supervisor starts into
- * phantom update restarts). Returns true when that line changed so the caller
+ * rotation still surface in a fresh view. Later polls read only appended
+ * agent.jsonl bytes, plus the unread remainder of a generation that rotated
+ * away between polls — never bytes before the consumed offset, since a
+ * duplicated supervisor start would fabricate a phantom update restart.
+ * Returns true when that line changed so the caller
  * can re-render. Never throws for a missing or unreadable log: that poll keeps
  * the consumed offset (a re-tail would fabricate restarts) but still
  * re-derives, so the notice expires with its window instead of surviving
@@ -396,11 +403,15 @@ export function refreshIncidentNoticeState(state: IncidentNoticeState, logPath: 
 	// [agent.jsonl.old, agent.jsonl] (readIncidentLogEntries), so a view opened
 	// after a rotation must see pairs that span it — an update restart whose
 	// earlier supervisor start sits in .old, or a burst straddling the files.
-	// Only this first read: a later re-read would duplicate supervisor-start
-	// lines into a phantom update restart (the classifier does not dedupe
-	// supervisor-start), which is also why the consumed offset never resets.
-	const firstRead = state.logOffset === undefined && state.logFileId === undefined;
-	const chunk = readIncidentLogLines(logPath, state.logOffset, state.logFileId);
+	// Only this first read tails .old from its start; a rotation noticed later
+	// reads just the unread remainder past the consumed offset (below), because
+	// re-parsing a consumed supervisor-start would duplicate it into a phantom
+	// update restart (the classifier does not dedupe supervisor-start), which is
+	// also why the consumed offset never resets.
+	const previousOffset = state.logOffset;
+	const previousFileId = state.logFileId;
+	const firstRead = previousOffset === undefined && previousFileId === undefined;
+	const chunk = readIncidentLogLines(logPath, previousOffset, previousFileId);
 	const sinceMs = nowMs - INCIDENT_NOTICE_WINDOW_MS;
 	// CLI window parity (buildIncidentReport bounds events by >= since && <=
 	// until): future-dated entries fall outside the window and never surface.
@@ -419,6 +430,19 @@ export function refreshIncidentNoticeState(state: IncidentNoticeState, logPath: 
 			const rotated = readIncidentLogLines(`${logPath}.old`, undefined, undefined);
 			if (rotated !== undefined) {
 				parsed = parseWindowedLines(rotated.lines);
+			}
+		} else if (previousOffset !== undefined && chunk.fileId !== previousFileId) {
+			// A rotation between polls left the previous generation's unread bytes
+			// — everything appended since the last poll, plus a line that was held
+			// back as partially written and then completed — in agent.jsonl.old.
+			// Read them from the consumed offset, so those incidents are not lost
+			// for the life of the state (the .old bridge above runs only once).
+			// Never before it: re-parsing a consumed supervisor-start would pair
+			// with the new file's start into a phantom update restart. A .old that
+			// is not that generation (an in-place replacement) contributes nothing.
+			const remainder = readIncidentLogLines(`${logPath}.old`, previousOffset, previousFileId, previousOffset);
+			if (remainder !== undefined && remainder.fileId === previousFileId) {
+				parsed = parseWindowedLines(remainder.lines);
 			}
 		}
 		parsed = parsed.concat(parseWindowedLines(chunk.lines));
