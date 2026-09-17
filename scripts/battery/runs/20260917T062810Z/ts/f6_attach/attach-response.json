@@ -1,0 +1,159 @@
+{
+ "id": "a1",
+ "type": "response",
+ "command": "attach",
+ "success": true,
+ "data": {
+  "protocol": {
+   "name": "prime-agent.daemon",
+   "version": 7
+  },
+  "activeSessionId": "cd1de2b9590e",
+  "snapshot": {
+   "activeSessionId": "cd1de2b9590e",
+   "summary": {
+    "id": "cd1de2b9590e",
+    "lifecycle": "draft",
+    "activity": "idle",
+    "isSessionActive": false,
+    "lastActivityAt": "2026-09-17T06:28:57.252Z",
+    "runtimeKind": "top-level",
+    "rlmDepth": 0,
+    "activeSessionId": "cd1de2b9590e",
+    "sessionId": "01a0ae0d-d41d-7212-a9b5-d653966cd279",
+    "sessionFile": "/home/ubuntu/lane-worktrees/trial-send-2/scripts/battery/runs/20260917T062810Z/ts/agent/sessions/01a0ae0d-d41d-7212-a9b5-d653966cd279.jsonl",
+    "sessionName": "battery-attach",
+    "cwd": "/home/ubuntu/lane-worktrees/trial-send-2/scripts/battery/runs/20260917T062810Z/ts/work",
+    "model": {
+     "id": "mock-1",
+     "name": "Mock 1",
+     "api": "openai-completions",
+     "provider": "prime-inference",
+     "baseUrl": "http://127.0.0.1:43981/v1",
+     "reasoning": false,
+     "input": [
+      "text"
+     ],
+     "cost": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0
+     },
+     "contextWindow": 128000,
+     "maxTokens": 4096
+    },
+    "thinkingLevel": "off",
+    "isStreaming": false,
+    "isCompacting": false,
+    "isBashRunning": false,
+    "hasRunningRlmChildren": false,
+    "isRunningTools": false,
+    "attachedClients": 1,
+    "messageCount": 0,
+    "unfinishedActionCount": 0,
+    "sessionActions": {
+     "queuedCount": 0,
+     "steering": [],
+     "followUps": []
+    },
+    "created": "2026-09-17T06:28:56.989Z",
+    "modified": "2026-09-17T06:28:57.252Z",
+    "diagnostics": [],
+    "workerState": "ready",
+    "workerPid": 2585997
+   },
+   "state": {
+    "activeSessionId": "cd1de2b9590e",
+    "cwd": "/home/ubuntu/lane-worktrees/trial-send-2/scripts/battery/runs/20260917T062810Z/ts/work",
+    "model": {
+     "id": "mock-1",
+     "name": "Mock 1",
+     "api": "openai-completions",
+     "provider": "prime-inference",
+     "baseUrl": "http://127.0.0.1:43981/v1",
+     "reasoning": false,
+     "input": [
+      "text"
+     ],
+     "cost": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0
+     },
+     "contextWindow": 128000,
+     "maxTokens": 4096
+    },
+    "thinkingLevel": "off",
+    "serviceTier": "default",
+    "availableThinkingLevels": [
+     "off"
+    ],
+    "isStreaming": false,
+    "isCompacting": false,
+    "isBashRunning": false,
+    "retryAttempt": 0,
+    "steeringMode": "one-at-a-time",
+    "followUpMode": "one-at-a-time",
+    "sessionFile": "/home/ubuntu/lane-worktrees/trial-send-2/scripts/battery/runs/20260917T062810Z/ts/agent/sessions/01a0ae0d-d41d-7212-a9b5-d653966cd279.jsonl",
+    "sessionId": "01a0ae0d-d41d-7212-a9b5-d653966cd279",
+    "sessionName": "battery-attach",
+    "sessionDir": "/home/ubuntu/lane-worktrees/trial-send-2/scripts/battery/runs/20260917T062810Z/ts/agent/sessions",
+    "leafId": "94b518d8",
+    "autoCompactionEnabled": true,
+    "messageCount": 0,
+    "sessionActions": {
+     "queuedCount": 0,
+     "steering": [],
+     "followUps": []
+    },
+    "compactionCount": 0,
+    "goal": {
+     "active": false,
+     "status": "idle",
+     "tokensUsed": 0,
+     "timeUsedSeconds": 0,
+     "continuationsUsed": 0
+    },
+    "scopedModels": [],
+    "activeToolNames": [
+     "ipython"
+    ],
+    "contextUsage": {
+     "tokens": 0,
+     "contextWindow": 128000,
+     "percent": 0
+    },
+    "heartbeat": null
+   },
+   "messages": [],
+   "lastEventSequence": 0,
+   "lastEventCursor": {
+    "generation": "6c60be1e6bc5",
+    "sequence": 0
+   },
+   "children": []
+  },
+  "replay": {
+   "status": "complete",
+   "toSequence": 0,
+   "toCursor": {
+    "generation": "6c60be1e6bc5",
+    "sequence": 0
+   }
+  },
+  "lastEventSequence": 0,
+  "lastEventCursor": {
+   "generation": "6c60be1e6bc5",
+   "sequence": 0
+  },
+  "client": {
+   "id": "9280f175a3ae",
+   "capabilities": [
+    "attach_snapshot",
+    "event_sequence"
+   ]
+  }
+ }
+}

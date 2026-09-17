@@ -190,9 +190,14 @@ pub fn event_to_update(event: &Value) -> Option<TurnUpdate> {
             let event_type = event.get("type").and_then(Value::as_str);
             let streaming = event_type != Some("message_end");
             match message.get("role").and_then(Value::as_str) {
-                // User messages carry the full payload on start; only a
-                // partial user frame would be a protocol anomaly.
-                Some("user") if event_type == Some("message_update") => {
+                // User messages carry the full payload on start; the
+                // message_end twin of the same row must not re-render it
+                // (TS interactive ignores user message_end frames), and
+                // only a partial user frame would be a protocol anomaly.
+                Some("user")
+                    if event_type == Some("message_update")
+                        || event_type == Some("message_end") =>
+                {
                     Some(TurnUpdate::StatusUpdate)
                 }
                 Some("user") => Some(TurnUpdate::UserMessage(message_text(&message))),

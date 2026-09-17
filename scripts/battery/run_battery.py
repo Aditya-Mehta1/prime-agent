@@ -197,6 +197,7 @@ class Battery:
 
     def f1_launch(self) -> None:
         """Fresh install state: splash, first-run notice, first prompt+reply."""
+        noticed: dict[str, bool] = {}
         for side in (self.sides["ts"], self.sides["rust"]):
             flow = "f1_launch"
             session = f"{self.runid}-f1-{side.name}"
@@ -223,28 +224,17 @@ class Battery:
                     break
                 time.sleep(1.0)
             side.evidence(flow, "01-launch.txt", frame)
-            if "Share agent traces" in frame:
-                self.record(
-                    flow,
-                    "visual",
-                    f"{side.name} shows a first-run notice on fresh install: splash + 'Share agent traces with Prime Intellect?' dialog (Share / Not now, /traces hint)",
-                    evidence=side.root / flow / "01-launch.txt",
-                )
+            noticed[side.name] = "Share agent traces" in frame
+            if noticed[side.name]:
+                # B-2: the notice is answerable (Down + Enter = Not now) and
+                # the pane settles into the main screen afterwards.
                 B.tmux_send(session, "Down")
                 time.sleep(0.5)
                 B.tmux_send(session, "Enter")
                 time.sleep(2.0)
                 side.evidence(flow, "02-notice-answered.txt", B.tmux_capture(session))
             elif "prime agent" in frame.lower() or "manage" in frame:
-                if side.name == "ts":
-                    self.record(flow, "visual", f"{side.name} splash captured with no first-run notice (already onboarded)", gap=False)
-                else:
-                    self.record(
-                        flow,
-                        "visual",
-                        "Rust launches straight into the TUI: no splash ASCII art and no first-run trace-sharing notice",
-                        evidence=side.root / flow / "01-launch.txt",
-                    )
+                side.evidence(flow, "02-no-notice.txt", frame)
             else:
                 self.record(flow, "visual", f"{side.name} launch frame shows no splash/welcome text", gap=True)
             # Wait for a settled main screen before sending the prompt.
@@ -294,6 +284,36 @@ class Battery:
                     evidence=side.root / flow / "first-prompt-mock-requests.json",
                 )
             B.tmux_kill(session)
+        # B-2 cross-side verdict: the first-run surface (splash + trace
+        # notice) is parity when both products show and answer it.
+        flow = "f1_launch"
+        if noticed.get("ts") and noticed.get("rust"):
+            self.record(
+                flow,
+                "visual",
+                "first-run splash + trace-sharing notice rendered and answerable on both sides (fresh install)",
+                gap=False,
+            )
+        elif noticed.get("ts") and not noticed.get("rust"):
+            self.record(
+                flow,
+                "visual",
+                "ts shows a first-run notice on fresh install: splash + 'Share agent traces with Prime Intellect?' dialog (Share / Not now, /traces hint)",
+                evidence=self.sides["ts"].root / flow / "01-launch.txt",
+            )
+            self.record(
+                flow,
+                "visual",
+                "Rust launches straight into the TUI: no splash ASCII art and no first-run trace-sharing notice",
+                evidence=self.sides["rust"].root / flow / "01-launch.txt",
+            )
+        elif noticed.get("rust") and not noticed.get("ts"):
+            self.record(
+                flow,
+                "visual",
+                "rust shows the first-run notice but ts does not (ts agent dir already onboarded?)",
+                evidence=self.sides["ts"].root / flow / "01-launch.txt",
+            )
 
     def f2_prompt(self) -> None:
         """Headless print mode: one prompt, one model response, protocol capture."""
@@ -791,6 +811,69 @@ class Battery:
                 )
             self.copy_sessions(side, flow)
 
+        # f6 cross-side verdict: the attach event stream must carry the same
+        # wire events (type + message role / customType), in order.
+        from collections import Counter
+
+        def fingerprints(side_name):
+            path = self.sides[side_name].root / flow / "attacher-events-after-prompt.json"
+            if not path.exists():
+                return None
+            out = []
+            for entry in json.loads(path.read_text()):
+                event = entry.get("event", entry)
+                message = event.get("message") or {}
+                etype = event.get("type")
+                # Row scope: the event-set parity locked here excludes the
+                # two documented model-surface diffs (see PORTING-NOTES and
+                # the f6 commit): the harness-digest custom message pair
+                # (TS delivers the per-turn digest as a custom message;
+                # Rust composes it into the request only) and the
+                # turn_end/agent_end payloads (TS carries the final message).
+                # Drop the filter when the model-surface lane lands
+                # custom-message wire parity.
+                if (
+                    etype in ("message_start", "message_end")
+                    and message.get("customType") == "harness_digest"
+                ):
+                    continue
+                if etype in ("turn_end", "agent_end"):
+                    out.append(str(etype))
+                    continue
+                out.append(
+                    "{}:{}".format(
+                        etype,
+                        message.get("role") or message.get("customType") or "",
+                    )
+                )
+            return out
+
+        ts_events = fingerprints("ts")
+        rust_events = fingerprints("rust")
+        if ts_events and rust_events:
+            if ts_events == rust_events:
+                self.record(
+                    flow,
+                    "protocol",
+                    f"attach event sequences match ({len(ts_events)} projected events, in order; "
+                    "harness-digest custom pairs and turn_end/agent_end payloads are out of scope here — "
+                    "documented model-surface diffs, see PORTING-NOTES)",
+                    gap=False,
+                )
+            else:
+                ts_counts = Counter(ts_events)
+                rust_counts = Counter(rust_events)
+                ts_only = ts_counts - rust_counts
+                rust_only = rust_counts - ts_counts
+                self.record(
+                    flow,
+                    "protocol",
+                    "attach event sequences differ: "
+                    f"ts={len(ts_events)} rust={len(rust_events)}; "
+                    f"ts-only={sorted(ts_only.elements())} rust-only={sorted(rust_only.elements())}",
+                    evidence=self.run_dir / flow,
+                )
+
     def session_config(self, side: B.Side) -> dict:
         # Identical on both sides: explicit provider/model flags ride the
         # create config over the wire and are authoritative in the worker
@@ -1024,7 +1107,11 @@ class Battery:
                     time.sleep(2.0)
                     second = B.tmux_capture(session)
                     stable = first == second and ("manage" in first or ">" in first)
-                # A healthy exchange first: the reply must render.
+                # A healthy exchange first: the reply must render. Own the
+                # mock script for this flow — the response queue is shared
+                # with every earlier flow in the same battery process, so a
+                # leftover response would break the HELLO_TEXT assertion.
+                side.mock.set_responses([{"text": HELLO_TEXT}])
                 B.tmux_send(session, "hello")
                 healthy = B.tmux_wait_text(session, HELLO_TEXT, timeout=90)
                 side.evidence(flow, "01-healthy-exchange.txt", healthy)
@@ -1225,9 +1312,12 @@ class Battery:
         else:
             self.record(flow, "perf", "typing threshold not evaluable: a side produced no keystroke samples", gap=True)
         # Release-build note: the perf row is only meaningful against a
-        # release build; a debug binary is a finding, not a baseline.
+        # release build; a debug binary is a finding, not a baseline. The
+        # workspace release profile keeps line-tables-only debug info
+        # (~103MB); a debug build of the same tree measures ~290MB, so the
+        # size threshold sits between them.
         size_mb = (rs["binary_bytes"] or 0) / 1_000_000
-        if "/debug/" in rs["binary"] or (rs["binary_bytes"] or 0) > 100_000_000:
+        if "/debug/" in rs["binary"] or (rs["binary_bytes"] or 0) > 150_000_000:
             self.record(
                 flow,
                 "perf",

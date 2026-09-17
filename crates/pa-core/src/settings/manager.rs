@@ -219,6 +219,33 @@ impl SettingsManager {
         self.save_global()
     }
 
+    /// TS `getOnboardingShown`: the shown flag with the legacy completed
+    /// flag as fallback; first run is defined by the settings alone.
+    pub fn get_onboarding_shown(&self) -> bool {
+        self.merged
+            .onboarding_shown
+            .or(self.merged.onboarding_completed)
+            .unwrap_or(false)
+    }
+
+    /// TS `getAgentTracesEnabled`: default off until the user opts in.
+    pub fn get_agent_traces_enabled(&self) -> bool {
+        self.merged
+            .agent_traces
+            .as_ref()
+            .and_then(|traces| traces.enabled)
+            .unwrap_or(false)
+    }
+
+    pub fn set_agent_traces_enabled(&mut self, enabled: bool) -> Result<()> {
+        let traces = self
+            .global
+            .agent_traces
+            .get_or_insert_with(Default::default);
+        traces.enabled = Some(enabled);
+        self.save_global()
+    }
+
     /// Replace the `packages` array in the global settings file.
     pub fn set_packages(&mut self, packages: Vec<serde_json::Value>) {
         self.global.packages = Some(packages.clone());

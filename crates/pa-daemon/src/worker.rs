@@ -153,6 +153,9 @@ pub(crate) struct SessionCore {
     pub(crate) compacting: bool,
     /// TS `autoCompactionEnabled` (settings default: on).
     pub(crate) auto_compaction_enabled: bool,
+    /// The last broadcast queue snapshot (TS `_lastSessionActionSnapshot`):
+    /// `session_action_update` fires only when the projection changed.
+    last_action_snapshot: Option<SessionActionSnapshot>,
 }
 
 impl crate::status_line::StatusSession for SessionCore {
@@ -301,6 +304,10 @@ impl Worker {
             shutdown_requested: false,
             compacting: false,
             auto_compaction_enabled: true,
+            // TS seeds `_lastSessionActionSnapshot` with the empty
+            // projection, so a fresh session's first empty snapshot is not
+            // an update.
+            last_action_snapshot: Some(SessionActionSnapshot::default()),
         };
         let active_session_id = config.active_session_id.clone();
         let script = config.script.clone();
@@ -1291,8 +1298,12 @@ impl Worker {
         let streaming_behavior = payload.get("streamingBehavior").and_then(Value::as_str);
         let (done_tx, done_rx) = oneshot::channel();
         let done = if wait { Some(done_tx) } else { None };
-        let snapshot = {
+        let (snapshot, queued_behind_work) = {
             let mut core = self.core.lock().unwrap();
+            // An idle session runs the prompt immediately: the lane is the
+            // work hand-off, not a queue, so the projection did not change
+            // (TS prompt admission with queueIfBusy=false never queues).
+            let queued_behind_work = core.busy;
             match streaming_behavior {
                 Some("steer") => core.steering.push_back(QueuedItem {
                     message: message.to_string(),
@@ -1310,9 +1321,11 @@ impl Worker {
             let active_session_id = core.active_session_id.clone();
             drop(core);
             self.persist_queue_snapshot(&active_session_id, &lanes);
-            snapshot
+            (snapshot, queued_behind_work)
         };
-        let _ = self.emit_action_update(&snapshot);
+        if queued_behind_work {
+            let _ = self.emit_action_update(&snapshot);
+        }
         self.work_notify.notify_one();
         if !wait {
             return response_success(None, "prompt", None);
@@ -1788,6 +1801,12 @@ impl Worker {
     /// Sequence and broadcast one session_event for the queue projection.
     fn emit_action_update(&self, snapshot: &SessionActionSnapshot) -> Result<()> {
         let mut core = self.core.lock().unwrap();
+        // TS `_emitQueueUpdate`: an unchanged projection stays silent (an
+        // empty queue before and after a turn is not an update).
+        if core.last_action_snapshot.as_ref() == Some(snapshot) {
+            return Ok(());
+        }
+        core.last_action_snapshot = Some(snapshot.clone());
         let sequence = core.last_event_sequence + 1;
         core.last_event_sequence = sequence;
         let meta = create_daemon_event_meta(
@@ -2051,7 +2070,13 @@ impl TurnRunner {
                 // is a message_start + message_end pair).
                 let frames: Vec<Value> = match event {
                     EngineEvent::UserMessage(message) => {
-                        vec![json!({ "type": "message_start", "message": message })]
+                        // TS emits the accepted user message as a
+                        // message_start + message_end pair (the row is
+                        // complete the moment it is accepted).
+                        vec![
+                            json!({ "type": "message_start", "message": message }),
+                            json!({ "type": "message_end", "message": message }),
+                        ]
                     }
                     EngineEvent::AssistantUpdate {
                         message,
@@ -2223,32 +2248,41 @@ impl TurnRunner {
                 );
             }
         }
-        {
-            let mut core = self.core.lock().unwrap();
-            let sequence = core.last_event_sequence + 1;
-            core.last_event_sequence = sequence;
-            let meta = create_daemon_event_meta(
-                &core.active_session_id,
-                sequence,
-                None,
-                Some(&core.generation),
-            );
-            let outbound = DaemonOutbound::SessionEvent {
-                active_session_id: self.active_session_id.clone(),
-                event: json!({ "type": "session_action_update", "actions": snapshot }),
-                meta: Some(meta),
-                rest: Default::default(),
-            };
-            let payload = serde_json::to_vec(&outbound).unwrap_or_default();
-            drop(core);
-            let _ = self
-                .events
-                .send(Arc::new(OutboundFrame::session_event(payload)));
-        }
+        let _ = self.emit_action_update(&snapshot);
         // A finished turn is the cue to refresh the session's status line
         // (the runner debounces a burst into one request).
         let _ = self.status_notify.send(());
         self.idle_notify.notify_waiters();
+    }
+
+    /// The post-turn queue projection (TS `_emitQueueUpdate`): an unchanged
+    /// snapshot stays silent.
+    fn emit_action_update(&self, snapshot: &SessionActionSnapshot) -> Result<()> {
+        let mut core = self.core.lock().unwrap();
+        if core.last_action_snapshot.as_ref() == Some(snapshot) {
+            return Ok(());
+        }
+        core.last_action_snapshot = Some(snapshot.clone());
+        let sequence = core.last_event_sequence + 1;
+        core.last_event_sequence = sequence;
+        let meta = create_daemon_event_meta(
+            &core.active_session_id,
+            sequence,
+            None,
+            Some(&core.generation),
+        );
+        let outbound = DaemonOutbound::SessionEvent {
+            active_session_id: core.active_session_id.clone(),
+            event: json!({ "type": "session_action_update", "actions": snapshot }),
+            meta: Some(meta),
+            rest: Default::default(),
+        };
+        let payload = serde_json::to_vec(&outbound)?;
+        drop(core);
+        let _ = self
+            .events
+            .send(Arc::new(OutboundFrame::session_event(payload)));
+        Ok(())
     }
 
     fn snapshot_from(&self, core: &SessionCore) -> SessionActionSnapshot {

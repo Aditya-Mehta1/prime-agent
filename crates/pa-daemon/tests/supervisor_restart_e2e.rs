@@ -551,7 +551,11 @@ fn supervisor_kill9_restart_sessions_re_register_and_survive() {
     assert_eq!(done["success"], true, "post-restart prompt failed: {done}");
     let answer = loop {
         let line = client2.next_line_of_type(&mut second_turn_lines, "session_event");
-        if line["event"]["type"].as_str() == Some("message_end") {
+        // The user row arrives as its own message_end pair first; the
+        // answer is the assistant's final message_end.
+        if line["event"]["type"].as_str() == Some("message_end")
+            && line["event"]["message"]["role"] == "assistant"
+        {
             break line["event"]["message"]["content"]
                 .as_str()
                 .expect("final text")

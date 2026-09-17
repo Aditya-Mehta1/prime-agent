@@ -195,65 +195,66 @@ fn hex_to_color(s: &str) -> Option<Color> {
     Some(Color::Rgb(r, g, b))
 }
 
-/// Quantize RGB to the xterm 256-color palette (rgbTo256 port).
+/// Quantize RGB to the xterm 256-color palette (TS `rgbTo256`): nearest cube
+/// level per channel, gray chosen by luma, gray wins only for near-neutral
+/// colors where it is the closer weighted distance.
 pub fn rgb_to_256(rgb: (u8, u8, u8)) -> u8 {
-    let (r, g, b) = rgb;
-    // grayscale detection
-    if r == g && g == b {
-        if r < 8 {
-            return 16;
+    const CUBE_VALUES: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    const GRAY_VALUES: [u8; 24] = {
+        let mut values = [0u8; 24];
+        let mut index = 0;
+        while index < 24 {
+            values[index] = (8 + index * 10) as u8;
+            index += 1;
         }
-        if r > 248 {
-            return 231;
-        }
-        return 232 + ((r as u16 - 8) * 24 / 247) as u8;
-    }
-    let component = |v: u8| -> u16 {
-        let v = v as u16;
-        if v < 48 {
-            0
-        } else if v < 115 {
-            1
-        } else {
-            (v - 35) / 40
-        }
+        values
     };
-    let cube = 16 + 36 * component(r) + 6 * component(g) + component(b);
-    let gray = 232 + (((r as u16 + g as u16 + b as u16) / 3) as f32 * (24.0 / 255.0)) as u16;
-    if cube_scores((r, g, b), cube) <= gray_scores((r, g, b), gray) {
-        u8::try_from(cube).unwrap_or(16)
+    let (r, g, b) = (f64::from(rgb.0), f64::from(rgb.1), f64::from(rgb.2));
+    let find_closest = |value: f64, values: &[u8]| -> usize {
+        values
+            .iter()
+            .enumerate()
+            .min_by(|(_, candidate), (index, _)| {
+                (value - f64::from(**candidate))
+                    .abs()
+                    .partial_cmp(&(value - f64::from(values[*index])).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(0)
+    };
+    let distance = |other: (u8, u8, u8)| -> f64 {
+        let (dr, dg, db) = (
+            r - f64::from(other.0),
+            g - f64::from(other.1),
+            b - f64::from(other.2),
+        );
+        dr * dr * 0.299 + dg * dg * 0.587 + db * db * 0.114
+    };
+    let (r_index, g_index, b_index) = (
+        find_closest(r, &CUBE_VALUES),
+        find_closest(g, &CUBE_VALUES),
+        find_closest(b, &CUBE_VALUES),
+    );
+    let cube_rgb = (
+        CUBE_VALUES[r_index],
+        CUBE_VALUES[g_index],
+        CUBE_VALUES[b_index],
+    );
+    let cube_index = 16 + 36 * r_index + 6 * g_index + b_index;
+    let cube_dist = distance(cube_rgb);
+    let gray = 0.299 * r + 0.587 * g + 0.114 * b;
+    let gray_slot = find_closest(gray, &GRAY_VALUES);
+    let gray_value = GRAY_VALUES[gray_slot];
+    let gray_index = 232 + gray_slot;
+    let gray_dist = distance((gray_value, gray_value, gray_value));
+    let max_channel = r.max(g).max(b);
+    let min_channel = r.min(g).min(b);
+    if max_channel - min_channel < 10.0 && gray_dist < cube_dist {
+        u8::try_from(gray_index).unwrap_or(16)
     } else {
-        u8::try_from(gray).unwrap_or(16)
+        u8::try_from(cube_index).unwrap_or(16)
     }
-}
-
-fn cube_score(rgb: (u8, u8, u8), idx: u16) -> f32 {
-    if !(16..=231).contains(&idx) {
-        return f32::MAX;
-    }
-    let i = idx - 16;
-    let levels = [0u16, 95, 135, 175, 215, 255];
-    let r = levels[(i / 36) as usize] as f32;
-    let g = levels[((i % 36) / 6) as usize] as f32;
-    let b = levels[(i % 6) as usize] as f32;
-    (r - rgb.0 as f32).abs() + (g - rgb.1 as f32).abs() + (b - rgb.2 as f32).abs()
-}
-
-fn gray_score(rgb: (u8, u8, u8), idx: u16) -> f32 {
-    if !(232..=255).contains(&idx) {
-        return f32::MAX;
-    }
-    let v = 8 + (idx - 232) * 10;
-    let v = v as f32;
-    (v - rgb.0 as f32).abs() + (v - rgb.1 as f32).abs() + (v - rgb.2 as f32).abs()
-}
-
-fn cube_scores(rgb: (u8, u8, u8), cube: u16) -> f32 {
-    cube_score(rgb, cube)
-}
-
-fn gray_scores(rgb: (u8, u8, u8), gray: u16) -> f32 {
-    gray_score(rgb, gray)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

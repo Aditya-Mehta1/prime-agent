@@ -403,6 +403,11 @@ fn direct_attach_ticket_streams_across_supervisor_kill9() {
         }),
     );
     assert_eq!(prompt["success"], true, "direct prompt failed: {prompt}");
+    // The wire emits the accepted user message as a message_start +
+    // message_end pair at turn start; the scripted reply arrives after its
+    // delayMs, so killing at the user row is still mid-turn. The break lands
+    // on the assistant message_end (the user pair's message_end is not the
+    // reply).
     let mut saw_message_start = false;
     let event = loop {
         let event = worker
@@ -411,11 +416,13 @@ fn direct_attach_ticket_streams_across_supervisor_kill9() {
         match event["event"]["type"].as_str() {
             Some("message_start") if !saw_message_start => {
                 saw_message_start = true;
-                // Mid-stream: kill -9 the supervisor NOW.
+                // Mid-turn: kill -9 the supervisor NOW.
                 daemon.child.kill().expect("kill -9 supervisor");
                 let _ = daemon.child.wait();
             }
-            Some("message_end") => break event,
+            Some("message_end") if event["event"]["message"]["role"] == "assistant" => {
+                break event;
+            }
             _ => {}
         }
     };
@@ -502,7 +509,11 @@ fn direct_attach_ticket_streams_across_supervisor_kill9() {
         let event = worker2
             .next_event(Duration::from_secs(10))
             .expect("second turn event");
-        if event["event"]["type"] == "message_end" {
+        // The user row arrives as its own message_end pair first; the
+        // answer is the assistant's final message_end.
+        if event["event"]["type"] == "message_end"
+            && event["event"]["message"]["role"] == "assistant"
+        {
             break event["event"]["message"]["content"].clone();
         }
     };

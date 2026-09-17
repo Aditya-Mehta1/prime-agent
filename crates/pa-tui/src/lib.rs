@@ -19,6 +19,7 @@ pub mod interactive;
 pub mod keybindings;
 pub mod keys;
 pub mod markdown;
+pub mod onboarding;
 pub mod session;
 pub mod session_ui;
 pub mod snapshot;

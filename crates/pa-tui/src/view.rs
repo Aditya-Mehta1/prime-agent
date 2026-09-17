@@ -37,6 +37,9 @@ pub struct AgentView {
     /// An active provider auto-retry (replaces the working loader while
     /// the retry loop waits, TS `retryLoader`).
     pub retry: Option<crate::chat::RetryState>,
+    /// The first-run onboarding pane (TS `runStartupOnboarding`): while
+    /// set, it owns the whole frame.
+    pub onboarding: Option<crate::onboarding::OnboardingScreen>,
     scroll_top: usize,
     following: bool,
     /// Rows of the terminal the editor should lay out against.
@@ -59,6 +62,7 @@ impl AgentView {
             pulse_frame: 0,
             working_since: None,
             retry: None,
+            onboarding: None,
             scroll_top: 0,
             following: true,
             terminal_rows: 24,
@@ -320,6 +324,11 @@ impl AgentView {
     /// Compose the fullscreen frame: top bar, transcript window (padded),
     /// dock at the bottom — exactly `height` rows.
     pub fn render_frame(&mut self, width: usize, height: usize) -> Vec<Line> {
+        // The onboarding splash covers the pane (TS `showOverlay` 100%):
+        // no top bar, transcript, or prompt dock behind it.
+        if let Some(screen) = &self.onboarding {
+            return screen.render(&self.theme, width, height);
+        }
         let top = render_top_bar(&self.chrome, &self.theme, width);
         let transcript = self.render_transcript(width);
         let dock = self.render_dock(width);
@@ -359,6 +368,9 @@ impl AgentView {
     /// Hardware cursor position within the last composed frame (0-based row,
     /// 0-based column), when the editor surface drew the cursor.
     pub fn frame_cursor(&self) -> Option<(usize, usize)> {
+        if self.onboarding.is_some() {
+            return None;
+        }
         self.dock_cursor
             .map(|(row, col)| (row + 1 + self.window_rows, col))
     }

@@ -17,6 +17,55 @@ use pa_tui::interactive::{InteractiveOptions, ModelSelection, SessionSelection, 
 const DAEMON_STARTUP_TIMEOUT_MS: u64 = 30_000;
 const DAEMON_SHUTDOWN_WAIT_MS: u64 = 5_000;
 
+/// Persistence for the first-run onboarding answers: the global settings
+/// file (TS `setAgentTracesEnabled` / `markOnboardingShown` + flush).
+struct SettingsOnboardingSink {
+    cwd: PathBuf,
+    agent_dir: PathBuf,
+}
+
+impl pa_tui::interactive::OnboardingSink for SettingsOnboardingSink {
+    fn agent_traces_enabled(&self) -> bool {
+        pa_core::settings::SettingsManager::create(&self.cwd, &self.agent_dir)
+            .get_agent_traces_enabled()
+    }
+
+    fn set_agent_traces_enabled(&self, enabled: bool) -> Result<()> {
+        let mut settings = pa_core::settings::SettingsManager::create(&self.cwd, &self.agent_dir);
+        settings.set_agent_traces_enabled(enabled)
+    }
+
+    fn mark_onboarding_complete(&self) -> Result<()> {
+        let mut settings = pa_core::settings::SettingsManager::create(&self.cwd, &self.agent_dir);
+        settings.set_onboarding_shown(true)
+    }
+}
+
+/// TS `shouldRunOnboarding` + `isOnboardingModelReady`: first run is defined
+/// by the settings flag alone, but the flow only shows the trace question
+/// (no login sequence) when a model with configured auth exists. Explicit
+/// provider/model flags with an API key count as ready.
+fn onboarding_task(
+    config: &crate::mode::RuntimeConfig,
+) -> Option<pa_tui::interactive::OnboardingTask> {
+    let settings = pa_core::settings::SettingsManager::create(&config.cwd, &config.agent_dir);
+    if settings.get_onboarding_shown() {
+        return None;
+    }
+    let model_ready = config.provider.is_some()
+        && config.model.is_some()
+        && (config.api_key.is_some() || std::env::var_os("PRIME_API_KEY").is_some());
+    if !model_ready {
+        return None;
+    }
+    Some(pa_tui::interactive::OnboardingTask {
+        sink: std::sync::Arc::new(SettingsOnboardingSink {
+            cwd: config.cwd.clone(),
+            agent_dir: config.agent_dir.clone(),
+        }),
+    })
+}
+
 /// Run the interactive TUI attached to the daemon. Returns the exit code.
 pub fn run_interactive_mode(options: &RunOptions) -> Result<i32> {
     let socket_path = resolve_socket_path(options.daemon_socket.as_deref());
@@ -76,6 +125,7 @@ fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<Inter
         initial_message: options.initial_message.clone(),
         theme: String::new(),
         version: crate::config::VERSION.to_string(),
+        onboarding: onboarding_task(config),
     })
 }
 

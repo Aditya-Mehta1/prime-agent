@@ -52,6 +52,32 @@ pub struct ModelSelection {
     pub api_key: Option<String>,
 }
 
+/// Persistence for the first-run onboarding answers. The TUI crate owns
+/// only the surface; the composition root (pa-cli) implements the sink
+/// against the settings manager, keeping pa-tui decoupled from pa-core.
+pub trait OnboardingSink: Send + Sync {
+    /// The persisted trace-sharing answer (TS `getAgentTracesEnabled`).
+    fn agent_traces_enabled(&self) -> bool;
+    /// Persist the trace-sharing answer (TS `setAgentTracesEnabled`).
+    fn set_agent_traces_enabled(&self, enabled: bool) -> anyhow::Result<()>;
+    /// Mark the onboarding flow completed (TS `markOnboardingShown` +
+    /// `flush`); an aborted flow leaves the flag unset.
+    fn mark_onboarding_complete(&self) -> anyhow::Result<()>;
+}
+
+/// The first-run flow to run before the session screen (TS
+/// `runStartupOnboarding`, model-ready branch: splash + trace question).
+#[derive(Clone)]
+pub struct OnboardingTask {
+    pub sink: std::sync::Arc<dyn OnboardingSink>,
+}
+
+impl std::fmt::Debug for OnboardingTask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnboardingTask").finish()
+    }
+}
+
 /// Options for one interactive run.
 #[derive(Debug, Clone)]
 pub struct InteractiveOptions {
@@ -73,6 +99,8 @@ pub struct InteractiveOptions {
     pub theme: String,
     /// Product version for the brand splash.
     pub version: String,
+    /// Run the first-run onboarding flow before the session screen.
+    pub onboarding: Option<OnboardingTask>,
 }
 
 impl InteractiveOptions {
@@ -147,6 +175,69 @@ fn typed_keys(text: &str) -> Vec<KeyEvent> {
         .collect()
 }
 
+/// Drive the onboarding pane until the trace question settles. Returns
+/// `true` when the exit keys quit the app (TS `onExit` → shutdown).
+async fn run_onboarding_phase(
+    task: &OnboardingTask,
+    view: &mut AgentView,
+    ui_rx: &mut mpsc::UnboundedReceiver<UiInput>,
+    renderer: &mut Renderer,
+) -> Result<bool> {
+    // TS model-ready branch: a user who already opted into traces sees no
+    // flow at all — the flow completes silently and marks itself seen.
+    if task.sink.agent_traces_enabled() {
+        let _ = task.sink.mark_onboarding_complete();
+        return Ok(false);
+    }
+    let mut screen = crate::onboarding::OnboardingScreen::new();
+    let keybindings = crate::keybindings::KeybindingsManager::new();
+    let mut exit_requested = false;
+    loop {
+        tokio::select! {
+            maybe_input = ui_rx.recv() => {
+                if let Some(UiInput::Key(key)) = maybe_input {
+                    let Some(key_id) = crate::keys::key_event_to_id(&key) else {
+                        continue;
+                    };
+                    match screen.handle_key(&key_id, &keybindings) {
+                        Some(crate::onboarding::OnboardingDecision::Selected(index)) => {
+                            // `Share` opts in; `Not now` keeps traces off
+                            // (TS finish(index === 0)). A cancel writes no
+                            // answer at all, but the flow still completed.
+                            let _ = task.sink.set_agent_traces_enabled(index == 0);
+                            let _ = task.sink.mark_onboarding_complete();
+                            break;
+                        }
+                        Some(crate::onboarding::OnboardingDecision::Cancelled) => {
+                            let _ = task.sink.mark_onboarding_complete();
+                            break;
+                        }
+                        Some(crate::onboarding::OnboardingDecision::Exit) => {
+                            exit_requested = true;
+                            break;
+                        }
+                        None => {}
+                    }
+                }
+            }
+            // The field animates behind the flow panels until dismissal
+            // (TS ANIMATION_INTERVAL_MS).
+            _ = tokio::time::sleep(Duration::from_millis(120)) => {
+                screen.tick();
+            }
+        }
+        view.onboarding = Some(screen.clone());
+        if let Some(renderer) = renderer.is_terminal_mut() {
+            crate::app::draw(renderer, view)?;
+        }
+        view.onboarding = None;
+    }
+    if exit_requested {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// Result of an interactive run: session identity plus, in headless mode, the
 /// rendered frames.
 #[derive(Debug, Clone, Default)]
@@ -193,12 +284,28 @@ pub async fn run_interactive(
         });
         session.dirty = true;
     }
+    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiInput>();
+    let mut renderer = Renderer::setup(ui, ui_tx)?;
+    // First-run onboarding owns the pane before the session screen (TS
+    // `runStartupOnboarding`, model-ready branch: splash + trace question).
+    // Headless harness runs have no terminal to draw it on and skip it.
+    if let Some(task) = options.onboarding.clone() {
+        let exit_requested =
+            run_onboarding_phase(&task, &mut view, &mut ui_rx, &mut renderer).await?;
+        if exit_requested {
+            let _ = session.detach().await;
+            return Ok(InteractiveOutcome {
+                active_session_id: session.active_session_id.clone(),
+                session_id: session.session_id.clone(),
+                last_assistant_text: None,
+                frames: Vec::new(),
+            });
+        }
+    }
     if let Some(initial) = &options.initial_message {
         session.submit_prompt(initial, &mut view).await?;
     }
 
-    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiInput>();
-    let mut renderer = Renderer::setup(ui, ui_tx)?;
     let mut pending: VecDeque<UiInput> = VecDeque::new();
     let mut running = true;
     let mut headless_done = false;

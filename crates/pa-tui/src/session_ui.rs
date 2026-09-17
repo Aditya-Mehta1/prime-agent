@@ -461,6 +461,7 @@ impl SessionUi {
             initial_message: None,
             theme: String::new(),
             version: String::new(),
+            onboarding: None,
         }
     }
 

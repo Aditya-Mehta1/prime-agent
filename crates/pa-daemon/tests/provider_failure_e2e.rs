@@ -372,7 +372,33 @@ fn provider_failure_is_retried_then_surfaced_to_attached_clients() {
     // The retry policy applied: one initial request plus two retries.
     assert_eq!(mock.count(), 3, "requests: initial + 2 retries");
 
+    // The accepted user message is a message_start + message_end pair
+    // (TS wire), and an unchanged queue projection stays silent (TS
+    // `_emitQueueUpdate` dedup): no session_action_update frames here.
     let types = event_types(&client.events);
+    assert!(
+        !types.iter().any(|t| t == "session_action_update"),
+        "an empty-to-empty queue is not an update, events: {types:?}"
+    );
+    let user_pairs = client
+        .events
+        .iter()
+        .filter(|event| {
+            event.get("type").and_then(Value::as_str) == Some("message_start")
+                && event["message"]["role"] == "user"
+        })
+        .count();
+    let user_ends = client
+        .events
+        .iter()
+        .filter(|event| {
+            event.get("type").and_then(Value::as_str) == Some("message_end")
+                && event["message"]["role"] == "user"
+        })
+        .count();
+    assert_eq!(user_pairs, 1, "one user message_start, events: {types:?}");
+    assert_eq!(user_ends, 1, "one user message_end, events: {types:?}");
+
     assert!(
         types.iter().filter(|t| *t == "auto_retry_start").count() == 2,
         "two retry starts expected, events: {types:?}"
