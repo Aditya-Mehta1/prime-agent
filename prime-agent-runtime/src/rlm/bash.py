@@ -113,6 +113,12 @@ _WRAPPERS = frozenset(
         "builtin",
         "exec",
         "busybox",
+        "strace",
+        "ltrace",
+        "watch",
+        "faketime",
+        "systemd-run",
+        "chroot",
     }
 )
 # These report on a program instead of running it, so a later sudo/doas is a name
@@ -169,7 +175,29 @@ _WRAPPER_VALUE_OPTIONS: dict[str, frozenset[str]] = {
     ),
     "nice": frozenset({"-n", "--adjustment"}),
     "exec": frozenset({"-a", "--argv0"}),
+    "strace": frozenset({"-o", "-e", "-p", "-s", "-a", "-u", "-b", "-I", "-P", "-D"}),
+    "ltrace": frozenset({"-o", "-e", "-p", "-s", "-l", "-L", "-u"}),
+    "watch": frozenset({"-n", "-d", "-t"}),
+    "faketime": frozenset({"-f", "-m", "-p"}),
+    "systemd-run": frozenset(
+        {
+            "-u",
+            "-p",
+            "-E",
+            "-M",
+            "-C",
+            "-K",
+            "--unit",
+            "--property",
+            "--setenv",
+            "--working-directory",
+            "--slice",
+            "--description",
+        }
+    ),
 }
+# Wrappers whose first non-flag operands are values, not the command they run.
+_WRAPPER_LEADING_OPERANDS: dict[str, int] = {"chroot": 1, "faketime": 1}
 # xargs options whose operand is a value, not the command xargs runs.
 _XARGS_OPERAND_OPTIONS = frozenset(
     {
@@ -194,6 +222,13 @@ _XARGS_OPERAND_OPTIONS = frozenset(
     }
 )
 _FIND_EXEC_FLAGS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+_FD_EXEC_FLAGS = frozenset({"-x", "--exec", "-X", "--exec-batch"})
+# Launchers whose `exec` flag hands the following words to a command.
+_EXEC_LAUNCHER_FLAGS: dict[str, frozenset[str]] = {
+    "find": _FIND_EXEC_FLAGS,
+    "fd": _FD_EXEC_FLAGS,
+    "fdfind": _FD_EXEC_FLAGS,
+}
 # Letters of the short flags above: a bundle such as `env -vu NAME` still starts
 # with a value-taking letter, so the walk must consume its operand there too.
 _WRAPPER_VALUE_LETTERS: dict[str, str] = {
@@ -203,8 +238,40 @@ _WRAPPER_VALUE_LETTERS: dict[str, str] = {
     "ionice": "cnpPu",
     "nice": "n",
     "exec": "a",
+    "strace": "oepsaubIPD",
+    "ltrace": "oepslLu",
+    "watch": "ndt",
+    "faketime": "fmp",
+    "systemd-run": "upEMCK",
 }
 _XARGS_OPERAND_LETTERS = "InadELPsJ"
+_PARALLEL_OPERAND_OPTIONS = frozenset(
+    {
+        "-j",
+        "-N",
+        "-n",
+        "-L",
+        "-S",
+        "-a",
+        "-I",
+        "--jobs",
+        "--max-args",
+        "--max-lines",
+        "--sshlogin",
+        "--ssh",
+        "--joblog",
+        "--results",
+        "--tmpdir",
+        "--colsep",
+        "--arg-file",
+    }
+)
+# Launchers that run their first non-flag word as a command, like xargs.
+_LAUNCHER_OPERAND_OPTIONS: dict[str, frozenset[str]] = {
+    "xargs": _XARGS_OPERAND_OPTIONS,
+    "parallel": _PARALLEL_OPERAND_OPTIONS,
+}
+_LAUNCHER_OPERAND_LETTERS: dict[str, str] = {"xargs": _XARGS_OPERAND_LETTERS, "parallel": "jNnLSaI"}
 _BRACE_EXPANSION_CAP = 64
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 _ANSI_C_ESCAPES = {
@@ -277,6 +344,13 @@ def _is_assignment(value: str) -> bool:
     return all(char.isalnum() or char == "_" for char in name)
 
 
+def _code_point_char(code: int) -> str | None:
+    """Character for a decoded code point, or None when it is not a valid one."""
+    if code < 0 or code > 0x10FFFF or 0xD800 <= code <= 0xDFFF:
+        return None
+    return chr(code)
+
+
 def _read_ansi_c(command: str, quote_index: int) -> tuple[str, int]:
     """Decode `$'...'` text from its opening quote; return the text and the next index."""
     out: list[str] = []
@@ -301,33 +375,39 @@ def _read_ansi_c(command: str, quote_index: int) -> tuple[str, int]:
             while cursor < length and len(digits) < 3 and command[cursor] in "01234567":
                 digits += command[cursor]
                 cursor += 1
-            out.append(chr(int(digits, 8) & 0xFF))
-            index = cursor
-            continue
+            decoded = _code_point_char(int(digits, 8) & 0xFF)
+            if decoded is not None:
+                out.append(decoded)
+                index = cursor
+                continue
         if code == "x":
             digits = ""
             cursor = index + 2
             while cursor < length and len(digits) < 2 and command[cursor] in _HEX_DIGITS:
                 digits += command[cursor]
                 cursor += 1
-            if digits:
-                out.append(chr(int(digits, 16)))
+            decoded = _code_point_char(int(digits, 16)) if digits else None
+            if decoded is not None:
+                out.append(decoded)
                 index = cursor
                 continue
         if code in ("u", "U"):
             width = 4 if code == "u" else 8
             digits = command[index + 2 : index + 2 + width]
             if len(digits) == width and all(digit in _HEX_DIGITS for digit in digits):
-                out.append(chr(int(digits, 16)))
-                index += 2 + width
-                continue
+                decoded = _code_point_char(int(digits, 16))
+                if decoded is not None:
+                    out.append(decoded)
+                    index += 2 + width
+                    continue
         if code == "c":
             control = command[index + 2 : index + 3]
-            if control and control != "\\":
-                out.append(chr(ord(control.upper()) ^ 0x40))
+            decoded = _code_point_char(ord(control.upper()) ^ 0x40) if control else None
+            if decoded is not None and control != "\\":
+                out.append(decoded)
                 index += 3
                 continue
-        # Unknown escape: keep the backslash and the character, as bash does.
+        # Unknown or out-of-range escape: keep the backslash and the character.
         out.append(char)
         index += 1
     return "".join(out), index
@@ -678,6 +758,12 @@ def _scan_segment(
         if word.is_data or word.is_redirect or word.is_operand or word.is_assignment:
             start += 1
             continue
+        if word.value in ("for", "select"):
+            start = _skip_loop_header(words, start + 1)
+            continue
+        if word.value == "case":
+            start = _skip_case_header(words, start + 1)
+            continue
         if word.kind == "group" or word.value in _KEYWORDS:
             start += 1
             continue
@@ -697,7 +783,9 @@ def _scan_segment(
                 return None
             continue
         if name in _WRAPPERS:
-            start, violation = _skip_wrapper_operands(words, start + 1, name, depth)
+            start, violation = _skip_wrapper_operands(
+                words, start + 1, name, depth, parent_mentions_sudo
+            )
             if violation:
                 return violation
             continue
@@ -706,9 +794,16 @@ def _scan_segment(
         if _word_names_sudo(word.value):
             return f"{name} would run this command as root or another user"
         if name == "alias":
-            return _scan_alias_bodies(words, start + 1, depth)
-        if name == "find":
-            return _scan_find_execs(words, start + 1, depth, parent_mentions_sudo, command_words)
+            return _scan_alias_bodies(words, start + 1, depth, parent_mentions_sudo)
+        if name in _EXEC_LAUNCHER_FLAGS:
+            return _scan_find_execs(
+                words,
+                start + 1,
+                depth,
+                parent_mentions_sudo,
+                command_words,
+                _EXEC_LAUNCHER_FLAGS[name],
+            )
         if word.has_expansion:
             if _mentions_sudo(words) or parent_mentions_sudo:
                 return (
@@ -725,12 +820,41 @@ def _is_duration(value: str) -> bool:
     return bool(digits) and digits.isdigit()
 
 
+def _skip_loop_header(words: list[_Word], start: int) -> int:
+    """Index after a `for`/`select` header: the loop variable and `in` list are names."""
+    while start < len(words):
+        word = words[start]
+        if word.is_operator or word.value in ("do", "done"):
+            break
+        start += 1
+    return start
+
+
+def _skip_case_header(words: list[_Word], start: int) -> int:
+    """Index of the `)` that closes the first `case` label list: subject and labels are names."""
+    while start < len(words):
+        word = words[start]
+        if word.is_operator:
+            if word.value == ")":
+                break
+            if word.value not in ("(", "|"):
+                break
+        elif word.value == "esac":
+            break
+        start += 1
+    return start
+
+
 def _ends_segment(word: _Word) -> bool:
     return word.is_operator or word.is_redirect or word.is_data or word.is_operand
 
 
 def _skip_wrapper_operands(
-    words: list[_Word], index: int, wrapper: str, depth: int
+    words: list[_Word],
+    index: int,
+    wrapper: str,
+    depth: int,
+    parent_mentions_sudo: bool = False,
 ) -> tuple[int, str | None]:
     """Index after a wrapper's own operands, plus any violation their text carries."""
     value_options = _WRAPPER_VALUE_OPTIONS.get(wrapper, frozenset())
@@ -753,13 +877,13 @@ def _skip_wrapper_operands(
             if glued is None:
                 operand = index + 1
                 if split_string and operand < len(words) and not _ends_segment(words[operand]):
-                    violation = _scan_text(words[operand].value, depth + 1)
+                    violation = _scan_text(words[operand].value, depth + 1, parent_mentions_sudo)
                     if violation:
                         return index, violation
                 index += 2
                 continue
             if split_string:
-                violation = _scan_text(glued, depth + 1)
+                violation = _scan_text(glued, depth + 1, parent_mentions_sudo)
                 if violation:
                     return index, violation
             index += 1
@@ -768,6 +892,9 @@ def _skip_wrapper_operands(
             index += 1
             continue
         break
+    for _ in range(_WRAPPER_LEADING_OPERANDS.get(wrapper, 0)):
+        if index < len(words) and not _ends_segment(words[index]) and not words[index].is_assignment:
+            index += 1
     return index, None
 
 
@@ -833,49 +960,117 @@ def _matches_sudo_pattern(value: str) -> bool:
     return any(compiled.fullmatch(name) for name in _SUDO_COMMAND_WORDS)
 
 
+def _is_integer(value: str) -> bool:
+    return value.lstrip("-").isdigit() and value.lstrip("-") != ""
+
+
+def _sequence_elements(body: str) -> tuple[int, list[str] | None] | None:
+    """Elements of a `x..y`/`x..y..step` brace sequence as (count, elements), else None.
+
+    The count is computed arithmetically first, so an oversized range such as
+    `{1..9999999}` fails closed without ever building its elements.
+    """
+    parts = body.split("..")
+    if len(parts) not in (2, 3):
+        return None
+    start_text, end_text = parts[0], parts[1]
+    step_text = parts[2].strip() if len(parts) == 3 else "1"
+    if not _is_integer(step_text) or int(step_text) == 0:
+        return None
+    step = abs(int(step_text))
+    numeric = _is_integer(start_text) and _is_integer(end_text)
+    if numeric:
+        low, high = int(start_text), int(end_text)
+    elif len(start_text) == 1 and len(end_text) == 1:
+        low, high = ord(start_text), ord(end_text)
+    else:
+        return None
+    if low > high:
+        step = -step
+    count = (high - low) // step + 1
+    if count > _BRACE_EXPANSION_CAP:
+        return count, None  # over the cap: fail closed, unbuilt
+    bounds = range(low, high + step, step)
+    if numeric:
+        return count, [str(number) for number in bounds]
+    return count, [chr(code) for code in bounds]
+
+
+def _brace_group_elements(body: str) -> tuple[int, list[str] | None] | None:
+    """Elements of an expanding brace group as (count, elements), or None when it stays literal.
+
+    `elements` is None when the group holds more than the cap, so the caller can fail
+    closed without building the product.
+    """
+    sequence = _sequence_elements(body)
+    if sequence is not None:
+        return sequence
+    parts = _top_level_split(body)
+    if parts is None:
+        return 0, None  # over the cap: `_top_level_split` stopped early
+    if len(parts) < 2:
+        return None  # `su{d}o` has no comma, so bash does not expand it
+    return len(parts), parts
+
+
+def _brace_group_chain(value: str) -> tuple[list[tuple[str, int, list[str] | None]], str] | None:
+    """Left-to-right expanding brace groups of a word, with the literal tail."""
+    chain: list[tuple[str, int, list[str] | None]] = []
+    tail = value
+    while True:
+        group = _first_brace_group(tail)
+        if group is None:
+            break
+        prefix, body, suffix = group
+        count, elements = _brace_group_elements(body)
+        chain.append((prefix, count, elements))
+        tail = suffix
+    return (chain, tail) if chain else None
+
+
 def _brace_alternatives(value: str) -> list[str] | None:
     """Brace-expansion candidates of a word, or None when they exceed the cap."""
     if value.count("{") > _BRACE_EXPANSION_CAP:
         return None  # a brace flood: more groups than the cap enumerates, fail closed
-    group = _first_brace_group(value)
-    if group is None:
+    chain = _brace_group_chain(value)
+    if chain is None:
         return [value]
-    prefix, alternatives, suffix = group
-    tails = _brace_alternatives(suffix)
-    if tails is None:
-        return None
-    expanded = [prefix + alternative + tail for alternative in alternatives for tail in tails]
-    return None if len(expanded) > _BRACE_EXPANSION_CAP else expanded
+    groups, tail = chain
+    total = 1
+    for _prefix, count, elements in groups:
+        if elements is None or count > _BRACE_EXPANSION_CAP:
+            return None
+        total *= count
+        if total > _BRACE_EXPANSION_CAP:
+            return None
+    expanded = [""]
+    for prefix, _count, elements in groups:
+        assert elements is not None
+        expanded = [candidate + prefix + element for candidate in expanded for element in elements]
+    return [candidate + tail for candidate in expanded]
 
 
-def _first_brace_group(value: str) -> tuple[str, list[str], str] | None:
-    """Leftmost brace group with a top-level comma, as (prefix, alternatives, suffix).
+def _first_brace_group(value: str) -> tuple[str, str, str] | None:
+    """Leftmost expanding brace group, as (prefix, body, suffix), else None.
 
-    One pass with a stack of open groups: every `{` is matched to its `}` once, so a
+    One pass with a stack of open groups matches every `{` to its `}` once, so a
     brace-heavy word stays linear instead of rescanning the tail for each `{`.
     """
-    open_groups: list[tuple[int, bool]] = []
-    candidates: list[tuple[int, int]] = []
+    open_groups: list[int] = []
+    groups: list[tuple[int, int]] = []
     for index, char in enumerate(value):
         if char == "{":
-            open_groups.append((index, False))
+            open_groups.append(index)
         elif char == "}" and open_groups:
-            start, comma = open_groups.pop()
-            if comma:
-                candidates.append((start, index))
-        elif char == "," and open_groups:
-            open_groups[-1] = (open_groups[-1][0], True)
-    if not candidates:
-        return None
-    start, end = min(candidates)
-    alternatives = _top_level_split(value[start + 1 : end])
-    if len(alternatives) < 2:
-        return None
-    return value[:start], alternatives, value[end + 1 :]
+            groups.append((open_groups.pop(), index))
+    for start, end in sorted(groups):
+        if _brace_group_elements(value[start + 1 : end]) is not None:
+            return value[:start], value[start + 1 : end], value[end + 1 :]
+    return None
 
 
-def _top_level_split(body: str) -> list[str]:
-    """Split a brace group body on its top-level commas."""
+def _top_level_split(body: str) -> list[str] | None:
+    """Split a brace group body on its top-level commas, or None past the cap."""
     parts: list[str] = []
     current: list[str] = []
     depth = 0
@@ -886,6 +1081,8 @@ def _top_level_split(body: str) -> list[str]:
             depth -= 1
         if char == "," and depth == 0:
             parts.append("".join(current))
+            if len(parts) > _BRACE_EXPANSION_CAP:
+                return None  # stop early instead of materialising a huge group
             current = []
             continue
         current.append(char)
@@ -977,13 +1174,13 @@ def _scan_interpreter(
 ) -> str | None:
     """Judge payloads a runner executes: shell -c, eval, xargs operands, heredocs."""
     name = os.path.basename(words[index].value)
-    if name not in _PAYLOAD_RUNNERS and name != "xargs":
+    if name not in _PAYLOAD_RUNNERS and name not in _LAUNCHER_OPERAND_OPTIONS:
         return None
     if depth >= _MAX_PAYLOAD_DEPTH:
         return _DEPTH_VIOLATION
     following = _segment_tail(words, index + 1)
-    if name == "xargs":
-        return _scan_xargs(words, following, depth, parent_mentions_sudo, command_words)
+    if name in _LAUNCHER_OPERAND_OPTIONS:
+        return _scan_xargs(words, following, depth, parent_mentions_sudo, command_words, name)
     if name in _SHELL_RUNNERS:
         for offset, candidate in enumerate(following):
             word = words[candidate]
@@ -1030,8 +1227,11 @@ def _scan_xargs(
     depth: int,
     parent_mentions_sudo: bool,
     command_words: set[int] | None = None,
+    launcher: str = "xargs",
 ) -> str | None:
-    """xargs runs its first non-flag word; option operands are judged fail-closed."""
+    """xargs/parallel run their first non-flag word; option operands are judged fail-closed."""
+    operand_options = _LAUNCHER_OPERAND_OPTIONS.get(launcher, _XARGS_OPERAND_OPTIONS)
+    operand_letters = _LAUNCHER_OPERAND_LETTERS.get(launcher, _XARGS_OPERAND_LETTERS)
     position = 0
     while position < len(following):
         word = words[following[position]]
@@ -1041,7 +1241,7 @@ def _scan_xargs(
             return _scan_segment(
                 words, following[position], depth, parent_mentions_sudo, command_words
             )
-        option, glued = _split_option(word.value, _XARGS_OPERAND_OPTIONS, _XARGS_OPERAND_LETTERS)
+        option, glued = _split_option(word.value, operand_options, operand_letters)
         if option is not None and glued is None and position + 1 < len(following):
             # BSD and GNU disagree on which operands are optional, so the operand
             # is judged as a command either way.
@@ -1065,11 +1265,14 @@ def _scan_script_source(
     for candidate in following:
         word = words[candidate]
         if word.heredoc == "<<<":
+            # The payload can be attached to the operator (`bash<<<'sudo id'`) or
+            # be the next word (`bash <<< 'sudo id'`); both are the script.
+            sources = [word.value[3:]] if word.value[3:] else []
             operand = candidate + 1
             if operand < len(words) and not words[operand].is_data:
-                violation = _scan_text(
-                    _strip_quotes(words[operand].value), depth + 1, parent_mentions_sudo
-                )
+                sources.append(words[operand].value)
+            for source in sources:
+                violation = _scan_text(_strip_quotes(source), depth + 1, parent_mentions_sudo)
                 if violation:
                     return violation
             continue
@@ -1084,13 +1287,15 @@ def _scan_script_source(
     return None
 
 
-def _scan_alias_bodies(words: list[_Word], start: int, depth: int) -> str | None:
+def _scan_alias_bodies(
+    words: list[_Word], start: int, depth: int, parent_mentions_sudo: bool = False
+) -> str | None:
     """An alias body is text that a later use of the alias runs."""
     for candidate in _segment_tail(words, start):
         body = _alias_body(words[candidate])
         if body is None:
             continue
-        violation = _scan_text(body, depth + 1)
+        violation = _scan_text(body, depth + 1, parent_mentions_sudo)
         if violation:
             return violation
     return None
@@ -1102,11 +1307,12 @@ def _scan_find_execs(
     depth: int,
     parent_mentions_sudo: bool,
     command_words: set[int] | None = None,
+    flags: frozenset[str] = _FIND_EXEC_FLAGS,
 ) -> str | None:
-    """`find -exec cmd` runs cmd, so its operand is judged as a command word."""
+    """`find -exec cmd` (and `fd -x cmd`) runs cmd, so its operand is judged as a command."""
     tail = _segment_tail(words, start)
     for offset, candidate in enumerate(tail):
-        if words[candidate].value not in _FIND_EXEC_FLAGS or offset + 1 >= len(tail):
+        if words[candidate].value not in flags or offset + 1 >= len(tail):
             continue
         operand = words[tail[offset + 1]]
         if operand.is_data or operand.is_redirect:

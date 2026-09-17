@@ -184,6 +184,31 @@ SUDO_MATCHING_COMMANDS = [
     "shopt -s expand_aliases\nalias p='exec sh'\ncat <<EOF | p\nsudo id\nEOF",
     "shopt -s expand_aliases\nalias p='stdbuf -o L sh'\ncat <<EOF | p\nsudo id\nEOF",
     "shopt -s expand_aliases\nalias p='xargs -I{} sh -c {}'\ncat <<EOF | p\nsudo id\nEOF",
+    "s{u..u}do id",
+    "s{u..x}do id",
+    "for x in 1\ndo sudo id\ndone",
+    "case \"$x\" in y) sudo id;; esac",
+    "case \"$x\" in\n(a|b) sudo id;;\nesac",
+    "bash<<<'sudo id'",
+    "sh<<<\"sudo id\"",
+    "CMD=sudo; export CMD; env -S '${CMD} id'",
+    "CMD=sudo; alias p='$CMD id'; shopt -s expand_aliases; eval p",
+    "watch sudo id",
+    "watch -n 1 sudo id",
+    "fd -x sudo id",
+    "fd -X sudo id",
+    "fdfind -x sudo id",
+    "fd -e txt -x sudo id",
+    "parallel sudo id",
+    "parallel -j 2 sudo id",
+    "strace sudo id",
+    "strace -f sudo id",
+    "strace -o /tmp/x sudo id",
+    "ltrace sudo id",
+    "ltrace -o /tmp/x sudo id",
+    "chroot / sudo id",
+    "faketime now sudo id",
+    "systemd-run -u x sudo id",
     "sudo",
 ]
 
@@ -234,6 +259,22 @@ SUDO_NON_MATCHING_COMMANDS = [
     "shopt -s expand_aliases\nalias p='ls'\ncat <<EOF\nsudo id\nEOF",
     "shopt -s expand_aliases\nalias p='env ls'\ncat <<EOF\nsudo id\nEOF",
     "shopt -s expand_aliases\nalias p='env ls'\ncat <<EOF | p\nsudo id\nEOF",
+    "for sudo in one two; do echo $sudo; done",
+    "case \"$x\" in sudo) echo hi;; esac",
+    "select sudo in a b; do echo $sudo; done",
+    "$'\\U00110000'",
+    "echo {1..5}",
+    "echo {l..q}s",
+    "echo {0,1,2,3,4,5,6,7,8,9}",
+    "watch -n 1 ls",
+    "fd -x wc -l",
+    "fd -X wc -l",
+    "parallel -j 2 echo hi",
+    "chroot / ls",
+    "faketime now ls",
+    "systemd-run -u x ls",
+    "strace -o /tmp/x ls",
+    "ltrace -o /tmp/x ls",
     "bash <(echo hi)",
     "CMD=ls; eval \"$CMD\"",
     "echo {a,b}",
@@ -275,6 +316,19 @@ class BraceFloodTest(unittest.TestCase):
         elapsed = time.monotonic() - started
         self.assertLess(elapsed, 5.0)
         self.assertIsNotNone(violation)
+
+    def test_brace_sequences_and_oversized_groups(self):
+        # Sequences expand like comma alternatives, and an oversized group fails
+        # closed from its element count instead of being built.
+        self.assertIsNotNone(bash_module._sudo_violation("s{u..u}do id"))
+        self.assertIsNone(bash_module._sudo_violation("echo {1..5}"))
+        started = time.monotonic()
+        self.assertIsNotNone(bash_module._sudo_violation("{1..9999999}"))
+        self.assertIsNotNone(bash_module._sudo_violation("{a,b}" * 22))
+        self.assertIsNone(
+            bash_module._sudo_violation("echo {0," + ",".join(map(str, range(20000))) + "}")
+        )
+        self.assertLess(time.monotonic() - started, 5.0)
 
     def test_brace_flood_operand_word_is_still_judged(self):
         # A long comma-free blob in operand position is data, not a command word:
