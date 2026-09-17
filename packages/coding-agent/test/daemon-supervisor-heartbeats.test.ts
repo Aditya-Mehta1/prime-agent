@@ -206,21 +206,20 @@ describe("daemon supervisor heartbeat aggregation", () => {
 
 	it("reports a gone heartbeat when the owning session is closed", async () => {
 		const supervisor = createSupervisorHarness();
-		// No workers and no durable session artifacts: the session closed and its
-		// scheduled jobs were cancelled with it, so the routing lookup fails.
-		supervisor.findWorkerForClient = vi.fn(async () => {
+		const unknown = async () => {
 			throw new Error("Unknown active session: gone-session");
-		});
-
-		await expect(
-			supervisor.handleCommand({} as DaemonSocketClient, {
-				id: "manage-gone",
-				type: "heartbeat_manage",
-				activeSessionId: "gone-session",
-				jobId: "heartbeat-1",
-				action: "stop",
-			}),
-		).rejects.toThrow("No active heartbeat found: heartbeat-1");
+		};
+		supervisor.findWorkerForClient = vi.fn(unknown);
+		const manage: DaemonCommand = {
+			id: "m1",
+			type: "heartbeat_manage",
+			activeSessionId: "gone-session",
+			jobId: "heartbeat-1",
+			action: "stop",
+		};
+		await expect(supervisor.handleCommand({} as DaemonSocketClient, manage)).rejects.toThrow(
+			"No active heartbeat found: heartbeat-1",
+		);
 	});
 
 	it("fails the manage forward when the worker outlives its budget", async () => {
@@ -233,7 +232,6 @@ describe("daemon supervisor heartbeat aggregation", () => {
 			};
 			supervisor.workers.set("target", target);
 			supervisor.forwardToWorker = vi.fn(() => new Promise<DaemonResponse>(() => {}));
-
 			const pending = supervisor.handleCommand({} as DaemonSocketClient, {
 				id: "manage-1",
 				type: "heartbeat_manage",
