@@ -194,6 +194,17 @@ _XARGS_OPERAND_OPTIONS = frozenset(
     }
 )
 _FIND_EXEC_FLAGS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+# Letters of the short flags above: a bundle such as `env -vu NAME` still starts
+# with a value-taking letter, so the walk must consume its operand there too.
+_WRAPPER_VALUE_LETTERS: dict[str, str] = {
+    "env": "uCS",
+    "timeout": "sk",
+    "stdbuf": "ioe",
+    "ionice": "cnpPu",
+    "nice": "n",
+    "exec": "a",
+}
+_XARGS_OPERAND_LETTERS = "InadELPsJ"
 _BRACE_EXPANSION_CAP = 64
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 _ANSI_C_ESCAPES = {
@@ -629,7 +640,9 @@ def _scan_text(text: str, depth: int, parent_mentions_sudo: bool = False) -> str
             return violation
     # A heredoc body that the same text feeds to a runner is a script, not data.
     if depth < _MAX_PAYLOAD_DEPTH and any(
-        not word.is_data and os.path.basename(word.value) in _PAYLOAD_RUNNERS for word in words
+        _is_command_position(words, index) and os.path.basename(word.value) in _PAYLOAD_RUNNERS
+        for index, word in enumerate(words)
+        if not word.is_data
     ):
         for word in words:
             if word.is_data or not word.heredoc_body:
@@ -638,6 +651,17 @@ def _scan_text(text: str, depth: int, parent_mentions_sudo: bool = False) -> str
             if violation:
                 return violation
     return None
+
+
+def _is_command_position(words: list[_Word], index: int) -> bool:
+    """True when the word at `index` sits where a command word is read."""
+    word = words[index]
+    if word.starts_command or index == 0:
+        return True
+    before = words[index - 1]
+    if before.is_operator or before.is_data or before.is_redirect:
+        return True
+    return before.value in _KEYWORDS or os.path.basename(before.value) in _WRAPPERS
 
 
 def _scan_segment(
@@ -705,6 +729,7 @@ def _skip_wrapper_operands(
 ) -> tuple[int, str | None]:
     """Index after a wrapper's own operands, plus any violation their text carries."""
     value_options = _WRAPPER_VALUE_OPTIONS.get(wrapper, frozenset())
+    value_letters = _WRAPPER_VALUE_LETTERS.get(wrapper, "")
     while index < len(words):
         word = words[index]
         if word.is_operator or word.is_redirect or word.is_data:
@@ -713,7 +738,7 @@ def _skip_wrapper_operands(
             index += 1
             continue
         if _is_flag_word(word):
-            option, glued = _split_option(word.value, value_options)
+            option, glued = _split_option(word.value, value_options, value_letters)
             if option is None:
                 index += 1
                 continue
@@ -805,6 +830,8 @@ def _matches_sudo_pattern(value: str) -> bool:
 
 def _brace_alternatives(value: str) -> list[str] | None:
     """Brace-expansion candidates of a word, or None when they exceed the cap."""
+    if value.count("{") > _BRACE_EXPANSION_CAP:
+        return None  # a brace flood: more groups than the cap enumerates, fail closed
     group = _first_brace_group(value)
     if group is None:
         return [value]
@@ -817,22 +844,29 @@ def _brace_alternatives(value: str) -> list[str] | None:
 
 
 def _first_brace_group(value: str) -> tuple[str, list[str], str] | None:
-    """First brace group with a top-level comma, as (prefix, alternatives, suffix)."""
-    start = value.find("{")
-    while start >= 0:
-        depth = 0
-        for index in range(start, len(value)):
-            if value[index] == "{":
-                depth += 1
-            elif value[index] == "}":
-                depth -= 1
-                if depth == 0:
-                    alternatives = _top_level_split(value[start + 1 : index])
-                    if len(alternatives) > 1:
-                        return value[:start], alternatives, value[index + 1 :]
-                    break
-        start = value.find("{", start + 1)
-    return None
+    """Leftmost brace group with a top-level comma, as (prefix, alternatives, suffix).
+
+    One pass with a stack of open groups: every `{` is matched to its `}` once, so a
+    brace-heavy word stays linear instead of rescanning the tail for each `{`.
+    """
+    open_groups: list[tuple[int, bool]] = []
+    candidates: list[tuple[int, int]] = []
+    for index, char in enumerate(value):
+        if char == "{":
+            open_groups.append((index, False))
+        elif char == "}" and open_groups:
+            start, comma = open_groups.pop()
+            if comma:
+                candidates.append((start, index))
+        elif char == "," and open_groups:
+            open_groups[-1] = (open_groups[-1][0], True)
+    if not candidates:
+        return None
+    start, end = min(candidates)
+    alternatives = _top_level_split(value[start + 1 : end])
+    if len(alternatives) < 2:
+        return None
+    return value[:start], alternatives, value[end + 1 :]
 
 
 def _top_level_split(body: str) -> list[str]:
@@ -854,16 +888,26 @@ def _top_level_split(body: str) -> list[str]:
     return parts
 
 
-def _split_option(value: str, options: frozenset[str]) -> tuple[str | None, str | None]:
-    """Match a flag word against an option set: (option, glued operand) or (None, None)."""
+def _split_option(
+    value: str, options: frozenset[str], value_letters: str = ""
+) -> tuple[str | None, str | None]:
+    """Match a flag word against an option set: (option, glued operand) or (None, None).
+
+    A short bundle (`env -vu NAME`, `xargs -rn 2`) is scanned for a value-taking
+    letter: letters before it are plain flags, letters after it are the glued operand.
+    """
     if value in options:
         return value, None
     if value.startswith("--") and "=" in value:
         option, _, glued = value.partition("=")
         return (option, glued) if option in options else (None, None)
     if len(value) > 2 and value[0] == "-" and value[1] != "-":
-        option = value[:2]
-        return (option, value[2:]) if option in options else (None, None)
+        offset = next(
+            (index for index, char in enumerate(value[1:]) if char in value_letters), None
+        )
+        if offset is None:
+            return None, None
+        return "-" + value[1 + offset], value[2 + offset :] or None
     return None, None
 
 
@@ -951,7 +995,7 @@ def _scan_xargs(
             return None
         if not _is_flag_word(word):
             return _scan_segment(words, following[position], depth, parent_mentions_sudo)
-        option, glued = _split_option(word.value, _XARGS_OPERAND_OPTIONS)
+        option, glued = _split_option(word.value, _XARGS_OPERAND_OPTIONS, _XARGS_OPERAND_LETTERS)
         if option is not None and glued is None and position + 1 < len(following):
             # BSD and GNU disagree on which operands are optional, so the operand
             # is judged as a command either way.

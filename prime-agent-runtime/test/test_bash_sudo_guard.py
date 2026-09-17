@@ -8,6 +8,7 @@ import io
 import os
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -82,7 +83,7 @@ SUDO_MATCHING_COMMANDS = [
     "$'su\\144o' -n id",
     "$'su\\u0064o' id",
     "$'su'$'\\x64''o' id",
-    "echo \"$(printf ')'; sudo id)\\\"",
+    "echo \"$(printf ')'; sudo id)\"",
     "coproc sudo id",
     "coproc sh -c 'sudo id'",
     "env -S 'sudo id'",
@@ -141,6 +142,18 @@ SUDO_MATCHING_COMMANDS = [
     "shopt -s expand_aliases\nalias p='sudo id'\neval p",
     "cat <<EOF | sh\nsudo id\nEOF",
     "while read -r l; do eval \"$l\"; done <<EOF\nsudo id\nEOF",
+    "env -vu FOO sudo id",
+    "env -vC /tmp sudo id",
+    "env -iu FOO sudo id",
+    "env -iC /tmp sudo id",
+    "env -iS'sudo id'",
+    "printf x | xargs -rn 2 sudo id",
+    "printf x | xargs -tn 1 sudo id",
+    "printf x | xargs -0n 1 sudo id",
+    "cat <<EOF | exec sh\nsudo id\nEOF",
+    "cat <<EOF | sudo id\nEOF",
+    "shopt -s expand_aliases; alias p='sudo id'; eval p",
+    "shopt -s expand_aliases\nalias p=$'sudo id'\np",
     "sudo",
 ]
 
@@ -180,6 +193,12 @@ SUDO_NON_MATCHING_COMMANDS = [
     'x="$(date)"',
     "diff <(echo a) <(echo b)",
     "cat >(wc -l) < /dev/null",
+    "env -0 ls",
+    "xargs -r echo hi",
+    "xargs -0 -n 1 echo",
+    "xargs -rn2 echo hi",
+    "echo sh <<EOF\nsudo id\nEOF",
+    "grep bash <<EOF\nsudo id\nEOF",
     "bash <(echo hi)",
     "CMD=ls; eval \"$CMD\"",
     "echo {a,b}",
@@ -208,6 +227,28 @@ class SudoDetectionTest(unittest.TestCase):
     def test_reason_phrases(self):
         self.assertIn("sudo", bash_module._sudo_violation("sudo ls"))
         self.assertIn("doas", bash_module._sudo_violation("doas id"))
+
+
+class BraceFloodTest(unittest.TestCase):
+    """The brace-expansion cap: a flood fails closed and never scans quadratically."""
+
+    FLOOD = "{" * 32000
+
+    def test_brace_flood_command_word_is_refused_promptly(self):
+        started = time.monotonic()
+        violation = bash_module._sudo_violation(self.FLOOD)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 5.0)
+        self.assertIsNotNone(violation)
+
+    def test_brace_flood_operand_word_is_still_judged(self):
+        # A long comma-free blob in operand position is data, not a command word:
+        # the word is judged without rescanning the tail for every `{`.
+        started = time.monotonic()
+        violation = bash_module._sudo_violation("echo " + self.FLOOD)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 5.0)
+        self.assertIsNone(violation)
 
 
 class SudoGuardTest(unittest.IsolatedAsyncioTestCase):
