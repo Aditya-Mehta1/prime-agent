@@ -1708,6 +1708,35 @@ def _revealed_shell_word(word: str, assignments: dict[str, str]) -> str | None:
     return _plain_word_text(word)
 
 
+def _apply_unalias(aliases: dict[str, str], words: list[str]) -> None:
+    """Apply one `unalias` invocation the way bash parses it.
+
+    Bash reads `unalias [-a] [--] NAME...` with getopt: the first operand ends
+    the option list, `--` ends it explicitly, and an option token it rejects
+    (`unalias -n g`, `unalias -an g`) makes the builtin remove nothing at all.
+    So an unknown `-` token keeps every alias defined, which only adds
+    detection, and a name is dropped only when the shell would drop it.
+    """
+    clears_all = False
+    names: list[str] = []
+    options = True
+    for word in words:
+        if options and word.startswith("-") and word != "-":
+            if word == "--":
+                options = False
+            elif word == "-a":
+                clears_all = True
+            else:
+                return  # bash rejects this option and removes nothing
+        else:
+            options = False  # the first operand ends the option list
+            names.append(word)
+    if clears_all:
+        aliases.clear()
+    for name in names:
+        aliases.pop(_plain_word_text(name) or name, None)
+
+
 def _reveal_shell_command_words(
     command: str,
     resolve_aliases: bool = True,
@@ -1746,7 +1775,7 @@ def _reveal_shell_command_words(
     pending: dict[str, str] = {}
     aliases = dict(aliases) if aliases else {}
     alias_args = False
-    unalias_args = False
+    unalias_words: list[str] | None = None
     out: list[str] = []
     index_map: list[int] = []
     unnameable: set[int] = set()
@@ -1765,7 +1794,9 @@ def _reveal_shell_command_words(
                 assignments.update(pending)
             pending.clear()
             alias_args = False
-            unalias_args = False
+            if unalias_words is not None:
+                _apply_unalias(aliases, unalias_words)
+                unalias_words = None
         cursor = word.end
         text = command[word.start : word.end]
         plain = _plain_word_text(text)
@@ -1781,7 +1812,11 @@ def _reveal_shell_command_words(
         if word.command and plain == "alias":
             alias_args = True  # the words after the builtin are definitions
         elif word.command and plain == "unalias":
-            unalias_args = True  # the words after it are names to drop
+            if unalias_words is not None:
+                _apply_unalias(aliases, unalias_words)
+            unalias_words = []  # the words after it are its operands
+        elif unalias_words is not None:
+            unalias_words.append(text)
         elif alias_args:
             definition = _LITERAL_ASSIGNMENT.fullmatch(text)
             if definition:
@@ -1790,10 +1825,6 @@ def _reveal_shell_command_words(
                 )
             else:
                 alias_args = False  # not a definition (`alias -p`, a bare name)
-        elif unalias_args and text.startswith("-a"):
-            aliases.clear()  # `unalias -a` drops every alias
-        elif unalias_args and plain is not None:
-            aliases.pop(plain, None)
         replacement = text if revealed is None else revealed
         if revealed is not None:
             # A revealed value is data the shell runs as a word, never shell
