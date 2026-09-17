@@ -1506,7 +1506,10 @@ def _body_reaches_runner(body: str, depth: int = 0) -> bool:
     ):
         return True
     if depth >= _MAX_PAYLOAD_DEPTH:
-        return False
+        # Too deep to resolve: the chain could still reach a runner, so the body
+        # counts as one and its heredocs are scanned as scripts, exactly as the
+        # rest of the scan refuses `_DEPTH_VIOLATION` at this cap.
+        return True
     # `alias a='alias b=sh'` runs the payload through `b`, so the aliases a body
     # defines are followed the way `_alias_body_names_runner` follows the text's.
     for index in reached:
@@ -1787,9 +1790,10 @@ def _hash_registered_command_names(words: list[_Word]) -> tuple[dict[str, str], 
 def _registered_command(value: str, hash_alias_names: dict[str, str] | None) -> str:
     """The file a `hash -p` registration makes this word run, else the word.
 
-    A name the walk models by itself keeps its own meaning: `_MODELLED_COMMAND_NAMES`
-    covers the shell builtins the hash table cannot shadow (`eval`, `command`,
-    `exec`, `builtin`, `type`, `alias`, `source`).
+    A shell builtin keeps its own meaning: `_SHADOWPROOF_BUILTINS` covers the
+    builtins the hash table cannot shadow (`eval`, `command`, `exec`, `builtin`,
+    `type`, `alias`, `source`, `.`, `hash`), while a registration naming an
+    external launcher is resolved to the file it runs.
     """
     if not hash_alias_names:
         return value

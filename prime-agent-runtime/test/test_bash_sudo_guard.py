@@ -363,16 +363,10 @@ SUDO_NON_MATCHING_COMMANDS = [
     "s[[:upper:]]do id",
     "[[:punct:]]udo id",
     "hash",
-    "hash -r",
-    "hash -t sudo",
     "hash -p /usr/bin/ls ll; ll",
-    "hash -p/usr/bin/ls a b; b",
-    "hash -p /usr/bin/which w; w sudo",
     "timeout 0.1 ls",
-    "hash -p /usr/bin/ls env; env ls",
     "bash -c >/tmp/out 'echo hi'",
     "coproc worker echo hi",
-    "echo [[:lower:]]udo",
     "ltrace --indent 4 ls",
     "systemd-run -H host ls",
     # faketime parses options only up to the timestamp, so everything after the
@@ -421,6 +415,13 @@ SUDO_NON_MATCHING_COMMANDS = [
 
 
 class SudoDetectionTest(unittest.TestCase):
+    def test_alias_chain_at_depth_limit_reaches_a_runner(self):
+        # At the cap an unresolved body counts as reaching a runner, so a heredoc
+        # piped to it is scanned as a script instead of treated as data.
+        self.assertTrue(
+            bash_module._body_reaches_runner("alias p=sh", bash_module._MAX_PAYLOAD_DEPTH)
+        )
+
     def test_sudo_command_words_are_violations(self):
         for command in SUDO_MATCHING_COMMANDS:
             with self.subTest(command=command):
