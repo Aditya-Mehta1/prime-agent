@@ -1388,20 +1388,26 @@ def _heredoc_delimiter(command: str, start: int) -> tuple[int, int, str, bool] |
     return word_start, i, word, True
 
 
-def _heredoc_body_end(command: str, line_end: int, delimiter: str) -> int | None:
+def _heredoc_body_end(
+    command: str, line_end: int, delimiter: str, strip_tabs: bool = False
+) -> int | None:
     """Just past the line that ends a heredoc body, or None when it never ends.
 
     `line_end` is the newline that ends the line holding the `<<` operator:
     the body starts on the line after it, so what a command line carries after
-    the delimiter (`cat <<EOF && git reset --hard`) still runs. A body without
-    its terminator keeps its text live: the shell would read the rest of the
-    command as heredoc data, which the scan cannot know.
+    the delimiter (`cat <<EOF && git reset --hard`) still runs. The shell ends
+    the body on a line that is exactly the delimiter, with leading tabs
+    stripped for a `<<-` heredoc and nothing else stripped, so a body the
+    shell keeps reading (`EOF   `, a `<<-EOF` terminator that is not tab
+    indented) is never ended early here. A body without its terminator keeps
+    its text live: the shell would read the rest of the command as heredoc
+    data, which the scan cannot know.
     """
     pos = command.find("\n", line_end)
     while pos != -1:
         line_stop = command.find("\n", pos + 1)
         line = command[pos + 1 :] if line_stop == -1 else command[pos + 1 : line_stop]
-        if line.rstrip() == delimiter:
+        if (line.lstrip("\t") if strip_tabs else line) == delimiter:
             return len(command) if line_stop == -1 else line_stop
         pos = line_stop
     return None
@@ -1483,7 +1489,14 @@ def _mask_shell_redirections(command: str) -> str:
                     chars[j] = " "
                 i = operator.end()
                 if operator.group(0) == "<<":
-                    heredoc = _heredoc_delimiter(command, i)
+                    # `<<-` drops the `-` from its delimiter word and lets the
+                    # terminator line be tab indented, so both the word to
+                    # match and the line to end on change; the `-` itself is
+                    # redirection syntax and is blanked with the operator.
+                    tabbed = command[i : i + 1] == "-"
+                    if tabbed:
+                        chars[i] = " "
+                    heredoc = _heredoc_delimiter(command, i + 1 if tabbed else i)
                     if heredoc is not None:
                         # A heredoc body is inert data: blank it up to its
                         # delimiter line. An unquoted delimiter still expands
@@ -1495,7 +1508,7 @@ def _mask_shell_redirections(command: str) -> str:
                             chars[j] = " "
                         line_end = command.find("\n", word_end)
                         body_end = (
-                            _heredoc_body_end(command, line_end, delimiter)
+                            _heredoc_body_end(command, line_end, delimiter, tabbed)
                             if line_end != -1
                             else None
                         )
@@ -2428,8 +2441,13 @@ def _directory_command_parts(
             return " ".join(prefix), plain, segment[written[index].end :]
         if plain in _TRANSPARENT_BUILTINS:
             prefix.append(raw)  # `"command" cd` still runs the builtin
-        elif raw == plain and plain in _SHELL_KEYWORDS:
-            continue  # `then` and `{` are syntax: the command word still follows
+        elif raw == plain and plain in _SHELL_KEYWORDS and plain != "!":
+            # `then` and `{` are syntax: the command word still follows them.
+            # `!` is the exception, because it inverts the builtin's status:
+            # `! cd missing && git reset --hard` runs the discard exactly when
+            # the cd fails, so the repository the cd names is not the one the
+            # discard needs, and the segment is read like any other non-cd.
+            continue
         elif _ASSIGNMENT_WORD.fullmatch(raw) is not None:
             if _REPLAYABLE_ASSIGNMENT.fullmatch(raw) is None:
                 return _UNRESOLVABLE_DISCARD_TARGET
@@ -2587,13 +2605,23 @@ def _resolve_discard_probe_target(
             # GIT_DIR; git reset --hard` really discards the caller). A
             # removal cannot be replayed in the probe's assignment prefix,
             # so refuse rather than probe a repository the discard may not
-            # touch; a piped unset runs in a subshell and never applies.
-            if seg_tokens and seg_tokens[0] == "unset" and parts[2 * index + 1] != "|":
-                if any(
+            # touch; a piped unset runs in a subshell and never applies. The
+            # builtin is read from the revealed word, because quoting, escapes,
+            # and the `command` wrapper do not stop it (`"unset" GIT_DIR`,
+            # `\unset GIT_DIR`, and `command unset GIT_DIR` all remove it).
+            removal = seg_tokens
+            while removal and _revealed_word_text(removal[0]) in _TRANSPARENT_BUILTINS:
+                removal = removal[1:]
+            if (
+                removal
+                and _revealed_word_text(removal[0]) == "unset"
+                and parts[2 * index + 1] != "|"
+                and any(
                     (plain := _plain_word_text(token)) is not None and plain.startswith("GIT_")
-                    for token in seg_tokens[1:]
-                ):
-                    return _UNRESOLVABLE_DISCARD_TARGET
+                    for token in removal[1:]
+                )
+            ):
+                return _UNRESOLVABLE_DISCARD_TARGET
             if parts[2 * index + 1] not in (";", "&&", "\n"):
                 continue  # pipe/subshell or short-circuit: the env does not persist
             if not seg_tokens:
