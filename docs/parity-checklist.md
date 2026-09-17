@@ -22,17 +22,22 @@ streaming `onProgress`/`onSession` callbacks.
   Verifier: `crates/pa-daemon/tests/supervisor_e2e.rs` asserts the event
   sequence and saved-session row shape against live-TS goldens (commit #58);
   `list --all` summary rows differentially asserted (commit #56).
-- missing: the CLI seam. `crates/pa-cli/src/public_command.rs`
-  `run_internal_agent_command` fails with `unavailable("the daemon client")`
-  for `list --all` / `agents` / `attach` / `send` / `schedule`, so the saved
-  scan never reaches users outside the daemon protocol.
+- done (was the CLI seam gap): the pa-cli daemon client (#67) wires the
+  saved-session scan to users. `crates/pa-cli/src/daemon_command.rs`
+  `run_daemon_command` connects to `~/.prime/agent/daemon.sock` and serves
+  `list` (`--all`/`-a`, `crates/pa-cli/src/daemon_command.rs` L151-184),
+  `kill`, `rename`, `send`, and `cron`/`schedule`;
+  `crates/pa-cli/src/daemon_session_list.rs` renders the rows. The `agents`
+  view entry point is parsed (`explicit_agents_view`,
+  `crates/pa-cli/src/public_command.rs` L148) but its mode rides the
+  unmerged agents-view lane.
 - partial (perf only, no behavior gap): TS scans incrementally (chunked reads +
   per-file fold state) while `read_session_info` re-reads whole files; row
   output is identical, so this is an optimization follow-up, not a parity bug.
 
-Follow-up spec (CLI lane): wire a pa-cli daemon client (connect to
-`~/.prime/agent/daemon.sock`, hello + envelope commands) behind
-`list`/`agents`/`attach`; the supervisor side is already parity-tested.
+Follow-up spec (CLI lane): landed in #67 (daemon client + daemon-backed
+commands); only the `agents` view entry point still waits on its lane. The
+supervisor side was already parity-tested.
 
 ## 2. Extensions / package-manager - partial (CLI half done)
 
@@ -102,7 +107,7 @@ session resource resolution) plus the extension runner under
   created session's skill list through the full binary pipeline.
 - missing (spec below): the extension runner.
 
-Follow-up spec - resource resolution (skills/resources lane, ~600-800 LoC):
+Follow-up spec - resource resolution (LANDED in #75; kept for history):
 port `DefaultPackageManager.resolve()`: precedence-ranked resolution of
 extensions/skills/prompts/themes from (a) configured packages (pi manifest in
 `package.json`, convention dirs, filter patterns with `!`/`+`/`-` override
@@ -211,25 +216,27 @@ records.
   before any record exists.
 
 
-## 5. Compaction daemon wiring (`compact` on the daemon session) - missing
+## 5. Compaction daemon wiring (`compact` on the daemon session) - done
 
 TS: `daemon-mode.ts` L5236 `case "compact"` -> `session.compact(customInstructions)`
 returning `CompactionResult`; `abort_compaction`; `set_auto_compaction`.
 
-- missing on the daemon surface: `crates/pa-daemon/src/protocol.rs`
-  `KNOWN_COMMAND_TYPES` has no `compact`/`abort_compaction`; the worker keeps
-  only `is_compacting` display fields.
+- done (#85): `compact`/`abort_compaction`/`set_auto_compaction` are worker
+  commands (`crates/pa-daemon/src/protocol.rs` L51-53 `KNOWN_COMMAND_TYPES`;
+  dispatch in `crates/pa-daemon/src/worker.rs` L843, handler
+  `handle_compaction` L1498-1500 with the `CompactionResult` wire shape).
 - done (engine side): `crates/pa-core/src/session_engine/mod.rs`
   `AgentSession::compact` + `compact_session.rs` (cut resolution, summarizer
   call, compaction entry persistence, context rebuild) and the `CompactionSettings`
   decision logic in `compaction.rs`.
-
-Follow-up spec (daemon lane): add `compact`/`abort_compaction` to the worker
-command set, routed to `AgentSessionEngine` via a `SessionEngine::compact`
-trait method (pa-core `AgentSession::compact` already returns
-`CompactionResult`); scripted engine answers with the TS error for engineless
-sessions. Verifier: faux-script session, assert compaction entry appears in
-the session file and get_state reports `compactionCount > 0`.
+- verifier: battery flow f7 against the live mock provider (run
+  `scripts/battery/runs/20260917T062810Z`: both sides answer `compact`
+  with summary/firstKeptEntryId/tokensBefore; known shape delta: TS adds
+  `details{readFiles, modifiedFiles}` which Rust omits).
+- remaining (kernel half): the model-facing `compact.status`/`compact.run`
+  host requests (TS `agent-session.ts` L3703-3731) have no registered Rust
+  product-path handler, so the model cannot trigger compaction of its own
+  session; see `docs/completion-matrix.md` family 6.
 
 ## 6. `rlm.create_session` through the daemon - missing
 
@@ -247,6 +254,11 @@ prompts it.
 - The system prompt already documents the surface
   (`crates/pa-core/src/prompts/mod.rs` L165), so the model believes it exists.
 
+Status note (surface-audit refresh): still missing on `main`; the
+unmerged lane `lane/rlm` (commits `5d09e36`, `5426b3b`, `4c2254c`, `7ae53d0`)
+carries the `rlm.*` handlers and child-session machinery. The user-facing
+picture lives in `docs/completion-matrix.md` families 9-10.
+
 Follow-up spec (RLM lane, large): register `rlm.run` (spawn), `rlm.find_models`,
 `rlm.create_session`, `rlm.progress_note`, `rlm.list_subagents`,
 `rlm.delete_subagent` host handlers in `runtime_wiring.rs`; the subagent
@@ -262,14 +274,14 @@ registry exists, the snapshot handler is small and the parent-child
 follow-up messaging already rides the stage-3 roster/peer plumbing
 (`crates/pa-daemon/src/agent_messaging.rs`). Not implemented in stage 3.
 
-## 7. Read-command surface (`get_session_stats` / `get_context_tree` / `get_commands` / `get_resource_snapshot`) - partial after this PR
+## 7. Read-command surface (`get_session_stats` / `get_context_tree` / `get_commands` / `get_resource_snapshot`) - partial
 
 TS: `daemon-mode.ts` L183352+ delegates to `getSessionStats` (TS
 `core/session-stats.ts` shape), `getContextTree` (`core/context-tree.ts`),
 `createAgentConnectionCommands` / `createAgentConnectionResourceSnapshot`
 (`modes/agent-connection/snapshot.ts`).
 
-- done in this PR: `get_session_stats` and `get_session_header` - worker
+- done (merged): `get_session_stats` and `get_session_header` - worker
   handlers computed from the session store, routed supervisor -> worker.
   Verifier: `crates/pa-daemon/tests/supervisor_e2e.rs`
   `session_stats_and_header_match_live_daemon_goldens` asserts the response
@@ -297,21 +309,41 @@ Live-TS goldens (read-only captures, protocol 7):
 
 ## 8. Adjacent gaps found during the audit
 
-- CLI daemon client: every daemon-backed public command in
-  `crates/pa-cli/src/public_command.rs` fails with an "unavailable" error
-  (`list`, `agents`, `attach`, `send`, `schedule`, `status`, ...). The TS
-  binary on PATH answers all of them. Largest single user-visible gap.
+- CLI daemon client: RESOLVED in #67 (`crates/pa-cli/src/daemon_client.rs`
+  + `daemon_command.rs` serve `list`/`kill`/`rename`/`send`/`cron` against
+  the daemon socket; `attach` opens the session). Still unavailable with a
+  typed "daemon discovery ... is not available in this build yet" error:
+  `status`, `doctor`, `shutdown` (`crates/pa-cli/src/public_command.rs`
+  L375-398) - drivers exist on the unmerged `lane/cli-discovery-2`
+  (`c4c285c`). Self-update (`update`) still reports the typed
+  self-update-unavailable error; `session export` is
+  `MissingSubsystem::SessionExport`.
 - Daemon command vocabulary: `crates/pa-daemon/src/protocol.rs`
-  `KNOWN_COMMAND_TYPES` accepts 26 command types; the TS supervisor accepts
-  ~100 (`daemon-supervisor.ts` `DAEMON_COMMAND_TYPES`). `pa-types` already
-  models all variants, so enabling them is per-command work in pa-daemon only.
-- Tool-result persistence: TS session files contain `toolResult` message
-  entries; the pa-core persistence listener writes only user/assistant
-  messages (`crates/pa-core/src/session_engine/mod.rs` `persist_event`).
-  Affects `get_session_stats.toolResults`, transcripts, and external
-  tooling reading session files.
+  `KNOWN_COMMAND_TYPES` (L25) accepts 32 command types (26 before #85/#89);
+  the TS supervisor accepts ~106 (`daemon-supervisor.ts` L244
+  `DAEMON_COMMAND_TYPES`). `pa-types` already models the variants, so
+  enabling them is per-command work in pa-daemon only. Still missing among
+  them: `get_context_tree`, `get_commands`, `get_resource_snapshot` (§7).
+- `model list` catalog output (found by the surface audit): the TS binary
+  prints the model catalog table (`cli/list-models.ts`); the Rust binary
+  answers "No response produced." because `RunOptions.list_models` has no
+  consuming runtime (`crates/pa-cli/src/print_runtime.rs`; only the dead
+  `UnavailableRuntime` checks it, `crates/pa-cli/src/mode.rs` L188). The
+  `config` command likewise reports the pa-tui resource-configuration UI as
+  not linked (`crates/pa-cli/src/lib.rs`).
+- Tool-result persistence (still open): TS session files contain
+  `toolResult` message entries; the pa-core persistence listener writes only
+  user/assistant messages (`crates/pa-core/src/session_engine/mod.rs`
+  L325-331 `persist_event`). Affects `get_session_stats.toolResults`,
+  transcripts, and external tooling reading session files.
 
 ## Battery findings (live A/B parity battery; first run 20260916T210320Z, fixed rows verified by run 20260916T221725Z)
+
+Battery greenness covers only the scripted flows f1-f11 over the deterministic
+mock provider. "0 gaps" (latest run 20260917T062810Z, 35 checks) does NOT
+mean product parity: it missed the interactive `--thinking` propagation
+blocker (`docs/completion-matrix.md` family 2) and does not exercise the
+partial/missing families catalogued there. Do not conflate the two.
 
 Standing battery harness committed at `scripts/battery/` (see
 `docs/parity-battery.md` for the flow list and re-run instructions). All
@@ -333,9 +365,14 @@ Categories: visual/behavior/protocol/timing.
   `runs/20260916T221725Z/{ts,rust}/f1_launch/first-prompt-mock-requests.json`
   (both sides request `mock-1`). Historical evidence:
   `runs/20260916T210320Z/extras/rust-interactive-model-flags-session.jsonl`.
-- B-2 (visual, f1): TS shows the splash + first-run "Share agent traces
-  with Prime Intellect?" notice (Share / Not now, `/traces` hint); Rust
-  launches straight into the TUI with neither. Evidence:
+- B-2 (visual, f1): FIXED (#93 "interactive: first-run parity (B-2)").
+  The Rust TUI now renders the splash + trace-sharing notice and answers
+  persistently (`crates/pa-tui/src/onboarding.rs`,
+  `crates/pa-tui/src/interactive.rs` L186-207). Verified by run
+  `runs/20260917T062810Z` ("first-run splash + trace-sharing notice
+  rendered and answerable on both sides"). The `/traces` command itself
+  still has no client UI and the trace upload subsystem does not exist
+  (`docs/completion-matrix.md` families 3/19). Historical evidence:
   `runs/20260916T210320Z/{ts,rust}/f1_launch/01-launch.txt`.
 - B-3 (timing, f1): FIXED (run `runs/20260917T041145Z/`). The worker connect
   budget is 30s (TS `WORKER_CONNECT_TIMEOUT_MS`): socket probes, connect,
@@ -398,11 +435,12 @@ Categories: visual/behavior/protocol/timing.
   (headless TUI over a live faux-engine session: echo/result rows, menu,
   suggestion, unavailable note, persisted session rows). Historical
   evidence: `runs/20260916T210320Z/rust/f4_commands/01-slash-menu.txt`.
-- B-10 (protocol, f7): TS daemon `compact` works and returns
-  `{summary, firstKeptEntryId, tokensBefore, details{readFiles, modifiedFiles}}`;
-  Rust answers `{"command":"unknown"}`. Evidence:
+- B-10 (protocol, f7): FIXED (#85, item 5 above is now `done`). Both sides
+  answer `compact` with `{summary, firstKeptEntryId, tokensBefore}`; the TS
+  response additionally carries `details{readFiles, modifiedFiles}` which the
+  Rust response omits (known shape delta). Verified by run
+  `runs/20260917T062810Z` f7 (both compacts succeed). Historical evidence:
   `runs/20260916T210320Z/{ts,rust}/f7_compaction/compact-response.json`.
-  (Same as item 5 above, now with live mock-provider evidence.)
 - B-11 (behavior, f8): FIXED. TS print `-c` refuses while the session is
   active in the daemon ("Session is already active in <id>: <path>"); the
   Rust print path now guards `-c`/`-r` with a daemon live-roster probe and
@@ -521,3 +559,6 @@ TS: `modes/daemon/daemon-supervisor.ts` `send_message` block, `daemon-mode.ts`
   sender relationship in the delivered prompt derives from `runtimeKind`
   (subagent -> child) instead of the family graph; the TS `deliveryMode` wire
   field is legacy-ignored in TS but honored here (default `steer` matches TS).
+
+The user-facing summary of this area now lives in
+`docs/completion-matrix.md` family 8.

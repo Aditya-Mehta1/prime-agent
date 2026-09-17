@@ -1338,6 +1338,11 @@ class Battery:
     def write_report(self) -> Path:
         path = self.run_dir / "report.md"
         lines = [f"# Parity battery run {self.stamp}", ""]
+        # Battery greenness is scoped: it proves only the scripted flows
+        # below, never overall product parity (docs/completion-matrix.md).
+        lines.append(
+            "Note: 0 gaps below covers only these scripted flows; it is not a product-parity verdict (docs/completion-matrix.md)."
+        )
         lines.append(f"- ts binary: {self.ts_bin}")
         lines.append(f"- rust binary: {self.rust_bin}")
         lines.append(f"- flows: {', '.join(self.flows)}")
