@@ -973,15 +973,17 @@ class DestructiveChmodRefusalError(RuntimeError):
 
 
 def _normalize_line_continuations(command: str) -> str:
-    """Collapse unquoted backslash-newline line continuations to `''`.
+    """Collapse unquoted backslash-newline line continuations.
 
     The shell removes the pair before it builds words, so `chmod -R \
 755 ~` runs as `chmod -R 755 ~` and `chmo\
 d -R 755 ~` runs as `chmod -R 755 ~` (an in-word continuation joins the
-    word). The replacement is the two-character empty quoted string `''`,
-    which is length-preserving so the scan's character indices stay aligned
-    with the original command, and which the word scanner folds to nothing,
-    so it joins words exactly like the removal bash performs. Single-quoted
+    word). A continuation between words becomes two spaces, which is
+    length-preserving so the scan's character indices stay aligned with the
+    original command; inside a word the pair is left for
+    `_strip_shell_escapes` to remove, because a two-character placeholder
+    there would fuse with a preceding `$` into ANSI-C quoting and hide the
+    expansion. Single-quoted
     backslash-newlines are literal data and a newline always ends a comment,
     so those are left untouched (both are still masked or live as before).
     """
@@ -1001,8 +1003,17 @@ d -R 755 ~` runs as `chmod -R 755 ~` (an in-word continuation joins the
             elif ch == "#" and (i == 0 or re.match(r"[\s;&|(){}]", chars[i - 1])):
                 comment = True
             elif ch == "\\" and i + 1 < n and chars[i + 1] == "\n":
-                chars[i] = "'"
-                chars[i + 1] = "'"
+                if i == 0 or re.match(r"[\s;&|(){}<>]", chars[i - 1]):
+                    # Between words: the pair separates them, so two spaces
+                    # keep the word layout and the indices aligned.
+                    chars[i] = " "
+                    chars[i + 1] = " "
+                # Inside a word the pair must join it, and the empty quoted
+                # string it used to be replaced with fused with a preceding
+                # `$` into ANSI-C quoting; the pair now stays and
+                # `_strip_shell_escapes` removes both characters, so
+                # `chmo<continuation>d` scans as `chmod` while
+                # `$<continuation>cmd` stays the expansion `$cmd`.
                 i += 1
         elif quote == "'":
             if ch == "'":
@@ -1212,6 +1223,10 @@ def _strip_shell_escapes(command: str) -> tuple[str, list[int]]:
                 comment = True
                 chars.append(ch)
                 index_map.append(i)
+            elif ch == "\\" and i + 1 < n and command[i + 1] == "\n":
+                # An in-word line continuation: the shell removes both
+                # characters before it builds the word, so they are dropped.
+                i += 1
             elif ch == "\\" and i + 1 < n and command[i + 1] != "\n":
                 chars.append(command[i + 1])  # literal X: drop the backslash
                 index_map.append(i + 1)

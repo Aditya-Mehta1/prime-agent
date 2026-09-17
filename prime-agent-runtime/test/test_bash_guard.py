@@ -543,7 +543,7 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
             "sudo $cmd -R 755 ~",
             "xargs $(printf chmod) -R 755 ~",
             "FOO=1 $cmd -R 755 ~",
-            "cmd=chmod; $cmd --recursive 755 ~",
+            "cmd=chmod; $cmd --recursive 755 ~", "cmd=chmod; $\\\ncmd -R 755 ~",
         ]:
             with self.subTest(command=command):
                 message = await self._refused(command, home=home.name)
