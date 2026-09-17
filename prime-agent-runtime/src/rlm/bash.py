@@ -175,10 +175,48 @@ _WRAPPER_VALUE_OPTIONS: dict[str, frozenset[str]] = {
     ),
     "nice": frozenset({"-n", "--adjustment"}),
     "exec": frozenset({"-a", "--argv0"}),
+    # -D, -f, -i, -q, -t, -T, -x, -y, -c, -C, -n, -v, -V are boolean in strace.
     "strace": frozenset(
-        {"-e", "-o", "-p", "-s", "-a", "-u", "-P", "--trace", "--output", "--attach", "--columns"}
+        {
+            "-a",
+            "-b",
+            "-e",
+            "-I",
+            "-o",
+            "-O",
+            "-p",
+            "-P",
+            "-s",
+            "-S",
+            "-u",
+            "-U",
+            "-X",
+            "--attach",
+            "--columns",
+            "--output",
+            "--trace",
+        }
     ),
-    "ltrace": frozenset({"-o", "-e", "-p", "-s", "-l", "-u", "-a", "-F", "--output"}),
+    # -L, -i, -q, -f, -c, -S, -T are boolean in ltrace; -n takes a value here.
+    "ltrace": frozenset(
+        {
+            "-A",
+            "-a",
+            "-d",
+            "-D",
+            "-e",
+            "-F",
+            "-l",
+            "-n",
+            "-o",
+            "-p",
+            "-s",
+            "-u",
+            "-w",
+            "-x",
+            "--output",
+        }
+    ),
     # -d and -t are boolean in watch: only the interval takes a value.
     "watch": frozenset({"-n", "--interval"}),
     "faketime": frozenset({"-f", "-m", "-p"}),
@@ -188,7 +226,9 @@ _WRAPPER_VALUE_OPTIONS: dict[str, frozenset[str]] = {
             "-u",
             "-p",
             "-E",
+            "-C",
             "-M",
+            "--capsule",
             "--unit",
             "--property",
             "--setenv",
@@ -242,12 +282,12 @@ _WRAPPER_VALUE_LETTERS: dict[str, str] = {
     "ionice": "cnpPu",
     "nice": "n",
     "exec": "a",
-    "strace": "oepsauP",
-    "ltrace": "oepsluaF",
+    "strace": "oepsaubIPOUXS",
+    "ltrace": "oepsluaFAwnDxd",
     "watch": "n",
     "faketime": "fmp",
     "chroot": "",
-    "systemd-run": "upEM",
+    "systemd-run": "upEMC",
 }
 _XARGS_OPERAND_LETTERS = "InadELPsJ"
 _PARALLEL_OPERAND_OPTIONS = frozenset(
