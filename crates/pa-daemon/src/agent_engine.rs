@@ -10,6 +10,12 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
+use pa_core::kernel::shared::HostRequestHandlers;
+use pa_core::session_engine::agent_messaging::{
+    register_agent_message_host_handlers, register_agent_observe_host_handlers,
+    AgentMessageController, AgentMessageDeliveryStatus, AgentMessageReceipt, AgentMessageSendInput,
+    AgentObserveController, AgentObserveMessagePreview, AgentObserveSummary,
+};
 use pa_core::session_engine::engine::{SessionEngine as CoreSessionEngine, SessionEngineConfig};
 use pa_core::session_engine::provider_adapter::{json_round_trip, real_stream_fn};
 use pa_types::ai::Model;
@@ -36,6 +42,19 @@ pub struct AgentEngineConfig {
     /// Verification seam: a scripted faux provider (`{"responses": [...]}`).
     /// Never set by the product.
     pub faux_script: Option<String>,
+    /// Supervisor socket + own active session id for the worker's supervisor
+    /// link. Present only inside a daemon worker; it enables the kernel's
+    /// agent_message/agent_observe host requests.
+    pub supervisor_link: Option<SupervisorLinkConfig>,
+}
+
+/// Supervisor-link coordinates for a daemon worker.
+#[derive(Clone, Debug)]
+pub struct SupervisorLinkConfig {
+    pub socket_path: std::path::PathBuf,
+    /// The worker's own active session id, stamped on outgoing messages so
+    /// the supervisor can attribute them to this session.
+    pub active_session_id: String,
 }
 
 /// A [`SessionEngine`] running real agent turns.
@@ -144,6 +163,25 @@ impl AgentSessionEngine {
             .api_key
     }
 
+    /// Kernel host-request handlers for agent messaging and observation,
+    /// routed through the worker's supervisor link. `None` outside a daemon
+    /// worker: without a supervisor there is nobody to reach.
+    fn extra_host_handlers(&self) -> Option<HostRequestHandlers> {
+        let config = self.config.supervisor_link.as_ref()?;
+        let link = Arc::new(crate::supervisor_link::SupervisorLink::new(
+            config.socket_path.clone(),
+        ));
+        let sender = Arc::new(LinkAgentMessageController {
+            link: Arc::clone(&link),
+            active_session_id: config.active_session_id.clone(),
+        });
+        let observer = Arc::new(LinkAgentObserveController { link });
+        let mut handlers = HostRequestHandlers::default();
+        register_agent_message_host_handlers(sender, &mut handlers);
+        register_agent_observe_host_handlers(observer, &mut handlers);
+        Some(handlers)
+    }
+
     async fn build_session(&self, model: &Model) -> anyhow::Result<CoreSessionEngine> {
         let agent_model =
             json_round_trip(model).ok_or_else(|| anyhow::anyhow!("model conversion failed"))?;
@@ -172,6 +210,7 @@ impl AgentSessionEngine {
             generic_mcp_servers: vec![],
             allow_recursion: None,
             session_manager: Some(session_manager),
+            extra_host_handlers: self.extra_host_handlers(),
             conversation_log_path: session_file,
             additional_skill_paths: vec![],
             additional_prompt_paths: vec![],
@@ -637,6 +676,7 @@ mod tests {
             session_dir: None,
             session_file: None,
             faux_script: None,
+            supervisor_link: None,
         })
         .unwrap();
         // The explicit selection from the session's create config is
@@ -671,6 +711,7 @@ mod tests {
             session_dir: None,
             session_file: None,
             faux_script: None,
+            supervisor_link: None,
         })
         .unwrap();
         // A create config with only a model keeps the provider and key.
@@ -699,6 +740,7 @@ mod tests {
             session_dir: None,
             session_file: None,
             faux_script: None,
+            supervisor_link: None,
         })
         .unwrap();
         let mut events: Vec<EngineEvent> = Vec::new();
@@ -748,6 +790,7 @@ fn agent_engine_streams_updates_and_final_message() {
         session_dir: None,
         session_file: None,
         faux_script: Some(serde_json::json!({ "responses": ["streamed answer"] }).to_string()),
+        supervisor_link: None,
     })
     .unwrap();
     let mut events: Vec<EngineEvent> = Vec::new();
@@ -831,4 +874,251 @@ fn session_wire_value(agent_message: &pa_agent::types::AgentMessage) -> Option<V
         _ => return None,
     };
     serde_json::to_value(&session_message).ok()
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor-link controllers (kernel agent_message/agent_observe bridges)
+// ---------------------------------------------------------------------------
+
+/// `agent_message.send` controller for daemon workers: one `send_message`
+/// command over the supervisor link (the TS worker's
+/// `sendRemoteAgentSessionMessage` path). Never retried: daemon commands
+/// are not idempotent.
+struct LinkAgentMessageController {
+    link: Arc<crate::supervisor_link::SupervisorLink>,
+    active_session_id: String,
+}
+
+impl AgentMessageController for LinkAgentMessageController {
+    async fn send_agent_message(
+        &self,
+        input: AgentMessageSendInput,
+    ) -> anyhow::Result<AgentMessageReceipt> {
+        let data = self
+            .link
+            .request_success(
+                json!({
+                    "type": "send_message",
+                    "targetActiveSessionId": input.target,
+                    "message": input.message,
+                    "fromActiveSessionId": self.active_session_id,
+                    "agentOrigin": true,
+                }),
+                std::time::Duration::from_secs(30),
+            )
+            .await?;
+        Ok(receipt_from_wire(&data, input))
+    }
+}
+
+/// Map the supervisor's receipt payload onto the kernel receipt shape.
+fn receipt_from_wire(data: &Value, input: AgentMessageSendInput) -> AgentMessageReceipt {
+    let delivery_status = if data.get("deliveryStatus").and_then(Value::as_str) == Some("delivered")
+    {
+        AgentMessageDeliveryStatus::Delivered
+    } else {
+        AgentMessageDeliveryStatus::Queued
+    };
+    let delivery_mode = match data.get("deliveryMode").and_then(Value::as_str) {
+        Some("follow_up") => "follow_up",
+        _ => "steer",
+    };
+    AgentMessageReceipt {
+        id: data
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        target: input.target.clone(),
+        message: input.message,
+        delivery_status,
+        delivery_mode: Some(delivery_mode),
+        receiver_role: input.receiver_role,
+        delivered_at: data
+            .get("deliveredAt")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        queued_at: data
+            .get("queuedAt")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
+}
+
+/// `agent_observe.*` controller for daemon workers: the roster via the
+/// supervisor's `list` command, message previews via `get_messages`.
+struct LinkAgentObserveController {
+    link: Arc<crate::supervisor_link::SupervisorLink>,
+}
+
+impl AgentObserveController for LinkAgentObserveController {
+    async fn list_agents(&self) -> anyhow::Result<Vec<AgentObserveSummary>> {
+        let data = self
+            .link
+            .request_success(
+                json!({ "type": "list" }),
+                std::time::Duration::from_secs(30),
+            )
+            .await?;
+        let sessions = data
+            .get("sessions")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(summaries_from_roster(sessions))
+    }
+
+    async fn get_agent(&self, target: &str) -> anyhow::Result<Option<AgentObserveSummary>> {
+        let data = self
+            .link
+            .request_success(
+                json!({ "type": "list" }),
+                std::time::Duration::from_secs(30),
+            )
+            .await?;
+        let sessions = data
+            .get("sessions")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(summaries_from_roster(sessions).into_iter().find(|summary| {
+            summary.active_session_id.as_deref() == Some(target)
+                || summary.session_id == target
+                || summary.session_name.as_deref() == Some(target)
+        }))
+    }
+
+    async fn recent_messages(
+        &self,
+        target: &str,
+        limit: usize,
+        max_chars: usize,
+    ) -> anyhow::Result<Vec<AgentObserveMessagePreview>> {
+        let data = self
+            .link
+            .request_success(
+                json!({
+                    "type": "get_messages",
+                    "activeSessionId": target,
+                }),
+                std::time::Duration::from_secs(30),
+            )
+            .await?;
+        let messages = data
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let total = messages.len();
+        let start = total.saturating_sub(limit);
+        let mut previews = Vec::new();
+        for (index, message) in messages.iter().enumerate().skip(start) {
+            let full_text = message_preview_text(message);
+            previews.push(AgentObserveMessagePreview {
+                index,
+                role: message
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                timestamp: message.get("timestamp").and_then(Value::as_u64),
+                text: truncate_chars(&full_text, max_chars),
+                truncated: full_text.chars().count() > max_chars,
+                tool_calls: Vec::new(),
+                custom_type: message
+                    .get("customType")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            });
+        }
+        Ok(previews)
+    }
+}
+
+/// Flatten the supervisor's `list` rows (session summaries) into roster
+/// summaries for `agent_observe`.
+fn summaries_from_roster(sessions: Vec<Value>) -> Vec<AgentObserveSummary> {
+    sessions
+        .into_iter()
+        .map(|session| {
+            let runtime_kind = session
+                .get("runtimeKind")
+                .and_then(Value::as_str)
+                .unwrap_or("top-level")
+                .to_string();
+            let relationship = match runtime_kind.as_str() {
+                "subagent" => {
+                    Some(pa_core::session_engine::agent_messaging::AgentFamilyRelationship::Child)
+                }
+                _ => None,
+            };
+            let queued = session
+                .get("sessionActions")
+                .and_then(|actions| actions.get("queuedCount"))
+                .and_then(Value::as_u64)
+                .unwrap_or_default() as usize;
+            AgentObserveSummary {
+                active_session_id: session
+                    .get("activeSessionId")
+                    .or_else(|| session.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                session_id: session
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                session_name: session
+                    .get("sessionName")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string),
+                relationship,
+                runtime_kind: Some(runtime_kind),
+                status: if session.get("activity").and_then(Value::as_str) == Some("idle") {
+                    "inactive".to_string()
+                } else {
+                    "running".to_string()
+                },
+                is_current: false,
+                is_streaming: session
+                    .get("isStreaming")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                is_compacting: session
+                    .get("isCompacting")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                attached_clients: session
+                    .get("attachedClients")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default() as usize,
+                queued_count: queued,
+                is_session_active: session
+                    .get("isSessionActive")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            }
+        })
+        .collect()
+}
+
+/// Concatenate a stored message's content into preview text.
+fn message_preview_text(message: &Value) -> String {
+    match message.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    text.chars().take(max_chars).collect()
 }

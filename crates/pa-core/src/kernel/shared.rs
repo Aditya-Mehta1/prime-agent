@@ -245,6 +245,18 @@ impl HostRequestHandlers {
         self.handlers = Arc::new(map);
     }
 
+    /// Merge another registry into this one; the other registry's entries
+    /// win on key collisions (later registrations override).
+    pub fn merge(&mut self, other: Self) {
+        let other_map = Arc::try_unwrap(other.handlers).unwrap_or_else(|shared| (*shared).clone());
+        let mut map = Arc::try_unwrap(std::mem::take(&mut self.handlers))
+            .unwrap_or_else(|shared| (*shared).clone());
+        for (key, handler) in other_map {
+            map.insert(key, handler);
+        }
+        self.handlers = Arc::new(map);
+    }
+
     pub fn get(&self, request_type: &str) -> Option<&HostHandlerFn> {
         self.handlers.get(request_type)
     }

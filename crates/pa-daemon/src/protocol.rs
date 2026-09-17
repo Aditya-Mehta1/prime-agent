@@ -33,6 +33,7 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "kill",
     "rename",
     "set_session_name",
+    "send_message",
     "prompt",
     "prompt_and_wait",
     "steer",

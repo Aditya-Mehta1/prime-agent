@@ -477,6 +477,31 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
     assert_eq!(sessions.len(), items);
     assert_eq!(rows[0], sessions[0]);
 
+    // Agent-to-agent messaging: an unknown target is rejected with the TS
+    // supervisor's unknown-session error. Client-to-client delivery e2e is
+    // deferred (the supervisor route path hangs in flight; superseded by
+    // the thin-supervisor peer-messaging stage - see docs/parity-checklist.md);
+    // the worker-side delivery itself is unit-tested in
+    // `worker::agent_message_tests`.
+    client.send_command(
+        "m1",
+        serde_json::json!({
+            "type": "send_message",
+            "targetActiveSessionId": "no-such-session",
+            "message": "anybody there?",
+        }),
+    );
+    let send_missing = client.read_response("m1");
+    assert_eq!(
+        send_missing["success"], false,
+        "send_message should fail: {send_missing}"
+    );
+    assert_eq!(send_missing["command"], "send_message");
+    assert_eq!(
+        send_missing["error"],
+        "Unknown active session: no-such-session"
+    );
+
     // Second turn of the script replays the next response.
     client.send_command(
         "p2",

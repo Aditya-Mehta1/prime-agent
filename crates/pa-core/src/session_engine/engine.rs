@@ -41,6 +41,9 @@ pub struct SessionEngineConfig {
     pub allow_recursion: Option<bool>,
     /// Session persistence (in-memory when None).
     pub session_manager: Option<SessionManager>,
+    /// Extra kernel host-request handlers (e.g. the daemon's message/observe
+    /// bridges), merged over the built-in goal/heartbeat registrations.
+    pub extra_host_handlers: Option<crate::kernel::shared::HostRequestHandlers>,
     /// Conversation-log path for the system prompt when the caller owns
     /// persistence outside the session manager (the daemon worker mirrors
     /// entries into its own session file).
@@ -167,11 +170,12 @@ pub async fn create_session(config: SessionEngineConfig) -> anyhow::Result<Sessi
     // kernel (unless the caller supplied one).
     let python_skills = super::runtime_wiring::kernel_python_skills(&resources.skills);
     let session_id = wiring.session.lock().await.get_session_id().to_string();
-    let provisioner = super::runtime_wiring::kernel_provisioner(
-        session_id,
-        wiring.handlers.clone(),
-        python_skills,
-    );
+    let mut handlers = wiring.handlers.clone();
+    if let Some(extra) = config.extra_host_handlers.clone() {
+        handlers.merge(extra);
+    }
+    let provisioner =
+        super::runtime_wiring::kernel_provisioner(session_id, handlers, python_skills);
     let mut tools = config.tools.clone();
     if !tools.iter().any(|tool| tool.name() == "ipython") {
         let definition = crate::tools::ipython::create_ipython_tool_definition(
@@ -378,6 +382,7 @@ mod tests {
             generic_mcp_servers: vec![],
             allow_recursion: None,
             session_manager: None,
+            extra_host_handlers: None,
             conversation_log_path: None,
             additional_skill_paths: vec![],
             additional_prompt_paths: vec![],

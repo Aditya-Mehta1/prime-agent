@@ -116,6 +116,7 @@ async fn print_mode_main(options: &RunOptions) -> Result<i32, String> {
             generic_mcp_servers: vec![],
             allow_recursion: None,
             session_manager,
+            extra_host_handlers: None,
             conversation_log_path: None,
             additional_skill_paths: config
                 .skills
@@ -599,6 +600,7 @@ async fn faux_print_mode(options: &RunOptions, script: &str) -> Result<i32, Stri
             generic_mcp_servers: vec![],
             allow_recursion: None,
             session_manager,
+            extra_host_handlers: None,
             conversation_log_path: None,
             additional_skill_paths: vec![],
             additional_prompt_paths: vec![],

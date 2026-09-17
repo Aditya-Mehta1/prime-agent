@@ -12,11 +12,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
+use pa_core::session_engine::agent_messaging::{
+    AgentFamilyRelationship, AgentMessagePromptPayload, AGENT_MESSAGE_SOURCE,
+    DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
+};
 use pa_types::platform::transport::{bind_transport, TransportStream};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, oneshot, Notify};
 
-use crate::agent_engine::{AgentEngineConfig, AgentSessionEngine};
+use crate::agent_engine::{AgentEngineConfig, AgentSessionEngine, SupervisorLinkConfig};
 use crate::engine::{
     EngineEvent, EngineModelSelection, PromptRequest, ScriptedEngine, SessionEngine,
 };
@@ -226,6 +230,15 @@ pub struct Worker {
     compaction: crate::compaction::CompactionManager,
 }
 
+/// Supervisor-link coordinates for a worker's agent engine: where the
+/// supervisor listens and who this worker is on it.
+fn supervisor_link_config(config: &WorkerConfig) -> SupervisorLinkConfig {
+    SupervisorLinkConfig {
+        socket_path: config.supervisor_socket_path.clone(),
+        active_session_id: config.active_session_id.clone(),
+    }
+}
+
 impl Worker {
     pub fn new(config: WorkerConfig, registration: Option<RegistrationHandle>) -> Self {
         let (events, _) = broadcast::channel(4096);
@@ -284,6 +297,7 @@ impl Worker {
                         session_dir: None,
                         session_file: None,
                         faux_script: Some(script.to_string()),
+                        supervisor_link: Some(supervisor_link_config(&config)),
                     }) {
                         Ok(engine) => std::sync::Arc::new(engine),
                         // Runtime construction failed: degrade to the echo engine.
@@ -305,6 +319,7 @@ impl Worker {
                         session_dir: None,
                         session_file: None,
                         faux_script: None,
+                        supervisor_link: Some(supervisor_link_config(&config)),
                     }) {
                         Ok(engine) => std::sync::Arc::new(engine),
                         // Runtime construction failed: degrade to the echo engine.
@@ -755,6 +770,7 @@ impl Worker {
             "clear_queue" => self.handle_clear_queue(),
             "abort_and_clear_queue" => self.handle_abort_and_clear_queue(),
             "get_last_assistant_text" => self.handle_get_last_assistant_text(),
+            "worker_deliver_message" => self.handle_worker_deliver_message(payload),
             "kill" => self.handle_kill(),
             "shutdown" => self.handle_shutdown(),
             "rename" => self.handle_rename("rename", payload),
@@ -1209,6 +1225,112 @@ impl Worker {
             "follow_up"
         };
         response_success(None, command, Some(json!({ "queued": true })))
+    }
+
+    /// Agent-to-agent message delivery, routed by the supervisor's
+    /// `send_message` arm: render the `[agent-message from ...]` prompt and
+    /// queue it on the requested lane. Answers with the delivery receipt
+    /// (`createAgentSessionMessageReceipt` shape): `queued` when a turn is
+    /// running (`queueIfBusy` semantics), `delivered` when the prompt
+    /// becomes the next run.
+    fn handle_worker_deliver_message(&self, payload: &Value) -> DaemonResponse {
+        if let Err(response) = self.require_created("worker_deliver_message") {
+            return response;
+        }
+        let message = payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if let Err(error) =
+            pa_core::session_engine::agent_messaging::normalize_agent_session_message(message)
+        {
+            return response_failure(None, "worker_deliver_message", &error.to_string(), None);
+        }
+        let sender = payload.get("sender").cloned().unwrap_or(Value::Null);
+        // Sender label precedence (TS `createAgentSessionMessagePrompt`):
+        // session name, session id, active session id, client id.
+        let sender_name = ["sessionName", "sessionId", "activeSessionId", "clientId"]
+            .iter()
+            .find_map(|key| sender.get(*key).and_then(Value::as_str))
+            .unwrap_or("unknown")
+            .to_string();
+        let from_relationship = match sender.get("runtimeKind").and_then(Value::as_str) {
+            Some("subagent") => Some(AgentFamilyRelationship::Child),
+            _ => None,
+        };
+        let prompt = pa_core::session_engine::agent_messaging::create_agent_session_message_prompt(
+            &AgentMessagePromptPayload {
+                message: message.to_string(),
+                sender_name,
+                from_relationship,
+            },
+        );
+        let lane = if payload.get("deliveryMode").and_then(Value::as_str) == Some("follow_up") {
+            Lane::FollowUp
+        } else {
+            Lane::Steering
+        };
+        let (id, summary, queued, snapshot) = {
+            let mut core = self.core.lock().unwrap();
+            let pending = core.steering.len() + core.follow_up.len();
+            if let Err(error) =
+                pa_core::session_engine::agent_messaging::assert_agent_message_queue_capacity(
+                    pending,
+                    DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
+                )
+            {
+                drop(core);
+                return response_failure(None, "worker_deliver_message", &error.to_string(), None);
+            }
+            let id = pa_core::session_engine::agent_messaging::create_agent_session_message_id();
+            match lane {
+                Lane::Steering => &mut core.steering,
+                Lane::FollowUp => &mut core.follow_up,
+            }
+            .push_back(QueuedItem {
+                message: prompt,
+                done: None,
+            });
+            let queued = core.busy;
+            let summary = self.summary_locked(&core);
+            let snapshot = self.snapshot_locked(&core);
+            self.persist_queue_snapshot_locked(&mut core);
+            (id, summary, queued, snapshot)
+        };
+        let _ = self.emit_action_update(&snapshot);
+        self.work_notify.notify_one();
+        let mut target = json!({
+            "activeSessionId": summary.active_session_id.clone().unwrap_or_default(),
+            "sessionId": summary.session_id,
+            "runtimeKind": summary
+                .runtime_kind
+                .clone()
+                .unwrap_or_else(|| "top-level".to_string()),
+        });
+        if let Some(name) = summary.session_name.clone().filter(|name| !name.is_empty()) {
+            target["sessionName"] = json!(name);
+        }
+        let timestamp = crate::util::now_iso();
+        let mut receipt = json!({
+            "id": id,
+            "source": AGENT_MESSAGE_SOURCE,
+            "target": target,
+            "message": message,
+            // TS receipts always report `steer`; the follow-up lane is the
+            // Rust extension for queue-behind-current-work delivery.
+            "deliveryMode": if lane == Lane::FollowUp { "follow_up" } else { "steer" },
+        });
+        if queued {
+            receipt["deliveryStatus"] = json!("queued");
+            receipt["queuedAt"] = json!(timestamp);
+        } else {
+            receipt["deliveryStatus"] = json!("delivered");
+            receipt["deliveredAt"] = json!(timestamp);
+        }
+        if !sender.is_null() {
+            receipt["from"] = json!(sender);
+        }
+        response_success(None, "worker_deliver_message", Some(receipt))
     }
 
     /// Graceful stop: the connection loop exits the process after replying.
@@ -1921,6 +2043,195 @@ pub async fn run_worker() -> Result<()> {
     let registration = crate::registration::start(&config);
     let worker = Arc::new(Worker::new(config, registration));
     worker.serve().await
+}
+
+#[cfg(test)]
+mod agent_message_tests {
+    use super::*;
+
+    fn test_worker() -> Arc<Worker> {
+        let dir = std::env::temp_dir().join(format!("pa-worker-am-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "target-session".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            script: Some(json!({ "responses": ["ack"] })),
+        };
+        Arc::new(Worker::new(config, None))
+    }
+
+    async fn created_worker() -> Arc<Worker> {
+        let worker = test_worker();
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({ "noSession": true, "cwd": "/tmp", "name": "target" }),
+            )
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        worker
+    }
+
+    fn queue_texts(core: &Mutex<SessionCore>, lane: Lane) -> Vec<String> {
+        let core = core.lock().unwrap();
+        match lane {
+            Lane::Steering => &core.steering,
+            Lane::FollowUp => &core.follow_up,
+        }
+        .iter()
+        .map(|item| item.message.clone())
+        .collect()
+    }
+
+    /// Receipt shape (`createAgentSessionMessageReceipt`): id, source,
+    /// target endpoint, sender echo, delivered status and timestamp while
+    /// the session is idle, and the rendered prompt on the steering lane.
+    #[tokio::test]
+    async fn deliver_message_answers_the_ts_receipt_shape() {
+        let worker = created_worker().await;
+        let response = worker
+            .dispatch(
+                "worker_deliver_message",
+                &json!({
+                    "targetActiveSessionId": "target-session",
+                    "message": "ping from the first session",
+                    "sender": {
+                        "activeSessionId": "source-session",
+                        "sessionId": "source-file",
+                        "sessionName": "source-agent",
+                        "runtimeKind": "top-level",
+                        "clientId": "cli-1",
+                    },
+                }),
+            )
+            .await;
+        assert!(response.success, "deliver failed: {response:?}");
+        assert_eq!(response.command, "worker_deliver_message");
+        let data = response.data.expect("receipt data");
+        assert!(
+            data["id"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("agentmsg_"),
+            "receipt id: {data}"
+        );
+        assert_eq!(data["source"], "agent_message");
+        assert_eq!(data["message"], "ping from the first session");
+        assert_eq!(data["deliveryStatus"], "delivered");
+        assert_eq!(data["deliveryMode"], "steer");
+        assert!(
+            data["deliveredAt"].as_str().is_some(),
+            "deliveredAt: {data}"
+        );
+        assert!(
+            data.get("queuedAt").is_none(),
+            "queuedAt on delivery: {data}"
+        );
+        assert_eq!(data["target"]["activeSessionId"], "target-session");
+        assert_eq!(data["target"]["sessionName"], "target");
+        assert!(!data["target"]["sessionId"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty());
+        assert_eq!(data["from"]["sessionName"], "source-agent");
+        assert_eq!(
+            queue_texts(&worker.core, Lane::Steering),
+            vec!["[agent-message from source-agent]\n\nping from the first session"],
+            "steering lane"
+        );
+        assert!(queue_texts(&worker.core, Lane::FollowUp).is_empty());
+    }
+
+    /// An explicit `follow_up` delivery mode queues behind current work
+    /// instead of steering, and a subagent sender renders the relationship.
+    #[tokio::test]
+    async fn deliver_message_follow_up_lane_and_subagent_sender() {
+        let worker = created_worker().await;
+        let response = worker
+            .dispatch(
+                "worker_deliver_message",
+                &json!({
+                    "targetActiveSessionId": "target-session",
+                    "message": "queue me",
+                    "sender": {
+                        "activeSessionId": "source-session",
+                        "sessionName": "source-agent",
+                        "runtimeKind": "subagent",
+                    },
+                    "deliveryMode": "follow_up",
+                }),
+            )
+            .await;
+        assert!(response.success, "deliver failed: {response:?}");
+        let data = response.data.expect("receipt data");
+        assert_eq!(data["deliveryMode"], "follow_up");
+        assert_eq!(
+            queue_texts(&worker.core, Lane::FollowUp),
+            vec!["[agent-message from child:source-agent]\n\nqueue me"],
+            "follow-up lane"
+        );
+        assert!(queue_texts(&worker.core, Lane::Steering).is_empty());
+    }
+
+    /// A busy session reports `queued` with `queuedAt` (`queueIfBusy`).
+    #[tokio::test]
+    async fn deliver_message_while_busy_queues() {
+        let worker = created_worker().await;
+        worker.core.lock().unwrap().busy = true;
+        let response = worker
+            .dispatch(
+                "worker_deliver_message",
+                &json!({
+                    "targetActiveSessionId": "target-session",
+                    "message": "while busy",
+                    "sender": { "activeSessionId": "source-session" },
+                }),
+            )
+            .await;
+        assert!(response.success, "deliver failed: {response:?}");
+        let data = response.data.expect("receipt data");
+        assert_eq!(data["deliveryStatus"], "queued");
+        assert!(data["queuedAt"].as_str().is_some(), "queuedAt: {data}");
+        assert!(
+            data.get("deliveredAt").is_none(),
+            "deliveredAt while queued: {data}"
+        );
+    }
+
+    /// The pending-capacity guard fails with the TS error string.
+    #[tokio::test]
+    async fn deliver_message_respects_the_pending_capacity() {
+        let worker = created_worker().await;
+        {
+            let mut core = worker.core.lock().unwrap();
+            for _ in 0..DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION {
+                core.follow_up.push_back(QueuedItem {
+                    message: "occupied".to_string(),
+                    done: None,
+                });
+            }
+        }
+        let response = worker
+            .dispatch(
+                "worker_deliver_message",
+                &json!({
+                    "targetActiveSessionId": "target-session",
+                    "message": "over the limit",
+                    "sender": { "activeSessionId": "source-session" },
+                }),
+            )
+            .await;
+        assert!(!response.success, "deliver should fail: {response:?}");
+        assert_eq!(
+            response.error.as_deref(),
+            Some("Target session has too many pending messages: 20 unfinished, limit is 20")
+        );
+    }
 }
 
 #[cfg(test)]

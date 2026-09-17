@@ -423,3 +423,44 @@ Deliberate deviations / notes:
 
 Run it: `python3 scripts/visual_parity.py --sizes 120x36 220x50` (requires the
 TS binary on PATH and a built `target/debug/prime-agent`).
+
+## 10. Agent-to-agent messaging (`send_message` / kernel `agent_message.*`) - partial
+
+TS: `modes/daemon/daemon-supervisor.ts` `send_message` block, `daemon-mode.ts`
+`worker_deliver_message` + `sendAgentSessionMessage`, `core/agent-messages.ts`
+(receipt/prompt/validation), `core/kernel/shared.ts` (sent-message bridge),
+`modes/daemon/supervisor-link.ts`.
+
+- done: supervisor `send_message` arm (`crates/pa-daemon/src/messaging.rs`):
+  source/target resolution with the TS unknown-session errors, self-target
+  refusal, sender endpoint from the source session's live summary (CLI-origin
+  sender is the client id), `worker_deliver_message` routing to the target.
+  Worker delivery (`crates/pa-daemon/src/worker.rs`
+  `handle_worker_deliver_message`): renders the exact TS
+  `[agent-message from ...]` prompt, steer lane by default / `follow_up` on
+  request, pending-capacity guard, `createAgentSessionMessageReceipt`-shaped
+  receipt. Worker->supervisor link (`crates/pa-daemon/src/supervisor_link.rs`,
+  TS supervisor-link.ts port) and the kernel `agent_message.send` /
+  `agent_observe.*` host controllers wired through the engine's
+  `extra_host_handlers` (`crates/pa-daemon/src/agent_engine.rs`).
+  Verifiers: unit tests per landed piece (`messaging.rs`,
+  `worker::agent_message_tests`, the `supervisor_link.rs` echo round-trip)
+  and the unknown-target e2e in `crates/pa-daemon/tests/supervisor_e2e.rs`.
+- known issue (superseded): the client-to-client `send_message` e2e (second
+  session created, `send_message` with `fromActiveSessionId` from the first)
+  hangs in flight - the client gets no reply within its 15s deadline;
+  suspected `route_command` deadlock on the supervisor's in-loop route. Do not
+  re-add that e2e as-is: the thin-supervisor Stage 3 peer-messaging work
+  removes the routed path (delivery over direct worker peer links), which
+  supersedes the bug. Worker-side delivery and the unknown-target path stay
+  covered by the unit tests above.
+- deferred gaps: the TS supervisor's saved-session wake-up for non-resident
+  targets (catalog resolve + worker reuse) is not ported - an unknown target
+  always answers `Unknown active session: <selector>` where the TS CLI would
+  wake the saved session and print `Sent to <name>`; the family-reach
+  assertion needs the session family catalog the thin supervisor does not
+  keep; delivered agent messages persist as plain user prompts, not TS
+  `custom` messages (`customType: "agent_message"` with a details block); the
+  sender relationship in the delivered prompt derives from `runtimeKind`
+  (subagent -> child) instead of the family graph; the TS `deliveryMode` wire
+  field is legacy-ignored in TS but honored here (default `steer` matches TS).

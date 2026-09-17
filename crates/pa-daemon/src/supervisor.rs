@@ -1037,6 +1037,12 @@ impl Supervisor {
                     .await;
                 (vec![response_line(&response)], false)
             }
+            DaemonCommand::SendMessage { .. } => {
+                let response = self
+                    .handle_send_message(&command_id, effective_client_id, &envelope.command)
+                    .await;
+                (vec![response_line(&response)], false)
+            }
             DaemonCommand::WorkerRegister { .. } => {
                 // Worker self-registration: rebuilds the roster entry from
                 // the worker's own identity instead of routing to a session.

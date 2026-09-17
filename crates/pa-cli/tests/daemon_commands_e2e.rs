@@ -533,9 +533,9 @@ fn rust_daemon_cli_commands_end_to_end() {
     assert_eq!(normalized.lines().count(), 2, "saved row after kill");
     assert!(normalized.contains("<timestamp>"), "{normalized}");
 
-    // The Rust supervisor does not implement send_message yet; the CLI
-    // surfaces the daemon's failure verbatim. The TS daemon accepts the same
-    // envelope - see the differential test.
+    // send_message reaches the supervisor's routing arm: the session is
+    // gone, so it answers with the TS unknown-session error (the CLI
+    // surfaces the daemon's failure verbatim).
     let send = run_cli(
         &cli,
         dir.path(),
@@ -543,7 +543,10 @@ fn rust_daemon_cli_commands_end_to_end() {
         &list_args(&socket_str, &["send", session.as_str(), "hello"]),
     );
     assert_eq!(send.status.code(), Some(1));
-    assert_eq!(stderr(&send), "Error: Unknown active session: \n");
+    assert_eq!(
+        stderr(&send),
+        format!("Error: Unknown active session: {session}\n")
+    );
 }
 
 #[test]
