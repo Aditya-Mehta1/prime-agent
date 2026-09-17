@@ -1038,8 +1038,9 @@ impl Supervisor {
                 (vec![response_line(&response)], false)
             }
             DaemonCommand::SendMessage { .. } => {
+                let client_id = effective_client_id.lock().unwrap().clone();
                 let response = self
-                    .handle_send_message(&command_id, effective_client_id, &envelope.command)
+                    .handle_send_message(&command_id, &client_id, &envelope.command)
                     .await;
                 (vec![response_line(&response)], false)
             }
