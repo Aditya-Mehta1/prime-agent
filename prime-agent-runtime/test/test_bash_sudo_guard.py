@@ -38,6 +38,9 @@ SUDO_MATCHING_COMMANDS = [
     "nice -n 10 sudo id",
     "! sudo id",
     "time sudo id",
+    "time -p sudo id",
+    "time -- sudo id",
+    "bash --rcfile /dev/null -c 'sudo id'",
     "cd /tmp && sudo make install",
     "echo hi\nsudo id",
     "( sudo id )",
@@ -337,6 +340,7 @@ SUDO_NON_MATCHING_COMMANDS = [
     "env -P /bin ls",
     "watch -q 5 ls",
     "strace --color=always ls",
+    "bash --rcfile /dev/null -c 'echo hi'",
     "ltrace --indent 4 ls",
     "systemd-run -H host ls",
     # faketime parses options only up to the timestamp, so everything after the

@@ -1000,6 +1000,13 @@ def _scan_segment(
         if word.value == "case":
             start = _skip_case_header(words, start + 1)
             continue
+        if word.value == "time":
+            # `time` is a keyword, not a program: its own flags are not the command
+            # word, so `time -p sudo id` still reaches the word that runs.
+            start += 1
+            while start < len(words) and _is_flag_word(words[start]):
+                start += 1
+            continue
         if word.kind == "group" or word.value in _KEYWORDS:
             start += 1
             continue
@@ -1420,7 +1427,9 @@ def _is_command_flag(value: str) -> bool:
 
 def _glued_payload(value: str) -> str | None:
     """Payload folded onto the flag word itself (`-c$'sudo id'` -> `-csudo id`)."""
-    if not value.startswith("-") or "c" not in value[1:]:
+    # Only short bundles fold a payload: a long option such as `--rcfile` merely
+    # contains a `c` and must stay in the flag loop.
+    if not value.startswith("-") or value.startswith("--") or "c" not in value[1:]:
         return None
     return value[value.index("c") + 1 :] or None
 
