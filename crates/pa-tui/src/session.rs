@@ -44,6 +44,11 @@ pub enum TranscriptItem {
     SystemNote {
         text: String,
     },
+    /// One decoded custom-message row (agent messages, injected prompts,
+    /// outcomes, and the generic custom box).
+    CustomRow {
+        entry: crate::chat::ChatEntry,
+    },
 }
 
 /// Live event surfaced through a [`SessionStream`].
@@ -120,8 +125,34 @@ pub fn entry_to_items(entry: &FileEntry) -> Vec<TranscriptItem> {
             provider: payload.provider.clone(),
             model_id: payload.model_id.clone(),
         }],
+        // Custom rows rejoin as their wire message form and decode through
+        // the same custom-type dispatch the live path uses.
+        FileEntry::CustomMessage { payload, .. } => {
+            let message = custom_message_wire_value(payload);
+            crate::custom_message::custom_message_entries(&message)
+                .into_iter()
+                .map(|entry| TranscriptItem::CustomRow { entry })
+                .collect()
+        }
         _ => Vec::new(),
     }
+}
+
+/// Rebuild the `role: "custom"` wire message shape from a persisted
+/// `custom_message` entry (the same rejoin the daemon session store and
+/// the TS session manager perform on load).
+fn custom_message_wire_value(payload: &pa_types::session::CustomMessageEntry) -> serde_json::Value {
+    let content = match serde_json::to_value(&payload.content) {
+        Ok(value) => value,
+        Err(_) => serde_json::Value::Null,
+    };
+    serde_json::json!({
+        "role": "custom",
+        "customType": payload.custom_type,
+        "content": content,
+        "display": payload.display,
+        "details": payload.details.clone().unwrap_or(serde_json::Value::Null),
+    })
 }
 
 fn message_to_items(message: &AgentMessage) -> Vec<TranscriptItem> {
@@ -209,6 +240,47 @@ impl SessionStream for JsonlSessionStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_message_entries_rejoin_and_decode() {
+        // A persisted custom_message entry rejoins as its wire shape and
+        // decodes through the same custom-type dispatch the live path
+        // uses; a non-display row renders nothing.
+        let entry = |display: bool| FileEntry::CustomMessage {
+            payload: pa_types::session::CustomMessageEntry {
+                custom_type: "agent_message".to_string(),
+                content: pa_types::ai::UserContent::Text(
+                    "[agent-message from child:lane]\n\nhi".to_string(),
+                ),
+                details: Some(serde_json::json!({
+                    "id": "agentmsg_t1",
+                    "message": "hi",
+                    "from": { "sessionName": "lane" },
+                    "fromRelationship": "child",
+                })),
+                display,
+                rest: serde_json::Map::new(),
+            },
+            base: pa_types::session::EntryBase {
+                id: Some("e1".to_string()),
+                parent_id: None,
+                timestamp: None,
+                rest: serde_json::Map::new(),
+            },
+        };
+        let items = entry_to_items(&entry(true));
+        let [TranscriptItem::CustomRow { entry: chat_entry }] = items.as_slice() else {
+            panic!("custom row: {items:?}");
+        };
+        match chat_entry {
+            crate::chat::ChatEntry::AgentMessage(row) => {
+                assert_eq!(row.participant, "from child lane");
+                assert_eq!(row.message, "hi");
+            }
+            other => panic!("agent row: {other:?}"),
+        }
+        assert!(entry_to_items(&entry(false)).is_empty());
+    }
 
     #[test]
     fn loads_real_session() {

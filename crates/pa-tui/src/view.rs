@@ -23,6 +23,23 @@ use ratatui::style::{Modifier, Style};
 /// (TS `FULLSCREEN_MIN_TRANSCRIPT_ROWS`).
 pub const FULLSCREEN_MIN_TRANSCRIPT_ROWS: usize = 3;
 
+/// TS `getSpacingContent`: an assistant message's conversation-spacing
+/// classification at the current detail level.
+enum SpacingContent {
+    Visible,
+    ToolOnly,
+    Hidden,
+}
+
+/// TS `isCompactAgentMessageNeighbor`: agent messages, tool calls, and
+/// shell completions render flush against each other.
+fn is_compact_neighbor(entry: &ChatEntry) -> bool {
+    matches!(
+        entry,
+        ChatEntry::Tool(_) | ChatEntry::AgentMessage(_) | ChatEntry::ShellCompletion(_)
+    )
+}
+
 pub struct AgentView {
     pub theme: Theme,
     /// The chat markdown fenced-code indent (`markdown.codeBlockIndent`,
@@ -247,6 +264,18 @@ impl AgentView {
         match entry {
             ChatEntry::Status { .. } | ChatEntry::User { .. } => true,
             ChatEntry::SlashCommand { .. } | ChatEntry::SlashCommandResult { .. } => true,
+            // Spacing-driven rows (agent messages, shell completions) lean
+            // on the conversation-spacing scan over PRECEDING entries: a
+            // streaming assistant's spacing contribution changes when its
+            // stream settles, so they render fresh until every assistant
+            // message in the transcript has settled (TS computes the
+            // leading blank dynamically on every render).
+            ChatEntry::AgentMessage(_) | ChatEntry::ShellCompletion(_) => !self
+                .chat
+                .iter()
+                .any(|entry| matches!(entry, ChatEntry::Assistant(m) if m.streaming)),
+            ChatEntry::InjectedPrompt(_) | ChatEntry::RefinementOutcome(_) => true,
+            ChatEntry::CustomPanel(_) => true,
             ChatEntry::Assistant(message) => !message.streaming,
             ChatEntry::Tool(card) => !matches!(
                 crate::tool_card::panel_status(card),
@@ -255,10 +284,88 @@ impl AgentView {
         }
     }
 
+    /// TS `createConversationSpacing.shouldAddLeadingSpace` for one
+    /// spacing-driven custom row (agent message, shell completion): scan
+    /// back over entries that contribute no rows at this detail level
+    /// (hidden thinking-only and tool-only assistant messages), then apply
+    /// the trailing-space and compact-neighbor rules. `expanded` follows
+    /// the TS `shouldAddLeadingSpace(expanded)` call shape.
+    fn conversation_leading(&self, index: usize, expanded: bool) -> bool {
+        let mut idx = index;
+        let mut tool_separator = false;
+        while idx > 0 {
+            idx -= 1;
+            match &self.chat[idx] {
+                ChatEntry::Assistant(message) => {
+                    match self.assistant_spacing_content(message) {
+                        SpacingContent::Hidden => continue,
+                        SpacingContent::ToolOnly => {
+                            tool_separator = true;
+                            continue;
+                        }
+                        SpacingContent::Visible => {
+                            // TS `hasTrailingSpace` on the visible body.
+                            let preceded_by_tool =
+                                idx > 0 && matches!(&self.chat[idx - 1], ChatEntry::Tool(_));
+                            if tool_separator
+                                || message.has_trailing_space(self.detail, preceded_by_tool)
+                            {
+                                return false;
+                            }
+                            // An assistant message is never a compact
+                            // neighbor; the collapsed and expanded rules
+                            // both add the leading blank here.
+                            return true;
+                        }
+                    }
+                }
+                preceding => {
+                    if tool_separator && !is_compact_neighbor(preceding) {
+                        return false;
+                    }
+                    if expanded {
+                        return true;
+                    }
+                    return !is_compact_neighbor(preceding);
+                }
+            }
+        }
+        // The scan exhausted the transcript (only hidden or tool-only
+        // assistant rows): TS keeps the tool separator with a trailing
+        // space (no leading blank); with nothing preceding at all, the
+        // expanded form sits flush against the top of the chat while the
+        // collapsed form still leads with a blank
+        // (`!isCompactAgentMessageNeighbor(undefined)`).
+        if tool_separator {
+            return false;
+        }
+        !expanded
+    }
+
+    /// TS `getSpacingContent`: an assistant message's contribution to
+    /// conversation spacing at the current detail level.
+    fn assistant_spacing_content(&self, message: &crate::chat::AssistantMessage) -> SpacingContent {
+        let visible_body = message.blocks.iter().any(|block| match block {
+            crate::chat::MessageBlock::Thinking(text) => {
+                self.detail.show_thinking() && !text.trim().is_empty()
+            }
+            crate::chat::MessageBlock::Text(text) => !text.trim().is_empty(),
+        });
+        if visible_body || message.aborted || (message.error.is_some() && !message.has_tool_calls) {
+            return SpacingContent::Visible;
+        }
+        if message.has_tool_calls {
+            SpacingContent::ToolOnly
+        } else {
+            SpacingContent::Hidden
+        }
+    }
+
     /// Lay out one chat entry's transcript rows (the only producer of
     /// cached layout rows).
     fn render_entry(
         &self,
+        index: usize,
         entry: &ChatEntry,
         width: usize,
         first: bool,
@@ -327,6 +434,41 @@ impl AgentView {
                 &self.theme,
                 width,
             ),
+            ChatEntry::AgentMessage(row) => crate::custom_message::render::render_agent_message(
+                row,
+                self.detail,
+                &self.theme,
+                width,
+                self.conversation_leading(index, self.detail.tool_output_expanded()),
+            ),
+            ChatEntry::InjectedPrompt(row) => {
+                crate::custom_message::render::render_injected_prompt(
+                    row,
+                    self.detail,
+                    &self.theme,
+                    width,
+                )
+            }
+            ChatEntry::ShellCompletion(row) => {
+                crate::custom_message::render::render_shell_completion(
+                    row,
+                    self.detail,
+                    &self.theme,
+                    width,
+                    self.conversation_leading(index, self.detail.tool_output_expanded()),
+                )
+            }
+            ChatEntry::RefinementOutcome(row) => {
+                crate::custom_message::refinement::render_refinement_outcome(
+                    row,
+                    self.detail,
+                    &self.theme,
+                    width,
+                )
+            }
+            ChatEntry::CustomPanel(row) => {
+                crate::custom_message::render::render_custom_panel(row, &self.theme, width)
+            }
         }
     }
 
@@ -357,7 +499,8 @@ impl AgentView {
             {
                 Some(rows) => rows.clone(),
                 None => {
-                    let rows = self.render_entry(entry, width, first, preceded_by_tool_activity);
+                    let rows =
+                        self.render_entry(index, entry, width, first, preceded_by_tool_activity);
                     if self.entry_cacheable(entry) {
                         self.entry_layout[index] = Some(rows.clone());
                     }
@@ -793,6 +936,7 @@ fn item_to_entry(item: TranscriptItem) -> ChatEntry {
             text: format!("\u{2699} {model_id}"),
             kind: crate::chat::StatusKind::Info,
         },
+        TranscriptItem::CustomRow { entry } => entry,
     }
 }
 
@@ -1174,6 +1318,137 @@ mod tests {
         let details = transcript_text(&mut view, 80);
         assert!(!overview.contains("thinking body"));
         assert!(details.contains("thinking body"));
+    }
+
+    fn agent_message_row() -> ChatEntry {
+        ChatEntry::AgentMessage(Box::new(crate::custom_message::AgentMessageRow {
+            participant: "from child lane".to_string(),
+            message: "hi".to_string(),
+        }))
+    }
+
+    fn shell_completion_row() -> ChatEntry {
+        ChatEntry::ShellCompletion(Box::new(crate::custom_message::ShellCompletionRow {
+            pid: Some(1),
+            exit_code: Some(0),
+            content: "[bash-done]".to_string(),
+        }))
+    }
+
+    /// TS `createConversationSpacing.shouldAddLeadingSpace` for one
+    /// spacing-driven row: scan back over hidden assistant rows, honor the
+    /// trailing space of a visible assistant, and sit flush against compact
+    /// neighbors (tool cards, agent messages, shell completions).
+    #[test]
+    fn conversation_leading_matches_ts_spacing_rules() {
+        let visible_assistant = || {
+            ChatEntry::Assistant(Box::new(AssistantMessage {
+                blocks: vec![MessageBlock::Text("done".to_string())],
+                has_tool_calls: true,
+                streaming: false,
+                error: None,
+                aborted: false,
+            }))
+        };
+        let tool_only_assistant = || {
+            ChatEntry::Assistant(Box::new(AssistantMessage {
+                blocks: Vec::new(),
+                has_tool_calls: true,
+                streaming: false,
+                error: None,
+                aborted: false,
+            }))
+        };
+        let user = || ChatEntry::User {
+            text: "hello".to_string(),
+        };
+
+        // Nothing preceding: the collapsed form leads with a blank, the
+        // expanded form sits flush against the top of the chat.
+        let view = view_with(vec![agent_message_row()]);
+        assert!(view.conversation_leading(0, false));
+        assert!(!view.conversation_leading(0, true));
+
+        // A user row is never a compact neighbor: both forms lead.
+        let view = view_with(vec![user(), agent_message_row()]);
+        assert!(view.conversation_leading(1, false));
+        assert!(view.conversation_leading(1, true));
+
+        // A visible assistant with tool calls carries the trailing space:
+        // the next agent message sits flush in both forms.
+        let view = view_with(vec![visible_assistant(), agent_message_row()]);
+        assert!(!view.conversation_leading(1, false));
+        assert!(!view.conversation_leading(1, true));
+
+        // A compact neighbor (tool card, shell completion, agent message):
+        // flush collapsed, blank expanded.
+        for neighbor in [
+            settled_tool_card("c1"),
+            shell_completion_row(),
+            agent_message_row(),
+        ] {
+            let view = view_with(vec![neighbor, agent_message_row()]);
+            assert!(!view.conversation_leading(1, false), "flush collapsed");
+            assert!(view.conversation_leading(1, true), "blank expanded");
+        }
+
+        // A tool-only assistant (no visible body) is a separator: the row
+        // after it keeps the trailing-space spacing in both forms.
+        let view = view_with(vec![tool_only_assistant(), agent_message_row()]);
+        assert!(!view.conversation_leading(1, false));
+        assert!(!view.conversation_leading(1, true));
+
+        // The backward scan returns at the first non-skippable row it
+        // meets: a user row NEWER than the tool-only assistant ends the
+        // scan, so the agent message leads (the separator is never
+        // reached).
+        let view = view_with(vec![tool_only_assistant(), user(), agent_message_row()]);
+        assert!(view.conversation_leading(2, false));
+        assert!(view.conversation_leading(2, true));
+        // With the separator NEWER than the non-compact row, the
+        // separator dominates (TS returns the tool separator with a
+        // trailing space), so the agent message renders flush.
+        let view = view_with(vec![user(), tool_only_assistant(), agent_message_row()]);
+        assert!(!view.conversation_leading(2, false));
+        assert!(!view.conversation_leading(2, true));
+        // A compact row older than the separator ends the scan WITHOUT the
+        // separator (TS falls through the `toolSeparator` branch to the
+        // compact row): flush collapsed, blank expanded.
+        let view = view_with(vec![
+            settled_tool_card("c2"),
+            tool_only_assistant(),
+            agent_message_row(),
+        ]);
+        assert!(!view.conversation_leading(2, false));
+        assert!(view.conversation_leading(2, true));
+
+        // A hidden thinking-only assistant contributes nothing to spacing:
+        // the scan skips it to the user row.
+        let hidden_assistant = || {
+            ChatEntry::Assistant(Box::new(AssistantMessage {
+                blocks: vec![MessageBlock::Thinking("quiet".to_string())],
+                has_tool_calls: false,
+                streaming: false,
+                error: None,
+                aborted: false,
+            }))
+        };
+        let mut view = view_with(vec![user(), hidden_assistant(), agent_message_row()]);
+        view.detail = Detail::Overview;
+        assert!(view.conversation_leading(2, false));
+    }
+
+    /// The custom rows render through the transcript path: the agent
+    /// message header plus its guttered body, and the shell-completion row.
+    #[test]
+    fn custom_rows_render_in_the_transcript() {
+        let mut view = view_with(vec![agent_message_row(), shell_completion_row()]);
+        view.detail = Detail::All;
+        let text = transcript_text(&mut view, 80);
+        assert!(text.contains("Agent message received \u{b7} from child lane"));
+        assert!(text.contains("\u{2570}\u{2500} hi"));
+        assert!(text.contains("Background shell command finished"));
+        assert!(text.contains("[bash-done]"));
     }
 
     /// A streaming assistant message updates across frames: its rows stay

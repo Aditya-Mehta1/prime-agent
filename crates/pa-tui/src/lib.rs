@@ -15,6 +15,7 @@ pub mod chrome;
 pub mod client_auth;
 pub mod code_preview;
 pub mod config_selector;
+pub mod custom_message;
 pub mod daemon_client;
 pub mod direct_transport;
 pub mod editor;

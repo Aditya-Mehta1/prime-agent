@@ -397,61 +397,11 @@ fn custom_row_update(message: &Value) -> Option<TurnUpdate> {
     }
 }
 
-/// The transcript entries for one `custom`-role message (`display` rows
-/// only; non-display and unrelated custom types render nothing).
+/// The transcript entries for one `custom`-role message: the custom-type
+/// dispatch lives in [`crate::custom_message::custom_message_entries`]
+/// (every entry type maps to its TS component).
 pub fn custom_message_entries(message: &Value) -> Vec<ChatEntry> {
-    use pa_types::slash_commands::{
-        SESSION_SLASH_COMMAND_CUSTOM_TYPE, SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
-    };
-    let custom_type = message
-        .get("customType")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let content = message_text(message);
-    let display = message
-        .get("display")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    if !display {
-        return Vec::new();
-    }
-    let is_command_row = custom_type == SESSION_SLASH_COMMAND_CUSTOM_TYPE;
-    let is_result_row = custom_type == SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE;
-    if !is_command_row && !is_result_row {
-        return Vec::new();
-    }
-    // The content must be a text payload and (echo rows) the command details
-    // must parse (TS `isSessionSlashCommandMessage`); otherwise the row
-    // renders the malformed notice.
-    let content_is_text = match message.get("content") {
-        Some(Value::String(_)) => true,
-        Some(Value::Array(blocks)) => {
-            blocks.len() == 1
-                && matches!(
-                    blocks[0].get("type").and_then(Value::as_str),
-                    Some("text") | None
-                )
-        }
-        _ => false,
-    };
-    let command_details_valid = message
-        .get("details")
-        .and_then(|details| details.get("command"))
-        .is_some_and(|command| {
-            command.get("name").is_some()
-                && command.get("args").is_some()
-                && command.get("text").is_some()
-        });
-    if !content_is_text || (is_command_row && !command_details_valid) {
-        return vec![ChatEntry::User {
-            text: "[Malformed session command message]".to_string(),
-        }];
-    }
-    if is_command_row {
-        vec![ChatEntry::SlashCommand { text: content }]
-    } else {
-        vec![ChatEntry::SlashCommandResult { content }]
-    }
+    crate::custom_message::custom_message_entries(message)
 }
 
 /// Concatenated text of a raw daemon message (string or block content).
@@ -1109,14 +1059,19 @@ mod tests {
             "display": false,
         });
         assert!(custom_message_entries(&hidden).is_empty());
-        // Unknown custom types render nothing.
+        // Unknown displayed custom types render the generic box (the TS
+        // live dispatch fallthrough; harness digests persist with
+        // display=false and render nothing).
         let other = json!({
             "role": "custom",
             "customType": "harness_digest",
             "content": "digest",
             "display": true,
         });
-        assert!(custom_message_entries(&other).is_empty());
+        assert!(matches!(
+            custom_message_entries(&other).as_slice(),
+            [ChatEntry::CustomPanel(_)]
+        ));
         // A command row without command details renders the malformed
         // notice (TS `isSessionSlashCommandMessage` fallback).
         let malformed = json!({

@@ -77,6 +77,16 @@ pub enum ChatEntry {
     /// One tool call and its execution state (rendered by
     /// [`crate::tool_card`]).
     Tool(Box<ToolCallCard>),
+    /// One received agent message (TS `AgentMessageComponent`).
+    AgentMessage(Box<crate::custom_message::AgentMessageRow>),
+    /// One injected prompt row (TS `InjectedPromptMessageComponent`).
+    InjectedPrompt(Box<crate::custom_message::InjectedPromptRow>),
+    /// One background-shell completion row (TS `ShellCompletionComponent`).
+    ShellCompletion(Box<crate::custom_message::ShellCompletionRow>),
+    /// One refinement outcome row (TS `RefinementOutcomeMessageComponent`).
+    RefinementOutcome(Box<crate::custom_message::RefinementOutcomeRow>),
+    /// One generic custom row (TS `CustomMessageComponent` box).
+    CustomPanel(Box<crate::custom_message::CustomPanelRow>),
 }
 
 // The card types live in `tool_card`; re-exported here because the
@@ -97,6 +107,20 @@ pub struct AssistantMessage {
     pub error: Option<String>,
     /// `stopReason: "aborted"` (drives the tool-call trailing spacer).
     pub aborted: bool,
+}
+
+impl AssistantMessage {
+    /// TS `AssistantMessageComponent.hasTrailingSpace`: the tool-call
+    /// separator renders for visible bodies, aborted messages, and messages
+    /// not following tool activity (the same condition `render_assistant`
+    /// applies).
+    pub fn has_trailing_space(&self, detail: Detail, preceded_by_tool_activity: bool) -> bool {
+        let has_visible_content = self.blocks.iter().any(|block| match block {
+            MessageBlock::Thinking(text) => detail.show_thinking() && !text.trim().is_empty(),
+            MessageBlock::Text(text) => !text.trim().is_empty(),
+        });
+        self.has_tool_calls && (has_visible_content || self.aborted || !preceded_by_tool_activity)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
