@@ -107,6 +107,9 @@ pub struct Supervisor {
     /// so the shutdown must interrupt it for the process to exit.
     shutdown_notify: tokio::sync::Notify,
     log: paths::RotatingLog,
+    /// Memoized ledger over the default sessions dir (ledgers are per
+    /// sessions-dir families; another dir gets a fresh instance).
+    rlm_ledger: tokio::sync::Mutex<Option<std::sync::Arc<crate::rlm_ledger::RlmSpawnLedger>>>,
 }
 
 impl Supervisor {
@@ -141,6 +144,7 @@ impl Supervisor {
             shutting_down: AtomicBool::new(false),
             shutdown_notify: tokio::sync::Notify::new(),
             log,
+            rlm_ledger: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -223,6 +227,49 @@ impl Supervisor {
 
     fn log_line(&self, message: &str) {
         self.log.append(&format!("[{}] {message}", util::now_iso()));
+    }
+
+    /// The spawn ledger for one sessions dir (TS `rlmSpawnLedgerFor`): the
+    /// default dir's ledger is memoized; any other dir constructs a fresh
+    /// instance (its seeding no-ops when its ledger file exists).
+    async fn rlm_spawn_ledger_for(
+        self: &Arc<Self>,
+        session_dir: Option<&str>,
+    ) -> std::sync::Arc<crate::rlm_ledger::RlmSpawnLedger> {
+        let default_dir = paths::sessions_dir(&self.options.agent_dir);
+        let requested = session_dir
+            .map(paths::expand_tilde)
+            .unwrap_or_else(|| default_dir.clone());
+        if requested != default_dir {
+            let log = paths::RotatingLog::new(paths::daemon_log_path(
+                &self.options.socket_path,
+                &self.options.agent_dir,
+            ));
+            return std::sync::Arc::new(crate::rlm_ledger::RlmSpawnLedger::new(
+                &self.options.agent_dir,
+                &requested,
+                move |message| {
+                    log.append(&format!("[{}] {message}", util::now_iso()));
+                },
+            ));
+        }
+        let mut cached = self.rlm_ledger.lock().await;
+        if let Some(ledger) = cached.as_ref() {
+            return std::sync::Arc::clone(ledger);
+        }
+        let log = paths::RotatingLog::new(paths::daemon_log_path(
+            &self.options.socket_path,
+            &self.options.agent_dir,
+        ));
+        let ledger = std::sync::Arc::new(crate::rlm_ledger::RlmSpawnLedger::new(
+            &self.options.agent_dir,
+            &requested,
+            move |message| {
+                log.append(&format!("[{}] {message}", util::now_iso()));
+            },
+        ));
+        *cached = Some(std::sync::Arc::clone(&ledger));
+        ledger
     }
 
     /// Adopt or relaunch persisted workers, concurrently: one dead worker's
@@ -765,6 +812,7 @@ impl Supervisor {
             name,
             config,
             telemetry_disabled,
+            runtime_metadata,
             ..
         } = create
         else {
@@ -872,6 +920,15 @@ impl Supervisor {
         for key in ["rlmDepth", "rlmMaxDepth", "parentSessionPath"] {
             if let Some(value) = config_object.and_then(|config| config.get(key)) {
                 durable_rest.insert(key.to_string(), value.clone());
+            }
+        }
+        // A child's RLM identity rides the durable create command too, so a
+        // respawned or adopted child stays identifiable for ledger appends.
+        if let Some(metadata) = &runtime_metadata {
+            for key in ["rlmChildId"] {
+                if let Some(value) = metadata.get(key) {
+                    durable_rest.insert(key.to_string(), value.clone());
+                }
             }
         }
         let descriptor = DaemonWorkerDescriptor {
@@ -1457,13 +1514,51 @@ impl Supervisor {
             }
         };
         let dir = session_dir
-            .map(|dir| crate::paths::expand_tilde(&dir))
+            .as_deref()
+            .map(crate::paths::expand_tilde)
             .unwrap_or_else(|| crate::paths::sessions_dir(&self.options.agent_dir));
         let scope_current = scope.as_str() == Some("current");
         let mut infos = crate::session_store::list_sessions(&dir);
         if scope_current {
             infos.retain(|info| info.cwd == cwd);
         }
+        // The saved catalog scan never visits session-artifacts, where RLM
+        // children persist: merge the passive ledger walk so a passivated
+        // descendant stays catalog-visible (TS
+        // `withPassiveRlmDescendantInfos`; a broken ledger degrades to the
+        // saved rows alone, it never fails the catalog).
+        let mut roots: Vec<crate::rlm_roster::RosterWalkRoot> = infos
+            .iter()
+            .map(|info| crate::rlm_roster::RosterWalkRoot {
+                session_file: info.path.clone(),
+                active_session_id: None,
+            })
+            .collect();
+        for resident in self.registry.list().await {
+            let descriptor = resident.descriptor.lock().await;
+            if let Some(session_file) = &descriptor.session_file {
+                roots.push(crate::rlm_roster::RosterWalkRoot {
+                    session_file: crate::lease::canonical_session_path(Path::new(session_file)),
+                    active_session_id: Some(descriptor.root_active_session_id.clone()),
+                });
+            }
+        }
+        let ledger = self.rlm_spawn_ledger_for(session_dir.as_deref()).await;
+        let passive = match crate::rlm_roster::walk_passive_rlm_children(&ledger, &roots) {
+            Ok(children) => children,
+            Err(error) => {
+                self.log_line(&format!(
+                    "Could not merge passive RLM descendants: {error:#}"
+                ));
+                Vec::new()
+            }
+        };
+        let mut merged = passive
+            .iter()
+            .map(crate::rlm_roster::passive_child_info)
+            .filter(|info| !scope_current || info.cwd == cwd)
+            .collect::<Vec<_>>();
+        infos.append(&mut merged);
         let total = infos.len();
         let mut lines = Vec::new();
         for (index, info) in infos.iter().enumerate() {
@@ -1508,34 +1603,87 @@ impl Supervisor {
         session_dir: Option<String>,
     ) -> DaemonResponse {
         let dir = session_dir
-            .map(|dir| paths::expand_tilde(&dir))
+            .as_deref()
+            .map(paths::expand_tilde)
             .unwrap_or_else(|| paths::sessions_dir(&self.options.agent_dir));
         let summaries: Vec<Value> = match all {
             Some(true) => {
+                // TS `buildSessionList` order: saved rows (resident ones
+                // replaced in place by their live summary), then passive
+                // ledger children, then resident-only rows.
                 let mut infos = list_sessions(&dir);
                 if let Some(cwd) = cwd {
                     infos.retain(|info| info.cwd == cwd);
                 }
-                infos
-                    .into_iter()
-                    .map(|info| saved_session_summary(&info))
-                    .collect()
+                let residents = self.registry.list().await;
+                let mut resident_by_file: Vec<ResidentRoot> = Vec::new();
+                for resident in residents.iter() {
+                    let descriptor = resident.descriptor.lock().await;
+                    if let Some(session_file) = &descriptor.session_file {
+                        resident_by_file.push(ResidentRoot {
+                            session_file: crate::lease::canonical_session_path(Path::new(
+                                session_file,
+                            )),
+                            resident: Arc::clone(resident),
+                            // Resident roots carry their active session id
+                            // so passive children of a resident parent
+                            // report parentActiveSessionId.
+                            active_session_id: Some(descriptor.root_active_session_id.clone()),
+                        });
+                    }
+                }
+                let mut summaries = Vec::new();
+                let mut roots: Vec<crate::rlm_roster::RosterWalkRoot> = Vec::new();
+                for info in &infos {
+                    roots.push(crate::rlm_roster::RosterWalkRoot {
+                        session_file: info.path.clone(),
+                        active_session_id: None,
+                    });
+                    let canonical = crate::lease::canonical_session_path(&info.path);
+                    let resident = resident_by_file
+                        .iter()
+                        .position(|root| root.session_file == canonical)
+                        .map(|at| resident_by_file.swap_remove(at));
+                    match resident {
+                        Some(root) => {
+                            roots.last_mut().expect("saved root").active_session_id =
+                                root.active_session_id;
+                            summaries.push(self.worker_summary(&root.resident).await);
+                        }
+                        None => summaries.push(saved_session_summary(info)),
+                    }
+                }
+                let mut resident_only = Vec::new();
+                for root in resident_by_file {
+                    roots.push(crate::rlm_roster::RosterWalkRoot {
+                        session_file: root.session_file,
+                        active_session_id: root.active_session_id,
+                    });
+                    resident_only.push(self.worker_summary(&root.resident).await);
+                }
+                let ledger = self.rlm_spawn_ledger_for(session_dir.as_deref()).await;
+                match crate::rlm_roster::walk_passive_rlm_children(&ledger, &roots) {
+                    Ok(children) => {
+                        for child in &children {
+                            summaries.push(crate::rlm_roster::passive_child_summary(child));
+                        }
+                    }
+                    Err(error) => {
+                        let message = format!("Could not walk passive RLM children: {error:#}");
+                        self.log_line(&message);
+                        return response_failure(Some(&command_id), &type_name, &message, None);
+                    }
+                }
+                // TS `buildSessionList` order: saved rows, passive children,
+                // then resident-only rows.
+                summaries.append(&mut resident_only);
+                summaries
             }
             _ => {
                 // Live residents of this supervisor.
                 let mut summaries = Vec::new();
                 for resident in self.registry.list().await {
-                    let response = self
-                        .route_command(&resident, "get_state", json!({}), ROUTE_TIMEOUT_MS)
-                        .await;
-                    match response {
-                        Ok(response) if response.success => {
-                            if let Some(data) = response.data {
-                                summaries.push(data);
-                            }
-                        }
-                        _ => summaries.push(offline_summary(&resident.worker_id)),
-                    }
+                    summaries.push(self.worker_summary(&resident).await);
                 }
                 summaries
             }
@@ -1545,6 +1693,103 @@ impl Supervisor {
             &type_name,
             Some(json!({ "sessions": summaries })),
         )
+    }
+
+    /// Persist one subagent deletion (TS `recordRlmSubagentDeletion`): the
+    /// ledger delete record is the topology tombstone, the display file gets
+    /// a status tombstone for hydration. The child's transcript stays (a
+    /// tombstoned-but-undeleted file is the accepted orphan of a failed
+    /// teardown); the row disappears from rosters because live-edge reads
+    /// drop tombstones.
+    async fn tombstone_rlm_child(
+        self: &Arc<Self>,
+        resident: &Arc<ResidentWorker>,
+        child_id: Option<&str>,
+        reason: crate::rlm_ledger::RlmLedgerDeleteReason,
+    ) -> Result<()> {
+        let (session_file, session_dir, child_id) = {
+            let descriptor = resident.descriptor.lock().await;
+            let session_file = descriptor
+                .session_file
+                .clone()
+                .ok_or_else(|| anyhow!("deleted RLM subagent has no session file"))?;
+            let session_dir = descriptor
+                .create_command
+                .rest
+                .get("sessionDir")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    Path::new(&session_file)
+                        .parent()
+                        .map(|dir| dir.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                });
+            (
+                session_file,
+                session_dir,
+                child_id.map(str::to_string).or_else(|| {
+                    descriptor
+                        .create_command
+                        .rest
+                        .get("rlmChildId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                }),
+            )
+        };
+        let Some(child_id) = child_id else {
+            anyhow::bail!("deleted RLM subagent is missing its child id");
+        };
+        let ledger = self.rlm_spawn_ledger_for(None).await;
+        ledger
+            .append_delete(&child_id, &session_file, reason)
+            .with_context(|| format!("tombstone RLM subagent {child_id}"))?;
+        // The display tombstone keeps the child's identity for hydration
+        // retries; best-effort because the ledger tombstone is the
+        // authority.
+        let display = crate::rlm_ledger::read_rlm_subagent_display(Path::new(&session_dir));
+        let tombstone = crate::rlm_ledger::RlmSubagentDisplayEntry {
+            type_tag: "rlm_subagent".to_string(),
+            child_id: child_id.clone(),
+            session_name: display
+                .as_ref()
+                .map(|entry| entry.session_name.clone())
+                .unwrap_or_default(),
+            session_dir,
+            session_file: display
+                .as_ref()
+                .map(|entry| entry.session_file.clone())
+                .unwrap_or_else(|| session_file.clone()),
+            rlm_parent_node_id: display
+                .as_ref()
+                .and_then(|entry| entry.rlm_parent_node_id.clone()),
+            prompt: display.as_ref().and_then(|entry| entry.prompt.clone()),
+            spawn_code: display.as_ref().and_then(|entry| entry.spawn_code.clone()),
+            model: display.as_ref().and_then(|entry| entry.model.clone()),
+            status: "deleted".to_string(),
+            created_at: display.as_ref().map(|entry| entry.created_at).unwrap_or(0),
+        };
+        if let Err(error) = crate::rlm_ledger::write_rlm_subagent_display(&tombstone) {
+            self.log_line(&format!(
+                "failed to reconcile display entry for tombstoned RLM subagent {child_id}: {error:#}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// One resident's live summary (`get_state`), with the recovering-row
+    /// fallback for an unreachable worker.
+    async fn worker_summary(self: &Arc<Self>, resident: &Arc<ResidentWorker>) -> Value {
+        let response = self
+            .route_command(resident, "get_state", json!({}), ROUTE_TIMEOUT_MS)
+            .await;
+        match response {
+            Ok(response) if response.success => response
+                .data
+                .unwrap_or_else(|| offline_summary(&resident.worker_id)),
+            _ => offline_summary(&resident.worker_id),
+        }
     }
 
     async fn handle_create(
@@ -1566,10 +1811,131 @@ impl Supervisor {
         let summary = response
             .data
             .unwrap_or_else(|| json!({ "id": resident.worker_id }));
+        // Spawn admission is the moment the supervisor knows the child's
+        // edge firsthand. The ledger is the only topology store, so the
+        // append's outcome is load-bearing: admission fails if the spawn
+        // record cannot be made durable (a swallowed failure would admit a
+        // child that listing and hydration can never find after
+        // passivation).
+        if let Err(error) = self.record_rlm_child_admission(command, &summary).await {
+            // Never leave an admitted-but-unrecorded child running: the
+            // ledger is the only topology store.
+            let _ = self.stop_worker(&resident).await;
+            return Err(error);
+        }
         // The new session joins the agent roster immediately (subscribers
         // see the roster_update before their next list).
         self.write_roster_summary(&summary, Some(&resident.worker_id));
         Ok(summary)
+    }
+
+    /// Record one RLM child admission: the spawn edge in the daemon-owned
+    /// ledger (durable topology) and the child's display file (hydration
+    /// metadata). No-op for top-level sessions.
+    async fn record_rlm_child_admission(
+        self: &Arc<Self>,
+        command: &DaemonCommand,
+        summary: &Value,
+    ) -> Result<()> {
+        let DaemonCommand::Create {
+            name,
+            config,
+            runtime_metadata,
+            ..
+        } = command
+        else {
+            return Ok(());
+        };
+        let Some(metadata) = runtime_metadata else {
+            return Ok(());
+        };
+        if metadata.get("kind").and_then(Value::as_str) != Some("subagent") {
+            return Ok(());
+        }
+        let child_id = metadata
+            .get("rlmChildId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("RLM child admission is missing rlmChildId"))?
+            .to_string();
+        let depth = metadata
+            .get("rlmDepth")
+            .and_then(Value::as_u64)
+            .unwrap_or(1) as u32;
+        let parent = metadata
+            .get("parentSessionFile")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("RLM child admission is missing parentSessionFile"))?;
+        let child = summary
+            .get("sessionFile")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("RLM child admission is missing the child session file"))?;
+        let session_name = summary
+            .get("sessionName")
+            .and_then(Value::as_str)
+            .or(name.as_deref())
+            .unwrap_or_default()
+            .to_string();
+        let session_dir = config
+            .as_ref()
+            .and_then(|config| config.get("sessionDir"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                Path::new(child)
+                    .parent()
+                    .map(|dir| dir.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            });
+        let ledger = self.rlm_spawn_ledger_for(None).await;
+        ledger
+            .append_spawn(crate::rlm_ledger::RlmSpawnInput {
+                child_id: child_id.clone(),
+                parent: parent.to_string(),
+                child: child.to_string(),
+                depth,
+                name: session_name.clone(),
+            })
+            .inspect_err(|error| {
+                self.log_line(&format!("failed to append RLM ledger spawn: {error:#}"))
+            })?;
+        let display = crate::rlm_ledger::RlmSubagentDisplayEntry {
+            type_tag: "rlm_subagent".to_string(),
+            child_id,
+            session_name,
+            session_dir,
+            session_file: child.to_string(),
+            rlm_parent_node_id: metadata
+                .get("rlmParentNodeId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            prompt: metadata
+                .get("prompt")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            spawn_code: metadata
+                .get("spawnCode")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            model: metadata.get("model").cloned(),
+            status: "running".to_string(),
+            created_at: metadata
+                .get("createdAt")
+                .and_then(Value::as_u64)
+                .unwrap_or_else(crate::util::now_ms),
+        };
+        let written =
+            crate::rlm_ledger::write_rlm_subagent_display(&display).inspect_err(|error| {
+                self.log_line(&format!(
+                    "failed to persist RLM subagent display entry: {error:#}"
+                ))
+            })?;
+        if !written {
+            self.log_line(&format!(
+                "skipped RLM subagent display entry for {}: deleted tombstone exists",
+                display.child_id
+            ));
+        }
+        Ok(())
     }
 
     async fn assert_session_name_available(self: &Arc<Self>, name: &str) -> Result<()> {
@@ -1619,6 +1985,38 @@ impl Supervisor {
                 false,
             );
         };
+        // A delete flows through the kill route with the `rlmLedgerDelete`
+        // marker (the parent-side `delete_subagent`). The deletion boundary
+        // is persisted BEFORE the teardown (TS `recordRlmSubagentDeletion`):
+        // a failed tombstone is a failed deletion with the child still
+        // alive and retryable; a plain stop carries no marker and must not
+        // tombstone the child - its passive row survives the stop.
+        if let DaemonCommand::Kill { rest, .. } = command {
+            if let Some(reason) = rest
+                .get("rlmLedgerDelete")
+                .and_then(Value::as_str)
+                .and_then(crate::rlm_ledger::RlmLedgerDeleteReason::from_wire)
+            {
+                let child_id = rest
+                    .get("rlmChildId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if let Err(error) = self
+                    .tombstone_rlm_child(&resident, child_id.as_deref(), reason)
+                    .await
+                {
+                    return (
+                        vec![response_line(&response_failure(
+                            Some(&command_id),
+                            &type_name,
+                            &format!("Failed to delete RLM subagent: {error:#}"),
+                            None,
+                        ))],
+                        false,
+                    );
+                }
+            }
+        }
         if let DaemonCommand::Attach {
             telemetry_disabled: Some(true),
             ..
@@ -1747,6 +2145,34 @@ impl Supervisor {
                 if let DaemonCommand::Kill { .. } = command {
                     if response.success {
                         self.stop_worker(&resident).await;
+                    }
+                }
+                if let DaemonCommand::Rename { name, .. } = command {
+                    // A subagent rename is durable in the ledger, so the
+                    // passive roster keeps the new name after passivation.
+                    if response.success {
+                        let descriptor = resident.descriptor.lock().await;
+                        let is_child = descriptor
+                            .create_command
+                            .rest
+                            .get("rlmDepth")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0)
+                            >= 1;
+                        let session_file = descriptor.session_file.clone();
+                        drop(descriptor);
+                        if is_child {
+                            if let Some(session_file) = session_file {
+                                let ledger = self.rlm_spawn_ledger_for(None).await;
+                                if let Err(error) =
+                                    ledger.append_rename_by_child_path(&session_file, name)
+                                {
+                                    self.log_line(&format!(
+                                        "failed to append RLM ledger rename: {error:#}"
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
                 if let DaemonCommand::RetryWorker { .. } = command {
@@ -1901,6 +2327,13 @@ fn client_command_payload(
         }
     }
     Ok((type_name, payload))
+}
+
+/// One resident's roster identity for the `list --all` merge.
+struct ResidentRoot {
+    session_file: PathBuf,
+    resident: Arc<ResidentWorker>,
+    active_session_id: Option<String>,
 }
 
 fn saved_session_summary(info: &crate::session_store::SessionInfo) -> Value {

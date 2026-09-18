@@ -225,12 +225,34 @@ async fn rlm_children_spawn_roster_collect_delete_end_to_end() {
         .join("parent-session-uuid")
         .join(&handle.rlm_child_id);
     assert_eq!(handle.session_dir, expected_dir.to_string_lossy());
+    // TS child-session layout: the child persists inside its per-child
+    // directory under the parent's session-artifacts tree, alongside the
+    // per-child display file the passive roster reads for hydration.
     let child_files: Vec<std::fs::DirEntry> = std::fs::read_dir(&expected_dir)
         .expect("child session dir")
         .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("jsonl")
+        })
         .collect();
     assert_eq!(child_files.len(), 1, "one session file in the child dir");
     assert!(child_files[0].path().to_string_lossy().ends_with(".jsonl"));
+    let display: Value = serde_json::from_str(
+        &std::fs::read_to_string(expected_dir.join("rlm-subagent.json")).expect("display file"),
+    )
+    .expect("parse display file");
+    assert_eq!(display["type"], "rlm_subagent");
+    assert_eq!(display["childId"], handle.rlm_child_id);
+    assert_eq!(display["sessionName"], "worker-a");
+    assert_eq!(display["status"], "running");
+    assert_eq!(
+        display["model"],
+        json!({ "provider": "scripted", "modelId": "faux-1" })
+    );
     // The child session header records the recursion identity (TS parity:
     // parentSession + rlmDepth on child sessions).
     let header: Value = {

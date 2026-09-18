@@ -118,27 +118,52 @@ fn digest_user_message(digest: &str, timestamp: i64) -> UserMessage {
     }
 }
 
-/// The newest digest recorded in the persisted context (custom digest entries
-/// and compaction heads), mirroring `_latestContextHarnessDigest`.
-pub fn latest_digest_from_entries(entries: &[FileEntry]) -> Option<String> {
-    entries
-        .iter()
-        .filter_map(|entry| match entry {
-            FileEntry::CustomMessage { payload, .. }
-                if payload.custom_type == super::headless::HARNESS_DIGEST_CUSTOM_TYPE =>
-            {
-                payload
-                    .details
-                    .as_ref()
-                    .and_then(|details| details.get("digest"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            }
-            FileEntry::Compaction { payload, .. } => payload.harness_digest.clone(),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .pop()
+/// The raw digest carried by one loop-context user row, when it carries the
+/// digest frame (standalone digest rows and the digest block that leads a
+/// compaction-summary row).
+fn digest_from_frame(text: &str) -> Option<&str> {
+    let after_prefix = text
+        .strip_prefix(super::messages::HARNESS_DIGEST_PREFIX)
+        .or_else(|| {
+            text.find(super::messages::HARNESS_DIGEST_PREFIX)
+                .map(|at| &text[at + super::messages::HARNESS_DIGEST_PREFIX.len()..])
+        })?;
+    let end = after_prefix
+        .find(super::messages::HARNESS_DIGEST_SUFFIX)
+        .map(|at| &after_prefix[..at])?;
+    Some(end.trim_end_matches('\n'))
+}
+
+/// The newest digest recorded in the live loop context (TS
+/// `_latestContextHarnessDigest`): digest rows and compaction-summary digest
+/// blocks, both of which are user turns after context conversion. Recency is
+/// by timestamp, not position - retained pre-compaction rows follow the
+/// compaction head, and out-of-context file entries must never suppress a
+/// cold-boundary delivery.
+pub fn latest_context_digest(messages: &[AgentMessage]) -> Option<String> {
+    let mut latest: Option<(i64, &str)> = None;
+    for message in messages {
+        let AgentMessage::Standard(Message::User(user)) = message else {
+            continue;
+        };
+        let text = match &user.content {
+            UserContent::Text(text) => text.as_str(),
+            UserContent::Parts(parts) => parts
+                .iter()
+                .find_map(|part| match part {
+                    UserPart::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .unwrap_or(""),
+        };
+        let Some(digest) = digest_from_frame(text) else {
+            continue;
+        };
+        if latest.is_none_or(|(timestamp, _)| user.timestamp > timestamp) {
+            latest = Some((user.timestamp, digest));
+        }
+    }
+    latest.map(|(_, digest)| digest.to_string())
 }
 
 /// Session-local harness state directory implied by a conversation-log path
@@ -226,17 +251,19 @@ impl super::AgentSession {
             return Ok(());
         };
         let recent_texts = self.recent_message_texts_newest_first().await;
-        let (digest, latest) = {
+        let goal = {
             let session = self.session.lock().await;
-            let goal = super::goal_driver::GoalDriver::load_persisted(&session)
+            super::goal_driver::GoalDriver::load_persisted(&session)
                 .state()
                 .objective
-                .clone();
-            let terms = digest_query_terms(goal.as_deref(), &recent_texts);
-            let digest = harness_digest_text(&context, terms);
-            let latest = latest_digest_from_entries(session.get_all_entries());
-            (digest, latest)
+                .clone()
         };
+        let terms = digest_query_terms(goal.as_deref(), &recent_texts);
+        let digest = harness_digest_text(&context, terms);
+        // Staleness is against the live loop context only (TS
+        // `_latestContextHarnessDigest`): pruned file entries are not
+        // in-context digests and must not suppress delivery.
+        let latest = latest_context_digest(&self.agent.state().await.messages);
         if latest.as_deref() == Some(digest.as_str()) {
             return Ok(());
         }
@@ -343,8 +370,15 @@ mod tests {
         let id = persist_digest(&mut session, "digest body");
         let _ = id;
         let entries = session.get_all_entries().to_vec();
+        let FileEntry::CustomMessage { payload, .. } = &entries[1] else {
+            panic!("expected digest entry");
+        };
         assert_eq!(
-            latest_digest_from_entries(&entries).as_deref(),
+            payload
+                .details
+                .as_ref()
+                .and_then(|details| details.get("digest"))
+                .and_then(serde_json::Value::as_str),
             Some("digest body")
         );
         let message = digest_session_message(&entries[1]).expect("digest entry");
@@ -365,5 +399,48 @@ mod tests {
                 |part| matches!(part, UserPart::Text(text) if text.text.contains("[harness-digest]"))
             )),
         }
+        // The loop-context staleness view reads the digest out of the frame,
+        // so a delivered digest row suppresses re-delivery while it is the
+        // newest (TS `_latestContextHarnessDigest`).
+        let mut context = vec![loop_message.clone()];
+        assert_eq!(
+            latest_context_digest(&context).as_deref(),
+            Some("digest body")
+        );
+        let mut later = harness_digest_loop_message("newer digest", 2);
+        if let AgentMessage::Standard(Message::User(user)) = &mut later {
+            user.timestamp = 2;
+        }
+        context.push(later);
+        assert_eq!(
+            latest_context_digest(&context).as_deref(),
+            Some("newer digest")
+        );
+        // A context with no digest rows never suppresses delivery.
+        assert_eq!(latest_context_digest(&[]), None);
+    }
+
+    #[test]
+    fn out_of_context_file_entries_never_count_as_context_digests() {
+        // A compaction-summary user row carries its digest block first; the
+        // frame reader extracts that digest, and a compaction row without a
+        // digest block contributes nothing.
+        let summary = harness_digest_loop_message("compaction head digest", 5);
+        let mut wrapped = match summary {
+            AgentMessage::Standard(Message::User(mut user)) => {
+                user.content = UserContent::Text(format!(
+                    "{HARNESS_DIGEST_PREFIX}compaction head digest{HARNESS_DIGEST_SUFFIX}\n\n[compaction] summary text"
+                ));
+                AgentMessage::Standard(Message::User(user))
+            }
+            other => other,
+        };
+        if let AgentMessage::Standard(Message::User(user)) = &mut wrapped {
+            user.timestamp = 5;
+        }
+        assert_eq!(
+            latest_context_digest(&[wrapped]).as_deref(),
+            Some("compaction head digest")
+        );
     }
 }

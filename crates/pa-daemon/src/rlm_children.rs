@@ -305,6 +305,11 @@ impl SupervisorChildSessionsInner {
             if prompt.len() <= RUNTIME_METADATA_PROMPT_MAX {
                 metadata["prompt"] = json!(prompt);
             }
+            // The resolved model rides the metadata so the supervisor's
+            // display entry carries it for passive hydration.
+            if let Some((provider, model_id)) = model.split_once('/') {
+                metadata["model"] = json!({ "provider": provider, "modelId": model_id });
+            }
             metadata
         });
         let create = DaemonCommand::Create {
@@ -700,7 +705,19 @@ impl RlmSubagentHost for SupervisorChildSessions {
             let active_session_id = record.lock().await.active_session_id.clone();
             // Kill first: a failed kill keeps the child tracked so the caller
             // can retry; a successful kill removes it from the registry.
-            this.kill_child(&active_session_id)
+            // The `rlmLedgerDelete` marker tells the supervisor this kill
+            // is a delete (a plain stop must not tombstone the child).
+            let record_guard = record.lock().await;
+            let command = DaemonCommand::Kill {
+                id: None,
+                active_session_id: active_session_id.clone(),
+                rest: serde_json::Map::from_iter([
+                    ("rlmLedgerDelete".to_string(), json!("user")),
+                    ("rlmChildId".to_string(), json!(record_guard.rlm_child_id)),
+                ]),
+            };
+            drop(record_guard);
+            this.command(&command, KILL_TIMEOUT_MS)
                 .await
                 .with_context(|| format!("kill RLM child \"{target}\""))?;
             let entry = {

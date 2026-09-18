@@ -27,7 +27,16 @@ routed `send_message` as the never-retried fallback), wire protocol serve/negoti
 `roster_update` pushes keyed by the TS roster `agentId` = session id, and
 authenticated `worker_roster_delta` self-reports so live status reaches
 subscribers without polling), cloud sandbox attach, session
-leases (`core/session-lease.ts` port). Supervisor-backed RLM child sessions
+leases (`core/session-lease.ts` port). Daemon-owned RLM spawn ledger (`rlm_ledger.rs`):
+one append-only JSONL per sessions dir (spawn/rename/delete admissions with
+the TS `rlm-ledger.ts` record grammar, bounds, stat-guarded replay, and
+legacy-registry seeding) plus the per-child display files; family topology
+is read from the ledger, never re-derived from session files. Passive-RLM
+roster walk (`rlm_roster.rs`): `list --all` and the saved-session catalog
+merge non-resident ledger children (walk roots = saved + resident session
+files), so passivated children stay roster-visible (TS
+`walkPassiveRlmSubagents` / `withPassiveRlmDescendantInfos`).
+Supervisor-backed RLM child sessions
 (`rlm_children.rs`, the daemon side of the pa-core `RlmSubagentHost` seam):
 `rlm.spawn`/`rlm.create_session` create real daemon sessions through the
 worker's supervisor link - one supervised worker process per child - and the

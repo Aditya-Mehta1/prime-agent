@@ -537,3 +537,70 @@ HEAD
   binary with fixture verifier scripts (counter-file verifier + always-fail
   verifier) over the faux provider in isolated HOMEs — no network, no daemon
   sockets.
+
+
+## Passive-RLM roster + ledger (roster-wire lane)
+
+- `crates/pa-daemon/src/rlm_ledger.rs` (port of
+  `modes/daemon/rlm-ledger.ts`): the daemon-owned RLM spawn ledger, one
+  append-only JSONL per sessions dir (`<agent-dir>/rlm-ledger/<sha256-16-of-canonical-dir>.jsonl`),
+  same record grammar (v:1 meta/spawn/rename/delete, unknown-op forward
+  compat, version violations fail closed), same read bounds (32MiB /
+  100k records), stat-guarded replay cache keyed on size+mtime+inode, and
+  legacy per-parent `rlm-subagents.jsonl` seeding with the atomic
+  no-clobber hard-link publish. The rename/delete record join falls back
+  to a sole childId edge (the symlink-retarget case). Per-child display
+  files (`rlm-subagent.json`) port `rlm-subagent-display.ts` including the
+  deleted-tombstone refusal.
+- `crates/pa-daemon/src/rlm_roster.rs` (port of
+  `walkPassiveRlmSubagents` + `withPassiveRlmDescendantInfos`): the
+  passive roster walk roots at every saved session file plus every resident
+  session file; live ledger edges group children by canonical parent path;
+  resident children contribute no row (their row comes from the live
+  registry) but stay walk roots for their own children; every other live
+  child's file is read for display data with the edge as the only topology
+  authority (fork headers never trusted). Row shapes match the TS
+  `buildSessionListWithPassiveRlmSubagents` enrichment (runtimeKind
+  subagent, rlmChildId, parentSessionPath, parentActiveSessionId when the
+  direct parent is resident, rlmParentNodeId fallback to the childId,
+  spawnCode from display/legacy metadata) and `inactiveLifecycleForSession`.
+- Supervisor admission moments mirror the TS daemon: `recordRlmSubagentState`
+  (spawn edge + display entry at create, admission fails if the spawn record
+  cannot be made durable), `recordRlmSubagentDeletion` (delete tombstones
+  BEFORE teardown; the parent-side `delete_subagent` kill carries an
+  `rlmLedgerDelete` marker so a plain `stop` never tombstones), and
+  `appendRlmLedgerRenameForState` (rename by child path, offline-safe).
+- `list --all` now composes TS `buildSessionList`: saved rows first with
+  resident replacements in place, then passive children, then resident-only
+  rows; a broken ledger fails the list command (TS propagates the walk
+  error) while the saved-session catalog degrades to the saved rows
+  (TS `withPassiveRlmDescendantInfos` catches).
+- Mechanism difference: TS memoizes the passive walk with stat
+  fingerprints (`passiveRlmSubagentMemo`); the Rust supervisor reads the
+  ledger behind its own stat guard and re-walks per list. `family()` /
+  `siblings()` ledger reads are not needed by any Rust surface yet and were
+  not ported.
+- Verifier: `crates/pa-daemon/tests/rlm_roster_walk_e2e.rs` — a synthetic
+  1,000-child ledger plus persisted child files yields the full 1,001-row
+  `list --all` roster against the real supervisor, performance-bounded
+  (TS reference: 1,001 rows in 0.78s).
+
+## Provider wire diff (roster-wire lane)
+
+- Field-by-field request-body diff against the TS binary (same transcript
+  replayed on both, mock provider capturing bodies; see the PR body table):
+  message serialization is byte-size identical for user/assistant rows,
+  tool calls, tool results, and cross-model thinking-as-text replay; the
+  only systematic differences are the layered system prompt (by design)
+  and the single-text-block user row shape (TS content array vs Rust plain
+  string, -28 bytes/row, same text).
+- One real omission found and fixed: Rust compared harness-digest
+  staleness against ALL session entries
+  (`latest_digest_from_entries(get_all_entries())`), so a digest stored
+  before a refinement/compaction context boundary suppressed re-delivery
+  even though it was no longer in the loop context. TS
+  `_latestContextHarnessDigest` scans `agent.state.messages` only, by
+  timestamp. Ported as `latest_context_digest` (frame-scoped, timestamp
+  recency); a refinement-boundary resume now re-injects the
+  `[harness-digest]` user row exactly like TS (verified end-to-end against
+  the TS binary).

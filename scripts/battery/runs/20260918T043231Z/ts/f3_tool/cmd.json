@@ -1,0 +1,19 @@
+{
+ "argv": [
+  "prime-agent",
+  "-p",
+  "--daemon-socket",
+  "/home/ubuntu/lane-worktrees/roster-wire/scripts/battery/runs/20260918T043231Z/ts/daemon.sock",
+  "--provider",
+  "prime-inference",
+  "--model",
+  "mock-1",
+  "--offline",
+  "Run the tool"
+ ],
+ "exit_code": 0,
+ "stdout": "tool turn done\n",
+ "stderr": "",
+ "duration_s": 47.41,
+ "timeout": false
+}

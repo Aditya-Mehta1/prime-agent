@@ -28,6 +28,8 @@ pub mod registration;
 pub(crate) mod registry;
 pub mod rlm_child_model;
 pub mod rlm_children;
+pub mod rlm_ledger;
+pub(crate) mod rlm_roster;
 pub(crate) mod session_commands;
 pub mod session_stats;
 pub mod session_store;

@@ -1,0 +1,15 @@
+[2026-09-18T04:28:49.353Z] supervisor: Prime Agent daemon supervisor 32a4adbb-7a30-4117-8827-52f4b58684a7 listening on /home/ubuntu/lane-worktrees/roster-wire/scripts/battery/runs/20260918T042841Z/ts/daemon.sock
+[2026-09-18T04:28:52.302Z] supervisor: Session worker 67d62b06c84b stderr: Prime Agent daemon listening on /tmp/vbat20260918T042841Z-ts/prime-agent-1000/worker-de9565fae228-67d62b06c84b.sock
+[2026-09-18T04:28:53.282Z] supervisor: Session worker 67d62b06c84b stderr: shutdown command received over socket; 1 active session(s) will be closed
+[2026-09-18T04:28:53.282Z] supervisor: Session worker 67d62b06c84b stderr: shutting down (exit 0); closing 1 active session(s)
+[2026-09-18T04:28:58.598Z] supervisor: Session worker cc42fcac0e86 stderr: Prime Agent daemon listening on /tmp/vbat20260918T042841Z-ts/prime-agent-1000/worker-de9565fae228-cc42fcac0e86.sock
+[2026-09-18T04:29:05.955Z] supervisor: Session worker cc42fcac0e86 stderr: shutdown command received over socket; 1 active session(s) will be closed
+[2026-09-18T04:29:05.955Z] supervisor: Session worker cc42fcac0e86 stderr: shutting down (exit 0); closing 1 active session(s)
+[2026-09-18T04:29:54.123Z] supervisor: Session worker db7acb45f80b stderr: Prime Agent daemon listening on /tmp/vbat20260918T042841Z-ts/prime-agent-1000/worker-de9565fae228-db7acb45f80b.sock
+[2026-09-18T04:30:00.863Z] supervisor: Supervisor command create failed: SessionAlreadyActiveError: Session is already active in 2a5fee61639c: /home/ubuntu/lane-worktrees/roster-wire/scripts/battery/runs/20260918T042841Z/ts/agent/sessions/01a0b2c7-326d-7121-94a2-d3c547af9c54.jsonl
+    at assertWorkerCreateOwner (/$bunfs/root/prime-agent:2190:35183)
+    at reuseWorkerForCreate (/$bunfs/root/prime-agent:2190:34316)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:11504)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T04:30:05.434Z] supervisor: Session worker db7acb45f80b stderr: shutting down (exit 0); closing 0 active session(s)
