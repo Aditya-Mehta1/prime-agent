@@ -108,6 +108,7 @@ mod command;
 pub mod framing;
 mod outbound;
 mod plane;
+pub mod update_flow;
 mod worker;
 
 pub use command::{
@@ -121,6 +122,18 @@ pub use outbound::{
     DaemonSessionClosedReason, DaemonSessionSnapshot, SnapshotPurpose, SocketIdentity,
 };
 pub use plane::{command_plane, is_session_plane_daemon_command, DaemonCommandPlane};
+pub use update_flow::{
+    legacy_update_restart_status, legacy_update_restarts_dir, prepared_marker_expiry,
+    socket_update_dir, update_intent_path, update_marker_path, update_prepared_dir,
+    update_restarts_dir, update_roster_path, update_status_path, update_transition_allowed,
+    PreparedMarkerExpiry, UpdateHeartbeatDeliveryMode, UpdateHeartbeatStatus, UpdateId,
+    UpdateIntent, UpdatePreparedMarker, UpdateProcessIdentity, UpdateRoster, UpdateRosterBinary,
+    UpdateRosterHeartbeat, UpdateRosterInFlight, UpdateRosterQueue, UpdateRosterSession,
+    UpdateRosterSessionKind, UpdateRosterSubagent, UpdateRosterSubagentStatus, UpdateRosterWorker,
+    UpdateState, UpdateStatus, UpdateStatusCounts, UpdateStatusFailure, UpdateSupervisorIdentity,
+    UpdateTimeoutBudget, UPDATE_ENV_PREFIX, UPDATE_ROSTER_FORMAT_VERSION,
+    UPDATE_STATUS_FORMAT_VERSION,
+};
 pub use worker::{
     DaemonPeerCommand, DaemonUpdateRestartManifest, DaemonUpdateRestartQueue,
     DaemonUpdateRestartSession, DaemonWorkerCommand, DaemonWorkerDescriptor,

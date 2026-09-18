@@ -15,6 +15,15 @@ Daemon wire mechanics shared by the serving side (pa-daemon) and clients (pa-tui
   product keeps the same single table in core and imports it from its TUI.
 - `extension_rpc`: the private, versioned NDJSON-over-stdio protocol between the pa-core extension host and the Node sidecar (handshake, RPC envelopes, registration payloads, `ExtensionError`). Both ends ship in the same release, so these types are strict (no catch-alls).
 
+- `daemon::update_flow`: the update-flow state machine's shared vocabulary
+  (docs/update-flow-state-machine.md): the coordinator FSM states + legal
+  transition table, `UpdateId`, the on-disk artifact schemas (`intent.json`,
+  `status.json` — TS status-file shape, `prepared/<id>/{roster,marker}.json`),
+  the roster-snapshot projection (sessions/workers/subagents/heartbeats,
+  durable session ids, heartbeat re-arm fields only), the timeout-budget
+  table with `PRIME_AGENT_UPDATE_*_MS` overrides, and the artifact path
+  layout under `<agent-dir>/update-restarts/`. Pure serde + pure data
+  helpers; the FSM drivers and watchdogs are owned by pa-daemon/pa-cli.
 Platform contracts (`platform`): the cross-crate transport, process-identity, socket-identity, and home-dir helpers (`platform::dirs::home_dir`: `HOME`, then on Windows `USERPROFILE` / `HOMEDRIVE`+`HOMEPATH` - Node `os.homedir()` parity, returning `None` so each caller owns its fallback). pa-types is the only crate every transport consumer can depend on (pa-tui depends on pa-types alone), so the shared trait vocabulary and its cfg-gated platform implementations live here: AF_UNIX on Unix, named pipes (`\.\pipe\`, `platform/windows_pipe.rs`) on Windows. Remaining platform areas (process control, perms, ...) are implemented per platform behind the same traits, not re-plumbed in callers.
 
 ## Non-goals
