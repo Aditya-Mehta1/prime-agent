@@ -39,7 +39,8 @@ pub(crate) enum ModelCommandOutcome {
 
 /// The TS `formatNoModelsAvailableMessage` note for an empty catalog.
 pub(crate) fn no_models_message() -> String {
-    "No models available. Use /login to log into a provider via OAuth or API key, then retry /model".to_string()
+    "No models available. Use /login to log into a provider via OAuth or API key, then retry /model"
+        .to_string()
 }
 
 /// Dispatch `/model [search]`: open the picker over `catalog` (an empty
@@ -226,8 +227,14 @@ mod tests {
     #[test]
     fn escape_and_ctrl_c_cancel_without_applying() {
         let mut picker = ModelPicker::new(&catalog(), None);
-        assert_eq!(picker.handle_key("escape", &kb()), ModelPickerAction::Cancel);
-        assert_eq!(picker.handle_key("ctrl+c", &kb()), ModelPickerAction::Cancel);
+        assert_eq!(
+            picker.handle_key("escape", &kb()),
+            ModelPickerAction::Cancel
+        );
+        assert_eq!(
+            picker.handle_key("ctrl+c", &kb()),
+            ModelPickerAction::Cancel
+        );
     }
 
     #[test]
@@ -303,7 +310,8 @@ mod tests {
 
     #[test]
     fn dispatch_without_search_opens_unfiltered() {
-        let ModelCommandOutcome::Open(picker) = model_command(&catalog(), Some(&current()), "") else {
+        let ModelCommandOutcome::Open(picker) = model_command(&catalog(), Some(&current()), "")
+        else {
             panic!("expected the picker to open")
         };
         assert_eq!(picker.query(), "");

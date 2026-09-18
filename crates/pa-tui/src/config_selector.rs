@@ -68,10 +68,7 @@ impl SelectorKind {
                 "Resource Configuration",
                 &[("space", "toggle"), ("escape", "close")],
             ),
-            SelectorKind::Model => (
-                "Select Model",
-                &[("enter", "select"), ("escape", "close")],
-            ),
+            SelectorKind::Model => ("Select Model", &[("enter", "select"), ("escape", "close")]),
         }
     }
 }

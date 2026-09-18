@@ -513,6 +513,8 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::SetAutoCompaction { .. } => "set_auto_compaction",
         DaemonCommand::Restart { .. } => "restart",
         DaemonCommand::Shutdown { .. } => "shutdown",
+        DaemonCommand::PrepareUpdateRestart { .. } => "prepare_update_restart",
+        DaemonCommand::CommitUpdateRestart { .. } => "commit_update_restart",
         DaemonCommand::AckResult { .. } => "ack_result",
         DaemonCommand::WorkerRegister { .. } => "worker_register",
         DaemonCommand::ReplaceAcpMcpServers { .. } => "replace_acp_mcp_servers",

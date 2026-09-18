@@ -23,7 +23,11 @@ Daemon wire mechanics shared by the serving side (pa-daemon) and clients (pa-tui
   durable session ids, heartbeat re-arm fields only), the timeout-budget
   table with `PRIME_AGENT_UPDATE_*_MS` overrides, and the artifact path
   layout under `<agent-dir>/update-restarts/`. Pure serde + pure data
-  helpers; the FSM drivers and watchdogs are owned by pa-daemon/pa-cli.
+  helpers; the FSM drivers and watchdogs are owned by pa-daemon/pa-cli. The
+  prepare/commit wire commands (`prepare_update_restart`/`
+  commit_update_restart`) and the TS mutation classification
+  (`is_daemon_mutating_command`, `is_update_drain_command` — the
+  update-flow admission gate's read tables) live in `daemon::{command,plane}`.
 Platform contracts (`platform`): the cross-crate transport, process-identity, socket-identity, and home-dir helpers (`platform::dirs::home_dir`: `HOME`, then on Windows `USERPROFILE` / `HOMEDRIVE`+`HOMEPATH` - Node `os.homedir()` parity, returning `None` so each caller owns its fallback). pa-types is the only crate every transport consumer can depend on (pa-tui depends on pa-types alone), so the shared trait vocabulary and its cfg-gated platform implementations live here: AF_UNIX on Unix, named pipes (`\.\pipe\`, `platform/windows_pipe.rs`) on Windows. Remaining platform areas (process control, perms, ...) are implemented per platform behind the same traits, not re-plumbed in callers.
 
 ## Non-goals

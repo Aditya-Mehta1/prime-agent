@@ -121,7 +121,10 @@ pub use outbound::{
     DaemonPeerTransportTicket, DaemonResponse, DaemonRuntimeIdentity, DaemonSavedSessionInfo,
     DaemonSessionClosedReason, DaemonSessionSnapshot, SnapshotPurpose, SocketIdentity,
 };
-pub use plane::{command_plane, is_session_plane_daemon_command, DaemonCommandPlane};
+pub use plane::{
+    command_plane, is_daemon_mutating_command, is_session_plane_daemon_command,
+    is_update_drain_command, DaemonCommandPlane,
+};
 pub use update_flow::{
     legacy_update_restart_status, legacy_update_restarts_dir, prepared_marker_expiry,
     socket_update_dir, update_intent_path, update_marker_path, update_prepared_dir,

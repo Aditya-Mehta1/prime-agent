@@ -55,6 +55,7 @@ pub fn command_plane(command_type: &str) -> DaemonCommandPlane {
         | "rename_saved_session"
         | "delete_saved_session"
         | "prepare_update_restart"
+        | "commit_update_restart"
         | "retry_worker"
         | "restart"
         | "shutdown" => Control,
@@ -140,6 +141,68 @@ pub fn is_session_plane_daemon_command(command_type: &str) -> bool {
     command_plane(command_type) == DaemonCommandPlane::Session
 }
 
+/// TS `READ_ONLY_DAEMON_COMMANDS`, verbatim: the commands that never mutate
+/// daemon state. Everything else counts as a mutation for the update-flow
+/// admission gate and the in-flight mutation drain (`attach`/`reattach` are
+/// intentionally read-only, so a reconnecting client is never fenced out).
+const READ_ONLY_DAEMON_COMMANDS: &[&str] = &[
+    "ack_result",
+    "list",
+    "list_saved_sessions",
+    "list_agent_peers",
+    "get_direct_worker_transport",
+    "attach",
+    "reattach",
+    "roster_subscribe",
+    "roster_unsubscribe",
+    "agent_messages_status",
+    "wait_for_idle",
+    "get_session_header",
+    "get_state",
+    "get_connection_state",
+    "get_messages",
+    "get_rlm_children",
+    "get_session_stats",
+    "get_context_tree",
+    "get_commands",
+    "get_resource_snapshot",
+    "get_model_catalog",
+    "get_available_models",
+    "get_queue",
+    "cron_list",
+    "heartbeats_list",
+    "heartbeat_get",
+    "get_session_context",
+    "get_session_tree",
+    "get_user_messages_for_forking",
+    "get_last_assistant_text",
+    "get_system_prompt",
+    "get_rlm_max_depth_status",
+    "get_tool_definition",
+];
+
+/// TS `isDaemonMutatingCommand`: a command mutates daemon state unless it is
+/// in the read-only table.
+pub fn is_daemon_mutating_command(command_type: &str) -> bool {
+    !READ_ONLY_DAEMON_COMMANDS.contains(&command_type)
+}
+
+/// TS `UPDATE_RESTART_DRAIN_COMMANDS`: mutations that still pass the
+/// admission gate while the prepare transaction is `Draining` — they cancel
+/// or drain in-flight session work, so letting them through shortens the
+/// drain instead of fencing it off.
+pub fn is_update_drain_command(command_type: &str) -> bool {
+    matches!(
+        command_type,
+        "extension_ui_response"
+            | "abort"
+            | "abort_bash"
+            | "abort_branch_summary"
+            | "abort_compaction"
+            | "abort_retry"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +237,59 @@ mod tests {
         }
         // Unknown commands never ride a peer link.
         assert!(!is_session_plane_daemon_command("not_a_command"));
+    }
+
+    /// TS `READ_ONLY_DAEMON_COMMANDS` membership as the admission gate reads
+    /// it: reads and attach pass, session work and lifecycle mutate.
+    #[test]
+    fn mutating_classification_matches_ts() {
+        for read_only in [
+            "ack_result",
+            "list",
+            "attach",
+            "reattach",
+            "get_state",
+            "get_messages",
+            "get_queue",
+            "wait_for_idle",
+            "heartbeats_list",
+            "get_last_assistant_text",
+        ] {
+            assert!(!is_daemon_mutating_command(read_only), "{read_only}");
+        }
+        for mutating in [
+            "prompt",
+            "create",
+            "kill",
+            "shutdown",
+            "restart",
+            "send_message",
+            "compact",
+            "set_model",
+            "clear_queue",
+            "rename",
+            "prepare_update_restart",
+            "commit_update_restart",
+        ] {
+            assert!(is_daemon_mutating_command(mutating), "{mutating}");
+        }
+    }
+
+    /// TS `UPDATE_RESTART_DRAIN_COMMANDS`, verbatim.
+    #[test]
+    fn update_drain_commands_match_ts() {
+        for drain in [
+            "extension_ui_response",
+            "abort",
+            "abort_bash",
+            "abort_branch_summary",
+            "abort_compaction",
+            "abort_retry",
+        ] {
+            assert!(is_update_drain_command(drain), "{drain}");
+        }
+        // Everything else still fences off during `Draining`.
+        assert!(!is_update_drain_command("prompt"));
+        assert!(!is_update_drain_command("create"));
     }
 }

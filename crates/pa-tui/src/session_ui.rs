@@ -13,8 +13,8 @@ use serde_json::Value;
 use crate::chat::{ChatEntry, MessageBlock, RetryState, StatusKind, ToolResultView, WorkingState};
 use crate::daemon_client::{DaemonClient, DaemonClientEvent};
 use crate::interactive::{InteractiveOptions, ModelSelection, SessionSelection};
-use crate::model_picker::{self, CurrentModel, ModelPickerAction};
 use crate::keys::key_event_to_id;
+use crate::model_picker::{self, CurrentModel, ModelPickerAction};
 use crate::snapshot::{
     assistant_message_parts, attach_data_from_response, event_to_update, reconstruct, TurnUpdate,
 };

@@ -1,4 +1,28 @@
 
+## Update-prepare transaction (spec redesign over the TS prepare RPC, 2026-09-18)
+
+`pa-daemon/src/update_prepare.rs` is a deliberate divergence from the TS
+`daemon-supervisor.ts` `prepareUpdateRestart` path (documented in
+`docs/update-flow-state-machine.md` §2/§5, not a transcription): TS runs the whole
+prepare as one blocking in-process RPC (drain -> fence -> worker prepare -> manifest
+persist -> commit -> stop) with a single 90 s deadline and no recovery state, so a
+coordinator death between persisting and clearing its fence wedges the next boot.
+The Rust side keeps the TS vocabulary and wire compat but restructures it:
+
+- `prepare_update_restart` is idempotent on `updateId` (a repeat reports the current
+  state; a different id is a typed refusal — TS refused concurrent prepares with the
+  plain `"Daemon is already preparing an update restart"` string, which is kept as the
+  message and now carries `DaemonErrorInfo::UpdatePrepareRefused`).
+- The admission gate, mutation-drain latch (`MutationDrainLatch`, TS
+  `mutation-drain-latch.ts`), gate refusal string, and the TS `UPDATE_RESTART_DRAIN_COMMANDS`
+  pass-through during `Draining` are ports; the drain commands table and
+  `READ_ONLY_DAEMON_COMMANDS` classification live in `pa-types::daemon::plane`
+  (TS `daemon-protocol.ts`).
+- Watchdog states (`Fenced`/`Snapshotted` TS never had) carry a durable
+  `prepared/<update-id>/marker.json` self-expiry (45 s) in addition to the hard
+  90 s prepare deadline, re-checked on a timer and on any later command, with
+  `Aborted -> Serving` as the failure default — the structural fix for the wedged
+  prepare.
 
 ## Daemon discovery containment (operator directive, 2026-09-17)
 

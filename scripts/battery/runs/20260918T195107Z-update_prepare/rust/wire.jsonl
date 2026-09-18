@@ -1,0 +1,9 @@
+{"command": "list", "data": {"sessions": []}, "id": "s1", "success": true, "type": "response"}
+{"command": "prepare_update_restart", "error": "prepare_update_restart requires an updateId", "id": "s2", "success": false, "type": "response"}
+{"command": "prepare_update_restart", "data": {"acceptedAt": "2026-09-18T19:51:12.548Z", "state": "fenced", "updateId": "upd-1"}, "id": "s2b", "success": true, "type": "response"}
+{"command": "create", "error": "Daemon is preparing an update restart", "id": "s3", "success": false, "type": "response"}
+{"command": "list", "data": {"sessions": []}, "id": "s4", "success": true, "type": "response"}
+{"command": "prepare_update_restart", "error": "Daemon is already preparing an update restart", "errorInfo": {"activeUpdateId": "upd-1", "code": "update_prepare_refused"}, "id": "s2c", "success": false, "type": "response"}
+{"command": "shutdown", "error": "Daemon is preparing an update restart", "id": "s6b", "success": false, "type": "response"}
+{"command": "create", "data": {"activeSessionId": "71613f9e812c", "activity": "idle", "attachedClients": 0, "created": "2026-09-18T19:51:17.730Z", "cwd": "/tmp/upw-final/rust/work", "hasRegisteredCronJob": false, "id": "71613f9e812c", "isBashRunning": false, "isCompacting": false, "isSessionActive": false, "isStreaming": false, "lastActivityAt": "2026-09-18T19:51:17.778Z", "lifecycle": "resident", "messageCount": 0, "modified": "2026-09-18T19:51:17.778Z", "rlmDepth": 0, "runtimeKind": "top-level", "sessionActions": {"followUps": [], "queuedCount": 0, "steering": []}, "sessionFile": "/tmp/upw-final/rust/agent/sessions/01a0b612-c1e2-72c3-9ab0-31f7bc7abe3e.jsonl", "sessionId": "01a0b612-c1e2-72c3-9ab0-31f7bc7abe3e", "thinkingLevel": "high", "unfinishedActionCount": 0, "workerPid": 732871, "workerState": "ready"}, "id": "s5", "success": true, "type": "response"}
+{"command": "shutdown", "id": "s6", "success": true, "type": "response"}

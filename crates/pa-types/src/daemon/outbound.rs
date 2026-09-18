@@ -49,6 +49,12 @@ pub enum DaemonErrorInfo {
         client_id: DaemonClientId,
         command_id: DaemonCommandId,
     },
+    /// `prepare_update_restart` with a different `updateId` while a prepare
+    /// transaction is active: a typed refusal the coordinator maps to
+    /// `Join` (spec `docs/update-flow-state-machine.md` §4).
+    UpdatePrepareRefused {
+        active_update_id: String,
+    },
 }
 
 /// Saved-session row pushed by `session_list_item` progress events.

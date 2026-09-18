@@ -24,6 +24,9 @@ uuid = { version = "1", features = ["v4", "v7"] }
 [dev-dependencies]
 tempfile = "3"
 url = "2"
+# `test-util` (tokio time pause) is test-only: the mutation-drain latch test
+# drives real timeouts through the paused clock.
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bin]]
 name = "pa-daemon"

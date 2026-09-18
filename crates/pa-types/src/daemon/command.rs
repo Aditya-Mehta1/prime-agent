@@ -1035,9 +1035,26 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    /// Coordinator -> supervisor: start (or idempotently poll) the prepare
+    /// transaction for `updateId`. The supervisor owns the deadline and the
+    /// self-expiry marker; a repeated request with the same id returns the
+    /// current state, a different id is refused.
     PrepareUpdateRestart {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        update_id: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// Coordinator -> supervisor: consume the prepared transaction and stop
+    /// gracefully (spec `docs/update-flow-state-machine.md` §5: the only
+    /// consumption of the prepared artifact).
+    CommitUpdateRestart {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        update_id: Option<String>,
         #[serde(flatten)]
         rest: JsonMap,
     },

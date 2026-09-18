@@ -96,6 +96,21 @@ round-trips through a real worker session and kernel - the kernel cell's
 session's host handlers, spawn the fixture
 (`tests/fixtures/mcp_echo_server.py`), and echo back.
 
+Update-prepare transaction (`update_prepare.rs`, spec
+`docs/update-flow-state-machine.md` §5): the supervisor-side FSM
+`Draining -> Fenced -> Snapshotted -> Prepared -> Stopping` with the
+mutation-drain latch + admission gate (mutating commands refused with
+"Daemon is preparing an update restart" while active; reads/attach and the
+TS abort-family drain commands stay served), the hard prepare deadline
+(90 s default) and the durable 45 s marker self-expiry as watchdogs — both
+re-checked on a timer and on any later command — idempotent
+`prepare_update_restart` on `updateId` (a different id is a typed refusal
+the coordinator maps to Join), and `Aborted -> Serving` with prepared-dir
+cleanup as the failure default. Slice note: the wire handler drives accept
+through `Fenced`; the worker graceful-stop snapshot that fills
+`prepared/<id>/{roster,marker}.json` and reaches `Prepared`/`Stopping` is
+the graceful-stop slice.
+
 ## Non-goals
 No agent behavior inside workers beyond hosting a pa-core engine; no UI.
 

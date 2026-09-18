@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use pa_types::daemon::{
-    DaemonCommand, DaemonOutbound, DaemonWorkerDescriptor, DaemonWorkerLifecycle,
-    DurableDaemonCreateCommand, SnapshotPurpose,
+    DaemonCommand, DaemonErrorInfo, DaemonOutbound, DaemonWorkerDescriptor, DaemonWorkerLifecycle,
+    DurableDaemonCreateCommand, SnapshotPurpose, UpdateId, UpdateTimeoutBudget,
 };
 use pa_types::platform::transport::{bind_transport, connect_transport, TransportStream};
 use serde_json::{json, Value};
@@ -40,6 +40,10 @@ use crate::protocol::{
 use crate::registry::{ResidentWorker, SessionRegistry, WorkerRegistration, WorkerRequest};
 use crate::session_store::{find_most_recent_session_for_cwd, list_sessions};
 use crate::snapshot_stream::{attach_client_capabilities, stream_attach, wants_chunked};
+use crate::update_prepare::{
+    update_gate_refuses, AbortOutcome, BeginOutcome, MutationDrainLatch, PrepareCoordinator,
+    PrepareOp, UPDATE_PREPARING_MESSAGE,
+};
 use crate::worker::{
     WORKER_ACTIVE_SESSION_ID_ENV, WORKER_INSTANCE_ID_ENV, WORKER_RECOVERY_JOURNAL_ENV,
     WORKER_ROLE_ENV, WORKER_SCRIPT_ENV, WORKER_SOCKET_ENV, WORKER_SUPERVISOR_SOCKET_ENV,
@@ -110,6 +114,16 @@ pub struct Supervisor {
     /// Memoized ledger over the default sessions dir (ledgers are per
     /// sessions-dir families; another dir gets a fresh instance).
     rlm_ledger: tokio::sync::Mutex<Option<std::sync::Arc<crate::rlm_ledger::RlmSpawnLedger>>>,
+    /// The update-prepare transaction (spec
+    /// `docs/update-flow-state-machine.md` §5): at most one per supervisor;
+    /// empty = `Serving`.
+    update_prepare: PrepareCoordinator,
+    /// In-flight mutating-command counter feeding the prepare transaction's
+    /// `Draining` wait (TS `MutationDrainLatch`).
+    mutation_drain: MutationDrainLatch,
+    /// Timeout budget of the update flow (`PRIME_AGENT_UPDATE_*_MS`
+    /// overridable for CI).
+    update_budget: UpdateTimeoutBudget,
 }
 
 impl Supervisor {
@@ -145,6 +159,9 @@ impl Supervisor {
             shutdown_notify: tokio::sync::Notify::new(),
             log,
             rlm_ledger: tokio::sync::Mutex::new(None),
+            update_prepare: PrepareCoordinator::new(),
+            mutation_drain: MutationDrainLatch::new(),
+            update_budget: UpdateTimeoutBudget::from_env(),
         })
     }
 
@@ -194,6 +211,15 @@ impl Supervisor {
             let supervisor = Arc::clone(&self);
             tokio::spawn(async move {
                 supervisor.adopt_persisted_workers().await;
+            });
+        }
+
+        // Update-prepare watchdog: aborts deadline- or self-expiry-breached
+        // prepare transactions even when no command arrives to re-check.
+        {
+            let supervisor = Arc::clone(&self);
+            tokio::spawn(async move {
+                supervisor.update_prepare_watchdog().await;
             });
         }
 
@@ -1189,7 +1215,69 @@ impl Supervisor {
             *effective_client_id.lock().unwrap() = client_id;
         }
         let type_name = command_type_name(&envelope.command).to_string();
-        match &envelope.command {
+        // Update-prepare watchdog on any later command (spec §5): a prepared
+        // transaction whose marker expired returns the supervisor to Serving
+        // before the command is served.
+        if let Some(abort) = self.update_prepare.abort_if_expired(util::now_ms()) {
+            self.finish_update_abort(abort).await;
+        }
+        // Admission gate: mutating commands are refused while a prepare
+        // transaction is active (TS "Daemon is preparing an update restart"),
+        // except the drain commands during `Draining`. The transaction's own
+        // drivers never reach the gate.
+        let is_update_driver = matches!(
+            &envelope.command,
+            DaemonCommand::PrepareUpdateRestart { .. } | DaemonCommand::CommitUpdateRestart { .. }
+        );
+        if !is_update_driver {
+            if let Some(state) = self.update_prepare.active_state() {
+                if update_gate_refuses(state, &type_name) {
+                    return (
+                        vec![response_line(&response_failure(
+                            Some(&command_id),
+                            &type_name,
+                            UPDATE_PREPARING_MESSAGE,
+                            None,
+                        ))],
+                        false,
+                    );
+                }
+            }
+        }
+        // Mutating commands count against the prepare transaction's drain.
+        let mutating =
+            !is_update_driver && pa_types::daemon::is_daemon_mutating_command(&type_name);
+        if mutating {
+            self.mutation_drain.begin();
+        }
+        let outcome = self
+            .execute_parsed_command(
+                &envelope.command,
+                effective_client_id,
+                attached,
+                roster_subscribed,
+                command_id,
+                type_name,
+            )
+            .await;
+        if mutating {
+            self.mutation_drain.end();
+        }
+        outcome
+    }
+
+    /// The parsed-command match of [`Self::dispatch_client`], executed under
+    /// the mutation-drain latch by that wrapper.
+    async fn execute_parsed_command(
+        self: &Arc<Self>,
+        command: &DaemonCommand,
+        effective_client_id: &Arc<std::sync::Mutex<String>>,
+        attached: &Arc<std::sync::Mutex<Vec<String>>>,
+        roster_subscribed: &Arc<std::sync::atomic::AtomicBool>,
+        command_id: String,
+        type_name: String,
+    ) -> (Vec<Value>, bool) {
+        match command {
             DaemonCommand::AckResult { .. } => (Vec::new(), false),
             DaemonCommand::Restart { .. } | DaemonCommand::Shutdown { .. } => {
                 let response = response_success(Some(&command_id), &type_name, None);
@@ -1221,9 +1309,7 @@ impl Supervisor {
                 (vec![response_line(&response)], false)
             }
             DaemonCommand::ListSavedSessions { .. } => {
-                let lines = self
-                    .handle_saved_session_list(&envelope.command, &command_id)
-                    .await;
+                let lines = self.handle_saved_session_list(command, &command_id).await;
                 (lines, false)
             }
             DaemonCommand::RosterSubscribe { .. } => {
@@ -1255,7 +1341,7 @@ impl Supervisor {
             }
             DaemonCommand::Create { .. } => {
                 let client_id = effective_client_id.lock().unwrap().clone();
-                match self.handle_create(&envelope.command, client_id).await {
+                match self.handle_create(command, client_id).await {
                     Ok(summary) => (
                         vec![response_line(&response_success(
                             Some(&command_id),
@@ -1289,7 +1375,7 @@ impl Supervisor {
             DaemonCommand::SendMessage { .. } => {
                 let client_id = effective_client_id.lock().unwrap().clone();
                 let response = self
-                    .handle_send_message(&command_id, &client_id, &envelope.command)
+                    .handle_send_message(&command_id, &client_id, command)
                     .await;
                 (vec![response_line(&response)], false)
             }
@@ -1315,7 +1401,18 @@ impl Supervisor {
                 // Worker self-registration: rebuilds the roster entry from
                 // the worker's own identity instead of routing to a session.
                 let response = self
-                    .handle_worker_register(&command_id, &type_name, &envelope.command)
+                    .handle_worker_register(&command_id, &type_name, command)
+                    .await;
+                (vec![response_line(&response)], false)
+            }
+            DaemonCommand::PrepareUpdateRestart { .. } => {
+                // The update-flow coordinator's prepare RPC: accepts (or
+                // idempotently polls) the supervisor-side prepare
+                // transaction (spec §5). Slice 2 drives it to `Fenced` -
+                // the worker snapshot that fills the roster and reaches
+                // `Prepared` is the graceful-stop slice.
+                let response = self
+                    .handle_prepare_update_restart(&command_id, &type_name, command)
                     .await;
                 (vec![response_line(&response)], false)
             }
@@ -1323,6 +1420,138 @@ impl Supervisor {
                 let client_id = effective_client_id.lock().unwrap().clone();
                 self.route_client_command(command, &client_id, attached, command_id, type_name)
                     .await
+            }
+        }
+    }
+
+    /// `prepare_update_restart`: accept or poll the prepare transaction.
+    ///
+    /// The RPC contract: a new `updateId` starts the transaction and waits
+    /// for the mutation drain, then reports `fenced`; a repeat with the same
+    /// id reports the current state (the poll never extends the budget); a
+    /// different id is refused (the coordinator maps the refusal to `Join`).
+    /// Any failure aborts the transaction - rollback is the default, the
+    /// supervisor returns to `Serving`, and nothing is left half-prepared.
+    async fn handle_prepare_update_restart(
+        self: &Arc<Self>,
+        command_id: &str,
+        type_name: &str,
+        command: &DaemonCommand,
+    ) -> DaemonResponse {
+        let DaemonCommand::PrepareUpdateRestart { update_id, .. } = command else {
+            return response_failure(
+                Some(command_id),
+                type_name,
+                "not a prepare_update_restart command",
+                None,
+            );
+        };
+        let Some(update_id) = update_id.clone().map(UpdateId::from) else {
+            return response_failure(
+                Some(command_id),
+                type_name,
+                "prepare_update_restart requires an updateId",
+                None,
+            );
+        };
+        let now = util::now_ms();
+        match self
+            .update_prepare
+            .begin(update_id.clone(), now, &self.update_budget)
+        {
+            BeginOutcome::Refused { active_update_id } => response_failure(
+                Some(command_id),
+                type_name,
+                "Daemon is already preparing an update restart",
+                Some(DaemonErrorInfo::UpdatePrepareRefused {
+                    active_update_id: active_update_id.0,
+                }),
+            ),
+            BeginOutcome::AlreadyActive {
+                state,
+                accepted_at_ms,
+            } => response_success(
+                Some(command_id),
+                type_name,
+                Some(json!({
+                    "updateId": update_id,
+                    "state": state.wire_name(),
+                    "acceptedAt": util::iso_from_unix_ms(accepted_at_ms),
+                })),
+            ),
+            BeginOutcome::Started {
+                accepted_at_ms,
+                prepare_deadline_ms,
+            } => {
+                // Draining: wait for in-flight mutations within the hard
+                // deadline, then report the fenced state.
+                let deadline = tokio::time::Instant::now()
+                    + Duration::from_millis(prepare_deadline_ms.saturating_sub(now));
+                if let Err(error) = self.mutation_drain.wait_for_drain(0, deadline).await {
+                    if let Some(abort) = self.update_prepare.abort(&update_id) {
+                        self.finish_update_abort(abort).await;
+                    }
+                    return response_failure(Some(command_id), type_name, &error.to_string(), None);
+                }
+                match self.update_prepare.drain_complete(&update_id) {
+                    PrepareOp::Applied(state) => response_success(
+                        Some(command_id),
+                        type_name,
+                        Some(json!({
+                            "updateId": update_id,
+                            "state": state.wire_name(),
+                            "acceptedAt": util::iso_from_unix_ms(accepted_at_ms),
+                        })),
+                    ),
+                    // The watchdog aborted the transaction while we drained
+                    // (the same deadline) - the supervisor is Serving again.
+                    PrepareOp::NotActive => response_failure(
+                        Some(command_id),
+                        type_name,
+                        "Timed out draining daemon mutations for update restart",
+                        None,
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Apply one abort outcome: delete the prepared artifacts if any, and
+    /// log the return to `Serving` (clients are notified through the
+    /// aborting RPC response; the per-phase banner event is the UX slice).
+    async fn finish_update_abort(self: &Arc<Self>, abort: AbortOutcome) {
+        if abort.delete_prepared {
+            let prepared_dir = self.update_prepared_dir(&abort.update_id);
+            if let Err(error) = crate::update_prepare::delete_prepared_dir(&prepared_dir) {
+                self.log_line(&format!(
+                    "update prepare cleanup failed for {}: {error:#}",
+                    abort.update_id
+                ));
+            }
+        }
+        self.log_line(&format!(
+            "update prepare aborted ({}): {}",
+            abort.update_id,
+            abort.reason.as_str()
+        ));
+    }
+
+    /// The prepared-artifact directory of one update under this socket's
+    /// scratch dir (swept at boot; created only by the prepare transaction).
+    fn update_prepared_dir(&self, update_id: &UpdateId) -> PathBuf {
+        let socket_hash = paths::hash_key(&self.options.socket_path.to_string_lossy(), 64);
+        crate::update_prepare::prepared_dir(&self.options.agent_dir, &socket_hash, update_id)
+    }
+
+    /// Update-prepare watchdog (spec §5): the deadline and the marker
+    /// self-expiry are re-checked on a timer, so a coordinator that dies
+    /// mid-prepare can never wedge the supervisor - every state has a
+    /// watchdog exit (invariant I1).
+    async fn update_prepare_watchdog(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if let Some(abort) = self.update_prepare.abort_if_expired(util::now_ms()) {
+                self.finish_update_abort(abort).await;
             }
         }
     }

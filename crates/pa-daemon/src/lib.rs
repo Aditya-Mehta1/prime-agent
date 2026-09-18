@@ -43,5 +43,6 @@ pub mod supervisor;
 pub mod supervisor_link;
 pub(crate) mod supervisor_roster;
 pub mod types;
+pub(crate) mod update_prepare;
 pub mod util;
 pub mod worker;
