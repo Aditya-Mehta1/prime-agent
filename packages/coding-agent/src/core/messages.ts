@@ -269,7 +269,7 @@ Command: ${JSON.stringify(details.command)}`,
 
 export interface SwarmProgressDetails {
 	runId: string;
-	kind: "finished" | "failed" | "paused" | "budget_exceeded";
+	kind: "finished" | "failed" | "paused" | "budget_exceeded" | "max_transitions_exceeded";
 	node?: string;
 	detail: string;
 }

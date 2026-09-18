@@ -24,6 +24,17 @@ describe("swarm progress", () => {
 		]);
 	});
 
+	it("renders the max_transitions pause kind verbatim (distinct from budget_exceeded)", () => {
+		const message = createSwarmProgressMessage({
+			runId: "run-2",
+			kind: "max_transitions_exceeded",
+			detail: "max_transitions 1 exceeded; no new entries",
+		});
+		expect(message.content).toBe(
+			"[swarm-progress run:run-2] max_transitions_exceeded: max_transitions 1 exceeded; no new entries",
+		);
+	});
+
 	it("renders the finished, failed, and paused milestone kinds verbatim", () => {
 		expect(createSwarmProgressMessage({ runId: "r", kind: "finished", detail: "all 3 nodes done" }).content).toBe(
 			"[swarm-progress run:r] finished: all 3 nodes done",

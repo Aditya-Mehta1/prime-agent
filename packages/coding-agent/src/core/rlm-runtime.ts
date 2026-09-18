@@ -126,7 +126,7 @@ interface AsyncBashConsumedRequest {
 
 type AsyncBashConsumedHandler = (request: AsyncBashConsumedRequest) => void | Promise<void>;
 
-export type SwarmProgressKind = "finished" | "failed" | "paused" | "budget_exceeded";
+export type SwarmProgressKind = "finished" | "failed" | "paused" | "budget_exceeded" | "max_transitions_exceeded";
 
 export interface SwarmProgressRequest {
 	runId: string;
@@ -137,7 +137,13 @@ export interface SwarmProgressRequest {
 
 export type SwarmProgressHandler = (request: SwarmProgressRequest) => void | Promise<void>;
 
-const SWARM_PROGRESS_KINDS: readonly SwarmProgressKind[] = ["finished", "failed", "paused", "budget_exceeded"];
+const SWARM_PROGRESS_KINDS: readonly SwarmProgressKind[] = [
+	"finished",
+	"failed",
+	"paused",
+	"budget_exceeded",
+	"max_transitions_exceeded",
+];
 
 function isSwarmProgressKind(value: unknown): value is SwarmProgressKind {
 	return typeof value === "string" && (SWARM_PROGRESS_KINDS as readonly string[]).includes(value);
