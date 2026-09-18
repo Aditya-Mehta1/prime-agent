@@ -1091,7 +1091,7 @@ jobs:
           # `gh api --paginate` applies --jq per page, so the version stream is
           # compared in one jq slurp after it.
           newer=$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
-            --jq '.[] | select(.draft == false) | select(.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) | .tag_name | sub("^v"; "")' \
+            --jq '.[] | select(.draft == false) | select(.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) | .tag_name | sub("^v"; "") | tojson' \
             | jq -sr --arg current "${PRODUCTION_VERSION}" \
               'map(split(".") | map(tonumber)) as $all | [$all[] | select(. > ($current | split(".") | map(tonumber)))] | if length == 0 then "" else (max | join(".")) end')
           if [ -n "$newer" ]; then

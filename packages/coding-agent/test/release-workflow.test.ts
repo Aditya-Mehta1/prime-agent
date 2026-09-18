@@ -730,6 +730,8 @@ describe("release ordering: nothing is public before verification", () => {
 		expect(recheck.run).toContain("finishing the channel pointers");
 		// The rollback guard: a stale re-run of an older version must refuse.
 		expect(recheck.run).toContain("| jq -sr --arg current");
+		// `gh --jq` prints raw strings, so the stream must be tojson'd before jq slurps it.
+		expect(recheck.run).toContain("| tojson");
 		expect(recheck.run).toContain("refusing to move the channel");
 		expect(recheck.run).toContain('test "$(jq -r .targetCommitish /tmp/release.json)" = "$BUILD_REF"');
 	});
