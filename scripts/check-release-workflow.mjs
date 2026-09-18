@@ -155,7 +155,7 @@ export const ALLOWED_VARIABLES = [
 	// Bound in the publish and finalize steps.
 	"file", "name", "digest", "local_digest", "existing_digest", "readback_digest", "count", "pointer", "prefix", "key", "head_status", "type", "expected", "actual",
 	// Bound in the release steps.
-	"TAG", "tag", "ref", "sha", "tagged", "release_id", "missing", "failed", "asset_id", "latest_main_sha", "newest",
+	"TAG", "tag", "ref", "sha", "tagged", "release_id", "missing", "failed", "asset_id", "latest_main_sha", "newest", "newer",
 	// Bound in the npm publish step.
 	"names", "tarball", "path",
 	// Bound in the tap bump step.

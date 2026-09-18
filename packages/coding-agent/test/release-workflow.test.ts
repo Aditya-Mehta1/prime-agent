@@ -729,7 +729,7 @@ describe("release ordering: nothing is public before verification", () => {
 		expect(recheck.run).toContain('if [ "$(jq -r .isDraft /tmp/release.json)" != true ]; then');
 		expect(recheck.run).toContain("finishing the channel pointers");
 		// The rollback guard: a stale re-run of an older version must refuse.
-		expect(recheck.run).toContain("max_by(splits");
+		expect(recheck.run).toContain("| jq -sr --arg current");
 		expect(recheck.run).toContain("refusing to move the channel");
 		expect(recheck.run).toContain('test "$(jq -r .targetCommitish /tmp/release.json)" = "$BUILD_REF"');
 	});
@@ -814,14 +814,14 @@ gh() {
 				target?: string;
 				assets?: { name: string; digest: string }[];
 				tag?: string;
-				newest?: string;
+				published?: string[];
 			}) => `
 gh() {
   case "$*" in
     "api repos/o/r/git/ref/tags/v1.2.3")
       ${options.tag ? `printf '%s' '${JSON.stringify({ ref: "refs/tags/v1.2.3", object: { type: "commit", sha: options.tag } })}'` : 'echo "gh: Not Found (HTTP 404)" >&2; return 1'} ;;
     *"select(.draft == false)"*)
-      printf '%s\n' '${options.newest ?? "1.2.3"}' ;;
+      ${options.published === undefined ? `printf '%s\\n' '"1.2.3"'` : options.published.length === 0 ? ":" : `printf '%s\\n' ${options.published.map((version) => `'"${version}"'`).join(" ")}`} ;;
     "release view v1.2.3 --json isDraft,targetCommitish")
       printf '%s' '${JSON.stringify({ isDraft: options.isDraft ?? true, targetCommitish: options.target ?? BUILD_REF })}' ;;
     "api repos/o/r/releases --paginate --jq .[] | select(.tag_name == \\"v1.2.3\\") | .id") echo 42 ;;
@@ -847,11 +847,17 @@ printf '%s' '${JSON.stringify(recorded)}' > manifest/github-assets.json
 			expect(rerun.stdout).toContain("finishing the channel pointers");
 			const rerunTagged = runStepScript(recheck, shims({ isDraft: false, tag: BUILD_REF }), env);
 			expect(rerunTagged.status, rerunTagged.stderr).toBe(0);
+			// The previous version being live is the normal release case, and an empty
+			// published set is a first release: both must proceed.
+			const normalTrain = runStepScript(recheck, shims({ published: ["1.2.2"] }), env);
+			expect(normalTrain.status, normalTrain.stderr).toBe(0);
+			const firstRelease = runStepScript(recheck, shims({ published: [] }), env);
+			expect(firstRelease.status, firstRelease.stderr).toBe(0);
 			// A stale re-run must never roll the channel back to an older version.
-			const rollback = runStepScript(recheck, shims({ newest: "1.2.4" }), env);
+			const rollback = runStepScript(recheck, shims({ published: ["1.2.2", "1.2.4"] }), env);
 			expect(rollback.status, rollback.stderr).toBe(1);
 			expect(rollback.stderr).toContain("Newer release v1.2.4");
-			const rollbackPublished = runStepScript(recheck, shims({ newest: "1.2.4", isDraft: false }), env);
+			const rollbackPublished = runStepScript(recheck, shims({ published: ["1.2.4"], isDraft: false }), env);
 			expect(rollbackPublished.status, rollbackPublished.stderr).toBe(1);
 			const swapped = runStepScript(
 				recheck,
