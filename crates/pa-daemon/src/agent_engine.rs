@@ -2,11 +2,12 @@
 //! the shared provider adapter, driven through the daemon's `SessionEngine`
 //! contract. Replaces the scripted faux engine when a model is configured.
 //!
-//! Streaming note: assistant updates are delivered as a batch after the turn
-//! settles (the worker persists the final message); live per-chunk streaming to
-//! daemon clients is a follow-up wiring on top of the same subscription seam.
+//! Streaming note: assistant updates are forwarded to the worker's emit
+//! callback as they arrive (one per provider stream event) while the turn
+//! runs — never buffered until the turn settles — matching the TS daemon's
+//! `void prompt(...)` live-broadcast behavior. The worker coalesces them
+//! for broadcast (see `worker::run_turn`).
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -1279,14 +1280,10 @@ impl AgentSessionEngine {
         first_attempt: bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) -> anyhow::Result<TurnOnce> {
-        // Stream assistant events while the turn runs. The turn starts
-        // asynchronously after admission, so the idle watcher must not fire
-        // before the run has begun.
+        // Stream assistant events while the turn runs.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<EngineEvent>();
-        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let subscription = {
             let tx = tx.clone();
-            let started_flag = started.clone();
             // Per-message usage accounting runs on every settled assistant
             // message (whatever the stop reason except errors), matching the
             // TS message_end hook. The driver owns the policy; this loop
@@ -1301,14 +1298,10 @@ impl AgentSessionEngine {
             agent
                 .subscribe(move |event, _signal| {
                     let tx = tx.clone();
-                    let started_flag = started_flag.clone();
                     let autonomous_state = std::sync::Arc::clone(&autonomous_state);
                     let autonomous_driver = std::sync::Arc::clone(&autonomous_driver);
                     Box::pin(async move {
                         use pa_agent::types::AgentEvent;
-                        if matches!(event, AgentEvent::AgentStart) {
-                            started_flag.store(true, Ordering::SeqCst);
-                        }
                         if let AgentEvent::MessageEnd {
                             message:
                                 pa_agent::types::AgentMessage::Standard(
@@ -1432,38 +1425,30 @@ impl AgentSessionEngine {
                 })
                 .await
         };
-        // Admit the turn: the first attempt prompts the session; a retry
-        // continues the parked conversation.
-        let admitted: anyhow::Result<()> = if first_attempt {
-            let guard = self.session.lock().await;
-            let engine = guard.as_ref().expect("session built");
-            engine
-                .session
-                .prompt(prompt, Default::default())
-                .await
-                .map(|_| ())
-        } else {
-            agent.continue_run().await.map(|_| ())
-        };
-        if let Err(error) = admitted {
-            let _ = subscription.unsubscribe().await;
-            return Err(anyhow::anyhow!("{error:#}"));
-        }
-        // Wait for the turn to settle, forwarding events into `emit` live.
-        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
-        let idle_agent = agent.clone();
-        let started_flag = started.clone();
-        self.runtime.spawn(async move {
-            loop {
-                idle_agent.wait_for_idle().await;
-                if started_flag.load(Ordering::SeqCst) {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // Admit the turn on the engine runtime without blocking the
+        // forwarding loop below: the admission future settles only when the
+        // whole turn settles (the TS daemon fires `prompt` with `void` and
+        // streams events from the session listeners while it runs), while
+        // the loop hands each streamed event to `emit` the moment it
+        // arrives. Buffering events until the future resolves is what made
+        // clients render a turn as one final batch.
+        let prompt_text = prompt.to_string();
+        let mut admitted = std::pin::pin!(async {
+            if first_attempt {
+                let guard = self.session.lock().await;
+                let engine = guard.as_ref().expect("session built");
+                engine
+                    .session
+                    .prompt(&prompt_text, Default::default())
+                    .await
+                    .map(|_| ())
+            } else {
+                agent.continue_run().await.map(|_| ())
             }
-            let _ = done_tx.send(());
         });
         let mut aborted = false;
+        let mut admission_error: Option<anyhow::Error> = None;
+        let mut settled = false;
         loop {
             tokio::select! {
                 event = rx.recv() => {
@@ -1476,24 +1461,39 @@ impl AgentSessionEngine {
                         None => break,
                     }
                 }
-                _ = &mut done_rx => {
-                    // Idle: drain any events that raced the signal, then settle.
+                outcome = &mut admitted => {
+                    settled = true;
+                    match outcome {
+                        Ok(()) => {}
+                        Err(error) => admission_error = Some(error),
+                    }
+                    // The turn settled: drain the events that raced the
+                    // resolution, then stop the loop.
                     while let Ok(event) = rx.try_recv() {
                         if !emit(event) {
                             aborted = true;
                             break;
                         }
                     }
-                    break;
                 }
             }
-            if aborted {
+            if aborted || settled {
                 break;
             }
+        }
+        if aborted {
+            // The emit callback cancelled the turn: stop the still-running
+            // admission and wait out its abort path before returning, so no
+            // run outlives this attempt.
+            agent.abort();
+            let _ = (&mut admitted).await;
         }
         let _ = subscription.unsubscribe().await;
         if aborted {
             return Ok(TurnOnce::Aborted);
+        }
+        if let Some(error) = admission_error {
+            return Err(anyhow::anyhow!("{error:#}"));
         }
         // The final assistant message decides the outcome (provider
         // failures included: the retry driver classifies them).
@@ -1963,6 +1963,91 @@ fn custom_rows(events: &[EngineEvent]) -> Vec<serde_json::Value> {
             _ => None,
         })
         .collect()
+}
+
+#[test]
+fn assistant_updates_stream_live_while_the_turn_runs() {
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = tempfile::TempDir::new().unwrap();
+    // A paced script: 40 short words at 100 tokens/second streams for
+    // roughly 0.4s wall time. If the engine buffered events until the turn
+    // settled, every update would share one emit timestamp; live
+    // forwarding spreads them across the stream.
+    let words = (0..40).map(|i| format!("w{i} ")).collect::<String>();
+    let script = serde_json::json!({
+        "engine": "faux",
+        "tokensPerSecond": 100.0,
+        "responses": [
+            {"content": [{"type": "text", "text": words}]}
+        ],
+    });
+    let engine = AgentSessionEngine::new(AgentEngineConfig {
+        cwd: dir.path().to_path_buf(),
+        agent_dir: dir.path().join("agent"),
+        provider: None,
+        model: None,
+        api_key: None,
+        thinking: None,
+        session_dir: None,
+        session_file: None,
+        faux_script: Some(script.to_string()),
+        supervisor_link: None,
+        telemetry_disabled: None,
+    })
+    .unwrap();
+    let start = std::time::Instant::now();
+    let mut updates: Vec<(std::time::Duration, usize)> = Vec::new();
+    engine.run_prompt(
+        0,
+        PromptRequest {
+            message: "hi".to_string(),
+            source: "user".to_string(),
+            agent_message_id: None,
+        },
+        &|| false,
+        &mut |event| {
+            if let EngineEvent::AssistantUpdate { message, .. } = &event {
+                let text_len = message["content"]
+                    .as_array()
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .map(|block| {
+                                block
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .map_or(0, str::len)
+                            })
+                            .sum()
+                    })
+                    .unwrap_or(0);
+                updates.push((start.elapsed(), text_len));
+            }
+            true
+        },
+    );
+    assert!(
+        updates.len() >= 10,
+        "the paced stream must produce many updates, got {}",
+        updates.len()
+    );
+    let first = updates.first().unwrap().0;
+    let last = updates.last().unwrap().0;
+    assert!(
+        (last - first) >= std::time::Duration::from_millis(200),
+        "updates must spread across the stream, got {first:?}..{last:?}"
+    );
+    // Content grows monotonically: every update carries the full partial
+    // message, so lengths never regress.
+    let lengths: Vec<usize> = updates.iter().map(|(_, len)| *len).collect();
+    let mut monotonic = lengths.clone();
+    monotonic.sort_unstable();
+    assert_eq!(lengths, monotonic, "partial message lengths regress");
+    // The settled final message arrives too (message_end, not just updates).
+    let final_len = lengths.last().copied().unwrap_or(0);
+    assert!(final_len >= 40 * 3, "final partial is the full text");
 }
 
 #[test]

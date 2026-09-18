@@ -1,0 +1,3 @@
+
+{"version":1,"type":"received","key":"[\"d750f883eafc\",\"sd\"]","clientId":"d750f883eafc","commandId":"sd","commandType":"shutdown","recordedAt":"2026-09-18T04:57:13.901Z"}
+{"version":1,"type":"result","key":"[\"d750f883eafc\",\"sd\"]","response":{"id":"sd","type":"response","command":"shutdown","success":true},"recordedAt":"2026-09-18T04:57:13.904Z"}

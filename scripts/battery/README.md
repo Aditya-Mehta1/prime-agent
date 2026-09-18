@@ -16,4 +16,7 @@ and a built Rust binary (default `target/release/prime-agent`).
 
 Files: `run_battery.py` (driver), `batterylib.py` (shared harness), 
 `mock_provider.py` (deterministic mock provider), `perf.py` (f10 perf rows),
-`framediff_first_run.py` (first-run frame diff).
+`framediff_first_run.py` (first-run frame diff),
+`streaming_render.py` (live token-stream rendering verifier: pane captures
+must grow progressively mid-turn over a paced faux provider, TS vs Rust
+differential on the settled frame).

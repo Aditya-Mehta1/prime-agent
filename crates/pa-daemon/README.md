@@ -50,6 +50,18 @@ is the shared trait in `pa_types::platform::transport`, and the private-frame
 codec plus command planes are the shared wire contract in
 `pa_types::daemon` (clients in pa-tui/pa-cli speak them).
 
+Live token-stream rendering
+(`streaming`): turn events forward from the hosted engine to the worker's
+emit path as they arrive (one `message_update` per provider delta, the
+full partial message per frame - never buffered until turn settle); the
+worker coalesces them for broadcast in a single-slot coalescer with a
+50ms flusher, while `message_start`/`message_end`/tool frames flush the
+parked update first and go out directly, so wire order and event-sequence
+order match uncoalesced streaming. The supervisor stays payload-free:
+deltas ride the worker -> client session-event stream (direct-attach or
+supervisor-routed). Verifier: `scripts/battery/streaming_render.py`
+(pane-growth acceptance + TS settled-frame differential).
+
 Autonomous
 continuation driving in the worker's engine: per-message usage accounting
 runs in the agent-loop subscription, and after every settled turn the

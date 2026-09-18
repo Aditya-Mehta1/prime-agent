@@ -2432,9 +2432,28 @@ impl TurnRunner {
             source: "user".to_string(),
             agent_message_id: None,
         };
+        // Live token-stream coalescing for this turn: the emit path parks
+        // `message_update` frames in a single slot and a flusher task
+        // broadcasts at most one parked snapshot per interval, while every
+        // other frame goes out directly (flushing the parked update first,
+        // so wire order matches event-sequence order exactly).
+        let coalescer = Arc::new(crate::streaming::TurnStreamCoalescer::new());
+        let flusher = {
+            let coalescer = Arc::clone(&coalescer);
+            let events = self.events.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(crate::streaming::UPDATE_FLUSH_INTERVAL).await;
+                    if !coalescer.flush_pending(&events) {
+                        break;
+                    }
+                }
+            })
+        };
         let engine = engine.clone();
         let core = Arc::clone(&self.core);
         let events = self.events.clone();
+        let turn_coalescer = Arc::clone(&coalescer);
         let done = item.done;
         let turn = tokio::task::spawn_blocking(move || {
             let mut done = done;
@@ -2617,8 +2636,11 @@ impl TurnRunner {
                         }
                     }
                 }
-                let mut payloads = Vec::new();
+                let mut update_payloads: Vec<Vec<u8>> = Vec::new();
+                let mut direct_payloads: Vec<Vec<u8>> = Vec::new();
                 for event_json in frames {
+                    let is_stream_update =
+                        event_json.get("type").and_then(Value::as_str) == Some("message_update");
                     let sequence = core.last_event_sequence + 1;
                     core.last_event_sequence = sequence;
                     let meta = create_daemon_event_meta(
@@ -2633,12 +2655,25 @@ impl TurnRunner {
                         meta: Some(meta),
                         rest: Default::default(),
                     };
-                    payloads.push(serde_json::to_vec(&outbound).unwrap_or_default());
+                    let payload = serde_json::to_vec(&outbound).unwrap_or_default();
+                    if is_stream_update {
+                        update_payloads.push(payload);
+                    } else {
+                        direct_payloads.push(payload);
+                    }
                 }
                 drop(core);
-                for payload in payloads {
-                    events.send(OutboundFrame::session_event(payload));
+                // Streaming updates park in the coalescer (each carries the
+                // full partial message, so a superseded snapshot is safe to
+                // drop); every other frame flushes the parked update and
+                // broadcasts directly. `park_update` only returns false
+                // after the turn joined, which cannot race this closure.
+                for payload in update_payloads {
+                    if !turn_coalescer.park_update(payload) {
+                        return false;
+                    }
                 }
+                turn_coalescer.send_direct(&direct_payloads, &events);
                 // Resolve `done` only after the turn's final frames are on
                 // the pump: the waiting response must observe their
                 // sequences (see `ConnectionSink`), so the response cannot
@@ -2657,6 +2692,11 @@ impl TurnRunner {
             engine.run_prompt(prompt_index, request, &aborted_probe, &mut emit);
         });
         let _ = turn.await;
+        // The turn's emit path is joined: nothing parks from here on, a
+        // stale parked partial must not surface after the settle events,
+        // and the flusher task stops on its next tick.
+        coalescer.close();
+        flusher.abort();
 
         {
             let mut core = self.core.lock().unwrap();
