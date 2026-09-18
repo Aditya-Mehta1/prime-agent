@@ -20,6 +20,7 @@ pub(crate) mod initial_message;
 pub(crate) mod interactive_mode;
 pub(crate) mod list_models;
 pub(crate) mod mcp_command;
+pub(crate) mod mcp_login;
 pub(crate) mod mode;
 pub(crate) mod package_command;
 pub(crate) mod prompt_command;

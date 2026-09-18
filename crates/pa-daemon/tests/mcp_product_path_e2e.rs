@@ -355,3 +355,133 @@ fn settings_declared_stdio_server_round_trips_through_the_kernel_mcp_client() {
         "tool name in the cell output: {ipython_result}"
     );
 }
+
+/// The begin_login host request is live in the daemon worker product path:
+/// the kernel reaches the session's real MCP manager, which answers with
+/// the TS wording for unknown servers (the full login flow is verified
+/// against the fixture OAuth transport in the mcp_login unit tests — a
+/// real login needs a live HTTPS provider, so this e2e pins the wiring).
+#[test]
+fn begin_login_host_request_is_live_in_the_worker() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let sessions_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+
+    let receipts_dir = dir.path().join("receipts");
+    std::fs::create_dir_all(&receipts_dir).expect("receipts dir");
+    let receipt = receipts_dir.join("begin-login.json");
+    let error_receipt = receipt.with_extension("error");
+    let cell = [
+        "from rlm import host_request",
+        "import json, traceback",
+        "try:",
+        "    outcomes = []",
+        "    for payload in ({\"server\": \"unknown-e2e\"}, {}):",
+        "        try:",
+        "            await host_request(\"mcp.begin_login\", payload)",
+        "            outcomes.append({\"ok\": True})",
+        "        except Exception as exc:",
+        "            outcomes.append({\"error\": str(exc)})",
+        "    open(RECEIPT, \"w\").write(json.dumps(outcomes))",
+        "    print(json.dumps(outcomes))",
+        "except Exception:",
+        "    open(ERROR_RECEIPT, \"w\").write(traceback.format_exc())",
+        "    raise",
+    ]
+    .join("\n")
+    .replace(
+        "ERROR_RECEIPT",
+        &format!("{:?}", error_receipt.display().to_string()),
+    )
+    .replace("RECEIPT", &format!("{:?}", receipt.display().to_string()));
+    let script = dir.path().join("faux.json");
+    std::fs::write(
+        &script,
+        json!({
+            "engine": "faux",
+            "responses": [
+                { "content": [
+                    { "type": "toolCall", "name": "ipython", "arguments": {
+                        "code": cell,
+                    } },
+                ] },
+                { "text": "begin_login probe done" },
+            ],
+        })
+        .to_string(),
+    )
+    .expect("write faux script");
+
+    let socket = dir.path().join("mcp.sock");
+    let _daemon = spawn_supervisor(&socket, &agent_dir, &kernel_python);
+    wait_socket_ready(&socket);
+    let (mut client, hello) = Client::connect(&socket);
+    assert_eq!(hello["type"], "daemon_hello");
+
+    client.send_command(
+        "c1",
+        json!({
+            "type": "create",
+            "config": {
+                "cwd": dir.path().to_string_lossy(),
+                "sessionDir": sessions_dir.to_string_lossy(),
+                "script": script.to_string_lossy(),
+            },
+        }),
+    );
+    let created = client.read_response("c1");
+    assert_eq!(created["success"], true, "create failed: {created}");
+    let session_id = created["data"]["activeSessionId"]
+        .as_str()
+        .or_else(|| created["data"]["id"].as_str())
+        .expect("active session id")
+        .to_string();
+    client.send_command(
+        "p1",
+        json!({ "type": "prompt", "activeSessionId": session_id, "message": "probe begin_login" }),
+    );
+    assert_eq!(client.read_response("p1")["success"], true, "prompt failed");
+    client.send_command(
+        "w1",
+        json!({ "type": "wait_for_idle", "activeSessionId": session_id }),
+    );
+    assert_eq!(
+        client.read_response("w1")["success"],
+        true,
+        "wait_for_idle failed"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let outcomes = loop {
+        if let Ok(error) = std::fs::read_to_string(&error_receipt) {
+            panic!("begin_login probe failed in the kernel cell: {error}");
+        }
+        if let Ok(content) = std::fs::read_to_string(&receipt) {
+            break serde_json::from_str::<Value>(&content).expect("receipt json");
+        }
+        if Instant::now() > deadline {
+            let session_messages = messages(&mut client, "dbg", &session_id);
+            panic!(
+                "receipt never appeared at {}; messages: {session_messages:?}",
+                receipt.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // The manager answered with the TS wording: unknown integration, then
+    // the missing-server error.
+    let outcomes = outcomes.as_array().expect("outcomes array");
+    assert_eq!(outcomes.len(), 2, "probe outcomes: {outcomes:?}");
+    assert_eq!(
+        outcomes[0]["error"], "Unknown MCP integration: unknown-e2e",
+        "probe outcomes: {outcomes:?}"
+    );
+    assert_eq!(
+        outcomes[1]["error"], "mcp.begin_login requires a server",
+        "probe outcomes: {outcomes:?}"
+    );
+}

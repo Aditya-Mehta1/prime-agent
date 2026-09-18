@@ -16,6 +16,7 @@ pub mod engine;
 pub mod framing;
 pub mod journal;
 pub mod lease;
+pub mod mcp_login;
 pub(crate) mod messaging;
 pub mod paths;
 pub(crate) mod peer;

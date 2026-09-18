@@ -109,6 +109,10 @@ pub struct InteractiveOptions {
     /// daemon worker installs no telemetry subscriber and attach obeys the
     /// TS `assertTelemetryAttachAllowed` guard.
     pub telemetry_disabled: Option<bool>,
+    /// `/mcp login` / `/mcp logout`: the client-side auth flows the
+    /// composition root provides (login suspends the TUI and prompts on
+    /// the terminal). `None` reports the commands as unavailable.
+    pub client_auth: Option<crate::client_auth::ClientAuthCommandsHandle>,
 }
 
 impl InteractiveOptions {
@@ -356,7 +360,19 @@ pub async fn run_interactive(
                 UiInput::Paste(text) => {
                     let _ = view.editor.handle_paste(&text);
                 }
-                UiInput::Submit(text) => session.submit_prompt(&text, &mut view).await?,
+                UiInput::Submit(text) => {
+                    // A terminal-suspending client command (`/mcp login`):
+                    // the auth flow prompts on the plain terminal.
+                    let suspended = session.needs_terminal_suspension(&text);
+                    if suspended {
+                        renderer.suspend()?;
+                    }
+                    let dispatched = session.submit_prompt(&text, &mut view).await;
+                    if suspended {
+                        renderer.resume()?;
+                    }
+                    dispatched?;
+                }
                 UiInput::HeadlessDone => headless_done = true,
                 UiInput::WaitIdle { .. } => unreachable!("barrier handled above"),
             }
@@ -557,6 +573,35 @@ impl Renderer {
         }
     }
 
+    /// Hand the terminal back to the process (raw mode off, alternate
+    /// screen left) so an interactive client command can prompt on it.
+    /// Headless verification runs keep their plain pipes.
+    fn suspend(&mut self) -> Result<()> {
+        match self {
+            Renderer::Terminal(_) => {
+                terminal::disable_raw_mode()?;
+                crossterm::execute!(std::io::stdout(), LeaveAlternateScreen)?;
+                Ok(())
+            }
+            Renderer::Headless { .. } => Ok(()),
+        }
+    }
+
+    /// Take the terminal back after a suspended client command.
+    fn resume(&mut self) -> Result<()> {
+        match self {
+            Renderer::Terminal(terminal) => {
+                terminal::enable_raw_mode()?;
+                crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
+                // A fresh full redraw: the suspended command left arbitrary
+                // output behind.
+                terminal.clear()?;
+                Ok(())
+            }
+            Renderer::Headless { .. } => Ok(()),
+        }
+    }
+
     fn is_terminal_mut(&mut self) -> Option<&mut Terminal<CrosstermBackend<std::io::Stdout>>> {
         match self {
             Renderer::Terminal(terminal) => Some(terminal),
@@ -619,6 +664,7 @@ mod tests {
             version: "0.0.0".to_string(),
             onboarding: None,
             telemetry_disabled: None,
+            client_auth: None,
         }
     }
 

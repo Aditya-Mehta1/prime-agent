@@ -28,6 +28,28 @@ pub enum AuthCredential {
         access: String,
         refresh: Option<String>,
         expires: i64,
+        /// Endpoint binding for MCP logins (`mcp:<server>` credentials): the
+        /// MCP endpoint the token was issued for; consumers refuse to send
+        /// it elsewhere.
+        #[serde(rename = "endpoint", default, skip_serializing_if = "Option::is_none")]
+        endpoint: Option<String>,
+        /// The token endpoint the token was exchanged at (refreshes reuse it).
+        #[serde(
+            rename = "tokenEndpoint",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        token_endpoint: Option<String>,
+        /// The OAuth client the login registered/pre-configured.
+        #[serde(rename = "clientId", default, skip_serializing_if = "Option::is_none")]
+        client_id: Option<String>,
+        /// RFC 9728 resource indicator; its presence marks a
+        /// protected-resource-metadata login.
+        #[serde(rename = "resource", default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+        /// RFC 8414/OIDC issuer selected by the protected-resource metadata.
+        #[serde(rename = "issuer", default, skip_serializing_if = "Option::is_none")]
+        issuer: Option<String>,
     },
 }
 

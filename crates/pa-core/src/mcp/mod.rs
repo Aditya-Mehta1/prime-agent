@@ -1,6 +1,17 @@
 //! Host side of MCP integrations. The protocol itself runs Python-side in the
 //! kernel; the host only gates integration skills by auth and serves `mcp.*`
-//! host requests. Port of core/mcp/mcp-manager.ts plus the TS MCP catalog.
+//! host requests. Port of core/mcp/mcp-manager.ts plus the TS MCP catalog
+//! (the OAuth flow lives in the `oauth*` submodules).
+
+mod login;
+mod oauth;
+mod oauth_callback;
+mod oauth_discovery;
+mod oauth_http;
+
+pub use login::{wire_begin_login, McpLoginContext, McpOAuth};
+pub use oauth::{mcp_login, mcp_refresh_token, McpLoginUi, McpOAuthConfig};
+pub use oauth_http::{OAuthHttp, OAuthHttpRequest, OAuthHttpResponse, ReqwestOAuthHttp};
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -182,13 +193,13 @@ impl AcpMcpServerConfig {
 
 /// A resolved integration: catalog/user entry plus auth state.
 #[derive(Debug, Clone)]
-struct ResolvedIntegration {
-    server: String,
-    label: String,
-    config: McpServerConfig,
-    uses_oauth: bool,
+pub(crate) struct ResolvedIntegration {
+    pub(crate) server: String,
+    pub(crate) label: String,
+    pub(crate) config: McpServerConfig,
+    pub(crate) uses_oauth: bool,
     /// True when this came from the `mcpServers` setting.
-    user_declared: bool,
+    pub(crate) user_declared: bool,
 }
 
 /// Options for constructing an [`McpManager`].
@@ -262,6 +273,23 @@ impl McpManager {
     /// Re-read settings and re-resolve integrations; call after a reload.
     pub fn refresh(&mut self) {
         self.resolve_integrations();
+    }
+
+    /// The resolved integrations (login resolution and status displays).
+    pub(crate) fn integrations(&self) -> &HashMap<String, ResolvedIntegration> {
+        &self.integrations
+    }
+
+    /// The shared auth store the login flow persists into.
+    pub(crate) fn auth_storage_handle(&self) -> Arc<tokio::sync::Mutex<AuthStorage>> {
+        Arc::clone(&self.auth_storage)
+    }
+
+    /// Wire (or clear) the interactive login behind the
+    /// `mcp.begin_login` host request. Hosts with a login UI set it
+    /// before the session registers host handlers.
+    pub fn set_begin_login(&mut self, begin_login: Option<BeginLoginFn>) {
+        self.begin_login = begin_login;
     }
 
     fn resolve_integrations(&mut self) {
@@ -409,8 +437,6 @@ impl McpManager {
         }
     }
 
-    /// `-<server>/SKILL.md` overrides for every built-in integration the user
-    /// is not logged into.
     /// Auth gating the system prompt and resource loader need, as one shared
     /// source: `-<server>/SKILL.md` overrides for built-in integrations the user
     /// is not logged into, plus the enabled persistent generic servers (prompt
@@ -421,7 +447,10 @@ impl McpManager {
         agent_dir: &std::path::Path,
     ) -> (Vec<String>, Vec<String>, McpManager) {
         let manager = McpManager::new(McpManagerOptions {
-            auth_storage: crate::auth::AuthStorage::create(agent_dir),
+            auth_storage: crate::auth::AuthStorage::create_with_oauth(
+                agent_dir,
+                std::sync::Arc::new(McpOAuth::new()),
+            ),
             get_user_servers: Box::new(move || Some(user_servers.clone())),
             begin_login: None,
         });
@@ -432,6 +461,8 @@ impl McpManager {
         )
     }
 
+    /// `-<server>/SKILL.md` overrides for every built-in integration the user
+    /// is not logged into.
     pub fn get_disabled_builtin_skill_overrides(&self) -> Vec<String> {
         BUILTIN_MCP_CATALOG
             .iter()
@@ -447,11 +478,13 @@ impl McpManager {
         let auth = self.auth_storage.clone();
         let acp_servers = self.acp_servers.clone();
         let usage_refresh = self.usage_report.clone();
+        let acp_servers_for_config = self.acp_servers.clone();
         handlers.register(
             "mcp.refresh",
             host_handler(move |payload| {
                 let auth = auth.clone();
                 let usage_refresh = usage_refresh.clone();
+                let acp_servers = acp_servers.clone();
                 Box::pin(async move {
                     let server = payload
                         .data
@@ -462,7 +495,20 @@ impl McpManager {
                     if server.is_empty() {
                         return Err(anyhow::anyhow!("mcp.refresh requires a server"));
                     }
-                    let key = auth.lock().await.get_api_key(&provider_id(&server));
+                    if acp_servers.lock().unwrap().contains_key(&server) {
+                        return Err(anyhow::anyhow!(
+                            "ACP MCP server {server} does not use host OAuth"
+                        ));
+                    }
+                    // Re-read the file first: a login from another process
+                    // (the interactive client's `/mcp login`) wrote the
+                    // credential after this manager cached its store. The
+                    // TS manager shares one in-process store; the daemon
+                    // worker's store must not serve the stale snapshot.
+                    let mut store = auth.lock().await;
+                    store.reload();
+                    let key = store.get_api_key(&provider_id(&server));
+                    drop(store);
                     if key.is_none() {
                         return Err(anyhow::anyhow!(
                             "Could not refresh credentials for {server}"
@@ -481,7 +527,7 @@ impl McpManager {
             "mcp.config",
             host_handler(move |payload| {
                 let integrations = integrations.clone();
-                let acp_servers = acp_servers.clone();
+                let acp_servers = acp_servers_for_config.clone();
                 let usage_config = usage_config.clone();
                 Box::pin(async move {
                     let server = payload

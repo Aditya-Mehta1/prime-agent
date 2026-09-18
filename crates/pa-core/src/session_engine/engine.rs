@@ -706,6 +706,128 @@ mod tests {
         )));
         let _ = ToolDefinitionBridge::new;
     }
+
+    /// The login chain's prompt-gating end to end at the engine level: a
+    /// settings-declared OAuth server stays gated, an endpoint-bound
+    /// credential (exactly what `mcp.begin_login` persists) unlocks it in
+    /// the NEXT session the engine builds, and a credential bound to
+    /// another endpoint does not.
+    #[tokio::test]
+    async fn oauth_creds_unlock_generic_mcp_gating_in_new_sessions() {
+        fn model() -> pa_agent::types::Model {
+            pa_agent::types::Model {
+                id: "m".into(),
+                name: "m".into(),
+                api: "test".into(),
+                provider: "test".into(),
+                base_url: "http://localhost".into(),
+                reasoning: false,
+                cost: Default::default(),
+                context_window: 1_000,
+                max_tokens: 100,
+            }
+        }
+
+        fn config(
+            cwd: &std::path::Path,
+            agent_dir: &std::path::Path,
+            stream_fn: pa_agent::stream::StreamFn,
+        ) -> SessionEngineConfig {
+            SessionEngineConfig {
+                cwd: cwd.to_path_buf(),
+                agent_dir: agent_dir.to_path_buf(),
+                mcp_manager: None,
+                model: Some(model()),
+                thinking_level: None,
+                stream_fn: Some(stream_fn),
+                tools: vec![],
+                custom_system_prompt: None,
+                prompt_guidelines: vec![],
+                generic_mcp_servers: vec![],
+                allow_recursion: None,
+                session_manager: None,
+                extra_host_handlers: None,
+                conversation_log_path: None,
+                additional_skill_paths: vec![],
+                additional_prompt_paths: vec![],
+                extra_builtin_skill_overrides: vec![],
+                rlm_subagent_host: None,
+                rlm_depth: None,
+                telemetry: None,
+                model_info: None,
+                cli_extension_sources: vec![],
+                extension_tool_allow_list: None,
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        // The settings declaration the daemon worker's MCP manager also
+        // resolves (an OAuth HTTP server, like `mcp add ... --oauth`).
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            serde_json::json!({
+                "mcpServers": {
+                    "fixture-oauth": {
+                        "type": "http",
+                        "url": "https://fixture.example/mcp",
+                        "oauth": true,
+                    },
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let provider = Arc::new(ScriptedProvider::new(model()));
+
+        // Gated: no credentials, no generic MCP guidance in the prompt.
+        let engine = create_session(config(&cwd, &agent_dir, provider.stream_fn()))
+            .await
+            .unwrap();
+        assert!(!engine.system_prompt.contains("# Generic MCP Connections"));
+
+        // The persisted credential begin_login leaves behind (the TS
+        // McpCredentials shape, endpoint-bound).
+        let write_credential = |endpoint: &str| {
+            std::fs::write(
+                agent_dir.join("auth.json"),
+                serde_json::json!({
+                    "mcp:fixture-oauth": {
+                        "type": "oauth",
+                        "access": "fixture-access",
+                        "refresh": "fixture-refresh",
+                        "expires": 999999999999999i64,
+                        "endpoint": endpoint,
+                        "tokenEndpoint": "https://fixture.example/token",
+                        "clientId": "fixture-client",
+                    },
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+
+        // A credential bound to another endpoint stays gated: the token
+        // must prove where it belongs (a retargeted entry forces a
+        // re-login).
+        write_credential("https://other.example/mcp");
+        let engine = create_session(config(&cwd, &agent_dir, provider.stream_fn()))
+            .await
+            .unwrap();
+        assert!(!engine.system_prompt.contains("# Generic MCP Connections"));
+
+        // The endpoint-bound credential unlocks the prompt guidance in the
+        // next session the engine builds.
+        write_credential("https://fixture.example/mcp");
+        let engine = create_session(config(&cwd, &agent_dir, provider.stream_fn()))
+            .await
+            .unwrap();
+        assert!(engine.system_prompt.contains("# Generic MCP Connections"));
+        assert!(engine.system_prompt.contains("`fixture-oauth`"));
+    }
 }
 
 #[tokio::test]

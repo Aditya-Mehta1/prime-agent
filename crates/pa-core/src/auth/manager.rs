@@ -206,10 +206,19 @@ impl AuthStorage {
 
     /// File-backed storage at `agentDir/auth.json`.
     pub fn create(agent_dir: impl AsRef<std::path::Path>) -> Self {
+        Self::create_with_oauth(agent_dir, Arc::new(NoOAuth))
+    }
+
+    /// File-backed storage with an explicit OAuth integration (the MCP
+    /// manager uses this so stored `mcp:*` tokens refresh on expiry).
+    pub fn create_with_oauth(
+        agent_dir: impl AsRef<std::path::Path>,
+        oauth: Arc<dyn OAuthIntegration>,
+    ) -> Self {
         let backend: Arc<dyn AuthStorageBackend> = Arc::new(
             super::storage::FileAuthStorageBackend::new(agent_dir.as_ref().join("auth.json")),
         );
-        Self::from_storage(backend, Arc::new(NoOAuth))
+        Self::from_storage(backend, oauth)
     }
 
     pub fn in_memory(data: AuthStorageData, oauth: Arc<dyn OAuthIntegration>) -> Self {
@@ -319,6 +328,7 @@ impl AuthStorage {
                 access,
                 refresh,
                 expires,
+                ..
             } => {
                 let api_key = self
                     .oauth
@@ -811,6 +821,12 @@ impl AuthStorage {
                 .data
                 .credential(provider_id)
                 .filter(|c| matches!(c, AuthCredential::Oauth { .. }));
+        }
+        if result.is_ok() {
+            // Reload from what we wrote: the in-memory snapshot must not
+            // serve the pre-refresh credential to a later read (a rotated
+            // refresh token is single-use).
+            self.reload();
         }
         refreshed
     }

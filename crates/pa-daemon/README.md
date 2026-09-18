@@ -70,7 +70,7 @@ session's host handlers, spawn the fixture
 No agent behavior inside workers beyond hosting a pa-core engine; no UI.
 
 ## Public API
-Supervisor entrypoint, worker entrypoint, client connection API for pa-tui/pa-cli, `acp::{run_acp_mode, AcpOptions}` (pa-cli dispatches `--mode acp` through it). Supervision internals `pub(crate)`.
+Supervisor entrypoint, worker entrypoint, `mcp_login::{WorkerMcpLoginUi, wire_worker_mcp_login}` (the worker's browser+callback login behind `mcp.begin_login`; wired by the agent engine before sessions register host handlers), client connection API for pa-tui/pa-cli, `acp::{run_acp_mode, AcpOptions}` (pa-cli dispatches `--mode acp` through it). Supervision internals `pub(crate)`.
 
 
 ## Depends on

@@ -5,6 +5,7 @@
 //! docs/windows-readiness.md for the plan and per-module dispositions).
 //! Call sites in the session engine never branch on `cfg` themselves.
 
+pub mod browser;
 pub mod lock_dir;
 pub mod perms;
 pub mod process;

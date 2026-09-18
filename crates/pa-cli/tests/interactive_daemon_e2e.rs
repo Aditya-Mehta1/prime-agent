@@ -303,6 +303,7 @@ async fn tui_attaches_prompts_streams_lists_and_switches() {
         version: "0.0.0".to_string(),
         onboarding: None,
         telemetry_disabled: None,
+        client_auth: None,
     };
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![
@@ -434,6 +435,7 @@ async fn ensure_daemon_running_spawns_supervisor_and_tui_attaches() {
         version: "0.0.0".to_string(),
         onboarding: None,
         telemetry_disabled: None,
+        client_auth: None,
     };
     // The interactive runtime's own launch sequence, minus the TTY: spawn
     // the real supervisor binary detached and wait for the hello handshake.
@@ -506,6 +508,7 @@ async fn tui_dispatches_slash_commands_menu_and_suggestions() {
         version: "0.0.0".to_string(),
         onboarding: None,
         telemetry_disabled: None,
+        client_auth: None,
     };
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![

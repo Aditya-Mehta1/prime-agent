@@ -12,6 +12,7 @@ pub mod autocomplete;
 pub mod chat;
 pub mod chat_slash;
 pub mod chrome;
+pub mod client_auth;
 pub mod code_preview;
 pub mod config_selector;
 pub mod daemon_client;

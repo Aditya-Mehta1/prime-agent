@@ -183,7 +183,10 @@ impl AgentSessionEngine {
         let mcp_cwd = config.cwd.clone();
         let mcp_agent_dir = agent_dir.clone();
         let mcp = pa_core::mcp::McpManager::new(pa_core::mcp::McpManagerOptions {
-            auth_storage: pa_core::auth::AuthStorage::create(&agent_dir),
+            auth_storage: pa_core::auth::AuthStorage::create_with_oauth(
+                &agent_dir,
+                std::sync::Arc::new(pa_core::mcp::McpOAuth::new()),
+            ),
             get_user_servers: Box::new(move || {
                 let settings = pa_core::settings::SettingsManager::create(&mcp_cwd, &mcp_agent_dir);
                 Some(
@@ -206,10 +209,21 @@ impl AgentSessionEngine {
             }),
             begin_login: None,
         });
+        // The kernel's `mcp.begin_login` host request: the worker runs the
+        // OAuth login (browser + local callback) and persists the
+        // endpoint-bound credential the shared auth store gates on. Wired
+        // before any session registers host handlers, so every session the
+        // worker builds exposes it.
+        let mcp = std::sync::Arc::new(std::sync::Mutex::new(mcp));
+        crate::mcp_login::wire_worker_mcp_login(
+            &mcp,
+            std::sync::Arc::new(crate::mcp_login::WorkerMcpLoginUi::from_env()),
+            std::sync::Arc::new(pa_core::mcp::ReqwestOAuthHttp::new()),
+        );
         Ok(Self {
             runtime,
             config,
-            mcp: std::sync::Arc::new(std::sync::Mutex::new(mcp)),
+            mcp,
             session_file,
             selection: std::sync::RwLock::new(selection),
             effective_thinking: std::sync::RwLock::new(None),

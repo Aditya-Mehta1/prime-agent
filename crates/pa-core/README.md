@@ -3,11 +3,16 @@
 The session engine.
 
 ## Scope
-MCP host side (`mcp.rs`): auth gating for built-in integrations (the
+MCP host side (`mcp/`): auth gating for built-in integrations (the
 disabled-skill overrides and `/mcp list` status), the `mcpServers` settings
 seam, and the `mcp.*` host-request handlers the kernel's generic MCP
 client reaches through (`mcp.config`, `mcp.refresh`, optional
-`mcp.begin_login`). The MCP protocol itself runs kernel-side (Python
+`mcp.begin_login`). The OAuth flow lives behind it (`oauth*` submodules:
+RFC 9728 discovery, dynamic registration, PKCE, the local callback
+server, token refresh; `login.rs`: login execution that persists the
+endpoint-bound credential into the shared auth store and the
+`wire_begin_login`/`McpOAuth` refresh integration hosts wire). The MCP
+protocol itself runs kernel-side (Python
 stdio/HTTP); the engine never spawns MCP servers. Tools (bash, edit, ipython + internal rename/stdout), file mutation queue, truncation and rendering rules, RLM kernel lifecycle (IPython spawn/execute/revive), skills loading, system prompt assembly, compaction, harness refinement, settings/config, package manager (npm/git/local source install/remove/list/update against settings), session manager (persist/resume). Autonomous mode
 (`autonomous`): runtime state with limit normalization, continuation and
 gate-failure texts, shell quality gates with retry windows and git

@@ -1221,6 +1221,7 @@ name = "pa-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures",
  "libc",
  "pa-agent",
  "pa-ai",
@@ -1233,6 +1234,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "url",
  "uuid",
 ]
 
@@ -1244,6 +1246,7 @@ dependencies = [
  "base64",
  "fancy-regex",
  "futures",
+ "getrandom 0.3.4",
  "globset",
  "hmac",
  "ignore",
@@ -1264,6 +1267,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "unicode-normalization",
+ "url",
  "uuid",
 ]
 
@@ -1285,6 +1289,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "url",
  "uuid",
 ]
 

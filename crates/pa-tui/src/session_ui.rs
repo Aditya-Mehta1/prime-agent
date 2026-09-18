@@ -61,6 +61,8 @@ pub(crate) struct SessionUi {
     pub(crate) open_agents_view: bool,
     /// `/resume <selector>`: open this selection next (the run returns it).
     pub(crate) pending_selection: Option<SessionSelection>,
+    /// `/mcp login` / `/mcp logout` (the composition root's auth flows).
+    client_auth: Option<crate::client_auth::ClientAuthCommandsHandle>,
     pub(crate) dirty: bool,
 }
 
@@ -100,6 +102,7 @@ impl SessionUi {
             exit_requested: false,
             open_agents_view: false,
             pending_selection: None,
+            client_auth: options.client_auth.clone(),
             dirty: true,
         };
         session
@@ -469,6 +472,11 @@ impl SessionUi {
                     }
                 }
             }
+            // TS `handleMcpCommand`'s login/logout branches: the auth
+            // flows run in the client process (the composition root's
+            // hook); the other management subcommands surface through the
+            // `mcp` CLI command instead of the TUI.
+            "mcp" => self.handle_mcp_command(resolved, view).await?,
             other => {
                 self.note(
                     &format!("/{other} is not available in this client yet"),
@@ -477,6 +485,35 @@ impl SessionUi {
             }
         }
         Ok(())
+    }
+
+    /// `/mcp <login|logout> <name>` (TS `handleMcpCommand`): usage errors,
+    /// then the composition root's auth flow. Only the login prompts on
+    /// the terminal, so `needs_terminal_suspension` covers it.
+    async fn handle_mcp_command(
+        &mut self,
+        resolved: &pa_types::slash_commands::ResolvedSlashCommand,
+        view: &mut AgentView,
+    ) -> Result<()> {
+        let Some(auth) = self.client_auth.clone() else {
+            self.note("/mcp is not available in this client yet", view);
+            return Ok(());
+        };
+        let note = crate::client_auth::run_mcp_auth_command(auth.0.as_ref(), &resolved.args).await;
+        self.note(&note, view);
+        Ok(())
+    }
+
+    /// Whether dispatching this input needs the terminal handed over
+    /// (raw-mode off, alternate screen left) so the auth flow can prompt.
+    pub(crate) fn needs_terminal_suspension(&self, text: &str) -> bool {
+        let Some((name, args)) = pa_types::slash_commands::parse_slash_command(text) else {
+            return false;
+        };
+        if name != "mcp" || self.client_auth.is_none() {
+            return false;
+        }
+        matches!(args.split_whitespace().next(), Some("login"))
     }
 
     /// `/resume <selector>`: a session file path, an `<id>.jsonl` under the
@@ -516,6 +553,7 @@ impl SessionUi {
             theme: String::new(),
             version: String::new(),
             onboarding: None,
+            client_auth: self.client_auth.clone(),
         }
     }
 

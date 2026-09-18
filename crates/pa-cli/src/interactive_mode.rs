@@ -246,6 +246,15 @@ fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<Inter
         onboarding: onboarding_task(config),
         // Only Some(true) rides the wire (TS `telemetryDisabled`).
         telemetry_disabled: config.telemetry_disabled.then_some(true),
+        // `/mcp login` / `/mcp logout`: the client-side auth flows run in
+        // this process (the TS interactive client's placement) and persist
+        // through the shared auth store the daemon's sessions read.
+        client_auth: Some(pa_tui::client_auth::ClientAuthCommandsHandle(
+            std::sync::Arc::new(crate::mcp_login::TerminalMcpAuth::new(
+                config.cwd.clone(),
+                config.agent_dir.clone(),
+            )),
+        )),
     })
 }
 
