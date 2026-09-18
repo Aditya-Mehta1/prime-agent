@@ -1860,13 +1860,14 @@ test("a . or .. segment is refused in every position of a credential-bearing ste
 		["--field=key=@file", "gh api --method POST repos/x --field=body=@/etc/passwd", /gh --field key=@file must name a downloaded artifact/],
 		["an unknown release option", 'gh release create "$TAG" --draft --generate-notes-from /etc/passwd artifacts/*', /gh release create carries an option the checker does not know/],
 		["an option built from an expansion", 'gh release create "$TAG" "--$flag" artifacts/*', /gh release create carries an option the checker does not know|gh option --\$flag is built from an expansion/],
-		["release download", 'gh release download "$TAG" --dir artifacts', /gh release may only create, edit, upload, view, list here/],
+		["release download outside the artifact directories", 'gh release download "$TAG" --dir /tmp/x', /gh release download may only write into a downloaded-artifact directory/],
 	]) {
 		const reasons = commandAllowlistReasons([...shellCommands(script)][0], { jobId: "github-release", artifactDirectories: directories });
 		assert.ok(reasons.some((reason) => pattern.test(reason)), `${label}: expected ${pattern}, got:\n${reasons.join("\n")}`);
 	}
 	for (const fine of [
 		'gh release upload "$TAG" artifacts/* --clobber',
+		'gh release download "$TAG" --dir artifacts --clobber',
 		'gh release create "$TAG" --draft --title "$TAG" --target "$BUILD_REF" --notes-file notes/RELEASE_NOTES.md artifacts/*',
 		'gh release edit beta --title "Beta (v${BETA_VERSION})" --target "$BUILD_REF" --notes-file /tmp/beta-release-notes.md --prerelease',
 		'gh release view "$TAG" --json isDraft,targetCommitish',
@@ -2116,8 +2117,8 @@ test("sed left the tap-bump allowlist, and every remaining tool is held to an op
 		["gh repo clone x y -- --config core.sshCommand=z", /gh repo clone may hand git only --depth/],
 		["gh repo clone -u other x y", /gh repo clone carries an option the checker does not know/],
 		["gh repo fork x", /gh repo may only clone/],
-		["gh release download v1", /gh release may only create, edit, upload, view, list/],
-		["gh release delete v1 --yes", /gh release may only create, edit, upload, view, list/],
+		["gh release unlabel v1", /gh release may only create, edit, upload, view, download, list/],
+		["gh release delete v1 --yes", /gh release may only create, edit, upload, view, download, list/],
 		['gh release create "$TAG" --draft --generate-notes-from /etc/passwd artifacts/*', /gh release create carries an option the checker does not know/],
 	]) {
 		assert.match(credentialStepReasons(script, { jobId: "tap-bump", artifactDirectories: ["artifacts"] }).join("\n"), pattern, script);

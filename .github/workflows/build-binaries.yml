@@ -708,10 +708,13 @@ jobs:
           if gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null | grep -qx false; then
             # A re-run after finalize-release published this release must finish, not
             # refuse: the channel pointers may still name the previous version. Never
-            # modify the published release; the digest-recording step below still
-            # proves its assets are exactly the bytes this run built, and the
-            # finalize-release re-check only allows the pointer move.
-            echo "Release $TAG is already published; leaving it untouched so the re-run can finish."
+            # modify the published release: its assets become the authoritative bytes
+            # for this re-run. Keyless sigstore bundles and SBOMs are not byte-stable,
+            # so a re-sign would never match the immutable R2 set, and publishing-r2
+            # would refuse the overwrite. The digest-recording step below re-proves
+            # the downloaded bytes against the digests GitHub recorded.
+            echo "Release $TAG is already published; reusing its assets so the re-run can finish."
+            gh release download "$TAG" --dir artifacts --clobber
             exit 0
           fi
           if gh release view "$TAG" >/dev/null 2>&1; then
@@ -1081,6 +1084,15 @@ jobs:
           # proved the published tag points at BUILD_REF (or is absent, in which
           # case the publish step below recreates it), and the asset comparison
           # below still refuses any change, so only the pointer move remains.
+          # Publishing an older version after a newer one is already live would
+          # roll the channel back; a stale re-run must not do that. The recheck
+          # refuses whenever the newest published release is not this version.
+          newest=$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+            --jq '[.[] | select(.draft == false) | select(.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) | .tag_name | sub("^v"; "")] | max_by(splits("\\.") | map(tonumber)) // ""')
+          if [ -n "$newest" ] && [ "$newest" != "${PRODUCTION_VERSION}" ]; then
+            echo "Newer release v${newest} is already published; refusing to move the channel to v${PRODUCTION_VERSION}." >&2
+            exit 1
+          fi
           gh release view "$TAG" --json isDraft,targetCommitish > /tmp/release.json
           test "$(jq -r .targetCommitish /tmp/release.json)" = "$BUILD_REF"
           if [ "$(jq -r .isDraft /tmp/release.json)" != true ]; then

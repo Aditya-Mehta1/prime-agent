@@ -728,6 +728,9 @@ describe("release ordering: nothing is public before verification", () => {
 		// still refused by the tag pre-check and the asset comparison.
 		expect(recheck.run).toContain('if [ "$(jq -r .isDraft /tmp/release.json)" != true ]; then');
 		expect(recheck.run).toContain("finishing the channel pointers");
+		// The rollback guard: a stale re-run of an older version must refuse.
+		expect(recheck.run).toContain("max_by(splits");
+		expect(recheck.run).toContain("refusing to move the channel");
 		expect(recheck.run).toContain('test "$(jq -r .targetCommitish /tmp/release.json)" = "$BUILD_REF"');
 	});
 
@@ -749,6 +752,7 @@ describe("release ordering: nothing is public before verification", () => {
 gh() {
   case "$*" in
     "release view v1.2.3 --json isDraft --jq .isDraft") printf 'false\\n' ;;
+    "release download v1.2.3 --dir artifacts --clobber") : ;;
     *) echo "unexpected gh call: $*" >&2; return 99 ;;
   esac
 }
@@ -756,9 +760,10 @@ gh() {
 		const result = runStepScript(create, shim, { PRODUCTION_VERSION: "1.2.3" });
 		expect(result.status, result.stderr).toBe(0);
 		expect(result.stdout).toContain("already published");
-		expect(result.stdout).toContain("leaving it untouched");
-		// The published path must not re-draft, re-upload, or edit anything.
-		expect(result.stdout).not.toContain("--clobber");
+		// The published assets become the authoritative bytes: no re-signing, so the
+		// non-byte-stable sigstore bundle and SBOMs stay consistent with R2.
+		expect(result.stdout).toContain("reusing its assets");
+		expect(create).toContain('gh release download "$TAG" --dir artifacts --clobber');
 	});
 
 	// test-policy: allow conditional-or-disabled-test -- git and tar fixtures only run on posix hosts
@@ -809,11 +814,14 @@ gh() {
 				target?: string;
 				assets?: { name: string; digest: string }[];
 				tag?: string;
+				newest?: string;
 			}) => `
 gh() {
   case "$*" in
     "api repos/o/r/git/ref/tags/v1.2.3")
       ${options.tag ? `printf '%s' '${JSON.stringify({ ref: "refs/tags/v1.2.3", object: { type: "commit", sha: options.tag } })}'` : 'echo "gh: Not Found (HTTP 404)" >&2; return 1'} ;;
+    *"select(.draft == false)"*)
+      printf '%s\n' '${options.newest ?? "1.2.3"}' ;;
     "release view v1.2.3 --json isDraft,targetCommitish")
       printf '%s' '${JSON.stringify({ isDraft: options.isDraft ?? true, targetCommitish: options.target ?? BUILD_REF })}' ;;
     "api repos/o/r/releases --paginate --jq .[] | select(.tag_name == \\"v1.2.3\\") | .id") echo 42 ;;
@@ -839,6 +847,12 @@ printf '%s' '${JSON.stringify(recorded)}' > manifest/github-assets.json
 			expect(rerun.stdout).toContain("finishing the channel pointers");
 			const rerunTagged = runStepScript(recheck, shims({ isDraft: false, tag: BUILD_REF }), env);
 			expect(rerunTagged.status, rerunTagged.stderr).toBe(0);
+			// A stale re-run must never roll the channel back to an older version.
+			const rollback = runStepScript(recheck, shims({ newest: "1.2.4" }), env);
+			expect(rollback.status, rollback.stderr).toBe(1);
+			expect(rollback.stderr).toContain("Newer release v1.2.4");
+			const rollbackPublished = runStepScript(recheck, shims({ newest: "1.2.4", isDraft: false }), env);
+			expect(rollbackPublished.status, rollbackPublished.stderr).toBe(1);
 			const swapped = runStepScript(
 				recheck,
 				shims({ assets: [recorded[0]!, { name: "install.sh", digest: "sha256:ee" }] }),

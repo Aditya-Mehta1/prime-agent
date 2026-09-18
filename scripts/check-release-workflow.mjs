@@ -155,7 +155,7 @@ export const ALLOWED_VARIABLES = [
 	// Bound in the publish and finalize steps.
 	"file", "name", "digest", "local_digest", "existing_digest", "readback_digest", "count", "pointer", "prefix", "key", "head_status", "type", "expected", "actual",
 	// Bound in the release steps.
-	"TAG", "tag", "ref", "sha", "tagged", "release_id", "missing", "failed", "asset_id", "latest_main_sha",
+	"TAG", "tag", "ref", "sha", "tagged", "release_id", "missing", "failed", "asset_id", "latest_main_sha", "newest",
 	// Bound in the npm publish step.
 	"names", "tarball", "path",
 	// Bound in the tap bump step.
@@ -522,6 +522,9 @@ const GH_RELEASE_OPTIONS = {
 	edit: { "--draft": 0, "--prerelease": 0, "--latest": 0, "--verify-tag": 0, "--title": 1, "-t": 1, "--target": 1, "--notes": 1, "-n": 1, "--notes-file": 1, "-F": 1, "--tag": 1, "--discussion-category": 1, "--repo": 1, "-R": 1 },
 	upload: { "--clobber": 0, "--repo": 1, "-R": 1 },
 	view: { "--json": 1, "--jq": 1, "-q": 1, "--template": 1, "-t": 1, "--repo": 1, "-R": 1 },
+	// Reading the published assets back on a re-run: read-only on GitHub, and the
+	// --dir target must be a downloaded-artifact directory (checked in releaseReasons).
+	download: { "--dir": 1, "-D": 1, "--clobber": 0, "--pattern": 1, "-p": 1, "--skip-existing": 0, "--repo": 1, "-R": 1 },
 	list: { "--json": 1, "--jq": 1, "-q": 1, "--template": 1, "-t": 1, "--repo": 1, "-R": 1, "--limit": 1, "-L": 1, "--exclude-drafts": 0, "--exclude-pre-releases": 0, "--order": 1, "-O": 1 },
 };
 /** `gh` options whose value is a file the command reads and sends; the file must be a downloaded artifact or a literal under /tmp. */
@@ -1911,6 +1914,16 @@ export function commandAllowlistReasons(input, { jobId = null, functions = new S
 					}
 				}
 				if (/^(view|list)$/.test(operation.text) && assets.length > 0) reasons.push(`gh release ${operation.text} takes no file: ${spelled}`);
+				if (operation.text === "download") {
+					// The published-asset reuse path: downloads may only land in a
+					// downloaded-artifact directory, never the workspace root or a path
+					// the step constructs.
+					const option = parsed.options.find((candidate) => candidate.name === "--dir" || candidate.name === "-D");
+					const target = option?.value && !option.value.expansion ? option.value.text : null;
+					if (!target || !artifactDirectories.includes(target)) {
+						reasons.push(`gh release download may only write into a downloaded-artifact directory (${dashArtifacts.join(", ") || "none"}), never ${target ?? "an expanded or missing path"}: ${spelled}`);
+					}
+				}
 			}
 		} else if (sub.text === "repo") {
 			if (args[1]?.text !== "clone" || args[1].expansion) reasons.push(`gh repo may only clone here: ${spelled}`);

@@ -79,9 +79,11 @@ is an output of the release, never an input.
   final pointer step failed, re-run it; it only writes pointers to objects `verify` already accepted.
   This includes the case where the GitHub release is already published and only the channel
   pointers are behind: a re-run re-checks the published release against the recorded asset digests
-  and the tag's commit, leaves the published release untouched, and moves only the pointers. The
-  `github-release` job equally refuses to modify a published release, so a full workflow re-run
-  also finishes instead of wedging.
+  and the tag's commit, leaves the published release untouched, and moves only the pointers. On a
+  full workflow re-run the `github-release` job likewise leaves the published release untouched and
+  **reuses its assets as the authoritative bytes** — keyless signature bundles and SBOMs are not
+  byte-stable, so a re-sign could never match the immutable R2 set. A stale re-run that would move
+  the channel back to an older version than the newest published release is refused.
 - **After the pointers move:** the release is live and immutable. Ship a new patch version; do not
   rewrite a published version.
 - A version whose tag already points at a different commit is refused outright.
