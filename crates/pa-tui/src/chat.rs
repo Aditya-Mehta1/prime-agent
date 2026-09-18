@@ -268,7 +268,7 @@ pub fn render_assistant(
     for (index, block) in visible_blocks.iter().enumerate() {
         match block {
             MessageBlock::Text(text) => {
-                out.extend(render_markdown_block(text, &md, theme, width));
+                out.extend(render_markdown_block(text, &md, width));
             }
             MessageBlock::Thinking(text) => {
                 out.extend(render_thinking_block(text, theme, width));
@@ -317,24 +317,20 @@ pub fn render_assistant(
 fn render_markdown_block(
     text: &str,
     md: &crate::markdown::MarkdownStyle,
-    theme: &Theme,
     width: usize,
 ) -> Vec<Line> {
     let content_width = width.saturating_sub(2).max(1);
     let rendered = crate::markdown::render_markdown(text.trim(), content_width, md);
-    let base = theme.fg_style(ThemeColor::MdBody);
-    let row_count = rendered.len();
     let mut out = Vec::new();
-    for (index, line) in rendered.into_iter().enumerate() {
+    for line in rendered.into_iter() {
         let mut row: Line = vec![Span::styled(" ".to_string(), Style::default())];
         row.extend(line);
-        // Continuation rows keep the open ANSI state through their padding.
-        let padding_style = if index + 1 < row_count {
-            base
-        } else {
-            Style::default()
-        };
-        out.push(pad_to(row, width, padding_style));
+        // TS pads every markdown row with unstyled spaces after the row's
+        // closing 39m reset (tmux trims them); padding never carries the
+        // content style, or a dangling SGR prefix survives the trim on rows
+        // whose content style differs from the body color (code rows, blank
+        // space rows).
+        out.push(pad_to(row, width, Style::default()));
     }
     out
 }
@@ -356,19 +352,14 @@ fn render_thinking_block(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
     md.list_bullet = dim;
     let content_width = width.saturating_sub(2).max(1);
     let rendered = crate::markdown::render_markdown(text.trim(), content_width, &md);
-    let row_count = rendered.len();
     let mut out = Vec::new();
-    for (index, line) in rendered.into_iter().enumerate() {
+    for line in rendered.into_iter() {
         // The markdown margin sits outside the styled content (default fg).
         let mut row: Line = vec![Span::raw(" ")];
         row.extend(line);
-        // Continuation rows keep the open ANSI state through their padding.
-        let padding_style = if index + 1 < row_count {
-            dim
-        } else {
-            Style::default()
-        };
-        out.push(pad_to(row, width, padding_style));
+        // TS pads with unstyled spaces after the row's closing reset (see
+        // render_markdown_block); padding never carries the dim content color.
+        out.push(pad_to(row, width, Style::default()));
     }
     out
 }

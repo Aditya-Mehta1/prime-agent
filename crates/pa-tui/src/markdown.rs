@@ -69,6 +69,14 @@ pub fn render_markdown(text: &str, width: usize, style: &MarkdownStyle) -> Vec<L
     let blocks = parse_blocks(&normalized);
     for (i, block) in blocks.iter().enumerate() {
         let next = blocks.get(i + 1);
+        // A blank source line separates blocks: TS's lexer emits one `space`
+        // token per blank run and `renderToken` pushes one empty row for it
+        // (markdown.ts `case "space"`). `parse_blocks` skips the blank
+        // source lines, so the row is emitted here, ahead of the block it
+        // precedes; adjacent blocks keep their `blank_after` row.
+        if block.sep_blank {
+            lines.push(Vec::new());
+        }
         render_block(block, next, content_width, style, &mut lines);
     }
     lines
@@ -342,16 +350,24 @@ fn render_block(
             }
         }
         BlockKind::Code { .. } => {
-            let border = style.code_block_border;
-            let top: String = "─".repeat(width.max(1));
-            out.push(vec![Span::styled(top, border)]);
+            // TS `renderCodeBlock`: no borders in the chat markdown - the
+            // block is `codeBlockIndent` (default "  ", settings-driven on
+            // the TS side) outside the styled code line, each source line
+            // rendered with the codeBlock style. The theme's
+            // `codeBlockBorder` hook exists in the TS MarkdownTheme too and
+            // is unused by the renderer on both sides.
+            let indent = "  ";
             for line in &block.lines {
-                let mut spans = vec![Span::styled(" ", style.code_block)];
-                spans.push(Span::styled(line.clone(), style.code_block));
-                out.push(spans);
+                out.push(vec![
+                    Span::raw(indent),
+                    Span::styled(line.clone(), style.code_block),
+                ]);
             }
-            let bottom: String = "─".repeat(width.max(1));
-            out.push(vec![Span::styled(bottom, border)]);
+            if block.lines.is_empty() {
+                // An empty block still renders one indented empty line
+                // (TS maps a lone codeBlock("")).
+                out.push(vec![Span::raw(indent)]);
+            }
             if blank_after(false) {
                 out.push(Vec::new());
             }
@@ -602,6 +618,15 @@ pub fn wrap_spans(spans: &[Span], width: usize, base: Style, out: &mut Vec<Line>
         let (text, style) = &tokens[i];
         let w = str_width(text);
         if col + w > width && !current.is_empty() {
+            // A wrapped row never carries its trailing gap: TS
+            // wrapTextWithAnsi drops the boundary space, so the styled
+            // content ends at the last word and the plain padding follows.
+            while current
+                .last()
+                .is_some_and(|span| span.content.trim().is_empty())
+            {
+                current.pop();
+            }
             out.push(std::mem::take(&mut current));
             col = 0;
             // drop leading whitespace at the new line start
@@ -695,10 +720,12 @@ mod tests {
     fn heading_and_paragraph() {
         let style = MarkdownStyle::default();
         let lines = render_markdown("# Title\n\nBody text here", 40, &style);
-        // Blank line between blocks: no empty spacer line (TS `space` token).
-        assert_eq!(lines.len(), 2);
+        // Blank line between blocks: the TS `space` token renders one empty
+        // row between them (markdown.ts `case "space"`).
+        assert_eq!(lines.len(), 3);
         assert_eq!(lines[0][0].content, "Title");
-        let joined: String = lines[1].iter().map(|s| s.content.as_str()).collect();
+        assert!(lines[1].is_empty(), "the space row is empty");
+        let joined: String = lines[2].iter().map(|s| s.content.as_str()).collect();
         assert_eq!(joined, "Body text here");
         // Adjacent heading + paragraph: heading pushes a blank line.
         let adjacent = render_markdown("# Title\nBody text here", 40, &style);
@@ -706,12 +733,67 @@ mod tests {
     }
 
     #[test]
-    fn code_block_borders() {
+    fn paragraph_blank_lines_render_space_rows() {
         let style = MarkdownStyle::default();
-        let lines = render_markdown("```rust\nfn main() {}\n```", 40, &style);
+        let lines = render_markdown("a\n\nb", 40, &style);
+        let flat: Vec<String> = lines
+            .iter()
+            .map(|line| line.iter().map(|s| s.content.as_str()).collect())
+            .collect();
+        assert_eq!(flat, vec!["a".to_string(), String::new(), "b".to_string()]);
+    }
+
+    #[test]
+    fn consecutive_blank_lines_render_one_space_row() {
+        let style = MarkdownStyle::default();
+        // marked collapses a blank-line run into one `space` token.
+        let lines = render_markdown("a\n\n\n\nb", 40, &style);
         assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0][0].content, "─".repeat(40));
-        assert_eq!(lines[1][1].content, "fn main() {}");
+        assert!(lines[1].is_empty());
+    }
+
+    #[test]
+    fn single_newline_stays_one_paragraph() {
+        let style = MarkdownStyle::default();
+        let lines = render_markdown("one\ntwo", 40, &style);
+        assert_eq!(lines.len(), 1);
+        let joined: String = lines[0].iter().map(|s| s.content.as_str()).collect();
+        assert_eq!(joined, "one two");
+    }
+
+    #[test]
+    fn code_block_keeps_space_rows_around_it() {
+        let style = MarkdownStyle::default();
+        let lines = render_markdown("para\n\n```rust\nfn a() {}\n```\n\nafter", 40, &style);
+        let flat: Vec<String> = lines
+            .iter()
+            .map(|line| line.iter().map(|s| s.content.as_str()).collect())
+            .collect();
+        assert_eq!(
+            flat,
+            vec![
+                "para".to_string(),
+                String::new(),
+                "  fn a() {}".to_string(),
+                String::new(),
+                "after".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn code_block_indented_no_borders() {
+        let style = MarkdownStyle::default();
+        // TS `renderCodeBlock`: `codeBlockIndent` (default "  ") outside the
+        // styled code line, no border rows in the chat markdown.
+        let lines = render_markdown("```rust\nfn main() {}\n```", 40, &style);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0][0].content, "  ");
+        assert_eq!(lines[0][1].content, "fn main() {}");
+        // An empty block still renders one indented empty line.
+        let empty = render_markdown("```\n```", 40, &style);
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0][0].content, "  ");
     }
 
     #[test]

@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
-"""Live token-stream rendering verifier (lane: streaming-render).
+"""Live token-stream rendering verifier (lane: streaming-render + streaming-gaps).
 
-Drives the Rust interactive TUI through a paced faux provider (a 240-word
-answer at a controlled tokensPerSecond) inside tmux and captures the pane
-repeatedly while the turn runs. The acceptance contract:
+Drives the interactive TUI through a paced faux provider inside tmux and
+captures the pane repeatedly while the turn runs. The acceptance contract:
 
 1. Mid-turn, the pane must GROW MONOTONICALLY: several growth samples
    (>= MIN_GROWTH_SAMPLES) at least MIN_SAMPLE_GAP apart, not one jump at
    turn end - i.e. token streaming renders live.
-2. The settled final frame must match the TS binary's settled frame
+2. Mid-turn, paragraph structure must be visible DURING streaming: once the
+   second paragraph's first words appear, an empty row separates it from the
+   first paragraph (TS renders the marked `space` token as a blank row), and
+   the two paragraphs never share a pane row.
+3. Mid-turn, a fenced code block streams as a growing region: its indented
+   code rows (TS renders no borders in chat markdown) are visible while the
+   turn still runs and grow across samples - not one dump at turn end.
+4. The settled final frame must match the TS binary's settled frame
    (differential, normalized for volatile chrome) - i.e. progressive
    rendering changed nothing about the settled output.
 
 Both sides run the same paced faux script (the TS side through the
 visual-parity faux extension; the Rust side through PRIME_AGENT_FAUX_SCRIPT),
-so the TS binary is the ground truth for both the live-growth behavior and
-the settled frame.
+so the TS binary is the ground truth for the live behaviors and the settled
+frame. Assertions 2 and 3 run on BOTH binaries: the TS side passing them
+proves the assertions describe real TS behavior before they gate the Rust
+side.
 
 tmux rules: default socket only (`env -u TMUX`), vplane-* session names, no
 kill-server; sessions are killed individually at the end.
@@ -36,10 +44,35 @@ TS_SCRIPT_MODEL = "faux-1"
 SIZE = ("120", "40")
 SESSION_NAME = "vplane-stream"
 
-# The paced answer: 240 single "wordN" tokens streamed at 25 tokens/second
-# (~10s of streaming) - long enough for many pane samples mid-turn.
+# The paced answer, structured for the streaming-structure assertions:
+# two word-paragraphs, a fenced rust block whose lines each carry words, and
+# a closing paragraph. 240 wordN tokens at 25 tokens/second (~10s).
 STREAM_WORDS = 240
+PARA_TWO_START = 81  # word81 opens paragraph two
+CODE_WORDS_START = 161  # word161 opens the fenced block
 TOKENS_PER_SECOND = 25
+
+
+def _paragraph(start, end):
+    return " ".join(f"word{i}" for i in range(start, end + 1))
+
+
+def _stream_text():
+    code_lines = []
+    next_word = CODE_WORDS_START
+    while next_word <= 232:
+        words = range(next_word, min(next_word + 4, 233))
+        code_lines.append(f"let v{words.start} = f({' '.join('word' + str(w) for w in words)});")
+        next_word += 4
+    return "\n\n".join(
+        [
+            _paragraph(1, 80),
+            _paragraph(PARA_TWO_START, 160),
+            "```\n" + "\n".join(code_lines) + "\n```",
+            _paragraph(233, STREAM_WORDS),
+        ]
+    )
+
 
 FAUX_SCRIPT = {
     "engine": "faux",
@@ -49,18 +82,11 @@ FAUX_SCRIPT = {
     "contextWindow": 128000,
     "tokensPerSecond": TOKENS_PER_SECOND,
     "responses": [
-        {
-            "content": [
-                {
-                    "type": "text",
-                    "text": " ".join(f"word{i}" for i in range(1, STREAM_WORDS + 1)),
-                }
-            ]
-        },
+        {"content": [{"type": "text", "text": _stream_text()}]},
     ],
 }
 
-PROMPT = "Write exactly two hundred words about the moon."
+PROMPT = "Write the structured answer."
 
 # Loader/spinner frames (chat.rs LOADER_FRAMES); a settled turn shows none.
 SPINNER_CHARS = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f\u25f4\u25f7\u25f6\u25f5\u25cb\u25f8\u25fb\u25fc"
@@ -156,8 +182,89 @@ def wait_for(session, needle, timeout):
     return False
 
 
+def pane_rows(pane):
+    return [line.rstrip() for line in pane.split("\n")]
+
+
+def row_with_word(rows, needle):
+    for index, row in enumerate(rows):
+        if needle in row:
+            return index
+    return None
+
+
+def code_block_rows(rows):
+    """The fenced block's content rows: 3 leading spaces (1 margin + 2
+    codeBlockIndent) followed by the code text (TS renders no borders)."""
+    return [r for r in rows if re.match(r"^ {3}let v\d+", r)]
+
+
+def assert_stream_structure(binary, panes, out_dir):
+    """Mid-stream assertions 2 and 3 over the sampled panes."""
+    errors = []
+
+    # 2. paragraph structure mid-stream: the first pane where paragraph two's
+    # opening words are visible must separate it from paragraph one with an
+    # empty row, and the paragraphs never share a row.
+    for pane in panes:
+        if f"word{PARA_TWO_START}" in pane:
+            rows = pane_rows(pane)
+            index = row_with_word(rows, f"word{PARA_TWO_START}")
+            if index is None or index == 0:
+                errors.append("paragraph two appeared at the pane top without a separator row")
+            elif rows[index - 1].strip() != "":
+                errors.append(
+                    f"paragraph two has no blank space row above it (row above: {rows[index - 1]!r})"
+                )
+            break
+    else:
+        errors.append("no mid-turn pane ever showed paragraph two")
+
+    shared = [
+        pane for pane in panes
+        if re.search(r"word80\b", pane) and re.search(f"word{PARA_TWO_START}\b", pane)
+    ]
+    for pane in shared:
+        rows = pane_rows(pane)
+        i1 = row_with_word(rows, "word80")
+        i2 = row_with_word(rows, f"word{PARA_TWO_START}")
+        if i1 is not None and i1 == i2:
+            errors.append("paragraphs one and two shared one pane row mid-stream")
+            break
+
+    # 3. the fenced block streams: it is visible while the turn still runs,
+    # and its visible content rows grow across samples.
+    growing = 0
+    last_count = -1
+    block_seen_mid_turn = False
+    for pane in panes:
+        rows = pane_rows(pane)
+        content = code_block_rows(rows)
+        if not content:
+            continue
+        if re.search(SPINNER_CLASS, pane):
+            block_seen_mid_turn = True
+        count = len(content)
+        if count > last_count:
+            if last_count >= 0:
+                growing += 1
+            last_count = count
+    if not block_seen_mid_turn:
+        errors.append("the fenced block never rendered mid-turn (indented code rows while the loader ran)")
+    if growing < 2:
+        errors.append(f"the fenced block content grew only {growing} times mid-turn (needs >= 2); rendering is batched")
+
+    if errors:
+        evidence_path = os.path.join(out_dir, f"{binary}-structure-errors.txt")
+        with open(evidence_path, "w") as f:
+            f.write("\n".join(errors))
+        raise AssertionError(
+            f"{binary}: streaming structure assertions failed: {errors[0]}; evidence: {evidence_path}"
+        )
+
+
 def run_session(binary, sandbox, shared_cwd, script_path, out_dir):
-    """Drive one binary: assert live growth, return the settled frame."""
+    """Drive one binary: assert live growth and structure; return the settled frame."""
     width, height = SIZE
     session = f"{SESSION_NAME}-{binary}"
     tmux("kill-session", "-t", session, check=False)
@@ -195,9 +302,10 @@ def run_session(binary, sandbox, shared_cwd, script_path, out_dir):
     tmux("send-keys", "-t", session, PROMPT)
     tmux("send-keys", "-t", session, "Enter")
 
-    # Sample the pane while the turn runs: growth must be progressive.
+    # Sample the pane while the turn runs: growth must be progressive and
+    # the structure assertions run over the sampled panes.
     growth = []  # (t, words) samples where the pane gained words
-    samples = []  # every sample, for evidence
+    panes = []  # every pane sample, for the structure assertions
     last_words = 0
     settled = False
     deadline = time.time() + TURN_TIMEOUT
@@ -205,10 +313,7 @@ def run_session(binary, sandbox, shared_cwd, script_path, out_dir):
         pane = capture(session)
         words = rendered_words(pane)
         now = time.time()
-        samples.append((now, words, bool(re.search(SPINNER_CLASS, pane))))
-        # Every pane sample that gained words is one growth sample: live
-        # streaming produces one per ~SAMPLE_INTERVAL (dozens over a paced
-        # turn); a batched render produces exactly one (0 -> full text).
+        panes.append(pane)
         if words > last_words:
             growth.append((round(now, 2), words))
             last_words = words
@@ -219,7 +324,7 @@ def run_session(binary, sandbox, shared_cwd, script_path, out_dir):
     evidence_path = os.path.join(out_dir, f"{binary}-samples.json")
     os.makedirs(out_dir, exist_ok=True)
     with open(evidence_path, "w") as f:
-        json.dump({"growth": growth, "samples": samples}, f, indent=1)
+        json.dump({"growth": growth, "panes": panes}, f, indent=1)
     if not settled:
         raise AssertionError(
             f"{binary}: the turn never settled (last words={last_words}); evidence: {evidence_path}"
@@ -230,6 +335,7 @@ def run_session(binary, sandbox, shared_cwd, script_path, out_dir):
             f"(needs >= {MIN_GROWTH_SAMPLES}); rendering is batched, not streamed; "
             f"evidence: {evidence_path}"
         )
+    assert_stream_structure(binary, panes, out_dir)
 
     # The settled final frame: one more beat after the loader row is gone,
     # so the trailing status chrome (usage tray, footer) finishes repainting.
@@ -281,12 +387,12 @@ def main():
     try:
         if args.only:
             frame, growth = run_session(args.only, sandboxes[args.only], shared_cwd, script_path, out_dir)
-            print(f"{args.only}: {len(growth)} progressive growth samples; captures in {out_dir}")
+            print(f"{args.only}: {len(growth)} progressive growth samples; structure assertions passed; captures in {out_dir}")
             return 0
         ts_frame, ts_growth = run_session("ts", sandboxes["ts"], shared_cwd, script_path, out_dir)
+        print(f"ts:   {len(ts_growth)} progressive growth samples; structure assertions passed")
         rust_frame, rust_growth = run_session("rust", sandboxes["rust"], shared_cwd, script_path, out_dir)
-        print(f"ts:   {len(ts_growth)} progressive growth samples")
-        print(f"rust: {len(rust_growth)} progressive growth samples")
+        print(f"rust: {len(rust_growth)} progressive growth samples; structure assertions passed")
         ts_norm = normalize(ts_frame, base)
         rust_norm = normalize(rust_frame, base)
         if ts_norm == rust_norm:
