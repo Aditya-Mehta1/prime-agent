@@ -16,10 +16,11 @@ from unittest.mock import Mock, patch
 from pydantic import ValidationError
 
 from cli import completed_report, main, validate_completion, workflow_source
-from controller import Canceled, Controller, cleanup, labels, side_complete
+from controller import Canceled, Controller, cleanup, labels
 from github import TITLE, GitHub
-from report import MARKER, METRICS, RUNTIME_METRICS, comparison, render
+from report import MARKER, METRICS, RUNTIME_METRICS, TRANSPORT_METRICS, UI_METRICS, comparison, render
 from schema import (
+    UI_METRIC_KEYS,
     Config,
     Observation,
     ProcessMemory,
@@ -27,10 +28,11 @@ from schema import (
     Request,
     Side,
     load_report,
+    side_complete,
     write_json,
 )
 from terminal import QUERIES, Display, Terminal
-from worker import environment, install, measure
+from worker import environment, install, measure, stop_agents
 
 SHA = "a" * 40
 HEAD = "b" * 40
@@ -63,7 +65,7 @@ class TerminalTests(unittest.TestCase):
 import os, sys, time, tty
 tty.setraw(0)
 time.sleep(float(sys.argv[1]))
-os.write(1, b'agents/resume\\r\\n> ')
+os.write(1, sys.argv[2].encode())
 while True:
     byte = os.read(0, 1)
     if byte == b'\\x7f':
@@ -80,9 +82,9 @@ while True:
             root = Path(directory)
             path = root / "fixture.py"
             path.write_text(script)
-            for delay in (0.05, 0.6):
+            for delay, label in ((0.05, "agents/resume\r\n> "), (0.6, ">\r\n← manage")):
                 terminal = Terminal(
-                    [sys.executable, str(path), str(delay)],
+                    [sys.executable, str(path), str(delay), label],
                     root,
                     os.environ.copy(),
                     root / f"transcript-{delay}",
@@ -175,7 +177,7 @@ class ReportTests(unittest.TestCase):
     def test_compact_tables_summarize_outcomes_without_treating_missing_samples_as_unchanged(self):
         report = fixture()
         report.status = "partial"
-        for definition in (*METRICS, *RUNTIME_METRICS):
+        for definition in (*METRICS, *RUNTIME_METRICS, *TRANSPORT_METRICS):
             count = 1 if definition.key in ("bundle", "disk") else (3 if definition.key == "install" else 10)
             report.main.metrics[definition.key] = observations(*([2.0] * count))
             report.pr_head.metrics[definition.key] = observations(*([2.0] * count))
@@ -185,11 +187,12 @@ class ReportTests(unittest.TestCase):
         report.pr_head.metrics["bundle"] = []
         text = render(report)
         self.assertIn(
-            "**Overall: 1 regressed · 1 improved · 13 no clear change · 1 incomplete · 1 unavailable.**",
+            "**Overall: 1 regressed · 1 improved · 14 no clear change · 1 incomplete · "
+            f"{len(UI_METRICS) + 1} unavailable.**",
             text,
         )
         tables = text.split("<details>")[0]
-        self.assertEqual(tables.count("| Metric | Main | This PR | Change |"), 2)
+        self.assertEqual(tables.count("| Metric | Main | This PR | Change |"), 4)
         for row in tables.splitlines():
             if row.startswith("|"):
                 self.assertEqual(len(row.strip("|").split("|")), 4)
@@ -223,7 +226,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("0/0", text)
         self.assertNotIn("TTFT", text)
         self.assertNotIn("Pinference", text)
-        for definition in RUNTIME_METRICS:
+        for definition in (*RUNTIME_METRICS, *TRANSPORT_METRICS):
             self.assertIn(definition.title, text)
 
     def test_schema_rejects_nonfinite_negative_duplicate_and_wrong_revision(self):
@@ -590,6 +593,33 @@ class LifecycleTests(unittest.TestCase):
 
 
 class MeasurementTests(unittest.TestCase):
+    def test_cleanup_accepts_a_session_that_exits_between_list_and_stop(self):
+        stale = subprocess.CalledProcessError(
+            1, ["prime-agent", "stop", "session", "--json"], stderr="Error: Unknown active session: session\n"
+        )
+        with patch(
+            "worker.run_as",
+            side_effect=['{"sessions": [{"activeSessionId": "session"}]}', stale, '{"sessions": []}'],
+        ) as run:
+            stop_agents(Path("/fixture"))
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(run.call_args.args[1], ["prime-agent", "list", "--json"])
+
+    def test_cleanup_preserves_real_stop_failures(self):
+        for error, remaining in (
+            ("Error: Unknown active session: session\n", '{"sessions": [{"activeSessionId": "session"}]}'),
+            ("Error: connection closed\n", '{"sessions": []}'),
+            ("Error: Unknown active session: another\n", '{"sessions": []}'),
+        ):
+            with self.subTest(error=error, remaining=remaining):
+                failure = subprocess.CalledProcessError(1, ["prime-agent", "stop"], stderr=error)
+                with patch(
+                    "worker.run_as",
+                    side_effect=['{"sessions": [{"activeSessionId": "session"}]}', failure, remaining],
+                ):
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        stop_agents(Path("/fixture"))
+
     def test_disk_footprint_is_measured_after_interactive_first_use(self):
         order = []
         terminal = Mock()
@@ -638,6 +668,9 @@ class MeasurementTests(unittest.TestCase):
             home = root / "benchmark1"
             (home / ".prime/agent/kernel-venv/bin").mkdir(parents=True)
             (home / ".prime/agent/kernel-venv/bin/python").touch()
+            command = home / ".local/bin/prime-agent"
+            command.parent.mkdir(parents=True)
+            command.write_text("#!/usr/bin/env node\n")
             side = Side(sha=SHA)
 
             def run_as(_user, command, *_args, **_kwargs):
@@ -680,14 +713,18 @@ class MeasurementTests(unittest.TestCase):
 
     def test_completion_requires_every_metric(self):
         side = Side(sha=SHA)
-        for definition in (*METRICS, *RUNTIME_METRICS):
-            count = 1 if definition.key in ("bundle", "disk") else (3 if definition.key == "install" else 10)
+        for definition in (*METRICS, *RUNTIME_METRICS, *TRANSPORT_METRICS, *UI_METRICS):
+            count = (
+                1
+                if definition.key in ("bundle", "disk")
+                else (3 if definition.key == "install" else (2 if definition.key in UI_METRIC_KEYS else 10))
+            )
             side.metrics[definition.key] = observations(*([1] * count))
-        self.assertTrue(side_complete(side, 10, 3))
-        for definition in (*METRICS, *RUNTIME_METRICS):
+        self.assertTrue(side_complete(side, 10, 3, 2))
+        for definition in (*METRICS, *RUNTIME_METRICS, *TRANSPORT_METRICS, *UI_METRICS):
             incomplete = side.model_copy(deep=True)
             incomplete.metrics[definition.key][-1] = Observation(trial=0, error="failed")
-            self.assertFalse(side_complete(incomplete, 10, 3))
+            self.assertFalse(side_complete(incomplete, 10, 3, 2))
 
 
 if __name__ == "__main__":
