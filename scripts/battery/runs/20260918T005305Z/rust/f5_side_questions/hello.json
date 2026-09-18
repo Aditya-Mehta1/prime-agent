@@ -1,0 +1,46 @@
+{
+ "appVersion": "0.1.0",
+ "clientId": "649bcaf303d3",
+ "protocol": {
+  "name": "prime-agent.daemon",
+  "version": 7
+ },
+ "runtime": {
+  "buildId": "pa-daemon-rs-0.1.0",
+  "executablePath": "/home/ubuntu/lane-worktrees/onboarding-parity/target/release/prime-agent"
+ },
+ "schemaId": "protocol-7-schema-28-92bc5368a082",
+ "schemaRevision": 28,
+ "serverCapabilities": [
+  "attach_snapshot",
+  "event_sequence",
+  "extension_ui",
+  "slim_attach",
+  "chunked_snapshot",
+  "client_owned_sessions",
+  "delete_rlm_subagent",
+  "heartbeat_catalog",
+  "heartbeat_management",
+  "model_catalog",
+  "side_question_transcript",
+  "transient_bash",
+  "session_input_admission",
+  "prompt_admission_cancellation",
+  "owned_prompt_cancellation",
+  "queue_message_mutation",
+  "authoritative_child_roster",
+  "owned_session_recovery_context",
+  "rlm_quiescence_barrier",
+  "session_input_pause",
+  "acp_mcp_servers",
+  "agent_roster",
+  "direct_peer_transport"
+ ],
+ "socketPath": "/home/ubuntu/lane-worktrees/onboarding-parity/scripts/battery/runs/20260918T005305Z/rust/daemon.sock",
+ "supervisorGeneration": "sup:309744",
+ "supervisorOwnerToken": "180d8909-8763-4c97-8cc6-1674f81543e5",
+ "supervisorPid": 309744,
+ "supervisorProcessStartId": "proc:471362",
+ "supervisorSocketPath": "/home/ubuntu/lane-worktrees/onboarding-parity/scripts/battery/runs/20260918T005305Z/rust/daemon.sock",
+ "type": "daemon_hello"
+}

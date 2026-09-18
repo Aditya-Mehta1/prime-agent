@@ -314,9 +314,27 @@ impl AgentSessionEngine {
         let available: Vec<Model> = registry.get_available().into_iter().cloned().collect();
         let selection = self.current_selection();
         let Some(model_name) = selection.model.as_deref() else {
+            // No flagged model: the TS `createAgentSession` startup chain —
+            // the saved settings default, then the featured default, then
+            // the first available model.
             let all: Vec<Model> = registry.get_all().to_vec();
-            if let Some(default) = pa_core::models::find_preferred_default_model(&available) {
-                return Ok(default.clone());
+            let settings = pa_core::settings::SettingsManager::create(
+                &self.config.cwd,
+                &self.config.agent_dir,
+            );
+            let startup =
+                pa_core::models::find_initial_model(&pa_core::models::InitialModelOptions {
+                    cli_provider: None,
+                    cli_model: None,
+                    scoped_models: &[],
+                    is_continuing: false,
+                    default_provider: settings.get_default_provider(),
+                    default_model_id: settings.get_default_model(),
+                    all_models: &all,
+                    available_models: &available,
+                });
+            if let Some(model) = startup {
+                return Ok(model);
             }
             return all.first().cloned().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -1616,6 +1634,34 @@ mod tests {
             engine.resolve_request_api_key(&model).as_deref(),
             Some("sk-battery")
         );
+    }
+
+    #[test]
+    fn settings_default_drives_unflagged_resolution() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_custom_provider_models_json(&agent_dir, "http://127.0.0.1:9");
+        let mut settings = pa_core::settings::SettingsManager::create(dir.path(), &agent_dir);
+        settings
+            .set_default_model_and_provider("battery".into(), "mock-1".into())
+            .unwrap();
+        let engine = AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir,
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: None,
+            faux_script: None,
+            supervisor_link: None,
+            telemetry_disabled: None,
+        })
+        .unwrap();
+        let model = engine.resolve_registry_model().expect("resolved model");
+        assert_eq!(model.provider, "battery");
+        assert_eq!(model.id, "mock-1");
     }
 
     #[test]

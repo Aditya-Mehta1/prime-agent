@@ -64,19 +64,20 @@ impl pa_tui::interactive::OnboardingSink for SettingsOnboardingSink {
 
 /// TS `shouldRunOnboarding` + `isOnboardingModelReady`: first run is defined
 /// by the settings flag alone, but the flow only shows the trace question
-/// (no login sequence) when a model with configured auth exists. Explicit
-/// provider/model flags with an API key count as ready.
-fn onboarding_task(
-    config: &crate::mode::RuntimeConfig,
-) -> Option<pa_tui::interactive::OnboardingTask> {
+/// (no login sequence) when the startup model resolves and has configured
+/// auth. The startup model follows the TS `findInitialModel` chain —
+/// explicit flags, the `--models` scope, the saved settings default, the
+/// featured default, the first available model — so a flagless launch with
+/// a configured default reaches the trace question exactly like TS. The
+/// TS non-ready path (sign-in + provider picker) is not ported yet: a
+/// first launch that resolves no usable model skips the notice.
+fn onboarding_task(options: &RunOptions) -> Option<pa_tui::interactive::OnboardingTask> {
+    let config = &options.config;
     let settings = pa_core::settings::SettingsManager::create(&config.cwd, &config.agent_dir);
     if settings.get_onboarding_shown() {
         return None;
     }
-    let model_ready = config.provider.is_some()
-        && config.model.is_some()
-        && (config.api_key.is_some() || std::env::var_os("PRIME_API_KEY").is_some());
-    if !model_ready {
+    if !startup_model_ready(options, &settings) {
         return None;
     }
     Some(pa_tui::interactive::OnboardingTask {
@@ -86,6 +87,48 @@ fn onboarding_task(
             created_at: std::time::Instant::now(),
         }),
     })
+}
+
+/// TS `isOnboardingModelReady` for the startup model: the resolved model
+/// must have configured auth (auth storage, an environment credential, or
+/// the models.json provider key). An explicit `--api-key` rides the
+/// resolved model's provider as a runtime key, so it counts too.
+fn startup_model_ready(
+    options: &RunOptions,
+    settings: &pa_core::settings::SettingsManager,
+) -> bool {
+    let config = &options.config;
+    let auth = pa_core::auth::AuthStorage::create(&config.agent_dir);
+    let mut registry =
+        pa_core::models::ModelRegistry::create(auth, config.agent_dir.join("models.json"));
+    // Sync resolution on a fresh registry must adopt the on-disk private
+    // authorization cache before `get_available` (same rule as the daemon
+    // create path).
+    registry.load_private_authorization_from_cache();
+    let all: Vec<pa_types::ai::Model> = registry.get_all().to_vec();
+    let available: Vec<pa_types::ai::Model> =
+        registry.get_available().into_iter().cloned().collect();
+    let scoped = config
+        .models
+        .as_deref()
+        .map(|patterns| pa_core::models::resolve_model_scope_from_models(patterns, &available))
+        .unwrap_or_default();
+    let is_continuing = options.session.resume.is_some() || options.session.continue_recent;
+    let startup_model =
+        pa_core::models::find_initial_model(&pa_core::models::InitialModelOptions {
+            cli_provider: config.provider.as_deref(),
+            cli_model: config.model.as_deref(),
+            scoped_models: &scoped,
+            is_continuing,
+            default_provider: settings.get_default_provider(),
+            default_model_id: settings.get_default_model(),
+            all_models: &all,
+            available_models: &available,
+        });
+    match startup_model {
+        Some(model) => registry.has_configured_auth(&model) || config.api_key.is_some(),
+        None => false,
+    }
 }
 
 /// Run the interactive TUI attached to the daemon. Returns the exit code.
@@ -261,7 +304,9 @@ fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<Inter
         initial_message: options.initial_message.clone(),
         theme: String::new(),
         version: crate::config::version().to_string(),
-        onboarding: onboarding_task(config),
+        // The startup-model chain (PR lane): the task is built from the full
+        // run options so the resolved startup model gates the notice.
+        onboarding: onboarding_task(options),
         // Only Some(true) rides the wire (TS `telemetryDisabled`).
         telemetry_disabled: config.telemetry_disabled.then_some(true),
         // `/mcp login` / `/mcp logout`: the client-side auth flows run in
@@ -523,5 +568,77 @@ mod tests {
             session_selection(&session, &Some(session_dir)).unwrap(),
             SessionSelection::Resume(file)
         );
+    }
+
+    #[test]
+    fn onboarding_gate_follows_settings_and_auth() {
+        use crate::mode::{AppMode, RuntimeConfig};
+
+        fn run_options(dir: &std::path::Path) -> RunOptions {
+            RunOptions {
+                app_mode: AppMode::Interactive,
+                config: RuntimeConfig {
+                    cwd: dir.to_path_buf(),
+                    agent_dir: dir.join("agent"),
+                    ..Default::default()
+                },
+                session: Default::default(),
+                messages: Vec::new(),
+                file_args: Vec::new(),
+                daemon_socket: None,
+                list_models: None,
+                export: None,
+                initial_message: None,
+                verbose: false,
+                offline: false,
+                agents_view_requested: false,
+                attach_agent: None,
+            }
+        }
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let agent = dir.path().join("agent");
+        std::fs::create_dir_all(&agent).expect("agent dir");
+
+        // A completed onboarding never reopens, regardless of model state.
+        let mut settings = pa_core::settings::SettingsManager::create(dir.path(), &agent);
+        settings.set_onboarding_shown(true).expect("set flag");
+        let options = run_options(dir.path());
+        assert!(onboarding_task(&options).is_none());
+        // Back to a first run for the readiness checks below.
+        settings.set_onboarding_shown(false).expect("reset flag");
+
+        // Flagless launch: a models.json provider key + saved default model
+        // resolve the startup model, so the trace question shows (TS
+        // `isOnboardingModelReady` over the `findInitialModel` chain).
+        std::fs::write(
+            agent.join("models.json"),
+            r#"{ "providers": {
+                "onboard-test": {
+                    "baseUrl": "https://onboard.test", "apiKey": "sk-onboard",
+                    "api": "openai-completions",
+                    "models": [ { "id": "m1", "name": "M1" } ]
+                },
+                "onboard-naked": {
+                    "baseUrl": "https://naked.test",
+                    "api": "openai-completions",
+                    "models": [ { "id": "m2", "name": "M2" } ]
+                }
+            } }"#,
+        )
+        .expect("models.json");
+        let mut settings = pa_core::settings::SettingsManager::create(dir.path(), &agent);
+        settings
+            .set_default_model_and_provider("onboard-test".into(), "m1".into())
+            .expect("saved default");
+        let options = run_options(dir.path());
+        assert!(onboarding_task(&options).is_some());
+
+        // Explicit flags that resolve to a provider without configured auth
+        // leave the model not ready: no trace question.
+        let mut options = run_options(dir.path());
+        options.config.provider = Some("onboard-naked".into());
+        options.config.model = Some("m2".into());
+        assert!(onboarding_task(&options).is_none());
     }
 }

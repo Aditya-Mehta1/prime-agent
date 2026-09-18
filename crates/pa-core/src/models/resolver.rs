@@ -506,6 +506,89 @@ pub fn resolve_cli_model(
     result
 }
 
+/// Inputs to the startup-model lookup (TS `findInitialModel`, composed with
+/// the `--models`-scope handling from `prepareSessionOptions`).
+#[derive(Clone, Copy)]
+pub struct InitialModelOptions<'a> {
+    /// Explicit `--provider` flag.
+    pub cli_provider: Option<&'a str>,
+    /// Explicit `--model` flag (a `provider/model` reference is inferred).
+    pub cli_model: Option<&'a str>,
+    /// Models resolved from `--models` patterns (against the available
+    /// catalog, TS `resolveModelScope`).
+    pub scoped_models: &'a [ScopedModel],
+    /// A continued/resumed session skips the scoped-model step (TS
+    /// `isContinuing`).
+    pub is_continuing: bool,
+    /// Saved default provider (settings `defaultProvider`).
+    pub default_provider: Option<&'a str>,
+    /// Saved default model id (settings `defaultModel`).
+    pub default_model_id: Option<&'a str>,
+    /// The full catalog (custom + built-in, auth not filtered).
+    pub all_models: &'a [Model],
+    /// The auth-configured catalog (TS `refreshAvailableModels`).
+    pub available_models: &'a [Model],
+}
+
+/// The startup model, in the TS priority order:
+/// 1. CLI flags (`--provider` + `--model`, resolved against the full catalog;
+///    an unresolved flagged model resolves to `None`, the caller's error)
+/// 2. The `--models` scope: the saved default when it is in scope, else the
+///    first scoped model (skipped for a continued session)
+/// 3. The saved settings default, rebuilt from the provider template when the
+///    saved id is missing from the catalog
+/// 4. The featured default (prime-inference glm-5.3, then per-provider ids)
+/// 5. The first available model.
+pub fn find_initial_model(options: &InitialModelOptions<'_>) -> Option<Model> {
+    if let (Some(provider), Some(pattern)) = (options.cli_provider, options.cli_model) {
+        let resolved = resolve_cli_model(Some(provider), pattern, options.all_models);
+        // A flagged model that cannot resolve fails the whole lookup; the
+        // caller surfaces the error (TS exits the process at this point).
+        return resolved.model;
+    }
+    if !options.scoped_models.is_empty() && !options.is_continuing {
+        let saved_in_scope = options
+            .default_provider
+            .zip(options.default_model_id)
+            .and_then(|(provider, id)| {
+                options
+                    .scoped_models
+                    .iter()
+                    .find(|scoped| scoped.model.provider == provider && scoped.model.id == id)
+            });
+        return saved_in_scope
+            .or_else(|| options.scoped_models.first())
+            .map(|scoped| scoped.model.clone());
+    }
+    if let (Some(provider), Some(id)) = (options.default_provider, options.default_model_id) {
+        if let Some(found) = options
+            .available_models
+            .iter()
+            .find(|model| model.provider == provider && model.id == id)
+        {
+            return Some(found.clone());
+        }
+        // A saved id missing from this build's snapshot survives on the
+        // provider template — except private Prime Inference ids, whose
+        // template route is authorized per team.
+        if !is_private_prime_inference_reference(provider, id) {
+            if let Some(rebuilt) = build_fallback_model(provider, id, options.available_models) {
+                return Some(rebuilt);
+            }
+        }
+    }
+    find_preferred_default_model(options.available_models)
+        .cloned()
+        .or_else(|| options.available_models.first().cloned())
+}
+
+/// The private-model predicate without a full `Model` value (TS
+/// `isPrivatePrimeInferenceModel({ provider, id })`).
+fn is_private_prime_inference_reference(provider: &str, model_id: &str) -> bool {
+    provider == "prime-inference"
+        && super::prime_inference::is_private_prime_inference_model_id(model_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::prime_inference::private_prime_inference_models;
@@ -606,5 +689,128 @@ mod tests {
         assert_eq!(fallback.id, "internal/glm-5.9-turbo");
         // Inherited the private template's compat (max_tokens field).
         assert!(fallback.compat.is_some());
+    }
+
+    #[test]
+    fn initial_model_prefers_cli_flags() {
+        let catalog = catalog();
+        let options = InitialModelOptions {
+            cli_provider: Some("anthropic"),
+            cli_model: Some("claude-sonnet-4-5"),
+            scoped_models: &[],
+            is_continuing: false,
+            default_provider: Some("openrouter"),
+            default_model_id: Some("openai/gpt-4o"),
+            all_models: &catalog,
+            available_models: &catalog,
+        };
+        let model = find_initial_model(&options).expect("flagged model resolves");
+        assert_eq!(model.provider, "anthropic");
+        assert_eq!(model.id, "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn initial_model_saved_default_wins_over_featured_default() {
+        let catalog = catalog();
+        let options = InitialModelOptions {
+            cli_provider: None,
+            cli_model: None,
+            scoped_models: &[],
+            is_continuing: false,
+            default_provider: Some("anthropic"),
+            default_model_id: Some("claude-sonnet-4-5"),
+            all_models: &catalog,
+            available_models: &catalog,
+        };
+        let model = find_initial_model(&options).expect("saved default resolves");
+        assert_eq!(model.provider, "anthropic");
+        assert_eq!(model.id, "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn initial_model_rebuilds_missing_saved_id_on_template() {
+        let catalog = catalog();
+        let options = InitialModelOptions {
+            cli_provider: None,
+            cli_model: None,
+            scoped_models: &[],
+            is_continuing: false,
+            default_provider: Some("anthropic"),
+            default_model_id: Some("claude-future-model"),
+            all_models: &catalog,
+            available_models: &catalog,
+        };
+        let model = find_initial_model(&options).expect("template rebuild resolves");
+        assert_eq!(model.provider, "anthropic");
+        assert_eq!(model.id, "claude-future-model");
+    }
+
+    #[test]
+    fn initial_model_falls_back_to_featured_then_first_available() {
+        let catalog = catalog();
+        // The featured default (prime-inference glm-5.3) wins when present.
+        let options = InitialModelOptions {
+            cli_provider: None,
+            cli_model: None,
+            scoped_models: &[],
+            is_continuing: false,
+            default_provider: None,
+            default_model_id: None,
+            all_models: &catalog,
+            available_models: &catalog,
+        };
+        let model = find_initial_model(&options).expect("featured default resolves");
+        assert_eq!(model.provider, "prime-inference");
+        assert_eq!(model.id, "z-ai/glm-5.3");
+        // Without it, the first available model takes over.
+        let available: Vec<Model> = catalog
+            .iter()
+            .filter(|model| model.provider == "anthropic")
+            .cloned()
+            .collect();
+        let fallback = InitialModelOptions {
+            available_models: &available,
+            ..options
+        };
+        let model = find_initial_model(&fallback).expect("first available resolves");
+        assert_eq!(model.provider, "anthropic");
+        assert_eq!(model.id, "claude-sonnet-4-5");
+        // An empty available catalog resolves to nothing.
+        let empty = InitialModelOptions {
+            available_models: &[],
+            ..options
+        };
+        assert_eq!(find_initial_model(&empty), None);
+    }
+
+    #[test]
+    fn initial_model_scope_prefers_saved_default_in_scope() {
+        let catalog = catalog();
+        let scoped = resolve_model_scope_from_models(
+            &["claude-sonnet".to_string(), "glm".to_string()],
+            &catalog,
+        );
+        let options = InitialModelOptions {
+            cli_provider: None,
+            cli_model: None,
+            scoped_models: &scoped,
+            is_continuing: false,
+            default_provider: Some("prime-inference"),
+            default_model_id: Some("z-ai/glm-5.3"),
+            all_models: &catalog,
+            available_models: &catalog,
+        };
+        let model = find_initial_model(&options).expect("scoped model resolves");
+        assert_eq!(model.provider, "prime-inference");
+        // The saved default is in scope and wins over scoped order.
+        assert_eq!(model.id, "z-ai/glm-5.3");
+        // A continued session skips the scope entirely.
+        let continued = InitialModelOptions {
+            is_continuing: true,
+            ..options
+        };
+        let model = find_initial_model(&continued).expect("saved default resolves");
+        assert_eq!(model.provider, "prime-inference");
+        assert_eq!(model.id, "z-ai/glm-5.3");
     }
 }

@@ -95,12 +95,10 @@ def _pids_referencing(needle: str) -> list[int]:
 
 def launch_argv(side: B.Side, daemon_socket: Path) -> list[str]:
     """The interactive launch invocation every perf launch uses, onboard
-    settle run included. The flagged provider/model resolve mock-1, which the
-    ready check needs in the frame; they also fire the Rust first-run
-    onboarding readiness gate (TS resolves the startup model from settings
-    and its auth, while the Rust port gates on the explicit flags), so the
-    flagless launch that used to run here never showed the trace notice and
-    left it to surface (and stall) the measured launches."""
+    settle run included. The flagged provider/model resolve mock-1: a fresh
+    install would show the first-run trace notice (both products resolve the
+    startup model from settings + auth now), so the flags keep the notice
+    out of the settle measurement while still exercising the readiness gate."""
     return [
         side.binary,
         "--daemon-socket",

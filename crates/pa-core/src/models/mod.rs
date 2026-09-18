@@ -28,7 +28,7 @@ pub use prime_inference_catalog::{
     refresh_prime_inference_models, PrimeInferenceCatalogEntry,
 };
 pub use resolver::{
-    build_fallback_model, find_exact_model_reference_match, find_preferred_default_model,
-    resolve_cli_model, resolve_model_scope_from_models, ResolveCliModelResult, ScopedModel,
-    PRIME_INFERENCE_DEFAULT_MODEL_ID,
+    build_fallback_model, find_exact_model_reference_match, find_initial_model,
+    find_preferred_default_model, resolve_cli_model, resolve_model_scope_from_models,
+    InitialModelOptions, ResolveCliModelResult, ScopedModel, PRIME_INFERENCE_DEFAULT_MODEL_ID,
 };

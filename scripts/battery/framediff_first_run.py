@@ -13,9 +13,11 @@ diff therefore splits the frame:
     brand-mark cells (the logo quiet zone); the drifting field around them
     cannot be synchronized across captures.
 
-Both sides run against the same mock provider setup as the battery (fresh
-agent dir, PRIME_API_KEY, models.json) so the first-run flow reaches the
-trace question. Exit code is non-zero when the frames differ.
+Both sides launch flagless (no --provider/--model): the onboarding gate
+must resolve the startup model from settings + auth, exactly like the TS
+`isOnboardingModelReady` chain, so the fresh agent dir (PRIME_API_KEY +
+models.json provider key, no saved default) reaches the trace question
+without explicit flags. Exit code is non-zero when the frames differ.
 
     python3 scripts/battery/framediff_first_run.py [--out DIR]
 """
@@ -142,6 +144,9 @@ def run_side(name: str, binary: str, base: Path, out: Path) -> dict[str, str]:
     root.mkdir(parents=True)
     side = make_side(name, binary, root)
     session = f"f1fd-{name}"
+    # Flagless: the startup model comes from settings + auth resolution
+    # (TS findInitialModel over the auth-configured catalog), not from
+    # explicit provider/model flags.
     argv = [
         "/usr/bin/env",
         # A real user terminal: the ambient sandbox pins NO_COLOR/FORCE_COLOR
@@ -156,10 +161,6 @@ def run_side(name: str, binary: str, base: Path, out: Path) -> dict[str, str]:
         binary,
         "--daemon-socket",
         str(side.daemon_socket),
-        "--provider",
-        "prime-inference",
-        "--model",
-        "mock-1",
         "--offline",
     ]
     B.tmux_launch(session, argv, side.env, side.work_dir)
