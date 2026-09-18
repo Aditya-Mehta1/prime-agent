@@ -15,15 +15,40 @@ pub(crate) const S: &str = r"[\t\n\x0B\f\r \u{00A0}\u{1680}\u{2000}-\u{200A}\u{2
 pub(crate) const W: &str = r"[A-Za-z0-9_]";
 
 pub(crate) struct Rx {
-    inner: fancy_regex::Regex,
+    inner: std::sync::Arc<fancy_regex::Regex>,
+}
+
+/// Compile-once regex cache: preview patterns are constants, but several
+/// are built dynamically from shared fragments; the card render path calls
+/// the preview on every frame, so compiling per call would dominate the
+/// render (the TS side relies on JS regex literals, which compile once).
+fn regex_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<fancy_regex::Regex>>>
+{
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<fancy_regex::Regex>>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 impl Rx {
-    /// Compile a preview regex; errors abort (patterns are compile-time constants).
+    /// Look up (or compile) a preview regex; errors abort (patterns are
+    /// compile-time constants).
     pub(crate) fn new(pattern: &str) -> Self {
-        Rx {
-            inner: fancy_regex::Regex::new(pattern).expect("code-preview regex must compile"),
-        }
+        let compiled = {
+            let mut cache = regex_cache()
+                .lock()
+                .expect("code-preview regex cache poisoned");
+            cache
+                .entry(pattern.to_string())
+                .or_insert_with(|| {
+                    std::sync::Arc::new(
+                        fancy_regex::Regex::new(pattern).expect("code-preview regex must compile"),
+                    )
+                })
+                .clone()
+        };
+        Rx { inner: compiled }
     }
 
     pub(crate) fn is_match(&self, text: &str) -> bool {
