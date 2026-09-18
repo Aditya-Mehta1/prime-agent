@@ -11,6 +11,7 @@ import {
 	type AgentsViewPersistentState,
 	createInitialAgentsViewPersistentState,
 	runAgentsViewMode,
+	waitThroughDaemonUpdateRestart,
 } from "../src/modes/agents-view/agents-view-mode.js";
 import * as agentsViewState from "../src/modes/agents-view/agents-view-state.js";
 import {
@@ -19,6 +20,8 @@ import {
 	resolveAgentsViewLeftResult,
 	type UnifiedSessionRecord,
 } from "../src/modes/agents-view/agents-view-state.js";
+import { DaemonSessionRecoveringError, DaemonUpdateRestartingError } from "../src/modes/daemon/daemon-errors.js";
+import { DaemonControlPlaneTransportError } from "../src/modes/daemon/daemon-routed-client.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import * as savedSessionCatalog from "../src/modes/daemon/saved-session-catalog.js";
 import type { InteractiveModeUiServices } from "../src/modes/interactive/interactive-mode-services.js";
@@ -38,14 +41,17 @@ vi.mock("../src/config.js", async (importOriginal) => {
 	return { ...actual, appendRotatingLog: vi.fn() };
 });
 
-vi.mock("../src/modes/daemon/daemon-client.js", () => ({
-	DaemonClient: class {
-		connect = vi.fn(async () => undefined);
-		close = vi.fn();
-		request = modeMocks.clientRequest;
-	},
-	getDaemonSocketCloseReason: vi.fn(),
-}));
+vi.mock("../src/modes/daemon/daemon-client.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../src/modes/daemon/daemon-client.js")>();
+	return {
+		...actual,
+		DaemonClient: class {
+			connect = vi.fn(async () => undefined);
+			close = vi.fn();
+			request = modeMocks.clientRequest;
+		},
+	};
+});
 
 vi.mock("../src/modes/agent-connection/daemon-agent-connection.js", () => ({
 	DaemonAgentConnection: Object.assign(function DaemonAgentConnection() {}, {
@@ -1264,27 +1270,49 @@ describe("agents view reply delivery on inactive sessions", () => {
 		expect(submit).toHaveBeenCalledWith("expanded paste body", "followUp");
 	});
 
-	it("creates a new daemon session over a dedicated connection and opens it", async () => {
-		const created = replySummary({ id: "active-new", activeSessionId: "active-new", lifecycle: "live" });
-		const request = vi.fn(async () => ({ success: true, data: created }));
-		const close = vi.fn();
-		const self: Record<string, unknown> = {
-			creatingNewSession: false,
-			stopped: false,
-			options: { config: { cwd: process.cwd() } },
-			connectDedicatedClient: vi.fn(async () => ({ request, close })),
-			setStatusMessage: vi.fn(),
-			selectSummary: vi.fn(),
-			finish: vi.fn(),
-		};
+	// [the view finishes mid-create, the requests the dedicated connection carries]
+	it.each([
+		["opens it", false, ["create"]],
+		["kills a session created after the view already finished", true, ["create", "kill"]],
+	] as const)(
+		"creates a new daemon session over a dedicated connection and %s",
+		async (_name, stopsDuringCreate, requestTypes) => {
+			const created = replySummary({ id: "active-new", activeSessionId: "active-new", lifecycle: "live" });
+			const requests: { type: string }[] = [];
+			const close = vi.fn();
+			const self: Record<string, unknown> = {
+				creatingNewSession: false,
+				stopped: false,
+				options: { config: {} },
+				connectDedicatedClient: vi.fn(async () => ({
+					close,
+					request: vi.fn(async (command: { type: string }) => {
+						requests.push(command);
+						// The view finishes while create is in flight.
+						if (stopsDuringCreate) self.stopped = true;
+						return { success: true, data: created };
+					}),
+				})),
+				setStatusMessage: vi.fn(),
+				selectSummary: vi.fn(),
+				finish: vi.fn(),
+			};
 
-		await expect(invoke("createNewSession", self)).resolves.toBe(true);
-		expect(request).toHaveBeenCalledWith(expect.objectContaining({ type: "create" }));
-		expect(self.selectSummary).toHaveBeenCalledWith(created);
-		expect(self.finish).toHaveBeenCalledWith({ type: "open", summary: created });
-		expect(close).toHaveBeenCalledOnce();
-		expect(self.creatingNewSession).toBe(false);
-	});
+			const result = await invoke("createNewSession", self);
+
+			expect(requests.map((r) => r.type)).toEqual(requestTypes);
+			if (stopsDuringCreate) {
+				expect(self.finish).not.toHaveBeenCalled();
+				expect(self.selectSummary).not.toHaveBeenCalled();
+			} else {
+				expect(result).toBe(true);
+				expect(self.selectSummary).toHaveBeenCalledWith(created);
+				expect(self.finish).toHaveBeenCalledWith({ type: "open", summary: created });
+				expect(close).toHaveBeenCalledOnce();
+				expect(self.creatingNewSession).toBe(false);
+			}
+		},
+	);
 
 	it("resumes a saved session before delivering the reply", async () => {
 		const request = vi.fn(async (command: { type: string }) => {
@@ -1369,7 +1397,11 @@ describe("agents view reply delivery on inactive sessions", () => {
 		expect(self.inactiveAgentIdentities).not.toContain("file:/tmp/sessions/saved-1.jsonl");
 	});
 
-	it("preserves a replacement composer when an older reply succeeds", async () => {
+	// [re-armed target survives, text entered mid-send survives]
+	it.each([
+		["preserves a replacement composer when an older reply succeeds", true],
+		["preserves new text entered while the same reply succeeds", false],
+	] as const)("%s", async (_name, rearmed) => {
 		const editor = editorWithText("old reply");
 		const oldTarget = { key: "saved-1", summary: savedSummary };
 		const newTarget = {
@@ -1383,40 +1415,18 @@ describe("agents view reply delivery on inactive sessions", () => {
 			setReplyTarget: vi.fn(),
 			refreshSessions: vi.fn(async () => true),
 			sendReply: vi.fn(async () => {
-				self.replyTarget = newTarget;
-				editor.setText("new reply");
+				if (rearmed) self.replyTarget = newTarget;
+				editor.setText("next reply");
 				return true;
 			}),
 		};
 
 		await invoke("submit", self, "old reply");
 
-		expect(self.replyTarget).toBe(newTarget);
-		expect(editor.getText()).toBe("new reply");
-		expect(self.setReplyTarget).not.toHaveBeenCalled();
-		expect(self.refreshSessions).toHaveBeenCalledWith();
-	});
-
-	it("preserves new text entered while the same reply succeeds", async () => {
-		const editor = editorWithText("first reply");
-		const target = { key: "saved-1", summary: savedSummary };
-		const self: Record<string, unknown> = {
-			replyTarget: target,
-			options: {},
-			editor,
-			setReplyTarget: vi.fn(),
-			refreshSessions: vi.fn(async () => true),
-			sendReply: vi.fn(async () => {
-				editor.setText("next reply");
-				return true;
-			}),
-		};
-
-		await invoke("submit", self, "first reply");
-
-		expect(self.replyTarget).toBe(target);
+		expect(self.replyTarget).toBe(rearmed ? newTarget : oldTarget);
 		expect(editor.getText()).toBe("next reply");
 		expect(self.setReplyTarget).not.toHaveBeenCalled();
+		if (rearmed) expect(self.refreshSessions).toHaveBeenCalledWith();
 	});
 
 	it.each([
@@ -1545,34 +1555,6 @@ describe("agents view reply delivery on inactive sessions", () => {
 		expect(self.selectSummary).not.toHaveBeenCalled();
 	});
 
-	it("kills a session created after the view already finished", async () => {
-		const created = replySummary({ id: "active-new", activeSessionId: "active-new", lifecycle: "live" });
-		const requests: { type: string }[] = [];
-		const self: Record<string, unknown> = {
-			creatingNewSession: false,
-			stopped: false,
-			options: { config: {} },
-			connectDedicatedClient: vi.fn(async () => ({
-				close: vi.fn(),
-				request: vi.fn(async (command: { type: string }) => {
-					requests.push(command);
-					// The view finishes while create is in flight.
-					self.stopped = true;
-					return { success: true, data: created };
-				}),
-			})),
-			setStatusMessage: vi.fn(),
-			selectSummary: vi.fn(),
-			finish: vi.fn(),
-		};
-
-		await invoke("createNewSession", self);
-
-		expect(requests.map((r) => r.type)).toEqual(["create", "kill"]);
-		expect(self.finish).not.toHaveBeenCalled();
-		expect(self.selectSummary).not.toHaveBeenCalled();
-	});
-
 	it("does not disarm a composer that was re-armed during the command", async () => {
 		const live = replySummary({ activeSessionId: "active-1", lifecycle: "live" });
 		const originalTarget = { key: "active-1", summary: live };
@@ -1629,5 +1611,121 @@ describe("agents view reply delivery on inactive sessions", () => {
 			{ name: "kill", args: "" },
 			expect.objectContaining({ activeSessionId: "active-9" }),
 		);
+	});
+});
+
+describe("agents view open during a daemon update restart", () => {
+	beforeEach(() => vi.clearAllMocks());
+
+	it.each([
+		[
+			"waits through the update restart and surfaces the wait notice",
+			true,
+			"Waited for the Prime Agent daemon update restart to finish",
+		],
+		[
+			"surfaces a permanent create failure unmasked by the wait",
+			false,
+			"Failed to open agent: File not found: /tmp/scope.jsonl",
+		],
+	] as const)("%s", async (_name, reachesSession, expectedMessage) => {
+		const saved = summary({ activeSessionId: undefined, lifecycle: "archived" });
+		let runs = 0;
+		vi.spyOn(AgentsViewMode.prototype, "run").mockImplementation(async function (this: AgentsViewMode) {
+			runs += 1;
+			if (runs === 1) return { type: "open", summary: saved, hasChildren: false };
+			expect(String(Reflect.get(this, "persistentState").statusMessage)).toContain(expectedMessage);
+			return { type: "exit" };
+		});
+		modeMocks.clientRequest
+			.mockResolvedValueOnce({
+				success: false,
+				error: "Daemon is preparing an update restart",
+			})
+			.mockResolvedValueOnce(
+				reachesSession
+					? { success: true, data: { ...saved, activeSessionId: "resumed-after-update", lifecycle: "live" } }
+					: { success: false, error: "File not found: /tmp/scope.jsonl" },
+			);
+		modeMocks.interactiveRun.mockResolvedValue({
+			type: "agents_view",
+			source: { activeSessionId: "resumed-after-update", sessionId: saved.sessionId, cwd: saved.cwd },
+		} as never);
+
+		await runAgentsViewMode({
+			config: { cwd: process.cwd() },
+			socketPath: "/tmp/agents-view-test.sock",
+			uiServices: createUiServices(),
+		});
+
+		expect(modeMocks.clientRequest).toHaveBeenCalledTimes(2);
+		expect(modeMocks.interactiveRun).toHaveBeenCalledTimes(reachesSession ? 1 : 0);
+		expect(runs).toBe(2);
+	});
+});
+
+describe("waitThroughDaemonUpdateRestart", () => {
+	const updateRestartDeadline =
+		/The Prime Agent daemon did not finish its update restart within \d+ seconds\. Try opening this agent again once the update finishes\. Last error: Daemon is preparing an update restart/;
+
+	// Post-arm transient shapes only; arming is pinned at the loop/deadline layers.
+	it("retries every restart-transient failure and reports that it waited", async () => {
+		const transientFailures = [
+			() => new Error("Failed to connect to the Prime Agent daemon: connect ENOENT"),
+			() => Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }),
+			() => new Error("Connection to the Prime Agent daemon closed."),
+			() => new Error('Timed out after 30000ms waiting for the Prime Agent daemon response to "create".'),
+			() => new DaemonControlPlaneTransportError(new Error("Connection to the Prime Agent daemon closed.")),
+			() => new Error("Unknown active session: update-restart-session"),
+			() => new DaemonSessionRecoveringError("update-restart-session"),
+		];
+		let attempts = 0;
+		const outcome = await waitThroughDaemonUpdateRestart(
+			async () => {
+				attempts += 1;
+				if (attempts === 1) throw new DaemonUpdateRestartingError();
+				const failure = transientFailures[attempts - 2];
+				if (failure) throw failure();
+				return "opened";
+			},
+			{ waitMs: 5_000, retryMs: 1 },
+		);
+		expect(outcome).toEqual({ result: "opened", waitedForUpdateRestart: true });
+	});
+
+	it("propagates a non-update failure before any update-restart signal", async () => {
+		let attempts = 0;
+		await expect(
+			waitThroughDaemonUpdateRestart(async () => {
+				attempts += 1;
+				throw new Error("spawn EMFILE");
+			}),
+		).rejects.toThrow("spawn EMFILE");
+		expect(attempts).toBe(1);
+	});
+
+	// The deadline races every attempt so an in-flight create cannot hold the open past the budget.
+	it("fails at the deadline even when an in-flight attempt would block past it", async () => {
+		vi.useFakeTimers();
+		const inFlight = new Promise<string>(() => {});
+		let attempts = 0;
+		try {
+			const opening = waitThroughDaemonUpdateRestart(
+				async () => {
+					attempts += 1;
+					if (attempts === 1) throw new DaemonUpdateRestartingError();
+					return inFlight;
+				},
+				{ waitMs: 60, retryMs: 5 },
+			).then(
+				() => "unexpectedly opened",
+				(error: Error) => error.message,
+			);
+			await vi.advanceTimersByTimeAsync(60);
+			expect(await opening).toMatch(updateRestartDeadline);
+			expect(attempts).toBe(2);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });

@@ -234,6 +234,7 @@ import {
 	getRefinementHistory,
 	type HarnessQueryTerms,
 	type HarnessState,
+	harnessDigestFingerprint,
 	harnessQueryTerms,
 	inferRefinementResultScope,
 	loadGlobalRefinementHistory,
@@ -6897,9 +6898,13 @@ export class AgentSession {
 						// The first-turn digest rides the turn's delivery records so a
 						// cancelled first turn strips it with the rest of the turn.
 						this._harnessDigestPending = false;
-						const digest = this._harnessDigest();
-						if (this._latestContextHarnessDigest() !== digest) {
-							nextTurnMessages = [createHarnessDigestMessage(digest), ...nextTurnMessages];
+						const { digest, stateFingerprint } = this._harnessDigestWithFingerprint();
+						const latest = this._latestContextHarnessDigestDetails();
+						if (!latest || !this._harnessDigestIsFresh(latest, digest, stateFingerprint)) {
+							nextTurnMessages = [
+								createHarnessDigestMessage(digest, Date.now(), stateFingerprint),
+								...nextTurnMessages,
+							];
 						}
 					}
 					const contextRecords = nextTurnMessages.map((message) =>
@@ -8546,6 +8551,8 @@ export class AgentSession {
 			}
 			this._semanticEdges.finishCompaction(semanticCompaction.compactionId, "completed");
 			// Attached mechanically; the digest never flows through the summarizer LLM.
+			const { digest: harnessDigest, stateFingerprint: harnessStateFingerprint } =
+				this._harnessDigestWithFingerprint();
 			this.sessionManager.appendCompaction(
 				summary,
 				firstKeptEntryId,
@@ -8554,7 +8561,8 @@ export class AgentSession {
 				fromExtension,
 				customInstructions,
 				usage,
-				this._harnessDigest(),
+				harnessDigest,
+				harnessStateFingerprint,
 			);
 		} catch (error) {
 			compactionSettled = true;
@@ -9091,18 +9099,47 @@ export class AgentSession {
 		);
 	}
 
-	/** The compact harness digest delivered at cold context boundaries (session start, resume, compaction head). */
-	private _harnessDigest(): string {
+	/**
+	 * Harness digest material loaded exactly once per digest build: the merged
+	 * state plus the render options (including the current query terms).
+	 */
+	private _harnessDigestMaterial(): {
+		state: HarnessState;
+		options: {
+			includeIpythonExamples: boolean;
+			includeShellExamples: boolean;
+			includeRefineExamples: boolean;
+			queryTerms: HarnessQueryTerms;
+		};
+	} {
 		const tools = this.getActiveToolNames();
 		const hasIpython = tools.includes("ipython");
 		const visibleSkills = this._modelVisibleSkills().filter((skill) => !skill.disableModelInvocation);
 		const hasRefineSkill = visibleSkills.some((skill) => skill.name === REFINE_SKILL_NAME);
-		return formatHarnessStateForPrompt(this._loadMergedHarnessState(), {
-			includeIpythonExamples: hasIpython,
-			includeShellExamples: tools.includes("bash"),
-			includeRefineExamples: hasIpython && hasRefineSkill,
-			queryTerms: this._buildHarnessDigestQueryTerms(),
-		});
+		return {
+			state: this._loadMergedHarnessState(),
+			options: {
+				includeIpythonExamples: hasIpython,
+				includeShellExamples: tools.includes("bash"),
+				includeRefineExamples: hasIpython && hasRefineSkill,
+				queryTerms: this._buildHarnessDigestQueryTerms(),
+			},
+		};
+	}
+
+	/**
+	 * Digest plus the fingerprint of the state that produced it. Cold boundaries
+	 * compare fingerprints instead of rendered text: relevance query terms
+	 * change per turn, so a rendered-text comparison re-delivers an unchanged
+	 * digest (and busts the provider prefix cache) at every boundary.
+	 */
+	private _harnessDigestWithFingerprint(): { digest: string; stateFingerprint: string } {
+		const { state, options } = this._harnessDigestMaterial();
+		const { queryTerms: _queryTerms, ...renderFlags } = options;
+		return {
+			digest: formatHarnessStateForPrompt(state, options),
+			stateFingerprint: harnessDigestFingerprint(state, renderFlags),
+		};
 	}
 
 	/**
@@ -9155,9 +9192,10 @@ export class AgentSession {
 	}
 
 	private _appendHarnessDigestIfStale(): void {
-		const digest = this._harnessDigest();
-		if (this._latestContextHarnessDigest() === digest) return;
-		const message = createHarnessDigestMessage(digest);
+		const { digest, stateFingerprint } = this._harnessDigestWithFingerprint();
+		const latest = this._latestContextHarnessDigestDetails();
+		if (latest && this._harnessDigestIsFresh(latest, digest, stateFingerprint)) return;
+		const message = createHarnessDigestMessage(digest, Date.now(), stateFingerprint);
 		try {
 			this.sessionManager.appendCustomMessageEntryWithRollback(
 				message.customType,
@@ -9183,28 +9221,54 @@ export class AgentSession {
 		for (const existing of this.agent.state.messages) {
 			if (existing.role === "compactionSummary" && existing.harnessDigest !== undefined) {
 				existing.harnessDigest = undefined;
+				existing.harnessStateFingerprint = undefined;
 			}
 		}
 		this.agent.state.messages.push(message);
 	}
 
-	private _latestContextHarnessDigest(): string | undefined {
+	/**
+	 * Whether the newest in-context digest already reflects the current harness
+	 * state. A digest is fresh when its state fingerprint matches the current
+	 * one; a digest without a fingerprint is compared by rendered
+	 * text instead.
+	 */
+	private _harnessDigestIsFresh(
+		latest: { digest: string; stateFingerprint?: string },
+		freshDigest: string,
+		freshFingerprint: string,
+	): boolean {
+		return latest.stateFingerprint !== undefined
+			? latest.stateFingerprint === freshFingerprint
+			: latest.digest === freshDigest;
+	}
+
+	private _latestContextHarnessDigestDetails():
+		| { timestamp: number; digest: string; stateFingerprint?: string }
+		| undefined {
 		// Retained pre-compaction messages follow the compaction head, so recency is by timestamp, not position.
-		let latest: { timestamp: number; digest: string } | undefined;
+		let latest: { timestamp: number; digest: string; stateFingerprint?: string } | undefined;
 		for (const message of this.agent.state.messages) {
-			let digest: string | undefined;
 			if (message.role === "custom" && message.customType === HARNESS_DIGEST_CUSTOM_TYPE) {
-				digest = (message.details as HarnessDigestDetails | undefined)?.digest;
+				const details = message.details as HarnessDigestDetails | undefined;
+				if (details?.digest !== undefined && (!latest || message.timestamp >= latest.timestamp)) {
+					latest = {
+						timestamp: message.timestamp,
+						digest: details.digest,
+						stateFingerprint: details.stateFingerprint,
+					};
+				}
 			} else if (message.role === "compactionSummary") {
-				digest = message.harnessDigest;
-			} else {
-				continue;
-			}
-			if (digest !== undefined && (!latest || message.timestamp >= latest.timestamp)) {
-				latest = { timestamp: message.timestamp, digest };
+				if (message.harnessDigest !== undefined && (!latest || message.timestamp >= latest.timestamp)) {
+					latest = {
+						timestamp: message.timestamp,
+						digest: message.harnessDigest,
+						stateFingerprint: message.harnessStateFingerprint,
+					};
+				}
 			}
 		}
-		return latest?.digest;
+		return latest;
 	}
 
 	/** Global harness state overlaid with this session's local state, when persisted. */
@@ -11901,7 +11965,14 @@ export class AgentSession {
 			}
 			this._pendingRlmSubagentSessionNames.add(requestedSessionName);
 		}
+		// The name stays reserved until the spawn admission settles: the
+		// detached runtime task releases it at admission completion (success
+		// or failure), and every pre-admission failure path releases it here.
+		const releaseReservedSessionName = () => {
+			if (requestedSessionName) this._pendingRlmSubagentSessionNames.delete(requestedSessionName);
+		};
 		let modelSelection: RlmSubagentModelSelection;
+		let childSessionDir: string;
 		try {
 			if (requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(requestedSessionName, true);
 			// An unpinned spawn model resolves against the persisted subagent
@@ -11910,20 +11981,22 @@ export class AgentSession {
 			modelSelection = await this._resolveRlmSubagentModel(
 				requestedModel ?? this.settingsManager.getSubagentDefaultModel(),
 			);
-		} finally {
-			if (requestedSessionName) this._pendingRlmSubagentSessionNames.delete(requestedSessionName);
-		}
-		if (requestedThinkingLevel !== undefined) {
-			const supported = getSupportedThinkingLevels(modelSelection.model) as ThinkingLevel[];
-			if (!supported.includes(requestedThinkingLevel)) {
-				throw new Error(
-					`Requested thinking level "${requestedThinkingLevel}" is not supported by model "${modelSelection.model.provider}/${modelSelection.model.id}"; supported levels: ${supported.join(", ")}`,
-				);
+			if (requestedThinkingLevel !== undefined) {
+				const supported = getSupportedThinkingLevels(modelSelection.model) as ThinkingLevel[];
+				if (!supported.includes(requestedThinkingLevel)) {
+					throw new Error(
+						`Requested thinking level "${requestedThinkingLevel}" is not supported by model "${modelSelection.model.provider}/${modelSelection.model.id}"; supported levels: ${supported.join(", ")}`,
+					);
+				}
 			}
+			if (this._disposed || this._disposing) {
+				throw new Error("Cannot spawn a subagent after its parent was disposed");
+			}
+			childSessionDir = this._createChildRlmSessionDir();
+		} catch (error) {
+			releaseReservedSessionName();
+			throw error;
 		}
-		if (this._disposed || this._disposing) throw new Error("Cannot spawn a subagent after its parent was disposed");
-
-		const childSessionDir = this._createChildRlmSessionDir();
 		const childNodeId = basename(childSessionDir);
 		const sessionName = requestedSessionName ?? createDefaultRlmSubagentSessionName(prompt, childNodeId);
 		if (!requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(sessionName);
@@ -12108,7 +12181,14 @@ export class AgentSession {
 		void (async () => {
 			let childRuntime: RlmSubagentRuntime | undefined;
 			try {
-				childRuntime = await this._createRlmSubagentRuntime(subagentOptions);
+				try {
+					childRuntime = await this._createRlmSubagentRuntime(subagentOptions);
+				} finally {
+					// Admission settled: in daemon mode the spawn edge is now
+					// durable, so the name transfers from the pending reservation
+					// to the admitted run. A failed admission frees the name.
+					releaseReservedSessionName();
+				}
 				const child = childRuntime.session;
 				if (run.status === "cancelled") throw new Error(run.error ?? "RLM child cancelled");
 				if (child.sessionName !== sessionName) child.setSessionName(sessionName);

@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -6,9 +6,31 @@ import { ReplKernelManager } from "../src/core/kernel/index.js";
 
 let tempDir = "";
 
-function writeExecutable(filePath: string, content: string): void {
-	writeFileSync(filePath, content);
-	chmodSync(filePath, 0o755);
+// Failing-start tests settle well inside the 30s ready timeout.
+const START_FAILURE_TIMEOUT_MS = 15_000;
+
+/** A fake kernel runtime (usually one that dies before ready) at the manager's python path. */
+function fakeRuntime(...lines: string[]): string {
+	const python = join(tempDir, "python");
+	writeFileSync(python, lines.join("\n"));
+	chmodSync(python, 0o755);
+	return python;
+}
+
+/** Runs a manager against a fake runtime with console noise muted, then always shuts it down. */
+async function withManager(
+	python: string,
+	body: (manager: ReplKernelManager) => Promise<void>,
+	stderrLogPath?: string,
+): Promise<void> {
+	const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+	const manager = new ReplKernelManager({ python, cwd: tempDir, stderrLogPath });
+	try {
+		await body(manager);
+	} finally {
+		errorSpy.mockRestore();
+		await manager.shutdown({ snapshot: true, drainHostRequests: true });
+	}
 }
 
 describe("ReplKernelManager startup", () => {
@@ -24,97 +46,87 @@ describe("ReplKernelManager startup", () => {
 	});
 
 	it("surfaces kernels that exit before ready with the stderr tail", async () => {
-		const python = join(tempDir, "python");
-		writeExecutable(python, ["#!/bin/sh", 'echo "fake runtime died before ready" >&2', "exit 42", ""].join("\n"));
-		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-		const manager = new ReplKernelManager({ python, cwd: tempDir });
-
-		try {
+		const python = fakeRuntime("#!/bin/sh", 'echo "fake runtime died before ready" >&2', "exit 42");
+		await withManager(python, async (manager) => {
 			await expect(manager.execute("print(1)")).rejects.toThrow(
 				/Kernel exited before ready[\s\S]*fake runtime died before ready/,
 			);
-		} finally {
-			errorSpy.mockRestore();
-			await manager.shutdown({ snapshot: true, drainHostRequests: true });
-		}
+		});
 	});
 
-	it("completes teardown while an inherited grandchild keeps writing stderr", async () => {
-		const python = join(tempDir, "python");
-		writeExecutable(
-			python,
-			[
-				"#!/bin/sh",
-				// A busy writer inherits fd 2 and survives the kernel: its stream
-				// never goes quiet and never EOFs.
-				"sh -c 'while :; do echo post-mortem noise; done' >&2 &",
-				"exit 42",
-				"",
-			].join("\n"),
-		);
-		const stderrLogPath = join(tempDir, "kernel-stderr.log");
-		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-		const manager = new ReplKernelManager({ python, cwd: tempDir, stderrLogPath });
+	it(
+		"completes teardown while an inherited grandchild keeps writing stderr",
+		async () => {
+			// A busy writer inherits fd 2 and survives the kernel: its stream never
+			// goes quiet and never EOFs.
+			const python = fakeRuntime("#!/bin/sh", "sh -c 'while :; do echo post-mortem noise; done' >&2 &", "exit 42");
+			const stderrLogPath = join(tempDir, "artifacts", "kernel-stderr.log");
+			await withManager(
+				python,
+				async (manager) => {
+					// Well under the ready timeout: teardown must not wait for the
+					// grandchild (destroying the pipe kills it with SIGPIPE).
+					await expect(manager.execute("print(1)")).rejects.toThrow(/Kernel exited before ready/);
+					expect(statSync(stderrLogPath).mode & 0o777).toBe(0o600);
+					expect(statSync(join(tempDir, "artifacts")).mode & 0o777).toBe(0o700);
+				},
+				stderrLogPath,
+			);
+		},
+		START_FAILURE_TIMEOUT_MS,
+	);
 
-		try {
-			// Well under the 30s ready timeout: teardown must not wait for the
-			// grandchild (destroying the pipe kills it with SIGPIPE).
-			await expect(manager.execute("print(1)")).rejects.toThrow(/Kernel exited before ready/);
-		} finally {
-			errorSpy.mockRestore();
-			await manager.shutdown({ snapshot: true, drainHostRequests: true });
-		}
-	}, 15000);
+	it(
+		"tightens a rotated kernel stderr log that was world-readable",
+		async () => {
+			const stderrLogPath = join(tempDir, "kernel-stderr.log");
+			writeFileSync(stderrLogPath, Buffer.alloc(5 * 1024 * 1024 + 1), { mode: 0o644 });
+			const python = fakeRuntime("#!/bin/sh", "exit 42");
+			await withManager(
+				python,
+				async (manager) => {
+					await expect(manager.execute("print(1)")).rejects.toThrow(/Kernel exited before ready/);
+					// The rotated file holds the historical exception payloads.
+					expect(statSync(`${stderrLogPath}.old`).mode & 0o777).toBe(0o600);
+					expect(statSync(stderrLogPath).mode & 0o777).toBe(0o600);
+				},
+				stderrLogPath,
+			);
+		},
+		START_FAILURE_TIMEOUT_MS,
+	);
 
 	it("fails a runtime announcing an unexpected protocol version", async () => {
-		const python = join(tempDir, "python");
-		writeExecutable(
-			python,
-			["#!/bin/sh", `echo '{"event":"ready","protocol":1,"python":"3.13.0"}'`, "exec sleep 60", ""].join("\n"),
+		const python = fakeRuntime(
+			"#!/bin/sh",
+			`echo '{"event":"ready","protocol":1,"python":"3.13.0"}'`,
+			"exec sleep 60",
 		);
-		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-		const manager = new ReplKernelManager({ python, cwd: tempDir });
-
-		try {
+		await withManager(python, async (manager) => {
 			await expect(manager.execute("print(1)")).rejects.toThrow(/speaks protocol 1, expected 3/);
-		} finally {
-			errorSpy.mockRestore();
-			await manager.shutdown({ snapshot: true, drainHostRequests: true });
-		}
+		});
 	});
 
 	it("rejects promptly when the kernel process fails to spawn", async () => {
-		const python = join(tempDir, "does-not-exist");
-		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-		const manager = new ReplKernelManager({ python, cwd: tempDir });
-
-		try {
-			// Without prompt rejection this would ride out the 30s ready timeout.
+		// Without prompt rejection this would ride out the 30s ready timeout.
+		await withManager(join(tempDir, "does-not-exist"), async (manager) => {
 			await expect(manager.start()).rejects.toThrow(/ENOENT/);
-		} finally {
-			errorSpy.mockRestore();
-			await manager.shutdown({ snapshot: true, drainHostRequests: true });
-		}
+		});
 	});
 
 	it("times out a runtime that never sends ready", async () => {
 		vi.useFakeTimers();
-		const python = join(tempDir, "python");
-		writeExecutable(python, ["#!/bin/sh", "exec sleep 120", ""].join("\n"));
-		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-		const manager = new ReplKernelManager({ python, cwd: tempDir });
-
 		try {
-			const startPromise = manager.start();
-			const expectation = expect(startPromise).rejects.toThrow(/did not become ready within 30000ms/);
-			await vi.advanceTimersByTimeAsync(30_000);
-			// The failure path runs a graceful shutdown bounded by its own deadline.
-			await vi.advanceTimersByTimeAsync(5_000);
-			await expectation;
+			await withManager(fakeRuntime("#!/bin/sh", "exec sleep 120"), async (manager) => {
+				const startPromise = manager.start();
+				const expectation = expect(startPromise).rejects.toThrow(/did not become ready within 30000ms/);
+				await vi.advanceTimersByTimeAsync(30_000);
+				// The failure path runs a graceful shutdown bounded by its own deadline.
+				await vi.advanceTimersByTimeAsync(5_000);
+				await expectation;
+			});
 		} finally {
 			vi.useRealTimers();
-			errorSpy.mockRestore();
-			await manager.shutdown({ snapshot: true, drainHostRequests: true });
 		}
 	});
 });

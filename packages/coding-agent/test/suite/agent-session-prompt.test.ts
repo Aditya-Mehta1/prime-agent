@@ -6,7 +6,12 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { BashResult } from "../../src/core/bash-executor.js";
-import { convertToLlm, HARNESS_DIGEST_CUSTOM_TYPE } from "../../src/core/messages.js";
+import {
+	convertToLlm,
+	HARNESS_DIGEST_CUSTOM_TYPE,
+	HARNESS_DIGEST_PREFIX,
+	HARNESS_DIGEST_SUFFIX,
+} from "../../src/core/messages.js";
 import type { PromptTemplate } from "../../src/core/prompt-templates.js";
 import { getLocalHarnessStateDir, loadHarnessState, saveHarnessState } from "../../src/core/refinement/index.js";
 import { createSyntheticSourceInfo } from "../../src/core/source-info.js";
@@ -962,10 +967,9 @@ describe("Harness digest at cold boundaries", () => {
 		expect(harness.session.messages[0]).toMatchObject({ role: "custom", customType: HARNESS_DIGEST_CUSTOM_TYPE });
 	});
 
-	it("resume dedupes identical digests and appends a fresh one when disk state changed", async () => {
-		// Empty global store: digest content must reflect only the local test entry.
+	function isolatedAgentDir(prefix: string): string {
 		const previousAgentDir = process.env.PRIME_AGENT_CODING_AGENT_DIR;
-		const agentDir = join(tmpdir(), `pi-digest-agent-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const agentDir = join(tmpdir(), `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(agentDir, { recursive: true });
 		tempDirs.push(agentDir);
 		process.env.PRIME_AGENT_CODING_AGENT_DIR = agentDir;
@@ -973,6 +977,79 @@ describe("Harness digest at cold boundaries", () => {
 			if (previousAgentDir === undefined) delete process.env.PRIME_AGENT_CODING_AGENT_DIR;
 			else process.env.PRIME_AGENT_CODING_AGENT_DIR = previousAgentDir;
 		});
+		return agentDir;
+	}
+
+	function seedMemory(
+		state: ReturnType<typeof loadHarnessState>,
+		id: string,
+		title: string,
+		content: string,
+		scope: "local" | "global" = "local",
+	): void {
+		state.entries.memory[id] = {
+			id,
+			kind: "memory",
+			title,
+			content,
+			path: "general",
+			scope,
+			reference: {},
+			arguments: {},
+			metadata: {},
+			source: "refine",
+			created_at: "2026-09-07T00:00:00.000Z",
+			updated_at: "2026-09-07T00:00:00.000Z",
+			version: 1,
+		};
+	}
+
+	it("skips digest re-delivery on resume when only query terms drifted and the state is unchanged", async () => {
+		// Hermetic store: the ambient developer harness would crowd the ranked window.
+		isolatedAgentDir("pi-digest-resume");
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		// Local material whose entries the resume-time query terms re-rank: the
+		// fresh render would differ, so only a state fingerprint can dedupe.
+		const localDir = getLocalHarnessStateDir(harness.sessionManager.getSessionArtifactDir());
+		expect(localDir).toBeDefined();
+		const state = loadHarnessState(localDir, "local");
+		seedMemory(state, "alpha_relevant", "Alpha second turn note", "Mentions second turns.");
+		seedMemory(state, "middle_plain", "Middle plain note", "Neutral material about tea varieties.");
+		seedMemory(state, "zeta_relevant", "Zeta hello note", "Greets with hello.");
+		saveHarnessState(localDir!, state);
+
+		harness.setResponses([fauxAssistantMessage("ack"), fauxAssistantMessage("ack")]);
+		await harness.session.prompt("hello");
+		await harness.session.prompt("second turn with different wording");
+		const before = digestMessages(harness);
+		expect(before).toHaveLength(1);
+		const digestTextBefore = getMessageText(before[0]);
+		expect(digestTextBefore).toContain("[local:alpha_relevant]");
+		const sessionFile = harness.sessionManager.getSessionFile();
+		expect(sessionFile).toBeDefined();
+		harness.session.dispose();
+
+		// Identical disk state, drifted query terms: the fresh render would
+		// differ, so only the fingerprint can dedupe. Exactly one byte-identical
+		// digest, with no copy stacked by the resume.
+		const resumed = await createHarness({ existingSessionFile: sessionFile });
+		harnesses.push(resumed);
+		const after = digestMessages(resumed);
+		expect(after).toHaveLength(1);
+		expect(getMessageText(after[0])).toBe(digestTextBefore);
+		const freshDigest = (
+			resumed.session as unknown as {
+				_harnessDigestWithFingerprint(): { digest: string; stateFingerprint: string };
+			}
+		)._harnessDigestWithFingerprint().digest;
+		expect(HARNESS_DIGEST_PREFIX + freshDigest + HARNESS_DIGEST_SUFFIX).not.toBe(getMessageText(after[0]));
+		resumed.session.dispose();
+	});
+
+	it("resume dedupes identical digests and appends a fresh one when disk state changed", async () => {
+		// Empty global store: digest content must reflect only the local test entry.
+		isolatedAgentDir("pi-digest-agent");
 		const harness = await createHarness({ persistSession: true });
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("hi")]);
@@ -991,21 +1068,7 @@ describe("Harness digest at cold boundaries", () => {
 		const localDir = getLocalHarnessStateDir(resumed.sessionManager.getSessionArtifactDir());
 		expect(localDir).toBeDefined();
 		const state = loadHarnessState(localDir, "local");
-		state.entries.memory.resume_test_memory = {
-			id: "resume_test_memory",
-			kind: "memory",
-			title: "Resume test memory",
-			content: "Written between resumes.",
-			path: "general",
-			scope: "local",
-			reference: {},
-			arguments: {},
-			metadata: {},
-			source: "refine",
-			created_at: "2026-09-07T00:00:00.000Z",
-			updated_at: "2026-09-07T00:00:00.000Z",
-			version: 1,
-		};
+		seedMemory(state, "resume_test_memory", "Resume test memory", "Written between resumes.");
 		saveHarnessState(localDir!, state);
 
 		const resumedStale = await createHarness({ existingSessionFile: sessionFile });
