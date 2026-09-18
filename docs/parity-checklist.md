@@ -559,10 +559,16 @@ TS: `modes/daemon/daemon-supervisor.ts` `send_message` block, `daemon-mode.ts`
   afterwards (no route starvation); (3) supervisor `kill -9`
   mid-conversation, workers re-register with the restarted supervisor, and
   the next kernel send still delivers.
-- deferred gaps: the TS supervisor's saved-session wake-up for non-resident
-  targets (catalog resolve + worker reuse) is not ported - an unknown target
-  always answers `Unknown active session: <selector>` where the TS CLI would
-  wake the saved session and print `Sent to <name>`; the family-reach
+- done (was deferred): saved-session wake for non-resident targets
+  (`crates/pa-daemon/src/session_catalog.rs` + the wake block in
+  `crates/pa-daemon/src/messaging.rs`): the catalog resolves the selector
+  (session-id prefix or exact name, cwd-scoped first; ambiguity carries the
+  TS `Ambiguous session selector` error), a resident worker hosting the file
+  is reused, otherwise one spawns over it; the CLI prints `Sent to <name>`
+  like TS. Verifier: `crates/pa-daemon/tests/saved_session_wake_e2e.rs` and
+  the CLI goldens in `pa-cli/tests/daemon_commands_e2e.rs` (including the
+  TS-differential wake flow).
+- deferred gaps: the family-reach
   assertion needs the session family catalog the thin supervisor does not
   keep; delivered agent messages persist as plain user prompts, not TS
   `custom` messages (`customType: "agent_message"` with a details block); the

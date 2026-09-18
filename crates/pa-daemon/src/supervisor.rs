@@ -800,7 +800,7 @@ impl Supervisor {
     }
 
     /// Launch a brand-new worker for a create command.
-    async fn launch_worker(
+    pub(crate) async fn launch_worker(
         self: &Arc<Self>,
         create: &DaemonCommand,
         owner_client_id: Option<String>,
@@ -930,6 +930,12 @@ impl Supervisor {
                     durable_rest.insert(key.to_string(), value.clone());
                 }
             }
+        }
+        // The whole subagent runtime identity rides the durable create
+        // command too, so a respawned child keeps its roster identity
+        // (parentPath#childId) across worker restarts.
+        if let Some(runtime_metadata) = &runtime_metadata {
+            durable_rest.insert("runtimeMetadata".to_string(), runtime_metadata.clone());
         }
         let descriptor = DaemonWorkerDescriptor {
             version: 2,

@@ -533,9 +533,9 @@ fn rust_daemon_cli_commands_end_to_end() {
     assert_eq!(normalized.lines().count(), 2, "saved row after kill");
     assert!(normalized.contains("<timestamp>"), "{normalized}");
 
-    // send_message reaches the supervisor's routing arm: the session is
-    // gone, so it answers with the TS unknown-session error (the CLI
-    // surfaces the daemon's failure verbatim).
+    // send_message by the stopped worker's active id answers with the TS
+    // unknown-session error: active ids are not durable, and the catalog
+    // keys saved sessions by session id and name only.
     let send = run_cli(
         &cli,
         dir.path(),
@@ -547,6 +547,19 @@ fn rust_daemon_cli_commands_end_to_end() {
         stderr(&send),
         format!("Error: Unknown active session: {session}\n")
     );
+
+    // The saved-session wake (messaging-7): sending by the saved session's
+    // NAME wakes it - the supervisor catalog-resolves the selector, spawns
+    // a worker over the persisted file, and delivers; the CLI renders the
+    // TS golden `Sent to <name>`.
+    let send_wake = run_cli(
+        &cli,
+        dir.path(),
+        &agent_dir,
+        &list_args(&socket_str, &["send", "renamed", "hello again"]),
+    );
+    assert_eq!(send_wake.status.code(), Some(0), "{}", stderr(&send_wake));
+    assert_eq!(stdout(&send_wake), "Sent to renamed\n");
 }
 
 #[test]
@@ -729,6 +742,33 @@ fn ts_daemon_differential_cli_output() {
     let stop_ts: Vec<&str> = vec!["stop", primary.as_str()];
     let stop_rs: Vec<&str> = vec!["stop", tertiary.as_str()];
     compare(&mut failures, &stop_ts, &stop_rs, "stop");
+
+    // Saved-session wake on the TS daemon (ground truth): each CLI sends to
+    // a session stopped earlier by its own name; both must wake it and
+    // render the delivered receipt (`Sent to <name>`). Different targets,
+    // so the compared observable is the delivered-receipt line shape.
+    let ts_wake = run_cli(
+        &ts,
+        dir.path(),
+        &agent_dir,
+        &["send", "parity-renamed", "wake from ts"],
+    );
+    let rs_wake = run_cli(
+        &rust,
+        dir.path(),
+        &agent_dir,
+        &["send", "parity-c", "wake from rs"],
+    );
+    if ts_wake.status.code() != rs_wake.status.code()
+        || stdout(&ts_wake) != "Sent to parity-renamed\n"
+        || stdout(&rs_wake) != "Sent to parity-c\n"
+    {
+        failures.push(format!(
+            "send wakes a saved session: ts {:#?} vs rs {:#?}",
+            (ts_wake.status.code(), stdout(&ts_wake), stderr(&ts_wake)),
+            (rs_wake.status.code(), stdout(&rs_wake), stderr(&rs_wake))
+        ));
+    }
 
     let _ = daemon.kill();
     let _ = daemon.wait();

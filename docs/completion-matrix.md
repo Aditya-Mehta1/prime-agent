@@ -26,10 +26,10 @@ below is evidence-based, not battery-based.
 | 2 | Thinking control (`--thinking`, `/effort`) | missing (interactive) | flag parsed but never reaches the worker; interactive unusable until the fix lane lands |
 | 3 | Slash commands | partial | registry/menu/autocomplete/session forwarding landed; almost all client command UIs report "not available" |
 | 4 | Agents view | in-flight | roster protocol + TUI mode + entry points on `lane/agents-view`, unmerged |
-| 5 | Daemon supervision & protocol | partial | 32 of ~106 TS command types; read commands, saved-session wake, reconnect missing |
+| 5 | Daemon supervision & protocol | partial | 32 of ~106 TS command types; read commands, reconnect missing (saved-session wake done) |
 | 6 | Compaction | complete (daemon wire) | kernel `compact.run` host handler lands with the family-10 lane (`lane/harness-handlers`): registered, registry-tested, and round-tripped through a real kernel |
 | 7 | Side questions | complete | - |
-| 8 | Agent-to-agent messaging | partial | peer transport done; saved-session wake, `custom` persistence, family-graph relations missing |
+| 8 | Agent-to-agent messaging | partial | peer transport done; saved-session wake done; `custom` persistence, family-graph relations missing |
 | 9 | RLM recursion (`rlm.spawn`/`collect`/subagents) | partial | `rlm.*` handlers + supervisor-backed child sessions land with the `lane/rlm` PR; kernel-side dogfood (row 11) still untested |
 | 10 | Kernel host-request surface & continual harness | in-flight | `lane/harness-handlers` registers `model.info`/`compact.*`/`refine.*` (+ pending state, turn-boundary consumption in daemon worker and print mode, registry round-trip tests, real-kernel wire-contract test via `create_session`); remaining: daemon-level dogfood e2e (a daemon session's settled boundary consuming a kernel-scheduled refinement end to end) |
 | 11 | RLM dogfood (this harness, run by the Rust binary) | missing | mission-host dogfood untested; depends on rows 9-10 |
@@ -131,7 +131,6 @@ Remaining (checklist §7/§8 stay authoritative):
 
 - Read commands `get_context_tree`, `get_commands`, `get_resource_snapshot`
   (blocked on RLM children / per-worker resource loading).
-- Saved-session wake for non-resident `send_message` targets (checklist §10).
 - `DaemonRoutedClient` reconnect semantics: the TS client
   (`modes/daemon/daemon-routed-client.ts`) reconnects and replays; the Rust
   CLI client (`pa-cli/src/daemon_client.rs`) is single-shot, no reconnect.
@@ -162,9 +161,11 @@ prompt rendering, kernel `agent_message.send`/`agent_observe.*` controllers,
 worker-to-worker peer transport with peer tickets, restart-survival e2e
 (`pa-daemon/tests/peer_messaging_e2e.rs`).
 
-Remaining (checklist §10 "deferred gaps" stands): saved-session wake,
+Remaining (checklist §10 "deferred gaps" stands):
 `customType: "agent_message"` persistence, family-graph-derived sender
-relations.
+relations. Saved-session wake for non-resident `send_message` targets is
+done (session-wake lane: `session_catalog.rs` + the messaging wake block,
+`saved_session_wake_e2e.rs`).
 
 ## 9. RLM recursion - partial (in review)
 

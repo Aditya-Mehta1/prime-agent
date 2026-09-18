@@ -160,6 +160,37 @@ impl SessionRegistry {
         self.workers.lock().await.values().cloned().collect()
     }
 
+    /// The resident hosting one session file (TS `findWorkerBySessionFile`):
+    /// the wake path reuses a worker that already owns the saved file instead
+    /// of spawning a second one over it. Canonicalized comparison, so a
+    /// respawned worker's descriptor path still matches.
+    pub(crate) async fn find_by_session_file(
+        &self,
+        session_file: &str,
+    ) -> Option<Arc<ResidentWorker>> {
+        let target = std::path::Path::new(session_file)
+            .canonicalize()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|_| session_file.to_string());
+        for resident in self.list().await {
+            let owned = resident
+                .descriptor
+                .lock()
+                .await
+                .session_file
+                .clone()
+                .unwrap_or_default();
+            let owned = std::path::Path::new(&owned)
+                .canonicalize()
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or(owned);
+            if owned == target {
+                return Some(resident);
+            }
+        }
+        None
+    }
+
     /// The resident whose durable authentication token matches (worker-
     /// authenticated supervisor requests, the TS `list_agent_peers`
     /// requester lookup). `None` rejects with the TS auth error.

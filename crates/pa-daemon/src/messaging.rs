@@ -3,13 +3,13 @@
 //! Port of the `send_message` block in `modes/daemon/daemon-supervisor.ts`:
 //! resolve the source and target workers, refuse self-targeting, then route
 //! `worker_deliver_message` to the target with sender info from the source
-//! session (agent origin) or the sending client (CLI origin). The TS
-//! supervisor can also wake a saved session from its catalog when the
-//! target is not resident; that wake-up path is deferred (see
-//! docs/parity-checklist.md), so an unknown target answers with the TS
-//! unknown-session error. The TS family-reach assertion needs the session
-//! family catalog, which the thin supervisor does not keep yet; it is
-//! deferred with it.
+//! session (agent origin) or the sending client (CLI origin). A target that
+//! is not resident is woken from the saved-session catalog: the selector
+//! resolves to a session file (`session_catalog.rs`), a resident worker
+//! hosting the file is reused, and otherwise a new worker spawns over it
+//! (the headless resume machinery). The TS family-reach assertion needs the
+//! session family catalog, which the thin supervisor does not keep yet; it
+//! stays deferred with it.
 
 use std::sync::Arc;
 
@@ -27,6 +27,9 @@ const WORKER_REQUEST_TIMEOUT_MS: u64 = 30_000;
 
 impl Supervisor {
     /// `send_message`: route to the target worker as `worker_deliver_message`.
+    /// An unknown target is not final: the supervisor wakes the saved session
+    /// the selector names (catalog resolve + worker reuse) before giving up
+    /// with the TS unknown-session error.
     pub(crate) async fn handle_send_message(
         self: &Arc<Self>,
         command_id: &str,
@@ -53,10 +56,47 @@ impl Supervisor {
             },
             None => None,
         };
-        let Ok(target) = self.registry.resolve(target_active_session_id).await else {
-            return fail(format!(
-                "Unknown active session: {target_active_session_id}"
-            ));
+        // The source summary, once read (the wake reads it for its scope;
+        // the sender endpoint reuses it).
+        let mut source_summary: Option<Value> = None;
+        let target = match self.registry.resolve(target_active_session_id).await {
+            Ok(resident) => resident,
+            Err(error) => {
+                // The wake scope needs the source summary (its cwd filters
+                // the catalog's local pass, TS `source?.summary.cwd`); a
+                // wake is the only path that reads it before the
+                // self-target guard, and a woken target is never the
+                // source, so the guard's error precedence is unchanged.
+                let wake_source = match &source {
+                    Some(source) => match self.source_worker_summary(source).await {
+                        Ok(summary) => Some((Arc::clone(source), summary)),
+                        Err(error) => return fail(format!("{error:#}")),
+                    },
+                    None => None,
+                };
+                let woken_summary = wake_source.as_ref().map(|(_, summary)| summary.clone());
+                match self
+                    .wake_saved_target(
+                        &error,
+                        target_active_session_id,
+                        wake_source
+                            .as_ref()
+                            .map(|(resident, summary)| (resident, summary)),
+                    )
+                    .await
+                {
+                    WakeOutcome::Woken(resident) => {
+                        source_summary = woken_summary;
+                        resident
+                    }
+                    WakeOutcome::Unknown => {
+                        return fail(format!(
+                            "Unknown active session: {target_active_session_id}"
+                        ))
+                    }
+                    WakeOutcome::Failed(error) => return fail(error),
+                }
+            }
         };
         if source
             .as_ref()
@@ -65,17 +105,26 @@ impl Supervisor {
             return fail("Agent messaging cannot target the sending session".to_string());
         }
         let sender = match &source {
-            Some(source) => match self.sender_endpoint(source, client_id).await {
-                Ok(sender) => sender,
-                Err(error) => return fail(format!("{error:#}")),
-            },
+            Some(source) => {
+                // The wake already read the summary for its scope; every
+                // other path reads it here (the TS sender endpoint comes
+                // from the roster summary).
+                let summary = match source_summary.take() {
+                    Some(summary) => summary,
+                    None => match self.source_worker_summary(source).await {
+                        Ok(summary) => summary,
+                        Err(error) => return fail(format!("{error:#}")),
+                    },
+                };
+                sender_endpoint_from_summary(&summary, client_id)
+            }
             // CLI origin: the TS worker attributes client-sent messages to
             // the client id (`createAgentSessionMessageSender`).
             None => json!({ "clientId": client_id }),
         };
         let delivery = DaemonWorkerCommand::WorkerDeliverMessage {
             id: None,
-            target_active_session_id: target_active_session_id.clone(),
+            target_active_session_id: target.worker_id.clone(),
             message: message.clone(),
             sender,
             delivery_mode: delivery_mode.clone(),
@@ -106,16 +155,12 @@ impl Supervisor {
         }
     }
 
-    /// Sender endpoint for an agent-origin message: the source session's
-    /// live summary (the TS supervisor reads the same fields from its
-    /// roster entry).
-    async fn sender_endpoint(
-        self: &Arc<Self>,
-        source: &Arc<ResidentWorker>,
-        client_id: &str,
-    ) -> Result<Value> {
+    /// The send source's live session summary (`get_state`), strict: the
+    /// read's error fails the send (the roster's own `worker_summary`
+    /// downgrades an unreachable worker to a recovering row instead).
+    async fn source_worker_summary(&self, resident: &Arc<ResidentWorker>) -> Result<Value> {
         let state = self
-            .route_command(source, "get_state", json!({}), WORKER_REQUEST_TIMEOUT_MS)
+            .route_command(resident, "get_state", json!({}), WORKER_REQUEST_TIMEOUT_MS)
             .await?;
         if !state.success {
             return Err(anyhow!(
@@ -125,29 +170,125 @@ impl Supervisor {
                     .unwrap_or_else(|| "source state unavailable".to_string())
             ));
         }
-        let summary = state
+        state
             .data
-            .ok_or_else(|| anyhow!("source session state unavailable"))?;
-        let mut sender = json!({
-            "activeSessionId": summary
-                .get("activeSessionId")
-                .or_else(|| summary.get("id"))
-                .cloned()
-                .unwrap_or(Value::Null),
-            "sessionId": summary.get("sessionId").cloned().unwrap_or(Value::Null),
-            "runtimeKind": summary
-                .get("runtimeKind")
-                .cloned()
-                .unwrap_or(json!("top-level")),
-            "clientId": client_id,
-        });
-        if let Some(name) = summary.get("sessionName").and_then(Value::as_str) {
-            if !name.is_empty() {
-                sender["sessionName"] = json!(name);
-            }
-        }
-        Ok(sender)
+            .ok_or_else(|| anyhow!("source session state unavailable"))
     }
+
+    /// Wake the saved session an unknown target selector names (the TS
+    /// `send_message` wake block): catalog-resolve the selector, reuse a
+    /// resident worker that already hosts the file, or spawn one over it.
+    /// `Unknown` keeps the caller's unknown-session error; `Failed` carries
+    /// the wake's own error (a catalog ambiguity outranks the miss, like
+    /// the TS `Ambiguous session selector` propagation).
+    async fn wake_saved_target(
+        self: &Arc<Self>,
+        resolve_error: &anyhow::Error,
+        selector: &str,
+        source: Option<(&Arc<ResidentWorker>, &Value)>,
+    ) -> WakeOutcome {
+        let rendered = resolve_error.to_string();
+        if !rendered.starts_with("Unknown active session:") {
+            return WakeOutcome::Failed(rendered);
+        }
+        // The catalog scope: the source session's cwd and session dir when
+        // the send is agent-origin, the supervisor's defaults otherwise
+        // (TS `source?.summary.cwd ?? defaultSessionConfig.cwd`).
+        let cwd = source
+            .and_then(|(_, summary)| summary.get("cwd"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|dir| dir.to_string_lossy().to_string())
+            })
+            .unwrap_or_else(|| "/".to_string());
+        let sessions_dir = match source {
+            Some((resident, _)) => {
+                let descriptor = resident.descriptor.lock().await;
+                descriptor
+                    .session_dir
+                    .clone()
+                    .map(|dir| crate::paths::expand_tilde(&dir))
+            }
+            None => None,
+        }
+        .unwrap_or_else(|| crate::paths::sessions_dir(&self.options.agent_dir));
+        let info =
+            match crate::session_catalog::resolve_saved_session(&sessions_dir, selector, &cwd) {
+                Ok(Some(info)) => info,
+                Ok(None) => return WakeOutcome::Unknown,
+                Err(error) => return WakeOutcome::Failed(error.to_string()),
+            };
+        let session_path = info.path.to_string_lossy().to_string();
+        // Reuse before spawning (TS `createOrReuseWorker`): a resident
+        // worker already hosting the file serves the wake.
+        if let Some(resident) = self.registry.find_by_session_file(&session_path).await {
+            return WakeOutcome::Woken(resident);
+        }
+        // The wake create: one worker over the saved file (the headless
+        // resume path), carrying the session's own cwd.
+        let create = DaemonCommand::Create {
+            id: None,
+            session_path: Some(session_path),
+            continue_recent: Some(false),
+            no_session: None,
+            name: None,
+            config: Some(json!({ "cwd": info.cwd })),
+            // Telemetry opt-out only ever rides an explicit user create;
+            // the wake create inherits the daemon default (absent).
+            telemetry_disabled: None,
+            runtime_metadata: None,
+            lifecycle: None,
+            env: None,
+            launch_env: None,
+            rest: Default::default(),
+        };
+        match self.launch_worker(&create, None).await {
+            Ok(resident) => {
+                self.refresh_roster_entry(&resident).await;
+                WakeOutcome::Woken(resident)
+            }
+            Err(error) => WakeOutcome::Failed(format!("{error:#}")),
+        }
+    }
+}
+
+/// Sender endpoint for an agent-origin message: the source session's live
+/// summary (the TS supervisor reads the same fields from its roster
+/// entry).
+fn sender_endpoint_from_summary(summary: &Value, client_id: &str) -> Value {
+    let mut sender = json!({
+        "activeSessionId": summary
+            .get("activeSessionId")
+            .or_else(|| summary.get("id"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "sessionId": summary.get("sessionId").cloned().unwrap_or(Value::Null),
+        "runtimeKind": summary
+            .get("runtimeKind")
+            .cloned()
+            .unwrap_or(json!("top-level")),
+        "clientId": client_id,
+    });
+    if let Some(name) = summary.get("sessionName").and_then(Value::as_str) {
+        if !name.is_empty() {
+            sender["sessionName"] = json!(name);
+        }
+    }
+    sender
+}
+
+/// The wake outcome for an unknown `send_message` target.
+enum WakeOutcome {
+    /// The saved session was woken (or reused); the resident serves it.
+    Woken(Arc<ResidentWorker>),
+    /// No saved session matched: the caller answers with the TS
+    /// unknown-session error.
+    Unknown,
+    /// The wake itself failed; the error is final.
+    Failed(String),
 }
 
 #[cfg(test)]
@@ -266,6 +407,30 @@ mod tests {
         assert_eq!(
             response.error.as_deref(),
             Some("Agent messaging cannot target the sending session")
+        );
+    }
+
+    /// A selector that names two saved sessions is ambiguous, and the
+    /// catalog's ambiguity error outranks the unknown-active-session miss
+    /// (TS preserves it for a2a senders).
+    #[tokio::test]
+    async fn ambiguous_saved_selector_carries_the_catalog_error() {
+        let supervisor = supervisor();
+        let sessions = crate::paths::sessions_dir(&supervisor.options.agent_dir);
+        std::fs::create_dir_all(&sessions).unwrap();
+        for _ in 0..2 {
+            let mut session = crate::session_store::SessionFile::create("/tmp", None, 0);
+            session.append_session_info("twin");
+            session.set_path(sessions.join(format!("{}.jsonl", session.session_id())));
+            session.rewrite().unwrap();
+        }
+        let response = supervisor
+            .handle_send_message("m1", "cli-1", &send_command("twin", None))
+            .await;
+        assert!(!response.success, "{response:?}");
+        assert_eq!(
+            response.error.as_deref(),
+            Some("Ambiguous session selector \"twin\"")
         );
     }
 

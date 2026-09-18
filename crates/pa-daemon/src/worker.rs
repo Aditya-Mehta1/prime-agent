@@ -172,6 +172,12 @@ pub(crate) struct SessionCore {
     rlm_depth: u32,
     /// `top-level` | `subagent` (summary `runtimeKind`).
     runtime_kind: String,
+    /// The subagent runtime identity (create `runtimeMetadata`): the child
+    /// id under its parent and the parent's live/persisted ids, carried on
+    /// every summary so the roster keys children `parentPath#childId`.
+    rlm_child_id: Option<String>,
+    parent_active_session_id: Option<String>,
+    parent_session_id: Option<String>,
 }
 
 impl crate::status_line::StatusSession for SessionCore {
@@ -447,6 +453,9 @@ impl Worker {
             last_action_snapshot: Some(SessionActionSnapshot::default()),
             rlm_depth: 0,
             runtime_kind: "top-level".to_string(),
+            rlm_child_id: None,
+            parent_active_session_id: None,
+            parent_session_id: None,
         };
         let active_session_id = config.active_session_id.clone();
         let script = config.script.clone();
@@ -1233,6 +1242,29 @@ impl Worker {
             .get("parentSessionPath")
             .and_then(Value::as_str)
             .map(str::to_string);
+        // The subagent runtime identity (TS `runtimeMetadata` on the create
+        // command): the child id and the parent's live/persisted ids ride
+        // the session summaries so the roster can key children
+        // `parentPath#childId` like TS `rosterAgentIdForSummary`.
+        let (rlm_child_id, parent_active_session_id, parent_session_id) = match payload
+            .get("runtimeMetadata")
+        {
+            Some(metadata) if metadata.get("kind").and_then(Value::as_str) == Some("subagent") => (
+                metadata
+                    .get("rlmChildId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                metadata
+                    .get("parentActiveSessionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                metadata
+                    .get("parentSessionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            ),
+            _ => (None, None, None),
+        };
         let thinking = payload
             .get("thinking")
             .and_then(Value::as_str)
@@ -1346,11 +1378,14 @@ impl Worker {
         core.created = true;
         core.abort_requested = false;
         core.rlm_depth = rlm_depth;
-        core.runtime_kind = if rlm_depth > 0 {
+        core.runtime_kind = if rlm_depth > 0 || rlm_child_id.is_some() {
             "subagent".to_string()
         } else {
             "top-level".to_string()
         };
+        core.rlm_child_id = rlm_child_id;
+        core.parent_active_session_id = parent_active_session_id;
+        core.parent_session_id = parent_session_id;
         let summary = self.summary_locked(&core);
         drop(core);
         // Seed the engine's RLM identity: recursion depth and bound, this
@@ -1487,6 +1522,9 @@ impl Worker {
             modified,
             first_message: store.and_then(|s| s.first_message()),
             parent_session_path: store.and_then(|store| store.header.parent_session.clone()),
+            parent_active_session_id: core.parent_active_session_id.clone(),
+            parent_session_id: core.parent_session_id.clone(),
+            rlm_child_id: core.rlm_child_id.clone(),
             usage,
             worker_state: Some("ready".to_string()),
             worker_pid: Some(std::process::id()),
@@ -2887,7 +2925,7 @@ fn session_summary(core: &SessionCore, thinking_level: &str) -> SessionSummary {
         is_session_active: streaming || compacting || queued > 0,
         has_registered_cron_job: Some(false),
         last_activity_at,
-        rlm_depth: Some(0),
+        rlm_depth: Some(core.rlm_depth),
         active_session_id: Some(core.active_session_id.clone()),
         session_id: store
             .map(|s| s.session_id().to_string())
@@ -2906,7 +2944,10 @@ fn session_summary(core: &SessionCore, thinking_level: &str) -> SessionSummary {
         created: store.map(|s| s.header.timestamp.clone()),
         modified,
         first_message: store.and_then(|s| s.first_message()),
-        parent_session_path: None,
+        parent_session_path: store.and_then(|store| store.header.parent_session.clone()),
+        parent_active_session_id: core.parent_active_session_id.clone(),
+        parent_session_id: core.parent_session_id.clone(),
+        rlm_child_id: core.rlm_child_id.clone(),
         usage,
         worker_state: Some("ready".to_string()),
         worker_pid: Some(std::process::id()),
@@ -2914,7 +2955,7 @@ fn session_summary(core: &SessionCore, thinking_level: &str) -> SessionSummary {
         summary: None,
         task_state: None,
         model: None,
-        runtime_kind: Some("top-level".to_string()),
+        runtime_kind: Some(core.runtime_kind.clone()),
         unfinished_action_count: Some(0),
     }
 }

@@ -20,7 +20,10 @@ command gating on peer links), worker-to-worker peer messaging (stage 3:
 `worker`-purpose single-use grants minted by `get_worker_peer_transport`
 for a source worker's kernel `agent_message.send`, direct
 `worker_deliver_message` on the target worker's socket with the supervisor
-routed `send_message` as the never-retried fallback), wire protocol serve/negotiation (including the
+routed `send_message` as the never-retried fallback), saved-session wake
+for non-resident `send_message` targets (`session_catalog.rs`: catalog
+resolve by session-id prefix or exact name, cwd-scoped first; a resident
+worker hosting the file is reused, otherwise one spawns over it), wire protocol serve/negotiation (including the
 `compact`/`abort_compaction`/`set_auto_compaction` commands and their
 `compaction_start`/`compaction_end` events), the agent-roster arms
 (`roster_subscribe`/`roster_unsubscribe` with the full snapshot, live

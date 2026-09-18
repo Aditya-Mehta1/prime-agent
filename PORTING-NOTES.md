@@ -604,3 +604,79 @@ HEAD
   recency); a refinement-boundary resume now re-injects the
   `[harness-digest]` user row exactly like TS (verified end-to-end against
   the TS binary).
+
+## Saved-session wake for `send_message` (session-wake lane)
+
+- TS ground truth: the `send_message` block in
+  `modes/daemon/daemon-supervisor.ts` — when the target lookup fails with
+  `Unknown active session:`, the supervisor resolves the selector against
+  the saved-session catalog (`daemon-catalog-process.ts` `resolve`:
+  cwd-scoped list first, then the whole catalog; a match is a session-id
+  prefix or an exact name; ambiguity is `Ambiguous session selector
+  "<selector>"` and outranks the miss), then `createOrReuseWorker` spawns or
+  reuses a worker over the file and routes the delivery. A miss keeps the
+  unknown-session error; the stopped worker's 12-hex active id is not
+  durable (catalog keys are the session uuid and the name), so it stays
+  unknown in both products.
+- Rust port: `crates/pa-daemon/src/session_catalog.rs` (the catalog
+  resolve over `session_store::list_sessions`), the wake block in
+  `crates/pa-daemon/src/messaging.rs` (`registry.find_by_session_file`
+  reuse first, then `launch_worker` over the file with the session's own
+  cwd from the header), and the CLI wake observed as the TS golden
+  `Sent to <name>` (`pa-cli` `run_send` was already the TS port; the
+  supervisor arm used to answer unknown). `session_catalog` resolves
+  locally by raw cwd equality (`info.cwd == cwd`), matching the existing
+  Rust saved-session list filter rather than TS `normalizeCwd`
+  canonicalization — on this surface both products agree for absolute
+  paths.
+- Scope cut vs TS: the wake reuses a resident worker by session file but
+  does not consult the RLM ledger or the opening-worker idempotency map
+  (`openingWorkers`/`catalogOpeningWorkers`); supervisor-backed creates are
+  serialized by the registry's per-worker adoption gates instead. The
+  family-reach assertion for agent-origin sends stays deferred (needs the
+  family catalog).
+- Verifier: `crates/pa-daemon/tests/saved_session_wake_e2e.rs` (kill a
+  session, send by name -> worker spawns, turn completes against a local
+  mock provider, second send reuses the resident worker, unknown and
+  stale-active-id selectors keep the TS errors); `pa-cli` `daemon_commands_e2e.rs`
+  extends the Rust end-to-end with the CLI `Sent to renamed` golden and
+  the TS-differential test now exercises the TS daemon's own wake with
+  both CLIs rendering the delivered receipt.
+
+
+## Resident RLM child roster identity (session-wake lane, family-id keys)
+
+- TS ground truth: `modes/daemon/agent-roster.ts` `rosterAgentIdForSummary`
+  keys every subagent roster row `parentSessionPath#rlmChildId` (the live
+  parent active id stands in when the parent has no session path); worker
+  summaries carry the identity fields, `daemon-mode.ts`
+  `rosterAgentIdForState` derives the same id from the create
+  `runtimeMetadata`, and child deletion pushes the roster removal under
+  that family key. The agents view computes the alias client-side from the
+  summary fields (`agents-view-state.ts`), never from a server-written
+  `rosterAgentId` field.
+- Rust port: `pa-daemon/src/worker.rs` parses the create command's
+  `runtimeMetadata` (kind=subagent; `rlm_children::launch_child` already
+  sends it on main) into `SessionCore` and emits `rlmChildId`,
+  `parentActiveSessionId`, and `parentSessionId` on every summary
+  (`types.rs` serde plumbing, skip-when-none). The roster store already
+  keys via `pa_types::daemon::agent_roster::roster_agent_id_for_summary`,
+  so `roster_subscribe` snapshots, `worker_roster_delta` pushes, and
+  `remove_roster_worker` removals all re-key resident children for free.
+  `supervisor.rs` persists `runtimeMetadata` in the durable create
+  command so a respawned child keeps its family key.
+- TUI: `agents_view_state.rs` `daemon_aliases` computes the
+  `agent:<parentPath#childId>` alias via the shared pa-types formula; the
+  old read of a `rosterAgentId` summary field was dead (no Rust writer
+  ever set it).
+- Ownership note for the roster-wire lane: roster-wire persists a
+  top-level `rlmChildId` rest key for its ledger tombstone path; this
+  change persists the whole `runtimeMetadata` block (a superset for
+  worker respawn parsing). Keep both inserts when the lanes meet.
+- Verifier: `agents_view_roster_e2e.rs`
+  `rlm_children_key_the_roster_by_parent_path_and_child_id` — a scripted
+  child spawned through `SupervisorChildSessions` joins the roster
+  snapshot keyed `parentSessionFile#childId` with runtimeKind/rlmChildId/
+  parentSessionPath/parentActiveSessionId/rlmDepth/sessionName, its live
+  delta arrives under the same key, and `delete_subagent` pushes the
+  removal under the family id.

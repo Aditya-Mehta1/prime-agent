@@ -86,6 +86,16 @@ pub struct SessionSummary {
     pub first_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_path: Option<String>,
+    /// The parent's live active-session id (subagent summaries).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_active_session_id: Option<String>,
+    /// The parent's persisted session id (subagent summaries).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    /// This subagent's child id under its parent (unique per parent; the
+    /// roster agent id qualifies it with the parent path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rlm_child_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

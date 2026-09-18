@@ -300,3 +300,184 @@ fn worker_roster_delta_requires_authentication() {
     assert_eq!(rejected["success"], false, "forged token must be rejected");
     assert_eq!(rejected["error"], "Worker authentication failed");
 }
+
+/// Family-depth roster rows: a supervisor-backed RLM child (one supervised
+/// worker per child) joins the roster keyed `parentSessionPath#childId`
+/// (TS `rosterAgentIdForSummary`), carrying the subagent identity fields the
+/// agents view and ACP subagent metas consume; deleting the child pushes the
+/// removal under that same key. The parent identity mirrors the
+/// `rlm_children` e2e harness: a scripted child over the supervisor link.
+#[tokio::test]
+async fn rlm_children_key_the_roster_by_parent_path_and_child_id() {
+    use pa_core::session_engine::rlm_host::{RlmSpawnRequest, RlmSubagentHost};
+    use pa_daemon::rlm_children::{ParentIdentity, SupervisorChildSessions};
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("daemon.sock");
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    let log = std::fs::File::create(dir.path().join("daemon.log")).expect("log file");
+    // Underscore keeps the kill guard alive for the test's scope.
+    let _daemon = {
+        #[allow(clippy::zombie_processes)]
+        let child = Command::new(env!("CARGO_BIN_EXE_pa-daemon"))
+            .arg("supervisor")
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--agent-dir")
+            .arg(&agent_dir)
+            .env("RUST_LOG", "pa_daemon=debug")
+            .stdout(log)
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn pa-daemon supervisor");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if socket.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        struct LoggedDaemon(Child);
+        impl Drop for LoggedDaemon {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        LoggedDaemon(child)
+    };
+    let (mut client, _hello) = Client::connect(&socket);
+
+    let script = dir.path().join("script.json");
+    std::fs::write(
+        &script,
+        serde_json::json!({ "responses": [ { "text": "child done", "delayMs": 20 } ] }).to_string(),
+    )
+    .expect("write script");
+    let parent_file = agent_dir.join("parent.jsonl");
+    let children = SupervisorChildSessions::new(
+        std::sync::Arc::new(pa_daemon::supervisor_link::SupervisorLink::new(
+            socket.clone(),
+        )),
+        agent_dir.clone(),
+        "parent-active-id".to_string(),
+    );
+    children.set_identity(ParentIdentity {
+        rlm_depth: 0,
+        rlm_max_depth: 2,
+        model: Some("scripted/faux-1".to_string()),
+        cwd: Some(agent_dir.to_string_lossy().to_string()),
+        session_id: Some("parent-session-uuid".to_string()),
+        session_file: Some(parent_file.to_string_lossy().to_string()),
+        thinking: None,
+        child_script: Some(script.to_string_lossy().to_string()),
+    });
+
+    let handle = children
+        .spawn(RlmSpawnRequest {
+            prompt: "ship the roster lane".to_string(),
+            name: Some("child-a".to_string()),
+            model: None,
+            thinking: None,
+            cell_source_code: None,
+        })
+        .await
+        .expect("spawn child");
+
+    // The roster snapshot keys the child `parentSessionPath#childId`.
+    client.send_command("r1", serde_json::json!({ "type": "roster_subscribe" }));
+    let subscribed = client.read_response("r1");
+    assert_eq!(
+        subscribed["success"], true,
+        "subscribe failed: {subscribed}"
+    );
+    let child_agent_id = format!("{}#{}", parent_file.to_string_lossy(), handle.rlm_child_id);
+    let roster = subscribed["data"]["roster"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let child_entry = roster
+        .iter()
+        .find(|entry| entry["agentId"] == serde_json::Value::String(child_agent_id.clone()))
+        .unwrap_or_else(|| panic!("child keyed by parent path: {roster:?}"));
+    let summary = &child_entry["summary"];
+    assert_eq!(summary["runtimeKind"], "subagent");
+    assert_eq!(summary["rlmChildId"], handle.rlm_child_id);
+    assert_eq!(
+        summary["parentSessionPath"],
+        parent_file.to_string_lossy().to_string()
+    );
+    assert_eq!(summary["parentActiveSessionId"], "parent-active-id");
+    assert_eq!(summary["rlmDepth"], 1);
+    assert_eq!(summary["sessionName"], "child-a");
+
+    // A second subscriber (the agents view pattern) sees the live delta of
+    // the child's next turn under the same key. The child's spawn turn runs
+    // before this subscribe, so wait for it to settle first.
+    let child_active_id = child_entry["summary"]["activeSessionId"]
+        .as_str()
+        .expect("child active session id")
+        .to_string();
+    client.send_command(
+        "w1",
+        serde_json::json!({
+            "type": "wait_for_idle",
+            "activeSessionId": child_active_id,
+        }),
+    );
+    assert_eq!(
+        client.read_response("w1")["success"],
+        true,
+        "wait_for_idle failed"
+    );
+    let (mut client_b, _hello_b) = Client::connect(&socket);
+    client_b.send_command("r2", serde_json::json!({ "type": "roster_subscribe" }));
+    assert_eq!(client_b.read_response("r2")["success"], true);
+    client.send_command(
+        "p1",
+        serde_json::json!({
+            "type": "prompt",
+            "activeSessionId": child_active_id,
+            "message": "go",
+        }),
+    );
+    let _ = client.read_response("p1");
+    let update = client_b.next_roster_update(|line| {
+        line["changed"]
+            .as_array()
+            .map(|entries| {
+                entries.iter().any(|entry| {
+                    entry["agentId"] == serde_json::Value::String(child_agent_id.clone())
+                })
+            })
+            .unwrap_or(false)
+    });
+    let changed = update["changed"].as_array().cloned().unwrap_or_default();
+    let changed_child = changed
+        .iter()
+        .find(|entry| entry["agentId"] == serde_json::Value::String(child_agent_id.clone()))
+        .expect("child delta under the family key");
+    assert!(
+        changed_child["status"] == "running" || changed_child["status"] == "idle",
+        "live status under the family key: {changed_child}"
+    );
+
+    // Deleting the child pushes the removal keyed by the same agent id.
+    children
+        .delete_subagent(handle.rlm_child_id.clone())
+        .await
+        .expect("delete child");
+    let removal = client_b.next_roster_update(|line| {
+        line["removed"]
+            .as_array()
+            .map(|ids| ids.contains(&serde_json::Value::String(child_agent_id.clone())))
+            .unwrap_or(false)
+    });
+    assert!(
+        removal["removed"]
+            .as_array()
+            .is_some_and(|ids| ids.contains(&serde_json::Value::String(child_agent_id.clone()))),
+        "removal keyed by the family id: {removal}"
+    );
+}

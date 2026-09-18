@@ -82,10 +82,11 @@ fn file_identity(path: &str) -> String {
 fn daemon_aliases(summary: &Value) -> Vec<String> {
     let mut aliases = Vec::new();
     if get_str(summary, "runtimeKind") == Some("subagent") && summary.get("rlmChildId").is_some() {
-        // The roster entry's agentId is the parent-qualified child id.
-        if let Some(agent_id) = get_str(summary, "rosterAgentId") {
-            aliases.push(format!("agent:{agent_id}"));
-        }
+        // The roster entry's agentId is the parent-qualified child id (TS
+        // computes it client-side from the summary fields; pa-types owns the
+        // one formula).
+        let agent_id = pa_types::daemon::agent_roster::roster_agent_id_for_summary(summary);
+        aliases.push(format!("agent:{agent_id}"));
     }
     if let Some(file) = get_str(summary, "sessionFile") {
         aliases.push(file_identity(file));
