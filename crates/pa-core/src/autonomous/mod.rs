@@ -349,6 +349,38 @@ pub fn autonomous_token_delta(usage: Option<&pa_types::ai::Usage>) -> u64 {
     }
 }
 
+/// The disabled status snapshot (TS `emptyAutonomousStatus`): what
+/// `wait_for_headless_completion` answers when no run is (or was) enabled.
+pub fn disabled_autonomous_status() -> AgentAutonomousStatus {
+    let state = create_autonomous_runtime_state(None, None);
+    autonomous_status(&state)
+}
+
+/// Limit check against a completed run's status snapshot (TS
+/// `autonomousLimitReason(status)` in acp-stop-reason.ts: the same counter
+/// fields the runtime state carries, evaluated on the wire shape so headless
+/// surfaces can derive the stop reason without the live state).
+pub fn autonomous_limit_reason_of_status(
+    status: &AgentAutonomousStatus,
+    now: u64,
+) -> Option<AutonomousLimitReason> {
+    if status.continuations_used >= status.limits.max_continuations {
+        return Some(AutonomousLimitReason::MaxContinuations);
+    }
+    if status.turns_used >= status.limits.max_turns {
+        return Some(AutonomousLimitReason::MaxTurns);
+    }
+    if status.tokens_used >= status.limits.max_tokens {
+        return Some(AutonomousLimitReason::MaxTokens);
+    }
+    if let Some(started_at) = status.started_at {
+        if now.saturating_sub(started_at) >= status.limits.timeout_ms {
+            return Some(AutonomousLimitReason::TimeoutMs);
+        }
+    }
+    None
+}
+
 /// Limit check against the current counters.
 pub fn autonomous_limit_reason(
     state: &AutonomousRuntimeState,

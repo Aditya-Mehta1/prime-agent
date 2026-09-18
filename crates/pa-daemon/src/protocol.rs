@@ -45,6 +45,7 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "follow_up",
     "abort",
     "wait_for_idle",
+    "wait_for_headless_completion",
     "get_state",
     "get_session_header",
     "get_session_stats",
@@ -428,6 +429,9 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         | DaemonCommand::WaitForIdle {
             active_session_id, ..
         }
+        | DaemonCommand::WaitForHeadlessCompletion {
+            active_session_id, ..
+        }
         | DaemonCommand::GetState {
             active_session_id, ..
         }
@@ -494,6 +498,7 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::StartSideQuestion { .. } => "start_side_question",
         DaemonCommand::AbortSideQuestion { .. } => "abort_side_question",
         DaemonCommand::WaitForIdle { .. } => "wait_for_idle",
+        DaemonCommand::WaitForHeadlessCompletion { .. } => "wait_for_headless_completion",
         DaemonCommand::GetState { .. } => "get_state",
         DaemonCommand::GetSessionHeader { .. } => "get_session_header",
         DaemonCommand::GetSessionStats { .. } => "get_session_stats",

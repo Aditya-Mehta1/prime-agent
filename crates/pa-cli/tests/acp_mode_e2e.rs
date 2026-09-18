@@ -1022,3 +1022,178 @@ fn acp_autonomous_disabled_reports_end_turn_without_accounting() {
         json!({ "stopReason": "end_turn" })
     );
 }
+
+#[test]
+fn acp_daemon_attached_publishes_the_goal_update_meta() {
+    // The daemon worker executes `/goal` and emits the `goal_update`
+    // session event; the daemon-attached ACP surface maps it to the
+    // namespaced `_meta.goal` update (TS acp-events.ts case "goal_update").
+    let home = tempfile::TempDir::new().unwrap();
+    let socket = home.path().join("daemon.sock");
+    let script_path = home.path().join("worker-script.json");
+    // A goal start schedules its continuation as the turn's model segment,
+    // so the faux engine needs one response.
+    let script = json!({ "engine": "faux", "responses": ["the goal turn settled"] });
+    std::fs::write(&script_path, script.to_string()).unwrap();
+    let bin = env!("CARGO_BIN_EXE_prime-agent");
+    let child = Command::new(bin)
+        .args([
+            "--mode",
+            "acp",
+            "--no-session",
+            "--daemon-socket",
+            socket.to_str().unwrap(),
+        ])
+        .env("HOME", home.path())
+        .env("PRIME_AGENT_AGENT_DIR", home.path().join("agent"))
+        .env("PRIME_AGENT_ACP_DAEMON_SCRIPT", &script_path)
+        .current_dir(home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary present");
+    let mut client = AcpChild::adopt(child);
+    let init = client.request("initialize", initialize_params());
+    let _ = client.wait_response(init, TIMEOUT);
+    let new = client.request("session/new", json!({ "mcpServers": [] }));
+    let (new_response, _) = client.wait_response(new, Duration::from_secs(60));
+    assert!(
+        new_response["result"]["sessionId"].is_string(),
+        "daemon-attached admission succeeds: {new_response}"
+    );
+    let session_id = new_response["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let prompt = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{ "type": "text", "text": "/goal --budget 500 make the daemon publish goal state" }],
+        }),
+    );
+    let (prompt_response, updates) = client.wait_response(prompt, Duration::from_secs(120));
+    assert_eq!(prompt_response["result"]["stopReason"], "end_turn");
+    let goal = updates.iter().find_map(|update| {
+        let meta = &update["params"]["update"]["_meta"]["ai.primeintellect.prime-agent"]["goal"];
+        (!meta.is_null()).then(|| meta.clone())
+    });
+    let goal = goal.expect("a _meta.goal update reached the ACP surface");
+    assert_eq!(goal["status"], "active");
+    assert_eq!(goal["objective"], "make the daemon publish goal state");
+    assert_eq!(goal["tokenBudget"], 500);
+    assert_eq!(goal["tokensUsed"], 0);
+    let close = client.request("session/close", json!({ "sessionId": session_id }));
+    let (close_response, _) = client.wait_response(close, Duration::from_secs(60));
+    assert_eq!(close_response["result"], json!({}));
+    drop(client);
+    shutdown_sandboxed_daemon(&socket);
+}
+
+#[test]
+fn acp_daemon_attached_reports_autonomous_accounting_and_limit_stop_reason() {
+    // An autonomous run with --max-turns 1: the completion envelope carries
+    // the _meta.autonomous accounting (TS waitForHeadlessCompletion), the
+    // quiescence observation counts the remaining continuations, and the
+    // turn limit surfaces as max_turn_requests (TS acpStopReason).
+    let home = tempfile::TempDir::new().unwrap();
+    let socket = home.path().join("daemon.sock");
+    let script_path = home.path().join("worker-script.json");
+    let script = json!({ "engine": "faux", "responses": [
+        "enabling the run",
+        "one turn runs, then the limit stops the run",
+    ] });
+    std::fs::write(&script_path, script.to_string()).unwrap();
+    let bin = env!("CARGO_BIN_EXE_prime-agent");
+    let child = Command::new(bin)
+        .args([
+            "--mode",
+            "acp",
+            "--no-session",
+            "--daemon-socket",
+            socket.to_str().unwrap(),
+        ])
+        .env("HOME", home.path())
+        .env("PRIME_AGENT_AGENT_DIR", home.path().join("agent"))
+        .env("PRIME_AGENT_ACP_DAEMON_SCRIPT", &script_path)
+        .current_dir(home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary present");
+    let mut client = AcpChild::adopt(child);
+    let init = client.request("initialize", initialize_params());
+    let _ = client.wait_response(init, TIMEOUT);
+    let new = client.request("session/new", json!({ "mcpServers": [] }));
+    let (new_response, _) = client.wait_response(new, Duration::from_secs(60));
+    assert!(
+        new_response["result"]["sessionId"].is_string(),
+        "daemon-attached admission succeeds: {new_response}"
+    );
+    let session_id = new_response["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Turn on the run with a one-turn budget.
+    let enable = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{ "type": "text", "text": "/autonomous on --max-turns 1" }],
+        }),
+    );
+    let (enable_response, updates) = client.wait_response(enable, Duration::from_secs(120));
+    assert_eq!(enable_response["result"]["stopReason"], "end_turn");
+    // The enabled accounting is already visible on the command turn's
+    // completion envelope (the headless-completion status of the run).
+    let enabled_meta = updates.iter().find_map(|update| {
+        let meta =
+            &update["params"]["update"]["_meta"]["ai.primeintellect.prime-agent"]["autonomous"];
+        (!meta.is_null()).then(|| meta.clone())
+    });
+    let enabled_meta = enabled_meta.expect("the enabled run's accounting reached the surface");
+    assert_eq!(enabled_meta["enabled"], true);
+    // The model turn: one turn runs, the max-turns limit stops the run.
+    let prompt = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{ "type": "text", "text": "say something" }],
+        }),
+    );
+    let (prompt_response, updates) = client.wait_response(prompt, Duration::from_secs(120));
+    assert_eq!(
+        prompt_response["result"],
+        json!({ "stopReason": "max_turn_requests" }),
+        "the turn limit maps to the TS stop reason: {prompt_response}"
+    );
+    let accounted = updates.iter().find_map(|update| {
+        let meta =
+            &update["params"]["update"]["_meta"]["ai.primeintellect.prime-agent"]["autonomous"];
+        (meta["enabled"] == json!(true) && meta["turnsUsed"] == json!(1)).then(|| meta.clone())
+    });
+    let accounted = accounted.expect("the limited turn's accounting reached the surface");
+    assert_eq!(accounted["continuationsUsed"], 0);
+    // The quiescence observation subtracts the run's own limits (TS
+    // quiescenceMeta): the named budget flag `--max-turns 1` makes the
+    // unnamed limits the JSON-safe unlimited sentinel (TS
+    // parseAutonomousCommand budget fill), so the remaining continuation
+    // slots are that sentinel minus the zero the stopped run consumed.
+    let remaining = updates.iter().find_map(|update| {
+        let quiescence =
+            &update["params"]["update"]["_meta"]["ai.primeintellect.prime-agent"]["quiescence"];
+        (!quiescence.is_null()).then(|| quiescence["remainingAutonomousContinuations"].clone())
+    });
+    assert_eq!(
+        remaining,
+        Some(json!(9_007_199_254_740_991u64)),
+        "the run's unlimited continuation budget minus used"
+    );
+    let close = client.request("session/close", json!({ "sessionId": session_id }));
+    let (close_response, _) = client.wait_response(close, Duration::from_secs(60));
+    assert_eq!(close_response["result"], json!({}));
+    drop(client);
+    shutdown_sandboxed_daemon(&socket);
+}

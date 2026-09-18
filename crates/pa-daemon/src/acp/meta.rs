@@ -177,6 +177,63 @@ pub struct PrimeAgentAutonomousMeta {
     pub limit_reason: Option<String>,
 }
 
+/// The `_meta.autonomous` accounting for a completion update: per-run usage
+/// plus the latest gate attempt and failure (TS `autonomousMeta` in
+/// acp-mode.ts). Shared by the in-process and daemon-attached settlements.
+pub fn autonomous_meta(
+    status: &pa_core::autonomous::AgentAutonomousStatus,
+) -> PrimeAgentAutonomousMeta {
+    let gate_attempt = std::iter::once(
+        status
+            .last_gate_failure
+            .as_ref()
+            .map_or(0, |failure| failure.attempt),
+    )
+    .chain(status.gate_attempts.values().copied())
+    .max()
+    .unwrap_or(0);
+    PrimeAgentAutonomousMeta {
+        enabled: status.enabled,
+        continuations_used: status.continuations_used,
+        turns_used: status.turns_used,
+        tokens_used: status.tokens_used,
+        gate_attempt: (gate_attempt > 0).then_some(gate_attempt),
+        gate_failure: status
+            .last_gate_failure
+            .as_ref()
+            .map(|failure| failure.exit_text.clone()),
+        limit_reason: None,
+    }
+}
+
+/// Map a finished turn onto an ACP stop reason (TS `acpStopReason` in
+/// acp-stop-reason.ts: autonomous quality gates deliberately never surface
+/// as a stop reason; token exhaustion is the one natively-expressed limit).
+pub fn acp_stop_reason_for_status(
+    cancelled: bool,
+    status: Option<&pa_core::autonomous::AgentAutonomousStatus>,
+) -> super::types::AcpStopReason {
+    use pa_core::autonomous::{autonomous_limit_reason_of_status, AutonomousLimitReason};
+    if cancelled {
+        return super::types::AcpStopReason::Cancelled;
+    }
+    let Some(status) = status else {
+        return super::types::AcpStopReason::EndTurn;
+    };
+    if !status.enabled {
+        return super::types::AcpStopReason::EndTurn;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default();
+    match autonomous_limit_reason_of_status(status, now) {
+        Some(AutonomousLimitReason::MaxTokens) => super::types::AcpStopReason::MaxTokens,
+        Some(_) => super::types::AcpStopReason::MaxTurnRequests,
+        None => super::types::AcpStopReason::EndTurn,
+    }
+}
+
 /// Wrap a prime-agent payload in its reverse-domain `_meta` envelope.
 pub fn prime_agent_meta(payload: PrimeAgentSessionMeta) -> Value {
     json!({ PRIME_AGENT_META_NAMESPACE: payload })

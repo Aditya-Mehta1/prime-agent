@@ -81,6 +81,10 @@ pub enum EngineEvent {
     Compaction { entry: Value, result: Value },
     /// The prompt completed (successfully or not).
     Done(std::result::Result<(), String>),
+    /// `goal_update`: the session goal state changed (TS wire event; the
+    /// ACP adapter surfaces it as the namespaced `_meta.goal` update).
+    /// The payload is the TS `GoalState` wire object.
+    GoalUpdate { goal: Value },
     /// `auto_retry_start`: a provider failure is being retried (TS wire
     /// event; the interactive transcript shows the retry countdown).
     AutoRetryStart {
@@ -219,6 +223,25 @@ pub trait SessionEngine: Send + Sync {
     /// splash and tray labels.
     fn model_metadata(&self) -> Option<Value> {
         None
+    }
+
+    /// The session's autonomous-run status snapshot (`wait_for_headless_completion`;
+    /// TS `DaemonAutonomousStatus`), when the engine tracks one. The
+    /// accounting lock is async-held (the turn loop's gate evaluation spans
+    /// awaits), so the engine answers through a boxed future the worker
+    /// awaits from its async command handler — a blocking lock would park
+    /// the runtime thread the handler runs on. The scripted harness reports
+    /// `None` and the worker answers the wire shape's disabled default.
+    fn autonomous_status(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Option<pa_core::autonomous::AgentAutonomousStatus>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async { None })
     }
 
     /// The worker's live session summary (the `create` response data). The

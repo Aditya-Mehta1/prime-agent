@@ -8,9 +8,10 @@
 //! `prompt_and_wait` while the streamed session events fan out as ACP
 //! updates. The turn settlement (response boundary, quiescence envelope,
 //! stop reason) mirrors the in-process mode: both serve the same captures.
-//! Autonomous runs stay on the in-process path (the daemon session owns
-//! its own continuation loop and reports it in its state, not on the ACP
-//! surface of this slice).
+//! The daemon worker's `goal_update` session events surface through the
+//! wire mapping (wire_events.rs), and the autonomous accounting rides the
+//! `wait_for_headless_completion` response into the completion envelope
+//! and the stop reason (TS `waitForHeadlessCompletion` + `acpStopReason`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -658,7 +659,7 @@ async fn handle_session_prompt(
     }
     let prompt = DaemonCommand::PromptAndWait {
         id: None,
-        active_session_id: hosted_daemon_session_id,
+        active_session_id: hosted_daemon_session_id.clone(),
         message: admitted.text,
         input: pa_types::daemon::PromptInput {
             content: None,
@@ -710,6 +711,32 @@ async fn handle_session_prompt(
     } else {
         PrimeAgentOutcome::Error
     };
+    // The autonomous accounting for the completion envelope: the daemon's
+    // headless-completion status (TS `waitForHeadlessCompletion`), fetched
+    // after the turn marker settled the run. A failed fetch degrades to no
+    // autonomous meta (the envelope still settles, like an in-process
+    // session without a run).
+    let autonomous_status = if response.success {
+        fetch_autonomous_status(link, &hosted_daemon_session_id).await
+    } else {
+        None
+    };
+    let autonomous_meta = autonomous_status
+        .as_ref()
+        .filter(|status| status.enabled)
+        .map(meta::autonomous_meta);
+    // The remaining continuation slots the quiescence observation reports
+    // (the in-process settlement computes the same subtraction).
+    let remaining_continuations = autonomous_status
+        .as_ref()
+        .filter(|status| status.enabled)
+        .map(|status| {
+            status
+                .limits
+                .max_continuations
+                .saturating_sub(status.continuations_used)
+        })
+        .unwrap_or(0);
     // The boundary, completion, and terminal quiescence frames match the
     // in-process settlement because both serve the same captures.
     let boundary = types::AcpSessionUpdate::SessionInfoUpdate {
@@ -727,12 +754,14 @@ async fn handle_session_prompt(
         )
         .await;
     // The completion envelope mirrors the in-process settlement: the
-    // quiescence event first, then the terminal quiescence envelope.
+    // autonomous accounting rides the quiescence event, then the terminal
+    // quiescence envelope repeats the observation.
     let quiescence = types::AcpSessionUpdate::SessionInfoUpdate {
         meta: meta::prime_agent_meta(PrimeAgentSessionMeta {
+            autonomous: autonomous_meta.clone(),
             quiescence: Some(meta::PrimeAgentQuiescenceMeta {
                 outstanding_subagents: 0,
-                remaining_autonomous_continuations: 0,
+                remaining_autonomous_continuations: remaining_continuations,
             }),
             ..Default::default()
         }),
@@ -742,9 +771,10 @@ async fn handle_session_prompt(
         .await;
     let terminal = types::AcpSessionUpdate::SessionInfoUpdate {
         meta: meta::prime_agent_meta(PrimeAgentSessionMeta {
+            autonomous: autonomous_meta.clone(),
             quiescence: Some(meta::PrimeAgentQuiescenceMeta {
                 outstanding_subagents: 0,
-                remaining_autonomous_continuations: 0,
+                remaining_autonomous_continuations: remaining_continuations,
             }),
             ..Default::default()
         }),
@@ -775,11 +805,38 @@ async fn handle_session_prompt(
         ));
         return;
     }
-    let stop_reason = types::AcpStopReason::EndTurn;
+    // The stop reason follows the TS mapping (acp-stop-reason.ts): a limit
+    // reached on the enabled run is the only non-end_turn outcome.
+    let stop_reason = meta::acp_stop_reason_for_status(false, autonomous_status.as_ref());
     let _ = tx.send(jsonrpc::response(
         id,
         serde_json::to_value(types::AcpStopReasonResponse { stop_reason }).expect("serializes"),
     ));
+}
+
+/// Fetch the session's autonomous-run status (`wait_for_headless_completion`
+/// on the daemon wire; TS `waitForHeadlessCompletion`). `None` degrades the
+/// settlement to no autonomous meta, never to a failed prompt.
+async fn fetch_autonomous_status(
+    link: &Arc<DaemonLink>,
+    active_session_id: &str,
+) -> Option<pa_core::autonomous::AgentAutonomousStatus> {
+    let response = link
+        .request(
+            DaemonCommand::WaitForHeadlessCompletion {
+                id: None,
+                active_session_id: active_session_id.to_string(),
+                wait_for_rlm_quiescence: None,
+                rest: Default::default(),
+            },
+            TURN_TIMEOUT_MS,
+        )
+        .await
+        .ok()?;
+    if !response.success {
+        return None;
+    }
+    serde_json::from_value(response.data.unwrap_or(Value::Null)).ok()
 }
 
 /// Abort the hosted session's work (the request and notification forms).

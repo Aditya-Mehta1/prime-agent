@@ -1651,6 +1651,8 @@ impl Supervisor {
             command,
             DaemonCommand::PromptAndWait { .. }
                 | DaemonCommand::WaitForIdle { .. }
+                // Headless completion settles a whole autonomous run.
+                | DaemonCommand::WaitForHeadlessCompletion { .. }
                 // Compaction runs a summarizer model call, like a turn.
                 | DaemonCommand::Compact { .. }
         ) {

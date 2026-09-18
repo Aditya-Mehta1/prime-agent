@@ -1053,6 +1053,7 @@ impl Worker {
             }
             "set_auto_compaction" => self.handle_set_auto_compaction(payload),
             "wait_for_idle" => self.handle_wait_for_idle().await,
+            "wait_for_headless_completion" => self.handle_wait_for_headless_completion().await,
             "get_state" => self.handle_get_state(),
             "get_messages" => self.handle_get_messages(),
             "get_session_header" => self.handle_get_session_header(),
@@ -1863,6 +1864,36 @@ impl Worker {
         }
     }
 
+    /// `wait_for_headless_completion` (TS daemon command): settle the
+    /// headless run first (same idle wait as `wait_for_idle`), then answer
+    /// the autonomous-run accounting snapshot (`DaemonAutonomousStatus`).
+    async fn handle_wait_for_headless_completion(&self) -> DaemonResponse {
+        if let Err(response) = self.require_created("wait_for_headless_completion") {
+            return response;
+        }
+        loop {
+            {
+                let core = self.core.lock().unwrap();
+                if !core.busy && core.steering.is_empty() && core.follow_up.is_empty() {
+                    break;
+                }
+            }
+            self.idle_notify.notified().await;
+        }
+        // The idle wait finished, so no turn holds the accounting state;
+        // the snapshot read cannot interleave with a running turn.
+        let status = self
+            .engine
+            .autonomous_status()
+            .await
+            .unwrap_or_else(pa_core::autonomous::disabled_autonomous_status);
+        response_success(
+            None,
+            "wait_for_headless_completion",
+            Some(serde_json::to_value(&status).unwrap_or(Value::Null)),
+        )
+    }
+
     fn handle_get_state(&self) -> DaemonResponse {
         if let Err(response) = self.require_created("get_state") {
             return response;
@@ -2535,6 +2566,10 @@ impl TurnRunner {
                         "type": "compaction_end",
                         "reason": "manual",
                         "result": result,
+                    })],
+                    EngineEvent::GoalUpdate { goal } => vec![json!({
+                        "type": "goal_update",
+                        "goal": goal,
                     })],
                     EngineEvent::Done(Ok(())) => vec![json!({ "type": "turn_end" })],
                     EngineEvent::Done(Err(error)) => {

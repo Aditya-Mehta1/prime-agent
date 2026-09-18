@@ -16,36 +16,16 @@ use pa_core::session_engine::session_commands::SessionCommandParams;
 use pa_core::session_engine::{PromptOptions, PromptOutcome, StreamingBehavior};
 
 use super::internal_error;
-use super::meta::{PrimeAgentAutonomousMeta, PrimeAgentEventPhase, PrimeAgentOutcome};
+use super::meta::{self, PrimeAgentAutonomousMeta, PrimeAgentEventPhase, PrimeAgentOutcome};
 use super::session::{self, AcpSession, TurnBoundary};
 use super::stop_reason_response;
 use super::types::PromptParams;
 use super::{events, jsonrpc, producer, AcpModeState, AcpStopReason, ConnectionState};
 
-/// The `_meta.autonomous` accounting for a completion update: per-run usage
-/// plus the latest gate attempt and failure (TS `autonomousMeta`).
+/// The `_meta.autonomous` accounting for a completion update: shared with
+/// the daemon-attached settlement (meta.rs).
 fn autonomous_meta(status: &AgentAutonomousStatus) -> PrimeAgentAutonomousMeta {
-    let gate_attempt = std::iter::once(
-        status
-            .last_gate_failure
-            .as_ref()
-            .map_or(0, |failure| failure.attempt),
-    )
-    .chain(status.gate_attempts.values().copied())
-    .max()
-    .unwrap_or(0);
-    PrimeAgentAutonomousMeta {
-        enabled: status.enabled,
-        continuations_used: status.continuations_used,
-        turns_used: status.turns_used,
-        tokens_used: status.tokens_used,
-        gate_attempt: (gate_attempt > 0).then_some(gate_attempt),
-        gate_failure: status
-            .last_gate_failure
-            .as_ref()
-            .map(|failure| failure.exit_text.clone()),
-        limit_reason: None,
-    }
+    meta::autonomous_meta(status)
 }
 
 pub(super) async fn handle_session_prompt(

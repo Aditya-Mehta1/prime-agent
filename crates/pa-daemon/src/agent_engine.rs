@@ -83,6 +83,10 @@ pub struct AgentSessionEngine {
     /// with the core engine's prompt gating, so admitted servers are one
     /// store for admission and execution.
     pub(crate) mcp: std::sync::Arc<std::sync::Mutex<pa_core::mcp::McpManager>>,
+    /// The last goal state emitted as a `goal_update` event: the TS session
+    /// emits on state change, so unchanged states (e.g. `/goal status`)
+    /// stay silent.
+    published_goal: std::sync::Mutex<Option<pa_core::goals::GoalState>>,
     /// The worker-owned session file (conversation-log path), set at create.
     session_file: std::sync::Mutex<Option<std::path::PathBuf>>,
     /// The authoritative model selection. Starts from the process fallback
@@ -224,6 +228,7 @@ impl AgentSessionEngine {
             runtime,
             config,
             mcp,
+            published_goal: std::sync::Mutex::new(None),
             session_file,
             selection: std::sync::RwLock::new(selection),
             effective_thinking: std::sync::RwLock::new(None),
@@ -526,7 +531,54 @@ fn now_millis() -> u64 {
         .unwrap_or_default()
 }
 
+/// Emit the `goal_update` engine event when the session's goal state
+/// changed since the last emission (per-session dedupe: the TS session
+/// listener fires on state change). Returns the emit callback's verdict.
+fn emit_goal_update_if_changed(
+    engine: &AgentSessionEngine,
+    emit: &mut dyn FnMut(EngineEvent) -> bool,
+) -> bool {
+    let goal = {
+        let guard = engine.session.blocking_lock();
+        let core = guard
+            .as_ref()
+            .expect("session built by execute_session_command");
+        let goal = core.goal_driver.blocking_lock().state().clone();
+        goal
+    };
+    {
+        let mut published = engine.published_goal.lock().expect("published goal lock");
+        if published.as_ref() == Some(&goal) {
+            return true;
+        }
+        *published = Some(goal.clone());
+    }
+    emit(EngineEvent::GoalUpdate {
+        goal: serde_json::to_value(&goal).unwrap_or(Value::Null),
+    })
+}
+
 impl SessionEngine for AgentSessionEngine {
+    fn autonomous_status(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Option<pa_core::autonomous::AgentAutonomousStatus>>
+                + Send
+                + '_,
+        >,
+    > {
+        // The turn loop's accounting holds the state lock across awaits
+        // (gate evaluation), so the snapshot takes the async lock; the
+        // caller waits for the session to settle first
+        // (wait_for_headless_completion waits for idle).
+        let autonomous = std::sync::Arc::clone(&self.autonomous);
+        Box::pin(async move {
+            let state = autonomous.lock().await;
+            Some(pa_core::autonomous::autonomous_status(&state))
+        })
+    }
+
     /// Finalize telemetry on the live core session: `agent session ended`
     /// plus one flush (TS dispose callback). Best-effort by contract: a
     /// failed end never blocks or fails shutdown.
@@ -830,12 +882,20 @@ impl SessionEngine for AgentSessionEngine {
         if let Some(command) =
             crate::session_commands::parse_prompt_session_command(&request.message)
         {
+            let command_name = command.name;
             let Some(execution) = crate::session_commands::run_session_command(self, command, emit)
             else {
                 return;
             };
             if let Some(error) = &execution.error {
                 emit(EngineEvent::Done(Err(error.clone())));
+                return;
+            }
+            // A `/goal` execution changed the durable goal state: the
+            // `goal_update` session event surfaces the new state to
+            // attached clients (TS emits on state change; unchanged
+            // states stay silent).
+            if command_name == "goal" && !emit_goal_update_if_changed(self, emit) {
                 return;
             }
             // A goal start/resume schedules its continuation context as

@@ -1,8 +1,9 @@
 //! Daemon session-event mapping: the TS `acpUpdatesForSessionEvent` port
 //! for the wire shapes a daemon worker streams (`message_start/update/end`,
-//! `tool_execution_*`, `compaction_end`, ...). The daemon-attached ACP
-//! transport rides this instead of the in-process loop-event projection
-//! (`events.rs`): same ACP frames, different producer side.
+//! `tool_execution_*`, `compaction_end`, `goal_update`, ...). The
+//! daemon-attached ACP transport rides this instead of the in-process
+//! loop-event projection (`events.rs`): same ACP frames, different producer
+//! side.
 //!
 //! Events with no ACP counterpart (`turn_end`, `auto_retry_*`,
 //! `agent_begin/end`, `session_action_update`) map to nothing, exactly like
@@ -189,6 +190,31 @@ pub fn wire_updates(event: &Value, state: &mut WireMappingState) -> Vec<AcpSessi
             };
             vec![update]
         }
+        "goal_update" => {
+            let goal = event.get("goal");
+            vec![AcpSessionUpdate::SessionInfoUpdate {
+                meta: prime_agent_meta(PrimeAgentSessionMeta {
+                    goal: Some(super::meta::PrimeAgentGoalMeta {
+                        status: goal
+                            .and_then(|goal| goal.get("status"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        objective: goal
+                            .and_then(|goal| goal.get("objective"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        token_budget: goal
+                            .and_then(|goal| goal.get("tokenBudget"))
+                            .and_then(Value::as_u64),
+                        tokens_used: goal
+                            .and_then(|goal| goal.get("tokensUsed"))
+                            .and_then(Value::as_u64),
+                    }),
+                    ..Default::default()
+                }),
+            }]
+        }
         "compaction_end" => {
             let result = event.get("result");
             vec![AcpSessionUpdate::SessionInfoUpdate {
@@ -327,6 +353,41 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&updates[0]).unwrap()["sessionUpdate"],
             "agent_message_chunk"
+        );
+    }
+
+    #[test]
+    fn goal_update_maps_to_the_namespaced_goal_meta() {
+        // TS acp-events.ts `case "goal_update"`: the GoalState fields the
+        // meta carries, nothing else.
+        let mut state = WireMappingState::default();
+        let updates = wire_updates(
+            &json!({
+                "type": "goal_update",
+                "goal": {
+                    "active": true,
+                    "status": "active",
+                    "goalId": "g1",
+                    "objective": "Name a river",
+                    "tokenBudget": 500,
+                    "tokensUsed": 0,
+                    "timeUsedSeconds": 0,
+                    "continuationsUsed": 0,
+                },
+            }),
+            &mut state,
+        );
+        assert_eq!(updates.len(), 1);
+        let value = serde_json::to_value(&updates[0]).unwrap();
+        assert_eq!(value["sessionUpdate"], "session_info_update");
+        assert_eq!(
+            value["_meta"]["ai.primeintellect.prime-agent"]["goal"],
+            json!({
+                "status": "active",
+                "objective": "Name a river",
+                "tokenBudget": 500,
+                "tokensUsed": 0,
+            })
         );
     }
 
