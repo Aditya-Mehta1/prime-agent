@@ -51,6 +51,16 @@ Every contributor (human or agent) must read this before working on this repo.
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo test --workspace` must pass before every merge. Run `make check` (same gates; the GitHub
   token lacks `workflow` scope, so CI is local/PR-review enforced until then).
+- **Parity-diff evidence is a merge gate** (the port's definition, not optional polish): every PR
+  that touches a user-visible surface must include a "parity-diff evidence" section in its
+  description showing the TS-binary comparison for what it changed: (1) rendered output —
+  frame-diff vs the TS binary (extend `scripts/visual_parity.py` or the specific harness); 
+  (2) interactive behavior — the same input handled identically (keys, mouse, timing); 
+  (3) wire parity — byte-compare the TS daemon's traffic for protocol changes; (4) user-visible
+  invariants — every user action produces the same visible reaction as TS (`/compact` shows
+  started+completed; `/model` shows the selector; a refinement shows its decoration). A feature
+  that "works" but was never diffed against the TS binary does not pass review. If TS shows it,
+  Rust shows it identically; if Rust shows something TS does not, that is also a parity bug.
 - PRs must state ownership compliance (crate README scope/non-goals/public API, dependency
   direction).
 
