@@ -149,6 +149,17 @@ impl SettingsManager {
         self.save_global()
     }
 
+    /// `markdown.codeBlockIndent` (TS `getCodeBlockIndent`): the string the
+    /// chat markdown renderer indents fenced code blocks by; the default
+    /// matches the TS default, two spaces.
+    pub fn get_code_block_indent(&self) -> String {
+        self.settings()
+            .markdown
+            .as_ref()
+            .and_then(|markdown| markdown.code_block_indent.clone())
+            .unwrap_or_else(|| "  ".to_string())
+    }
+
     /// Record a model use at the front of `recentModels` (capped at 20).
     pub fn record_model_use(&mut self, provider: &str, model: &str) {
         let key = format!("{provider}/{model}");
@@ -606,6 +617,7 @@ fn load_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::types::MarkdownSettings;
 
     #[test]
     fn in_memory_loads_merges_and_saves() {
@@ -621,6 +633,24 @@ mod tests {
         );
         manager.reload().unwrap();
         assert_eq!(manager.get_default_model(), Some("z-ai/glm-5.3"));
+    }
+
+    #[test]
+    fn code_block_indent_reads_markdown_settings_with_ts_default() {
+        // `markdown.codeBlockIndent` (TS getCodeBlockIndent): absent -> the
+        // TS default two spaces; set -> the configured string.
+        let manager = SettingsManager::in_memory(Settings::default());
+        assert_eq!(manager.get_code_block_indent(), "  ");
+
+        let settings = Settings {
+            markdown: Some(MarkdownSettings {
+                code_block_indent: Some("    ".to_string()),
+                mermaid: None,
+            }),
+            ..Settings::default()
+        };
+        let manager = SettingsManager::in_memory(settings);
+        assert_eq!(manager.get_code_block_indent(), "    ");
     }
 
     #[test]

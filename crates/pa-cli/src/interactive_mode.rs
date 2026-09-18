@@ -359,7 +359,13 @@ fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<Inter
     // runtime). Verification harness only; never set by the product.
     let script_path = std::env::var_os("PRIME_AGENT_FAUX_SCRIPT").map(PathBuf::from);
     let session = session_selection(&options.session, &session_dir)?;
+    // The chat markdown code-block indent reads the effective settings on
+    // startup (TS `getCodeBlockIndent` -> `getMarkdownThemeWithSettings`).
+    let code_block_indent =
+        pa_core::settings::SettingsManager::create(&config.cwd, &config.agent_dir)
+            .get_code_block_indent();
     Ok(InteractiveOptions {
+        code_block_indent,
         socket_path,
         cwd: config.cwd.clone(),
         session_dir,
@@ -720,5 +726,53 @@ mod tests {
         options.config.provider = Some("onboard-naked".into());
         options.config.model = Some("m2".into());
         assert!(onboarding_task(&options).is_none());
+    }
+
+    #[test]
+    fn build_tui_options_reads_code_block_indent_settings() {
+        // `markdown.codeBlockIndent` rides InteractiveOptions at startup
+        // (TS `getCodeBlockIndent` -> `getMarkdownThemeWithSettings`); a
+        // non-default value reaches the TUI, and no setting keeps the TS
+        // default two spaces.
+        fn run_options(dir: &std::path::Path) -> RunOptions {
+            RunOptions {
+                app_mode: crate::mode::AppMode::Interactive,
+                config: crate::mode::RuntimeConfig {
+                    cwd: dir.to_path_buf(),
+                    agent_dir: dir.join("agent"),
+                    ..Default::default()
+                },
+                session: Default::default(),
+                messages: Vec::new(),
+                file_args: Vec::new(),
+                daemon_socket: None,
+                list_models: None,
+                export: None,
+                initial_message: None,
+                verbose: false,
+                offline: false,
+                agents_view_requested: false,
+                attach_agent: None,
+            }
+        }
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let agent = dir.path().join("agent");
+        std::fs::create_dir_all(&agent).expect("agent dir");
+        std::fs::write(
+            agent.join("settings.json"),
+            r#"{ "markdown": { "codeBlockIndent": "    " } }"#,
+        )
+        .expect("settings.json");
+        let options = build_tui_options(&run_options(dir.path()), dir.path().join("d.sock"))
+            .expect("options");
+        assert_eq!(options.code_block_indent, "    ");
+
+        // No markdown settings: the TS default.
+        let bare = tempfile::TempDir::new().expect("temp dir");
+        std::fs::create_dir_all(bare.path().join("agent")).expect("agent dir");
+        let options = build_tui_options(&run_options(bare.path()), bare.path().join("d.sock"))
+            .expect("options");
+        assert_eq!(options.code_block_indent, "  ");
     }
 }

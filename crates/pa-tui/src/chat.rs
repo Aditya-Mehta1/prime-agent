@@ -202,11 +202,17 @@ pub fn render_text_rows(text: &str, style: Style, width: usize) -> Vec<Line> {
 
 /// The user-message block (TS `UserMessageComponent`: Box(2,1) on
 /// `userMessageBg`, markdown inside colored `userMessageText`).
-pub fn render_user_block(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
+pub fn render_user_block(
+    text: &str,
+    theme: &Theme,
+    code_block_indent: &str,
+    width: usize,
+) -> Vec<Line> {
     let bg = theme.bg_style(ThemeBg::UserMessageBg);
     let content_width = width.saturating_sub(4).max(1);
     let body = theme.fg_style(ThemeColor::UserMessageText);
-    let md = crate::markdown::MarkdownStyle::from_theme(theme);
+    let mut md = crate::markdown::MarkdownStyle::from_theme(theme);
+    md.code_block_indent = code_block_indent.to_string();
     let rendered = crate::markdown::render_markdown(text, content_width, &md);
     let mut rows: Vec<Line> = Vec::new();
     let blank = vec![Span::styled(" ".repeat(width), bg)];
@@ -247,6 +253,7 @@ pub fn render_assistant(
     message: &AssistantMessage,
     detail: Detail,
     theme: &Theme,
+    code_block_indent: &str,
     width: usize,
     preceded_by_tool_activity: bool,
 ) -> Vec<Line> {
@@ -264,14 +271,15 @@ pub fn render_assistant(
     if has_visible_content {
         out.push(spacer());
     }
-    let md = crate::markdown::MarkdownStyle::from_theme(theme);
+    let mut md = crate::markdown::MarkdownStyle::from_theme(theme);
+    md.code_block_indent = code_block_indent.to_string();
     for (index, block) in visible_blocks.iter().enumerate() {
         match block {
             MessageBlock::Text(text) => {
                 out.extend(render_markdown_block(text, &md, width));
             }
             MessageBlock::Thinking(text) => {
-                out.extend(render_thinking_block(text, theme, width));
+                out.extend(render_thinking_block(text, theme, &md, width));
                 // Thinking adds spacing only when another visible block follows.
                 if index + 1 < visible_blocks.len() {
                     out.push(spacer());
@@ -336,8 +344,13 @@ fn render_markdown_block(
 }
 
 /// The thinking block: markdown with every style collapsed to `dim`.
-fn render_thinking_block(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
-    let mut md = crate::markdown::MarkdownStyle::from_theme(theme);
+fn render_thinking_block(
+    text: &str,
+    theme: &Theme,
+    md: &crate::markdown::MarkdownStyle,
+    width: usize,
+) -> Vec<Line> {
+    let mut md = md.clone();
     let dim = theme.fg_style(ThemeColor::Dim);
     md.body = dim;
     md.heading = dim;
@@ -468,7 +481,7 @@ mod tests {
 
     #[test]
     fn user_block_renders_box_rows() {
-        let rows = render_user_block("Run a quick check.", &theme(), 60);
+        let rows = render_user_block("Run a quick check.", &theme(), "  ", 60);
         assert_eq!(rows.len(), 3);
         let text = rows[1]
             .iter()
@@ -480,7 +493,7 @@ mod tests {
 
     #[test]
     fn user_block_carries_zone_markers() {
-        let rows = render_user_block("Run a quick check.", &theme(), 60);
+        let rows = render_user_block("Run a quick check.", &theme(), "  ", 60);
         // The zone-start sequence leads the first block row; the end and
         // final sequences lead the last block row (TS prepends both).
         assert!(crate::osc133::row_markers(&rows[0]).start);
@@ -502,7 +515,7 @@ mod tests {
             error: None,
             aborted: false,
         };
-        let rows = render_assistant(&plain, Detail::Overview, &theme(), 60, false);
+        let rows = render_assistant(&plain, Detail::Overview, &theme(), "  ", 60, false);
         assert!(crate::osc133::row_markers(&rows[0]).start);
         assert!(crate::osc133::row_markers(rows.last().unwrap()).end);
 
@@ -513,8 +526,51 @@ mod tests {
             error: None,
             aborted: false,
         };
-        let rows = render_assistant(&with_tools, Detail::Overview, &theme(), 60, false);
+        let rows = render_assistant(&with_tools, Detail::Overview, &theme(), "  ", 60, false);
         assert_eq!(crate::osc133::row_markers(&rows[0]), Default::default());
+    }
+
+    #[test]
+    fn code_block_indent_rides_the_render_calls() {
+        // `markdown.codeBlockIndent` (TS getCodeBlockIndent ->
+        // getMarkdownThemeWithSettings): the settings string flows through
+        // render_assistant / render_user_block into every fenced block.
+        let message = AssistantMessage {
+            blocks: vec![MessageBlock::Text(
+                "intro\n\n```\nfn main() {}\n```".to_string(),
+            )],
+            has_tool_calls: false,
+            streaming: false,
+            error: None,
+            aborted: false,
+        };
+        let strip_markers = |row: &str| {
+            row.replace(crate::osc133::ZONE_END_PREFIX, "")
+                .replace(crate::osc133::ZONE_END, "")
+                .trim_end()
+                .to_string()
+        };
+        let rows = render_assistant(&message, Detail::Overview, &theme(), "    ", 60, false);
+        let flat: Vec<String> = rows
+            .iter()
+            .map(|line| line.iter().map(|s| s.content.as_str()).collect::<String>())
+            .map(|row| strip_markers(&row))
+            .collect();
+        assert!(
+            flat.iter().any(|row| row == "     fn main() {}"),
+            "non-default indent applied: {flat:?}"
+        );
+        // The default (no setting) stays two spaces.
+        let rows = render_assistant(&message, Detail::Overview, &theme(), "  ", 60, false);
+        let flat: Vec<String> = rows
+            .iter()
+            .map(|line| line.iter().map(|s| s.content.as_str()).collect::<String>())
+            .map(|row| strip_markers(&row))
+            .collect();
+        assert!(
+            flat.iter().any(|row| row == "   fn main() {}"),
+            "default indent: {flat:?}"
+        );
     }
 
     #[test]
@@ -552,7 +608,7 @@ mod tests {
             error: Some("Error: request failed after retries".into()),
             aborted: false,
         };
-        let rows = render_assistant(&message, Detail::Overview, &theme(), 60, false);
+        let rows = render_assistant(&message, Detail::Overview, &theme(), "  ", 60, false);
         let flat: Vec<String> = rows
             .iter()
             .map(|line| line.iter().map(|s| s.content.as_str()).collect())
@@ -573,7 +629,7 @@ mod tests {
             error: None,
             aborted: false,
         };
-        let rows = render_assistant(&message, Detail::Overview, &theme(), 60, true);
+        let rows = render_assistant(&message, Detail::Overview, &theme(), "  ", 60, true);
         assert_eq!(rows.last().unwrap().len(), 0, "trailing spacer");
         // A tool-only message after tool activity renders no spacers.
         let message = AssistantMessage {
@@ -583,7 +639,7 @@ mod tests {
             error: None,
             aborted: false,
         };
-        let rows = render_assistant(&message, Detail::Overview, &theme(), 60, true);
+        let rows = render_assistant(&message, Detail::Overview, &theme(), "  ", 60, true);
         assert!(rows.is_empty(), "got: {rows:?}");
     }
 

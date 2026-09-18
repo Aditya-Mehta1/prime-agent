@@ -325,6 +325,7 @@ fn interactive_session_rss_plateaus_over_long_stream() {
         session: SessionSelection::New,
         initial_message: None,
         theme: "prime".to_string(),
+        code_block_indent: "  ".to_string(),
         version: "0.0.0".to_string(),
         onboarding: None,
         telemetry_disabled: None,

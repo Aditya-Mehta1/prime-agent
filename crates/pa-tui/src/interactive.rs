@@ -132,6 +132,10 @@ pub struct InteractiveOptions {
     /// Prompt sent immediately after attach (CLI message arguments).
     pub initial_message: Option<String>,
     pub theme: String,
+    /// The chat markdown fenced-code indent, resolved by the composition
+    /// root from `markdown.codeBlockIndent` (TS `getCodeBlockIndent`;
+    /// default two spaces).
+    pub code_block_indent: String,
     /// Product version for the brand splash.
     pub version: String,
     /// Run the first-run onboarding flow before the session screen.
@@ -161,6 +165,7 @@ impl std::fmt::Debug for InteractiveOptions {
             .field("session", &self.session)
             .field("initial_message", &self.initial_message)
             .field("theme", &self.theme)
+            .field("code_block_indent", &self.code_block_indent)
             .field("version", &self.version)
             .field("onboarding", &self.onboarding)
             .field("telemetry_disabled", &self.telemetry_disabled)
@@ -353,6 +358,7 @@ pub async fn run_interactive(
 
     let theme = crate::app::load_theme(&options.theme);
     let mut view = AgentView::new(theme);
+    view.code_block_indent = options.code_block_indent.clone();
     apply_startup_chrome(&mut view, &options);
     session.refresh_stats().await;
     session.rebuild_view(&mut view);
@@ -767,6 +773,7 @@ mod tests {
             session: SessionSelection::New,
             initial_message: None,
             theme: "prime".to_string(),
+            code_block_indent: "  ".to_string(),
             version: "0.0.0".to_string(),
             onboarding: None,
             telemetry_disabled: None,

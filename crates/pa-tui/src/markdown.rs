@@ -8,8 +8,9 @@ use crate::{Line, Span};
 use ratatui::style::{Modifier, Style};
 use ratatui::text as rt;
 
-/// Styling hooks resolved from a theme.
-#[derive(Debug, Clone, Copy)]
+/// Styling hooks resolved from a theme (plus the settings-driven
+/// `code_block_indent`; not `Copy` because of the indent `String`).
+#[derive(Debug, Clone)]
 pub struct MarkdownStyle {
     pub body: Style,
     pub heading: Style,
@@ -25,6 +26,9 @@ pub struct MarkdownStyle {
     pub bold: Modifier,
     pub italic: Modifier,
     pub strikethrough: Modifier,
+    /// The fenced-code indent string (`markdown.codeBlockIndent` in
+    /// settings, TS `codeBlockIndent` on the markdown theme; default "  ").
+    pub code_block_indent: String,
 }
 
 impl Default for MarkdownStyle {
@@ -54,6 +58,7 @@ impl MarkdownStyle {
             bold: Modifier::BOLD,
             italic: Modifier::ITALIC,
             strikethrough: Modifier::CROSSED_OUT,
+            code_block_indent: "  ".to_string(),
         }
     }
 }
@@ -351,12 +356,12 @@ fn render_block(
         }
         BlockKind::Code { .. } => {
             // TS `renderCodeBlock`: no borders in the chat markdown - the
-            // block is `codeBlockIndent` (default "  ", settings-driven on
-            // the TS side) outside the styled code line, each source line
-            // rendered with the codeBlock style. The theme's
-            // `codeBlockBorder` hook exists in the TS MarkdownTheme too and
-            // is unused by the renderer on both sides.
-            let indent = "  ";
+            // block is `codeBlockIndent` (settings-driven, default "  ")
+            // outside the styled code line, each source line rendered with
+            // the codeBlock style. The theme's `codeBlockBorder` hook exists
+            // in the TS MarkdownTheme too and is unused by the renderer on
+            // both sides.
+            let indent = style.code_block_indent.as_str();
             for line in &block.lines {
                 out.push(vec![
                     Span::raw(indent),

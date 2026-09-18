@@ -54,6 +54,10 @@ pub(crate) struct SessionUi {
     /// Telemetry opt-out carried over from the run options; every attach to
     /// another session keeps carrying it (TS attach parity).
     telemetry_disabled: Option<bool>,
+    /// The chat markdown fenced-code indent from the run's options
+    /// (`markdown.codeBlockIndent`); `/new` re-opens with the same value
+    /// instead of resetting it to the default.
+    code_block_indent: String,
     /// Snapshot chat entries to fold into the view on the next rebuild.
     pending_snapshot: Option<Vec<ChatEntry>>,
     /// Snapshot labels (model) for the next rebuild.
@@ -125,6 +129,7 @@ impl SessionUi {
             script_path: options.script_path.clone(),
             model_selection: options.model_selection.clone(),
             telemetry_disabled: options.telemetry_disabled,
+            code_block_indent: options.code_block_indent.clone(),
             pending_snapshot: None,
             pending_model: None,
             context: None,
@@ -644,6 +649,7 @@ impl SessionUi {
             initial_message: None,
             telemetry_disabled: self.telemetry_disabled,
             theme: String::new(),
+            code_block_indent: self.code_block_indent.clone(),
             version: String::new(),
             onboarding: None,
             client_auth: self.client_auth.clone(),

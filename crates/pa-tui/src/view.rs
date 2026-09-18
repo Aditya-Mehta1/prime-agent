@@ -25,6 +25,9 @@ pub const FULLSCREEN_MIN_TRANSCRIPT_ROWS: usize = 3;
 
 pub struct AgentView {
     pub theme: Theme,
+    /// The chat markdown fenced-code indent (`markdown.codeBlockIndent`,
+    /// TS `getMarkdownThemeWithSettings`; default two spaces).
+    pub code_block_indent: String,
     pub editor: Editor,
     pub chrome: ChromeState,
     pub chat: Vec<ChatEntry>,
@@ -71,6 +74,7 @@ impl AgentView {
     pub fn new(theme: Theme) -> Self {
         Self {
             theme,
+            code_block_indent: "  ".to_string(),
             editor: Editor::new(),
             chrome: ChromeState::default(),
             chat: Vec::new(),
@@ -267,7 +271,12 @@ impl AgentView {
                 if !first {
                     rows.push(Vec::new());
                 }
-                rows.extend(render_user_block(text, &self.theme, width));
+                rows.extend(render_user_block(
+                    text,
+                    &self.theme,
+                    &self.code_block_indent,
+                    width,
+                ));
                 rows
             }
             ChatEntry::SlashCommand { text } => {
@@ -297,6 +306,7 @@ impl AgentView {
                 message,
                 self.detail,
                 &self.theme,
+                &self.code_block_indent,
                 width,
                 preceded_by_tool_activity,
             ),
