@@ -207,10 +207,23 @@ fn attach_data() -> Value {
     })
 }
 
+/// The per-turn pacing floor: the mock streams turns as fast as the loop
+/// can consume them, so on an idle box the whole scripted session finished
+/// in under 0.8s and the 100ms RSS sampler collected fewer than the eight
+/// samples the plateau analysis needs (a load-flake: the session ran
+/// FASTER unloaded). Pacing the producer gives the session a deterministic
+/// minimum duration (40 turns x 50ms = 2s) independent of machine speed,
+/// so the sample count stays far above the floor under any legitimate
+/// load. The plateau assertion itself is unchanged: resident memory in
+/// the last quarter of the run must stay within the allowance of the
+/// warm-up state.
+const TURN_PACE: Duration = Duration::from_millis(50);
+
 /// One scripted turn: streamed assistant text deltas, a tool call with a
 /// large result, and turn completion. Larger than typical turns on purpose:
 /// any per-frame or per-event retention becomes visible quickly.
 fn stream_turn(writer: &mut UnixStream) {
+    std::thread::sleep(TURN_PACE);
     let event = |payload: Value| json!({ "type": "session_event", "activeSessionId": "s1", "event": payload });
     write_json(writer, &event(json!({ "type": "turn_start" })));
     write_json(
