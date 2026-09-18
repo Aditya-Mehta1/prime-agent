@@ -166,6 +166,9 @@ impl Inner {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        // Hidden window on Windows (TS `spawnHidden`); the kernel stays in
+        // this process's group - its lifecycle is supervised directly.
+        crate::platform::process::set_no_window(command.as_std_mut());
         if let Some(cwd) = &cwd {
             command.current_dir(cwd);
         }

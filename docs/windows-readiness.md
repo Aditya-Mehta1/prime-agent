@@ -16,9 +16,9 @@ Markers: **[D]** daemon-redesign-critical (fixed in this lane),
 | module | owns | Unix impl | Windows stub |
 |---|---|---|---|
 | `pa-types::platform::transport` | `TransportListener` / `TransportStream` (async, dyn-compatible) + `BlockingTransportStream`; `bind_transport` / `connect_transport` / `connect_blocking` | AF_UNIX socket files | named pipes (`platform/windows_pipe.rs`, lane `windows`): byte-mode duplex instances, busy-retry connect, blocking client with read deadline |
-| `pa-types::platform::process` | `process_start_id` (pid-reuse identity), `is_process_alive` | `/proc/<pid>/stat` + `/proc/<pid>/status` | `None` / `Err(...)` |
-| `pa-core::platform::process` | `Signal`, `kill_pid`, `kill_process_group_or_pid`, `pid_exists`, `set_new_process_group`, `termination_signal` | libc `kill(2)`, `process_group(0)`, `ExitStatusExt` | false-returning (unproven-kill semantics) + no-op group set; real impl = taskkill/Job objects |
-| `pa-core::platform::lock_dir` | `LockDir::acquire` | mkdir `{file}.lock` + `utimensat` mtime bump, rmdir on Drop (proper-lockfile protocol) | `create_dir` works; mtime probe no-op until a Windows port lands |
+| `pa-types::platform::process` | `process_start_id` (pid-reuse identity), `is_process_alive` | `/proc/<pid>/stat` + `/proc/<pid>/status` | implemented (lane `windows`): `win:<creation FILETIME ticks>` via `OpenProcess`+`GetProcessTimes` (byte-equal in meaning to the TS PowerShell `.Ticks` query); liveness via `STILL_ACTIVE` exit-code probe, access-denied reads alive (TS EPERM semantics) |
+| `pa-core::platform::process` | `Signal`, `kill_pid`, `kill_process_group_or_pid`, `pid_exists`, `set_new_process_group`, `set_no_window`, `termination_signal` | libc `kill(2)`, `process_group(0)`, `ExitStatusExt` | implemented (lane `windows`): `kill_pid` = TerminateProcess on the single pid (libuv/Node win32 mapping); `kill_process_group_or_pid` = absolute-System32 `taskkill /F /T /PID` (TS hardened `killOrphanProcess`; Job objects skipped - TS precedent is taskkill); `pid_exists` = shared handle probe; `set_new_process_group` = `CREATE_NEW_PROCESS_GROUP\|DETACHED_PROCESS\|CREATE_NO_WINDOW` (Node `detached:true` via `spawnHidden`); `set_no_window` = `CREATE_NO_WINDOW` (TS `windowsHide`); `termination_signal` = None (exit codes) |
+| `pa-core::platform::lock_dir` | `LockDir::acquire` | mkdir `{file}.lock` + `utimensat` mtime bump, rmdir on Drop (proper-lockfile protocol) | implemented (lane `windows`): same mkdir/rmdir protocol; mtime probe via `CreateFileW(FILE_FLAG_BACKUP_SEMANTICS)` + `SetFileTime` |
 | `pa-core::platform::perms` | `restrict_file` (0o600), `restrict_dir` (0o700), `set_private_mode`, `file_mode`, `is_executable`, `is_readable_writable` | chmod/mode bits, `access(2)` | inherited-ACL no-ops (documented degradation), open-probe readability |
 | `pa-core::platform::shell` | `get_shell_config`, `resolve_kernel_bash_shell` | `/bin/bash` -> `which bash` -> `sh` | `Err(...)`; real impl = TS Git-Bash candidate order (never PATH) |
 | `pa-daemon::platform` (paths) | per-OS endpoint naming: `socket_dir`, `default_daemon_socket_path`, `worker_socket_path`, `socket_identity` | `<TMPDIR>/prime-agent-<uid>/*.sock`, dev/ino identity | `\\.\pipe\prime-agent-daemon`, `\\.\pipe\prime-agent-worker-<key>-<id>`, identity `None` |
@@ -153,13 +153,23 @@ No platform coupling found (loop policy only; no process/socket code).
    and run on a real Windows runner).
 2. `pa-daemon::platform`: pipe-name endpoints exist already (this lane);
    verify the TS win32 naming exactly, drop the uid suffix there.
-3. `pa-core::platform::process`: `pid_exists`/`is_process_alive` via
-   `OpenProcess`; `kill_*` via `taskkill /F /T` from an absolute System32
-   path (TS precedent) or Job objects for the bash tool; spawn flags
-   `CREATE_NO_WINDOW` (TS `windowsHide`) on the daemon worker and detached
-   supervisor spawns.
-4. `pa-core::platform::lock_dir`: the mkdir/rmdir protocol is portable as-is;
-   port the `utimensat` mtime probe (`SetFileTime` on the directory).
+3. `pa-core::platform::process` + `pa-types::platform::process`: DONE
+   (lane `windows`) - handle-probe liveness/identity (`OpenProcess`,
+   `GetProcessTimes`, `STILL_ACTIVE`), `TerminateProcess` for single-pid
+   signals, absolute-System32 `taskkill /F /T` for tree kills (TS
+   precedent; Job objects not needed for parity), and the Node
+   `detached`/`windowsHide` creation-flag pair (`set_new_process_group`
+   now sets the detached+hidden flags on Windows; new `set_no_window`
+   backs the TS `spawnHidden` spawns: bash tool, kernel bootstrap/REPL,
+   daemon worker, taskkill itself). Windows-only tests compile in the
+   cross-check and run on a real Windows runner.
+4. `pa-core::platform::lock_dir`: DONE (lane `windows`) - the mkdir/rmdir
+   protocol was already portable; the mtime probe now writes through
+   `CreateFileW(FILE_FLAG_BACKUP_SEMANTICS)` + `SetFileTime` on the lock
+   directory, so the staleness judgment is exact on NTFS too. The
+   `LockFileEx` variant was NOT needed: the TS product's proper-lockfile
+   protocol (directory presence + mtime) is the byte-compatibility
+   contract, and it works on Windows as-is.
 5. `pa-core::platform::perms`: decide the ACL story (TS: none - files inherit
    ACLs; document or add an explicit-ACL helper).
 6. `pa-core::platform::shell`: TS Git-Bash candidate order; kernel `bash()`

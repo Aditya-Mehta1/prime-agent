@@ -287,9 +287,11 @@ async fn run_async(command: &str, args: &[String]) -> anyhow::Result<()> {
     let command = command.to_string();
     let args = args.to_vec();
     tokio::task::spawn_blocking(move || {
-        let status = std::process::Command::new(&command)
-            .args(&args)
-            .stdin(Stdio::null())
+        let mut child = std::process::Command::new(&command);
+        child.args(&args).stdin(Stdio::null());
+        // Hidden window on Windows (TS `spawnHidden`).
+        crate::platform::process::set_no_window(&mut child);
+        let status = child
             .status()
             .with_context(|| format!("failed to spawn {command}"))?;
         if status.success() {
@@ -312,13 +314,15 @@ fn python_imports(python: &str, module_name: &str) -> bool {
 }
 
 fn run_quiet(command: &str, args: &[&str]) -> bool {
-    let output = std::process::Command::new(command)
+    let mut child = std::process::Command::new(command);
+    child
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    matches!(output, Ok(status) if status.success())
+        .stderr(Stdio::null());
+    // Hidden window on Windows (TS `spawnHidden`).
+    crate::platform::process::set_no_window(&mut child);
+    matches!(child.status(), Ok(status) if status.success())
 }
 
 /// The runtime-ready assertion from the TS product: a current

@@ -503,6 +503,10 @@ impl Supervisor {
         if std::path::Path::new(&cwd).is_dir() {
             command.current_dir(&cwd);
         }
+        // Detached and window-hidden, the TS worker spawn
+        // (`spawnHidden(..., { detached: true })`): the worker leaves the
+        // supervisor's console group and shows no fresh console.
+        pa_core::platform::process::set_new_process_group(command.as_std_mut());
         let child = command
             .spawn()
             .with_context(|| format!("spawn session worker {}", resident.worker_id))?;

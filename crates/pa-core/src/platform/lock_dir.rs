@@ -50,11 +50,111 @@ fn set_mtime(path: &Path, tv_sec: i64, tv_nsec: i64) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+/// Windows: the directory's last-write time via `CreateFileW` (the only
+/// way to open a directory is `FILE_FLAG_BACKUP_SEMANTICS`) +
+/// `SetFileTime` - the mtime probe proper-lockfile performs with
+/// `utimensat` on Unix.
+#[cfg(windows)]
+fn set_mtime(path: &Path, tv_sec: i64, tv_nsec: i64) -> io::Result<()> {
+    win32::set_last_write_time(path, tv_sec, tv_nsec)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn set_mtime(_path: &Path, _tv_sec: i64, _tv_nsec: i64) -> io::Result<()> {
     Err(io::Error::other(
-        "directory lock mtime probe is not yet implemented on Windows",
+        "directory lock mtime probe is not implemented on this platform",
     ))
+}
+
+/// The kernel32 file-time surface for the lock probe, hand-declared (repo
+/// policy: pinned constants/externs, no windows-sys dependency).
+#[cfg(windows)]
+mod win32 {
+    #![allow(non_snake_case)]
+
+    use std::ffi::c_void;
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    /// `winbase.h`: required to open a directory handle.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    /// `winbase.h`: write access to the file's times.
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+    /// `winnt.h` `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`:
+    /// a concurrent stat of the lock dir must not be blocked.
+    const FILE_SHARE_ALL: u32 = 0x0000_0007;
+    /// `winbase.h` `OPEN_EXISTING`.
+    const OPEN_EXISTING: u32 = 3;
+    /// `winbase.h`: `CreateFileW` returns this (not null) on failure.
+    const INVALID_HANDLE_VALUE: isize = -1;
+
+    /// A Win32 `FILETIME`: 100ns ticks since 1601-01-01 UTC, split 32/32.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct FileTime {
+        dwLowDateTime: u32,
+        dwHighDateTime: u32,
+    }
+
+    type Handle = *mut c_void;
+
+    extern "system" {
+        fn CreateFileW(
+            filename: *const u16,
+            desired_access: u32,
+            share_mode: u32,
+            security_attributes: *mut c_void,
+            creation_disposition: u32,
+            flags_and_attributes: u32,
+            template_file: Handle,
+        ) -> Handle;
+        fn CloseHandle(handle: Handle) -> i32;
+        fn SetFileTime(
+            handle: Handle,
+            creation_time: *const FileTime,
+            last_access_time: *const FileTime,
+            last_write_time: *const FileTime,
+        ) -> i32;
+    }
+
+    /// `(tv_sec, tv_nsec)` -> FILETIME. The Windows epoch trails the Unix
+    /// epoch by 11644473600 seconds; the sub-second part is nanoseconds
+    /// against FILETIME's 100ns ticks.
+    fn unix_to_filetime(tv_sec: i64, tv_nsec: i64) -> FileTime {
+        const EPOCH_DELTA_TICKS: i64 = 11_644_473_600 * 10_000_000;
+        let ticks = tv_sec * 10_000_000 + EPOCH_DELTA_TICKS + tv_nsec / 100;
+        FileTime {
+            dwLowDateTime: ticks as u32,
+            dwHighDateTime: (ticks >> 32) as u32,
+        }
+    }
+
+    /// Set the directory's last-write time.
+    pub(crate) fn set_last_write_time(path: &Path, tv_sec: i64, tv_nsec: i64) -> io::Result<()> {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_WRITE_ATTRIBUTES,
+                FILE_SHARE_ALL,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle as isize == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let last_write = unix_to_filetime(tv_sec, tv_nsec);
+        let ok = unsafe { SetFileTime(handle, std::ptr::null(), std::ptr::null(), &last_write) };
+        unsafe { CloseHandle(handle) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 /// An exclusive cross-process lock on `{path}.lock`, released on drop by
@@ -117,12 +217,26 @@ impl LockDir {
         Ok(())
     }
 
-    #[cfg(not(unix))]
+    /// The mkdir is the acquisition signal; the mtime probe makes the
+    /// staleness judgment meaningful on NTFS too (directory mtimes would
+    /// otherwise sit on the second, and stale takeovers would misjudge).
+    #[cfg(windows)]
     fn create(path: &Path) -> io::Result<()> {
         fs::create_dir(path)?;
-        // Windows directory mtimes come from the filesystem; the mtime
-        // probe is pending (see docs/windows-readiness.md).
+        let (tv_sec, tv_nsec) = probe_mtime();
+        if let Err(error) = set_mtime(path, tv_sec, tv_nsec) {
+            // Never leave a lock artifact behind a failed probe.
+            let _ = fs::remove_dir(path);
+            return Err(error);
+        }
         Ok(())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn create(path: &Path) -> io::Result<()> {
+        // No mtime probe on this platform: staleness is judged from the
+        // filesystem's own directory mtime.
+        fs::create_dir(path)
     }
 
     /// Decide the fate of an incumbent at `path`. Returns only when the
@@ -234,7 +348,6 @@ mod tests {
         assert!(!lock_of(&file).exists(), "release removes the directory");
     }
 
-    #[cfg(unix)]
     #[test]
     fn mtime_matches_the_proper_lockfile_probe_shape() {
         let dir = tempfile::tempdir().unwrap();
