@@ -13,6 +13,7 @@ use serde_json::Value;
 use crate::chat::{ChatEntry, MessageBlock, RetryState, StatusKind, ToolResultView, WorkingState};
 use crate::daemon_client::{DaemonClient, DaemonClientEvent};
 use crate::interactive::{InteractiveOptions, ModelSelection, SessionSelection};
+use crate::model_picker::{self, CurrentModel, ModelPickerAction};
 use crate::keys::key_event_to_id;
 use crate::snapshot::{
     assistant_message_parts, attach_data_from_response, event_to_update, reconstruct, TurnUpdate,
@@ -49,6 +50,10 @@ pub(crate) struct SessionUi {
     session_dir: Option<PathBuf>,
     script_path: Option<PathBuf>,
     model_selection: ModelSelection,
+    /// The available-model catalog for the `/model` picker (the
+    /// composition root resolves it from the model registry at startup;
+    /// entitlement refreshes are daemon-side, so the catalog is a snapshot).
+    model_catalog: Vec<pa_types::ai::Model>,
     /// Telemetry opt-out carried over from the run options; every attach to
     /// another session keeps carrying it (TS attach parity).
     telemetry_disabled: Option<bool>,
@@ -126,6 +131,7 @@ impl SessionUi {
             session_dir: options.session_dir.clone(),
             script_path: options.script_path.clone(),
             model_selection: options.model_selection.clone(),
+            model_catalog: options.model_catalog.clone(),
             telemetry_disabled: options.telemetry_disabled,
             code_block_indent: options.code_block_indent.clone(),
             pending_snapshot: None,
@@ -568,6 +574,32 @@ impl SessionUi {
                     }
                 }
             }
+            // `/model [search]` (TS `handleModelCommand`): open the inline
+            // picker over the startup catalog, the search term prefilled
+            // as its filter; Enter applies, Esc cancels.
+            "model" => {
+                let current = view.chrome.model_id.as_deref().and_then(|model_id| {
+                    self.model_catalog
+                        .iter()
+                        .find(|model| model.id == model_id)
+                        .map(|model| CurrentModel {
+                            provider: model.provider.clone(),
+                            model_id: model_id.to_string(),
+                        })
+                });
+                match model_picker::model_command(
+                    &self.model_catalog,
+                    current.as_ref(),
+                    &resolved.args,
+                ) {
+                    model_picker::ModelCommandOutcome::Open(picker) => {
+                        view.model_picker = Some(picker);
+                    }
+                    model_picker::ModelCommandOutcome::NoModels(message) => {
+                        self.note(&message, view);
+                    }
+                }
+            }
             // TS `handleMcpCommand`'s login/logout branches: the auth
             // flows run in the client process (the composition root's
             // hook); the other management subcommands surface through the
@@ -642,6 +674,7 @@ impl SessionUi {
             session_dir: self.session_dir.clone(),
             script_path: self.script_path.clone(),
             model_selection: self.model_selection.clone(),
+            model_catalog: self.model_catalog.clone(),
             no_session: false,
             session: SessionSelection::New,
             initial_message: None,
@@ -765,6 +798,46 @@ impl SessionUi {
         Some(format!("Press {key} again to exit"))
     }
 
+    /// One key press while the `/model` picker is open: Esc/Ctrl+C close
+    /// it without applying; Enter applies the selection.
+    async fn handle_model_picker_key(&mut self, key: KeyEvent, view: &mut AgentView) -> Result<()> {
+        let Some(id) = key_event_to_id(&key) else {
+            return Ok(());
+        };
+        let action = view
+            .model_picker
+            .as_mut()
+            .map(|picker| picker.handle_key(&id, view.editor.keybindings()));
+        match action {
+            Some(ModelPickerAction::None) => {}
+            Some(ModelPickerAction::Cancel) => {
+                view.model_picker = None;
+                self.dirty = true;
+            }
+            Some(ModelPickerAction::Apply { provider, model_id }) => {
+                view.model_picker = None;
+                self.apply_model_selection(&provider, &model_id, view);
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// Apply a picked model: the `ModelSelection` the create path already
+    /// serializes into every `create` config carries the picked model, so
+    /// `/new` sessions and later creates start on it. (Switching the model
+    /// of the live session rides the daemon `set_model` seam, which the
+    /// worker does not handle yet; until it lands, this is the apply
+    /// surface and the note says so.)
+    fn apply_model_selection(&mut self, provider: &str, model_id: &str, view: &mut AgentView) {
+        self.model_selection.provider = Some(provider.to_string());
+        self.model_selection.model = Some(model_id.to_string());
+        self.note(
+            &format!("Model set: {model_id} (new sessions start on it)"),
+            view,
+        );
+    }
+
     /// Abort the active turn off the UI loop (TS `interruptOrClearInput`
     /// fires `void abort()`): the request never blocks key handling, and a
     /// failure surfaces later as a transcript note.
@@ -816,6 +889,12 @@ impl SessionUi {
         view: &mut AgentView,
         running: &mut bool,
     ) -> Result<()> {
+        // The `/model` picker owns the frame while open: every key goes to
+        // it, before the editor, the viewport keys, or Ctrl+C (which
+        // cancels the picker instead of aborting a turn).
+        if view.model_picker.is_some() {
+            return self.handle_model_picker_key(key, view).await;
+        }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             if view.editor.is_showing_autocomplete() {
                 view.editor.cancel_autocomplete();

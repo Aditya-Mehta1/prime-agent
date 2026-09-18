@@ -48,10 +48,39 @@ pub enum SelectorAction {
 /// The maximum rows the list shows at once (TS `maxVisible`).
 const MAX_VISIBLE: usize = 15;
 
+/// The selector's frame chrome: which surface is being picked. The list,
+/// filter, and selection behavior are shared; only the header title and
+/// its key hints differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectorKind {
+    /// The resource-configuration modal (`prime-agent config`): checkbox
+    /// semantics, Space toggles.
+    ResourceConfig,
+    /// The `/model` picker: single-select semantics, Enter applies.
+    Model,
+}
+
+impl SelectorKind {
+    /// The header title and its `(key, action)` hints.
+    fn header(self) -> (&'static str, &'static [(&'static str, &'static str)]) {
+        match self {
+            SelectorKind::ResourceConfig => (
+                "Resource Configuration",
+                &[("space", "toggle"), ("escape", "close")],
+            ),
+            SelectorKind::Model => (
+                "Select Model",
+                &[("enter", "select"), ("escape", "close")],
+            ),
+        }
+    }
+}
+
 /// The selector state: rows, the active filter, and the cursor position
 /// within the filtered view.
 #[derive(Debug, Clone)]
 pub struct ConfigSelector {
+    kind: SelectorKind,
     rows: Vec<SelectorRow>,
     filtered: Vec<usize>,
     query: String,
@@ -59,10 +88,18 @@ pub struct ConfigSelector {
 }
 
 impl ConfigSelector {
-    /// Build the selector from flat rows (group, subgroup, item order).
+    /// Build the resource-configuration selector from flat rows (group,
+    /// subgroup, item order).
     pub fn new(rows: Vec<SelectorRow>) -> Self {
+        Self::with_kind(rows, SelectorKind::ResourceConfig)
+    }
+
+    /// Build the selector for a specific surface (the `/model` picker uses
+    /// [`SelectorKind::Model`]).
+    pub fn with_kind(rows: Vec<SelectorRow>, kind: SelectorKind) -> Self {
         let filtered = (0..rows.len()).collect();
         let mut selector = ConfigSelector {
+            kind,
             rows,
             filtered,
             query: String::new(),
@@ -72,9 +109,22 @@ impl ConfigSelector {
         selector
     }
 
+    /// The selector's frame kind.
+    pub fn kind(&self) -> SelectorKind {
+        self.kind
+    }
+
     /// The current filter query.
     pub fn query(&self) -> &str {
         &self.query
+    }
+
+    /// Replace the filter query in one step (the `/model <search>` prefill;
+    /// typing the same characters one key at a time cannot express a
+    /// space, which the key loop treats as toggle).
+    pub fn set_query(&mut self, query: &str) {
+        self.query = query.to_string();
+        self.apply_filter();
     }
 
     /// The checked state of one item row.
@@ -394,7 +444,13 @@ impl ConfigSelector {
             border(),
             Vec::new(),
             self.header_line(theme, width),
-            vec![theme.fg_span(ThemeColor::Muted, "Type to filter resources")],
+            vec![theme.fg_span(
+                ThemeColor::Muted,
+                match self.kind {
+                    SelectorKind::ResourceConfig => "Type to filter resources",
+                    SelectorKind::Model => "Type to filter models",
+                },
+            )],
             Vec::new(),
         ];
         lines.extend(self.list_rows(theme, width));
@@ -403,14 +459,18 @@ impl ConfigSelector {
         lines
     }
 
-    /// "Resource Configuration ... Space toggle · Esc close" (TS
-    /// `ConfigSelectorHeader.render`).
+    /// "<title> ... <key action> · <key action>" (the resource header is TS
+    /// `ConfigSelectorHeader.render`; the model header carries the picker's
+    /// own hints).
     fn header_line(&self, theme: &Theme, width: usize) -> Line {
-        let title = "Resource Configuration";
-        let hint = raw_key_hint(theme, "space", "toggle");
-        let mut hint_parts = hint;
-        hint_parts.push(Span::raw(theme.fg_span(ThemeColor::Muted, " · ").content));
-        hint_parts.extend(raw_key_hint(theme, "escape", "close"));
+        let (title, hints) = self.kind.header();
+        let mut hint_parts: Line = Vec::new();
+        for (position, (key, action)) in hints.iter().enumerate() {
+            if position > 0 {
+                hint_parts.push(Span::raw(theme.fg_span(ThemeColor::Muted, " · ").content));
+            }
+            hint_parts.extend(raw_key_hint(theme, key, action));
+        }
         let title_width = str_width(title);
         let hint_width = crate::width::spans_width(&hint_parts);
         let spacing = width.saturating_sub(title_width + hint_width).max(1);

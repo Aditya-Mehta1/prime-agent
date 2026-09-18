@@ -43,6 +43,9 @@ pub struct AgentView {
     /// The first-run onboarding pane (TS `runStartupOnboarding`): while
     /// set, it owns the whole frame.
     pub onboarding: Option<crate::onboarding::OnboardingScreen>,
+    /// The `/model` inline picker (TS `ModelSelectorComponent` seam):
+    /// while set, it owns the whole frame like the onboarding pane.
+    pub model_picker: Option<crate::model_picker::ModelPicker>,
     scroll_top: usize,
     following: bool,
     /// The transcript-tail offset of the last composed frame (TS
@@ -84,6 +87,7 @@ impl AgentView {
             working_since: None,
             retry: None,
             onboarding: None,
+            model_picker: None,
             scroll_top: 0,
             following: true,
             last_max_scroll: 0,
@@ -516,6 +520,9 @@ impl AgentView {
         if let Some(screen) = &self.onboarding {
             return screen.render(&self.theme, width, height);
         }
+        if let Some(picker) = &self.model_picker {
+            return picker_pane(picker.render(&self.theme, width), width, height);
+        }
         let top = render_top_bar(&self.chrome, &self.theme, width);
         let transcript = self.render_transcript(width);
         let dock = self.render_dock(width);
@@ -567,7 +574,7 @@ impl AgentView {
     /// Hardware cursor position within the last composed frame (0-based row,
     /// 0-based column), when the editor surface drew the cursor.
     pub fn frame_cursor(&self) -> Option<(usize, usize)> {
-        if self.onboarding.is_some() {
+        if self.onboarding.is_some() || self.model_picker.is_some() {
             return None;
         }
         self.dock_cursor
@@ -598,6 +605,16 @@ fn indicator_row(indicator: &str, bg: Style, border: Style, width: usize) -> Lin
     let used = str_width(indicator);
     row.push(Span::styled(" ".repeat(width.saturating_sub(used)), bg));
     row
+}
+
+/// Fit the model picker's frame to the window (same geometry as the
+/// full-screen selector loop: pad to height, truncate at height).
+fn picker_pane(mut frame: Vec<Line>, width: usize, height: usize) -> Vec<Line> {
+    while frame.len() < height {
+        frame.push(vec![Span::raw(" ".repeat(width.max(1)))]);
+    }
+    frame.truncate(height);
+    frame
 }
 
 /// Pad a rendered row to the full width (default background).

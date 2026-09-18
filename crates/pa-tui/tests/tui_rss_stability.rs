@@ -321,6 +321,7 @@ fn interactive_session_rss_plateaus_over_long_stream() {
         session_dir: None,
         script_path: None,
         model_selection: ModelSelection::default(),
+        model_catalog: Vec::new(),
         no_session: false,
         session: SessionSelection::New,
         initial_message: None,

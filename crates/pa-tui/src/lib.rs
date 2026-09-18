@@ -25,6 +25,7 @@ pub mod interactive;
 pub mod keybindings;
 pub mod keys;
 pub mod markdown;
+pub mod model_picker;
 pub mod onboarding;
 pub mod osc133;
 pub mod session;

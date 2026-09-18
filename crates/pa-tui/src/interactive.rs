@@ -118,6 +118,10 @@ impl std::fmt::Debug for OnboardingTask {
 pub struct InteractiveOptions {
     pub socket_path: PathBuf,
     pub cwd: PathBuf,
+    /// The available-model catalog for the `/model` picker (a startup
+    /// snapshot resolved by the composition root; pa-tui stays pa-types
+    /// only, so the registry itself lives above this crate).
+    pub model_catalog: Vec<pa_types::ai::Model>,
     /// Persistence directory for new sessions (`sessionDir` in the create
     /// config; defaults to the daemon's sessions dir when `None`).
     pub session_dir: Option<PathBuf>,
@@ -161,6 +165,7 @@ impl std::fmt::Debug for InteractiveOptions {
             .field("session_dir", &self.session_dir)
             .field("script_path", &self.script_path)
             .field("model_selection", &self.model_selection)
+            .field("model_catalog", &self.model_catalog)
             .field("no_session", &self.no_session)
             .field("session", &self.session)
             .field("initial_message", &self.initial_message)
@@ -769,6 +774,7 @@ mod tests {
             session_dir: None,
             script_path: None,
             model_selection: selection,
+            model_catalog: Vec::new(),
             no_session: false,
             session: SessionSelection::New,
             initial_message: None,

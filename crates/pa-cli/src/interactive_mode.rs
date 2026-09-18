@@ -364,8 +364,19 @@ fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<Inter
     let code_block_indent =
         pa_core::settings::SettingsManager::create(&config.cwd, &config.agent_dir)
             .get_code_block_indent();
+    // The `/model` picker catalog: a startup snapshot of the available
+    // models (same registry and private-authorization cache adoption as
+    // the startup-model chain; entitlement refreshes run daemon-side, so
+    // the picker works off the snapshot).
+    let auth = pa_core::auth::AuthStorage::create(&config.agent_dir);
+    let mut registry =
+        pa_core::models::ModelRegistry::create(auth, config.agent_dir.join("models.json"));
+    registry.load_private_authorization_from_cache();
+    let model_catalog: Vec<pa_types::ai::Model> =
+        registry.get_available().into_iter().cloned().collect();
     Ok(InteractiveOptions {
         code_block_indent,
+        model_catalog,
         socket_path,
         cwd: config.cwd.clone(),
         session_dir,
