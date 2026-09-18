@@ -180,6 +180,48 @@ def measure_typing(session: str, side_name: str, text: str = TYPING_TEXT) -> lis
     return latencies
 
 
+def measure_resume(
+    side: B.Side,
+    tag: str,
+    daemon_socket: Path,
+    corpus: Path,
+    timeout_s: float,
+) -> dict:
+    """One interactive `--resume <corpus>` launch, measured to the ready
+    frame (prompt line + manage bar + resolved model id). The record
+    carries `session`, `first_frame_s`, `ready_s`, and the ready frame: the
+    ready time is snapshot ingest plus first full layout, the path a
+    transcript-scale resume pays before the user can type."""
+    session = tag
+    daemon_socket.parent.mkdir(parents=True, exist_ok=True)
+    if daemon_socket.exists():
+        daemon_socket.unlink()
+    argv = launch_argv(side, daemon_socket) + ["--resume", str(corpus)]
+    t0 = time.time()
+    B.tmux_launch(session, argv, side.env, side.work_dir)
+    first_frame_s = None
+    ready_s = None
+    ready_frame = ""
+    deadline = t0 + timeout_s
+    while time.time() < deadline:
+        frame = B.tmux_capture(session)
+        if first_frame_s is None and frame.strip():
+            first_frame_s = round(time.time() - t0, 3)
+        if is_ready(side.name, frame):
+            ready_s = round(time.time() - t0, 3)
+            ready_frame = frame
+            break
+        time.sleep(0.05)
+    B.tmux_kill(session)
+    return {
+        "session": session,
+        "first_frame_s": first_frame_s,
+        "ready_s": ready_s,
+        "ready_frame_rows": len(ready_frame.splitlines()) if ready_frame else 0,
+        "ready_frame_tail": ready_frame[-2000:] if ready_frame else "",
+    }
+
+
 def summarize(values: list[float]) -> dict:
     ordered = sorted(values)
     if not ordered:

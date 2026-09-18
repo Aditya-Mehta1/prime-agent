@@ -7,7 +7,7 @@
 //! algorithm for its golden-replay corpus. Consolidating the two copies into
 //! pa-types as pure data helpers is a tracked follow-up.
 
-mod bash;
+pub(crate) mod bash;
 mod cell;
 
 pub use cell::parse_ipython_bash_cell;

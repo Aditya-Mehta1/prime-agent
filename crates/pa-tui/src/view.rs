@@ -52,6 +52,16 @@ pub struct AgentView {
     /// re-emits rows whose content changed (mirroring the TS renderer,
     /// which writes a row's marker sequences when it rewrites that row).
     osc_last_rows: Vec<String>,
+    /// Rendered rows per chat entry (incremental layout): a frame re-renders
+    /// only entries invalidated since the last frame; settled entries clone
+    /// their cached rows instead of re-running markdown and code previews.
+    /// A transcript-scale frame pays full layout cost once per entry, not
+    /// once per draw.
+    entry_layout: Vec<Option<Vec<Line>>>,
+    /// The width the cached rows were laid out for.
+    layout_width: usize,
+    /// The conversation-detail mode the cached rows were laid out for.
+    layout_detail: Detail,
 }
 
 impl AgentView {
@@ -73,6 +83,9 @@ impl AgentView {
             dock_cursor: None,
             window_rows: 0,
             osc_last_rows: Vec::new(),
+            entry_layout: Vec::new(),
+            layout_width: 0,
+            layout_detail: Detail::Overview,
         }
     }
 
@@ -111,14 +124,33 @@ impl AgentView {
         self.terminal_rows = rows;
     }
 
-    /// Append one chat component.
+    /// Append one chat component (no cached layout yet: the next frame
+    /// renders it and stores its rows).
     pub fn push_entry(&mut self, entry: ChatEntry) {
         self.chat.push(entry);
+        self.entry_layout.push(None);
     }
 
     /// Append a replay transcript item (mapped onto chat components).
     pub fn push(&mut self, item: TranscriptItem) {
         self.chat.push(item_to_entry(item));
+        self.entry_layout.push(None);
+    }
+
+    /// Drop the whole transcript and its cached layout (a fresh snapshot
+    /// rebuild re-renders every row).
+    pub fn clear_chat(&mut self) {
+        self.chat.clear();
+        self.entry_layout.clear();
+    }
+
+    /// Mark one chat entry's cached rows stale: a mutation changed its
+    /// content (streamed blocks, tool-card state, an attached error row),
+    /// so the next frame lays it out again.
+    pub fn mark_entry_stale(&mut self, index: usize) {
+        if let Some(slot) = self.entry_layout.get_mut(index) {
+            *slot = None;
+        }
     }
 
     /// The conversation-detail label for the prompt-context row.
@@ -145,78 +177,126 @@ impl AgentView {
         self.following = true;
     }
 
+    /// Whether one chat entry's rows are stable: content that later frames
+    /// cannot change (nothing mutates status/user/slash rows once pushed;
+    /// an assistant message stops changing when its stream settles; a tool
+    /// card stops animating once it holds a final result).
+    fn entry_cacheable(&self, entry: &ChatEntry) -> bool {
+        match entry {
+            ChatEntry::Status { .. } | ChatEntry::User { .. } => true,
+            ChatEntry::SlashCommand { .. } | ChatEntry::SlashCommandResult { .. } => true,
+            ChatEntry::Assistant(message) => !message.streaming,
+            ChatEntry::Tool(card) => !matches!(
+                crate::tool_card::panel_status(card),
+                crate::tool_card::PanelStatus::Queued | crate::tool_card::PanelStatus::Running
+            ),
+        }
+    }
+
+    /// Lay out one chat entry's transcript rows (the only producer of
+    /// cached layout rows).
+    fn render_entry(
+        &self,
+        entry: &ChatEntry,
+        width: usize,
+        first: bool,
+        preceded_by_tool_activity: bool,
+    ) -> Vec<Line> {
+        match entry {
+            ChatEntry::Status { text, kind } => {
+                let style = match kind {
+                    crate::chat::StatusKind::Info => self.theme.fg_style(ThemeColor::Dim),
+                    crate::chat::StatusKind::Warning => self.theme.fg_style(ThemeColor::Warning),
+                    crate::chat::StatusKind::Error => self.theme.fg_style(ThemeColor::Error),
+                };
+                let mut rows = Vec::new();
+                rows.push(Vec::new());
+                rows.extend(render_text_rows(text, style, width));
+                rows
+            }
+            ChatEntry::User { text } => {
+                let mut rows = Vec::new();
+                if !first {
+                    rows.push(Vec::new());
+                }
+                rows.extend(render_user_block(text, &self.theme, width));
+                rows
+            }
+            ChatEntry::SlashCommand { text } => {
+                // The echo row leads with a spacer when the chat is not
+                // empty (TS adds `Spacer(1)` before the component).
+                let mut rows = Vec::new();
+                if !first {
+                    rows.push(Vec::new());
+                }
+                let typed = pa_types::slash_commands::parse_slash_command(text)
+                    .map(|(name, _)| name)
+                    .unwrap_or_default();
+                let takes_argument = pa_types::slash_commands::SlashCommandRegistry::builtin()
+                    .takes_argument(&typed);
+                rows.extend(crate::chat_slash::render_slash_command(
+                    text,
+                    takes_argument,
+                    &self.theme,
+                    width,
+                ));
+                rows
+            }
+            ChatEntry::SlashCommandResult { content } => {
+                crate::chat_slash::render_slash_command_result(content, &self.theme, width)
+            }
+            ChatEntry::Assistant(message) => render_assistant(
+                message,
+                self.detail,
+                &self.theme,
+                width,
+                preceded_by_tool_activity,
+            ),
+            ChatEntry::Tool(card) => crate::tool_card::render_tool_card(
+                card,
+                self.pulse_frame,
+                self.detail,
+                &self.theme,
+                width,
+            ),
+        }
+    }
+
     /// Render the scrollable transcript: splash rows, chat component rows,
     /// and the working loader when a turn is active.
     pub fn render_transcript(&mut self, width: usize) -> Vec<Line> {
         if let (Some(working), Some(since)) = (&mut self.working, self.working_since) {
             working.elapsed_secs = since.elapsed().as_secs();
         }
+        // A width or detail change re-flows every row: drop the whole
+        // layout cache (the flags below gate every entry's stored rows).
+        if self.layout_width != width || self.layout_detail != self.detail {
+            self.layout_width = width;
+            self.layout_detail = self.detail;
+            self.entry_layout.iter_mut().for_each(|slot| *slot = None);
+        }
+        self.entry_layout.resize(self.chat.len(), None);
         let mut lines: Vec<Line> = render_splash(&self.chrome, &self.theme, width);
         let mut first = true;
         let mut preceded_by_tool_activity = false;
-        for entry in &self.chat {
-            match entry {
-                ChatEntry::Status { text, kind } => {
-                    let style = match kind {
-                        crate::chat::StatusKind::Info => self.theme.fg_style(ThemeColor::Dim),
-                        crate::chat::StatusKind::Warning => {
-                            self.theme.fg_style(ThemeColor::Warning)
-                        }
-                        crate::chat::StatusKind::Error => self.theme.fg_style(ThemeColor::Error),
-                    };
-                    lines.push(Vec::new());
-                    lines.extend(render_text_rows(text, style, width));
-                }
-                ChatEntry::User { text } => {
-                    if !first {
-                        lines.push(Vec::new());
+        for (index, entry) in self.chat.iter().enumerate() {
+            // Incremental layout: settled entries re-use their stored
+            // rows; anything still animating (streaming messages, queued
+            // or running tool cards) renders fresh and stores nothing.
+            let rows = match self.entry_layout[index]
+                .as_ref()
+                .filter(|_| self.entry_cacheable(entry))
+            {
+                Some(rows) => rows.clone(),
+                None => {
+                    let rows = self.render_entry(entry, width, first, preceded_by_tool_activity);
+                    if self.entry_cacheable(entry) {
+                        self.entry_layout[index] = Some(rows.clone());
                     }
-                    lines.extend(render_user_block(text, &self.theme, width));
+                    rows
                 }
-                ChatEntry::SlashCommand { text } => {
-                    // The echo row leads with a spacer when the chat is not
-                    // empty (TS adds `Spacer(1)` before the component).
-                    if !first {
-                        lines.push(Vec::new());
-                    }
-                    let typed = pa_types::slash_commands::parse_slash_command(text)
-                        .map(|(name, _)| name)
-                        .unwrap_or_default();
-                    let takes_argument = pa_types::slash_commands::SlashCommandRegistry::builtin()
-                        .takes_argument(&typed);
-                    lines.extend(crate::chat_slash::render_slash_command(
-                        text,
-                        takes_argument,
-                        &self.theme,
-                        width,
-                    ));
-                }
-                ChatEntry::SlashCommandResult { content } => {
-                    lines.extend(crate::chat_slash::render_slash_command_result(
-                        content,
-                        &self.theme,
-                        width,
-                    ));
-                }
-                ChatEntry::Assistant(message) => {
-                    lines.extend(render_assistant(
-                        message,
-                        self.detail,
-                        &self.theme,
-                        width,
-                        preceded_by_tool_activity,
-                    ));
-                }
-                ChatEntry::Tool(card) => {
-                    lines.extend(crate::tool_card::render_tool_card(
-                        card,
-                        self.pulse_frame,
-                        self.detail,
-                        &self.theme,
-                        width,
-                    ));
-                }
-            }
+            };
+            lines.extend(rows);
             preceded_by_tool_activity = matches!(entry, ChatEntry::Tool(_));
             first = false;
         }
@@ -526,7 +606,9 @@ fn item_to_entry(item: TranscriptItem) -> ChatEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat::{AssistantMessage, MessageBlock};
     use crate::theme::{ColorMode, Theme};
+    use crate::tool_card::{ToolCallCard, ToolResultView};
 
     fn view() -> AgentView {
         AgentView::new(Theme::builtin("prime", ColorMode::TrueColor))
@@ -580,5 +662,158 @@ mod tests {
         // The editor prompt sits above the (empty) tray row.
         let joined = frame.iter().map(text_of).collect::<Vec<_>>().join("\n");
         assert!(joined.contains("Collapsed mode"));
+    }
+
+    fn view_with(entries: Vec<ChatEntry>) -> AgentView {
+        let mut view = AgentView::new(crate::theme::Theme::builtin(
+            "prime",
+            crate::theme::ColorMode::Color256,
+        ));
+        for entry in entries {
+            view.push_entry(entry);
+        }
+        view
+    }
+
+    fn settled_tool_card(id: &str) -> ChatEntry {
+        ChatEntry::Tool(Box::new(ToolCallCard {
+            id: id.to_string(),
+            name: "bash".to_string(),
+            args: serde_json::json!({"command": "echo done"}),
+            started: true,
+            started_at: Some(std::time::Instant::now()),
+            ended_at: Some(std::time::Instant::now()),
+            result: Some(ToolResultView {
+                content: vec![serde_json::json!({"type": "text", "text": "done"})],
+                details: serde_json::Value::Null,
+                is_error: false,
+            }),
+            result_partial: false,
+        }))
+    }
+
+    fn transcript_text(view: &mut AgentView, width: usize) -> String {
+        let rows = view.render_transcript(width);
+        rows.iter()
+            .map(|line| line.iter().map(|span| span.content.as_str()).collect())
+            .collect::<Vec<String>>()
+            .join("\n")
+    }
+
+    /// A settled transcript renders identically from the layout cache and
+    /// from a fresh layout: caching must never change the frame.
+    #[test]
+    fn cached_transcript_rows_match_fresh_render() {
+        let mut view = view_with(vec![
+            ChatEntry::User {
+                text: "hello".to_string(),
+            },
+            ChatEntry::Assistant(Box::new(AssistantMessage {
+                blocks: vec![MessageBlock::Text("world".to_string())],
+                has_tool_calls: false,
+                streaming: false,
+                error: None,
+                aborted: false,
+            })),
+            settled_tool_card("call_1"),
+        ]);
+        let fresh = transcript_text(&mut view, 80);
+        let cached = transcript_text(&mut view, 80);
+        assert_eq!(fresh, cached);
+    }
+
+    /// A mutation marked stale re-renders: the cached rows must never hide
+    /// new content (streamed blocks, tool-card state, attached errors).
+    #[test]
+    fn stale_entry_re_renders_new_content() {
+        let mut view = view_with(vec![ChatEntry::Assistant(Box::new(AssistantMessage {
+            blocks: vec![MessageBlock::Text("part one".to_string())],
+            has_tool_calls: false,
+            streaming: false,
+            error: None,
+            aborted: false,
+        }))]);
+        let before = transcript_text(&mut view, 80);
+        if let Some(ChatEntry::Assistant(open)) = view.chat.get_mut(0) {
+            open.blocks = vec![MessageBlock::Text("part one part two".to_string())];
+        }
+        view.mark_entry_stale(0);
+        let after = transcript_text(&mut view, 80);
+        assert!(before.contains("part one"));
+        assert!(!before.contains("part two"));
+        assert!(after.contains("part one part two"));
+    }
+
+    /// A running tool card animates: its rows must not be cached (the
+    /// spinner frame advances), while a settled card's rows ignore the
+    /// pulse frame.
+    #[test]
+    fn running_card_is_not_cached_and_settled_card_is() {
+        let running = ChatEntry::Tool(Box::new(ToolCallCard {
+            id: "call_r".to_string(),
+            name: "bash".to_string(),
+            args: serde_json::json!({"command": "sleep 1"}),
+            started: true,
+            started_at: Some(std::time::Instant::now()),
+            ended_at: None,
+            result: None,
+            result_partial: false,
+        }));
+        let mut view = view_with(vec![running, settled_tool_card("call_d")]);
+        view.pulse_frame = 0;
+        let frame0 = transcript_text(&mut view, 80);
+        view.pulse_frame = 1;
+        let frame1 = transcript_text(&mut view, 80);
+        assert_ne!(frame0, frame1, "the running spinner must animate");
+
+        // With only a settled card, the pulse frame cannot change rows.
+        let mut settled_view = view_with(vec![settled_tool_card("call_d")]);
+        settled_view.pulse_frame = 0;
+        let s0 = transcript_text(&mut settled_view, 80);
+        settled_view.pulse_frame = 7;
+        let s7 = transcript_text(&mut settled_view, 80);
+        assert_eq!(s0, s7);
+    }
+
+    /// A conversation-detail change re-flows every cached row (thinking
+    /// blocks and tool output expand).
+    #[test]
+    fn detail_change_invalidates_cached_rows() {
+        let mut view = view_with(vec![ChatEntry::Assistant(Box::new(AssistantMessage {
+            blocks: vec![
+                MessageBlock::Thinking("thinking body".to_string()),
+                MessageBlock::Text("answer".to_string()),
+            ],
+            has_tool_calls: false,
+            streaming: false,
+            error: None,
+            aborted: false,
+        }))]);
+        let overview = transcript_text(&mut view, 80);
+        view.detail = view.detail.next();
+        let details = transcript_text(&mut view, 80);
+        assert!(!overview.contains("thinking body"));
+        assert!(details.contains("thinking body"));
+    }
+
+    /// A streaming assistant message updates across frames: its rows stay
+    /// out of the cache until the stream settles.
+    #[test]
+    fn streaming_assistant_updates_across_frames() {
+        let mut view = view_with(vec![ChatEntry::Assistant(Box::new(AssistantMessage {
+            blocks: vec![MessageBlock::Text("so far".to_string())],
+            has_tool_calls: false,
+            streaming: true,
+            error: None,
+            aborted: false,
+        }))]);
+        let frame0 = transcript_text(&mut view, 80);
+        assert!(frame0.contains("so far"));
+        if let Some(ChatEntry::Assistant(open)) = view.chat.get_mut(0) {
+            open.blocks = vec![MessageBlock::Text("so far, and more".to_string())];
+        }
+        view.mark_entry_stale(0);
+        let frame1 = transcript_text(&mut view, 80);
+        assert!(frame1.contains("and more"));
     }
 }

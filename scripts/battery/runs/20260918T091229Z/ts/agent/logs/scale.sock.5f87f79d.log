@@ -1,0 +1,3 @@
+[2026-09-18T09:12:41.964Z] supervisor: Prime Agent daemon supervisor ca19808c-8f83-497a-8e44-a1c8904ae155 listening on /home/ubuntu/lane-worktrees/replay-perf/scripts/battery/runs/20260918T091229Z/ts/f12_scale_resume/scale.sock
+[2026-09-18T09:12:42.989Z] supervisor: Session worker a46849499b40 stderr: Prime Agent daemon listening on /tmp/vbat20260918T091229Z-ts/prime-agent-1000/worker-5f87f79df789-a46849499b40.sock
+[2026-09-18T09:12:55.814Z] supervisor: Prime Agent daemon supervisor 36260a2e-0402-45ba-a7ac-2b1ce40c3075 listening on /home/ubuntu/lane-worktrees/replay-perf/scripts/battery/runs/20260918T091229Z/ts/f12_scale_resume/scale.sock

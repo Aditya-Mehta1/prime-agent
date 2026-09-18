@@ -399,6 +399,14 @@ pub async fn run_interactive(
                 match maybe_event {
                     Some(event) => {
                         session.apply_client_event(event, &mut view);
+                        // Batch the rest of the queued frames before this
+                        // iteration's render: a stream burst applies as one
+                        // transcript pass instead of one full re-layout per
+                        // frame (a replay-scale ingest renders once per
+                        // batch, not once per row).
+                        while let Ok(event) = events.try_recv() {
+                            session.apply_client_event(event, &mut view);
+                        }
                         // A settled turn refreshes the tray's context usage.
                         if was_active && !session.turn_active {
                             session.refresh_stats().await;
@@ -424,9 +432,19 @@ pub async fn run_interactive(
             view.pulse_frame = view.pulse_frame.wrapping_add(1);
         }
 
+        // Render when the transcript changed or an animation is live; an
+        // idle session re-renders nothing (a full-transcript layout costs
+        // linear time, so redrawing an unchanged idle frame burns CPU for
+        // every attached session).
+        let animating = session.turn_active || view.retry.is_some();
+        if animating {
+            session.dirty = true;
+        }
         if let Some(renderer) = renderer.is_terminal_mut() {
-            crate::app::draw(renderer, &mut view)?;
-            session.dirty = false;
+            if session.dirty {
+                crate::app::draw(renderer, &mut view)?;
+                session.dirty = false;
+            }
         } else if session.dirty {
             renderer.render_headless(&mut session, &mut view);
         }

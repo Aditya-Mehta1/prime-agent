@@ -19,4 +19,18 @@ Files: `run_battery.py` (driver), `batterylib.py` (shared harness),
 `framediff_first_run.py` (first-run frame diff),
 `streaming_render.py` (live token-stream rendering verifier: pane captures
 must grow progressively mid-turn over a paced faux provider, TS vs Rust
-differential on the settled frame).
+differential on the settled frame),
+`scale_corpus.py` (f12 heavy-scale corpus generator).
+
+Heavy flow (opt-in, not part of the default battery run):
+
+    PA_BATTERY_HEAVY=1 python3 scripts/battery/run_battery.py --flows f12_scale_resume
+
+`f12_scale_resume` generates a deterministic PA_BATTERY_HEAVY_TURNS-turn
+session (default 5,000 turns = 15,261 transcript rows of user / assistant /
+ipython-tool turns plus harness-digest rows) and measures interactive
+`--resume` -> ready for both binaries through tmux. Gates: the Rust side
+must reach ready within SCALE_RESUME_MAX_READY_S (30s) and within
+SCALE_RESUME_MAX_RATIO (2.0x) of the TS side in the same run - a
+regression gate for the snapshot replay/render path (per-row re-layout or
+uncached preview work must not come back).

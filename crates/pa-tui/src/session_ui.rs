@@ -203,7 +203,7 @@ impl SessionUi {
     /// Fold the pending snapshot into the view (fresh transcript, footer
     /// labels). Called after attach and after every session switch.
     pub(crate) fn rebuild_view(&mut self, view: &mut AgentView) {
-        view.chat.clear();
+        view.clear_chat();
         if let Some(items) = self.pending_snapshot.take() {
             for entry in items {
                 view.push_entry(entry);
@@ -889,6 +889,7 @@ impl SessionUi {
                     open.has_tool_calls = has_tool_calls;
                     open.streaming = streaming;
                 }
+                view.mark_entry_stale(index);
             }
             None => {
                 if !blocks.is_empty() {
@@ -909,12 +910,15 @@ impl SessionUi {
             // A streamed tool call first appears queued; the execution start
             // event flips it to running, and later frames refresh its args
             // while they stream (TS `updateArgs`).
-            match view
+            let card_index = view
                 .chat
-                .iter_mut()
-                .find(|entry| matches!(entry, ChatEntry::Tool(card) if card.id == *id))
-            {
-                Some(ChatEntry::Tool(card)) => card.args = args.clone(),
+                .iter()
+                .position(|entry| matches!(entry, ChatEntry::Tool(card) if card.id == *id));
+            match card_index.map(|index| (index, view.chat.get_mut(index))) {
+                Some((index, Some(ChatEntry::Tool(card)))) => {
+                    card.args = args.clone();
+                    view.mark_entry_stale(index);
+                }
                 _ => view.push_entry(ChatEntry::Tool(Box::new(ToolCallCard {
                     id: id.clone(),
                     name: name.clone(),
@@ -967,16 +971,22 @@ impl SessionUi {
             if let Some(ChatEntry::Assistant(open)) = view.chat.get_mut(index) {
                 open.error = Some(text);
                 open.aborted = aborted;
+                view.mark_entry_stale(index);
                 return;
             }
         }
-        let last_assistant = view.chat.iter_mut().rev().find_map(|entry| match entry {
-            ChatEntry::Assistant(message) => Some(message),
-            _ => None,
-        });
-        if let Some(last) = last_assistant {
-            last.error = Some(text);
-            last.aborted = aborted;
+        let last_assistant = view
+            .chat
+            .iter()
+            .rev()
+            .position(|entry| matches!(entry, ChatEntry::Assistant(_)));
+        if let Some(offset) = last_assistant {
+            let index = view.chat.len() - 1 - offset;
+            if let Some(ChatEntry::Assistant(open)) = view.chat.get_mut(index) {
+                open.error = Some(text);
+                open.aborted = aborted;
+                view.mark_entry_stale(index);
+            }
         }
     }
 
@@ -989,17 +999,20 @@ impl SessionUi {
         args: Value,
         view: &mut AgentView,
     ) {
-        for entry in &mut view.chat {
-            if let ChatEntry::Tool(card) = entry {
-                if card.id == tool_call_id {
-                    card.started = true;
-                    card.started_at = Some(std::time::Instant::now());
-                    if !args.is_null() {
-                        card.args = args;
-                    }
-                    return;
+        let card_index = view
+            .chat
+            .iter()
+            .position(|entry| matches!(entry, ChatEntry::Tool(card) if card.id == tool_call_id));
+        if let Some(index) = card_index {
+            if let Some(ChatEntry::Tool(card)) = view.chat.get_mut(index) {
+                card.started = true;
+                card.started_at = Some(std::time::Instant::now());
+                if !args.is_null() {
+                    card.args = args;
                 }
+                view.mark_entry_stale(index);
             }
+            return;
         }
         view.push_entry(ChatEntry::Tool(Box::new(ToolCallCard {
             id: tool_call_id.to_string(),
@@ -1029,16 +1042,18 @@ impl SessionUi {
             details: result.get("details").cloned().unwrap_or(Value::Null),
             is_error,
         };
-        for entry in &mut view.chat {
-            if let ChatEntry::Tool(card) = entry {
-                if card.id == tool_call_id {
-                    card.result = Some(result);
-                    card.result_partial = partial;
-                    if !partial {
-                        card.ended_at = Some(std::time::Instant::now());
-                    }
-                    return;
+        let card_index = view
+            .chat
+            .iter()
+            .position(|entry| matches!(entry, ChatEntry::Tool(card) if card.id == tool_call_id));
+        if let Some(index) = card_index {
+            if let Some(ChatEntry::Tool(card)) = view.chat.get_mut(index) {
+                card.result = Some(result);
+                card.result_partial = partial;
+                if !partial {
+                    card.ended_at = Some(std::time::Instant::now());
                 }
+                view.mark_entry_stale(index);
             }
         }
     }

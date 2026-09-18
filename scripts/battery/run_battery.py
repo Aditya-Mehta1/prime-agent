@@ -46,12 +46,25 @@ NL = chr(10)
 
 ALL_FLOWS = ["f1_launch", "f2_prompt", "f3_tool", "f4_commands", "f5_side_questions", "f6_attach", "f7_compaction", "f8_resume", "f9_agents_view", "f10_perf", "f11_provider_failure"]
 
+# Heavy flows: opt-in by name (`--flows f12_scale_resume`) plus
+# PA_BATTERY_HEAVY=1; they measure transcript-scale resume, not parity, and
+# would inflate a normal battery run's wall time.
+HEAVY_FLOWS = ["f12_scale_resume"]
+
 # PERF row thresholds, measured on this box by scripts/battery/perf.py:
 # the invariant is that the Rust binary is never materially slower than
 # the TS binary on cold startup or keystroke-to-render latency.
 PERF_STARTUP_MAX_RATIO = 1.5
 PERF_TYPING_MAX_RATIO = 1.5
 PERF_RUNS = 3
+
+# f12 thresholds: a transcript-scale interactive resume (snapshot ingest +
+# first full layout) must be scale-ready — seconds, not minutes. The TS
+# binary resumes the same corpus in ~3.4s; the Rust gate is an absolute cap
+# (the box's background load makes tight differential ratios noisy) plus a
+# regression ratio against the TS side measured in the same run.
+SCALE_RESUME_MAX_READY_S = 30.0
+SCALE_RESUME_MAX_RATIO = 2.0
 
 HELLO_TEXT = "battery hello from mock"
 # The dashboard status-line model the TS daemon asks after each turn (B-7).
@@ -1294,6 +1307,79 @@ class Battery:
             time.sleep(0.5)
         return False
 
+    def f12_scale_resume(self) -> None:
+        """HEAVY (opt-in: --flows f12_scale_resume + PA_BATTERY_HEAVY=1):
+        transcript-scale interactive `--resume` -> ready, Rust vs TS. The
+        corpus is deterministic (scripts/battery/scale_corpus.py): a
+        PA_BATTERY_HEAVY_TURNS-turn session (default 5,000 = 15,261
+        transcript rows) of user/assistant/ipython-tool turns. Ready means
+        the interactive frame a user would type at: ingest of the resume
+        snapshot plus the first full layout, in seconds — the regression
+        gate for the replay path."""
+        import scale_corpus as SC
+
+        flow = "f12_scale_resume"
+        if os.environ.get("PA_BATTERY_HEAVY") != "1":
+            self.record(
+                flow,
+                "perf",
+                "skipped: set PA_BATTERY_HEAVY=1 (and pass --flows f12_scale_resume) to run the heavy-scale resume gate",
+                gap=False,
+            )
+            return
+        turns = int(os.environ.get("PA_BATTERY_HEAVY_TURNS", "5000"))
+        timeout_s = float(os.environ.get("PA_BATTERY_HEAVY_TIMEOUT", "300"))
+        corpus = SC.corpus_path(turns, self.run_dir, str(self.run_dir))
+        rows = SC.corpus_rows(turns)
+        ready: dict[str, float | None] = {}
+        for side in (self.sides["ts"], self.sides["rust"]):
+            self.perf_onboard(side)
+            socket = side.root / flow / "scale.sock"
+            rec = P.measure_resume(
+                side,
+                f"{self.runid}-scale-{side.name}",
+                socket,
+                corpus,
+                timeout_s,
+            )
+            P.stop_perf_daemon(socket)
+            side.evidence_json(flow, "resume.json", rec)
+            ready[side.name] = rec["ready_s"]
+            if rec["ready_s"] is None:
+                self.record(
+                    flow,
+                    "perf",
+                    f"{side.name}: {turns}-turn ({rows}-row) interactive resume never reached ready within {timeout_s:.0f}s",
+                    evidence=side.root / flow / "resume.json",
+                )
+            else:
+                self.record(
+                    flow,
+                    "perf",
+                    f"{side.name}: {turns}-turn ({rows}-row) interactive resume ready in {rec['ready_s']}s "
+                    f"(first frame {rec['first_frame_s']}s)",
+                    gap=False,
+                )
+        ts_ready = ready.get("ts")
+        rs_ready = ready.get("rust")
+        if ts_ready is not None and rs_ready is not None:
+            ratio = rs_ready / ts_ready
+            detail = (
+                f"scale resume: rust {rs_ready:.3f}s vs ts {ts_ready:.3f}s for {rows} rows "
+                f"(ratio {ratio:.2f}, thresholds: ratio <= {SCALE_RESUME_MAX_RATIO}, rust <= {SCALE_RESUME_MAX_READY_S}s)"
+            )
+            if rs_ready <= SCALE_RESUME_MAX_READY_S and ratio <= SCALE_RESUME_MAX_RATIO:
+                self.record(flow, "perf", detail, gap=False)
+            else:
+                self.record(flow, "perf", f"REGRESSION {detail}", evidence=self.run_dir / flow)
+        else:
+            self.record(
+                flow,
+                "perf",
+                "scale-resume thresholds not evaluable: a side never reached ready",
+                gap=True,
+            )
+
     def f11_provider_failure(self) -> None:
         """Kill the mock provider mid-session: the interactive transcript
         must surface the provider failure (retry banner + error row(s))
@@ -1626,7 +1712,7 @@ class Battery:
         print(f"battery run dir: {self.run_dir}")
         self.make_side("ts", self.ts_bin)
         self.make_side("rust", self.rust_bin)
-        order = {f: getattr(self, f) for f in ALL_FLOWS}
+        order = {f: getattr(self, f) for f in ALL_FLOWS + HEAVY_FLOWS}
         try:
             for flow in self.flows:
                 print(f"== {flow}", flush=True)
@@ -1652,8 +1738,8 @@ def main() -> int:
     args = parser.parse_args()
     flows = [f.strip() for f in args.flows.split(",") if f.strip()]
     for flow in flows:
-        if flow not in ALL_FLOWS:
-            parser.error(f"unknown flow {flow}; valid: {ALL_FLOWS}")
+        if flow not in ALL_FLOWS and flow not in HEAVY_FLOWS:
+            parser.error(f"unknown flow {flow}; valid: {ALL_FLOWS + HEAVY_FLOWS}")
     battery = Battery(Path(args.runs_root), args.ts_bin, args.rust_bin, flows)
     return battery.run()
 

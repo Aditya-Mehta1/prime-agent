@@ -1317,6 +1317,7 @@ dependencies = [
  "fancy-regex",
  "pa-types",
  "ratatui",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

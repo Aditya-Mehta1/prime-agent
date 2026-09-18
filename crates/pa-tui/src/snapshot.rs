@@ -11,6 +11,7 @@ use crate::chat::{AssistantMessage, ChatEntry, MessageBlock, ToolCallCard};
 use pa_types::daemon::{DaemonEventCursor, DaemonReplayInfo};
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
 
 /// The slim attach result: the `data` object of a successful `attach`
 /// response (`createAttachResult` wire shape).
@@ -125,18 +126,44 @@ fn apply_tool_result(chat: &mut [ChatEntry], result: ToolResultReplay) {
 
 /// Replay a whole transcript: map every message to its rows, then fold
 /// `toolResult` messages onto the pending tool cards their ids refer to.
+/// Card ids are unique, so one id-to-index map replaces the per-result
+/// card scan (a replay-scale fold stays linear).
 pub fn transcript_to_entries(messages: &[Value]) -> Vec<ChatEntry> {
     let mut chat: Vec<ChatEntry> = Vec::new();
     let mut tool_results: Vec<ToolResultReplay> = Vec::new();
+    let mut card_index: HashMap<String, usize> = HashMap::new();
     for message in messages {
         if let Some(result) = tool_result_message_view(message) {
             tool_results.push(result);
             continue;
         }
+        let first_new = chat.len();
         chat.extend(message_value_to_entries(message));
+        for (offset, entry) in chat[first_new..].iter().enumerate() {
+            if let ChatEntry::Tool(card) = entry {
+                card_index
+                    .entry(card.id.clone())
+                    .or_insert(first_new + offset);
+            }
+        }
     }
-    for result in tool_results {
-        apply_tool_result(&mut chat, result);
+    for ToolResultReplay { tool_call_id, view } in tool_results {
+        let Some(index) = card_index.get(&tool_call_id).copied() else {
+            continue;
+        };
+        if let Some(ChatEntry::Tool(card)) = chat.get_mut(index) {
+            if card.result.is_none() {
+                card.started = true;
+                // Replayed cards never saw the live execution: the timing
+                // collapses to the rebuild instant, so the bash `Took` row
+                // renders the same `0.0s` the TS component does on replay.
+                let now = std::time::Instant::now();
+                card.started_at = Some(now);
+                card.ended_at = Some(now);
+                card.result = Some(view);
+                card.result_partial = false;
+            }
+        }
     }
     chat
 }

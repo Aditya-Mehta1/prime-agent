@@ -5,8 +5,9 @@
 //! scanner. Split from the bash-side preview module for module-size
 //! hygiene; behavior matches the TS source.
 
+use super::bash::re_once;
 use super::bash::{
-    descriptor, is_comment_line, js_trim, js_trim_end, path_tail, preview_bash_command, re,
+    descriptor, is_comment_line, js_trim, js_trim_end, path_tail, preview_bash_command,
     simplify_bash_command_line, CodePreview, S,
 };
 use super::cell::parse_ipython_bash_cell;
@@ -16,25 +17,22 @@ fn is_skippable_python_line(line: &str) -> bool {
     let trimmed = js_trim(line);
     trimmed.is_empty()
         || is_comment_line(trimmed)
-        || re(&format!(r"^{S}*(?:import{S}+\S|from{S}+\S+{S}+import{S}+)")).is_match(trimmed)
+        || re_once!(format!(r"^{S}*(?:import{S}+\S|from{S}+\S+{S}+import{S}+)")).is_match(trimmed)
 }
 
 fn python_indent(line: &str) -> usize {
-    re(&format!(r"^{S}*"))
+    re_once!(format!(r"^{S}*"))
         .find(line)
         .map(|m| m.as_str().chars().count())
         .unwrap_or(0)
 }
 
 fn python_call_pattern(inner: &str) -> bool {
-    re(&format!(
-        r"^{S}*(?:await{S}+)?[A-Za-z_][A-Za-z0-9_.]*{S}*\("
-    ))
-    .is_match(inner)
+    re_once!(format!(r"^{S}*(?:await{S}+)?[A-Za-z_][A-Za-z0-9_.]*{S}*\(")).is_match(inner)
 }
 
 fn python_low_signal_call_pattern(inner: &str) -> bool {
-    re(&format!(
+    re_once!(format!(
         r"^{S}*(?:await{S}+)?(?:print|len|str|repr|int|float|list|dict|set|tuple){S}*\("
     ))
     .is_match(inner)
@@ -42,7 +40,7 @@ fn python_low_signal_call_pattern(inner: &str) -> bool {
 
 fn python_print_inner_call(line: &str) -> Option<String> {
     let trimmed = js_trim(line);
-    let inner = re(r"^print\((.*)\)$")
+    let inner = re_once!(r"^print\((.*)\)$")
         .captures(trimmed)
         .and_then(|c| c.get(1))
         .map(|m| js_trim(m.as_str()).to_string());
@@ -51,10 +49,10 @@ fn python_print_inner_call(line: &str) -> Option<String> {
 
 fn python_path_vars(lines: &[String]) -> std::collections::HashMap<String, String> {
     let mut vars = std::collections::HashMap::new();
-    let path_assign = re(&format!(
+    let path_assign = re_once!(format!(
         r#"^{S}*([A-Za-z_][A-Za-z0-9_]*){S}*={S}*(?:Path|pathlib\.Path)\((["'])([^"']+)\2\)"#
     ));
-    let string_assign = re(&format!(
+    let string_assign = re_once!(format!(
         r#"^{S}*([A-Za-z_][A-Za-z0-9_]*){S}*={S}*(["'])([^"']+)\2"#
     ));
     for line in lines {
@@ -78,7 +76,7 @@ fn python_file_operation(
     line: &str,
     paths: &std::collections::HashMap<String, String>,
 ) -> Option<String> {
-    let m = re(
+    let m = re_once!(
         r"^(?:await\s+)?([A-Za-z_][A-Za-z0-9_]*)\.(write_text|write_bytes|read_text|read_bytes|mkdir|unlink|rename|replace|touch)\s*\(",
     )
     .captures(js_trim(line))?;
@@ -100,18 +98,20 @@ fn python_file_operation(
 
 fn python_subprocess_command(line: &str) -> Option<String> {
     let trimmed = js_trim(line);
-    if let Some(c) = re(r#"subprocess\.(?:run|check_call|check_output|Popen)\(\s*(["`])([^"`]+)\1"#)
-        .captures(trimmed)
+    if let Some(c) =
+        re_once!(r#"subprocess\.(?:run|check_call|check_output|Popen)\(\s*(["`])([^"`]+)\1"#)
+            .captures(trimmed)
     {
         return c.get(2).map(|g| simplify_bash_command_line(g.as_str()));
     }
-    if let Some(c) =
-        re(r"subprocess\.(?:run|check_call|check_output|Popen)\(\s*\[([^\]]+)\]").captures(trimmed)
+    if let Some(c) = re_once!(r"subprocess\.(?:run|check_call|check_output|Popen)\(\s*\[([^\]]+)\]")
+        .captures(trimmed)
     {
         let inner = c.get(1)?.as_str();
-        let words_re = re(r#"["']([^"']+)["']"#);
+        let words_re = re_once!(r#"["']([^"']+)["']"#);
         let words: Vec<&str> = words_re
             .captures_iter(inner)
+            .into_iter()
             .filter_map(|c| c.get(1).map(|g| g.as_str()))
             .collect();
         return Some(simplify_bash_command_line(&words.join(" ")));
@@ -135,19 +135,19 @@ fn python_preview_line(
     paths: &std::collections::HashMap<String, String>,
 ) -> String {
     let line = lines.get(index).map(String::as_str).unwrap_or("");
-    if index > 0 && re(&format!(r"^{S}*(?:async{S}+def|def|class){S}+")).is_match(line) {
+    if index > 0 && re_once!(format!(r"^{S}*(?:async{S}+def|def|class){S}+")).is_match(line) {
         let previous = lines.get(index - 1).map(String::as_str).unwrap_or("");
-        if re(&format!(r"^{S}*@")).is_match(js_trim(previous)) {
+        if re_once!(format!(r"^{S}*@")).is_match(js_trim(previous)) {
             return format!("{} {}", js_trim(previous), js_trim(line));
         }
     }
-    if re(&format!(
+    if re_once!(format!(
         r"^{S}*(?:if|elif|else|for|while|with|try|except|finally)\b.*:\s*$"
     ))
     .is_match(line)
     {
         if let Some(child_index) = first_python_child_line(lines, index) {
-            let head = re(r":\s*$").replace(js_trim(line), ":");
+            let head = re_once!(r":\s*$").replace(js_trim(line), ":");
             let child = lines.get(child_index).cloned().unwrap_or_default();
             return format!("{head} {}", simplify_python_preview_line(&child, paths));
         }
@@ -159,7 +159,7 @@ fn first_python_child_line(lines: &[String], parent_index: usize) -> Option<usiz
     let parent_line = lines.get(parent_index).cloned().unwrap_or_default();
     let parent_indent = python_indent(&parent_line);
     for (i, line) in lines.iter().enumerate().skip(parent_index + 1) {
-        if is_skippable_python_line(line) || re(&format!(r"^{S}*@")).is_match(js_trim(line)) {
+        if is_skippable_python_line(line) || re_once!(format!(r"^{S}*@")).is_match(js_trim(line)) {
             continue;
         }
         if python_indent(line) <= parent_indent {
@@ -178,8 +178,8 @@ fn python_line_score(
     let line = lines.get(index).cloned().unwrap_or_default();
     let trimmed = js_trim(&line).to_string();
     if is_skippable_python_line(&line)
-        || re(&format!(r"^{S}*@")).is_match(&trimmed)
-        || re(r"^[)\]},;\s]+(?:#.*)?$").is_match(&trimmed)
+        || re_once!(format!(r"^{S}*@")).is_match(&trimmed)
+        || re_once!(r"^[)\]},;\s]+(?:#.*)?$").is_match(&trimmed)
     {
         return -1;
     }
@@ -189,21 +189,21 @@ fn python_line_score(
     if python_subprocess_command(&line).is_some() {
         return 90;
     }
-    if re(&format!(
+    if re_once!(format!(
         r#"^{S}*if{S}+__name__{S}*=={S}*['"]__main__['"]{S}*:"#
     ))
     .is_match(&line)
     {
         return 70;
     }
-    if re(&format!(
+    if re_once!(format!(
         r"^{S}*(?:await{S}+)?[A-Za-z_][A-Za-z0-9_.]*\.(?:write_text|write_bytes|mkdir|unlink|rename|replace|touch|append|extend|update|add|remove|discard|close|commit|execute|run){S}*\("
     ))
     .is_match(&line)
     {
         return 80;
     }
-    if re(&format!(
+    if re_once!(format!(
         r"^{S}*(?:if|elif|else|for|while|with|try|except|finally)\b.*:\s*$"
     ))
     .is_match(&line)
@@ -213,10 +213,10 @@ fn python_line_score(
             Some(child_index) => (python_line_score(lines, child_index, paths) - 5).max(20),
         };
     }
-    if re(&format!(r"^{S}*(?:async{S}+def|def|class){S}+")).is_match(&line) {
+    if re_once!(format!(r"^{S}*(?:async{S}+def|def|class){S}+")).is_match(&line) {
         return 50;
     }
-    if re(&format!(
+    if re_once!(format!(
         r#"^{S}*[A-Za-z_][A-Za-z0-9_]*(?:{S}*:\s*[^=]+)?{S}*={S}*(?:await{S}+)?(?:Path|pathlib\.Path|json\.loads|json\.dumps|str|int|float|list|dict|set|tuple){S}*\("#
     ))
     .is_match(&line)
@@ -230,7 +230,7 @@ fn python_line_score(
     if print_inner_call.is_some() && !is_low_signal_call {
         return 55;
     }
-    if re(&format!(
+    if re_once!(format!(
         r"^{S}*[A-Za-z_][A-Za-z0-9_]*(?:{S}*:\s*[^=]+)?{S}*={S}*(?:await{S}+)?[A-Za-z_][A-Za-z0-9_.]*{S}*\("
     ))
     .is_match(&line)
@@ -250,7 +250,7 @@ fn python_line_score(
 
 fn python_preview_index(lines: &[String], index: usize) -> usize {
     let line = lines.get(index).cloned().unwrap_or_default();
-    if !re(&format!(
+    if !re_once!(format!(
         r"^{S}*(?:if|elif|else|for|while|with|try|except|finally)\b.*:\s*$"
     ))
     .is_match(&line)
@@ -398,7 +398,7 @@ pub fn python_statement_lines(code: &str) -> Vec<String> {
 fn extract_bash_skill_command(code: &str) -> Option<String> {
     let triple_double = "\"\"\"";
     let triple_single = concat!("''", "'");
-    let m = re(&format!(
+    let m = re_once!(format!(
         r#"{S}*(?:[A-Za-z_][A-Za-z0-9_]*{S}*={S}*)?(?:await{S}+)?bash{S}*\({S}*[rR]?({triple_double}|{triple_single}|"|')"#
     ))
     .captures(code)?;
@@ -431,7 +431,7 @@ pub fn preview_python_code(code: &str) -> CodePreview {
     let raw_lines: Vec<String> = code.split('\n').map(String::from).collect();
     let lines: Vec<String> = python_statement_lines(code)
         .into_iter()
-        .map(|line| re(&format!(r"^({S}*);{S}*")).replace(&line, "$1"))
+        .map(|line| re_once!(format!(r"^({S}*);{S}*")).replace(&line, "$1"))
         .collect();
     let paths = python_path_vars(&lines);
     let mut best_index: Option<usize> = None;
