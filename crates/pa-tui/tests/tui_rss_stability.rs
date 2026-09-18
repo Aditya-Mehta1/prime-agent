@@ -12,6 +12,11 @@
 //! reads `/proc/self/statm` while the interactive loop runs; the assertion
 //! is a plateau: resident memory in the last quarter of the run must sit
 //! within a bounded delta of the warm-up state.
+//!
+//! Linux-only by construction (`/proc/self/statm`, AF_UNIX mock sockets);
+//! the whole file compiles to nothing elsewhere (Windows RSS regression
+//! needs its own counter path; see docs/windows-readiness.md).
+#![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};

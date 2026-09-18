@@ -502,6 +502,7 @@ mod controller_tests {
     use crate::protocol::{response_failure, response_success};
     use crate::supervisor_link::SupervisorLink;
     use pa_core::session_engine::agent_messaging::AgentMessageController;
+    use pa_types::platform::transport::bind_transport;
     use serde_json::{json, Value};
     use std::sync::Arc;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -514,16 +515,16 @@ mod controller_tests {
         roster: Value,
         ticket_response: Option<Value>,
     ) {
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let listener = bind_transport(&socket).await.unwrap();
         tokio::spawn(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else {
+                let Ok(stream) = listener.accept().await else {
                     return;
                 };
                 let roster = roster.clone();
                 let ticket_response = ticket_response.clone();
                 tokio::spawn(async move {
-                    let (reader, mut writer) = stream.into_split();
+                    let (reader, mut writer) = stream.split();
                     let mut reader = BufReader::new(reader);
                     writer
                         .write_all(
@@ -685,12 +686,12 @@ mod controller_tests {
     async fn direct_ticket_delivers_to_the_target_worker_socket() {
         let dir = tempfile::TempDir::new().unwrap();
         let worker_socket = dir.path().join("worker.sock");
-        let listener = tokio::net::UnixListener::bind(&worker_socket).unwrap();
+        let listener = bind_transport(&worker_socket).await.unwrap();
         let received = Arc::new(std::sync::Mutex::new(Vec::<(String, Value)>::new()));
         let recorded = Arc::clone(&received);
         tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (reader, mut writer) = stream.into_split();
+            let stream = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.split();
             let mut reader = crate::framing::PrivateFrameReader::new(
                 reader,
                 crate::framing::DEFAULT_PRIVATE_FRAME_LIMITS,

@@ -18,6 +18,10 @@
 //! The sessions run the real agent engine over the scripted faux provider
 //! (`engine: "faux"`), so the kernel host request, the supervisor link, the
 //! peer ticket, and the direct socket delivery are all exercised for real.
+//!
+//! Linux-only e2e (AF_UNIX sockets, process-group kills): compiles to
+//! nothing elsewhere, like the other pa-daemon e2e verifiers.
+#![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;

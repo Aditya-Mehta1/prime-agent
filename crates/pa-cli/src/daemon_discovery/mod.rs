@@ -150,13 +150,28 @@ fn state_root_matches(root: &DaemonStateRoot, socket_path: &Path) -> bool {
     if is_never_touch(socket_path) {
         return false;
     }
-    if socket_path == root.default_socket_path || socket_path.parent() == Some(&root.socket_dir) {
-        return true;
+    #[cfg(windows)]
+    {
+        // Windows daemons share one named pipe per machine, so there is
+        // nothing to scope beyond the containment guard (TS
+        // `createDaemonStateRootMatcher` returns an always-true predicate on
+        // win32).
+        let _ = (root, socket_path);
+        true
     }
-    inside(socket_path.parent(), &root.agent_dir)
+    #[cfg(not(windows))]
+    {
+        if socket_path == root.default_socket_path || socket_path.parent() == Some(&root.socket_dir)
+        {
+            return true;
+        }
+        inside(socket_path.parent(), &root.agent_dir)
+    }
 }
 
-/// True when `directory` is `parent` or sits below it (TS `isInside`).
+/// True when `directory` is `parent` or sits below it (TS `isInside`). Only
+/// the non-Windows root matcher scopes; the Windows arm accepts any path.
+#[cfg(not(windows))]
 fn inside(directory: Option<&Path>, parent: &Path) -> bool {
     let Some(directory) = directory else {
         return false;
@@ -205,6 +220,7 @@ pub(crate) fn is_daemon_process_listening(
 /// Socket files in the given socket dir (TS `scanSocketDir`): live daemons
 /// and orphaned files alike. Never-touch paths are filtered out here too,
 /// so even a root handed in on purpose cannot sweep them.
+#[cfg(unix)]
 fn scan_socket_dir(socket_dir: &Path) -> Vec<PathBuf> {
     let entries = match std::fs::read_dir(socket_dir) {
         Ok(entries) => entries,
@@ -220,6 +236,16 @@ fn scan_socket_dir(socket_dir: &Path) -> Vec<PathBuf> {
     sockets
 }
 
+/// Windows daemon endpoints are named pipes: there is no socket directory to
+/// sweep, and discovery comes from tracked worker descriptors and the
+/// default pipe (TS `scanSocketDir` returns [] on win32).
+#[cfg(not(unix))]
+fn scan_socket_dir(_socket_dir: &Path) -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// True when the path is a unix socket file.
+#[cfg(unix)]
 fn is_socket_file(path: &Path) -> bool {
     use std::os::unix::fs::FileTypeExt;
     std::fs::symlink_metadata(path)
@@ -535,6 +561,7 @@ mod tests {
 
     /// A synthetic state root inside a fixture directory: unit tests never
     /// touch the ambient environment's real agent dir or socket dir.
+    #[cfg(not(windows))]
     fn fixture_root(dir: &Path) -> DaemonStateRoot {
         DaemonStateRoot {
             agent_dir: dir.join("agent"),
@@ -558,6 +585,9 @@ mod tests {
         ));
     }
 
+    /// Unix scoping semantics; the Windows matcher is deliberately
+    /// always-true after the containment guard (one pipe per machine).
+    #[cfg(not(windows))]
     #[test]
     fn state_root_matches_own_paths_only() {
         let root = fixture_root(Path::new("/fixture"));

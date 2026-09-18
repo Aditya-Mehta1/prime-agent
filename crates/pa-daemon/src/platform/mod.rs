@@ -5,6 +5,6 @@
 
 mod paths;
 
-#[cfg(unix)]
-pub use paths::socket_dir;
-pub use paths::{default_daemon_socket_path, socket_identity, worker_socket_path, SocketIdentity};
+pub use paths::{
+    default_daemon_socket_path, socket_dir, socket_identity, worker_socket_path, SocketIdentity,
+};

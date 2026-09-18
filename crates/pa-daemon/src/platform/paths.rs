@@ -19,6 +19,17 @@ pub fn socket_dir() -> PathBuf {
     tmp.join(format!("prime-agent-{uid}"))
 }
 
+/// The socket-dir half of a discovery state root on Windows. Daemon
+/// endpoints are named pipes with no directory, but TS still computes
+/// `<tmpdir>/prime-agent-user` there (`getuid` is undefined, so the uid
+/// suffix is the literal `user`) so `DaemonStateRoot` keeps one shape, and
+/// discovery never sweeps it (the socket-dir scan returns nothing on
+/// Windows).
+#[cfg(not(unix))]
+pub fn socket_dir() -> PathBuf {
+    std::env::temp_dir().join("prime-agent-user")
+}
+
 /// Read the effective uid without libc: `/proc/self/status` on Linux,
 /// HOME-derived uniqueness elsewhere (best-effort, same as today).
 #[cfg(unix)]

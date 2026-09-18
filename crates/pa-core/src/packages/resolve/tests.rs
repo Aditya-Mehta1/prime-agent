@@ -5,7 +5,6 @@
 //! dedupe, multi-file extension discovery, and the offline/missing-source
 //! policies.
 
-use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -238,8 +237,12 @@ fn auto_discovers_project_prompts_with_overrides() {
         .any(|r| r.path == prompt_path && !r.enabled));
 }
 
+/// Unix symlink layout; Windows needs `symlink_dir` and a privileged
+/// developer mode to create links, so the case runs on Unix only.
+#[cfg(unix)]
 #[test]
 fn resolves_symlinked_user_and_project_resources_once() {
+    use std::os::unix::fs::symlink;
     let _guard = ENV_MUTEX.lock().unwrap();
     let previous_home = std::env::var("HOME").ok();
     let mut fixture = Fixture::new();
@@ -436,8 +439,11 @@ fn home_agents_skills_stays_user_scoped_when_cwd_is_under_home() {
     }
 }
 
+/// Unix symlink layout (see `resolves_symlinked_user_and_project_resources_once`).
+#[cfg(unix)]
 #[test]
 fn user_skill_entries_dedupe_when_agent_skills_symlinks_agents_skills() {
+    use std::os::unix::fs::symlink;
     let _guard = ENV_MUTEX.lock().unwrap();
     let previous_home = std::env::var("HOME").ok();
     let mut fixture = Fixture::new();

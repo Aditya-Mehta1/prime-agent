@@ -4,6 +4,10 @@
 //! events, restarts the supervisor, and reattaches with a fresh ticket for the
 //! same session. Also verifies the peer gate (single-use grants, session-plane
 //! command allowlist) at the socket level.
+//!
+//! Linux-only e2e (AF_UNIX sockets, `kill -9` semantics): compiles to
+//! nothing elsewhere, like the other pa-daemon e2e verifiers.
+#![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
