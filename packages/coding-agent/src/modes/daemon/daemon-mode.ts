@@ -144,7 +144,12 @@ import {
 } from "./agent-roster.js";
 import { createCompactAssistantDelta } from "./compact-session-stream.js";
 import { filterClientEnv, withClientEnv } from "./daemon-client-env.js";
-import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
+import {
+	deserializeDaemonError,
+	serializeDaemonError,
+	UPDATE_RESTART_PREPARING_ERROR_INFO,
+	UPDATE_RESTART_PREPARING_MESSAGE,
+} from "./daemon-errors.js";
 import { bindActiveSessionState } from "./daemon-extension-binding.js";
 import {
 	collectDaemonLaunchEnv,
@@ -304,6 +309,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"agent_messages_resume",
 	"agent_messages_clear",
 	"abort",
+	"abort_and_send_queued",
 	"start_side_question",
 	"abort_side_question",
 	"execute_bash",
@@ -2888,6 +2894,33 @@ export class AgentDaemon {
 		parentState: ActiveSessionState,
 		options: CreateRlmSubagentRuntimeOptions,
 	): Promise<AgentSessionRuntime> {
+		// The sibling name is held under a daemon-wide reservation for the
+		// whole admission and re-asserted at this boundary, so a same-name
+		// sibling that lands mid-admission fails closed before the durable
+		// ledger edge is appended.
+		const nameReservation = {
+			name: options.sessionName,
+			depth: options.rlmDepth,
+			parentSessionId: options.parentSession.sessionId,
+			...(options.parentSession.sessionFile ? { parentSessionPath: options.parentSession.sessionFile } : {}),
+		};
+		const reservationKey = sessionNameReservationKey(nameReservation);
+		if (this.pendingSessionNames.has(reservationKey)) {
+			throw new Error(formatAgentSessionNameUnavailable(options.sessionName, options.rlmDepth));
+		}
+		this.pendingSessionNames.add(reservationKey);
+		try {
+			await this.assertFamilySessionNameAvailable(nameReservation, parentState, true);
+			return await this.admitRlmSubagentRuntime(parentState, options);
+		} finally {
+			this.pendingSessionNames.delete(reservationKey);
+		}
+	}
+
+	private async admitRlmSubagentRuntime(
+		parentState: ActiveSessionState,
+		options: CreateRlmSubagentRuntimeOptions,
+	): Promise<AgentSessionRuntime> {
 		const sessionManager = SessionManager.create(options.parentSession.sessionManager.getCwd(), options.sessionDir);
 		sessionManager.newSession({
 			parentSession: options.parentSession.sessionFile,
@@ -3960,7 +3993,12 @@ export class AgentDaemon {
 				if (this.updateRestart && !updateLifecycle) {
 					this.write(
 						client,
-						failure(workerCommand.id, workerCommand.type, "Daemon is preparing an update restart"),
+						failure(
+							workerCommand.id,
+							workerCommand.type,
+							UPDATE_RESTART_PREPARING_MESSAGE,
+							UPDATE_RESTART_PREPARING_ERROR_INFO,
+						),
 					);
 					return;
 				}
@@ -3996,7 +4034,10 @@ export class AgentDaemon {
 				: restartPhase !== undefined && command.type !== "shutdown";
 		if (mutation && restartRejected) {
 			clearParsedAdmission();
-			this.write(client, failure(command.id, command.type, "Daemon is preparing an update restart"));
+			this.write(
+				client,
+				failure(command.id, command.type, UPDATE_RESTART_PREPARING_MESSAGE, UPDATE_RESTART_PREPARING_ERROR_INFO),
+			);
 			return;
 		}
 		if (mutation) this.mutationDrain.begin();
@@ -4750,6 +4791,12 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				state.runtime.session.requestAbort();
 				return success(command.id, "abort");
+			}
+
+			case "abort_and_send_queued": {
+				const state = this.getSessionState(command.activeSessionId);
+				state.runtime.session.abortAndSendQueued();
+				return success(command.id, "abort_and_send_queued");
 			}
 
 			case "start_side_question": {

@@ -106,6 +106,7 @@ describe("daemon mode helpers", () => {
 					saved: Awaited<ReturnType<typeof SessionManager.listAll>>,
 					jobs: AgentCronJob[],
 				): Promise<Array<{ sessionFile?: string; rlmChildId?: string }>>;
+				rlmSpawnLedger(): { liveEdges(): Promise<Array<{ childId: string; name: string }>> };
 			};
 			const parentState = await internals.createRuntime({ type: "create", sessionPath: parentSessionFile });
 			Object.assign(parentState.runtime.session, {
@@ -118,24 +119,30 @@ describe("daemon mode helpers", () => {
 				hasRunningRlmChildren: () => false,
 				getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
 			});
-			const childRuntime = await internals.createRlmSubagentRuntime(parentState, {
-				parentSession: parentState.runtime.session,
-				id: "child-1",
-				prompt: "complete and persist",
-				sessionName: "real-worker",
-				sessionDir: childSessionDir,
-				model: { provider: "test", id: "model" } as Model<Api>,
-				thinkingLevel: "off",
-				serviceTier: null,
-				scopedModels: [],
-				activeToolNames: [],
-				customTools: [],
-				includeGoals: false,
-				includeCompactSkill: false,
-				rlmDepth: 1,
-				rlmMaxDepth: 4,
-				rlmParentNodeId: "child-1",
-			});
+			const spawn = (id: string) =>
+				internals.createRlmSubagentRuntime(parentState, {
+					parentSession: parentState.runtime.session,
+					id,
+					prompt: "complete and persist",
+					sessionName: "real-worker",
+					sessionDir: join(parentManager.getSessionArtifactDir()!, id),
+					model: { provider: "test", id: "model" } as Model<Api>,
+					thinkingLevel: "off" as const,
+					serviceTier: null,
+					scopedModels: [],
+					activeToolNames: [],
+					customTools: [],
+					includeGoals: false,
+					includeCompactSkill: false,
+					rlmDepth: 1,
+					rlmMaxDepth: 4,
+					rlmParentNodeId: id,
+				});
+			const admission = spawn("child-1");
+			await expect(spawn("child-2")).rejects.toThrow('Agent name "real-worker" is unavailable');
+			const childRuntime = await admission;
+			const edges = await internals.rlmSpawnLedger().liveEdges();
+			expect(edges.filter((edge) => edge.name === "real-worker")).toHaveLength(1);
 			const childState = [...internals.sessions.values()].find(
 				(state) => state.runtime.session === childRuntime.session,
 			);
@@ -173,6 +180,12 @@ describe("daemon mode helpers", () => {
 				status: "completed",
 				prompt: "complete and persist",
 			});
+			await host.deleteRlmSubagentRuntime?.("child-1", childRuntime.session);
+			await spawn("child-3");
+			const edgesAfter = await internals.rlmSpawnLedger().liveEdges();
+			const namedEdges = edgesAfter.filter((edge) => edge.name === "real-worker");
+			expect(namedEdges).toHaveLength(1);
+			expect(namedEdges[0]?.childId).toBe("child-3");
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
