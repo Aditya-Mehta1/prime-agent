@@ -101,6 +101,38 @@ impl Client {
             }
         }
     }
+
+    /// Send one raw supervisor line (commands whose response interleaves
+    /// with event pushes; `send_command` would drop the pushes).
+    fn send(&mut self, value: &Value) {
+        let mut line = serde_json::to_string(value).expect("serialize line");
+        line.push('\n');
+        self.writer.write_all(line.as_bytes()).expect("send");
+        self.writer.flush().expect("flush");
+    }
+
+    /// Read one supervisor line before the deadline: the roster pushes a
+    /// kill produces interleave with its response, so the reader must be
+    /// bounded instead of blocking.
+    fn read_line_bounded(&mut self, timeout: Duration) -> Value {
+        let deadline = Instant::now() + timeout;
+        self.reader
+            .get_mut()
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("set read timeout");
+        loop {
+            assert!(Instant::now() < deadline, "no supervisor line arrived");
+            let mut line = String::new();
+            match self.reader.read_line(&mut line) {
+                Ok(0) => panic!("supervisor closed the connection"),
+                Ok(_) if line.trim().is_empty() => continue,
+                Ok(_) => return serde_json::from_str(line.trim()).expect("parse line"),
+                // Would-block (EAGAIN): keep polling until the deadline.
+                Err(_) if Instant::now() < deadline => {}
+                Err(error) => panic!("no supervisor line arrived: {error}"),
+            }
+        }
+    }
 }
 
 /// One persisted child session file: a header plus two messages, laid out
@@ -229,4 +261,191 @@ fn list_all_returns_the_full_synthetic_thousand_child_roster() {
                 .as_ref()
         )
     );
+}
+
+/// TS `seedRosterLedger` parity at the subscribe surface: a child spawned
+/// under a real resident parent seeds into the live roster, so a subscriber
+/// that subscribes after the spawn sees the full family in the snapshot;
+/// after the child worker shuts down (a plain stop, no tombstone), the
+/// child survives as a seeded passive row - both in the push the existing
+/// subscriber receives and in a fresh subscriber's snapshot.
+#[tokio::test]
+async fn subscribe_after_spawn_then_shutdown_seeds_the_passive_child() {
+    use pa_core::session_engine::rlm_host::{RlmSpawnRequest, RlmSubagentHost};
+    use pa_daemon::rlm_children::{ParentIdentity, SupervisorChildSessions};
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("daemon.sock");
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let (mut client, hello) = Client::connect(&socket);
+    assert_eq!(hello["type"], "daemon_hello");
+
+    // The parent is a real resident session: its session file is the seed
+    // root the child's ledger edge must descend from.
+    let script = dir.path().join("script.json");
+    std::fs::write(
+        &script,
+        json!({ "responses": [ { "text": "child answer", "delayMs": 20 } ] }).to_string(),
+    )
+    .expect("write script");
+    let created = client.send_command(
+        "c1",
+        json!({
+            "type": "create",
+            "config": {
+                "cwd": dir.path().to_string_lossy(),
+                "sessionDir": agent_dir.join("sessions").to_string_lossy(),
+                "script": script.to_string_lossy(),
+            },
+        }),
+    );
+    assert_eq!(created["success"], true, "create failed: {created}");
+    let parent_file = created["data"]["sessionFile"]
+        .as_str()
+        .expect("parent session file")
+        .to_string();
+    let parent_active_id = created["data"]["activeSessionId"]
+        .as_str()
+        .expect("parent active session id")
+        .to_string();
+    let parent_session_id = created["data"]["sessionId"]
+        .as_str()
+        .expect("parent session id")
+        .to_string();
+
+    // Spawn the child under the parent's real session file.
+    let children = SupervisorChildSessions::new(
+        std::sync::Arc::new(pa_daemon::supervisor_link::SupervisorLink::new(
+            socket.clone(),
+        )),
+        agent_dir.clone(),
+        parent_active_id.clone(),
+    );
+    children.set_identity(ParentIdentity {
+        rlm_depth: 0,
+        rlm_max_depth: 2,
+        model: Some("scripted/faux-1".to_string()),
+        cwd: Some(agent_dir.to_string_lossy().to_string()),
+        session_id: Some(parent_session_id.clone()),
+        session_file: Some(parent_file.clone()),
+        thinking: None,
+        child_script: Some(script.to_string_lossy().to_string()),
+    });
+    let handle = children
+        .spawn(RlmSpawnRequest {
+            prompt: "ship the seed lane".to_string(),
+            name: Some("worker-a".to_string()),
+            model: None,
+            thinking: None,
+            cell_source_code: None,
+        })
+        .await
+        .expect("spawn child");
+    let child_agent_id = format!("{parent_file}#{}", handle.rlm_child_id);
+
+    // Both rows settle as residents in the supervisor roster.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let child_active_id = loop {
+        assert!(Instant::now() < deadline, "list never showed the child");
+        let list = client.send_command("l2", json!({ "type": "list" }));
+        if let Some(active_id) = list["data"]["sessions"].as_array().and_then(|sessions| {
+            sessions
+                .iter()
+                .find(|summary| summary["rlmChildId"] == handle.rlm_child_id)
+                .and_then(|summary| summary["activeSessionId"].as_str())
+                .map(str::to_string)
+        }) {
+            break active_id;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    // Subscribe after the spawn: the snapshot carries the resident family.
+    let subscribed = client.send_command("r1", json!({ "type": "roster_subscribe" }));
+    assert_eq!(
+        subscribed["success"], true,
+        "subscribe failed: {subscribed}"
+    );
+    let snapshot = subscribed["data"]["roster"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let child_entry = snapshot
+        .iter()
+        .find(|entry| entry["agentId"] == json!(child_agent_id))
+        .unwrap_or_else(|| panic!("resident child row missing: {snapshot:?}"));
+    assert_eq!(child_entry["summary"]["activeSessionId"], child_active_id);
+    assert_eq!(child_entry["summary"]["runtimeKind"], "subagent");
+    assert_eq!(child_entry["summary"]["parentSessionPath"], parent_file);
+
+    // Shutdown the child worker: a plain kill, no ledger tombstone. The
+    // kill's pushes interleave with its response, so the lines are read
+    // raw: the removal push under the family key, then the seeded passive
+    // row push, then the response.
+    client.send(&json!({
+        "type": "command",
+        "id": "k1",
+        "protocol": { "name": "prime-agent.daemon", "version": 7 },
+        "command": { "type": "kill", "activeSessionId": child_active_id },
+    }));
+    let mut kill_ok = false;
+    let mut removal_seen = false;
+    let seeded = loop {
+        let line = client.read_line_bounded(Duration::from_secs(15));
+        if line["type"] == "roster_update" {
+            if line["removed"]
+                .as_array()
+                .is_some_and(|ids| ids.contains(&json!(child_agent_id)))
+            {
+                removal_seen = true;
+            }
+            if let Some(entry) = line["changed"].as_array().and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| {
+                        entry["agentId"] == json!(child_agent_id) && entry["status"] == "inactive"
+                    })
+                    .cloned()
+            }) {
+                break entry;
+            }
+        } else if line.get("id").and_then(Value::as_str) == Some("k1") {
+            kill_ok = line["success"] == true;
+        }
+    };
+    assert!(kill_ok, "kill failed");
+    assert!(removal_seen, "the removal push never arrived");
+    let seeded_summary = &seeded["summary"];
+    assert!(seeded_summary["activeSessionId"].is_null());
+    assert_eq!(seeded_summary["runtimeKind"], "subagent");
+    assert_eq!(seeded_summary["rlmChildId"], handle.rlm_child_id);
+    assert_eq!(seeded_summary["sessionName"], "worker-a");
+    assert_eq!(seeded_summary["parentSessionPath"], parent_file);
+    assert_eq!(seeded_summary["messageCount"], 0);
+
+    // A fresh subscriber sees the full family immediately: the seeded
+    // child plus the still-resident parent.
+    let (mut client_b, _hello_b) = Client::connect(&socket);
+    let resubscribed = client_b.send_command("r2", json!({ "type": "roster_subscribe" }));
+    assert_eq!(
+        resubscribed["success"], true,
+        "second subscribe failed: {resubscribed}"
+    );
+    let roster = resubscribed["data"]["roster"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let seeded_entry = roster
+        .iter()
+        .find(|entry| entry["agentId"] == json!(child_agent_id))
+        .unwrap_or_else(|| panic!("seeded child missing from the snapshot: {roster:?}"));
+    assert_eq!(seeded_entry["status"], "inactive");
+    assert_eq!(seeded_entry["summary"]["messageCount"], 0);
+    let parent_entry = roster
+        .iter()
+        .find(|entry| entry["agentId"] == json!(parent_session_id))
+        .expect("parent still resident");
+    assert_eq!(parent_entry["summary"]["activeSessionId"], parent_active_id);
 }

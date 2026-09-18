@@ -29,7 +29,13 @@ worker hosting the file is reused, otherwise one spawns over it), wire protocol 
 (`roster_subscribe`/`roster_unsubscribe` with the full snapshot, live
 `roster_update` pushes keyed by the TS roster `agentId` = session id, and
 authenticated `worker_roster_delta` self-reports so live status reaches
-subscribers without polling), cloud sandbox attach, session
+subscribers without polling) plus the live-roster ledger seed (TS
+`seedRosterLedger`, `supervisor_roster.rs`: passivated ledger descendants
+of resident workers seed into the live roster - roots are the resident
+session files, descent is membership at any parent-walk step, and
+present rows by agent id or session file are never overwritten - at
+subscribe, spawn-admission, and worker-stop moments, so subscribers see
+the full family, not just resident rows), cloud sandbox attach, session
 leases (`core/session-lease.ts` port). Daemon-owned RLM spawn ledger (`rlm_ledger.rs`):
 one append-only JSONL per sessions dir (spawn/rename/delete admissions with
 the TS `rlm-ledger.ts` record grammar, bounds, stat-guarded replay, and

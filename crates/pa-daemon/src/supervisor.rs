@@ -225,14 +225,14 @@ impl Supervisor {
         Ok(())
     }
 
-    fn log_line(&self, message: &str) {
+    pub(crate) fn log_line(&self, message: &str) {
         self.log.append(&format!("[{}] {message}", util::now_iso()));
     }
 
     /// The spawn ledger for one sessions dir (TS `rlmSpawnLedgerFor`): the
     /// default dir's ledger is memoized; any other dir constructs a fresh
     /// instance (its seeding no-ops when its ledger file exists).
-    async fn rlm_spawn_ledger_for(
+    pub(crate) async fn rlm_spawn_ledger_for(
         self: &Arc<Self>,
         session_dir: Option<&str>,
     ) -> std::sync::Arc<crate::rlm_ledger::RlmSpawnLedger> {
@@ -406,6 +406,9 @@ impl Supervisor {
                     "session worker {} failed after {failures} consecutive failures",
                     resident.worker_id
                 ));
+                // The dead worker's transcript stays a passive family row
+                // while any resident root anchors it (the seed walk).
+                self.seed_roster_ledger().await;
                 return;
             }
             let backoff_ms = (BASE_BACKOFF_MS << (failures - 1).min(7)).min(MAX_BACKOFF_MS);
@@ -1224,7 +1227,7 @@ impl Supervisor {
             }
             DaemonCommand::RosterSubscribe { .. } => {
                 roster_subscribed.store(true, std::sync::atomic::Ordering::SeqCst);
-                let response = self.handle_roster_subscribe(&command_id, &type_name);
+                let response = self.handle_roster_subscribe(&command_id, &type_name).await;
                 (vec![response_line(&response)], false)
             }
             DaemonCommand::RosterUnsubscribe { .. } => {
@@ -1832,6 +1835,12 @@ impl Supervisor {
         // The new session joins the agent roster immediately (subscribers
         // see the roster_update before their next list).
         self.write_roster_summary(&summary, Some(&resident.worker_id));
+        // The spawn append is a ledger-append moment: the new edge can be
+        // the first time this family is live in the roster (a resumed
+        // parent, a supervisor restart), so the seed runs here too - after
+        // the fresh child's own row, so it only touches genuinely passive
+        // descendants (TS `seedRosterLedger` skips present rows).
+        self.seed_roster_ledger().await;
         Ok(summary)
     }
 
@@ -2209,6 +2218,12 @@ impl Supervisor {
         self.registry.remove(&resident.worker_id).await;
         self.registry.forget(&resident.worker_id).await;
         self.remove_roster_worker(&resident.worker_id);
+        // A plain stop carries no ledger tombstone: the child's passive
+        // row must survive the stop for subscribers (TS keeps the
+        // passivated row in the worker's roster push; the Rust
+        // equivalent reseeds it from the ledger here). A tombstoned
+        // child no longer has a live edge, so the seed skips it.
+        self.seed_roster_ledger().await;
     }
 
     async fn begin_shutdown(self: &Arc<Self>) {
