@@ -633,10 +633,9 @@ impl SessionUi {
             return Ok(());
         }
         if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            view.detail = match view.detail {
-                crate::chat::Detail::Overview => crate::chat::Detail::Details,
-                crate::chat::Detail::Details => crate::chat::Detail::Overview,
-            };
+            // Ctrl+O cycles conversation detail (TS `app.tools.expand`):
+            // overview -> details -> all -> overview.
+            view.detail = view.detail.next();
             self.dirty = true;
             return Ok(());
         }
@@ -833,6 +832,8 @@ impl SessionUi {
                             blocks,
                             has_tool_calls,
                             streaming,
+                            error: None,
+                            aborted: false,
                         },
                     )));
                     self.streaming_index = Some(view.chat.len() - 1);
@@ -841,66 +842,77 @@ impl SessionUi {
         }
         for (id, name, args) in &tool_calls {
             // A streamed tool call first appears queued; the execution start
-            // event flips it to running.
-            if !view
+            // event flips it to running, and later frames refresh its args
+            // while they stream (TS `updateArgs`).
+            match view
                 .chat
-                .iter()
-                .any(|entry| matches!(entry, ChatEntry::Tool(card) if card.id == *id))
+                .iter_mut()
+                .find(|entry| matches!(entry, ChatEntry::Tool(card) if card.id == *id))
             {
-                view.push_entry(ChatEntry::Tool(Box::new(ToolCallCard {
+                Some(ChatEntry::Tool(card)) => card.args = args.clone(),
+                _ => view.push_entry(ChatEntry::Tool(Box::new(ToolCallCard {
                     id: id.clone(),
                     name: name.clone(),
                     args: args.clone(),
                     started: false,
-                    result: None,
-                    result_partial: false,
-                })));
+                    ..Default::default()
+                }))),
             }
         }
         if !streaming {
             self.streaming_index = None;
-            self.render_failed_assistant_message(message, &tool_calls, view);
+            self.attach_assistant_error(message, &tool_calls, view);
         }
     }
 
-    /// The final frame of a failed assistant message renders its error row
-    /// (TS `AssistantMessageComponent.rebuild`: `Error: <message>` for a
-    /// provider failure, the abort text for an abort). Tool-carrying
-    /// messages leave the error to their pending tool cards.
-    fn render_failed_assistant_message(
+    /// The final frame of a failed assistant message attaches its error
+    /// row (TS renders it inside the assistant component): `aborted` always
+    /// shows, `error` only when the message carries no tool calls (the
+    /// pending cards carry the failure then).
+    fn attach_assistant_error(
         &mut self,
         message: &Value,
         tool_calls: &[(String, String, Value)],
         view: &mut AgentView,
     ) {
-        if !tool_calls.is_empty() {
-            return;
-        }
         let stop_reason = message.get("stopReason").and_then(Value::as_str);
-        let text = match stop_reason {
-            Some("error") => {
-                let error = message
-                    .get("errorMessage")
-                    .and_then(Value::as_str)
-                    .filter(|text| !text.is_empty())
-                    .unwrap_or("Unknown error");
-                format!("Error: {error}")
-            }
+        let (text, aborted) = match stop_reason {
             Some("aborted") => {
                 let error = message
                     .get("errorMessage")
                     .and_then(Value::as_str)
                     .filter(|text| !text.is_empty() && *text != "Request was aborted")
                     .unwrap_or("Operation aborted");
-                error.to_string()
+                (error.to_string(), true)
+            }
+            Some("error") if tool_calls.is_empty() => {
+                let error = message
+                    .get("errorMessage")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or("Unknown error");
+                (format!("Error: {error}"), false)
             }
             _ => return,
         };
         self.turn_error_shown = true;
-        view.push_entry(ChatEntry::Status {
-            text,
-            kind: StatusKind::Error,
+        // The message frame rendered before this call: attach the error to
+        // the most recent assistant entry (its own final frame).
+        if let Some(index) = self.streaming_index {
+            if let Some(ChatEntry::Assistant(open)) = view.chat.get_mut(index) {
+                open.error = Some(text);
+                open.aborted = aborted;
+                return;
+            }
+        }
+        let last_assistant = view.chat.iter_mut().rev().find_map(|entry| match entry {
+            ChatEntry::Assistant(message) => Some(message),
+            _ => None,
         });
+        if let Some(last) = last_assistant {
+            last.error = Some(text);
+            last.aborted = aborted;
+        }
     }
 
     /// `tool_execution_start`: mark the matching card running (or create it
@@ -916,6 +928,7 @@ impl SessionUi {
             if let ChatEntry::Tool(card) = entry {
                 if card.id == tool_call_id {
                     card.started = true;
+                    card.started_at = Some(std::time::Instant::now());
                     if !args.is_null() {
                         card.args = args;
                     }
@@ -928,8 +941,8 @@ impl SessionUi {
             name: tool_name.to_string(),
             args,
             started: true,
-            result: None,
-            result_partial: false,
+            started_at: Some(std::time::Instant::now()),
+            ..Default::default()
         })));
     }
 
@@ -956,6 +969,9 @@ impl SessionUi {
                 if card.id == tool_call_id {
                     card.result = Some(result);
                     card.result_partial = partial;
+                    if !partial {
+                        card.ended_at = Some(std::time::Instant::now());
+                    }
                     return;
                 }
             }

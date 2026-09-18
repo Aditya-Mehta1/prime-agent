@@ -17,6 +17,7 @@ pub mod config_selector;
 pub mod daemon_client;
 pub mod direct_transport;
 pub mod editor;
+pub mod error_summary;
 pub mod fuzzy;
 pub mod interactive;
 pub mod keybindings;
@@ -27,6 +28,7 @@ pub mod session;
 pub mod session_ui;
 pub mod snapshot;
 pub mod theme;
+pub mod tool_card;
 pub mod view;
 pub mod width;
 

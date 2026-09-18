@@ -5,8 +5,8 @@
 //! owns row geometry and scroll behavior only.
 
 use crate::chat::{
-    render_assistant, render_loader, render_text_rows, render_tool_card, render_user_block,
-    ChatEntry, Detail, WorkingState,
+    render_assistant, render_loader, render_text_rows, render_user_block, ChatEntry, Detail,
+    WorkingState,
 };
 use crate::chrome::{
     conversation_detail_status, render_prompt_context, render_splash, render_top_bar, render_tray,
@@ -91,12 +91,11 @@ impl AgentView {
             .first_key("app.tools.expand")
             .map(|key| crate::keybindings::format_key_text(&key))
             .unwrap_or_default();
-        // The TS label: "Details" keeps the expand hint (only "Expanded"
-        // collapses).
-        match self.detail {
-            Detail::Overview => conversation_detail_status(false, &key),
-            Detail::Details => format!("Details mode ({key} to expand)"),
-        }
+        conversation_detail_status(
+            self.detail.tool_output_expanded(),
+            self.detail.show_thinking(),
+            &key,
+        )
     }
 
     /// Scroll position of the transcript window: following keeps the tail
@@ -118,6 +117,7 @@ impl AgentView {
         }
         let mut lines: Vec<Line> = render_splash(&self.chrome, &self.theme, width);
         let mut first = true;
+        let mut preceded_by_tool_activity = false;
         for entry in &self.chat {
             match entry {
                 ChatEntry::Status { text, kind } => {
@@ -163,12 +163,25 @@ impl AgentView {
                     ));
                 }
                 ChatEntry::Assistant(message) => {
-                    lines.extend(render_assistant(message, self.detail, &self.theme, width));
+                    lines.extend(render_assistant(
+                        message,
+                        self.detail,
+                        &self.theme,
+                        width,
+                        preceded_by_tool_activity,
+                    ));
                 }
                 ChatEntry::Tool(card) => {
-                    lines.extend(render_tool_card(card, self.pulse_frame, &self.theme, width));
+                    lines.extend(crate::tool_card::render_tool_card(
+                        card,
+                        self.pulse_frame,
+                        self.detail,
+                        &self.theme,
+                        width,
+                    ));
                 }
             }
+            preceded_by_tool_activity = matches!(entry, ChatEntry::Tool(_));
             first = false;
         }
         // While the provider retry loop waits, its countdown loader owns
@@ -424,6 +437,8 @@ fn item_to_entry(item: TranscriptItem) -> ChatEntry {
                 blocks: vec![crate::chat::MessageBlock::Text(text)],
                 has_tool_calls: false,
                 streaming: false,
+                error: None,
+                aborted: false,
             }))
         }
         TranscriptItem::ToolCall {
@@ -435,8 +450,7 @@ fn item_to_entry(item: TranscriptItem) -> ChatEntry {
             name,
             args: serde_json::from_str(&arguments).unwrap_or(serde_json::Value::Null),
             started: false,
-            result: None,
-            result_partial: false,
+            ..Default::default()
         })),
         TranscriptItem::ToolResult {
             tool_call_id,
@@ -449,10 +463,9 @@ fn item_to_entry(item: TranscriptItem) -> ChatEntry {
             started: true,
             result: Some(crate::chat::ToolResultView {
                 content: vec![serde_json::json!({ "type": "text", "text": text })],
-                details: serde_json::Value::Null,
-                is_error: false,
+                ..Default::default()
             }),
-            result_partial: false,
+            ..Default::default()
         })),
         TranscriptItem::BashExecution {
             command, exit_code, ..
@@ -461,8 +474,7 @@ fn item_to_entry(item: TranscriptItem) -> ChatEntry {
             name: "bash".to_string(),
             args: serde_json::json!({ "command": command, "exitCode": exit_code }),
             started: true,
-            result: None,
-            result_partial: false,
+            ..Default::default()
         })),
         TranscriptItem::AgentStatus { summary, .. } => ChatEntry::Status {
             text: summary,

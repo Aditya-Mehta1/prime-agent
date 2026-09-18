@@ -144,6 +144,12 @@ fn handle_key(
         view.editor.cancel_autocomplete();
         return;
     }
+    if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        // Ctrl+O cycles conversation detail (TS `app.tools.expand`):
+        // overview -> details -> all -> overview.
+        view.detail = view.detail.next();
+        return;
+    }
     let Some(id) = key_event_to_id(&key) else {
         return;
     };

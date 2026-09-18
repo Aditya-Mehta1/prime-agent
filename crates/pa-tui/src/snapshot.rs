@@ -109,6 +109,12 @@ fn apply_tool_result(chat: &mut [ChatEntry], result: ToolResultReplay) {
         if let ChatEntry::Tool(card) = entry {
             if card.id == tool_call_id && card.result.is_none() {
                 card.started = true;
+                // Replayed cards never saw the live execution: the timing
+                // collapses to the rebuild instant, so the bash `Took` row
+                // renders the same `0.0s` the TS component does on replay.
+                let now = std::time::Instant::now();
+                card.started_at = Some(now);
+                card.ended_at = Some(now);
                 card.result = Some(view);
                 card.result_partial = false;
                 return;
@@ -475,11 +481,37 @@ pub fn assistant_value_to_entries(message: &Value) -> Vec<ChatEntry> {
         return Vec::new();
     }
     let mut entries = Vec::new();
-    if !blocks.is_empty() || message.get("errorMessage").is_some() {
+    // TS `AssistantMessageComponent.rebuild`: an abort renders its error row
+    // inside the message; a provider error renders only without tool calls
+    // (their cards carry the failure).
+    let stop_reason = message.get("stopReason").and_then(Value::as_str);
+    let error = match stop_reason {
+        Some("aborted") => Some(
+            message
+                .get("errorMessage")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty() && *text != "Request was aborted")
+                .unwrap_or("Operation aborted")
+                .to_string(),
+        ),
+        Some("error") if tool_calls.is_empty() => Some(format!(
+            "Error: {}",
+            message
+                .get("errorMessage")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .unwrap_or("Unknown error")
+        )),
+        _ => None,
+    };
+    let aborted = stop_reason == Some("aborted");
+    if !blocks.is_empty() || error.is_some() {
         entries.push(ChatEntry::Assistant(Box::new(AssistantMessage {
             blocks,
             has_tool_calls: !tool_calls.is_empty(),
             streaming: false,
+            error,
+            aborted,
         })));
     }
     for (id, name, args) in tool_calls {
@@ -488,8 +520,7 @@ pub fn assistant_value_to_entries(message: &Value) -> Vec<ChatEntry> {
             name,
             args,
             started: false,
-            result: None,
-            result_partial: false,
+            ..Default::default()
         })));
     }
     entries

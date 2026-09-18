@@ -1,25 +1,51 @@
 //! Transcript component rendering: status rows, the user-message block,
-//! assistant messages (text and thinking), tool-call cards, and the working
-//! loader line. Ports the TS chat components' row geometry: `user-message.ts`
-//! (Box 2x1 on `userMessageBg`), `assistant-message.ts` block spacers,
-//! `ipython-cell.ts` collapsed card line, `tool-panel.ts`, and
-//! `loader.ts` (`Loader` + `agent-activity.ts` labels).
+//! assistant messages (text, thinking, and their error rows), and the
+//! working loader line. Ports the TS chat components' row geometry:
+//! `user-message.ts` (Box 2x1 on `userMessageBg`), `assistant-message.ts`
+//! block spacers, and `loader.ts` (`Loader` + `agent-activity.ts` labels).
+//! Tool-call cards live in `crate::tool_card`.
 
-use serde_json::Value;
-
-use crate::code_preview::{preview_ipython_code, CodePreviewLanguage};
 use crate::theme::{Theme, ThemeBg, ThemeColor};
 use crate::width::str_width;
 use crate::{Line, Span};
 use ratatui::style::Style;
 
-/// How much detail the conversation shows (TS `setChatDetail` cycles).
+/// How much detail the conversation shows (TS `setChatDetail` levels).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Detail {
-    /// `overview`: thinking hidden, tool output collapsed.
+    /// `overview`: thinking hidden, tool output and edit diffs collapsed.
     Overview,
-    /// `details`: thinking visible, tool output collapsed.
+    /// `details`: thinking visible, edit diffs expanded, tool output collapsed.
     Details,
+    /// `all`: thinking visible, edit diffs and tool output expanded.
+    All,
+}
+
+impl Detail {
+    /// The Ctrl+O cycle (TS `toggleToolOutputExpansion`): overview adds
+    /// details, details adds the expanded output, all wraps to overview.
+    pub fn next(self) -> Self {
+        match self {
+            Detail::Overview => Detail::Details,
+            Detail::Details => Detail::All,
+            Detail::All => Detail::Overview,
+        }
+    }
+
+    /// Thinking blocks render (TS `hideThinkingBlock = detail === "overview"`).
+    pub fn show_thinking(self) -> bool {
+        !matches!(self, Detail::Overview)
+    }
+
+    /// Tool output expands (TS `toolOutputExpanded = detail === "all"`).
+    pub fn tool_output_expanded(self) -> bool {
+        matches!(self, Detail::All)
+    }
+
+    /// Edit diffs expand (TS `editDiffsExpanded = detail !== "overview"`).
+    pub fn edit_diffs_expanded(self) -> bool {
+        !matches!(self, Detail::Overview)
+    }
 }
 
 /// One rendered chat component.
@@ -48,9 +74,14 @@ pub enum ChatEntry {
     SlashCommandResult { content: String },
     /// One assistant message: ordered content blocks.
     Assistant(Box<AssistantMessage>),
-    /// One tool call and its execution state.
+    /// One tool call and its execution state (rendered by
+    /// [`crate::tool_card`]).
     Tool(Box<ToolCallCard>),
 }
+
+// The card types live in `tool_card`; re-exported here because the
+// transcript vocabulary (`ChatEntry`) is this module's.
+pub use crate::tool_card::{ToolCallCard, ToolResultView};
 
 /// An assistant message's visible content (tool calls move to cards).
 #[derive(Debug, Clone, PartialEq)]
@@ -60,33 +91,18 @@ pub struct AssistantMessage {
     pub has_tool_calls: bool,
     /// The message is still streaming (an update may replace its blocks).
     pub streaming: bool,
+    /// A failed assistant message's error row (TS renders abort and error
+    /// text inside the message component): `aborted` always renders,
+    /// `error` only without tool calls (their cards carry the failure).
+    pub error: Option<String>,
+    /// `stopReason: "aborted"` (drives the tool-call trailing spacer).
+    pub aborted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MessageBlock {
     Thinking(String),
     Text(String),
-}
-
-/// One tool call rendered as a card (`ipython` gets the cell card; other
-/// tools render the generic tool panel).
-#[derive(Debug, Clone, PartialEq)]
-pub struct ToolCallCard {
-    pub id: String,
-    pub name: String,
-    pub args: Value,
-    /// `tool_execution_start` seen.
-    pub started: bool,
-    /// Partial (streaming) result; `None` until the first result frame.
-    pub result: Option<ToolResultView>,
-    pub result_partial: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ToolResultView {
-    pub content: Vec<Value>,
-    pub details: Value,
-    pub is_error: bool,
 }
 
 /// The working loader (TS `Loader`): spinner + activity label.
@@ -224,8 +240,9 @@ pub fn render_assistant(
     detail: Detail,
     theme: &Theme,
     width: usize,
+    preceded_by_tool_activity: bool,
 ) -> Vec<Line> {
-    let show_thinking = detail != Detail::Overview;
+    let show_thinking = detail.show_thinking();
     let visible_blocks: Vec<&MessageBlock> = message
         .blocks
         .iter()
@@ -234,11 +251,11 @@ pub fn render_assistant(
             MessageBlock::Text(text) => !text.trim().is_empty(),
         })
         .collect();
+    let has_visible_content = !visible_blocks.is_empty();
     let mut out: Vec<Line> = Vec::new();
-    if visible_blocks.is_empty() {
-        return out;
+    if has_visible_content {
+        out.push(spacer());
     }
-    out.push(spacer());
     let md = crate::markdown::MarkdownStyle::from_theme(theme);
     for (index, block) in visible_blocks.iter().enumerate() {
         match block {
@@ -254,7 +271,23 @@ pub fn render_assistant(
             }
         }
     }
-    if message.has_tool_calls {
+    if let Some(error) = &message.error {
+        out.push(spacer());
+        out.extend(crate::error_summary::render_collapsible_error(
+            error,
+            None,
+            detail.tool_output_expanded(),
+            ThemeColor::Error,
+            theme,
+            width,
+        ));
+    }
+    // TS `AssistantMessageComponent.hasTrailingSpace`: the tool-call
+    // separator renders for visible bodies, aborted messages, and messages
+    // not following tool activity.
+    if message.has_tool_calls
+        && (has_visible_content || message.aborted || !preceded_by_tool_activity)
+    {
         out.push(spacer());
     }
     out
@@ -319,273 +352,6 @@ fn render_thinking_block(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
         out.push(pad_to(row, width, padding_style));
     }
     out
-}
-
-/// The tool-call card: `ipython` renders the cell card, every other tool the
-/// generic tool panel (`tool-panel.ts` + fallback preview).
-pub fn render_tool_card(
-    card: &ToolCallCard,
-    frame: usize,
-    theme: &Theme,
-    width: usize,
-) -> Vec<Line> {
-    if card.name == "ipython" {
-        render_ipython_card(card, frame, theme, width)
-    } else {
-        render_generic_tool_panel(card, theme, width)
-    }
-}
-
-/// Card status (`ipython-cell.ts statusKind`).
-enum CardStatus {
-    Queued,
-    Running,
-    Done,
-    Error,
-}
-
-fn card_status(card: &ToolCallCard) -> CardStatus {
-    if let Some(result) = &card.result {
-        if !card.result_partial {
-            return if result.is_error {
-                CardStatus::Error
-            } else {
-                CardStatus::Done
-            };
-        }
-    }
-    if card.started || card.result.is_some() {
-        CardStatus::Running
-    } else {
-        CardStatus::Queued
-    }
-}
-
-/// The `ipython` collapsed card line: marker, language label, code preview,
-/// line counts, and duration, joined by dim separators.
-fn render_ipython_card(
-    card: &ToolCallCard,
-    frame: usize,
-    theme: &Theme,
-    width: usize,
-) -> Vec<Line> {
-    let code = card
-        .args
-        .get("code")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let preview = preview_ipython_code(&code);
-    let language = match preview.language {
-        CodePreviewLanguage::Bash => "bash".to_string(),
-        CodePreviewLanguage::Python => "python".to_string(),
-    };
-    let muted = theme.fg_style(ThemeColor::Muted);
-    let dim = theme.fg_style(ThemeColor::Dim);
-    let success = theme.fg_style(ThemeColor::Success);
-    let error = theme.fg_style(ThemeColor::Error);
-    let bash_mode = theme.fg_style(ThemeColor::BashMode);
-
-    let mut parts: Vec<Line> = Vec::new();
-    let marker: Line = match card_status(card) {
-        CardStatus::Error => vec![Span::styled("\u{2717}".to_string(), error)],
-        CardStatus::Done => vec![Span::styled("\u{2713}".to_string(), success)],
-        CardStatus::Running => vec![Span::styled(
-            working_icon_frame(frame).to_string(),
-            bash_mode,
-        )],
-        CardStatus::Queued => vec![Span::styled("\u{25c7}".to_string(), muted)],
-    };
-    let marker = {
-        let mut lead: Line = marker;
-        lead.push(Span::styled(" ".to_string(), Style::default()));
-        lead.push(Span::styled(language, muted));
-        lead
-    };
-    parts.push(marker);
-    if !preview.text.is_empty() {
-        parts.push(vec![Span::styled(preview.text, dim)]);
-    } else if !card.started {
-        parts.push(vec![Span::styled("waiting for code".to_string(), dim)]);
-    }
-    if let Some(counts) = line_counts(card, &code) {
-        parts.push(vec![Span::styled(counts, dim)]);
-    }
-    if let Some(duration) = result_duration_ms(card) {
-        parts.push(vec![Span::styled(duration, dim)]);
-    }
-    if let Some(ename) = result_error_name(card) {
-        parts.push(vec![Span::styled(ename, error)]);
-    }
-
-    let mut row: Line = vec![Span::styled(" ".to_string(), Style::default())];
-    for (index, part) in parts.iter().enumerate() {
-        if index > 0 {
-            row.push(Span::styled(" \u{00b7} ".to_string(), dim));
-        }
-        row.extend(part.iter().cloned());
-    }
-    let used: usize = row.iter().map(|s| str_width(&s.content)).sum();
-    if used > width {
-        row = crate::width::truncate_line(&row, width, "");
-    }
-    vec![row]
-}
-
-/// `↑in ↓out lines` (TS `lineCounts`): non-empty input lines, output lines
-/// from the structured stdout/stderr/result fields.
-fn line_counts(card: &ToolCallCard, code: &str) -> Option<String> {
-    let body = code;
-    let input = body.lines().filter(|line| !line.trim().is_empty()).count();
-    let output = match &card.result {
-        None => 0,
-        Some(result) => {
-            let details = &result.details;
-            let structured = [
-                details.get("stdout"),
-                details.get("stderr"),
-                details.get("result"),
-                details.get("backgroundOutput"),
-            ]
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .filter(|text| !text.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-            let text = if structured.trim().is_empty() {
-                result
-                    .content
-                    .iter()
-                    .filter_map(|block| block.get("text").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            } else {
-                structured
-            };
-            if text.trim().is_empty() {
-                0
-            } else {
-                text.lines().count()
-            }
-        }
-    };
-    let mut segments = Vec::new();
-    if input > 0 {
-        segments.push(format!("\u{2191} {input}"));
-    }
-    if output > 0 {
-        segments.push(format!("\u{2193} {output}"));
-    }
-    if segments.is_empty() {
-        None
-    } else {
-        Some(format!("{} lines", segments.join(" ")))
-    }
-}
-
-/// Cell duration (`formatDuration`: `2ms`, `1.2s`).
-fn result_duration_ms(card: &ToolCallCard) -> Option<String> {
-    let duration = card
-        .result
-        .as_ref()?
-        .details
-        .get("durationMs")
-        .and_then(Value::as_u64)?;
-    if duration < 1_000 {
-        Some(format!("{}ms", (duration as f64).round()))
-    } else {
-        Some(format!("{:.1}s", duration as f64 / 1_000.0))
-    }
-}
-
-/// The error name shown on a failed cell.
-fn result_error_name(card: &ToolCallCard) -> Option<String> {
-    let result = card.result.as_ref()?;
-    if card.result_partial {
-        return None;
-    }
-    result
-        .details
-        .get("error")
-        .and_then(|error| error.get("ename"))
-        .and_then(Value::as_str)
-        .or_else(|| result.details.get("errorEname").and_then(Value::as_str))
-        .map(str::to_string)
-}
-
-/// The generic tool panel (TS `ToolPanel` + fallback preview): a `label ·
-/// status` header row and preview body rows on `toolPanelBg`.
-fn render_generic_tool_panel(card: &ToolCallCard, theme: &Theme, width: usize) -> Vec<Line> {
-    let bg = theme.bg_style(ThemeBg::ToolPanelBg);
-    let muted = theme.fg_style(ThemeColor::Muted);
-    let dim = theme.fg_style(ThemeColor::Dim);
-    let success = theme.fg_style(ThemeColor::Success);
-    let error = theme.fg_style(ThemeColor::Error);
-    let bash_mode = theme.fg_style(ThemeColor::BashMode);
-    let padding = 2usize;
-    let content_width = width.saturating_sub(padding * 2).max(1);
-
-    let status: Line = match card_status(card) {
-        CardStatus::Error => vec![Span::styled("error".to_string(), error)],
-        CardStatus::Done => vec![Span::styled("done".to_string(), success)],
-        CardStatus::Running => vec![Span::styled("running".to_string(), bash_mode)],
-        CardStatus::Queued => vec![Span::styled("queued".to_string(), muted)],
-    };
-    let mut header: Line = Vec::new();
-    header.push(Span::styled(card.name.clone(), muted));
-    header.push(Span::styled(" \u{00b7} ".to_string(), dim));
-    header.extend(status);
-
-    let mut lines = vec![panel_line(header, bg, width)];
-    // Fallback preview body: the call arguments and any text output.
-    let mut body: Vec<Line> = Vec::new();
-    let args = serde_json::to_string_pretty(&card.args).unwrap_or_default();
-    for row in crate::width::wrap_text(&args, content_width) {
-        body.push(row);
-    }
-    if let Some(result) = &card.result {
-        let output = result
-            .content
-            .iter()
-            .filter_map(|block| block.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n");
-        for row in crate::width::wrap_text(&output, content_width) {
-            body.push(row);
-        }
-    }
-    if !body.is_empty() {
-        lines.push(panel_line(Vec::new(), bg, width));
-        for row in body {
-            let output_style = theme.fg_style(ThemeColor::ToolOutput);
-            let styled: Line = row
-                .into_iter()
-                .map(|span| Span::styled(span.content, output_style))
-                .collect();
-            lines.push(panel_line(styled, bg, width));
-        }
-    }
-    lines
-}
-
-/// One tool-panel row: content indented by 2, padded to the full width on
-/// the panel background (TS `toolPanelLine`).
-fn panel_line(content: Line, bg: Style, width: usize) -> Line {
-    let padding = 2usize;
-    let content_width = width.saturating_sub(padding * 2).max(1);
-    let mut line: Line = vec![Span::styled(" ".repeat(padding), bg)];
-    let used: usize = content.iter().map(|s| str_width(&s.content)).sum();
-    for span in content {
-        line.push(Span::styled(span.content, bg.patch(span.style)));
-    }
-    if used > content_width {
-        line = crate::width::truncate_line(&line, width, "");
-        return line;
-    }
-    line.push(Span::styled(" ".repeat(content_width - used), bg));
-    line.push(Span::styled(" ".repeat(padding), bg));
-    line
 }
 
 /// The working loader rows (TS `Loader.render`: `["", spinner + message]`).
@@ -670,6 +436,27 @@ mod tests {
     }
 
     #[test]
+    fn detail_cycle_visits_all_three_levels() {
+        // TS `toggleToolOutputExpansion`: overview -> details -> all -> overview.
+        let mut detail = Detail::Overview;
+        assert!(!detail.show_thinking());
+        assert!(!detail.tool_output_expanded());
+        assert!(!detail.edit_diffs_expanded());
+        detail = detail.next();
+        assert_eq!(detail, Detail::Details);
+        assert!(detail.show_thinking());
+        assert!(!detail.tool_output_expanded());
+        assert!(detail.edit_diffs_expanded());
+        detail = detail.next();
+        assert_eq!(detail, Detail::All);
+        assert!(detail.show_thinking());
+        assert!(detail.tool_output_expanded());
+        assert!(detail.edit_diffs_expanded());
+        detail = detail.next();
+        assert_eq!(detail, Detail::Overview);
+    }
+
+    #[test]
     fn user_block_renders_box_rows() {
         let rows = render_user_block("Run a quick check.", &theme(), 60);
         assert_eq!(rows.len(), 3);
@@ -682,28 +469,44 @@ mod tests {
     }
 
     #[test]
-    fn ipython_card_done_line() {
-        let card = ToolCallCard {
-            id: "toolu_1".into(),
-            name: "ipython".into(),
-            args: serde_json::json!({ "code": "print('visual parity ok')" }),
-            started: true,
-            result: Some(ToolResultView {
-                content: vec![serde_json::json!({ "type": "text", "text": "visual parity ok" })],
-                details: serde_json::json!({ "status": "ok", "durationMs": 2, "stdout": "visual parity ok\n" }),
-                is_error: false,
-            }),
-            result_partial: false,
+    fn assistant_error_row_and_spacers() {
+        let message = AssistantMessage {
+            blocks: vec![MessageBlock::Text("Running the checks.".into())],
+            has_tool_calls: false,
+            streaming: false,
+            error: Some("Error: request failed after retries".into()),
+            aborted: false,
         };
-        let rows = render_tool_card(&card, 0, &theme(), 100);
-        let text = rows[0]
+        let rows = render_assistant(&message, Detail::Overview, &theme(), 60, false);
+        let flat: Vec<String> = rows
             .iter()
-            .map(|s| s.content.as_str())
-            .collect::<String>();
+            .map(|line| line.iter().map(|s| s.content.as_str()).collect())
+            .collect();
+        assert_eq!(flat[0], "", "leading spacer");
         assert!(
-            text.contains("\u{2713} python \u{00b7} print('visual parity ok') \u{00b7} \u{2191} 1 \u{2193} 1 lines"),
-            "got: {text}"
+            flat.iter().any(|row| row.contains("Error: request failed")),
+            "got: {flat:?}"
         );
+        // A tool-carrying message keeps its trailing spacer.
+        let message = AssistantMessage {
+            blocks: vec![MessageBlock::Text("body".into())],
+            has_tool_calls: true,
+            streaming: false,
+            error: None,
+            aborted: false,
+        };
+        let rows = render_assistant(&message, Detail::Overview, &theme(), 60, true);
+        assert_eq!(rows.last().unwrap().len(), 0, "trailing spacer");
+        // A tool-only message after tool activity renders no spacers.
+        let message = AssistantMessage {
+            blocks: Vec::new(),
+            has_tool_calls: true,
+            streaming: false,
+            error: None,
+            aborted: false,
+        };
+        let rows = render_assistant(&message, Detail::Overview, &theme(), 60, true);
+        assert!(rows.is_empty(), "got: {rows:?}");
     }
 
     #[test]

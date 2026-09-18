@@ -313,10 +313,18 @@ pub fn render_prompt_context(detail_label: &str, theme: &Theme, width: usize) ->
     vec![Vec::new(), row]
 }
 
-/// The conversation-detail status label (TS `formatConversationDetailStatus`).
-pub fn conversation_detail_status(expanded: bool, key_display: &str) -> String {
-    let label = if expanded { "Expanded" } else { "Collapsed" };
-    let action = if expanded { "collapse" } else { "expand" };
+/// The conversation-detail status label (TS `formatConversationDetailStatus`):
+/// "Expanded" (all output), "Details" (thinking + diffs, output collapsed), or
+/// "Collapsed"; only Expanded flips the key hint to "collapse".
+pub fn conversation_detail_status(all_output: bool, details: bool, key_display: &str) -> String {
+    let label = if all_output {
+        "Expanded"
+    } else if details {
+        "Details"
+    } else {
+        "Collapsed"
+    };
+    let action = if all_output { "collapse" } else { "expand" };
     format!("{label} mode ({key_display} to {action})")
 }
 
@@ -438,11 +446,15 @@ mod tests {
     #[test]
     fn detail_status_label() {
         assert_eq!(
-            conversation_detail_status(false, "Ctrl+O"),
+            conversation_detail_status(false, false, "Ctrl+O"),
             "Collapsed mode (Ctrl+O to expand)"
         );
         assert_eq!(
-            conversation_detail_status(true, "Ctrl+O"),
+            conversation_detail_status(false, true, "Ctrl+O"),
+            "Details mode (Ctrl+O to expand)"
+        );
+        assert_eq!(
+            conversation_detail_status(true, true, "Ctrl+O"),
             "Expanded mode (Ctrl+O to collapse)"
         );
     }
