@@ -10,9 +10,7 @@ use pa_types::daemon::DaemonCommand;
 use pa_types::slash_commands::{SlashCommandExecution, SlashCommandRegistry};
 use serde_json::Value;
 
-use crate::chat::{
-    ChatEntry, MessageBlock, RetryState, StatusKind, ToolCallCard, ToolResultView, WorkingState,
-};
+use crate::chat::{ChatEntry, MessageBlock, RetryState, StatusKind, ToolResultView, WorkingState};
 use crate::daemon_client::{DaemonClient, DaemonClientEvent};
 use crate::interactive::{InteractiveOptions, ModelSelection, SessionSelection};
 use crate::keys::key_event_to_id;
@@ -992,7 +990,7 @@ impl SessionUi {
                 tool_name,
                 args,
             } => {
-                self.apply_tool_start(&tool_call_id, &tool_name, args, view);
+                crate::snapshot::apply_tool_execution_start(view, &tool_call_id, &tool_name, args);
                 self.set_working_activity("Executing", false, view);
             }
             TurnUpdate::ToolExecutionUpdate {
@@ -1123,25 +1121,10 @@ impl SessionUi {
         }
         for (id, name, args) in &tool_calls {
             // A streamed tool call first appears queued; the execution start
-            // event flips it to running, and later frames refresh its args
-            // while they stream (TS `updateArgs`).
-            let card_index = view
-                .chat
-                .iter()
-                .position(|entry| matches!(entry, ChatEntry::Tool(card) if card.id == *id));
-            match card_index.map(|index| (index, view.chat.get_mut(index))) {
-                Some((index, Some(ChatEntry::Tool(card)))) => {
-                    card.args = args.clone();
-                    view.mark_entry_stale(index);
-                }
-                _ => view.push_entry(ChatEntry::Tool(Box::new(ToolCallCard {
-                    id: id.clone(),
-                    name: name.clone(),
-                    args: args.clone(),
-                    started: false,
-                    ..Default::default()
-                }))),
-            }
+            // event flips it to running, and later frames refresh its name
+            // and args while they stream (TS `updateArgs` + the latest
+            // streaming call winning at component creation).
+            crate::snapshot::apply_streamed_tool_card(view, id, name, args);
         }
         if !streaming {
             let open = self.streaming_index.take();
@@ -1189,40 +1172,6 @@ impl SessionUi {
                 aborted: error.aborted,
             },
         )));
-    }
-
-    /// `tool_execution_start`: mark the matching card running (or create it
-    /// when the message frame has not arrived yet).
-    fn apply_tool_start(
-        &mut self,
-        tool_call_id: &str,
-        tool_name: &str,
-        args: Value,
-        view: &mut AgentView,
-    ) {
-        let card_index = view
-            .chat
-            .iter()
-            .position(|entry| matches!(entry, ChatEntry::Tool(card) if card.id == tool_call_id));
-        if let Some(index) = card_index {
-            if let Some(ChatEntry::Tool(card)) = view.chat.get_mut(index) {
-                card.started = true;
-                card.started_at = Some(std::time::Instant::now());
-                if !args.is_null() {
-                    card.args = args;
-                }
-                view.mark_entry_stale(index);
-            }
-            return;
-        }
-        view.push_entry(ChatEntry::Tool(Box::new(ToolCallCard {
-            id: tool_call_id.to_string(),
-            name: tool_name.to_string(),
-            args,
-            started: true,
-            started_at: Some(std::time::Instant::now()),
-            ..Default::default()
-        })));
     }
 
     /// Attach a (partial or final) tool result to the matching card.

@@ -501,6 +501,89 @@ pub fn message_value_to_entries(message: &Value) -> Vec<ChatEntry> {
     }
 }
 
+/// Fold one streamed tool call into the live transcript (TS
+/// `getOrCreatePendingToolComponent` without its async deferral).
+///
+/// A provider announces a tool call before its function name streams in:
+/// the wire `toolCall` block first arrives with an empty `name`, and later
+/// `message_update` frames fill it. A card is therefore only created once
+/// the call is identifiable (`id` non-empty) and named; a card created
+/// earlier would carry the empty name forever (no later event corrects it),
+/// fall through to the generic panel, and render the raw arguments JSON
+/// instead of the tool's own card. An existing card refreshes from the
+/// latest frame — the newest streamed name and arguments win (TS builds the
+/// component against the latest streaming call).
+pub fn apply_streamed_tool_card(
+    view: &mut crate::view::AgentView,
+    id: &str,
+    name: &str,
+    args: &Value,
+) {
+    if id.is_empty() || name.is_empty() {
+        return;
+    }
+    let card_index = view
+        .chat
+        .iter()
+        .position(|entry| matches!(entry, ChatEntry::Tool(card) if card.id == id));
+    match card_index {
+        Some(index) => {
+            if let Some(ChatEntry::Tool(card)) = view.chat.get_mut(index) {
+                card.name = name.to_string();
+                card.args = args.clone();
+            }
+            view.mark_entry_stale(index);
+        }
+        None => view.push_entry(ChatEntry::Tool(Box::new(ToolCallCard {
+            id: id.to_string(),
+            name: name.to_string(),
+            args: args.clone(),
+            started: false,
+            ..Default::default()
+        }))),
+    }
+}
+
+/// `tool_execution_start` folded into the live transcript: mark the matching
+/// card running, or create it when the assistant-message frames have not
+/// arrived yet. The daemon-reported tool name is authoritative — it
+/// backfills a card still carrying an empty streamed name, so the card
+/// routes to its tool-specific renderer (TS creates missing components with
+/// `event.toolName`).
+pub fn apply_tool_execution_start(
+    view: &mut crate::view::AgentView,
+    tool_call_id: &str,
+    tool_name: &str,
+    args: Value,
+) {
+    let card_index = view
+        .chat
+        .iter()
+        .position(|entry| matches!(entry, ChatEntry::Tool(card) if card.id == tool_call_id));
+    if let Some(index) = card_index {
+        if let Some(ChatEntry::Tool(card)) = view.chat.get_mut(index) {
+            card.started = true;
+            card.started_at = Some(std::time::Instant::now());
+            if card.name.is_empty() && !tool_name.is_empty() {
+                card.name = tool_name.to_string();
+            }
+            if !args.is_null() {
+                card.args = args;
+            }
+            view.mark_entry_stale(index);
+        }
+        return;
+    }
+    view.push_entry(ChatEntry::Tool(Box::new(ToolCallCard {
+        id: tool_call_id.to_string(),
+        name: tool_name.to_string(),
+        args,
+        started: true,
+        started_at: Some(std::time::Instant::now()),
+        ..Default::default()
+    })));
+}
+
 /// The failure row a failed assistant message renders (TS
 /// `AssistantMessageComponent.rebuild`): an abort always shows, a provider
 /// `error` only when the message carries no tool calls (their cards carry
@@ -655,6 +738,122 @@ fn content_to_text(content: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn test_view() -> crate::view::AgentView {
+        crate::view::AgentView::new(crate::theme::Theme::builtin(
+            "prime",
+            crate::theme::ColorMode::TrueColor,
+        ))
+    }
+
+    fn card_of(view: &crate::view::AgentView) -> Option<&ToolCallCard> {
+        view.chat.iter().find_map(|entry| match entry {
+            ChatEntry::Tool(card) => Some(card.as_ref()),
+            _ => None,
+        })
+    }
+
+    fn rendered_card_text(view: &crate::view::AgentView) -> Vec<String> {
+        let Some(card) = card_of(view) else {
+            return Vec::new();
+        };
+        crate::tool_card::render_tool_card(card, 0, crate::chat::Detail::Overview, &view.theme, 100)
+            .iter()
+            .map(|line| line.iter().map(|span| span.content.as_str()).collect())
+            .collect()
+    }
+
+    /// The live wire shape that broke the ipython card: a provider announces
+    /// the tool call before the function name streams in (the openai-style
+    /// toolcall-start frame carries the block unnamed), so the first
+    /// `message_update` frame has an empty `name`. The card must not freeze
+    /// on that frame — the named frame routes it to the ipython renderer and
+    /// the collapsed line shows the code preview, not the raw arguments
+    /// JSON.
+    #[test]
+    fn unnamed_streamed_tool_call_renders_code_once_named() {
+        let mut view = test_view();
+        apply_streamed_tool_card(&mut view, "call-1", "", &json!({ "code": "fibonacci(23)" }));
+        assert!(
+            card_of(&view).is_none(),
+            "a call without a streamed name renders no card yet"
+        );
+        apply_streamed_tool_card(
+            &mut view,
+            "call-1",
+            "ipython",
+            &json!({ "code": "fibonacci(23)" }),
+        );
+        let card = card_of(&view).expect("the named frame creates the card");
+        assert_eq!(card.name, "ipython");
+        assert!(card.args.get("code").is_some(), "args stream into the card");
+        let rows = rendered_card_text(&view);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("python") && row.contains("fibonacci(23)")),
+            "the ipython card renders the code preview: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| !row.contains("\"code\"") && !row.contains('{')),
+            "the raw arguments JSON must not render: {rows:?}"
+        );
+    }
+
+    /// The latest streamed frame wins on an existing card (TS builds the
+    /// pending component against the latest streaming call), so a card that
+    /// somehow kept an empty name picks the name up from the next frame.
+    #[test]
+    fn existing_card_refreshes_name_and_args_from_latest_frame() {
+        let mut view = test_view();
+        view.push_entry(ChatEntry::Tool(Box::new(ToolCallCard {
+            id: "call-1".into(),
+            name: String::new(),
+            args: Value::Null,
+            ..Default::default()
+        })));
+        apply_streamed_tool_card(&mut view, "call-1", "ipython", &json!({ "code": "x = 1" }));
+        let card = card_of(&view).expect("the streamed frame finds the card");
+        assert_eq!(card.name, "ipython");
+        assert_eq!(card.args.get("code"), Some(&json!("x = 1")));
+    }
+
+    /// `tool_execution_start` reports the actual tool name ("ipython" on
+    /// the wire today); it backfills a card still unnamed and creates the
+    /// card when the message frames have not arrived yet.
+    #[test]
+    fn tool_execution_start_reports_the_tool_name() {
+        let mut view = test_view();
+        view.push_entry(ChatEntry::Tool(Box::new(ToolCallCard {
+            id: "call-1".into(),
+            name: String::new(),
+            args: Value::Null,
+            ..Default::default()
+        })));
+        apply_tool_execution_start(
+            &mut view,
+            "call-1",
+            "ipython",
+            json!({ "code": "print('hi')" }),
+        );
+        let card = card_of(&view).expect("the start event finds the card");
+        assert_eq!(card.name, "ipython");
+        assert!(card.started, "the start event marks execution started");
+
+        let mut fresh = test_view();
+        apply_tool_execution_start(
+            &mut fresh,
+            "call-2",
+            "ipython",
+            json!({ "code": "fibonacci(23)" }),
+        );
+        let rows = rendered_card_text(&fresh);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("python") && row.contains("fibonacci(23)")),
+            "a card created from the start event renders the code preview: {rows:?}"
+        );
+    }
 
     fn slim_attach() -> Value {
         json!({
