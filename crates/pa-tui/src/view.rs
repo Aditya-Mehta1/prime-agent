@@ -71,6 +71,11 @@ pub struct AgentView {
     layout_width: usize,
     /// The conversation-detail mode the cached rows were laid out for.
     layout_detail: Detail,
+    /// Row texts of the inline frame at the last main-screen flush (TS
+    /// `exitFullscreen`'s inline repaint): the next flush diffs against
+    /// this, so suspend/resume/exit cycles never duplicate the transcript
+    /// in terminal scrollback.
+    flushed_frame: Vec<String>,
 }
 
 impl AgentView {
@@ -98,6 +103,7 @@ impl AgentView {
             entry_layout: Vec::new(),
             layout_width: 0,
             layout_detail: Detail::Overview,
+            flushed_frame: Vec::new(),
         }
     }
 
@@ -580,6 +586,76 @@ impl AgentView {
         self.dock_cursor
             .map(|(row, col)| (row + 1 + self.window_rows, col))
     }
+
+    /// The inline layout the exit flush paints onto the main screen (TS
+    /// `exitFullscreen`'s synchronous inline repaint): the full transcript
+    /// plus the dock, without the fullscreen window, top-bar pin, or height
+    /// padding. Unlike an alt-screen frame, these rows persist in the
+    /// terminal's native scrollback, which is what keeps the exit frame
+    /// (and the resume hint printed below it) visible after the app exits.
+    pub fn render_inline_frame(&mut self, width: usize) -> Vec<Line> {
+        let mut rows = self.render_transcript(width);
+        rows.extend(self.render_dock(width));
+        rows
+    }
+
+    /// Rows of the inline layout that changed since the last main-screen
+    /// flush, as a write plan for the flush primitive (TS
+    /// `exitFullscreen`'s inline repaint):
+    ///
+    /// - [`FlushPlan::Append`] when the flushed frame is a prefix of the
+    ///   new one (or nothing was flushed yet): the new tail appends below
+    ///   the cursor and flows into native scrollback — this is the exit
+    ///   path that keeps the exit frame and resume hint visible.
+    /// - [`FlushPlan::Repaint`] when rows above the flushed tail changed
+    ///   (a transcript that grew past a suspend-time flush, a snapshot
+    ///   rebuild): the visible screen is erased and the last screenful
+    ///   repainted, mirroring the TS full redraw. Scrollback above the
+    ///   screen is never rewritten — terminal scrollback is immutable,
+    ///   the same trade-off the TS renderer makes.
+    pub fn take_flush_plan(&mut self, width: usize, screen_height: usize) -> FlushPlan {
+        let rows = self.render_inline_frame(width);
+        let texts: Vec<String> = rows.iter().map(row_text_of).collect();
+        let first_changed = (0..self.flushed_frame.len().max(texts.len())).find(|&index| {
+            let old = self.flushed_frame.get(index).map(String::as_str);
+            let new = texts.get(index).map(String::as_str);
+            old != new
+        });
+        let plan = match first_changed {
+            // Identical frame: nothing to write.
+            None => FlushPlan::Append(Vec::new()),
+            // The flushed frame is a prefix: append the new tail.
+            Some(index) if index >= self.flushed_frame.len() => {
+                FlushPlan::Append(rows[index.min(rows.len())..].to_vec())
+            }
+            // Rows above the flushed tail changed: repaint the visible
+            // window (the frame tail), leaving scrollback untouched.
+            Some(_) => {
+                let start = rows.len().saturating_sub(screen_height);
+                FlushPlan::Repaint(rows[start..].to_vec())
+            }
+        };
+        self.flushed_frame = texts;
+        plan
+    }
+}
+
+/// The main-screen write plan produced by [`AgentView::take_flush_plan`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum FlushPlan {
+    /// Write the rows below the cursor (joined with newlines), scrolling
+    /// excess rows into native scrollback.
+    Append(Vec<Line>),
+    /// Erase the visible screen (scrollback above it stays) and paint the
+    /// rows from the top — the TS full-redraw path for changes above the
+    /// flushed tail.
+    Repaint(Vec<Line>),
+}
+
+/// Concatenated span contents of a row (includes zero-width OSC zone
+/// markers, which must persist into scrollback).
+fn row_text_of(line: &Line) -> String {
+    line.iter().map(|span| span.content.as_str()).collect()
 }
 
 /// Split a string at a char boundary.
@@ -874,6 +950,85 @@ mod tests {
         let plain = vec![crate::Span::raw(" ".repeat(80))];
         let out = composite_follow_hint(&plain, " ctrl+shift+down to follow ", 80);
         assert_eq!(crate::osc133::row_markers(&out), Default::default());
+    }
+
+    #[test]
+    fn flush_plan_appends_then_repaints_the_changed_tail() {
+        let mut v = view();
+        v.chrome.version = "0.0.0".to_string();
+        v.chrome.cwd = "/w".to_string();
+        v.chrome.chat_name = "w".to_string();
+        v.push(TranscriptItem::UserMessage {
+            text: "first turn".to_string(),
+        });
+        // The first flush appends the whole inline frame (splash,
+        // transcript, dock) and keeps the zero-width zone markers embedded
+        // in the rows — they must survive into scrollback for
+        // shell-integration jumps.
+        let first = v.take_flush_plan(80, 24);
+        let FlushPlan::Append(rows) = &first else {
+            panic!("first flush must append");
+        };
+        let joined = rows.iter().map(text_of).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("prime agent v0.0.0"));
+        assert!(joined.contains("first turn"));
+        assert!(rows.iter().any(|l| crate::osc133::row_markers(l).start));
+
+        // An unchanged frame flushes nothing.
+        assert_eq!(v.take_flush_plan(80, 24), FlushPlan::Append(Vec::new()));
+
+        // New transcript rows land ABOVE the flushed dock, so the flush
+        // repaints the visible window: the changed region is rewritten, not
+        // appended below the stale dock (which would duplicate it).
+        v.push(TranscriptItem::UserMessage {
+            text: "second turn".to_string(),
+        });
+        let FlushPlan::Repaint(rows) = v.take_flush_plan(80, 24) else {
+            panic!("growth past the flushed dock must repaint");
+        };
+        let joined = rows.iter().map(text_of).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("second turn"));
+        assert!(joined.contains("first turn"));
+        // The repaint covers at most one screenful: a long transcript
+        // repaints only the tail.
+        let mut long = filled(view(), 30);
+        let FlushPlan::Append(_) = long.take_flush_plan(80, 10) else {
+            panic!("first flush of a long transcript must append");
+        };
+        long.push(TranscriptItem::UserMessage {
+            text: "late turn".to_string(),
+        });
+        let FlushPlan::Repaint(rows) = long.take_flush_plan(80, 10) else {
+            panic!("growth past the flushed dock must repaint");
+        };
+        assert!(rows.len() <= 10);
+        let joined = rows.iter().map(text_of).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("late turn"));
+        assert!(!joined.contains("reply 0"));
+
+        // A shrinking rebuild never rewinds into a rewrite of scrollback:
+        // the changed region repaints the visible window only.
+        v.clear_chat();
+        let FlushPlan::Repaint(rows) = v.take_flush_plan(80, 24) else {
+            panic!("a rebuild past the flushed frame must repaint");
+        };
+        let joined = rows.iter().map(text_of).collect::<Vec<_>>().join("\n");
+        assert!(!joined.contains("second turn"));
+    }
+
+    #[test]
+    fn inline_frame_is_transcript_plus_dock_without_padding() {
+        let mut v = filled(view(), 30);
+        // The inline layout is the unpinned frame: every transcript row is
+        // present (no window slicing) and no height padding rows follow.
+        let frame = v.render_frame(80, 24);
+        let inline = v.render_inline_frame(80);
+        assert!(inline.iter().any(|l| text_of(l).contains("reply 0")));
+        assert!(inline.iter().any(|l| text_of(l).contains("reply 29")));
+        assert!(frame.len() == 24 && inline.len() != frame.len());
+        // The dock rows ride at the end (prompt context, editor, tray).
+        let joined = inline.iter().map(text_of).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("Collapsed mode"));
     }
 
     #[test]

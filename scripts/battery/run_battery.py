@@ -1663,6 +1663,11 @@ class Battery:
         # shutdown-path resume hint (formatResumeHint) corroborates a
         # graceful shutdown instead.
         rec["resume_hint"] = "Resume this session with:" in frame
+        # TS exit parity: leaving fullscreen flushes the transcript frame
+        # onto the main screen (tui.ts exitFullscreen), so the dead pane
+        # shows the last submitted prompt — not a blank screen. Both sides
+        # must leave the exit frame behind.
+        rec["exit_frame"] = "hold the turn" in frame
         return rec
 
     def f13_ctrlc_exit(self) -> None:
@@ -1694,6 +1699,7 @@ class Battery:
                     and rec.get("elapsed_s") is not None
                     and rec["elapsed_s"] <= bound_s
                     and exit_ok
+                    and rec.get("exit_frame")
                 )
                 if ok:
                     exit_code = rec.get("exit_code")
@@ -1708,6 +1714,8 @@ class Battery:
                     summary = f"{side.name}: C-c C-c did not exit cleanly (case {case})"
                     if "error" in rec:
                         summary += f": {rec['error']}"
+                    elif not rec.get("exit_frame"):
+                        summary += ": the exit frame is missing from the dead pane"
                     elif rec.get("elapsed_s") is not None:
                         summary += (
                             f": exit took {rec['elapsed_s']}s, status {rec.get('status')}"

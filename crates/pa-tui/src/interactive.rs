@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 
 use crate::daemon_client::DaemonClient;
 use crate::session_ui::SessionUi;
-use crate::view::AgentView;
+use crate::view::{AgentView, FlushPlan};
 
 use crossterm::event::KeyEvent;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
@@ -340,7 +340,11 @@ enum UiInput {
     Key(KeyEvent),
     Paste(String),
     Submit(String),
-    WaitIdle { timeout_ms: u64 },
+    WaitIdle {
+        timeout_ms: u64,
+    },
+    /// The terminal was resized: the next draw repaints the new geometry.
+    Resize,
     HeadlessDone,
 }
 
@@ -384,6 +388,10 @@ pub async fn run_interactive(
             run_onboarding_phase(&task, &mut view, &mut ui_rx, &mut renderer).await?;
         if exit_requested {
             let _ = session.detach().await;
+            // The user quit at the onboarding screen: still hand the
+            // terminal back (raw mode off, alt screen left and flushed)
+            // exactly like a session exit.
+            renderer.finish(&mut view);
             return Ok(InteractiveOutcome {
                 active_session_id: session.active_session_id.clone(),
                 session_id: session.session_id.clone(),
@@ -441,7 +449,7 @@ pub async fn run_interactive(
                     // the auth flow prompts on the plain terminal.
                     let suspended = session.needs_terminal_suspension(&text);
                     if suspended {
-                        renderer.suspend()?;
+                        renderer.suspend(&mut view)?;
                     }
                     let dispatched = session.submit_prompt(&text, &mut view).await;
                     if suspended {
@@ -450,6 +458,14 @@ pub async fn run_interactive(
                     dispatched?;
                 }
                 UiInput::HeadlessDone => headless_done = true,
+                UiInput::Resize => {
+                    // The editor lays its window out against the new row
+                    // count; the branch's dirty flag repaints the frame at
+                    // the new geometry.
+                    if let Ok((_width, height)) = crossterm::terminal::size() {
+                        view.set_terminal_rows(height);
+                    }
+                }
                 UiInput::WaitIdle { .. } => unreachable!("barrier handled above"),
             }
             // Paint the handled input in this iteration: the select below can
@@ -565,7 +581,7 @@ pub async fn run_interactive(
         session_id: session.session_id.clone(),
         resume_hint,
         last_assistant_text: session.last_assistant_text.clone(),
-        frames: renderer.finish(),
+        frames: renderer.finish(&mut view),
         return_to_agents_view: session.open_agents_view,
         selection_request: session.pending_selection,
     };
@@ -645,6 +661,10 @@ impl Renderer {
                     crossterm::event::Event::Paste(text) => {
                         ui_tx.send(UiInput::Paste(text)).is_ok()
                     }
+                    // TS forces a full re-render on resize (tui.ts
+                    // widthChanged/heightChanged); the loop repaints on
+                    // the dirty flag this sets.
+                    crossterm::event::Event::Resize(..) => ui_tx.send(UiInput::Resize).is_ok(),
                     _ => true,
                 });
                 let backend = CrosstermBackend::new(std::io::stdout());
@@ -686,17 +706,17 @@ impl Renderer {
     }
 
     /// Hand the terminal back to the process (raw mode off, alternate
-    /// screen left, cursor visible) so an interactive client command can
-    /// prompt on it. Headless verification runs keep their plain pipes.
-    /// The trailing cursor-show leaves the terminal with a visible cursor
-    /// (the TS teardown contract: the shell prompt that follows must not
-    /// sit on a hidden cursor).
-    fn suspend(&mut self) -> Result<()> {
+    /// screen left and flushed, cursor visible) so an interactive client
+    /// command can prompt on it. Headless verification runs keep their
+    /// plain pipes. The trailing cursor-show leaves the terminal with a
+    /// visible cursor (the TS teardown contract: the shell prompt that
+    /// follows must not sit on a hidden cursor).
+    fn suspend(&mut self, view: &mut AgentView) -> Result<()> {
         match self {
             Renderer::Terminal(_) => {
-                terminal::disable_raw_mode()?;
-                crossterm::execute!(std::io::stdout(), LeaveAlternateScreen)?;
+                self.flush_to_main_screen(view)?;
                 crossterm::execute!(std::io::stdout(), crossterm::cursor::Show)?;
+                terminal::disable_raw_mode()?;
                 Ok(())
             }
             Renderer::Headless { .. } => Ok(()),
@@ -716,6 +736,50 @@ impl Renderer {
             }
             Renderer::Headless { .. } => Ok(()),
         }
+    }
+
+    /// Leave the alternate screen and paint the accumulated inline layout
+    /// onto the main screen (TS `TUI.stop` -> `exitFullscreen`: leave the
+    /// alt screen first, then the inline repaint flushes the
+    /// fullscreen-era transcript into native scrollback). This is what
+    /// keeps the exit frame — and the resume hint the composition root
+    /// prints below it — visible after the process exits, instead of the
+    /// blank main screen an alt-screen exit alone leaves behind.
+    ///
+    /// The kill-switch `PRIME_AGENT_TUI_EXIT_FLUSH=0` skips the paint (the
+    /// alt screen is still left): the flush is the one new output path that
+    /// writes into the user's scrollback, so it can be disabled without a
+    /// release if it misbehaves.
+    fn flush_to_main_screen(&mut self, view: &mut AgentView) -> Result<()> {
+        // Only the terminal renderer owns a real screen to flush;
+        // headless verification keeps its plain pipes.
+        if !matches!(self, Renderer::Terminal(_)) {
+            return Ok(());
+        }
+        crossterm::execute!(std::io::stdout(), LeaveAlternateScreen)?;
+        if !exit_flush_enabled() {
+            return Ok(());
+        }
+        let (width, height) = terminal::size()?;
+        let plan = view.take_flush_plan(width as usize, height as usize);
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let mut buffer = String::new();
+        match plan {
+            FlushPlan::Append(rows) if rows.is_empty() => {}
+            FlushPlan::Append(rows) => {
+                write_flush_rows(&mut buffer, &rows);
+            }
+            FlushPlan::Repaint(rows) => {
+                // Erase the visible screen only — scrollback above it
+                // stays (TS `fullRender`'s `\x1b[2J\x1b[H`).
+                buffer.push_str("\x1b[2J\x1b[H");
+                write_flush_rows(&mut buffer, &rows);
+            }
+        }
+        out.write_all(buffer.as_bytes())?;
+        out.flush()?;
+        Ok(())
     }
 
     fn is_terminal_mut(&mut self) -> Option<&mut Terminal<CrosstermBackend<std::io::Stdout>>> {
@@ -750,12 +814,16 @@ impl Renderer {
         session.dirty = false;
     }
 
-    fn finish(self) -> Vec<String> {
+    fn finish(mut self, view: &mut AgentView) -> Vec<String> {
         match self {
             Renderer::Terminal(_) => {
-                let _ = terminal::disable_raw_mode();
-                let _ = crossterm::execute!(std::io::stdout(), LeaveAlternateScreen);
+                // TS `TUI.stop`: leave the alt screen and flush the inline
+                // frame onto the main screen, then show the cursor and
+                // restore cooked mode — the resume hint the composition
+                // root prints next lands right below the flushed frame.
+                let _ = self.flush_to_main_screen(view);
                 let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
+                let _ = terminal::disable_raw_mode();
                 Vec::new()
             }
             Renderer::Headless { frames, .. } => frames,
@@ -763,9 +831,53 @@ impl Renderer {
     }
 }
 
+/// Encode the flushed rows into `buffer` as one write: each row starts at
+/// column 0 (`\r`, required because raw mode maps `\n` to a bare line
+/// feed), rows are joined with CRLF, and a trailing CRLF parks the cursor
+/// below the frame (TS `TUI.stop`'s closing newline) so whatever prints
+/// next — the shell prompt or the resume hint — starts on a fresh line.
+fn write_flush_rows(buffer: &mut String, rows: &[crate::Line]) {
+    for row in rows {
+        buffer.push('\r');
+        buffer.push_str(&crate::ansi::line_to_ansi(row));
+        buffer.push_str("\r\n");
+    }
+}
+
+/// Whether the main-screen exit flush is enabled: on unless
+/// `PRIME_AGENT_TUI_EXIT_FLUSH=0` opts out.
+fn exit_flush_enabled() -> bool {
+    std::env::var_os("PRIME_AGENT_TUI_EXIT_FLUSH").is_none_or(|value| value != "0")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flush_rows_write_crlf_and_keep_zone_markers() {
+        // A marked row keeps its zero-width zone sequence inline (the
+        // flushed row persists into scrollback, where absolute-position
+        // marker re-emission cannot reach) and every row lands on its own
+        // line with explicit CR (raw mode maps `\n` to a bare line feed).
+        let mut marked = vec![crate::Span::raw("hello")];
+        crate::osc133::mark_start(&mut marked);
+        let styled = vec![crate::Span::styled(
+            "world",
+            ratatui::style::Style::default().fg(ratatui::style::Color::Indexed(1)),
+        )];
+        let mut buffer = String::new();
+        write_flush_rows(&mut buffer, &[marked, styled]);
+        let expected = format!(
+            "\r{}hello\r\n\r\x1b[38;5;1mworld\x1b[0m\r\n",
+            crate::osc133::ZONE_START
+        );
+        assert_eq!(buffer, expected);
+        // No rows: no output.
+        let mut empty = String::new();
+        write_flush_rows(&mut empty, &[]);
+        assert!(empty.is_empty());
+    }
 
     fn options(selection: ModelSelection) -> InteractiveOptions {
         InteractiveOptions {

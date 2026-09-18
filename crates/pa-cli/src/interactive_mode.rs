@@ -270,6 +270,15 @@ pub fn run_interactive_mode(options: &RunOptions) -> Result<i32> {
             }
         }
     })?;
+    // tmux (verified on 3.2a) can drop the pane's final output when the
+    // process dies immediately after writing it: the just-printed resume
+    // hint — and the tail of the exit flush — races the pane-death
+    // handling and the dead pane comes up blank. Holding the process
+    // briefly after the last write lets the terminal apply it first. The
+    // TS product wins this race only by exiting slower (its input drain
+    // plus node teardown); the bound stays far inside the exit-within-1s
+    // contract.
+    std::thread::sleep(Duration::from_millis(300));
     Ok(0)
 }
 
