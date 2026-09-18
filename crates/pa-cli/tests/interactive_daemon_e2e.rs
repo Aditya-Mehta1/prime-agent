@@ -569,8 +569,8 @@ async fn tui_dispatches_slash_commands_menu_and_suggestions() {
         "the unknown-command suggestion matched the TS string:\n{rendered}"
     );
     assert!(
-        rendered.contains("/model is not available in this client yet"),
-        "the unavailable client command reported itself:\n{rendered}"
+        rendered.contains("No models available. Use /login to log into a provider"),
+        "the /model command surfaced the TS no-models note:\n{rendered}"
     );
     // The menu: the first registry entry is selected at `/`, and `/goa`
     // fuzzy-matches to the goal command.
