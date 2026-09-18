@@ -1,0 +1,36 @@
+$ printf 'PRIMARYSCREENMARKER-0123456789'
+PRIMARYSCREENMARKER-0123456789$ exec /home/ubuntu/.local/share/prime-agent/releases/0.9.5-linux-x64-bc4b0ed791d1e8b3b5d6
+a95249a60306d9579fc0d6038e5d7d82f068d81f008d/prime-agent agents --daemon-socket /home/ubuntu/lane-worktrees/flicker/scri
+pts/battery/runs/20260918T210307Z-flicker/rust/daemon.sock
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

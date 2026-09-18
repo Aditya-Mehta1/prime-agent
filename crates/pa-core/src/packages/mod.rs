@@ -134,3 +134,11 @@ pub(crate) fn temporary_dir(prefix: &str, suffix: Option<&str>) -> PathBuf {
         .join(&hash)
         .join(suffix.unwrap_or_default())
 }
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// Process-wide env reads and writes (HOME, PI_OFFLINE) serialize
+    /// through one lock across the packages test modules: parallel test
+    /// threads in the same binary otherwise race the process env.
+    pub(crate) static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}

@@ -1761,6 +1761,28 @@ mod tests {
     #[test]
     fn agent_engine_reports_model_resolution_failures() {
         let dir = tempfile::TempDir::new().unwrap();
+        // One auth-configured model keeps the available list non-empty in
+        // every environment (a clean env with no credentials resolves to
+        // "No models available" before the flagged-provider error, while a
+        // machine with ambient env credentials reaches this test's branch).
+        std::fs::create_dir_all(dir.path().join("agent")).unwrap();
+        std::fs::write(
+            dir.path().join("agent").join("models.json"),
+            serde_json::json!({
+                "providers": {
+                    "battery": {
+                        "api": "openai-completions",
+                        "baseUrl": "http://127.0.0.1:9",
+                        "apiKey": "sk-battery",
+                        "models": [
+                            { "id": "mock-1", "contextWindow": 128000, "maxTokens": 4096 }
+                        ]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
         let engine = AgentSessionEngine::new(AgentEngineConfig {
             cwd: dir.path().to_path_buf(),
             agent_dir: dir.path().join("agent"),

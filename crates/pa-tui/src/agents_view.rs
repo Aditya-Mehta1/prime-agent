@@ -506,7 +506,11 @@ impl Renderer {
         match ui {
             AgentsViewUiMode::Terminal => {
                 crossterm::terminal::enable_raw_mode()?;
-                crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+                // Adopt the alternate screen the previous surface left in
+                // place (TS `pendingAltScreenHandoff`); only the first
+                // surface of the process enters it, so a view switch never
+                // flashes the primary screen.
+                crate::altscreen::enter()?;
                 // One reader thread feeds the view; the reader registry
                 // joins the previous surface's reader (the chat it opened)
                 // before this one starts polling.
@@ -518,7 +522,16 @@ impl Renderer {
                     _ => true,
                 });
                 let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
-                Ok(Renderer::Terminal(ratatui::Terminal::new(backend)?))
+                let mut terminal = ratatui::Terminal::new(backend)?;
+                // The adopted buffer still holds the previous view's frame;
+                // clear it so the first draw is a full repaint of the same
+                // buffer (a fresh alt screen is already blank).
+                terminal.clear()?;
+                // The handoff left the cursor hidden (TS `stop` with
+                // `preserveAltScreen` hides it); this surface wants its own
+                // visible cursor back.
+                crossterm::execute!(std::io::stdout(), crossterm::cursor::Show)?;
+                Ok(Renderer::Terminal(terminal))
             }
             AgentsViewUiMode::Headless(plan) => {
                 let steps = plan.steps;
@@ -595,14 +608,23 @@ impl Renderer {
         }
     }
 
-    fn finish(self) -> Vec<String> {
+    /// Teardown. `preserve_alt_screen` mirrors TS `ui.stop({ preserveAltScreen })`:
+    /// a handoff to the chat the view just selected keeps the alternate screen
+    /// (and raw mode, so the handoff gap cannot echo into the preserved frame)
+    /// for the adopting surface, hiding the cursor; a real exit releases the
+    /// screen and restores the terminal. `flushFullscreen` stays false either
+    /// way (TS agents-view-mode `finish`): the picker frame is never flushed
+    /// onto the main screen.
+    fn finish(self, preserve_alt_screen: bool) -> Vec<String> {
         match self {
             Renderer::Terminal(_) => {
-                let _ = crossterm::terminal::disable_raw_mode();
-                let _ = crossterm::execute!(
-                    std::io::stdout(),
-                    crossterm::terminal::LeaveAlternateScreen
-                );
+                if preserve_alt_screen {
+                    let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide);
+                } else {
+                    let _ = crossterm::terminal::disable_raw_mode();
+                    let _ = crate::altscreen::leave();
+                    let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
+                }
                 Vec::new()
             }
             Renderer::Headless { frames, .. } => frames,
@@ -721,7 +743,9 @@ pub async fn run_agents_view(
         renderer.draw(&mut mode);
     }
 
-    let frames = renderer.finish();
+    // A selection hands the pane to the chat it opened (TS `result.type !== "exit"`);
+    // exiting releases the alternate screen.
+    let frames = renderer.finish(mode.selection.is_some());
     let _ = client
         .request(DaemonCommand::RosterUnsubscribe {
             id: None,

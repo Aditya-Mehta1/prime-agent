@@ -6,7 +6,6 @@
 //! policies.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use super::{MetadataSource, ResolvedResource, ResourceOrigin};
 use crate::packages::manager::BundledSkillsDir;
@@ -15,8 +14,9 @@ use crate::packages::{PackageManager, PackageManagerOptions, ResolveExtensionOpt
 use crate::settings::SettingsManager;
 
 /// Environment mutations (HOME, PI_OFFLINE) are process-wide: tests that
-/// touch them serialize through this lock.
-static ENV_MUTEX: Mutex<()> = Mutex::new(());
+/// touch them, and tests that read the env-sensitive update flows,
+/// serialize through the shared packages lock.
+use crate::packages::test_support::ENV_MUTEX;
 
 struct Fixture {
     root: tempfile::TempDir,

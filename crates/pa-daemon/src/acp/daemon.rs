@@ -635,7 +635,22 @@ async fn handle_session_prompt(
         let mut guard = state.lock().await;
         match guard.session.as_mut() {
             Some(hosted) if hosted.acp_session_id == params.session_id => {
-                hosted.cancel_requested = false;
+                // TS `entry.cancelling`: a prompt admitted while a cancel
+                // is in flight is dropped by the cancel and answers the
+                // protocol stop reason instead of running a turn. Clearing
+                // the flag here instead would lose the cancel (the
+                // notification handler may have run first); taking it
+                // settles the cancel so the next prompt runs normally.
+                if std::mem::take(&mut hosted.cancel_requested) {
+                    let _ = tx.send(jsonrpc::response(
+                        id,
+                        serde_json::to_value(types::AcpStopReasonResponse {
+                            stop_reason: types::AcpStopReason::Cancelled,
+                        })
+                        .expect("serializes"),
+                    ));
+                    return;
+                }
                 (
                     Arc::clone(&hosted.producer),
                     hosted.daemon_active_session_id.clone(),
@@ -688,12 +703,14 @@ async fn handle_session_prompt(
     // for the marker so every turn frame is published before the settle
     // (the event relay may otherwise trail the response).
     let _ = tokio::time::timeout(std::time::Duration::from_secs(30), emitted_rx).await;
+    // Read-and-take the flag (TS clears `entry.cancelling` when the
+    // cancel settles): this turn settles as cancelled, the next starts clean.
     let cancelled = state
         .lock()
         .await
         .session
-        .as_ref()
-        .map(|hosted| hosted.cancel_requested)
+        .as_mut()
+        .map(|hosted| std::mem::take(&mut hosted.cancel_requested))
         .unwrap_or(true);
     if cancelled {
         producer.finish_prompt(turn_id).await;

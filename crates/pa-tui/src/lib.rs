@@ -6,6 +6,7 @@
 
 pub mod agents_view;
 pub mod agents_view_state;
+pub mod altscreen;
 pub mod ansi;
 pub mod app;
 pub mod autocomplete;

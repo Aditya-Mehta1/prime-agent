@@ -727,6 +727,7 @@ mod tests {
                 },
                 "onboard-naked": {
                     "baseUrl": "https://naked.test",
+                    "apiKey": "!exit 1",
                     "api": "openai-completions",
                     "models": [ { "id": "m2", "name": "M2" } ]
                 }
@@ -741,7 +742,10 @@ mod tests {
         assert!(onboarding_task(&options).is_some());
 
         // Explicit flags that resolve to a provider without configured auth
-        // leave the model not ready: no trace question.
+        // leave the model not ready: no trace question. TS `validateConfig`
+        // requires an "apiKey" for custom providers, but a `!command` key
+        // that fails resolves to nothing (TS `resolveConfigValue`), so the
+        // provider stays unauthenticated.
         let mut options = run_options(dir.path());
         options.config.provider = Some("onboard-naked".into());
         options.config.model = Some("m2".into());

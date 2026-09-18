@@ -149,6 +149,7 @@ impl Sandbox {
 
 #[test]
 fn npm_install_list_remove_flow() {
+    let _guard = super::test_support::ENV_MUTEX.lock().unwrap();
     let sandbox = Sandbox::new("npm-flow");
     let mut manager = sandbox.manager();
 
@@ -179,6 +180,7 @@ fn npm_install_list_remove_flow() {
 
 #[test]
 fn npm_update_skips_matching_versions() {
+    let _guard = super::test_support::ENV_MUTEX.lock().unwrap();
     let sandbox = Sandbox::new("npm-update-match");
     let mut manager = sandbox.manager();
     manager
@@ -195,6 +197,7 @@ fn npm_update_skips_matching_versions() {
 
 #[test]
 fn npm_update_reinstalls_moved_versions() {
+    let _guard = super::test_support::ENV_MUTEX.lock().unwrap();
     let sandbox = Sandbox::new("npm-update-moved");
     let mut manager = sandbox.manager();
     manager
@@ -217,6 +220,7 @@ fn npm_update_reinstalls_moved_versions() {
 
 #[test]
 fn update_unknown_source_is_an_error_with_suggestion() {
+    let _guard = super::test_support::ENV_MUTEX.lock().unwrap();
     let sandbox = Sandbox::new("npm-update-unknown");
     let mut manager = sandbox.manager();
     manager
@@ -231,6 +235,7 @@ fn update_unknown_source_is_an_error_with_suggestion() {
 
 #[test]
 fn git_clone_update_remove_flow() {
+    let _guard = super::test_support::ENV_MUTEX.lock().unwrap();
     let sandbox = Sandbox::new("git-flow");
     let (bare, work) = make_bare_repo(&sandbox.root);
 
@@ -293,6 +298,7 @@ fn git_clone_update_remove_flow() {
 
 #[test]
 fn git_ref_checkout_installs_the_pinned_revision() {
+    let _guard = super::test_support::ENV_MUTEX.lock().unwrap();
     let sandbox = Sandbox::new("git-ref");
     let dir_root = sandbox.root.clone();
     let (bare, work) = make_bare_repo(&dir_root);

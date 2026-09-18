@@ -24,7 +24,7 @@ use crate::session_ui::SessionUi;
 use crate::view::{AgentView, FlushPlan};
 
 use crossterm::event::KeyEvent;
-use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
@@ -391,7 +391,7 @@ pub async fn run_interactive(
             // The user quit at the onboarding screen: still hand the
             // terminal back (raw mode off, alt screen left and flushed)
             // exactly like a session exit.
-            renderer.finish(&mut view);
+            renderer.finish(&mut view, false);
             return Ok(InteractiveOutcome {
                 active_session_id: session.active_session_id.clone(),
                 session_id: session.session_id.clone(),
@@ -576,13 +576,17 @@ pub async fn run_interactive(
         )
         .await;
     }
+    // Agents-back and `/resume` hand the pane to the agents view; the
+    // alternate screen stays in place for it instead of flushing to the
+    // main screen (TS `stop({ preserveAltScreen: true })`).
+    let preserve_alt_screen = session.open_agents_view;
     let outcome = InteractiveOutcome {
         active_session_id: session.active_session_id.clone(),
         session_id: session.session_id.clone(),
         resume_hint,
         last_assistant_text: session.last_assistant_text.clone(),
-        frames: renderer.finish(&mut view),
-        return_to_agents_view: session.open_agents_view,
+        frames: renderer.finish(&mut view, preserve_alt_screen),
+        return_to_agents_view: preserve_alt_screen,
         selection_request: session.pending_selection,
     };
     session.client.close();
@@ -652,7 +656,11 @@ impl Renderer {
         match ui {
             UiMode::Terminal => {
                 terminal::enable_raw_mode()?;
-                crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
+                // Adopt the alternate screen the previous surface left in
+                // place (TS `pendingAltScreenHandoff`); only the first
+                // surface of the process enters it, so a view switch never
+                // flashes the primary screen.
+                crate::altscreen::enter()?;
                 // One reader thread feeds the loop; crossterm events are
                 // process-global, so the reader registry joins the previous
                 // surface's reader before this one starts polling.
@@ -668,7 +676,16 @@ impl Renderer {
                     _ => true,
                 });
                 let backend = CrosstermBackend::new(std::io::stdout());
-                Ok(Renderer::Terminal(Terminal::new(backend)?))
+                let mut terminal = Terminal::new(backend)?;
+                // The adopted buffer still holds the previous view's frame;
+                // clear it so the first draw is a full repaint of the same
+                // buffer (a fresh alt screen is already blank).
+                terminal.clear()?;
+                // The handoff left the cursor hidden (TS `stop` with
+                // `preserveAltScreen` hides it); this surface wants its own
+                // visible cursor back.
+                crossterm::execute!(std::io::stdout(), crossterm::cursor::Show)?;
+                Ok(Renderer::Terminal(terminal))
             }
             UiMode::Headless(plan) => {
                 let steps = plan.steps;
@@ -728,7 +745,9 @@ impl Renderer {
         match self {
             Renderer::Terminal(terminal) => {
                 terminal::enable_raw_mode()?;
-                crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
+                // The suspension released the alternate screen (the client
+                // command prompted on the primary one); re-enter it.
+                crate::altscreen::enter()?;
                 // A fresh full redraw: the suspended command left arbitrary
                 // output behind.
                 terminal.clear()?;
@@ -756,7 +775,7 @@ impl Renderer {
         if !matches!(self, Renderer::Terminal(_)) {
             return Ok(());
         }
-        crossterm::execute!(std::io::stdout(), LeaveAlternateScreen)?;
+        crate::altscreen::leave()?;
         if !exit_flush_enabled() {
             return Ok(());
         }
@@ -814,16 +833,25 @@ impl Renderer {
         session.dirty = false;
     }
 
-    fn finish(mut self, view: &mut AgentView) -> Vec<String> {
+    /// Teardown. `preserve_alt_screen` mirrors TS `ui.stop({ preserveAltScreen })`:
+    /// an exit that hands the pane to the agents view (agents-back, `/resume`)
+    /// keeps the alternate screen for the adopting view, hides the cursor, and
+    /// skips the main-screen flush — raw mode also stays on, because the
+    /// in-process handoff gap would otherwise echo keypresses into the
+    /// preserved frame (TS `pendingInputHandoff`). Every other exit follows
+    /// TS `TUI.stop`: leave the alt screen, flush the inline frame onto the
+    /// main screen, show the cursor, restore cooked mode — the resume hint
+    /// the composition root prints next lands right below the flushed frame.
+    fn finish(mut self, view: &mut AgentView, preserve_alt_screen: bool) -> Vec<String> {
         match self {
             Renderer::Terminal(_) => {
-                // TS `TUI.stop`: leave the alt screen and flush the inline
-                // frame onto the main screen, then show the cursor and
-                // restore cooked mode — the resume hint the composition
-                // root prints next lands right below the flushed frame.
-                let _ = self.flush_to_main_screen(view);
-                let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
-                let _ = terminal::disable_raw_mode();
+                if preserve_alt_screen {
+                    let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide);
+                } else {
+                    let _ = self.flush_to_main_screen(view);
+                    let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
+                    let _ = terminal::disable_raw_mode();
+                }
                 Vec::new()
             }
             Renderer::Headless { frames, .. } => frames,
