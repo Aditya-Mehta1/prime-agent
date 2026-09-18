@@ -10,6 +10,8 @@
 pub mod identity;
 pub mod process;
 pub mod transport;
+#[cfg(windows)]
+pub(crate) mod windows_pipe;
 
 pub use identity::socket_identity;
 pub use process::{is_process_alive, process_start_id};

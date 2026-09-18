@@ -162,14 +162,56 @@ pub async fn connect_transport(path: &Path) -> Result<Box<dyn TransportStream>> 
     Ok(Box::new(stream))
 }
 
-#[cfg(not(unix))]
-pub async fn bind_transport(_path: &Path) -> Result<Box<dyn TransportListener>> {
-    anyhow::bail!("Windows transport (named pipes) is not yet implemented")
+#[cfg(windows)]
+impl TransportListener for super::windows_pipe::NamedPipeListener {
+    fn accept(&self) -> AcceptFuture<'_> {
+        Box::pin(async move {
+            let server = self.accept().await?;
+            Ok(Box::new(server) as Box<dyn TransportStream>)
+        })
+    }
 }
 
-#[cfg(not(unix))]
-pub async fn connect_transport(_path: &Path) -> Result<Box<dyn TransportStream>> {
-    anyhow::bail!("Windows transport (named pipes) is not yet implemented")
+#[cfg(windows)]
+impl TransportStream for tokio::net::windows::named_pipe::NamedPipeServer {
+    fn split(self: Box<Self>) -> (Box<dyn AsyncReadHalf>, Box<dyn AsyncWriteHalf>) {
+        let (reader, writer) = tokio::io::split(*self);
+        (Box::new(reader), Box::new(writer))
+    }
+}
+
+#[cfg(windows)]
+impl TransportStream for tokio::net::windows::named_pipe::NamedPipeClient {
+    fn split(self: Box<Self>) -> (Box<dyn AsyncReadHalf>, Box<dyn AsyncWriteHalf>) {
+        let (reader, writer) = tokio::io::split(*self);
+        (Box::new(reader), Box::new(writer))
+    }
+}
+
+/// The pipe name handed to `CreateNamedPipe`/`CreateFile`: the `\.\pipe\`
+/// names from `pa-daemon::platform` pass through unchanged (they must be
+/// UTF-8 for the Windows APIs).
+#[cfg(windows)]
+fn pipe_name(path: &Path) -> Result<String> {
+    path.to_str()
+        .map(str::to_string)
+        .with_context(|| format!("pipe name is not UTF-8: {}", path.display()))
+}
+
+/// Bind a listening endpoint at `path` (a named pipe on Windows).
+#[cfg(windows)]
+pub async fn bind_transport(path: &Path) -> Result<Box<dyn TransportListener>> {
+    let name = pipe_name(path)?;
+    let listener = super::windows_pipe::NamedPipeListener::bind(&name)?;
+    Ok(Box::new(listener))
+}
+
+/// Connect to the endpoint at `path` asynchronously.
+#[cfg(windows)]
+pub async fn connect_transport(path: &Path) -> Result<Box<dyn TransportStream>> {
+    let name = pipe_name(path)?;
+    let client = super::windows_pipe::connect(&name).await?;
+    Ok(Box::new(client))
 }
 
 /// A blocking full-duplex stream, for the CLI's one-shot command client.
@@ -202,11 +244,12 @@ pub fn connect_blocking(path: &Path) -> std::io::Result<Box<dyn BlockingTranspor
     Ok(Box::new(stream))
 }
 
-#[cfg(not(unix))]
-pub fn connect_blocking(_path: &Path) -> std::io::Result<Box<dyn BlockingTransportStream>> {
-    Err(std::io::Error::other(
-        "Windows transport (named pipes) is not yet implemented",
-    ))
+/// Connect to the endpoint at `path`, blocking until connected.
+#[cfg(windows)]
+pub fn connect_blocking(path: &Path) -> std::io::Result<Box<dyn BlockingTransportStream>> {
+    let name = pipe_name(path).map_err(std::io::Error::other)?;
+    let client = super::windows_pipe::BlockingPipeClient::connect(&name)?;
+    Ok(Box::new(client))
 }
 
 #[cfg(all(test, unix))]

@@ -15,7 +15,7 @@ Markers: **[D]** daemon-redesign-critical (fixed in this lane),
 
 | module | owns | Unix impl | Windows stub |
 |---|---|---|---|
-| `pa-types::platform::transport` | `TransportListener` / `TransportStream` (async, dyn-compatible) + `BlockingTransportStream`; `bind_transport` / `connect_transport` / `connect_blocking` | AF_UNIX socket files | `Err("Windows transport (named pipes) is not yet implemented")` |
+| `pa-types::platform::transport` | `TransportListener` / `TransportStream` (async, dyn-compatible) + `BlockingTransportStream`; `bind_transport` / `connect_transport` / `connect_blocking` | AF_UNIX socket files | named pipes (`platform/windows_pipe.rs`, lane `windows`): byte-mode duplex instances, busy-retry connect, blocking client with read deadline |
 | `pa-types::platform::process` | `process_start_id` (pid-reuse identity), `is_process_alive` | `/proc/<pid>/stat` + `/proc/<pid>/status` | `None` / `Err(...)` |
 | `pa-core::platform::process` | `Signal`, `kill_pid`, `kill_process_group_or_pid`, `pid_exists`, `set_new_process_group`, `termination_signal` | libc `kill(2)`, `process_group(0)`, `ExitStatusExt` | false-returning (unproven-kill semantics) + no-op group set; real impl = taskkill/Job objects |
 | `pa-core::platform::lock_dir` | `LockDir::acquire` | mkdir `{file}.lock` + `utimensat` mtime bump, rmdir on Drop (proper-lockfile protocol) | `create_dir` works; mtime probe no-op until a Windows port lands |
@@ -144,9 +144,12 @@ No platform coupling found (loop policy only; no process/socket code).
 
 ## Windows implementation checklist (follow-up lane)
 
-1. `pa-types::platform::transport`: tokio named-pipe server (`\\.\pipe\`)
-   implementing `TransportListener`/`TransportStream`; blocking client via
-   `CreateFile` on the pipe name. Callers are already trait-typed.
+1. `pa-types::platform::transport`: DONE (lane `windows`) - tokio named-pipe
+   server (`\\.\pipe\`) implementing `TransportListener`/`TransportStream`
+   plus a blocking client (`platform/windows_pipe.rs`); verified by
+   `cargo check`/`clippy -p pa-types --target x86_64-pc-windows-gnu
+   --all-targets` (green; the Windows-only round-trip tests compile there
+   and run on a real Windows runner).
 2. `pa-daemon::platform`: pipe-name endpoints exist already (this lane);
    verify the TS win32 naming exactly, drop the uid suffix there.
 3. `pa-core::platform::process`: `pid_exists`/`is_process_alive` via
