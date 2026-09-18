@@ -1138,65 +1138,51 @@ impl SessionUi {
             }
         }
         if !streaming {
-            self.streaming_index = None;
-            self.attach_assistant_error(message, &tool_calls, view);
+            let open = self.streaming_index.take();
+            self.finalize_assistant_error(message, &tool_calls, open, view);
         }
     }
 
-    /// The final frame of a failed assistant message attaches its error
-    /// row (TS renders it inside the assistant component): `aborted` always
+    /// The final frame of a failed assistant message renders its error row
+    /// (TS renders it inside the assistant component): `aborted` always
     /// shows, `error` only when the message carries no tool calls (the
-    /// pending cards carry the failure then).
-    fn attach_assistant_error(
+    /// pending cards carry the failure then). The row renders inside the
+    /// message's own component — the open streaming entry when one exists,
+    /// otherwise a fresh entry: TS creates one component per assistant
+    /// message (`message_start`), so a content-less provider failure stacks
+    /// its own error row per failed attempt instead of decorating the
+    /// previous reply (TS `AssistantMessageComponent.rebuild`).
+    fn finalize_assistant_error(
         &mut self,
         message: &Value,
         tool_calls: &[(String, String, Value)],
+        open: Option<usize>,
         view: &mut AgentView,
     ) {
-        let stop_reason = message.get("stopReason").and_then(Value::as_str);
-        let (text, aborted) = match stop_reason {
-            Some("aborted") => {
-                let error = message
-                    .get("errorMessage")
-                    .and_then(Value::as_str)
-                    .filter(|text| !text.is_empty() && *text != "Request was aborted")
-                    .unwrap_or("Operation aborted");
-                (error.to_string(), true)
-            }
-            Some("error") if tool_calls.is_empty() => {
-                let error = message
-                    .get("errorMessage")
-                    .and_then(Value::as_str)
-                    .filter(|text| !text.is_empty())
-                    .unwrap_or("Unknown error");
-                (format!("Error: {error}"), false)
-            }
-            _ => return,
+        let Some(error) = crate::snapshot::assistant_error_row(message, tool_calls) else {
+            return;
         };
         self.turn_error_shown = true;
-        // The message frame rendered before this call: attach the error to
-        // the most recent assistant entry (its own final frame).
-        if let Some(index) = self.streaming_index {
-            if let Some(ChatEntry::Assistant(open)) = view.chat.get_mut(index) {
-                open.error = Some(text);
-                open.aborted = aborted;
+        if let Some(index) = open {
+            if let Some(ChatEntry::Assistant(entry)) = view.chat.get_mut(index) {
+                entry.error = Some(error.text);
+                entry.aborted = error.aborted;
                 view.mark_entry_stale(index);
                 return;
             }
         }
-        let last_assistant = view
-            .chat
-            .iter()
-            .rev()
-            .position(|entry| matches!(entry, ChatEntry::Assistant(_)));
-        if let Some(offset) = last_assistant {
-            let index = view.chat.len() - 1 - offset;
-            if let Some(ChatEntry::Assistant(open)) = view.chat.get_mut(index) {
-                open.error = Some(text);
-                open.aborted = aborted;
-                view.mark_entry_stale(index);
-            }
-        }
+        // The message rendered no component (empty content): TS still
+        // renders the message's own error component, so the failure stacks
+        // as a separate row instead of attaching to the last assistant.
+        view.push_entry(ChatEntry::Assistant(Box::new(
+            crate::chat::AssistantMessage {
+                blocks: Vec::new(),
+                has_tool_calls: false,
+                streaming: false,
+                error: Some(error.text),
+                aborted: error.aborted,
+            },
+        )));
     }
 
     /// `tool_execution_start`: mark the matching card running (or create it

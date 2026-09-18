@@ -501,44 +501,70 @@ pub fn message_value_to_entries(message: &Value) -> Vec<ChatEntry> {
     }
 }
 
-/// Decode an assistant wire message into a message component plus tool cards.
-pub fn assistant_value_to_entries(message: &Value) -> Vec<ChatEntry> {
-    let (blocks, tool_calls) = assistant_message_parts(message);
-    if blocks.is_empty() && tool_calls.is_empty() {
-        return Vec::new();
-    }
-    let mut entries = Vec::new();
-    // TS `AssistantMessageComponent.rebuild`: an abort renders its error row
-    // inside the message; a provider error renders only without tool calls
-    // (their cards carry the failure).
+/// The failure row a failed assistant message renders (TS
+/// `AssistantMessageComponent.rebuild`): an abort always shows, a provider
+/// `error` only when the message carries no tool calls (their cards carry
+/// the failure then). `None` for settled messages.
+pub struct AssistantErrorRow {
+    /// The rendered row text (provider errors carry the `Error: ` prefix).
+    pub text: String,
+    /// `stopReason: "aborted"` (drives the tool-call trailing spacer).
+    pub aborted: bool,
+}
+
+/// Decode a failed assistant message's error row (TS `createErrorComponent`
+/// inputs); `None` for settled messages.
+pub fn assistant_error_row(
+    message: &Value,
+    tool_calls: &[(String, String, Value)],
+) -> Option<AssistantErrorRow> {
     let stop_reason = message.get("stopReason").and_then(Value::as_str);
-    let error = match stop_reason {
-        Some("aborted") => Some(
-            message
+    match stop_reason {
+        Some("aborted") => Some(AssistantErrorRow {
+            text: message
                 .get("errorMessage")
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty() && *text != "Request was aborted")
                 .unwrap_or("Operation aborted")
                 .to_string(),
-        ),
-        Some("error") if tool_calls.is_empty() => Some(format!(
-            "Error: {}",
-            message
-                .get("errorMessage")
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-                .unwrap_or("Unknown error")
-        )),
+            aborted: true,
+        }),
+        Some("error") if tool_calls.is_empty() => Some(AssistantErrorRow {
+            text: format!(
+                "Error: {}",
+                message
+                    .get("errorMessage")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or("Unknown error")
+            ),
+            aborted: false,
+        }),
         _ => None,
-    };
-    let aborted = stop_reason == Some("aborted");
+    }
+}
+
+/// Decode an assistant wire message into a message component plus tool cards.
+pub fn assistant_value_to_entries(message: &Value) -> Vec<ChatEntry> {
+    let (blocks, tool_calls) = assistant_message_parts(message);
+    // TS `AssistantMessageComponent.rebuild`: an abort renders its error row
+    // inside the message; a provider error renders only without tool calls
+    // (their cards carry the failure). The component exists for every
+    // assistant message (`message_start` creates one), so a content-less
+    // failed provider attempt still folds into its own error row (TS
+    // `buildConversationComponents` pushes the component unconditionally).
+    let error = assistant_error_row(message, &tool_calls);
+    if blocks.is_empty() && tool_calls.is_empty() && error.is_none() {
+        return Vec::new();
+    }
+    let mut entries = Vec::new();
     if !blocks.is_empty() || error.is_some() {
         entries.push(ChatEntry::Assistant(Box::new(AssistantMessage {
             blocks,
             has_tool_calls: !tool_calls.is_empty(),
             streaming: false,
-            error,
-            aborted,
+            error: error.as_ref().map(|row| row.text.clone()),
+            aborted: error.as_ref().is_some_and(|row| row.aborted),
         })));
     }
     for (id, name, args) in tool_calls {
@@ -1025,5 +1051,110 @@ mod tests {
             result.content,
             vec![json!({ "type": "text", "text": "out" })]
         );
+    }
+
+    /// A provider-failure turn replays like the TS transcript: the healthy
+    /// exchange renders once, and every failed retry attempt folds into its
+    /// own error row (TS `buildConversationComponents` pushes one component
+    /// per assistant message, even a content-less failure).
+    #[test]
+    fn transcript_replay_stacks_provider_failure_rows() {
+        let failed_attempt = |timestamp: u64| {
+            json!({
+                "role": "assistant",
+                "content": [],
+                "provider": "prime-inference", "model": "mock-1",
+                "stopReason": "error",
+                "errorMessage": "Connection error.",
+                "timestamp": timestamp,
+            })
+        };
+        let transcript = [
+            json!({ "role": "user", "content": "hello", "timestamp": 1 }),
+            json!({
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "battery hello from mock" }],
+                "provider": "prime-inference", "model": "mock-1",
+                "usage": { "input": 10, "output": 2 }, "stopReason": "stop",
+                "timestamp": 2,
+            }),
+            json!({ "role": "user", "content": "again", "timestamp": 3 }),
+            failed_attempt(4),
+            failed_attempt(5),
+            failed_attempt(6),
+        ];
+        let chat = transcript_to_entries(&transcript);
+        // One user + reply, one user, then one entry per failed attempt.
+        assert_eq!(chat.len(), 6, "chat: {chat:?}");
+        let replies: Vec<&crate::chat::AssistantMessage> = chat
+            .iter()
+            .filter_map(|entry| match entry {
+                ChatEntry::Assistant(message) => Some(message.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(replies.len(), 4);
+        assert_eq!(
+            replies[0].blocks,
+            vec![MessageBlock::Text("battery hello from mock".to_string())]
+        );
+        assert!(replies[0].error.is_none(), "the healthy reply stays clean");
+        for row in &replies[1..] {
+            assert!(row.blocks.is_empty());
+            assert_eq!(
+                row.error.as_deref(),
+                Some("Error: Connection error."),
+                "each failed attempt stacks its own error row"
+            );
+            assert!(!row.aborted);
+        }
+    }
+
+    /// An aborted assistant message folds into its abort row even when the
+    /// message streamed no content (TS renders the abort row always).
+    #[test]
+    fn transcript_replay_renders_contentless_abort() {
+        let transcript = [
+            json!({ "role": "user", "content": "hello", "timestamp": 1 }),
+            json!({
+                "role": "assistant",
+                "content": [],
+                "provider": "faux", "model": "faux-1",
+                "stopReason": "aborted",
+                "timestamp": 2,
+            }),
+        ];
+        let chat = transcript_to_entries(&transcript);
+        assert_eq!(chat.len(), 2, "chat: {chat:?}");
+        let Some(ChatEntry::Assistant(message)) = chat.get(1) else {
+            panic!("abort row: {chat:?}");
+        };
+        assert!(message.blocks.is_empty());
+        assert_eq!(message.error.as_deref(), Some("Operation aborted"));
+        assert!(message.aborted);
+    }
+
+    /// A settled content-less assistant message renders nothing (TS: the
+    /// component's rows are empty and spacing stays `hidden`).
+    #[test]
+    fn transcript_replay_skips_contentless_settled_messages() {
+        let items = message_value_to_entries(&json!({
+            "role": "assistant",
+            "content": [],
+            "stopReason": "stop",
+        }));
+        assert_eq!(items, Vec::new());
+        // A provider error beside tool calls renders no message row either:
+        // the cards carry the failure.
+        let items = message_value_to_entries(&json!({
+            "role": "assistant",
+            "content": [
+                { "type": "toolCall", "id": "t1", "name": "bash", "arguments": { "command": "ls" } },
+            ],
+            "stopReason": "error",
+            "errorMessage": "Connection error.",
+        }));
+        assert_eq!(items.len(), 1);
+        assert!(matches!(&items[0], ChatEntry::Tool(card) if card.name == "bash"));
     }
 }
