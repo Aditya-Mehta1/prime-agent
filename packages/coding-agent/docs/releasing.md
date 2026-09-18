@@ -77,6 +77,11 @@ is an output of the release, never an input.
   refers to them. Uploads refuse to overwrite, so a retry is safe.
 - **In `finalize-release`:** the tag and GitHub release may exist before the pointers move. If the
   final pointer step failed, re-run it; it only writes pointers to objects `verify` already accepted.
+  This includes the case where the GitHub release is already published and only the channel
+  pointers are behind: a re-run re-checks the published release against the recorded asset digests
+  and the tag's commit, leaves the published release untouched, and moves only the pointers. The
+  `github-release` job equally refuses to modify a published release, so a full workflow re-run
+  also finishes instead of wedging.
 - **After the pointers move:** the release is live and immutable. Ship a new patch version; do not
   rewrite a published version.
 - A version whose tag already points at a different commit is refused outright.

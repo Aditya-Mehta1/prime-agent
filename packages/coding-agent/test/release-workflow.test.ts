@@ -724,7 +724,10 @@ describe("release ordering: nothing is public before verification", () => {
 		expect(publishStep.run).toContain('if [ "$tagged" != "$BUILD_REF" ]; then');
 		const recheck = step(finalize, "Refuse an existing tag at another commit and re-check the draft");
 		expect(recheck.run).toContain("cmp -s /tmp/current-assets.json /tmp/recorded-assets.json");
-		expect(recheck.run).toContain('test "$(jq -r .isDraft /tmp/release.json)" = true');
+		// A re-run after publish must finish the pointer move; every tampered state is
+		// still refused by the tag pre-check and the asset comparison.
+		expect(recheck.run).toContain('if [ "$(jq -r .isDraft /tmp/release.json)" != true ]; then');
+		expect(recheck.run).toContain("finishing the channel pointers");
 		expect(recheck.run).toContain('test "$(jq -r .targetCommitish /tmp/release.json)" = "$BUILD_REF"');
 	});
 
@@ -738,6 +741,24 @@ describe("release ordering: nothing is public before verification", () => {
 		expect(create.run).not.toContain("--draft=false");
 		expect(create.run).not.toMatch(/git\/refs/); // the draft never creates a ref
 		expect(create.run).toContain('test "$(jq -r .isDraft /tmp/release.json)" = true');
+	});
+
+	it("github-release leaves an already published release untouched so a re-run can finish", () => {
+		const create = step(githubRelease, "Create or refresh the draft release").run!;
+		const shim = `
+gh() {
+  case "$*" in
+    "release view v1.2.3 --json isDraft --jq .isDraft") printf 'false\\n' ;;
+    *) echo "unexpected gh call: $*" >&2; return 99 ;;
+  esac
+}
+`;
+		const result = runStepScript(create, shim, { PRODUCTION_VERSION: "1.2.3" });
+		expect(result.status, result.stderr).toBe(0);
+		expect(result.stdout).toContain("already published");
+		expect(result.stdout).toContain("leaving it untouched");
+		// The published path must not re-draft, re-upload, or edit anything.
+		expect(result.stdout).not.toContain("--clobber");
 	});
 
 	// test-policy: allow conditional-or-disabled-test -- git and tar fixtures only run on posix hosts
@@ -777,7 +798,7 @@ describe("release ordering: nothing is public before verification", () => {
 			expect(result.stderr).toContain("not a full commit SHA");
 		});
 
-		it("finalize-release refuses a draft whose assets, target or draft state changed since github-release", () => {
+		it("finalize-release re-checks the recorded assets and lets a published re-run finish", () => {
 			const recheck = step(finalize, "Refuse an existing tag at another commit and re-check the draft").run!;
 			const recorded = [
 				{ name: "SHA256SUMS", size: 1, digest: "sha256:aa" },
@@ -809,8 +830,15 @@ printf '%s' '${JSON.stringify(recorded)}' > manifest/github-assets.json
 			expect(good.stdout).toContain("2 assets unchanged");
 			expect(runStepScript(recheck, shims({ tag: BUILD_REF }), env).status).toBe(0);
 			expect(runStepScript(recheck, shims({ tag: OTHER_REF }), env).status).toBe(1);
-			expect(runStepScript(recheck, shims({ isDraft: false }), env).status).toBe(1);
 			expect(runStepScript(recheck, shims({ target: OTHER_REF }), env).status).toBe(1);
+			// A re-run after this job's own publish finds the release published: it must
+			// let the re-run finish the channel pointers (the tag pre-check and the asset
+			// comparison above still refuse every tampered state).
+			const rerun = runStepScript(recheck, shims({ isDraft: false }), env);
+			expect(rerun.status, rerun.stderr).toBe(0);
+			expect(rerun.stdout).toContain("finishing the channel pointers");
+			const rerunTagged = runStepScript(recheck, shims({ isDraft: false, tag: BUILD_REF }), env);
+			expect(rerunTagged.status, rerunTagged.stderr).toBe(0);
 			const swapped = runStepScript(
 				recheck,
 				shims({ assets: [recorded[0]!, { name: "install.sh", digest: "sha256:ee" }] }),

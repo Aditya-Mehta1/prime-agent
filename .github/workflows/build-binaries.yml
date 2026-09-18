@@ -706,8 +706,13 @@ jobs:
           set -euo pipefail
           TAG="v${PRODUCTION_VERSION}"
           if gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null | grep -qx false; then
-            echo "Release $TAG is already published; refusing to touch it." >&2
-            exit 1
+            # A re-run after finalize-release published this release must finish, not
+            # refuse: the channel pointers may still name the previous version. Never
+            # modify the published release; the digest-recording step below still
+            # proves its assets are exactly the bytes this run built, and the
+            # finalize-release re-check only allows the pointer move.
+            echo "Release $TAG is already published; leaving it untouched so the re-run can finish."
+            exit 0
           fi
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release edit "$TAG" --draft --target "$BUILD_REF" --notes-file notes/RELEASE_NOTES.md --title "$TAG"
@@ -1068,13 +1073,19 @@ jobs:
             echo "Tag ${TAG} already points at ${tagged}, not ${BUILD_REF}; refusing to publish." >&2
             exit 1
           fi
-          # The release must still be the draft github-release created, aimed at
-          # BUILD_REF, and its assets must still be exactly the bytes whose
-          # digests github-release recorded (a draft is editable by anyone with
-          # write access until this step publishes it).
+          # The release must still be aimed at BUILD_REF and its assets must still be
+          # exactly the bytes whose digests github-release recorded. A re-run after
+          # this job already published the release finds isDraft=false: that is the
+          # recovery case the re-check must let finish, because the channel pointers
+          # may still name the previous version. The tag pre-check above already
+          # proved the published tag points at BUILD_REF (or is absent, in which
+          # case the publish step below recreates it), and the asset comparison
+          # below still refuses any change, so only the pointer move remains.
           gh release view "$TAG" --json isDraft,targetCommitish > /tmp/release.json
-          test "$(jq -r .isDraft /tmp/release.json)" = true
           test "$(jq -r .targetCommitish /tmp/release.json)" = "$BUILD_REF"
+          if [ "$(jq -r .isDraft /tmp/release.json)" != true ]; then
+            echo "Release ${TAG} is already published (tag ${tagged:-absent}); finishing the channel pointers."
+          fi
           release_id=$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
             --jq ".[] | select(.tag_name == \"${TAG}\") | .id" | head -n 1)
           test -n "$release_id"
@@ -1086,7 +1097,7 @@ jobs:
             diff /tmp/recorded-assets.json /tmp/current-assets.json >&2 || true
             exit 1
           fi
-          echo "Draft ${TAG} targets ${BUILD_REF}; tag ${tagged:-absent}; $(jq length /tmp/current-assets.json) assets unchanged."
+          echo "Release ${TAG} targets ${BUILD_REF}; tag ${tagged:-absent}; $(jq length /tmp/current-assets.json) assets unchanged."
 
       - name: Publish the release and prove the tag points at BUILD_REF
         run: |
