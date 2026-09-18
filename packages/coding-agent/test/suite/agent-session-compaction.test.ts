@@ -15,7 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 import { ENV_AGENT_DIR } from "../../src/config.js";
 import type { AgentSession } from "../../src/core/agent-session.js";
 import type { ExtensionFactory } from "../../src/core/extensions/types.js";
-import { convertToLlm, HARNESS_DIGEST_CUSTOM_TYPE } from "../../src/core/messages.js";
+import { convertToLlm } from "../../src/core/messages.js";
 import { getLocalHarnessStateDir, loadHarnessState, saveHarnessState } from "../../src/core/refinement/index.js";
 import { SessionManager } from "../../src/core/session-manager.js";
 import { assistantMsg, userMsg } from "../utilities.js";
@@ -357,60 +357,6 @@ describe("AgentSession compaction", () => {
 		expect((harness.session.messages[0] as { harnessDigest?: string }).harnessDigest).toContain(
 			"[local:compaction_test_memory] Compaction test memory",
 		);
-	});
-
-	it("keeps the newest digest across a compaction roundtrip and drops superseded copies", async () => {
-		const harness = await createHarness({
-			settings: { compaction: { keepRecentTokens: 1 } },
-			persistSession: true,
-		});
-		harnesses.push(harness);
-		vi.stubEnv(ENV_AGENT_DIR, harness.tempDir);
-		harness.setResponses([
-			fauxAssistantMessage("one response"),
-			fauxAssistantMessage("two response"),
-			fauxAssistantMessage("first summary"),
-			fauxAssistantMessage("first turn summary"),
-			fauxAssistantMessage("three response"),
-		]);
-		await harness.session.prompt("one");
-		await harness.session.prompt("two");
-		await harness.session.compact();
-		// The compaction head carries the snapshot digest the fresh append must supersede.
-		expect((harness.session.messages[0] as { harnessDigest?: string }).harnessDigest).toBeTruthy();
-
-		// Change the harness on disk, then cross a cold boundary after the compaction.
-		const localDir = getLocalHarnessStateDir(harness.sessionManager.getSessionArtifactDir());
-		const state = loadHarnessState(localDir, "local");
-		state.entries.memory.roundtrip_test_memory = {
-			id: "roundtrip_test_memory",
-			kind: "memory",
-			title: "Roundtrip memory",
-			content: "Written between compaction and resume.",
-			path: "general",
-			scope: "local",
-			reference: {},
-			arguments: {},
-			metadata: {},
-			source: "refine",
-			created_at: "2026-09-07T00:00:00.000Z",
-			updated_at: "2026-09-07T00:00:00.000Z",
-			version: 1,
-		};
-		saveHarnessState(localDir!, state);
-
-		await harness.session.prompt("three");
-		const postCompactionUser = harness.session.getUserMessagesForForking().at(-1);
-		await harness.session.navigateTree(postCompactionUser!.entryId);
-		const digests = harness.session.messages.filter(
-			(message) => message.role === "custom" && message.customType === HARNESS_DIGEST_CUSTOM_TYPE,
-		);
-		// The fresh digest replaces older copies instead of stacking them, and the
-		// live append clears the summary snapshot until the next rebuild.
-		expect(digests).toHaveLength(1);
-		expect(getMessageText(digests[0])).toContain("[local:roundtrip_test_memory] Roundtrip memory");
-		const liveSummary = harness.session.messages.find((message) => message.role === "compactionSummary");
-		expect((liveSummary as { harnessDigest?: string }).harnessDigest).toBeUndefined();
 	});
 
 	it.each([

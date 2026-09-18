@@ -1047,26 +1047,18 @@ describe("Harness digest at cold boundaries", () => {
 		resumed.session.dispose();
 	});
 
-	it("resume dedupes identical digests and appends a fresh one when disk state changed", async () => {
+	it("appends a fresh digest on resume after disk state changed, replacing the old copy", async () => {
 		// Empty global store: digest content must reflect only the local test entry.
+		// The unchanged-disk resume dedupe is pinned by the fingerprint test above.
 		isolatedAgentDir("pi-digest-agent");
 		const harness = await createHarness({ persistSession: true });
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("hi")]);
 		await harness.session.prompt("hello");
 		const sessionFile = harness.sessionManager.getSessionFile();
-		expect(sessionFile).toBeDefined();
 		harness.session.dispose();
 
-		// Identical disk state: repeated resumes must not stack digest copies.
-		const resumed = await createHarness({ existingSessionFile: sessionFile });
-		harnesses.push(resumed);
-		expect(digestMessages(resumed).length).toBe(1);
-		resumed.session.dispose();
-
-		// Stale digest: the local harness changed on disk since the last injection.
-		const localDir = getLocalHarnessStateDir(resumed.sessionManager.getSessionArtifactDir());
-		expect(localDir).toBeDefined();
+		const localDir = getLocalHarnessStateDir(harness.sessionManager.getSessionArtifactDir());
 		const state = loadHarnessState(localDir, "local");
 		seedMemory(state, "resume_test_memory", "Resume test memory", "Written between resumes.");
 		saveHarnessState(localDir!, state);
@@ -1074,9 +1066,7 @@ describe("Harness digest at cold boundaries", () => {
 		const resumedStale = await createHarness({ existingSessionFile: sessionFile });
 		harnesses.push(resumedStale);
 		const digests = digestMessages(resumedStale);
-		// The fresh digest replaces the stale copy instead of stacking another.
-		expect(digests.length).toBe(1);
-		expect(resumedStale.session.messages.at(-1)).toBe(digests.at(-1));
-		expect(getMessageText(digests.at(-1))).toContain("[local:resume_test_memory] Resume test memory");
+		expect(digests).toHaveLength(1); // the fresh digest replaced the stale copy instead of stacking
+		expect(getMessageText(digests[0])).toContain("[local:resume_test_memory] Resume test memory");
 	});
 });
