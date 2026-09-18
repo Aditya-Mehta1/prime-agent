@@ -566,7 +566,10 @@ mod tests {
             .iter()
             .map(|line| line.iter().map(|s| s.content.as_str()).collect())
             .collect();
-        assert_eq!(flat[0], "", "leading spacer");
+        assert!(
+            flat[0].starts_with(crate::osc133::ZONE_START),
+            "leading spacer carries the OSC-133 start marker: {flat:?}"
+        );
         assert!(
             flat.iter().any(|row| row.contains("Error: request failed")),
             "got: {flat:?}"
