@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
@@ -19,6 +20,17 @@ const REFINEMENT_HISTORY_FILE_NAME = "refinements.jsonl";
 const DEFAULT_OVERVIEW_ENTRY_LIMIT = 6;
 const DEFAULT_OVERVIEW_REFINEMENT_LIMIT = 5;
 const DEFAULT_OVERVIEW_CONTENT_LIMIT = 180;
+
+/**
+ * Bump when the fingerprinted material or its canonical serialization changes,
+ * so fingerprints minted under different versions never compare equal.
+ * Normalizing a render-ignored flag out of the material does not need a
+ * bump: fingerprint equality still implies identical renders (with IPython
+ * examples off the normalization is a no-op; with them on, equality means
+ * the shell flag was already false, i.e. identical renders), so equality
+ * across the change is render-safe.
+ */
+const HARNESS_DIGEST_FINGERPRINT_VERSION = 1;
 
 export type RefinementKind = "prompt" | "memory" | "skill" | "subagent";
 export type RefinementAction = "create" | "update" | "delete";
@@ -468,8 +480,9 @@ export function formatRefinementNoticeBody(result: RefinementResult): string {
 /**
  * Query terms for relevance-ranked harness digests: term -> weight.
  * Built by the caller from task signal (goal objective, recent
- * messages). The ranking is a pure weighted-term overlap over the
- * entry's searchable fields.
+ * messages). The ranking is weighted term overlap over the entry's
+ * searchable fields, discounted per term by document frequency in the
+ * ranked corpus, so rare distinctive terms outweigh ubiquitous ones.
  */
 export type HarnessQueryTerms = Map<string, number>;
 
@@ -518,8 +531,45 @@ export function harnessQueryTerms(text: string): string[] {
 	return [...new Set(terms)];
 }
 
-/** Score one harness entry against query terms: weighted term overlap. */
-export function scoreHarnessEntryForQuery(entry: HarnessEntry, terms: HarnessQueryTerms): number {
+/**
+ * Inverse document frequency per query term over the entries being
+ * ranked: `log(1 + documents / matches)`. A term present in every entry
+ * still weighs `log(2)`, while a term in one entry of N weighs
+ * `log(1 + N)`, so rare distinctive terms outrank ubiquitous ones.
+ * Terms matching no entry are absent (they cannot score anything).
+ */
+export function harnessQueryTermIdf(entries: HarnessEntry[], terms: HarnessQueryTerms): Map<string, number> {
+	const idf = new Map<string, number>();
+	if (terms.size === 0) return idf;
+	let documents = 0;
+	const matches = new Map<string, number>();
+	for (const entry of entries) {
+		documents += 1;
+		const title = searchableField(entry.title);
+		const content = searchableField(entry.content);
+		const identifier = `${searchableField(entry.path)} ${searchableField(entry.id)}`;
+		for (const term of terms.keys()) {
+			if (title.includes(term) || content.includes(term) || identifier.includes(term)) {
+				matches.set(term, (matches.get(term) ?? 0) + 1);
+			}
+		}
+	}
+	for (const [term, documentFrequency] of matches) {
+		idf.set(term, Math.log(1 + documents / documentFrequency));
+	}
+	return idf;
+}
+
+/**
+ * Score one harness entry against query terms: weighted term overlap,
+ * with each matched term's weight discounted by its document frequency
+ * in the ranked corpus (`idf`; a missing map weights every term at 1).
+ */
+export function scoreHarnessEntryForQuery(
+	entry: HarnessEntry,
+	terms: HarnessQueryTerms,
+	idf?: Map<string, number>,
+): number {
 	if (terms.size === 0) return 0;
 	const title = searchableField(entry.title);
 	const content = searchableField(entry.content);
@@ -534,17 +584,24 @@ export function scoreHarnessEntryForQuery(entry: HarnessEntry, terms: HarnessQue
 		if (title.includes(term)) fields += 1;
 		if (content.includes(term)) fields += 1;
 		if (identifier.includes(term)) fields += 1;
-		if (fields > 0) score += weight * (1 + (fields - 1) * 0.5);
+		if (fields > 0) {
+			score += weight * (idf?.get(term) ?? 1) * (1 + (fields - 1) * 0.5);
+		}
 	}
 	return score;
 }
 
-function compareRankedHarnessEntries(a: HarnessEntry, b: HarnessEntry, terms: HarnessQueryTerms): number {
-	const scoreDifference = scoreHarnessEntryForQuery(b, terms) - scoreHarnessEntryForQuery(a, terms);
+function compareRankedHarnessEntries(
+	a: HarnessEntry,
+	b: HarnessEntry,
+	terms: HarnessQueryTerms,
+	idf?: Map<string, number>,
+): number {
+	const scoreDifference = scoreHarnessEntryForQuery(b, terms, idf) - scoreHarnessEntryForQuery(a, terms, idf);
 	if (scoreDifference !== 0) return scoreDifference;
-	// Recency breaks ties; alphabetical order keeps selection deterministic.
-	const recencyDifference = (Date.parse(b.updated_at) || 0) - (Date.parse(a.updated_at) || 0);
-	if (recencyDifference !== 0) return recencyDifference;
+	// Equal scores tie on stable identifier order (path, title, id), so
+	// touching unrelated entries never reshuffles equal-score siblings and the
+	// rendered digest keeps a stable prefix for provider prompt-cache reuse.
 	return [a.path, a.title, a.id].join("\0").localeCompare([b.path, b.title, b.id].join("\0"));
 }
 
@@ -590,9 +647,14 @@ export function formatHarnessStateForPrompt(
 	const queryTerms = options.queryTerms;
 	let totalEntries = 0;
 	for (const kind of Object.keys(state.entries) as RefinementKind[]) {
-		const entries = Object.values(state.entries[kind]).sort((a, b) =>
+		// The ranked corpus is the kind's own entries: they compete for the
+		// same top-k slots, so document frequency discounts terms ubiquitous
+		// within the kind rather than across unrelated kinds.
+		const ranked = Object.values(state.entries[kind]);
+		const idf = queryTerms !== undefined && queryTerms.size > 0 ? harnessQueryTermIdf(ranked, queryTerms) : undefined;
+		const entries = ranked.sort((a, b) =>
 			queryTerms !== undefined && queryTerms.size > 0
-				? compareRankedHarnessEntries(a, b, queryTerms)
+				? compareRankedHarnessEntries(a, b, queryTerms, idf)
 				: [a.path, a.title, a.id].join("\0").localeCompare([b.path, b.title, b.id].join("\0")),
 		);
 		totalEntries += entries.length;
@@ -648,6 +710,70 @@ export function formatHarnessStateForPrompt(
 	}
 
 	return lines.join("\n").trim();
+}
+
+/**
+ * Stable fingerprint of the harness material a digest renders. Equal states
+ * (per the fields the digest actually prints) produce equal fingerprints, so
+ * cold boundaries can skip digest re-delivery with a state comparison instead
+ * of a rendered-text comparison that query-term relevance keeps invalidating.
+ *
+ * Covered: entry identity and content (entry order is normalized away, as is
+ * the call contract on non-skill entries, which the formatter never prints),
+ * plus the render flags and each refinement's printed fields in stored order,
+ * since the formatter renders a positional newest tail. The shell-examples
+ * flag participates only when IPython examples are not rendered: the formatter
+ * never reads it then, so it is normalized out of the fingerprint to keep an
+ * unchanged digest fresh. Excluded: `metadata`, `source`, and the invisible
+ * `created_at`/`updated_at` bookkeeping, and relevance query terms (the
+ * digest stays frozen per delivery; see `compareRankedHarnessEntries`).
+ */
+export function harnessDigestFingerprint(
+	state: HarnessState,
+	renderFlags: {
+		includeIpythonExamples: boolean;
+		includeShellExamples: boolean;
+		includeRefineExamples: boolean;
+	},
+): string {
+	const entries = (Object.keys(state.entries) as RefinementKind[])
+		.flatMap((kind) => Object.values(state.entries[kind]))
+		.map((entry) => ({
+			scope: entry.scope ?? "global",
+			kind: entry.kind,
+			id: entry.id,
+			title: entry.title,
+			path: entry.path,
+			version: entry.version,
+			content: entry.content,
+			// Only skills render the kernel call contract, so another kind can
+			// change these fields without changing a single digest byte.
+			reference: entry.kind === "skill" ? entry.reference : undefined,
+			arguments: entry.kind === "skill" ? entry.arguments : undefined,
+		}))
+		.sort((a, b) => [a.scope, a.kind, a.id].join("\0").localeCompare([b.scope, b.kind, b.id].join("\0")));
+	// Refinements keep their stored order: the formatter renders the newest
+	// tail of the array, so an order-only change renders differently and must
+	// not reuse the previous digest.
+	const refinements = state.refinements.map((event) => ({
+		id: event.id,
+		trigger: event.trigger,
+		changes: event.changes,
+		outcome: event.outcome,
+	}));
+	// The formatter renders the shell call-contract only when IPython examples
+	// are absent, so the shell flag cannot change the digest while IPython
+	// examples take precedence; fingerprint only the flags the render reads.
+	const effectiveRenderFlags = renderFlags.includeIpythonExamples
+		? { ...renderFlags, includeShellExamples: false }
+		: renderFlags;
+	const material = JSON.stringify({
+		version: HARNESS_DIGEST_FINGERPRINT_VERSION,
+		renderFlags: effectiveRenderFlags,
+		entries,
+		refinements,
+	});
+	return createHash("sha256").update(material).digest("hex");
 }
 
 function overviewForPrompt(state: HarnessState): string {

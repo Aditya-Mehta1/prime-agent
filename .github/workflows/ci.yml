@@ -40,6 +40,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Setup Node.js
@@ -156,6 +157,13 @@ jobs:
           uv run --locked ruff check .
           uv run --locked ruff format --check .
           uv run --locked python -m unittest discover -s tests -v
+
+      - name: Test behavioral evaluation harness
+        if: matrix.name == 'runtime python'
+        run: |
+          uv run --locked --project scripts/benchmarks ruff check --config scripts/benchmarks/pyproject.toml scripts/evals/short_swe
+          uv run --locked --project scripts/benchmarks ruff format --config scripts/benchmarks/pyproject.toml --check scripts/evals/short_swe
+          uv run --locked --project scripts/benchmarks pytest -q scripts/evals/short_swe/tests
 
   standalone:
     needs: trust

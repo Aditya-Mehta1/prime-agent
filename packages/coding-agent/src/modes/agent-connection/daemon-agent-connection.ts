@@ -16,6 +16,7 @@ import type {
 	AgentHeartbeatUpdateAction,
 } from "../../core/cron-jobs.js";
 import type { AcpMcpServerConfig } from "../../core/mcp/acp-mcp-types.js";
+import type { CustomMessage } from "../../core/messages.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { SessionAlreadyActiveError } from "../../core/session-lease.js";
@@ -1280,6 +1281,22 @@ export class DaemonAgentConnection implements AgentConnection {
 		await this.requestOk({ type: "abort", activeSessionId: this.activeSessionId });
 	}
 
+	async abortAndSendQueued(): Promise<void> {
+		if (!this.client.supportsServerCapability("abort_and_send_queued")) {
+			await this.abort();
+			return;
+		}
+		try {
+			await this.requestOk({ type: "abort_and_send_queued", activeSessionId: this.activeSessionId });
+		} catch (error) {
+			if (isUnknownDaemonCommandError(error, "abort_and_send_queued")) {
+				await this.abort();
+				return;
+			}
+			throw error;
+		}
+	}
+
 	async cancelRlmChild(childId: string): Promise<boolean> {
 		try {
 			const result = await this.requestData<{ cancelled: boolean }>({
@@ -1317,6 +1334,16 @@ export class DaemonAgentConnection implements AgentConnection {
 			},
 			DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS,
 		);
+	}
+
+	async appendCustomMessage(
+		message: Pick<CustomMessage, "customType" | "content" | "display" | "details">,
+	): Promise<void> {
+		await this.requestOk({
+			type: "append_custom_message",
+			activeSessionId: this.activeSessionId,
+			message,
+		});
 	}
 
 	async executeBash(command: string, options?: AgentConnectionExecuteBashOptions): Promise<void> {
