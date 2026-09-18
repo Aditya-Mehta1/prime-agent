@@ -81,7 +81,7 @@ pub enum ChatEntry {
 
 // The card types live in `tool_card`; re-exported here because the
 // transcript vocabulary (`ChatEntry`) is this module's.
-pub use crate::tool_card::{ToolCallCard, ToolResultView};
+pub use crate::tool_card::{render_tool_card, ToolCallCard, ToolResultView};
 
 /// An assistant message's visible content (tool calls move to cards).
 #[derive(Debug, Clone, PartialEq)]
