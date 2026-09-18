@@ -227,11 +227,9 @@ fn expand_home_path(path: &str) -> String {
     }
 }
 
-/// The home directory (the `HOME` environment variable).
+/// The home directory (`HOME`, else the Windows profile chain).
 fn home_dir() -> std::path::PathBuf {
-    std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default()
+    pa_types::platform::home_dir().unwrap_or_default()
 }
 
 /// The `@`-attachment token at the cursor, when one is being typed (TS

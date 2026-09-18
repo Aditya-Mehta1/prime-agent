@@ -1,0 +1,8 @@
+{"cwd":"/home/ubuntu/lane-worktrees/win-dirs/scripts/battery/runs/20260918T144744Z/rust/work","id":"01a0b4fe-51cc-715f-981c-deea1c09e095","rlmDepth":0,"timestamp":"2026-09-18T14:49:21.100Z","type":"session","version":3}
+{"type":"model_change","id":"2cf1ba39","parentId":null,"timestamp":"2026-09-18T14:49:21.112Z","modelId":"mock-1","provider":"prime-inference"}
+{"type":"thinking_level_change","id":"fe537044","parentId":"2cf1ba39","timestamp":"2026-09-18T14:49:21.112Z","thinkingLevel":"off"}
+{"type":"service_tier_change","id":"a41dbca4","parentId":"fe537044","timestamp":"2026-09-18T14:49:21.112Z","serviceTier":"default"}
+{"type":"session_state","id":"b861f448","parentId":"a41dbca4","timestamp":"2026-09-18T14:49:21.112Z","state":{"status":"active"}}
+{"type":"session_info","id":"826ee268","parentId":"b861f448","timestamp":"2026-09-18T14:49:21.119Z","name":"battery-attach"}
+{"type":"message","id":"1300e274","parentId":"826ee268","timestamp":"2026-09-18T14:49:21.154Z","message":{"content":[{"text":"say something","type":"text"}],"role":"user","timestamp":1789742961154}}
+{"type":"message","id":"24297317","parentId":"1300e274","timestamp":"2026-09-18T14:49:21.222Z","message":{"api":"openai-completions","content":[{"text":"attach stream reply","type":"text"}],"model":"mock-1","provider":"prime-inference","responseId":"chatcmpl-battery","role":"assistant","stopReason":"stop","timestamp":1789742961205,"usage":{"cacheRead":80,"cacheWrite":0,"cost":{"cacheRead":0,"cacheWrite":0,"input":0,"output":0,"total":0},"input":20,"output":10,"totalTokens":110}}}

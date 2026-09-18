@@ -117,9 +117,7 @@ fn has_vertex_adc_credentials() -> bool {
 }
 
 fn default_adc_path() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"));
+    let home = pa_types::platform::home_dir().unwrap_or_else(|| PathBuf::from("/"));
     home.join(".config")
         .join("gcloud")
         .join("application_default_credentials.json")
@@ -133,7 +131,7 @@ pub fn get_prime_team_id() -> Option<String> {
             return Some(trimmed);
         }
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let home = pa_types::platform::home_dir()?;
     let config_path = home.join(".prime").join("config.json");
     let text = std::fs::read_to_string(config_path).ok()?;
     let parsed: serde_json::Value = serde_json::from_str(&text).ok()?;

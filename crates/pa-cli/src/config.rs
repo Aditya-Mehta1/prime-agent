@@ -61,16 +61,21 @@ pub const ENV_OFFLINE: &str = "PI_OFFLINE";
 /// `PRIME_AGENT_STARTUP_BENCHMARK`: truthy values enable startup benchmarking.
 pub const ENV_STARTUP_BENCHMARK: &str = "PI_STARTUP_BENCHMARK";
 
-/// Expand a leading `~` or `~/` path segment against the home directory.
+/// Expand a leading `~`, `~/`, or (Windows) `~\` segment against the home
+/// directory (TS `expandTildePath`, including the win32 backslash arm).
 pub fn expand_tilde_path(path: &str) -> PathBuf {
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(home) = pa_types::platform::home_dir() else {
         return PathBuf::from(path);
     };
     if path == "~" {
-        return PathBuf::from(home);
+        return home;
     }
     if let Some(rest) = path.strip_prefix("~/") {
-        return Path::new(&home).join(rest);
+        return home.join(rest);
+    }
+    #[cfg(windows)]
+    if let Some(rest) = path.strip_prefix("~\\") {
+        return home.join(rest);
     }
     PathBuf::from(path)
 }
@@ -79,8 +84,7 @@ pub fn expand_tilde_path(path: &str) -> PathBuf {
 pub fn get_agent_dir() -> PathBuf {
     match std::env::var(ENV_AGENT_DIR) {
         Ok(dir) if !dir.is_empty() => expand_tilde_path(&dir),
-        _ => std::env::var_os("HOME")
-            .map(PathBuf::from)
+        _ => pa_types::platform::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(CONFIG_DIR_NAME),
     }

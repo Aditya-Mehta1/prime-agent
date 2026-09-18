@@ -159,7 +159,9 @@ fn webp_dimensions(b: &[u8]) -> Option<ImageDimensions> {
 
 /// Shorten an absolute path under the user's home directory to `~/...`.
 pub fn shorten_path(path: &str) -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = pa_types::platform::home_dir()
+        .map(|home| home.to_string_lossy().into_owned())
+        .unwrap_or_default();
     if !home.is_empty() && path.starts_with(&home) {
         return format!("~{}", &path[home.len()..]);
     }
@@ -276,6 +278,9 @@ mod tests {
         assert_eq!(strip_ansi("plain"), "plain");
     }
 
+    // HOME-asserting: with no HOME (the Windows default), the shortening
+    // no-ops, so the test only runs where HOME is the real source.
+    #[cfg(unix)]
     #[test]
     fn shorten_path_replaces_home() {
         let home = std::env::var("HOME").unwrap_or_default();

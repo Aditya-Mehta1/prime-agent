@@ -62,9 +62,11 @@ fn normalize_at_prefix(file_path: &str) -> &str {
     file_path.strip_prefix('@').unwrap_or(file_path)
 }
 
-/// Expand a leading `~` to the user's home directory (POSIX rules).
+/// Expand a leading `~` (and, on Windows, `~\\`) to the user's home
+/// directory (TS `expandPath`).
 pub fn expand_path(file_path: &str) -> String {
-    expand_path_platform(file_path, std::env::var("HOME").ok().as_deref())
+    let home = pa_types::platform::home_dir().map(|home| home.to_string_lossy().into_owned());
+    expand_path_platform(file_path, home.as_deref())
 }
 
 fn expand_path_platform(file_path: &str, home: Option<&str>) -> String {
@@ -74,9 +76,26 @@ fn expand_path_platform(file_path: &str, home: Option<&str>) -> String {
         return home.to_string();
     }
     if let Some(rest) = normalized.strip_prefix("~/") {
-        return posix_join(home, rest);
+        return path_join(home, rest);
+    }
+    #[cfg(windows)]
+    if let Some(rest) = normalized.strip_prefix("~\\") {
+        return path_join(home, rest);
     }
     normalized
+}
+
+/// Node `path.join(a, b)` for the expansion: `path.posix.join` on POSIX,
+/// `path.win32.join` on Windows (TS `expandPath` picks per platform).
+fn path_join(a: &str, b: &str) -> String {
+    #[cfg(windows)]
+    {
+        win32_join(a, b)
+    }
+    #[cfg(not(windows))]
+    {
+        posix_join(a, b)
+    }
 }
 
 /// Node `path.posix.join(a, b)`: single-slash separation plus lexical normalization.
@@ -97,6 +116,32 @@ fn posix_join(a: &str, b: &str) -> String {
     let mut joined = segments.join("/");
     if a.starts_with('/') {
         joined.insert(0, '/');
+    }
+    if joined.is_empty() {
+        joined.push('.');
+    }
+    joined
+}
+
+/// Node `path.win32.join(a, b)`: backslash separation plus lexical
+/// normalization with both `/` and `\\` as segment boundaries.
+#[cfg(windows)]
+fn win32_join(a: &str, b: &str) -> String {
+    let mut segments: Vec<String> = Vec::new();
+    for part in [a, b] {
+        for seg in part.split(['/', '\\']) {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    segments.pop();
+                }
+                other => segments.push(other.to_string()),
+            }
+        }
+    }
+    let mut joined = segments.join("\\");
+    if a.starts_with('\\') {
+        joined.insert(0, '\\');
     }
     if joined.is_empty() {
         joined.push('.');

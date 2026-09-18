@@ -86,8 +86,8 @@ pub fn resolve_credentials(profile: Option<&str>) -> Option<AwsCredentials> {
         .map(|profile| profile.to_string())
         .or_else(|| env("AWS_PROFILE"))
         .unwrap_or_else(|| "default".to_string());
-    let home = std::env::var("HOME").ok()?;
-    let path = std::path::Path::new(&home).join(".aws/credentials");
+    let home = pa_types::platform::home_dir()?;
+    let path = home.join(".aws/credentials");
     let text = std::fs::read_to_string(path).ok()?;
     parse_ini_credentials(&text, &profile)
 }
@@ -311,8 +311,8 @@ fn env_region_or_profile() -> Option<String> {
     let profile = std::env::var("AWS_PROFILE")
         .ok()
         .filter(|v| !v.is_empty())?;
-    let home = std::env::var("HOME").ok()?;
-    let text = std::fs::read_to_string(std::path::Path::new(&home).join(".aws/config")).ok()?;
+    let home = pa_types::platform::home_dir()?;
+    let text = std::fs::read_to_string(home.join(".aws/config")).ok()?;
     let mut in_section = false;
     for line in text.lines() {
         let trimmed = line.trim();

@@ -1,4 +1,5 @@
-//! Cross-crate platform contracts: transport and process identity.
+//! Cross-crate platform contracts: transport, process identity, and home-dir
+//! resolution.
 //!
 //! pa-types is the only crate every platform consumer can depend on
 //! (pa-tui depends on pa-types alone; pa-daemon, pa-cli, pa-core all sit
@@ -7,12 +8,14 @@
 //! native process queries on Windows later. Adding a platform means adding an
 //! implementation - call sites never branch on `cfg` themselves.
 
+pub mod dirs;
 pub mod identity;
 pub mod process;
 pub mod transport;
 #[cfg(windows)]
 pub(crate) mod windows_pipe;
 
+pub use dirs::home_dir;
 pub use identity::socket_identity;
 pub use process::{is_process_alive, process_start_id};
 pub use transport::{

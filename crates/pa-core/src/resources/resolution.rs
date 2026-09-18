@@ -162,9 +162,7 @@ fn resolve_resource_path(input: &str, cwd: &Path) -> PathBuf {
 }
 
 fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+    pa_types::platform::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// The full resolve step of resource loading: package-manager resolution

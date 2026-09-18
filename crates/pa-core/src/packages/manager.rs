@@ -605,7 +605,7 @@ pub(super) fn split_entry(entry: &serde_json::Value) -> (String, bool) {
 
 /// Expand `~`/`~/` against the home directory (a tilde path is absolute).
 fn expand_tilde(input: &str) -> Option<PathBuf> {
-    let home = PathBuf::from(std::env::var_os("HOME")?);
+    let home = pa_types::platform::home_dir()?;
     if input == "~" {
         return Some(home);
     }

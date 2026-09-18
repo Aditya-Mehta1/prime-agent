@@ -3,40 +3,44 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use sha2::{Digest, Sha256};
 
 pub const AGENT_DIR_ENV: &str = "PRIME_AGENT_CODING_AGENT_DIR";
 pub const SESSION_DIR_ENV: &str = "PRIME_AGENT_SESSION_DIR";
 pub const CONFIG_DIR_NAME: &str = ".prime/agent";
 
-pub fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+/// The home directory for state layout. Unresolvable home is an explicit
+/// error, not a degraded `/tmp` default: the daemon owns durable state and
+/// must refuse to start rather than write it outside the user profile
+/// (TS `getAgentDir` throws when `os.homedir()` fails).
+pub fn home_dir() -> Result<PathBuf> {
+    pa_types::platform::home_dir()
+        .ok_or_else(|| anyhow!("home directory not found: set HOME (or USERPROFILE on Windows)"))
 }
 
-pub fn expand_tilde(path: &str) -> PathBuf {
+/// Expand a leading `~`/`~/` against [`home_dir`]; other paths pass through.
+pub fn expand_tilde(path: &str) -> Result<PathBuf> {
     if let Some(rest) = path.strip_prefix("~/") {
-        home_dir().join(rest)
+        Ok(home_dir()?.join(rest))
     } else if path == "~" {
         home_dir()
     } else {
-        PathBuf::from(path)
+        Ok(PathBuf::from(path))
     }
 }
 
-pub fn agent_dir() -> PathBuf {
+pub fn agent_dir() -> Result<PathBuf> {
     match std::env::var_os(AGENT_DIR_ENV) {
         Some(dir) if !dir.is_empty() => expand_tilde(&dir.to_string_lossy()),
-        _ => home_dir().join(CONFIG_DIR_NAME),
+        _ => Ok(home_dir()?.join(CONFIG_DIR_NAME)),
     }
 }
 
-pub fn sessions_dir(agent_dir: &Path) -> PathBuf {
+pub fn sessions_dir(agent_dir: &Path) -> Result<PathBuf> {
     match std::env::var_os(SESSION_DIR_ENV) {
         Some(dir) if !dir.is_empty() => expand_tilde(&dir.to_string_lossy()),
-        _ => agent_dir.join("sessions"),
+        _ => Ok(agent_dir.join("sessions")),
     }
 }
 

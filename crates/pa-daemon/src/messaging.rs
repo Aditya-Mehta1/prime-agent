@@ -213,8 +213,17 @@ impl Supervisor {
                     .map(|dir| crate::paths::expand_tilde(&dir))
             }
             None => None,
-        }
-        .unwrap_or_else(|| crate::paths::sessions_dir(&self.options.agent_dir));
+        };
+        let sessions_dir = match sessions_dir {
+            Some(result) => match result {
+                Ok(dir) => dir,
+                Err(error) => return WakeOutcome::Failed(error.to_string()),
+            },
+            None => match crate::paths::sessions_dir(&self.options.agent_dir) {
+                Ok(dir) => dir,
+                Err(error) => return WakeOutcome::Failed(error.to_string()),
+            },
+        };
         let info =
             match crate::session_catalog::resolve_saved_session(&sessions_dir, selector, &cwd) {
                 Ok(Some(info)) => info,
@@ -416,7 +425,7 @@ mod tests {
     #[tokio::test]
     async fn ambiguous_saved_selector_carries_the_catalog_error() {
         let supervisor = supervisor();
-        let sessions = crate::paths::sessions_dir(&supervisor.options.agent_dir);
+        let sessions = crate::paths::sessions_dir(&supervisor.options.agent_dir).unwrap();
         std::fs::create_dir_all(&sessions).unwrap();
         for _ in 0..2 {
             let mut session = crate::session_store::SessionFile::create("/tmp", None, 0);

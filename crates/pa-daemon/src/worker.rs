@@ -87,10 +87,11 @@ impl WorkerConfig {
         let supervisor_socket_path = std::env::var_os(WORKER_SUPERVISOR_SOCKET_ENV)
             .map(PathBuf::from)
             .unwrap_or_default();
+        let agent_dir = paths::agent_dir()?;
         let recovery_journal_path = std::env::var_os(WORKER_RECOVERY_JOURNAL_ENV)
             .map(PathBuf::from)
             .unwrap_or_else(|| {
-                paths::agent_dir()
+                agent_dir
                     .join("daemon-workers")
                     .join(format!("{}.recovery.jsonl", active_session_id))
             });
@@ -108,7 +109,7 @@ impl WorkerConfig {
             token,
             worker_instance_id: std::env::var(WORKER_INSTANCE_ID_ENV).unwrap_or_default(),
             active_session_id,
-            agent_dir: paths::agent_dir(),
+            agent_dir,
             recovery_journal_path,
             script,
             telemetry_disabled,
@@ -1169,10 +1170,13 @@ impl Worker {
                 );
             }
         }
-        let session_path = payload
-            .get("sessionPath")
-            .and_then(Value::as_str)
-            .map(paths::expand_tilde);
+        let session_path = match payload.get("sessionPath").and_then(Value::as_str) {
+            Some(path) => match paths::expand_tilde(path) {
+                Ok(expanded) => Some(expanded),
+                Err(error) => return response_failure(None, "create", &error.to_string(), None),
+            },
+            None => None,
+        };
         let no_session = payload
             .get("noSession")
             .and_then(Value::as_bool)
@@ -1227,11 +1231,16 @@ impl Worker {
             .and_then(Value::as_str)
             .unwrap_or("/")
             .to_string();
-        let session_dir = payload
-            .get("sessionDir")
-            .and_then(Value::as_str)
-            .map(paths::expand_tilde)
-            .unwrap_or_else(|| paths::sessions_dir(&self.config.agent_dir));
+        let session_dir = match payload.get("sessionDir").and_then(Value::as_str) {
+            Some(dir) => match paths::expand_tilde(dir) {
+                Ok(expanded) => expanded,
+                Err(error) => return response_failure(None, "create", &error.to_string(), None),
+            },
+            None => match paths::sessions_dir(&self.config.agent_dir) {
+                Ok(dir) => dir,
+                Err(error) => return response_failure(None, "create", &error.to_string(), None),
+            },
+        };
         // RLM recursion identity (children of an RLM parent run at depth+1):
         // the durable create replays these so a respawned child keeps them.
         let (rlm_depth, rlm_max_depth) = match create_payload_rlm_depth(payload) {

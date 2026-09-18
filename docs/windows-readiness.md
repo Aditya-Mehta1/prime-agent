@@ -42,7 +42,9 @@ No other platform coupling in pa-types (serde types only).
 ### pa-ai
 
 No platform coupling found: pure HTTP/streaming over reqwest (rustls). No
-`unsafe`, no `libc`, no path assumptions beyond URL parsing.
+`unsafe`, no `libc`. The `~/.aws` / `~/.config/gcloud` / `~/.prime` config
+reads resolved via `$HOME` only (lane `win-dirs` finding) now route through
+`pa_types::platform::home_dir` with the same per-site fallbacks.
 
 ### pa-agent
 
@@ -73,6 +75,11 @@ No platform coupling found (loop policy only; no process/socket code).
 | `tools/golden_replay.rs:94` (`/bin/bash -c` fixture runner) | test-only | **[T]** | whole module is `#![cfg(test)]`; route through `platform::shell` in a follow-up |
 | `tools/edit_diff.rs:572` (`access_readable`, dead code w/ mode bits + euid) | test-only/dead | **[T]** | gated `#[cfg(unix)]`; candidate for deletion in a follow-up |
 | `packages/tests.rs:5`, auth/settings test modules (mode assertions) | test-only | **[T]** | keep, or `platform::perms::file_mode` on the Windows lane |
+| home-dir reads (skills loader/prompt-templates, packages mod/manager/resolve-auto, resources, settings manager, bootstrap venv, path/render/shell tools, models) | dirs | **[P]** | fixed (lane `win-dirs`): routed through `pa-types::platform::dirs::home_dir`, per-site fallbacks preserved |
+| `tools/shell_utils.rs` `get_shell_env` (PATH split/join on hardcoded `:`) | path delimiter | **[P]** | fixed (lane `win-dirs`): `std::env::split_paths`/`join_paths` (Node `path.delimiter`) |
+| `kernel/bootstrap/venv.rs` `find_executable` (bare name, no PATHEXT) + `~/.local/bin/uv` (no `.exe`) | PATH/PATHEXT | **[P]** | fixed (lane `win-dirs`): TS `windowsExecutableCandidates` port (pure fn, unit-tested on Linux) + `uv.exe` fallback |
+| `auth/resolve_config_value.rs` (hardcoded `Command::new("bash")` for `!command`) | shell selection | **[P]** | fixed (lane `win-dirs`): configured shell via `platform::shell` with `ComSpec` (cmd.exe) fallback on win32 (TS `executeWithConfiguredShell` + `execSync`); Unix keeps `bash -c` |
+| `tools/render_utils.rs` `shorten_path_replaces_home` (HOME-reading unit test) | test-only | **[T]** | fixed (lane `win-dirs`): gated `#[cfg(unix)]` |
 
 ### pa-daemon
 
@@ -86,7 +93,7 @@ No platform coupling found (loop policy only; no process/socket code).
 | `lease.rs` (`/proc/<pid>/stat`, `/proc/<pid>/status` liveness) | /proc identity | **[D]** | fixed: `pa_types::platform::process` (single parser shared with pa-core now); unverifiable liveness errs and counts the owner alive (fail-safe against reclaiming live leases) |
 | `protocol.rs` (`process_start_id` from `/proc`) | /proc identity | **[D]** | fixed: shared parser |
 | `descriptor.rs` (0o600 persist) | chmod | **[D]** | fixed: `pa_core::platform::perms` |
-| `paths.rs` (HOME-based agent dir, `expand_tilde`, 0o700 ensure_dir) | dirs + chmod | **[D]** (dirs feed session store layout) | ensure_dir fixed via perms wall; HOME resolution: portable-ish (`HOME` vs `USERPROFILE`) - move to a `Dirs` helper in the Windows lane (TS `config.ts` uses `os.homedir()`) |
+| `paths.rs` (HOME-based agent dir, `expand_tilde`, 0o700 ensure_dir) | dirs + chmod | **[D]** (dirs feed session store layout) | ensure_dir fixed via perms wall; HOME resolution fixed (lane `win-dirs`): `pa-types::platform::dirs::home_dir` (`HOME` -> `USERPROFILE` -> `HOMEDRIVE`+`HOMEPATH`, Node `os.homedir()` parity), and the unresolvable home is an explicit error instead of the old silent `/tmp` default (`home_dir`/`agent_dir`/`sessions_dir`/`expand_tilde` return `Result`) |
 | `session_store.rs:593,621`, `worker.rs:1583`, `types.rs:195`, `session_stats.rs:286`, tests | test-only literals | **[T]** | in `#[cfg(test)]`; no action |
 
 ### pa-cli
@@ -99,12 +106,14 @@ No platform coupling found (loop policy only; no process/socket code).
 | `daemon_discovery/mod.rs` (`std::os::unix` socket probe, `socket_dir()`, Unix-only root scoping; landed post-audit in #97) | transport + socket-dir scoping | **[D]** | fixed (lane `windows`): `scan_socket_dir`/`is_socket_file` gated `#[cfg(unix)]` with an empty not-unix sweep (TS `scanSocketDir` returns [] on win32); `state_root_matches` Windows arm is containment + always-true (TS `createDaemonStateRootMatcher` win32 predicate); `pa-daemon::platform::socket_dir` gained a not-unix impl (`<tmpdir>/prime-agent-user`, TS `defaultDaemonSocketDir` win32 shape) |
 | `tests/daemon_commands_e2e.rs`, `tests/interactive_daemon_e2e.rs` (std UnixStream, `/proc/<pid>/stat` liveness) | test-only | **[T]** | keep; these drive the Linux product end-to-end; Windows CI lane will gate them `#[cfg(unix)]` |
 | `tests/package_e2e.rs` (0o755 shim) | test-only | **[T]** | keep |
+| `config.rs` (`expand_tilde_path`/`get_agent_dir` HOME reads) | dirs | **[P]** | fixed (lane `win-dirs`): `pa_types::platform::home_dir` + the win32 `~\` arm (TS `expandTildePath`) |
 
 ### pa-tui
 
 | file:line | coupling | category | disposition |
 |---|---|---|---|
 | `daemon_client.rs` (tokio `UnixStream::connect`, `into_split`) | transport | **[D]** | fixed: `connect_transport` + `TransportStream::split`; mock tests gated `#[cfg(all(test, unix))]` |
+| `autocomplete.rs`/`chrome.rs`/`bin/pa-tui-replay.rs` (`HOME` reads for `~` completion/splash/replay dirs) | dirs | **[P]** | fixed (lane `win-dirs`): `pa_types::platform::home_dir` (pa-tui depends on pa-types alone), per-site fallbacks preserved |
 
 ### Non-issues confirmed during the audit
 
@@ -182,7 +191,20 @@ No platform coupling found (loop policy only; no process/socket code).
    resolution via canonical install paths only.
 7. `Dirs` helper: `HOME` vs `USERPROFILE` resolution for agent dir (both in
    `pa-daemon/src/paths.rs` and `pa-core/src/tools/shell_utils.rs`
-   `get_agent_dir`).
+   `get_agent_dir`). DONE (lane `win-dirs`): `pa-types::platform::dirs::home_dir`
+   resolves `HOME` first (TS package-manager `process.env.HOME || homedir()`),
+   then `USERPROFILE`, then `HOMEDRIVE`+`HOMEPATH`; every production
+   home-dir read routes through it (pa-ai bedrock/ADC/team-id, pa-core
+   skills/packages/resources/settings/bootstrap/venv/path-tools, pa-cli
+   config, pa-tui autocomplete/chrome/replay, pa-daemon paths), tilde
+   expansion gains the win32 `~\\` arm, `path.win32.join` semantics back
+   `expand_path` on Windows, and the daemon's unresolvable home is an
+   explicit error. Same lane: `get_shell_env` PATH split/join via
+   `std::env::split_paths`/`join_paths` (Node `path.delimiter`), PATHEXT
+   candidate resolution in the kernel bootstrap `find_executable`
+   (+ `uv.exe` fallback), and `!command` config values spawn the configured
+   shell with a `ComSpec` fallback on win32 (TS
+   `executeWithConfiguredShell` + `execSync`).
 8. Atomic writes: add the TS `renameOntoSync` EPERM/EACCES/EBUSY retry to
    `settings::storage::atomic_write` (only fires on win32).
 9. Session-lease / orphan-journal rename semantics: verify Windows rename

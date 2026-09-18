@@ -246,8 +246,9 @@ pub fn render_splash(state: &ChromeState, theme: &Theme, width: usize) -> Vec<Li
         ]);
     }
     let cwd_label = "cwd ";
+    let home = pa_types::platform::home_dir().map(|home| home.to_string_lossy().into_owned());
     let cwd = truncate_path_middle(
-        &format_splash_cwd(&state.cwd, std::env::var("HOME").ok().as_deref()),
+        &format_splash_cwd(&state.cwd, home.as_deref()),
         meta_width.saturating_sub(str_width(cwd_label)).max(1),
     );
     meta_lines.push(vec![

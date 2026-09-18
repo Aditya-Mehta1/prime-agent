@@ -517,11 +517,11 @@ impl SettingsManager {
 
     pub fn get_session_dir(&self) -> Option<std::path::PathBuf> {
         let session_dir = self.merged.session_dir.as_ref()?;
-        let home = std::env::var("HOME").ok()?;
+        let home = pa_types::platform::home_dir()?;
         Some(if session_dir == "~" {
-            home.into()
+            home
         } else if let Some(rest) = session_dir.strip_prefix("~/") {
-            std::path::PathBuf::from(home).join(rest)
+            home.join(rest)
         } else {
             session_dir.into()
         })

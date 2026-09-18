@@ -52,7 +52,18 @@ impl Supervisor {
         if roots.is_empty() {
             return;
         }
-        let ledger = self.rlm_spawn_ledger_for(None).await;
+        // The seed degrades to a log line on any failure, exactly like
+        // the TS boot seed (including the unresolvable-home error the
+        // ledger's sessions dir reports).
+        let ledger = match self.rlm_spawn_ledger_for(None).await {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                self.log_line(&format!(
+                    "Could not seed the agent roster from the spawn ledger: {error:#}"
+                ));
+                return;
+            }
+        };
         let edges = match ledger.live_edges() {
             Ok(edges) => edges,
             Err(error) => {

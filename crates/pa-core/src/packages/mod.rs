@@ -79,9 +79,7 @@ fn expand_tilde(path: &str) -> PathBuf {
 }
 
 fn home_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/"))
+    pa_types::platform::home_dir().unwrap_or_else(|| PathBuf::from("/"))
 }
 
 /// The workspace root at compile time (source-checkout layout): pa-core

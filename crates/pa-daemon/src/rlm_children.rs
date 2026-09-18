@@ -639,7 +639,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 Some(cwd) => Path::new(identity.cwd.as_deref().unwrap_or("/")).join(cwd),
                 None => PathBuf::from(identity.cwd.clone().unwrap_or_else(|| "/".to_string())),
             };
-            let sessions_dir = crate::paths::sessions_dir(&this.agent_dir);
+            let sessions_dir = crate::paths::sessions_dir(&this.agent_dir)?;
             std::fs::create_dir_all(&sessions_dir)
                 .with_context(|| format!("create sessions dir {}", sessions_dir.display()))?;
             let thinking = request.thinking.as_deref().or(identity.thinking.as_deref());

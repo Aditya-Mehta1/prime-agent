@@ -22,7 +22,9 @@ pub fn get_agent_dir() -> String {
 }
 
 fn home_dir() -> String {
-    std::env::var("HOME").unwrap_or_default()
+    pa_types::platform::home_dir()
+        .map(|home| home.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Directory containing the agent's bundled binaries, prepended to PATH.
@@ -45,15 +47,24 @@ pub fn get_shell_env() -> std::collections::HashMap<String, String> {
         .cloned()
         .unwrap_or_else(|| "PATH".to_string());
     let current_path = env.get(&path_key).cloned().unwrap_or_default();
-    if !current_path
-        .split(':')
-        .filter(|p| !p.is_empty())
-        .any(|p| p == bin_dir)
-    {
+    // Node `path.delimiter` (`:` on Unix, `;` on Windows): the std
+    // split/join helpers carry the same per-platform delimiter, and empty
+    // entries drop exactly like the TS `.filter(Boolean)`.
+    let has_bin_dir = std::env::split_paths(&current_path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .any(|dir| dir == std::path::Path::new(&bin_dir));
+    if !has_bin_dir {
         let updated = if current_path.is_empty() {
             bin_dir
         } else {
-            format!("{bin_dir}:{current_path}")
+            let mut entries = vec![std::path::PathBuf::from(&bin_dir)];
+            entries.extend(
+                std::env::split_paths(&current_path).filter(|dir| !dir.as_os_str().is_empty()),
+            );
+            std::env::join_paths(entries)
+                .expect("bin dir path has no NUL byte")
+                .to_string_lossy()
+                .into_owned()
         };
         env.insert(path_key, updated);
     }

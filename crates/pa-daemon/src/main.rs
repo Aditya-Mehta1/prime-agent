@@ -23,10 +23,14 @@ async fn main() -> Result<()> {
                     other => return Err(anyhow!("unknown supervisor option: {other}")),
                 }
             }
+            let agent_dir = match agent_dir {
+                Some(dir) => dir,
+                None => pa_daemon::paths::agent_dir()?,
+            };
             let options = pa_daemon::supervisor::SupervisorOptions {
                 socket_path: socket_path
                     .unwrap_or_else(pa_daemon::socket::default_daemon_socket_path),
-                agent_dir: agent_dir.unwrap_or_else(pa_daemon::paths::agent_dir),
+                agent_dir,
             };
             pa_daemon::supervisor::run_supervisor(options).await
         }

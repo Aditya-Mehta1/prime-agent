@@ -220,16 +220,15 @@ pub struct LoadPromptTemplatesOptions {
 
 fn normalize_path(input: &str) -> PathBuf {
     let trimmed = input.trim();
+    let home = || pa_types::platform::home_dir().unwrap_or_default();
     if trimmed == "~" {
-        return std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default();
+        return home();
     }
     if let Some(rest) = trimmed.strip_prefix("~/") {
-        return PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(rest);
+        return home().join(rest);
     }
     if let Some(rest) = trimmed.strip_prefix('~') {
-        return PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(rest);
+        return home().join(rest);
     }
     PathBuf::from(trimmed)
 }

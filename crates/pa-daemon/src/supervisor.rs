@@ -123,7 +123,7 @@ impl Supervisor {
                 version: 1,
                 socket_path: options.socket_path.to_string_lossy().to_string(),
                 default_session_dir: Some(
-                    paths::sessions_dir(&options.agent_dir)
+                    paths::sessions_dir(&options.agent_dir)?
                         .to_string_lossy()
                         .to_string(),
                 ),
@@ -235,27 +235,28 @@ impl Supervisor {
     pub(crate) async fn rlm_spawn_ledger_for(
         self: &Arc<Self>,
         session_dir: Option<&str>,
-    ) -> std::sync::Arc<crate::rlm_ledger::RlmSpawnLedger> {
-        let default_dir = paths::sessions_dir(&self.options.agent_dir);
-        let requested = session_dir
-            .map(paths::expand_tilde)
-            .unwrap_or_else(|| default_dir.clone());
+    ) -> Result<std::sync::Arc<crate::rlm_ledger::RlmSpawnLedger>> {
+        let default_dir = paths::sessions_dir(&self.options.agent_dir)?;
+        let requested = match session_dir {
+            Some(dir) => paths::expand_tilde(dir)?,
+            None => default_dir.clone(),
+        };
         if requested != default_dir {
             let log = paths::RotatingLog::new(paths::daemon_log_path(
                 &self.options.socket_path,
                 &self.options.agent_dir,
             ));
-            return std::sync::Arc::new(crate::rlm_ledger::RlmSpawnLedger::new(
+            return Ok(std::sync::Arc::new(crate::rlm_ledger::RlmSpawnLedger::new(
                 &self.options.agent_dir,
                 &requested,
                 move |message| {
                     log.append(&format!("[{}] {message}", util::now_iso()));
                 },
-            ));
+            )));
         }
         let mut cached = self.rlm_ledger.lock().await;
         if let Some(ledger) = cached.as_ref() {
-            return std::sync::Arc::clone(ledger);
+            return Ok(std::sync::Arc::clone(ledger));
         }
         let log = paths::RotatingLog::new(paths::daemon_log_path(
             &self.options.socket_path,
@@ -269,7 +270,7 @@ impl Supervisor {
             },
         ));
         *cached = Some(std::sync::Arc::clone(&ledger));
-        ledger
+        Ok(ledger)
     }
 
     /// Adopt or relaunch persisted workers, concurrently: one dead worker's
@@ -879,10 +880,10 @@ impl Supervisor {
                 "Session cannot be both no-session and session-pathed"
             ));
         }
-        let session_dir_path = session_dir
-            .as_deref()
-            .map(paths::expand_tilde)
-            .unwrap_or_else(|| paths::sessions_dir(&self.options.agent_dir));
+        let session_dir_path = match session_dir.as_deref() {
+            Some(dir) => paths::expand_tilde(dir)?,
+            None => paths::sessions_dir(&self.options.agent_dir)?,
+        };
         if *continue_recent == Some(true) {
             let recent = find_most_recent_session_for_cwd(&session_dir_path, &cwd_value);
             if recent.is_none() {
@@ -1522,10 +1523,21 @@ impl Supervisor {
                 (cwd.clone(), session_dir.clone())
             }
         };
-        let dir = session_dir
-            .as_deref()
-            .map(crate::paths::expand_tilde)
-            .unwrap_or_else(|| crate::paths::sessions_dir(&self.options.agent_dir));
+        let dir = match session_dir.as_deref() {
+            Some(dir) => crate::paths::expand_tilde(dir),
+            None => crate::paths::sessions_dir(&self.options.agent_dir),
+        };
+        let dir = match dir {
+            Ok(dir) => dir,
+            Err(error) => {
+                return vec![response_line(&response_failure(
+                    Some(command_id),
+                    "list_saved_sessions",
+                    &error.to_string(),
+                    None,
+                ))];
+            }
+        };
         let scope_current = scope.as_str() == Some("current");
         let mut infos = crate::session_store::list_sessions(&dir);
         if scope_current {
@@ -1552,7 +1564,17 @@ impl Supervisor {
                 });
             }
         }
-        let ledger = self.rlm_spawn_ledger_for(session_dir.as_deref()).await;
+        let ledger = match self.rlm_spawn_ledger_for(session_dir.as_deref()).await {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                return vec![response_line(&response_failure(
+                    Some(command_id),
+                    "list_saved_sessions",
+                    &error.to_string(),
+                    None,
+                ))];
+            }
+        };
         let passive = match crate::rlm_roster::walk_passive_rlm_children(&ledger, &roots) {
             Ok(children) => children,
             Err(error) => {
@@ -1611,10 +1633,16 @@ impl Supervisor {
         cwd: Option<String>,
         session_dir: Option<String>,
     ) -> DaemonResponse {
-        let dir = session_dir
-            .as_deref()
-            .map(paths::expand_tilde)
-            .unwrap_or_else(|| paths::sessions_dir(&self.options.agent_dir));
+        let dir = match session_dir.as_deref() {
+            Some(dir) => paths::expand_tilde(dir),
+            None => paths::sessions_dir(&self.options.agent_dir),
+        };
+        let dir = match dir {
+            Ok(dir) => dir,
+            Err(error) => {
+                return response_failure(Some(&command_id), &type_name, &error.to_string(), None);
+            }
+        };
         let summaries: Vec<Value> = match all {
             Some(true) => {
                 // TS `buildSessionList` order: saved rows (resident ones
@@ -1670,7 +1698,17 @@ impl Supervisor {
                     });
                     resident_only.push(self.worker_summary(&root.resident).await);
                 }
-                let ledger = self.rlm_spawn_ledger_for(session_dir.as_deref()).await;
+                let ledger = match self.rlm_spawn_ledger_for(session_dir.as_deref()).await {
+                    Ok(ledger) => ledger,
+                    Err(error) => {
+                        return response_failure(
+                            Some(&command_id),
+                            &type_name,
+                            &error.to_string(),
+                            None,
+                        );
+                    }
+                };
                 match crate::rlm_roster::walk_passive_rlm_children(&ledger, &roots) {
                     Ok(children) => {
                         for child in &children {
@@ -1750,7 +1788,10 @@ impl Supervisor {
         let Some(child_id) = child_id else {
             anyhow::bail!("deleted RLM subagent is missing its child id");
         };
-        let ledger = self.rlm_spawn_ledger_for(None).await;
+        let ledger = self
+            .rlm_spawn_ledger_for(None)
+            .await
+            .with_context(|| "resolve the spawn ledger sessions dir".to_string())?;
         ledger
             .append_delete(&child_id, &session_file, reason)
             .with_context(|| format!("tombstone RLM subagent {child_id}"))?;
@@ -1901,7 +1942,7 @@ impl Supervisor {
                     .map(|dir| dir.to_string_lossy().to_string())
                     .unwrap_or_default()
             });
-        let ledger = self.rlm_spawn_ledger_for(None).await;
+        let ledger = self.rlm_spawn_ledger_for(None).await?;
         ledger
             .append_spawn(crate::rlm_ledger::RlmSpawnInput {
                 child_id: child_id.clone(),
@@ -2178,13 +2219,14 @@ impl Supervisor {
                         drop(descriptor);
                         if is_child {
                             if let Some(session_file) = session_file {
-                                let ledger = self.rlm_spawn_ledger_for(None).await;
-                                if let Err(error) =
-                                    ledger.append_rename_by_child_path(&session_file, name)
-                                {
-                                    self.log_line(&format!(
-                                        "failed to append RLM ledger rename: {error:#}"
-                                    ));
+                                if let Ok(ledger) = self.rlm_spawn_ledger_for(None).await {
+                                    if let Err(error) =
+                                        ledger.append_rename_by_child_path(&session_file, name)
+                                    {
+                                        self.log_line(&format!(
+                                            "failed to append RLM ledger rename: {error:#}"
+                                        ));
+                                    }
                                 }
                             }
                         }
