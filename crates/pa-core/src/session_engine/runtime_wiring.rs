@@ -117,6 +117,7 @@ pub fn kernel_provisioner(
     handlers: HostRequestHandlers,
     python_skills: Vec<KernelPythonSkill>,
     agent_dir: &std::path::Path,
+    on_bootstrap_result: Option<crate::kernel::provisioner::KernelBootstrapResultHandler>,
 ) -> Arc<KernelProvisioner> {
     let mut env = HashMap::with_capacity(1);
     env.insert(
@@ -136,6 +137,7 @@ pub fn kernel_provisioner(
             snapshot_dir: None,
             ready_gate: None,
             on_restore: None,
+            on_bootstrap_result,
         },
     ))
 }

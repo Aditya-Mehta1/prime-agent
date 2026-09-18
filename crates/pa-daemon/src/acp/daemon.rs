@@ -464,6 +464,9 @@ async fn handle_session_new(
         no_session: Some(true),
         name: None,
         config: Some(config),
+        // ACP-created sessions follow the worker's own telemetry posture
+        // (settings + env); external clients never toggle telemetry.
+        telemetry_disabled: None,
         runtime_metadata: None,
         lifecycle: None,
         env: None,

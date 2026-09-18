@@ -19,6 +19,7 @@ Parity contract = user experience + model-facing surface, not internal mechanism
 | crate | role | TS origin |
 |---|---|---|
 | `pa-types` | shared wire & domain types, protocol messages | coding-agent core types, daemon protocol |
+| `pa-telemetry` | event schema, queueing/batching, sinks (PostHog/file/noop/mock), install id | core/telemetry.ts |
 | `pa-ai` | providers, model registry, streaming | packages/ai |
 | `pa-agent` | agent loop | packages/agent |
 | `pa-core` | session engine: tools, skills, prompts, compaction, refinement, kernel/RLM manager, subagents, session manager, settings | packages/coding-agent core/ |
@@ -48,6 +49,8 @@ Cycle-free, one direction, enforced in Cargo.toml and at review:
 
 ```
 pa-types  <-- shared vocabulary, nothing else is shared
+pa-telemetry <-- telemetry library (schema/queue/sinks); depends on no workspace crate;
+            consumers: pa-core, pa-daemon, pa-cli (pa-tui stays pa-types-only)
    ^
    |        pa-ai (providers/registry)
    |           ^
@@ -61,7 +64,7 @@ pa-tui --> pa-types only;  pa-cli --> everything (composition root)
 ```
 
 Rules:
-- pa-types depends on nothing in the workspace.
+- pa-types and pa-telemetry depend on nothing in the workspace.
 - A crate may depend only on crates below it in this diagram. No cycles, ever.
 - Cross-crate access goes through minimal public APIs only; internals are `pub(crate)`.
 - If a change forces edits across many crate internals, the boundary is wrong - fix the boundary, not the call sites.

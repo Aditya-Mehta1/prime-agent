@@ -58,6 +58,9 @@ pub struct AgentEngineConfig {
     /// link. Present only inside a daemon worker; it enables the kernel's
     /// agent_message/agent_observe host requests.
     pub supervisor_link: Option<SupervisorLinkConfig>,
+    /// Telemetry opt-out from the create command (Some(true) installs no
+    /// telemetry; None/Some(false) resolve the configured sinks).
+    pub telemetry_disabled: Option<bool>,
 }
 
 /// Supervisor-link coordinates for a daemon worker.
@@ -430,7 +433,26 @@ impl AgentSessionEngine {
         if let Some(children) = &self.children {
             children.set_model(format!("{}/{}", model.provider, model.id));
         }
+        // Session telemetry: the composition root is this worker process;
+        // the create command's opt-out rides the engine config (TS main.ts
+        // `telemetryDisabled` on the runtime config). Sinks resolve from
+        // settings + env inside `build_client`.
+        let telemetry = (self.config.telemetry_disabled != Some(true)).then(|| {
+            let settings = pa_core::settings::SettingsManager::create(
+                &self.config.cwd,
+                &self.config.agent_dir,
+            );
+            pa_core::session_engine::telemetry::TelemetryWiring {
+                client: pa_core::session_engine::telemetry::build_client(
+                    &settings,
+                    &self.config.agent_dir,
+                ),
+                execution_mode: Some("daemon".to_string()),
+                now: None,
+            }
+        });
         pa_core::session_engine::engine::create_session(SessionEngineConfig {
+            telemetry,
             cwd: self.config.cwd.clone(),
             agent_dir: self.config.agent_dir.clone(),
             mcp_manager: Some(std::sync::Arc::clone(&self.mcp)),
@@ -473,6 +495,44 @@ fn now_millis() -> u64 {
 }
 
 impl SessionEngine for AgentSessionEngine {
+    /// Finalize telemetry on the live core session: `agent session ended`
+    /// plus one flush (TS dispose callback). Best-effort by contract: a
+    /// failed end never blocks or fails shutdown.
+    fn end_telemetry(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let session = self.session.lock().await;
+            let Some(engine) = session.as_ref() else {
+                return;
+            };
+            let Some(telemetry) = &engine.telemetry else {
+                return;
+            };
+            let _ = telemetry.end().await;
+        })
+    }
+
+    /// The daemon `kill` path: report `session archived` (lifetime in ms),
+    /// then finalize with `agent session ended` + flush. Best-effort like
+    /// all telemetry; `SessionTelemetry::end` is idempotent, so a later
+    /// worker shutdown stays a no-op for a killed session.
+    fn archive_session_telemetry(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let session = self.session.lock().await;
+            let Some(engine) = session.as_ref() else {
+                return;
+            };
+            let Some(telemetry) = &engine.telemetry else {
+                return;
+            };
+            telemetry.note_archived();
+            let _ = telemetry.end().await;
+        })
+    }
+
     fn acp_mcp_manager(
         &self,
     ) -> Option<std::sync::Arc<std::sync::Mutex<pa_core::mcp::McpManager>>> {
@@ -1522,6 +1582,7 @@ mod tests {
             session_file: None,
             faux_script: None,
             supervisor_link: None,
+            telemetry_disabled: None,
         })
         .unwrap();
         // The explicit selection from the session's create config is
@@ -1559,6 +1620,7 @@ mod tests {
             session_file: None,
             faux_script: None,
             supervisor_link: None,
+            telemetry_disabled: None,
         })
         .unwrap();
         // A create config with only a model keeps the provider and key.
@@ -1590,6 +1652,7 @@ mod tests {
             session_file: None,
             faux_script: None,
             supervisor_link: None,
+            telemetry_disabled: None,
         })
         .unwrap();
         let mut events: Vec<EngineEvent> = Vec::new();
@@ -1655,6 +1718,7 @@ mod tests {
             session_file: None,
             faux_script: None,
             supervisor_link: None,
+            telemetry_disabled: None,
         })
         .unwrap();
         // Without an explicit flag the TS default applies (medium, clamped).
@@ -1715,6 +1779,7 @@ fn run_prompts(
         session_file: None,
         faux_script: Some(script.to_string()),
         supervisor_link: None,
+        telemetry_disabled: None,
     })
     .unwrap();
     let mut events: Vec<EngineEvent> = Vec::new();
@@ -1866,6 +1931,7 @@ fn autonomous_gate_pass_and_failure_drive_the_loop() {
             serde_json::json!({ "responses": ["first attempt", "fixed it"] }).to_string(),
         ),
         supervisor_link: None,
+        telemetry_disabled: None,
     })
     .unwrap();
     let on = format!("/autonomous on --gate {gate:?}");
@@ -1962,6 +2028,7 @@ fn the_turn_loop_is_driven_by_the_driver_trait() {
         session_file: None,
         faux_script: Some(serde_json::json!({ "responses": ["one", "two"] }).to_string()),
         supervisor_link: None,
+        telemetry_disabled: None,
     })
     .unwrap();
     let status = pa_core::autonomous::autonomous_status(&engine.autonomous.blocking_lock());
@@ -2044,6 +2111,7 @@ fn agent_engine_streams_updates_and_final_message() {
         session_file: None,
         faux_script: Some(serde_json::json!({ "responses": ["streamed answer"] }).to_string()),
         supervisor_link: None,
+        telemetry_disabled: None,
     })
     .unwrap();
     let mut events: Vec<EngineEvent> = Vec::new();

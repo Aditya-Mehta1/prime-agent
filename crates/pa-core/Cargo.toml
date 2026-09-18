@@ -16,6 +16,7 @@ tracing.workspace = true
 pa-types.workspace = true
 pa-ai.workspace = true
 pa-agent.workspace = true
+pa-telemetry.workspace = true
 base64 = "0.22"
 fancy-regex = "0.14"
 libc = "0.2"

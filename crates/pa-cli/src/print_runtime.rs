@@ -231,8 +231,20 @@ async fn build_headless_engine_parts(options: &RunOptions) -> Result<HeadlessEng
         Some(build_session_manager(options)?)
     };
 
+    // Telemetry (TS `installAgentTelemetry` parity for headless sessions):
+    // the CLI's env/settings opt-out decides; enabled sessions resolve the
+    // configured sinks. Depth 0 only, enforced by the engine.
+    let telemetry = (!config.telemetry_disabled).then(|| {
+        let settings = pa_core::settings::SettingsManager::create(&config.cwd, &config.agent_dir);
+        pa_core::session_engine::telemetry::TelemetryWiring {
+            client: pa_core::session_engine::telemetry::build_client(&settings, &config.agent_dir),
+            execution_mode: Some("print".to_string()),
+            now: None,
+        }
+    });
     let engine = pa_core::session_engine::engine::create_session(
         pa_core::session_engine::engine::SessionEngineConfig {
+            telemetry,
             cwd: config.cwd.clone(),
             agent_dir: config.agent_dir.clone(),
             mcp_manager: None,
@@ -807,6 +819,8 @@ async fn build_faux_engine_parts(
     };
     let engine = pa_core::session_engine::engine::create_session(
         pa_core::session_engine::engine::SessionEngineConfig {
+            // Faux verification harness: no product telemetry.
+            telemetry: None,
             cwd: config.cwd.clone(),
             agent_dir: config.agent_dir.clone(),
             mcp_manager: None,

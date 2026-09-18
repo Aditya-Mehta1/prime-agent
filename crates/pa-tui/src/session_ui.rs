@@ -34,6 +34,9 @@ pub(crate) struct SessionUi {
     session_dir: Option<PathBuf>,
     script_path: Option<PathBuf>,
     model_selection: ModelSelection,
+    /// Telemetry opt-out carried over from the run options; every attach to
+    /// another session keeps carrying it (TS attach parity).
+    telemetry_disabled: Option<bool>,
     /// Snapshot chat entries to fold into the view on the next rebuild.
     pending_snapshot: Option<Vec<ChatEntry>>,
     /// Snapshot labels (model) for the next rebuild.
@@ -83,6 +86,7 @@ impl SessionUi {
             session_dir: options.session_dir.clone(),
             script_path: options.script_path.clone(),
             model_selection: options.model_selection.clone(),
+            telemetry_disabled: options.telemetry_disabled,
             pending_snapshot: None,
             pending_model: None,
             context: None,
@@ -132,7 +136,7 @@ impl SessionUi {
             client_id: None,
             capabilities: None,
             resume_cursor: None,
-            telemetry_disabled: None,
+            telemetry_disabled: self.telemetry_disabled.filter(|disabled| *disabled),
             recovery_config: None,
             env: None,
             launch_env: None,
@@ -508,6 +512,7 @@ impl SessionUi {
             no_session: false,
             session: SessionSelection::New,
             initial_message: None,
+            telemetry_disabled: self.telemetry_disabled,
             theme: String::new(),
             version: String::new(),
             onboarding: None,
@@ -1020,6 +1025,7 @@ async fn create_session(
             no_session: options.no_session.then_some(true),
             name: None,
             config: Some(options.create_config()),
+            telemetry_disabled: options.telemetry_disabled.filter(|disabled| *disabled),
             runtime_metadata: None,
             lifecycle: None,
             env: None,

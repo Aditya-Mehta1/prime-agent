@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/pa-telemetry",
     "crates/pa-types",
     "crates/pa-ai",
     "crates/pa-agent",
@@ -22,6 +23,7 @@ anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 tracing = { version = "0.1", features = ["attributes"] }
+pa-telemetry = { path = "crates/pa-telemetry" }
 pa-types = { path = "crates/pa-types" }
 pa-ai = { path = "crates/pa-ai" }
 pa-agent = { path = "crates/pa-agent" }

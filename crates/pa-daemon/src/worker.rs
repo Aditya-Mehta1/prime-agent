@@ -54,6 +54,10 @@ pub const WORKER_RECOVERY_JOURNAL_ENV: &str = "PRIME_AGENT_INTERNAL_DAEMON_WORKE
 pub const WORKER_SCRIPT_ENV: &str = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_SCRIPT";
 /// Worker socket path (supervisor passes it explicitly).
 pub const WORKER_SOCKET_ENV: &str = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_SOCKET";
+/// Telemetry opt-out for the worker's sessions (supervisor passes the create
+/// command's `telemetryDisabled` through here, TS descriptor parity).
+pub const WORKER_TELEMETRY_DISABLED_ENV: &str =
+    "PRIME_AGENT_INTERNAL_DAEMON_WORKER_TELEMETRY_DISABLED";
 
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -65,6 +69,10 @@ pub struct WorkerConfig {
     pub agent_dir: PathBuf,
     pub recovery_journal_path: PathBuf,
     pub script: Option<Value>,
+    /// Telemetry opt-out inherited from the create command ("1" = disabled;
+    /// absent/other = enabled). Sessions created on this worker install no
+    /// telemetry subscriber.
+    pub telemetry_disabled: Option<bool>,
 }
 
 impl WorkerConfig {
@@ -92,6 +100,8 @@ impl WorkerConfig {
                 let content = std::fs::read_to_string(path).ok()?;
                 serde_json::from_str::<Value>(&content).ok()
             });
+        let telemetry_disabled =
+            std::env::var_os(WORKER_TELEMETRY_DISABLED_ENV).map(|value| value == "1");
         Ok(WorkerConfig {
             socket_path,
             supervisor_socket_path,
@@ -101,6 +111,7 @@ impl WorkerConfig {
             agent_dir: paths::agent_dir(),
             recovery_journal_path,
             script,
+            telemetry_disabled,
         })
     }
 }
@@ -483,6 +494,7 @@ impl Worker {
                         session_file: None,
                         faux_script: Some(script.to_string()),
                         supervisor_link: Some(supervisor_link_config(&config)),
+                        telemetry_disabled: config.telemetry_disabled,
                     }) {
                         Ok(engine) => std::sync::Arc::new(engine),
                         // Runtime construction failed: degrade to the echo engine.
@@ -506,6 +518,7 @@ impl Worker {
                         session_file: None,
                         faux_script: None,
                         supervisor_link: Some(supervisor_link_config(&config)),
+                        telemetry_disabled: config.telemetry_disabled,
                     }) {
                         Ok(engine) => std::sync::Arc::new(engine),
                         // Runtime construction failed: degrade to the echo engine.
@@ -1049,8 +1062,8 @@ impl Worker {
             "abort_and_clear_queue" => self.handle_abort_and_clear_queue(),
             "get_last_assistant_text" => self.handle_get_last_assistant_text(),
             "worker_deliver_message" => self.handle_worker_deliver_message(payload),
-            "kill" => self.handle_kill(),
-            "shutdown" => self.handle_shutdown(),
+            "kill" => self.handle_kill().await,
+            "shutdown" => self.handle_shutdown().await,
             "rename" => self.handle_rename("rename", payload),
             "set_session_name" => self.handle_rename("set_session_name", payload),
             "replace_acp_mcp_servers" => self.handle_replace_acp_mcp_servers(payload),
@@ -1774,13 +1787,16 @@ impl Worker {
     }
 
     /// Graceful stop: the connection loop exits the process after replying.
-    fn handle_shutdown(&self) -> DaemonResponse {
+    /// The session's telemetry finalizes first (TS dispose callback:
+    /// `agent session ended` + one flush), bounded by the sink timeouts.
+    async fn handle_shutdown(&self) -> DaemonResponse {
         {
             let mut core = self.core.lock().unwrap();
             core.shutdown_requested = true;
             core.abort_requested = true;
         }
         self.work_notify.notify_one();
+        self.engine.end_telemetry().await;
         response_success(None, "shutdown", None)
     }
 
@@ -1980,8 +1996,11 @@ impl Worker {
         )
     }
 
-    fn handle_kill(&self) -> DaemonResponse {
+    async fn handle_kill(&self) -> DaemonResponse {
         self.side_questions.abort_all();
+        // `session archived` (schema v1) + the session-ended finalization:
+        // kill disposes the session like the TS dispose callback does.
+        self.engine.archive_session_telemetry().await;
         let mut core = self.core.lock().unwrap();
         if let Some(store) = core.store.as_mut() {
             let _ = store.append_session_state("archived");
@@ -2866,6 +2885,7 @@ mod agent_message_tests {
             active_session_id: "target-session".to_string(),
             agent_dir: dir.join("agent"),
             recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
             script: Some(json!({ "responses": ["ack"] })),
         };
         Arc::new(Worker::new(config, None))

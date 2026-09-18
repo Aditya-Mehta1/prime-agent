@@ -1,0 +1,212 @@
+# Telemetry event schema (version 1)
+
+The versioned catalog of every telemetry event Prime Agent emits, with its
+properties. Emitted through `pa-telemetry` (`TelemetryClient::track`), delivered
+to PostHog (batched capture; endpoint + project key from configuration) and
+mirrored locally at `<agentDir>/telemetry.jsonl` (FileSink, default-on).
+
+Schema rules:
+
+- Every event carries `schema_version` (integer). Breaking changes to an
+  event's properties bump the schema version; additive changes do not.
+- Event names keep the TS product's lowercase-space convention
+  (`agent started`), so series stay comparable across implementations.
+- Properties are JSON primitives only, enforced at the [`Properties`] boundary:
+  no objects (except the documented `phase_timings` primitive map), no arrays.
+- NEVER prompt content, session content, model output, tool arguments or
+  results, file paths, or repository data. The seams in this document are the
+  complete set of emission points; anything not listed is not emitted.
+- Identity is pseudonymous: `distinct_id` = the anonymous installation id from
+  `<agentDir>/telemetry.json`. No user identity, no auth tokens, no hostnames.
+
+## Base properties
+
+Merged under every event's own properties (event-specific values win on
+conflict):
+
+| property | type | values / notes |
+|---|---|---|
+| `version` | string | product version, e.g. `0.1.0` |
+| `schema_version` | number | this document's version: `1` |
+| `os_family` | string | `linux`, `darwin`, `windows` (std::env::consts::OS) |
+| `architecture` | string | `x86_64`, `aarch64`, ... (std::env::consts::ARCH) |
+| `install_method` | string | `binary` for the compiled Rust build (additive later) |
+| `execution_mode` | string | `interactive`, headless mode names, or `unknown` |
+| `libc` | string | `glibc` / `musl` / `none` / `unknown` (compile-time target env on Linux; `none` off Linux) |
+| `libc_version` | string | glibc version where determinable, else `unknown` |
+| `cpu_baseline` | string | `avx2` / `no_avx2` (/proc/cpuinfo on linux x86_64), `not_applicable` off x86_64, `unknown` when no probe |
+| `os_release` | string | kernel version where determinable, else `unknown` |
+| `os_product_version` | string | macOS product version, else `unknown` |
+
+Platform-fidelity properties are never faked: unknown means unknown.
+
+## Session/run lifecycle (TS-parity events)
+
+### `agent started`
+
+Session creation, depth-0 sessions only (subagents never double-report).
+
+| property | type | notes |
+|---|---|---|
+| `session_id` | string | per-process session uuid (random per client, NOT the on-disk session id) |
+| `skill_count` | number | skills in the inventory at session start |
+| `python_skill_count` | number | of which Python-backed skills |
+
+### `agent run completed`
+
+One agent run (prompt → final assistant message). Emitted when the run
+finalizes (agent ends, or the turn action deactivates after the agent ended).
+
+| property | type | notes |
+|---|---|---|
+| `session_id` | string | as above |
+| `outcome` | string | `success` / `error` / `aborted` |
+| `duration_ms` | number | run start → finalize |
+| `visible_ttft_ms` | number or null | first visible text delta since first turn start |
+| `first_model_event_ms` | number or null | first model event since first turn start |
+| `model_latency_ms` | number | sum of assistant-message turn latencies |
+| `max_model_latency_ms` | number | max single turn latency |
+| `model_call_count` | number | assistant messages received |
+| `turn_count` | number | turns in the run |
+| `tool_call_count` | number | tool executions |
+| `tool_error_count` | number | tool executions that errored |
+| `input_tokens` | number | usage totals |
+| `output_tokens` | number | |
+| `cache_read_tokens` | number | |
+| `cache_write_tokens` | number | |
+| `total_tokens` | number | |
+| `compaction_count` | number | completed compactions |
+| `retry_count` | number | auto-retries |
+| `provider_category` | string | `anthropic`, `openai`, `google`, `prime`, `openrouter`, `bedrock`, `vertex`, `mistral`, `groq`, `xai`, `custom`, `unknown` |
+| `model_category` | string | `claude`, `gpt`, `o1`, `o3`, `o4`, `gemini`, `glm`, `kimi`, `qwen`, `deepseek`, `llama`, `mistral`, `custom`, `unknown` |
+| `error_category` | string or null | `authentication`, `rate_limit`, `timeout`, `context_limit`, `network`, `provider_unavailable`, `other`; null when no error |
+
+### `agent session ended`
+
+Session dispose (interactive exit, worker shutdown).
+
+| property | type | notes |
+|---|---|---|
+| `session_id` | string | |
+| `duration_ms` | number | session lifetime |
+| `prompt_count` | number | user prompts |
+| `run_count` | number | |
+| `successful_run_count` | number | |
+| `failed_run_count` | number | |
+| `aborted_run_count` | number | |
+| `tool_call_count` | number | session total |
+| `compaction_count` | number | session total |
+| `model_call_count` | number | session total |
+| `input_tokens` / `output_tokens` / `cache_read_tokens` / `cache_write_tokens` / `total_tokens` | number | session totals |
+
+### `agent command used`
+
+Builtin slash commands only (resolved canonical name).
+
+| property | type | notes |
+|---|---|---|
+| `command_name` | string | canonical builtin command name |
+
+### `onboarding completed`
+
+| property | type | notes |
+|---|---|---|
+| `duration_ms` | number | |
+| `outcome` | string | `success` / `error` / `aborted` |
+| `auth_category` | string | `oauth`, `api_key`, `runtime_api_key`, `environment`, `prime_cli`, `models_json`, `fallback`, `stale`, `stored`, `none` |
+| `provider_category` | string | as above |
+
+## New v1 events (adoption backbone)
+
+### `startup`
+
+Process entry to a ready interactive session environment. One-shot client,
+emitted and flushed before the TUI starts.
+
+| property | type | notes |
+|---|---|---|
+| `duration_ms` | number | total startup |
+| `phase_timings` | object | primitive map of phase name → ms (`daemon_ready`) |
+| `execution_mode` | string | `interactive` |
+
+### `onboarding completed`
+
+| property | type | notes |
+|---|---|---|
+| `duration_ms` | number | onboarding-task creation → completion |
+| `outcome` | string | `success` (the Rust onboarding flow is the trace question; no error/abort path exists yet) |
+| `auth_category` | string | `none` (no auth step in the flow) |
+| `provider_category` | string | `unknown` |
+
+### `daemon event`
+
+Supervision lifecycle, emitted by the supervisor process. Counts only,
+never session payload.
+
+| property | type | notes |
+|---|---|---|
+| `kind` | string | `worker_spawned`, `worker_exited`, `worker_restarted`, `attach`, `reattach`, `detach` |
+| `exit_reason` | string | only for `worker_exited`: `normal` / `crash` |
+
+### `mcp connector used`
+
+`mcp.*` host-request activity. Server name ONLY — never tool names,
+arguments, or results.
+
+| property | type | notes |
+|---|---|---|
+| `action` | string | `config` / `refresh` |
+| `server_name` | string | server id from settings / ACP admission |
+
+### `tool executed`
+
+Per tool execution. Tool name only — never arguments or results.
+
+| property | type | notes |
+|---|---|---|
+| `session_id` | string | |
+| `tool_name` | string | `bash`, `edit`, `ipython`, skill tool names |
+| `duration_ms` | number | execution wall time |
+| `is_error` | boolean | execution failed |
+
+### `kernel bootstrap`
+
+One per actual kernel boot (memoized startups report once): process spawn,
+handshake, namespace restore, and runtime bootstrap.
+
+| property | type | notes |
+|---|---|---|
+| `duration_ms` | number | whole bootstrap wall time |
+| `cold` | boolean | no prior namespace snapshot existed to restore |
+| `outcome` | string | `success` / `error` |
+
+### `session archived`
+
+Emitted on the daemon `kill` path, before the session-ended finalization.
+
+| property | type | notes |
+|---|---|---|
+| `duration_ms` | number | session lifetime at archive time |
+
+## Planned events (seams not yet in the product)
+
+These stay in the catalog as planned schema v1 additions; they are NOT
+emitted yet. Each lands in the same PR as its product seam (see the
+adoption convention below):
+
+- `skill used` (`skill_name`, `skill_kind`, `source`): the product has no
+  skill-command execution seam yet.
+
+## Cohorts and breakdowns
+
+`distinct_id` is the installation id, so PostHog cohorts and breakdowns work
+directly over any base property (`version`, `os_family`, `architecture`,
+`libc`, `execution_mode`) and per-event properties (`provider_category`,
+`model_category`, `tool_name`, `skill_name`). Feature flags are fetched via the
+decide v3 API against the same `distinct_id`.
+
+## Adoption convention
+
+Every user-visible feature ships its adoption event in the same PR: add the
+event name + properties here (bump `schema_version` on breaking changes) and
+emit it at the feature's seam from day one. See AGENTS.md.

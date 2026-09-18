@@ -29,6 +29,7 @@ pub mod runtime_wiring;
 pub mod session_commands;
 pub mod side_question;
 pub mod slash_commands;
+pub mod telemetry;
 pub mod tool_bridge;
 pub mod turn_boundary;
 

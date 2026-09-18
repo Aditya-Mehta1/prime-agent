@@ -92,6 +92,9 @@ pub(crate) enum ClientRouting {
 pub struct Supervisor {
     pub(crate) options: SupervisorOptions,
     descriptor_dir: PathBuf,
+    /// Daemon-lifecycle telemetry (`daemon event` schema v1), resolved at
+    /// run start (None = opted out); never blocks supervision paths.
+    telemetry: std::sync::Mutex<Option<pa_telemetry::TelemetryClient>>,
     pub(crate) registry: SessionRegistry,
     /// Worker outbound frames, with their client routing.
     pub(crate) events: broadcast::Sender<(ClientRouting, Value)>,
@@ -131,6 +134,7 @@ impl Supervisor {
         Ok(Supervisor {
             options,
             descriptor_dir,
+            telemetry: std::sync::Mutex::new(None),
             registry: SessionRegistry::new(),
             events,
             roster: std::sync::Mutex::new(crate::agent_roster::AgentRoster::new()),
@@ -140,8 +144,31 @@ impl Supervisor {
         })
     }
 
+    /// Emit a `daemon event` (best-effort, non-blocking; no-op when the
+    /// daemon is opted out).
+    fn note_daemon_event(&self, kind: &str, exit_reason: Option<&str>) {
+        if let Some(client) = &*self.telemetry.lock().unwrap() {
+            pa_core::session_engine::telemetry::track_daemon_event(client, kind, exit_reason);
+        }
+    }
+
     /// Bind the client socket, adopt or relaunch persisted workers, serve.
     pub async fn run(self: Arc<Self>) -> Result<()> {
+        // Daemon telemetry: same env/settings posture as the sessions
+        // (the supervisor is the `daemon` execution mode).
+        {
+            let settings = pa_core::settings::SettingsManager::create(
+                std::env::current_dir().unwrap_or_default(),
+                &self.options.agent_dir,
+            );
+            let disabled = match pa_telemetry::env_telemetry_override() {
+                Some(enabled) => !enabled,
+                None => !settings.get_telemetry_enabled(),
+            };
+            *self.telemetry.lock().unwrap() = (!disabled).then(|| {
+                pa_core::session_engine::telemetry::build_client(&settings, &self.options.agent_dir)
+            });
+        }
         socket::prepare_socket_path(&self.options.socket_path).await?;
         let listener = bind_transport(&self.options.socket_path)
             .await
@@ -291,6 +318,7 @@ impl Supervisor {
                         "session worker {} stopped intentionally (status {status:?})",
                         resident.worker_id
                     ));
+                    self.note_daemon_event("worker_exited", Some("normal"));
                     return;
                 }
             } else if adopted_pid != 0 {
@@ -316,6 +344,7 @@ impl Supervisor {
                     return;
                 }
             }
+            self.note_daemon_event("worker_exited", Some("crash"));
             let failures = resident.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
             if failures > MAX_CONSECUTIVE_FAILURES {
                 let mut descriptor = resident.descriptor.lock().await;
@@ -341,6 +370,7 @@ impl Supervisor {
             match self.relaunch_worker(&resident).await {
                 Ok(new_child) => {
                     resident.consecutive_failures.store(0, Ordering::SeqCst);
+                    self.note_daemon_event("worker_restarted", None);
                     child = Some(new_child);
                 }
                 Err(error) => {
@@ -442,6 +472,7 @@ impl Supervisor {
             .and_then(Value::as_str)
             .map(str::to_string);
         let session_dir = descriptor.session_dir.clone();
+        let telemetry_disabled = descriptor.telemetry_disabled == Some(true);
         drop(descriptor);
 
         let executable = std::env::current_exe().context("resolve pa-daemon executable")?;
@@ -465,6 +496,9 @@ impl Supervisor {
         }
         if let Some(dir) = session_dir {
             command.env(paths::SESSION_DIR_ENV, dir);
+        }
+        if telemetry_disabled {
+            command.env(crate::worker::WORKER_TELEMETRY_DISABLED_ENV, "1");
         }
         if std::path::Path::new(&cwd).is_dir() {
             command.current_dir(&cwd);
@@ -726,6 +760,7 @@ impl Supervisor {
             no_session,
             name,
             config,
+            telemetry_disabled,
             ..
         } = create
         else {
@@ -855,7 +890,9 @@ impl Supervisor {
             root_session_id: None,
             session_file: session_path.clone(),
             session_dir: session_dir.clone(),
-            telemetry_disabled: None,
+            // TS main.ts `telemetryDisabled`: only ever `Some(true)`
+            // (the enabled case stays absent on the wire).
+            telemetry_disabled: telemetry_disabled.and(Some(true)),
             created_at: now.clone(),
             updated_at: now,
             lifecycle: DaemonWorkerLifecycle::Starting,
@@ -1578,6 +1615,34 @@ impl Supervisor {
                 false,
             );
         };
+        if let DaemonCommand::Attach {
+            telemetry_disabled: Some(true),
+            ..
+        }
+        | DaemonCommand::Reattach {
+            telemetry_disabled: Some(true),
+            ..
+        } = command
+        {
+            let worker_disabled = {
+                let descriptor = resident.descriptor.lock().await;
+                descriptor.telemetry_disabled
+            };
+            if worker_disabled != Some(true) {
+                // TS `assertTelemetryAttachAllowed`: a telemetry-disabled
+                // client may not attach to a worker running with telemetry
+                // enabled.
+                return (
+                    vec![response_line(&response_failure(
+                        Some(&command_id),
+                        &type_name,
+                        "Cannot attach to this active agent while telemetry is disabled for the current invocation. Stop the agent and retry so it can restart without telemetry.",
+                        None,
+                    ))],
+                    false,
+                );
+            }
+        }
         let timeout = if matches!(
             command,
             DaemonCommand::PromptAndWait { .. }
@@ -1629,6 +1694,14 @@ impl Supervisor {
                                 .and_then(Value::as_str)
                                 .map(str::to_string)
                                 .unwrap_or_else(|| resident.worker_id.clone());
+                            self.note_daemon_event(
+                                if matches!(command, DaemonCommand::Reattach { .. }) {
+                                    "reattach"
+                                } else {
+                                    "attach"
+                                },
+                                None,
+                            );
                             let mut attached = attached.lock().unwrap();
                             if !attached.iter().any(|id| id == &active_id) {
                                 attached.push(active_id.clone());
@@ -1658,6 +1731,7 @@ impl Supervisor {
                 }
                 if let DaemonCommand::Detach { .. } = command {
                     if response.success {
+                        self.note_daemon_event("detach", None);
                         attached
                             .lock()
                             .unwrap()

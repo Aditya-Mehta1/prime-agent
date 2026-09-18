@@ -1226,6 +1226,7 @@ dependencies = [
  "pa-ai",
  "pa-core",
  "pa-daemon",
+ "pa-telemetry",
  "pa-tui",
  "pa-types",
  "serde",
@@ -1250,6 +1251,7 @@ dependencies = [
  "nix",
  "pa-agent",
  "pa-ai",
+ "pa-telemetry",
  "pa-types",
  "reqwest",
  "serde",
@@ -1274,6 +1276,7 @@ dependencies = [
  "pa-agent",
  "pa-ai",
  "pa-core",
+ "pa-telemetry",
  "pa-types",
  "regex",
  "serde",
@@ -1282,6 +1285,20 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "pa-telemetry"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 

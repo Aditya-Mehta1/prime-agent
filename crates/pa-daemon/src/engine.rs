@@ -162,6 +162,24 @@ pub trait SessionEngine: Send + Sync {
         None
     }
 
+    /// Finalize session telemetry at session close: emit
+    /// `agent session ended` and flush once (TS dispose callback).
+    /// Best-effort: implementations bound the wait (sink timeouts) and never
+    /// fail or block shutdown. Engines without telemetry do nothing.
+    fn end_telemetry(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::ready(()))
+    }
+
+    /// The daemon `kill` path: emit `session archived` then finalize
+    /// (`agent session ended` + flush). Best-effort like `end_telemetry`.
+    fn archive_session_telemetry(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::ready(()))
+    }
+
     /// The `(provider, model id)` pair the session will run on, when the
     /// engine can resolve one; fresh daemon sessions record it in their
     /// creation prefix (`model_change`). Engines without a model return

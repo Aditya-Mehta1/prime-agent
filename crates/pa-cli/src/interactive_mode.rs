@@ -22,6 +22,10 @@ const DAEMON_SHUTDOWN_WAIT_MS: u64 = 5_000;
 struct SettingsOnboardingSink {
     cwd: PathBuf,
     agent_dir: PathBuf,
+    /// When the onboarding task was created: the `onboarding completed`
+    /// duration measures sink creation to completion (the TUI starts the
+    /// flow right away; the trace-question flow is the whole onboarding).
+    created_at: std::time::Instant,
 }
 
 impl pa_tui::interactive::OnboardingSink for SettingsOnboardingSink {
@@ -37,7 +41,24 @@ impl pa_tui::interactive::OnboardingSink for SettingsOnboardingSink {
 
     fn mark_onboarding_complete(&self) -> Result<()> {
         let mut settings = pa_core::settings::SettingsManager::create(&self.cwd, &self.agent_dir);
-        settings.set_onboarding_shown(true)
+        settings.set_onboarding_shown(true)?;
+        // `onboarding completed` (schema v1): the Rust onboarding flow is the
+        // trace question, so outcome is always success and no auth/provider
+        // step runs (auth_category `none`). Best-effort like all telemetry.
+        if !crate::mode::telemetry_disabled(&settings) {
+            let client =
+                pa_core::session_engine::telemetry::build_client(&settings, &self.agent_dir);
+            let mut properties = pa_telemetry::base_properties("interactive");
+            properties.set(
+                "duration_ms",
+                serde_json::Value::from(self.created_at.elapsed().as_millis() as u64),
+            );
+            properties.set("outcome", serde_json::Value::from("success"));
+            properties.set("auth_category", serde_json::Value::from("none"));
+            properties.set("provider_category", serde_json::Value::from("unknown"));
+            client.track("onboarding completed", properties);
+        }
+        Ok(())
     }
 }
 
@@ -62,6 +83,7 @@ fn onboarding_task(
         sink: std::sync::Arc::new(SettingsOnboardingSink {
             cwd: config.cwd.clone(),
             agent_dir: config.agent_dir.clone(),
+            created_at: std::time::Instant::now(),
         }),
     })
 }
@@ -70,12 +92,52 @@ fn onboarding_task(
 pub fn run_interactive_mode(options: &RunOptions) -> Result<i32> {
     let socket_path = resolve_socket_path(options.daemon_socket.as_deref());
     let tui_options = build_tui_options(options, socket_path)?;
+    // Telemetry disclosure (TS agent-session-services): once per
+    // installation, only after onboarding marked itself shown (a first
+    // interactive run belongs to the onboarding screen; the notice surfaces
+    // on the next launch). Divergence from TS: the TS product renders it as
+    // (a session diagnostic in the TUI; the Rust build prints it to stderr
+    // before the TUI starts, which keeps the same text visible without a
+    // daemon-side diagnostics round-trip).
+    if !tui_options.telemetry_disabled.unwrap_or(false) {
+        let mut settings = pa_core::settings::SettingsManager::create(
+            &options.config.cwd,
+            &options.config.agent_dir,
+        );
+        if settings.get_onboarding_shown() && !settings.get_telemetry_notice_shown() {
+            eprintln!(
+                "Prime Agent sends pseudonymous usage and performance metrics without prompts, responses, tool content, file paths, or repository data. Disable this with telemetry.enabled=false, PRIME_AGENT_TELEMETRY=0, DO_NOT_TRACK=1, or offline mode."
+            );
+            if let Err(error) = settings.set_telemetry_notice_shown(true) {
+                eprintln!("Warning: could not persist the telemetry notice: {error}");
+            }
+        }
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("build the interactive runtime")?;
+    let startup_started = std::time::Instant::now();
     runtime.block_on(async {
         ensure_daemon_running(&tui_options.socket_path, &tui_options.cwd).await?;
+        // `startup` (schema v1): process entry to a ready interactive
+        // session environment (daemon listening). Emitted through a
+        // one-shot client that flushes immediately; the session's own
+        // telemetry rides the daemon worker.
+        if !options.config.telemetry_disabled {
+            let agent_dir = options.config.agent_dir.clone();
+            let settings =
+                pa_core::settings::SettingsManager::create(&options.config.cwd, &agent_dir);
+            let client = pa_core::session_engine::telemetry::build_client(&settings, &agent_dir);
+            let daemon_ready_ms = startup_started.elapsed().as_millis() as u64;
+            let mut properties = pa_telemetry::base_properties("interactive");
+            properties.set("duration_ms", serde_json::Value::from(daemon_ready_ms));
+            let mut phase_timings = pa_telemetry::Properties::new();
+            phase_timings.set("daemon_ready", serde_json::Value::from(daemon_ready_ms));
+            properties.set_map("phase_timings", &phase_timings);
+            client.track("startup", properties);
+            let _ = client.shutdown().await;
+        }
         // `prime-agent agents` and bare `--resume` open the agents view
         // (TS `agentsViewRequested`); the view then opens sessions, and a
         // session exits back into the view until the user exits it. TS gates
@@ -182,6 +244,8 @@ fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<Inter
         theme: String::new(),
         version: crate::config::VERSION.to_string(),
         onboarding: onboarding_task(config),
+        // Only Some(true) rides the wire (TS `telemetryDisabled`).
+        telemetry_disabled: config.telemetry_disabled.then_some(true),
     })
 }
 

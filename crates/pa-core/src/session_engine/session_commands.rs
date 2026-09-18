@@ -172,6 +172,11 @@ pub async fn execute_session_command(
 ) -> SessionCommandExecution {
     let mut execution = SessionCommandExecution::default();
     execution.push_message(slash_command_echo(command));
+    // Telemetry adoption seam: builtin session commands carry their usage
+    // event from the single dispatch point (canonical name only).
+    if let Some(telemetry) = &engine.telemetry {
+        telemetry.note_command_used(command.name);
+    }
     let result = match command.name {
         "compact" => execute_compact(engine, params, command, &mut execution).await,
         "refine" => execute_refine(engine, params, command, &mut execution).await,
@@ -210,6 +215,9 @@ async fn execute_compact(
     match outcome {
         CompactOutcome::Skipped(_) => {}
         CompactOutcome::Ran(run) => {
+            if let Some(telemetry) = &engine.telemetry {
+                telemetry.note_compaction();
+            }
             execution.compaction = Some(CompactionExecution {
                 entry: run.entry,
                 result: run.result,

@@ -186,6 +186,11 @@ fn main_impl(args: Vec<String>, runtime: &dyn mode::Runtime) -> Result<i32, Stri
     }
 
     let agent_dir = crate::config::get_agent_dir();
+    // Telemetry opt-in resolution (TS main.ts): env override, then settings.
+    // The runtime config only carries the disabled case.
+    let telemetry_disabled = crate::mode::telemetry_disabled(
+        &pa_core::settings::SettingsManager::create(&cwd, &agent_dir),
+    );
     let session_dir = parsed
         .session_dir
         .as_deref()
@@ -206,7 +211,7 @@ fn main_impl(args: Vec<String>, runtime: &dyn mode::Runtime) -> Result<i32, Stri
             agent_dir,
             session_dir.clone(),
             app_mode,
-            false,
+            telemetry_disabled,
         ),
         session: mode::SessionOptions {
             continue_recent: parsed.continue_,

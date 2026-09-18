@@ -104,6 +104,11 @@ pub struct InteractiveOptions {
     pub version: String,
     /// Run the first-run onboarding flow before the session screen.
     pub onboarding: Option<OnboardingTask>,
+    /// Telemetry opt-out (TS `telemetryDisabled`): `Some(true)` only when
+    /// the invocation disabled telemetry; carried on create/attach so the
+    /// daemon worker installs no telemetry subscriber and attach obeys the
+    /// TS `assertTelemetryAttachAllowed` guard.
+    pub telemetry_disabled: Option<bool>,
 }
 
 impl InteractiveOptions {
@@ -613,6 +618,7 @@ mod tests {
             theme: "prime".to_string(),
             version: "0.0.0".to_string(),
             onboarding: None,
+            telemetry_disabled: None,
         }
     }
 

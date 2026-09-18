@@ -54,6 +54,13 @@ Every contributor (human or agent) must read this before working on this repo.
 - PRs must state ownership compliance (crate README scope/non-goals/public API, dependency
   direction).
 
+## Adoption telemetry
+
+Every user-visible feature ships its adoption telemetry event in the same PR as the feature:
+the event name + properties are added to `docs/telemetry-events.md` (schema versioned), and a
+seam emits it from day one. Telemetry properties never carry prompt, session, or file content
+(primitives only; see `pa-telemetry` and the privacy contract in `docs/telemetry-design.md`).
+
 ## Branding
 
 The product is Prime Agent - we are not a pi fork. Scrub "pi"/"pi-mono"/"pi-ai"/

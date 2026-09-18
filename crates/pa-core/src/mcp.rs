@@ -203,15 +203,31 @@ pub struct McpManagerOptions {
     pub begin_login: Option<BeginLoginFn>,
 }
 
+/// Telemetry usage reporter for MCP connector activity: called with
+/// `(action, server)` on every successful `mcp.*` host request. Server name
+/// only — never tool names, arguments, or results. Set by the session engine
+/// before host handlers register (the wire handlers capture it).
+pub type McpUsageReporter = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
+
 /// Host-side MCP manager: auth gating, config resolution, `mcp.*` host
 /// requests, and ACP session servers.
 pub struct McpManager {
     auth_storage: Arc<tokio::sync::Mutex<AuthStorage>>,
     get_user_servers: Box<dyn Fn() -> Option<HashMap<String, McpServerConfig>> + Send + Sync>,
     begin_login: Option<BeginLoginFn>,
+    usage_report: Option<McpUsageReporter>,
     integrations: HashMap<String, ResolvedIntegration>,
     acp_servers: std::sync::Arc<std::sync::Mutex<HashMap<String, AcpMcpServerConfig>>>,
     acp_owner_id: std::sync::Mutex<Option<String>>,
+}
+
+impl McpManager {
+    /// Set the telemetry usage reporter (session engine wiring; see
+    /// [`McpUsageReporter`]). Must run before
+    /// [`McpManager::register_host_handlers`] so the handlers capture it.
+    pub fn set_usage_report(&mut self, reporter: Option<McpUsageReporter>) {
+        self.usage_report = reporter;
+    }
 }
 
 fn provider_id(server: &str) -> String {
@@ -234,6 +250,7 @@ impl McpManager {
             auth_storage: Arc::new(tokio::sync::Mutex::new(options.auth_storage)),
             get_user_servers: options.get_user_servers,
             begin_login: options.begin_login,
+            usage_report: None,
             integrations: HashMap::new(),
             acp_servers: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             acp_owner_id: std::sync::Mutex::new(None),
@@ -408,10 +425,12 @@ impl McpManager {
     pub fn register_host_handlers(&self, handlers: &mut HostRequestHandlers) {
         let auth = self.auth_storage.clone();
         let acp_servers = self.acp_servers.clone();
+        let usage_refresh = self.usage_report.clone();
         handlers.register(
             "mcp.refresh",
             host_handler(move |payload| {
                 let auth = auth.clone();
+                let usage_refresh = usage_refresh.clone();
                 Box::pin(async move {
                     let server = payload
                         .data
@@ -428,16 +447,21 @@ impl McpManager {
                             "Could not refresh credentials for {server}"
                         ));
                     }
+                    if let Some(report) = &usage_refresh {
+                        report("refresh", &server);
+                    }
                     Ok(json!({}))
                 })
             }),
         );
         let integrations = self.integrations.clone();
+        let usage_config = self.usage_report.clone();
         handlers.register(
             "mcp.config",
             host_handler(move |payload| {
                 let integrations = integrations.clone();
                 let acp_servers = acp_servers.clone();
+                let usage_config = usage_config.clone();
                 Box::pin(async move {
                     let server = payload
                         .data
@@ -453,6 +477,9 @@ impl McpManager {
                         let mut config = serde_json::to_value(acp).unwrap_or(Value::Null);
                         if let Value::Object(map) = &mut config {
                             map.insert("credentialSource".to_string(), json!("acp"));
+                        }
+                        if let Some(report) = &usage_config {
+                            report("config", &server);
                         }
                         return Ok(config);
                     }

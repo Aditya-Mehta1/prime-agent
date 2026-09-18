@@ -16,6 +16,8 @@ use crate::session::manager::SessionManager;
 use crate::skills::PromptTemplate;
 use pa_types::session::FileEntry;
 
+use pa_telemetry::base_properties;
+
 use super::{AgentSession, PromptOptions, PromptOutcome};
 
 /// Everything needed to assemble a session.
@@ -71,6 +73,9 @@ pub struct SessionEngineConfig {
     /// Optional name allow-list for extension tools (`--tools`, TS
     /// `isAllowedTool`); an absent list allows every registered tool.
     pub extension_tool_allow_list: Option<Vec<String>>,
+    /// Session telemetry wiring (PostHog client + execution mode). `None`
+    /// (opt-out) installs nothing; non-depth-0 sessions never install.
+    pub telemetry: Option<super::telemetry::TelemetryWiring>,
     /// An externally owned MCP manager (the daemon worker's session store):
     /// the engine adopts it instead of building its own, so ACP-admitted
     /// servers reach the prompt's MCP gating through the same store the
@@ -107,6 +112,9 @@ pub struct SessionEngine {
     /// `model.info` host requests and the pending requests the turn loop
     /// consumes after a settled turn).
     pub turn_boundary: std::sync::Arc<super::turn_boundary::TurnBoundaryRequests>,
+    /// Installed session telemetry (agent-event subscriber). `None` when
+    /// telemetry is disabled or the session is not depth 0.
+    pub telemetry: Option<std::sync::Arc<super::telemetry::SessionTelemetry>>,
 }
 
 /// Resolve the MCP gating the resource loader and prompt need: skill
@@ -252,10 +260,26 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     }
     // The `mcp.*` host requests (config/refresh/begin_login) the kernel's
     // generic MCP registry sends while listing or calling generic servers.
-    mcp_manager
-        .lock()
-        .unwrap()
-        .register_host_handlers(&mut handlers);
+    // Telemetry reports connector usage (server name + action only) when the
+    // session is telemetry-enabled; set before the handlers register so
+    // their closures capture the reporter.
+    {
+        let mut manager = mcp_manager.lock().unwrap();
+        if let Some(wiring) = &config.telemetry {
+            let client = wiring.client.clone();
+            let execution_mode = wiring
+                .execution_mode
+                .clone()
+                .unwrap_or_else(|| super::telemetry::EXECUTION_MODE_UNKNOWN.to_string());
+            manager.set_usage_report(Some(std::sync::Arc::new(move |action, server| {
+                let mut properties = base_properties(&execution_mode);
+                properties.set("action", serde_json::Value::from(action));
+                properties.set("server_name", serde_json::Value::from(server));
+                client.track("mcp connector used", properties);
+            })));
+        }
+        manager.register_host_handlers(&mut handlers);
+    }
     // The turn-boundary surface: `model.info` always; `compact.*` behind
     // the compaction `agentCallable` setting; `refine.*` behind the TS
     // `_autoRefineAllowedForSession` gate (depth 0 with a local harness
@@ -282,11 +306,36 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     if config.rlm_depth.unwrap_or(0) == 0 && local_harness_dir.is_some() {
         turn_boundary.register_refine_handlers(&mut handlers);
     }
+    // `kernel bootstrap` telemetry: the provisioner reports every actual
+    // boot (duration, cold/revived, outcome) through the session's client.
+    let on_bootstrap_result = config.telemetry.as_ref().map(|wiring| {
+        let client = wiring.client.clone();
+        let execution_mode = wiring
+            .execution_mode
+            .clone()
+            .unwrap_or_else(|| super::telemetry::EXECUTION_MODE_UNKNOWN.to_string());
+        std::sync::Arc::new(
+            move |stats: crate::kernel::provisioner::KernelBootstrapStats| {
+                let mut properties = base_properties(&execution_mode);
+                properties.set("cold", serde_json::Value::from(stats.cold));
+                properties.set(
+                    "outcome",
+                    serde_json::Value::from(match stats.outcome {
+                        crate::kernel::provisioner::KernelBootstrapOutcome::Ready => "success",
+                        crate::kernel::provisioner::KernelBootstrapOutcome::Error => "error",
+                    }),
+                );
+                properties.set("duration_ms", serde_json::Value::from(stats.duration_ms));
+                client.track("kernel bootstrap", properties);
+            },
+        ) as crate::kernel::provisioner::KernelBootstrapResultHandler
+    });
     let provisioner = super::runtime_wiring::kernel_provisioner(
         session_id,
         handlers,
         python_skills,
         &config.agent_dir,
+        on_bootstrap_result,
     );
     let mut tools = config.tools.clone();
     // Extension loading (design doc §3.2, stage 2): discovery already
@@ -462,6 +511,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     });
 
     let agent = Arc::new(agent);
+    let telemetry_agent = std::sync::Arc::clone(&agent);
     let session = AgentSession::from_session_arc(
         agent.clone(),
         wiring.session.clone(),
@@ -479,6 +529,27 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         model_info,
     });
 
+    // Session telemetry: installed only for depth-0 sessions (TS parity —
+    // subagents never double-report). The composition root supplies the
+    // resolved client; `None` wires the opt-out fast path.
+    let telemetry = match (config.telemetry.take(), config.rlm_depth.unwrap_or(0)) {
+        (Some(wiring), 0) => {
+            let skill_counts = super::telemetry::SkillCounts {
+                skill_count: resources.skills.len(),
+                python_skill_count: super::runtime_wiring::kernel_python_skills(&resources.skills)
+                    .len(),
+            };
+            let installed = super::telemetry::install_session_telemetry(
+                &telemetry_agent,
+                &wiring,
+                Some(skill_counts),
+            )
+            .await?;
+            Some(std::sync::Arc::new(installed))
+        }
+        _ => None,
+    };
+
     let goal_driver = wiring.runtime.goal_driver().clone();
     Ok(SessionEngine {
         session,
@@ -491,6 +562,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         extension_runner,
         extension_diagnostics,
         turn_boundary,
+        telemetry,
     })
 }
 
@@ -580,6 +652,7 @@ mod tests {
             extra_builtin_skill_overrides: vec![],
             rlm_subagent_host: None,
             rlm_depth: None,
+            telemetry: None,
             model_info: None,
             cli_extension_sources: vec![],
             extension_tool_allow_list: None,
