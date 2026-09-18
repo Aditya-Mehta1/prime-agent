@@ -515,25 +515,14 @@ impl Renderer {
                 terminal::enable_raw_mode()?;
                 crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
                 // One reader thread feeds the loop; crossterm events are
-                // process-global and must be read from a single place.
-                std::thread::spawn(move || loop {
-                    if !crossterm::event::poll(Duration::from_millis(100)).unwrap_or(false) {
-                        continue;
+                // process-global, so the reader registry joins the previous
+                // surface's reader before this one starts polling.
+                crate::input::spawn_terminal_reader(move |event| match event {
+                    crossterm::event::Event::Key(key) => ui_tx.send(UiInput::Key(key)).is_ok(),
+                    crossterm::event::Event::Paste(text) => {
+                        ui_tx.send(UiInput::Paste(text)).is_ok()
                     }
-                    match crossterm::event::read() {
-                        Ok(crossterm::event::Event::Key(key)) => {
-                            if ui_tx.send(UiInput::Key(key)).is_err() {
-                                break;
-                            }
-                        }
-                        Ok(crossterm::event::Event::Paste(text)) => {
-                            if ui_tx.send(UiInput::Paste(text)).is_err() {
-                                break;
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(_) => break,
-                    }
+                    _ => true,
                 });
                 let backend = CrosstermBackend::new(std::io::stdout());
                 Ok(Renderer::Terminal(Terminal::new(backend)?))

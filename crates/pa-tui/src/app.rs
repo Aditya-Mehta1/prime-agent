@@ -181,6 +181,10 @@ pub(crate) fn draw(
     let height = area.height as usize;
     let frame = view.render_frame(width, height);
     let cursor = view.frame_cursor();
+    // Zone markers ride on the composed rows; plan their emission before
+    // the cell paint (which strips them), then write the sequences at their
+    // rows after the frame is painted.
+    let emissions = view.take_osc_emissions(&frame);
     terminal.draw(|f| {
         let lines: Vec<ratatui::text::Line<'static>> =
             frame.iter().map(crate::markdown::to_ratatui_line).collect();
@@ -191,16 +195,52 @@ pub(crate) fn draw(
             }
         }
     })?;
+    emit_zone_markers(&emissions, cursor)?;
+    Ok(())
+}
+
+/// Write OSC 133 zone-marker sequences at their frame rows. The sequences
+/// are zero-width: the grid content is untouched and only the row flags the
+/// terminal shell-integration reads change. The frame cursor is restored
+/// afterwards (the marker writes move it).
+fn emit_zone_markers(
+    emissions: &[(usize, crate::osc133::RowMarkers)],
+    cursor: Option<(usize, usize)>,
+) -> Result<()> {
+    if emissions.is_empty() {
+        return Ok(());
+    }
+    use crossterm::cursor::MoveTo;
+    use std::io::Write;
+    let mut out = stdout();
+    for (row, markers) in emissions {
+        crossterm::queue!(out, MoveTo(0, *row as u16))?;
+        if markers.start {
+            out.write_all(crate::osc133::ZONE_START.as_bytes())?;
+        }
+        if markers.end {
+            out.write_all(crate::osc133::ZONE_END.as_bytes())?;
+            out.write_all(crate::osc133::ZONE_FINAL.as_bytes())?;
+        }
+    }
+    if let Some((row, col)) = cursor {
+        crossterm::queue!(out, MoveTo(col as u16, row as u16))?;
+    }
+    out.flush()?;
     Ok(())
 }
 
 /// Render one frame as plain text (headless structural dump used by the tmux
-/// verifier and diff tests). ANSI styling is stripped.
+/// verifier and diff tests). ANSI styling and OSC zone markers are stripped.
 pub fn render_frame_text(view: &mut AgentView, width: u16, height: u16) -> Vec<String> {
     let frame = view.render_frame(width as usize, height as usize);
     frame
         .iter()
-        .map(|line| line.iter().map(|s| s.content.as_str()).collect())
+        .map(|line| {
+            let mut stripped = line.clone();
+            crate::osc133::strip(&mut stripped);
+            stripped.iter().map(|s| s.content.as_str()).collect()
+        })
         .collect()
 }
 

@@ -16,8 +16,72 @@ pub fn char_width(c: char) -> usize {
     }
 }
 
+/// Length of a complete ANSI escape sequence at the start of `s`, if any
+/// (TS `createAnsiCodeExtractor`): CSI parameter/intermediate/final bytes,
+/// OSC and APC strings ending at BEL or ST, and DCS/PM/SOS ending at ST.
+/// A malformed or unterminated sequence returns `None` and stays visible.
+fn escape_len(s: &str) -> Option<usize> {
+    let mut chars = s.char_indices();
+    let (_, first) = chars.next()?;
+    if first != '\x1b' {
+        return None;
+    }
+    let (_, second) = chars.next()?;
+    let mut consumed = 1 + second.len_utf8();
+    let mut pending = chars;
+    match second {
+        '[' => {
+            let mut has_intermediate = false;
+            for (_, c) in pending.by_ref() {
+                let byte = c as u32;
+                consumed += c.len_utf8();
+                if (0x30..=0x3f).contains(&byte) && !has_intermediate {
+                    continue;
+                }
+                if (0x20..=0x2f).contains(&byte) {
+                    has_intermediate = true;
+                    continue;
+                }
+                if (0x40..=0x7e).contains(&byte) {
+                    return Some(consumed);
+                }
+                return None;
+            }
+            None
+        }
+        ']' | '_' | 'P' | '^' | 'X' => {
+            let allow_bel = second == ']' || second == '_';
+            while let Some((index, c)) = pending.next() {
+                if c == '\x07' && allow_bel {
+                    return Some(index + 1);
+                }
+                if c == '\x1b' {
+                    match pending.next() {
+                        Some((after, '\\')) => return Some(after + 1),
+                        _ => return None,
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 pub fn str_width(s: &str) -> usize {
-    s.chars().map(char_width).sum()
+    let mut width = 0;
+    let mut rest = s;
+    while !rest.is_empty() {
+        match escape_len(rest) {
+            Some(len) => rest = &rest[len..],
+            None => {
+                let c = rest.chars().next().expect("non-empty rest");
+                width += char_width(c);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
+    }
+    width
 }
 
 pub fn spans_width(spans: &[Span]) -> usize {
@@ -70,13 +134,24 @@ pub fn truncate_line(line: &Line, max_width: usize, ellipsis: &str) -> Line {
     let mut out: Line = Vec::new();
     let mut used = 0usize;
     'outer: for span in line {
-        for c in span.content.chars() {
+        let mut rest = span.content.as_str();
+        while !rest.is_empty() {
+            if let Some(len) = escape_len(rest) {
+                // Escape sequences copy through untouched at zero width.
+                for c in rest[..len].chars() {
+                    push_char(&mut out, span.style, c);
+                }
+                rest = &rest[len..];
+                continue;
+            }
+            let c = rest.chars().next().expect("non-empty rest");
             let w = char_width(c);
             if used + w > budget {
                 break 'outer;
             }
             push_char(&mut out, span.style, c);
             used += w;
+            rest = &rest[c.len_utf8()..];
         }
     }
     if !ellipsis.is_empty() {

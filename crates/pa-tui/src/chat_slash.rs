@@ -116,7 +116,16 @@ pub fn render_slash_command(
         }
         spans
     };
-    wrap_block(text, theme, width, style_row)
+    let mut rows = wrap_block(text, theme, width, style_row);
+    // Zone markers on the echo block (TS `SlashCommandMessageComponent`);
+    // result rows render unmarked.
+    if let Some(first) = rows.first_mut() {
+        crate::osc133::mark_start(first);
+    }
+    if let Some(last) = rows.last_mut() {
+        crate::osc133::mark_end(last);
+    }
+    rows
 }
 
 /// The result row: plain content, default foreground on the block surface.
@@ -181,6 +190,7 @@ fn argument_token_end(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::osc133;
     use crate::theme::{ColorMode, Theme};
 
     fn theme() -> Theme {
@@ -196,12 +206,16 @@ mod tests {
     #[test]
     fn echo_row_uses_block_geometry() {
         let rows = render_slash_command("/goal status", true, &theme(), 40);
+        // The echo block carries the zone markers (TS marks the echo but
+        // never the result row).
+        assert!(osc133::row_markers(&rows[0]).start);
+        assert!(osc133::row_markers(&rows[2]).end);
         assert_eq!(
             plain(&rows),
             vec![
-                " ".repeat(40),
+                osc133::ZONE_START.to_string() + &" ".repeat(40),
                 format!("  {}  ", "/goal status") + &" ".repeat(40 - 2 - 12 - 2),
-                " ".repeat(40),
+                osc133::ZONE_END_PREFIX.to_string() + &" ".repeat(40),
             ]
         );
     }

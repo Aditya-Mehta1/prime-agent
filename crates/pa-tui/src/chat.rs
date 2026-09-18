@@ -229,6 +229,14 @@ pub fn render_user_block(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
         rows.push(pad_to(row, width, bg));
     }
     rows.push(blank);
+    // Zone markers: `A` on the first block row, `B`/`C` on the last (TS
+    // `UserMessageComponent.render`).
+    if let Some(first) = rows.first_mut() {
+        crate::osc133::mark_start(first);
+    }
+    if let Some(last) = rows.last_mut() {
+        crate::osc133::mark_end(last);
+    }
     rows
 }
 
@@ -289,6 +297,17 @@ pub fn render_assistant(
         && (has_visible_content || message.aborted || !preceded_by_tool_activity)
     {
         out.push(spacer());
+    }
+    // Zone markers on message bodies without tool calls (TS
+    // `AssistantMessageComponent.render`: tool-call messages return
+    // unmarked).
+    if !message.has_tool_calls {
+        if let Some(first) = out.first_mut() {
+            crate::osc133::mark_start(first);
+        }
+        if let Some(last) = out.last_mut() {
+            crate::osc133::mark_end(last);
+        }
     }
     out
 }
@@ -466,6 +485,71 @@ mod tests {
             .collect::<String>();
         assert_eq!(text.trim(), "Run a quick check.");
         assert_eq!(text.len(), 60);
+    }
+
+    #[test]
+    fn user_block_carries_zone_markers() {
+        let rows = render_user_block("Run a quick check.", &theme(), 60);
+        // The zone-start sequence leads the first block row; the end and
+        // final sequences lead the last block row (TS prepends both).
+        assert!(crate::osc133::row_markers(&rows[0]).start);
+        assert!(crate::osc133::row_markers(&rows[2]).end);
+        let first: String = rows[0].iter().map(|s| s.content.as_str()).collect();
+        assert!(first.starts_with(crate::osc133::ZONE_START));
+        let last: String = rows[2].iter().map(|s| s.content.as_str()).collect();
+        assert!(last.starts_with(crate::osc133::ZONE_END_PREFIX));
+        // Markers are zero-width: marked rows still measure full width.
+        assert_eq!(crate::width::line_width(&rows[0]), 60);
+    }
+
+    #[test]
+    fn assistant_markers_skip_tool_call_messages() {
+        let plain = AssistantMessage {
+            blocks: vec![MessageBlock::Text("Done.".to_string())],
+            has_tool_calls: false,
+            streaming: false,
+            error: None,
+            aborted: false,
+        };
+        let rows = render_assistant(&plain, Detail::Overview, &theme(), 60, false);
+        assert!(crate::osc133::row_markers(&rows[0]).start);
+        assert!(crate::osc133::row_markers(rows.last().unwrap()).end);
+
+        let with_tools = AssistantMessage {
+            blocks: vec![MessageBlock::Text("Working.".to_string())],
+            has_tool_calls: true,
+            streaming: false,
+            error: None,
+            aborted: false,
+        };
+        let rows = render_assistant(&with_tools, Detail::Overview, &theme(), 60, false);
+        assert_eq!(crate::osc133::row_markers(&rows[0]), Default::default());
+    }
+
+    #[test]
+    fn ipython_card_done_line() {
+        let card = ToolCallCard {
+            id: "toolu_1".into(),
+            name: "ipython".into(),
+            args: serde_json::json!({ "code": "print('visual parity ok')" }),
+            started: true,
+            result: Some(ToolResultView {
+                content: vec![serde_json::json!({ "type": "text", "text": "visual parity ok" })],
+                details: serde_json::json!({ "status": "ok", "durationMs": 2, "stdout": "visual parity ok\n" }),
+                is_error: false,
+            }),
+            result_partial: false,
+            ..Default::default()
+        };
+        let rows = render_tool_card(&card, 0, Detail::Overview, &theme(), 100);
+        let text = rows[0]
+            .iter()
+            .map(|s| s.content.as_str())
+            .collect::<String>();
+        assert!(
+            text.contains("\u{2713} python \u{00b7} print('visual parity ok') \u{00b7} \u{2191} 1 \u{2193} 1 lines"),
+            "got: {text}"
+        );
     }
 
     #[test]

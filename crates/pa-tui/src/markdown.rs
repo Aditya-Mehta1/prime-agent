@@ -674,9 +674,13 @@ fn wrap_quote(spans: &[Span], width: usize, style: &MarkdownStyle, out: &mut Vec
     }
 }
 
-/// Convert our Line type to ratatui text for rendering.
+/// Convert our Line type to ratatui text for rendering. OSC zone markers are
+/// stripped: ratatui has no escape-sequence support and would count their
+/// bytes as visible cells (`app::draw` re-emits them per row instead).
 pub fn to_ratatui_line(line: &Line) -> rt::Line<'static> {
-    let spans: Vec<rt::Span<'static>> = line
+    let mut stripped = line.clone();
+    crate::osc133::strip(&mut stripped);
+    let spans: Vec<rt::Span<'static>> = stripped
         .iter()
         .map(|s| rt::Span::styled(s.content.clone(), s.style))
         .collect();

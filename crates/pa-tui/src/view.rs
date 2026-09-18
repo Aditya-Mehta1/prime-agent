@@ -48,6 +48,10 @@ pub struct AgentView {
     dock_cursor: Option<(usize, usize)>,
     /// Window height of the last composed frame (cursor positioning).
     window_rows: usize,
+    /// Plain text of the last frame's rows: OSC zone-marker emission only
+    /// re-emits rows whose content changed (mirroring the TS renderer,
+    /// which writes a row's marker sequences when it rewrites that row).
+    osc_last_rows: Vec<String>,
 }
 
 impl AgentView {
@@ -68,7 +72,39 @@ impl AgentView {
             terminal_rows: 24,
             dock_cursor: None,
             window_rows: 0,
+            osc_last_rows: Vec::new(),
         }
+    }
+
+    /// Zone-marker emission plan for a freshly composed frame: every marked
+    /// row whose content changed since the last frame. The marker sequences
+    /// are part of the row content (a row gaining or keeping its marker is a
+    /// changed row, exactly like the TS renderer's per-row writes).
+    pub fn take_osc_emissions(
+        &mut self,
+        frame: &[Line],
+    ) -> Vec<(usize, crate::osc133::RowMarkers)> {
+        let rows: Vec<String> = frame
+            .iter()
+            .map(|line| line.iter().map(|s| s.content.as_str()).collect())
+            .collect();
+        let plan = frame
+            .iter()
+            .enumerate()
+            .filter_map(|(row, line)| {
+                let markers = crate::osc133::row_markers(line);
+                if !markers.start && !markers.end {
+                    return None;
+                }
+                let changed = self
+                    .osc_last_rows
+                    .get(row)
+                    .is_none_or(|prev| prev != &rows[row]);
+                changed.then_some((row, markers))
+            })
+            .collect();
+        self.osc_last_rows = rows;
+        plan
     }
 
     pub fn set_terminal_rows(&mut self, rows: u16) {
@@ -513,6 +549,24 @@ mod tests {
         assert!(joined.contains("prime agent v0.0.0"));
         assert!(joined.contains("Collapsed mode (Ctrl+O to expand)"));
         assert!(joined.contains(">"));
+    }
+
+    #[test]
+    fn osc_emissions_reemit_only_changed_rows() {
+        let mut v = view();
+        v.chrome.version = "0.0.0".to_string();
+        v.chrome.cwd = "/w".to_string();
+        v.chrome.chat_name = "w".to_string();
+        v.push(TranscriptItem::UserMessage {
+            text: "hello".to_string(),
+        });
+        let frame = v.render_frame(80, 24);
+        let first = v.take_osc_emissions(&frame);
+        let marked: Vec<usize> = first.iter().map(|(row, _)| *row).collect();
+        assert!(!marked.is_empty());
+        // Re-emitting an unchanged frame rewrites no rows.
+        let again = v.take_osc_emissions(&frame);
+        assert!(again.is_empty());
     }
 
     #[test]

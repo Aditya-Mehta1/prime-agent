@@ -57,10 +57,15 @@ pub(crate) struct SessionUi {
     turn_error_shown: bool,
     pub(crate) last_assistant_text: Option<String>,
     pub(crate) exit_requested: bool,
-    /// `/resume`: reopen the agents view after this session detaches.
+    /// `/resume` or the agents-back key: reopen the agents view after this
+    /// session detaches.
     pub(crate) open_agents_view: bool,
     /// `/resume <selector>`: open this selection next (the run returns it).
     pub(crate) pending_selection: Option<SessionSelection>,
+    /// Whether this run may hand the terminal back to the agents view (TS
+    /// `returnToAgentsView`): true for every daemon-hosted session, false
+    /// only for `--no-session` runs.
+    pub(crate) return_to_agents_view: bool,
     /// `/mcp login` / `/mcp logout` (the composition root's auth flows).
     client_auth: Option<crate::client_auth::ClientAuthCommandsHandle>,
     pub(crate) dirty: bool,
@@ -102,6 +107,7 @@ impl SessionUi {
             exit_requested: false,
             open_agents_view: false,
             pending_selection: None,
+            return_to_agents_view: !options.no_session,
             client_auth: options.client_auth.clone(),
             dirty: true,
         };
@@ -680,6 +686,27 @@ impl SessionUi {
         let Some(id) = key_event_to_id(&key) else {
             return Ok(());
         };
+        // Agents-back (TS `custom-editor.ts` onAgentsBack): with an empty
+        // editor the bound key (default left) hands the terminal to the
+        // agents view instead of moving the cursor; with text in the editor
+        // the key stays an editor cursor motion. A `--no-session` run has
+        // no daemon fleet to browse, so the key stays consumed but only
+        // reports that (TS `requestAgentsView` status).
+        if view.editor.keybindings().matches(&id, "app.agents.back")
+            && view.editor.get_text().trim().is_empty()
+        {
+            if self.return_to_agents_view {
+                self.open_agents_view = true;
+                self.exit_requested = true;
+            } else {
+                self.note(
+                    "The agents view needs a daemon-hosted session; start normally (without --no-session) to browse sessions",
+                    view,
+                );
+            }
+            self.dirty = true;
+            return Ok(());
+        }
         view.editor.handle_input(&id);
         for event in view.editor.take_events() {
             if let crate::editor::EditorEvent::Submitted(text) = event {

@@ -502,20 +502,15 @@ impl Renderer {
             AgentsViewUiMode::Terminal => {
                 crossterm::terminal::enable_raw_mode()?;
                 crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
-                std::thread::spawn(move || loop {
-                    if !crossterm::event::poll(Duration::from_millis(100)).unwrap_or(false) {
-                        continue;
+                // One reader thread feeds the view; the reader registry
+                // joins the previous surface's reader (the chat it opened)
+                // before this one starts polling.
+                crate::input::spawn_terminal_reader(move |event| match event {
+                    crossterm::event::Event::Key(key) => {
+                        let id = crate::keys::key_event_to_id(&key).unwrap_or_default();
+                        ui_tx.send(UiInput::Key(id)).is_ok()
                     }
-                    match crossterm::event::read() {
-                        Ok(crossterm::event::Event::Key(key)) => {
-                            let id = crate::keys::key_event_to_id(&key).unwrap_or_default();
-                            if ui_tx.send(UiInput::Key(id)).is_err() {
-                                break;
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(_) => break,
-                    }
+                    _ => true,
                 });
                 let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
                 Ok(Renderer::Terminal(ratatui::Terminal::new(backend)?))

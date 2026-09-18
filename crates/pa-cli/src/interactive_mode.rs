@@ -147,20 +147,32 @@ pub fn run_interactive_mode(options: &RunOptions) -> Result<i32> {
         let agents_view = options.session.resume_bare
             || (options.agents_view_requested && tui_options.onboarding.is_none());
         if agents_view {
-            run_agents_view_flow(tui_options).await
+            run_agents_view_flow(tui_options, None).await
         } else {
-            pa_tui::interactive::run_interactive(tui_options, UiMode::Terminal).await?;
-            Ok(())
+            let outcome =
+                pa_tui::interactive::run_interactive(tui_options.clone(), UiMode::Terminal).await?;
+            // TS `main.ts`: a direct session run closes into the agents view
+            // when the exit came through agents-back or `/resume`
+            // (`launchAgentsView` anchored on the session just left); every
+            // other exit (ctrl+c/ctrl+d, `/quit`) ends the process.
+            if outcome.return_to_agents_view {
+                run_agents_view_flow(tui_options, Some(outcome.session_id.clone())).await
+            } else {
+                Ok(())
+            }
         }
     })?;
     Ok(0)
 }
 
-/// The agents-view loop: open the view, run the session it opens, return to
-/// the view when the session detaches (TS `isReturningToAgentsView`), and
-/// exit when the view itself exits or a `/resume` resolves elsewhere.
-async fn run_agents_view_flow(base: InteractiveOptions) -> Result<()> {
-    let mut anchor: Option<String> = None;
+/// The agents-view loop: open the view, run the session it opens, and return
+/// to the view when the session detaches through agents-back or bare
+/// `/resume` (TS `InteractiveMode.run` returning `agents_view`). Every other
+/// session exit — ctrl+c/ctrl+d, `/quit`, `/exit` — ends the whole app (TS
+/// `shutdown()` exits the process instead of reopening the view). A
+/// `/resume <selector>` chain runs its target before the loop decides again.
+async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) -> Result<()> {
+    let mut anchor = anchor;
     loop {
         let view_options = pa_tui::agents_view::AgentsViewOptions {
             socket_path: base.socket_path.clone(),
@@ -183,14 +195,20 @@ async fn run_agents_view_flow(base: InteractiveOptions) -> Result<()> {
         let outcome =
             pa_tui::interactive::run_interactive(session_options, UiMode::Terminal).await?;
         anchor = Some(outcome.session_id.clone());
-        // `/resume <selector>` routes straight to that session; `/resume`
-        // (bare) and every other exit return to the agents view.
+        if !outcome.return_to_agents_view {
+            return Ok(());
+        }
+        // `/resume <selector>` routes straight to that session before the
+        // loop reopens the view.
         let mut pending = outcome.selection_request;
         while let Some(selection) = pending.take() {
             let mut next = base.clone();
             next.session = selection;
             let outcome = pa_tui::interactive::run_interactive(next, UiMode::Terminal).await?;
             anchor = Some(outcome.session_id.clone());
+            if !outcome.return_to_agents_view {
+                return Ok(());
+            }
             pending = outcome.selection_request;
         }
     }
