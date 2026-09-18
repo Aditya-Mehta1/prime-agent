@@ -63,6 +63,9 @@ pub struct ChromeState {
     pub thinking_suffix: Option<String>,
     /// Startup warning (tmux keyboard setup), rendered as a status row.
     pub tmux_notice: Option<String>,
+    /// Tray override label (TS `getTrayOverrideLabel`): while the Ctrl+C
+    /// exit hint is armed, it replaces the tray's location label.
+    pub tray_override: Option<String>,
 }
 
 /// Context usage for the tray label (`N (P%)`).
@@ -334,7 +337,11 @@ pub fn render_tray(state: &ChromeState, theme: &Theme, width: usize) -> Line {
     let dim = theme.fg_style(ThemeColor::Dim);
     let muted = theme.fg_style(ThemeColor::Muted);
     let mut left: Line = Vec::new();
-    if state.show_manage {
+    if let Some(override_label) = &state.tray_override {
+        // TS `renderInfoLine`: the override label replaces the location
+        // label on the left while it is set.
+        left.push(Span::styled(override_label.clone(), muted));
+    } else if state.show_manage {
         left.push(Span::styled("\u{2190}".to_string(), dim));
         left.push(Span::styled(" manage".to_string(), muted));
     }
@@ -441,6 +448,20 @@ mod tests {
         assert!(text.starts_with("\u{2190} manage"));
         assert!(text.contains("faux-1 \u{00b7} 6.1k (5%)"));
         assert_eq!(str_width(&text), 120);
+    }
+
+    #[test]
+    fn tray_override_replaces_location_label() {
+        let state = ChromeState {
+            show_manage: true,
+            tray_override: Some("Press Ctrl+C again to exit".to_string()),
+            model_id: Some("faux-1".to_string()),
+            ..Default::default()
+        };
+        let line = render_tray(&state, &theme(), 120);
+        let text = line.iter().map(|s| s.content.as_str()).collect::<String>();
+        assert!(text.starts_with("Press Ctrl+C again to exit"));
+        assert!(!text.contains("manage"));
     }
 
     #[test]

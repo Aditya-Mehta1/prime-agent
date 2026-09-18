@@ -153,6 +153,33 @@ fn handle_key(
     let Some(id) = key_event_to_id(&key) else {
         return;
     };
+    // Transcript viewport keys (TS tui.ts consumes them before the editor
+    // in fullscreen): page scroll, top, follow.
+    let (page_up, page_down, to_top, follow) = {
+        let kb = view.editor.keybindings();
+        (
+            kb.matches(&id, "tui.viewport.pageUp"),
+            kb.matches(&id, "tui.viewport.pageDown"),
+            kb.matches(&id, "tui.viewport.top"),
+            kb.matches(&id, "tui.viewport.follow"),
+        )
+    };
+    if page_up {
+        view.scroll_by(-(view.page_size() as isize));
+        return;
+    }
+    if page_down {
+        view.scroll_by(view.page_size() as isize);
+        return;
+    }
+    if to_top {
+        view.scroll_to_top();
+        return;
+    }
+    if follow {
+        view.scroll_to_bottom();
+        return;
+    }
     let is_paste_marker_key = false;
     let _ = is_paste_marker_key;
     view.editor.handle_input(&id);

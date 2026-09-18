@@ -148,6 +148,11 @@ impl Shared {
 /// A live connection to the daemon supervisor socket, optionally upgraded
 /// with a direct worker link (session-plane commands and events go straight
 /// to the session process; the supervisor stays the control plane).
+///
+/// Cheap to clone: clones share the same socket, pending-request table, and
+/// direct link, so a background request (the Ctrl+C abort) races a live
+/// client exactly.
+#[derive(Clone)]
 pub struct DaemonClient {
     socket_path: PathBuf,
     client_id: String,

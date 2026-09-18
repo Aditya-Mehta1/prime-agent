@@ -11,7 +11,9 @@
 //! attach/submit/stream/render path without a TTY.
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -26,6 +28,11 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
+
+/// Cap on the exit-path telemetry flush: the PostHog sink alone allows up
+/// to 1.5s, so the exit event must be dropped rather than awaited past the
+/// exit-within-1s contract.
+const TELEMETRY_EXIT_TIMEOUT_MS: u64 = 500;
 
 /// Which session the interactive run opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +62,30 @@ pub struct ModelSelection {
     pub thinking: Option<pa_types::ai::ModelThinkingLevel>,
 }
 
+/// Adoption telemetry for interactive-view interactions (schema v1 events
+/// `tui scroll used` and `tui exit`). pa-tui stays pa-types-only, so the
+/// composition root implements this against the telemetry client.
+/// The seam is object-safe (held as `Arc<dyn InteractionTelemetry>` in the
+/// options and session UI), so the async methods return boxed futures with an
+/// explicit `Send` bound instead of RPITIT.
+pub trait InteractionTelemetry: Send + Sync {
+    /// The first transcript scroll action of a run: `action` is
+    /// `page_up` / `page_down` / `top` / `follow`.
+    fn scroll_used(
+        &self,
+        action: &'static str,
+        resumed_following: bool,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    /// How the client run ended: `reason` is `ctrl_c_twice` / `ctrl_d` /
+    /// `session_request` / `daemon_closed`, with whether a turn was still
+    /// active at exit.
+    fn client_exit(
+        &self,
+        reason: &'static str,
+        turn_active: bool,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
+
 /// Persistence for the first-run onboarding answers. The TUI crate owns
 /// only the surface; the composition root (pa-cli) implements the sink
 /// against the settings manager, keeping pa-tui decoupled from pa-core.
@@ -81,8 +112,9 @@ impl std::fmt::Debug for OnboardingTask {
     }
 }
 
-/// Options for one interactive run.
-#[derive(Debug, Clone)]
+/// Options for one interactive run. `Debug` skips the telemetry handle (the
+/// trait object is not `Debug`).
+#[derive(Clone)]
 pub struct InteractiveOptions {
     pub socket_path: PathBuf,
     pub cwd: PathBuf,
@@ -113,6 +145,28 @@ pub struct InteractiveOptions {
     /// composition root provides (login suspends the TUI and prompts on
     /// the terminal). `None` reports the commands as unavailable.
     pub client_auth: Option<crate::client_auth::ClientAuthCommandsHandle>,
+    /// Adoption telemetry for the interactive view; `None` drops events.
+    pub telemetry: Option<std::sync::Arc<dyn InteractionTelemetry>>,
+}
+
+impl std::fmt::Debug for InteractiveOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InteractiveOptions")
+            .field("socket_path", &self.socket_path)
+            .field("cwd", &self.cwd)
+            .field("session_dir", &self.session_dir)
+            .field("script_path", &self.script_path)
+            .field("model_selection", &self.model_selection)
+            .field("no_session", &self.no_session)
+            .field("session", &self.session)
+            .field("initial_message", &self.initial_message)
+            .field("theme", &self.theme)
+            .field("version", &self.version)
+            .field("onboarding", &self.onboarding)
+            .field("telemetry_disabled", &self.telemetry_disabled)
+            .field("client_auth", &self.client_auth)
+            .finish()
+    }
 }
 
 impl InteractiveOptions {
@@ -259,6 +313,9 @@ async fn run_onboarding_phase(
 pub struct InteractiveOutcome {
     pub active_session_id: String,
     pub session_id: String,
+    /// The TS `formatResumeHint` line (a resumable, flushed session), for
+    /// the composition root to print after the terminal is restored.
+    pub resume_hint: Option<String>,
     pub last_assistant_text: Option<String>,
     pub frames: Vec<String>,
     /// `/resume` requested the agents view next (return-to-session flow).
@@ -289,7 +346,10 @@ pub async fn run_interactive(
     let (client, mut events) = DaemonClient::connect(&options.socket_path)
         .await
         .with_context(|| "the interactive UI could not attach to the daemon")?;
-    let mut session = SessionUi::open(client, &options).await?;
+    // Background notes (a failed abort request) fold into the transcript
+    // through the same loop that renders daemon events.
+    let (notes_tx, mut notes_rx) = mpsc::unbounded_channel::<String>();
+    let mut session = SessionUi::open(client, &options, notes_tx).await?;
 
     let theme = crate::app::load_theme(&options.theme);
     let mut view = AgentView::new(theme);
@@ -316,6 +376,7 @@ pub async fn run_interactive(
             return Ok(InteractiveOutcome {
                 active_session_id: session.active_session_id.clone(),
                 session_id: session.session_id.clone(),
+                resume_hint: None,
                 last_assistant_text: None,
                 frames: Vec::new(),
                 // Onboarding exit leaves no session open; no return-to-view
@@ -335,6 +396,10 @@ pub async fn run_interactive(
     let mut wait_idle_deadline: Option<Instant> = None;
 
     while running {
+        // The tray override row (the Ctrl+C exit hint) follows the session's
+        // hint state on every frame.
+        view.chrome.tray_override = session.tray_override();
+
         // Process one queued UI input. A WaitIdle step is a barrier: it stays
         // at the head of the queue until the turn finishes (or its deadline).
         if let Some(UiInput::WaitIdle { timeout_ms }) = pending.front() {
@@ -383,6 +448,11 @@ pub async fn run_interactive(
                 crate::app::draw(renderer, &mut view)?;
                 session.dirty = false;
             }
+            // An exit key must not wait out the select tick before the
+            // bounded shutdown path runs.
+            if !running {
+                break;
+            }
         }
         if headless_done
             && pending.is_empty()
@@ -415,6 +485,7 @@ pub async fn run_interactive(
                     }
                     None => {
                         session.note("the daemon connection closed", &mut view);
+                        session.exit_reason = "daemon_closed";
                         running = false;
                     }
                 }
@@ -422,6 +493,11 @@ pub async fn run_interactive(
             maybe_input = ui_rx.recv() => {
                 if let Some(input) = maybe_input {
                     pending.push_back(input);
+                }
+            }
+            maybe_note = notes_rx.recv() => {
+                if let Some(note) = maybe_note {
+                    session.apply_background_note(&note, &mut view);
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(50)) => {}
@@ -449,16 +525,34 @@ pub async fn run_interactive(
             renderer.render_headless(&mut session, &mut view);
         }
         if session.exit_requested {
+            session.exit_reason = "session_request";
             running = false;
         }
     }
 
+    // TS `shutdown` fetches the session stats while the connection is
+    // alive, then prints the resume hint after teardown; pa-cli prints it
+    // once the terminal is restored. Bounded best-effort.
+    let resume_hint = session.exit_resume_hint().await;
     // Detach explicitly so the session's attached-client count stays honest;
     // the supervisor also detaches this connection when the socket closes.
-    let _ = session.detach().await;
+    // Bounded hard: a wedged worker socket can never hold the exit path.
+    session.detach_for_exit().await;
+    // `tui exit` (schema v1): how the run ended. Bounded the same way as
+    // the detach — telemetry must never hold the exit path open either.
+    let exit_reason = session.exit_reason();
+    let turn_active_at_exit = session.turn_active;
+    if let Some(telemetry) = &session.telemetry {
+        let _ = tokio::time::timeout(
+            Duration::from_millis(TELEMETRY_EXIT_TIMEOUT_MS),
+            telemetry.client_exit(exit_reason, turn_active_at_exit),
+        )
+        .await;
+    }
     let outcome = InteractiveOutcome {
         active_session_id: session.active_session_id.clone(),
         session_id: session.session_id.clone(),
+        resume_hint,
         last_assistant_text: session.last_assistant_text.clone(),
         frames: renderer.finish(),
         return_to_agents_view: session.open_agents_view,
@@ -581,13 +675,17 @@ impl Renderer {
     }
 
     /// Hand the terminal back to the process (raw mode off, alternate
-    /// screen left) so an interactive client command can prompt on it.
-    /// Headless verification runs keep their plain pipes.
+    /// screen left, cursor visible) so an interactive client command can
+    /// prompt on it. Headless verification runs keep their plain pipes.
+    /// The trailing cursor-show leaves the terminal with a visible cursor
+    /// (the TS teardown contract: the shell prompt that follows must not
+    /// sit on a hidden cursor).
     fn suspend(&mut self) -> Result<()> {
         match self {
             Renderer::Terminal(_) => {
                 terminal::disable_raw_mode()?;
                 crossterm::execute!(std::io::stdout(), LeaveAlternateScreen)?;
+                crossterm::execute!(std::io::stdout(), crossterm::cursor::Show)?;
                 Ok(())
             }
             Renderer::Headless { .. } => Ok(()),
@@ -646,6 +744,7 @@ impl Renderer {
             Renderer::Terminal(_) => {
                 let _ = terminal::disable_raw_mode();
                 let _ = crossterm::execute!(std::io::stdout(), LeaveAlternateScreen);
+                let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
                 Vec::new()
             }
             Renderer::Headless { frames, .. } => frames,
@@ -672,6 +771,7 @@ mod tests {
             onboarding: None,
             telemetry_disabled: None,
             client_auth: None,
+            telemetry: None,
         }
     }
 
@@ -689,5 +789,40 @@ mod tests {
     fn create_config_omits_thinking_when_no_flag_was_given() {
         let config = options(ModelSelection::default()).create_config();
         assert!(config.get("thinking").is_none());
+    }
+
+    #[test]
+    fn resume_hint_names_a_flushed_session() {
+        let dir = std::env::temp_dir().join("pa-tui-resume-hint-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("session.jsonl");
+        std::fs::write(&file, "{}").unwrap();
+        let stats = json!({
+            "sessionId": "s1",
+            "sessionFile": file.display().to_string(),
+            "userMessages": 1
+        });
+        assert_eq!(
+            crate::session_ui::resume_hint_from_stats(&stats),
+            Some("Resume this session with: prime-agent --resume s1".to_string())
+        );
+        // An unflushed empty session and a missing session file are both
+        // unresumable (TS omits the hint for either).
+        assert_eq!(
+            crate::session_ui::resume_hint_from_stats(&json!({
+                "sessionId": "s1",
+                "sessionFile": file.display().to_string(),
+                "userMessages": 0
+            })),
+            None
+        );
+        assert_eq!(
+            crate::session_ui::resume_hint_from_stats(&json!({
+                "sessionId": "s1",
+                "sessionFile": dir.join("missing.jsonl").display().to_string(),
+                "userMessages": 3
+            })),
+            None
+        );
     }
 }

@@ -22,6 +22,23 @@ use crate::snapshot::{
 use crate::view::AgentView;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
+
+/// How long the Ctrl+C exit hint arms the second-press exit (TS
+/// `EXIT_HINT_DURATION_MS`).
+const CTRL_C_EXIT_HINT_MS: u64 = 2_000;
+/// Cap on any daemon request awaited on the key-handling path: the UI loop
+/// must stay responsive to Ctrl+C while a submission travels (the TS loop
+/// never blocks on these — aborts are fire-and-forget, submissions resolve
+/// off the render path).
+const UI_REQUEST_TIMEOUT_MS: u64 = 10_000;
+/// Cap on the detach request during the exit path: the client must exit
+/// promptly even when the worker socket is wedged.
+const EXIT_DETACH_TIMEOUT_MS: u64 = 600;
+/// Cap on the exit-path session-stats fetch (TS `formatResumeHint` inputs):
+/// best-effort like the detach, never able to hold the exit open.
+const EXIT_STATS_TIMEOUT_MS: u64 = 500;
 
 /// Live UI state for one attached daemon session.
 pub(crate) struct SessionUi {
@@ -69,6 +86,19 @@ pub(crate) struct SessionUi {
     /// `/mcp login` / `/mcp logout` (the composition root's auth flows).
     client_auth: Option<crate::client_auth::ClientAuthCommandsHandle>,
     pub(crate) dirty: bool,
+    /// The Ctrl+C exit hint (TS `ctrlCExitHintExpiresAt`): a second press
+    /// inside the window terminates the client, regardless of turn state.
+    ctrl_c_hint_until: Option<Instant>,
+    /// Notes surfacing from background tasks (the async abort result) into
+    /// the UI loop.
+    notes: mpsc::UnboundedSender<String>,
+    /// Adoption telemetry (`tui scroll used` / `tui exit`); `None` drops
+    /// events.
+    pub(crate) telemetry: Option<std::sync::Arc<dyn crate::interactive::InteractionTelemetry>>,
+    /// Whether this run already reported its first scroll action.
+    scroll_adoption_emitted: bool,
+    /// How the client run ended (the `tui exit` reason).
+    pub(crate) exit_reason: &'static str,
 }
 
 impl SessionUi {
@@ -76,6 +106,7 @@ impl SessionUi {
     pub(crate) async fn open(
         client: DaemonClient,
         options: &InteractiveOptions,
+        notes: mpsc::UnboundedSender<String>,
     ) -> Result<SessionUi> {
         let active_session_id = match &options.session {
             SessionSelection::New => create_session(&client, options, None).await?,
@@ -110,6 +141,11 @@ impl SessionUi {
             return_to_agents_view: !options.no_session,
             client_auth: options.client_auth.clone(),
             dirty: true,
+            ctrl_c_hint_until: None,
+            notes,
+            telemetry: options.telemetry.clone(),
+            scroll_adoption_emitted: false,
+            exit_reason: "daemon_closed",
         };
         session
             .attach_session(&active_session_id)
@@ -231,12 +267,14 @@ impl SessionUi {
     /// and the branch total cost.
     pub(crate) async fn refresh_stats(&mut self) {
         let Ok(data) = self
-            .client
-            .request_ok(DaemonCommand::GetSessionStats {
-                id: None,
-                active_session_id: self.active_session_id.clone(),
-                rest: Default::default(),
-            })
+            .bounded_request(
+                Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                DaemonCommand::GetSessionStats {
+                    id: None,
+                    active_session_id: self.active_session_id.clone(),
+                    rest: Default::default(),
+                },
+            )
             .await
         else {
             return;
@@ -272,14 +310,61 @@ impl SessionUi {
     }
 
     pub(crate) async fn detach(&self) -> Result<()> {
-        self.client
-            .request_ok(DaemonCommand::Detach {
+        self.bounded_request(
+            Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+            DaemonCommand::Detach {
                 id: None,
                 active_session_id: Some(self.active_session_id.clone()),
                 rest: Default::default(),
-            })
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Detach during the exit path, bounded hard: a wedged worker socket can
+    /// never hold the client open (the exit contract is exit-within-1s even
+    /// then, so this must stay well under the bound).
+    pub(crate) async fn detach_for_exit(&self) {
+        let _ = tokio::time::timeout(
+            Duration::from_millis(EXIT_DETACH_TIMEOUT_MS),
+            self.client.request_ok(DaemonCommand::Detach {
+                id: None,
+                active_session_id: Some(self.active_session_id.clone()),
+                rest: Default::default(),
+            }),
+        )
+        .await;
+    }
+
+    /// Fetch the exit resume hint (TS `shutdown` fetches `getSessionStats`
+    /// while the connection is alive, then prints `formatResumeHint` after
+    /// teardown). Bounded best-effort: a wedged worker or a dead connection
+    /// yields no hint instead of holding the exit open.
+    pub(crate) async fn exit_resume_hint(&self) -> Option<String> {
+        let stats = tokio::time::timeout(
+            Duration::from_millis(EXIT_STATS_TIMEOUT_MS),
+            self.client.request_ok(DaemonCommand::GetSessionStats {
+                id: None,
+                active_session_id: self.active_session_id.clone(),
+                rest: Default::default(),
+            }),
+        )
+        .await;
+        resume_hint_from_stats(&stats.ok()?.ok()?)
+    }
+
+    /// One daemon request with a hard await cap: the UI loop only ever
+    /// blocks this long on it.
+    async fn bounded_request(&self, timeout: Duration, command: DaemonCommand) -> Result<Value> {
+        tokio::time::timeout(timeout, self.client.request_ok(command))
             .await
-            .map(|_| ())
+            .map_err(|_| {
+                anyhow!(
+                    "timed out after {}ms waiting for the Prime Agent daemon response",
+                    timeout.as_millis()
+                )
+            })?
     }
 
     /// Submit a prompt. The user message arrives back as a `message_start`
@@ -300,8 +385,9 @@ impl SessionUi {
     /// commands travel the same path — the session engine parses and
     /// executes them instead of admitting a model turn.
     async fn send_prompt(&mut self, text: &str, view: &mut AgentView) -> Result<()> {
-        self.client
-            .request_ok(DaemonCommand::Prompt {
+        self.bounded_request(
+            Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+            DaemonCommand::Prompt {
                 id: None,
                 active_session_id: self.active_session_id.clone(),
                 message: text.to_string(),
@@ -319,9 +405,10 @@ impl SessionUi {
                     admission_id: None,
                 },
                 rest: Default::default(),
-            })
-            .await
-            .map_err(|error| anyhow!("{error:#}"))?;
+            },
+        )
+        .await
+        .map_err(|error| anyhow!("{error:#}"))?;
         if !self.turn_active {
             self.turn_active = true;
         }
@@ -560,20 +647,23 @@ impl SessionUi {
             version: String::new(),
             onboarding: None,
             client_auth: self.client_auth.clone(),
+            telemetry: self.telemetry.clone(),
         }
     }
 
     async fn refresh_list(&mut self, view: &mut AgentView) -> Result<()> {
         let data = self
-            .client
-            .request_ok(DaemonCommand::List {
-                id: None,
-                all: None,
-                cwd: None,
-                session_dir: None,
-                include_client_owned: None,
-                rest: Default::default(),
-            })
+            .bounded_request(
+                Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                DaemonCommand::List {
+                    id: None,
+                    all: None,
+                    cwd: None,
+                    session_dir: None,
+                    include_client_owned: None,
+                    rest: Default::default(),
+                },
+            )
             .await?;
         let sessions = data
             .get("sessions")
@@ -640,6 +730,82 @@ impl SessionUi {
         Ok(())
     }
 
+    /// The Ctrl+C exit hint is armed (TS `isCtrlCExitHintVisible`): a
+    /// second press inside the window terminates the client.
+    fn ctrl_c_hint_visible(&self) -> bool {
+        self.ctrl_c_hint_until
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    /// Arm the Ctrl+C exit hint (TS `showCtrlCExitHint`).
+    fn show_ctrl_c_hint(&mut self) {
+        self.ctrl_c_hint_until = Some(Instant::now() + Duration::from_millis(CTRL_C_EXIT_HINT_MS));
+    }
+
+    /// Disarm the hint (TS `clearCtrlCExitHint`: escape, editing text, or
+    /// shutdown).
+    fn clear_ctrl_c_hint(&mut self) {
+        self.ctrl_c_hint_until = None;
+    }
+
+    /// The tray override label while the exit hint is armed (TS
+    /// `getTrayOverrideLabel`: `Press Ctrl+C again to exit`).
+    pub(crate) fn tray_override(&self) -> Option<String> {
+        if !self.ctrl_c_hint_visible() {
+            return None;
+        }
+        let key = crate::keybindings::KeybindingsManager::new()
+            .first_key("app.clear")
+            .map(|key| crate::keybindings::format_key_text(&key))
+            .unwrap_or_else(|| "Ctrl+C".to_string());
+        Some(format!("Press {key} again to exit"))
+    }
+
+    /// Abort the active turn off the UI loop (TS `interruptOrClearInput`
+    /// fires `void abort()`): the request never blocks key handling, and a
+    /// failure surfaces later as a transcript note.
+    fn abort_turn(&self) {
+        let client = self.client.clone();
+        let active_session_id = self.active_session_id.clone();
+        let notes = self.notes.clone();
+        tokio::spawn(async move {
+            let result = client
+                .request_ok(DaemonCommand::Abort {
+                    id: None,
+                    active_session_id,
+                    rest: Default::default(),
+                })
+                .await;
+            if let Err(error) = result {
+                let _ = notes.send(format!("the abort failed: {error:#}"));
+            }
+        });
+    }
+
+    /// Apply one background note (a failed abort request) to the transcript.
+    pub(crate) fn apply_background_note(&mut self, text: &str, view: &mut AgentView) {
+        self.note(text, view);
+    }
+
+    /// The `tui exit` reason recorded at the point the loop stopped.
+    pub(crate) fn exit_reason(&self) -> &'static str {
+        self.exit_reason
+    }
+
+    /// Report the first scroll action of the run (`tui scroll used`),
+    /// fire-and-forget so the keypress never waits on the telemetry flush.
+    fn track_scroll(&mut self, action: &'static str, resumed_following: bool) {
+        if self.scroll_adoption_emitted {
+            return;
+        }
+        self.scroll_adoption_emitted = true;
+        if let Some(telemetry) = self.telemetry.clone() {
+            tokio::spawn(async move {
+                telemetry.scroll_used(action, resumed_following).await;
+            });
+        }
+    }
+
     pub(crate) async fn handle_key(
         &mut self,
         key: KeyEvent,
@@ -649,31 +815,34 @@ impl SessionUi {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             if view.editor.is_showing_autocomplete() {
                 view.editor.cancel_autocomplete();
+                self.clear_ctrl_c_hint();
                 return Ok(());
             }
-            // Ctrl+C aborts an active turn, exits when idle (TS parity: the
-            // first press cancels work, the shell exits on the second).
+            // TS `handleCtrlC`: the first press interrupts (aborting an
+            // active turn, showing the exit hint); a second press inside
+            // the hint window shuts down unconditionally — no turn wait,
+            // no abort wait — so the client always exits promptly.
+            if self.ctrl_c_hint_visible() {
+                self.exit_reason = "ctrl_c_twice";
+                *running = false;
+                return Ok(());
+            }
             if self.turn_active {
-                let _ = self
-                    .client
-                    .request_ok(DaemonCommand::Abort {
-                        id: None,
-                        active_session_id: self.active_session_id.clone(),
-                        rest: Default::default(),
-                    })
-                    .await;
+                self.abort_turn();
                 self.note("aborting the current turn", view);
-                return Ok(());
             }
-            *running = false;
+            self.show_ctrl_c_hint();
+            self.dirty = true;
             return Ok(());
         }
         if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.exit_reason = "ctrl_d";
             *running = false;
             return Ok(());
         }
         if key.code == KeyCode::Esc {
             view.editor.cancel_autocomplete();
+            self.clear_ctrl_c_hint();
             return Ok(());
         }
         if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -686,6 +855,41 @@ impl SessionUi {
         let Some(id) = key_event_to_id(&key) else {
             return Ok(());
         };
+        // Transcript viewport keys (TS tui.ts consumes them before the
+        // editor in fullscreen): page scroll, top, follow.
+        let (page_up, page_down, to_top, follow) = {
+            let kb = view.editor.keybindings();
+            (
+                kb.matches(&id, "tui.viewport.pageUp"),
+                kb.matches(&id, "tui.viewport.pageDown"),
+                kb.matches(&id, "tui.viewport.top"),
+                kb.matches(&id, "tui.viewport.follow"),
+            )
+        };
+        if page_up {
+            view.scroll_by(-(view.page_size() as isize));
+            self.track_scroll("page_up", view.is_following());
+            self.dirty = true;
+            return Ok(());
+        }
+        if page_down {
+            view.scroll_by(view.page_size() as isize);
+            self.track_scroll("page_down", view.is_following());
+            self.dirty = true;
+            return Ok(());
+        }
+        if to_top {
+            view.scroll_to_top();
+            self.track_scroll("top", view.is_following());
+            self.dirty = true;
+            return Ok(());
+        }
+        if follow {
+            view.scroll_to_bottom();
+            self.track_scroll("follow", view.is_following());
+            self.dirty = true;
+            return Ok(());
+        }
         // Agents-back (TS `custom-editor.ts` onAgentsBack): with an empty
         // editor the bound key (default left) hands the terminal to the
         // agents view instead of moving the cursor; with text in the editor
@@ -708,6 +912,11 @@ impl SessionUi {
             return Ok(());
         }
         view.editor.handle_input(&id);
+        // TS clears the exit hint as soon as the editor carries text: the
+        // `Press Ctrl+C again to exit` row belongs to the empty prompt.
+        if !view.editor.get_text().is_empty() {
+            self.clear_ctrl_c_hint();
+        }
         for event in view.editor.take_events() {
             if let crate::editor::EditorEvent::Submitted(text) = event {
                 view.editor.add_to_history(&text);
@@ -1098,6 +1307,26 @@ fn sorted_session_rows(mut sessions: Vec<Value>) -> Vec<Value> {
         right.cmp(&left)
     });
     sessions
+}
+
+/// TS `formatResumeHint` (resume-hint.ts): the post-exit hint names how to
+/// resume the session just left. Ephemeral (no session file) and unflushed
+/// empty sessions are omitted — neither can be resumed. Persistence is
+/// lazy: a file that does not exist on disk cannot be resumed either.
+pub(crate) fn resume_hint_from_stats(stats: &Value) -> Option<String> {
+    let session_id = stats.get("sessionId").and_then(Value::as_str)?;
+    let session_file = stats.get("sessionFile").and_then(Value::as_str)?;
+    let user_messages = stats
+        .get("userMessages")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    if session_file.is_empty() || user_messages == 0 || !std::path::Path::new(session_file).exists()
+    {
+        return None;
+    }
+    Some(format!(
+        "Resume this session with: prime-agent --resume {session_id}"
+    ))
 }
 
 /// Send a `create` command and return the new session's active id. A

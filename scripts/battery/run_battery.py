@@ -44,7 +44,7 @@ import perf as P  # noqa: E402
 
 NL = chr(10)
 
-ALL_FLOWS = ["f1_launch", "f2_prompt", "f3_tool", "f4_commands", "f5_side_questions", "f6_attach", "f7_compaction", "f8_resume", "f9_agents_view", "f10_perf", "f11_provider_failure"]
+ALL_FLOWS = ["f1_launch", "f2_prompt", "f3_tool", "f4_commands", "f5_side_questions", "f6_attach", "f7_compaction", "f8_resume", "f9_agents_view", "f10_perf", "f11_provider_failure", "f12_scroll", "f13_ctrlc_exit"]
 
 # Heavy flows: opt-in by name (`--flows f12_scale_resume`) plus
 # PA_BATTERY_HEAVY=1; they measure transcript-scale resume, not parity, and
@@ -1522,6 +1522,202 @@ class Battery:
                     f"provider-failure rendering parity: {verdicts['rust']['errorRows']} error row(s) on both sides",
                     gap=False,
                 )
+
+    # -- scroll + exit-lane verifiers (f12/f13) --------------------------------
+
+    def settle_first_run(self, session: str, timeout: float = 40.0) -> None:
+        """Wait past first-run dialogs (the trace notice) into the ready
+        prompt; answers the notice when one shows (perf_onboard pattern)."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            frame = B.tmux_capture(session)
+            if "Share agent traces" in frame:
+                B.tmux_send(session, "Down")
+                time.sleep(0.5)
+                B.tmux_send(session, "Enter")
+                time.sleep(1.0)
+            elif P.is_ready(session, frame) or (">" in frame and "manage" in frame):
+                return
+            else:
+                time.sleep(0.5)
+
+    def f12_scroll(self) -> None:
+        """Scrollback: PageUp pages history into view with the follow hint;
+        paging back to the tail resumes following. Both sides must move the
+        transcript window (pane frames carry the content offsets)."""
+        flow = "f12_scroll"
+        turns = 16
+        for side in (self.sides["ts"], self.sides["rust"]):
+            self.ensure_daemon(side)
+            side.mock.set_responses([{"text": "scroll filler reply"}])
+            session = f"{self.runid}-f12-{side.name}"
+            argv = P.launch_argv(side, side.daemon_socket)
+            B.tmux_launch(session, argv, side.env, side.work_dir)
+            self.settle_first_run(session)
+            for i in range(turns):
+                mark = len(side.mock.requests())
+                B.tmux_send(session, f"prompt {i}")
+                deadline = time.time() + 30
+                while time.time() < deadline and len(side.mock.requests()) <= mark:
+                    time.sleep(0.2)
+            time.sleep(2.0)
+            follow_frame = B.tmux_capture(session)
+            side.evidence(flow, "01-following.txt", follow_frame)
+            for _ in range(6):
+                B.tmux_send(session, "PageUp", enter=False)
+                time.sleep(0.15)
+            time.sleep(1.0)
+            paged_frame = B.tmux_capture(session)
+            side.evidence(flow, "02-paged.txt", paged_frame)
+            for _ in range(6):
+                B.tmux_send(session, "PageDown", enter=False)
+                time.sleep(0.15)
+            time.sleep(1.0)
+            resume_frame = B.tmux_capture(session)
+            side.evidence(flow, "03-resumed.txt", resume_frame)
+            B.tmux_kill(session)
+            checks = {
+                "follow shows tail prompt": f"prompt {turns - 1}" in follow_frame,
+                "follow hides top prompt": "prompt 0" not in follow_frame,
+                "paged shows early prompt": "prompt 2" in paged_frame,
+                "paged hides tail prompt": f"prompt {turns - 1}" not in paged_frame,
+                "paged shows follow hint": "to follow" in paged_frame,
+                "resumed shows tail prompt": f"prompt {turns - 1}" in resume_frame,
+                "resumed hides follow hint": "to follow" not in resume_frame,
+            }
+            failed = [name for name, ok in checks.items() if not ok]
+            if failed:
+                self.record(
+                    flow,
+                    "behavior",
+                    f"{side.name}: scrollback checks failed: {', '.join(failed)}",
+                    evidence=side.root / flow,
+                )
+            else:
+                self.record(
+                    flow,
+                    "behavior",
+                    f"{side.name}: PageUp pages history into view with the follow hint; paging back to the tail resumes following",
+                    gap=False,
+                )
+
+    def ctrl_c_exit_timing(self, side: B.Side, case: str, wedge: bool) -> dict:
+        """Launch one interactive session, hold it mid-turn against a
+        delayed mock response, send C-c C-c, and time the client exit."""
+        self.ensure_daemon(side)
+        side.mock.set_responses([{"text": "held reply", "delayMs": 20_000}])
+        session = f"{self.runid}-f13-{side.name}-{case}"
+        argv = P.launch_argv(side, side.daemon_socket)
+        B.tmux_launch(session, argv, side.env, side.work_dir)
+        B.tmux("set-option", "-t", session, "remain-on-exit", "on", check=False)
+        self.settle_first_run(session)
+        mark = len(side.mock.requests())
+        B.tmux_send(session, "hold the turn")
+        deadline = time.time() + 30
+        while time.time() < deadline and len(side.mock.requests()) <= mark:
+            time.sleep(0.2)
+        if len(side.mock.requests()) <= mark:
+            B.tmux_kill(session)
+            return {"case": case, "error": "the held prompt never reached the mock"}
+        if wedge:
+            # Kill the session worker mid-turn (SIGKILL): the worker socket
+            # is dead and cannot answer the abort or the detach.
+            children = B.children_of(side.daemon_proc.pid)
+            if not children:
+                B.tmux_kill(session)
+                return {"case": case, "error": "no worker process found to wedge"}
+            os.kill(children[-1], 9)
+            time.sleep(0.5)
+        B.tmux_send(session, "C-c", enter=False)
+        time.sleep(0.3)
+        exit_at = time.time()
+        B.tmux_send(session, "C-c", enter=False)
+        deadline = exit_at + 10
+        status = None
+        while time.time() < deadline:
+            out = B.tmux(
+                "display-message",
+                "-p",
+                "-t",
+                session,
+                "#{pane_dead} #{pane_dead_status}",
+                check=False,
+            ).stdout.strip()
+            if out.startswith("1"):
+                status = out
+                break
+            time.sleep(0.05)
+        elapsed_s = round(time.time() - exit_at, 2)
+        frame = B.tmux_capture(session)
+        side.evidence("f13_ctrlc_exit", f"{side.name}-{case}-final.txt", frame)
+        B.tmux_kill(session)
+        rec = {"case": case, "elapsed_s": elapsed_s}
+        if status is None:
+            rec["error"] = "the pane never died"
+            return rec
+        rec["status"] = status
+        rec["exit_code"] = int(status.split()[1]) if len(status.split()) > 1 else None
+        # The TS pane process is reaped late, so tmux never populates
+        # pane_dead_status for it (the observed pane stays a defunct
+        # process); its exit code is unobservable through tmux. The
+        # shutdown-path resume hint (formatResumeHint) corroborates a
+        # graceful shutdown instead.
+        rec["resume_hint"] = "Resume this session with:" in frame
+        return rec
+
+    def f13_ctrlc_exit(self) -> None:
+        """Double Ctrl+C exit: a long-turn session must exit within 1s of
+        the second press, both with a healthy worker and with the worker
+        killed -9 mid-turn (no deadlock on the dead worker socket)."""
+        flow = "f13_ctrlc_exit"
+        for case, sides, wedge in (
+            ("healthy", (self.sides["ts"], self.sides["rust"]), False),
+            ("wedged", (self.sides["rust"],), True),
+        ):
+            for side in sides:
+                rec = self.ctrl_c_exit_timing(side, case, wedge)
+                side.evidence_json(flow, f"{side.name}-{case}.json", rec)
+                # The exit-latency contract is the Rust client's (exit within
+                # 1s of the second press, exit code 0). The TS reference's
+                # timing is recorded as evidence; its shutdown drains input
+                # for up to 1s by design, so only a clean exit is required.
+                bound_s = 1.0 if side.name == "rust" else 10.0
+                # The TS exit code is often unobservable through tmux (the
+                # reaped-late pane leaves no pane_dead_status); the TS source
+                # exits via process.exit(0), so a dead pane inside the bound
+                # with the shutdown-path resume hint counts as clean.
+                exit_ok = rec.get("exit_code") == 0 or (
+                    side.name == "ts" and rec.get("exit_code") is None and rec.get("resume_hint")
+                )
+                ok = (
+                    "error" not in rec
+                    and rec.get("elapsed_s") is not None
+                    and rec["elapsed_s"] <= bound_s
+                    and exit_ok
+                )
+                if ok:
+                    exit_code = rec.get("exit_code")
+                    code_note = f"exit code {exit_code}" if exit_code is not None else "resume hint after exit"
+                    self.record(
+                        flow,
+                        "behavior",
+                        f"{side.name}: C-c C-c exits in {rec['elapsed_s']}s (case {case}, {code_note})",
+                        gap=False,
+                    )
+                else:
+                    summary = f"{side.name}: C-c C-c did not exit cleanly (case {case})"
+                    if "error" in rec:
+                        summary += f": {rec['error']}"
+                    elif rec.get("elapsed_s") is not None:
+                        summary += (
+                            f": exit took {rec['elapsed_s']}s, status {rec.get('status')}"
+                        )
+                    self.record(
+                        flow,
+                        "behavior",
+                        summary,
+                        evidence=side.root / flow / f"{side.name}-{case}.json",
+                    )
 
     def perf_onboard(self, side: B.Side) -> None:
         """Settle first-run dialogs (the TS trace notice) once before measuring,

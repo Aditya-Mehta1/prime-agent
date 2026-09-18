@@ -329,6 +329,7 @@ fn interactive_session_rss_plateaus_over_long_stream() {
         onboarding: None,
         telemetry_disabled: None,
         client_auth: None,
+        telemetry: None,
     };
     let plan = HeadlessPlan {
         steps,

@@ -188,6 +188,25 @@ Emitted on the daemon `kill` path, before the session-ended finalization.
 |---|---|---|
 | `duration_ms` | number | session lifetime at archive time |
 
+### `tui scroll used`
+
+The interactive transcript viewport's first scroll action per client run
+(adoption; later actions in the same run are not reported).
+
+| property | type | notes |
+|---|---|---|
+| `action` | string | `page_up` / `page_down` / `top` / `follow` |
+| `resumed_following` | boolean | the action resumed tail-following |
+
+### `tui exit`
+
+How one interactive client run ended.
+
+| property | type | notes |
+|---|---|---|
+| `exit_reason` | string | `ctrl_c_twice` (second press of the exit-hint window), `ctrl_d`, `session_request` (`/exit`, `/quit`, `/resume`, agents-back), `daemon_closed` |
+| `turn_active` | boolean | a turn was still running at exit |
+
 ## Planned events (seams not yet in the product)
 
 These stay in the catalog as planned schema v1 additions; they are NOT

@@ -55,6 +55,19 @@ pub fn row_markers(line: &Line) -> RowMarkers {
     markers
 }
 
+/// Split a rendered row into its leading marker spans and the visible rest,
+/// so an overlay can repaint a marked row without losing its zone flags.
+pub(crate) fn split_leading_markers(line: &Line) -> (Line, Line) {
+    let mut index = 0;
+    while line
+        .get(index)
+        .is_some_and(|span| markers_only(&span.content))
+    {
+        index += 1;
+    }
+    (line[..index].to_vec(), line[index..].to_vec())
+}
+
 /// Strip zone-marker spans from a rendered row. Markers are always inserted
 /// as their own raw spans at the row head, so removal only inspects leading
 /// spans whose content is made of marker sequences.
@@ -112,6 +125,21 @@ mod tests {
         assert_eq!(last[0].content, ZONE_END_PREFIX);
         let markers = row_markers(&last);
         assert!(markers.end && !markers.start);
+    }
+
+    #[test]
+    fn split_leading_markers_keeps_zone_flags() {
+        let mut line = row();
+        mark_start(&mut line);
+        let (markers, rest) = split_leading_markers(&line);
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].content, ZONE_START);
+        let joined: String = rest.iter().map(|s| s.content.as_str()).collect();
+        assert_eq!(joined, "hello world");
+        // An unmarked row splits into nothing + everything.
+        let (markers, rest) = split_leading_markers(&row());
+        assert!(markers.is_empty());
+        assert_eq!(rest.len(), 2);
     }
 
     #[test]

@@ -42,6 +42,9 @@ pub struct AgentView {
     pub onboarding: Option<crate::onboarding::OnboardingScreen>,
     scroll_top: usize,
     following: bool,
+    /// The transcript-tail offset of the last composed frame (TS
+    /// `lastMaxScroll`): scroll deltas page from here, not from zero.
+    last_max_scroll: usize,
     /// Rows of the terminal the editor should lay out against.
     terminal_rows: u16,
     /// Cursor cell within the last dock render: (dock row, column).
@@ -79,6 +82,7 @@ impl AgentView {
             onboarding: None,
             scroll_top: 0,
             following: true,
+            last_max_scroll: 0,
             terminal_rows: 24,
             dock_cursor: None,
             window_rows: 0,
@@ -166,15 +170,59 @@ impl AgentView {
         )
     }
 
-    /// Scroll position of the transcript window: following keeps the tail
-    /// pinned; otherwise the offset stays where the user left it.
+    /// Scroll the transcript window (TS `FullscreenViewport.scrollBy`):
+    /// a following view pages from the tail; scrolling up pauses following
+    /// and reaching the bottom resumes it.
     pub fn scroll_by(&mut self, delta: isize) {
-        self.following = false;
-        self.scroll_top = (self.scroll_top as isize + delta).max(0) as usize;
+        let base = if self.following {
+            self.last_max_scroll
+        } else {
+            self.scroll_top
+        };
+        self.scroll_top = (base as isize + delta).max(0) as usize;
+        self.following = self.scroll_top >= self.last_max_scroll;
+        if self.following {
+            self.scroll_top = self.last_max_scroll;
+        }
     }
 
+    /// Jump to the transcript start (TS `scrollToTop`); an empty transcript
+    /// keeps following.
+    pub fn scroll_to_top(&mut self) {
+        self.scroll_top = 0;
+        self.following = self.last_max_scroll == 0;
+    }
+
+    /// Jump to the transcript end and resume following (TS
+    /// `scrollToBottom`).
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_top = self.last_max_scroll;
+        self.following = true;
+    }
+
+    /// Resume following (fresh attach, session switch).
     pub fn follow(&mut self) {
         self.following = true;
+    }
+
+    /// One page of the transcript window (TS `pageSize`: the window minus
+    /// one row, at least one).
+    pub fn page_size(&self) -> usize {
+        self.window_rows.saturating_sub(1).max(1)
+    }
+
+    /// Whether the window pins the transcript tail.
+    pub fn is_following(&self) -> bool {
+        self.following
+    }
+
+    /// Scroll state of the last composed frame (TS `ScrollInfo`).
+    pub fn scroll_info(&self) -> ScrollInfo {
+        ScrollInfo {
+            following: self.following,
+            lines_above: self.scroll_top,
+            lines_below: self.last_max_scroll.saturating_sub(self.scroll_top),
+        }
     }
 
     /// Whether one chat entry's rows are stable: content that later frames
@@ -478,6 +526,7 @@ impl AgentView {
         } else {
             self.scroll_top = self.scroll_top.min(max_scroll);
         }
+        self.last_max_scroll = max_scroll;
         let start = self.scroll_top.min(max_scroll);
         self.window_rows = window_height;
         let mut frame: Vec<Line> = Vec::with_capacity(height);
@@ -490,6 +539,17 @@ impl AgentView {
         }
         for line in dock {
             frame.push(pad_row(line, width));
+        }
+        // A paused viewport carries the follow hint over the last transcript
+        // window row (TS composites it above the dock, below overlays).
+        if !self.following {
+            if let Some(row) = frame.get_mut(window_height) {
+                let key = crate::keybindings::KeybindingsManager::new()
+                    .first_key("tui.viewport.follow")
+                    .unwrap_or_else(|| "ctrl+shift+down".to_string());
+                let label = format!(" {key} to follow ");
+                *row = composite_follow_hint(row, &label, width);
+            }
         }
         frame
     }
@@ -537,6 +597,36 @@ fn pad_row(line: Line, width: usize) -> Line {
     if used < width {
         out.push(Span::raw(" ".repeat(width - used)));
     }
+    out
+}
+
+/// Scroll state of the transcript window (TS `ScrollInfo`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollInfo {
+    pub following: bool,
+    pub lines_above: usize,
+    pub lines_below: usize,
+}
+
+/// Composite the follow hint over one frame row (TS `renderFullscreen`:
+/// `ctrl+shift+down to follow` reversed, centered, over the last transcript
+/// window row). Leading OSC-133 zone markers stay at the row head so the
+/// marker plan keeps flagging the row.
+fn composite_follow_hint(row: &Line, label: &str, width: usize) -> Line {
+    let label_width = str_width(label);
+    let (markers, rest) = crate::osc133::split_leading_markers(row);
+    let col = width.saturating_sub(label_width) / 2;
+    let mut out: Line = markers;
+    out.extend(crate::width::slice_line_by_column(&rest, 0, col));
+    out.push(Span::styled(
+        label.to_string(),
+        Style::default().add_modifier(Modifier::REVERSED),
+    ));
+    out.extend(crate::width::slice_line_by_column(
+        &rest,
+        col.saturating_add(label_width),
+        width,
+    ));
     out
 }
 
@@ -649,6 +739,114 @@ mod tests {
         // Re-emitting an unchanged frame rewrites no rows.
         let again = v.take_osc_emissions(&frame);
         assert!(again.is_empty());
+    }
+
+    /// Fill the transcript past one window so there is scrollable history.
+    fn filled(mut v: AgentView, turns: usize) -> AgentView {
+        v.chrome.version = "0.0.0".to_string();
+        v.chrome.cwd = "/w".to_string();
+        v.chrome.chat_name = "w".to_string();
+        v.onboarding = None;
+        for index in 0..turns {
+            v.push(TranscriptItem::UserMessage {
+                text: format!("user line {index}"),
+            });
+            v.push(TranscriptItem::Assistant {
+                text: format!("assistant reply {index}"),
+            });
+        }
+        v
+    }
+
+    fn row_text(line: &Line) -> String {
+        line.iter().map(|s| s.content.as_str()).collect::<String>()
+    }
+
+    #[test]
+    fn scroll_pages_from_tail_and_resumes_at_bottom() {
+        let mut v = filled(view(), 30);
+        let frame = v.render_frame(80, 24);
+        // Fresh render follows the tail.
+        assert!(v.is_following());
+        let info = v.scroll_info();
+        assert_eq!(info.lines_below, 0);
+        assert!(frame.iter().any(|l| row_text(l).contains("reply 29")));
+
+        // PageUp pauses following and moves the window up a page: `page`
+        // rows remain below the window (`ScrollInfo` reports the tail
+        // distance in `lines_below`, the transcript-top offset in
+        // `lines_above`).
+        let page = v.page_size();
+        v.scroll_by(-(page as isize));
+        assert!(!v.is_following());
+        assert_eq!(v.scroll_info().lines_below, page);
+
+        // Scrolling back down reaches the tail and resumes following.
+        v.scroll_by(page as isize);
+        assert!(v.is_following());
+        assert_eq!(v.scroll_info().lines_below, 0);
+    }
+
+    #[test]
+    fn scroll_offset_is_visible_in_frames() {
+        let mut v = filled(view(), 30);
+        let following = v.render_frame(80, 24);
+        v.scroll_to_top();
+        let top = v.render_frame(80, 24);
+        // The top frame shows the earliest history the following frame
+        // scrolled past: distinct window content for the same transcript.
+        assert!(top.iter().any(|l| row_text(l).contains("reply 0")));
+        assert!(!following.iter().any(|l| row_text(l).contains("reply 0")));
+        assert!(following.iter().any(|l| row_text(l).contains("reply 29")));
+        assert!(!top.iter().any(|l| row_text(l).contains("reply 29")));
+    }
+
+    #[test]
+    fn follow_hint_shows_when_paused_and_hides_when_following() {
+        let mut v = filled(view(), 30);
+        let following_frame = v.render_frame(80, 24);
+        assert!(!following_frame
+            .iter()
+            .any(|l| row_text(l).contains("to follow")));
+        v.scroll_by(-(v.page_size() as isize));
+        let paused_frame = v.render_frame(80, 24);
+        assert!(paused_frame
+            .iter()
+            .any(|l| row_text(l).contains("ctrl+shift+down to follow")));
+        // The follow key resumes: the hint disappears.
+        v.scroll_to_bottom();
+        let resumed_frame = v.render_frame(80, 24);
+        assert!(v.is_following());
+        assert!(!resumed_frame
+            .iter()
+            .any(|l| row_text(l).contains("to follow")));
+        // scrollToTop pins the top; the hint shows again (TS shows it for
+        // every non-following window, even at the very top).
+        v.scroll_to_top();
+        let top_frame = v.render_frame(80, 24);
+        assert!(!v.is_following());
+        assert!(top_frame.iter().any(|l| row_text(l).contains("to follow")));
+    }
+
+    #[test]
+    fn follow_hint_keeps_zone_markers_on_the_composited_row() {
+        // A marked row composited with the hint keeps its zone flags at
+        // the head (the marker plan keeps flagging the row) and keeps the
+        // visible text around the centered label.
+        let mut row = vec![crate::Span::raw("x".repeat(80))];
+        crate::osc133::mark_end(&mut row);
+        let mut out = composite_follow_hint(&row, " ctrl+shift+down to follow ", 80);
+        let markers = crate::osc133::row_markers(&out);
+        assert!(markers.end && !markers.start);
+        assert!(row_text(&out).contains("to follow"));
+        assert_eq!(str_width(&row_text(&out)), 80);
+        // Stripping the markers leaves the hint visible.
+        crate::osc133::strip(&mut out);
+        assert!(row_text(&out).contains("to follow"));
+        // An unmarked row stays unmarked.
+        let plain = vec![crate::Span::raw(" ".repeat(80))];
+        let out = composite_follow_hint(&plain, " ctrl+shift+down to follow ", 80);
+        assert_eq!(crate::osc133::row_markers(&out), Default::default());
     }
 
     #[test]

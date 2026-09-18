@@ -1,0 +1,37 @@
+[
+ {
+  "flow": "f12_scroll",
+  "category": "behavior",
+  "gap": false,
+  "summary": "ts: PageUp pages history into view with the follow hint; paging back to the tail resumes following",
+  "evidence": ""
+ },
+ {
+  "flow": "f12_scroll",
+  "category": "behavior",
+  "gap": false,
+  "summary": "rust: PageUp pages history into view with the follow hint; paging back to the tail resumes following",
+  "evidence": ""
+ },
+ {
+  "flow": "f13_ctrlc_exit",
+  "category": "behavior",
+  "gap": false,
+  "summary": "ts: C-c C-c exits in 0.15s (case healthy, resume hint after exit)",
+  "evidence": ""
+ },
+ {
+  "flow": "f13_ctrlc_exit",
+  "category": "behavior",
+  "gap": false,
+  "summary": "rust: C-c C-c exits in 0.05s (case healthy, exit code 0)",
+  "evidence": ""
+ },
+ {
+  "flow": "f13_ctrlc_exit",
+  "category": "behavior",
+  "gap": false,
+  "summary": "rust: C-c C-c exits in 0.05s (case wedged, exit code 0)",
+  "evidence": ""
+ }
+]

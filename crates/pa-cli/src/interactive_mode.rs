@@ -4,7 +4,9 @@
 //! interactive loop. The session keeps running in the worker after the UI
 //! exits; reattaching later restores it from the same session file.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -131,6 +133,68 @@ fn startup_model_ready(
     }
 }
 
+/// `tui scroll used` / `tui exit` adoption telemetry: a one-shot client per
+/// event, tracked and flushed at the emission point (the `startup`-event
+/// pattern). Telemetry must never fail the session: opt-out or a broken
+/// install id drops the event.
+struct CliInteractionTelemetry {
+    cwd: PathBuf,
+    agent_dir: PathBuf,
+}
+
+impl CliInteractionTelemetry {
+    /// A one-shot client, or `None` when telemetry is opted out.
+    fn client(&self) -> Option<pa_telemetry::TelemetryClient> {
+        let settings = pa_core::settings::SettingsManager::create(&self.cwd, &self.agent_dir);
+        if crate::mode::telemetry_disabled(&settings) {
+            return None;
+        }
+        Some(pa_core::session_engine::telemetry::build_client(
+            &settings,
+            &self.agent_dir,
+        ))
+    }
+}
+
+impl pa_tui::interactive::InteractionTelemetry for CliInteractionTelemetry {
+    fn scroll_used(
+        &self,
+        action: &'static str,
+        resumed_following: bool,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let Some(client) = self.client() else {
+                return;
+            };
+            let mut properties = pa_telemetry::base_properties("interactive");
+            properties.set("action", serde_json::Value::from(action));
+            properties.set(
+                "resumed_following",
+                serde_json::Value::from(resumed_following),
+            );
+            client.track("tui scroll used", properties);
+            let _ = client.shutdown().await;
+        })
+    }
+
+    fn client_exit(
+        &self,
+        reason: &'static str,
+        turn_active: bool,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let Some(client) = self.client() else {
+                return;
+            };
+            let mut properties = pa_telemetry::base_properties("interactive");
+            properties.set("exit_reason", serde_json::Value::from(reason));
+            properties.set("turn_active", serde_json::Value::from(turn_active));
+            client.track("tui exit", properties);
+            let _ = client.shutdown().await;
+        })
+    }
+}
+
 /// Run the interactive TUI attached to the daemon. Returns the exit code.
 pub fn run_interactive_mode(options: &RunOptions) -> Result<i32> {
     let socket_path = resolve_socket_path(options.daemon_socket.as_deref());
@@ -201,11 +265,21 @@ pub fn run_interactive_mode(options: &RunOptions) -> Result<i32> {
             if outcome.return_to_agents_view {
                 run_agents_view_flow(tui_options, Some(outcome.session_id.clone())).await
             } else {
+                print_resume_hint(&outcome.resume_hint);
                 Ok(())
             }
         }
     })?;
     Ok(0)
+}
+
+/// TS `shutdown` prints the dim resume hint (`formatResumeHint`) to stdout
+/// after the TUI is restored; agents-view returns suppress it. Dim is the
+/// TS `chalk.dim` styling (`ESC[2m` ... `ESC[22m`).
+fn print_resume_hint(hint: &Option<String>) {
+    if let Some(hint) = hint {
+        println!("\x1b[2m{hint}\x1b[22m");
+    }
 }
 
 /// The agents-view loop: open the view, run the session it opens, and return
@@ -239,6 +313,7 @@ async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) 
             pa_tui::interactive::run_interactive(session_options, UiMode::Terminal).await?;
         anchor = Some(outcome.session_id.clone());
         if !outcome.return_to_agents_view {
+            print_resume_hint(&outcome.resume_hint);
             return Ok(());
         }
         // `/resume <selector>` routes straight to that session before the
@@ -250,6 +325,7 @@ async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) 
             let outcome = pa_tui::interactive::run_interactive(next, UiMode::Terminal).await?;
             anchor = Some(outcome.session_id.clone());
             if !outcome.return_to_agents_view {
+                print_resume_hint(&outcome.resume_hint);
                 return Ok(());
             }
             pending = outcome.selection_request;
@@ -318,6 +394,10 @@ fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<Inter
                 config.agent_dir.clone(),
             )),
         )),
+        telemetry: Some(std::sync::Arc::new(CliInteractionTelemetry {
+            cwd: config.cwd.clone(),
+            agent_dir: config.agent_dir.clone(),
+        })),
     })
 }
 

@@ -1,0 +1,46 @@
+pa-daemon client connection error: Broken pipe (os error 32)
+[supervisor] spawned worker pid Some(107426)
+[supervisor] wrote worker frame worker_auth: Ok("ok")
+[worker 107426] accepted connection
+[worker 107426] accepted connection
+[worker 107426] hello write failed: write private frame: Broken pipe (os error 32)
+[supervisor] worker frame: Some(String("daemon_hello"))
+[worker 107426] got command worker_auth
+[worker 107426] auth ok
+[supervisor] worker frame: Some(String("response"))
+[supervisor] wrote worker frame create: Ok("ok")
+[worker 107426] got command create
+[supervisor] worker frame: Some(String("response"))
+[supervisor] wrote worker frame get_state: Ok("ok")
+[worker 107426] got command get_state
+[supervisor] worker frame: Some(String("response"))
+[supervisor] wrote worker frame get_state: Ok("ok")
+[worker 107426] got command get_state
+[supervisor] worker frame: Some(String("response"))
+[supervisor] wrote worker frame worker_register_peer_transport: Ok("ok")
+[worker 107426] got command worker_register_peer_transport
+[supervisor] worker frame: Some(String("response"))
+[worker 107426] accepted connection
+[worker 107426] got command peer_auth
+[worker 107426] got command attach
+[worker 107426] got command get_session_stats
+[worker 107426] got command prompt
+[supervisor] worker frame: Some(String("session_event"))
+[supervisor] worker frame: Some(String("session_event"))
+[supervisor] worker frame: Some(String("session_event"))
+[supervisor] worker frame: Some(String("session_event"))
+[supervisor] worker frame: Some(String("session_event"))
+[supervisor] worker frame: Some(String("session_event"))
+[supervisor] worker frame: Some(String("session_event"))
+[supervisor] worker frame: Some(String("session_event"))
+[supervisor] worker frame: Some(String("session_event"))
+[supervisor] worker frame: Some(String("session_event"))
+[supervisor] worker frame: Some(String("session_event"))
+[worker 107426] got command get_session_stats
+[worker 107426] got command get_session_stats
+[worker 107426] got command detach
+[supervisor] worker frame: Some(String("session_status"))
+[supervisor] wrote worker frame shutdown: Ok("ok")
+[worker 107426] got command shutdown
+[supervisor] worker frame: Some(String("response"))
+[worker 107426 registration] registration connection lost: supervisor closed the registration connection

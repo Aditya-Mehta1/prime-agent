@@ -418,6 +418,23 @@ def tmux_send(session: str, keys: str, enter: bool = True) -> None:
     tmux("send-keys", "-t", session, keys, "Enter" if enter else "")
 
 
+def children_of(pid: int) -> list[int]:
+    """Live child pids of `pid` (youngest last), by /proc traversal."""
+    out = []
+    for proc_dir in Path("/proc").iterdir():
+        if not proc_dir.name.isdigit():
+            continue
+        try:
+            stat = (proc_dir / "stat").read_text()
+        except OSError:
+            continue
+        # The comm field can contain spaces/parens: split after the last ')'.
+        rest = stat[stat.rfind(")") + 1 :].split()
+        if len(rest) >= 2 and rest[1] == str(pid):
+            out.append(int(proc_dir.name))
+    return sorted(out)
+
+
 def tmux_kill(session: str) -> None:
     tmux("kill-session", "-t", session, check=False)
 

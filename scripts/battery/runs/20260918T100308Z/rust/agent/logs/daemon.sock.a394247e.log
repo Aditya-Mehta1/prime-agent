@@ -1,0 +1,3 @@
+supervisor started pid 121983
+[2026-09-18T10:03:08.668Z] session worker 02f8a8ca4a9f registered (epoch 1, pid 122007)
+[2026-09-18T10:03:08.752Z] session worker 02f8a8ca4a9f re-registered (epoch 2, pid 122007)
