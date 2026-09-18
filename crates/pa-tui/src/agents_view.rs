@@ -410,8 +410,13 @@ impl AgentsViewMode {
             " ".to_string(),
             ratatui::style::Style::default(),
         ));
+        // TS `formatTableCell(title, nameWidth)`: the name cell (icon +
+        // title) clips to the column width, so a long session name can
+        // never push the model, activity, and cost/age columns off-screen.
+        // The icon and its space take the first two cells of the column.
+        let title = truncate_text(&row.title, layout.name_width.saturating_sub(2));
         line.push(crate::Span::styled(
-            row.title.clone(),
+            title.clone(),
             if named {
                 theme
                     .fg_style(ThemeColor::Text)
@@ -421,7 +426,7 @@ impl AgentsViewMode {
             },
         ));
         line.push(crate::Span::styled(
-            " ".repeat(layout.name_width.saturating_sub(str_width(&row.title) + 2)),
+            " ".repeat(layout.name_width.saturating_sub(str_width(&title) + 2)),
             ratatui::style::Style::default(),
         ));
         line.push(crate::Span::styled(
@@ -736,5 +741,83 @@ fn first_input(pending: &mut Vec<UiInput>) -> Option<UiInput> {
         None
     } else {
         Some(pending.remove(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One idle row under test plus a holder row that keeps the selection,
+    /// with the given title and one model id. The activity text and cost/age
+    /// stay fixed so the expected rows are exact.
+    fn mode_with_row(title: &str, model: &str) -> (AgentsViewMode, usize) {
+        let mut mode = AgentsViewMode::new(AgentsViewOptions {
+            socket_path: PathBuf::from("/tmp/agents-view-test.sock"),
+            cwd: PathBuf::from("/tmp"),
+            session_dir: None,
+            theme: "prime".to_string(),
+            version: "0.0.0".to_string(),
+            anchor_session_id: None,
+        });
+        let row = |title: &str| AgentsViewRow {
+            section: Section::Idle,
+            identity: title.to_string(),
+            summary: serde_json::json!({ "sessionName": title }),
+            title: title.to_string(),
+            status_label: String::new(),
+            model: model.to_string(),
+            activity: "idle now".to_string(),
+            cost: 0.0,
+            age: "1s".to_string(),
+        };
+        mode.rows = vec![row("holder"), row(title)];
+        (mode, 1)
+    }
+
+    fn flat(line: &Line) -> String {
+        line.iter().map(|s| s.content.as_str()).collect()
+    }
+
+    /// The exact expected idle-row text: name cell (icon + title, clipped or
+    /// padded to `name_width`), model and activity cells padded to their
+    /// columns, then the cost/age details.
+    fn expected_row(title_cell: &str, layout: &RowLayout) -> String {
+        let bullet = "\u{2022}";
+        format!(
+            "{bullet} {title_cell}  {}  {}  $0.00   1s",
+            cell("mock-1", layout.model_width),
+            cell("idle now", layout.activity_width),
+        )
+    }
+
+    #[test]
+    fn long_session_names_clip_to_the_name_column() {
+        let (mode, index) = mode_with_row(&"a".repeat(100), "mock-1");
+        let layout = build_layout(&mode.rows, 120);
+        // TS `buildCompactAgentsViewLayout` at width 120 with these rows.
+        assert_eq!(layout.name_width, 28);
+        assert_eq!(layout.model_width, 12);
+        assert_eq!(layout.activity_width, 64);
+        let line = mode.render_row(&mode.rows[index], &layout, 120);
+        let text = flat(&line);
+        // TS `formatTableCell` clips with an empty ellipsis marker: the
+        // name cell keeps the icon and space plus 26 name characters.
+        assert_eq!(text, expected_row(&"a".repeat(26), &layout));
+        // Every column still renders after the clipped name.
+        let model_at = text.find("mock-1").expect("model column present");
+        assert_eq!(str_width(&text[..model_at]), 28 + 2);
+        assert!(text.ends_with("$0.00   1s"));
+    }
+
+    #[test]
+    fn short_session_names_pad_to_the_name_column() {
+        let (mode, index) = mode_with_row("short name", "mock-1");
+        let layout = build_layout(&mode.rows, 120);
+        assert_eq!(layout.name_width, 28);
+        let line = mode.render_row(&mode.rows[index], &layout, 120);
+        let text = flat(&line);
+        let name_cell = format!("short name{}", " ".repeat(28 - 2 - 10));
+        assert_eq!(text, expected_row(&name_cell, &layout));
     }
 }
