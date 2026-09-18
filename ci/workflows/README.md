@@ -9,8 +9,13 @@ Local gates mirror every workflow step today:
 
     make check            # fmt + clippy + test + release build (ci.yml fmt/clippy-test jobs)
     make deny             # cargo-deny advisories + licenses (ci.yml deny job)
+    make windows-cross    # cfg-hygiene: cross-target check + clippy -D warnings (ci.yml windows-cross job)
     make actionlint       # validates the staged workflow files
     make release-dry-run  # local mirror of the release build-job gates (release.yml)
+
+The `windows` job runs on a real `windows-latest` runner (portable tests plus
+the Windows-only platform tests); it has no local mirror - the sandbox is
+Linux-only.
 
 ## Promotion (once the token gains `workflow` scope)
 

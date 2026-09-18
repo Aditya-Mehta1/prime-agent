@@ -170,8 +170,14 @@ No platform coupling found (loop policy only; no process/socket code).
    `LockFileEx` variant was NOT needed: the TS product's proper-lockfile
    protocol (directory presence + mtime) is the byte-compatibility
    contract, and it works on Windows as-is.
-5. `pa-core::platform::perms`: decide the ACL story (TS: none - files inherit
-   ACLs; document or add an explicit-ACL helper).
+5. `pa-core::platform::perms`: DECIDED (lane `windows`) - TS parity is
+   inherited ACLs, no explicit-ACL helper. The TS product performs no
+   chmod-equivalent on win32 (its socket/lock chmod helpers return early);
+   product state lives under the agent dir inside the user profile, whose
+   ACLs are user-scoped by the OS default, which is the same protection
+   0o600/0o700 buys on Unix. The no-op restriction helpers and the
+   open-probe readability checks stay; tightening later would be an
+   explicit-ACL helper behind `restrict_file`, not a new abstraction.
 6. `pa-core::platform::shell`: TS Git-Bash candidate order; kernel `bash()`
    resolution via canonical install paths only.
 7. `Dirs` helper: `HOME` vs `USERPROFILE` resolution for agent dir (both in
@@ -198,8 +204,15 @@ No platform coupling found (loop policy only; no process/socket code).
   The `x86_64-pc-windows-msvc` std target is installed too, but its check
   stops at ring's `lib.exe` requirement (no MSVC tools in this sandbox);
   pa-types and pa-tui (the crates without native deps) check clean against
-  it. `--target x86_64-pc-windows-gnu --workspace --all-targets` is the
-  per-PR cfg-hygiene verifier until a real Windows runner exists. The check
-  found and fixed real cfg leaks during this lane (ungated Unix trait impls
-  in the transport module, a dead `access_readable` helper that was actually
-  live, test modules importing `std::os::unix`).
+  it. The check found and fixed real cfg leaks during this lane (ungated Unix
+  trait impls in the transport module, a dead `access_readable` helper that
+  was actually live, test modules importing `std::os::unix`).
+- Lane `windows` upgrade: the per-PR cfg-hygiene verifier is now
+  `make windows-cross` - the same cross-target check plus
+  `clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings`
+  (it caught the lock_dir dead-code and a clippy::err_expect in the
+  Windows-only tests). The staged ci.yml carries the matching
+  `windows-cross` job and a real `windows` job (`windows-latest` runner)
+  that runs the portable tests plus every Windows-only platform test;
+  promotion happens with the rest of ci/workflows/ once the token gains
+  `workflow` scope.

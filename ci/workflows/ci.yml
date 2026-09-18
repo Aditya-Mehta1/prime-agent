@@ -61,6 +61,51 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  # Windows-readiness gates (docs/windows-readiness.md): the cfg-hygiene
+  # verifier the win-audit lane established, now at the stronger -D warnings
+  # level, plus the real Windows runner the platform units target. The cross
+  # job type-checks every crate (including the cfg(windows) implementations
+  # and the Windows-only tests) for x86_64-pc-windows-gnu; ring's C needs a
+  # cross compiler even for check builds.
+  windows-cross:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0 action pin; toolchain pinned below
+        with:
+          toolchain: "1.98.1"
+          targets: x86_64-pc-windows-gnu
+          components: clippy
+      - name: Install the mingw-w64 cross toolchain (ring C for the target)
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: windows-cross
+      - run: cargo check --locked --workspace --target x86_64-pc-windows-gnu --all-targets
+      - run: cargo clippy --locked --workspace --target x86_64-pc-windows-gnu --all-targets -- -D warnings
+
+  # The real Windows runner: portable tests plus the Windows-only platform
+  # tests (named pipes, process identity, locks mtime probe, shell ordering).
+  # Linux-only e2e verifiers are `#![cfg(unix)]`-gated and skip here.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0 action pin; toolchain pinned below
+        with:
+          toolchain: "1.98.1"
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: windows
+      - run: cargo build --locked --workspace
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+
   deny:
     runs-on: ubuntu-latest
     steps:

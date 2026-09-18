@@ -121,3 +121,25 @@ pub fn is_readable(path: &Path) -> Result<(), std::io::Error> {
     // Windows: a read open probe is the equivalent permission test.
     std::fs::File::open(path).map(|_| ())
 }
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    /// The probes a Windows runner must verify: the restriction helpers
+    /// are no-ops (inherited ACLs) that never break access, and the
+    /// readability checks are open probes.
+    #[test]
+    fn restriction_is_a_no_op_and_probes_match_open_semantics() {
+        let dir = std::env::temp_dir().join(format!("pa-perms-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("probe.txt");
+        std::fs::write(&file, "x").expect("write");
+        assert!(restrict_file(&file).is_ok());
+        assert!(restrict_dir(&dir).is_ok());
+        assert!(is_readable_writable(&file));
+        assert!(is_readable(&file).is_ok());
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&dir);
+    }
+}
