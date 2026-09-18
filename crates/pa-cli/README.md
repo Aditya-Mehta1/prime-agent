@@ -20,6 +20,16 @@ pa-daemon supervisor over its JSONL Unix socket through the crate-private client
 (`daemon_client.rs`). The client never spawns a daemon - the TS CLI only auto-starts one for
 the internal `daemon start`/`open` commands, which are not reachable from the public surface.
 
+## Packaged layout / kernel packaging
+
+The release artifact is exe-adjacent (TS install.sh native layout): the binary
+plus `package.json` (the version manifest `--version` reads at runtime, with
+the compiled-in version as the fallback), `prime-agent-runtime/` (the kernel
+sidecar), `skills/`, and `docs/`. `scripts/package_release.py` (`make package`)
+assembles, validates, version-pins, hashes, and tars it; the hidden
+`--prime-agent-bootstrap` flag is the installer handoff that pre-bootstraps the
+kernel venv. Verifier: `tests/packaged_layout_e2e.rs`.
+
 ## Daemon discovery
 The discovery commands (`status`, `doctor [--fix]`, `shutdown [--force]`, TS
 `cli/daemon-ps.ts`) live in the crate-private `daemon_discovery` module: an OS census of

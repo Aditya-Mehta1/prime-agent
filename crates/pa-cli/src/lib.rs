@@ -59,6 +59,13 @@ fn main_impl(args: Vec<String>, runtime: &dyn mode::Runtime) -> Result<i32, Stri
         std::env::set_var(crate::config::ENV_OFFLINE, "1");
     }
 
+    // Install-time kernel preparation (TS cli-main.ts): the installer invokes
+    // `prime-agent --prime-agent-bootstrap` after extracting a release, so
+    // the venv is ready before the first session.
+    if args.len() == 1 && args[0] == "--prime-agent-bootstrap" {
+        return run_runtime_bootstrap();
+    }
+
     // Public command routing: help requests, removed commands, management
     // commands, and the model/session rewrites.
     let public_command = public_command::handle_public_command(&args);
@@ -98,7 +105,7 @@ fn main_impl(args: Vec<String>, runtime: &dyn mode::Runtime) -> Result<i32, Stri
     }
 
     if parsed.version {
-        println!("{}", crate::config::VERSION);
+        println!("{}", crate::config::version());
         return Ok(0);
     }
     if parsed.help {
@@ -237,6 +244,26 @@ fn main_impl(args: Vec<String>, runtime: &dyn mode::Runtime) -> Result<i32, Stri
     match runtime.run(&options) {
         Ok(exit_code) => Ok(exit_code),
         Err(missing) => Err(missing.error_message()),
+    }
+}
+
+/// Prepare the kernel runtime at install time (TS `runtime-bootstrap.ts`):
+/// resolve or bootstrap the kernel Python and print its path. Failures print
+/// the bootstrap error text and exit 1 (the installer surfaces them and the
+/// retry happens on first Python use).
+fn run_runtime_bootstrap() -> Result<i32, String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    match runtime.block_on(pa_core::kernel::ensure_kernel_python(
+        pa_core::kernel::EnsureKernelPythonOptions::default(),
+    )) {
+        Ok(python) => {
+            println!("kernel python: {}", python.display());
+            Ok(0)
+        }
+        Err(error) => Err(format!("{error:#}")),
     }
 }
 

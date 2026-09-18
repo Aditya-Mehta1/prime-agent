@@ -5,6 +5,7 @@ check:
 	cargo test --workspace
 	cargo build --release --workspace
 
+
 # Supply-chain gates (docs/installer-ci-design.md §7/§9) — local mirrors of the
 # ci.yml workflow jobs. They fail loudly when the tool is missing instead of
 # silently skipping the gate.
@@ -21,9 +22,9 @@ actionlint:
 
 # Local mirror of the release build-job gates (docs/installer-ci-design.md §9):
 # release build against the committed lockfile, deterministic tarball assembly,
-# then end-to-end verification of the host-target artifact. Until the
-# kernel-packaging lane merges (which vendors prime-agent-runtime/ at the repo
-# root), pass RUNTIME_DIR=<worktree>/prime-agent-runtime.
+# then end-to-end verification of the host-target artifact. The vendored
+# prime-agent-runtime/ at the repo root is the default runtime sidecar
+# (kernel-packaging lane); pass RUNTIME_DIR to re-anchor it.
 VERSION := $(shell sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1)
 TARGET := $(shell rustc -vV | sed -n 's/^host: //p')
 RUNTIME_DIR ?=
@@ -43,4 +44,9 @@ audit-build:
 	@command -v cargo-auditable >/dev/null 2>&1 || { echo "cargo-auditable not installed (cargo install cargo-auditable --locked)"; exit 1; }
 	cargo auditable build --release --locked --workspace
 
-.PHONY: check deny actionlint release-dry-run audit-build
+# Packaging dry-run: stage the exe-adjacent release layout, version-pin,
+# hash, and tar the artifact under target/release-package.
+package:
+	python3 scripts/package_release.py
+
+.PHONY: check deny actionlint release-dry-run audit-build package

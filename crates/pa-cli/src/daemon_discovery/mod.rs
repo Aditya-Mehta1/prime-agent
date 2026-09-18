@@ -397,7 +397,7 @@ const LIST_TIMEOUT_MS: u64 = 30_000;
 fn classify_reachable(probe: &ProbeResult) -> DaemonStatus {
     if probe.protocol_version == Some(pa_types::daemon::DAEMON_PROTOCOL_VERSION)
         && probe.schema_id.as_deref() == Some(pa_types::daemon::DAEMON_SCHEMA_ID)
-        && probe.version.as_deref() == Some(config::VERSION)
+        && probe.version.as_deref() == Some(config::version())
     {
         DaemonStatus::Current
     } else {

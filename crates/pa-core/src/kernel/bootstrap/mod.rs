@@ -92,12 +92,24 @@ impl EnsureKernelPythonOptions {
 }
 
 fn format_bootstrap_failure(error: &anyhow::Error) -> anyhow::Error {
-    anyhow!(
+    let mut message = format!(
         "Failed to set up the Python kernel runtime. {error:#}\n\
          First-time setup needs internet to install uv, Python, prime-agent-runtime, and default Python packages; once set up, prime-agent runs offline. \
          An interrupted runtime upgrade needs network once more, so re-run this while online. \
          Set PRIME_AGENT_KERNEL_PYTHON to a Python with a current prime-agent-runtime and default Python packages installed to skip auto-bootstrap."
-    )
+    );
+    // The packaged exe-adjacent sidecar is the kernel runtime source; when it
+    // is missing everywhere (packaged layout and source checkout), name it:
+    // a registry fallback then has no local runtime to fall back from, and
+    // the raw install error alone is not actionable.
+    if venv::packaged_runtime_dir().is_none() {
+        let package = venv::package_dir();
+        message.push_str(&format!(
+            "\nThe packaged prime-agent-runtime directory was not found (looked next to the executable at {} and PI_PACKAGE_DIR); reinstall prime-agent so the kernel runtime ships beside the binary.",
+            package.display()
+        ));
+    }
+    anyhow!(message)
 }
 
 /// One in-flight bootstrap per unique options set, joined by concurrent callers.

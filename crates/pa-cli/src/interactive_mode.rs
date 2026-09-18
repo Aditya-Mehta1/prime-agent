@@ -242,7 +242,7 @@ fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<Inter
         session,
         initial_message: options.initial_message.clone(),
         theme: String::new(),
-        version: crate::config::VERSION.to_string(),
+        version: crate::config::version().to_string(),
         onboarding: onboarding_task(config),
         // Only Some(true) rides the wire (TS `telemetryDisabled`).
         telemetry_disabled: config.telemetry_disabled.then_some(true),

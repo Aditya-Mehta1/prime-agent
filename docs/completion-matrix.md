@@ -358,14 +358,30 @@ harness those environments drive headlessly.
 Remaining: verifier flows over the daemon RPC mode (unwired, family 16), and
 ACP autonomous-meta observation exercised by a live verifier harness.
 
-## 21. Native release / installer / CI - missing
+## 21. Native release / installer / CI - partial (kernel packaging done)
 
-The Rust binary does not ship the `prime-agent-runtime` kernel sidecar next
-to the binary; battery and parity harnesses run with `PI_PACKAGE_DIR` pointing
-at the installed TS release (checklist §9 note, `scripts/battery/batterylib.py`
-`find_runtime_package_dir`). No native release manifests, installer, or
-release CI (a reference sketch exists at `docs/ci.yml.reference`; merge gates
-run locally via `make check`).
+Kernel packaging (the kernel-packaging lane) is done: the exe-adjacent release
+layout is ported (binary + `package.json` version manifest +
+`prime-agent-runtime/` sidecar + `skills/` + `docs/` + `LICENSE`, resolved at
+runtime via
+`PI_PACKAGE_DIR` or the binary directory, with a source-checkout fallback),
+`scripts/package_release.py` is the packaging dry-run (TS
+`assemble-release-archives.mjs` + `copy-binary-assets.mjs` parity: staging,
+required-asset validation, symlink/dev-cache rejection (`.venv`,
+`__pycache__`, `*.pyc`), version pinning against the binary, `SHA256SUMS` +
+`binaries.json` integrity manifests, tarball; `make package`), and the hidden
+`--prime-agent-bootstrap` flag is the installer handoff (TS
+`runtime-bootstrap.ts`). `--version` reports the packaged manifest version
+(TS reads `getPackageJsonPath()` at runtime). Verifier:
+`crates/pa-cli/tests/packaged_layout_e2e.rs` - a packaged session boots the
+kernel with no `PI_PACKAGE_DIR` (staged skills and version manifest resolve
+exe-adjacent), missing-sidecar and bad-override failure UX, and the packaging
+dry-run artifact integrity. The heavy sidecar-venv bootstrap
+(`--ignored`) exercises the fresh-venv path.
+
+Remaining: the installer (`install.sh`) itself, R2/native update manifests,
+and release CI (a reference sketch exists at `docs/ci.yml.reference`; merge
+gates run locally via `make check`).
 
 ## 22. Platform readiness - in-flight
 

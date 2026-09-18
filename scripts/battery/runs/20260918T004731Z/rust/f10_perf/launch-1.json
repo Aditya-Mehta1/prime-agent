@@ -1,0 +1,33 @@
+{
+ "session": "vbat20260918T004731Z-perf-rust-1",
+ "first_frame_s": 0.334,
+ "ready_s": 0.334,
+ "typing_ms": [
+  56.3,
+  80.8,
+  57.2,
+  61.1,
+  71.6,
+  53.0,
+  66.0,
+  73.9,
+  78.0,
+  84.9,
+  66.7,
+  65.1,
+  70.8,
+  85.3,
+  66.5,
+  78.7,
+  64.6,
+  46.0,
+  57.2,
+  60.2,
+  61.2,
+  70.4,
+  47.5,
+  54.4,
+  54.7
+ ],
+ "ready_frame": "                                                          work  $0.00\n\n                  \u2597\u2584\u2584\u2588\u2580\n    \u2588\u2588\u2588\u2584       \u2597\u2584\u2588\u2588\u2588\u2580\n   \u2597\u2588\u259b\u2590\u2588\u2599   \u2597\u2584\u2588\u2580\u2597\u2588\u2580       prime agent v0.1.0\n  \u2597\u2588\u259b \u259f\u2588\u2588\u2599\u2584\u2588\u2588\u259b \u259f\u259b         model mock-1\n  \u2597\u259f\u258c \u2590\u2588\u2588\u2588\u259b\u2598\u2597\u2584\u2588\u2596          cwd ~/lane-worktrees/kernel-packaging/scripts/battery/runs/20260918T004731Z/rust/work\n \u259f\u2588\u2588\u2588\u2584  \u2584\u2584\u259f\u2588\u2588\u2588\u2580\n \u259c\u2588\u259b\u2580\u2598  \u259c\u2588\u259b\u2580\u2598\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n                                                                                      Collapsed mode (Ctrl+O to expand)\n\n >\n\n\u2190 manage                                                                                                 mock-1 \u00b7 0 (0%)\n"
+}

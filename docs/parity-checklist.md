@@ -482,10 +482,14 @@ Verified states (both at 120x36 and 220x50, PASS on 2025-06-27):
   token estimate, spinner frames.
 
 Deliberate deviations / notes:
-- The Rust binary does not ship the `prime-agent-runtime` sidecar next to the
-  binary like the TS release does; the harness sets `PI_PACKAGE_DIR` to the
-  installed TS release directory so both run the same kernel runtime
-  (`find_runtime_package_dir` in the harness).
+- The kernel-packaging lane added the packaged sidecar resolution (binary
+  directory + `PI_PACKAGE_DIR`, source-checkout fallback), so a packaged
+  layout (`make package` / `scripts/package_release.py`) boots without
+  `PI_PACKAGE_DIR`; the visual-parity harness still points `PI_PACKAGE_DIR`
+  at the installed TS release so both products run the same runtime
+  (`find_runtime_package_dir` in the harness) - see
+  `crates/pa-cli/tests/packaged_layout_e2e.rs` for the packaged-layout
+  verifier.
 - `code_preview` helpers are vendored under `crates/pa-tui/src/code_preview/`
   (pa-tui may not depend on pa-core); consolidation into pa-types is a
   follow-up.

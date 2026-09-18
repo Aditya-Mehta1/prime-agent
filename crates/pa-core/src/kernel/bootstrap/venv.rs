@@ -463,7 +463,7 @@ pub(crate) fn write_bootstrap_version(
 /// Directory of the installed `prime-agent-runtime` sources. The Rust binary
 /// ships the same sidecar layout the compiled TS executable uses; an explicit
 /// `PI_PACKAGE_DIR` override wins (matching the TS `getPackageDir`).
-fn package_dir() -> PathBuf {
+pub(super) fn package_dir() -> PathBuf {
     if let Ok(env_dir) = std::env::var("PI_PACKAGE_DIR") {
         if !env_dir.is_empty() {
             return expand_home(&env_dir);
@@ -476,12 +476,27 @@ fn package_dir() -> PathBuf {
     exe_dir
 }
 
-fn runtime_candidate_dirs() -> Vec<PathBuf> {
+/// The packaged sidecar directory (the exe-adjacent layout): the TS
+/// `runtimeCandidateDirs` bun-binary candidates, `PI_PACKAGE_DIR` included
+/// through [`package_dir`].
+pub(super) fn packaged_runtime_dir() -> Option<PathBuf> {
     let package = package_dir();
-    vec![
+    [
         package.join("prime-agent-runtime"),
         package.join("dist").join("prime-agent-runtime"),
     ]
+    .into_iter()
+    .find(|candidate| candidate.join("pyproject.toml").exists())
+}
+
+fn runtime_candidate_dirs() -> Vec<PathBuf> {
+    let mut candidates = packaged_runtime_dir().into_iter().collect::<Vec<_>>();
+    // Source checkouts keep the sidecar at the workspace root (TS resolves
+    // module-relative monorepo candidates the same way).
+    if let Some(root) = crate::packages::source_checkout_root() {
+        candidates.push(root.join("prime-agent-runtime"));
+    }
+    candidates
 }
 
 fn resolve_runtime_source_dir() -> Option<PathBuf> {

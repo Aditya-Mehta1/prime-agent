@@ -108,7 +108,7 @@ async fn acp_mode_main(options: &RunOptions) -> Result<i32, String> {
     let exit_code = pa_daemon::acp::run_acp_mode(pa_daemon::acp::AcpOptions {
         engine: std::sync::Arc::new(engine.engine),
         actual_cwd: config.cwd.clone(),
-        product_version: crate::config::VERSION.to_string(),
+        product_version: crate::config::version().to_string(),
         model: Some(engine.model),
         api_key: engine.api_key,
         agent_dir: config.agent_dir.clone(),
@@ -149,7 +149,7 @@ async fn try_daemon_attached_acp(options: &RunOptions) -> Option<i32> {
             pa_daemon::acp::daemon::DaemonAcpOptions {
                 socket_path,
                 actual_cwd: config.cwd.clone(),
-                product_version: crate::config::VERSION.to_string(),
+                product_version: crate::config::version().to_string(),
                 provider: config.provider.clone(),
                 model: config.model.clone(),
                 api_key: None,
@@ -738,7 +738,10 @@ async fn build_faux_engine_parts(
     // Response entries: a plain string (or `{"text": ...}`) answers with
     // fixed text; `{"systemPrompt": true}` answers with the request's system
     // prompt (binary-level verification of session assembly; never used by
-    // the product).
+    // the product); `{"content": [...]}` entries carry content blocks
+    // (thinking, text, tool calls) through the shared faux-script parser the
+    // daemon worker seam uses, so binary-level tests can script full turns
+    // (e.g. an `ipython` kernel cell).
     let response_steps: Vec<pa_ai::faux::FauxResponseStep> = script
         .get("responses")
         .and_then(serde_json::Value::as_array)
@@ -746,45 +749,57 @@ async fn build_faux_engine_parts(
             entries
                 .iter()
                 .map(|entry| match entry {
-                    serde_json::Value::String(text) => pa_ai::faux::FauxResponseStep::Message(
+                    serde_json::Value::String(text) => Ok(pa_ai::faux::FauxResponseStep::Message(
                         pa_ai::faux::faux_assistant_text_message(
                             text,
                             pa_ai::faux::FauxAssistantMessageOptions::default(),
                         ),
-                    ),
-                    serde_json::Value::Object(map) => {
+                    )),
+                    serde_json::Value::Object(map)
                         if map.get("systemPrompt").and_then(serde_json::Value::as_bool)
-                            == Some(true)
-                        {
-                            pa_ai::faux::FauxResponseStep::Factory(std::sync::Arc::new(
-                                |context, _options, _call, _model| {
-                                    Ok(pa_ai::faux::faux_assistant_text_message(
-                                        context.system_prompt.as_deref().unwrap_or_default(),
-                                        pa_ai::faux::FauxAssistantMessageOptions::default(),
-                                    ))
-                                },
-                            ))
-                        } else {
-                            pa_ai::faux::FauxResponseStep::Message(
-                                pa_ai::faux::faux_assistant_text_message(
-                                    map.get("text")
-                                        .and_then(serde_json::Value::as_str)
-                                        .unwrap_or_default(),
+                            == Some(true) =>
+                    {
+                        Ok(pa_ai::faux::FauxResponseStep::Factory(std::sync::Arc::new(
+                            |context, _options, _call, _model| {
+                                Ok(pa_ai::faux::faux_assistant_text_message(
+                                    context.system_prompt.as_deref().unwrap_or_default(),
                                     pa_ai::faux::FauxAssistantMessageOptions::default(),
-                                ),
-                            )
-                        }
+                                ))
+                            },
+                        )))
                     }
-                    _ => pa_ai::faux::FauxResponseStep::Message(
+                    serde_json::Value::Object(map) if map.contains_key("content") => {
+                        pa_ai::faux::script::parse_faux_script(&serde_json::json!({
+                            "responses": [entry]
+                        }))
+                        .map(|parsed| {
+                            let mut steps = parsed.responses.into_iter();
+                            let first = steps
+                                .next()
+                                .expect("a content entry parses into one response step");
+                            debug_assert!(steps.next().is_none());
+                            first
+                        })
+                        .map_err(|error| error.to_string())
+                    }
+                    serde_json::Value::Object(map) => Ok(pa_ai::faux::FauxResponseStep::Message(
+                        pa_ai::faux::faux_assistant_text_message(
+                            map.get("text")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default(),
+                            pa_ai::faux::FauxAssistantMessageOptions::default(),
+                        ),
+                    )),
+                    _ => Ok(pa_ai::faux::FauxResponseStep::Message(
                         pa_ai::faux::faux_assistant_text_message(
                             "",
                             pa_ai::faux::FauxAssistantMessageOptions::default(),
                         ),
-                    ),
+                    )),
                 })
-                .collect()
+                .collect::<Result<Vec<_>, String>>()
         })
-        .ok_or_else(|| "PRIME_AGENT_FAUX_SCRIPT requires a responses array".to_string())?;
+        .ok_or_else(|| "PRIME_AGENT_FAUX_SCRIPT requires a responses array".to_string())??;
     // The same faux-script model contract as the daemon worker seam: a
     // `reasoning` model makes the harness script thinking-capable turns so
     // thinking-level resolution can be verified without the network.

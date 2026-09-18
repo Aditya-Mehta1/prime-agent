@@ -87,3 +87,55 @@ read-modify-write cycles, so staleness takeover only sees genuinely crashed
 holders. The cron `with_state_locks` still runs its action unlocked when
 acquisition fails (pre-existing shape; now logged at warn) because the store
 API has no failure channel; TS throws there.
+
+
+## Kernel packaging lane notes
+
+- Packaged layout (TS install.sh native path + copy-binary-assets.mjs): the
+  release artifact is the binary plus exe-adjacent `package.json` (the
+  version manifest: `{"version", "piConfig"}`), `prime-agent-runtime/` (the
+  vendored sidecar), `skills/`, `docs/`, `README.md`, and `LICENSE`. Runtime
+  resolution (`pa-core/src/kernel/bootstrap/venv.rs` `packaged_runtime_dir`,
+  moved with #118's bootstrap split) is
+  `PI_PACKAGE_DIR` -> binary directory -> `dist/` -> source-checkout root
+  (TS `runtimeCandidateDirs` module-relative candidates; the compile-time
+  workspace root replaces them and never resolves on a user machine).
+- Relation to the installer-ci lane's `scripts/release/assemble_artifacts.py`
+  (merged in #114): that script assembles the CI distribution tarball +
+  `manifest.json` (release-pipeline contract, staged at `ci/workflows/`),
+  while `scripts/package_release.py` is the TS-installer-packaging dry run
+  (exe-adjacent layout, dev-cache exclusions, version pin, `SHA256SUMS` +
+  `binaries.json`); `make release-dry-run` runs the former, `make package`
+  the latter.
+- `scripts/package_release.py` ports `assemble-release-archives.mjs` +
+  `copy-binary-assets.mjs`: staging walk rejects symlinks and the TS
+  exclusion set (`node_modules`, `.venv`, `__pycache__`, `*.pyc`,
+  `*.egg-info`, caches, `.git`, `.DS_Store`), `validateBinaryAssets`-style
+  required-asset checks, version pinning (the binary's compiled `--version`
+  must equal the release version - cargo embeds it, where TS stamps
+  `package.json` post-build via `setBinaryVersion`), `SHA256SUMS` +
+  `binaries.json` (`{platform, file, sha256, executableSha256}`), and a
+  flat tarball `prime-agent-<version>-<platform>.tar.gz`. `make package` is
+  the entry point; `--root` re-anchors assets for the e2e's synthetic tree.
+- `--version` reads the packaged `package.json` at runtime (TS `VERSION`
+  is `getPackageJsonPath()`-based) with the compiled-in version as the
+  fallback (dev checkouts). `--prime-agent-bootstrap` is the TS
+  `runtime-bootstrap.ts` installer handoff: `ensureKernelPython` + prints
+  `kernel python: <path>`; the TS fd/rg preloads (`ensureTool`) are not
+  ported (no tools-manager in this build yet).
+- Missing-sidecar failure UX: bootstrap failures keep the TS
+  `formatBootstrapFailure` text and append a hint naming the executable
+  directory when the packaged sidecar is absent (the registry fallback the
+  TS keeps would otherwise surface a bare pip error; the runtime is not on
+  a registry).
+- Verifier: `crates/pa-cli/tests/packaged_layout_e2e.rs` - a staged layout
+  boots a kernel session with `PI_PACKAGE_DIR` removed (the ipython cell
+  runs with a live `rlm`, the staged marker skill reaches the skill
+  inventory, the staged manifest reports the pinned version), the
+  missing-sidecar and bad-override failure UX, and the packaging dry-run
+  (staging, exclusions, version pin, `SHA256SUMS`/`binaries.json`, tarball
+  integrity). The ignored test bootstraps a fresh venv from the packaged
+  sidecar over uv + network.
+- Print-mode faux scripts accept content-block entries (tool calls) through
+  the shared `pa_ai::faux::script::parse_faux_script` (the daemon worker
+  seam already used it), so binary-level e2e can script full kernel turns.

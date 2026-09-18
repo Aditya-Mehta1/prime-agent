@@ -86,7 +86,9 @@ fn home_dir() -> PathBuf {
 
 /// The workspace root at compile time (source-checkout layout): pa-core
 /// lives at `<root>/crates/pa-core`.
-fn source_checkout_root() -> Option<&'static std::path::Path> {
+/// Compile-time workspace root (`<root>/crates/pa-core` ancestors), shared by
+/// every package-dir resolution that falls back to the source-checkout layout.
+pub(crate) fn source_checkout_root() -> Option<&'static std::path::Path> {
     static ROOT: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     ROOT.get_or_init(|| {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
