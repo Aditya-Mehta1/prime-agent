@@ -4,26 +4,40 @@ Ground truth for the RLM-1 post-training surface. Derived from the live TS produ
 
 ## System prompt structure
 
-The base system prompt given to the model contains, in order:
+The system prompt is layered (roadmap item 3; TS-prompt parity is superseded):
+a cache-stable static prefix of human-editable layer files, followed by one
+dynamic tail that carries every session-specific value.
 
-1. Identity block ("You are a general purpose agent...", working dir, conversation log path,
-   recursive agent depth, pre-installed Python packages, installed skill modules).
-2. Tool-call contract: installed Python skills are pre-imported modules; read SKILL.md;
-   call documented functions; CLI fallback; continual-harness entries are Python REPL skills
-   with explicit `reference`/`arguments`.
-3. REPL kernel rules: persistent Python state across cells, `bash()` background-handle
-   contract (h.pid, h.running, h.tail, h.output, h.poll, h.kill, await), no subprocess/os.system,
-   os.chdir/environ persistence, "no long blocking awaits/polling".
-4. Delegation contract: `await rlm.spawn('sub-task', name=...)` returns immediately with
-   rlm_child_id/name/session_dir/model; results only via `agent_message.send` replies or files;
-   `rlm.list_subagents()`, `rlm.collect(targets, timeout_ms)`, `agent_observe` restrictions
-   (parent/siblings/children only), `rlm.create_session` for daemon-backed depth-0 sessions,
-   `rlm.progress_note`, model inheritance and `thinking` override rules.
-5. Continual harness block (prompt notes, memories, skills, subagent specs as compact digests,
-   with routing guidance and `await refine.run()` triggers).
-6. Available-skills inventory (name, type, python_import, description, location).
-7. Prose style guidance (simplified technical English, progress updates, list usage).
-8. Harness-digest: counts + recent refinements.
+Static prefix (byte-identical across sessions; provider-cacheable):
+
+1. `prompts/layers/core.md` — the harness description and the full
+   programmatic-tool API surface (one tool: `ipython`; everything else is a
+   programmatic tool in the REPL: `bash`/`edit`/`websearch`/`attach_image`,
+   `rlm.*` subagent management, `agent_message`/`agent_observe`, the
+   continual-harness CRUD, `compact`/`goal`/`rlm_heartbeat`/`refine`,
+   generic `mcp`), plus the skill contract.
+2. `prompts/layers/usage.md` — mandatory usage rules (bash backgrounding,
+   edit usage, delegation, refinement policy, root-agent progress rules).
+3. `prompts/layers/opinionated.md` — style and engineering guidelines the
+   user may override with clear intent.
+4. `prompts/layers/per_model.md` — per-model instruction blocks keyed by
+   model selector patterns (shipped empty; the mechanism is live).
+
+Dynamic tail, appended in order: pre-installed packages, project context
+(AGENTS.md), skills inventory (`<available_skills>`), generic MCP servers,
+environment (date, cwd, conversation log, image-input capability), session
+role (recursive depth, parent, spawning availability), additional guidance,
+appended prompt.
+
+The harness digest (`[harness-digest]` message) stays a separate user
+message at cold-context boundaries, after the system prompt.
+
+Observability: `prime-agent prompt [--model <selector>] [--cwd <dir>]
+[--json]` prints the per-layer breakdown (cached static layers, then the
+dynamic tail) followed by the fully-assembled prompt. Guard tests pin the
+cache boundary (`prompt_guards.rs`) and the documented tool surface against
+the real registered surface (bootstrap bindings, host requests, bundled
+skills).
 
 ## Tool names exposed to the model
 

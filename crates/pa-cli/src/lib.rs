@@ -22,6 +22,7 @@ pub(crate) mod list_models;
 pub(crate) mod mcp_command;
 pub(crate) mod mode;
 pub(crate) mod package_command;
+pub(crate) mod prompt_command;
 pub(crate) mod public_command;
 
 /// The runtime boundary: everything a mode-runner crate implements to plug

@@ -194,6 +194,20 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         "Export a saved session to HTML",
     ),
     CommandSpec::new(&["config"], "config", "Configure package resources"),
+    CommandSpec::new(
+        &["prompt"],
+        "prompt [--model <selector>] [--cwd <dir>] [--json]",
+        "Print the assembled system prompt with its layer breakdown",
+    )
+    .description(
+        "Assembles the effective system prompt the way a fresh root session does \
+and prints the per-layer breakdown (cached static layers, then the dynamic tail) followed by the full prompt text.",
+    )
+    .options(&[
+        "--model <selector>  Preview per-model instructions for a provider/id selector",
+        "--cwd <dir>         Assemble for this working directory (default: current)",
+        "--json              Print segments and prompt as JSON",
+    ]),
 ];
 
 /// Command names that once existed and now print removal guidance.

@@ -352,7 +352,25 @@ fn normalize(text: &str, sandbox_roots: &[&Path]) -> String {
     // Docs paths in login guidance resolve to each binary's own install dir
     // (package dir); compare the shape, not the installation location.
     text = normalize_docs_paths(&text);
+    // The `prompt` dump command (roadmap item 3: layered system prompt) is a
+    // Rust-first addition the TS product has not adopted yet; normalize its
+    // help rows out so the rest of the command surface still compares
+    // equal. When the TS product adopts the command, drop this normalizer.
+    text = normalize_prompt_command_rows(&text);
     normalize_versions(&text)
+}
+
+/// Remove the `prompt` command row from top-level help (the Rust binary
+/// lists a command the TS binary does not have yet).
+fn normalize_prompt_command_rows(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !(trimmed.starts_with("prompt")
+                && trimmed.contains("Print the assembled system prompt"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Replace `<any dir>/docs/providers.md|models.md` lines with a placeholder.

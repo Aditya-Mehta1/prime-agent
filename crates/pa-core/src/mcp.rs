@@ -411,6 +411,27 @@ impl McpManager {
 
     /// `-<server>/SKILL.md` overrides for every built-in integration the user
     /// is not logged into.
+    /// Auth gating the system prompt and resource loader need, as one shared
+    /// source: `-<server>/SKILL.md` overrides for built-in integrations the user
+    /// is not logged into, plus the enabled persistent generic servers (prompt
+    /// MCP guidance). Returns the manager the caller keeps for `mcp.*` host
+    /// requests.
+    pub fn prompt_gating(
+        user_servers: std::collections::HashMap<String, McpServerConfig>,
+        agent_dir: &std::path::Path,
+    ) -> (Vec<String>, Vec<String>, McpManager) {
+        let manager = McpManager::new(McpManagerOptions {
+            auth_storage: crate::auth::AuthStorage::create(agent_dir),
+            get_user_servers: Box::new(move || Some(user_servers.clone())),
+            begin_login: None,
+        });
+        (
+            manager.get_disabled_builtin_skill_overrides(),
+            manager.get_enabled_persistent_generic_servers(),
+            manager,
+        )
+    }
+
     pub fn get_disabled_builtin_skill_overrides(&self) -> Vec<String> {
         BUILTIN_MCP_CATALOG
             .iter()

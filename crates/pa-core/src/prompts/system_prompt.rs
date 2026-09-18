@@ -1,25 +1,81 @@
-//! System prompt construction. Port of core/system-prompt.ts — model-facing
-//! parity: section order and strings must match the TS output.
+//! Layered system-prompt assembly: static layer files first (cacheable),
+//! every session-specific value last. See the parent module docs.
 
-use std::collections::HashSet;
+use crate::skills::{format_skills_for_prompt, Skill};
 
-use super::{
-    build_child_agent_doctrine, build_rlm_prompt, build_subagent_guidance,
-    ChildAgentDoctrineOptions, RlmPromptOptions, SubagentGuidanceOptions,
-};
-use crate::skills::{format_skills_for_prompt, get_python_skill_runtime_info, Skill};
+use super::layers;
 
+/// The bundled skill the refinement trigger guidance keys on.
 pub const REFINE_SKILL_NAME: &str = "refine";
 
+/// Whether a prompt segment belongs to the cache-stable prefix or the
+/// session-specific tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentKind {
+    /// Cacheable static prefix content (layer files, or a user replacement).
+    Static,
+    /// Session-specific tail content; must never leak into [`SegmentKind::Static`].
+    Dynamic,
+}
+
+/// One named slice of the assembled prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptSegment {
+    /// Stable segment name (`core`, `usage`, `packages`, `environment`, ...).
+    pub name: &'static str,
+    pub kind: SegmentKind,
+    /// Provenance: the layer file, or what generated the segment.
+    pub source: &'static str,
+    pub text: String,
+}
+
+impl PromptSegment {
+    fn static_segment(name: &'static str, source: &'static str, text: String) -> Self {
+        Self {
+            name,
+            kind: SegmentKind::Static,
+            source,
+            text,
+        }
+    }
+
+    fn dynamic_segment(name: &'static str, source: &'static str, text: String) -> Self {
+        Self {
+            name,
+            kind: SegmentKind::Dynamic,
+            source,
+            text,
+        }
+    }
+}
+
+/// The assembled prompt plus its per-layer breakdown. `cached_prefix_len` is
+/// the byte length of the static prefix: `assembled[..cached_prefix_len]` is
+/// byte-identical across every session that shares the same custom-prompt
+/// and model-selection inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemPromptBreakdown {
+    pub segments: Vec<PromptSegment>,
+    pub assembled: String,
+    pub cached_prefix_len: usize,
+}
+
+/// Inputs for one session's prompt. Static inputs (`custom_prompt`, `model`)
+/// select the cached prefix; everything else feeds the dynamic tail.
 #[derive(Debug, Default)]
 pub struct BuildSystemPromptOptions<'a> {
-    /// Custom system prompt (replaces the default RLM prompt).
+    /// Replaces the layered static prefix with user text. The dynamic tail
+    /// still applies.
     pub custom_prompt: Option<String>,
+    /// Resolved model selector (`provider/id`), selecting per-model blocks.
+    pub model: Option<&'a str>,
+    /// Whether the resolved model accepts image input, when known.
+    pub vision_capable: Option<bool>,
     /// Active tools. Tool schemas carry tool descriptions outside the prompt.
     pub selected_tools: Option<Vec<&'a str>>,
-    /// Additional guideline bullets appended to the system prompt.
+    /// Additional guideline bullets appended to the dynamic tail.
     pub prompt_guidelines: Option<Vec<String>>,
-    /// Text to append to the system prompt.
+    /// Text appended to the end of the prompt.
     pub append_system_prompt: Option<String>,
     /// Working directory.
     pub cwd: String,
@@ -29,7 +85,7 @@ pub struct BuildSystemPromptOptions<'a> {
     pub context_files: Vec<(String, String)>,
     /// Pre-loaded skills.
     pub skills: Vec<Skill>,
-    /// Whether to include the model-facing rlm recursion guidance.
+    /// Whether to include the subagent surface in this session.
     pub allow_recursion: Option<bool>,
     /// Fixed recursive-agent depth for this session.
     pub rlm_depth: Option<u32>,
@@ -37,6 +93,242 @@ pub struct BuildSystemPromptOptions<'a> {
     pub rlm_parent_agent: Option<&'a str>,
     /// Enabled user-configured generic MCP servers.
     pub generic_mcp_servers: Vec<String>,
+}
+
+/// Build the system prompt (assembled text only).
+pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
+    system_prompt_breakdown(options).assembled
+}
+
+/// Build the system prompt with its per-layer breakdown.
+pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemPromptBreakdown {
+    let mut segments: Vec<PromptSegment> = Vec::new();
+
+    // The static prefix: the user's replacement prompt, or the layered files.
+    match options.custom_prompt.as_deref() {
+        Some(custom) if !custom.is_empty() => {
+            segments.push(PromptSegment::static_segment(
+                "custom",
+                "--system-prompt",
+                custom.to_string(),
+            ));
+        }
+        _ => {
+            segments.push(PromptSegment::static_segment(
+                "core",
+                layers::layer_source("core").unwrap_or_default(),
+                layers::CORE_LAYER.trim().to_string(),
+            ));
+            segments.push(PromptSegment::static_segment(
+                "usage",
+                layers::layer_source("usage").unwrap_or_default(),
+                layers::USAGE_LAYER.trim().to_string(),
+            ));
+            segments.push(PromptSegment::static_segment(
+                "opinionated",
+                layers::layer_source("opinionated").unwrap_or_default(),
+                layers::OPINIONATED_LAYER.trim().to_string(),
+            ));
+            let per_model = layers::per_model_text(options.model);
+            if !per_model.is_empty() {
+                segments.push(PromptSegment::static_segment(
+                    "per-model",
+                    layers::layer_source("per-model").unwrap_or_default(),
+                    per_model.join("\n\n"),
+                ));
+            }
+        }
+    }
+    let cached_prefix_len = segments
+        .iter()
+        .map(|segment| segment.text.len())
+        .sum::<usize>()
+        + 2 * segments.len().saturating_sub(1);
+
+    // The dynamic tail, in fixed order: packages -> project context ->
+    // skills inventory -> MCP servers -> environment -> session role ->
+    // additional guidance -> appended prompt.
+    let tools: Vec<&str> = options
+        .selected_tools
+        .clone()
+        .unwrap_or_else(|| vec!["ipython"]);
+    let has_ipython = tools.contains(&"ipython");
+    let has_file_access = has_ipython || tools.contains(&"bash");
+
+    segments.push(PromptSegment::dynamic_segment(
+        "packages",
+        "kernel bootstrap defaults",
+        packages_section(),
+    ));
+
+    let context = context_files_section(&options.context_files);
+    if !context.is_empty() {
+        segments.push(PromptSegment::dynamic_segment(
+            "project-context",
+            "AGENTS.md discovery",
+            context,
+        ));
+    }
+
+    let visible_skills: Vec<&Skill> = options
+        .skills
+        .iter()
+        .filter(|skill| !skill.disable_model_invocation)
+        .collect();
+    if has_file_access && !visible_skills.is_empty() {
+        let inventory = format_skills_for_prompt(&options.skills).trim().to_string();
+        segments.push(PromptSegment::dynamic_segment(
+            "skills-inventory",
+            "skill discovery",
+            inventory,
+        ));
+    }
+
+    if has_ipython {
+        let mcp = format_generic_mcp_guidance(&options.generic_mcp_servers);
+        if !mcp.is_empty() {
+            segments.push(PromptSegment::dynamic_segment(
+                "mcp-servers",
+                "generic MCP settings",
+                mcp,
+            ));
+        }
+    }
+
+    segments.push(PromptSegment::dynamic_segment(
+        "environment",
+        "session configuration",
+        environment_section(options),
+    ));
+
+    let role = session_role_section(options, has_ipython);
+    if !role.is_empty() {
+        segments.push(PromptSegment::dynamic_segment(
+            "session-role",
+            "RLM recursion state",
+            role,
+        ));
+    }
+
+    let guidelines = options
+        .prompt_guidelines
+        .as_deref()
+        .map(format_prompt_guidelines)
+        .unwrap_or_default();
+    if !guidelines.is_empty() {
+        segments.push(PromptSegment::dynamic_segment(
+            "additional-guidance",
+            "prompt guidelines",
+            format!("# Additional Guidance\n\n{guidelines}"),
+        ));
+    }
+
+    if let Some(extra) = options.append_system_prompt.as_deref() {
+        if !extra.is_empty() {
+            segments.push(PromptSegment::dynamic_segment(
+                "appended-prompt",
+                "--append-system-prompt",
+                extra.to_string(),
+            ));
+        }
+    }
+
+    let assembled = segments
+        .iter()
+        .map(|segment| segment.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    SystemPromptBreakdown {
+        segments,
+        assembled,
+        cached_prefix_len,
+    }
+}
+
+fn packages_section() -> String {
+    use crate::kernel::bootstrap::default_rlm_extra_import_labels;
+    let mut lines = vec![format!(
+        "Pre-installed Python packages: {}.",
+        default_rlm_extra_import_labels().join(", ")
+    )];
+    lines.push(
+        "Install additional packages with `uv pip install <pkg>` (this is a uv-managed venv with no pip module)."
+            .to_string(),
+    );
+    lines.join("\n")
+}
+
+fn context_files_section(context_files: &[(String, String)]) -> String {
+    if context_files.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec![
+        "# Project Context".to_string(),
+        String::new(),
+        "Project-specific instructions and guidelines:".to_string(),
+        String::new(),
+    ];
+    for (file_path, content) in context_files {
+        lines.push(format!("## {file_path}\n\n{content}"));
+    }
+    lines.join("\n")
+}
+
+fn environment_section(options: &BuildSystemPromptOptions) -> String {
+    let cwd = options.cwd.replace('\\', "/");
+    let messages_path = options
+        .messages_path
+        .clone()
+        .unwrap_or_else(|| "not persisted".to_string())
+        .replace('\\', "/");
+    let mut lines = vec![
+        format!("Current date: {}", today()),
+        format!("Working directory: {cwd}"),
+        format!("Conversation log: {messages_path}"),
+    ];
+    match options.vision_capable {
+        Some(true) => lines.push(
+            "Image input: this model can see images; `attach_image` loads them into context."
+                .to_string(),
+        ),
+        Some(false) => lines.push(
+            "Image input: this model cannot see images; `attach_image` errors for it.".to_string(),
+        ),
+        None => {}
+    }
+    lines.join("\n")
+}
+
+fn session_role_section(options: &BuildSystemPromptOptions, has_ipython: bool) -> String {
+    let depth = options.rlm_depth.unwrap_or(0);
+    let mut lines = vec![format!(
+        "Recursive agent depth: {depth}{}",
+        if depth == 0 { " (root)" } else { " (not root)" }
+    )];
+    if !has_ipython {
+        lines.push(
+            "This session has no Python REPL (`ipython` tool): the programmatic tools described above are unavailable here."
+                .to_string(),
+        );
+    }
+    if options.allow_recursion == Some(false) {
+        lines.push("Subagent spawning is disabled in this session.".to_string());
+    }
+    if depth > 0 {
+        lines.push(format!(
+            "You are a child agent spawned by {}. Task prompts are labeled `[task from parent]`.",
+            options.rlm_parent_agent.unwrap_or("your parent agent")
+        ));
+        if has_ipython {
+            lines.push(
+                "When a task calls for an answer, reply explicitly with `await agent_message.send(message, receiver_role=\"parent\")`. Not every message or task needs a reply; continue cleanup after sending and go idle normally.".to_string(),
+            );
+            lines.push(
+                "For long-running work, report brief progress with `await rlm.progress_note('...')` (at most 512 characters, throttled to about one note per 10 seconds); the parent sees notes without needing a reply.".to_string(),
+            );
+        }
+    }
+    lines.join("\n")
 }
 
 fn today() -> String {
@@ -60,7 +352,7 @@ fn today() -> String {
 }
 
 fn format_prompt_guidelines(guidelines: &[String]) -> String {
-    let mut seen = HashSet::new();
+    let mut seen = std::collections::HashSet::new();
     let mut list = Vec::new();
     for guideline in guidelines {
         let normalized = guideline.trim();
@@ -73,7 +365,7 @@ fn format_prompt_guidelines(guidelines: &[String]) -> String {
 
 fn format_generic_mcp_guidance(servers: &[String]) -> String {
     let mut enabled: Vec<&String> = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = std::collections::HashSet::new();
     for server in servers {
         if seen.insert(server) {
             enabled.push(server);
@@ -102,144 +394,6 @@ fn format_generic_mcp_guidance(servers: &[String]) -> String {
         ));
     }
     lines.join("\n")
-}
-
-/// Build the system prompt with tools, guidelines, and context.
-pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
-    let prompt_cwd = options.cwd.replace('\\', "/");
-    let prompt_messages_path = options
-        .messages_path
-        .clone()
-        .unwrap_or_else(|| "not persisted".to_string())
-        .replace('\\', "/");
-    let date = today();
-    let append_section = options
-        .append_system_prompt
-        .as_deref()
-        .map(|text| format!("\n\n{text}"))
-        .unwrap_or_default();
-
-    let context_files = &options.context_files;
-    let tools: Vec<&str> = options
-        .selected_tools
-        .clone()
-        .unwrap_or_else(|| vec!["ipython"]);
-    let has_ipython = tools.contains(&"ipython");
-    let visible_skills: Vec<&Skill> = options
-        .skills
-        .iter()
-        .filter(|skill| !skill.disable_model_invocation)
-        .collect();
-    let runtime_info = get_python_skill_runtime_info(
-        &visible_skills
-            .iter()
-            .map(|skill| (*skill).clone())
-            .collect::<Vec<_>>(),
-    );
-    let visible_python_import_names: Vec<&str> = runtime_info
-        .iter()
-        .map(|info| info.import_name.as_str())
-        .collect();
-    let has_refine_skill = visible_skills
-        .iter()
-        .any(|skill| skill.name == REFINE_SKILL_NAME);
-    let generic_mcp_section = if has_ipython {
-        format_generic_mcp_guidance(&options.generic_mcp_servers)
-    } else {
-        String::new()
-    };
-
-    if let Some(custom_prompt) = &options.custom_prompt {
-        let mut prompt = custom_prompt.clone();
-        if !context_files.is_empty() {
-            prompt.push_str("\n\n# Project Context\n\n");
-            prompt.push_str("Project-specific instructions and guidelines:\n\n");
-            for (file_path, content) in context_files {
-                prompt.push_str(&format!("## {file_path}\n\n{content}\n\n"));
-            }
-        }
-        let custom_prompt_has_file_access = options
-            .selected_tools
-            .as_ref()
-            .is_none_or(|selected| selected.contains(&"ipython") || selected.contains(&"bash"));
-        if custom_prompt_has_file_access && !options.skills.is_empty() {
-            prompt.push_str(&format_skills_for_prompt(&options.skills));
-        }
-        prompt.push_str(&format!("\nCurrent date: {date}"));
-        prompt.push_str(&format!("\nCurrent working directory: {prompt_cwd}"));
-        let doctrine = build_child_agent_doctrine(&ChildAgentDoctrineOptions {
-            depth: options.rlm_depth,
-            parent_agent: options.rlm_parent_agent,
-            installed_skills: visible_python_import_names.clone(),
-            active_tools: Some(tools.clone()),
-        });
-        if let Some(doctrine) = doctrine {
-            prompt.push_str(&format!("\n\n{doctrine}"));
-        }
-        if !generic_mcp_section.is_empty() {
-            prompt.push_str(&format!("\n\n{generic_mcp_section}"));
-        }
-        if !append_section.is_empty() {
-            prompt.push_str(&append_section);
-        }
-        return prompt;
-    }
-
-    let mut prompt = build_rlm_prompt(&RlmPromptOptions {
-        cwd: prompt_cwd,
-        messages_path: prompt_messages_path,
-        installed_skills: visible_python_import_names.clone(),
-        active_tools: Some(
-            tools
-                .iter()
-                .copied()
-                .filter(|name| matches!(*name, "ipython" | "bash" | "edit"))
-                .collect(),
-        ),
-        allow_recursion: options.allow_recursion,
-        depth: options.rlm_depth,
-        parent_agent: options.rlm_parent_agent,
-        ..Default::default()
-    });
-
-    let allow_recursion = options.allow_recursion.unwrap_or(true);
-    if allow_recursion && has_ipython {
-        let visible_names: HashSet<&str> = visible_python_import_names.iter().copied().collect();
-        prompt.push_str(&format!(
-            "\n\n{}",
-            build_subagent_guidance(&SubagentGuidanceOptions {
-                include_refine_examples: Some(has_refine_skill),
-                has_agent_message: visible_names.contains("agent_message"),
-                has_agent_observe: visible_names.contains("agent_observe"),
-            })
-        ));
-    }
-    if !generic_mcp_section.is_empty() {
-        prompt.push_str(&format!("\n\n{generic_mcp_section}"));
-    }
-    let guidelines = options
-        .prompt_guidelines
-        .as_deref()
-        .map(format_prompt_guidelines)
-        .unwrap_or_default();
-    if !guidelines.is_empty() {
-        prompt.push_str(&format!("\n\n# Additional Guidance\n\n{guidelines}"));
-    }
-    if !context_files.is_empty() {
-        prompt.push_str("\n\n# Project Context\n\n");
-        prompt.push_str("Project-specific instructions and guidelines:\n\n");
-        for (file_path, content) in context_files {
-            prompt.push_str(&format!("## {file_path}\n\n{content}\n\n"));
-        }
-    }
-    let has_file_access = tools.contains(&"ipython") || tools.contains(&"bash");
-    if has_file_access && !options.skills.is_empty() {
-        prompt.push_str(&format_skills_for_prompt(&options.skills));
-    }
-    if !append_section.is_empty() {
-        prompt.push_str(&append_section);
-    }
-    prompt
 }
 
 #[cfg(test)]
@@ -273,6 +427,7 @@ mod tests {
         BuildSystemPromptOptions {
             cwd: "/w".to_string(),
             messages_path: Some("/log.jsonl".to_string()),
+            model: Some("mock/mock-1"),
             skills: vec![
                 skill("web-search", Some("websearch")),
                 skill("refine", Some("refine")),
@@ -283,41 +438,119 @@ mod tests {
     }
 
     #[test]
-    fn default_prompt_composes_rlm_and_skills() {
-        let prompt = build_system_prompt(&base_options());
-        assert!(prompt.starts_with("You are a general purpose agent"));
-        assert!(prompt.contains("# Delegating to sub-agents"));
-        assert!(prompt.contains("<available_skills>"));
-        assert!(prompt.contains("<python_import>websearch</python_import>"));
-        // Python imports flow into the RLM prompt's installed skills list.
-        assert!(prompt.contains("`websearch`, `refine`, `agent_message`"));
-        // Generic MCP section absent when no servers configured.
-        assert!(!prompt.contains("# Generic MCP Connections"));
+    fn default_prompt_is_layered_with_static_prefix_first() {
+        let breakdown = system_prompt_breakdown(&base_options());
+        let prompt = &breakdown.assembled;
+        // Static layers lead, in order.
+        assert!(prompt.starts_with("# prime-agent harness"));
+        assert!(breakdown.segments[0].kind == SegmentKind::Static);
+        assert!(breakdown.segments[0].name == "core");
+        let names: Vec<&str> = breakdown
+            .segments
+            .iter()
+            .map(|segment| segment.name)
+            .collect();
+        assert_eq!(
+            names[..4],
+            ["core", "usage", "opinionated", "packages"],
+            "core/usage/opinionated layers, then the dynamic tail"
+        );
+        // The cached prefix is exactly the static segments.
+        assert_eq!(
+            &prompt[..breakdown.cached_prefix_len],
+            layers::static_prefix(Some("mock/mock-1"))
+        );
+        // Dynamic values live strictly after the prefix.
+        let tail = &prompt[breakdown.cached_prefix_len..];
+        assert!(tail.contains("Working directory: /w"));
+        assert!(tail.contains("Conversation log: /log.jsonl"));
+        assert!(tail.contains("<available_skills>"));
+        assert!(tail.contains("Recursive agent depth: 0 (root)"));
+        assert!(tail.contains("Pre-installed Python packages: requests, httpx,"));
     }
 
     #[test]
-    fn custom_prompt_appends_context_and_date() {
+    fn dynamic_tail_isolates_the_cached_prefix() {
+        let mut other = base_options();
+        other.cwd = "/somewhere/else".to_string();
+        other.messages_path = None;
+        other.rlm_depth = Some(2);
+        other.rlm_parent_agent = Some("the lead");
+        other.generic_mcp_servers = vec!["slack".to_string()];
+        other.context_files = vec![("AGENTS.md".to_string(), "Rule one.".to_string())];
+        let left = system_prompt_breakdown(&base_options());
+        let right = system_prompt_breakdown(&other);
+        // Different sessions share one byte-identical cacheable prefix.
+        assert_eq!(
+            left.assembled[..left.cached_prefix_len],
+            right.assembled[..right.cached_prefix_len]
+        );
+        assert_eq!(left.cached_prefix_len, right.cached_prefix_len);
+        // And the tails differ in the session-specific values.
+        assert!(right.assembled[right.cached_prefix_len..]
+            .contains("Enabled generic MCP servers: `slack`"));
+        assert!(right.assembled[right.cached_prefix_len..]
+            .contains("You are a child agent spawned by the lead."));
+    }
+
+    #[test]
+    fn custom_prompt_replaces_layers_keeps_tail() {
         let mut options = base_options();
         options.custom_prompt = Some("Be terse.".to_string());
         options.context_files = vec![("AGENTS.md".to_string(), "Rule one.".to_string())];
-        let prompt = build_system_prompt(&options);
+        let breakdown = system_prompt_breakdown(&options);
+        let prompt = &breakdown.assembled;
         assert!(prompt.starts_with("Be terse."));
-        assert!(prompt.contains("# Project Context"));
-        assert!(prompt.contains("## AGENTS.md\n\nRule one.\n\n"));
-        assert!(prompt.contains("\nCurrent date: "));
-        assert!(prompt.contains("\nCurrent working directory: /w"));
-        // Custom prompts skip the default RLM assembly.
-        assert!(!prompt.contains("# Delegating to sub-agents"));
+        assert_eq!(breakdown.segments[0].name, "custom");
+        assert!(prompt.contains("## AGENTS.md\n\nRule one."));
+        assert!(prompt.contains("Working directory: /w"));
+        assert!(prompt.contains("Current date: "));
+        // The layered defaults are gone.
+        assert!(!prompt.contains("# prime-agent harness"));
     }
 
     #[test]
-    fn mcp_and_guidelines_sections() {
+    fn mcp_and_guidelines_are_tail_segments() {
         let mut options = base_options();
         options.generic_mcp_servers = vec!["t".to_string(), "t".to_string()];
         options.prompt_guidelines = Some(vec!["be careful".to_string(), "be careful".to_string()]);
-        let prompt = build_system_prompt(&options);
-        assert!(prompt.contains("# Generic MCP Connections"));
-        assert!(prompt.contains("Enabled generic MCP servers: `t`."));
-        assert!(prompt.contains("# Additional Guidance\n\n- be careful"));
+        let breakdown = system_prompt_breakdown(&options);
+        let names: Vec<&str> = breakdown
+            .segments
+            .iter()
+            .map(|segment| segment.name)
+            .collect();
+        assert!(names.contains(&"mcp-servers"));
+        assert!(names.contains(&"additional-guidance"));
+        assert!(breakdown.assembled.contains("# Generic MCP Connections"));
+        assert!(breakdown
+            .assembled
+            .contains("Enabled generic MCP servers: `t`."));
+        assert!(breakdown
+            .assembled
+            .contains("# Additional Guidance\n\n- be careful"));
+    }
+
+    #[test]
+    fn per_model_blocks_extend_the_cached_prefix() {
+        // The shipped map has no blocks, so a model-mapped block can only be
+        // verified through the parser; assert the composition contract here:
+        // any per-model text lands inside the cached prefix.
+        let breakdown = system_prompt_breakdown(&base_options());
+        let static_segments = breakdown
+            .segments
+            .iter()
+            .filter(|segment| segment.kind == SegmentKind::Static);
+        for segment in static_segments {
+            assert_eq!(
+                breakdown
+                    .assembled
+                    .find(&segment.text)
+                    .map(|at| at < breakdown.cached_prefix_len),
+                Some(true),
+                "static segment {} sits inside the cached prefix",
+                segment.name
+            );
+        }
     }
 }

@@ -349,7 +349,17 @@ def tmux_launch(
     tmux panes inherit the tmux server's environment, not the client's, so
     the pane command is wrapped in `env KEY=VALUE ...` (and TMUX unset) to
     guarantee isolation from the ambient agent session.
+
+    The pane runs with `-c cwd` as its working directory, so a relative
+    `command[0]` (e.g. `target/release/prime-agent` passed from the repo
+    root) would resolve against the pane cwd and vanish instantly. Resolve
+    the binary to an absolute path before it reaches the pane.
     """
+    if command and not os.path.isabs(command[0]) and "/" in command[0]:
+        resolved = Path(command[0]).resolve()
+        if not resolved.exists():
+            raise RuntimeError(f"tmux_launch: binary {command[0]} not found at {resolved}")
+        command = [str(resolved), *command[1:]]
     # The pane inherits the tmux server env, so only the deltas (the scrubbed
     # overrides) need explicit assignment; everything else stays inherited.
     assignment = [

@@ -427,63 +427,64 @@ class Battery:
                 "protocol",
                 f"harness-digest user message: ts={has_digest(ts_msgs)} rust={has_digest(rs_msgs)}",
             )
-        # system prompt comparison (only when both have one)
+        # system prompt comparison. TS-prompt parity is SUPERSEDED for the
+        # system prompt (roadmap item 3: the Rust product adopts the layered
+        # prompt redesign - cached static layers + dynamic tail - as its
+        # native prompt). The battery now checks the Rust prompt against the
+        # layered shape instead of the TS text, and keeps the raw TS prompt
+        # in the diff file as reference evidence.
         ts_sys = [m["content"] for m in ts_msgs if m.get("role") == "system"]
         rs_sys = [m["content"] for m in rs_msgs if m.get("role") == "system"]
-        if ts_sys and rs_sys:
+        if rs_sys:
             diff_path = self.run_dir / "protocol-request-diff.txt"
             with open(diff_path, "a") as f:
                 f.write(f"=== {flow} system prompt ==={NL}")
-                f.write("--- TS ---" + NL)
-                f.write(ts_sys[0] + NL)
+                if ts_sys:
+                    f.write("--- TS ---" + NL)
+                    f.write(ts_sys[0] + NL)
                 f.write("--- RUST ---" + NL)
                 f.write(rs_sys[0] + NL)
-            ts_norm = self.normalize_system_prompt(self.sides["ts"], ts_sys[0])
-            rs_norm = self.normalize_system_prompt(self.sides["rust"], rs_sys[0])
-            if ts_norm != rs_norm:
+            shape = self.layered_prompt_shape(rs_sys[0])
+            if shape:
                 self.record(
                     flow,
                     "protocol",
-                    f"system prompt text differs (ts {len(ts_sys[0])} chars vs rust {len(rs_sys[0])} chars; normalized diff in protocol-request-diff.txt)",
-                    evidence=diff_path,
+                    f"system prompt: rust layered redesign (cached static layers + dynamic tail; TS-prompt parity superseded; raw prompts in protocol-request-diff.txt)",
+                    gap=False,
                 )
             else:
-                with open(diff_path, "a") as f:
-                    f.write(f"=== {flow} normalized system prompt === identical{NL}")
+                self.record(
+                    flow,
+                    "protocol",
+                    f"system prompt: rust prompt does not match the layered shape (expected '# prime-agent harness' static core, mandatory-rules layer, skills inventory, dynamic tail; raw prompts in protocol-request-diff.txt)",
+                    evidence=diff_path,
+                )
+        elif ts_sys and not rs_sys:
+            self.record(flow, "protocol", "system prompt: rust request has no system message but ts does")
 
-    def normalize_system_prompt(self, side: B.Side, text: str) -> str:
-        """Normalize per-side and per-run values that can never match across
-        binaries: the side's run directory (cwd + conversation-log path),
-        session UUIDs, skill SKILL.md locations (each binary ships skills in
-        its own install/workspace directory), and directory-listing order
-        (both products list skills in raw readdir order, which differs
-        between the two skills directories)."""
-        text = text.replace(str(side.root), "<side-root>")
-        text = re.sub(
-            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-            "<session-id>",
-            text,
-        )
-        text = re.sub(r"(<location>)[^<]*(</location>)", r"\1<skills-dir>\2", text)
-        # Skill order is raw readdir order on both sides; compare as sets.
-        def sort_skill_block(match: "re.Match[str]") -> str:
-            header, block = match.group(1), match.group(2)
-            entries = sorted(re.findall(r"  <skill>.*?  </skill>", block, re.DOTALL))
-            return header + NL.join(entries) + "</available_skills>"
-
-        text = re.sub(
-            r"(The following skills provide specialized instructions.*?\n<available_skills>\n)(.*?)</available_skills>",
-            sort_skill_block,
-            text,
-            flags=re.DOTALL,
-        )
-        text = re.sub(
-            r"Installed Python skill modules \(pre-imported\): ([^\n]+)",
-            lambda m: "Installed Python skill modules (pre-imported): "
-            + ", ".join(sorted(re.findall(r"`([^`]+)`", m.group(0)))),
-            text,
-        )
-        return text
+    def layered_prompt_shape(self, text: str) -> bool:
+        """Whether the Rust system prompt matches the layered redesign:
+        the static core layer first, the mandatory usage layer, the
+        opinionated layer, then the dynamic tail (packages, skills
+        inventory, environment). Marker-based, so layer text edits do not
+        flap the battery; content-level pinning lives in the pa-core golden
+        snapshot test."""
+        markers = [
+            "# prime-agent harness",
+            "The following are mandatory rules",
+            "The following guidelines to agents have been shown",
+            "Pre-installed Python packages:",
+            "<available_skills>",
+            "Working directory:",
+            "Recursive agent depth: 0 (root)",
+        ]
+        at = -1
+        for marker in markers:
+            found = text.find(marker, at + 1)
+            if found == -1:
+                return False
+            at = found
+        return True
 
     def f3_tool(self) -> None:
         """Tool call turn: deterministic ipython tool call in both products."""
@@ -1230,7 +1231,7 @@ class Battery:
         text = text.replace(str(side.agent_dir), "<agent>")
         text = text.replace(str(side.work_dir), "<work>")
         text = re.sub(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", "<uuid>", text)
-        text = re.sub(r"(?<![a-zA-Z])\d+[smhd](?![a-zA-Z])", "<age>", text)
+        text = re.sub(r"(?<![a-zA-Z]) *\d+[smhd](?![a-zA-Z])", " <age>", text)
         text = re.sub(r"\bv\d+\.\d+[^ ]*", "<version>", text)
         text = re.sub(r"\$0\.\d\d", "<cost>", text)
         # The animated running-row icon and the per-build version string.

@@ -149,16 +149,7 @@ fn mcp_gating_blocking(
     user_servers: std::collections::HashMap<String, crate::mcp::McpServerConfig>,
     agent_dir: &std::path::Path,
 ) -> (Vec<String>, Vec<String>, crate::mcp::McpManager) {
-    let manager = crate::mcp::McpManager::new(crate::mcp::McpManagerOptions {
-        auth_storage: crate::auth::AuthStorage::create(agent_dir),
-        get_user_servers: Box::new(move || Some(user_servers.clone())),
-        begin_login: None,
-    });
-    (
-        manager.get_disabled_builtin_skill_overrides(),
-        manager.get_enabled_persistent_generic_servers(),
-        manager,
-    )
+    crate::mcp::McpManager::prompt_gating(user_servers, agent_dir)
 }
 
 /// Assemble a session: load resources, build the system prompt, and start the
@@ -403,9 +394,16 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         }
     }
 
+    // The per-model prompt layer keys on the resolved `provider/id`
+    // selector; vision capability gates the image-input line. Both are
+    // captured before `model_info` moves into the turn-boundary handler.
+    let prompt_model_selector = Some(format!("{}/{}", model_info.provider, model_info.id));
+    let prompt_vision_capable = Some(model_info.input.contains(&pa_types::ai::ModelInput::Image));
     let system_prompt = crate::prompts::system_prompt::build_system_prompt(
         &crate::prompts::system_prompt::BuildSystemPromptOptions {
             custom_prompt: resources.system_prompt.clone(),
+            model: prompt_model_selector.as_deref(),
+            vision_capable: prompt_vision_capable,
             cwd: cwd.display().to_string(),
             messages_path: conversation_log.clone(),
             context_files: resources
@@ -660,10 +658,12 @@ mod tests {
         .await
         .unwrap();
 
-        // The system prompt is the default RLM assembly.
+        // The system prompt is the layered assembly: static core layer
+        // first, dynamic tail after.
+        assert!(engine.system_prompt.starts_with("# prime-agent harness"));
         assert!(engine
             .system_prompt
-            .starts_with("You are a general purpose agent"));
+            .contains("Recursive agent depth: 0 (root)"));
 
         let outcome = engine
             .prompt("run the echo tool", PromptOptions::default())

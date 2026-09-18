@@ -89,6 +89,30 @@ acquisition fails (pre-existing shape; now logged at warn) because the store
 API has no failure channel; TS throws there.
 
 
+## System prompt: layered redesign supersedes TS-prompt parity (roadmap item 3, 2026-09-18)
+
+The Rust product ships the redesigned layered system prompt as its native prompt
+(adopting Sebastian's draft text), not the TS product's base prompt. TS-prompt
+parity is explicitly superseded for the system prompt only; every other
+model-surface row still compares against the TS binary:
+
+- The prompt is assembled from human-editable layer files (`pa-core`
+  `prompts/layers/`): `core.md` (harness description + the full programmatic-tool
+  API), `usage.md` (mandatory rules), `opinionated.md` (overridable guidelines),
+  `per_model.md` (per-model instruction map, shipped empty). These form the
+  cache-stable prefix.
+- Every session-specific value (packages, project context, skills inventory,
+  MCP servers, environment, session role) is appended strictly after the prefix
+  as the dynamic tail, so providers can cache the prefix across sessions.
+- `prime-agent prompt [--model] [--cwd] [--json]` dumps the fully-assembled
+  effective prompt with the per-layer breakdown (cached prefix vs dynamic tail).
+- The golden system-prompt test now pins the Rust prompt itself
+  (`PA_UPDATE_GOLDEN=1` regenerates) instead of the TS text; the battery f2 row
+  checks the layered shape (static layers, then the dynamic tail) and keeps the
+  raw TS prompt in `protocol-request-diff.txt` as reference evidence. The
+  `prompt` CLI command is Rust-only until the TS product adopts one; the
+  differential CLI corpus normalizes it out of the help comparisons.
+
 ## Kernel packaging lane notes
 
 - Packaged layout (TS install.sh native path + copy-binary-assets.mjs): the
@@ -139,3 +163,4 @@ API has no failure channel; TS throws there.
 - Print-mode faux scripts accept content-block entries (tool calls) through
   the shared `pa_ai::faux::script::parse_faux_script` (the daemon worker
   seam already used it), so binary-level e2e can script full kernel turns.
+
