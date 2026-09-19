@@ -329,6 +329,9 @@ fn print_resume_hint(hint: &Option<String>) {
 /// `/resume <selector>` chain runs its target before the loop decides again.
 async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) -> Result<()> {
     let mut anchor = anchor;
+    // TS `AgentsViewPersistentState.query`: a chat opened from a filtered
+    // roster re-enters the view with the same query typed.
+    let mut query: Option<String> = None;
     loop {
         let view_options = pa_tui::agents_view::AgentsViewOptions {
             socket_path: base.socket_path.clone(),
@@ -337,6 +340,7 @@ async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) 
             theme: base.theme.clone(),
             version: base.version.clone(),
             anchor_session_id: anchor.clone(),
+            query: query.clone(),
         };
         let view = pa_tui::agents_view::run_agents_view(
             view_options,
@@ -346,6 +350,7 @@ async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) 
         let Some(selection) = view.selection else {
             return Ok(());
         };
+        query = view.query;
         let mut session_options = base.clone();
         session_options.session = selection;
         let outcome =

@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 
 use crate::agents_view_state::truncate_text;
 use crate::agents_view_state::{
-    build_layout, build_rows, filter_empty_sessions, matches_query, parse_search_query,
+    build_layout, build_rows, filter_empty_sessions, filter_unified_sessions, parse_search_query,
     reconcile_unified_sessions, section_title, AgentsViewRow, RowLayout, Section,
 };
 use crate::daemon_client::{DaemonClient, DaemonClientEvent};
@@ -37,6 +37,10 @@ pub struct AgentsViewOptions {
     /// The session the view was opened from: keeps its recency slot and
     /// survives the empty-catalog filter.
     pub anchor_session_id: Option<String>,
+    /// The query restored from the previous view run (TS
+    /// `AgentsViewPersistentState.query`: returning from an opened chat
+    /// keeps the filter typed before opening it).
+    pub query: Option<String>,
 }
 
 /// How the view is driven.
@@ -70,6 +74,9 @@ pub struct AgentsViewOutcome {
     /// The session the user opened; `None` when the flow exits here.
     pub selection: Option<SessionSelection>,
     pub frames: Vec<String>,
+    /// The query typed in this run, for the caller to restore on re-entry
+    /// (TS `AgentsViewPersistentState.query`).
+    pub query: Option<String>,
 }
 
 /// TS `WORKING_ICON_INTERVAL_MS`: the running-row icon frame cadence.
@@ -105,6 +112,7 @@ struct AgentsViewMode {
 impl AgentsViewMode {
     fn new(options: AgentsViewOptions) -> Self {
         let theme = crate::app::load_theme(&options.theme);
+        let query = options.query.clone().unwrap_or_default();
         AgentsViewMode {
             options,
             theme,
@@ -112,7 +120,7 @@ impl AgentsViewMode {
             saved: Vec::new(),
             rows: Vec::new(),
             selected: 0,
-            query: String::new(),
+            query,
             status: None,
             exit_armed: false,
             exit_guard: crate::exit_guard::ExitGuard::new(),
@@ -132,10 +140,7 @@ impl AgentsViewMode {
             build_rows(&filtered, self.options.anchor_session_id.as_deref())
         } else {
             let parsed = parse_search_query(query);
-            let matching: Vec<_> = filtered
-                .into_iter()
-                .filter(|record| matches_query(&record.searchable, &parsed))
-                .collect();
+            let matching = filter_unified_sessions(&filtered, &parsed);
             build_rows(&matching, self.options.anchor_session_id.as_deref())
         };
         if let Some(identity) = identity {
@@ -789,6 +794,7 @@ pub async fn run_agents_view(
     Ok(AgentsViewOutcome {
         selection: mode.selection,
         frames,
+        query: (!mode.query.is_empty()).then(|| mode.query.clone()),
     })
 }
 
@@ -816,6 +822,7 @@ mod tests {
             theme: "prime".to_string(),
             version: "0.0.0".to_string(),
             anchor_session_id: None,
+            query: None,
         });
         let row = |title: &str| AgentsViewRow {
             section: Section::Idle,

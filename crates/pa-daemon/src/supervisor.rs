@@ -3075,11 +3075,16 @@ fn saved_session_row(info: &crate::session_store::SessionInfo) -> Value {
         "modified": info.modified,
         "messageCount": info.message_count,
         "firstMessage": info.first_message,
-        // The scan does not concatenate the transcript; consumers use the
-        // per-session read paths for full text.
-        "allMessagesText": "",
+        // The scan's capped transcript corpus (TS `allMessagesText`): the
+        // agents-view full-transcript search field.
+        "allMessagesText": info.all_messages_text,
         "state": info.state.as_ref().map(|state| json!({ "status": state })),
     });
+    if let Some(status) = &info.agent_status {
+        row.as_object_mut()
+            .expect("row object")
+            .insert("agentStatus".to_string(), status.clone());
+    }
     let object = row.as_object_mut().expect("row object");
     if let Some(name) = &info.name {
         object.insert("name".to_string(), json!(name));

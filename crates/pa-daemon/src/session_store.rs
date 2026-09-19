@@ -540,6 +540,32 @@ pub struct SessionInfo {
     pub modified: String,
     pub message_count: usize,
     pub first_message: String,
+    /// Every user/assistant message text, concatenated, capped at
+    /// `SESSION_LIST_SEARCH_TEXT_MAX_CHARS` (TS `allMessagesText`: the
+    /// agents-view full-transcript search corpus).
+    pub all_messages_text: String,
+    /// The latest `agent_status` recap (`summary` is searchable).
+    pub agent_status: Option<Value>,
+}
+
+/// TS `SESSION_LIST_SEARCH_TEXT_MAX_CHARS`: the transcript search-text cap.
+pub const SESSION_LIST_SEARCH_TEXT_MAX_CHARS: usize = 64 * 1024;
+
+/// TS `appendCappedSearchText`: space-join the texts, cut the final
+/// addition so the corpus never grows past the cap.
+fn append_capped_search_text(current: &mut String, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let used = current.chars().count();
+    if used >= SESSION_LIST_SEARCH_TEXT_MAX_CHARS {
+        return;
+    }
+    if used > 0 {
+        current.push(' ');
+    }
+    let remaining = SESSION_LIST_SEARCH_TEXT_MAX_CHARS - current.chars().count();
+    current.extend(text.chars().take(remaining));
 }
 
 pub fn read_session_info(path: &Path) -> Option<SessionInfo> {
@@ -550,6 +576,8 @@ pub fn read_session_info(path: &Path) -> Option<SessionInfo> {
     let mut model = None;
     let mut message_count = 0usize;
     let mut first_message = String::new();
+    let mut all_messages_text = String::new();
+    let mut agent_status: Option<Value> = None;
     let mut last_activity_ms: Option<u64> = None;
     for line in content.lines() {
         let trimmed = line.trim();
@@ -589,6 +617,11 @@ pub fn read_session_info(path: &Path) -> Option<SessionInfo> {
                     entry.fields.get("modelId")?.as_str()?.to_string(),
                 ));
             }
+            // Keep the latest recap/verdict (TS `agent_status` fold): the
+            // `summary` text is part of the agents-view search corpus.
+            "agent_status" => {
+                agent_status = entry.fields.get("status").cloned();
+            }
             "message" => {
                 message_count += 1;
                 if let Some(message) = entry.fields.get("message") {
@@ -611,6 +644,12 @@ pub fn read_session_info(path: &Path) -> Option<SessionInfo> {
                         if !text.is_empty() {
                             first_message = text;
                         }
+                    }
+                    // TS `allMessagesText`: user and assistant text
+                    // content feeds the full-transcript search.
+                    if matches!(role, Some("user" | "assistant")) {
+                        let text = message_text(message);
+                        append_capped_search_text(&mut all_messages_text, &text);
                     }
                 }
             }
@@ -646,6 +685,8 @@ pub fn read_session_info(path: &Path) -> Option<SessionInfo> {
         } else {
             first_message
         },
+        all_messages_text,
+        agent_status,
     })
 }
 
@@ -723,6 +764,74 @@ mod tests {
             info.model.as_ref().map(|(p, m)| (p.as_str(), m.as_str())),
             Some(("p", "m"))
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_builds_transcript_search_text_and_latest_agent_status() {
+        let dir = temp_dir();
+        let mut session = SessionFile::create("/tmp", None, 0);
+        let path = dir.join(session_file_name(session.session_id()));
+        session.set_path(path.clone());
+        session.append_message(
+            json!({"role": "user", "content": "fix the login bug", "timestamp": 1u64}),
+        );
+        session.append_message(json!({
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "fixed in auth.rs" }],
+            "provider": "p", "model": "m", "timestamp": 2u64
+        }));
+        // Tool traffic is counted but never enters the search corpus.
+        session.append_message(
+            json!({"role": "toolResult", "content": "tool noise", "timestamp": 3u64}),
+        );
+        session.append_entry(
+            "agent_status",
+            json!({
+                "status": { "summary": "first recap", "basedOnMessageCount": 1 }
+            }),
+        );
+        session.append_entry(
+            "agent_status",
+            json!({
+                "status": { "summary": "login fix landed", "basedOnMessageCount": 2 }
+            }),
+        );
+        session.rewrite().unwrap();
+
+        let info = read_session_info(&path).unwrap();
+        assert_eq!(info.all_messages_text, "fix the login bug fixed in auth.rs");
+        assert_eq!(
+            info.agent_status,
+            Some(json!({
+                "summary": "login fix landed", "basedOnMessageCount": 2
+            }))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transcript_search_text_caps_at_the_ts_limit() {
+        let dir = temp_dir();
+        let mut session = SessionFile::create("/tmp", None, 0);
+        let path = dir.join(session_file_name(session.session_id()));
+        session.set_path(path.clone());
+        for round in 0..3 {
+            let message = "x".repeat(30 * 1024);
+            session.append_message(json!({
+                "role": "user", "content": format!("{round} {message}"), "timestamp": round + 1
+            }));
+        }
+        session.rewrite().unwrap();
+
+        let info = read_session_info(&path).unwrap();
+        assert_eq!(
+            info.all_messages_text.chars().count(),
+            SESSION_LIST_SEARCH_TEXT_MAX_CHARS
+        );
+        // Space-joined like TS: exactly one separator between messages.
+        assert!(info.all_messages_text.starts_with("0 xxx"));
+        assert!(info.all_messages_text.contains("1 xxx"));
         let _ = fs::remove_dir_all(&dir);
     }
 

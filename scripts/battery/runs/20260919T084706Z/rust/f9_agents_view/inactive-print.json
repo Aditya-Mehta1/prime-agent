@@ -1,0 +1,19 @@
+{
+ "argv": [
+  "/tmp/prime-agent-session-search",
+  "-p",
+  "--daemon-socket",
+  "/home/ubuntu/lane-worktrees/session-search/scripts/battery/runs/20260919T084706Z/rust/daemon.sock",
+  "--provider",
+  "prime-inference",
+  "--model",
+  "mock-1",
+  "--offline",
+  "f9 inactive prompt"
+ ],
+ "exit_code": 0,
+ "stdout": "f9 idle reply\n",
+ "stderr": "",
+ "duration_s": 0.11,
+ "timeout": false
+}

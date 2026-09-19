@@ -1158,7 +1158,11 @@ class Battery:
             # refuses to attach an active agent across that telemetry mismatch.
             argv = [side.binary, "agents", "--daemon-socket", str(side.daemon_socket)]
             B.tmux_launch(view_session, argv, side.env, side.work_dir)
-            frame120 = B.tmux_wait_text(view_session, "Running \(|Idle \(|Inactive \(|No sessions", timeout=30)
+            # Wait for the catalog-fed Inactive section, not just any
+            # heading: the saved catalog loads asynchronously, and the first
+            # capture must show the full roster (an early "Running (" match
+            # captured a pre-catalog frame; run 20260919T084345Z).
+            frame120 = B.tmux_wait_text(view_session, "Inactive \(|No sessions", timeout=45)
             side.evidence(flow, "01-agents-view-120x36.txt", frame120)
             frames[side.name]["120x36"] = frame120
             B.tmux_resize(view_session, (220, 50))
@@ -1192,6 +1196,65 @@ class Battery:
                     f"{side.name}: agents view groups the roster into Running/Idle/Inactive sections with the scripted sessions in place",
                     gap=False,
                 )
+            # Search-filter surface: typing narrows the roster to the
+            # match, Escape clears the query and restores the roster, and a
+            # transcript-only phrase still finds its session.
+            B.tmux_send(view_session, "busy", enter=False)
+            time.sleep(1.0)
+            filtered = B.tmux_capture(view_session)
+            side.evidence(flow, "03-filtered-roster-120x36.txt", filtered)
+            frames[side.name]["filtered-120x36"] = filtered
+            if "battery-f9-busy" not in filtered:
+                self.record(
+                    flow,
+                    "behavior",
+                    f"{side.name}: the 'busy' query lost its match from the filtered roster",
+                    evidence=side.root / flow / "03-filtered-roster-120x36.txt",
+                )
+            for hidden_marker in ("battery-f9-idle", "f9 inactive prompt"):
+                if hidden_marker in filtered:
+                    self.record(
+                        flow,
+                        "behavior",
+                        f"{side.name}: the 'busy' query did not hide '{hidden_marker}'",
+                        evidence=side.root / flow / "03-filtered-roster-120x36.txt",
+                    )
+            B.tmux_send(view_session, "Escape", enter=False)
+            time.sleep(1.0)
+            cleared = B.tmux_capture(view_session)
+            side.evidence(flow, "04-cleared-roster-120x36.txt", cleared)
+            for restored_marker in ("battery-f9-busy", "battery-f9-idle", "f9 inactive prompt"):
+                if restored_marker not in cleared:
+                    self.record(
+                        flow,
+                        "behavior",
+                        f"{side.name}: clearing the query did not restore '{restored_marker}'",
+                        evidence=side.root / flow / "04-cleared-roster-120x36.txt",
+                    )
+            # A quoted phrase that only appears as a saved transcript
+            # message (not as a name or first prompt) matches through the
+            # allMessagesText corpus.
+            B.tmux_send(view_session, '"f9 idle reply"', enter=False)
+            time.sleep(1.0)
+            transcript = B.tmux_capture(view_session)
+            side.evidence(flow, "05-transcript-filtered-120x36.txt", transcript)
+            frames[side.name]["transcript-120x36"] = transcript
+            if "battery-f9-idle" not in transcript:
+                self.record(
+                    flow,
+                    "behavior",
+                    f"{side.name}: a transcript-only phrase did not find its session",
+                    evidence=side.root / flow / "05-transcript-filtered-120x36.txt",
+                )
+            if "battery-f9-busy" in transcript:
+                self.record(
+                    flow,
+                    "behavior",
+                    f"{side.name}: the transcript phrase left an unrelated row in the roster",
+                    evidence=side.root / flow / "05-transcript-filtered-120x36.txt",
+                )
+            B.tmux_send(view_session, "Escape", enter=False)
+            time.sleep(0.5)
             # Attach target: search down to the running row, open it, and the
             # in-flight reply must render in the attached session UI.
             B.tmux_send(view_session, "busy")
@@ -1220,8 +1283,9 @@ class Battery:
             # Leave the mock script plain for the flows that follow (f11's
             # healthy exchange expects the HELLO_TEXT response).
             side.mock.set_responses([{"text": HELLO_TEXT}])
-        # Frame diff: same scripted roster, same size, TS vs Rust.
-        for size_label in ("120x36", "220x50"):
+        # Frame diff: same scripted roster, same size, TS vs Rust — the
+        # unfiltered view and the filtered search results.
+        for size_label in ("120x36", "220x50", "filtered-120x36", "transcript-120x36"):
             ts_frame = frames.get("ts", {}).get(size_label)
             rs_frame = frames.get("rust", {}).get(size_label)
             if ts_frame is None or rs_frame is None:

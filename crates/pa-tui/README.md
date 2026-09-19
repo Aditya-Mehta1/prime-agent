@@ -4,9 +4,13 @@ The terminal UI.
 
 ## Scope
 Rendering (markdown, themes, layout, tool panels, custom-message decorated rows), image support (the terminal-image library: capability detection, Kitty/iTerm2 protocol encoders, dimension parsing; the image component with the fullscreen compose fallback; `terminal.showImages` gating of tool-result image rows; clipboard image paste behind `app.clipboard.pasteImage` with `[image #N]` editor markers, byte-budgeted registry, and wire-image attach), editor (cursor/kill-ring/undo/history/word ops), keybindings (configurable, TS defaults), autocomplete, fullscreen/scrollback, input handling, and the double-Ctrl+C force-quit guard (the exit contract: two in-window Ctrl+C presses end the process within 1.5s of the second press regardless of daemon or loop state; cleanup inside that window is best-effort). Interactive sessions attached through the daemon: the JSONL client socket (hello handshake, command envelopes, session-event loop), slim-attach snapshot reconstruction, prompt submission with streamed assistant output, live session list and switch, the inline pickers (`/model`: the composition-root catalog snapshot, current-first rows named by model, apply through the daemon `set_model` command with the `Model: <id>` status row; `/effort`: the session's thinking levels from `get_state`, the unsupported-model note, and apply through `set_thinking_level`), the TS `showStatus` back-to-back rewrite (a status emitted with nothing after the previous one rewrites it in place), and the agents view (the unified live-roster +
-saved-catalog session list: Running/Idle/Inactive sections, inline search,
-open-to-attach/resume, `n`-via-ctrl+n new session, live `roster_subscribe`
-pushes).
+saved-catalog session list: Running/Idle/Inactive sections, inline search
+(TS query language: case-insensitive substring tokens, `"quoted phrases"`,
+`re:` regex, capped fuzzy fallback; the corpus spans ids, names,
+first/last messages, the capped saved transcript, the recap summary, cwd,
+and file paths; Escape clears the query and the view restores the roster;
+the query survives opening a chat and returning), open-to-attach/resume,
+`n`-via-ctrl+n new session, live `roster_subscribe` pushes).
 
 ## Non-goals
 No session logic, no providers, no loop policy. The interactive UI renders daemon events and sends user intents (prompts, abort, switch) as daemon commands; the session loop itself lives in the pa-daemon worker. It never computes agent behavior and never spawns the supervisor (launch semantics live in pa-cli).

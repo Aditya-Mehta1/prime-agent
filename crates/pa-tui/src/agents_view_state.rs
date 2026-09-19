@@ -141,6 +141,14 @@ fn saved_search_text(saved: &Value) -> String {
         get_str(saved, "id"),
         get_str(saved, "name"),
         get_str(saved, "firstMessage"),
+        // The capped transcript corpus (TS `allMessagesText`): a query can
+        // find a session by any user/assistant message text.
+        get_str(saved, "allMessagesText"),
+        // The latest recap's summary (TS `agentStatus?.summary`).
+        saved
+            .get("agentStatus")
+            .and_then(|status| status.get("summary"))
+            .and_then(Value::as_str),
         get_str(saved, "cwd"),
         get_str(saved, "path"),
         get_str(saved, "parentSessionPath"),
@@ -493,6 +501,76 @@ fn normalize(text: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The keys by which a record's parent is referenced (TS `getParentKeys`).
+fn parent_keys(record: &UnifiedRecord) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Some(daemon) = &record.daemon {
+        for field in ["parentActiveSessionId", "parentSessionId"] {
+            if let Some(id) = get_str(daemon, field) {
+                let prefix = if field == "parentActiveSessionId" {
+                    "active"
+                } else {
+                    "session"
+                };
+                keys.push(format!("{prefix}:{id}"));
+            }
+        }
+        if let Some(path) = get_str(daemon, "parentSessionPath") {
+            keys.push(file_identity(path));
+        }
+    }
+    if let Some(parent) = record
+        .saved
+        .as_ref()
+        .and_then(|saved| get_str(saved, "parentSessionPath"))
+    {
+        keys.push(file_identity(parent));
+    }
+    keys
+}
+
+/// TS `filterUnifiedSessions`: keep the matching records plus every
+/// ancestor, so the hierarchy leading to a match stays reachable (a child
+/// hit keeps its parent rows in the set). Catalog order decides rendering.
+pub fn filter_unified_sessions(
+    records: &[UnifiedRecord],
+    query: &ParsedSearchQuery,
+) -> Vec<UnifiedRecord> {
+    let by_alias: HashMap<&str, usize> = records
+        .iter()
+        .enumerate()
+        .flat_map(|(index, record)| {
+            record
+                .aliases
+                .iter()
+                .map(move |alias| (alias.as_str(), index))
+        })
+        .collect();
+    let mut retained = vec![false; records.len()];
+    for index in 0..records.len() {
+        if retained[index] || !matches_query(&records[index].searchable, query) {
+            continue;
+        }
+        let mut current = Some(index);
+        while let Some(i) = current {
+            if retained[i] {
+                break;
+            }
+            retained[i] = true;
+            current = parent_keys(&records[i])
+                .iter()
+                .find_map(|key| by_alias.get(key.as_str()))
+                .copied();
+        }
+    }
+    records
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| retained[*index])
+        .map(|(_, record)| record.clone())
+        .collect()
 }
 
 /// Epoch milliseconds from an RFC 3339 timestamp (`YYYY-MM-DDTHH:MM:SS.sssZ`).
@@ -998,6 +1076,118 @@ mod tests {
             text,
             &parse_search_query(r#""node cve"#.replace('"', "").as_str())
         ));
+    }
+
+    #[test]
+    fn search_matches_metadata_fields_case_insensitively() {
+        // TS `createUnifiedSearchableText`: the corpus joins id, name,
+        // firstMessage, transcript text, recap summary, cwd, and paths.
+        let saved = vec![json!({
+            "id": "sess-alpha",
+            "path": "/x/alpha.jsonl",
+            "name": "RoSTER worker",
+            "firstMessage": "deploy the Gateway",
+            "allMessagesText": "the gateway probe returned 503 twice",
+            "agentStatus": { "summary": "gateway deploy finished" },
+            "cwd": "/home/u/API-server",
+            "parentSessionPath": "/x/parent.jsonl",
+        })];
+        let records = reconcile_unified_sessions(&[], &saved);
+        let text = &records[0].searchable;
+        // Case-insensitive substring matches on every metadata field.
+        for query in [
+            "alpha",
+            "roster",
+            "deploy the gateway",
+            "GATEWAY PROBE",
+            "gateway deploy finished",
+            "api-server",
+            "parent.jsonl",
+        ] {
+            let parsed = parse_search_query(query);
+            assert!(
+                matches_query(text, &parsed),
+                "query {query:?} should match: {text}"
+            );
+        }
+        // Partial words need the fuzzy path (ordered subsequence).
+        assert!(matches_query(text, &parse_search_query("gtwy")));
+        // A field that is nowhere in the corpus does not match.
+        assert!(!matches_query(text, &parse_search_query("zebra")));
+    }
+
+    #[test]
+    fn search_covers_live_recap_and_saved_transcript_together() {
+        // A merged record: live daemon summary plus saved enrichment.
+        let roster = vec![roster_entry(
+            "s1",
+            "idle",
+            json!({
+                "sessionId": "s1",
+                "activeSessionId": "a1",
+                "sessionFile": "/x/s1.jsonl",
+                "summary": "tuned the retry policy",
+            }),
+        )];
+        let saved = vec![json!({
+            "id": "s1",
+            "path": "/x/s1.jsonl",
+            "allMessagesText": "we bumped the backoff ceiling to 30s",
+        })];
+        let records = reconcile_unified_sessions(&roster, &saved);
+        assert_eq!(records.len(), 1);
+        // Both sources are in the merged corpus (TS
+        // `createUnifiedSearchText(record.daemon, record.saved)`).
+        assert!(matches_query(
+            &records[0].searchable,
+            &parse_search_query("retry")
+        ));
+        assert!(matches_query(
+            &records[0].searchable,
+            &parse_search_query("backoff ceiling")
+        ));
+    }
+
+    #[test]
+    fn search_retains_the_ancestors_of_a_match() {
+        // A saved child session whose parentSessionPath names the parent
+        // row: a query matching only the child keeps the parent visible
+        // (TS `filterUnifiedSessions` ancestor retention).
+        let saved = vec![
+            json!({
+                "id": "parent",
+                "path": "/x/parent.jsonl",
+                "name": "root agent",
+                "firstMessage": "orchestrate",
+                "messageCount": 1,
+            }),
+            json!({
+                "id": "child",
+                "path": "/x/child.jsonl",
+                "parentSessionPath": "/x/parent.jsonl",
+                "name": "child agent",
+                "firstMessage": "find the fibonacci bug",
+                "messageCount": 1,
+            }),
+        ];
+        let records = reconcile_unified_sessions(&[], &saved);
+        let filtered = filter_unified_sessions(&records, &parse_search_query("fibonacci"));
+        let titles: Vec<&str> = filtered
+            .iter()
+            .map(|record| {
+                get_str(record.saved.as_ref().unwrap_or(&Value::Null), "name").unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(titles, vec!["root agent", "child agent"]);
+        // An unrelated query matches nothing, and the parent alone matches
+        // only its own query.
+        assert!(filter_unified_sessions(&records, &parse_search_query("zebra")).is_empty());
+        let parent_only = filter_unified_sessions(&records, &parse_search_query("orchestrate"));
+        assert_eq!(parent_only.len(), 1);
+        assert_eq!(
+            get_str(parent_only[0].saved.as_ref().unwrap(), "name"),
+            Some("root agent")
+        );
     }
 
     #[test]
