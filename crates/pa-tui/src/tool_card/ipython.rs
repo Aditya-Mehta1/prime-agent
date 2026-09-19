@@ -89,6 +89,7 @@ pub fn render(
     detail: Detail,
     theme: &Theme,
     width: usize,
+    show_images: bool,
 ) -> Vec<Line> {
     let code = cell_code(card).trim_end();
     let details = card
@@ -116,7 +117,19 @@ pub fn render(
         return lines;
     }
     let has_code = render_code(&mut lines, code, theme, width);
-    render_output(card, &details, &mut lines, has_code, theme, width);
+    render_output(
+        card,
+        &details,
+        &mut lines,
+        has_code,
+        show_images,
+        theme,
+        width,
+    );
+    // Image blocks render below the card when shown (TS the
+    // `N images rendered below` note refers to these rows, which
+    // `tool-execution.ts` adds for every tool shell).
+    lines.extend(super::image_rows(&card.result, show_images, theme));
     lines
 }
 
@@ -398,6 +411,7 @@ fn render_output(
     details: &IpythonDetails,
     lines: &mut Vec<Line>,
     has_code: bool,
+    show_images: bool,
     theme: &Theme,
     width: usize,
 ) {
@@ -644,7 +658,11 @@ fn render_output(
     if image_count > 0 {
         start_output(&mut output_started, lines);
         let noun = if image_count == 1 { "image" } else { "images" };
-        let text = format!("{image_count} {noun} hidden");
+        let text = if show_images {
+            format!("{image_count} {noun} rendered below")
+        } else {
+            format!("{image_count} {noun} hidden")
+        };
         let prefix = output_prefix(&mut output_marker_pending);
         add_wrapped(
             lines,
@@ -761,7 +779,7 @@ mod tests {
             false,
             false,
         );
-        let lines = render(&card, 0, Detail::Overview, &theme(), 100);
+        let lines = render(&card, 0, Detail::Overview, &theme(), 100, true);
         assert_eq!(lines.len(), 1);
         let text = text_of(&lines[0]);
         assert!(
@@ -781,7 +799,7 @@ mod tests {
             true,
             false,
         );
-        let lines = render(&card, 0, Detail::Overview, &theme(), 100);
+        let lines = render(&card, 0, Detail::Overview, &theme(), 100, true);
         let text = text_of(&lines[0]);
         assert!(text.contains("\u{2717} python"), "got: {text}");
         assert!(text.contains("ValueError"), "got: {text}");
@@ -799,7 +817,7 @@ mod tests {
             false,
             false,
         );
-        let lines = render(&card, 0, Detail::All, &theme(), 100);
+        let lines = render(&card, 0, Detail::All, &theme(), 100, true);
         let flat: Vec<String> = lines.iter().map(text_of).collect();
         assert!(
             flat[1].starts_with(" \u{2570}\u{2500} for i in range(3):"),
@@ -829,7 +847,7 @@ mod tests {
             true,
             false,
         );
-        let lines = render(&card, 0, Detail::All, &theme(), 100);
+        let lines = render(&card, 0, Detail::All, &theme(), 100, true);
         let flat: Vec<String> = lines.iter().map(text_of).collect();
         assert!(
             flat.iter().any(|row| row.contains("ValueError: boom")),
@@ -845,10 +863,10 @@ mod tests {
             false,
             false,
         );
-        let lines = render(&card, 0, Detail::All, &theme(), 100);
+        let lines = render(&card, 0, Detail::All, &theme(), 100, true);
         assert!(lines.len() > 1, "all mode expands rows");
-        let collapsed = render(&card, 0, Detail::Overview, &theme(), 100);
-        let details = render(&card, 0, Detail::Details, &theme(), 100);
+        let collapsed = render(&card, 0, Detail::Overview, &theme(), 100, true);
+        let details = render(&card, 0, Detail::Details, &theme(), 100, true);
         assert_eq!(collapsed.len(), 1);
         assert_eq!(details.len(), 1, "details mode keeps tool output collapsed");
     }
@@ -861,7 +879,7 @@ mod tests {
             false,
             false,
         );
-        let lines = render(&card, 0, Detail::All, &theme(), 100);
+        let lines = render(&card, 0, Detail::All, &theme(), 100, true);
         let flat: Vec<String> = lines.iter().map(text_of).collect();
         assert!(flat[0].contains("bash"), "got: {flat:?}");
         assert!(flat[1].contains("%%bash"), "got: {flat:?}");
@@ -877,7 +895,7 @@ mod tests {
             "result": "<BashHandle pid=421 running command='sleep 0.1'>",
         });
         let card = cell_card(code, details, false, false);
-        let lines = render(&card, 0, Detail::Overview, &theme(), 100);
+        let lines = render(&card, 0, Detail::Overview, &theme(), 100, true);
         let text = text_of(&lines[0]);
         assert!(text.contains("cell 12ms"), "got: {text}");
         let details = json!({
@@ -886,7 +904,7 @@ mod tests {
             "result": "<BashHandle pid=421 exit_code=1 command='sleep 0.1'>",
         });
         let card2 = cell_card(code, details, false, false);
-        let lines = render(&card2, 0, Detail::Overview, &theme(), 100);
+        let lines = render(&card2, 0, Detail::Overview, &theme(), 100, true);
         let text = text_of(&lines[0]);
         assert!(text.contains("exit 1"), "got: {text}");
         assert!(text.contains("\u{2717}"), "got: {text}");
@@ -895,12 +913,63 @@ mod tests {
     #[test]
     fn partial_cell_shows_waiting_for_output() {
         let card = cell_card("print(2)", json!({ "status": "ok" }), false, true);
-        let lines = render(&card, 0, Detail::All, &theme(), 100);
+        let lines = render(&card, 0, Detail::All, &theme(), 100, true);
         let flat: Vec<String> = lines.iter().map(text_of).collect();
         assert!(
             flat.iter().any(|row| row.contains("waiting for output...")),
             "got: {flat:?}"
         );
+    }
+
+    fn image_cell_card() -> ToolCallCard {
+        use base64::Engine;
+        let mut bytes = vec![0x89, b'P', b'N', b'G'];
+        bytes.extend(vec![0u8; 12]);
+        bytes.extend(8u32.to_be_bytes());
+        bytes.extend(4u32.to_be_bytes());
+        let png = base64::engine::general_purpose::STANDARD.encode(bytes);
+        ToolCallCard {
+            id: "toolu_1".into(),
+            name: "ipython".into(),
+            args: json!({ "code": "display(img)" }),
+            started: true,
+            result: Some(super::super::ToolResultView {
+                content: vec![json!({ "type": "image", "data": png, "mimeType": "image/png" })],
+                details: json!({ "status": "ok", "durationMs": 3 }),
+                is_error: false,
+            }),
+            result_partial: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn shown_image_counts_render_below_the_cell() {
+        let card = image_cell_card();
+        let lines = render(&card, 0, Detail::All, &theme(), 100, true);
+        let flat: Vec<String> = lines.iter().map(text_of).collect();
+        assert!(
+            flat.iter()
+                .any(|row| row.contains("1 image rendered below")),
+            "got: {flat:?}"
+        );
+        assert!(
+            flat.iter()
+                .any(|row| row.contains("\u{2570}\u{2500} [image/png \u{b7} 8\u{d7}4]")),
+            "got: {flat:?}"
+        );
+    }
+
+    #[test]
+    fn hidden_image_counts_stay_hidden_with_no_rows() {
+        let card = image_cell_card();
+        let lines = render(&card, 0, Detail::All, &theme(), 100, false);
+        let flat: Vec<String> = lines.iter().map(text_of).collect();
+        assert!(
+            flat.iter().any(|row| row.contains("1 image hidden")),
+            "got: {flat:?}"
+        );
+        assert!(!flat.iter().any(|row| row.contains("[image/png")));
     }
 
     #[test]
@@ -911,7 +980,7 @@ mod tests {
             false,
             false,
         );
-        let lines = render(&card, 0, Detail::All, &theme(), 100);
+        let lines = render(&card, 0, Detail::All, &theme(), 100, true);
         let flat: Vec<String> = lines.iter().map(text_of).collect();
         assert!(
             flat.iter().any(|row| row.contains("no output")),

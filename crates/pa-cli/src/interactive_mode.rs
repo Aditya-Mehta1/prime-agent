@@ -208,6 +208,21 @@ impl pa_tui::interactive::InteractionTelemetry for CliInteractionTelemetry {
             let _ = client.shutdown().await;
         })
     }
+
+    fn image_pasted(&self, mime_type: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        // The returned future borrows only `self`, so the mime type rides
+        // inside it by value.
+        let mime_type = mime_type.to_string();
+        Box::pin(async move {
+            let Some(client) = self.client() else {
+                return;
+            };
+            let mut properties = pa_telemetry::base_properties("interactive");
+            properties.set("mime_type", serde_json::Value::from(mime_type));
+            client.track("tui image pasted", properties);
+            let _ = client.shutdown().await;
+        })
+    }
 }
 
 /// Run the interactive TUI attached to the daemon. Returns the exit code.
@@ -385,9 +400,9 @@ fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<Inter
     let session = session_selection(&options.session, &session_dir)?;
     // The chat markdown code-block indent reads the effective settings on
     // startup (TS `getCodeBlockIndent` -> `getMarkdownThemeWithSettings`).
-    let code_block_indent =
-        pa_core::settings::SettingsManager::create(&config.cwd, &config.agent_dir)
-            .get_code_block_indent();
+    let settings = pa_core::settings::SettingsManager::create(&config.cwd, &config.agent_dir);
+    let code_block_indent = settings.get_code_block_indent();
+    let show_images = settings.get_show_images();
     // The `/model` picker catalog: a startup snapshot of the available
     // models (same registry and private-authorization cache adoption as
     // the startup-model chain; entitlement refreshes run daemon-side, so
@@ -442,6 +457,7 @@ fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<Inter
         no_session: options.session.no_session,
         session,
         initial_message: options.initial_message.clone(),
+        show_images,
         theme: String::new(),
         version: crate::config::version().to_string(),
         // The startup-model chain (PR lane): the task is built from the full

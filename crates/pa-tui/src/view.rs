@@ -69,6 +69,10 @@ pub struct AgentView {
     /// The `/effort` inline picker (TS `ThinkingSelectorComponent` seam):
     /// while set, it owns the whole frame like the model picker.
     pub effort_picker: Option<crate::effort_picker::EffortPicker>,
+    /// The `terminal.showImages` setting (TS `getShowImages`, default
+    /// true): image blocks render their metadata rows when set, their
+    /// `[Image: ...]` text placeholders otherwise.
+    pub show_images: bool,
     scroll_top: usize,
     following: bool,
     /// The transcript-tail offset of the last composed frame (TS
@@ -118,6 +122,7 @@ impl AgentView {
             onboarding: None,
             model_picker: None,
             effort_picker: None,
+            show_images: true,
             scroll_top: 0,
             following: true,
             last_max_scroll: 0,
@@ -493,6 +498,7 @@ impl AgentView {
                 self.detail,
                 &self.theme,
                 width,
+                self.show_images,
             ),
             ChatEntry::AgentMessage(row) => crate::custom_message::render::render_agent_message(
                 row,
@@ -740,6 +746,17 @@ impl AgentView {
     /// Compose the fullscreen frame: top bar, transcript window (padded),
     /// dock at the bottom — exactly `height` rows.
     pub fn render_frame(&mut self, width: usize, height: usize) -> Vec<Line> {
+        // The fullscreen compose forces image components to their textual
+        // fallback (TS `withFullscreenImageFallback` around the fullscreen
+        // render): the frame repaints on every tick, and re-emitting an
+        // image placement each paint would corrupt the display. Graphics
+        // placements belong to the inline paint path only.
+        crate::image_component::with_fullscreen_image_fallback(|| {
+            self.render_frame_inner(width, height)
+        })
+    }
+
+    fn render_frame_inner(&mut self, width: usize, height: usize) -> Vec<Line> {
         // The onboarding splash covers the pane (TS `showOverlay` 100%):
         // no top bar, transcript, or prompt dock behind it.
         if let Some(screen) = &self.onboarding {
@@ -988,13 +1005,18 @@ fn item_to_entry(item: TranscriptItem) -> ChatEntry {
             tool_call_id,
             tool_name,
             text,
+            content,
         } => ChatEntry::Tool(Box::new(crate::chat::ToolCallCard {
             id: tool_call_id,
             name: tool_name,
             args: serde_json::Value::Null,
             started: true,
             result: Some(crate::chat::ToolResultView {
-                content: vec![serde_json::json!({ "type": "text", "text": text })],
+                content: if content.is_empty() {
+                    vec![serde_json::json!({ "type": "text", "text": text })]
+                } else {
+                    content
+                },
                 ..Default::default()
             }),
             ..Default::default()

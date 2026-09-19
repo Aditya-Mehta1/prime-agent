@@ -151,7 +151,33 @@ impl Lane {
 #[derive(Debug)]
 struct QueuedItem {
     message: String,
+    /// Images attached to the prompt (wire `images`: base64 payload plus
+    /// mime type), admitted with the message as multimodal content.
+    images: Vec<pa_agent::types::ImageContent>,
     done: Option<oneshot::Sender<Result<(), String>>>,
+}
+
+/// Parse the wire `images` array of a prompt-family command (each entry
+/// `{type: "image", data, mimeType}`). Entries that do not carry payload
+/// data or a mime type are dropped, not failed: the text still admits.
+fn parse_prompt_images(payload: &Value) -> Vec<pa_agent::types::ImageContent> {
+    let Some(images) = payload.get("images").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    images
+        .iter()
+        .filter_map(|image| {
+            if image.get("type").and_then(Value::as_str) != Some("image") {
+                return None;
+            }
+            let data = image.get("data").and_then(Value::as_str)?;
+            let mime_type = image.get("mimeType").and_then(Value::as_str)?;
+            Some(pa_agent::types::ImageContent {
+                data: data.to_string(),
+                mime_type: mime_type.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// The live session: store, queue, sequencing. Shared by the connection tasks,
@@ -1724,6 +1750,7 @@ impl Worker {
             return response_failure(None, "prompt", "Prompt cannot be empty", None);
         }
         let streaming_behavior = payload.get("streamingBehavior").and_then(Value::as_str);
+        let images = parse_prompt_images(payload);
         let (done_tx, done_rx) = oneshot::channel();
         let done = if wait { Some(done_tx) } else { None };
         let (snapshot, queued_behind_work) = {
@@ -1735,12 +1762,14 @@ impl Worker {
             match streaming_behavior {
                 Some("steer") => core.steering.push_back(QueuedItem {
                     message: message.to_string(),
+                    images: images.clone(),
                     done,
                 }),
                 // Plain prompts admitted while busy drain when the run goes
                 // idle, like `queueIfBusy` prompt admission.
                 _ => core.follow_up.push_back(QueuedItem {
                     message: message.to_string(),
+                    images: images.clone(),
                     done,
                 }),
             }
@@ -1774,12 +1803,14 @@ impl Worker {
             .and_then(Value::as_str)
             .unwrap_or_default();
         let mut core = self.core.lock().unwrap();
+        let images = parse_prompt_images(payload);
         match lane {
             Lane::Steering => &mut core.steering,
             Lane::FollowUp => &mut core.follow_up,
         }
         .push_back(QueuedItem {
             message: message.to_string(),
+            images,
             done: None,
         });
         let snapshot = self.snapshot_locked(&core);
@@ -1859,6 +1890,7 @@ impl Worker {
             }
             .push_back(QueuedItem {
                 message: prompt,
+                images: Vec::new(),
                 done: None,
             });
             let queued = core.busy;
@@ -2503,10 +2535,14 @@ fn restore_queue_snapshot(
     let mut steering = VecDeque::new();
     let mut follow_up = VecDeque::new();
     fn pending(lanes: Vec<String>) -> VecDeque<QueuedItem> {
+        // Images on a queued prompt do not survive the worker restart:
+        // the recovery journal stores the message lanes as text (the TS
+        // command-recovery journal keeps the same text-only shape).
         lanes
             .into_iter()
             .map(|message| QueuedItem {
                 message,
+                images: Vec::new(),
                 done: None,
             })
             .collect()
@@ -2619,6 +2655,7 @@ impl TurnRunner {
         };
         let request = PromptRequest {
             message: item.message.clone(),
+            images: item.images.clone(),
             source: "user".to_string(),
             agent_message_id: None,
         };
@@ -3434,6 +3471,7 @@ mod agent_message_tests {
             for _ in 0..DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION {
                 core.follow_up.push_back(QueuedItem {
                     message: "occupied".to_string(),
+                    images: Vec::new(),
                     done: None,
                 });
             }
@@ -3452,6 +3490,98 @@ mod agent_message_tests {
         assert_eq!(
             response.error.as_deref(),
             Some("Target session has too many pending messages: 20 unfinished, limit is 20")
+        );
+    }
+}
+
+#[cfg(test)]
+mod prompt_image_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parses_wire_images_and_drops_incomplete_entries() {
+        let payload = json!({
+            "message": "look",
+            "images": [
+                { "type": "image", "data": "QUJD", "mimeType": "image/png" },
+                { "type": "image", "mimeType": "image/png" },
+                { "type": "image", "data": "QQ==" },
+                { "type": "text", "text": "not an image" }
+            ]
+        });
+        let images = parse_prompt_images(&payload);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data, "QUJD");
+        assert_eq!(images[0].mime_type, "image/png");
+    }
+
+    #[test]
+    fn missing_or_empty_images_admit_text_only() {
+        assert!(parse_prompt_images(&json!({ "message": "plain" })).is_empty());
+        assert!(parse_prompt_images(&json!({ "images": [] })).is_empty());
+        assert!(parse_prompt_images(&json!({ "images": null })).is_empty());
+    }
+
+    fn test_worker() -> Arc<Worker> {
+        let dir = std::env::temp_dir().join(format!("pa-worker-img-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "target-session".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({ "responses": ["ack"] })),
+        };
+        Arc::new(Worker::new(config, None))
+    }
+
+    /// A `prompt` command with wire images queues the attachments with the
+    /// message (they ride the queue item into the engine as multimodal
+    /// user content).
+    #[tokio::test]
+    async fn prompt_with_images_queues_the_images_with_the_message() {
+        let worker = test_worker();
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({ "noSession": true, "cwd": "/tmp", "name": "target" }),
+            )
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        // Busy session: the prompt lands on the follow-up lane.
+        worker.core.lock().unwrap().busy = true;
+        let response = worker
+            .dispatch(
+                "prompt",
+                &json!({
+                    "message": "look at this",
+                    "images": [
+                        { "type": "image", "data": "QUJD", "mimeType": "image/png" }
+                    ],
+                }),
+            )
+            .await;
+        assert!(response.success, "prompt failed: {response:?}");
+        let images = {
+            let core = worker.core.lock().unwrap();
+            core.follow_up
+                .iter()
+                .map(|item| item.images.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(images.len(), 1, "one queued item");
+        assert_eq!(
+            images[0],
+            vec![pa_agent::types::ImageContent {
+                data: "QUJD".to_string(),
+                mime_type: "image/png".to_string(),
+            }],
+            "the attachment rides the queue item"
         );
     }
 }
@@ -3644,6 +3774,7 @@ mod turn_stream_tests {
                 engine,
                 QueuedItem {
                     message: "burst".to_string(),
+                    images: Vec::new(),
                     done: None,
                 },
             )

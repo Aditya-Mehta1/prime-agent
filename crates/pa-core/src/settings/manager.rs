@@ -160,6 +160,17 @@ impl SettingsManager {
             .unwrap_or_else(|| "  ".to_string())
     }
 
+    /// `terminal.showImages` (TS `getShowImages`): whether image blocks in
+    /// tool results render their type/dimension metadata rows; the
+    /// default matches the TS default, true.
+    pub fn get_show_images(&self) -> bool {
+        self.settings()
+            .terminal
+            .as_ref()
+            .and_then(|terminal| terminal.show_images)
+            .unwrap_or(true)
+    }
+
     /// Record a model use at the front of `recentModels` (capped at 20).
     pub fn record_model_use(&mut self, provider: &str, model: &str) {
         let key = format!("{provider}/{model}");

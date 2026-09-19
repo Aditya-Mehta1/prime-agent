@@ -17,6 +17,10 @@ use crate::chat::{
 use crate::daemon_client::{DaemonClient, DaemonClientEvent};
 use crate::effort_picker::{self, EffortPickerAction};
 use crate::goal_surface::{format_goal_status, tray_goal_label, GoalView};
+use crate::image_load::LoadedImage;
+use crate::image_markers::{
+    collect_marked_images, evict_images_to_budget, format_image_marker, image_marker_ids,
+};
 use crate::interactive::{InteractiveOptions, ModelSelection, SessionSelection};
 use crate::keys::key_event_to_id;
 use crate::model_picker::{self, CurrentModel, ModelPickerAction};
@@ -59,6 +63,11 @@ pub(crate) struct SessionUi {
     /// composition root resolves it from the model registry at startup;
     /// entitlement refreshes are daemon-side, so the catalog is a snapshot).
     model_catalog: Vec<pa_types::ai::Model>,
+    /// Pasted images held for their editor markers, keyed by marker id
+    /// (TS `pastedImages`). Insertion order is paste order.
+    pasted_images: std::collections::BTreeMap<u64, LoadedImage>,
+    /// The next `[image #N]` marker id (TS `nextImageMarkerId`).
+    next_image_marker_id: u64,
     /// Telemetry opt-out carried over from the run options; every attach to
     /// another session keeps carrying it (TS attach parity).
     telemetry_disabled: Option<bool>,
@@ -70,6 +79,8 @@ pub(crate) struct SessionUi {
     /// tracks its previous row for the back-to-back in-place rewrite; any
     /// later entry invalidates it through the length check).
     last_status_index: Option<usize>,
+    /// The `terminal.showImages` setting, carried into `/new` runs.
+    show_images: bool,
     /// Snapshot chat entries to fold into the view on the next rebuild.
     pending_snapshot: Option<Vec<ChatEntry>>,
     /// Snapshot labels (model) for the next rebuild.
@@ -157,6 +168,9 @@ impl SessionUi {
             telemetry_disabled: options.telemetry_disabled,
             code_block_indent: options.code_block_indent.clone(),
             last_status_index: None,
+            show_images: options.show_images,
+            pasted_images: Default::default(),
+            next_image_marker_id: 1,
             pending_snapshot: None,
             pending_model: None,
             context: None,
@@ -544,6 +558,89 @@ impl SessionUi {
             })?
     }
 
+    /// The retained-bytes budget for pasted images (TS
+    /// `MAX_PASTED_IMAGE_BYTES`): the registry evicts oldest entries once
+    /// the retained base64 payload exceeds it.
+    const MAX_PASTED_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+
+    /// Read the clipboard image and register it behind a new editor
+    /// marker (TS `handleClipboardImagePaste`). A clipboard without a
+    /// supported image is a no-op; clipboard errors are silently ignored
+    /// (the clipboard may lack permissions), matching the TS catch.
+    async fn handle_clipboard_image_paste(&mut self, view: &mut AgentView) {
+        let Some(attachment) = crate::clipboard_image::read_clipboard_image().await else {
+            return;
+        };
+        let marker_id = self.next_image_marker_id;
+        self.next_image_marker_id += 1;
+        let mime_type = attachment.mime_type.clone();
+        self.remember_pasted_image(marker_id, attachment, view);
+        view.editor
+            .insert_text_at_cursor(&format_image_marker(marker_id));
+        if let Some(telemetry) = self.telemetry.clone() {
+            tokio::spawn(async move {
+                telemetry.image_pasted(&mime_type).await;
+            });
+        }
+        if !self.model_supports_images(view) {
+            self.note(
+                "Current model does not support images; the attachment will be omitted.",
+                view,
+            );
+        }
+        self.dirty = true;
+    }
+
+    /// Record a pasted image, evicting the oldest entries once the
+    /// retained bytes exceed [`Self::MAX_PASTED_IMAGE_BYTES`] (TS
+    /// `rememberPastedImage`). The just-added image and every image whose
+    /// marker is still reachable are never evicted, so a live marker never
+    /// loses its image.
+    fn remember_pasted_image(&mut self, id: u64, image: LoadedImage, view: &AgentView) {
+        self.pasted_images.insert(id, image);
+        let mut keep = Self::live_image_marker_ids(&view.editor);
+        keep.insert(id);
+        let mut images = std::mem::take(&mut self.pasted_images);
+        evict_images_to_budget(
+            &mut images,
+            |image: &LoadedImage| image.data.len(),
+            Self::MAX_PASTED_IMAGE_BYTES,
+            &keep,
+        );
+        self.pasted_images = images;
+    }
+
+    /// Marker ids still reachable - current editor text and prompt history
+    /// (recallable with the up arrow) - which are never evicted so a
+    /// recall never finds a marker with no image. The TS version also
+    /// scans the compaction/connection queues, which live daemon-side
+    /// here.
+    fn live_image_marker_ids(editor: &crate::editor::Editor) -> std::collections::BTreeSet<u64> {
+        let mut ids = std::collections::BTreeSet::new();
+        ids.extend(image_marker_ids(&editor.get_text()));
+        ids.extend(
+            editor
+                .get_history()
+                .iter()
+                .flat_map(|text| image_marker_ids(text)),
+        );
+        ids
+    }
+
+    /// Whether the current model takes image input (TS
+    /// `model.input.includes("image")`), when the model is known from the
+    /// startup catalog; unknown models are assumed capable (the daemon
+    /// re-checks against the resolved model anyway).
+    fn model_supports_images(&self, view: &AgentView) -> bool {
+        let Some(model_id) = view.chrome.model_id.as_deref() else {
+            return true;
+        };
+        let Some(model) = self.model_catalog.iter().find(|model| model.id == model_id) else {
+            return true;
+        };
+        model.input.contains(&pa_types::ai::ModelInput::Image)
+    }
+
     /// Submit a prompt. The user message arrives back as a `message_start`
     /// session event (no local echo), and prompts sent while a turn is active
     /// queue on the daemon side.
@@ -561,7 +658,37 @@ impl SessionUi {
     /// Send a prompt to the session and start the working loader. Session
     /// commands travel the same path — the session engine parses and
     /// executes them instead of admitting a model turn.
+    /// The images whose markers are present in `text`, or `None` when
+    /// there are none (TS `collectImagesFor`). Resolved against the
+    /// current model: when it has no image input the attachments are
+    /// dropped here, matching the paste-time hint.
+    fn collect_images_for(&self, text: &str, view: &AgentView) -> Option<serde_json::Value> {
+        if !self.model_supports_images(view) {
+            return None;
+        }
+        let images: Vec<&LoadedImage> = collect_marked_images(&self.pasted_images, text)
+            .into_iter()
+            .map(|(_, image)| image)
+            .collect();
+        if images.is_empty() {
+            return None;
+        }
+        Some(serde_json::Value::Array(
+            images
+                .iter()
+                .map(|image| {
+                    serde_json::json!({
+                        "type": "image",
+                        "data": image.data,
+                        "mimeType": image.mime_type,
+                    })
+                })
+                .collect(),
+        ))
+    }
+
     async fn send_prompt(&mut self, text: &str, view: &mut AgentView) -> Result<()> {
+        let images = self.collect_images_for(text, view);
         self.bounded_request(
             Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
             DaemonCommand::Prompt {
@@ -570,7 +697,7 @@ impl SessionUi {
                 message: text.to_string(),
                 input: pa_types::daemon::PromptInput {
                     content: None,
-                    images: None,
+                    images,
                     streaming_behavior: None,
                     queue_if_busy: None,
                     expand_prompt_templates: None,
@@ -967,6 +1094,7 @@ impl SessionUi {
             telemetry_disabled: self.telemetry_disabled,
             theme: String::new(),
             code_block_indent: self.code_block_indent.clone(),
+            show_images: self.show_images,
             version: String::new(),
             onboarding: None,
             client_auth: self.client_auth.clone(),
@@ -1422,6 +1550,18 @@ impl SessionUi {
         let Some(id) = key_event_to_id(&key) else {
             return Ok(());
         };
+        // Image paste (TS `app.clipboard.pasteImage`, ctrl+v): reads the
+        // clipboard image and inserts its marker into the editor. The
+        // editor's own ctrl+v is unbound otherwise, so the match is exact
+        // before any editor motion.
+        if view
+            .editor
+            .keybindings()
+            .matches(&id, "app.clipboard.pasteImage")
+        {
+            self.handle_clipboard_image_paste(view).await;
+            return Ok(());
+        }
         // Transcript viewport keys (TS tui.ts consumes them before the
         // editor in fullscreen): page scroll, top, follow.
         let (page_up, page_down, to_top, follow) = {

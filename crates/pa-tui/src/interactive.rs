@@ -89,6 +89,9 @@ pub trait InteractionTelemetry: Send + Sync {
         reason: &'static str,
         turn_active: bool,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    /// An image was pasted into the editor from the clipboard (event
+    /// `tui image pasted`); `mime_type` is the attachment's sniffed format.
+    fn image_pasted(&self, mime_type: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 /// Persistence for the first-run onboarding answers. The TUI crate owns
@@ -140,6 +143,10 @@ pub struct InteractiveOptions {
     pub session: SessionSelection,
     /// Prompt sent immediately after attach (CLI message arguments).
     pub initial_message: Option<String>,
+    /// The `terminal.showImages` setting, default true (TS `getShowImages`):
+    /// whether image blocks render their metadata rows or the
+    /// `[Image: ...]` placeholders.
+    pub show_images: bool,
     pub theme: String,
     /// The chat markdown fenced-code indent, resolved by the composition
     /// root from `markdown.codeBlockIndent` (TS `getCodeBlockIndent`;
@@ -437,6 +444,9 @@ pub async fn run_interactive(
     let theme = crate::app::load_theme(&options.theme);
     let mut view = AgentView::new(theme);
     view.code_block_indent = options.code_block_indent.clone();
+    // The `terminal.showImages` setting rides the startup options (TS
+    // `getShowImages`), resolved by the composition root.
+    view.show_images = options.show_images;
     apply_startup_chrome(&mut view, &options);
     session.refresh_stats().await;
     session.rebuild_view(&mut view);
@@ -1119,7 +1129,15 @@ impl Renderer {
 fn write_flush_rows(buffer: &mut String, rows: &[crate::Line]) {
     for row in rows {
         buffer.push('\r');
-        buffer.push_str(&crate::ansi::line_to_ansi(row));
+        // An image-placement row is written raw (TS `applyLineResets` /
+        // `paint` skip image lines): styling or padding a protocol
+        // escape sequence would corrupt the placement.
+        let raw: String = row.iter().map(|span| span.content.as_str()).collect();
+        if crate::terminal_image::is_image_line(&raw) {
+            buffer.push_str(&raw);
+        } else {
+            buffer.push_str(&crate::ansi::line_to_ansi(row));
+        }
         buffer.push_str("\r\n");
     }
 }
@@ -1170,6 +1188,7 @@ mod tests {
             no_session: false,
             session: SessionSelection::New,
             initial_message: None,
+            show_images: true,
             theme: "prime".to_string(),
             code_block_indent: "  ".to_string(),
             version: "0.0.0".to_string(),

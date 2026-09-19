@@ -69,7 +69,12 @@ verdicts persisted as `agent_status` session entries (real classifications
 and transcript error verdicts only; respawns seed from the persisted
 verdict). Worker session files carry the TS creation prefix
 (`model_change`/`thinking_level_change`/`service_tier_change`), and queue
-snapshots persist to the worker recovery journal, not the session file. Platform wall
+snapshots persist to the worker recovery journal, not the session file.
+Prompt attachments: the `prompt`/`steer`/`follow_up` wire `images` array
+(base64 payload + mime type) rides the queue item into the session engine
+as multimodal user content (images on a queued prompt do not survive a
+worker respawn - the recovery journal keeps the text lanes only, the TS
+command-recovery shape). Platform wall
 (`platform`): per-OS endpoint naming and socket identity; the transport itself
 is the shared trait in `pa_types::platform::transport`, and the private-frame
 codec plus command planes are the shared wire contract in

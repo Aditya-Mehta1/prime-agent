@@ -338,6 +338,7 @@ fn interactive_session_rss_plateaus_over_long_stream() {
         no_session: false,
         session: SessionSelection::New,
         initial_message: None,
+        show_images: true,
         theme: "prime".to_string(),
         code_block_indent: "  ".to_string(),
         version: "0.0.0".to_string(),

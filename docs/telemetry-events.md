@@ -202,6 +202,15 @@ The interactive transcript viewport's first scroll action per client run
 | `action` | string | `page_up` / `page_down` / `top` / `follow` |
 | `resumed_following` | boolean | the action resumed tail-following |
 
+### `tui image pasted`
+
+An image was pasted into the input editor from the clipboard and attached
+to the prompt (adoption of inline image support).
+
+| property | type | notes |
+|---|---|---|
+| `mime_type` | string | the attachment's sniffed format (`image/png`, `image/jpeg`, `image/gif`, `image/webp`) |
+
 ### `update completed`
 
 The staged-activation update flow (`prime-agent update`), emitted once per

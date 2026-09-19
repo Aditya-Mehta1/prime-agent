@@ -16,6 +16,9 @@ use serde_json::{json, Value};
 #[derive(Debug, Clone)]
 pub struct PromptRequest {
     pub message: String,
+    /// Images attached to the prompt (base64 payload plus mime type),
+    /// admitted as multimodal content after the text block.
+    pub images: Vec<pa_agent::types::ImageContent>,
     pub source: String,
     pub agent_message_id: Option<String>,
 }
@@ -842,6 +845,7 @@ mod tests {
         )
         .unwrap();
         let request_for = |message: &str| PromptRequest {
+            images: Vec::new(),
             message: message.to_string(),
             source: "test".to_string(),
             agent_message_id: None,
@@ -872,6 +876,7 @@ mod tests {
         engine.run_prompt(
             0,
             PromptRequest {
+                images: Vec::new(),
                 message: "x".into(),
                 source: "test".into(),
                 agent_message_id: None,

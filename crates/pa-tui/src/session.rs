@@ -26,6 +26,9 @@ pub enum TranscriptItem {
         tool_call_id: String,
         tool_name: String,
         text: String,
+        /// The full wire content blocks (text and image), so replayed tool
+        /// results render their image rows like live ones.
+        content: Vec<serde_json::Value>,
     },
     BashExecution {
         command: String,
@@ -158,7 +161,10 @@ fn custom_message_wire_value(payload: &pa_types::session::CustomMessageEntry) ->
 fn message_to_items(message: &AgentMessage) -> Vec<TranscriptItem> {
     match message {
         AgentMessage::User(u) => vec![TranscriptItem::UserMessage {
-            text: u.content.text(),
+            // TS `readUserText` + the image-only placeholder: a prompt
+            // with content but no text shows `[image]` instead of
+            // rendering nothing.
+            text: user_display_text(&u.content),
         }],
         AgentMessage::Assistant(a) => {
             let mut items = Vec::new();
@@ -186,18 +192,15 @@ fn message_to_items(message: &AgentMessage) -> Vec<TranscriptItem> {
         AgentMessage::ToolResult(t) => vec![TranscriptItem::ToolResult {
             tool_call_id: t.tool_call_id.clone(),
             tool_name: t.tool_name.clone(),
-            text: t
+            text: tool_result_text(&t.content),
+            content: t
                 .content
                 .iter()
-                .map(|b| match b {
-                    pa_types::ai::UserContentBlock::Text(t) => t.text.clone(),
-                    pa_types::ai::UserContentBlock::Image(_) => String::new(),
-                    // Un-modeled blocks have no display text (TS renders only
-                    // typed text blocks).
-                    pa_types::ai::UserContentBlock::Raw(_) => String::new(),
+                .map(|block| match serde_json::to_value(block) {
+                    Ok(value) => value,
+                    Err(_) => serde_json::Value::Null,
                 })
-                .collect::<Vec<_>>()
-                .join("\n"),
+                .collect(),
         }],
         AgentMessage::BashExecution(b) => vec![TranscriptItem::BashExecution {
             command: b.command.clone(),
@@ -207,6 +210,37 @@ fn message_to_items(message: &AgentMessage) -> Vec<TranscriptItem> {
         // Custom/branch/compaction messages carry UI-specific payloads; the
         // standard agent view skips non-displayed ones.
         _ => Vec::new(),
+    }
+}
+
+/// The concatenated text of a replayed tool result's text blocks
+/// (un-modeled blocks have no display text, TS renders only typed text
+/// blocks).
+fn tool_result_text(content: &[pa_types::ai::UserContentBlock]) -> String {
+    content
+        .iter()
+        .map(|block| match block {
+            pa_types::ai::UserContentBlock::Text(text) => text.text.clone(),
+            pa_types::ai::UserContentBlock::Image(_) | pa_types::ai::UserContentBlock::Raw(_) => {
+                String::new()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The user-message display text (TS `conversation-components`' user
+/// branch): the text blocks joined, or the `[image]` placeholder when the
+/// message carries content but no text.
+fn user_display_text(content: &pa_types::ai::UserContent) -> String {
+    let text = content.text();
+    if !text.is_empty() {
+        return text;
+    }
+    match content {
+        pa_types::ai::UserContent::Text(text) if !text.is_empty() => "[image]".to_string(),
+        pa_types::ai::UserContent::Blocks(blocks) if !blocks.is_empty() => "[image]".to_string(),
+        _ => String::new(),
     }
 }
 

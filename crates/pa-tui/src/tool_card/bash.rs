@@ -8,8 +8,7 @@
 use serde_json::Value;
 
 use super::{
-    format_bash_duration, image_fallback_rows, panel_header, panel_line, ToolCallCard,
-    ToolResultView,
+    format_bash_duration, image_rows, panel_header, panel_line, ToolCallCard, ToolResultView,
 };
 use crate::chat::Detail;
 use crate::code_preview::{preview_bash_command, CodePreviewLanguage};
@@ -26,6 +25,7 @@ pub fn render(
     detail: Detail,
     theme: &Theme,
     width: usize,
+    show_images: bool,
 ) -> Vec<Line> {
     let bg = theme.bg_style(ThemeBg::ToolPanelBg);
     let content_width = width.saturating_sub(2 * 2).max(1);
@@ -39,7 +39,7 @@ pub fn render(
             content_width,
         ));
     }
-    children.extend(image_fallback_rows(&card.result, theme));
+    children.extend(image_rows(&card.result, show_images, theme));
 
     let mut lines = vec![panel_line(panel_header(card, frame, theme), bg, width)];
     if !children.is_empty() {
@@ -296,7 +296,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let card = done_card("seq 1 12", &output);
-        let rows = render(&card, 0, Detail::Overview, &theme(), 120);
+        let rows = render(&card, 0, Detail::Overview, &theme(), 120, true);
         let flat: Vec<String> = rows.iter().map(text_of).collect();
         assert!(
             flat.iter().any(|r| r.contains("bash \u{00b7} done")),
@@ -320,7 +320,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let card = done_card("seq 1 12", &output);
-        let rows = render(&card, 0, Detail::All, &theme(), 120);
+        let rows = render(&card, 0, Detail::All, &theme(), 120, true);
         let flat: Vec<String> = rows.iter().map(text_of).collect();
         assert!(
             flat.iter().any(|r| r.trim_end().ends_with("1")),
@@ -335,7 +335,7 @@ mod tests {
     #[test]
     fn duration_row_rendered() {
         let card = done_card("echo hi", "hi");
-        let rows = render(&card, 0, Detail::Overview, &theme(), 120);
+        let rows = render(&card, 0, Detail::Overview, &theme(), 120, true);
         let flat: Vec<String> = rows.iter().map(text_of).collect();
         assert!(flat.iter().any(|r| r.contains("Took ")), "got: {flat:?}");
     }
@@ -356,7 +356,7 @@ mod tests {
             }),
             is_error: false,
         });
-        let rows = render(&card, 0, Detail::Overview, &theme(), 120);
+        let rows = render(&card, 0, Detail::Overview, &theme(), 120, true);
         let flat: Vec<String> = rows.iter().map(text_of).collect();
         assert!(
             flat.iter()
@@ -381,7 +381,7 @@ mod tests {
             }),
             is_error: false,
         });
-        let rows = render(&card, 0, Detail::Overview, &theme(), 120);
+        let rows = render(&card, 0, Detail::Overview, &theme(), 120, true);
         let flat: Vec<String> = rows.iter().map(text_of).collect();
         assert!(
             flat.iter()
@@ -404,7 +404,7 @@ mod tests {
             result_partial: true,
             ..Default::default()
         };
-        let rows = render(&card, 3, Detail::Overview, &theme(), 120);
+        let rows = render(&card, 3, Detail::Overview, &theme(), 120, true);
         let flat: Vec<String> = rows.iter().map(text_of).collect();
         assert!(flat.iter().any(|r| r.contains("running")), "got: {flat:?}");
         assert!(flat.iter().any(|r| r.contains("Elapsed ")), "got: {flat:?}");
@@ -419,7 +419,7 @@ mod tests {
             started: false,
             ..Default::default()
         };
-        let rows = render(&card, 0, Detail::Overview, &theme(), 120);
+        let rows = render(&card, 0, Detail::Overview, &theme(), 120, true);
         let flat: Vec<String> = rows.iter().map(text_of).collect();
         assert!(
             flat.iter().any(|r| r.contains("$ [invalid arg]")),
@@ -433,7 +433,7 @@ mod tests {
             started: false,
             ..Default::default()
         };
-        let rows = render(&card, 0, Detail::Overview, &theme(), 120);
+        let rows = render(&card, 0, Detail::Overview, &theme(), 120, true);
         let flat: Vec<String> = rows.iter().map(text_of).collect();
         assert!(flat.iter().any(|r| r.contains("$ ...")), "got: {flat:?}");
     }

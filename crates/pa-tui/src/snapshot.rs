@@ -413,7 +413,12 @@ pub fn event_to_update(event: &Value) -> Option<TurnUpdate> {
                 {
                     Some(TurnUpdate::StatusUpdate)
                 }
-                Some("user") => Some(TurnUpdate::UserMessage(message_text(&message))),
+                Some("user") => Some(match user_display_text(&message) {
+                    Some(text) => TurnUpdate::UserMessage(text),
+                    // Nothing to show (an empty user message is a protocol
+                    // anomaly): the transcript does not grow a blank row.
+                    None => TurnUpdate::StatusUpdate,
+                }),
                 Some("assistant") => Some(TurnUpdate::AssistantMessage {
                     message,
                     streaming,
@@ -516,6 +521,22 @@ pub fn custom_message_entries(message: &Value) -> Vec<ChatEntry> {
     crate::custom_message::custom_message_entries(message)
 }
 
+/// The user-message display text (TS `conversation-components`' user
+/// branch): the text blocks joined, or the `[image]` placeholder when the
+/// message carries content but no text (an image-only prompt), or `None`
+/// for a message with nothing to show.
+pub fn user_display_text(message: &Value) -> Option<String> {
+    let text = message_text(message);
+    if !text.is_empty() {
+        return Some(text);
+    }
+    match message.get("content") {
+        Some(Value::String(content)) if !content.is_empty() => Some("[image]".to_string()),
+        Some(Value::Array(blocks)) if !blocks.is_empty() => Some("[image]".to_string()),
+        _ => None,
+    }
+}
+
 /// Concatenated text of a raw daemon message (string or block content).
 pub fn message_text(message: &Value) -> String {
     match message.get("content") {
@@ -552,9 +573,9 @@ pub fn message_value_to_entries(message: &Value) -> Vec<ChatEntry> {
         .and_then(Value::as_str)
         .unwrap_or_default();
     match role {
-        "user" => vec![ChatEntry::User {
-            text: content_to_text(message.get("content").unwrap_or(&Value::Null)),
-        }],
+        "user" => user_display_text(message)
+            .map(|text| vec![ChatEntry::User { text }])
+            .unwrap_or_default(),
         "assistant" => assistant_value_to_entries(message),
         "custom" => custom_message_entries(message),
         "compactionSummary" => compaction_summary_entries(message),
@@ -807,18 +828,6 @@ pub fn assistant_message_parts(
     (blocks, tool_calls)
 }
 
-fn content_to_text(content: &Value) -> String {
-    match content {
-        Value::String(text) => text.clone(),
-        Value::Array(blocks) => blocks
-            .iter()
-            .filter_map(block_text)
-            .collect::<Vec<_>>()
-            .join(""),
-        _ => String::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,10 +852,56 @@ mod tests {
         let Some(card) = card_of(view) else {
             return Vec::new();
         };
-        crate::tool_card::render_tool_card(card, 0, crate::chat::Detail::Overview, &view.theme, 100)
-            .iter()
-            .map(|line| line.iter().map(|span| span.content.as_str()).collect())
-            .collect()
+        crate::tool_card::render_tool_card(
+            card,
+            0,
+            crate::chat::Detail::Overview,
+            &view.theme,
+            100,
+            true,
+        )
+        .iter()
+        .map(|line| line.iter().map(|span| span.content.as_str()).collect())
+        .collect()
+    }
+
+    #[test]
+    fn image_only_user_message_shows_the_image_placeholder() {
+        let message = json!({
+            "role": "user",
+            "content": [
+                { "type": "image", "data": "QUJD", "mimeType": "image/png" }
+            ]
+        });
+        assert_eq!(user_display_text(&message), Some("[image]".to_string()));
+        assert_eq!(
+            message_value_to_entries(&message),
+            vec![ChatEntry::User {
+                text: "[image]".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn user_message_with_text_and_image_keeps_the_text() {
+        let message = json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "look at this" },
+                { "type": "image", "data": "QUJD", "mimeType": "image/png" }
+            ]
+        });
+        assert_eq!(
+            user_display_text(&message),
+            Some("look at this".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_user_message_renders_no_entry() {
+        let message = json!({ "role": "user", "content": [] });
+        assert_eq!(user_display_text(&message), None);
+        assert!(message_value_to_entries(&message).is_empty());
     }
 
     /// The live wire shape that broke the ipython card: a provider announces

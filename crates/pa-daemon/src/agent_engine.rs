@@ -1050,21 +1050,34 @@ impl SessionEngine for AgentSessionEngine {
             // goal_update only on state change; the interactive surface
             // dedupes announcements).
             if let Some(continuation) = execution.continuation_prompt {
-                self.run_turns(&continuation, aborted, &mut emit);
+                self.run_turns(&continuation, &[], aborted, &mut emit);
             } else {
                 emit(EngineEvent::Done(Ok(())));
             }
             return;
         }
-        // The accepted user message is recorded by the worker.
+        // The accepted user message is recorded by the worker. Images
+        // ride as multimodal content blocks after the text (TS prompt
+        // admission: the text part first, then the image parts).
+        let mut content = vec![json!({ "type": "text", "text": request.message })];
+        for image in &request.images {
+            let mut block = match serde_json::to_value(image) {
+                Ok(Value::Object(block)) => Value::Object(block),
+                _ => continue,
+            };
+            if let Some(object) = block.as_object_mut() {
+                object.insert("type".to_string(), json!("image"));
+            }
+            content.push(block);
+        }
         if !emit(EngineEvent::UserMessage(json!({
             "role": "user",
-            "content": [{ "type": "text", "text": request.message }],
+            "content": content,
             "timestamp": now_millis(),
         }))) {
             return;
         }
-        self.run_turns(&request.message, aborted, &mut emit);
+        self.run_turns(&request.message, &request.images, aborted, &mut emit);
     }
 }
 
@@ -1077,6 +1090,7 @@ impl AgentSessionEngine {
     fn run_model_turn(
         &self,
         prompt: &str,
+        images: &[pa_agent::types::ImageContent],
         aborted: &dyn Fn() -> bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) -> TurnResult {
@@ -1109,6 +1123,7 @@ impl AgentSessionEngine {
                     first_attempt.set(false);
                     let agent = agent.clone();
                     let prompt = prompt.clone();
+                    let images = images.to_vec();
                     let model = model.clone();
                     async move {
                         // A retry re-issues the failed turn: the failed
@@ -1119,7 +1134,7 @@ impl AgentSessionEngine {
                             drop_trailing_assistant(&agent).await;
                         }
                         match self
-                            .run_turn_once(&agent, &prompt, first, &mut **emit)
+                            .run_turn_once(&agent, &prompt, &images, first, &mut **emit)
                             .await
                         {
                             Ok(TurnOnce::Message { assistant }) => {
@@ -1341,12 +1356,19 @@ impl AgentSessionEngine {
     fn run_turns(
         &self,
         first_prompt: &str,
+        first_images: &[pa_agent::types::ImageContent],
         aborted: &dyn Fn() -> bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) {
+        // The first turn admits the prompt with its images; every
+        // autonomous follow-up turn runs text-only (the TS driver
+        // regenerates from the loop state, never re-sending attachments).
         let mut prompt = first_prompt.to_string();
+        let mut first = true;
         loop {
-            let turn = self.run_model_turn(&prompt, aborted, emit);
+            let images: &[pa_agent::types::ImageContent] = if first { first_images } else { &[] };
+            first = false;
+            let turn = self.run_model_turn(&prompt, images, aborted, emit);
             let assistant = match turn {
                 TurnResult::Message(assistant) => assistant,
                 // An aborted turn never services boundary requests (TS
@@ -1462,6 +1484,7 @@ impl AgentSessionEngine {
         &self,
         agent: &std::sync::Arc<pa_agent::agent::Agent>,
         prompt: &str,
+        images: &[pa_agent::types::ImageContent],
         first_attempt: bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) -> anyhow::Result<TurnOnce> {
@@ -1650,13 +1673,14 @@ impl AgentSessionEngine {
         // arrives. Buffering events until the future resolves is what made
         // clients render a turn as one final batch.
         let prompt_text = prompt.to_string();
+        let prompt_images = images.to_vec();
         let mut admitted = std::pin::pin!(async {
             if first_attempt {
                 let guard = self.session.lock().await;
                 let engine = guard.as_ref().expect("session built");
                 engine
                     .session
-                    .prompt(&prompt_text, Default::default())
+                    .prompt_with_images(&prompt_text, prompt_images, Default::default())
                     .await
                     .map(|_| ())
             } else {
@@ -1913,6 +1937,65 @@ mod tests {
         );
     }
 
+    fn bare_engine(dir: &std::path::Path) -> AgentSessionEngine {
+        let agent_dir = dir.join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.to_path_buf(),
+            agent_dir,
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: None,
+            faux_script: None,
+            supervisor_link: None,
+            telemetry_disabled: None,
+        })
+        .unwrap()
+    }
+
+    /// A prompt with images records the attachments as multimodal content
+    /// blocks after the text (TS prompt admission), even when the model
+    /// turn itself cannot run.
+    #[test]
+    fn prompt_images_ride_the_user_message_content() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = bare_engine(dir.path());
+        let mut events: Vec<EngineEvent> = Vec::new();
+        engine.run_prompt(
+            0,
+            PromptRequest {
+                images: vec![pa_agent::types::ImageContent {
+                    data: "QUJD".to_string(),
+                    mime_type: "image/png".to_string(),
+                }],
+                message: "look at this".to_string(),
+                source: "user".to_string(),
+                agent_message_id: None,
+            },
+            &|| false,
+            &mut |event| {
+                events.push(event);
+                true
+            },
+        );
+        let user = events.iter().find_map(|event| match event {
+            EngineEvent::UserMessage(message) => Some(message.clone()),
+            _ => None,
+        });
+        let user = user.expect("user message emitted");
+        assert_eq!(
+            user["content"][0],
+            json!({ "type": "text", "text": "look at this" })
+        );
+        assert_eq!(
+            user["content"][1],
+            json!({ "type": "image", "data": "QUJD", "mimeType": "image/png" })
+        );
+    }
+
     #[test]
     fn settings_default_drives_unflagged_resolution() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -2018,6 +2101,7 @@ mod tests {
         engine.run_prompt(
             0,
             PromptRequest {
+                images: Vec::new(),
                 message: "hi".to_string(),
                 source: "user".to_string(),
                 agent_message_id: None,
@@ -2146,6 +2230,7 @@ fn run_prompts(
         engine.run_prompt(
             0,
             PromptRequest {
+                images: Vec::new(),
                 message: prompt.to_string(),
                 source: "user".to_string(),
                 agent_message_id: None,
@@ -2241,6 +2326,7 @@ fn assistant_updates_stream_live_while_the_turn_runs() {
     engine.run_prompt(
         0,
         PromptRequest {
+            images: Vec::new(),
             message: "hi".to_string(),
             source: "user".to_string(),
             agent_message_id: None,
@@ -2474,6 +2560,7 @@ fn autonomous_gate_pass_and_failure_drive_the_loop() {
         engine.run_prompt(
             0,
             PromptRequest {
+                images: Vec::new(),
                 message: prompt.to_string(),
                 source: "user".to_string(),
                 agent_message_id: None,
@@ -2589,6 +2676,7 @@ fn the_turn_loop_is_driven_by_the_driver_trait() {
     engine.run_prompt(
         0,
         PromptRequest {
+            images: Vec::new(),
             message: "go".to_string(),
             source: "user".to_string(),
             agent_message_id: None,
@@ -2652,6 +2740,7 @@ fn agent_engine_streams_updates_and_final_message() {
     engine.run_prompt(
         0,
         PromptRequest {
+            images: Vec::new(),
             message: "hi".to_string(),
             source: "user".to_string(),
             agent_message_id: None,

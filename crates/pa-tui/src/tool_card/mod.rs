@@ -49,8 +49,10 @@ pub struct ToolResultView {
 
 impl ToolResultView {
     /// The joined text of the result's text blocks, ANSI stripped, with
-    /// hidden image blocks appended as `[Image: ...]` fallbacks
-    /// (TS `render-utils.getTextOutput` without dimensions).
+    /// hidden image blocks appended as `[Image: ...]` fallback text (TS
+    /// `render-utils.getTextOutput` with `showImages` false: each image
+    /// contributes its mime type and, when the payload parses, its
+    /// dimensions).
     pub fn text_output(&self, show_images: bool) -> String {
         let mut parts: Vec<String> = Vec::new();
         for block in &self.content {
@@ -64,10 +66,7 @@ impl ToolResultView {
                     )
                     .replace('\r', ""),
                 ),
-                Some("image") if !show_images => {
-                    let mime = block.get("mimeType").and_then(Value::as_str);
-                    parts.push(image_fallback(mime));
-                }
+                Some("image") if !show_images => parts.push(hidden_image_text(block)),
                 _ => {}
             }
         }
@@ -75,9 +74,21 @@ impl ToolResultView {
     }
 }
 
-/// `imageFallback(mimeType)` (no filename, no dimensions in the transcript).
-pub fn image_fallback(mime_type: Option<&str>) -> String {
-    format!("[Image: [{}]]", mime_type.unwrap_or("image/unknown"))
+/// The `[Image: ...]` text standing in for one hidden image block (TS
+/// `imageFallback(mimeType, dims)`).
+fn hidden_image_text(block: &Value) -> String {
+    let mime = block
+        .get("mimeType")
+        .and_then(Value::as_str)
+        .unwrap_or("image/unknown");
+    let dimensions = match (
+        block.get("data").and_then(Value::as_str),
+        block.get("mimeType").and_then(Value::as_str),
+    ) {
+        (Some(data), Some(mime)) => crate::terminal_image::get_image_dimensions(data, mime),
+        _ => None,
+    };
+    crate::terminal_image::image_fallback(mime, dimensions, None)
 }
 
 /// The animated working icon glyph (TS `working-icon.ts`).
@@ -85,18 +96,22 @@ pub fn working_icon(frame: usize) -> &'static str {
     crate::chat::working_icon_frame(frame)
 }
 
-/// Render one tool-call card through its tool shell.
+/// Render one tool-call card through its tool shell. `show_images` is the
+/// `terminal.showImages` setting (TS `showImages` on the tool component):
+/// image blocks render their metadata rows when set, their
+/// `[Image: ...]` text placeholders otherwise.
 pub fn render_tool_card(
     card: &ToolCallCard,
     frame: usize,
     detail: Detail,
     theme: &Theme,
     width: usize,
+    show_images: bool,
 ) -> Vec<Line> {
     match card.name.as_str() {
-        "ipython" => ipython::render(card, frame, detail, theme, width),
-        "bash" => bash::render(card, frame, detail, theme, width),
-        _ => generic::render(card, frame, detail, theme, width),
+        "ipython" => ipython::render(card, frame, detail, theme, width, show_images),
+        "bash" => bash::render(card, frame, detail, theme, width, show_images),
+        _ => generic::render(card, frame, detail, theme, width, show_images),
     }
 }
 
@@ -191,10 +206,18 @@ pub fn format_size(bytes: usize) -> String {
     }
 }
 
-/// Image result blocks render their fallback row below the card (the TS
-/// `Image` component with `fallbackOnly` renders the placeholder in plain
-/// terminals like tmux).
-pub(crate) fn image_fallback_rows(result: &Option<ToolResultView>, theme: &Theme) -> Vec<Line> {
+/// Image result blocks render their metadata row below the card (TS
+/// `tool-execution.ts` adds one `Image` component per result image
+/// block, with `fallbackOnly` and the `\u{2570}\u{2500}` prefix, in the
+/// toolOutput fallback color). Blocks without data or a mime type, and
+/// every image while `show_images` is false, render nothing here — the
+/// hidden ones contribute their `[Image: ...]` text through
+/// [`ToolResultView::text_output`] instead.
+pub(crate) fn image_rows(
+    result: &Option<ToolResultView>,
+    show_images: bool,
+    theme: &Theme,
+) -> Vec<Line> {
     let Some(result) = result else {
         return Vec::new();
     };
@@ -203,18 +226,29 @@ pub(crate) fn image_fallback_rows(result: &Option<ToolResultView>, theme: &Theme
         if block.get("type").and_then(Value::as_str) != Some("image") {
             continue;
         }
-        if block.get("data").and_then(Value::as_str).is_none()
-            || block.get("mimeType").and_then(Value::as_str).is_none()
-        {
+        let (Some(data), Some(mime)) = (
+            block.get("data").and_then(Value::as_str),
+            block.get("mimeType").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        if !show_images {
             continue;
         }
-        rows.push(vec![Span::styled(
-            format!(
-                "    \u{2570}\u{2500} {}",
-                image_fallback(block.get("mimeType").and_then(Value::as_str))
-            ),
+        let mut image = crate::image_component::ImageComponent::new(
+            data.to_string(),
+            mime.to_string(),
             theme.fg_style(ThemeColor::ToolOutput),
-        )]);
+            crate::image_component::ImageOptions {
+                fallback_only: true,
+                fallback_prefix: Some("    \u{2570}\u{2500} ".to_string()),
+                ..Default::default()
+            },
+            None,
+        );
+        // The fallback-only row ignores the layout width (TS renders the
+        // metadata as one unwrapped line); 80 matches the TS default.
+        rows.extend(image.render(80));
     }
     rows
 }

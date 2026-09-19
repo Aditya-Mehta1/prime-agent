@@ -3,7 +3,7 @@
 //! header, then the call arguments and any text output with the shared
 //! `... more lines` fallback preview.
 
-use super::{image_fallback_rows, panel_header, panel_line, ToolCallCard};
+use super::{image_rows, panel_header, panel_line, ToolCallCard};
 use crate::chat::Detail;
 use crate::theme::{Theme, ThemeBg, ThemeColor};
 use crate::width::wrap_text;
@@ -15,14 +15,17 @@ pub fn render(
     detail: Detail,
     theme: &Theme,
     width: usize,
+    show_images: bool,
 ) -> Vec<Line> {
     let bg = theme.bg_style(ThemeBg::ToolPanelBg);
     let content_width = width.saturating_sub(2 * 2).max(1);
     let mut children: Vec<Line> = Vec::new();
     // TS `formatToolExecution`: the arguments preview, a blank row, then the
-    // output preview (each independently previewed).
+    // output preview (each independently previewed). Hidden image blocks
+    // contribute their `[Image: ...]` text here (`getTextOutput` with
+    // `showImages` false).
     let args = serde_json::to_string_pretty(&card.args).unwrap_or_default();
-    let output = card.result.as_ref().map(|r| r.text_output(true));
+    let output = card.result.as_ref().map(|r| r.text_output(show_images));
     if !args.is_empty() {
         children.extend(fallback_preview(
             &args,
@@ -42,7 +45,7 @@ pub fn render(
             content_width,
         ));
     }
-    children.extend(image_fallback_rows(&card.result, theme));
+    children.extend(image_rows(&card.result, show_images, theme));
 
     let mut lines = vec![panel_line(panel_header(card, frame, theme), bg, width)];
     if !children.is_empty() {
@@ -102,6 +105,74 @@ mod tests {
         line.iter().map(|s| s.content.as_str()).collect()
     }
 
+    fn image_card() -> ToolCallCard {
+        let png = tiny_png(64, 32);
+        ToolCallCard {
+            id: "t".into(),
+            name: "custom".into(),
+            args: json!({}),
+            started: true,
+            result: Some(super::super::ToolResultView {
+                content: vec![
+                    json!({ "type": "text", "text": "done" }),
+                    json!({ "type": "image", "data": png, "mimeType": "image/png" }),
+                ],
+                details: json!({}),
+                is_error: false,
+            }),
+            result_partial: false,
+            ..Default::default()
+        }
+    }
+
+    fn tiny_png(width: u32, height: u32) -> String {
+        use base64::Engine;
+        let mut bytes = vec![0x89, b'P', b'N', b'G'];
+        bytes.extend(vec![0u8; 12]);
+        bytes.extend(width.to_be_bytes());
+        bytes.extend(height.to_be_bytes());
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn shown_image_blocks_render_their_metadata_row_below_the_output() {
+        let card = image_card();
+        let rows = render(&card, 0, Detail::All, &theme(), 120, true);
+        let flat: Vec<String> = rows.iter().map(text_of).collect();
+        assert!(
+            flat.iter()
+                .any(|r| r.contains("    \u{2570}\u{2500} [image/png \u{b7} 64\u{d7}32]")),
+            "got: {flat:?}"
+        );
+        assert!(!flat.iter().any(|r| r.contains("[Image:")));
+    }
+
+    #[test]
+    fn hidden_image_blocks_fall_back_to_placeholder_text() {
+        let card = image_card();
+        let rows = render(&card, 0, Detail::All, &theme(), 120, false);
+        let flat: Vec<String> = rows.iter().map(text_of).collect();
+        assert!(
+            flat.iter()
+                .any(|r| r.contains("[Image: [image/png] 64x32]")),
+            "got: {flat:?}"
+        );
+        assert!(!flat.iter().any(|r| r.contains("\u{2570}\u{2500}")));
+    }
+
+    #[test]
+    fn image_blocks_without_payload_data_render_no_rows() {
+        let mut card = image_card();
+        card.result = Some(super::super::ToolResultView {
+            content: vec![json!({ "type": "image", "mimeType": "image/png" })],
+            details: json!({}),
+            is_error: false,
+        });
+        let rows = render(&card, 0, Detail::All, &theme(), 120, true);
+        let flat: Vec<String> = rows.iter().map(text_of).collect();
+        assert!(!flat.iter().any(|r| r.contains("[image/png")));
+    }
+
     #[test]
     fn collapsed_fallback_shows_three_lines_and_hint() {
         let card = ToolCallCard {
@@ -117,7 +188,7 @@ mod tests {
             result_partial: false,
             ..Default::default()
         };
-        let rows = render(&card, 0, Detail::Overview, &theme(), 120);
+        let rows = render(&card, 0, Detail::Overview, &theme(), 120, true);
         let flat: Vec<String> = rows.iter().map(text_of).collect();
         assert!(
             flat.iter().any(|r| r.contains("custom \u{00b7} done")),
