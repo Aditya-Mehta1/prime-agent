@@ -13,6 +13,7 @@ use crate::chrome::{
     ChromeState,
 };
 use crate::editor::Editor;
+use crate::keybindings::KeybindingsManager;
 use crate::session::TranscriptItem;
 use crate::theme::{Theme, ThemeBg, ThemeColor};
 use crate::width::str_width;
@@ -38,6 +39,29 @@ fn is_compact_neighbor(entry: &ChatEntry) -> bool {
         entry,
         ChatEntry::Tool(_) | ChatEntry::AgentMessage(_) | ChatEntry::ShellCompletion(_)
     )
+}
+
+/// A `/share` gist upload in flight (TS `BorderedLoader` with
+/// `CancellableLoader`): the spinner "Creating gist..." rows that replace
+/// the editor while `gh gist create` runs.
+#[derive(Debug, Clone)]
+pub struct ShareLoader {
+    /// The message under the spinner.
+    pub message: String,
+}
+
+impl ShareLoader {
+    pub fn new() -> Self {
+        ShareLoader {
+            message: "Creating gist...".to_string(),
+        }
+    }
+}
+
+impl Default for ShareLoader {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub struct AgentView {
@@ -73,6 +97,9 @@ pub struct AgentView {
     /// The `/effort` inline picker (TS `ThinkingSelectorComponent` seam):
     /// while set, it owns the whole frame like the model picker.
     pub effort_picker: Option<crate::effort_picker::EffortPicker>,
+    /// A `/share` gist upload in flight (TS `BorderedLoader`): while set,
+    /// it replaces the editor with the cancellable loader rows.
+    pub share_loader: Option<ShareLoader>,
     /// The `terminal.showImages` setting (TS `getShowImages`, default
     /// true): image blocks render their metadata rows when set, their
     /// `[Image: ...]` text placeholders otherwise.
@@ -128,6 +155,7 @@ impl AgentView {
             tree_selector: None,
             fork_selector: None,
             effort_picker: None,
+            share_loader: None,
             show_images: true,
             scroll_top: 0,
             following: true,
@@ -822,21 +850,25 @@ impl AgentView {
         // The tree and fork selectors mount in the editor container (TS
         // `showSelector`): an auto-height pane over the dock's rows with the
         // transcript above it — not the `/model` picker's full-pane overlay.
-        let selector_dock: Option<Vec<Line>> =
-            if self.tree_selector.is_some() || self.fork_selector.is_some() {
-                // TS's editor container holds the prompt context (the detail
-                // hint) and the editor; `showSelector` replaces only the editor
-                // part, so the hint stays above the pane.
-                let mut dock = render_prompt_context(&self.detail_label(), &self.theme, width);
-                if let Some(selector) = self.tree_selector.as_ref() {
-                    dock.extend(selector.render(&self.theme, width));
-                } else if let Some(selector) = self.fork_selector.as_ref() {
-                    dock.extend(selector.render(&self.theme, width));
-                }
-                Some(dock)
-            } else {
-                None
-            };
+        let selector_dock: Option<Vec<Line>> = if self.tree_selector.is_some()
+            || self.fork_selector.is_some()
+            || self.share_loader.is_some()
+        {
+            // TS's editor container holds the prompt context (the detail
+            // hint) and the editor; `showSelector` replaces only the editor
+            // part, so the hint stays above the pane.
+            let mut dock = render_prompt_context(&self.detail_label(), &self.theme, width);
+            if let Some(selector) = self.tree_selector.as_ref() {
+                dock.extend(selector.render(&self.theme, width));
+            } else if let Some(selector) = self.fork_selector.as_ref() {
+                dock.extend(selector.render(&self.theme, width));
+            } else if let Some(loader) = self.share_loader.as_ref() {
+                dock.extend(self.render_share_loader(loader, width));
+            }
+            Some(dock)
+        } else {
+            None
+        };
         let top = render_top_bar(&self.chrome, &self.theme, width);
         let transcript = self.render_transcript(width);
         let dock = selector_dock.unwrap_or_else(|| self.render_dock(width));
@@ -885,6 +917,46 @@ impl AgentView {
         frame
     }
 
+    /// The `/share` loader rows (TS `BorderedLoader` + `CancellableLoader`):
+    /// border, spinner + message, cancel hint, border — replacing the
+    /// editor in the dock while `gh gist create` runs.
+    fn render_share_loader(&self, loader: &ShareLoader, width: usize) -> Vec<Line> {
+        let border = self.theme.fg_style(ThemeColor::Border);
+        let muted = self.theme.fg_style(ThemeColor::Muted);
+        let dim = self.theme.fg_style(ThemeColor::Dim);
+        let spinner =
+            crate::chat::LOADER_FRAMES[self.pulse_frame % crate::chat::LOADER_FRAMES.len()];
+        let mut rows: Vec<Line> = Vec::with_capacity(7);
+        rows.push(vec![Span::styled("─".repeat(width.max(1)), border)]);
+        let mut row: Line = vec![Span::styled(" ".to_string(), Style::default())];
+        row.push(Span::styled(spinner.to_string(), dim));
+        row.push(Span::styled(" ".to_string(), muted));
+        row.push(Span::styled(loader.message.clone(), muted));
+        rows.push(row);
+        rows.push(vec![Span::raw(String::new())]);
+        // TS `keyHint("tui.select.cancel", "cancel")`: every key of the
+        // binding, first letter capitalized, then the description.
+        let keys = KeybindingsManager::new().get_keys("tui.select.cancel");
+        let key_text: Vec<String> = keys
+            .iter()
+            .map(|key| {
+                let mut characters = key.chars();
+                match characters.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect();
+        let key_text = key_text.join("/");
+        let mut hint: Line = vec![Span::styled(" ".to_string(), Style::default())];
+        hint.push(Span::styled(key_text, dim));
+        hint.push(Span::styled(" cancel".to_string(), muted));
+        rows.push(hint);
+        rows.push(vec![Span::raw(String::new())]);
+        rows.push(vec![Span::styled("─".repeat(width.max(1)), border)]);
+        rows
+    }
+
     /// Hardware cursor position within the last composed frame (0-based row,
     /// 0-based column), when the editor surface drew the cursor.
     pub fn frame_cursor(&self) -> Option<(usize, usize)> {
@@ -893,6 +965,7 @@ impl AgentView {
             || self.effort_picker.is_some()
             || self.tree_selector.is_some()
             || self.fork_selector.is_some()
+            || self.share_loader.is_some()
         {
             return None;
         }

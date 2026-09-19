@@ -273,6 +273,14 @@ pub trait SessionEngine: Send + Sync {
         None
     }
 
+    /// The session's assembled system prompt, when the engine can produce
+    /// it synchronously (the HTML export embeds it like the TS
+    /// `state.systemPrompt`). Engines whose session is busy or not yet
+    /// built report `None` and the export omits the section.
+    fn export_system_prompt(&self) -> Option<String> {
+        None
+    }
+
     /// The engine's resolved model as connection-state wire data
     /// (`{ id, provider, reasoning }`), when known. Drives the interactive
     /// splash and tray labels.

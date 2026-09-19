@@ -18,7 +18,7 @@ serde_json = "1"
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net", "process"] }
 
 [[bin]]
 name = "pa-tui-replay"

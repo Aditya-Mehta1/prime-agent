@@ -38,6 +38,7 @@ pub use tools::rlm_bootstrap::{build_rlm_bootstrap_code, PythonSkillRuntimeInfo}
 pub mod auth;
 pub mod autonomous;
 pub mod cron;
+pub mod export_html;
 pub mod extensions;
 pub mod goals;
 pub mod kernel;

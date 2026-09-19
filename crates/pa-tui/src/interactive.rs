@@ -453,11 +453,14 @@ pub async fn run_interactive(
     // Background notes (a failed abort request) fold into the transcript
     // through the same loop that renders daemon events.
     let (notes_tx, mut notes_rx) = mpsc::unbounded_channel::<String>();
+    // The `/share` upload task reports here; the loop folds the outcome
+    // into the transcript and clears the loader.
+    let (share_tx, mut share_rx) = mpsc::unbounded_channel::<crate::session_ui::ShareNote>();
     // The double-Ctrl+C force-quit guard: the terminal reader observes the
     // pair even while this loop is wedged in a daemon request, and a plain
     // std-thread watchdog enforces the exit deadline without the runtime.
     let exit_guard = ExitGuard::new();
-    let mut session = SessionUi::open(client, &options, notes_tx).await?;
+    let mut session = SessionUi::open(client, &options, notes_tx, share_tx).await?;
     session.exit_guard = exit_guard.clone();
 
     let theme = crate::app::load_theme(&options.theme);
@@ -599,11 +602,15 @@ pub async fn run_interactive(
                 break;
             }
         }
+        // A `/share` upload in flight holds the run open like an active
+        // turn: the headless harness must not finish before its outcome
+        // rows land (a live terminal never ends the run on its own).
         if headless_done
             && pending.is_empty()
             && !session.turn_active
             && wait_idle_deadline.is_none()
             && !session.dirty
+            && !session.share_pending()
         {
             break;
         }
@@ -691,6 +698,11 @@ pub async fn run_interactive(
                     session.apply_background_note(&note, &mut view);
                 }
             }
+            maybe_share = share_rx.recv() => {
+                if let Some(outcome) = maybe_share {
+                    session.apply_share_outcome(outcome, &mut view);
+                }
+            }
             _reconnect_tick = async {
                 match reconnect.as_ref() {
                     Some(state) => tokio::time::sleep_until(state.next_attempt).await,
@@ -773,7 +785,7 @@ pub async fn run_interactive(
 
         // Spinner animation: the loader frame advances while a turn or a
         // compaction runs.
-        if session.turn_active || view.compaction.is_some() {
+        if session.turn_active || view.compaction.is_some() || view.share_loader.is_some() {
             view.pulse_frame = view.pulse_frame.wrapping_add(1);
         }
 
@@ -781,7 +793,10 @@ pub async fn run_interactive(
         // idle session re-renders nothing (a full-transcript layout costs
         // linear time, so redrawing an unchanged idle frame burns CPU for
         // every attached session).
-        let animating = session.turn_active || view.retry.is_some() || view.compaction.is_some();
+        let animating = session.turn_active
+            || view.retry.is_some()
+            || view.compaction.is_some()
+            || view.share_loader.is_some();
         if animating {
             session.dirty = true;
         }

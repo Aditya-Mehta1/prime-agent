@@ -36,6 +36,7 @@ pub(crate) mod rlm_roster;
 pub(crate) mod session_archive;
 pub(crate) mod session_catalog;
 pub(crate) mod session_commands;
+pub mod session_export;
 pub mod session_stats;
 pub mod session_store;
 pub mod session_tree;

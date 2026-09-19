@@ -841,6 +841,14 @@ impl SessionEngine for AgentSessionEngine {
         Some(self.effective_thinking().wire_name().to_string())
     }
 
+    /// The built core session's assembled prompt (the export embeds it).
+    /// Best-effort: mid-turn the session lock is held, and the export omits
+    /// the section rather than blocking the command.
+    fn export_system_prompt(&self) -> Option<String> {
+        let session = self.session.try_lock().ok()?;
+        session.as_ref().map(|core| core.system_prompt.clone())
+    }
+
     fn model_metadata(&self) -> Option<Value> {
         let model = self.resolve_model().ok()?;
         Some(json!({

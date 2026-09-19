@@ -25,6 +25,7 @@ pub mod editor;
 pub mod effort_picker;
 pub mod error_summary;
 mod exit_guard;
+pub mod export_share;
 pub mod fuzzy;
 pub mod goal_surface;
 pub mod hyperlinks;

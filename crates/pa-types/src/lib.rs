@@ -20,6 +20,7 @@ pub mod goal;
 pub mod platform;
 pub mod session;
 pub mod slash_commands;
+pub mod themes;
 pub mod usage;
 
 use serde::{Deserialize, Serialize};

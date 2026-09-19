@@ -126,7 +126,6 @@ pub struct RunOptions {
     pub file_args: Vec<String>,
     pub daemon_socket: Option<String>,
     pub list_models: Option<Option<String>>,
-    pub export: Option<String>,
     /// The combined first prompt (stdin + @file text + first message).
     pub initial_message: Option<String>,
     pub verbose: bool,
@@ -141,7 +140,6 @@ pub struct RunOptions {
 pub enum MissingSubsystem {
     SessionEngine,
     ModelRegistry,
-    SessionExport,
     PackageManager,
 }
 
@@ -150,7 +148,6 @@ impl MissingSubsystem {
         match self {
             MissingSubsystem::SessionEngine => "the session engine (pa-core)",
             MissingSubsystem::ModelRegistry => "the model registry (pa-ai)",
-            MissingSubsystem::SessionExport => "the session HTML exporter (pa-core)",
             MissingSubsystem::PackageManager => "the capability package manager (pa-core)",
         }
     }
@@ -187,9 +184,6 @@ impl Runtime for UnavailableRuntime {
     fn run(&self, options: &RunOptions) -> Result<i32, MissingSubsystem> {
         if options.list_models.is_some() {
             return Err(MissingSubsystem::ModelRegistry);
-        }
-        if options.export.is_some() {
-            return Err(MissingSubsystem::SessionExport);
         }
         let _ = options.app_mode;
         Err(MissingSubsystem::SessionEngine)

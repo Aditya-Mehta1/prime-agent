@@ -18,6 +18,12 @@ Daemon wire mechanics shared by the serving side (pa-daemon) and clients (pa-tui
   (the TUI dispatch + autocomplete, the session engine's command admission,
   CLI suggestion help) plus its pure parse/suggestion helpers — the TS
   product keeps the same single table in core and imports it from its TUI.
+- `themes`: the bundled theme definition files (`prime`/`dark`/`light`) as
+  pure data, shared by the TUI's theme loader (pa-tui renders terminal
+  colors from them) and the session HTML exporter (pa-core resolves them
+  into CSS variables). Everything built on top of the files — terminal
+  color rendering, export CSS generation, custom-theme discovery — belongs
+  to the consuming crates.
 - `extension_rpc`: the private, versioned NDJSON-over-stdio protocol between the pa-core extension host and the Node sidecar (handshake, RPC envelopes, registration payloads, `ExtensionError`). Both ends ship in the same release, so these types are strict (no catch-alls).
 
 - `daemon::update_flow`: the update-flow state machine's shared vocabulary

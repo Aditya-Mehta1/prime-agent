@@ -527,3 +527,124 @@ fn differential_env_flag_cases_match_ts_binary() {
         );
     }
 }
+
+fn fixture_session() -> String {
+    [
+        r##"{"type":"session","id":"d7f6e5c4","version":3,"timestamp":"2026-09-01T10:00:00.000Z","cwd":"/tmp/project"}"##,
+        r##"{"type":"message","id":"e1","parentId":null,"timestamp":"2026-09-01T10:00:01.000Z","message":{"role":"user","content":"export a fixture"}}"##,
+        r##"{"type":"message","id":"e2","parentId":"e1","timestamp":"2026-09-01T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"the answer"}],"usage":{"inputTokens":10,"outputTokens":5}}}"##,
+        r##"{"type":"message","id":"e3","parentId":"e2","timestamp":"2026-09-01T10:00:03.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"tc1","name":"bash","arguments":{"command":"ls"}}]}}"##,
+        r##"{"type":"message","id":"e4","parentId":"e3","timestamp":"2026-09-01T10:00:04.000Z","message":{"role":"toolResult","toolCallId":"tc1","toolName":"bash","content":[{"type":"text","text":"file.txt"}],"isError":false}}"##,
+        r##"{"type":"label","id":"e5","parentId":"e4","targetId":"e1","label":"start","timestamp":"2026-09-01T10:00:05.000Z"}"##,
+    ]
+    .join("\n")
+    + "\n"
+}
+
+/// The base64-embedded session data of an exported file, decoded and parsed
+/// (the wire contract is the decoded JSON, not the base64 bytes).
+fn exported_session_data(html: &str) -> serde_json::Value {
+    use base64::Engine as _;
+    let marker = "session-data\" type=\"application/json\">";
+    let start = html.find(marker).expect("session data element");
+    let blob = &html[start + marker.len()..];
+    let blob = blob.split('<').next().expect("script close");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(blob.trim())
+        .expect("base64 session data");
+    serde_json::from_slice(&decoded).expect("session data JSON")
+}
+
+/// The theme CSS custom properties as a sorted set (the TS exporter emits
+/// them in file order, the Rust one sorted - the values are the contract).
+fn exported_css_vars(html: &str) -> Vec<String> {
+    let mut vars: Vec<String> = html
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("--") && line.ends_with(';'))
+        .map(str::to_string)
+        .collect();
+    vars.sort();
+    vars
+}
+
+/// Differential parity for `session export`: the same fixture exported by
+/// the TS binary and the Rust binary prints the same success line and
+/// produces files carrying the same session data, the same theme CSS
+/// variables, and the same template scaffolding.
+#[test]
+fn differential_session_export_matches_ts_binary() {
+    let Some(ts) = ts_binary() else {
+        eprintln!("SKIPPED: TS prime-agent binary not found (set PA_TS_BINARY)");
+        return;
+    };
+    let rust = PathBuf::from(env!("CARGO_BIN_EXE_prime-agent"));
+    let ts_sandbox = sandbox("ts-export");
+    let rs_sandbox = sandbox("rs-export");
+    let sandbox_roots: Vec<&Path> = vec![&ts_sandbox, &rs_sandbox];
+    let fixture = "fixture-session.jsonl";
+    for sandbox in [&ts_sandbox, &rs_sandbox] {
+        std::fs::write(sandbox.join("cwd").join(fixture), fixture_session())
+            .expect("write fixture");
+    }
+
+    let ts_out = run(
+        &ts,
+        &["session", "export", fixture, "out.html"],
+        &ts_sandbox,
+    );
+    let rs_out = run(
+        &rust,
+        &["session", "export", fixture, "out.html"],
+        &rs_sandbox,
+    );
+    assert_eq!(ts_out.exit_code, rs_out.exit_code, "exit codes");
+    assert_eq!(
+        normalize(&ts_out.stdout, &sandbox_roots),
+        normalize(&rs_out.stdout, &sandbox_roots),
+        "stdout"
+    );
+    assert_eq!(
+        normalize(&ts_out.stderr, &sandbox_roots),
+        normalize(&rs_out.stderr, &sandbox_roots),
+        "stderr"
+    );
+    assert!(
+        rs_out.stdout.contains("Exported to: out.html"),
+        "success line: {}",
+        rs_out.stdout
+    );
+
+    let ts_html =
+        std::fs::read_to_string(ts_sandbox.join("cwd").join("out.html")).expect("TS export");
+    let rs_html =
+        std::fs::read_to_string(rs_sandbox.join("cwd").join("out.html")).expect("Rust export");
+
+    // Same session data: header, entries, leaf.
+    assert_eq!(
+        exported_session_data(&ts_html),
+        exported_session_data(&rs_html)
+    );
+    // Same theme CSS custom properties.
+    assert_eq!(exported_css_vars(&ts_html), exported_css_vars(&rs_html));
+    // Same template scaffolding (the product export template, verbatim).
+    for marker in [
+        "<title>Session Export</title>",
+        "hamburger",
+        "marked",
+        "hljs",
+    ] {
+        assert!(ts_html.contains(marker), "TS export has {marker}");
+        assert!(rs_html.contains(marker), "Rust export has {marker}");
+    }
+
+    // The missing-file error is the same surface too.
+    let ts_missing = run(&ts, &["session", "export", "nope.jsonl"], &ts_sandbox);
+    let rs_missing = run(&rust, &["session", "export", "nope.jsonl"], &rs_sandbox);
+    assert_eq!(ts_missing.exit_code, rs_missing.exit_code);
+    assert_eq!(
+        normalize(&ts_missing.stderr, &sandbox_roots),
+        normalize(&rs_missing.stderr, &sandbox_roots),
+        "missing-file stderr"
+    );
+}

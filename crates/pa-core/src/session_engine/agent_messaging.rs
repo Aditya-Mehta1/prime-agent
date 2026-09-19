@@ -203,19 +203,26 @@ pub fn assert_agent_message_queue_capacity(
     Ok(())
 }
 
-/// Names interpolated into a `[... child:<name>]` header line must not carry
-/// the header's own delimiters (brackets, newlines, commas, colons).
+/// Names interpolated into a `[<kind> ...]` header line must not carry the
+/// characters that delimit the header itself (brackets, newlines, commas,
+/// or the relationship separator ":"): runs of those collapse into one
+/// space, then the value trims (TS `sanitizeMessageHeaderValue`).
 pub(crate) fn sanitize_message_header_value(value: &str) -> String {
-    value
-        .chars()
-        .map(|char| {
-            if char.is_alphanumeric() || char == '-' || char == '_' {
-                char
-            } else {
-                '_'
+    let mut out = String::with_capacity(value.len());
+    let mut pending_space = false;
+    for char in value.chars() {
+        let delimiter = char.is_whitespace() || matches!(char, ',' | ':' | '[' | ']');
+        if delimiter {
+            pending_space = true;
+        } else {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
             }
-        })
-        .collect()
+            pending_space = false;
+            out.push(char);
+        }
+    }
+    out
 }
 
 /// The rendered prompt a receiving context sees.
@@ -806,7 +813,7 @@ mod tests {
         };
         assert_eq!(
             create_agent_session_message_prompt(&evil),
-            "[agent-message from bad_name_]\n\nm"
+            "[agent-message from bad name!]\n\nm"
         );
         // Legacy transcript header parsing.
         let header = format!(

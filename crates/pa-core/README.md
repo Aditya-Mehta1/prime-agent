@@ -35,6 +35,16 @@ re-routes to the next provider in catalog order; the TS
 progression). The drivers are pure decision logic: the host (pa-daemon)
 owns the attempt, the wait, and the model switch.
 
+Session HTML export (`export_html`): the standalone viewer file for
+`/export` and `session export` - the embedded product template
+(assets/export-html, vendored marked/highlight.js attributed in its
+NOTICE.md) plus the theme-to-CSS resolution over the bundled theme data
+(pa-types) and custom themes under `<agent-dir>/themes/`, and the two
+entry points (`export_session_to_html` for the daemon worker's
+`export_html` command, `export_from_file` for the CLI). Terminal theme
+rendering stays pa-tui's; the share-viewer flow (gist creation) is the
+caller's.
+
 ## Non-goals
 No provider HTTP (pa-ai), no loop policy (pa-agent), no daemon supervision (pa-daemon), no TUI (pa-tui). No update coordination (the pa-cli coordinator owns the FSM; the update-flow seam here is the daemon-free support layer: `update::version` (semver/channel policy), `update::install` (the managed install-root layout), `update::release` (the channel manifest fetch), `update::download` (sha256-verified archive download + staging) - spec `docs/update-flow-state-machine.md`). Event emission at the session seams, ctx-action binding, slash-command dispatch at the product surface, and reload/stale-ctx semantics are design stages 3+ (docs/extensions-runner-design.md); the package manager installs sources and resolves resource paths only.
 

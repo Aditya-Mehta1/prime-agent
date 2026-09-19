@@ -16,6 +16,7 @@ use crate::chat::{
 };
 use crate::daemon_client::{DaemonClient, DaemonClientEvent};
 use crate::effort_picker::{self, EffortPickerAction};
+use crate::export_share::{self, GhAuthStatus, GistOutcome};
 use crate::goal_surface::{format_goal_status, tray_goal_label, GoalView};
 use crate::image_load::LoadedImage;
 use crate::image_markers::{
@@ -29,7 +30,7 @@ use crate::snapshot::{
 };
 use crate::tree_selector::{TreeSelector, TreeSelectorAction};
 use crate::user_message_selector::{UserMessageSelector, UserMessageSelectorAction};
-use crate::view::AgentView;
+use crate::view::{AgentView, ShareLoader};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::time::{Duration, Instant};
@@ -53,6 +54,18 @@ const ESCAPE_REPEAT_WINDOW_MS: std::time::Duration = std::time::Duration::from_m
 const EXIT_STATS_TIMEOUT_MS: u64 = 500;
 
 /// Live UI state for one attached daemon session.
+/// The `/share` upload task's report: the created gist or the failure
+/// message (TS resolves the same promise from the gh process result).
+pub(crate) type ShareNote = Result<GistOutcome, String>;
+
+/// A `/share` upload in flight: the abortable task and the temp export.
+pub(crate) struct ShareRun {
+    /// The upload task; aborting it kills `gh` (`kill_on_drop`).
+    task: tokio::task::JoinHandle<()>,
+    /// The temp HTML export `gh gist create` uploads (removed on settle).
+    tmp_file: std::path::PathBuf,
+}
+
 pub(crate) struct SessionUi {
     pub(crate) client: DaemonClient,
     pub(crate) active_session_id: String,
@@ -91,6 +104,12 @@ pub(crate) struct SessionUi {
     last_status_index: Option<usize>,
     /// The `terminal.showImages` setting, carried into `/new` runs.
     show_images: bool,
+    /// A `/share` gist upload in flight (TS `BorderedLoader` + the gh
+    /// spawn): aborting the task kills `gh` (kill-on-drop).
+    share: Option<ShareRun>,
+    /// Where the upload task reports its outcome (the run loop folds it
+    /// into the transcript).
+    share_notes: mpsc::UnboundedSender<ShareNote>,
     /// Snapshot chat entries to fold into the view on the next rebuild.
     pending_snapshot: Option<Vec<ChatEntry>>,
     /// Snapshot labels (model) for the next rebuild.
@@ -175,6 +194,7 @@ impl SessionUi {
         client: DaemonClient,
         options: &InteractiveOptions,
         notes: mpsc::UnboundedSender<String>,
+        share_notes: mpsc::UnboundedSender<ShareNote>,
     ) -> Result<SessionUi> {
         let active_session_id = match &options.session {
             SessionSelection::New => create_session(&client, options, None).await?,
@@ -199,6 +219,8 @@ impl SessionUi {
             branch_summary_skip_prompt: options.branch_summary_skip_prompt,
             last_status_index: None,
             show_images: options.show_images,
+            share: None,
+            share_notes,
             pasted_images: Default::default(),
             next_image_marker_id: 1,
             pending_snapshot: None,
@@ -1207,6 +1229,26 @@ impl SessionUi {
             // hook); the other management subcommands surface through the
             // `mcp` CLI command instead of the TUI.
             "mcp" => self.handle_mcp_command(resolved, view).await?,
+            // TS `handleExportCommand`: an explicit `.jsonl` path exports
+            // the current branch; anything else (including no argument)
+            // exports HTML.
+            "export" => {
+                self.track_command_used("export");
+                self.handle_export_command(resolved, view).await?;
+            }
+            // TS `handleShareCommand`: an argument is the usage error (the
+            // text stays in the editor); otherwise the session exports to a
+            // temp file and uploads as a secret gist.
+            "share" => {
+                if !resolved.args.is_empty() {
+                    view.editor
+                        .set_text(&format!("/{} {}", resolved.original_name, resolved.args));
+                    self.error_row("Usage: /share", view);
+                } else {
+                    self.track_command_used("share");
+                    self.handle_share_command(view).await?;
+                }
+            }
             other => {
                 self.note(
                     &format!("/{other} is not available in this client yet"),
@@ -1214,6 +1256,180 @@ impl SessionUi {
                 );
             }
         }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Session export and share (/export, /share)
+    // ------------------------------------------------------------------
+
+    /// The TS `showError` row: `⚠ Error: <message>` in the error color.
+    fn error_row(&mut self, message: &str, view: &mut AgentView) {
+        view.push_entry(ChatEntry::Status {
+            text: format!("\u{26a0} Error: {message}"),
+            kind: StatusKind::Error,
+        });
+        self.dirty = true;
+    }
+
+    /// `/export [path]` (TS `handleExportCommand`): export the session to
+    /// HTML — or, for an explicit `.jsonl` path, the current branch as a
+    /// JSONL file — and report the written path. The daemon owns the
+    /// export; failures surface as the TS error row.
+    async fn handle_export_command(
+        &mut self,
+        resolved: &pa_types::slash_commands::ResolvedSlashCommand,
+        view: &mut AgentView,
+    ) -> Result<()> {
+        let command_text = if resolved.args.is_empty() {
+            "/export".to_string()
+        } else {
+            format!("/export {}", resolved.args)
+        };
+        let output_path = export_share::path_command_argument(&command_text, "/export");
+        let request = if output_path
+            .as_deref()
+            .is_some_and(|path| path.ends_with(".jsonl"))
+        {
+            DaemonCommand::ExportJsonl {
+                id: None,
+                active_session_id: self.active_session_id.clone(),
+                output_path,
+                rest: Default::default(),
+            }
+        } else {
+            DaemonCommand::ExportHtml {
+                id: None,
+                active_session_id: self.active_session_id.clone(),
+                output_path,
+                rest: Default::default(),
+            }
+        };
+        match self
+            .bounded_request(Duration::from_millis(UI_REQUEST_TIMEOUT_MS), request)
+            .await
+        {
+            Ok(data) => {
+                let path = data.get("path").and_then(Value::as_str).unwrap_or_default();
+                self.note(&format!("Session exported to: {path}"), view);
+            }
+            Err(error) => {
+                self.error_row(&format!("Failed to export session: {error:#}"), view);
+            }
+        }
+        Ok(())
+    }
+
+    /// `/share` (TS `handleShareCommand`): gate on the GitHub CLI, export
+    /// the session to a temp file, then upload it as a secret gist while
+    /// the cancellable loader replaces the editor.
+    async fn handle_share_command(&mut self, view: &mut AgentView) -> Result<()> {
+        match export_share::probe_gh_auth() {
+            GhAuthStatus::NotLoggedIn => {
+                self.error_row(
+                    "GitHub CLI is not logged in. Run 'gh auth login' first.",
+                    view,
+                );
+                return Ok(());
+            }
+            GhAuthStatus::NotInstalled => {
+                self.error_row(
+                    "GitHub CLI (gh) is not installed. Install it from https://cli.github.com/",
+                    view,
+                );
+                return Ok(());
+            }
+            GhAuthStatus::Ok => {}
+        }
+        // The temp export `gh` uploads (TS `os.tmpdir()/session.html`).
+        let tmp_file = std::env::temp_dir().join("session.html");
+        let export = self
+            .bounded_request(
+                Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                DaemonCommand::ExportHtml {
+                    id: None,
+                    active_session_id: self.active_session_id.clone(),
+                    output_path: Some(tmp_file.to_string_lossy().into_owned()),
+                    rest: Default::default(),
+                },
+            )
+            .await;
+        if let Err(error) = export {
+            self.error_row(&format!("Failed to export session: {error:#}"), view);
+            return Ok(());
+        }
+        // The upload runs in the background: the loader keeps the UI live,
+        // the run loop folds the outcome in when it lands.
+        let child = match export_share::spawn_gist_create(&tmp_file) {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = std::fs::remove_file(&tmp_file);
+                self.error_row(&format!("Failed to create gist: {error}"), view);
+                return Ok(());
+            }
+        };
+        let notes = self.share_notes.clone();
+        let task = tokio::spawn(async move {
+            let outcome = export_share::gist_outcome(child).await;
+            let _ = notes.send(outcome);
+        });
+        self.share = Some(ShareRun {
+            task,
+            tmp_file: tmp_file.clone(),
+        });
+        view.share_loader = Some(ShareLoader::new());
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Whether a `/share` upload is in flight (the run loop must not end
+    /// before its outcome row lands).
+    pub(crate) fn share_pending(&self) -> bool {
+        self.share.is_some()
+    }
+
+    /// A `/share` upload settled: drop the loader, clean the temp file, and
+    /// surface the TS rows — the share URL, or the failure. A late outcome
+    /// after a cancel is ignored (the run is gone, the cancel showed its
+    /// own row).
+    pub(crate) fn apply_share_outcome(&mut self, outcome: ShareNote, view: &mut AgentView) {
+        let Some(run) = self.share.take() else {
+            return;
+        };
+        view.share_loader = None;
+        let _ = std::fs::remove_file(&run.tmp_file);
+        match outcome {
+            Ok(gist) => {
+                self.note(
+                    &format!("Share URL: {}\nGist: {}", gist.preview_url, gist.gist_url),
+                    view,
+                );
+            }
+            Err(message) => {
+                self.error_row(&format!("Failed to create gist: {message}"), view);
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// One key press while the `/share` loader is open (TS
+    /// `CancellableLoader`): the cancel binding aborts the upload, every
+    /// other key is the loader's.
+    async fn handle_share_loader_key(&mut self, key: KeyEvent, view: &mut AgentView) -> Result<()> {
+        if let Some(id) = key_event_to_id(&key) {
+            let kb = view.editor.keybindings();
+            if kb.matches(&id, "tui.select.cancel") {
+                if let Some(run) = self.share.take() {
+                    // Aborting the task drops the child and kills `gh`
+                    // (kill-on-drop); the temp file goes with the run.
+                    run.task.abort();
+                    let _ = std::fs::remove_file(&run.tmp_file);
+                }
+                view.share_loader = None;
+                self.note("Share cancelled", view);
+            }
+        }
+        self.dirty = true;
         Ok(())
     }
 
@@ -2023,6 +2239,12 @@ impl SessionUi {
         }
         if view.fork_selector.is_some() {
             return self.handle_fork_selector_key(key, view).await;
+        }
+        // The `/share` loader owns the frame while an upload runs (TS the
+        // loader takes focus): the cancel binding aborts, other keys are
+        // the loader's.
+        if view.share_loader.is_some() {
+            return self.handle_share_loader_key(key, view).await;
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             // One handled Ctrl+C press: the force-quit guard disarms once

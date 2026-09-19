@@ -25,6 +25,7 @@ path = "src/main.rs"
 
 [dev-dependencies]
 tempfile = "3"
+base64 = "0.22"
 libc = "0.2"
 futures = { workspace = true }
 crossterm = "0.28"

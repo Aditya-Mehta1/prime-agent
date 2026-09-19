@@ -225,6 +225,37 @@ impl SessionCore {
     pub(crate) fn has_ongoing_work(&self) -> bool {
         self.busy || self.compacting || !self.steering.is_empty() || !self.follow_up.is_empty()
     }
+
+    /// A created session core for command modules' unit tests (the private
+    /// bookkeeping fields stay owned here).
+    #[cfg(test)]
+    pub(crate) fn test_core(store: Option<SessionFile>, cwd: String) -> Self {
+        SessionCore {
+            active_session_id: store
+                .as_ref()
+                .map(|store| store.session_id().to_string())
+                .unwrap_or_else(|| "test-session".to_string()),
+            generation: String::new(),
+            last_event_sequence: 0,
+            store,
+            cwd,
+            steering: VecDeque::new(),
+            follow_up: VecDeque::new(),
+            busy: false,
+            created: true,
+            attached_client_ids: Vec::new(),
+            abort_requested: false,
+            shutdown_requested: false,
+            compacting: false,
+            auto_compaction_enabled: true,
+            last_action_snapshot: Some(SessionActionSnapshot::default()),
+            rlm_depth: 0,
+            runtime_kind: "top-level".to_string(),
+            rlm_child_id: None,
+            parent_active_session_id: None,
+            parent_session_id: None,
+        }
+    }
 }
 
 impl crate::status_line::StatusSession for SessionCore {
@@ -490,6 +521,8 @@ pub struct Worker {
     compaction: crate::compaction::CompactionManager,
     /// Session-tree navigation: `/tree` moves, branch summaries, forks.
     tree_navigation: crate::branch_navigation::TreeNavigation,
+    /// Session export: the `/export` HTML and JSONL branches.
+    exports: crate::session_export::ExportCommands,
     /// Session-scoped ACP MCP servers for engines without their own store
     /// (the scripted harness); the real engine's manager serves the
     /// product path.
@@ -651,6 +684,11 @@ impl Worker {
             Arc::clone(&core),
             idle_notify.clone(),
         );
+        let exports = crate::session_export::ExportCommands::new(
+            std::sync::Arc::clone(&engine),
+            Arc::clone(&core),
+            config.agent_dir.clone(),
+        );
         // The session-scoped ACP MCP manager: auth storage construction is
         // blocking, so the builder runs off the async runtime (the same
         // pattern as the session engine's MCP gating).
@@ -675,6 +713,7 @@ impl Worker {
             peer_grants: PeerGrantStore::new(),
             compaction,
             tree_navigation,
+            exports,
             acp_mcp: std::sync::Arc::new(std::sync::Mutex::new(acp_mcp)),
         }
     }
@@ -1195,6 +1234,8 @@ impl Worker {
                 self.tree_navigation.abort();
                 response_success(None, "abort_branch_summary", None)
             }
+            "export_html" => self.exports.export_html(payload),
+            "export_jsonl" => self.exports.export_jsonl(payload),
             "mutate_queued_message" => self.handle_mutate_queued_message(payload),
             "resume_queue" => self.handle_resume_queue(),
             other => response_failure(

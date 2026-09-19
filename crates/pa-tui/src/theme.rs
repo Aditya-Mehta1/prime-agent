@@ -474,16 +474,15 @@ fn bg_name_lookup(name: &str) -> Option<&'static str> {
     })
 }
 
-pub const PRIME_JSON: &str = include_str!("../themes/prime.json");
-pub const DARK_JSON: &str = include_str!("../themes/dark.json");
-pub const LIGHT_JSON: &str = include_str!("../themes/light.json");
+/// The bundled theme files, shared with the session HTML exporter via
+/// [`pa_types::themes`] (the theme *data* is shared vocabulary; this crate
+/// owns everything built on top of it).
+pub const PRIME_JSON: &str = pa_types::themes::PRIME_THEME_JSON;
+pub const DARK_JSON: &str = pa_types::themes::DARK_THEME_JSON;
+pub const LIGHT_JSON: &str = pa_types::themes::LIGHT_THEME_JSON;
 
 pub fn builtin_theme_json(name: &str) -> ThemeJson {
-    let raw = match name {
-        "dark" => DARK_JSON,
-        "light" => LIGHT_JSON,
-        _ => PRIME_JSON,
-    };
+    let raw = pa_types::themes::builtin_theme_json(name).unwrap_or(PRIME_JSON);
     serde_json::from_str(raw)
         .unwrap_or_else(|_| serde_json::from_str(PRIME_JSON).expect("prime.json is valid"))
 }
