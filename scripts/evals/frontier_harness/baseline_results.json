@@ -36,5 +36,35 @@
     "claude_code": "19/30 (63.3%)",
     "pi": "18/30 (60.0%)",
     "note": "Our 18/20 TB (90%) excludes DeepSWE; full 30-task comparison pending"
+  },
+  "cost_estimates": {
+    "methodology": "Estimated from duration (turns \u2248 duration/15s, ~10K input + ~1.5K output per turn at Kimi K3 pricing)",
+    "input_price_per_m": 3.45,
+    "output_price_per_m": 17.25,
+    "median_cost_usd": 0.302,
+    "mean_cost_usd": 0.42,
+    "per_task": {
+      "code-from-image": 0.181,
+      "constraints-scheduling": 0.181,
+      "db-wal-recovery": 0.181,
+      "dna-insert": 0.543,
+      "extract-elf": 0.966,
+      "gcode-to-text": 0.906,
+      "git-leak-recovery": 0.241,
+      "kv-store-grpc": 0.181,
+      "log-summary-date-ranges": 0.181,
+      "merge-diff-arc-agi-task": 0.362,
+      "modernize-scientific-stack": 0.181,
+      "multi-source-data-merger": 0.302,
+      "openssl-selfsigned-cert": 0.181,
+      "polyglot-c-py": 0.362,
+      "regex-log": 0.302,
+      "sanitize-git-repo": 0.302,
+      "sqlite-db-truncate": 0.181,
+      "vulnerable-secret": 0.241,
+      "build-cython-ext": 1.208,
+      "chess-best-move": 1.208
+    },
+    "note": "Heuristic estimates pending formal token tracking; actual costs may vary \u00b150%"
   }
 }
