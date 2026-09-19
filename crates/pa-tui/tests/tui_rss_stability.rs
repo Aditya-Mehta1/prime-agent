@@ -353,6 +353,8 @@ fn interactive_session_rss_plateaus_over_long_stream() {
         client_auth: None,
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
+        session_rlm_depth: None,
+        session_has_children: false,
     };
     let plan = HeadlessPlan {
         steps,

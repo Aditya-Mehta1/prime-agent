@@ -266,6 +266,8 @@ async fn tui_export_and_share_surface() {
         client_auth: None,
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
+        session_rlm_depth: None,
+        session_has_children: false,
     };
     let html_out = dir.path().join("export.html");
     let jsonl_out = dir.path().join("branch.jsonl");

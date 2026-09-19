@@ -1901,6 +1901,9 @@ impl SessionUi {
             client_auth: self.client_auth.clone(),
             telemetry: self.telemetry.clone(),
             keybindings: self.keybindings.clone(),
+            // `/new` starts a fresh root session: no depth label.
+            session_rlm_depth: None,
+            session_has_children: false,
         }
     }
 

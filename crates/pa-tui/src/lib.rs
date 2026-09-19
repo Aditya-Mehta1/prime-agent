@@ -5,6 +5,7 @@
 //! the terminal layer paints them with crossterm + ratatui diffing.
 
 pub mod agents_view;
+pub mod agents_view_forest;
 pub mod agents_view_state;
 pub mod altscreen;
 pub mod ansi;

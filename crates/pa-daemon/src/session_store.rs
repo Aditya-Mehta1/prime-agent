@@ -202,6 +202,15 @@ impl SessionFile {
         &self.header.id
     }
 
+    /// The header's RLM depth (TS `sessionManager.getHeader()?.rlmDepth`):
+    /// a resumed session inherits its persisted depth when the create
+    /// payload does not carry one (TS `config.rlmDepth ?? header.rlmDepth`).
+    pub fn rlm_depth(&self) -> Option<u32> {
+        self.header
+            .rlm_depth
+            .and_then(|depth| u32::try_from(depth).ok())
+    }
+
     /// Walk the leaf-to-root entry path (the active branch).
     pub fn branch(&self) -> Vec<&SessionEntry> {
         let mut path = Vec::new();

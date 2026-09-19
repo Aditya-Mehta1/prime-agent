@@ -194,6 +194,10 @@ async fn search_narrows_the_roster_and_escape_restores_it() {
         anchor_session_id: None,
         scope: None,
         query: None,
+        expanded_ancestors: Vec::new(),
+        selected_row_identity: None,
+        selected_key: None,
+        status_message: None,
     };
     let plan = AgentsHeadlessPlan {
         steps: vec![

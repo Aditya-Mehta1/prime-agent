@@ -392,6 +392,8 @@ async fn tui_attaches_prompts_streams_lists_and_switches() {
         client_auth: None,
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
+        session_rlm_depth: None,
+        session_has_children: false,
     };
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![
@@ -543,6 +545,8 @@ async fn ensure_daemon_running_spawns_supervisor_and_tui_attaches() {
         client_auth: None,
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
+        session_rlm_depth: None,
+        session_has_children: false,
     };
     // The interactive runtime's own launch sequence, minus the TTY: spawn
     // the real supervisor binary detached and wait for the hello handshake.
@@ -627,6 +631,8 @@ async fn tui_dispatches_slash_commands_menu_and_suggestions() {
         client_auth: None,
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
+        session_rlm_depth: None,
+        session_has_children: false,
     };
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![
@@ -821,6 +827,8 @@ async fn tui_model_picker_applies_and_effort_reports() {
         client_auth: None,
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
+        session_rlm_depth: None,
+        session_has_children: false,
     };
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![
@@ -916,6 +924,8 @@ async fn tui_compact_on_a_short_session_warns_nothing_to_compact() {
         client_auth: None,
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
+        session_rlm_depth: None,
+        session_has_children: false,
     };
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![
@@ -1043,6 +1053,8 @@ async fn tui_compact_shows_the_loader_then_the_summary_and_rebuilds() {
         client_auth: None,
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
+        session_rlm_depth: None,
+        session_has_children: false,
     };
     let ctrl_o = || {
         pa_tui::interactive::HeadlessStep::Key(crossterm::event::KeyEvent::new(
@@ -1234,6 +1246,8 @@ async fn tui_session_tree_navigates_forks_and_clones() {
         client_auth: None,
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
+        session_rlm_depth: None,
+        session_has_children: false,
     };
     let key = |code: KeyCode| {
         pa_tui::interactive::HeadlessStep::Key(crossterm::event::KeyEvent::new(
@@ -1424,6 +1438,8 @@ async fn tui_big_streamed_turns_render_at_the_producer_rate() {
         client_auth: None,
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
+        session_rlm_depth: None,
+        session_has_children: false,
     };
     // 45s per turn is the throughput bound: the producer finishes each
     // turn in ~4s, so 45s tolerates real box load (sibling e2e binaries,
@@ -1550,6 +1566,8 @@ async fn tui_renders_and_fires_user_keybindings_from_settings() {
         // The exact load path the CLI uses: the fixture overrides the
         // default set.
         keybindings: pa_tui::keybindings::KeybindingsManager::create(&agent_dir),
+        session_rlm_depth: None,
+        session_has_children: false,
     };
     let key = |code: KeyCode, modifiers: KeyModifiers| {
         pa_tui::interactive::HeadlessStep::Key(crossterm::event::KeyEvent::new(code, modifiers))

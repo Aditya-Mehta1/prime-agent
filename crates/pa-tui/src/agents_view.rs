@@ -15,17 +15,21 @@ use pa_types::daemon::DaemonCommand;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+use crate::agents_view_forest::{
+    ancestor_session_ids, build_rows, compute_rollups, has_session_children, resolve_selection,
+    scope_ancestors, scope_depth, scope_to_subtree, AgentsViewRow, RowKind, SelectionKey,
+};
 use crate::agents_view_state::truncate_text;
 use crate::agents_view_state::{
-    build_layout, build_rows, filter_empty_sessions, filter_unified_sessions, parse_search_query,
-    reconcile_unified_sessions, scope_depth, scope_to_descendants, section_title, AgentsViewRow,
-    RowLayout, Section,
+    build_layout, filter_empty_sessions, filter_unified_sessions, parse_search_query,
+    reconcile_unified_sessions, section_title, RowLayout, Section,
 };
 
 /// The scope a scoped view opened on (TS `AgentsViewScopeKey` plus the
 /// display name): the view lists this session's descendants and the back
 /// key returns to it.
-pub use crate::agents_view_state::AgentsViewScope;
+pub use crate::agents_view_forest::AgentsViewScope;
+pub use crate::agents_view_forest::SelectionKey as AgentsViewSelectionKey;
 use crate::daemon_client::{DaemonClient, DaemonClientEvent};
 use crate::interactive::SessionSelection;
 use crate::theme::{Theme, ThemeBg, ThemeColor};
@@ -51,6 +55,33 @@ pub struct AgentsViewOptions {
     /// `AgentsViewPersistentState.query`: returning from an opened chat
     /// keeps the filter typed before opening it).
     pub query: Option<String>,
+    /// Session ids to re-expand on open, root-most first (TS
+    /// `pendingExpandedAncestorSessionIds`: returning from a drilled-in
+    /// child re-opens the tree down to the row the user left).
+    pub expanded_ancestors: Vec<String>,
+    /// The row identity to restore the selection on (TS
+    /// `persistentState.selectedRowIdentity`).
+    pub selected_row_identity: Option<String>,
+    /// The selection key that survives an identity flip (TS
+    /// `persistentState.selectedSessionKey`).
+    pub selected_key: Option<SelectionKey>,
+    /// A status message the previous run left for this one (TS
+    /// `persistentState.statusMessage`): the unattachable-child fallback.
+    pub status_message: Option<String>,
+}
+
+/// The open action the run ended with (TS `AgentsViewRunResult`'s
+/// `open`/`scope_back` arms, unified): the session the flow opens plus
+/// the row metadata it carries across the view/session loop.
+#[derive(Debug, Clone)]
+pub struct OpenedRow {
+    pub selection: SessionSelection,
+    pub expanded_ancestors: Vec<String>,
+    pub selected_row_identity: String,
+    pub selected_key: SelectionKey,
+    pub rlm_depth: Option<u32>,
+    pub has_children: bool,
+    pub status_message: Option<String>,
 }
 
 /// How the view is driven.
@@ -87,6 +118,33 @@ pub struct AgentsViewOutcome {
     /// The query typed in this run, for the caller to restore on re-entry
     /// (TS `AgentsViewPersistentState.query`).
     pub query: Option<String>,
+    /// The view exited through its parent key while scoped (TS
+    /// `scope_back`): the flow pops the scope frame, so a later agents-back
+    /// lands in the parent scope, not this one.
+    pub scope_popped: bool,
+    /// The scope root left the roster mid-run (TS
+    /// `resolveAgentsViewScopeFrames` dropping a frame): the flow drops the
+    /// scope frame.
+    pub scope_dropped: bool,
+    /// Session ids of the opened row's ancestors, root-most first (TS
+    /// `expandedAncestorSessionIds`): the flow feeds the next view run so
+    /// the tree re-expands to the drilled row.
+    pub expanded_ancestors: Vec<String>,
+    /// The opened (or scope-back) row's identity and key, for the next
+    /// run's selection restore (TS `persistentState.selectedRowIdentity` /
+    /// `selectedSessionKey`).
+    pub selected_row_identity: Option<String>,
+    pub selected_key: Option<SelectionKey>,
+    /// The opened session's `rlmDepth` (TS `sessionDepth`): a drilled-in
+    /// child renders its `depth N` tray label.
+    pub opened_rlm_depth: Option<u32>,
+    /// Whether the opened session has direct children (TS
+    /// `sessionHasChildren`).
+    pub opened_has_children: bool,
+    /// A status message the session opener left (TS
+    /// `statusMessage` on the open result): the unattachable-child
+    /// fallback surfaces it in the next view run.
+    pub status_message: Option<String>,
 }
 
 /// TS `WORKING_ICON_INTERVAL_MS`: the running-row icon frame cadence.
@@ -115,6 +173,22 @@ struct AgentsViewMode {
     scope_depth: Option<u32>,
     /// The scope root resolved on the last rebuild.
     scope_active: bool,
+    /// Whether the scope root left the roster mid-run (TS
+    /// `resolveAgentsViewScopeFrames` dropping the frame): reported on the
+    /// outcome so the flow drops the scope.
+    scope_dropped: bool,
+    /// Parent row identities whose subagent lists are expanded (TS
+    /// `expandedSubagentParents`).
+    expanded_parents: std::collections::HashSet<String>,
+    /// Session ids to expand on the next rebuild (TS
+    /// `pendingExpandedAncestorSessionIds`, consumed once).
+    pending_ancestors: Option<Vec<String>>,
+    /// The row identity the selection restores on (TS
+    /// `persistentState.selectedRowIdentity`).
+    selected_identity: Option<String>,
+    /// The selection key that survives an identity flip (TS
+    /// `persistentState.selectedSessionKey`).
+    selected_key: Option<SelectionKey>,
     /// First ctrl+c shows the exit hint; the second exits.
     exit_armed: bool,
     /// The double-Ctrl+C force-quit guard (the run's shared instance is
@@ -122,13 +196,24 @@ struct AgentsViewMode {
     exit_guard: crate::exit_guard::ExitGuard,
     pulse: usize,
     running: bool,
-    selection: Option<SessionSelection>,
+    /// The view exited through its parent key (TS `scope_back`): the flow
+    /// pops the scope frame.
+    scope_popped: bool,
+    /// The open action the run ended with (`None` while the view runs).
+    opened: Option<OpenedRow>,
+    /// ctrl+n requested a fresh session (TS `app.agents.new`).
+    new_session: bool,
 }
 
 impl AgentsViewMode {
     fn new(options: AgentsViewOptions) -> Self {
         let theme = crate::app::load_theme(&options.theme);
         let query = options.query.clone().unwrap_or_default();
+        let status = options.status_message.clone();
+        let pending_ancestors =
+            (!options.expanded_ancestors.is_empty()).then(|| options.expanded_ancestors.clone());
+        let selected_identity = options.selected_row_identity.clone();
+        let selected_key = options.selected_key.clone();
         AgentsViewMode {
             options,
             theme,
@@ -137,62 +222,141 @@ impl AgentsViewMode {
             rows: Vec::new(),
             selected: 0,
             query,
-            status: None,
+            status,
             scope_depth: None,
             scope_active: false,
+            scope_dropped: false,
+            expanded_parents: Default::default(),
+            pending_ancestors,
+            selected_identity,
+            selected_key,
             exit_armed: false,
             exit_guard: crate::exit_guard::ExitGuard::new(),
             pulse: 0,
             running: true,
-            selection: None,
+            scope_popped: false,
+            opened: None,
+            new_session: false,
         }
     }
 
-    /// Rebuild rows from the current roster, catalog, and query. A scoped
-    /// run lists only the scope root's descendants (TS `scopeToSessionSubtree`
-    /// with the root's own row excluded); a scope root that left the roster
-    /// falls back to the global list with a status message.
+    /// The unified records the view runs on (reconciled from the live
+    /// roster and the saved catalog).
+    fn records(&self) -> Vec<crate::agents_view_state::UnifiedRecord> {
+        reconcile_unified_sessions(&self.roster, &self.saved)
+    }
+
+    /// Rebuild rows from the current roster, catalog, and query (TS
+    /// `reconcileCatalogs` + `getFilteredRecords`). A scoped run lists the
+    /// scope root's subtree with the root's own row excluded (its direct
+    /// children list as top-level rows); a scope root that left the roster
+    /// falls back to the global list with a status message and reports the
+    /// drop so the flow discards the scope.
     fn rebuild_rows(&mut self) {
         let identity = self.rows.get(self.selected).map(|row| row.identity.clone());
-        let records = reconcile_unified_sessions(&self.roster, &self.saved);
+        let records = self.records();
+        // Scope resolution (TS `resolveAgentsViewScopeFrames`): a frame
+        // whose root is gone drops, with the nearest fallback surfaced as a
+        // status message.
         let mut scope_active = false;
-        let filtered = match &self.options.scope {
-            Some(scope) => {
-                let empty = filter_empty_sessions(&records, None);
-                match scope_to_descendants(&empty, scope) {
-                    Some(scoped) => {
-                        scope_active = true;
-                        self.scope_depth = scope_depth(&empty, scope);
-                        scoped
-                    }
-                    None => {
-                        self.scope_depth = None;
-                        self.status = Some(
-                            "Scope is no longer available; returned to the global view".to_string(),
-                        );
-                        filter_empty_sessions(&records, self.options.anchor_session_id.as_deref())
-                    }
+        let scoped = match &self.options.scope {
+            Some(scope) if !self.scope_dropped => match scope_to_subtree(&records, scope) {
+                Some(scoped) => {
+                    scope_active = true;
+                    self.scope_depth = scope_depth(&records, scope);
+                    Some(scoped)
                 }
-            }
-            None => filter_empty_sessions(&records, self.options.anchor_session_id.as_deref()),
+                None => {
+                    self.scope_depth = None;
+                    self.scope_dropped = true;
+                    self.status = Some(
+                        "Scope is no longer available; returned to the global view".to_string(),
+                    );
+                    None
+                }
+            },
+            _ => None,
         };
         self.scope_active = scope_active;
-        let query = self.query.trim();
-        let rows = if query.is_empty() {
-            build_rows(&filtered, self.options.anchor_session_id.as_deref())
-        } else {
-            let parsed = parse_search_query(query);
-            let matching = filter_unified_sessions(&filtered, &parsed);
-            build_rows(&matching, self.options.anchor_session_id.as_deref())
+        let working: &[_] = match &scoped {
+            Some(scoped) => scoped,
+            None => &records,
         };
-        if let Some(identity) = identity {
-            if let Some(index) = rows.iter().position(|row| row.identity == identity) {
-                self.selected = index;
-            } else {
-                self.selected = 0;
+        // The empty-catalog filter preserves the anchor and the scope root
+        // (TS `preservedSessionIds`); the search filter keeps ancestors so
+        // a match never orphans its parent row.
+        let mut preserved = Vec::new();
+        if let Some(anchor) = self.options.anchor_session_id.as_deref() {
+            preserved.push(anchor);
+        }
+        if let Some(scope) = self.options.scope.as_ref() {
+            if let Some(session) = scope.session_id.as_deref() {
+                preserved.push(session);
             }
         }
+        let filtered = filter_empty_sessions(working, &preserved);
+        let filtered = if self.query.trim().is_empty() {
+            filtered
+        } else {
+            let parsed = parse_search_query(self.query.trim());
+            filter_unified_sessions(&filtered, &parsed)
+        };
+        let rollups = compute_rollups(&filtered);
+        let mut rows = build_rows(
+            &filtered,
+            self.options.scope.as_ref(),
+            &self.expanded_parents,
+            &rollups,
+            self.options.anchor_session_id.as_deref(),
+        );
+        // Re-expand the drilled-in row's ancestors (TS
+        // `applyPendingAncestorExpansion`): a nested ancestor's row only
+        // appears once its own parent is expanded, so expand-and-rebuild
+        // until a pass reveals nothing new.
+        if let Some(wanted) = self.pending_ancestors.take() {
+            let mut added = true;
+            while added {
+                added = false;
+                for row in &rows {
+                    if row.kind == RowKind::SubagentSummary {
+                        continue;
+                    }
+                    let session_id = row.summary.get("sessionId").and_then(Value::as_str);
+                    if session_id.is_some_and(|id| wanted.iter().any(|w| w == id))
+                        && self.expanded_parents.insert(row.identity.clone())
+                    {
+                        added = true;
+                    }
+                }
+                if added {
+                    rows = build_rows(
+                        &filtered,
+                        self.options.scope.as_ref(),
+                        &self.expanded_parents,
+                        &rollups,
+                        self.options.anchor_session_id.as_deref(),
+                    );
+                }
+            }
+        }
+        // Keep the selection on the same row across rebuilds, falling back
+        // to the carried identity/key (TS `resolveAgentsViewSelectionState`).
+        self.selected = resolve_selection(
+            &rows,
+            self.selected,
+            identity.as_deref().or(self.selected_identity.as_deref()),
+            self.selected_key.as_ref(),
+        );
         self.rows = rows;
+        // Track the selected row's identity and key (TS
+        // `syncSelectedRowState`): they survive rebuilds and view re-entry.
+        if let Some(row) = self.rows.get(self.selected) {
+            self.selected_identity = Some(row.identity.clone());
+            self.selected_key = Some(crate::agents_view_forest::selection_key(&row.summary));
+        } else {
+            self.selected_identity = None;
+            self.selected_key = None;
+        }
     }
 
     /// Apply one roster push (`changed` upserts, `removed` deletes,
@@ -223,30 +387,142 @@ impl AgentsViewMode {
         self.rebuild_rows();
     }
 
-    /// Move the selection by `delta` rows.
+    /// Move the selection by `delta` selectable rows (TS `moveSelection`).
     fn move_selection(&mut self, delta: isize) {
-        if self.rows.is_empty() {
+        let selectable: Vec<usize> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.selectable())
+            .map(|(index, _)| index)
+            .collect();
+        if selectable.is_empty() {
             self.selected = 0;
             return;
         }
-        let next = self.selected as isize + delta;
-        self.selected = next.clamp(0, self.rows.len() as isize - 1) as usize;
+        let current = selectable
+            .iter()
+            .position(|index| *index == self.selected)
+            .unwrap_or(0);
+        let next = (current as isize + delta).clamp(0, selectable.len() as isize - 1) as usize;
+        self.selected = selectable[next];
     }
 
-    /// Open the selected row: attach a live session, or reopen the saved
-    /// file. `n` requests a fresh session.
+    /// Open the selected row (TS `openSelected`): the summary row toggles
+    /// its list, a nested child drills into its transcript with its
+    /// ancestor chain, and a top-level agent opens its session.
     fn open_selected(&mut self) {
-        let Some(row) = self.rows.get(self.selected) else {
+        let Some(row) = self.rows.get(self.selected).cloned() else {
             return;
         };
+        match row.kind {
+            RowKind::SubagentSummary => self.toggle_subagent_list(&row),
+            RowKind::Subagent => self.open_subagent_row(&row),
+            RowKind::Agent => self.open_row(&row, Vec::new()),
+        }
+    }
+
+    /// Toggle the selected parent's subagent list (TS `toggleSubagentList`):
+    /// alt+right and open both land here; the target is the selected row's
+    /// parent for a summary row, the row itself otherwise.
+    fn toggle_subagent_list(&mut self, row: &AgentsViewRow) {
+        let target = match row.kind {
+            RowKind::SubagentSummary => row.parent_identity.clone(),
+            _ => Some(row.identity.clone()),
+        };
+        let Some(target) = target else {
+            return;
+        };
+        if self.expanded_parents.remove(&target) {
+            // Collapsing also hides the spawn program (TS clears
+            // `programShownParents` with the expansion); the program
+            // surface is not part of this lane.
+        } else {
+            self.expanded_parents.insert(target);
+        }
+        self.rebuild_rows();
+    }
+
+    /// Drill into a nested child row (TS `openSelectedSubagent`): the open
+    /// result carries the child's ancestor chain, so the tree re-expands to
+    /// the row when the chat returns to the view.
+    fn open_subagent_row(&mut self, row: &AgentsViewRow) {
+        let ancestors = ancestor_session_ids(&self.rows, row.parent_identity.as_deref());
+        if row.summary.get("activeSessionId").is_some() || row.summary.get("sessionFile").is_some()
+        {
+            self.open_row(row, ancestors);
+            return;
+        }
+        // The whole subagent tree belongs to its root agent's session, so a
+        // child without its own runtime resolves to its top-level ancestor
+        // (TS `createUnattachableChildOpenResult`): open the parent, keep
+        // the child row selected, and surface why.
+        let root = self.find_subagent_root_row(row);
+        let Some(root) = root else {
+            self.status = Some(
+                "Cannot open agent without an active runtime or saved session file".to_string(),
+            );
+            return;
+        };
+        let root = root.clone();
+        self.status = None;
+        self.open_row_with(
+            &root,
+            ancestors,
+            Some("Child session is unavailable; opened its parent instead".to_string()),
+            Some(row.identity.clone()),
+        );
+    }
+
+    /// The top-level ancestor row of a nested row (TS `findSubagentRootRow`).
+    fn find_subagent_root_row(&self, row: &AgentsViewRow) -> Option<&AgentsViewRow> {
+        let mut identity = row.parent_identity.clone();
+        let mut guard = 0;
+        while let Some(current) = identity {
+            guard += 1;
+            if guard > self.rows.len() {
+                return None;
+            }
+            let parent = self
+                .rows
+                .iter()
+                .find(|candidate| candidate.identity == current)?;
+            match parent.kind {
+                RowKind::Agent => return Some(parent),
+                _ => identity = parent.parent_identity.clone(),
+            }
+        }
+        None
+    }
+
+    /// Open a session row: attach a live session, or reopen the saved
+    /// file (TS `finish({ type: "open" })`), carrying the row's identity,
+    /// key, and depth metadata for the flow.
+    fn open_row(&mut self, row: &AgentsViewRow, ancestors: Vec<String>) {
+        self.open_row_with(row, ancestors, None, None);
+    }
+
+    /// The open action shared by the drill-in paths.
+    fn open_row_with(
+        &mut self,
+        row: &AgentsViewRow,
+        ancestors: Vec<String>,
+        status_message: Option<String>,
+        selected_identity: Option<String>,
+    ) {
         let summary = &row.summary;
         if let Some(active) = summary
             .get("activeSessionId")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
         {
-            self.selection = Some(SessionSelection::Attach(active.to_string()));
-            self.running = false;
+            self.finish_open(
+                SessionSelection::Attach(active.to_string()),
+                row,
+                ancestors,
+                status_message,
+                selected_identity,
+            );
             return;
         }
         if let Some(file) = summary
@@ -254,52 +530,128 @@ impl AgentsViewMode {
             .and_then(Value::as_str)
             .filter(|file| !file.is_empty())
         {
-            self.selection = Some(SessionSelection::Resume(PathBuf::from(file)));
-            self.running = false;
+            self.finish_open(
+                SessionSelection::Resume(PathBuf::from(file)),
+                row,
+                ancestors,
+                status_message,
+                selected_identity,
+            );
             return;
         }
         self.status =
             Some("Cannot open agent without an active runtime or saved session file".to_string());
     }
 
+    /// Record the open outcome (TS the run result the loop consumes): the
+    /// selection plus the row metadata the flow and the session carry.
+    fn finish_open(
+        &mut self,
+        selection: SessionSelection,
+        row: &AgentsViewRow,
+        ancestors: Vec<String>,
+        status_message: Option<String>,
+        selected_identity: Option<String>,
+    ) {
+        let key = crate::agents_view_forest::selection_key(&row.summary);
+        let has_children = has_session_children(&self.records(), &key);
+        self.opened = Some(OpenedRow {
+            selection,
+            expanded_ancestors: ancestors,
+            selected_row_identity: selected_identity.unwrap_or_else(|| row.identity.clone()),
+            selected_key: key,
+            rlm_depth: row
+                .summary
+                .get("rlmDepth")
+                .and_then(Value::as_u64)
+                .map(|depth| depth as u32),
+            has_children,
+            status_message,
+        });
+        self.running = false;
+    }
+
     /// Hand the terminal back to the scope root's session (TS
-    /// `finish({ type: "open", summary: backSession })`): the scoped view
-    /// detaches and reattaches the session it was opened from.
-    fn open_scope_root(&mut self) {
+    /// `finish({ type: "scope_back" })` when `pop`: the scoped view
+    /// detaches and the flow pops the scope frame — the return chat it
+    /// opened from reopens, and a later agents-back lands in the parent
+    /// scope. Escape reopens the same session without popping the frame.
+    fn open_scope_root(&mut self, pop: bool) {
         let Some(scope) = self.options.scope.clone() else {
             return;
         };
-        if let Some(active) = scope.active_session_id.clone().filter(|id| !id.is_empty()) {
-            self.selection = Some(SessionSelection::Attach(active));
+        let Some(active) = scope.active_session_id.clone().filter(|id| !id.is_empty()) else {
+            // No runtime to return to: the flow reopens the view (TS
+            // scope_back without a return chat continues the loop).
+            self.scope_popped = pop;
             self.running = false;
-        }
+            return;
+        };
+        self.scope_popped = pop;
+        let summary = self
+            .records()
+            .iter()
+            .map(crate::agents_view_state::summary_for_record)
+            .find(|summary| {
+                summary.get("activeSessionId").and_then(Value::as_str) == Some(active.as_str())
+            })
+            .unwrap_or_default();
+        let key = crate::agents_view_forest::selection_key(&summary);
+        let has_children = has_session_children(&self.records(), &key);
+        self.opened = Some(OpenedRow {
+            selection: SessionSelection::Attach(active),
+            expanded_ancestors: scope_ancestors(&self.records(), &scope),
+            selected_row_identity: self.selected_identity.clone().unwrap_or_default(),
+            selected_key: self.selected_key.clone().unwrap_or_default(),
+            rlm_depth: summary
+                .get("rlmDepth")
+                .and_then(Value::as_u64)
+                .map(|depth| depth as u32),
+            has_children,
+            status_message: None,
+        });
+        self.running = false;
     }
 
     /// Handle one key id. Returns the status-line override when the caller
     /// should surface one (none of the PR-2 actions do).
     fn handle_key(&mut self, key: &str) {
         self.exit_armed = false;
+        let selected = self.rows.get(self.selected).cloned();
+        let has_query = !self.query.is_empty();
         match key {
             "up" => self.move_selection(-1),
             "down" => self.move_selection(1),
             "pageUp" => self.move_selection(-(self.rows.len() as isize).min(10)),
             "pageDown" => self.move_selection((self.rows.len() as isize).min(10)),
             // TS `app.agents.open` (right) and the editor submit (enter)
-            // both open the selection; search text is never a prompt.
+            // both open the selection (a non-empty query still opens while
+            // the cursor sits at its end — always true for this editor);
+            // the summary row toggles its list instead.
             "enter" | "right" => self.open_selected(),
+            // TS `app.agents.expand` (alt+right): toggle the selected
+            // parent's list when it has children.
+            "alt+right" if !has_query => {
+                if let Some(row) = selected {
+                    if row.kind == RowKind::SubagentSummary || row.descendant_count > 0 {
+                        self.toggle_subagent_list(&row);
+                    }
+                }
+            }
             // TS `app.agents.new`: ctrl+n starts a session; a plain "n" is
             // search text like any other character.
             "ctrl+n" => {
-                self.selection = Some(SessionSelection::New);
+                self.opened = None;
                 self.running = false;
+                self.new_session = true;
             }
             // The scoped view's parent key (TS `app.agents.back`): left
-            // hands the terminal back to the scope root's session; the
-            // global view has no hierarchy parent and consumes left
-            // without opening a chat (TS onEscape handles escape alone).
-            "left" => {
+            // hands the terminal back to the scope root's session and pops
+            // the scope; the global view has no hierarchy parent and
+            // consumes left without opening a chat.
+            "left" if !has_query => {
                 if self.scope_active {
-                    self.open_scope_root();
+                    self.open_scope_root(true);
                 }
             }
             "escape" => {
@@ -307,7 +659,9 @@ impl AgentsViewMode {
                     self.query.clear();
                     self.rebuild_rows();
                 } else if self.scope_active {
-                    self.open_scope_root();
+                    // TS escape reopens the last-opened session (the scope
+                    // root in this flow) without touching the scope frame.
+                    self.open_scope_root(false);
                 } else {
                     self.running = false;
                 }
@@ -434,6 +788,10 @@ impl AgentsViewMode {
     }
 
     /// The sectioned session list (legend header, section headings, rows).
+    /// Nested rows (summary rows and expanded subagents) render inside
+    /// their top-level agent's section block, and the headings count
+    /// top-level agents only (TS `getDisplayRowsForSection` /
+    /// `countRowsBySection`).
     fn render_list(&mut self, width: usize, max_rows: usize) -> Vec<Line> {
         if max_rows == 0 {
             return Vec::new();
@@ -457,22 +815,31 @@ impl AgentsViewMode {
             vec![],
         ];
         for section in [Section::Running, Section::Idle, Section::Inactive] {
-            let rows: Vec<&AgentsViewRow> = self
-                .rows
-                .iter()
-                .filter(|row| row.section == section)
-                .collect();
-            if rows.is_empty() {
+            let mut block: Vec<&AgentsViewRow> = Vec::new();
+            let mut include = false;
+            for row in &self.rows {
+                if row.depth == 0 {
+                    include = row.kind == RowKind::Agent && row.section == section;
+                }
+                if include {
+                    block.push(row);
+                }
+            }
+            if block.is_empty() {
                 continue;
             }
             if lines.len() > 2 {
                 lines.push(vec![]);
             }
+            let top_level = block
+                .iter()
+                .filter(|row| row.kind == RowKind::Agent)
+                .count();
             lines.push(vec![self.theme.fg(
                 ThemeColor::Muted,
-                format!("{} ({})", section_title(section), rows.len()),
+                format!("{} ({})", section_title(section), top_level),
             )]);
-            for row in rows {
+            for row in block {
                 lines.push(self.render_row(row, &layout, width));
             }
         }
@@ -482,12 +849,28 @@ impl AgentsViewMode {
         lines
     }
 
-    /// One session row: icon, title, model, activity, cost/age; the
-    /// selected row carries the selection background.
+    /// One session row (TS `renderRow`): the summary rows render their
+    /// `▸/▾ title` cell over the full width; agent rows render icon, title
+    /// (nested rows indented), model, activity, cost/age. The selected row
+    /// carries the selection background.
     fn render_row(&self, row: &AgentsViewRow, layout: &RowLayout, width: usize) -> Line {
         let theme = &self.theme;
         let selected = Some(row.identity.as_str())
             == self.rows.get(self.selected).map(|r| r.identity.as_str());
+        if row.kind == RowKind::SubagentSummary {
+            // TS: `formatTableCell(`${indent}${expanded ? "▾" : "▸"} ${title}`, width)`.
+            let indent = "  ".repeat(row.depth);
+            let marker = if row.expanded { "\u{25be}" } else { "\u{25b8}" };
+            let text = format!("{indent}{marker} {}", row.title);
+            let mut line: Line = vec![crate::Span::raw(crate::agents_view_state::truncate_text(
+                &text, width,
+            ))];
+            line = pad_line(line, width);
+            if selected {
+                return theme.bg_paint(ThemeBg::SelectedBg, line);
+            }
+            return line;
+        }
         let icon = match row.section {
             Section::Running => ["\u{25c7}", "\u{25c8}", "\u{25c6}", "\u{25c8}"][self.pulse % 4],
             _ => "\u{2022}",
@@ -500,25 +883,34 @@ impl AgentsViewMode {
         let icon_style = theme
             .fg_style(icon_color)
             .add_modifier(ratatui::style::Modifier::BOLD);
-        // TS `renderRow`: `icon title` padded to the name column, then the
-        // model and activity cells, then the dim cost/age details.
+        // TS `renderRow`: `${"  ".repeat(depth)}${icon} ${title}` padded to
+        // the name column, then the model and activity cells, then the dim
+        // cost/age details.
         let named = row
             .summary
             .get("sessionName")
             .and_then(Value::as_str)
             .map(|name| !name.trim().is_empty())
             .unwrap_or(false);
+        let indent = "  ".repeat(row.depth);
+        let indent_width = str_width(&indent);
         let mut line: Line = Vec::new();
+        if indent_width > 0 {
+            line.push(crate::Span::raw(indent));
+        }
         line.push(crate::Span::styled(icon, icon_style));
         line.push(crate::Span::styled(
             " ".to_string(),
             ratatui::style::Style::default(),
         ));
-        // TS `formatTableCell(title, nameWidth)`: the name cell (icon +
-        // title) clips to the column width, so a long session name can
-        // never push the model, activity, and cost/age columns off-screen.
-        // The icon and its space take the first two cells of the column.
-        let title = truncate_text(&row.title, layout.name_width.saturating_sub(2));
+        // TS `formatTableCell(title, nameWidth)`: the name cell (indent +
+        // icon + title) clips to the column width, so a long session name
+        // can never push the model, activity, and cost/age columns
+        // off-screen. The icon and its space take the first two cells.
+        let title = truncate_text(
+            &row.title,
+            layout.name_width.saturating_sub(2 + indent_width),
+        );
         line.push(crate::Span::styled(
             title.clone(),
             if named {
@@ -530,7 +922,11 @@ impl AgentsViewMode {
             },
         ));
         line.push(crate::Span::styled(
-            " ".repeat(layout.name_width.saturating_sub(str_width(&title) + 2)),
+            " ".repeat(
+                layout
+                    .name_width
+                    .saturating_sub(str_width(&title) + 2 + indent_width),
+            ),
             ratatui::style::Style::default(),
         ));
         line.push(crate::Span::styled(
@@ -575,11 +971,23 @@ impl AgentsViewMode {
             return truncate_line(vec![theme.fg(ThemeColor::Error, status.clone())], width);
         }
         // TS keyText glyphs: up/down render as arrows, right as →, ctrl+n as
-        // Ctrl+N; the scoped view adds the parent-back hint.
+        // Ctrl+N. The summary row swaps the open action for expand/collapse
+        // (TS `renderHints`'s `rightAction`); the scoped view adds the
+        // parent-back hint.
+        let right_action = match self.rows.get(self.selected) {
+            Some(row) if row.kind == RowKind::SubagentSummary => {
+                if row.expanded {
+                    "collapse"
+                } else {
+                    "expand"
+                }
+            }
+            _ => "open",
+        };
         let hints = if self.scope_active {
-            "\u{2191}/\u{2193} navigate   Enter/\u{2192} open   \u{2190} parent   Ctrl+N new"
+            format!("\u{2191}/\u{2193} navigate   Enter/\u{2192} {right_action}   \u{2190} parent   Ctrl+N new")
         } else {
-            "\u{2191}/\u{2193} navigate   Enter/\u{2192} open   Ctrl+N new"
+            format!("\u{2191}/\u{2193} navigate   Enter/\u{2192} {right_action}   Ctrl+N new")
         };
         truncate_line(vec![theme.fg(ThemeColor::Muted, hints.to_string())], width)
     }
@@ -825,7 +1233,12 @@ pub async fn run_agents_view(
         if let Some(input) = first_input(&mut pending) {
             match input {
                 UiInput::Key(key) => mode.handle_key(&key),
-                UiInput::Settled | UiInput::Done => {}
+                UiInput::Settled => {}
+                // The headless plan ended: the run stops here (the
+                // interactive harness's `HeadlessDone` contract). A plan
+                // that ends without an exit key still captures its frames
+                // and returns instead of spinning forever.
+                UiInput::Done => mode.running = false,
             }
             if let Renderer::Terminal(_) = renderer {
                 renderer.draw(&mut mode);
@@ -872,7 +1285,7 @@ pub async fn run_agents_view(
     }
     // A selection hands the pane to the chat it opened (TS `result.type !== "exit"`);
     // exiting releases the alternate screen.
-    let frames = renderer.finish(mode.selection.is_some());
+    let frames = renderer.finish(mode.opened.is_some() || mode.new_session);
     let _ = client
         .request(DaemonCommand::RosterUnsubscribe {
             id: None,
@@ -883,13 +1296,28 @@ pub async fn run_agents_view(
     // A selection hands the terminal to a session run: the process keeps
     // going, so retire the watchdog. A selection-less exit ends the
     // process, where the deadline dies with it — or fires if it wedged.
-    if mode.selection.is_some() {
+    if mode.opened.is_some() || mode.new_session {
         exit_guard.cancel();
     }
+    let opened = mode.opened.take();
     Ok(AgentsViewOutcome {
-        selection: mode.selection,
+        selection: opened
+            .as_ref()
+            .map(|row| row.selection.clone())
+            .or(mode.new_session.then_some(SessionSelection::New)),
         frames,
         query: (!mode.query.is_empty()).then(|| mode.query.clone()),
+        scope_popped: mode.scope_popped,
+        scope_dropped: mode.scope_dropped,
+        expanded_ancestors: opened
+            .as_ref()
+            .map(|row| row.expanded_ancestors.clone())
+            .unwrap_or_default(),
+        selected_row_identity: opened.as_ref().map(|row| row.selected_row_identity.clone()),
+        selected_key: opened.as_ref().map(|row| row.selected_key.clone()),
+        opened_rlm_depth: opened.as_ref().and_then(|row| row.rlm_depth),
+        opened_has_children: opened.as_ref().map(|row| row.has_children).unwrap_or(false),
+        status_message: opened.as_ref().and_then(|row| row.status_message.clone()),
     })
 }
 
@@ -919,6 +1347,10 @@ mod tests {
             anchor_session_id: None,
             scope: None,
             query: None,
+            expanded_ancestors: Vec::new(),
+            selected_row_identity: None,
+            selected_key: None,
+            status_message: None,
         });
         let row = |title: &str| AgentsViewRow {
             section: Section::Idle,
@@ -930,6 +1362,12 @@ mod tests {
             activity: "idle now".to_string(),
             cost: 0.0,
             age: "1s".to_string(),
+            depth: 0,
+            descendant_count: 0,
+            running_subagent_count: 0,
+            expanded: false,
+            parent_identity: None,
+            kind: RowKind::Agent,
         };
         mode.rows = vec![row("holder"), row(title)];
         (mode, 1)
@@ -979,5 +1417,237 @@ mod tests {
         let text = flat(&line);
         let name_cell = format!("short name{}", " ".repeat(28 - 2 - 10));
         assert_eq!(text, expected_row(&name_cell, &layout));
+    }
+
+    fn roster_entry(agent: &str, status: &str, summary: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "agentId": agent, "status": status, "summary": summary })
+    }
+
+    fn parent_summary(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "sessionId": id,
+            "activeSessionId": format!("{id}-live"),
+            "sessionFile": format!("/x/{id}.jsonl"),
+            "runtimeKind": "top-level",
+            "sessionName": format!("{id} name"),
+            "messageCount": 2,
+            "rlmDepth": 0,
+        })
+    }
+
+    fn child_summary(id: &str, parent: &str, name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "sessionId": id,
+            "activeSessionId": format!("{id}-live"),
+            "sessionFile": format!("/x/{id}.jsonl"),
+            "runtimeKind": "subagent",
+            "rlmChildId": format!("child-{id}"),
+            "parentActiveSessionId": format!("{parent}-live"),
+            "parentSessionId": parent,
+            "parentSessionPath": format!("/x/{parent}.jsonl"),
+            "sessionName": name,
+            "messageCount": 1,
+            "rlmDepth": 1,
+        })
+    }
+
+    /// A mode over a live parent/child roster, no scope, fresh selection.
+    fn mode_with_parent_and_child() -> AgentsViewMode {
+        let mut mode = AgentsViewMode::new(AgentsViewOptions {
+            socket_path: PathBuf::from("/tmp/agents-view-test.sock"),
+            cwd: PathBuf::from("/tmp"),
+            session_dir: None,
+            theme: "prime".to_string(),
+            version: "0.0.0".to_string(),
+            anchor_session_id: None,
+            scope: None,
+            query: None,
+            expanded_ancestors: Vec::new(),
+            selected_row_identity: None,
+            selected_key: None,
+            status_message: None,
+        });
+        mode.roster = vec![
+            roster_entry("p", "idle", parent_summary("p")),
+            roster_entry("c", "running", child_summary("c", "p", "worker one")),
+        ];
+        mode.rebuild_rows();
+        mode
+    }
+
+    #[test]
+    fn alt_right_toggles_the_subagent_list() {
+        let mut mode = mode_with_parent_and_child();
+        // Collapsed: the parent, its summary row, nothing else.
+        assert_eq!(mode.rows.len(), 2);
+        assert_eq!(mode.rows[1].kind, RowKind::SubagentSummary);
+        assert!(!mode.rows[1].expanded);
+        // alt+right on the parent row (descendantCount > 0) expands.
+        mode.handle_key("alt+right");
+        assert_eq!(mode.rows.len(), 3);
+        assert!(mode.rows[1].expanded);
+        assert_eq!(mode.rows[2].kind, RowKind::Subagent);
+        assert_eq!(mode.rows[2].depth, 1);
+        // alt+right again collapses.
+        mode.handle_key("alt+right");
+        assert_eq!(mode.rows.len(), 2);
+        assert!(!mode.rows[1].expanded);
+    }
+
+    #[test]
+    fn enter_toggles_the_summary_row_and_drills_into_a_child() {
+        let mut mode = mode_with_parent_and_child();
+        // The selection starts on the parent; down lands on the summary
+        // row, and Enter toggles it (TS `openSelected` on a summary row).
+        mode.handle_key("down");
+        assert_eq!(mode.rows[mode.selected].kind, RowKind::SubagentSummary);
+        mode.handle_key("enter");
+        assert_eq!(mode.rows.len(), 3);
+        assert!(mode.rows[1].expanded);
+        // Enter on the summary row again collapses.
+        mode.handle_key("enter");
+        assert_eq!(mode.rows.len(), 2);
+        // Expand, walk to the child, drill in (TS `openSelectedSubagent`).
+        mode.handle_key("enter");
+        mode.handle_key("down");
+        assert_eq!(mode.rows[mode.selected].kind, RowKind::Subagent);
+        mode.handle_key("enter");
+        let opened = mode.opened.as_ref().expect("open recorded");
+        assert_eq!(
+            opened.selection,
+            SessionSelection::Attach("c-live".to_string())
+        );
+        // The drill-in carries the ancestor chain for the return
+        // re-expansion and the child's depth for its tray label.
+        assert_eq!(opened.expanded_ancestors, vec!["p".to_string()]);
+        assert_eq!(opened.rlm_depth, Some(1));
+        // The child itself has no children in this fixture.
+        assert!(!opened.has_children);
+        assert!(!mode.running);
+    }
+
+    #[test]
+    fn pending_ancestors_expand_and_selection_restores_after_reentry() {
+        // A fresh run carrying the drilled-in child's return state (TS
+        // `pendingExpandedAncestorSessionIds` + the persisted selection).
+        let mut mode = AgentsViewMode::new(AgentsViewOptions {
+            socket_path: PathBuf::from("/tmp/agents-view-test.sock"),
+            cwd: PathBuf::from("/tmp"),
+            session_dir: None,
+            theme: "prime".to_string(),
+            version: "0.0.0".to_string(),
+            anchor_session_id: None,
+            scope: None,
+            query: None,
+            expanded_ancestors: vec!["p".to_string()],
+            selected_row_identity: None,
+            selected_key: Some(crate::agents_view_forest::SelectionKey {
+                session_id: Some("c".to_string()),
+                active_session_id: Some("c-live".to_string()),
+            }),
+            status_message: None,
+        });
+        mode.roster = vec![
+            roster_entry("p", "idle", parent_summary("p")),
+            roster_entry("c", "running", child_summary("c", "p", "worker one")),
+        ];
+        mode.rebuild_rows();
+        // The ancestor expansion opened the parent's list and the child
+        // row's selection restored.
+        assert_eq!(mode.rows.len(), 3);
+        assert!(mode.rows[1].expanded);
+        assert_eq!(mode.rows[mode.selected].title, "worker one");
+    }
+
+    #[test]
+    fn scoped_left_returns_the_root_and_pops_the_scope() {
+        let mut mode = AgentsViewMode::new(AgentsViewOptions {
+            socket_path: PathBuf::from("/tmp/agents-view-test.sock"),
+            cwd: PathBuf::from("/tmp"),
+            session_dir: None,
+            theme: "prime".to_string(),
+            version: "0.0.0".to_string(),
+            anchor_session_id: None,
+            scope: Some(AgentsViewScope {
+                session_id: Some("p".to_string()),
+                active_session_id: Some("p-live".to_string()),
+                session_name: Some("p name".to_string()),
+            }),
+            query: None,
+            expanded_ancestors: Vec::new(),
+            selected_row_identity: None,
+            selected_key: None,
+            status_message: None,
+        });
+        mode.roster = vec![
+            roster_entry("p", "idle", parent_summary("p")),
+            roster_entry("c", "running", child_summary("c", "p", "worker one")),
+        ];
+        mode.rebuild_rows();
+        // The scoped view lists the direct child as a top-level row.
+        assert!(mode.scope_active);
+        assert_eq!(mode.rows.len(), 1);
+        assert_eq!(mode.rows[0].kind, RowKind::Agent);
+        // The parent key hands the terminal back to the scope root and
+        // marks the scope popped for the flow.
+        mode.handle_key("left");
+        assert!(mode.scope_popped);
+        let opened = mode.opened.as_ref().expect("scope-back open");
+        assert_eq!(
+            opened.selection,
+            SessionSelection::Attach("p-live".to_string())
+        );
+        // The scope root has no ancestors of its own, so nothing
+        // re-expands after the return chat.
+        assert!(opened.expanded_ancestors.is_empty());
+    }
+
+    #[test]
+    fn unattachable_child_opens_its_root_with_a_status() {
+        let mut mode = mode_with_parent_and_child();
+        // A finished child with no runtime and no file resolves to its
+        // top-level ancestor (TS `createUnattachableChildOpenResult`).
+        let unattachable = serde_json::json!({
+            "sessionId": "gc",
+            "runtimeKind": "subagent",
+            "rlmChildId": "child-gc",
+            "rlmDepth": 2,
+            "parentActiveSessionId": "c-live",
+            "parentSessionId": "c",
+            "sessionName": "lost grandchild",
+            "messageCount": 1,
+        });
+        mode.roster
+            .push(roster_entry("gc", "inactive", unattachable));
+        mode.expanded_parents.insert("file:/x/p.jsonl".to_string());
+        mode.rebuild_rows();
+        // The child row's identity comes from the roster-qualified id.
+        let child_identity = mode
+            .rows
+            .iter()
+            .find(|row| row.title == "worker one")
+            .expect("child row renders")
+            .identity
+            .clone();
+        mode.expanded_parents.insert(child_identity);
+        mode.rebuild_rows();
+        let grandchild = mode
+            .rows
+            .iter()
+            .position(|row| row.title == "lost grandchild")
+            .expect("grandchild row renders");
+        mode.selected = grandchild;
+        mode.handle_key("enter");
+        let opened = mode.opened.as_ref().expect("open recorded");
+        // The parent chain's root session opens instead, with the child
+        // row kept for the selection restore and a status message.
+        assert_eq!(
+            opened.selection,
+            SessionSelection::Attach("p-live".to_string())
+        );
+        assert_eq!(
+            opened.status_message.as_deref(),
+            Some("Child session is unavailable; opened its parent instead")
+        );
     }
 }

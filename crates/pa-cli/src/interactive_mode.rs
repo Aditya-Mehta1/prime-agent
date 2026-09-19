@@ -344,10 +344,19 @@ fn print_resume_hint(hint: &Option<String>) {
 /// `/resume <selector>` chain runs its target before the loop decides again.
 async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) -> Result<()> {
     let mut anchor = anchor;
-    let mut scope: Option<pa_tui::agents_view::AgentsViewScope> = None;
-    // TS `AgentsViewPersistentState.query`: a chat opened from a filtered
-    // roster re-enters the view with the same query typed.
+    // The view/session loop's carried state (TS `AgentsViewPersistentState`):
+    // a stack of scope frames (the scope plus the return chat each was
+    // opened from), the typed query, the drilled-in row's ancestors to
+    // re-expand, and the selected row's identity and key.
+    let mut frames: Vec<(
+        pa_tui::agents_view::AgentsViewScope,
+        Option<SessionSelection>,
+    )> = Vec::new();
     let mut query: Option<String> = None;
+    let mut expanded_ancestors: Vec<String> = Vec::new();
+    let mut selected_row_identity: Option<String> = None;
+    let mut selected_key: Option<pa_tui::agents_view::AgentsViewSelectionKey> = None;
+    let mut status_message: Option<String> = None;
     loop {
         let view_options = pa_tui::agents_view::AgentsViewOptions {
             socket_path: base.socket_path.clone(),
@@ -356,20 +365,40 @@ async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) 
             theme: base.theme.clone(),
             version: base.version.clone(),
             anchor_session_id: anchor.clone(),
-            scope: scope.take(),
+            scope: frames.last().map(|(scope, _)| scope.clone()),
             query: query.clone(),
+            expanded_ancestors: expanded_ancestors.clone(),
+            selected_row_identity: selected_row_identity.clone(),
+            selected_key: selected_key.clone(),
+            status_message: status_message.take(),
         };
         let view = pa_tui::agents_view::run_agents_view(
             view_options,
             pa_tui::agents_view::AgentsViewUiMode::Terminal,
         )
         .await?;
+        // A dropped scope root or the view's parent key pops the frame (TS
+        // `resolveAgentsViewScopeFrames` / the `scope_back` arm), so a later
+        // agents-back lands in the parent scope; both clear the query.
+        let scope_frame_popped = view.scope_dropped || view.scope_popped;
+        if scope_frame_popped {
+            frames.pop();
+        }
         let Some(selection) = view.selection else {
             return Ok(());
         };
-        query = view.query;
+        expanded_ancestors = view.expanded_ancestors.clone();
+        selected_row_identity = view.selected_row_identity.clone();
+        selected_key = view.selected_key.clone();
+        status_message = view.status_message.clone();
+        query = if scope_frame_popped { None } else { view.query };
+        // The opened row's depth metadata rides the session run (TS
+        // `sessionDepth`/`sessionHasChildren`): a drilled-in child renders
+        // its `depth N` tray label.
         let mut session_options = base.clone();
         session_options.session = selection;
+        session_options.session_rlm_depth = view.opened_rlm_depth;
+        session_options.session_has_children = view.opened_has_children;
         let outcome =
             pa_tui::interactive::run_interactive(session_options, UiMode::Terminal).await?;
         anchor = Some(outcome.session_id.clone());
@@ -377,15 +406,17 @@ async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) 
             print_resume_hint(&outcome.resume_hint);
             return Ok(());
         }
-        // The subagent summary line's open action reopens the view scoped
-        // to the session it was opened from; the plain agents-back handoff
-        // reopens the global view. A scoped open clears the persistent
-        // query (TS agents-view-mode `scoped_agents_view` arm sets
-        // `persistentState.query = ""`): the scope already narrows the
-        // list, and the filter typed to find the session would otherwise
-        // hide the subtree.
-        scope = outcome.agents_view_scope;
-        if scope.is_some() {
+        if let Some(scope) = outcome.agents_view_scope {
+            // The session's subagent summary line opened the agents view
+            // scoped to its subtree: push a frame with the session as the
+            // return chat (TS `transitionAgentsViewScope` push arm) and
+            // clear the query — the scope already narrows the list, and a
+            // filter typed to find the session would hide the subtree.
+            frames.retain(|(frame, _)| frame.session_id != scope.session_id);
+            frames.push((
+                scope,
+                Some(SessionSelection::Attach(outcome.active_session_id.clone())),
+            ));
             query = None;
         }
         // `/resume <selector>` routes straight to that session before the
@@ -400,8 +431,12 @@ async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) 
                 print_resume_hint(&outcome.resume_hint);
                 return Ok(());
             }
-            scope = outcome.agents_view_scope;
-            if scope.is_some() {
+            if let Some(scope) = outcome.agents_view_scope {
+                frames.retain(|(frame, _)| frame.session_id != scope.session_id);
+                frames.push((
+                    scope,
+                    Some(SessionSelection::Attach(outcome.active_session_id.clone())),
+                ));
                 query = None;
             }
             pending = outcome.selection_request;
@@ -523,6 +558,11 @@ fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<Inter
             agent_dir: config.agent_dir.clone(),
         })),
         keybindings,
+        // RLM depth metadata comes from the agents view when it opens a row
+        // (TS `sessionDepth`/`sessionHasChildren`); a direct CLI session is
+        // a root run.
+        session_rlm_depth: None,
+        session_has_children: false,
     })
 }
 

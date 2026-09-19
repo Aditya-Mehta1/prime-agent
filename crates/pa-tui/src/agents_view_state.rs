@@ -28,7 +28,7 @@ pub fn section_title(section: Section) -> &'static str {
     }
 }
 
-fn section_rank(section: Section) -> u8 {
+pub(crate) fn section_rank(section: Section) -> u8 {
     match section {
         Section::Running => 0,
         Section::Idle => 1,
@@ -297,6 +297,11 @@ pub fn summary_for_record(record: &UnifiedRecord) -> Value {
             "lifecycle": "archived",
             "activity": "idle",
             "isSessionActive": false,
+            // TS synthesizes the runtime kind from the saved depth (a saved
+            // child with a parent path but no depth is depth 1).
+            "runtimeKind": if saved.get("rlmDepth").and_then(Value::as_u64)
+                .unwrap_or(if saved.get("parentSessionPath").is_some() { 1 } else { 0 })
+                > 0 { "subagent" } else { "top-level" },
             "cwd": saved.get("cwd").cloned().unwrap_or(Value::Null),
             "sessionFile": saved.get("path").cloned().unwrap_or(Value::Null),
             "parentSessionPath": saved.get("parentSessionPath").cloned().unwrap_or(Value::Null),
@@ -324,43 +329,70 @@ fn json_model(model: &Value) -> Value {
 /// Hide abandoned empty catalog rows (TS `filterEmptyAgentsViewSessions`):
 /// an inactive row with no messages, name, usage, or transcript stays out
 /// unless the session is the view's anchor.
-pub fn filter_empty_sessions(
-    records: &[UnifiedRecord],
-    anchor: Option<&str>,
-) -> Vec<UnifiedRecord> {
+pub fn filter_empty_sessions(records: &[UnifiedRecord], preserved: &[&str]) -> Vec<UnifiedRecord> {
+    // Ancestors of every kept row stay visible (TS filterEmpty… retains the
+    // parent chain): nesting must never orphan a child whose parent record
+    // looks empty.
+    let by_alias: HashMap<&str, usize> = records
+        .iter()
+        .enumerate()
+        .flat_map(|(index, record)| {
+            record
+                .aliases
+                .iter()
+                .map(move |alias| (alias.as_str(), index))
+        })
+        .collect();
+    let mut retained = vec![false; records.len()];
+    let keep = |index: usize, retained: &mut Vec<bool>| {
+        let mut current = Some(index);
+        while let Some(position) = current {
+            if retained[position] {
+                break;
+            }
+            retained[position] = true;
+            current = parent_keys(&records[position])
+                .iter()
+                .find_map(|key| by_alias.get(key.as_str()))
+                .copied();
+        }
+    };
+    for (index, record) in records.iter().enumerate() {
+        let summary = summary_for_record(record);
+        let keep_row = record.section != Section::Inactive
+            || get_str(&summary, "activeSessionId").is_some()
+            || summary.get("isSessionActive") == Some(&Value::Bool(true))
+            || summary
+                .get("attachedClients")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                > 0
+            || summary
+                .get("messageCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                > 0
+            || get_str(&summary, "sessionName").is_some()
+            || get_str(&summary, "firstMessage")
+                .map(|text| !text.trim().is_empty() && text.trim() != "(no messages)")
+                .unwrap_or(false)
+            || summary
+                .get("usage")
+                .and_then(|usage| usage.get("cost"))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                > 0.0
+            || crate::agents_view_forest::is_subagent_summary(&summary)
+            || get_str(&summary, "sessionId").is_some_and(|id| preserved.contains(&id));
+        if keep_row {
+            keep(index, &mut retained);
+        }
+    }
     records
         .iter()
-        .filter(|record| {
-            let summary = summary_for_record(record);
-            let keep = record.section != Section::Inactive
-                || get_str(&summary, "activeSessionId").is_some()
-                || summary.get("isSessionActive") == Some(&Value::Bool(true))
-                || summary
-                    .get("attachedClients")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0)
-                    > 0
-                || summary
-                    .get("messageCount")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0)
-                    > 0
-                || get_str(&summary, "sessionName").is_some()
-                || summary
-                    .get("firstMessage")
-                    .and_then(Value::as_str)
-                    .map(|text| !text.trim().is_empty() && text.trim() != "(no messages)")
-                    .unwrap_or(false)
-                || summary
-                    .get("usage")
-                    .and_then(|usage| usage.get("cost"))
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0)
-                    > 0.0
-                || get_str(&summary, "sessionId").is_some_and(|id| Some(id) == anchor);
-            keep
-        })
-        .cloned()
+        .enumerate()
+        .filter(|(index, _)| retained[*index])
+        .map(|(_, record)| record.clone())
         .collect()
 }
 
@@ -609,7 +641,7 @@ fn iso_to_unix_ms(iso: &str) -> Option<i64> {
     Some(((days * 86_400 + hour * 3_600 + minute * 60 + second) * 1000) + millis)
 }
 
-fn timestamp_ms(value: Option<&str>) -> i64 {
+pub(crate) fn timestamp_ms(value: Option<&str>) -> i64 {
     value.and_then(iso_to_unix_ms).unwrap_or(0)
 }
 
@@ -631,242 +663,6 @@ pub fn relative_age(value: Option<&str>, now_ms: u64) -> String {
         return format!("{hours}h");
     }
     format!("{}d", hours / 24)
-}
-
-/// One rendered list row (the PR-2 flat shape: agent rows only; subagent
-/// nesting rows arrive with the RLM ledger surface).
-#[derive(Debug, Clone, PartialEq)]
-pub struct AgentsViewRow {
-    pub section: Section,
-    pub identity: String,
-    /// The merged summary the open action acts on.
-    pub summary: Value,
-    pub title: String,
-    pub status_label: String,
-    pub model: String,
-    /// The row's own activity text (`status · recap`).
-    pub activity: String,
-    pub cost: f64,
-    pub age: String,
-}
-
-/// The row title (TS `getAgentsViewSessionTitle`): name, first prompt, cwd
-/// basename, session id, id — first non-empty wins.
-pub fn session_title(summary: &Value) -> String {
-    let cwd_basename = get_str(summary, "cwd").map(|cwd| {
-        std::path::Path::new(cwd)
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_default()
-    });
-    for candidate in [
-        get_str(summary, "sessionName"),
-        get_str(summary, "firstMessage"),
-        cwd_basename.as_deref(),
-        get_str(summary, "sessionId"),
-        get_str(summary, "id"),
-    ] {
-        let normalized = candidate
-            .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
-            .unwrap_or_default();
-        if !normalized.is_empty() {
-            return normalized;
-        }
-    }
-    "Untitled agent".to_string()
-}
-
-/// The activity-side status label (TS `getSessionStatusLabel`, the fields
-/// the Rust summaries carry).
-fn session_status_label(summary: &Value) -> String {
-    if let Some(label) = get_str(summary, "statusLabel") {
-        return label.to_string();
-    }
-    if summary
-        .get("lastHeardFromAt")
-        .is_some_and(|value| !value.is_null())
-    {
-        return format!(
-            "last heard {}",
-            relative_age(get_str(summary, "lastHeardFromAt"), now_ms())
-        );
-    }
-    // A non-ready worker cannot report fresh runtime flags; its state is the row's story.
-    if let Some(state) = get_str(summary, "workerState") {
-        if state != "ready" {
-            return state.to_string();
-        }
-    }
-    if summary.get("isCompacting") == Some(&Value::Bool(true)) {
-        return "compacting".to_string();
-    }
-    if summary.get("isStreaming") == Some(&Value::Bool(true)) {
-        let running_tools = summary.get("isRunningTools") == Some(&Value::Bool(true));
-        return if running_tools {
-            "running tools".to_string()
-        } else {
-            "thinking".to_string()
-        };
-    }
-    if summary.get("isRunningTools") == Some(&Value::Bool(true)) {
-        return "running tools".to_string();
-    }
-    if summary.get("isBashRunning") == Some(&Value::Bool(true)) {
-        return "running bash".to_string();
-    }
-    if let Some(active) = summary
-        .get("sessionActions")
-        .and_then(|actions| actions.get("active"))
-        .filter(|active| !active.is_null())
-    {
-        if let Some(label) = active.get("label").and_then(Value::as_str) {
-            return label.to_string();
-        }
-        if let Some(kind) = active.get("kind").and_then(Value::as_str) {
-            return kind.replace('_', " ");
-        }
-    }
-    let queued = summary
-        .get("sessionActions")
-        .and_then(|actions| actions.get("queuedCount"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    if queued > 0 {
-        return format!("{queued} queued");
-    }
-    if get_str(summary, "lifecycle") == Some("archived") {
-        return "archived".to_string();
-    }
-    if summary.get("hasActiveHeartbeat") == Some(&Value::Bool(true)) {
-        return "heartbeat active".to_string();
-    }
-    if get_str(summary, "runtimeKind") == Some("subagent")
-        && summary.get("repliedSinceTask") == Some(&Value::Bool(true))
-    {
-        return "replied".to_string();
-    }
-    if get_str(summary, "activity") == Some("working") {
-        return "classifying".to_string();
-    }
-    if get_str(summary, "taskState") == Some("error") {
-        return "error".to_string();
-    }
-    match get_str(summary, "taskState") {
-        Some("completed") => "completed".to_string(),
-        _ => "needs input".to_string(),
-    }
-}
-
-/// The model column text: the bare model id plus `:level` when a thinking
-/// level is active ("off" reads as noise and stays bare).
-fn session_model(summary: &Value) -> String {
-    let Some(id) = get_str(summary, "model").or_else(|| {
-        summary
-            .get("model")
-            .and_then(|model| model.get("id"))
-            .and_then(Value::as_str)
-    }) else {
-        return "-".to_string();
-    };
-    let bare = id.rsplit('/').next().unwrap_or(id).to_string();
-    match get_str(summary, "thinkingLevel") {
-        Some(level) if level != "off" => format!("{bare}:{level}"),
-        _ => bare,
-    }
-}
-
-/// Build the flat section-sorted rows (TS `buildAgentsViewRows` +
-/// `compareAgentsViewRows` without the subagent forest).
-pub fn build_rows(records: &[UnifiedRecord], anchor: Option<&str>) -> Vec<AgentsViewRow> {
-    let now = now_ms();
-    let mut rows: Vec<AgentsViewRow> = records
-        .iter()
-        .map(|record| {
-            let summary = summary_for_record(record);
-            let title = session_title(&summary);
-            // TS renderRow: the status label shows only when the summary
-            // carries `lastHeardFromAt` (live subagent contact) or its own
-            // `statusLabel`; roster rows with neither render no activity.
-            let has_status_source = summary.get("lastHeardFromAt").is_some_and(|v| !v.is_null())
-                || summary.get("statusLabel").is_some_and(|v| !v.is_null());
-            let status = if has_status_source {
-                session_status_label(&summary)
-            } else {
-                String::new()
-            };
-            let recap = get_str(&summary, "summary").unwrap_or_default();
-            let activity = if recap.is_empty() {
-                status.clone()
-            } else {
-                format!("{status} · {recap}")
-            };
-            let age = relative_age(
-                if get_str(&summary, "activeSessionId").is_some() {
-                    get_str(&summary, "created").or_else(|| get_str(&summary, "modified"))
-                } else {
-                    get_str(&summary, "modified").or_else(|| get_str(&summary, "created"))
-                },
-                now,
-            );
-            AgentsViewRow {
-                section: record.section,
-                identity: record.identity.clone(),
-                cost: summary
-                    .get("usage")
-                    .and_then(|usage| usage.get("cost"))
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0),
-                title,
-                status_label: status,
-                model: session_model(&summary),
-                activity,
-                age,
-                summary,
-            }
-        })
-        .collect();
-    rows.sort_by(|a, b| compare_rows(a, b, anchor));
-    rows
-}
-
-fn compare_rows(a: &AgentsViewRow, b: &AgentsViewRow, anchor: Option<&str>) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    let section = section_rank(a.section).cmp(&section_rank(b.section));
-    if section != Ordering::Equal {
-        return section;
-    }
-    // Message-less rows sink to the bottom of their section (anchor exempt).
-    let empty = |row: &AgentsViewRow| {
-        row.summary
-            .get("messageCount")
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-            == 0
-            && Some(get_str(&row.summary, "sessionId").unwrap_or_default()) != anchor
-    };
-    let empty_rank = empty(a).cmp(&empty(b));
-    if empty_rank != Ordering::Equal {
-        return empty_rank;
-    }
-    if a.section != Section::Running {
-        let activity = timestamp_ms(get_str(&b.summary, "lastActivityAt"))
-            .cmp(&timestamp_ms(get_str(&a.summary, "lastActivityAt")));
-        if activity != Ordering::Equal {
-            return activity;
-        }
-    }
-    let created = timestamp_ms(get_str(&b.summary, "created"))
-        .cmp(&timestamp_ms(get_str(&a.summary, "created")));
-    if created != Ordering::Equal {
-        return created;
-    }
-    let title = a.title.cmp(&b.title);
-    if title != Ordering::Equal {
-        return title;
-    }
-    get_str(&a.summary, "sessionId")
-        .unwrap_or_default()
-        .cmp(get_str(&b.summary, "sessionId").unwrap_or_default())
 }
 
 /// The column layout of the list (TS `buildCompactAgentsViewLayout`).
@@ -901,7 +697,7 @@ pub(crate) fn truncate_text(value: &str, width: usize) -> String {
     out
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -916,7 +712,7 @@ fn pad_start(value: &str, width: usize) -> String {
 }
 
 /// Compute the compact column layout for the rows at `width`.
-pub fn build_layout(rows: &[AgentsViewRow], width: usize) -> RowLayout {
+pub fn build_layout(rows: &[crate::agents_view_forest::AgentsViewRow], width: usize) -> RowLayout {
     let cost_width = rows
         .iter()
         .map(|row| str_width(&format!("${:.2}", row.cost)))
@@ -973,69 +769,10 @@ pub fn build_layout(rows: &[AgentsViewRow], width: usize) -> RowLayout {
     }
 }
 
-/// The scope of a scoped agents view (TS `AgentsViewScopeKey` plus the
-/// display name): the subtree root the view lists descendants of.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AgentsViewScope {
-    pub session_id: Option<String>,
-    pub active_session_id: Option<String>,
-    pub session_name: Option<String>,
-}
-
-/// Restrict records to the scope root's descendants, excluding the root
-/// itself (TS `scopeToSessionSubtree` + the scoped row exclusion: the
-/// root's direct children list as top-level rows). The root resolves by
-/// session id or active session id; `None` means the scope root is gone
-/// and the caller falls back to the global list.
-pub fn scope_to_descendants(
-    records: &[UnifiedRecord],
-    scope: &AgentsViewScope,
-) -> Option<Vec<UnifiedRecord>> {
-    let summaries: Vec<Value> = records.iter().map(summary_for_record).collect();
-    let summary_refs: Vec<&Value> = summaries.iter().collect();
-    let root = summaries.iter().position(|summary| {
-        get_str(summary, "sessionId").is_some_and(|id| Some(id) == scope.session_id.as_deref())
-            || get_str(summary, "activeSessionId")
-                .is_some_and(|id| Some(id) == scope.active_session_id.as_deref())
-    })?;
-    let root_summary = &summaries[root];
-    let parent = crate::subagents::SessionIdentity::new(
-        get_str(root_summary, "activeSessionId").map(str::to_string),
-        get_str(root_summary, "sessionId").map(str::to_string),
-        get_str(root_summary, "sessionFile").map(str::to_string),
-    );
-    let positions: std::collections::HashSet<usize> =
-        crate::subagents::descendant_positions(&summary_refs, &parent)
-            .into_iter()
-            .collect();
-    Some(
-        records
-            .iter()
-            .enumerate()
-            .filter(|(position, _)| positions.contains(position))
-            .map(|(_, record)| record.clone())
-            .collect(),
-    )
-}
-
-/// The scope root's depth label (TS `getAgentsViewDepth`:
-/// `rlmDepth + 1`); `None` when the root is not in the record set.
-pub fn scope_depth(records: &[UnifiedRecord], scope: &AgentsViewScope) -> Option<u32> {
-    records
-        .iter()
-        .map(summary_for_record)
-        .find(|summary| {
-            get_str(summary, "sessionId").is_some_and(|id| Some(id) == scope.session_id.as_deref())
-                || get_str(summary, "activeSessionId")
-                    .is_some_and(|id| Some(id) == scope.active_session_id.as_deref())
-        })
-        .and_then(|summary| summary.get("rlmDepth").and_then(Value::as_u64))
-        .map(|depth| depth as u32 + 1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents_view_forest::session_title;
     use serde_json::json;
 
     fn roster_entry(agent: &str, status: &str, summary: Value) -> Value {
@@ -1075,13 +812,13 @@ mod tests {
         })];
         let records = reconcile_unified_sessions(&[], &saved);
         assert_eq!(records[0].section, Section::Inactive);
-        let filtered = filter_empty_sessions(&records, None);
+        let filtered = filter_empty_sessions(&records, &[]);
         assert_eq!(filtered.len(), 1);
-        // An empty unnamed saved row hides unless it is the anchor.
+        // An empty unnamed saved row hides unless it is preserved.
         let empty = vec![json!({ "id": "s3", "path": "/x/s3.jsonl", "messageCount": 0 })];
         let records = reconcile_unified_sessions(&[], &empty);
-        assert!(filter_empty_sessions(&records, None).is_empty());
-        assert_eq!(filter_empty_sessions(&records, Some("s3")).len(), 1);
+        assert!(filter_empty_sessions(&records, &[]).is_empty());
+        assert_eq!(filter_empty_sessions(&records, &["s3"]).len(), 1);
     }
 
     #[test]
@@ -1101,7 +838,13 @@ mod tests {
             "messageCount": 2,
         })];
         let records = reconcile_unified_sessions(&roster, &saved);
-        let rows = build_rows(&records, None);
+        let rows = crate::agents_view_forest::build_rows(
+            &records,
+            None,
+            &Default::default(),
+            &Default::default(),
+            None,
+        );
         assert_eq!(rows[0].section, Section::Running);
         assert_eq!(rows[1].section, Section::Idle);
         assert_eq!(rows[2].section, Section::Inactive);
@@ -1309,7 +1052,13 @@ mod tests {
             json!({ "sessionId": "s1", "usage": { "cost": 1.5 } }),
         )];
         let records = reconcile_unified_sessions(&roster, &[]);
-        let rows = build_rows(&records, None);
+        let rows = crate::agents_view_forest::build_rows(
+            &records,
+            None,
+            &Default::default(),
+            &Default::default(),
+            None,
+        );
         let layout = build_layout(&rows, 120);
         assert!(layout.legend.contains("Session"));
         assert!(layout.legend.contains("Model"));

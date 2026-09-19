@@ -60,6 +60,10 @@ pub struct ChromeState {
     pub context: Option<ContextUsage>,
     /// `← manage` hint: shown for persisted (attachable) sessions.
     pub show_manage: bool,
+    /// The attached session's RLM depth (TS `formatAgentDepthLabel`): a
+    /// subagent session renders `depth N` after the manage hint; a root
+    /// session (depth 0 or unknown) renders none.
+    pub tray_depth: Option<u32>,
     /// Thinking effort suffix rendered as `model:effort` in the tray.
     pub thinking_suffix: Option<String>,
     /// Startup warning (tmux keyboard setup), rendered as a status row.
@@ -381,6 +385,13 @@ pub fn render_tray(state: &ChromeState, theme: &Theme, width: usize) -> Line {
     } else if state.show_manage {
         left.push(Span::styled("\u{2190}".to_string(), dim));
         left.push(Span::styled(" manage".to_string(), muted));
+        // TS `getTrayLocationLabel`: a subagent session joins its
+        // `depth N` label onto the manage hint (a root session
+        // renders none).
+        if let Some(depth) = state.tray_depth.filter(|depth| *depth > 0) {
+            left.push(Span::styled("  ".to_string(), muted));
+            left.push(Span::styled(format!("depth {depth}"), muted));
+        }
     }
     let mut right: Line = Vec::new();
     if let Some(goal) = &state.goal_label {

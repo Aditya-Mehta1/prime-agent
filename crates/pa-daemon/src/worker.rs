@@ -1575,8 +1575,11 @@ impl Worker {
                 Err(error) => return response_failure(None, "create", &error.to_string(), None),
             },
             (Some(path), false) => {
-                let mut created =
-                    SessionFile::create(&cwd, parent_session_path.as_deref(), rlm_depth);
+                let mut created = SessionFile::create(
+                    &cwd,
+                    parent_session_path.as_deref(),
+                    rlm_depth.unwrap_or(0),
+                );
                 created.set_path(path.clone());
                 if let Err(error) = created.rewrite() {
                     return response_failure(None, "create", &error.to_string(), None);
@@ -1596,8 +1599,11 @@ impl Worker {
             }
             // In-memory session: no file, like the TS `noSession` create.
             (None, true) => {
-                let mut created =
-                    SessionFile::create(&cwd, parent_session_path.as_deref(), rlm_depth);
+                let mut created = SessionFile::create(
+                    &cwd,
+                    parent_session_path.as_deref(),
+                    rlm_depth.unwrap_or(0),
+                );
                 append_creation_prefix(
                     &mut created,
                     self.engine.as_ref(),
@@ -1608,8 +1614,11 @@ impl Worker {
                 created
             }
             (None, false) => {
-                let mut created =
-                    SessionFile::create(&cwd, parent_session_path.as_deref(), rlm_depth);
+                let mut created = SessionFile::create(
+                    &cwd,
+                    parent_session_path.as_deref(),
+                    rlm_depth.unwrap_or(0),
+                );
                 let path = session_dir.join(session_file_name(created.session_id()));
                 created.set_path(path);
                 if let Err(error) = created.rewrite() {
@@ -1685,8 +1694,17 @@ impl Worker {
         core.follow_up_mode = follow_up_mode;
         core.scoped_models = Vec::new();
         core.retry_abort_requested = false;
+        // The session's depth falls back to the opened file's header (TS
+        // `config.rlmDepth ?? header.rlmDepth`): a resumed saved subagent
+        // session keeps its persisted depth. The runtime kind stays the
+        // create's runtime identity (TS `metadata.kind`) — a resumed
+        // subagent file is a top-level runtime that merely carries its
+        // persisted depth, so the roster does not re-nest it under its
+        // original parent.
+        let rlm_depth = rlm_depth.or_else(|| core.store.as_ref().and_then(SessionFile::rlm_depth));
+        let rlm_depth = rlm_depth.unwrap_or(0);
         core.rlm_depth = rlm_depth;
-        core.runtime_kind = if rlm_depth > 0 || rlm_child_id.is_some() {
+        core.runtime_kind = if rlm_child_id.is_some() {
             "subagent".to_string()
         } else {
             "top-level".to_string()
@@ -2847,7 +2865,7 @@ fn worker_server_capabilities() -> Vec<String> {
 /// RLM depth fields of a create payload: `(depth, max_depth)`. Values must
 /// be non-negative integers that fit a u32; anything else fails the create
 /// instead of silently truncating.
-fn create_payload_rlm_depth(payload: &Value) -> Result<(u32, Option<u32>), String> {
+fn create_payload_rlm_depth(payload: &Value) -> Result<(Option<u32>, Option<u32>), String> {
     fn parse(payload: &Value, key: &str) -> Result<Option<u32>, String> {
         match payload.get(key) {
             None | Some(Value::Null) => Ok(None),
@@ -2858,7 +2876,7 @@ fn create_payload_rlm_depth(payload: &Value) -> Result<(u32, Option<u32>), Strin
                 .ok_or_else(|| format!("create {key} must be a non-negative integer")),
         }
     }
-    let depth = parse(payload, "rlmDepth")?.unwrap_or(0);
+    let depth = parse(payload, "rlmDepth")?;
     let max_depth = parse(payload, "rlmMaxDepth")?;
     Ok((depth, max_depth))
 }

@@ -193,6 +193,13 @@ pub struct InteractiveOptions {
     /// `KeybindingsManager.create()`): every hint and key handler renders
     /// and dispatches through this set.
     pub keybindings: KeybindingsManager,
+    /// The attached session's persisted RLM depth (TS `sessionDepth`):
+    /// the agents view passes it when it opens a row, and a subagent
+    /// session renders its `depth N` tray label.
+    pub session_rlm_depth: Option<u32>,
+    /// Whether the opened session had direct children (TS
+    /// `sessionHasChildren`).
+    pub session_has_children: bool,
 }
 
 impl std::fmt::Debug for InteractiveOptions {
@@ -904,6 +911,7 @@ fn apply_startup_chrome(view: &mut AgentView, options: &InteractiveOptions) {
     view.chrome.cwd = options.cwd.to_string_lossy().to_string();
     view.chrome.chat_name = crate::chrome::display_name(&view.chrome.cwd);
     view.chrome.show_manage = !options.no_session;
+    view.chrome.tray_depth = options.session_rlm_depth;
 }
 
 /// The tmux keyboard notice (TS `checkTmuxKeyboardSetup`): warn once per
@@ -1274,6 +1282,8 @@ mod tests {
             client_auth: None,
             telemetry: None,
             keybindings: crate::keybindings::KeybindingsManager::new(),
+            session_rlm_depth: None,
+            session_has_children: false,
         }
     }
 
