@@ -46,6 +46,7 @@ pub(crate) mod mouse;
 pub(crate) mod mouse_tracking;
 pub mod onboarding;
 pub mod osc133;
+pub(crate) mod prompt_highlight;
 pub mod queued;
 pub(crate) mod search_input;
 pub mod session;

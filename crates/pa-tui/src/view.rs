@@ -13,10 +13,14 @@ use crate::chrome::{
     ChromeState,
 };
 use crate::editor::Editor;
+use crate::prompt_highlight::{
+    command_token, editor_chunk_highlights, editor_text_spans, find_arg_tokens, ArgTokenSpan,
+};
 use crate::session::TranscriptItem;
 use crate::theme::{Theme, ThemeBg, ThemeColor};
 use crate::width::str_width;
 use crate::{Line, Span};
+use pa_types::slash_commands::SlashCommandRegistry;
 use ratatui::style::{Modifier, Style};
 
 /// Minimum transcript rows when the dock would crowd them out
@@ -850,6 +854,18 @@ impl AgentView {
         } else {
             rows.push(vec![Span::styled(" ".repeat(width), bg)]);
         }
+        // TS `CustomEditor.render`: a bare `--` separator highlights only
+        // while the first line opens with an argument-taking slash command.
+        let editor_lines = self.editor.get_lines();
+        let registry = SlashCommandRegistry::builtin();
+        let include_bare_separator = editor_lines
+            .first()
+            .and_then(|first| command_token(first))
+            .is_some_and(|token| registry.takes_argument(&token.name));
+        let arg_token_spans: Vec<Vec<ArgTokenSpan>> = editor_lines
+            .iter()
+            .map(|line| find_arg_tokens(line, 0, include_bare_separator))
+            .collect();
         let mut cursor: Option<(usize, usize)> = None;
         for (index, line) in visible.iter().enumerate() {
             let mut row: Line = vec![Span::styled(" ".to_string(), bg)];
@@ -862,31 +878,43 @@ impl AgentView {
             }
             row.push(Span::styled(" ".to_string(), bg));
             let text: &str = &line.text;
-            let before = line.cursor_pos.min(text.chars().count()).to_string();
-            let _ = before;
-            let (head, tail) = split_at_chars(text, line.cursor_pos.min(text.chars().count()));
+            let cursor_pos = line
+                .has_cursor
+                .then(|| line.cursor_pos.min(text.chars().count()));
+            // The prompt-highlight spans of this chunk: argument tokens, and
+            // the command token of the first layout line in accent unless
+            // the cursor sits inside it (TS `styleDisplayText`).
+            let command = (scroll_offset + index == 0)
+                .then(|| command_token(text))
+                .flatten();
+            let command_takes_argument = command
+                .as_ref()
+                .is_some_and(|token| registry.takes_argument(&token.name));
+            let highlights = editor_chunk_highlights(
+                text,
+                arg_token_spans
+                    .get(line.source_line)
+                    .map_or(&[][..], |spans| spans),
+                line.source_start,
+                command.as_ref(),
+                command_takes_argument,
+                cursor_pos,
+            );
+            row.extend(editor_text_spans(
+                &self.theme,
+                text,
+                &highlights,
+                cursor_pos,
+                bg,
+            ));
             let mut used = str_width(text);
-            if line.has_cursor {
-                if tail.is_empty() {
-                    row.push(Span::styled(head.to_string(), bg));
-                    row.push(Span::styled(
-                        " ".to_string(),
-                        bg.add_modifier(Modifier::REVERSED),
-                    ));
-                    used += 1;
-                } else {
-                    let first = tail.chars().next().unwrap_or(' ');
-                    let rest: String = tail[first.len_utf8()..].to_string();
-                    row.push(Span::styled(head.to_string(), bg));
-                    row.push(Span::styled(
-                        first.to_string(),
-                        bg.add_modifier(Modifier::REVERSED),
-                    ));
-                    row.push(Span::styled(rest, bg));
-                }
+            if cursor_pos == Some(text.chars().count()) {
+                // The end-of-line cursor appends one reversed cell.
+                used += 1;
+            }
+            if let Some(position) = cursor_pos {
+                let head = split_at_chars(text, position).0;
                 cursor = Some((index + 1, str_width(head) + 4));
-            } else {
-                row.push(Span::styled(text.to_string(), bg));
             }
             row.push(Span::styled(
                 " ".repeat(input_width.saturating_sub(used)),

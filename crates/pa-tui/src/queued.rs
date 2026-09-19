@@ -1,6 +1,8 @@
 //! The queued-message strip above the prompt dock (TS
 //! `updatePendingMessagesDisplay`): every steering/follow-up message parked
-//! behind the running turn renders as a dimmed preview row, with one hint
+//! behind the running turn renders as a preview row - dim, with the TS
+//! prompt-highlight styling on top (a leading slash command in accent,
+//! `@path`/`--flag` argument tokens in their own colors) - with one hint
 //! row below them. The strip is empty (renders nothing) when the queue is
 //! empty, so delivered messages make it disappear.
 //!
@@ -108,17 +110,22 @@ pub fn render_queue(
     if queue.is_empty() {
         return Vec::new();
     }
-    let style = theme.fg_style(ThemeColor::Dim);
     let mut rows = vec![Vec::new()];
-    let preview = |label: &str, message: &str| preview_row(label, message, style, width);
     for message in &queue.steering {
-        rows.push(preview(STEERING_LABEL, message));
+        rows.push(preview_row(theme, STEERING_LABEL, message, width));
     }
     for message in &queue.follow_ups {
-        rows.push(preview(FOLLOW_UP_LABEL, message));
+        rows.push(preview_row(theme, FOLLOW_UP_LABEL, message, width));
     }
     let hint = format!("\u{2570}\u{2500} {browse_key} to browse and edit queued messages");
-    rows.push(preview_row("", &hint, style, width));
+    let hint_line: crate::Line = vec![
+        crate::Span::raw(" ".repeat(width.min(1))),
+        crate::Span::styled(hint, theme.fg_style(ThemeColor::Dim)),
+    ];
+    rows.push(pad_line(
+        truncate_line(&hint_line, width.saturating_sub(1), "..."),
+        width,
+    ));
     rows
 }
 
@@ -148,24 +155,22 @@ pub struct QueueBrowseKeys {
     pub follow_up: String,
 }
 
-/// One dim preview row (TS `TruncatedText(text, 1, 0)`): the labeled
-/// message's first line truncated with `...` to the padded content width,
-/// with a plain 1-col left pad and the row padded to the full width.
-fn preview_row(label: &str, message: &str, style: ratatui::style::Style, width: usize) -> Line {
+/// One styled preview row (TS
+/// `TruncatedText(styleQueuedMessagePreview(...), 1, 0)`): the labeled
+/// message's first line with the TS prompt-highlight styling (dim base,
+/// accent on a leading recognized command's `/name` segment, colored
+/// argument tokens), truncated with `...` to the padded content width, with
+/// a plain 1-col left pad and the row padded to the full width.
+fn preview_row(theme: &Theme, label: &str, message: &str, width: usize) -> Line {
     let text = match message.split_once('\n') {
         Some((first_line, _)) => first_line,
         None => message,
     };
-    let text = if label.is_empty() {
-        text.to_string()
-    } else {
-        format_queued_message_preview(text, label)
-    };
     let padding_x = width.min(1);
-    let line: crate::Line = vec![
-        crate::Span::raw(" ".repeat(padding_x)),
-        crate::Span::styled(text, style),
-    ];
+    let mut line: crate::Line = vec![crate::Span::raw(" ".repeat(padding_x))];
+    line.extend(crate::prompt_highlight::style_queued_message_preview(
+        theme, text, label,
+    ));
     // The right pad keeps the row at the full width like TS
     // (`lineWithPadding + paddingNeeded`), so 1 left pad + content cut to
     // `width - 1` leaves the trailing space.
@@ -386,6 +391,43 @@ mod tests {
             80,
         );
         assert_eq!(rows[3], expected_hint, "the hint row matches TS");
+    }
+
+    #[test]
+    fn slash_previews_render_the_command_segment_in_accent() {
+        let queue = QueuedMessages {
+            steering: vec!["/hotkeys".to_string()],
+            follow_ups: vec!["fix @Cargo.toml --quiet".to_string()],
+        };
+        let theme = theme();
+        let rows = render_queue(&theme, &queue, "alt+up", 80);
+        assert_eq!(rows.len(), 4);
+        let expected_command: crate::Line = crate::width::pad_line(
+            vec![
+                crate::Span::raw(" "),
+                theme.fg_span(ThemeColor::Dim, "Steering: "),
+                theme.fg_span(ThemeColor::Accent, "/hotkeys"),
+            ],
+            80,
+        );
+        assert_eq!(
+            rows[1], expected_command,
+            "a recognized command previews dim-labeled with its accent segment"
+        );
+        let expected_plain: crate::Line = crate::width::pad_line(
+            vec![
+                crate::Span::raw(" "),
+                theme.fg_span(ThemeColor::Dim, "Follow-up: fix "),
+                theme.fg_span(ThemeColor::Success, "@Cargo.toml"),
+                theme.fg_span(ThemeColor::Dim, " "),
+                theme.fg_span(ThemeColor::MdLink, "--quiet"),
+            ],
+            80,
+        );
+        assert_eq!(
+            rows[2], expected_plain,
+            "a plain preview stays dim with its argument tokens colored"
+        );
     }
 
     #[test]
