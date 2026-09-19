@@ -375,12 +375,23 @@ impl AgentSession {
 }
 
 async fn persist_event(session: &Arc<tokio::sync::Mutex<SessionManager>>, event: AgentEvent) {
-    if let AgentEvent::MessageEnd { message, .. } = event {
-        let Some(session_message) = loop_message_to_session(&message) else {
-            return;
-        };
-        let mut session = session.lock().await;
-        session.append_message(session_message);
+    match event {
+        AgentEvent::MessageEnd { message, .. } => {
+            let Some(session_message) = loop_message_to_session(&message) else {
+                return;
+            };
+            let mut session = session.lock().await;
+            session.append_message(session_message);
+        }
+        // Git state is captured at both run boundaries, exactly like the TS
+        // extension-event path: a commit or branch switch made during the run
+        // (e.g. via the bash tool) lands in the session file at `agent_end`.
+        // The persist check lives inside `record_git_state_if_changed`.
+        AgentEvent::AgentStart | AgentEvent::AgentEnd { .. } => {
+            let mut session = session.lock().await;
+            session.record_git_state_if_changed();
+        }
+        _ => {}
     }
 }
 
@@ -671,6 +682,73 @@ mod tests {
             })
             .unwrap();
         assert_eq!(user_text, "Fix lint please");
+    }
+
+    /// Git state is captured at both run boundaries (TS `_emitExtensionEvent`
+    /// calls `recordGitStateIfChanged` on `agent_start`/`agent_end`): a commit
+    /// made between session creation and the run lands as a `git_state`
+    /// entry, and an unchanged context at `agent_end` adds nothing.
+    #[tokio::test]
+    async fn run_boundaries_record_git_state() {
+        fn git(cwd: &std::path::Path, args: &[&str]) {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git is available in the test environment");
+            assert!(output.status.success(), "git {args:?} failed");
+        }
+        fn commit(dir: &std::path::Path, message: &str) -> String {
+            std::fs::write(dir.join("file.txt"), format!("{message}\n")).unwrap();
+            git(dir, &["add", "-A"]);
+            git(dir, &["commit", "-q", "-m", message]);
+            let output = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+
+        let repo = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        git(repo.path(), &["config", "user.email", "t@t.co"]);
+        git(repo.path(), &["config", "user.name", "t"]);
+        commit(repo.path(), "init");
+
+        let provider = Arc::new(ScriptedProvider::new(test_model()));
+        provider.push_text_turn("ok");
+        let options = AgentOptions {
+            initial_state: AgentInitialState {
+                model: Some(test_model()),
+                ..Default::default()
+            },
+            stream_fn: Some(provider.stream_fn()),
+            ..Default::default()
+        };
+        let agent = Agent::new(options);
+        let session = SessionManager::persisted(repo.path(), sessions.path());
+        let engine = AgentSession::new(Arc::new(agent), session, vec![])
+            .await
+            .unwrap();
+
+        // The run starts on a newer commit than the header captured.
+        let second_sha = commit(repo.path(), "second");
+        engine.prompt("hi", PromptOptions::default()).await.unwrap();
+        engine.agent().wait_for_idle().await;
+
+        let entries = engine.entries().await;
+        let git_states: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                FileEntry::GitState { payload, .. } => Some(payload.git.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(git_states.len(), 1, "one git_state per changed context");
+        assert_eq!(git_states[0].commit.as_deref(), Some(second_sha.as_str()));
+        assert_eq!(git_states[0].branch.as_deref(), Some("main"));
     }
 }
 

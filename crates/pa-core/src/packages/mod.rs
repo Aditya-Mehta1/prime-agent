@@ -29,7 +29,7 @@ pub use resolve::{
     MetadataSource, MissingSourceAction, PathMetadata, ResolveExtensionOptions, ResolvedPaths,
     ResolvedResource, ResourceOrigin, ResourceType,
 };
-pub use source::{GitSource, LocalSource, NpmSource, ParsedSource, SourceScope};
+pub use source::{parse_git_url, GitSource, LocalSource, NpmSource, ParsedSource, SourceScope};
 
 use std::path::PathBuf;
 

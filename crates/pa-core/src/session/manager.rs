@@ -69,24 +69,45 @@ pub fn format_iso(millis: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}.{ms:03}Z")
 }
 
+/// One quiet git probe: `--no-optional-locks`, stdio ignore/pipe/ignore,
+/// `None` on any failure or empty output (TS `runGit` in utils/git.ts).
+fn run_git_probe(cwd: &Path, args: &[&str]) -> Option<String> {
+    std::process::Command::new("git")
+        .arg("--no-optional-locks")
+        .args(args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|stdout| stdout.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 /// Capture git context for the header (best effort; None outside a repo).
+///
+/// Contract (TS `captureGitContext`): every field is independently optional;
+/// the context exists when at least one probe succeeds. `branch` is
+/// `--show-current`, so a detached HEAD yields no branch. The remote URL is
+/// normalized through the git-source parser when it parses, else kept
+/// verbatim.
 pub fn capture_git_context(cwd: &Path) -> Option<GitContext> {
-    let run = |args: &[&str]| -> Option<String> {
-        std::process::Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-            .filter(|value| !value.is_empty())
-    };
-    let commit = run(&["rev-parse", "HEAD"])?;
-    let branch = run(&["rev-parse", "--abbrev-ref", "HEAD"]);
-    let repo_url = run(&["remote", "get-url", "origin"]);
+    let commit = run_git_probe(cwd, &["rev-parse", "HEAD"]);
+    let branch = run_git_probe(cwd, &["branch", "--show-current"]);
+    let remote = run_git_probe(cwd, &["remote", "get-url", "origin"]);
+    if commit.is_none() && branch.is_none() && remote.is_none() {
+        return None;
+    }
     Some(GitContext {
-        repo_url,
-        commit: Some(commit),
+        repo_url: remote.map(|url| {
+            crate::packages::parse_git_url(&url)
+                .map(|source| source.repo)
+                .unwrap_or(url)
+        }),
+        commit,
         branch,
     })
 }

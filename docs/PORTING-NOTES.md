@@ -1,3 +1,56 @@
+## PR/git context (roadmap item 5, 2026-09-19)
+
+Reference: TS `packages/coding-agent/src/utils/git.ts` (`captureGitContext`,
+`runGit`) + `core/session-manager.ts` (`recordGitStateIfChanged`) +
+`core/agent-session.ts` (`_emitExtensionEvent` recording git state on
+`agent_start`/`agent_end`).
+
+- Scope correction (audited against TS 0.9.5, installed binary and all repo
+  branches): the TS product has NO PR-number extraction, NO review status,
+  and never shells out to `gh`. Its git context is exactly three
+  repo-identity fields (repoUrl, commit, branch). Porting a PR/review
+  surface would violate the parity rule ("if Rust shows something TS does
+  not, that is also a parity bug"), so this lane implements the TS strategy
+  only. A future PR/review surface needs a TS release that carries it (or
+  an explicit product decision against TS).
+- `capture_git_context` (pa-core session/manager.rs) now matches TS
+  byte-for-byte in behavior: `git --no-optional-locks` probes with
+  ignore/pipe/ignore stdio; `branch --show-current` (detached HEAD yields no
+  branch, not "HEAD"); every field independently optional with the context
+  present when ANY probe succeeds (a fresh repo without commits still
+  reports its branch); the remote URL normalized through the shared
+  `packages::parse_git_url` port (same primitive TS `parseGitUrl` provides)
+  and kept verbatim when it does not parse (scp-like ssh remotes).
+- Git state recording is wired where the TS has it: the session engine's
+  persistence listener records a `git_state` entry on `agent_start` and
+  `agent_end` (the TS `_emitExtensionEvent` calls
+  `recordGitStateIfChanged` on both), so a commit or branch switch made
+  during a run (e.g. via bash) lands in the session file. The unchanged
+  context dedupes via the leaf-to-root walk, exactly like TS.
+- The TS `FooterDataProvider` (git-branch watching for extension custom
+  footers) is intentionally NOT ported: the Rust TUI has no extension UI
+  API yet, the TS `FooterComponent` renders nothing by default (footer is
+  intentionally empty in the prime brand), so the port would be dead code
+  with no consumer. It ports with the extension UI surface when that lane
+  lands.
+- User-visible surface audit (why there is no pane-capture evidence): the
+  TS TUI shows no git/PR information anywhere by default (top bar = chat
+  name + spend, tray = goal/heartbeat/model/context %, footer = empty);
+  git context is data-only (session header `git` field, `git_state`
+  entries, trace upload headers). The Rust port matches: same data, no
+  new visible UI.
+- Verifiers: `crates/pa-core/tests/git_context.rs` (fixture-repo capture:
+  branch+commit+normalized URL, detached HEAD, no origin, scp-like ssh
+  verbatim, non-git dir, fresh repo, dirty tree; session lifecycle:
+  header capture, no-change dedupe, commit-change entry, branch-path
+  re-record, git_state stays out of the LLM context; byte-parity pin of a
+  real TS-binary session header) + `session_engine` run-boundary test.
+- Parity evidence: `prime-agent -p --session-dir ... "say hi"` in a
+  fixture repo (https remote, one commit) writes the header git context
+  `{"repoUrl":"https://github.com/acme/widgets.git","commit":"5a0875...",
+  "branch":"main"}` and zero git_state entries (unchanged context); the
+  pinned test replays that exact header line through the Rust parser.
+
 ## Update boot sweep + roster restore + re-arm (slice 5, 2026-09-19)
 
 Reference: `docs/update-flow-state-machine.md` (§6/§8/§10) over the TS
