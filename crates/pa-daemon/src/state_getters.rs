@@ -9,7 +9,7 @@
 
 use serde_json::{json, Value};
 
-use pa_core::models::{is_private_prime_inference_model, ModelRegistry};
+use pa_core::models::ModelRegistry;
 
 use crate::protocol::{response_failure, response_success, DaemonResponse};
 use crate::worker::Worker;
@@ -243,48 +243,6 @@ impl Worker {
             None,
             "get_rlm_max_depth_status",
             Some(self.engine.rlm_max_depth_status()),
-        )
-    }
-
-    /// `get_model_catalog` (TS `refreshModelCatalog`): every catalog model
-    /// (private Prime Inference models only while their authorization is
-    /// on disk) plus the configured provider ids.
-    pub(crate) fn handle_get_model_catalog(&self) -> DaemonResponse {
-        if let Err(response) = self.require_created("get_model_catalog") {
-            return response;
-        }
-        let registry = worker_model_registry(&self.config.agent_dir);
-        let available: Vec<&pa_types::ai::Model> = registry.get_available().to_vec();
-        let available_private: std::collections::HashSet<String> = available
-            .iter()
-            .filter(|model| is_private_prime_inference_model(model))
-            .map(|model| format!("{}/{}", model.provider, model.id))
-            .collect();
-        let models: Vec<Value> = registry
-            .get_all()
-            .iter()
-            .filter(|model| {
-                !is_private_prime_inference_model(model)
-                    || available_private.contains(&format!("{}/{}", model.provider, model.id))
-            })
-            .filter_map(|model| serde_json::to_value(model).ok())
-            .collect();
-        let configured_providers: Vec<String> = {
-            let mut providers: Vec<String> = available
-                .iter()
-                .map(|model| model.provider.clone())
-                .collect();
-            providers.sort();
-            providers.dedup();
-            providers
-        };
-        response_success(
-            None,
-            "get_model_catalog",
-            Some(json!({
-                "models": models,
-                "configuredProviders": configured_providers,
-            })),
         )
     }
 

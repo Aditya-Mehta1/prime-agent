@@ -389,9 +389,12 @@ async fn subscribe_after_spawn_then_shutdown_seeds_the_passive_child() {
     assert_eq!(child_entry["summary"]["parentSessionPath"], parent_file);
 
     // Shutdown the child worker: a plain kill, no ledger tombstone. The
-    // kill's pushes interleave with its response, so the lines are read
-    // raw: the removal push under the family key, then the seeded passive
-    // row push, then the response.
+    // kill's pushes and its response interleave in either order on the
+    // wire, so the lines are read raw and DRAINED until both the k1
+    // response and the seeded passive-row push have arrived: breaking on
+    // the first seeded roster row would assert a kill failure whenever
+    // that push lands before the response (an ordering race, not a
+    // product bug).
     client.send(&json!({
         "type": "command",
         "id": "k1",
@@ -400,7 +403,8 @@ async fn subscribe_after_spawn_then_shutdown_seeds_the_passive_child() {
     }));
     let mut kill_ok = false;
     let mut removal_seen = false;
-    let seeded = loop {
+    let mut seeded_row: Option<Value> = None;
+    loop {
         let line = client.read_line_bounded(Duration::from_secs(15));
         if line["type"] == "roster_update" {
             if line["removed"]
@@ -417,13 +421,17 @@ async fn subscribe_after_spawn_then_shutdown_seeds_the_passive_child() {
                     })
                     .cloned()
             }) {
-                break entry;
+                seeded_row = Some(entry);
             }
         } else if line.get("id").and_then(Value::as_str) == Some("k1") {
             kill_ok = line["success"] == true;
         }
-    };
+        if kill_ok && seeded_row.is_some() {
+            break;
+        }
+    }
     assert!(kill_ok, "kill failed");
+    let seeded = seeded_row.expect("seeded passive row");
     assert!(removal_seen, "the removal push never arrived");
     let seeded_summary = &seeded["summary"];
     assert!(seeded_summary["activeSessionId"].is_null());

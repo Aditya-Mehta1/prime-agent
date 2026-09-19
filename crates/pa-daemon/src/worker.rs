@@ -1260,7 +1260,6 @@ impl Worker {
             "get_system_prompt" => self.handle_get_system_prompt().await,
             "get_tool_definition" => self.handle_get_tool_definition(payload).await,
             "get_rlm_max_depth_status" => self.handle_get_rlm_max_depth_status(),
-            "get_model_catalog" => self.handle_get_model_catalog(),
             "get_available_models" => self.handle_get_available_models(),
             "worker_deliver_message" => self.handle_worker_deliver_message(payload),
             "update_snapshot" => self.handle_update_snapshot(),
