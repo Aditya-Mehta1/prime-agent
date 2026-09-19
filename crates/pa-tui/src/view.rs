@@ -70,6 +70,12 @@ pub struct AgentView {
     pub code_block_indent: String,
     pub editor: Editor,
     pub chrome: ChromeState,
+    /// Queued input parked behind the running turn (steering/follow-up
+    /// lanes); renders as the dim strip above the prompt dock.
+    pub queued: crate::queued::QueuedMessages,
+    /// The queue item selected for browsing/edit (TS `QueueSelection`):
+    /// while set, the dim browse header renders above the editor.
+    pub queue_selected: Option<crate::queued::QueueSelectionItem>,
     pub chat: Vec<ChatEntry>,
     pub detail: Detail,
     pub working: Option<WorkingState>,
@@ -146,6 +152,8 @@ impl AgentView {
             code_block_indent: "  ".to_string(),
             editor: Editor::new(),
             chrome: ChromeState::default(),
+            queued: crate::queued::QueuedMessages::default(),
+            queue_selected: None,
             chat: Vec::new(),
             detail: Detail::Overview,
             working: None,
@@ -701,7 +709,19 @@ impl AgentView {
     /// (when showing), the editor surface, the tray, and the subagent
     /// summary box (TS `SubagentSummaryLine` under the tray).
     pub fn render_dock(&mut self, width: usize) -> Vec<Line> {
-        let mut lines = render_prompt_context(&self.detail_label(), &self.theme, width);
+        // The queued-input strip sits directly above the prompt dock rows
+        // (TS `queuedMessagesContainer` above the recap/editor).
+        let browse_key = {
+            let kb = self.editor.keybindings();
+            crate::keybindings::format_key_text(&kb.get_keys("app.message.navigateOlder").join("/"))
+        };
+        let queue_rows = crate::queued::render_queue(&self.theme, &self.queued, &browse_key, width);
+        let mut lines = queue_rows;
+        lines.extend(render_prompt_context(
+            &self.detail_label(),
+            &self.theme,
+            width,
+        ));
         let context_rows = lines.len();
         let overlay_rows = self.render_autocomplete_overlay(width);
         lines.extend(overlay_rows);
@@ -800,6 +820,33 @@ impl AgentView {
         if scroll_offset > 0 {
             let indicator = format!(" \u{2191} {scroll_offset} more");
             rows.push(indicator_row(&indicator, bg, border, width));
+        } else if let Some(selected) = &self.queue_selected {
+            // TS `getQueueSelectionHeader`: the editor's header line while
+            // a parked message is selected - one dim row on the editor
+            // background where the blank top row sits otherwise.
+            let keys = {
+                let kb = self.editor.keybindings();
+                let display =
+                    |id: &str| crate::keybindings::format_key_text(&kb.get_keys(id).join("/"));
+                crate::queued::QueueBrowseKeys {
+                    navigate_older: display("app.message.navigateOlder"),
+                    navigate_newer: display("app.message.navigateNewer"),
+                    move_earlier: display("app.message.moveEarlier"),
+                    move_later: display("app.message.moveLater"),
+                    follow_up: display("app.message.followUp"),
+                }
+            };
+            // Dim text on the editor background (the header line renders
+            // inside the editor box like the `> ` rows): the dim
+            // foreground patched over the editor background style.
+            let dim = bg.patch(self.theme.fg_style(ThemeColor::Dim));
+            let header = crate::queued::browse_header_text(selected, &keys);
+            let mut row: Line = vec![Span::styled(" ".repeat(padding_x), bg)];
+            let line: Line = vec![Span::styled(header, dim)];
+            row.extend(crate::width::truncate_line(&line, content_width, "..."));
+            let used = crate::width::line_width(&row);
+            row.push(Span::styled(" ".repeat(width.saturating_sub(used)), bg));
+            rows.push(row);
         } else {
             rows.push(vec![Span::styled(" ".repeat(width), bg)]);
         }

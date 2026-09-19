@@ -54,6 +54,10 @@ pub struct Reconstructed {
     /// one (TS `snapshot.ts: goal: session.goalState`).
     pub goal: Option<pa_types::goal::GoalState>,
     pub last_event_sequence: u64,
+    /// The queued input parked behind the run (`state.sessionActions`) so an
+    /// attach re-syncs the queue strip (TS re-reads the queue after
+    /// subscribe because a `session_action_update` in the gap is lost).
+    pub queued: crate::queued::QueuedMessages,
 }
 
 impl Reconstructed {
@@ -237,6 +241,18 @@ pub fn reconstruct(attach: &AttachData) -> Reconstructed {
     let goal = state
         .and_then(|state| state.get("goal"))
         .and_then(|goal| serde_json::from_value::<pa_types::goal::GoalState>(goal.clone()).ok());
+    let actions = state.and_then(|state| state.get("sessionActions")).cloned();
+    let queued = crate::queued::QueuedMessages {
+        steering: actions
+            .as_ref()
+            .map(|a| queue_lane(a, "steering"))
+            .unwrap_or_default(),
+        follow_ups: actions
+            .as_ref()
+            .map(|a| queue_lane(a, "followUps"))
+            .unwrap_or_default(),
+    };
+
     Reconstructed {
         chat: messages,
         model_id,
@@ -244,7 +260,23 @@ pub fn reconstruct(attach: &AttachData) -> Reconstructed {
         session_id,
         goal,
         last_event_sequence,
+        queued,
     }
+}
+
+/// One lane of a `sessionActions` wire value: the preview strings in order.
+fn queue_lane(actions: &Value, key: &str) -> Vec<String> {
+    actions
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The model id from a `state.model` wire value (`{id, provider}` or a
@@ -351,7 +383,13 @@ pub enum TurnUpdate {
     /// `goal_update`: the session goal state changed (raw wire `goal`
     /// payload; the session view owns announcement and tray rendering).
     GoalUpdate(Value),
-    /// `session_action_update` and other state churn: the footer status only.
+    /// `session_action_update`: the queue projection changed (a message
+    /// parked behind the run, was delivered, or was cleared).
+    QueueUpdated {
+        steering: Vec<String>,
+        follow_ups: Vec<String>,
+    },
+    /// Other state churn: the footer status only.
     StatusUpdate,
 }
 
@@ -532,6 +570,14 @@ pub fn event_to_update(event: &Value) -> Option<TurnUpdate> {
         "goal_update" => Some(TurnUpdate::GoalUpdate(
             event.get("goal").cloned().unwrap_or(Value::Null),
         )),
+        "session_action_update" => {
+            let actions = event.get("actions").cloned().unwrap_or(Value::Null);
+            Some(TurnUpdate::QueueUpdated {
+                steering: queue_lane(&actions, "steering"),
+                follow_ups: queue_lane(&actions, "followUps"),
+            })
+        }
+
         // Queue churn and unknown events only affect the status line.
         _ => Some(TurnUpdate::StatusUpdate),
     }
@@ -1153,6 +1199,46 @@ mod tests {
         assert_eq!(view.session_id, "0199-sess");
         assert_eq!(view.session_name.as_deref(), Some("my session"));
         assert_eq!(view.last_event_sequence, 9);
+    }
+
+    #[test]
+    fn reconstructs_the_queue_from_session_actions() {
+        let mut attach = slim_attach();
+        attach["snapshot"]["state"]["sessionActions"] = json!({
+            "queuedCount": 2,
+            "steering": ["turn right"],
+            "followUps": ["then summarize"],
+        });
+        let data = attach_data_from_response(&attach).unwrap();
+        let view = reconstruct(&data);
+        assert_eq!(
+            view.queued,
+            crate::queued::QueuedMessages {
+                steering: vec!["turn right".to_string()],
+                follow_ups: vec!["then summarize".to_string()],
+            },
+            "an attach re-syncs the queue strip from the snapshot"
+        );
+    }
+
+    #[test]
+    fn decodes_session_action_update_as_the_queue_projection() {
+        let update = event_to_update(&json!({
+            "type": "session_action_update",
+            "actions": {
+                "queuedCount": 1,
+                "steering": [],
+                "followUps": ["queued follow-up"],
+            },
+        }))
+        .expect("a queue update");
+        assert_eq!(
+            update,
+            TurnUpdate::QueueUpdated {
+                steering: vec![],
+                follow_ups: vec!["queued follow-up".to_string()],
+            }
+        );
     }
 
     #[test]

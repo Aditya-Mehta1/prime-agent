@@ -261,6 +261,16 @@ How one interactive client run ended.
 | `exit_reason` | string | `ctrl_c_twice` (second press of the exit-hint window), `ctrl_d`, `session_request` (`/exit`, `/quit`, `/resume`, agents-back), `daemon_closed` |
 | `turn_active` | boolean | a turn was still running at exit |
 
+### `tui input queued`
+
+A prompt submission parked in the steering/follow-up queue behind a
+running turn (adoption of the visible follow-up queue; emitted once per
+parked submission, not per rendered row).
+
+| property | type | notes |
+|---|---|---|
+| `lane` | string | `steering` (Enter while a turn runs) / `follow_up` (the follow-up key) |
+
 ### `tui subagents open`
 
 The subagent summary line opened the scoped agents view (adoption of the

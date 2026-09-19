@@ -443,6 +443,12 @@ impl Editor {
         self.emit(EditorEvent::Changed(self.get_text()));
     }
 
+    /// Submit the current text outside the Enter key path (the
+    /// `app.message.followUp` key): the same clear-and-emit submit.
+    pub fn submit(&mut self) {
+        self.submit_value();
+    }
+
     fn submit_value(&mut self) {
         self.cancel_autocomplete();
         let result = self

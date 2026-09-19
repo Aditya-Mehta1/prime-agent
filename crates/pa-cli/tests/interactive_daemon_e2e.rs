@@ -1680,3 +1680,116 @@ async fn tui_renders_and_fires_user_keybindings_from_settings() {
     );
     drop(supervisor);
 }
+
+/// The visible follow-up queue (TS `queuedMessagesContainer`): prompts
+/// submitted while a turn runs park on their lanes — Enter on the steering
+/// lane, the follow-up key on the follow-up lane — and render as dim
+/// preview rows above the prompt dock with the browse hint. The strip
+/// clears as the queue drains behind the run.
+#[tokio::test]
+async fn tui_prompts_queued_behind_a_turn_render_the_queue_strip() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let session_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let supervisor = spawn_supervisor(dir.path());
+
+    // The first turn holds in flight for 1.5s (`delayMs`): the parked
+    // submissions land inside that window, deterministically busy (the
+    // runner flips `busy` when it pops the work, long before the 750ms
+    // barrier below).
+    let script_path = dir.path().join("script.json");
+    let script = serde_json::json!({ "responses": [
+        { "text": "first turn", "delayMs": 1500 },
+        { "text": "steered delivery" },
+        { "text": "followed up delivery" },
+    ]});
+    std::fs::write(&script_path, script.to_string()).expect("write script");
+
+    let options = pa_tui::interactive::InteractiveOptions {
+        socket_path: supervisor.socket.clone(),
+        cwd: dir.path().to_path_buf(),
+        session_dir: Some(session_dir.clone()),
+        script_path: Some(script_path.clone()),
+        model_selection: Default::default(),
+        model_catalog: Vec::new(),
+        model_configured_providers: Default::default(),
+        model_recent_models: Vec::new(),
+        default_thinking_level: None,
+        no_session: false,
+        session: pa_tui::interactive::SessionSelection::New,
+        show_images: true,
+        initial_message: None,
+        theme: "prime".to_string(),
+        code_block_indent: "  ".to_string(),
+        tree_filter_mode: String::new(),
+        branch_summary_skip_prompt: false,
+        version: "0.0.0".to_string(),
+        onboarding: None,
+        telemetry_disabled: None,
+        client_auth: None,
+        telemetry: None,
+        keybindings: pa_tui::keybindings::KeybindingsManager::new(),
+        session_rlm_depth: None,
+        session_has_children: false,
+    };
+    let plan = pa_tui::interactive::HeadlessPlan {
+        steps: vec![
+            pa_tui::interactive::HeadlessStep::Submit("start the slow turn".to_string()),
+            // Half-way through the scripted hold the turn is provably
+            // running: the parked submissions below queue behind it.
+            pa_tui::interactive::HeadlessStep::WaitMs(750),
+            // Enter while the turn runs parks on the steering lane.
+            pa_tui::interactive::HeadlessStep::Submit("steering prompt".to_string()),
+            // The follow-up key (alt+enter) parks on the follow-up lane.
+            pa_tui::interactive::HeadlessStep::Type("follow-up prompt".to_string()),
+            pa_tui::interactive::HeadlessStep::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::ALT,
+            )),
+            // The barrier holds until the queue drained behind the turn.
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 60_000 },
+        ],
+        width: 100,
+        height: 30,
+    };
+    let outcome =
+        pa_tui::interactive::run_interactive(options, pa_tui::interactive::UiMode::Headless(plan))
+            .await
+            .expect("interactive run");
+
+    assert!(!outcome.frames.is_empty(), "frames were captured");
+    let rendered = outcome.frames.join("\n");
+    // The queue strip rendered both parked previews and the browse hint.
+    assert!(
+        rendered.contains("Steering: steering prompt"),
+        "the steering preview rendered:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Follow-up: follow-up prompt"),
+        "the follow-up preview rendered:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("to browse and edit queued messages"),
+        "the browse hint rendered:\n{rendered}"
+    );
+    // The queued prompts delivered once the run went idle: their turns'
+    // scripted responses rendered, and the strip cleared.
+    assert!(
+        rendered.contains("steered delivery"),
+        "the steering prompt delivered:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("followed up delivery"),
+        "the follow-up prompt delivered:\n{rendered}"
+    );
+    let last = outcome.frames.last().expect("a final frame");
+    assert!(
+        !last.contains("to browse and edit queued messages")
+            && !last.contains("Steering: ")
+            && !last.contains("Follow-up: "),
+        "the queue strip cleared after delivery:\n{last}"
+    );
+    drop(supervisor);
+}

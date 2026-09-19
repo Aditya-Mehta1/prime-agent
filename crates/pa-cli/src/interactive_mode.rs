@@ -238,6 +238,18 @@ impl pa_tui::interactive::InteractionTelemetry for CliInteractionTelemetry {
             let _ = client.shutdown().await;
         })
     }
+
+    fn queued_input(&self, lane: &'static str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let Some(client) = self.client() else {
+                return;
+            };
+            let mut properties = pa_telemetry::base_properties("interactive");
+            properties.set("lane", serde_json::Value::from(lane));
+            client.track("tui input queued", properties);
+            let _ = client.shutdown().await;
+        })
+    }
 }
 
 /// Run the interactive TUI attached to the daemon. Returns the exit code.

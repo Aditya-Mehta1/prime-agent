@@ -99,6 +99,9 @@ pub trait InteractionTelemetry: Send + Sync {
     /// An image was pasted into the editor from the clipboard (event
     /// `tui image pasted`); `mime_type` is the attachment's sniffed format.
     fn image_pasted(&self, mime_type: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    /// A submission parked in the follow-up queue behind a running turn:
+    /// `lane` is `steering` (Enter) / `follow_up` (the follow-up key).
+    fn queued_input(&self, lane: &'static str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 /// Persistence for the first-run onboarding answers. The TUI crate owns
@@ -288,6 +291,10 @@ pub enum HeadlessStep {
     SettleIdle,
     /// Hold until the current turn finishes (bounded by `timeout_ms`).
     WaitIdle { timeout_ms: u64 },
+    /// Hold the plan for `ms` before the next step: the verifier's timing
+    /// window (queue prompts deterministically inside a scripted
+    /// `delayMs` hold, where the turn is provably busy).
+    WaitMs(u64),
     /// Scroll the transcript to its top row (the `tui.viewport.top` key
     /// path): the verifier's window into the head of the transcript.
     ScrollTop,
@@ -627,7 +634,10 @@ pub async fn run_interactive(
         // at the head of the queue until the turn finishes (or its deadline).
         if let Some(UiInput::WaitIdle { timeout_ms }) = pending.front() {
             let timeout_ms = *timeout_ms;
-            if session.turn_active {
+            // A parked follow-up/steering message keeps the barrier waiting
+            // until the session delivers it (the queue strip must clear
+            // before the next step observes the frames).
+            if session.turn_active || !view.queued.is_empty() {
                 if wait_idle_deadline.is_none() {
                     wait_idle_deadline = Some(Instant::now() + Duration::from_millis(timeout_ms));
                 } else if Instant::now() > wait_idle_deadline.unwrap() {
@@ -713,6 +723,7 @@ pub async fn run_interactive(
         if headless_done
             && pending.is_empty()
             && !session.turn_active
+            && view.queued.is_empty()
             && wait_idle_deadline.is_none()
             && !session.dirty
             && !session.share_pending()
@@ -1225,6 +1236,9 @@ impl Renderer {
                                 if ui_tx.send(UiInput::WaitIdle { timeout_ms }).is_err() {
                                     return;
                                 }
+                            }
+                            HeadlessStep::WaitMs(ms) => {
+                                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                             }
                             HeadlessStep::ScrollTop => {
                                 if ui_tx.send(UiInput::ScrollTop).is_err() {

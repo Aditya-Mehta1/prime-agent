@@ -25,6 +25,7 @@ use crate::image_markers::{
 use crate::interactive::{InteractiveOptions, ModelSelection, SessionSelection};
 use crate::keys::key_event_to_id;
 use crate::model_picker::{CurrentModel, ModelPicker, ModelPickerAction, ModelPickerOptions};
+use crate::queued::{QueueBrowseDirection, QueueLane};
 use crate::snapshot::{
     assistant_message_parts, attach_data_from_response, event_to_update, reconstruct, TurnUpdate,
 };
@@ -58,6 +59,16 @@ const ESCAPE_REPEAT_WINDOW_MS: std::time::Duration = std::time::Duration::from_m
 /// best-effort like the detach, never able to hold the exit open.
 const EXIT_STATS_TIMEOUT_MS: u64 = 500;
 
+/// How a submitted prompt travels to the session (TS `streamingBehavior`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmitBehavior {
+    /// Plain Enter: mid-turn input parks on the steering lane (TS "steer").
+    Steer,
+    /// The follow-up key (`alt+enter`): parks on the follow-up lane and
+    /// delivers when the run goes idle.
+    FollowUp,
+}
+
 /// Live UI state for one attached daemon session.
 /// The `/share` upload task's report: the created gist or the failure
 /// message (TS resolves the same promise from the gh process result).
@@ -76,6 +87,20 @@ pub(crate) struct ShareRun {
     task: tokio::task::JoinHandle<()>,
     /// The temp HTML export `gh gist create` uploads (removed on settle).
     tmp_file: std::path::PathBuf,
+}
+
+/// TS status notes: the mutation status vocabulary (`applied`, `rejected`,
+/// `invalid`, `unsupported`) maps to the TS status rows; `is_edit` picks the
+/// edit phrasing over the reorder phrasing.
+fn queue_mutation_status_note(status: &str, is_edit: bool) -> String {
+    match status {
+        "invalid" => {
+            "Edited command is not a valid session command; edit kept in the editor".to_string()
+        }
+        "unsupported" => "Queue editing requires a newer daemon".to_string(),
+        _ if is_edit => "Queue changed; edit kept in the editor".to_string(),
+        _ => "Queue changed; reorder not applied".to_string(),
+    }
 }
 
 pub(crate) struct SessionUi {
@@ -143,6 +168,11 @@ pub(crate) struct SessionUi {
     pending_snapshot: Option<Vec<ChatEntry>>,
     /// Snapshot labels (model) for the next rebuild.
     pending_model: Option<String>,
+    /// Snapshot queue state for the next rebuild (attach re-sync).
+    pending_queue: Option<crate::queued::QueuedMessages>,
+    /// The parked-message browse state (TS `QueueSelection`): which queued
+    /// row alt+up/alt+down selected, and its stashed editor draft.
+    queue_selection: crate::queued::QueueSelection,
     /// Context usage + cost refreshed from `get_session_stats`.
     context: Option<crate::chrome::ContextUsage>,
     cost_usd: Option<f64>,
@@ -273,6 +303,8 @@ impl SessionUi {
             next_image_marker_id: 1,
             pending_snapshot: None,
             pending_model: None,
+            pending_queue: None,
+            queue_selection: crate::queued::QueueSelection::default(),
             context: None,
             cost_usd: None,
             list_rows: Vec::new(),
@@ -454,6 +486,7 @@ impl SessionUi {
                 }
                 _ => None,
             });
+        self.pending_queue = Some(reconstructed.queued);
         self.pending_snapshot = Some(reconstructed.chat);
         self.goal_view.seed(reconstructed.goal.unwrap_or_default());
         // The resynced state owns the loader (TS `renderResyncedSession`
@@ -596,6 +629,12 @@ impl SessionUi {
         if let Some(model) = self.pending_model.take() {
             view.chrome.model_id = Some(model);
         }
+        view.queued = self.pending_queue.take().unwrap_or_default();
+        // A rebuilt view starts from the snapshot's queue: any browse
+        // selection belonged to the previous queue and drops (TS
+        // `resetCurrentSessionRenderState` clears the selection).
+        let _ = self.queue_selection.reset();
+        view.queue_selected = None;
         view.chrome.chat_name = self.session_display();
         view.chrome.context = self.context;
         view.chrome.cost_usd = self.cost_usd;
@@ -899,9 +938,9 @@ impl SessionUi {
         model.input.contains(&pa_types::ai::ModelInput::Image)
     }
 
-    /// Submit a prompt. The user message arrives back as a `message_start`
-    /// session event (no local echo), and prompts sent while a turn is active
-    /// queue on the daemon side.
+    /// Submit a prompt (the Enter path). The user message arrives back as a
+    /// `message_start` session event (no local echo), and prompts sent while
+    /// a turn is active queue on the daemon side.
     pub(crate) async fn submit_prompt(&mut self, text: &str, view: &mut AgentView) -> Result<()> {
         let text = text.trim();
         if text.is_empty() {
@@ -913,16 +952,18 @@ impl SessionUi {
         // TS `clearShortcutGuide`: every prompt submission dismisses the
         // `?` quick-shortcut guide (slash commands keep it).
         view.shortcut_guide = None;
-        self.send_prompt(text, view).await
+        self.send_prompt(text, SubmitBehavior::Steer, view).await
     }
 
     /// Send a prompt to the session and start the working loader. Session
     /// commands travel the same path — the session engine parses and
-    /// executes them instead of admitting a model turn.
-    /// The images whose markers are present in `text`, or `None` when
-    /// there are none (TS `collectImagesFor`). Resolved against the
-    /// current model: when it has no image input the attachments are
-    /// dropped here, matching the paste-time hint.
+    /// executes them instead of admitting a model turn. `behavior` is the
+    /// TS streaming behavior: Enter parks mid-turn input on the steering
+    /// lane, the follow-up key on the follow-up lane; an idle session runs
+    /// either immediately. The images whose markers are present in
+    /// `text`, or `None` when there are none (TS `collectImagesFor`).
+    /// Resolved against the current model: when it has no image input the
+    /// attachments are dropped here, matching the paste-time hint.
     fn collect_images_for(&self, text: &str, view: &AgentView) -> Option<serde_json::Value> {
         if !self.model_supports_images(view) {
             return None;
@@ -948,7 +989,12 @@ impl SessionUi {
         ))
     }
 
-    async fn send_prompt(&mut self, text: &str, view: &mut AgentView) -> Result<()> {
+    async fn send_prompt(
+        &mut self,
+        text: &str,
+        behavior: SubmitBehavior,
+        view: &mut AgentView,
+    ) -> Result<()> {
         if let Some(error) = self.reconnection_failed.clone() {
             // The re-attach window expired (TS terminal close): the session
             // connection is closed, so nothing dispatches. The error row
@@ -968,8 +1014,11 @@ impl SessionUi {
                 input: pa_types::daemon::PromptInput {
                     content: None,
                     images,
-                    streaming_behavior: None,
-                    queue_if_busy: None,
+                    streaming_behavior: Some(match behavior {
+                        SubmitBehavior::Steer => pa_types::daemon::StreamingBehavior::Steer,
+                        SubmitBehavior::FollowUp => pa_types::daemon::StreamingBehavior::FollowUp,
+                    }),
+                    queue_if_busy: Some(true),
                     expand_prompt_templates: None,
                     source: None,
                     agent_message_id: None,
@@ -983,6 +1032,20 @@ impl SessionUi {
         )
         .await
         .map_err(|error| anyhow!("{error:#}"))?;
+        // A submission while a turn runs parks in the queue behind it: the
+        // queue strip shows the message until the session delivers it
+        // (adoption telemetry for the follow-up queue).
+        if self.turn_active {
+            if let Some(telemetry) = self.telemetry.clone() {
+                let lane = match behavior {
+                    SubmitBehavior::Steer => "steering",
+                    SubmitBehavior::FollowUp => "follow_up",
+                };
+                tokio::spawn(async move {
+                    telemetry.queued_input(lane).await;
+                });
+            }
+        }
         if !self.turn_active {
             self.turn_active = true;
         }
@@ -1132,7 +1195,7 @@ impl SessionUi {
             // bails out before fuzzy matching). Close typos get the exact TS
             // error; everything else passes through to the model.
             if name.chars().count() > 64 {
-                return self.send_prompt(text, view).await;
+                return self.send_prompt(text, SubmitBehavior::Steer, view).await;
             }
             let candidates = registry.suggestion_candidates();
             return match pa_types::slash_commands::find_slash_command_suggestion(&name, &candidates)
@@ -1144,7 +1207,7 @@ impl SessionUi {
                     );
                     Ok(())
                 }
-                None => self.send_prompt(text, view).await,
+                None => self.send_prompt(text, SubmitBehavior::Steer, view).await,
             };
         };
 
@@ -1152,7 +1215,9 @@ impl SessionUi {
             .get(resolved.name)
             .expect("resolved name is builtin");
         match command.execution {
-            SlashCommandExecution::Session => self.send_prompt(text, view).await,
+            SlashCommandExecution::Session => {
+                self.send_prompt(text, SubmitBehavior::Steer, view).await
+            }
             SlashCommandExecution::Client => self.dispatch_client_command(&resolved, view).await,
         }
     }
@@ -2560,6 +2625,16 @@ impl SessionUi {
         if view.editor.keybindings().matches(&id, "app.input.clear") {
             view.editor.cancel_autocomplete();
             self.clear_ctrl_c_hint();
+            // Leaving browse mode restores the stashed draft instead of
+            // arming an accidental empty-submit delete of the selected
+            // queued message (TS `clearInputBar`).
+            if self.queue_selection.has_draft() {
+                let draft = self.queue_selection.reset();
+                view.editor.set_text(&draft);
+                self.sync_queue_selection(view);
+                self.dirty = true;
+                return Ok(());
+            }
             // Double-Escape (TS `handleEscape`'s repeat window): the second
             // press within 500ms opens the tree when the session is idle or
             // the editor empty, and clears the input otherwise.
@@ -2746,6 +2821,65 @@ impl SessionUi {
                 return Ok(());
             }
         }
+        // The queue browse keys (TS `app.message.navigateOlder/Newer`,
+        // defaults alt+up/alt+down) walk the parked messages newest-first,
+        // stashing the editor draft; while a message is selected, the
+        // reorder keys (TS `app.message.moveEarlier/Later`) move it.
+        {
+            let (older, newer, earlier, later) = {
+                let kb = view.editor.keybindings();
+                (
+                    kb.matches(&id, "app.message.navigateOlder"),
+                    kb.matches(&id, "app.message.navigateNewer"),
+                    kb.matches(&id, "app.message.moveEarlier"),
+                    kb.matches(&id, "app.message.moveLater"),
+                )
+            };
+            if older {
+                self.browse_queue_selection(QueueBrowseDirection::Older, view);
+                self.dirty = true;
+                return Ok(());
+            }
+            if newer {
+                self.browse_queue_selection(QueueBrowseDirection::Newer, view);
+                self.dirty = true;
+                return Ok(());
+            }
+            if earlier {
+                self.move_queue_selection(-1, view).await?;
+                return Ok(());
+            }
+            if later {
+                self.move_queue_selection(1, view).await?;
+                return Ok(());
+            }
+        }
+        // The follow-up key (TS `app.message.followUp`, default alt+enter):
+        // the same submit path as Enter, but the message parks on the
+        // follow-up lane and delivers when the run goes idle. While a
+        // queued message is selected, the edit re-parks it there instead
+        // (TS `handleFollowUp`'s browsing branch).
+        if view
+            .editor
+            .keybindings()
+            .matches(&id, "app.message.followUp")
+        {
+            view.editor.submit();
+            for event in view.editor.take_events() {
+                if let crate::editor::EditorEvent::Submitted(text) = event {
+                    if self.queue_selection.is_browsing() {
+                        self.apply_queue_selection(&text, QueueLane::FollowUp, view)
+                            .await?;
+                    } else {
+                        view.editor.add_to_history(&text);
+                        self.send_prompt(&text, SubmitBehavior::FollowUp, view)
+                            .await?;
+                    }
+                }
+            }
+            self.dirty = true;
+            return Ok(());
+        }
         view.editor.handle_input(&id);
         // TS clears the exit hint as soon as the editor carries text: the
         // `Press Ctrl+C again to exit` row belongs to the empty prompt.
@@ -2754,10 +2888,163 @@ impl SessionUi {
         }
         for event in view.editor.take_events() {
             if let crate::editor::EditorEvent::Submitted(text) = event {
-                view.editor.add_to_history(&text);
-                self.submit_prompt(&text, view).await?;
+                if self.queue_selection.is_browsing() {
+                    // Enter steers the selected parked message: the edit
+                    // replaces it and moves it onto the steering lane
+                    // (TS `applyQueueSelection(text, "steering")`).
+                    self.apply_queue_selection(&text, QueueLane::Steering, view)
+                        .await?;
+                } else {
+                    view.editor.add_to_history(&text);
+                    self.submit_prompt(&text, view).await?;
+                }
             }
         }
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Project the browse selection to the view: the dim header row above
+    /// the editor (TS `getQueueSelectionHeader` reads the live selection).
+    fn sync_queue_selection(&mut self, view: &mut AgentView) {
+        view.queue_selected = self.queue_selection.selected().cloned();
+    }
+
+    /// TS `browseQueueSelection`: move the selection one parked message
+    /// older/newer and show it in the editor. Entering the browse stashes
+    /// the editor draft; reaching the draft again restores it.
+    fn browse_queue_selection(&mut self, direction: QueueBrowseDirection, view: &mut AgentView) {
+        let text = self
+            .queue_selection
+            .browse(&view.queued, &view.editor.get_text(), direction);
+        if let Some(text) = text {
+            view.editor.set_text(&text);
+        }
+        self.sync_queue_selection(view);
+    }
+
+    /// Send one `mutate_queued_message` and return its status string (TS
+    /// answers every outcome `success` with `{ status }`; only a malformed
+    /// request fails the command, which surfaces as the error here).
+    async fn queue_mutation(
+        &self,
+        lane: QueueLane,
+        index: usize,
+        expected_text: &str,
+        mutation: Value,
+    ) -> Result<Option<String>> {
+        let data = self
+            .bounded_request(
+                Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                DaemonCommand::MutateQueuedMessage {
+                    id: None,
+                    active_session_id: self.active_session_id.clone(),
+                    lane: Value::String(lane.wire_name().to_string()),
+                    index: index as u64,
+                    expected_text: expected_text.to_string(),
+                    mutation,
+                    rest: Default::default(),
+                },
+            )
+            .await
+            .map_err(|error| anyhow!("{error:#}"))?;
+        Ok(data
+            .get("status")
+            .and_then(Value::as_str)
+            .map(str::to_string))
+    }
+
+    /// TS `moveQueueSelection`: reorder the selected message one slot
+    /// earlier/later in its lane. The move is mirrored locally - the
+    /// `session_action_update` event may land after the response, and the
+    /// strip and selection must not wait for it (TS mirrors for the same
+    /// reason).
+    async fn move_queue_selection(&mut self, direction: i64, view: &mut AgentView) -> Result<()> {
+        let Some(selected) = self.queue_selection.selected().cloned() else {
+            return Ok(());
+        };
+        let status = self
+            .queue_mutation(
+                selected.lane,
+                selected.index,
+                &selected.text,
+                serde_json::json!({ "type": "move", "direction": direction }),
+            )
+            .await;
+        match status {
+            Ok(Some(status)) if status == "applied" => {
+                let target = selected.index as i64 + direction;
+                crate::queued::mirror_lane_move(
+                    &mut view.queued,
+                    selected.lane,
+                    selected.index,
+                    target,
+                );
+                if target >= 0 {
+                    self.queue_selection.refresh_at(
+                        &view.queued,
+                        selected.lane,
+                        target as usize,
+                        &selected.text,
+                    );
+                }
+                self.sync_queue_selection(view);
+                self.dirty = true;
+            }
+            Ok(Some(status)) => self.note(&queue_mutation_status_note(&status, false), view),
+            // A malformed request (never sent by this build) surfaces the
+            // daemon error like every other command.
+            Ok(None) => {}
+            Err(error) => self.note(&format!("{error:#}"), view),
+        }
+        Ok(())
+    }
+
+    /// TS `applyQueueSelection`: apply the edited editor text to the
+    /// selected parked message. Empty text deletes it; otherwise the edit
+    /// replaces it and moves it to `target_lane` - Enter steers, the
+    /// follow-up key parks it for idle delivery.
+    async fn apply_queue_selection(
+        &mut self,
+        text: &str,
+        target_lane: QueueLane,
+        view: &mut AgentView,
+    ) -> Result<()> {
+        let Some(selected) = self.queue_selection.selected().cloned() else {
+            return Ok(());
+        };
+        let trimmed = text.trim();
+        // `images` stays absent on a replace: the server keeps the item's
+        // attachments (some markers cannot be resolved by this client).
+        let mutation = if trimmed.is_empty() {
+            serde_json::json!({ "type": "delete" })
+        } else {
+            serde_json::json!({ "type": "replace", "text": trimmed, "lane": target_lane.wire_name() })
+        };
+        let status = self
+            .queue_mutation(selected.lane, selected.index, &selected.text, mutation)
+            .await;
+        match status {
+            Ok(Some(status)) if status == "applied" => {
+                if !trimmed.is_empty() {
+                    view.editor.add_to_history(trimmed);
+                }
+                let draft = self.queue_selection.reset();
+                view.editor.set_text(&draft);
+            }
+            Ok(Some(status)) => {
+                // Enter submissions clear the editor before the mutation;
+                // a failed edit returns to the editor, never swallowed.
+                view.editor.set_text(text);
+                self.note(&queue_mutation_status_note(&status, true), view);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                view.editor.set_text(text);
+                self.note(&format!("{error:#}"), view);
+            }
+        }
+        self.sync_queue_selection(view);
         self.dirty = true;
         Ok(())
     }
@@ -3042,6 +3329,33 @@ impl SessionUi {
             }
             TurnUpdate::GoalUpdate(goal) => {
                 self.apply_goal_update(goal, view);
+            }
+            TurnUpdate::QueueUpdated {
+                steering,
+                follow_ups,
+            } => {
+                view.queued = crate::queued::QueuedMessages {
+                    steering,
+                    follow_ups,
+                };
+                // A queue change under an active browse reconciles the
+                // selection (TS `refreshQueueSelectionAt`): the cursor
+                // survives only when the addressed item is unchanged; a
+                // stale selection drops and its stashed draft returns to
+                // the editor.
+                if let Some(selected) = self.queue_selection.selected() {
+                    let (lane, index, text) =
+                        (selected.lane, selected.index, selected.text.clone());
+                    if let Some(draft) =
+                        self.queue_selection
+                            .refresh_at(&view.queued, lane, index, &text)
+                    {
+                        if view.editor.get_text() == text {
+                            view.editor.set_text(&draft);
+                        }
+                    }
+                }
+                self.sync_queue_selection(view);
             }
             TurnUpdate::StatusUpdate => {}
         }
