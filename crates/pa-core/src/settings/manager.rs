@@ -236,6 +236,16 @@ impl SettingsManager {
         self.save_global()
     }
 
+    /// TS `setRetryEnabled`: the auto-retry toggle the provider retry
+    /// policy reads (`retry.enabled`).
+    pub fn set_retry_enabled(&mut self, enabled: bool) -> Result<()> {
+        self.global
+            .retry
+            .get_or_insert_with(Default::default)
+            .enabled = Some(enabled);
+        self.save_global()
+    }
+
     pub fn set_transport(&mut self, transport: TransportSetting) -> Result<()> {
         self.global.transport = Some(transport);
         self.save_global()
@@ -421,6 +431,22 @@ impl SettingsManager {
 
     pub fn get_auxiliary_model(&self) -> Option<&str> {
         self.merged.auxiliary_model.as_deref()
+    }
+
+    /// TS `setDefaultServiceTier`: the persisted default a fresh session
+    /// starts from; the stored string is the same vocabulary
+    /// `get_default_service_tier` parses.
+    pub fn set_default_service_tier(&mut self, tier: pa_types::ai::ServiceTier) -> Result<()> {
+        use pa_types::ai::ServiceTier;
+        let name = match tier {
+            ServiceTier::Auto => "auto",
+            ServiceTier::Default => "default",
+            ServiceTier::Flex => "flex",
+            ServiceTier::Scale => "scale",
+            ServiceTier::Priority => "priority",
+        };
+        self.global.default_service_tier = Some(name.to_string());
+        self.save_global()
     }
 
     /// Service tier a fresh session records as its preference (TS

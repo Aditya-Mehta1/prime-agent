@@ -351,6 +351,102 @@ pub trait SessionEngine: Send + Sync {
     /// a child that replied needs no no-reply notice (TS
     /// `_parentReplyCount`). Engines without children ignore it.
     fn mark_child_reply(&self, _child_active_session_id: &str) {}
+
+    /// The session's RLM children as wire snapshots (TS
+    /// `RlmChildAgentSnapshot`), the `get_rlm_children` response and the
+    /// context-tree children. The child registry lock is async (the spawn
+    /// path holds it across awaits), so the engine answers through a
+    /// boxed future, like `autonomous_status`. Engines without a child
+    /// registry report none.
+    fn rlm_child_snapshots(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Value>> + Send + '_>> {
+        Box::pin(async { Vec::new() })
+    }
+
+    /// The connection-surface command catalog (TS
+    /// `createAgentConnectionCommands`): extension commands, prompt
+    /// templates, then skills. The core session and the extension
+    /// registry lock are async, so the engine answers through a boxed
+    /// future. Engines without a resource surface report none.
+    fn connection_commands(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Value>> + Send + '_>> {
+        Box::pin(async { Vec::new() })
+    }
+
+    /// The connection resource snapshot (TS
+    /// `createAgentConnectionResourceSnapshot`): context files, skills,
+    /// prompts, extensions, and their diagnostics. The core session and
+    /// the extension registry lock are async, so the engine answers
+    /// through a boxed future. Engines without a resource surface report
+    /// the empty snapshot.
+    fn resource_snapshot(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send + '_>> {
+        Box::pin(async { empty_resource_snapshot() })
+    }
+
+    /// The session's system prompt (TS `session.systemPrompt`). The core
+    /// session lock is async, so the engine answers through a boxed
+    /// future. Engines without a prompt report the empty string.
+    fn system_prompt(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + '_>> {
+        Box::pin(async { Ok(String::new()) })
+    }
+
+    /// One tool definition by name (TS `session.getToolDefinition`), when
+    /// the engine exposes one. The core session lock is async, so the
+    /// engine answers through a boxed future.
+    fn tool_definition(
+        &self,
+        _name: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Value>> + Send + '_>> {
+        Box::pin(async { None })
+    }
+
+    /// Run one refinement (TS `session.refine`, the daemon `refine`
+    /// command): plan, apply, and persist the harness state. The returned
+    /// value is the TS `RefinementResult` wire object; engines without
+    /// refinement support answer an error and the caller surfaces it as
+    /// the command failure.
+    fn run_refinement(
+        &self,
+        options: pa_core::session_engine::refine::RefineOptions,
+    ) -> Result<Value> {
+        let _ = options;
+        anyhow::bail!("This session does not support refinement")
+    }
+
+    /// The session's RLM max-depth status (TS `getRlmMaxDepthStatus`):
+    /// `{ maxDepth, source }`. The depth bound comes from settings, so
+    /// engines report the shared default.
+    fn rlm_max_depth_status(&self) -> Value {
+        json!({
+            "maxDepth": crate::rlm_children::DEFAULT_RLM_MAX_DEPTH,
+            "source": "settings",
+        })
+    }
+}
+
+/// The resource snapshot for a session without a resource surface (the TS
+/// loader shape over empty lists): every category present, every list
+/// empty.
+pub fn empty_resource_snapshot() -> Value {
+    json!({
+        "contextFiles": [],
+        "skills": [],
+        "prompts": [],
+        "extensions": [],
+        "themes": [],
+        "diagnostics": {
+            "skills": [],
+            "prompts": [],
+            "extensions": [],
+            "themes": [],
+        },
+    })
 }
 
 /// One compaction request (the `compact` command fields).

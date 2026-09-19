@@ -88,6 +88,21 @@ pub fn session_stats(store: &SessionFile, context_window: Option<u64>) -> Value 
     stats
 }
 
+/// `contextUsage` for one whole store (the `get_context_tree` root node):
+/// `None` when the context window is unknown, matching `session_stats`.
+pub(crate) fn store_context_usage(
+    store: &SessionFile,
+    context_window: Option<u64>,
+) -> Option<Value> {
+    let branch = store.branch();
+    let messages: Vec<&Value> = branch
+        .iter()
+        .filter(|entry| entry.type_ == "message")
+        .filter_map(|entry| entry.fields.get("message"))
+        .collect();
+    context_usage(&branch, &messages, context_window)
+}
+
 /// `toolCall` content blocks on one assistant message.
 fn tool_call_count(message: &Value) -> u64 {
     message

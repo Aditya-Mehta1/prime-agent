@@ -79,6 +79,8 @@ pub enum TransportSetting {
     Auto,
     Sse,
     WebSocket,
+    #[serde(rename = "websocket-cached")]
+    WebSocketCached,
 }
 
 /// `number | "unlimited"` autonomous limit.

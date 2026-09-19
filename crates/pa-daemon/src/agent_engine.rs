@@ -288,6 +288,23 @@ impl AgentSessionEngine {
             .expect("autonomous driver lock") = driver;
     }
 
+    /// The async build of the core session (the same funnel as
+    /// `ensure_core_session`, awaited on the caller's runtime instead of
+    /// parked on the engine's own): read seams (`get_system_prompt`)
+    /// reaching an unbuilt session build it here.
+    pub(crate) async fn ensure_core_session_async(&self, model: &Model) -> anyhow::Result<()> {
+        {
+            let guard = self.session.lock().await;
+            if guard.is_some() {
+                return Ok(());
+            }
+        }
+        let built = self.build_session(model).await?;
+        self.mirror_goal_runtime(&built);
+        self.session.lock().await.replace(built);
+        Ok(())
+    }
+
     /// Build the core session once (same once-only rule as `session_agent`).
     pub(crate) fn ensure_core_session(&self, model: &Model) -> anyhow::Result<()> {
         {
@@ -564,6 +581,74 @@ impl AgentSessionEngine {
         })
         .await
     }
+}
+
+/// One artifact reference (TS `createArtifactReference` in
+/// modes/agent-connection/snapshot.ts): the sha256-derived id, the owning
+/// session, the artifact type, and the logical path (cwd-relative when the
+/// file lives under the cwd, else the basename).
+fn artifact_reference(
+    session_id: &str,
+    cwd: &str,
+    artifact_type: &str,
+    file_path: &str,
+) -> Option<Value> {
+    if file_path.is_empty() {
+        return None;
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::new()
+        .chain_update(format!("{session_id}\0{artifact_type}\0{file_path}"))
+        .finalize();
+    let id = format!("artifact_{}", hex_prefix(&digest, 16));
+    let mut reference = json!({
+        "id": id,
+        "sessionId": session_id,
+        "type": artifact_type,
+        "logicalPath": logical_artifact_path(cwd, file_path),
+    });
+    let logical = reference["logicalPath"].as_str().unwrap_or_default();
+    let resolved_cwd = std::path::Path::new(cwd);
+    let resolved_path = std::path::Path::new(file_path);
+    if let (Ok(relative), true) = (
+        resolved_path.strip_prefix(resolved_cwd),
+        logical.chars().next().is_some_and(|c| c != '.' && c != '/'),
+    ) {
+        reference["relativePath"] = json!(relative.to_string_lossy().replace('\\', "/"));
+    }
+    Some(reference)
+}
+
+/// The first `len` hex characters of a digest.
+fn hex_prefix(digest: &[u8], len: usize) -> String {
+    digest
+        .iter()
+        .flat_map(|byte| [format!("{:02x}", byte >> 4), format!("{:02x}", byte & 0x0f)])
+        .collect::<String>()
+        .chars()
+        .take(len)
+        .collect()
+}
+
+/// TS `createArtifactPathInfo`: synthetic paths (`<...>`) stay as-is; a
+/// path under the cwd keeps its cwd-relative form; anything else degrades
+/// to the basename.
+fn logical_artifact_path(cwd: &str, file_path: &str) -> String {
+    if file_path.starts_with('<') && file_path.ends_with('>') {
+        return file_path.to_string();
+    }
+    let resolved_cwd = std::path::Path::new(cwd);
+    let resolved_path = std::path::Path::new(file_path);
+    if let Ok(relative) = resolved_path.strip_prefix(resolved_cwd) {
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if !relative.is_empty() && !relative.starts_with("..") && !relative.starts_with('/') {
+            return relative;
+        }
+    }
+    std::path::Path::new(file_path)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "artifact".to_string())
 }
 
 fn now_millis() -> u64 {
@@ -1151,6 +1236,245 @@ impl SessionEngine for AgentSessionEngine {
                 }
             }
         }
+    }
+
+    fn rlm_child_snapshots(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Value>> + Send + '_>> {
+        let children = self.children.clone();
+        Box::pin(async move {
+            let Some(children) = children else {
+                return Vec::new();
+            };
+            children.child_snapshots().await
+        })
+    }
+
+    fn connection_commands(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Value>> + Send + '_>> {
+        Box::pin(async move {
+            let guard = self.session.lock().await;
+            let Some(engine) = guard.as_ref() else {
+                return Vec::new();
+            };
+            // TS `createAgentConnectionCommands` order: extension
+            // commands, then prompt templates, then skills. The Rust
+            // extension registry does not track per-command source info,
+            // so extension entries carry the TS fields minus
+            // `sourceInfo`.
+            let mut commands = Vec::new();
+            if let Some(runner) = &engine.extension_runner {
+                let registry = runner.registry().await;
+                for command in registry.commands() {
+                    let mut entry = json!({
+                        "name": command.invocation_name,
+                        "registeredName": command.name,
+                        "source": "extension",
+                    });
+                    if let Some(description) = &command.description {
+                        entry["description"] = json!(description);
+                    }
+                    commands.push(entry);
+                }
+            }
+            for template in &engine.prompt_templates {
+                let mut entry = json!({
+                    "name": template.name,
+                    "source": "prompt",
+                    "sourceInfo": template.source_info,
+                });
+                if let Some(hint) = &template.argument_hint {
+                    entry["argumentHint"] = json!(hint);
+                }
+                if !template.description.is_empty() {
+                    entry["description"] = json!(template.description);
+                }
+                commands.push(entry);
+            }
+            for skill in &engine.skills {
+                let mut entry = json!({
+                    "name": format!("skill:{}", skill.name),
+                    "source": "skill",
+                    "sourceInfo": skill.source_info,
+                });
+                if !skill.description.is_empty() {
+                    entry["description"] = json!(skill.description);
+                }
+                commands.push(entry);
+            }
+            commands
+        })
+    }
+
+    fn resource_snapshot(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send + '_>> {
+        Box::pin(async move {
+            let session_id = {
+                let guard = self.session.lock().await;
+                match guard.as_ref() {
+                    Some(engine) => engine.session.session_id().await,
+                    None => {
+                        // The session builds lazily (first prompt); the
+                        // resource surface reads the session's own loader
+                        // results, so an unbuilt session answers the
+                        // empty snapshot.
+                        return crate::engine::empty_resource_snapshot();
+                    }
+                }
+            };
+            let guard = self.session.lock().await;
+            let Some(engine) = guard.as_ref() else {
+                return crate::engine::empty_resource_snapshot();
+            };
+            let cwd = self.config.cwd.display().to_string();
+            let mut skills = Vec::new();
+            for skill in &engine.skills {
+                let mut entry = json!({
+                    "name": skill.name,
+                    "filePath": skill.file_path.display().to_string(),
+                    "sourceInfo": skill.source_info,
+                });
+                if !skill.description.is_empty() {
+                    entry["description"] = json!(skill.description);
+                }
+                if let Some(artifact) = artifact_reference(
+                    &session_id,
+                    &cwd,
+                    "skill",
+                    &skill.file_path.display().to_string(),
+                ) {
+                    entry["artifact"] = artifact;
+                }
+                skills.push(entry);
+            }
+            let mut prompts = Vec::new();
+            for template in &engine.prompt_templates {
+                let mut entry = json!({
+                    "name": template.name,
+                    "filePath": template.file_path,
+                    "sourceInfo": template.source_info,
+                });
+                if !template.description.is_empty() {
+                    entry["description"] = json!(template.description);
+                }
+                if let Some(hint) = &template.argument_hint {
+                    entry["argumentHint"] = json!(hint);
+                }
+                if let Some(artifact) =
+                    artifact_reference(&session_id, &cwd, "prompt", &template.file_path)
+                {
+                    entry["artifact"] = artifact;
+                }
+                prompts.push(entry);
+            }
+            let mut context_files = Vec::new();
+            for file in &engine.agents_files {
+                let mut entry = json!({ "path": file.path.display().to_string() });
+                if let Some(artifact) = artifact_reference(
+                    &session_id,
+                    &cwd,
+                    "context_file",
+                    &file.path.display().to_string(),
+                ) {
+                    entry["artifact"] = artifact;
+                }
+                context_files.push(entry);
+            }
+            json!({
+                "contextFiles": context_files,
+                "skills": skills,
+                "prompts": prompts,
+                "extensions": [],
+                "themes": [],
+                "diagnostics": {
+                    "skills": engine.skill_diagnostics,
+                    "prompts": [],
+                    "extensions": engine
+                        .extension_diagnostics
+                        .iter()
+                        .map(|error| json!({ "type": "error", "message": error }))
+                        .collect::<Vec<_>>(),
+                    "themes": [],
+                },
+            })
+        })
+    }
+
+    fn system_prompt(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + '_>>
+    {
+        Box::pin(async move {
+            // The TS session exists from create; this port builds the
+            // core session lazily on the first turn, so a prompt read
+            // before any turn builds it now (the async build path, never
+            // the blocking `ensure_core_session`: this future runs on the
+            // caller's runtime).
+            let model = self.resolve_model()?;
+            self.ensure_core_session_async(&model).await?;
+            let guard = self.session.lock().await;
+            let engine = guard.as_ref().expect("session built above");
+            Ok(engine.system_prompt.clone())
+        })
+    }
+
+    fn tool_definition(
+        &self,
+        name: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Value>> + Send + '_>> {
+        let name = name.to_string();
+        Box::pin(async move {
+            let guard = self.session.lock().await;
+            let engine = guard.as_ref()?;
+            let state = engine.session.agent().state().await;
+            let tool = state.tools.iter().find(|tool| tool.name() == name)?;
+            Some(json!({
+                "name": tool.name(),
+                "label": tool.label(),
+                "description": tool.description(),
+                "parameters": tool.parameters(),
+            }))
+        })
+    }
+
+    fn run_refinement(
+        &self,
+        options: pa_core::session_engine::refine::RefineOptions,
+    ) -> anyhow::Result<Value> {
+        let model = self.resolve_model()?;
+        self.ensure_core_session(&model)?;
+        let api_key = self.resolve_request_api_key(&model);
+        let global_harness_dir = self.config.agent_dir.clone();
+        let guard = self.session.blocking_lock();
+        let core = guard
+            .as_ref()
+            .expect("session built by ensure_core_session");
+        let result = self.runtime.block_on(async {
+            core.session
+                .refine(
+                    &options,
+                    pa_core::session_engine::refine::RefinementSource::User,
+                    &model,
+                    api_key,
+                    global_harness_dir,
+                )
+                .await
+        })?;
+        serde_json::to_value(&result)
+            .map_err(|error| anyhow::anyhow!("refinement result conversion failed: {error}"))
+    }
+
+    fn rlm_max_depth_status(&self) -> Value {
+        let (max_depth, source) = match &self.children {
+            // The depth bound the create command seeded the children
+            // registry with (chat override lands with the `set_rlm_max_depth`
+            // wave; until then every session runs the inherited default).
+            Some(children) => (children.rlm_max_depth(), "settings"),
+            None => (DEFAULT_RLM_MAX_DEPTH, "settings"),
+        };
+        json!({ "maxDepth": max_depth, "source": source })
     }
 
     fn run_prompt(

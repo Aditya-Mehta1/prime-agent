@@ -40,6 +40,7 @@ use crate::protocol::{
 };
 use crate::registration::RegistrationHandle;
 use crate::session_store::{session_file_name, SessionFile};
+use crate::setting_switches::{effective_service_tier, supports_fast_mode};
 use crate::types::{AgentConnectionState, SessionActionSnapshot, SessionSummary};
 
 /// TS-parity worker environment variables (`daemon-worker-protocol.ts`).
@@ -213,9 +214,26 @@ pub(crate) struct SessionCore {
     /// The subagent runtime identity (create `runtimeMetadata`): the child
     /// id under its parent and the parent's live/persisted ids, carried on
     /// every summary so the roster keys children `parentPath#childId`.
-    rlm_child_id: Option<String>,
+    pub(crate) rlm_child_id: Option<String>,
     parent_active_session_id: Option<String>,
     parent_session_id: Option<String>,
+    /// The session's service-tier preference (TS `_serviceTierPreference`;
+    /// `None` is the settings default "auto"). The effective tier clamps
+    /// `priority` to `default` on models without fast mode.
+    pub(crate) service_tier: Option<pa_types::ai::ServiceTier>,
+    /// The queue delivery modes (TS `agent.steeringMode` / `followUpMode`):
+    /// `"all"` or `"one-at-a-time"`.
+    pub(crate) steering_mode: String,
+    pub(crate) follow_up_mode: String,
+    /// The scoped model list (TS `_scopedModels`): wire entries
+    /// `{ model, thinkingLevel? }` the model cycler cycles within.
+    pub(crate) scoped_models: Vec<Value>,
+    /// A retry in flight was aborted (`abort_retry`); the turn's abort
+    /// probe reads it and the next turn start clears it.
+    pub(crate) retry_abort_requested: bool,
+    /// Restored next-turn rows (TS `_pendingNextTurnMessages`,
+    /// `restore_next_turn`): delivered as prefix rows with the next turn.
+    pub(crate) pending_next_turn: Vec<Value>,
 }
 
 impl SessionCore {
@@ -254,6 +272,12 @@ impl SessionCore {
             rlm_child_id: None,
             parent_active_session_id: None,
             parent_session_id: None,
+            service_tier: None,
+            steering_mode: "all".to_string(),
+            follow_up_mode: "all".to_string(),
+            scoped_models: Vec::new(),
+            retry_abort_requested: false,
+            pending_next_turn: Vec::new(),
         }
     }
 }
@@ -508,7 +532,7 @@ pub struct Worker {
     pub(crate) engine: std::sync::Arc<dyn SessionEngine>,
     pub(crate) work_notify: Arc<Notify>,
     idle_notify: Arc<Notify>,
-    events: Arc<EventPump>,
+    pub(crate) events: Arc<EventPump>,
     recovery: Arc<Mutex<Option<WorkerRecoveryJournal>>>,
     /// Post-turn status-line runner (seeded from persisted verdicts at
     /// session create).
@@ -527,6 +551,9 @@ pub struct Worker {
     /// (the scripted harness); the real engine's manager serves the
     /// product path.
     acp_mcp: std::sync::Arc<std::sync::Mutex<pa_core::mcp::McpManager>>,
+    /// The user-bash slot (`execute_bash` / `execute_bash_and_wait` /
+    /// `abort_bash`): one command runs at a time, killed on abort.
+    pub(crate) user_bash: std::sync::Arc<crate::user_bash::UserBash>,
 }
 
 /// Supervisor-link coordinates for a worker's agent engine: where the
@@ -567,6 +594,12 @@ impl Worker {
             rlm_child_id: None,
             parent_active_session_id: None,
             parent_session_id: None,
+            service_tier: None,
+            steering_mode: "all".to_string(),
+            follow_up_mode: "all".to_string(),
+            scoped_models: Vec::new(),
+            retry_abort_requested: false,
+            pending_next_turn: Vec::new(),
         };
         let active_session_id = config.active_session_id.clone();
         let script = config.script.clone();
@@ -715,6 +748,7 @@ impl Worker {
             tree_navigation,
             exports,
             acp_mcp: std::sync::Arc::new(std::sync::Mutex::new(acp_mcp)),
+            user_bash: std::sync::Arc::new(crate::user_bash::UserBash::new()),
         }
     }
 
@@ -1216,6 +1250,17 @@ impl Worker {
             "clear_queue" => self.handle_clear_queue(),
             "abort_and_clear_queue" => self.handle_abort_and_clear_queue(),
             "get_last_assistant_text" => self.handle_get_last_assistant_text(),
+            "get_connection_state" => self.handle_get_connection_state(),
+            "get_rlm_children" => self.handle_get_rlm_children().await,
+            "get_context_tree" => self.handle_get_context_tree().await,
+            "get_commands" => self.handle_get_commands().await,
+            "get_resource_snapshot" => self.handle_get_resource_snapshot().await,
+            "get_session_context" => self.handle_get_session_context(),
+            "get_system_prompt" => self.handle_get_system_prompt().await,
+            "get_tool_definition" => self.handle_get_tool_definition(payload).await,
+            "get_rlm_max_depth_status" => self.handle_get_rlm_max_depth_status(),
+            "get_model_catalog" => self.handle_get_model_catalog(),
+            "get_available_models" => self.handle_get_available_models(),
             "worker_deliver_message" => self.handle_worker_deliver_message(payload),
             "update_snapshot" => self.handle_update_snapshot(),
             "kill" => self.handle_kill().await,
@@ -1225,6 +1270,15 @@ impl Worker {
             "replace_acp_mcp_servers" => self.handle_replace_acp_mcp_servers(payload),
             "set_model" => self.handle_set_model(payload).await,
             "set_thinking_level" => self.handle_set_thinking_level(payload).await,
+            "cycle_model" => self.handle_cycle_model(payload).await,
+            "set_scoped_models" => self.handle_set_scoped_models(payload),
+            "cycle_thinking_level" => self.handle_cycle_thinking_level().await,
+            "set_service_tier" => self.handle_set_service_tier(payload),
+            "set_transport" => self.handle_set_transport(payload),
+            "set_steering_mode" => self.handle_set_queue_mode("set_steering_mode", payload),
+            "set_follow_up_mode" => self.handle_set_queue_mode("set_follow_up_mode", payload),
+            "set_auto_retry" => self.handle_set_auto_retry(payload),
+            "abort_retry" => self.handle_abort_retry(),
             "get_session_tree" => self.tree_navigation.get_session_tree(),
             "get_user_messages_for_forking" => self.tree_navigation.get_user_messages_for_forking(),
             "set_session_entry_label" => self.tree_navigation.set_session_entry_label(payload),
@@ -1238,6 +1292,15 @@ impl Worker {
             "export_jsonl" => self.exports.export_jsonl(payload),
             "mutate_queued_message" => self.handle_mutate_queued_message(payload),
             "resume_queue" => self.handle_resume_queue(),
+            "execute_bash" => self.handle_execute_bash(payload),
+            "execute_bash_and_wait" => self.handle_execute_bash_and_wait(payload).await,
+            "abort_bash" => self.handle_abort_bash().await,
+            "append_custom_message" => self.handle_append_custom_message(payload),
+            "restore_next_turn" => self.handle_restore_next_turn(payload),
+            "restore_actions" => self.handle_restore_actions(payload),
+            "refine" => self.handle_refine(payload).await,
+            "reload" => self.handle_reload().await,
+            "extension_ui_response" => self.handle_extension_ui_response(payload),
             other => response_failure(
                 None,
                 command_type,
@@ -1539,6 +1602,23 @@ impl Worker {
         if !store.path.as_os_str().is_empty() {
             self.engine.set_session_file(store.path.clone());
         }
+        // The session's settings-seeded switches (TS createAgentSession:
+        // the service tier and the queue delivery modes come from the
+        // settings manager; the durable prefix records the same tier).
+        let (service_tier, steering_mode, follow_up_mode) = {
+            let settings = pa_core::settings::SettingsManager::create(&cwd, &self.config.agent_dir);
+            let queue_mode = |mode: pa_core::settings::QueueModeSetting| -> String {
+                match mode {
+                    pa_core::settings::QueueModeSetting::All => "all".to_string(),
+                    pa_core::settings::QueueModeSetting::OneAtATime => "one-at-a-time".to_string(),
+                }
+            };
+            (
+                settings.get_default_service_tier(),
+                queue_mode(settings.get_steering_mode()),
+                queue_mode(settings.get_follow_up_mode()),
+            )
+        };
         let mut core = self.core.lock().unwrap();
         core.cwd = cwd;
         core.steering = steering;
@@ -1546,6 +1626,11 @@ impl Worker {
         core.store = Some(store);
         core.created = true;
         core.abort_requested = false;
+        core.service_tier = Some(service_tier);
+        core.steering_mode = steering_mode;
+        core.follow_up_mode = follow_up_mode;
+        core.scoped_models = Vec::new();
+        core.retry_abort_requested = false;
         core.rlm_depth = rlm_depth;
         core.runtime_kind = if rlm_depth > 0 || rlm_child_id.is_some() {
             "subagent".to_string()
@@ -2360,19 +2445,32 @@ impl Worker {
         )
     }
 
-    fn connection_state_locked(&self, core: &SessionCore) -> AgentConnectionState {
+    pub(crate) fn connection_state_locked(&self, core: &SessionCore) -> AgentConnectionState {
         let store = core.store.as_ref();
+        let model = self.engine.model_metadata();
+        let model_fast_mode = model
+            .as_ref()
+            .and_then(|model| model.get("id"))
+            .and_then(Value::as_str)
+            .map(supports_fast_mode)
+            .unwrap_or(false);
         AgentConnectionState {
             is_streaming: core.busy,
             is_compacting: core.compacting,
             active_session_id: Some(core.active_session_id.clone()),
             cwd: core.cwd.clone(),
-            model: self.engine.model_metadata(),
+            model,
             thinking_level: self
                 .engine
                 .effective_thinking_level()
                 .unwrap_or_else(|| "default".to_string()),
-            service_tier: "auto".to_string(),
+            // The effective tier: the preference clamped to the model's
+            // fast-mode support (`priority` degrades to `default`).
+            service_tier: crate::setting_switches::service_tier_wire_name(
+                effective_service_tier(core.service_tier, model_fast_mode)
+                    .unwrap_or(pa_types::ai::ServiceTier::Auto),
+            )
+            .to_string(),
             // The resolved model's supported levels (TS `getSupportedThinkingLevels`
             // in `getState`): a non-reasoning model reports ["off"], which the
             // client treats as no thinking surface.
@@ -2380,10 +2478,10 @@ impl Worker {
                 .engine
                 .supported_thinking_levels()
                 .unwrap_or_else(|| vec!["off".to_string()]),
-            is_bash_running: false,
+            is_bash_running: self.user_bash.is_running(),
             retry_attempt: 0,
-            steering_mode: "all".to_string(),
-            follow_up_mode: "all".to_string(),
+            steering_mode: core.steering_mode.clone(),
+            follow_up_mode: core.follow_up_mode.clone(),
             session_file: store.map(|s| s.path.to_string_lossy().to_string()),
             session_id: store
                 .map(|s| s.session_id().to_string())
@@ -2405,7 +2503,7 @@ impl Worker {
                 })
                 .unwrap_or(0),
             goal: self.engine.goal_state_value(),
-            scoped_models: Vec::new(),
+            scoped_models: core.scoped_models.clone(),
             active_tool_names: Vec::new(),
             context_usage: None,
             recap: None,
@@ -2440,6 +2538,53 @@ impl Worker {
             busy,
             operation,
         )
+    }
+
+    /// Sequence and broadcast one `session_event` frame at the worker
+    /// level (the TS `_emit` backing for switch notifications).
+    pub(crate) fn emit_worker_event(&self, event: Value) {
+        let mut core = self.core.lock().unwrap();
+        let sequence = core.last_event_sequence + 1;
+        core.last_event_sequence = sequence;
+        let meta = create_daemon_event_meta(
+            &core.active_session_id,
+            sequence,
+            None,
+            Some(&core.generation),
+        );
+        let active_session_id = core.active_session_id.clone();
+        let outbound = DaemonOutbound::SessionEvent {
+            active_session_id,
+            event,
+            meta: Some(meta),
+            rest: Default::default(),
+        };
+        let payload = serde_json::to_vec(&outbound).unwrap_or_default();
+        drop(core);
+        self.events.send(OutboundFrame::session_event(payload));
+    }
+
+    /// Record one durable custom row and broadcast its
+    /// `message_start`/`message_end` pair (the TS `_emit` for rows the
+    /// session appends outside a turn: `append_custom_message`, the
+    /// `refine` outcome and notice, restored prefix rows).
+    pub(crate) fn emit_custom_row(&self, message: Value) {
+        {
+            let mut core = self.core.lock().unwrap();
+            if let Some(store) = core.store.as_mut() {
+                let _ = store.persist_entry(
+                    "custom_message",
+                    json!({
+                        "customType": message.get("customType").cloned().unwrap_or(Value::Null),
+                        "content": message.get("content").cloned().unwrap_or(Value::Null),
+                        "display": message.get("display").cloned().unwrap_or(Value::Bool(true)),
+                        "details": message.get("details").cloned().unwrap_or(Value::Null),
+                    }),
+                );
+            }
+        }
+        self.emit_worker_event(json!({ "type": "message_start", "message": message }));
+        self.emit_worker_event(json!({ "type": "message_end", "message": message }));
     }
 
     /// Sequence and broadcast one session_event for the queue projection.
@@ -2678,7 +2823,7 @@ struct TurnRunner {
     pub(crate) core: Arc<Mutex<SessionCore>>,
     work_notify: Arc<Notify>,
     idle_notify: Arc<Notify>,
-    events: Arc<EventPump>,
+    pub(crate) events: Arc<EventPump>,
     engine: std::sync::Arc<dyn SessionEngine>,
     /// Shared worker recovery journal (queue snapshot persistence).
     recovery: Arc<Mutex<Option<WorkerRecoveryJournal>>>,
@@ -2702,10 +2847,12 @@ impl TurnRunner {
                 if let Some(item) = core.steering.pop_front() {
                     core.busy = true;
                     core.abort_requested = false;
+                    core.retry_abort_requested = false;
                     Some(item)
                 } else if let Some(item) = core.follow_up.pop_front() {
                     core.busy = true;
                     core.abort_requested = false;
+                    core.retry_abort_requested = false;
                     Some(item)
                 } else {
                     core.busy = false;
@@ -3108,8 +3255,26 @@ impl TurnRunner {
             };
             let aborted_probe = {
                 let core = Arc::clone(&core);
-                move || core.lock().unwrap().abort_requested
+                // `abort_retry` stops an in-flight retry without aborting
+                // the turn itself (TS `abortRetry` only reaches the retry
+                // controller).
+                move || {
+                    core.lock().unwrap().abort_requested
+                        || core.lock().unwrap().retry_abort_requested
+                }
             };
+            // Restored next-turn rows ride this delivery (TS
+            // `prefixMessages`): emitted before the accepted prompt, the
+            // same durable-row path as in-turn custom rows.
+            let parked = {
+                let mut core = core.lock().unwrap();
+                std::mem::take(&mut core.pending_next_turn)
+            };
+            for row in parked {
+                if !emit(EngineEvent::CustomMessage(row)) {
+                    break;
+                }
+            }
             engine.run_prompt(prompt_index, request, &aborted_probe, &mut emit);
         });
         let _ = turn.await;
@@ -3909,6 +4074,12 @@ mod turn_stream_tests {
             rlm_child_id: None,
             parent_active_session_id: None,
             parent_session_id: None,
+            service_tier: None,
+            steering_mode: "all".to_string(),
+            follow_up_mode: "all".to_string(),
+            scoped_models: Vec::new(),
+            retry_abort_requested: false,
+            pending_next_turn: Vec::new(),
         }));
         let (status_notify, _status_rx) = tokio::sync::mpsc::unbounded_channel();
         TurnRunner {

@@ -222,6 +222,54 @@ impl SupervisorChildSessions {
         *self.inner.identity.lock().expect("identity lock") = identity;
     }
 
+    /// The inherited RLM depth bound (TS `getRlmMaxDepthStatus().maxDepth`
+    /// before any chat override).
+    pub fn rlm_max_depth(&self) -> u32 {
+        self.inner
+            .identity
+            .lock()
+            .expect("identity lock")
+            .rlm_max_depth
+    }
+
+    /// Wire snapshots of the tracked children (TS
+    /// `RlmChildAgentSnapshot`, the `get_rlm_children` response and the
+    /// context-tree children): the child id, its live identity, label,
+    /// run status, elapsed duration, answer preview, and session dir.
+    /// `parent_id` (the parent's own RLM node id) is overlaid by the
+    /// worker, which owns that identity.
+    pub async fn child_snapshots(&self) -> Vec<Value> {
+        let model = self
+            .inner
+            .identity
+            .lock()
+            .expect("identity lock")
+            .model
+            .clone();
+        let children = self.inner.children.lock().await;
+        let mut snapshots = Vec::new();
+        for record in children.iter() {
+            let record = record.lock().await;
+            let mut snapshot = json!({
+                "id": record.rlm_child_id,
+                "activeSessionId": record.active_session_id,
+                "sessionName": record.session_name,
+                "label": record.label,
+                "status": record.status(),
+                "durationMs": now_ms().saturating_sub(record.started_at_ms),
+                "sessionDir": record.session_dir,
+            });
+            if let Some(model) = &model {
+                snapshot["model"] = json!(model);
+            }
+            if let Some(answer) = &record.answer_preview {
+                snapshot["answerPreview"] = json!(answer);
+            }
+            snapshots.push(snapshot);
+        }
+        snapshots
+    }
+
     /// The children registry snapshot behind the `agent_message` family
     /// view: the same registry `rlm.list_subagents` reads (the resident
     /// child set of this parent), without the per-child worker refresh -

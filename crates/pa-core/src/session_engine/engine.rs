@@ -87,6 +87,9 @@ pub struct SessionEngineConfig {
 pub struct SessionEngine {
     pub session: AgentSession,
     pub skills: Vec<crate::skills::Skill>,
+    /// Skill-loading diagnostics (TS `getSkills().diagnostics`; the
+    /// connection resource snapshot surfaces them).
+    pub skill_diagnostics: Vec<crate::skills::ResourceDiagnostic>,
     pub prompt_templates: Vec<PromptTemplate>,
     pub agents_files: Vec<crate::resources::ContextFile>,
     pub system_prompt: String,
@@ -564,6 +567,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     Ok(SessionEngine {
         session,
         skills: resources.skills,
+        skill_diagnostics: resources.skill_diagnostics,
         prompt_templates: resources.prompts,
         agents_files: resources.agents_files,
         system_prompt,
