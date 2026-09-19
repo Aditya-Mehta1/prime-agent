@@ -123,7 +123,8 @@ impl SettingsStorage for FileSettingsStorage {
     }
 }
 
-/// Atomic write: temp file + rename, private mode like `writeFileAtomicSync`.
+/// Atomic write: temp file + rename, private mode like `writeFileAtomicSync`
+/// (its win32-only destination-busy retry rides along in `rename_onto`).
 pub fn atomic_write(path: &Path, content: &str) -> Result<()> {
     let temp = PathBuf::from(format!("{}.tmp{}", path.display(), std::process::id()));
     {
@@ -134,7 +135,7 @@ pub fn atomic_write(path: &Path, content: &str) -> Result<()> {
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
     }
-    fs::rename(&temp, path)?;
+    crate::platform::rename_onto(&temp, path)?;
     Ok(())
 }
 

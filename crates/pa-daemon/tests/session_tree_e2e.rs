@@ -4,6 +4,7 @@
 //! leaf no-op, branch summary, unknown target), and `fork`. The wire shapes
 //! are the TS daemon-protocol contract; the leaf moves are asserted through
 //! the store's `get_messages` read of the moved branch.
+#![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;

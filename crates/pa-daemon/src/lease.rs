@@ -126,19 +126,74 @@ fn owner_alive(owner: &LeaseOwner) -> bool {
     }
 }
 
+/// Whether a failed candidate-onto-lease-directory rename means the lease
+/// directory already exists (TS `isRenameTargetContention`).
+///
+/// POSIX: renaming onto an existing directory raises EEXIST/ENOTEMPTY.
+/// Windows: the same race surfaces as EPERM/EACCES instead, so those count
+/// as contention only when the target actually exists - a real permission
+/// problem must still propagate. EBUSY (a destination held open by
+/// antivirus/indexer) is never contention: TS leaves it out.
+fn is_rename_target_contention(
+    directory: &Path,
+    error: &std::io::Error,
+    platform_windows: bool,
+) -> bool {
+    match error.kind() {
+        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::DirectoryNotEmpty => true,
+        std::io::ErrorKind::PermissionDenied => {
+            platform_windows && directory.try_exists().unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+/// Total attempts before a transient stale-reclaim rename failure surfaces
+/// (TS `reclaimStaleLease` caps at 8 with a `10ms * attempt` backoff).
+const WIN32_RECLAIM_ATTEMPTS: u32 = 8;
+
+/// Whether a failed stale-reclaim rename deserves another attempt on the
+/// given platform, and how long to wait first (`10ms * attempt`). `None`
+/// means the failure surfaces. Attempts are 1-based; only the win32
+/// destination-busy family (EPERM/EACCES via `PermissionDenied`, EBUSY via
+/// raw `ERROR_SHARING_VIOLATION`/`ERROR_LOCK_VIOLATION`) retries.
+fn reclaim_retry_delay_ms(
+    platform_windows: bool,
+    error: &std::io::Error,
+    attempt: u32,
+) -> Option<u64> {
+    if !platform_windows || attempt >= WIN32_RECLAIM_ATTEMPTS {
+        return None;
+    }
+    let transient = error.kind() == std::io::ErrorKind::PermissionDenied
+        || matches!(error.raw_os_error(), Some(32) | Some(33));
+    transient.then(|| 10 * u64::from(attempt))
+}
+
 fn reclaim_stale(directory: &Path) -> bool {
     let stale = directory.with_extension(format!(
         "lock.stale-{}-{}",
         std::process::id(),
         uuid::Uuid::new_v4().simple()
     ));
-    match fs::rename(directory, &stale) {
-        Ok(()) => {
-            let _ = fs::remove_dir_all(&stale);
-            true
+    let platform_windows = cfg!(windows);
+    let mut attempt = 1;
+    loop {
+        match fs::rename(directory, &stale) {
+            Ok(()) => {
+                let _ = fs::remove_dir_all(&stale);
+                return true;
+            }
+            // The lease path is already free: nothing to reclaim.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(error) => match reclaim_retry_delay_ms(platform_windows, &error, attempt) {
+                Some(delay) => {
+                    std::thread::sleep(Duration::from_millis(delay));
+                    attempt += 1;
+                }
+                None => return false,
+            },
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-        Err(_) => false,
     }
 }
 
@@ -253,9 +308,7 @@ pub fn acquire_session_lease(
                     if error.kind() == std::io::ErrorKind::NotFound {
                         continue;
                     }
-                    if error.kind() == std::io::ErrorKind::AlreadyExists
-                        || error.kind() == std::io::ErrorKind::DirectoryNotEmpty
-                    {
+                    if is_rename_target_contention(&directory, &error, cfg!(windows)) {
                         match read_owner(&directory)? {
                             Some(existing) if owner_alive(&existing) => {
                                 return Err(SessionAlreadyActiveError::for_owner(
@@ -321,5 +374,79 @@ mod tests {
         second.release();
         std::env::remove_var(SESSION_LEASES_ENABLED_ENV);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_target_contention_covers_exist_and_not_empty() {
+        // TS: EEXIST and ENOTEMPTY are contention on every platform.
+        for kind in [
+            std::io::ErrorKind::AlreadyExists,
+            std::io::ErrorKind::DirectoryNotEmpty,
+        ] {
+            let error = std::io::Error::from(kind);
+            assert!(is_rename_target_contention(
+                Path::new("/tmp"),
+                &error,
+                false
+            ));
+            assert!(is_rename_target_contention(Path::new("/tmp"), &error, true));
+        }
+    }
+
+    #[test]
+    fn rename_target_contention_denied_only_when_win32_target_exists() {
+        // TS: EPERM/EACCES count as contention on win32 when - and only
+        // when - the lease directory actually exists.
+        let dir = std::env::temp_dir().join(format!("pa-lease-c-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(is_rename_target_contention(&dir, &denied, true));
+        assert!(!is_rename_target_contention(&dir, &denied, false));
+        let missing = dir.join("missing");
+        assert!(!is_rename_target_contention(&missing, &denied, true));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_target_contention_ignores_unrelated_failures() {
+        // TS: EBUSY and other codes are never contention (a shared-open
+        // destination must surface, not read as a conflict).
+        for error in [
+            std::io::Error::from(std::io::ErrorKind::Other),
+            // ERROR_SHARING_VIOLATION stays raw in std (libuv EBUSY).
+            std::io::Error::from_raw_os_error(32),
+        ] {
+            assert!(!is_rename_target_contention(
+                Path::new("/tmp"),
+                &error,
+                true
+            ));
+        }
+    }
+
+    #[test]
+    fn reclaim_retry_is_win32_only_with_linear_backoff_until_cap() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let busy = std::io::Error::from_raw_os_error(33);
+        for error in [&denied, &busy] {
+            for attempt in 1..WIN32_RECLAIM_ATTEMPTS {
+                assert_eq!(
+                    reclaim_retry_delay_ms(true, error, attempt),
+                    Some(10 * u64::from(attempt)),
+                    "attempt={attempt}"
+                );
+            }
+            assert_eq!(
+                reclaim_retry_delay_ms(true, error, WIN32_RECLAIM_ATTEMPTS),
+                None
+            );
+            assert_eq!(
+                reclaim_retry_delay_ms(true, error, WIN32_RECLAIM_ATTEMPTS + 3),
+                None
+            );
+            assert_eq!(reclaim_retry_delay_ms(false, error, 1), None);
+        }
+        let unrelated = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(reclaim_retry_delay_ms(true, &unrelated, 1), None);
     }
 }

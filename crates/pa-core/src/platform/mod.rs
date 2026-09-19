@@ -9,6 +9,7 @@ pub mod browser;
 pub mod lock_dir;
 pub mod perms;
 pub mod process;
+pub mod rename;
 pub mod shell;
 
 pub use lock_dir::LockDir;
@@ -19,4 +20,5 @@ pub use process::{
     kill_pid, kill_process_group_or_pid, pid_exists, set_new_process_group, set_no_window,
     termination_signal, Signal,
 };
+pub use rename::rename_onto;
 pub use shell::{get_shell_config, resolve_kernel_bash_shell, ShellConfig};

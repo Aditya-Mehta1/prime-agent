@@ -86,12 +86,18 @@ fn write_launcher(root: &Path, link: &str, target: &str) -> Result<()> {
     let temporary = launcher.with_extension("swap-tmp");
     let _ = std::fs::remove_file(&temporary);
     #[cfg(unix)]
-    std::os::unix::fs::symlink(target, &temporary)
-        .with_context(|| format!("stage the {link} launcher"))?;
+    {
+        std::os::unix::fs::symlink(target, &temporary)
+            .with_context(|| format!("stage the {link} launcher"))?;
+        std::fs::rename(&temporary, &launcher)
+            .with_context(|| format!("point the {link} launcher at {target}"))
+    }
     #[cfg(not(unix))]
-    anyhow::bail!("the staged activation requires unix symlink semantics");
-    std::fs::rename(&temporary, &launcher)
-        .with_context(|| format!("point the {link} launcher at {target}"))
+    {
+        // The staged activation requires unix symlink semantics.
+        let _ = target;
+        anyhow::bail!("the staged activation requires unix symlink semantics");
+    }
 }
 
 /// The launcher's current link target (the `../releases/...` text).

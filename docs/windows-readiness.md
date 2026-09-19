@@ -205,11 +205,25 @@ No platform coupling found (loop policy only; no process/socket code).
    (+ `uv.exe` fallback), and `!command` config values spawn the configured
    shell with a `ComSpec` fallback on win32 (TS
    `executeWithConfiguredShell` + `execSync`).
-8. Atomic writes: add the TS `renameOntoSync` EPERM/EACCES/EBUSY retry to
-   `settings::storage::atomic_write` (only fires on win32).
-9. Session-lease / orphan-journal rename semantics: verify Windows rename
-   replaces as Unix does (`std::fs::rename` uses MoveFileEx with
-   REPLACE_EXISTING - check and test).
+8. Atomic writes: DONE (lane `win-rename`) - the TS `renameOntoSync`
+   EPERM/EACCES/EBUSY retry lives in `platform::rename::rename_onto` (5 total
+   attempts, `10ms * attempt` backoff, win32-only; the access-denied family
+   via `PermissionDenied` plus raw `ERROR_SHARING_VIOLATION`/
+   `ERROR_LOCK_VIOLATION` as libuv EBUSY) and backs the durable write in
+   `settings::storage::atomic_write` (and every caller that persists through
+   it: auth storage, cron, refinement, package installs/updates).
+9. Session-lease / orphan-journal rename semantics: DONE (lane
+   `win-rename`) - `std::fs::rename` on Windows calls `MoveFileExW` with
+   `MOVEFILE_REPLACE_EXISTING` (std `sys/pal/windows/fs.rs`), so durable
+   writes replace an existing destination exactly like Unix; the
+   cross-platform `rename_onto_replaces_destination` test covers the
+   replace-existing invariant (orphan-journal persists are plain
+   temp-onto-path renames like TS `worker-recovery-journal.ts`). For the
+   directory renames the TS lease adds win32 arms the port now carries:
+   `is_rename_target_contention` (EEXIST/ENOTEMPTY always; EPERM/EACCES on
+   win32 only when the lease directory exists, EBUSY never) and the
+   stale-reclaim transient retry (win32-only, 8 total attempts, `10ms *
+   attempt`, EPERM/EACCES/EBUSY) in `pa-daemon` `lease.rs`.
 10. Gate the remaining test-only `/proc` and UnixSocket usages with
     `#[cfg(unix)]` where they assert Linux behavior.
 
