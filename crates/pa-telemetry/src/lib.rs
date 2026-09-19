@@ -17,6 +17,7 @@ mod flags;
 mod install_id;
 mod platform;
 mod properties;
+mod rename;
 mod sink;
 mod sinks;
 mod time;
@@ -31,6 +32,7 @@ pub use flags::{FlagsClient, FLAG_CACHE_TTL};
 pub use install_id::install_id;
 pub use platform::{base_properties, SCHEMA_VERSION};
 pub use properties::Properties;
+pub use rename::rename_onto;
 pub use sink::{SinkOutcome, TelemetrySink};
 pub use sinks::{FileSink, MockSink, NoopSink, PostHogEndpoint, PostHogSink, RecordedBatch};
 

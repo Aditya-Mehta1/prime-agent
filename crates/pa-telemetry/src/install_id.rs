@@ -73,12 +73,14 @@ fn read_install_id(path: &Path) -> Result<Option<String>> {
 }
 
 /// Atomically replace invalid state (temp file + rename, both sides of the
-/// rename land on the same filesystem inside the agent dir).
+/// rename land on the same filesystem inside the agent dir). The rename goes
+/// through `rename_onto` so the win32 destination-busy retry applies, like
+/// the TS `writeTelemetryStateAtomically` (`writeFileAtomicSync`).
 fn replace_invalid_state(path: &Path, payload: &[u8]) -> Result<()> {
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, payload).with_context(|| format!("write {}", tmp.display()))?;
     set_file_private(&tmp)?;
-    std::fs::rename(&tmp, path)
+    crate::rename_onto(&tmp, path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
 }
 

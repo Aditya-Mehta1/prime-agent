@@ -839,7 +839,8 @@ pub fn write_rlm_subagent_display(entry: &RlmSubagentDisplayEntry) -> Result<boo
     let payload = serde_json::to_string(entry)?;
     let temp = dir.join(format!("rlm-subagent.json.tmp-{}", crate::util::now_ms()));
     fs::write(&temp, format!("{payload}\n"))?;
-    fs::rename(&temp, dir.join("rlm-subagent.json"))?;
+    pa_core::platform::rename_onto(&temp, &dir.join("rlm-subagent.json"))
+        .with_context(|| format!("persist rlm-subagent display at {}", dir.display()))?;
     Ok(true)
 }
 

@@ -205,13 +205,25 @@ No platform coupling found (loop policy only; no process/socket code).
    (+ `uv.exe` fallback), and `!command` config values spawn the configured
    shell with a `ComSpec` fallback on win32 (TS
    `executeWithConfiguredShell` + `execSync`).
-8. Atomic writes: DONE (lane `win-rename`) - the TS `renameOntoSync`
-   EPERM/EACCES/EBUSY retry lives in `platform::rename::rename_onto` (5 total
-   attempts, `10ms * attempt` backoff, win32-only; the access-denied family
-   via `PermissionDenied` plus raw `ERROR_SHARING_VIOLATION`/
-   `ERROR_LOCK_VIOLATION` as libuv EBUSY) and backs the durable write in
-   `settings::storage::atomic_write` (and every caller that persists through
-   it: auth storage, cron, refinement, package installs/updates).
+8. Atomic writes: DONE (lane `win-rename`; follow-up lane `persist-rename`
+   routed the remaining sites) - the TS `renameOntoSync`
+   EPERM/EACCES/EBUSY retry lives in `pa-telemetry`'s `rename_onto`
+   (re-exported as pa-core `platform::rename_onto`; 5 total attempts,
+   `10ms * attempt` backoff, win32-only; the access-denied family via
+   `PermissionDenied` plus raw `ERROR_SHARING_VIOLATION`/
+   `ERROR_LOCK_VIOLATION` as libuv EBUSY) and backs every durable
+   temp+rename persist whose TS counterpart goes through
+   `writeFileAtomicSync`: pa-core `settings::storage::atomic_write` (auth
+   storage, cron, refinement, package installs/updates) and the session
+   manager's `atomic_write` (rewrite + crash repair), pa-daemon's worker
+   descriptor/supervisor-config writes (`descriptor::write_file_atomic`),
+   the update-flow manifest artifacts, the RLM display files, the session
+   store rewrite, the command journal's compaction, and pa-telemetry's
+   install-id replacement. Deliberately NOT routed (TS-matched bare
+   renames): the worker recovery journal's compaction (TS
+   `worker-recovery-journal.ts` `renameSync`), the update-flow status and
+   intent files (TS `writeJsonAtomically` `renameSync`), log rotations,
+   lock/lease/aside renames, and the sessions-archive move.
 9. Session-lease / orphan-journal rename semantics: DONE (lane
    `win-rename`) - `std::fs::rename` on Windows calls `MoveFileExW` with
    `MOVEFILE_REPLACE_EXISTING` (std `sys/pal/windows/fs.rs`), so durable

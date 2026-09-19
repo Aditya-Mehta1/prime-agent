@@ -452,7 +452,8 @@ impl SessionFile {
             writer.flush()?;
             writer.get_ref().sync_all()?;
         }
-        fs::rename(&temp, path).with_context(|| format!("persist {}", path.display()))?;
+        pa_core::platform::rename_onto(&temp, path)
+            .with_context(|| format!("persist {}", path.display()))?;
         Ok(())
     }
 

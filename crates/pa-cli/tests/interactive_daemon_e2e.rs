@@ -1720,6 +1720,7 @@ async fn tui_prompts_queued_behind_a_turn_render_the_queue_strip() {
         no_session: false,
         session: pa_tui::interactive::SessionSelection::New,
         show_images: true,
+        fullscreen_mouse: true,
         initial_message: None,
         theme: "prime".to_string(),
         code_block_indent: "  ".to_string(),

@@ -33,7 +33,18 @@ fn append_record(path: &Path, record: &Value) -> Result<()> {
     Ok(())
 }
 
-fn rewrite_records(path: &Path, records: &[Value]) -> Result<()> {
+/// How the temp journal lands on its path.
+#[derive(Debug, Clone, Copy)]
+enum Finalize {
+    /// Rename through `rename_onto`: the bounded win32 destination-busy
+    /// retry (TS `writeFileAtomicSync` -> `renameOntoSync`).
+    RetryBusy,
+    /// Bare rename; every failure surfaces immediately (TS
+    /// `worker-recovery-journal.ts` uses plain `renameSync` - no retry).
+    Bare,
+}
+
+fn rewrite_records(path: &Path, records: &[Value], finalize: Finalize) -> Result<()> {
     let temp = path.with_extension(format!("jsonl.tmp-{}", std::process::id()));
     {
         let file = File::create(&temp).with_context(|| format!("create {}", temp.display()))?;
@@ -46,7 +57,11 @@ fn rewrite_records(path: &Path, records: &[Value]) -> Result<()> {
         writer.flush()?;
         writer.get_ref().sync_all()?;
     }
-    fs::rename(&temp, path).with_context(|| format!("persist {}", path.display()))?;
+    let rename = match finalize {
+        Finalize::RetryBusy => pa_core::platform::rename_onto(&temp, path),
+        Finalize::Bare => fs::rename(&temp, path),
+    };
+    rename.with_context(|| format!("persist {}", path.display()))?;
     Ok(())
 }
 
@@ -184,7 +199,7 @@ impl CommandRecoveryJournal {
             }
             records.push(received);
         }
-        rewrite_records(&self.path, &records)?;
+        rewrite_records(&self.path, &records, Finalize::RetryBusy)?;
         self.record_count = records.len();
         Ok(())
     }
@@ -395,7 +410,7 @@ impl WorkerRecoveryJournal {
             .map(serde_json::to_value)
             .collect::<std::result::Result<_, _>>()?;
         records.extend(snapshots);
-        rewrite_records(&self.path, &records)
+        rewrite_records(&self.path, &records, Finalize::Bare)
     }
 }
 

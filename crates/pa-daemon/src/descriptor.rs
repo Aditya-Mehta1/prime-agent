@@ -203,7 +203,8 @@ pub fn write_file_atomic(path: &Path, content: &str) -> Result<()> {
         writer.get_ref().sync_all()?;
     }
     let _ = pa_core::platform::perms::restrict_file(&temp);
-    std::fs::rename(&temp, path).with_context(|| format!("persist {}", path.display()))?;
+    pa_core::platform::rename_onto(&temp, path)
+        .with_context(|| format!("persist {}", path.display()))?;
     Ok(())
 }
 
@@ -268,6 +269,19 @@ use std::io::Write as _;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_file_atomic_replaces_an_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("descriptor.json");
+        std::fs::write(&path, "stale").unwrap();
+        write_file_atomic(&path, "next").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "next");
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().count() == 1,
+            "the temp file must not survive the rename"
+        );
+    }
 
     #[test]
     fn durable_create_round_trips() {

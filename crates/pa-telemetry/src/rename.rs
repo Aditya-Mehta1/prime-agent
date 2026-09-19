@@ -2,11 +2,19 @@
 //!
 //! Windows raises transient EPERM/EACCES/EBUSY when the destination of a
 //! rename is held open (antivirus, search indexer) and the underlying
-//! `MoveFileExW(REPLACE_EXISTING)` fails. The durable-write path (settings
-//! storage `atomic_write`) retries that failure class a bounded number of
-//! times before surfacing the error. Unix renames never see this failure
-//! mode - EPERM/EACCES there are real permission problems - so the retry
-//! never fires off Windows.
+//! `MoveFileExW(REPLACE_EXISTING)` fails. Every durable persist write
+//! (temp file + rename onto the destination) retries that failure class a
+//! bounded number of times before surfacing the error, matching the TS
+//! product where `writeFileAtomicSync` wraps every durable write. Unix
+//! renames never see this failure mode - EPERM/EACCES there are real
+//! permission problems - so the retry never fires off Windows.
+//!
+//! This crate sits at the bottom of the workspace dependency graph and
+//! every persist owner (pa-telemetry's install id, pa-core's settings and
+//! session persists, pa-daemon's descriptors/journals/session store)
+//! already depends on it, so the shared primitive lives here; pa-core
+//! re-exports it as `platform::rename_onto` so its platform wall stays the
+//! engine's single platform entry.
 
 use std::fs;
 use std::io;

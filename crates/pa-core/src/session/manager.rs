@@ -233,9 +233,9 @@ fn repair_jsonl_damage(file_path: &Path) {
     if !content.is_empty() {
         content.push('\n');
     }
-    if std::fs::write(file_path, content.as_bytes()).is_ok() {
-        let _ = crate::platform::perms::restrict_file(file_path);
-    }
+    // TS repairs crash damage through `writeFileAtomicSync`: the repaired
+    // file lands by rename, never as a torn in-place write.
+    let _ = atomic_write(file_path, &content);
     let _ = (repaired_tail, dropped_lines);
 }
 
@@ -1035,6 +1035,9 @@ fn resolve_session_rlm_depth(header: &SessionHeader, _session_path: &Path) -> u6
     0
 }
 
+/// Atomic session-file write: private temp + fsync + rename onto the
+/// destination (TS `writeFileAtomicSync`; the win32 destination-busy retry
+/// rides along in `rename_onto`).
 fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
     let temp = PathBuf::from(format!("{}.tmp{}", path.display(), std::process::id()));
     {
@@ -1045,7 +1048,7 @@ fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
     }
-    std::fs::rename(&temp, path)
+    crate::platform::rename_onto(&temp, path)
 }
 
 #[cfg(test)]
