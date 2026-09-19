@@ -21,6 +21,11 @@ pub struct PromptRequest {
     pub images: Vec<pa_agent::types::ImageContent>,
     pub source: String,
     pub agent_message_id: Option<String>,
+    /// An injected custom row (wire `role: "custom"`) that replaces the
+    /// accepted user message for this turn: the turn persists and renders
+    /// the custom row, then runs the model on `message` (TS injected-prompt
+    /// turns: RLM child terminal notices).
+    pub custom_message: Option<Value>,
 }
 
 /// Explicit model selection from a session's create config (the wire
@@ -208,6 +213,13 @@ pub trait SessionEngine: Send + Sync {
     fn model_context_window(&self) -> Option<u64> {
         None
     }
+    /// The worker's turn loop completed (its `EngineEvent::Done` was seen):
+    /// engines hosting RLM children use the boundary to release prompt tasks
+    /// spawned mid-turn, so the parent's own continuation request always
+    /// reaches the provider before a child's first turn (TS event-loop
+    /// ordering: the continuation fetch is already in flight when the
+    /// detached child task runs). Engines without children ignore it.
+    fn on_turn_done(&self) {}
 
     /// Finalize session telemetry at session close: emit
     /// `agent session ended` and flush once (TS dispose callback).
@@ -324,6 +336,13 @@ pub trait SessionEngine: Send + Sync {
     fn configure_rlm_identity(&self, _identity: RlmSessionIdentity) -> Result<()> {
         Ok(())
     }
+
+    /// An agent message from `child_active_session_id` (one of this
+    /// session's RLM children) reached this session. The engine's child
+    /// registry records it so a child's terminal notice can be withheld:
+    /// a child that replied needs no no-reply notice (TS
+    /// `_parentReplyCount`). Engines without children ignore it.
+    fn mark_child_reply(&self, _child_active_session_id: &str) {}
 }
 
 /// One compaction request (the `compact` command fields).
@@ -610,12 +629,13 @@ fn scripted_usage() -> Value {
 }
 
 impl SessionEngine for ScriptedEngine {
+    /// No model metadata: the TS scripted harness reports no resolved
+    /// model on the session summary (`summaryForActiveSession` reads the
+    /// agent's model, unset in the harness), so the roster summary and the
+    /// CLI `list` table stay empty for scripted sessions — the `faux-1`
+    /// id rides on the message rows only.
     fn model_metadata(&self) -> Option<Value> {
-        Some(json!({
-            "id": "faux-1",
-            "provider": "scripted",
-            "reasoning": false,
-        }))
+        None
     }
 
     fn run_prompt(
@@ -637,9 +657,17 @@ impl SessionEngine for ScriptedEngine {
             }
             None => format!("echo: {}", request.message),
         };
-        if !emit(EngineEvent::UserMessage(
-            json!({"role": "user", "content": request.message, "timestamp": crate::util::now_ms()}),
-        )) {
+        // An injected custom row replaces the accepted user message: the
+        // turn persists and renders the row, then runs on `message` (the
+        // real engine's injected-prompt contract, mirrored here so the
+        // scripted harness exercises the same worker path).
+        let accepted = match &request.custom_message {
+            Some(custom) => EngineEvent::CustomMessage(custom.clone()),
+            None => EngineEvent::UserMessage(
+                json!({"role": "user", "content": request.message, "timestamp": crate::util::now_ms()}),
+            ),
+        };
+        if !emit(accepted) {
             emit(cancelled());
             return;
         }
@@ -988,6 +1016,7 @@ mod tests {
             message: message.to_string(),
             source: "test".to_string(),
             agent_message_id: None,
+            custom_message: None,
         };
         let collect = |engine: &ScriptedEngine, index: usize, message: &str| {
             let mut final_message = None;
@@ -1019,6 +1048,7 @@ mod tests {
                 message: "x".into(),
                 source: "test".into(),
                 agent_message_id: None,
+                custom_message: None,
             },
             &|| false,
             &mut |event| {

@@ -260,6 +260,15 @@ How one interactive client run ended.
 | `exit_reason` | string | `ctrl_c_twice` (second press of the exit-hint window), `ctrl_d`, `session_request` (`/exit`, `/quit`, `/resume`, agents-back), `daemon_closed` |
 | `turn_active` | boolean | a turn was still running at exit |
 
+### `tui subagents open`
+
+The subagent summary line opened the scoped agents view (adoption of the
+subagent inspection surface; emitted once per open action).
+
+| property | type | notes |
+|---|---|---|
+| `children_total` | number | live RLM descendant count at open time |
+
 ## Planned events (seams not yet in the product)
 
 These stay in the catalog as planned schema v1 additions; they are NOT

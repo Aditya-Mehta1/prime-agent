@@ -18,8 +18,14 @@ use tokio::sync::mpsc;
 use crate::agents_view_state::truncate_text;
 use crate::agents_view_state::{
     build_layout, build_rows, filter_empty_sessions, filter_unified_sessions, parse_search_query,
-    reconcile_unified_sessions, section_title, AgentsViewRow, RowLayout, Section,
+    reconcile_unified_sessions, scope_depth, scope_to_descendants, section_title, AgentsViewRow,
+    RowLayout, Section,
 };
+
+/// The scope a scoped view opened on (TS `AgentsViewScopeKey` plus the
+/// display name): the view lists this session's descendants and the back
+/// key returns to it.
+pub use crate::agents_view_state::AgentsViewScope;
 use crate::daemon_client::{DaemonClient, DaemonClientEvent};
 use crate::interactive::SessionSelection;
 use crate::theme::{Theme, ThemeBg, ThemeColor};
@@ -37,6 +43,10 @@ pub struct AgentsViewOptions {
     /// The session the view was opened from: keeps its recency slot and
     /// survives the empty-catalog filter.
     pub anchor_session_id: Option<String>,
+    /// Open scoped to one session's subtree (the subagent summary line's
+    /// open action; TS `scoped_agents_view`): the root lists its
+    /// descendants, and the back key reopens this session.
+    pub scope: Option<AgentsViewScope>,
     /// The query restored from the previous view run (TS
     /// `AgentsViewPersistentState.query`: returning from an opened chat
     /// keeps the filter typed before opening it).
@@ -99,6 +109,12 @@ struct AgentsViewMode {
     selected: usize,
     query: String,
     status: Option<String>,
+    /// The scope root's `depth` metadata (`rlmDepth + 1`); `None` when the
+    /// scope root is not on the roster (the view falls back to the global
+    /// list with a status message, TS scope-resolution fallback).
+    scope_depth: Option<u32>,
+    /// The scope root resolved on the last rebuild.
+    scope_active: bool,
     /// First ctrl+c shows the exit hint; the second exits.
     exit_armed: bool,
     /// The double-Ctrl+C force-quit guard (the run's shared instance is
@@ -122,6 +138,8 @@ impl AgentsViewMode {
             selected: 0,
             query,
             status: None,
+            scope_depth: None,
+            scope_active: false,
             exit_armed: false,
             exit_guard: crate::exit_guard::ExitGuard::new(),
             pulse: 0,
@@ -130,11 +148,35 @@ impl AgentsViewMode {
         }
     }
 
-    /// Rebuild rows from the current roster, catalog, and query.
+    /// Rebuild rows from the current roster, catalog, and query. A scoped
+    /// run lists only the scope root's descendants (TS `scopeToSessionSubtree`
+    /// with the root's own row excluded); a scope root that left the roster
+    /// falls back to the global list with a status message.
     fn rebuild_rows(&mut self) {
         let identity = self.rows.get(self.selected).map(|row| row.identity.clone());
         let records = reconcile_unified_sessions(&self.roster, &self.saved);
-        let filtered = filter_empty_sessions(&records, self.options.anchor_session_id.as_deref());
+        let mut scope_active = false;
+        let filtered = match &self.options.scope {
+            Some(scope) => {
+                let empty = filter_empty_sessions(&records, None);
+                match scope_to_descendants(&empty, scope) {
+                    Some(scoped) => {
+                        scope_active = true;
+                        self.scope_depth = scope_depth(&empty, scope);
+                        scoped
+                    }
+                    None => {
+                        self.scope_depth = None;
+                        self.status = Some(
+                            "Scope is no longer available; returned to the global view".to_string(),
+                        );
+                        filter_empty_sessions(&records, self.options.anchor_session_id.as_deref())
+                    }
+                }
+            }
+            None => filter_empty_sessions(&records, self.options.anchor_session_id.as_deref()),
+        };
+        self.scope_active = scope_active;
         let query = self.query.trim();
         let rows = if query.is_empty() {
             build_rows(&filtered, self.options.anchor_session_id.as_deref())
@@ -220,6 +262,19 @@ impl AgentsViewMode {
             Some("Cannot open agent without an active runtime or saved session file".to_string());
     }
 
+    /// Hand the terminal back to the scope root's session (TS
+    /// `finish({ type: "open", summary: backSession })`): the scoped view
+    /// detaches and reattaches the session it was opened from.
+    fn open_scope_root(&mut self) {
+        let Some(scope) = self.options.scope.clone() else {
+            return;
+        };
+        if let Some(active) = scope.active_session_id.clone().filter(|id| !id.is_empty()) {
+            self.selection = Some(SessionSelection::Attach(active));
+            self.running = false;
+        }
+    }
+
     /// Handle one key id. Returns the status-line override when the caller
     /// should surface one (none of the PR-2 actions do).
     fn handle_key(&mut self, key: &str) {
@@ -238,10 +293,21 @@ impl AgentsViewMode {
                 self.selection = Some(SessionSelection::New);
                 self.running = false;
             }
+            // The scoped view's parent key (TS `app.agents.back`): left
+            // hands the terminal back to the scope root's session; the
+            // global view has no hierarchy parent and consumes left
+            // without opening a chat (TS onEscape handles escape alone).
+            "left" => {
+                if self.scope_active {
+                    self.open_scope_root();
+                }
+            }
             "escape" => {
                 if !self.query.is_empty() {
                     self.query.clear();
                     self.rebuild_rows();
+                } else if self.scope_active {
+                    self.open_scope_root();
                 } else {
                     self.running = false;
                 }
@@ -293,18 +359,42 @@ impl AgentsViewMode {
                 .filter(|row| row.section == Section::Inactive)
                 .count(),
         );
+        let mut extra_metadata = vec![(
+            "agents".to_string(),
+            format!("{running} running, {idle} idle, {inactive} inactive"),
+        )];
+        if let Some(depth) = self.scope_depth {
+            extra_metadata.push(("depth".to_string(), depth.to_string()));
+        }
         let chrome = crate::chrome::ChromeState {
             version: self.options.version.clone(),
             cwd: self.options.cwd.to_string_lossy().to_string(),
-            extra_metadata: Some((
-                "agents".to_string(),
-                format!("{running} running, {idle} idle, {inactive} inactive"),
-            )),
+            extra_metadata,
+            splash_hide_cwd: self.scope_active,
             ..Default::default()
         };
         // `render_splash` already trails one blank row (TS renderContent's
         // `headerLines.push("")`).
         lines.extend(crate::chrome::render_splash(&chrome, theme, width));
+        // The scoped view's back label (TS `<back> back · <title> ›
+        // subagents`), dim, over the full width under the splash.
+        if self.scope_active {
+            if let Some(scope) = &self.options.scope {
+                let title = scope
+                    .session_name
+                    .clone()
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| "Untitled agent".to_string());
+                let label = truncate_text(
+                    &format!("\u{2190} back \u{b7} {title} \u{203a} subagents"),
+                    width,
+                );
+                let mut row = vec![crate::Span::styled(label, theme.fg_style(ThemeColor::Dim))];
+                row = crate::width::pad_line(row, width);
+                lines.push(row);
+                lines.push(vec![]);
+            }
+        }
 
         // Inline search prompt (TS renders the transparent editor with the
         // `> ` prefix, paddingX 2, and the dim "Search sessions" placeholder).
@@ -484,8 +574,13 @@ impl AgentsViewMode {
         if let Some(status) = &self.status {
             return truncate_line(vec![theme.fg(ThemeColor::Error, status.clone())], width);
         }
-        // TS keyText glyphs: up/down render as arrows, right as →, ctrl+n as Ctrl+N.
-        let hints = "\u{2191}/\u{2193} navigate   Enter/\u{2192} open   Ctrl+N new";
+        // TS keyText glyphs: up/down render as arrows, right as →, ctrl+n as
+        // Ctrl+N; the scoped view adds the parent-back hint.
+        let hints = if self.scope_active {
+            "\u{2191}/\u{2193} navigate   Enter/\u{2192} open   \u{2190} parent   Ctrl+N new"
+        } else {
+            "\u{2191}/\u{2193} navigate   Enter/\u{2192} open   Ctrl+N new"
+        };
         truncate_line(vec![theme.fg(ThemeColor::Muted, hints.to_string())], width)
     }
 }
@@ -822,6 +917,7 @@ mod tests {
             theme: "prime".to_string(),
             version: "0.0.0".to_string(),
             anchor_session_id: None,
+            scope: None,
             query: None,
         });
         let row = |title: &str| AgentsViewRow {

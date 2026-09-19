@@ -434,6 +434,7 @@ mod tests {
             let mut core = worker.core.lock().unwrap();
             core.steering.push_back(crate::worker::QueuedItem {
                 message: "waiting prompt".to_string(),
+                custom_message: None,
                 images: Vec::new(),
                 done: Some(done_tx),
             });

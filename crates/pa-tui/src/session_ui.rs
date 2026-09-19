@@ -115,6 +115,20 @@ pub(crate) struct SessionUi {
     /// `/resume` or the agents-back key: reopen the agents view after this
     /// session detaches.
     pub(crate) open_agents_view: bool,
+    /// The subagent summary line opened the scoped agents view: the scope
+    /// the view opens on (this session's subtree).
+    pub(crate) scoped_agents_view: Option<crate::agents_view::AgentsViewScope>,
+    /// The live agent roster (the session view's `roster_subscribe`
+    /// subscription, TS `rosterBar`): drives the subagent summary counts.
+    roster: Vec<Value>,
+    /// The subagent summary line holds keyboard focus.
+    subagents_focused: bool,
+    /// The last computed descendant counts (selectability reads them between
+    /// roster updates).
+    subagent_counts: crate::subagents::SubagentCounts,
+    /// This session's persisted file path (family identity of the
+    /// subagent linkage; `None` for unpersisted sessions).
+    session_file: Option<String>,
     /// `/resume <selector>`: open this selection next (the run returns it).
     pub(crate) pending_selection: Option<SessionSelection>,
     /// Whether this run may hand the terminal back to the agents view (TS
@@ -199,6 +213,11 @@ impl SessionUi {
             last_assistant_text: None,
             exit_requested: false,
             open_agents_view: false,
+            scoped_agents_view: None,
+            roster: Vec::new(),
+            subagents_focused: false,
+            subagent_counts: crate::subagents::SubagentCounts::default(),
+            session_file: None,
             pending_selection: None,
             return_to_agents_view: !options.no_session,
             client_auth: options.client_auth.clone(),
@@ -334,7 +353,20 @@ impl SessionUi {
         let reconstructed = reconstruct(&attach);
         self.active_session_id = attach.active_session_id;
         self.session_id = reconstructed.session_id;
-        self.session_name = reconstructed.session_name;
+        self.session_name = reconstructed.session_name.clone();
+        self.session_file = attach
+            .snapshot
+            .get("state")
+            .and_then(|state| state.get("sessionFile"))
+            .and_then(Value::as_str)
+            .filter(|file| !file.is_empty())
+            .map(str::to_string);
+        // The subagent summary follows the fresh session's family: the old
+        // roster belongs to the previous session, and the focus returns to
+        // the editor (TS `resetSubagentSummary` on rebind).
+        self.roster.clear();
+        self.subagents_focused = false;
+        self.subscribe_roster().await;
         self.pending_model = reconstructed.model_id;
         self.last_assistant_text = reconstructed
             .chat
@@ -356,6 +388,114 @@ impl SessionUi {
         Ok(())
     }
 
+    /// Subscribe this client to the live agent roster (TS
+    /// `subscribeAgentRoster`): the snapshot seeds the subagent summary
+    /// counts, `roster_update` pushes keep them live. A failed
+    /// subscription degrades to no counts (TS `rosterBar = undefined`).
+    async fn subscribe_roster(&mut self) {
+        let snapshot = self
+            .client
+            .request(DaemonCommand::RosterSubscribe {
+                id: None,
+                rest: Default::default(),
+            })
+            .await;
+        if let Ok(response) = snapshot {
+            if response.success {
+                self.roster = response
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("roster"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+            }
+        }
+    }
+
+    /// Apply one roster push (`changed` upsert by agent id, `removed`
+    /// deletes, `resync` replaces the whole roster; TS `roster-store`).
+    fn apply_roster_update(&mut self, changed: Vec<Value>, removed: Vec<String>, resync: bool) {
+        if resync {
+            self.roster.clear();
+        }
+        for entry in changed {
+            let Some(agent_id) = entry.get("agentId").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some(existing) = self
+                .roster
+                .iter_mut()
+                .find(|row| row.get("agentId").and_then(Value::as_str) == Some(agent_id))
+            {
+                *existing = entry;
+            } else {
+                self.roster.push(entry);
+            }
+        }
+        for agent_id in removed {
+            self.roster.retain(|row| {
+                row.get("agentId").and_then(Value::as_str) != Some(agent_id.as_str())
+            });
+        }
+    }
+
+    /// Recompute the subagent summary box from the roster (TS
+    /// `updateSubagentSummaryLine`): live counts over this session's
+    /// descendants, focused when the summary line holds the focus.
+    fn update_subagent_summary(&mut self, view: &mut AgentView) {
+        let identity = crate::subagents::SessionIdentity::new(
+            (!self.active_session_id.is_empty()).then(|| self.active_session_id.clone()),
+            (!self.session_id.is_empty()).then(|| self.session_id.clone()),
+            self.session_file.clone(),
+        );
+        let counts = crate::subagents::count_descendants(&self.roster, &identity);
+        self.subagent_counts = counts;
+        if counts.total == 0 {
+            self.subagents_focused = false;
+            view.chrome.subagents = None;
+            return;
+        }
+        view.chrome.subagents = Some(crate::chrome::SubagentSummary {
+            running: counts.running,
+            idle: counts.idle,
+            inactive: counts.inactive,
+            focused: self.subagents_focused,
+            openable: self.return_to_agents_view,
+        });
+    }
+
+    /// Whether the subagent summary line may take focus (TS `isSelectable`):
+    /// children exist and the run can open the scoped agents view.
+    fn subagents_selectable(&self) -> bool {
+        self.return_to_agents_view && self.subagent_counts.total > 0
+    }
+
+    /// Open the scoped agents view from the focused summary line (TS
+    /// `openScopedAgentsView` -> `returnToAgentsView("scoped_agents_view")`):
+    /// the session detaches and the agents view reopens scoped to this
+    /// session's subtree, anchored on it.
+    fn open_scoped_agents_view(&mut self, view: &mut AgentView) {
+        self.subagents_focused = false;
+        self.update_subagent_summary(view);
+        // `tui subagents open`: fire-and-forget like the scroll adoption
+        // event - the keypress never waits on the telemetry flush.
+        if let Some(telemetry) = self.telemetry.clone() {
+            let children_total = self.subagent_counts.total as u64;
+            tokio::spawn(async move {
+                telemetry.subagents_view_opened(children_total).await;
+            });
+        }
+        self.scoped_agents_view = Some(crate::agents_view::AgentsViewScope {
+            active_session_id: Some(self.active_session_id.clone()),
+            session_id: Some(self.session_id.clone()),
+            session_name: self.session_name.clone(),
+        });
+        self.open_agents_view = true;
+        self.exit_requested = true;
+        self.dirty = true;
+    }
+
     /// Fold the pending snapshot into the view (fresh transcript, footer
     /// labels). Called after attach and after every session switch.
     pub(crate) fn rebuild_view(&mut self, view: &mut AgentView) {
@@ -373,6 +513,7 @@ impl SessionUi {
         view.chrome.chat_name = self.session_display();
         view.chrome.context = self.context;
         view.chrome.cost_usd = self.cost_usd;
+        self.update_subagent_summary(view);
         // The rebuilt transcript invalidates the announcement row tracking;
         // the goal state itself carries over (seeded at attach).
         self.goal_view.reset_row_tracking();
@@ -1996,6 +2137,49 @@ impl SessionUi {
             self.dirty = true;
             return Ok(());
         }
+        // The subagent summary line owns focus while focused (TS
+        // `SubagentSummaryLine.handleInput`): confirm/open opens the scoped
+        // agents view, up/cancel/back returns to the editor, expand cycles
+        // the conversation detail, and every other key falls through to the
+        // editor after releasing the focus.
+        if self.subagents_focused {
+            let kb = view.editor.keybindings();
+            if kb.matches(&id, "tui.select.confirm") || kb.matches(&id, "app.agents.open") {
+                self.open_scoped_agents_view(view);
+                return Ok(());
+            }
+            if kb.matches(&id, "tui.select.up")
+                || kb.matches(&id, "tui.select.cancel")
+                || kb.matches(&id, "app.agents.back")
+            {
+                self.subagents_focused = false;
+                self.update_subagent_summary(view);
+                self.dirty = true;
+                return Ok(());
+            }
+            if kb.matches(&id, "app.tools.expand") {
+                view.detail = view.detail.next();
+                self.subagents_focused = false;
+                self.dirty = true;
+                return Ok(());
+            }
+            self.subagents_focused = false;
+            self.update_subagent_summary(view);
+        }
+        // TS `app.subagents.focus` (default alt+a): the summary line takes
+        // focus when it is selectable.
+        if view
+            .editor
+            .keybindings()
+            .matches(&id, "app.subagents.focus")
+        {
+            if self.subagents_selectable() {
+                self.subagents_focused = true;
+                self.update_subagent_summary(view);
+            }
+            self.dirty = true;
+            return Ok(());
+        }
         // Agents-back (TS `custom-editor.ts` onAgentsBack): with an empty
         // editor the bound key (default left) hands the terminal to the
         // agents view instead of moving the cursor; with text in the editor
@@ -2109,11 +2293,21 @@ impl SessionUi {
                     }
                 }
             }
-            // Saved-session list frames and roster pushes belong to the
-            // agents-view UI; the session view only reads its own session.
+            // The roster push keeps the subagent summary counts live (TS
+            // `subscribeAgentRoster` -> `updateSubagentSummaryLine`).
+            DaemonClientEvent::RosterUpdate {
+                changed,
+                removed,
+                resync,
+            } => {
+                self.apply_roster_update(changed, removed, resync);
+                self.update_subagent_summary(view);
+                self.dirty = true;
+            }
+            // Saved-session list frames belong to the agents-view UI; the
+            // session view only reads its own session.
             DaemonClientEvent::SessionListItem { .. }
-            | DaemonClientEvent::SessionListProgress { .. }
-            | DaemonClientEvent::RosterUpdate { .. } => {}
+            | DaemonClientEvent::SessionListProgress { .. } => {}
         }
     }
 

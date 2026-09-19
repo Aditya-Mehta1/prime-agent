@@ -192,6 +192,7 @@ async fn search_narrows_the_roster_and_escape_restores_it() {
         theme: "prime".to_string(),
         version: "0.0.0".to_string(),
         anchor_session_id: None,
+        scope: None,
         query: None,
     };
     let plan = AgentsHeadlessPlan {

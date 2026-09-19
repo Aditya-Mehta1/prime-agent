@@ -88,6 +88,13 @@ pub trait InteractionTelemetry: Send + Sync {
         reason: &'static str,
         turn_active: bool,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    /// The subagent summary line opened the scoped agents view (`tui
+    /// subagents open`): `children_total` is the live descendant count at
+    /// open time.
+    fn subagents_view_opened(
+        &self,
+        children_total: u64,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
     /// An image was pasted into the editor from the clipboard (event
     /// `tui image pasted`); `mime_type` is the attachment's sniffed format.
     fn image_pasted(&self, mime_type: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
@@ -367,6 +374,10 @@ pub struct InteractiveOutcome {
     pub frames: Vec<String>,
     /// `/resume` requested the agents view next (return-to-session flow).
     pub return_to_agents_view: bool,
+    /// The subagent summary line opened the agents view scoped to this
+    /// session's subtree; `None` with `return_to_agents_view` means the
+    /// plain view.
+    pub agents_view_scope: Option<crate::agents_view::AgentsViewScope>,
     /// `/resume <selector>` requested this session next.
     pub selection_request: Option<SessionSelection>,
 }
@@ -488,6 +499,7 @@ pub async fn run_interactive(
                 resume_hint: None,
                 last_assistant_text: None,
                 frames: Vec::new(),
+                agents_view_scope: None,
                 // Onboarding exit leaves no session open; no return-to-view
                 // or pending selection applies.
                 return_to_agents_view: false,
@@ -824,6 +836,7 @@ pub async fn run_interactive(
         last_assistant_text: session.last_assistant_text.clone(),
         frames: renderer.finish(&mut view, preserve_alt_screen),
         return_to_agents_view: preserve_alt_screen,
+        agents_view_scope: session.scoped_agents_view.take(),
         selection_request: session.pending_selection,
     };
     session.client.close();

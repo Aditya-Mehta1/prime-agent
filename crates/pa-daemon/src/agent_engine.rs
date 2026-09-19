@@ -1063,6 +1063,29 @@ impl SessionEngine for AgentSessionEngine {
         Ok(())
     }
 
+    /// An agent message from one of this session's children arrived: the
+    /// children registry records it so the child's no-reply terminal
+    /// notice is withheld (TS `_parentReplyCount` on the child run).
+    fn mark_child_reply(&self, child_active_session_id: &str) {
+        if let Some(children) = &self.children {
+            let children = Arc::clone(children);
+            let child = child_active_session_id.to_string();
+            // The delivery handler is sync; the registry lock is async, so
+            // the mark parks on this engine's own runtime.
+            self.runtime.spawn(async move {
+                children.mark_replied(&child).await;
+            });
+        }
+    }
+
+    /// The worker's turn completed: release child prompt tasks waiting on
+    /// the turn boundary (see `SupervisorChildSessions::wait_turn_done`).
+    fn on_turn_done(&self) {
+        if let Some(children) = &self.children {
+            children.notify_turn_done();
+        }
+    }
+
     fn run_side_question(
         &self,
         request: SideQuestionRequest,
@@ -1161,25 +1184,35 @@ impl SessionEngine for AgentSessionEngine {
             }
             return;
         }
-        // The accepted user message is recorded by the worker. Images
-        // ride as multimodal content blocks after the text (TS prompt
-        // admission: the text part first, then the image parts).
-        let mut content = vec![json!({ "type": "text", "text": request.message })];
-        for image in &request.images {
-            let mut block = match serde_json::to_value(image) {
-                Ok(Value::Object(block)) => Value::Object(block),
-                _ => continue,
-            };
-            if let Some(object) = block.as_object_mut() {
-                object.insert("type".to_string(), json!("image"));
+        // The accepted turn row: an injected custom row (wire
+        // `role: "custom"`) replaces the user message — the row persists
+        // and renders as itself while the model turn still runs on the
+        // message text (TS injected-prompt turns: RLM child terminal
+        // notices). The plain turn records the accepted user message;
+        // images ride as multimodal content blocks after the text (TS
+        // prompt admission: the text part first, then the image parts).
+        let accepted = match &request.custom_message {
+            Some(custom) => EngineEvent::CustomMessage(custom.clone()),
+            None => {
+                let mut content = vec![json!({ "type": "text", "text": request.message })];
+                for image in &request.images {
+                    let mut block = match serde_json::to_value(image) {
+                        Ok(Value::Object(block)) => Value::Object(block),
+                        _ => continue,
+                    };
+                    if let Some(object) = block.as_object_mut() {
+                        object.insert("type".to_string(), json!("image"));
+                    }
+                    content.push(block);
+                }
+                EngineEvent::UserMessage(json!({
+                    "role": "user",
+                    "content": content,
+                    "timestamp": now_millis(),
+                }))
             }
-            content.push(block);
-        }
-        if !emit(EngineEvent::UserMessage(json!({
-            "role": "user",
-            "content": content,
-            "timestamp": now_millis(),
-        }))) {
+        };
+        if !emit(accepted) {
             return;
         }
         self.run_turns(&request.message, &request.images, aborted, &mut emit);
@@ -2248,6 +2281,7 @@ mod tests {
                 message: "look at this".to_string(),
                 source: "user".to_string(),
                 agent_message_id: None,
+                custom_message: None,
             },
             &|| false,
             &mut |event| {
@@ -2379,6 +2413,7 @@ mod tests {
                 message: "hi".to_string(),
                 source: "user".to_string(),
                 agent_message_id: None,
+                custom_message: None,
             },
             &|| false,
             &mut |event| {
@@ -2508,6 +2543,7 @@ fn run_prompts(
                 message: prompt.to_string(),
                 source: "user".to_string(),
                 agent_message_id: None,
+                custom_message: None,
             },
             &|| false,
             &mut |event| {
@@ -2604,6 +2640,7 @@ fn assistant_updates_stream_live_while_the_turn_runs() {
             message: "hi".to_string(),
             source: "user".to_string(),
             agent_message_id: None,
+            custom_message: None,
         },
         &|| false,
         &mut |event| {
@@ -2838,6 +2875,7 @@ fn autonomous_gate_pass_and_failure_drive_the_loop() {
                 message: prompt.to_string(),
                 source: "user".to_string(),
                 agent_message_id: None,
+                custom_message: None,
             },
             &|| false,
             &mut |event| {
@@ -2954,6 +2992,7 @@ fn the_turn_loop_is_driven_by_the_driver_trait() {
             message: "go".to_string(),
             source: "user".to_string(),
             agent_message_id: None,
+            custom_message: None,
         },
         &|| false,
         &mut |event| {
@@ -3018,6 +3057,7 @@ fn agent_engine_streams_updates_and_final_message() {
             message: "hi".to_string(),
             source: "user".to_string(),
             agent_message_id: None,
+            custom_message: None,
         },
         &|| false,
         &mut |event| {

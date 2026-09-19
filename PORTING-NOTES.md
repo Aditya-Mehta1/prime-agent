@@ -1357,6 +1357,70 @@ HEAD
   removal under the family id.
 
 
+ HEAD
+## RLM child terminal notices + subagent TUI surface (subagent-surface lane)
+
+- TS ground truth: `agent-session.ts` tracks every `rlm.spawn` run and, when
+  a child finishes without an agent message to the parent
+  (`child._parentReplyCount` unchanged), appends the
+  `rlm_child_terminal_notice` custom row (`[child-exited: no-reply ...]` with
+  the last assistant text preview) as a queued `followUp` turn action whose
+  delivery record carries the custom message; the row renders in the parent
+  transcript ("RLM child status") and the turn runs the model on the notice
+  content. Deletion of a still-running child emits the `cancelled` notice
+  ("Deleted by parent orchestrator"); failures emit `rlm_child_failure`. The
+  TUI half: `SubagentSummaryLine` (the `subagents` counts box under the
+  editor, `alt+a` to focus, confirm/open to drill in) feeds from the daemon
+  roster (`countRosterSubagentStatuses` over `collectSubagentDescendantSummaries`),
+  and `returnToAgentsView("scoped_agents_view")` opens the agents view
+  scoped to the session's subtree (`scopeToSessionSubtree`, root excluded,
+  `depth rlmDepth+1` metadata, `left` returns to the parent).
+- Rust port (mechanism notes):
+  - `pa-core/session_engine/rlm_notices.rs` owns the wire vocabulary and the
+    two row constructors (content + details byte-parity with
+    `messages.ts`).
+  - The daemon (not the parent engine) owns child runs, so the settle
+    watcher lives in `SupervisorChildSessions`: on spawn admission a
+    detached task slices `wait_for_idle` against the child worker, settles
+    through the existing `refresh_record` path, and delivers the no-reply
+    notice when the child never replied. Reply tracking: the parent
+    worker's `worker_deliver_message` handler marks the child on the
+    registry (`SessionEngine::mark_child_reply`, TS `_parentReplyCount`).
+  - Delivery rides the supervisor `follow_up` route with the wire's
+    `customMessage` input (already in `PromptInput`): the parent worker
+    queues the item, and `run_prompt` emits the custom row instead of the
+    user row while the model turn still runs on the notice content — the
+    same turn shape TS's injected notice action produces.
+  - `delete_subagent` of a still-running child delivers the `cancelled`
+    notice; the record's `notice_delivered` claim collapses the race with a
+    natural settle.
+  - Not ported yet: `rlm_child_failure` emission (a crashed child worker
+    respawns under the recovery redesign, so a run-level error verdict is
+    the worker-recovery lane's surface); the queue-visibility suppression of
+    notice turns (TS `queueVisible: false`); the TS in-process
+    `get_rlm_children` snapshot fallback (the Rust summary counts read the
+    public roster, which every daemon session is on).
+- TUI: `chrome.rs` renders the counts box (TS `SubagentSummaryLine.render`
+  geometry: success/warning/dim counts, gap, focused `Enter/→ open` vs
+  `↓ select` hint, selected background); `session_ui.rs` subscribes the
+  session client to the roster (`roster_subscribe` + `roster_update`
+  pushes, TS `subscribeAgentRoster`), counts descendants via
+  `subagents.rs` (`collectSubagentDescendantSummaries` key math:
+  active/session/file parent keys), and hands the terminal to the scoped
+  agents view (`InteractiveOutcome.agents_view_scope`, pa-cli keeps the
+  scope across the view/session loop). The scoped view lists the scope
+  root's descendants excluding the root (`scope_to_descendants`), renders
+  the `← back · <title> › subagents` label, the `depth rlmDepth+1` splash
+  metadata row, the `← parent` hint, and `left`/escape reopens the scope
+  root's session (TS `finish({type:"open", summary: backSession})`).
+- Adoption telemetry: `tui subagents open` (`children_total`) rides the
+  same `InteractionTelemetry` seam as the scroll/exit events.
+- Verifiers: `pa-daemon/src/worker.rs`
+  `an_injected_custom_turn_replaces_the_user_row` (the injected turn's wire
+  shape); `rlm_children.rs` `watch_tests` (no-reply notice delivered to the
+  parent, replied child suppressed) over a scripted supervisor;
+  `pa-tui/src/subagents.rs` descendant-count tests; the f20 battery rerun.
+
 
 ## Provider failover (lane `provider-failover`)
 

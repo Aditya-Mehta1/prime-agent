@@ -973,6 +973,66 @@ pub fn build_layout(rows: &[AgentsViewRow], width: usize) -> RowLayout {
     }
 }
 
+/// The scope of a scoped agents view (TS `AgentsViewScopeKey` plus the
+/// display name): the subtree root the view lists descendants of.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentsViewScope {
+    pub session_id: Option<String>,
+    pub active_session_id: Option<String>,
+    pub session_name: Option<String>,
+}
+
+/// Restrict records to the scope root's descendants, excluding the root
+/// itself (TS `scopeToSessionSubtree` + the scoped row exclusion: the
+/// root's direct children list as top-level rows). The root resolves by
+/// session id or active session id; `None` means the scope root is gone
+/// and the caller falls back to the global list.
+pub fn scope_to_descendants(
+    records: &[UnifiedRecord],
+    scope: &AgentsViewScope,
+) -> Option<Vec<UnifiedRecord>> {
+    let summaries: Vec<Value> = records.iter().map(summary_for_record).collect();
+    let summary_refs: Vec<&Value> = summaries.iter().collect();
+    let root = summaries.iter().position(|summary| {
+        get_str(summary, "sessionId").is_some_and(|id| Some(id) == scope.session_id.as_deref())
+            || get_str(summary, "activeSessionId")
+                .is_some_and(|id| Some(id) == scope.active_session_id.as_deref())
+    })?;
+    let root_summary = &summaries[root];
+    let parent = crate::subagents::SessionIdentity::new(
+        get_str(root_summary, "activeSessionId").map(str::to_string),
+        get_str(root_summary, "sessionId").map(str::to_string),
+        get_str(root_summary, "sessionFile").map(str::to_string),
+    );
+    let positions: std::collections::HashSet<usize> =
+        crate::subagents::descendant_positions(&summary_refs, &parent)
+            .into_iter()
+            .collect();
+    Some(
+        records
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| positions.contains(position))
+            .map(|(_, record)| record.clone())
+            .collect(),
+    )
+}
+
+/// The scope root's depth label (TS `getAgentsViewDepth`:
+/// `rlmDepth + 1`); `None` when the root is not in the record set.
+pub fn scope_depth(records: &[UnifiedRecord], scope: &AgentsViewScope) -> Option<u32> {
+    records
+        .iter()
+        .map(summary_for_record)
+        .find(|summary| {
+            get_str(summary, "sessionId").is_some_and(|id| Some(id) == scope.session_id.as_deref())
+                || get_str(summary, "activeSessionId")
+                    .is_some_and(|id| Some(id) == scope.active_session_id.as_deref())
+        })
+        .and_then(|summary| summary.get("rlmDepth").and_then(Value::as_u64))
+        .map(|depth| depth as u32 + 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -203,7 +203,9 @@ pub fn assert_agent_message_queue_capacity(
     Ok(())
 }
 
-fn sanitize_message_header_value(value: &str) -> String {
+/// Names interpolated into a `[... child:<name>]` header line must not carry
+/// the header's own delimiters (brackets, newlines, commas, colons).
+pub(crate) fn sanitize_message_header_value(value: &str) -> String {
     value
         .chars()
         .map(|char| {

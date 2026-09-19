@@ -48,9 +48,10 @@ pub struct ChromeState {
     pub cwd: String,
     /// Current model id (splash `model` line; `None` hides the line).
     pub model_id: Option<String>,
-    /// One extra metadata line (`label value`, e.g. the agents view's
-    /// `agents N running, ...` count row; `None` hides the line).
-    pub extra_metadata: Option<(String, String)>,
+    /// Extra metadata lines under the splash (`label value` each; e.g. the
+    /// agents view's `agents N running, ...` count row and, in scoped
+    /// mode, the `depth N` row). Empty renders none.
+    pub extra_metadata: Vec<(String, String)>,
     /// Top-bar chat name (session name or the cwd basename).
     pub chat_name: String,
     /// Session spend (USD) beside the chat name.
@@ -70,6 +71,35 @@ pub struct ChromeState {
     /// Tray override label (TS `getTrayOverrideLabel`): while the Ctrl+C
     /// exit hint is armed, it replaces the tray's location label.
     pub tray_override: Option<String>,
+    /// The subagent summary box under the tray (TS `SubagentSummaryLine`):
+    /// `None` hides the box; a zero-total summary renders nothing either.
+    pub subagents: Option<SubagentSummary>,
+    /// Hide the splash `cwd` line (TS `getSplashCwd` returns `undefined`
+    /// for the scoped agents view, so its metadata rows stay centered
+    /// against the logo without the cwd row).
+    pub splash_hide_cwd: bool,
+}
+
+/// Live descendant counts of a session's RLM children (TS
+/// `SubagentSummaryCounts` + the focus/openable state of the summary line).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SubagentSummary {
+    pub running: usize,
+    pub idle: usize,
+    pub inactive: usize,
+    /// The summary line holds keyboard focus (selected background, the
+    /// open hint instead of the select hint).
+    pub focused: bool,
+    /// The current run may open the scoped agents view (TS `setOpenable`:
+    /// true for every daemon-hosted session).
+    pub openable: bool,
+}
+
+impl SubagentSummary {
+    /// Every retained descendant.
+    pub fn total(&self) -> usize {
+        self.running + self.idle + self.inactive
+    }
 }
 
 /// Context usage for the tray label (`N (P%)`).
@@ -228,7 +258,7 @@ pub fn render_splash(state: &ChromeState, theme: &Theme, width: usize) -> Vec<Li
         meta_lines.push(vec![Span::styled(title.to_string(), text)]);
         meta_lines.push(vec![Span::styled(version, muted)]);
     }
-    if let Some((label_text, value_text)) = &state.extra_metadata {
+    for (label_text, value_text) in &state.extra_metadata {
         let label = format!("{label_text} ");
         let value = truncate_to_width(
             value_text,
@@ -249,16 +279,18 @@ pub fn render_splash(state: &ChromeState, theme: &Theme, width: usize) -> Vec<Li
             Span::styled(value, muted),
         ]);
     }
-    let cwd_label = "cwd ";
-    let home = pa_types::platform::home_dir().map(|home| home.to_string_lossy().into_owned());
-    let cwd = truncate_path_middle(
-        &format_splash_cwd(&state.cwd, home.as_deref()),
-        meta_width.saturating_sub(str_width(cwd_label)).max(1),
-    );
-    meta_lines.push(vec![
-        Span::styled(cwd_label.to_string(), dim),
-        Span::styled(cwd, muted),
-    ]);
+    if !state.splash_hide_cwd {
+        let cwd_label = "cwd ";
+        let home = pa_types::platform::home_dir().map(|home| home.to_string_lossy().into_owned());
+        let cwd = truncate_path_middle(
+            &format_splash_cwd(&state.cwd, home.as_deref()),
+            meta_width.saturating_sub(str_width(cwd_label)).max(1),
+        );
+        meta_lines.push(vec![
+            Span::styled(cwd_label.to_string(), dim),
+            Span::styled(cwd, muted),
+        ]);
+    }
 
     let mut lines: Vec<Line> = vec![Vec::new()];
     let row_count = logo_raw.len().max(meta_lines.len());
@@ -388,6 +420,135 @@ pub fn render_tray(state: &ChromeState, theme: &Theme, width: usize) -> Line {
     line
 }
 
+/// Truncate a styled span row to a visible width, replacing the tail with
+/// the ellipsis when it does not fit (TS `truncateToWidth` on the composed
+/// row).
+fn truncate_spans_to_width(spans: &[crate::Span], width: usize) -> Vec<crate::Span> {
+    let mut out: Vec<crate::Span> = Vec::new();
+    let mut remaining = width;
+    for span in spans {
+        if remaining == 0 {
+            break;
+        }
+        let mut text = String::new();
+        let mut consumed = 0usize;
+        for ch in span.content.chars() {
+            let char_width = crate::width::char_width(ch);
+            if consumed + char_width > remaining {
+                break;
+            }
+            text.push(ch);
+            consumed += char_width;
+        }
+        if text.is_empty() {
+            break;
+        }
+        let mut truncated = false;
+        if consumed < str_width(&span.content) {
+            // The span could not fit whole: the ellipsis replaces the first
+            // character that would not fit, and nothing after it renders.
+            text.push('\u{2026}');
+            truncated = true;
+        }
+        let mut piece = span.clone();
+        piece.content = text;
+        out.push(piece);
+        remaining -= consumed;
+        if truncated {
+            break;
+        }
+    }
+    out
+}
+
+/// The subagent summary box (TS `SubagentSummaryLine.render`, the counts
+/// box under the tray): a `\u{256d}\u{2500} subagents \u{2500}\u{256e}` frame with the
+/// status counts left and the open/select hint right; the focused row
+/// carries the selection background. A zero-total summary renders nothing.
+pub fn render_subagent_summary(
+    summary: &SubagentSummary,
+    confirm_hint: &str,
+    open_hint: &str,
+    select_hint: &str,
+    theme: &Theme,
+    width: usize,
+) -> Vec<Line> {
+    if summary.total() == 0 || width < 2 {
+        return Vec::new();
+    }
+    let inner = width - 2;
+    let border = theme.fg_style(ThemeColor::Border);
+    let label = "subagents";
+    let label_width = str_width(label);
+    let top_rule = "\u{2500}".repeat(inner.saturating_sub(3 + label_width));
+    let top: Line = vec![
+        Span::styled("\u{256d}\u{2500} ".to_string(), border),
+        Span::styled(label.to_string(), theme.fg_style(ThemeColor::Accent)),
+        Span::styled(format!(" {top_rule}\u{256e}"), border),
+    ];
+    let counts = [
+        (
+            ThemeColor::Success,
+            format!("\u{25cf} {} running", summary.running),
+        ),
+        (
+            ThemeColor::Warning,
+            format!("\u{25d0} {} idle", summary.idle),
+        ),
+        (
+            ThemeColor::Dim,
+            format!("\u{25cb} {} inactive", summary.inactive),
+        ),
+    ];
+    let counts_width: usize = counts
+        .iter()
+        .map(|(_, text)| str_width(text))
+        .sum::<usize>()
+        + (counts.len() - 1) * 3;
+    let hint = match (summary.openable, summary.focused) {
+        (true, true) => format!("{confirm_hint}/{open_hint} open"),
+        (true, false) => format!("{select_hint} select"),
+        _ => String::new(),
+    };
+    let hint_width = str_width(&hint);
+    let gap = inner.saturating_sub(2 + counts_width + hint_width).max(1);
+    // The composed row: one leading space, counts (3-space separated), the
+    // gap, the hint, one trailing space (TS `\u{20}${counts}${gap}${hint}\u{20}`).
+    let mut spans: Vec<crate::Span> = vec![Span::raw(" ".to_string())];
+    for (index, (color, text)) in counts.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("   ".to_string()));
+        }
+        spans.push(Span::styled(text.clone(), theme.fg_style(*color)));
+    }
+    spans.push(Span::raw(" ".repeat(gap)));
+    if !hint.is_empty() {
+        spans.push(Span::styled(hint.clone(), theme.fg_style(ThemeColor::Dim)));
+    }
+    spans.push(Span::raw(" ".to_string()));
+    let body = truncate_spans_to_width(&spans, inner);
+    let body_width: usize = body.iter().map(|s| str_width(&s.content)).sum();
+    let pad = inner.saturating_sub(body_width);
+    let mut row: Line = vec![Span::styled("\u{2502}".to_string(), border)];
+    if summary.focused {
+        let selected = theme.bg_style(ThemeBg::SelectedBg);
+        for mut span in body {
+            span.style = span.style.patch(selected);
+            row.push(span);
+        }
+        row.push(Span::styled(" ".repeat(pad), selected));
+    } else {
+        row.extend(body);
+        row.push(Span::raw(" ".repeat(pad)));
+    }
+    row.push(Span::styled("\u{2502}".to_string(), border));
+    let bottom: Line = vec![Span::styled(
+        format!("\u{2570}{}\u{256f}", "\u{2500}".repeat(inner)),
+        border,
+    )];
+    vec![top, row, bottom]
+}
+
 /// The editor surface background: `userMessageBg` (TS `getEditorTheme`).
 pub fn editor_background(theme: &Theme) -> ratatui::style::Style {
     theme.bg_style(ThemeBg::UserMessageBg)
@@ -395,6 +556,62 @@ pub fn editor_background(theme: &Theme) -> ratatui::style::Style {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn subagent_summary_box_matches_ts_geometry() {
+        let theme = Theme::builtin("prime", ColorMode::TrueColor);
+        let summary = SubagentSummary {
+            running: 0,
+            idle: 1,
+            inactive: 0,
+            focused: false,
+            openable: true,
+        };
+        let rows = render_subagent_summary(&summary, "Enter", "\u{2192}", "\u{2193}", &theme, 120);
+        assert_eq!(rows.len(), 3, "the box frame is three rows");
+        let flat = |row: &Line| row.iter().map(|s| s.content.as_str()).collect::<String>();
+        assert_eq!(
+            flat(&rows[0]),
+            "\u{256d}\u{2500} subagents ".to_string() + &"\u{2500}".repeat(106) + "\u{256e}"
+        );
+        assert_eq!(
+            flat(&rows[1]),
+            "\u{2502} \u{25cf} 0 running   \u{25d0} 1 idle   \u{25cb} 0 inactive".to_string()
+                + &" ".repeat(71)
+                + "\u{2193} select \u{2502}"
+        );
+        assert_eq!(
+            flat(&rows[2]),
+            "\u{2570}".to_string() + &"\u{2500}".repeat(118) + "\u{256f}"
+        );
+        assert_eq!(str_width(&flat(&rows[1])), 120);
+    }
+
+    #[test]
+    fn subagent_summary_box_hidden_without_children() {
+        let theme = Theme::builtin("prime", ColorMode::TrueColor);
+        let summary = SubagentSummary::default();
+        assert!(
+            render_subagent_summary(&summary, "Enter", "\u{2192}", "\u{2193}", &theme, 120)
+                .is_empty()
+        );
+        let focused = SubagentSummary {
+            running: 2,
+            idle: 0,
+            inactive: 1,
+            focused: true,
+            openable: true,
+        };
+        let rows = render_subagent_summary(&focused, "Enter", "\u{2192}", "\u{2193}", &theme, 120);
+        let flat = |row: &Line| row.iter().map(|s| s.content.as_str()).collect::<String>();
+        assert!(
+            flat(&rows[1])
+                .trim()
+                .ends_with("Enter/\u{2192} open \u{2502}"),
+            "{}",
+            flat(&rows[1])
+        );
+    }
+
     use super::*;
     use crate::theme::{ColorMode, Theme};
 

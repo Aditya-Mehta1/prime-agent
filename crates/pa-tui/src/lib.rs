@@ -43,6 +43,7 @@ pub mod osc133;
 pub mod session;
 pub mod session_ui;
 pub mod snapshot;
+pub mod subagents;
 mod terminal_image;
 pub mod theme;
 pub mod tool_card;

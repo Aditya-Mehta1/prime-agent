@@ -503,14 +503,25 @@ impl AgentView {
                 width,
                 preceded_by_tool_activity,
             ),
-            ChatEntry::Tool(card) => crate::tool_card::render_tool_card(
-                card,
-                self.pulse_frame,
-                self.detail,
-                &self.theme,
-                width,
-                self.show_images,
-            ),
+            ChatEntry::Tool(card) => {
+                // TS `ToolExecutionComponent`: the leading spacer rides on
+                // `createConversationSpacing(...).shouldAddLeadingSpace`
+                // (the same spacing the assistant and agent-message rows
+                // use; consecutive tool cards stay flush).
+                let mut rows: Vec<Line> = Vec::new();
+                if self.conversation_leading(index, self.detail.tool_output_expanded()) {
+                    rows.push(Vec::new());
+                }
+                rows.extend(crate::tool_card::render_tool_card(
+                    card,
+                    self.pulse_frame,
+                    self.detail,
+                    &self.theme,
+                    width,
+                    self.show_images,
+                ));
+                rows
+            }
             ChatEntry::AgentMessage(row) => crate::custom_message::render::render_agent_message(
                 row,
                 self.detail,
@@ -620,7 +631,8 @@ impl AgentView {
     }
 
     /// Render the dock: prompt-context row(s), the autocomplete overlay
-    /// (when showing), the editor surface, the tray.
+    /// (when showing), the editor surface, the tray, and the subagent
+    /// summary box (TS `SubagentSummaryLine` under the tray).
     pub fn render_dock(&mut self, width: usize) -> Vec<Line> {
         let mut lines = render_prompt_context(&self.detail_label(), &self.theme, width);
         let context_rows = lines.len();
@@ -631,7 +643,35 @@ impl AgentView {
         self.dock_cursor = cursor.map(|(row, col)| (context_rows + overlay_count + row, col));
         lines.extend(editor_rows);
         lines.push(render_tray(&self.chrome, &self.theme, width));
+        if let Some(summary) = self.chrome.subagents {
+            let hints = self.summary_key_hints();
+            lines.extend(crate::chrome::render_subagent_summary(
+                &summary,
+                &hints.0,
+                &hints.1,
+                &hints.2,
+                &self.theme,
+                width,
+            ));
+        }
         lines
+    }
+
+    /// The summary-line hint key texts (TS `keyText`): the confirm/open
+    /// pair for the focused open hint, the primary cursor-down key for the
+    /// select hint.
+    fn summary_key_hints(&self) -> (String, String, String) {
+        let kb = self.editor.keybindings();
+        let key = |binding: &str| {
+            kb.first_key(binding)
+                .map(|key| crate::keybindings::format_key_text(&key))
+                .unwrap_or_default()
+        };
+        (
+            key("tui.select.confirm"),
+            key("app.agents.open"),
+            key("tui.editor.cursorDown"),
+        )
     }
 
     /// The autocomplete dropdown, mounted just above the editor surface (TS
@@ -1521,6 +1561,40 @@ mod tests {
     /// TS `createConversationSpacing.shouldAddLeadingSpace` for one
     /// spacing-driven row: scan back over hidden assistant rows, honor the
     /// trailing space of a visible assistant, and sit flush against compact
+    /// TS `UserMessageComponent` is a Box(2,1): its vertical padding row
+    /// under the content is the first of two blanks before a tool card
+    /// (the card's `shouldAddLeadingSpace` spacer is the second). The f20
+    /// spawn frame shows exactly this seam.
+    #[test]
+    fn tool_card_after_user_message_keeps_ts_two_blank_seam() {
+        let mut view = view_with(vec![
+            ChatEntry::User {
+                text: "run the cell".to_string(),
+            },
+            settled_tool_card("t1"),
+        ]);
+        let rows = view.render_transcript(120);
+        let flat: Vec<String> = rows
+            .iter()
+            .map(|l| l.iter().map(|s| s.content.as_str()).collect())
+            .collect();
+        let user = flat
+            .iter()
+            .position(|r| r.contains("run the cell"))
+            .expect("user row");
+        // The box padding row carries the OSC 133 zone-end markers behind
+        // its background spaces; both seam rows are visually empty (zero
+        // printable width once the blank padding is trimmed away).
+        let empty = |row: &str| crate::width::str_width(row.trim()) == 0;
+        assert!(empty(&flat[user + 1]), "box bottom padding row");
+        assert!(empty(&flat[user + 2]), "tool leading spacer row");
+        assert!(
+            flat[user + 3].trim().starts_with("bash"),
+            "card after the two blanks: {:?}",
+            &flat[user + 3..]
+        );
+    }
+
     /// neighbors (tool cards, agent messages, shell completions).
     #[test]
     fn conversation_leading_matches_ts_spacing_rules() {

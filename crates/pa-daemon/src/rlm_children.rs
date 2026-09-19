@@ -22,6 +22,9 @@ use pa_core::session_engine::rlm_host::{
     RlmHostFuture, RlmSpawnHandle, RlmSpawnRequest, RlmSubagentActivity, RlmSubagentEntry,
     RlmSubagentHost,
 };
+use pa_core::session_engine::rlm_notices::{
+    create_rlm_child_terminal_notice, RlmChildTerminalNotice,
+};
 use pa_types::daemon::{DaemonCommand, DaemonSessionLifecycle, PromptInput};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
@@ -34,6 +37,15 @@ use crate::util::now_ms;
 
 /// Depth bound without an explicit override (TS `resolveRlmMaxDepth` default).
 pub const DEFAULT_RLM_MAX_DEPTH: u32 = 2;
+
+/// How long a detached child prompt waits for its spawning parent turn to
+/// complete before prompting anyway (a stuck turn must not orphan the
+/// child's task; the watcher still settles it).
+const TURN_DONE_WAIT_SECS: u64 = 60;
+
+/// Grace between the first idle observation of a child and the settle
+/// decision (see the stability re-check in `watch_child_settle`).
+const WATCH_SETTLE_GRACE_MS: u64 = 250;
 /// Deadline for one child-session create over the link (TS uses 120s).
 const CREATE_TIMEOUT_MS: u64 = 120_000;
 const PROMPT_TIMEOUT_MS: u64 = 30_000;
@@ -41,8 +53,19 @@ const STATE_TIMEOUT_MS: u64 = 30_000;
 const KILL_TIMEOUT_MS: u64 = 30_000;
 /// Grace over a collect budget passed to the worker `wait_for_idle`.
 const IDLE_WAIT_GRACE_MS: u64 = 5_000;
+/// Budget for one terminal-notice delivery over the supervisor route.
+const NOTICE_DELIVERY_TIMEOUT_MS: u64 = 30_000;
 /// Prompts longer than this are not mirrored into create runtime metadata.
 const RUNTIME_METADATA_PROMPT_MAX: usize = 4096;
+/// One wait slice of the settle watcher: the supervisor's long-poll budget
+/// for `wait_for_idle` covers it; longer runs re-slice.
+const WATCH_WAIT_SLICE_MS: u64 = 60_000;
+/// Re-poll cadence after a wait slice ends without a settled child.
+const WATCH_POLL_INTERVAL_MS: u64 = 2_000;
+/// Consecutive unreachable polls before the watcher gives up (the child's
+/// worker may be restarting; a permanently unreachable child ends the
+/// watch without a notice instead of spinning forever).
+const WATCH_MAX_UNREACHABLE_POLLS: u32 = 150;
 /// The parent identity children are spawned from: recursion bounds, the
 /// inherited model selector and thinking level, and the parent session's
 /// persistence identity.
@@ -99,6 +122,19 @@ struct ChildRecord {
     settled_status: Option<&'static str>,
     answer_preview: Option<String>,
     answer_captured: bool,
+    /// An agent message from this child reached the parent since its task
+    /// was admitted (TS `_parentReplyCount`): the no-reply terminal notice
+    /// is withheld once set.
+    replied_since_task: bool,
+    /// The terminal notice for this child was claimed: exactly one of the
+    /// settle watcher, the delete path, or a late natural settle delivers
+    /// it (double-claim races collapse here).
+    notice_delivered: bool,
+    /// The task prompt was admitted (the detached task reached its
+    /// `prompt_child` call). Readers must not settle a pre-prompt child:
+    /// it is idle with an empty queue by construction, which is exactly
+    /// the idle shape a premature settle reads.
+    prompt_admitted: bool,
 }
 
 impl ChildRecord {
@@ -139,6 +175,12 @@ struct SupervisorChildSessionsInner {
     // paths (the create command) without a runtime `block_on`.
     identity: std::sync::Mutex<ParentIdentity>,
     children: Mutex<Vec<Arc<Mutex<ChildRecord>>>>,
+    /// Bumped once per completed parent turn (the worker's `EngineEvent::Done`
+    /// boundary). Prompt tasks spawned mid-turn wait for the next bump so
+    /// the parent's continuation request is always in flight (and its
+    /// response recorded) before the child's first model turn starts — the
+    /// deterministic ordering TS gets from its single-threaded event loop.
+    turn_done: tokio::sync::watch::Sender<u64>,
 }
 
 impl Clone for SupervisorChildSessions {
@@ -163,8 +205,15 @@ impl SupervisorChildSessions {
                 parent_active_session_id,
                 identity: std::sync::Mutex::new(ParentIdentity::with_default_depth()),
                 children: Mutex::new(Vec::new()),
+                turn_done: tokio::sync::watch::Sender::new(0),
             }),
         }
+    }
+
+    /// The worker saw the parent's turn end: release prompt tasks waiting
+    /// on the boundary (called once per `EngineEvent::Done`).
+    pub fn notify_turn_done(&self) {
+        self.inner.turn_done.send_modify(|value| *value += 1);
     }
 
     /// Replace the parent identity (the worker session sets it once its own
@@ -192,6 +241,21 @@ impl SupervisorChildSessions {
         identities
     }
 
+    /// Record that `child_active_session_id` sent an agent message to this
+    /// parent since its task was admitted. The settle watcher reads the
+    /// flag before delivering a no-reply terminal notice (TS
+    /// `_parentReplyCount`).
+    pub async fn mark_replied(&self, child_active_session_id: &str) {
+        let children = self.inner.children.lock().await;
+        for record in children.iter() {
+            let mut record = record.lock().await;
+            if record.active_session_id == child_active_session_id {
+                record.replied_since_task = true;
+                return;
+            }
+        }
+    }
+
     /// Test seam: admit one child record without the supervisor round trip
     /// (the controller tests exercise the family join on registry state).
     #[cfg(test)]
@@ -211,6 +275,9 @@ impl SupervisorChildSessions {
                 settled_status: None,
                 answer_preview: None,
                 answer_captured: false,
+                replied_since_task: false,
+                notice_delivered: false,
+                prompt_admitted: true,
             })));
     }
 
@@ -263,6 +330,18 @@ impl SupervisorChildSessions {
 }
 
 impl SupervisorChildSessionsInner {
+    /// Wait for the parent turn that spawned a task to complete (generation
+    /// strictly greater than the one captured at spawn admission). Bounded:
+    /// a turn that never settles releases the child anyway.
+    pub async fn wait_turn_done(&self, generation: u64) {
+        let mut receiver = self.turn_done.subscribe();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(TURN_DONE_WAIT_SECS),
+            receiver.wait_for(|value| *value > generation),
+        )
+        .await;
+    }
+
     /// Send one daemon command over the supervisor link and return its
     /// response data. The link owns timeouts/reconnects; this only maps the
     /// command to its wire value.
@@ -307,15 +386,17 @@ impl SupervisorChildSessionsInner {
         Ok(base)
     }
 
-    /// Launch one child session over the supervisor link and prompt it.
+    /// Create one child session over the supervisor link (no prompt yet).
     /// `depth` is the child's recursion depth; `session_dir` holds its
     /// persisted session; `model` is the resolved `provider/id` selector.
     #[allow(clippy::too_many_arguments)]
-    async fn launch_child(
+    async fn create_child(
         &self,
         child_id: &str,
         name: Option<&str>,
-        prompt: &str,
+        // The spawned task's prompt, mirrored into the create runtime
+        // metadata (`None` for a depth-0 resident session).
+        prompt: Option<&str>,
         depth: u32,
         model: &str,
         thinking: Option<&str>,
@@ -354,7 +435,9 @@ impl SupervisorChildSessionsInner {
             if let Some(parent_file) = &identity.session_file {
                 metadata["parentSessionFile"] = json!(parent_file);
             }
-            if prompt.len() <= RUNTIME_METADATA_PROMPT_MAX {
+            if let Some(prompt) =
+                prompt.filter(|prompt| prompt.len() <= RUNTIME_METADATA_PROMPT_MAX)
+            {
                 metadata["prompt"] = json!(prompt);
             }
             // The resolved model rides the metadata so the supervisor's
@@ -386,6 +469,39 @@ impl SupervisorChildSessionsInner {
             .await
             .with_context(|| format!("spawn RLM child session {child_id}"))?;
         let created = CreatedChild::from_summary(&summary, session_dir)?;
+        Ok(created)
+    }
+
+    /// Create and promptly admit one child's task (the depth-0 resident
+    /// session path: the prompt is part of the awaited admission).
+    #[allow(clippy::too_many_arguments)]
+    async fn launch_child(
+        &self,
+        child_id: &str,
+        name: Option<&str>,
+        prompt: &str,
+        depth: u32,
+        model: &str,
+        thinking: Option<&str>,
+        cwd: &str,
+        session_dir: &Path,
+        runtime_metadata: Option<Value>,
+        identity: &ParentIdentity,
+    ) -> Result<CreatedChild> {
+        let created = self
+            .create_child(
+                child_id,
+                name,
+                None,
+                depth,
+                model,
+                thinking,
+                cwd,
+                session_dir,
+                runtime_metadata,
+                identity,
+            )
+            .await?;
         // A failed prompt tears the just-created session down (TS kills the
         // created session in the create-path catch block).
         if let Err(error) = self.prompt_child(&created.active_session_id, prompt).await {
@@ -517,6 +633,12 @@ impl SupervisorChildSessionsInner {
     /// ran out of work and capture its answer once. An unreachable child
     /// keeps its last known state (the supervisor may be restarting).
     async fn refresh_record(&self, record: &Arc<Mutex<ChildRecord>>) {
+        {
+            let record = record.lock().await;
+            if !record.prompt_admitted {
+                return;
+            }
+        }
         let active_session_id = record.lock().await.active_session_id.clone();
         let busy = self.child_busy(&active_session_id).await;
         if !matches!(busy, Ok(false)) {
@@ -528,10 +650,125 @@ impl SupervisorChildSessionsInner {
         let mut record = record.lock().await;
         if record.settled_status.is_none() {
             record.settled_status = Some("done");
-            if !record.answer_captured {
+            // A settled preview is never overwritten with a later miss, but
+            // a `None` capture (the settle raced the admission-to-run
+            // hand-off) recovers on a later refresh.
+            if !record.answer_captured || record.answer_preview.is_none() {
                 record.answer_preview = answer;
                 record.answer_captured = true;
             }
+        }
+    }
+
+    /// Watch one admitted child until its run settles, then deliver the
+    /// parent's terminal notice when the child never replied (TS
+    /// `deliverTerminalMessageToParent` on the detached run task). The
+    /// watcher owns no registry state: it stops as soon as the record is
+    /// removed (deleted children carry their own cancelled notice).
+    async fn watch_child_settle(&self, record: &Arc<Mutex<ChildRecord>>) {
+        let mut unreachable_polls: u32 = 0;
+        loop {
+            let active_session_id = record.lock().await.active_session_id.clone();
+            // One bounded idle-wait slice: a slice that times out while the
+            // child still runs re-slices; the returned slice means the child
+            // drained its queue.
+            self.wait_for_child(
+                &active_session_id,
+                Duration::from_millis(WATCH_WAIT_SLICE_MS),
+            )
+            .await;
+            self.refresh_record(record).await;
+            let settled = record.lock().await.settled_status.is_some();
+            if settled {
+                // Stability re-check: a prompt admitted to an idle worker
+                // can read idle once between the admission and the turn
+                // pop (the queue snapshot and the busy flag change under
+                // different locks on the far side of a socket). A short
+                // grace closes that window; a child that went busy again
+                // (a queued continuation) keeps watching.
+                tokio::time::sleep(Duration::from_millis(WATCH_SETTLE_GRACE_MS)).await;
+                if !matches!(self.child_busy(&active_session_id).await, Ok(false)) {
+                    record.lock().await.settled_status = None;
+                    continue;
+                }
+                self.refresh_record(record).await;
+                self.deliver_settle_notice(record).await;
+                return;
+            }
+            // Still running (a timed-out slice or a re-queued continuation):
+            // re-check liveness so a dead worker cannot spin the watch.
+            let busy = self.child_busy(&active_session_id).await;
+            match busy {
+                Ok(_) => unreachable_polls = 0,
+                Err(_) => {
+                    unreachable_polls += 1;
+                    if unreachable_polls >= WATCH_MAX_UNREACHABLE_POLLS {
+                        eprintln!(
+                            "pa-daemon: RLM child settle watcher gave up on an unreachable child {active_session_id}"
+                        );
+                        return;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(WATCH_POLL_INTERVAL_MS)).await;
+        }
+    }
+
+    /// Deliver the no-reply terminal notice for a settled child that never
+    /// sent an agent message to the parent. Exactly-once: the record's
+    /// notice claim collapses the races between the watcher, a natural
+    /// settle during `delete_subagent`, and the delete path itself.
+    async fn deliver_settle_notice(&self, record: &Arc<Mutex<ChildRecord>>) {
+        let notice = {
+            let mut record = record.lock().await;
+            if record.notice_delivered || record.replied_since_task {
+                return;
+            }
+            record.notice_delivered = true;
+            RlmChildTerminalNotice::CompletedWithoutReply {
+                child_id: record.rlm_child_id.clone(),
+                session_name: record.session_name.clone(),
+                last_assistant_text_preview: record.answer_preview.clone(),
+            }
+        };
+        self.deliver_terminal_notice(&notice).await;
+    }
+
+    /// Deliver one terminal notice into the parent session: the notice rides
+    /// the supervisor's `follow_up` route as an injected custom turn (the
+    /// row renders in the parent transcript and the turn runs on the
+    /// notice content, the TS `followUp` notice action).
+    async fn deliver_terminal_notice(&self, notice: &RlmChildTerminalNotice) {
+        let message = create_rlm_child_terminal_notice(notice, now_ms());
+        let Some(content) = custom_message_text(&message) else {
+            eprintln!("pa-daemon: RLM child notice carried no text content");
+            return;
+        };
+        let wire = serde_json::to_value(pa_types::session::AgentMessage::Custom(message))
+            .unwrap_or(Value::Null);
+        let command = DaemonCommand::FollowUp {
+            id: None,
+            active_session_id: self.parent_active_session_id.clone(),
+            message: content,
+            input: PromptInput {
+                content: None,
+                images: None,
+                streaming_behavior: None,
+                queue_if_busy: None,
+                expand_prompt_templates: None,
+                source: None,
+                agent_message_id: None,
+                custom_message: Some(wire),
+                queue_key: None,
+                prefix_messages: None,
+                admission_id: None,
+            },
+            rest: Default::default(),
+        };
+        if let Err(error) = self.command(&command, NOTICE_DELIVERY_TIMEOUT_MS).await {
+            eprintln!(
+                "pa-daemon: RLM child terminal notice was not delivered to the parent session: {error:#}"
+            );
         }
     }
 
@@ -592,6 +829,15 @@ impl CreatedChild {
     }
 }
 
+/// The plain text of a custom row's content (the notice turn's model
+/// prompt); `None` for non-text content shapes.
+fn custom_message_text(message: &pa_types::session::CustomMessage) -> Option<String> {
+    match &message.content {
+        pa_types::ai::UserContent::Text(text) => Some(text.clone()),
+        _ => None,
+    }
+}
+
 impl RlmSubagentHost for SupervisorChildSessions {
     fn spawn(&self, request: RlmSpawnRequest) -> RlmHostFuture<RlmSpawnHandle> {
         let this = Arc::clone(&self.inner);
@@ -628,10 +874,10 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 "createdAt": now_ms(),
             });
             let created = this
-                .launch_child(
+                .create_child(
                     &child_id,
                     Some(&name),
-                    &request.prompt,
+                    Some(&request.prompt),
                     identity.rlm_depth + 1,
                     &model,
                     thinking,
@@ -652,11 +898,43 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 settled_status: None,
                 answer_preview: None,
                 answer_captured: false,
+                replied_since_task: false,
+                notice_delivered: false,
+                prompt_admitted: false,
             };
-            this.children
-                .lock()
-                .await
-                .push(Arc::new(Mutex::new(record)));
+            let record = Arc::new(Mutex::new(record));
+            this.children.lock().await.push(Arc::clone(&record));
+            // The task prompt runs detached from the spawn admission (TS
+            // `void (async () => ...)`): the handle returns at registration
+            // and the child's first turn starts after the parent's own
+            // continuation request is in flight. The watcher starts once
+            // the prompt is admitted (it idles on a pre-prompt child).
+            let watcher_this = Arc::clone(&this);
+            let watcher_record = Arc::clone(&record);
+            let prompt = request.prompt.clone();
+            let child_active_session_id = created.active_session_id.clone();
+            // Capture the current turn boundary before detaching: spawn
+            // admission happens mid-turn, so the parent's continuation
+            // request (already issued for this turn's tool result) is
+            // guaranteed to reach the provider first (see
+            // `wait_turn_done`).
+            let turn_generation = *this.turn_done.subscribe().borrow();
+            tokio::spawn(async move {
+                watcher_this.wait_turn_done(turn_generation).await;
+                watcher_record.lock().await.prompt_admitted = true;
+                if let Err(error) = watcher_this
+                    .prompt_child(&child_active_session_id, &prompt)
+                    .await
+                {
+                    eprintln!(
+                        "pa-daemon: RLM child task prompt failed for {child_active_session_id}: {error:#}"
+                    );
+                    let _ = watcher_this.kill_child(&child_active_session_id).await;
+                    watcher_record.lock().await.settled_status = Some("error");
+                    return;
+                }
+                watcher_this.watch_child_settle(&watcher_record).await;
+            });
             Ok(RlmSpawnHandle {
                 rlm_child_id: child_id,
                 name,
@@ -769,6 +1047,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 ]),
             };
             drop(record_guard);
+            let was_running = record.lock().await.settled_status.is_none();
             this.command(&command, KILL_TIMEOUT_MS)
                 .await
                 .with_context(|| format!("kill RLM child \"{target}\""))?;
@@ -776,6 +1055,26 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 let record = record.lock().await;
                 SupervisorChildSessions::entry(&record)
             };
+            // A still-running child was cut short by the delete: the parent
+            // session receives the cancelled terminal notice (TS
+            // `completeDeletion`, reason `Deleted by parent orchestrator`).
+            // The settle watcher stops silently once the record leaves the
+            // registry, so the delete path owns this notice.
+            if was_running {
+                let notice = {
+                    let mut record = record.lock().await;
+                    let claimed = !record.notice_delivered;
+                    record.notice_delivered = true;
+                    claimed.then(|| RlmChildTerminalNotice::Cancelled {
+                        child_id: record.rlm_child_id.clone(),
+                        session_name: record.session_name.clone(),
+                        reason: Some("Deleted by parent orchestrator".to_string()),
+                    })
+                };
+                if let Some(notice) = notice {
+                    this.deliver_terminal_notice(&notice).await;
+                }
+            }
             this.children
                 .lock()
                 .await
@@ -822,5 +1121,188 @@ impl RlmSubagentHost for SupervisorChildSessions {
             }
             Ok(results)
         })
+    }
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::*;
+    use crate::protocol::{response_failure, response_success};
+    use pa_types::platform::transport::bind_transport;
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::sync::mpsc;
+
+    /// A scripted JSONL supervisor for the watcher tests: creates one child
+    /// session, reports it idle with a final answer, and captures the
+    /// `follow_up` commands routed to the parent (the terminal-notice
+    /// deliveries). `idle_delay_ms` paces `wait_for_idle` so a test can act
+    /// while the child is still "running".
+    async fn spawn_fake_supervisor(
+        socket: std::path::PathBuf,
+        follow_up_tx: mpsc::UnboundedSender<Value>,
+        idle_delay_ms: u64,
+    ) {
+        let listener = bind_transport(&socket).await.unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok(stream) = listener.accept().await else {
+                    return;
+                };
+                let follow_up_tx = follow_up_tx.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.split();
+                    let mut reader = BufReader::new(reader);
+                    writer
+                        .write_all(
+                            b"{\"type\":\"daemon_hello\",\"protocol\":{\"name\":\"prime-agent.daemon\",\"version\":7}}\n",
+                        )
+                        .await
+                        .unwrap();
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap() == 0 {
+                            return;
+                        }
+                        let value: Value = serde_json::from_str(line.trim()).unwrap();
+                        let id = value["id"].as_str().unwrap_or_default().to_string();
+                        let command = value["command"].clone();
+                        let command_type: &str = command["type"].as_str().unwrap_or_default();
+                        let response = match command_type {
+                            "create" => response_success(
+                                Some(&id),
+                                command_type,
+                                Some(json!({
+                                    "activeSessionId": "child-live",
+                                    "sessionId": "child-file",
+                                    "sessionFile": "/tmp/child.jsonl",
+                                    "sessionName": "f20-worker",
+                                })),
+                            ),
+                            "prompt" => response_success(Some(&id), command_type, None),
+                            "wait_for_idle" => {
+                                tokio::time::sleep(std::time::Duration::from_millis(idle_delay_ms))
+                                    .await;
+                                response_success(Some(&id), command_type, None)
+                            }
+                            "get_state" => response_success(
+                                Some(&id),
+                                command_type,
+                                Some(json!({
+                                    "isStreaming": false,
+                                    "sessionActions": { "queuedCount": 0 },
+                                })),
+                            ),
+                            "get_last_assistant_text" => response_success(
+                                Some(&id),
+                                command_type,
+                                Some(json!({ "text": "the child final answer" })),
+                            ),
+                            "follow_up" => {
+                                let _ = follow_up_tx.send(command.clone());
+                                response_success(
+                                    Some(&id),
+                                    command_type,
+                                    Some(json!({ "queued": true })),
+                                )
+                            }
+                            other => response_failure(Some(&id), other, "unexpected command", None),
+                        };
+                        let mut line = serde_json::to_string(&response).unwrap();
+                        line.push('\n');
+                        if writer.write_all(line.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    async fn sessions_with_fake_supervisor(
+        follow_up_tx: mpsc::UnboundedSender<Value>,
+        idle_delay_ms: u64,
+    ) -> SupervisorChildSessions {
+        let socket = std::env::temp_dir().join(format!(
+            "pa-rlm-watch-{}.sock",
+            uuid::Uuid::new_v4().simple()
+        ));
+        spawn_fake_supervisor(socket.clone(), follow_up_tx, idle_delay_ms).await;
+        let link = Arc::new(crate::supervisor_link::SupervisorLink::new(socket));
+        let sessions =
+            SupervisorChildSessions::new(link, std::env::temp_dir(), "parent-live".to_string());
+        // A live parent carries its resolved model on the identity; the
+        // spawn path resolves the child's model from it.
+        sessions.set_identity(ParentIdentity {
+            model: Some("mock/mock-1".to_string()),
+            cwd: Some(std::env::temp_dir().to_string_lossy().to_string()),
+            ..ParentIdentity::with_default_depth()
+        });
+        sessions
+    }
+
+    async fn spawn_child(sessions: &SupervisorChildSessions) -> RlmSpawnHandle {
+        sessions
+            .spawn(RlmSpawnRequest {
+                prompt: "f20 child task".to_string(),
+                name: Some("f20-worker".to_string()),
+                model: None,
+                thinking: None,
+                cell_source_code: None,
+            })
+            .await
+            .expect("spawn must succeed against the fake supervisor")
+    }
+
+    /// A child that settles without replying delivers the no-reply terminal
+    /// notice to the parent session as an injected follow-up turn.
+    #[tokio::test]
+    async fn a_settled_child_without_a_reply_delivers_the_terminal_notice() {
+        let (follow_up_tx, mut follow_up_rx) = mpsc::unbounded_channel();
+        let sessions = sessions_with_fake_supervisor(follow_up_tx, 0).await;
+        let handle = spawn_child(&sessions).await;
+        // The worker releases the detached prompt at its turn boundary.
+        sessions.notify_turn_done();
+
+        let follow_up =
+            tokio::time::timeout(std::time::Duration::from_secs(10), follow_up_rx.recv())
+                .await
+                .expect("the watcher must deliver the notice")
+                .expect("the follow_up channel stays open");
+        assert_eq!(follow_up["type"], "follow_up");
+        assert_eq!(follow_up["activeSessionId"], "parent-live");
+        let custom = &follow_up["customMessage"];
+        assert_eq!(custom["role"], "custom");
+        assert_eq!(custom["customType"], "rlm_child_terminal_notice");
+        assert_eq!(
+            custom["content"],
+            "[child-exited: no-reply child:f20-worker]\n\nLast assistant text: the child final answer"
+        );
+        assert_eq!(custom["details"]["childId"], handle.rlm_child_id);
+        assert_eq!(custom["details"]["sessionName"], "f20-worker");
+        // Exactly one notice lands: the watcher delivers once.
+        let extra =
+            tokio::time::timeout(std::time::Duration::from_millis(300), follow_up_rx.recv()).await;
+        assert!(extra.is_err(), "no second notice may arrive");
+    }
+
+    /// A child that sent an agent message back gets no terminal notice: the
+    /// reply is the parent's report (TS `_parentReplyCount`).
+    #[tokio::test]
+    async fn a_replied_child_gets_no_terminal_notice() {
+        let (follow_up_tx, mut follow_up_rx) = mpsc::unbounded_channel();
+        // A slow idle wait keeps the child "running" while the test marks
+        // the reply.
+        let sessions = sessions_with_fake_supervisor(follow_up_tx, 250).await;
+        let handle = spawn_child(&sessions).await;
+        assert!(!handle.rlm_child_id.is_empty());
+        sessions.mark_replied("child-live").await;
+        // The worker releases the detached prompt at its turn boundary.
+        sessions.notify_turn_done();
+
+        let extra =
+            tokio::time::timeout(std::time::Duration::from_secs(2), follow_up_rx.recv()).await;
+        assert!(extra.is_err(), "a replied child must not deliver a notice");
     }
 }

@@ -194,6 +194,21 @@ impl pa_tui::interactive::InteractionTelemetry for CliInteractionTelemetry {
         })
     }
 
+    fn subagents_view_opened(
+        &self,
+        children_total: u64,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let Some(client) = self.client() else {
+                return;
+            };
+            let mut properties = pa_telemetry::base_properties("interactive");
+            properties.set("children_total", serde_json::Value::from(children_total));
+            client.track("tui subagents open", properties);
+            let _ = client.shutdown().await;
+        })
+    }
+
     fn command_used(&self, command: &'static str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         // `agent command used` (TS `captureAgentCommandUsed`): builtin
         // client commands report from the client; session commands report
@@ -329,6 +344,7 @@ fn print_resume_hint(hint: &Option<String>) {
 /// `/resume <selector>` chain runs its target before the loop decides again.
 async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) -> Result<()> {
     let mut anchor = anchor;
+    let mut scope: Option<pa_tui::agents_view::AgentsViewScope> = None;
     // TS `AgentsViewPersistentState.query`: a chat opened from a filtered
     // roster re-enters the view with the same query typed.
     let mut query: Option<String> = None;
@@ -340,6 +356,7 @@ async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) 
             theme: base.theme.clone(),
             version: base.version.clone(),
             anchor_session_id: anchor.clone(),
+            scope: scope.take(),
             query: query.clone(),
         };
         let view = pa_tui::agents_view::run_agents_view(
@@ -360,6 +377,17 @@ async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) 
             print_resume_hint(&outcome.resume_hint);
             return Ok(());
         }
+        // The subagent summary line's open action reopens the view scoped
+        // to the session it was opened from; the plain agents-back handoff
+        // reopens the global view. A scoped open clears the persistent
+        // query (TS agents-view-mode `scoped_agents_view` arm sets
+        // `persistentState.query = ""`): the scope already narrows the
+        // list, and the filter typed to find the session would otherwise
+        // hide the subtree.
+        scope = outcome.agents_view_scope;
+        if scope.is_some() {
+            query = None;
+        }
         // `/resume <selector>` routes straight to that session before the
         // loop reopens the view.
         let mut pending = outcome.selection_request;
@@ -371,6 +399,10 @@ async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) 
             if !outcome.return_to_agents_view {
                 print_resume_hint(&outcome.resume_hint);
                 return Ok(());
+            }
+            scope = outcome.agents_view_scope;
+            if scope.is_some() {
+                query = None;
             }
             pending = outcome.selection_request;
         }

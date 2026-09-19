@@ -151,6 +151,9 @@ impl Lane {
 #[derive(Debug)]
 pub(crate) struct QueuedItem {
     pub(crate) message: String,
+    /// An injected custom row that replaces this turn's user message (the
+    /// RLM child terminal notices ride the follow-up lane this way).
+    pub(crate) custom_message: Option<Value>,
     /// Images attached to the prompt (wire `images`: base64 payload plus
     /// mime type), admitted with the message as multimodal content.
     pub(crate) images: Vec<pa_agent::types::ImageContent>,
@@ -1656,7 +1659,10 @@ impl Worker {
             status_label: None,
             summary: None,
             task_state: None,
-            model: None,
+            // The engine's resolved model (the agents-view Model column:
+            // TS roster summaries carry it; a not-yet-resolved engine
+            // reports none).
+            model: self.engine.model_metadata(),
             runtime_kind: Some(core.runtime_kind.clone()),
             unfinished_action_count: Some(0),
         }
@@ -1769,6 +1775,10 @@ impl Worker {
             return response_failure(None, "prompt", "Prompt cannot be empty", None);
         }
         let streaming_behavior = payload.get("streamingBehavior").and_then(Value::as_str);
+        let custom_message = match parse_custom_message(payload.get("customMessage")) {
+            Ok(custom_message) => custom_message,
+            Err(error) => return response_failure(None, "prompt", &error, None),
+        };
         let images = parse_prompt_images(payload);
         let (done_tx, done_rx) = oneshot::channel();
         let done = if wait { Some(done_tx) } else { None };
@@ -1781,6 +1791,7 @@ impl Worker {
             match streaming_behavior {
                 Some("steer") => core.steering.push_back(QueuedItem {
                     message: message.to_string(),
+                    custom_message,
                     images: images.clone(),
                     done,
                 }),
@@ -1788,6 +1799,7 @@ impl Worker {
                 // idle, like `queueIfBusy` prompt admission.
                 _ => core.follow_up.push_back(QueuedItem {
                     message: message.to_string(),
+                    custom_message,
                     images: images.clone(),
                     done,
                 }),
@@ -1821,6 +1833,10 @@ impl Worker {
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        let custom_message = match parse_custom_message(payload.get("customMessage")) {
+            Ok(custom_message) => custom_message,
+            Err(error) => return response_failure(None, lane.as_str(), &error, None),
+        };
         let mut core = self.core.lock().unwrap();
         let images = parse_prompt_images(payload);
         match lane {
@@ -1829,6 +1845,7 @@ impl Worker {
         }
         .push_back(QueuedItem {
             message: message.to_string(),
+            custom_message,
             images,
             done: None,
         });
@@ -1867,6 +1884,15 @@ impl Worker {
             return response_failure(None, "worker_deliver_message", &error.to_string(), None);
         }
         let sender = payload.get("sender").cloned().unwrap_or(Value::Null);
+        // A delivery from one of this session's RLM children counts as the
+        // child's reply: the settle watcher withholds the no-reply notice.
+        if let Some(child) = sender
+            .get("activeSessionId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            self.engine.mark_child_reply(child);
+        }
         // Sender label precedence (TS `createAgentSessionMessagePrompt`):
         // session name, session id, active session id, client id.
         let sender_name = ["sessionName", "sessionId", "activeSessionId", "clientId"]
@@ -1909,6 +1935,7 @@ impl Worker {
             }
             .push_back(QueuedItem {
                 message: prompt,
+                custom_message: None,
                 images: Vec::new(),
                 done: None,
             });
@@ -2530,6 +2557,34 @@ pub(crate) struct QueueLanes {
 }
 
 /// Read the pending lanes off a locked core.
+/// The wire `customMessage` of a prompt/follow-up command: an injected
+/// custom row (`role: "custom"` with a non-empty `customType`) that
+/// replaces the turn's user row. `Err` rejects the command loudly — a
+/// malformed notice must not silently degrade into a plain prompt.
+fn parse_custom_message(value: Option<&Value>) -> Result<Option<Value>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let invalid = "Invalid customMessage: expected a custom message object with a customType";
+    let Some(object) = value.as_object() else {
+        return Err(invalid.to_string());
+    };
+    if object.get("role").and_then(Value::as_str) != Some("custom") {
+        return Err(invalid.to_string());
+    }
+    let custom_type = object
+        .get("customType")
+        .and_then(Value::as_str)
+        .filter(|kind| !kind.is_empty());
+    if custom_type.is_none() {
+        return Err(invalid.to_string());
+    }
+    Ok(Some(value.clone()))
+}
+
 pub(crate) fn queue_lanes(core: &SessionCore) -> QueueLanes {
     QueueLanes {
         steering: core
@@ -2561,6 +2616,7 @@ fn restore_queue_snapshot(
             .into_iter()
             .map(|message| QueuedItem {
                 message,
+                custom_message: None,
                 images: Vec::new(),
                 done: None,
             })
@@ -2647,6 +2703,7 @@ impl TurnRunner {
                     .engine
                     .effective_thinking_level()
                     .unwrap_or_else(|| "default".to_string()),
+                self.engine.model_metadata(),
             )
         };
         let summary = serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null);
@@ -2677,6 +2734,7 @@ impl TurnRunner {
             images: item.images.clone(),
             source: "user".to_string(),
             agent_message_id: None,
+            custom_message: item.custom_message.clone(),
         };
         // Live token-stream coalescing for this turn: the emit path parks
         // `message_update` frames in a single slot and a flusher task
@@ -2783,6 +2841,10 @@ impl TurnRunner {
                     _ => {}
                 }
                 let done_result = if let EngineEvent::Done(result) = &event {
+                    // The turn boundary releases RLM child prompt tasks
+                    // waiting on it (the parent's continuation request is
+                    // in flight before any child's first turn).
+                    engine.on_turn_done();
                     Some(result.clone())
                 } else {
                     None
@@ -3131,7 +3193,11 @@ pub async fn run_worker() -> Result<()> {
 /// shared shape `get_state`, the roster, and list rows all serve. Free so
 /// the turn runner can push roster deltas without the worker handle; the
 /// thinking level rides in from the engine (the core has no engine access).
-fn session_summary(core: &SessionCore, thinking_level: &str) -> SessionSummary {
+fn session_summary(
+    core: &SessionCore,
+    thinking_level: &str,
+    model: Option<Value>,
+) -> SessionSummary {
     let store = core.store.as_ref();
     let streaming = core.busy;
     let compacting = core.compacting;
@@ -3234,7 +3300,7 @@ fn session_summary(core: &SessionCore, thinking_level: &str) -> SessionSummary {
         status_label: None,
         summary: None,
         task_state: None,
-        model: None,
+        model,
         runtime_kind: Some(core.runtime_kind.clone()),
         unfinished_action_count: Some(0),
     }
@@ -3507,6 +3573,7 @@ mod agent_message_tests {
             for _ in 0..DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION {
                 core.follow_up.push_back(QueuedItem {
                     message: "occupied".to_string(),
+                    custom_message: None,
                     images: Vec::new(),
                     done: None,
                 });
@@ -3827,6 +3894,7 @@ mod turn_stream_tests {
                 engine,
                 QueuedItem {
                     message: "burst".to_string(),
+                    custom_message: None,
                     images: Vec::new(),
                     done: None,
                 },
@@ -3841,6 +3909,91 @@ mod turn_stream_tests {
             }
         }
         events
+    }
+
+    /// Run one scripted turn and return its session-event frames in wire
+    /// order, with the queued item carrying an injected custom row.
+    async fn turn_session_events_with_custom_message(
+        engine: Arc<dyn SessionEngine>,
+        custom_message: Value,
+    ) -> Vec<Value> {
+        let runner = burst_runner(Arc::clone(&engine));
+        let mut subscription = runner.events.subscribe();
+        runner
+            .run_turn(
+                engine,
+                QueuedItem {
+                    message: "[child-exited: no-reply child:lane]".to_string(),
+                    custom_message: Some(custom_message),
+                    images: Vec::new(),
+                    done: None,
+                },
+            )
+            .await;
+        let mut events = Vec::new();
+        while let Ok(frame) = subscription.try_recv() {
+            if frame.outbound_type == "session_event" {
+                if let Ok(outbound) = serde_json::from_slice::<Value>(&frame.payload) {
+                    events.push(outbound["event"].clone());
+                }
+            }
+        }
+        events
+    }
+
+    /// An injected custom row replaces the turn's user row: the wire carries
+    /// the custom message's `message_start`/`message_end` pair and no
+    /// user-message frame, while the model turn still runs on the notice
+    /// text (the RLM child terminal-notice path).
+    #[tokio::test]
+    async fn an_injected_custom_turn_replaces_the_user_row() {
+        let engine = Arc::new(
+            ScriptedEngine::from_value(json!({
+                "responses": ["notice acknowledged"],
+            }))
+            .unwrap_or_default(),
+        );
+        let custom = json!({
+            "role": "custom",
+            "customType": "rlm_child_terminal_notice",
+            "content": "[child-exited: no-reply child:lane]",
+            "display": true,
+            "details": {
+                "kind": "completed_without_reply",
+                "childId": "sub-1",
+                "sessionName": "lane",
+            },
+        });
+        let events = turn_session_events_with_custom_message(engine, custom).await;
+
+        let starts = positions_of(&events, "message_start");
+        let ends = positions_of(&events, "message_end");
+        // The custom row opens as a message_start pair; the scripted
+        // assistant reply opens as a `message_update` (the scripted
+        // harness carries no provider `start` stream event), so exactly
+        // one start is on the wire and both rows settle.
+        assert_eq!(starts.len(), 1, "only the custom row opens a start");
+        assert_eq!(
+            ends.len(),
+            2,
+            "the custom row and the assistant reply settle"
+        );
+        // The first row is the custom notice, not a user message.
+        assert_eq!(events[starts[0]]["message"]["role"], "custom");
+        assert_eq!(
+            events[starts[0]]["message"]["customType"],
+            "rlm_child_terminal_notice"
+        );
+        // No user row was recorded for the turn.
+        let user_rows = events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("message_start")
+                && event["message"]["role"] == "user"
+        });
+        assert!(!user_rows, "the injected turn must not emit a user row");
+        // The model turn ran on the notice text and settled the reply
+        // (the scripted engine carries the reply as a plain string).
+        assert_eq!(events[ends[1]]["message"]["role"], "assistant");
+        assert_eq!(events[ends[1]]["message"]["content"], "notice acknowledged");
     }
 
     fn positions_of(events: &[Value], frame_type: &str) -> Vec<usize> {
