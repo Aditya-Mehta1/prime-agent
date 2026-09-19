@@ -1,0 +1,75 @@
+--- ts (recovered)
+                                                      battery-f21  $0.00
+
+                  ▗▄▄█▀
+    ███▄       ▗▄███▀
+   ▗█▛▐█▙   ▗▄█▀▗█▀       prime agent v0.9.5
+  ▗█▛ ▟██▙▄██▛ ▟▛         model mock-1
+  ▗▟▌ ▐███▛▘▗▄█▖          cwd ~/lane-worktrees/battery-flows/scripts/battery/runs/20260918T231155Z/ts/work
+ ▟███▄  ▄▄▟███▀
+ ▜█▛▀▘  ▜█▛▀▘
+
+
+  f21 seed turn
+
+
+ f21 recovery fixture reply
+
+ Daemon connection lost; reconnecting…
+
+ ⚠ Error: Daemon reconnection failed: Session worker is failed
+
+ ⚠ Error: Daemon control-plane transport failed: Cannot send daemon command "prompt" because the Prime Agent daemon is
+ not connected. Socket: /home/ubuntu/lane-worktrees/battery-flows/scripts/battery/runs/20260918T231155Z/ts/daemon.sock.
+ Daemon log:
+ /home/ubuntu/lane-worktrees/battery-flows/scripts/battery/runs/20260918T231155Z/ts/agent/logs/daemon.sock.0afc19c4.log
+ .
+
+
+
+
+
+
+                                                                                      Collapsed mode (Ctrl+O to expand)
+
+ >  f21 keep working after the crash
+
+← manage                                                                                               mock-1 · 110 (0%)
+
++++ rust (recovered)
+                                                      battery-f21  $0.00
+
+                  ▗▄▄█▀
+    ███▄       ▗▄███▀
+   ▗█▛▐█▙   ▗▄█▀▗█▀       prime agent v0.1.0
+  ▗█▛ ▟██▙▄██▛ ▟▛         model mock-1
+  ▗▟▌ ▐███▛▘▗▄█▖          cwd ~/lane-worktrees/battery-flows/scripts/battery/runs/20260918T231155Z/rust/work
+ ▟███▄  ▄▄▟███▀
+ ▜█▛▀▘  ▜█▛▀▘
+
+
+  f21 seed turn
+
+
+ f21 recovery fixture reply
+
+ ⠦ Waiting · 330s
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                      Collapsed mode (Ctrl+O to expand)
+
+ >
+
+← manage                                                                                               mock-1 · 110 (0%)

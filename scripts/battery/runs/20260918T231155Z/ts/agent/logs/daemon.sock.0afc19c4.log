@@ -1,0 +1,237 @@
+[2026-09-18T23:11:56.051Z] supervisor: Prime Agent daemon supervisor ea7ee024-72bf-4382-8e80-0a14fe925927 listening on /home/ubuntu/lane-worktrees/battery-flows/scripts/battery/runs/20260918T231155Z/ts/daemon.sock
+[2026-09-18T23:11:56.418Z] supervisor: Session worker c489828bf06b stderr: Prime Agent daemon listening on /tmp/vbat20260918T231155Z-ts/prime-agent-1000/worker-0afc19c4fea9-c489828bf06b.sock
+[2026-09-18T23:12:17.218Z] supervisor: Session worker 87f80ade4d64 stderr: Prime Agent daemon listening on /tmp/vbat20260918T231155Z-ts/prime-agent-1000/worker-0afc19c4fea9-87f80ade4d64.sock
+[2026-09-18T23:14:45.013Z] supervisor: Session worker a29c7b3d0814 stderr: Prime Agent daemon listening on /tmp/vbat20260918T231155Z-ts/prime-agent-1000/worker-0afc19c4fea9-a29c7b3d0814.sock
+[2026-09-18T23:14:51.248Z] supervisor: Session worker 6a706fa1fb34 stderr: Prime Agent daemon listening on /tmp/vbat20260918T231155Z-ts/prime-agent-1000/worker-0afc19c4fea9-6a706fa1fb34.sock
+[2026-09-18T23:18:03.255Z] supervisor: Session worker d05e1a62cd65 stderr: Prime Agent daemon listening on /tmp/vbat20260918T231155Z-ts/prime-agent-1000/worker-0afc19c4fea9-d05e1a62cd65.sock
+[2026-09-18T23:23:58.901Z] supervisor: Session worker 6ad262b96576 stderr: Prime Agent daemon listening on /tmp/vbat20260918T231155Z-ts/prime-agent-1000/worker-0afc19c4fea9-6ad262b96576.sock
+[2026-09-18T23:24:11.103Z] supervisor: Session worker 6ad262b96576 stderr: shutdown command received over socket; 1 active session(s) will be closed
+[2026-09-18T23:24:11.141Z] supervisor: Session worker 6ad262b96576 stderr: shutting down (exit 0); closing 1 active session(s)
+[2026-09-18T23:24:11.221Z] supervisor: Evicted empty session worker 6ad262b96576 root=01a0b6d5-7a42-73e9-bfb2-65a601170d26 on last client detach
+[2026-09-18T23:25:02.906Z] supervisor: Session worker 9d80394c2483 stderr: Prime Agent daemon listening on /tmp/vbat20260918T231155Z-ts/prime-agent-1000/worker-0afc19c4fea9-9d80394c2483.sock
+[2026-09-18T23:31:43.476Z] supervisor: Session worker 8c4c0d6f3d9e stderr: Prime Agent daemon listening on /tmp/vbat20260918T231155Z-ts/prime-agent-1000/worker-0afc19c4fea9-8c4c0d6f3d9e.sock
+[2026-09-18T23:34:24.130Z] supervisor: Session worker 7b9bd5ec1851 stderr: Prime Agent daemon listening on /tmp/vbat20260918T231155Z-ts/prime-agent-1000/worker-0afc19c4fea9-7b9bd5ec1851.sock
+[2026-09-18T23:44:40.263Z] supervisor: Session worker 7d4d04b24ac4 stderr: Prime Agent daemon listening on /tmp/vbat20260918T231155Z-ts/prime-agent-1000/worker-0afc19c4fea9-7d4d04b24ac4.sock
+[2026-09-18T23:45:46.438Z] supervisor: Supervisor command attach failed: Error: read ECONNRESET
+    at close (node:net:676:40)
+[2026-09-18T23:45:46.542Z] supervisor: Supervisor command attach failed: Error: Session worker is recovering
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:45:46.745Z] supervisor: Supervisor command attach failed: Error: Session worker is recovering
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:45:46.946Z] supervisor: Recovered worker 7d4d04b24ac4 without replaying uncertain operations: agent_end
+[2026-09-18T23:45:47.147Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:45:47.951Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:45:49.554Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:45:50.537Z] supervisor: Supervisor command get_state failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at forwardToWorker (/$bunfs/root/prime-agent:2190:74714)
+    at <anonymous> (/$bunfs/root/prime-agent:2190:27856)
+    at handleCommand (/$bunfs/root/prime-agent:2190:28170)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:45:51.556Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:45:53.557Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:45:55.559Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:45:57.562Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:45:59.564Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:46:01.567Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:46:03.569Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:46:05.573Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:46:07.576Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:46:09.579Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:46:11.582Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:46:13.584Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:46:15.586Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:46:17.589Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:46:19.592Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:46:21.594Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:46:23.596Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:46:25.598Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:46:27.601Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:46:29.603Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:46:31.606Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:46:33.608Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:46:35.611Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:46:37.614Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:46:39.617Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:46:41.620Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:46:43.622Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:46:45.624Z] supervisor: Supervisor command attach failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at attachClient (/$bunfs/root/prime-agent:2190:76166)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:12080)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:50:51.647Z] supervisor: Supervisor command get_state failed: Error: Session worker is failed
+    at requireAvailableWorkerClient (/$bunfs/root/prime-agent:2190:69447)
+    at forwardToWorker (/$bunfs/root/prime-agent:2190:74714)
+    at <anonymous> (/$bunfs/root/prime-agent:2190:27856)
+    at handleCommand (/$bunfs/root/prime-agent:2190:28170)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T23:56:37.506Z] supervisor: Session worker 7b9bd5ec1851 stderr: shutting down (exit 0); closing 0 active session(s)
+[2026-09-18T23:56:37.624Z] supervisor: Session worker 9d80394c2483 stderr: shutting down (exit 0); closing 0 active session(s)
+[2026-09-18T23:56:37.646Z] supervisor: Session worker 8c4c0d6f3d9e stderr: shutting down (exit 0); closing 0 active session(s)
+[2026-09-18T23:56:39.464Z] supervisor: Session worker 87f80ade4d64 stderr: shutting down (exit 0); closing 0 active session(s)
+[2026-09-18T23:56:39.676Z] supervisor: Session worker d05e1a62cd65 stderr: shutting down (exit 0); closing 0 active session(s)
+[2026-09-18T23:56:39.700Z] supervisor: Session worker c489828bf06b stderr: shutting down (exit 0); closing 0 active session(s)
+[2026-09-18T23:56:39.752Z] supervisor: Session worker a29c7b3d0814 stderr: shutting down (exit 0); closing 0 active session(s)
+[2026-09-18T23:56:39.772Z] supervisor: Session worker 6a706fa1fb34 stderr: shutting down (exit 0); closing 0 active session(s)

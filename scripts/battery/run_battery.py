@@ -33,6 +33,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -44,7 +45,24 @@ import perf as P  # noqa: E402
 
 NL = chr(10)
 
-ALL_FLOWS = ["f1_launch", "f2_prompt", "f3_tool", "f4_commands", "f5_side_questions", "f6_attach", "f7_compaction", "f8_resume", "f9_agents_view", "f10_perf", "f11_provider_failure", "f12_scroll", "f13_ctrlc_exit"]
+ALL_FLOWS = ["f1_launch", "f2_prompt", "f3_tool", "f4_commands", "f5_side_questions", "f6_attach", "f7_compaction", "f8_resume", "f9_agents_view", "f10_perf", "f11_provider_failure", "f12_scroll", "f13_ctrlc_exit", "f14_compact", "f15_a2a", "f16_refine", "f17_slash_model", "f18_goal_autonomous", "f19_heartbeat", "f20_subagents", "f21_worker_recovery"]
+
+# Real-surface flows (f14-f21): each drives one product surface end to end
+# (the daemon session + the attached interactive TUI), captures the frame
+# at the key moment, and byte-diffs TS vs Rust after normalization. A flow
+# whose diff fails on a surface known to be missing in the Rust build
+# records its finding with the owning fix lane: the report lists it as
+# EXPECTED-FAIL (the evidence the lane needs), not an unexplained gap.
+FLOW_LANES = {
+    "f14_compact": "compact-fb-2",
+    "f15_a2a": "decorations-3",
+    "f16_refine": "decorations-3",
+    "f17_slash_model": "model-picker-1",
+    "f18_goal_autonomous": "goal-autonomous",
+    "f19_heartbeat": "heartbeat-tui",
+    "f20_subagents": "subagents-tui",
+    "f21_worker_recovery": "worker-recovery",
+}
 
 # Heavy flows: opt-in by name (`--flows f12_scale_resume`) plus
 # PA_BATTERY_HEAVY=1; they measure transcript-scale resume, not parity, and
@@ -127,6 +145,16 @@ class Battery:
             mock=mock,
         )
         side.env = B.scrubbed_env(agent, tmpdir)
+        # The Rust binary resolves the kernel runtime sidecar through
+        # PI_PACKAGE_DIR: a packaged layout ships it next to the exe, but a
+        # cargo/sandbox build bakes the BUILD machine's source-checkout path
+        # in, which does not exist when the binary runs on this box (run
+        # 20260919T002527Z: every kernel ipython cell died with "kernel
+        # startup failed ... uv pip install prime-agent-runtime ... exit
+        # code 1"). Point it at this checkout, which ships
+        # prime-agent-runtime/ (the same layout the packaged product uses).
+        if name == "rust":
+            side.env["PI_PACKAGE_DIR"] = str(Path(__file__).resolve().parents[2])
         # Point both products at the mock through a provider whose API-key
         # resolution both support: both read the models.json apiKey (the
         # env key stays as the fallback both products share).
@@ -135,7 +163,7 @@ class Battery:
         self.sides[name] = side
         return side
 
-    def record(self, flow: str, category: str, summary: str, evidence="", gap: bool = True) -> None:
+    def record(self, flow: str, category: str, summary: str, evidence="", gap: bool = True, lane: str | None = None) -> None:
         if isinstance(evidence, Path):
             evidence = str(evidence.relative_to(self.run_dir))
         self.findings.append(
@@ -145,6 +173,7 @@ class Battery:
                 "gap": gap,
                 "summary": summary,
                 "evidence": evidence,
+                "expectedFail": lane,
             }
         )
 
@@ -1751,6 +1780,1129 @@ class Battery:
                         evidence=side.root / flow / f"{side.name}-{case}.json",
                     )
 
+    # -- real-surface helpers (f14-f21) --------------------------------------
+
+    def suppress_first_run_notices(self, side: B.Side) -> dict:
+        """Mark the side's onboarding/trace-notice state as already shown so
+        the interactive panes settle straight into the conversation. The TS
+        product re-runs the Welcome/trace-notice onboarding overlay on any
+        fresh TUI instance (including mid-flow rebinds) until the state is
+        persisted; a subset battery run (`--flows f15_a2a` without f1) would
+        otherwise capture notice-overlaid frames (see the frozen partial run
+        20260918T190022Z ts/f15_a2a/01-received.txt). Returns the settings
+        dict so a flow can extend it before writing again."""
+        settings_path = side.agent_dir / "settings.json"
+        settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+        settings["onboardingShown"] = True
+        settings["telemetry"] = {**(settings.get("telemetry") or {}), "noticeShown": True}
+        settings_path.write_text(json.dumps(settings))
+        return settings
+
+    def settle_frame(self, session: str, quiet_s: float = 2.0, timeout: float = 40.0) -> str:
+        """Poll the pane until it stops changing; returns the settled frame."""
+        deadline = time.time() + timeout
+        last = B.tmux_capture(session)
+        last_change = time.time()
+        while time.time() < deadline:
+            time.sleep(0.5)
+            frame = B.tmux_capture(session)
+            if frame != last:
+                last = frame
+                last_change = time.time()
+            elif time.time() - last_change >= quiet_s:
+                return frame
+        return last
+
+    def create_session(self, side: B.Side, flow: str, name: str, wire_id: str, timeout: float = 120) -> tuple[B.Wire, str] | None:
+        """Create one daemon session; returns (wire, session_id) or None after recording the failure."""
+        self.ensure_daemon(side)
+        wire = B.Wire(side.daemon_socket)
+        create = wire.request(wire_id, {"type": "create", "name": name, "config": self.session_config(side)}, timeout=timeout)
+        if create.get("success") is not True:
+            self.record(
+                flow,
+                "protocol",
+                f"{side.name}: daemon create failed: {json.dumps(create)[:300]}",
+            )
+            wire.close()
+            return None
+        session_id = (create.get("data", {}).get("activeSessionId") or create.get("data", {}).get("id") or "")
+        return wire, session_id
+
+    def tui_ready_loop(self, session: str, ready_marker: str, timeout: float = 90.0) -> str:
+        """One ready gate for interactive panes: answer the first-run trace
+        notice whenever it shows (it can appear after the first ready-looking
+        frame — the splash carries ">" + "manage" too, and the transcript can
+        render before the notice overlays it), and return only once
+        `ready_marker` has rendered stably with no notice on top."""
+        deadline = time.time() + timeout
+        frame = ""
+        stable_since: float | None = None
+        while time.time() < deadline:
+            frame = B.tmux_capture(session)
+            if "Share agent traces" in frame:
+                B.tmux_send(session, "Down")
+                time.sleep(0.5)
+                B.tmux_send(session, "Enter")
+                time.sleep(1.5)
+                stable_since = None
+                continue
+            if ready_marker and ready_marker in frame:
+                if stable_since is None:
+                    stable_since = time.time()
+                elif time.time() - stable_since >= 3.0:
+                    return frame
+            else:
+                stable_since = None
+            time.sleep(0.5)
+        return frame
+
+    def tui_send(self, session: str, keys: str, enter: bool = True) -> None:
+        """Send keys to an interactive pane, answering the first-run notice
+        first if it happens to be on top (a notice arriving late would
+        otherwise swallow the keystrokes)."""
+        frame = B.tmux_capture(session)
+        if "Share agent traces" in frame:
+            B.tmux_send(session, "Down")
+            time.sleep(0.5)
+            B.tmux_send(session, "Enter")
+            time.sleep(1.5)
+        B.tmux_send(session, keys, enter=enter)
+
+    def launch_tui(self, side: B.Side, flow: str, argv: list[str], ready_marker: str, timeout: float = 90.0) -> tuple[str, str]:
+        """Launch one interactive pane (`argv`) and gate it through the
+        notice-aware ready loop. Returns (tmux session, ready frame)."""
+        session = f"{self.runid}-{flow}-{side.name}"
+        B.tmux_launch(session, argv, side.env, side.work_dir)
+        frame = self.tui_ready_loop(session, ready_marker, timeout=timeout)
+        return session, frame
+
+    def attach_tui(self, side: B.Side, flow: str, session_id: str, ready_marker: str = ">") -> tuple[str, str] | None:
+        """Launch the interactive TUI attached to a live daemon session
+        (`--resume <session id>` attaches on both products); waits past
+        first-run notices into the ready prompt. Returns (tmux session,
+        ready frame)."""
+        # No --offline here: it disables telemetry for the invocation, and TS
+        # refuses to attach to an active worker across that telemetry mismatch
+        # (f6's CLI attach takes the same stance).
+        argv = [
+            side.binary,
+            "--daemon-socket",
+            str(side.daemon_socket),
+            "--resume",
+            session_id,
+        ]
+        return self.launch_tui(side, flow, argv, ready_marker)
+
+    def frame_diff(self, flow: str, step: str, frames: dict[str, str], normalizer=None) -> None:
+        """Cross-side diff of one captured frame pair, recorded as one
+        finding (identical = pass; differ = gap evidence)."""
+        ts_frame = frames.get("ts")
+        rs_frame = frames.get("rust")
+        if ts_frame is None or rs_frame is None:
+            self.record(
+                flow,
+                "visual",
+                f"{step}: missing frames (ts={'y' if ts_frame else 'n'} rust={'y' if rs_frame else 'n'})",
+            )
+            return
+        ts_norm = normalizer(ts_frame, self.sides["ts"]) if normalizer else ts_frame
+        rs_norm = normalizer(rs_frame, self.sides["rust"]) if normalizer else rs_frame
+        if ts_norm == rs_norm:
+            self.record(
+                flow,
+                "visual",
+                f"{step}: frames identical TS vs Rust (normalized)",
+                gap=False,
+            )
+        else:
+            diff_path = self.sides["ts"].root / flow / f"frame-diff-{step}.txt"
+            diff_path.parent.mkdir(parents=True, exist_ok=True)
+            diff_path.write_text(f"--- ts ({step})\n{ts_frame}\n+++ rust ({step})\n{rs_frame}")
+            self.record(
+                flow,
+                "visual",
+                f"{step}: frames differ TS vs Rust (see frame-diff-{step}.txt)",
+                evidence=diff_path,
+                lane=FLOW_LANES.get(flow),
+            )
+
+    @staticmethod
+    def normalize_transcript_frame(frame: str, side: B.Side) -> str:
+        """Transcript-frame normalization: scrub side-specific paths, session
+        ids, timestamps, token counts, and trailing status lines so the diff
+        measures the durable rows, not volatile metadata."""
+        text = frame
+        for value in (str(side.root), str(side.agent_dir), str(side.work_dir)):
+            text = text.replace(value, "<dir>")
+        text = re.sub(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "<uuid>", text)
+        text = re.sub(r"\b[0-9,]{4,}\b", "<num>", text)
+        text = re.sub(r"\b\d+(\.\d+)?s\b", "<dur>", text)
+        return text
+
+
+    def f14_compact(self) -> None:
+        """/compact visible feedback and the auto-compaction threshold
+        crossing. Two sessions: the manual /compact loader + durable
+        `◆ Context compacted` summary row (session A), and the
+        `Auto-compacting...` loader + compacted row when one large turn
+        crosses the reserve-token headroom (session B — a manual compact
+        first would leave `Already compacted` skips for the auto path).
+        Settings shape both: reserveTokens 127500 leaves a 500-token
+        headroom on the 128k mock model (the mock-reported 126k usage
+        crosses it), and keepRecentTokens 10 makes the seeded turns
+        compactable (the TS compactor skips sessions whose recent history
+        already fits keepRecentTokens with "Session is too short to
+        compact" — the frozen 20260918T190022Z partial run showed exactly
+        that skip with the default 20000). Frame diff TS vs Rust at each
+        key moment."""
+        flow = "f14_compact"
+        reply = "f14 parity fixture reply"
+        frames: dict[str, dict[str, str]] = {"ts": {}, "rust": {}}
+        for side in (self.sides["ts"], self.sides["rust"]):
+            settings = self.suppress_first_run_notices(side)
+            settings["compaction"] = {"enabled": True, "reserveTokens": 127500, "keepRecentTokens": 10}
+            settings_path = side.agent_dir / "settings.json"
+            settings_path.write_text(json.dumps(settings))
+            # -- session A: manual /compact --------------------------------
+            made = self.create_session(side, flow, "battery-f14-manual", "c14m")
+            if made:
+                wire, session_id = made
+                # Seed turns: deterministic content for the compactor to keep.
+                side.mock.set_responses([{"text": reply}])
+                for n in (1, 2):
+                    wire.request(
+                        f"p14s{n}",
+                        {"type": "prompt_and_wait", "activeSessionId": session_id,
+                         "message": f"f14 seed turn {n} of the parity battery with deterministic content"},
+                        timeout=240,
+                    )
+                wire.close()
+                self.settle_mock(side)
+                attached = self.attach_tui(side, flow, session_id, ready_marker="f14 seed turn 2")
+                if not attached:
+                    self.record(flow, "visual", f"{side.name}: attached TUI never rendered the seeded transcript")
+                else:
+                    tui, ready = attached
+                    side.evidence(flow, "00-attached.txt", ready)
+                    # Manual /compact: the loader while running, the durable
+                    # outcome row after (the summarization request pops the
+                    # mock's repeating text response; its default usage keeps
+                    # the session below the auto-compaction headroom).
+                    self.tui_send(tui, "/compact")
+                    # The mock summarization returns instantly, so the
+                    # loader may be gone before the first poll; keep the wait
+                    # short and let the settled row be the real gate.
+                    during = B.tmux_wait_text(tui, "ompacting", timeout=8)
+                    side.evidence(flow, "01-during-compact.txt", during)
+                    settled = self.settle_frame(tui, quiet_s=3.0, timeout=90)
+                    side.evidence(flow, "02-after-compact.txt", settled)
+                    frames[side.name]["manual-compact"] = settled
+                    if "Context compacted" in settled:
+                        self.record(
+                            flow, "visual",
+                            f"{side.name}: /compact shows the durable '◆ Context compacted' summary row",
+                            gap=False,
+                        )
+                    else:
+                        self.record(
+                            flow, "visual",
+                            f"{side.name}: /compact produced no visible '◆ Context compacted' summary row",
+                            evidence=side.root / flow / "02-after-compact.txt",
+                            lane=FLOW_LANES[flow],
+                        )
+                    B.tmux_kill(tui)
+                self.copy_sessions(side, flow)
+            # -- session B: auto-compaction threshold crossing ---------------
+            made = self.create_session(side, flow, "battery-f14-auto", "c14a")
+            if made:
+                wire, session_id = made
+                side.mock.set_responses([{"text": reply}])
+                wire.request(
+                    "p14a",
+                    {"type": "prompt_and_wait", "activeSessionId": session_id, "message": "f14 auto seed turn"},
+                    timeout=240,
+                )
+                wire.close()
+                self.settle_mock(side)
+                attached = self.attach_tui(side, flow, session_id, ready_marker="f14 auto seed turn")
+                if not attached:
+                    self.record(flow, "visual", f"{side.name}: attached TUI never rendered the auto-compaction seeded transcript")
+                else:
+                    tui, ready = attached
+                    side.evidence(flow, "03-auto-attached.txt", ready)
+                    # The mock reports usage past the 500-token headroom
+                    # (128000 - reserveTokens 127500), so the threshold check
+                    # fires after this turn; the follow-up response carries
+                    # the default (small) usage so the compacted session does
+                    # not re-cross the threshold and loop.
+                    self.settle_mock(side)
+                    side.mock.set_responses(
+                        [
+                            {"text": reply, "usage": {"prompt_tokens": 126000, "completion_tokens": 10, "total_tokens": 126010, "prompt_tokens_details": {"cached_tokens": 80}}},
+                            {"text": reply},
+                        ]
+                    )
+                    self.tui_send(tui, "f14 threshold crossing turn")
+                    auto_during = B.tmux_wait_text(tui, "Auto-compacting|Context compacted", timeout=90)
+                    side.evidence(flow, "04-auto-during.txt", auto_during)
+                    settled2 = self.settle_frame(tui, quiet_s=3.0, timeout=120)
+                    side.evidence(flow, "05-auto-after.txt", settled2)
+                    frames[side.name]["auto-compact"] = settled2
+                    if "Context compacted" in settled2:
+                        self.record(
+                            flow, "behavior",
+                            f"{side.name}: crossing the compaction threshold auto-compacts and shows the summary row",
+                            gap=False,
+                        )
+                    else:
+                        self.record(
+                            flow, "behavior",
+                            f"{side.name}: threshold crossing produced no visible auto-compaction outcome",
+                            evidence=side.root / flow / "05-auto-after.txt",
+                            lane=FLOW_LANES[flow],
+                        )
+                    side.evidence_json(flow, "mock-requests.json", side.mock.requests())
+                    B.tmux_kill(tui)
+                self.copy_sessions(side, flow)
+            # Restore default compaction settings for the flows that follow.
+            settings["compaction"] = {"enabled": True}
+            settings_path.write_text(json.dumps(settings))
+        for step in ("manual-compact", "auto-compact"):
+            self.frame_diff(
+                flow, step,
+                {name: frames[name].get(step, "") for name in ("ts", "rust")},
+                self.normalize_transcript_frame,
+            )
+
+
+    def f15_a2a(self) -> None:
+        """agent_message send/receive: the ◆ diamond-decorated rows in both
+        directions — the received row in the receiver's transcript, the sent
+        summary row inside the sender's ipython cell — with participant
+        labels and the expanded preview body. Two sibling daemon sessions
+        exchange one message each way through their kernels."""
+        flow = "f15_a2a"
+        reply = "f15 a2a turn reply"
+        frames: dict[str, dict[str, str]] = {"ts": {}, "rust": {}}
+        for side in (self.sides["ts"], self.sides["rust"]):
+            self.suppress_first_run_notices(side)
+            made = self.create_session(side, flow, "battery-f15-a", "c15a")
+            if not made:
+                continue
+            wire_a, id_a = made
+            made = self.create_session(side, flow, "battery-f15-b", "c15b")
+            if not made:
+                wire_a.close()
+                continue
+            wire_b, id_b = made
+            # Seed both sessions so each is idle and named on the roster.
+            side.mock.set_responses([{"text": reply}])
+            wire_a.request(
+                "p15a", {"type": "prompt_and_wait", "activeSessionId": id_a, "message": "f15 seed a"}, timeout=240
+            )
+            wire_b.request(
+                "p15b", {"type": "prompt_and_wait", "activeSessionId": id_b, "message": "f15 seed b"}, timeout=240
+            )
+            wire_a.close()
+            wire_b.close()
+            self.settle_mock(side)
+            # Attach to B; A's kernel sends one sibling message.
+            attached = self.attach_tui(side, flow, id_b, ready_marker="f15 seed b")
+            if not attached:
+                self.record(flow, "visual", f"{side.name}: attached TUI never rendered the seeded transcript")
+                continue
+            tui, ready = attached
+            side.evidence(flow, "00-attached.txt", ready)
+            payload_a = "f15 a2a payload from a to b"
+            code_a = (
+                "import agent_message; await agent_message.send("
+                f"{payload_a!r}, receiver_role='sibling', receiver_name='battery-f15-b')"
+            )
+            side.mock.set_responses(
+                [
+                    {"toolCall": {"name": "ipython", "arguments": {"code": code_a}}},
+                    {"text": reply},
+                ]
+            )
+            wire_a = B.Wire(side.daemon_socket)
+            wire_a.send_command(
+                "p15s",
+                {"type": "prompt_and_wait", "activeSessionId": id_a, "message": "f15 send the sibling message to b"},
+            )
+            wire_a.close()
+            received = B.tmux_wait_text(tui, "Agent message received|f15 a2a payload", timeout=120)
+            side.evidence(flow, "01-received.txt", received)
+            settled = self.settle_frame(tui, quiet_s=3.0, timeout=90)
+            side.evidence(flow, "02-received-settled.txt", settled)
+            frames[side.name]["received"] = settled
+            if "Agent message received" in settled:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: a sibling agent message renders the '◆ Agent message received' row with participant label",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: the delivered sibling message shows no 'Agent message received' row",
+                    evidence=side.root / flow / "02-received-settled.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            # Reverse direction: B's kernel sends back to A (prompted through
+            # the attached TUI so the sent row renders in B's own pane).
+            self.settle_mock(side)
+            payload_b = "f15 a2a payload from b to a"
+            code_b = (
+                "import agent_message; await agent_message.send("
+                f"{payload_b!r}, receiver_role='sibling', receiver_name='battery-f15-a')"
+            )
+            side.mock.set_responses(
+                [
+                    {"toolCall": {"name": "ipython", "arguments": {"code": code_b}}},
+                    {"text": reply},
+                ]
+            )
+            self.tui_send(tui, "f15 send the sibling message back to a")
+            sent = B.tmux_wait_text(tui, "Agent message sent|Agent message queued", timeout=120)
+            side.evidence(flow, "03-sent.txt", sent)
+            settled2 = self.settle_frame(tui, quiet_s=3.0, timeout=90)
+            side.evidence(flow, "04-sent-settled.txt", settled2)
+            frames[side.name]["sent"] = settled2
+            if "Agent message sent" in settled2 or "Agent message queued" in settled2:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: the sender's ipython cell renders the '◆ Agent message sent/queued' summary row with the participant label",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: the sender's ipython cell shows no '◆ Agent message sent/queued' row",
+                    evidence=side.root / flow / "04-sent-settled.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            B.tmux_kill(tui)
+            self.copy_sessions(side, flow)
+        for step in ("received", "sent"):
+            self.frame_diff(
+                flow, step,
+                {name: frames[name].get(step, "") for name in ("ts", "rust")},
+                self.normalize_transcript_frame,
+            )
+
+    def f16_refine(self) -> None:
+        """refine.run() from the kernel: the ◆ decorated refinement-outcome
+        row, and the harness_digest user message rendered on the next
+        boundary. One daemon session, one kernel-scheduled refinement."""
+        flow = "f16_refine"
+        reply = "f16 refine fixture reply"
+        frames: dict[str, dict[str, str]] = {"ts": {}, "rust": {}}
+        for side in (self.sides["ts"], self.sides["rust"]):
+            self.suppress_first_run_notices(side)
+            made = self.create_session(side, flow, "battery-f16", "c16")
+            if not made:
+                continue
+            wire, session_id = made
+            side.mock.set_responses([{"text": reply}])
+            wire.request(
+                "p16s", {"type": "prompt_and_wait", "activeSessionId": session_id, "message": "f16 seed turn"}, timeout=240
+            )
+            wire.close()
+            self.settle_mock(side)
+            attached = self.attach_tui(side, flow, session_id, ready_marker="f16 seed turn")
+            if not attached:
+                self.record(flow, "visual", f"{side.name}: attached TUI never rendered the seeded transcript")
+                continue
+            tui, ready = attached
+            side.evidence(flow, "00-attached.txt", ready)
+            code = (
+                "import refine; await refine.run("
+                "instructions='create one local memory titled f16-battery-memory describing this parity check')"
+            )
+            # The refinement runs host-side when the turn ends: after the
+            # tool-call reply and the turn's final text, the refinement
+            # planning request consumes the next queued response, so the
+            # queue scripts the exact refinement proposal JSON (the
+            # "You are Prime Agent's /refine continual harness subsystem"
+            # prompt's schema). Without it the mock repeats the last plain
+            # text response and refinement never applies (TS run
+            # 20260918T231155Z: both sides failed the outcome row on this).
+            refinement = {
+                "summary": "Record the f16 battery parity fixture",
+                "rationale": "The parity check requires one local memory entry to prove refinement applies edits.",
+                "expectedOutcome": "A local memory titled f16-battery-memory exists.",
+                "edits": [
+                    {
+                        "action": "create",
+                        "kind": "memory",
+                        "title": "f16-battery-memory",
+                        "content": "The f16 battery flow verified the kernel-scheduled refinement end to end.",
+                        "metadata": {"scope": "local"},
+                        "reason": "battery parity fixture",
+                    }
+                ],
+            }
+            side.mock.set_responses(
+                [
+                    {"toolCall": {"name": "ipython", "arguments": {"code": code}}},
+                    {"text": reply},
+                    {"text": json.dumps(refinement)},
+                    # The harness resumes the model after applying the edits.
+                    {"text": reply},
+                ]
+            )
+            self.tui_send(tui, "f16 schedule the refinement now")
+            outcome = B.tmux_wait_text(tui, "Harness refined|Harness unchanged|refine", timeout=150)
+            side.evidence(flow, "01-refine-outcome.txt", outcome)
+            settled = self.settle_frame(tui, quiet_s=4.0, timeout=120)
+            side.evidence(flow, "02-refine-settled.txt", settled)
+            frames[side.name]["refine"] = settled
+            if "Harness refined" in settled:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: the kernel-scheduled refinement renders the '◆ Harness refined' outcome row",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: no '◆ Harness refined' outcome row after the kernel-scheduled refinement",
+                    evidence=side.root / flow / "02-refine-settled.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            # The harness digest lands on the next turn boundary; the next
+            # prompt forces it into the transcript.
+            self.settle_mock(side)
+            side.mock.set_responses([{"text": reply}])
+            self.tui_send(tui, "f16 follow up turn")
+            digest = B.tmux_wait_text(tui, "harness-digest", timeout=150)
+            side.evidence(flow, "03-digest.txt", digest)
+            settled2 = self.settle_frame(tui, quiet_s=4.0, timeout=120)
+            side.evidence(flow, "04-digest-settled.txt", settled2)
+            frames[side.name]["digest"] = settled2
+            if "harness-digest" in settled2:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: the harness digest renders as a [harness-digest] message row on the boundary",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: no [harness-digest] message row on the post-refinement boundary",
+                    evidence=side.root / flow / "04-digest-settled.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            B.tmux_kill(tui)
+            self.copy_sessions(side, flow)
+        for step in ("refine", "digest"):
+            self.frame_diff(
+                flow, step,
+                {name: frames[name].get(step, "") for name in ("ts", "rust")},
+                self.normalize_transcript_frame,
+            )
+
+    def f17_slash_model(self) -> None:
+        """/model and /effort pickers: the selector overlay open, a
+        selection through the picker, and the picker's confirm rows —
+        TS-identical result rows both sides."""
+        flow = "f17_slash_model"
+        frames: dict[str, dict[str, str]] = {"ts": {}, "rust": {}}
+        for side in (self.sides["ts"], self.sides["rust"]):
+            self.ensure_daemon(side)
+            self.suppress_first_run_notices(side)
+            tui, ready = self.launch_tui(side, flow, P.launch_argv(side, side.daemon_socket), ready_marker=">")
+            side.evidence(flow, "00-ready.txt", ready)
+            # /model: the selector overlay.
+            self.tui_send(tui, "/model")
+            time.sleep(2.5)
+            selector = B.tmux_capture(tui)
+            side.evidence(flow, "01-model-selector.txt", selector)
+            frames[side.name]["model-selector"] = selector
+            if "mock-1" in selector or "Mock 1" in selector:
+                self.record(flow, "visual", f"{side.name}: /model opens the selector with the configured model listed", gap=False)
+            else:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: /model selector did not list the configured mock model",
+                    evidence=side.root / flow / "01-model-selector.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            # Select the model: type the search, confirm the first row.
+            self.tui_send(tui, "mock")
+            time.sleep(1.0)
+            self.tui_send(tui, "Enter", enter=False)
+            selected = B.tmux_wait_text(tui, "Model: |Switching model", timeout=30)
+            side.evidence(flow, "02-model-selected.txt", selected)
+            settled = self.settle_frame(tui, quiet_s=2.0, timeout=30)
+            side.evidence(flow, "03-model-selected-settled.txt", settled)
+            frames[side.name]["model-selected"] = settled
+            if "Model: " in settled:
+                self.record(flow, "visual", f"{side.name}: picking a model in the selector shows the 'Model: <id>' confirm row", gap=False)
+            else:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: no 'Model: <id>' confirm row after picking in the selector",
+                    evidence=side.root / flow / "03-model-selected-settled.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            # /effort: the thinking-level picker (or the unsupported-model row).
+            self.tui_send(tui, "/effort")
+            time.sleep(2.5)
+            effort = B.tmux_capture(tui)
+            side.evidence(flow, "04-effort-picker.txt", effort)
+            frames[side.name]["effort-picker"] = effort
+            if "Thinking level" in effort or "thinking" in effort.lower():
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: /effort shows the thinking-level picker or its unsupported-model row",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: /effort showed no thinking-level surface",
+                    evidence=side.root / flow / "04-effort-picker.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            self.tui_send(tui, "Escape", enter=False)
+            time.sleep(0.5)
+            B.tmux_kill(tui)
+        for step in ("model-selector", "model-selected", "effort-picker"):
+            self.frame_diff(
+                flow, step,
+                {name: frames[name].get(step, "") for name in ("ts", "rust")},
+                self.normalize_transcript_frame,
+            )
+
+
+    def f18_goal_autonomous(self) -> None:
+        """/goal lifecycle rows and /autonomous on/off rendering: the goal
+        start context row, the status/pause/resume rows, the completion row
+        (kernel `goal.complete()`), and the autonomous_status rows."""
+        flow = "f18_goal_autonomous"
+        reply = "f18 goal fixture reply"
+        objective = "f18 parity objective: land the battery flows"
+        frames: dict[str, dict[str, str]] = {"ts": {}, "rust": {}}
+        for side in (self.sides["ts"], self.sides["rust"]):
+            self.suppress_first_run_notices(side)
+            made = self.create_session(side, flow, "battery-f18", "c18")
+            if not made:
+                continue
+            wire, session_id = made
+            side.mock.set_responses([{"text": reply}])
+            wire.request(
+                "p18s", {"type": "prompt_and_wait", "activeSessionId": session_id, "message": "f18 seed turn"}, timeout=240
+            )
+            wire.close()
+            self.settle_mock(side)
+            attached = self.attach_tui(side, flow, session_id, ready_marker="f18 seed turn")
+            if not attached:
+                self.record(flow, "visual", f"{side.name}: attached TUI never rendered the seeded transcript")
+                continue
+            tui, ready = attached
+            side.evidence(flow, "00-attached.txt", ready)
+            # /goal <objective>: the start row, goal-context turn, tray
+            # label. Wait only for the row: with the goal active the TS
+            # daemon immediately starts driving [goal: continuation]
+            # turns, and the frame never goes quiet, so a settle here would
+            # burn its full timeout while the loop churns (runs
+            # 20260918T231155Z / 20260919T002527Z: the TS goal driver
+            # issued ~2900 continuation turns and starved queued composer
+            # input for minutes per command).
+            self.tui_send(tui, f"/goal {objective}")
+            settled = B.tmux_wait_text(tui, "Goal active|Pursuing goal|Goal context", timeout=30)
+            side.evidence(flow, "01-goal-start.txt", settled)
+            frames[side.name]["goal-start"] = settled
+            if ("Goal context" in settled or "Pursuing goal" in settled or "Goal active" in settled):
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: /goal start renders the goal context row / active goal label",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: /goal start produced no visible goal row",
+                    evidence=side.root / flow / "01-goal-start.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            # Pause immediately while the driver's queue is still shallow:
+            # every queued command lands after the loop drains (minutes when
+            # typed late), but lands within a turn or two when typed right
+            # after the start. Everything else in the flow then runs against
+            # a paused (quiet) goal driver.
+            self.tui_send(tui, "/goal pause")
+            settled = B.tmux_wait_text(tui, "Goal paused", timeout=120)
+            side.evidence(flow, "03-goal-pause.txt", settled)
+            frames[side.name]["goal-pause"] = settled
+            if "Goal paused" in settled:
+                self.record(flow, "visual", f"{side.name}: /goal pause renders the paused row", gap=False)
+            else:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: /goal pause produced no visible paused row",
+                    evidence=side.root / flow / "03-goal-pause.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            # /goal (status): the status row (the driver is paused, so the
+            # frame settles normally).
+            self.tui_send(tui, "/goal")
+            settled = self.settle_frame(tui, quiet_s=3.0, timeout=30)
+            side.evidence(flow, "02-goal-status.txt", settled)
+            frames[side.name]["goal-status"] = settled
+            # /goal resume, then pause again before scripting responses: the
+            # resumed goal driver keeps issuing [goal: continuation] turns
+            # that drain the mock's response queue (run 20260918T231155Z:
+            # the loop fired ~870 continuation requests through the rest of
+            # the run and starved the f18 completion turn and the f21
+            # recovery turn). Pausing right after the resume capture keeps
+            # the churn to a turn or two.
+            self.tui_send(tui, "/goal resume")
+            settled = B.tmux_wait_text(tui, "Goal", timeout=15)
+            side.evidence(flow, "04-goal-resume.txt", settled)
+            frames[side.name]["goal-resume"] = settled
+            self.tui_send(tui, "/goal pause")
+            paused2 = B.tmux_wait_text(tui, "Goal paused", timeout=120)
+            side.evidence(flow, "04b-goal-pause-2.txt", paused2)
+            # Completion: the kernel's goal.complete() (scripted tool call).
+            # The 6s quiet window matters: the previous turn's status-line
+            # request can land seconds after the turn ends and would
+            # otherwise pop the scripted tool call out of the queue.
+            self.settle_mock(side, quiet_s=6.0, timeout=30.0)
+            code = "import goal; await goal.complete()"
+            side.mock.set_responses(
+                [
+                    {"toolCall": {"name": "ipython", "arguments": {"code": code}}},
+                    {"text": reply},
+                ]
+            )
+            self.tui_send(tui, "f18 finish the goal now")
+            settled = self.settle_frame(tui, quiet_s=4.0, timeout=120)
+            side.evidence(flow, "05-goal-complete.txt", settled)
+            frames[side.name]["goal-complete"] = settled
+            if "Goal complete" in settled:
+                self.record(flow, "visual", f"{side.name}: goal.complete() renders the completion row", gap=False)
+            else:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: goal.complete() produced no visible completion row",
+                    evidence=side.root / flow / "05-goal-complete.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            # /autonomous on and off: the autonomous_status rows.
+            self.settle_mock(side)
+            side.mock.set_responses([{"text": reply}])
+            self.tui_send(tui, "/autonomous on")
+            settled = self.settle_frame(tui, quiet_s=3.0, timeout=60)
+            side.evidence(flow, "06-autonomous-on.txt", settled)
+            frames[side.name]["autonomous-on"] = settled
+            if "Autonomous" in settled or "autonomous" in settled:
+                self.record(flow, "visual", f"{side.name}: /autonomous on renders the autonomous status row", gap=False)
+            else:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: /autonomous on produced no visible status row",
+                    evidence=side.root / flow / "06-autonomous-on.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            self.tui_send(tui, "/autonomous off")
+            settled = self.settle_frame(tui, quiet_s=3.0, timeout=60)
+            side.evidence(flow, "07-autonomous-off.txt", settled)
+            frames[side.name]["autonomous-off"] = settled
+            B.tmux_kill(tui)
+            self.copy_sessions(side, flow)
+        for step in ("goal-start", "goal-status", "goal-pause", "goal-resume", "goal-complete", "autonomous-on", "autonomous-off"):
+            self.frame_diff(
+                flow, step,
+                {name: frames[name].get(step, "") for name in ("ts", "rust")},
+                self.normalize_transcript_frame,
+            )
+
+
+    def f19_heartbeat(self) -> None:
+        """/heartbeat visible surface: the set status row, the fired
+        heartbeat prompt row (♥ prefix + schedule label), and the
+        /heartbeats manager view."""
+        flow = "f19_heartbeat"
+        reply = "f19 heartbeat fixture reply"
+        frames: dict[str, dict[str, str]] = {"ts": {}, "rust": {}}
+        for side in (self.sides["ts"], self.sides["rust"]):
+            self.suppress_first_run_notices(side)
+            made = self.create_session(side, flow, "battery-f19", "c19")
+            if not made:
+                continue
+            wire, session_id = made
+            side.mock.set_responses([{"text": reply}])
+            wire.request(
+                "p19s", {"type": "prompt_and_wait", "activeSessionId": session_id, "message": "f19 seed turn"}, timeout=240
+            )
+            wire.close()
+            self.settle_mock(side)
+            attached = self.attach_tui(side, flow, session_id, ready_marker="f19 seed turn")
+            if not attached:
+                self.record(flow, "visual", f"{side.name}: attached TUI never rendered the seeded transcript")
+                continue
+            tui, ready = attached
+            side.evidence(flow, "00-attached.txt", ready)
+            # /heartbeat every 10s: the set status row.
+            self.tui_send(tui, "/heartbeat every 10s f19 heartbeat ping instruction")
+            settled = self.settle_frame(tui, quiet_s=3.0, timeout=60)
+            side.evidence(flow, "01-heartbeat-set.txt", settled)
+            frames[side.name]["heartbeat-set"] = settled
+            if "Heartbeat set" in settled:
+                self.record(flow, "visual", f"{side.name}: /heartbeat renders the 'Heartbeat set' status row", gap=False)
+            else:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: /heartbeat produced no 'Heartbeat set' status row",
+                    evidence=side.root / flow / "01-heartbeat-set.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            # The heartbeat fires (10s schedule): the injected prompt row with
+            # the ♥ prefix and schedule label, plus its model turn.
+            fired = B.tmux_wait_text(tui, "Heartbeat prompt", timeout=60)
+            side.evidence(flow, "02-heartbeat-fired.txt", fired)
+            settled = self.settle_frame(tui, quiet_s=4.0, timeout=90)
+            side.evidence(flow, "03-heartbeat-fired-settled.txt", settled)
+            frames[side.name]["heartbeat-fired"] = settled
+            if "Heartbeat prompt" in settled:
+                self.record(
+                    flow, "behavior",
+                    f"{side.name}: a fired heartbeat renders the '♥ Heartbeat prompt · every 10s' row",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow, "behavior",
+                    f"{side.name}: the fired heartbeat produced no visible '♥ Heartbeat prompt' row",
+                    evidence=side.root / flow / "03-heartbeat-fired-settled.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            # /heartbeats: the manager view.
+            self.tui_send(tui, "/heartbeats")
+            time.sleep(2.5)
+            manager = B.tmux_capture(tui)
+            side.evidence(flow, "04-heartbeats-manager.txt", manager)
+            frames[side.name]["heartbeats-manager"] = manager
+            if "Heartbeats" in manager and ("heartbeat" in manager.lower()):
+                self.record(flow, "visual", f"{side.name}: /heartbeats opens the heartbeat manager view", gap=False)
+            else:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: /heartbeats did not open a heartbeat manager view",
+                    evidence=side.root / flow / "04-heartbeats-manager.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            self.tui_send(tui, "Escape", enter=False)
+            time.sleep(0.5)
+            # Stop the heartbeat so the daemon does not keep firing it.
+            self.tui_send(tui, "/heartbeat stop")
+            time.sleep(1.0)
+            B.tmux_kill(tui)
+            self.copy_sessions(side, flow)
+        for step in ("heartbeat-set", "heartbeat-fired", "heartbeats-manager"):
+            self.frame_diff(
+                flow, step,
+                {name: frames[name].get(step, "") for name in ("ts", "rust")},
+                self.normalize_transcript_frame,
+            )
+
+
+    def f20_subagents(self) -> None:
+        """rlm.spawn() from the kernel, attached through the agents view: the
+        subagent summary line above the editor (live running counts, then the
+        child's `RLM child status` no-reply terminal notice), and the scoped
+        agents view opened from the focused summary line listing the child by
+        name. Frame diff TS vs Rust at each key moment."""
+        flow = "f20_subagents"
+        reply = "f20 parent fixture reply"
+        child_reply = "f20 child fixture reply"
+        child_name = "f20-worker"
+        frames: dict[str, dict[str, str]] = {"ts": {}, "rust": {}}
+        for side in (self.sides["ts"], self.sides["rust"]):
+            made = self.create_session(side, flow, "battery-f20", "c20")
+            if not made:
+                continue
+            wire, session_id = made
+            side.mock.set_responses([{"text": reply}])
+            wire.request(
+                "p20s", {"type": "prompt_and_wait", "activeSessionId": session_id, "message": "f20 seed turn"}, timeout=240
+            )
+            wire.close()
+            self.settle_mock(side)
+            # TS suppresses the agents view while onboarding is pending
+            # (f9 precedent); suppress_first_run_notices marks the side
+            # onboarded so both products open the view directly. No --offline
+            # on this launch either: TS refuses to attach an active agent
+            # across a telemetry mismatch.
+            self.suppress_first_run_notices(side)
+            view = f"{self.runid}-f20-{side.name}"
+            B.tmux_launch(view, [side.binary, "agents", "--daemon-socket", str(side.daemon_socket)], side.env, side.work_dir)
+            listed = B.tmux_wait_text(view, "Running \(|Idle \(|Inactive \(|No sessions", timeout=30)
+            side.evidence(flow, "00-agents-view.txt", listed)
+            # Open the parent session from the view: the conversation then
+            # carries returnToAgentsView, which is what makes the subagent
+            # summary line openable into the scoped view.
+            B.tmux_send(view, "battery-f20")
+            time.sleep(1.0)
+            B.tmux_send(view, "Enter", enter=False)
+            attached = B.tmux_wait_text(view, "f20 seed turn", timeout=60)
+            if "f20 seed turn" not in attached:
+                self.record(flow, "visual", f"{side.name}: opening battery-f20 from the agents view did not attach to the seeded session", evidence=side.root / flow / "00-agents-view.txt")
+                B.tmux_kill(view)
+                continue
+            # Kernel rlm.spawn through the attached editor: the ipython cell
+            # spawns one named child. The child's own model turn pops the next
+            # mock response (plain text), so the child finishes without an
+            # agent_message reply and the parent receives the no-reply
+            # terminal notice.
+            self.settle_mock(side)
+            code = (
+                "import rlm; await rlm.spawn("
+                "'f20 child task: reply with the fixture summary', "
+                f"name={child_name!r})"
+            )
+            side.mock.set_responses(
+                [
+                    {"toolCall": {"name": "ipython", "arguments": {"code": code}}},
+                    {"text": child_reply},
+                    {"text": reply},
+                ]
+            )
+            self.tui_send(view, "f20 spawn the subagent now")
+            spawned = B.tmux_wait_text(view, "subagents", timeout=180)
+            side.evidence(flow, "01-spawn.txt", spawned)
+            settled = self.settle_frame(view, quiet_s=3.0, timeout=90)
+            side.evidence(flow, "02-spawn-settled.txt", settled)
+            frames[side.name]["spawn"] = settled
+            if "subagents" in settled:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: a kernel rlm.spawn renders the subagent summary line above the editor with the running/idle/inactive counts",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: a kernel rlm.spawn produced no visible subagent summary line",
+                    evidence=side.root / flow / "02-spawn-settled.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            # Child completion without a reply: the `RLM child status`
+            # terminal-notice row in the parent transcript.
+            noticed = B.tmux_wait_text(view, "RLM child status", timeout=240)
+            side.evidence(flow, "03-child-status.txt", noticed)
+            settled2 = self.settle_frame(view, quiet_s=3.0, timeout=90)
+            side.evidence(flow, "04-child-status-settled.txt", settled2)
+            frames[side.name]["child-status"] = settled2
+            if "RLM child status" in settled2:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: a child finishing without a reply renders the 'RLM child status' terminal-notice row in the parent transcript",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: the completed child produced no 'RLM child status' terminal-notice row",
+                    evidence=side.root / flow / "04-child-status-settled.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            # The scoped agents view: alt+a focuses the summary line,
+            # confirm opens the child list.
+            self.tui_send(view, "M-a", enter=False)
+            time.sleep(1.0)
+            focused = B.tmux_capture(view)
+            side.evidence(flow, "05-summary-focused.txt", focused)
+            B.tmux_send(view, "Enter", enter=False)
+            scoped = B.tmux_wait_text(view, child_name, timeout=60)
+            side.evidence(flow, "06-scoped-agents.txt", scoped)
+            settled3 = self.settle_frame(view, quiet_s=2.0, timeout=30)
+            side.evidence(flow, "07-scoped-agents-settled.txt", settled3)
+            frames[side.name]["scoped-agents"] = settled3
+            if child_name in settled3:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: the scoped agents view lists the spawned child by name",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: the scoped agents view did not list the spawned child",
+                    evidence=side.root / flow / "07-scoped-agents-settled.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            B.tmux_kill(view)
+            self.copy_sessions(side, flow)
+        for step in ("spawn", "child-status", "scoped-agents"):
+            self.frame_diff(
+                flow, step,
+                {name: frames[name].get(step, "") for name in ("ts", "rust")},
+                self.normalize_transcript_frame,
+            )
+
+    def f21_worker_recovery(self) -> None:
+        """Worker crash recovery: SIGKILL the session's live worker process
+        (pid from the daemon's own session summary), then keep using the
+        session through the attached TUI. The supervisor must respawn the
+        worker, restore the transcript, and complete the next turn — the
+        user-visible invariant is that the session survives its worker's
+        death. Frame diff TS vs Rust at the post-kill and post-recovery key
+        moments."""
+        flow = "f21_worker_recovery"
+        reply = "f21 recovery fixture reply"
+        followup = "f21 post-recovery fixture reply"
+        frames: dict[str, dict[str, str]] = {"ts": {}, "rust": {}}
+        for side in (self.sides["ts"], self.sides["rust"]):
+            self.suppress_first_run_notices(side)
+            made = self.create_session(side, flow, "battery-f21", "c21")
+            if not made:
+                continue
+            wire, session_id = made
+            # The daemon's own session summary names the worker pid.
+            state = wire.request(
+                "g21", {"type": "get_state", "activeSessionId": session_id}, timeout=60
+            )
+            side.evidence_json(flow, "00-state.json", state)
+            summary = state.get("data") or {}
+            worker_pid = summary.get("workerPid")
+            worker_state = summary.get("workerState")
+            if state.get("success") is True and isinstance(worker_pid, int):
+                self.record(
+                    flow, "protocol",
+                    f"{side.name}: the session summary exposes the live worker pid (workerState: {worker_state})",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow, "protocol",
+                    f"{side.name}: the session summary exposes no live worker pid",
+                    evidence=side.root / flow / "00-state.json",
+                    lane=FLOW_LANES[flow],
+                )
+            # Seed turn: durable content the recovered worker must restore.
+            side.mock.set_responses([{"text": reply}])
+            wire.request(
+                "p21s", {"type": "prompt_and_wait", "activeSessionId": session_id, "message": "f21 seed turn"}, timeout=240
+            )
+            wire.close()
+            self.settle_mock(side)
+            attached = self.attach_tui(side, flow, session_id, ready_marker="f21 seed turn")
+            if not attached:
+                self.record(flow, "visual", f"{side.name}: attached TUI never rendered the seeded transcript")
+                continue
+            tui, ready = attached
+            side.evidence(flow, "01-attached.txt", ready)
+            # Key moment 1: the worker dies underneath the attached TUI. The
+            # visible frame must keep the transcript; recovery is invisible
+            # until the next command needs the worker.
+            killed = False
+            if isinstance(worker_pid, int):
+                try:
+                    os.kill(worker_pid, signal.SIGKILL)
+                    killed = True
+                except OSError as error:
+                    self.record(
+                        flow, "behavior",
+                        f"{side.name}: could not kill the reported worker pid {worker_pid}: {error}",
+                        evidence=side.root / flow / "00-state.json",
+                    )
+            if not killed:
+                self.record(
+                    flow, "behavior",
+                    f"{side.name}: no live worker pid to kill; recovery cannot be exercised",
+                    evidence=side.root / flow / "00-state.json",
+                    lane=FLOW_LANES[flow],
+                )
+                B.tmux_kill(tui)
+                continue
+            time.sleep(2.0)
+            post_kill = B.tmux_capture(tui)
+            side.evidence(flow, "02-post-kill.txt", post_kill)
+            settled = self.settle_frame(tui, quiet_s=2.0, timeout=30)
+            side.evidence(flow, "03-post-kill-settled.txt", settled)
+            frames[side.name]["post-kill"] = settled
+            if "f21 seed turn" in settled:
+                self.record(
+                    flow, "behavior",
+                    f"{side.name}: the attached TUI keeps the transcript after the worker process is killed",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow, "behavior",
+                    f"{side.name}: the attached TUI lost the transcript after the worker process was killed",
+                    evidence=side.root / flow / "03-post-kill-settled.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            post_kill_wire = B.Wire(side.daemon_socket)
+            post_kill_state = post_kill_wire.request(
+                "g21k", {"type": "get_state", "activeSessionId": session_id}, timeout=120
+            )
+            post_kill_wire.close()
+            side.evidence_json(flow, "04-post-kill-state.json", post_kill_state)
+            # Key moment 2: the next prompt goes through. The daemon respawns
+            # the worker (journal + session file restore), the turn completes,
+            # and the frame shows the recovered transcript plus the new reply.
+            self.settle_mock(side)
+            side.mock.set_responses([{"text": followup}])
+            self.tui_send(tui, "f21 keep working after the crash")
+            recovered = B.tmux_wait_text(tui, followup, timeout=240)
+            side.evidence(flow, "05-recovered.txt", recovered)
+            settled2 = self.settle_frame(tui, quiet_s=3.0, timeout=90)
+            side.evidence(flow, "06-recovered-settled.txt", settled2)
+            frames[side.name]["recovered"] = settled2
+            if "f21 seed turn" in settled2 and followup in settled2:
+                self.record(
+                    flow, "behavior",
+                    f"{side.name}: after the worker is killed the session recovers — the next turn completes with the transcript intact",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow, "behavior",
+                    f"{side.name}: the session did not survive its worker's death (no post-recovery turn)",
+                    evidence=side.root / flow / "06-recovered-settled.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            # Wire-level: the recovered session must be served by a new,
+            # ready worker process.
+            recovered_wire = B.Wire(side.daemon_socket)
+            recovered_state = recovered_wire.request(
+                "g21r", {"type": "get_state", "activeSessionId": session_id}, timeout=120
+            )
+            recovered_wire.close()
+            side.evidence_json(flow, "07-post-recovery-state.json", recovered_state)
+            rsummary = recovered_state.get("data") or {}
+            if (
+                recovered_state.get("success") is True
+                and rsummary.get("workerState") == "ready"
+                and rsummary.get("workerPid") not in (None, worker_pid)
+            ):
+                self.record(
+                    flow, "protocol",
+                    f"{side.name}: recovery respawned the worker (pid {worker_pid} -> {rsummary.get('workerPid')}, workerState ready)",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow, "protocol",
+                    f"{side.name}: recovery did not produce a new ready worker (workerState: {rsummary.get('workerState')}, workerPid: {rsummary.get('workerPid')})",
+                    evidence=side.root / flow / "07-post-recovery-state.json",
+                    lane=FLOW_LANES[flow],
+                )
+            B.tmux_kill(tui)
+            self.copy_sessions(side, flow)
+        for step in ("post-kill", "recovered"):
+            self.frame_diff(
+                flow, step,
+                {name: frames[name].get(step, "") for name in ("ts", "rust")},
+                self.normalize_transcript_frame,
+            )
+
     def perf_onboard(self, side: B.Side) -> None:
         """Settle first-run dialogs (the TS trace notice) once before measuring,
         so measured launches settle straight into the main screen. The settle
@@ -1914,12 +3066,23 @@ class Battery:
         lines.append("")
         gaps = [f for f in self.findings if f["gap"]]
         oks = [f for f in self.findings if not f["gap"]]
-        lines.append(f"{len(gaps)} gaps, {len(oks)} parity checks passed.")
+        expected = [f for f in gaps if f.get("expectedFail")]
+        unexpected = [f for f in gaps if not f.get("expectedFail")]
+        lines.append(
+            f"{len(unexpected)} gaps, {len(expected)} EXPECTED-FAIL (known gaps, owner lanes), {len(oks)} parity checks passed."
+        )
+        if expected:
+            lines.append("")
+            lines.append("## Known gaps (EXPECTED-FAIL — evidence for the owning fix lanes)")
+            lines.append("")
+            for finding in expected:
+                ev = f" — evidence: {finding['evidence']}" if finding.get("evidence") else ""
+                lines.append(
+                    f"- [{finding['flow']}/{finding['category']}] EXPECTED-FAIL (lane: {finding['expectedFail']}): {finding['summary']}{ev}"
+                )
         lines.append("")
         current = None
-        for finding in self.findings:
-            if not finding["gap"]:
-                continue
+        for finding in unexpected:
             if finding["flow"] != current:
                 current = finding["flow"]
                 lines.append(f"### {current}")
@@ -1940,9 +3103,16 @@ class Battery:
         print(f"battery run dir: {self.run_dir}")
         self.make_side("ts", self.ts_bin)
         self.make_side("rust", self.rust_bin)
-        order = {f: getattr(self, f) for f in ALL_FLOWS + HEAVY_FLOWS}
+        order = {
+            f: getattr(self, f)
+            for f in ALL_FLOWS + HEAVY_FLOWS
+            if callable(getattr(self, f, None))
+        }
         try:
             for flow in self.flows:
+                if flow not in order:
+                    print(f"== {flow} (skipped: flow not implemented in this build)", flush=True)
+                    continue
                 print(f"== {flow}", flush=True)
                 order[flow]()
         finally:

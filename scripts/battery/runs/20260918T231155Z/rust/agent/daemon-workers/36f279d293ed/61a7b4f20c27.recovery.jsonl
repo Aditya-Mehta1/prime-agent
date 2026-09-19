@@ -1,0 +1,8 @@
+{"activeSessionId":"61a7b4f20c27","busy":true,"operation":"create","recordedAt":"2026-09-18T23:15:24.225Z","sessionFile":"/home/ubuntu/lane-worktrees/battery-flows/scripts/battery/runs/20260918T231155Z/rust/agent/sessions/01a0b6cd-9f9f-7776-923f-0a5b793e7fd0.jsonl","sessionId":"01a0b6cd-9f9f-7776-923f-0a5b793e7fd0"}
+{"active_session_id":"61a7b4f20c27","follow_up":["f15 seed b"],"recorded_at":"2026-09-18T23:15:26.280Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"61a7b4f20c27","follow_up":[],"recorded_at":"2026-09-18T23:15:26.851Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"61a7b4f20c27","follow_up":[],"recorded_at":"2026-09-18T23:15:49.479Z","steering":["[agent-message from battery-f15-a]\n\nf15 a2a payload from a to b"],"type":"queue_snapshot","version":1}
+{"active_session_id":"61a7b4f20c27","follow_up":[],"recorded_at":"2026-09-18T23:15:49.517Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"61a7b4f20c27","follow_up":["f15 send the sibling message back to a"],"recorded_at":"2026-09-18T23:15:54.918Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"61a7b4f20c27","follow_up":[],"recorded_at":"2026-09-18T23:15:55.476Z","steering":[],"type":"queue_snapshot","version":1}
+{"activeSessionId":"61a7b4f20c27","busy":false,"operation":"shutdown","recordedAt":"2026-09-18T23:56:39.225Z","sessionFile":"/home/ubuntu/lane-worktrees/battery-flows/scripts/battery/runs/20260918T231155Z/rust/agent/sessions/01a0b6cd-9f9f-7776-923f-0a5b793e7fd0.jsonl","sessionId":"01a0b6cd-9f9f-7776-923f-0a5b793e7fd0"}

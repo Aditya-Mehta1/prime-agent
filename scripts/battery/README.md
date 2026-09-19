@@ -1,8 +1,12 @@
 # Parity battery
 
-NOTE: battery greenness ("0 gaps") covers only the scripted flows f1-f11 run
+NOTE: battery greenness ("0 gaps") covers only the scripted flows run
 here over the deterministic mock provider - it is not a product-parity
-statement. See `docs/completion-matrix.md` for the evidence-based
+statement. Flows f14-f21 are the real-surface flows (compact, a2a, refine,
+/model, goal/autonomous, heartbeat, subagents, worker recovery): they drive
+the daemon session plus the attached interactive TUI, frame-diff TS vs Rust
+at the key moment, and record surface gaps as EXPECTED-FAIL with the owning
+fix lane. See `docs/completion-matrix.md` for the evidence-based
 completion picture, and `docs/parity-battery.md` for the flow list.
 
 One-command re-run (from the repo root):

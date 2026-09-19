@@ -11,9 +11,12 @@ Script file format:
       "responses": [
         {"text": "hello"},
         {"toolCall": {"name": "bash", "arguments": {"command": "echo hi"}}},
-        {"text": "done"}
+        {"text": "done", "delayMs": 500, "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110, "prompt_tokens_details": {"cached_tokens": 80}}}
       ]
     }
+Optional per-response keys: `delayMs` (stream starts after the delay) and
+`usage` (overrides the reported token usage, so a flow can push the session
+past a context/compaction threshold deterministically).
 Each POST to /chat/completions pops the next scripted response (round-robin
 when the script runs dry: the last entry repeats). Every request and the raw
 request bodies are logged to `<script>.requests.jsonl` for wire-level diffs.
@@ -178,6 +181,12 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 send(chunk_delta({"role": "assistant", "content": ""}))
             send(chunk_delta({}, "stop"))
+            usage = entry.get("usage") or {
+                "prompt_tokens": 100,
+                "completion_tokens": 10,
+                "total_tokens": 110,
+                "prompt_tokens_details": {"cached_tokens": 80},
+            }
             send(
                 {
                     "id": "chatcmpl-battery",
@@ -185,12 +194,7 @@ class Handler(BaseHTTPRequestHandler):
                     "created": 1750000000,
                     "model": "mock-1",
                     "choices": [],
-                    "usage": {
-                        "prompt_tokens": 100,
-                        "completion_tokens": 10,
-                        "total_tokens": 110,
-                        "prompt_tokens_details": {"cached_tokens": 80},
-                    },
+                    "usage": usage,
                 }
             )
             done = b"data: [DONE]\r\n\r\n"

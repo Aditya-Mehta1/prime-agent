@@ -1,0 +1,36 @@
+                                                      battery-f18  $0.00
+ Goal continuation · f18 parity objective: land the battery flows
+
+ f18 goal fixture reply
+
+ Goal continuation · f18 parity objective: land the battery flows
+
+ f18 goal fixture reply
+
+ Goal continuation · f18 parity objective: land the battery flows
+
+ f18 goal fixture reply
+
+ Goal continuation · f18 parity objective: land the battery flows
+
+ f18 goal fixture reply
+
+ Goal continuation · f18 parity objective: land the battery flows
+
+ f18 goal fixture reply
+
+ Goal continuation · f18 parity objective: land the battery flows
+
+ ✓ python · waiting for code · ↑ 1 ↓ 1 lines · 4ms
+
+
+  f18 finish the goal now
+
+
+ f18 goal fixture reply
+
+                                                                                      Collapsed mode (Ctrl+O to expand)
+
+ >
+
+← manage                                                                                               mock-1 · 110 (0%)

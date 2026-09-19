@@ -1,0 +1,8 @@
+{"activeSessionId":"ce78278346e6","busy":true,"operation":"create","recordedAt":"2026-09-19T01:20:21.110Z","sessionFile":"/home/ubuntu/lane-worktrees/battery-flows/scripts/battery/runs/20260919T011717Z/rust/agent/sessions/01a0b740-045c-72c0-874a-2c0cd0fe893c.jsonl","sessionId":"01a0b740-045c-72c0-874a-2c0cd0fe893c"}
+{"active_session_id":"ce78278346e6","follow_up":["f15 seed b"],"recorded_at":"2026-09-19T01:20:21.214Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"ce78278346e6","follow_up":[],"recorded_at":"2026-09-19T01:20:21.303Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"ce78278346e6","follow_up":[],"recorded_at":"2026-09-19T01:20:51.170Z","steering":["[agent-message from battery-f15-a]\n\nf15 a2a payload from a to b"],"type":"queue_snapshot","version":1}
+{"active_session_id":"ce78278346e6","follow_up":[],"recorded_at":"2026-09-19T01:20:51.249Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"ce78278346e6","follow_up":["f15 send the sibling message back to a"],"recorded_at":"2026-09-19T01:20:56.681Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"ce78278346e6","follow_up":[],"recorded_at":"2026-09-19T01:20:57.555Z","steering":[],"type":"queue_snapshot","version":1}
+{"activeSessionId":"ce78278346e6","busy":false,"operation":"shutdown","recordedAt":"2026-09-19T01:52:25.846Z","sessionFile":"/home/ubuntu/lane-worktrees/battery-flows/scripts/battery/runs/20260919T011717Z/rust/agent/sessions/01a0b740-045c-72c0-874a-2c0cd0fe893c.jsonl","sessionId":"01a0b740-045c-72c0-874a-2c0cd0fe893c"}

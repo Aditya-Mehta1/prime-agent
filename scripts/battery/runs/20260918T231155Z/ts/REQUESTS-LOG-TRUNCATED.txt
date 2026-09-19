@@ -1,0 +1,14 @@
+TRUNCATED: ts/mock-script.json.requests.jsonl
+
+The full raw request log for this run was 1649.9 MB / 1752 requests and is
+NOT committed (GitHub caps files at 100 MB). The first 100 request lines are
+kept verbatim (f14-f17 + the early f18 requests).
+
+Why it grew: the f18 /goal flow left the TS goal-continuation driver running
+after its "/goal resume" step. The driver kept issuing [goal: continuation]
+turns (~1 MB of history each, ~870 requests from mid-run to the end), which
+also drained the mock's response queue and starved the f18 completion turn
+and the f21 post-recovery turn on the TS side. Fixed in run_battery.py
+(pause-again before the completion turn) in the same change that commits
+this run; run 20260918T231155Z is superseded by the follow-up run in this
+PR as the authoritative f14-f21 evidence.

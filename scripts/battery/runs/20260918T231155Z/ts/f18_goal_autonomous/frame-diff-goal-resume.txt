@@ -1,0 +1,75 @@
+--- ts (goal-resume)
+                                                      battery-f18  $0.00
+ f18 goal fixture reply
+
+ Goal continuation · f18 parity objective: land the battery flows
+
+ f18 goal fixture reply
+
+ Goal continuation · f18 parity objective: land the battery flows
+
+ f18 goal fixture reply
+
+ Goal continuation · f18 parity objective: land the battery flows
+
+ f18 goal fixture reply
+
+ Goal continuation · f18 parity objective: land the battery flows
+
+ f18 goal fixture reply
+
+ Goal continuation · f18 parity objective: land the battery flows
+
+ f18 goal fixture reply
+
+ Goal continuation · f18 parity objective: land the battery flows
+
+ f18 goal fixture reply
+
+ Goal continuation · f18 parity objective: land the battery flows
+
+ ⠼ Waiting · 1m 30s · ↑ 15k tokens
+
+                                                                                      Collapsed mode (Ctrl+O to expand)
+
+ >
+
+← manage                                                                     Pursuing goal (3m 16s) · mock-1 · 4.4k (3%)
+
++++ rust (goal-resume)
+                                                      battery-f18  $0.00
+  f18 seed turn
+
+
+ f18 goal fixture reply
+
+
+  /goal f18 parity objective: land the battery flows
+
+
+  Goal active: f18 parity objective: land the battery flows
+
+
+ f18 goal fixture reply
+
+
+  /goal /goal pause
+
+
+  Goal active: /goal pause
+
+
+ f18 goal fixture reply
+
+
+  /goal resume
+
+
+  Goal active: /goal pause
+
+
+                                                                                      Collapsed mode (Ctrl+O to expand)
+
+ >
+
+← manage                                                                                               mock-1 · 110 (0%)

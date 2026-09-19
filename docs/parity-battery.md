@@ -48,6 +48,21 @@ Rust side no longer needs the env-var model workaround (gap B-1 fixed).
 | f7_compaction | daemon `compact` on a grown session | compact response, session entries |
 | f8_resume | headless session persisted, then print `-c` + interactive `--resume` | stdout/exit (B-11 row: both sides refuse an active session), session shape diff |
 | f9_agents_view | the agents view over a scripted roster (running + idle live sessions, one saved-catalog session): section grouping, open-to-attach on the running row, and a normalized TS-vs-Rust frame diff at 120x36 and 220x50 | tmux frames + wire responses |
+| f14_compact | `/compact` in the attached TUI (session A): the compaction loader and the durable `◆ Context compacted` summary row; the auto-compaction threshold crossing (session B): the `Auto-compacting...` loader and the compacted row when one mock-reported 126k-usage turn crosses the 500-token reserve headroom. Settings shape the fixture: `reserveTokens` 127500 + `keepRecentTokens` 10 keep the seeded turns compactable (default 20000 skips with "Session is too short to compact") | tmux frames (per key moment, normalized frame diff), mock request log |
+| f15_a2a | sibling agent-to-agent messaging over the daemon: a sibling's delivered message (`◆ Agent message received` row) and the sender's `◆ Agent message sent/queued` row, both with participant labels | tmux frames (normalized frame diff), wire prompt logs |
+| f16_refine | kernel-scheduled `refine.run()`: the `◆ Harness refined` outcome row and the `[harness-digest]` boundary message on the next turn | tmux frames (normalized frame diff) |
+| f17_slash_model | `/model` and `/effort`: the selector overlay open, a selection through the picker (`Model: <id>` confirm row), and the thinking-level picker | tmux frames (normalized frame diff) |
+| f18_goal_autonomous | `/goal` lifecycle (start context row, status, pause/resume, kernel `goal.complete()` completion row) and `/autonomous on|off` status rows | tmux frames (normalized frame diff) |
+| f19_heartbeat | `/heartbeat` set status row, the fired `♥ Heartbeat prompt · every <schedule>` row, and the `/heartbeats` manager view | tmux frames (normalized frame diff) |
+| f20_subagents | kernel `rlm.spawn()`: the subagent summary line above the editor (live counts), the child's `RLM child status` no-reply terminal notice, and the scoped agents view opened from the focused summary line (child listed by name) | tmux frames (normalized frame diff), roster/agents-view frames |
+| f21_worker_recovery | worker crash recovery: SIGKILL the session's worker (pid from the daemon session summary), then keep using the session through the attached TUI — the next turn must complete with the transcript intact, and the session summary must show a new ready worker pid | tmux frames (post-kill + recovered, normalized frame diff), get_state wire snapshots |
+
+Flows f10-f13 (perf, provider failure, scroll, ctrl+c exit) predate this table
+entry; f14-f21 are the real-surface flows: each drives one product surface end
+to end (daemon session + attached interactive TUI), captures the frame at the
+key moment, and byte-diffs TS vs Rust after normalization. A flow whose diff
+fails on a surface known to be missing in the Rust build records its finding
+with the owning fix lane and the report lists it as EXPECTED-FAIL.
 
 First full committed run: `scripts/battery/runs/20260916T210320Z/`
 (11 gaps, 18 passed checks). Worker-timeout/socket-path evidence:
@@ -98,3 +113,54 @@ auth through the registry (auth storage, then the models.json provider
 authenticate; the battery's env-var model workaround is gone.
 
 
+
+
+## Battery-flows unit (f14-f21) — latest run 20260919T011717Z
+
+Authoritative run for the f14-f21 unit: TS `prime-agent` (v0.9.5, ground
+truth) vs the Rust release binary (sandbox build, rustc 1.98.1, merged base
+through #150-#153), both against the deterministic mock provider.
+`runs/20260919T011717Z/` holds the full evidence (report.md, findings.json,
+per-side tmux frames, session transcripts, mock wire logs).
+
+Result: 0 gaps, 26 parity checks passed, 44 EXPECTED-FAIL rows (known gaps,
+each tagged with its owning fix lane in findings.json).
+
+Harness fixes proven in this run (all in `scripts/battery/run_battery.py`):
+
+- **f18 goal-loop taming.** With an active goal the TS daemon immediately
+  drives `[goal: continuation]` turns and starves queued composer input; run
+  20260918T231155Z measured ~2900 loop turns and a 1.65GB wire log. The flow
+  now pauses right after the start row renders (the queue is still shallow),
+  so the loop churns ~2 turns and the TS wire log is 1.3MB. All TS f18 rows
+  pass; the completion turn is scripted with a 6s mock-settle window so the
+  previous turn's status-line request cannot pop the queued tool call.
+- **f16 refinement scripting.** The refinement-proposal JSON is queued as a
+  proper tool call (mock round-robin had starved it); the TS "Harness
+  refined" row passes.
+- **Sandbox-built rust binary + kernel runtime.** A cargo/sandbox build
+  bakes the BUILD machine's source-checkout path into runtime resolution
+  (run 20260919T002527Z: every kernel ipython cell died with "kernel
+  startup failed ... `uv pip install prime-agent-runtime ...` exit 1").
+  The battery now sets `PI_PACKAGE_DIR` to the checkout for the rust side
+  (the same layout the packaged product ships), so kernel flows (f15
+  send, f16 refinement, f18 goal.complete, f20 rlm.spawn) execute their
+  kernel cells on the rust side.
+
+Per-lane EXPECTED-FAIL triage (44 rows, run 20260919T011717Z):
+
+| lane | flow | rows | rust-side substance |
+|---|---|---|---|
+| compact-fb-2 | f14 | 4 | no `◆ Context compacted` row on `/compact`; no auto-compaction outcome on threshold crossing; manual+auto frame diffs (lane fix #501c5a4 not in this base) |
+| decorations-3 | f15 | 4 | sibling message IS delivered (`custom_message` in the session) but no `◆ Agent message received` row renders; sender shows no `◆ Agent message sent` row |
+| decorations-3 | f16 | 5 | the refinement tool call leaves no refinement entry in the rust session and no `◆ Harness refined` row; no `[harness-digest]` row on either side (TS digest expectation needs reconciliation with TS behavior) |
+| model-picker-1 | f17 | 6 | `/model` selector does not list the configured mock model; no `Model: <id>` confirm row; `/effort` shows no thinking-level surface |
+| goal-autonomous | f18 | 8 | `goal.complete()` executes (session shows `status: complete`) but no completion row renders; all 7 goal/autonomous frame diffs differ. Note: the completed goal's recorded objective is the literal `/goal resume` text — rust appears to re-create the goal on `/goal resume` instead of resuming it |
+| heartbeat-tui | f19 | 6 | no `Heartbeat set` row on `/heartbeat`; fired heartbeat shows no `♥ Heartbeat prompt` row; `/heartbeats` opens no manager view |
+| subagents-tui | f20 | 6 | `rlm.spawn` works (`RLMSpawnHandle` with `rlm_child_id` in the session) but no spawn summary line, no `RLM child status` terminal notice, and the scoped-agents view does not list the child |
+| worker-recovery | f21 | 5 | both sides fail the post-recovery turn. TS: worker kill ends in `Session worker is failed`, no new ready worker (workerState: None). Rust: worker respawn PASSES (new pid, workerState ready) but the post-recovery turn does not complete. Reconcile which surface is ground truth |
+
+Run history for this unit: 20260918T231155Z (first run, committed; found the
+TS goal-loop runaway), 20260919T002527Z (found the sandbox-baked runtime
+path; superseded, not committed), 20260919T011717Z (authoritative,
+committed).

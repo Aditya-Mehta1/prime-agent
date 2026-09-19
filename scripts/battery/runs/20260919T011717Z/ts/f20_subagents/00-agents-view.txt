@@ -1,0 +1,36 @@
+
+                  ▗▄▄█▀
+    ███▄       ▗▄███▀
+   ▗█▛▐█▙   ▗▄█▀▗█▀       prime agent v0.9.5
+  ▗█▛ ▟██▙▄██▛ ▟▛         agents 0 running, 8 idle, 0 inactive
+  ▗▟▌ ▐███▛▘▗▄█▖          cwd ~/lane-worktrees/battery-flows/scripts/battery/runs/20260919T011717Z/ts/work
+ ▟███▄  ▄▄▟███▀
+ ▜█▛▀▘  ▜█▛▀▘
+
+ >   Search sessions
+
+Session                       Model         Activity                                                           Cost  Age
+
+Idle (8)
+• battery-f20                 mock-1                                                                          $0.00   6s
+• battery-f19                 mock-1                                                                          $0.00   1m
+• battery-f18                 mock-1                                                                          $0.00   3m
+• battery-f16                 mock-1                                                                          $0.00  10m
+• battery-f15-b               mock-1                                                                          $0.00  13m
+• battery-f15-a               mock-1                                                                          $0.00  13m
+• battery-f14-auto            mock-1                                                                          $0.00  16m
+• battery-f14-manual          mock-1                                                                          $0.00  16m
+
+
+
+
+
+
+
+
+
+
+
+
+
+↑/↓ navigate   Enter/→ open   Ctrl+N new

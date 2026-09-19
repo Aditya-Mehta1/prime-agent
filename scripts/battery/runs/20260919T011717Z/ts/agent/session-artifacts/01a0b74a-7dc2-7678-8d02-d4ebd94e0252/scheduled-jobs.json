@@ -1,0 +1,26 @@
+{
+  "jobs": [
+    {
+      "id": "5887546d-c8e2-4937-8a2a-ee78626cbe81",
+      "status": "cancelled",
+      "source": "heartbeat",
+      "runtimeKind": "top-level",
+      "deliveryMode": "steer",
+      "activeSessionId": "24f742e0e703",
+      "sessionId": "01a0b74a-7dc2-7678-8d02-d4ebd94e0252",
+      "sessionFile": "/home/ubuntu/lane-worktrees/battery-flows/scripts/battery/runs/20260919T011717Z/ts/agent/sessions/01a0b74a-7dc2-7678-8d02-d4ebd94e0252.jsonl",
+      "cwd": "/home/ubuntu/lane-worktrees/battery-flows/scripts/battery/runs/20260919T011717Z/ts/work",
+      "prompt": "f19 heartbeat ping instruction",
+      "schedule": {
+        "kind": "interval",
+        "expression": "every 10s",
+        "intervalMs": 10000
+      },
+      "createdAt": "2026-09-19T01:31:57.048Z",
+      "updatedAt": "2026-09-19T01:32:15.113Z",
+      "runCount": 1,
+      "lastRunAt": "2026-09-19T01:32:07.192Z"
+    }
+  ],
+  "dispatches": []
+}

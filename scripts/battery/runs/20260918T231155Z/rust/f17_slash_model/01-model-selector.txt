@@ -1,0 +1,36 @@
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+Select Model                                                                                    Enter select · Esc close
+Type to filter models
+
+>
+
+>     [ ] anthropic/claude-fable-5
+      [ ] anthropic/claude-fable-5.1
+      [ ] anthropic/claude-haiku-4.5
+      [ ] anthropic/claude-opus-4.1
+      [ ] anthropic/claude-opus-4.5
+      [ ] anthropic/claude-opus-4.6
+      [ ] anthropic/claude-opus-4.7
+      [ ] anthropic/claude-opus-4.8
+      [ ] anthropic/claude-opus-5
+      [ ] anthropic/claude-sonnet-4
+      [ ] anthropic/claude-sonnet-4.5
+      [ ] anthropic/claude-sonnet-4.6
+      [ ] anthropic/claude-sonnet-5
+      [ ] deepseek/deepseek-chat
+      [ ] deepseek/deepseek-chat-v3-0324
+  (1/111)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+
+
+
+
+
+
+
+
