@@ -85,10 +85,14 @@ pub async fn wait_for_hello(socket_path: &Path, budget_ms: u64) -> Option<Update
             client.close();
             return Some(identity);
         }
-        if Instant::now() + BOOT_POLL >= deadline {
+        let now = Instant::now();
+        if now >= deadline {
             return None;
         }
-        tokio::time::sleep(BOOT_POLL).await;
+        // The retry poll never steps past the budget: a silent socket is
+        // waited out to the deadline (TS `waitForHello` bounds the whole
+        // handshake wait, not one retry slice).
+        tokio::time::sleep(BOOT_POLL.min(deadline - now)).await;
     }
 }
 

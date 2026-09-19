@@ -36,8 +36,21 @@ pub struct StatusWriter {
 }
 
 impl StatusWriter {
-    /// A fresh coordinator status at `Acquire` (epoch starts at 1).
-    pub fn new(path: &Path, update_id: &UpdateId, socket_path: &str) -> Self {
+    /// A fresh coordinator status at `Acquire` (epoch starts at 1), with
+    /// the initial record on disk before the caller proceeds (TS
+    /// `DaemonUpdateRestartStatusWriter` persists in its constructor, so
+    /// a joining process that tails this path never races the first write).
+    pub fn new(path: &Path, update_id: &UpdateId, socket_path: &str) -> Result<Self> {
+        let writer = Self::fresh(path, update_id, socket_path);
+        writer
+            .persist()
+            .context("write the initial coordinator status")?;
+        Ok(writer)
+    }
+
+    /// The in-memory `Acquire` record without a disk write (the adoption
+    /// path rewrites the epoch before its single persisting write).
+    fn fresh(path: &Path, update_id: &UpdateId, socket_path: &str) -> Self {
         let now = crate::util_time::now_iso8601();
         let identity = coordinator_identity();
         Self {
@@ -66,7 +79,7 @@ impl StatusWriter {
     /// `Staged`): the epoch continues above the recorded one, so this
     /// process's writes can never be regressed by the predecessor's.
     pub fn adopt(path: &Path, update_id: &UpdateId, socket_path: &str) -> Result<Self> {
-        let mut writer = Self::new(path, update_id, socket_path);
+        let mut writer = Self::fresh(path, update_id, socket_path);
         if let Some(existing) = read_status(path) {
             writer.status.epoch = existing.epoch + 1;
             writer.status.started_at = existing.started_at;
@@ -75,12 +88,6 @@ impl StatusWriter {
             .persist()
             .context("write the adopted coordinator status")?;
         Ok(writer)
-    }
-
-    /// Persist without changing state (the initial `Acquire` record and
-    /// the heartbeat both use this).
-    pub fn save(&self) -> Result<()> {
-        self.persist()
     }
 
     /// Move to `state` (a driver bug to move illegally — pa-types owns the
@@ -250,7 +257,8 @@ mod tests {
     async fn writes_and_receives_the_ts_schema() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("status.json");
-        let mut writer = StatusWriter::new(&path, &update_id(), "/tmp/s.sock");
+        let mut writer = StatusWriter::new(&path, &update_id(), "/tmp/s.sock").unwrap();
+        assert_eq!(read_status(&path).unwrap().state, UpdateState::Acquire);
         writer.set_state(UpdateState::Planning).unwrap();
         writer.set_message(Some("planned".into())).unwrap();
         let read = read_status(&path).expect("status parses back");
@@ -267,7 +275,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("status.json");
         let predecessor_epoch = {
-            let mut writer = StatusWriter::new(&path, &update_id(), "/tmp/s.sock");
+            // The predecessor drives the spec's legal path to `Staged`
+            // (`Acquire -> Planning -> Downloading -> Staged`): the
+            // coordinator's `set_state` asserts the transition table.
+            let mut writer = StatusWriter::new(&path, &update_id(), "/tmp/s.sock").unwrap();
+            writer.set_state(UpdateState::Planning).unwrap();
+            writer.set_state(UpdateState::Downloading).unwrap();
             writer.set_state(UpdateState::Staged).unwrap();
             writer.current().epoch
         };
@@ -296,11 +309,9 @@ mod tests {
     async fn heartbeat_touches_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("status.json");
-        let writer = Arc::new(Mutex::new(StatusWriter::new(
-            &path,
-            &update_id(),
-            "/tmp/s.sock",
-        )));
+        let writer = Arc::new(Mutex::new(
+            StatusWriter::new(&path, &update_id(), "/tmp/s.sock").unwrap(),
+        ));
         let before = read_status(&path).unwrap().epoch;
         let heartbeat = StatusHeartbeat::start(Arc::clone(&writer));
         tokio::time::sleep(std::time::Duration::from_millis(STATUS_HEARTBEAT_MS + 200)).await;

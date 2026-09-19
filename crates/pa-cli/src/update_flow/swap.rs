@@ -193,12 +193,14 @@ mod tests {
     #[tokio::test]
     async fn the_candidate_probe_reports_stdout_and_failures() {
         // A clean exit with stdout parses; a failing command is an error.
-        let ok = probe(Path::new("/bin/sh"), &["true"], PROBE_TIMEOUT)
+        let ok = probe(Path::new("/bin/sh"), &["-c", "true"], PROBE_TIMEOUT)
             .await
             .unwrap();
         assert!(ok.is_empty());
-        assert!(probe(Path::new("/bin/sh"), &["exit 3"], PROBE_TIMEOUT)
-            .await
-            .is_err());
+        assert!(
+            probe(Path::new("/bin/sh"), &["-c", "exit 3"], PROBE_TIMEOUT)
+                .await
+                .is_err()
+        );
     }
 }

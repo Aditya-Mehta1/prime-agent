@@ -63,8 +63,7 @@ pub async fn run_update_command(options: &UpdateCommandOptions) -> Result<i32> {
         }
         AcquireOutcome::Acquired => {}
     }
-    let mut writer = StatusWriter::new(&status_path, &update_id, &socket_path.to_string_lossy());
-    writer.save()?;
+    let mut writer = StatusWriter::new(&status_path, &update_id, &socket_path.to_string_lossy())?;
     writer.set_state(UpdateState::Planning)?;
     let budget = UpdateTimeoutBudget::from_env();
     let download_base = std::env::var("PRIME_AGENT_DOWNLOAD_BASE_URL").ok();

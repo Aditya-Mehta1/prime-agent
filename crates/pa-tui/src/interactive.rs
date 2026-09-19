@@ -234,6 +234,12 @@ pub enum HeadlessStep {
     /// Type text character by character (raw editor input, so autocomplete
     /// and editor state react exactly as to a keystroke).
     Type(String),
+    /// Materialize the parked editor suggestions — the state a live user
+    /// gets after pausing typing for one input-idle tick, so the next step
+    /// (typically `Enter`) completes against the open dropdown. A burst of
+    /// `Type` steps without this barrier submits as typed, exactly like a
+    /// terminal keystroke burst.
+    SettleIdle,
     /// Hold until the current turn finishes (bounded by `timeout_ms`).
     WaitIdle { timeout_ms: u64 },
     /// Scroll the transcript to its top row (the `tui.viewport.top` key
@@ -356,6 +362,8 @@ enum UiInput {
     Key(KeyEvent),
     Paste(String),
     Submit(String),
+    /// One materialized input-idle tick (the headless `SettleIdle` step).
+    SettleIdle,
     WaitIdle {
         timeout_ms: u64,
     },
@@ -468,6 +476,14 @@ pub async fn run_interactive(
                 }
                 UiInput::Paste(text) => {
                     let _ = view.editor.handle_paste(&text);
+                }
+                // The headless plan's pause step: the queued keystroke
+                // batch ahead of this barrier is fully handled, so the
+                // parked suggestions materialize now — the same state the
+                // terminal loop's 50 ms idle tick produces after a real
+                // user pauses typing.
+                UiInput::SettleIdle => {
+                    session.materialize_editor_autocomplete(&mut view);
                 }
                 UiInput::Submit(text) => {
                     // A terminal-suspending client command (`/mcp login`):
@@ -775,6 +791,11 @@ impl Renderer {
                                     if ui_tx.send(UiInput::Key(key)).is_err() {
                                         return;
                                     }
+                                }
+                            }
+                            HeadlessStep::SettleIdle => {
+                                if ui_tx.send(UiInput::SettleIdle).is_err() {
+                                    return;
                                 }
                             }
                             HeadlessStep::WaitIdle { timeout_ms } => {

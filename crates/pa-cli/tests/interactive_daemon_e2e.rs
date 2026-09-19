@@ -532,7 +532,14 @@ async fn tui_dispatches_slash_commands_menu_and_suggestions() {
             // The autocomplete menu: typed input like a user keystroke by
             // keystroke, completed with Enter, then submitted.
             pa_tui::interactive::HeadlessStep::Type("/".to_string()),
+            // A real user pauses between keystrokes: the parked suggestion
+            // request materializes (the dropdown opens) before Enter, the
+            // state the terminal loop reaches after one input-idle tick.
+            pa_tui::interactive::HeadlessStep::SettleIdle,
             pa_tui::interactive::HeadlessStep::Type("goa".to_string()),
+            pa_tui::interactive::HeadlessStep::SettleIdle,
+            // With the dropdown open, Enter completes the selected
+            // suggestion (`/goal `); the second Enter submits it.
             pa_tui::interactive::HeadlessStep::Type("\n".to_string()),
             pa_tui::interactive::HeadlessStep::Type("\n".to_string()),
             pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
