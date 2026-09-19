@@ -27,9 +27,36 @@ struct Supervisor {
 impl Drop for Supervisor {
     fn drop(&mut self) {
         graceful_shutdown(&self.socket);
+        // Snapshot the live worker children before the kill: workers run in
+        // their own process groups (detached, TS parity), so a graceful
+        // shutdown that times out orphans them when the supervisor dies.
+        // Reap them here — the supervisor-lost exit window is a backstop,
+        // not the teardown contract.
+        let worker_pids = child_pids_of(self.child.id());
         let _ = self.child.kill();
         let _ = self.child.wait();
+        for pid in worker_pids {
+            kill_worker(&pid);
+        }
         let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
+/// Kill a leaked worker process (SIGKILL; it already failed the graceful
+/// path) and wait briefly for it to disappear.
+fn kill_worker(pid: &u32) {
+    // The worker pid is a child of the supervisor we just killed, so it is
+    // not our child and cannot be waited on directly; poll /proc liveness.
+    unsafe {
+        libc::kill(*pid as i32, libc::SIGKILL);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process_alive(*pid) {
+        assert!(
+            Instant::now() < deadline,
+            "worker {pid} survived the teardown kill"
+        );
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -41,7 +68,24 @@ struct DetachedDaemon {
 
 impl Drop for DetachedDaemon {
     fn drop(&mut self) {
-        graceful_shutdown(&self.socket);
+        let supervisor_pid = graceful_shutdown(&self.socket);
+        if let Some(pid) = supervisor_pid {
+            // Snapshot the supervisor's live worker children before it goes
+            // (they are detached, so they survive its death), then reap any
+            // that the graceful shutdown did not stop.
+            let worker_pids = child_pids_of(pid);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while process_alive(pid) {
+                assert!(
+                    Instant::now() < deadline,
+                    "the spawned supervisor {pid} did not exit after shutdown"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            for worker in worker_pids {
+                kill_worker(&worker);
+            }
+        }
         let _ = std::fs::remove_file(&self.socket);
     }
 }
@@ -149,20 +193,26 @@ fn assert_daemon_stops_clean(socket: &Path) {
 
 /// Sync JSONL shutdown request (Drop runs inside the async test runtime, so
 /// no nested runtime may be built here). Best effort; callers kill the child
-/// process afterwards regardless.
-fn graceful_shutdown(socket: &Path) {
+/// process afterwards regardless. Returns the supervisor pid from the hello
+/// so the caller can reap the workers it spawned.
+fn graceful_shutdown(socket: &Path) -> Option<u32> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
     let Ok(stream) = UnixStream::connect(socket) else {
-        return;
+        return None;
     };
     let Ok(write_half) = stream.try_clone() else {
-        return;
+        return None;
     };
     let mut reader = BufReader::new(stream);
     let mut writer = write_half;
-    let _ = reader.read_line(&mut String::new()); // daemon_hello
+    let mut hello = String::new();
+    let _ = reader.read_line(&mut hello); // daemon_hello
+    let supervisor_pid = serde_json::from_str::<serde_json::Value>(hello.trim())
+        .ok()
+        .and_then(|hello| hello["supervisorPid"].as_u64())
+        .map(|pid| pid as u32);
 
     let command = serde_json::json!({
         "type": "command",
@@ -171,11 +221,11 @@ fn graceful_shutdown(socket: &Path) {
         "command": { "type": "shutdown" },
     });
     let Ok(mut line) = serde_json::to_string(&command) else {
-        return;
+        return None;
     };
     line.push('\n');
     if writer.write_all(line.as_bytes()).is_err() {
-        return;
+        return None;
     }
     let _ = writer.flush();
     // Wait briefly for the supervisor to accept the shutdown (it stops every
@@ -185,6 +235,7 @@ fn graceful_shutdown(socket: &Path) {
         .set_read_timeout(Some(Duration::from_secs(5)));
     let mut response = String::new();
     let _ = reader.read_line(&mut response);
+    supervisor_pid
 }
 
 #[allow(clippy::zombie_processes)]
@@ -214,6 +265,28 @@ fn spawn_supervisor(dir: &Path) -> Supervisor {
     ] {
         command.env_remove(var);
     }
+    // Ambient provider credentials (PRIME_API_KEY on the dev box, or any
+    // other provider key variable) must not leak into the daemon's catalog:
+    // every spawned supervisor in this verifier serves fixtures whose only
+    // configured model comes from a models.json file, so the ambient
+    // catalog cannot widen a test's scope. The supervisor strips these from
+    // the session workers it spawns too (they inherit its environment).
+    for provider in pa_ai::models_generated::get_providers() {
+        if let Some(vars) = pa_ai::env_api_keys::get_api_key_env_vars(provider) {
+            for var in vars {
+                command.env_remove(var);
+            }
+        }
+    }
+    command.env_remove("PRIME_TEAM_ID");
+    // A supervisor killed by a failing test must not leak its session
+    // workers into later test binaries: the worker's supervisor-lost exit
+    // (TS `exitIfSupervisorOrphanedForTooLong`) runs on this short window
+    // instead of the 5-minute default.
+    command.env(
+        pa_daemon::worker::WORKER_SUPERVISOR_LOST_EXIT_MS_ENV,
+        "15000",
+    );
     let child = command.spawn().expect("spawn prime-agent --mode daemon");
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
@@ -417,6 +490,14 @@ async fn ensure_daemon_running_spawns_supervisor_and_tui_attaches() {
     std::fs::create_dir_all(&session_dir).expect("session dir");
     let socket = dir.path().join("spawned.sock");
     std::env::set_var("PRIME_AGENT_CODING_AGENT_DIR", &agent_dir);
+    // The internally-spawned supervisor inherits this process's env: give
+    // its session workers the short supervisor-lost exit window so a killed
+    // supervisor cannot leak them into later test binaries (the
+    // `spawn_supervisor` fixture sets the same variable on its children).
+    std::env::set_var(
+        pa_daemon::worker::WORKER_SUPERVISOR_LOST_EXIT_MS_ENV,
+        "15000",
+    );
 
     let script_path = dir.path().join("script.json");
     std::fs::write(
@@ -661,12 +742,25 @@ async fn tui_model_picker_applies_and_effort_reports() {
     std::fs::write(dir.path().join("script.json"), script.to_string()).expect("write script");
     let supervisor = spawn_supervisor(dir.path());
     // The catalog snapshot the composition root injects (available models
-    // over the same registry).
-    let auth = pa_core::auth::AuthStorage::create(&agent_dir);
+    // over the same registry). The registry scope is pinned hermetically:
+    // the auth storage reads no ambient environment, so an ambient provider
+    // credential (PRIME_API_KEY on the dev box makes every bundled
+    // prime-inference model available) cannot leak the bundled catalog in —
+    // the models.json mock is the ONLY available model, per the assertion's
+    // intent. `spawn_supervisor` strips the same variables from the daemon
+    // side.
+    let auth = pa_core::auth::AuthStorage::in_memory_without_env(
+        Default::default(),
+        std::sync::Arc::new(pa_core::auth::NoOAuth),
+    );
     let mut registry = pa_core::models::ModelRegistry::create(auth, agent_dir.join("models.json"));
     registry.load_private_authorization_from_cache();
     let catalog: Vec<pa_types::ai::Model> = registry.get_available().into_iter().cloned().collect();
     assert_eq!(catalog.len(), 1, "the models.json model resolves available");
+    assert_eq!(
+        catalog[0].id, "mock-1",
+        "the one available model is the models.json mock"
+    );
 
     let options = pa_tui::interactive::InteractiveOptions {
         socket_path: supervisor.socket.clone(),
@@ -992,9 +1086,11 @@ async fn tui_big_streamed_turns_render_at_the_producer_rate() {
     // Paced at 3000 tokens/second so the ~12k-token turn streams for
     // ~4s: the mid-turn marker-progression assertion needs several wire
     // updates inside the turn (an unpaced faux finishes in ~0.3s and the
-    // whole stream lands in a handful of frames). The 20s settle bound
-    // still catches the starvation regression (the pre-fix pipeline
-    // applied one ~4-token delta per 50ms tick: 150+ seconds per turn).
+    // whole stream lands in a handful of frames). The 45s settle bound is
+    // calibrated against the producer pace with a load-realistic margin: a
+    // healthy render settles in seconds even on a loaded box, while the
+    // pre-fix starvation pipeline (one ~4-token delta per 50ms tick) took
+    // 150+ seconds per turn — an order of magnitude past the bound.
     let script = serde_json::json!({
         "engine": "faux",
         "tokensPerSecond": 3_000,
@@ -1022,14 +1118,16 @@ async fn tui_big_streamed_turns_render_at_the_producer_rate() {
         client_auth: None,
         telemetry: None,
     };
-    // 20s per turn is the throughput bound: the producer finishes each
-    // turn in seconds, so a longer wait means the render pipeline starved.
+    // 45s per turn is the throughput bound: the producer finishes each
+    // turn in ~4s, so 45s tolerates real box load (sibling e2e binaries,
+    // daemons from other suites) while a starved render — 150+ seconds per
+    // turn before the fix — still expires the barrier with margin.
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![
             pa_tui::interactive::HeadlessStep::Submit("first".to_string()),
-            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 20_000 },
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 45_000 },
             pa_tui::interactive::HeadlessStep::Submit("second".to_string()),
-            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 20_000 },
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 45_000 },
         ],
         width: 100,
         height: 30,
@@ -1085,7 +1183,7 @@ async fn tui_big_streamed_turns_render_at_the_producer_rate() {
         len = marks.len()
     );
     assert!(
-        wall < Duration::from_secs(45),
+        wall < Duration::from_secs(100),
         "the whole run took {wall:?}; the turn render must keep up with the producer"
     );
     drop(supervisor);

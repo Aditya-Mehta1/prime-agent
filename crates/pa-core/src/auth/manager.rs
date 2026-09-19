@@ -105,6 +105,29 @@ pub(crate) trait EnvCredentialSource: Send + Sync {
 /// Process-environment credential source (production).
 struct ProcessEnvCredentials;
 
+/// No-op environment credential source: no ambient variable can supply a
+/// provider key or team id. The hermetic seam behind
+/// [`AuthStorage::in_memory_without_env`].
+struct NoEnvCredentials;
+
+impl EnvCredentialSource for NoEnvCredentials {
+    fn key_names(&self, _provider: &str) -> Option<Vec<String>> {
+        None
+    }
+
+    fn api_key(&self, _provider: &str) -> Option<String> {
+        None
+    }
+
+    fn prime_team_id(&self) -> Option<String> {
+        None
+    }
+
+    fn ambient_identity_material(&self, provider: &str) -> String {
+        provider.to_string()
+    }
+}
+
 impl EnvCredentialSource for ProcessEnvCredentials {
     fn key_names(&self, provider: &str) -> Option<Vec<String>> {
         pa_ai::env_api_keys::find_env_keys(provider)
@@ -222,22 +245,30 @@ impl AuthStorage {
     }
 
     pub fn in_memory(data: AuthStorageData, oauth: Arc<dyn OAuthIntegration>) -> Self {
-        let backend: Arc<dyn AuthStorageBackend> =
-            Arc::new(super::storage::InMemoryAuthStorageBackend::default());
-        let content = serde_json::to_string_pretty(&data.0).unwrap_or_default();
-        backend
-            .with_lock(&mut |current| {
-                let _ = current;
-                Ok(((), Some(content.clone())))
-            })
-            .ok();
-        Self::from_storage(backend, oauth)
+        Self::in_memory_with_env_source(data, oauth, Arc::new(ProcessEnvCredentials))
+    }
+
+    /// In-memory storage with no ambient environment source: hermetic
+    /// resolution for embedded hosts and test harnesses that must pin the
+    /// model catalog scope (an ambient provider credential variable such
+    /// as PRIME_API_KEY cannot make models available through this
+    /// storage). Otherwise behaves like [`AuthStorage::in_memory`].
+    pub fn in_memory_without_env(data: AuthStorageData, oauth: Arc<dyn OAuthIntegration>) -> Self {
+        Self::in_memory_with_env_source(data, oauth, Arc::new(NoEnvCredentials))
     }
 
     /// In-memory storage with an injected environment source: hermetic
     /// resolution for tests and embedded hosts (no ambient env reads).
     #[cfg(test)]
     pub(crate) fn in_memory_with_env(
+        data: AuthStorageData,
+        oauth: Arc<dyn OAuthIntegration>,
+        env_credentials: Arc<dyn EnvCredentialSource>,
+    ) -> Self {
+        Self::in_memory_with_env_source(data, oauth, env_credentials)
+    }
+
+    fn in_memory_with_env_source(
         data: AuthStorageData,
         oauth: Arc<dyn OAuthIntegration>,
         env_credentials: Arc<dyn EnvCredentialSource>,

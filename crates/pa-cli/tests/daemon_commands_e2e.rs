@@ -118,6 +118,14 @@ fn spawn_daemon(binary: &Path, socket: &Path, agent_dir: &Path) -> Daemon {
     for key in SCRUB_ENV {
         command.env_remove(key);
     }
+    // A supervisor killed at teardown must not leak its session workers
+    // into later test binaries: the worker's supervisor-lost exit (TS
+    // `exitIfSupervisorOrphanedForTooLong`) runs on this short window
+    // instead of the 5-minute default.
+    command.env(
+        pa_daemon::worker::WORKER_SUPERVISOR_LOST_EXIT_MS_ENV,
+        "15000",
+    );
     let child = command.spawn().expect("spawn daemon supervisor");
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -647,6 +655,13 @@ fn ts_daemon_differential_cli_output() {
     for key in SCRUB_ENV {
         daemon_command.env_remove(key);
     }
+    // Teardown symmetry with the Rust daemon: the TS worker's orphan-exit
+    // window is the same env var (wire parity), so a killed TS supervisor
+    // reaps its workers on the same short bound.
+    daemon_command.env(
+        pa_daemon::worker::WORKER_SUPERVISOR_LOST_EXIT_MS_ENV,
+        "15000",
+    );
     let mut daemon = daemon_command.spawn().expect("spawn TS daemon");
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {

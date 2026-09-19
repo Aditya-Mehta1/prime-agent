@@ -77,6 +77,14 @@ fn spawn_daemon(socket: &Path, agent_dir: &Path) -> Daemon {
         .arg(agent_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        // A supervisor killed at teardown must not leak its session workers
+        // into later test binaries: the worker's supervisor-lost exit (TS
+        // `exitIfSupervisorOrphanedForTooLong`) runs on this short window
+        // instead of the 5-minute default.
+        .env(
+            pa_daemon::worker::WORKER_SUPERVISOR_LOST_EXIT_MS_ENV,
+            "15000",
+        )
         .spawn()
         .expect("spawn pa-daemon supervisor");
     let deadline = Instant::now() + Duration::from_secs(10);

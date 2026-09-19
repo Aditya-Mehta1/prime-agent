@@ -60,6 +60,12 @@ pub const WORKER_SOCKET_ENV: &str = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_SOCKET";
 /// command's `telemetryDisabled` through here, TS descriptor parity).
 pub const WORKER_TELEMETRY_DISABLED_ENV: &str =
     "PRIME_AGENT_INTERNAL_DAEMON_WORKER_TELEMETRY_DISABLED";
+/// Supervisor-lost exit window (ms): a session worker whose supervisor
+/// socket stays unreachable for this long exits instead of lingering
+/// orphaned (TS `WORKER_SUPERVISOR_LOST_EXIT_MS_ENV` wire parity; the
+/// supervisor's environment flows to the workers it spawns).
+pub const WORKER_SUPERVISOR_LOST_EXIT_MS_ENV: &str =
+    "PRIME_AGENT_INTERNAL_WORKER_SUPERVISOR_LOST_EXIT_MS";
 
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -163,7 +169,7 @@ pub(crate) struct SessionCore {
     pub(crate) created: bool,
     attached_client_ids: Vec<String>,
     pub(crate) abort_requested: bool,
-    shutdown_requested: bool,
+    pub(crate) shutdown_requested: bool,
     /// True while a compaction run is in flight (TS `isCompacting`).
     pub(crate) compacting: bool,
     /// TS `autoCompactionEnabled` (settings default: on).
@@ -181,6 +187,15 @@ pub(crate) struct SessionCore {
     rlm_child_id: Option<String>,
     parent_active_session_id: Option<String>,
     parent_session_id: Option<String>,
+}
+
+impl SessionCore {
+    /// Whether a turn, compaction, or queued action is in flight — the TS
+    /// `hasOngoingSessionWork` predicate. An active run owns the worker a
+    /// little longer; the supervisor-lost exit waits for it to settle.
+    pub(crate) fn has_ongoing_work(&self) -> bool {
+        self.busy || self.compacting || !self.steering.is_empty() || !self.follow_up.is_empty()
+    }
 }
 
 impl crate::status_line::StatusSession for SessionCore {
@@ -397,10 +412,38 @@ impl ConnectionSink {
     }
 }
 
+/// Releases a connection's supervisor claim when the connection ends:
+/// the supervisor-role connection on the worker's socket is the supervisor's
+/// presence proof for the orphan-exit monitor, so its end must decrement
+/// the claim count on every return path. Inspects the role at drop time —
+/// only a connection that authenticated as the supervisor ever claimed.
+struct SupervisorClaimRelease {
+    role: Arc<std::sync::Mutex<crate::peer::ConnectionRole>>,
+    claims: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for SupervisorClaimRelease {
+    fn drop(&mut self) {
+        let supervisor = matches!(
+            *self.role.lock().unwrap(),
+            crate::peer::ConnectionRole::Supervisor { .. }
+        );
+        if supervisor {
+            self.claims
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
 pub struct Worker {
     pub(crate) config: WorkerConfig,
     /// Supervisor self-registration handle; `None` for standalone workers.
     registration: Option<RegistrationHandle>,
+    /// Live connections authenticated as the supervisor role. A non-zero
+    /// count disarms the supervisor-lost exit monitor (TS
+    /// `hasAuthenticatedSupervisorConnection`): while the supervisor is
+    /// connected on this socket, it is by definition reachable.
+    pub(crate) supervisor_claims: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) core: Arc<Mutex<SessionCore>>,
     pub(crate) engine: std::sync::Arc<dyn SessionEngine>,
     work_notify: Arc<Notify>,
@@ -435,6 +478,7 @@ fn supervisor_link_config(config: &WorkerConfig) -> SupervisorLinkConfig {
 impl Worker {
     pub fn new(config: WorkerConfig, registration: Option<RegistrationHandle>) -> Self {
         let events = Arc::new(EventPump::new());
+        let supervisor_claims = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let core = SessionCore {
             active_session_id: config.active_session_id.clone(),
             generation: crate::util::new_display_id(),
@@ -583,6 +627,7 @@ impl Worker {
         Worker {
             config,
             registration,
+            supervisor_claims,
             core,
             engine,
             work_notify,
@@ -602,6 +647,12 @@ impl Worker {
         *self.recovery.lock().unwrap() = Some(WorkerRecoveryJournal::open(
             &self.config.recovery_journal_path,
         )?);
+        // A worker spawned under a supervisor arms the orphan-exit monitor
+        // (TS `startSupervisorMonitor`): nobody else reaps it if the
+        // supervisor dies without a graceful stop.
+        if !self.config.supervisor_socket_path.as_os_str().is_empty() {
+            crate::supervisor_lost::start(self.clone());
+        }
         crate::socket::prepare_socket_path(&self.config.socket_path).await?;
         let listener = bind_transport(&self.config.socket_path)
             .await
@@ -682,6 +733,15 @@ impl Worker {
         // The connection's authenticated role, shared with the event
         // fan-out task (streaming is gated on it).
         let role = Arc::new(std::sync::Mutex::new(ConnectionRole::Unauthenticated));
+
+        // Releases the supervisor claim this connection may take (see
+        // `SupervisorClaimRelease`): the claim's lifetime is the
+        // connection's, so every return path (EOF, auth failure, frame
+        // error) goes through the same decrement.
+        let _claim_release = SupervisorClaimRelease {
+            role: Arc::clone(&role),
+            claims: Arc::clone(&self.supervisor_claims),
+        };
 
         // Connection-closed signal: the read loop fires it when the peer is
         // gone (EOF, auth failure) or drops it on return. The fan-out task
@@ -950,6 +1010,8 @@ impl Worker {
                     Some(json!({ "capabilities": capabilities })),
                 );
                 *role.lock().unwrap() = ConnectionRole::Supervisor { generation };
+                self.supervisor_claims
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 self.write_response_frame(sink, request_id, &success).await;
                 AuthOutcome::Authenticated
             }
@@ -2243,7 +2305,7 @@ impl Worker {
         let _ = journal.record_queue_snapshot(active_session_id, &lanes.steering, &lanes.follow_up);
     }
 
-    fn record_recovery(&self, busy: bool, operation: &str) -> Result<()> {
+    pub(crate) fn record_recovery(&self, busy: bool, operation: &str) -> Result<()> {
         let mut guard = self.recovery.lock().unwrap();
         let Some(journal) = guard.as_mut() else {
             return Ok(());

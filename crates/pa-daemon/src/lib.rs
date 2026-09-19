@@ -42,6 +42,7 @@ pub mod status_line;
 pub(crate) mod streaming;
 pub mod supervisor;
 pub mod supervisor_link;
+pub(crate) mod supervisor_lost;
 pub(crate) mod supervisor_roster;
 pub mod types;
 pub(crate) mod update_prepare;

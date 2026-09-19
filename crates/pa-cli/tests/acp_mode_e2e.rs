@@ -674,6 +674,16 @@ fn acp_daemon_attached_serves_a_client_owned_session() {
         .env("HOME", home.path())
         .env("PRIME_AGENT_AGENT_DIR", home.path().join("agent"))
         .env("PRIME_AGENT_ACP_DAEMON_SCRIPT", &script_path)
+        // The ACP child spawns the sandboxed supervisor, which spawns the
+        // session worker; a killed child must not leak that worker into
+        // later test binaries. The supervisor-lost exit (TS
+        // `exitIfSupervisorOrphanedForTooLong`) runs on this short window
+        // (the env flows child -> supervisor -> worker) instead of the
+        // 5-minute default.
+        .env(
+            pa_daemon::worker::WORKER_SUPERVISOR_LOST_EXIT_MS_ENV,
+            "15000",
+        )
         .current_dir(home.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -729,6 +739,16 @@ fn acp_daemon_attached_admits_mcp_servers_through_the_wire() {
         .env("HOME", home.path())
         .env("PRIME_AGENT_AGENT_DIR", home.path().join("agent"))
         .env("PRIME_AGENT_ACP_DAEMON_SCRIPT", &script_path)
+        // The ACP child spawns the sandboxed supervisor, which spawns the
+        // session worker; a killed child must not leak that worker into
+        // later test binaries. The supervisor-lost exit (TS
+        // `exitIfSupervisorOrphanedForTooLong`) runs on this short window
+        // (the env flows child -> supervisor -> worker) instead of the
+        // 5-minute default.
+        .env(
+            pa_daemon::worker::WORKER_SUPERVISOR_LOST_EXIT_MS_ENV,
+            "15000",
+        )
         .current_dir(home.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -790,6 +810,16 @@ fn acp_daemon_attached_cancels_mid_turn() {
         .env("HOME", home.path())
         .env("PRIME_AGENT_AGENT_DIR", home.path().join("agent"))
         .env("PRIME_AGENT_ACP_DAEMON_SCRIPT", &script_path)
+        // The ACP child spawns the sandboxed supervisor, which spawns the
+        // session worker; a killed child must not leak that worker into
+        // later test binaries. The supervisor-lost exit (TS
+        // `exitIfSupervisorOrphanedForTooLong`) runs on this short window
+        // (the env flows child -> supervisor -> worker) instead of the
+        // 5-minute default.
+        .env(
+            pa_daemon::worker::WORKER_SUPERVISOR_LOST_EXIT_MS_ENV,
+            "15000",
+        )
         .current_dir(home.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1047,6 +1077,16 @@ fn acp_daemon_attached_publishes_the_goal_update_meta() {
         .env("HOME", home.path())
         .env("PRIME_AGENT_AGENT_DIR", home.path().join("agent"))
         .env("PRIME_AGENT_ACP_DAEMON_SCRIPT", &script_path)
+        // The ACP child spawns the sandboxed supervisor, which spawns the
+        // session worker; a killed child must not leak that worker into
+        // later test binaries. The supervisor-lost exit (TS
+        // `exitIfSupervisorOrphanedForTooLong`) runs on this short window
+        // (the env flows child -> supervisor -> worker) instead of the
+        // 5-minute default.
+        .env(
+            pa_daemon::worker::WORKER_SUPERVISOR_LOST_EXIT_MS_ENV,
+            "15000",
+        )
         .current_dir(home.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1117,6 +1157,16 @@ fn acp_daemon_attached_reports_autonomous_accounting_and_limit_stop_reason() {
         .env("HOME", home.path())
         .env("PRIME_AGENT_AGENT_DIR", home.path().join("agent"))
         .env("PRIME_AGENT_ACP_DAEMON_SCRIPT", &script_path)
+        // The ACP child spawns the sandboxed supervisor, which spawns the
+        // session worker; a killed child must not leak that worker into
+        // later test binaries. The supervisor-lost exit (TS
+        // `exitIfSupervisorOrphanedForTooLong`) runs on this short window
+        // (the env flows child -> supervisor -> worker) instead of the
+        // 5-minute default.
+        .env(
+            pa_daemon::worker::WORKER_SUPERVISOR_LOST_EXIT_MS_ENV,
+            "15000",
+        )
         .current_dir(home.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

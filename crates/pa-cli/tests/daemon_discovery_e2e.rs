@@ -65,6 +65,14 @@ fn spawn_daemon(socket: &Path, agent_dir: &Path, tmp_dir: &Path) -> Daemon {
     for key in SCRUB_ENV {
         command.env_remove(key);
     }
+    // A supervisor killed at teardown must not leak its session workers
+    // into later test binaries: the worker's supervisor-lost exit (TS
+    // `exitIfSupervisorOrphanedForTooLong`) runs on this short window
+    // instead of the 5-minute default.
+    command.env(
+        pa_daemon::worker::WORKER_SUPERVISOR_LOST_EXIT_MS_ENV,
+        "15000",
+    );
     let child = command.spawn().expect("spawn daemon supervisor");
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
