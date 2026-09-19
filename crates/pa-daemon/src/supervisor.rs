@@ -13,9 +13,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use futures::future::join_all;
 use pa_types::daemon::{
     DaemonCommand, DaemonErrorInfo, DaemonOutbound, DaemonWorkerDescriptor, DaemonWorkerLifecycle,
-    DurableDaemonCreateCommand, SnapshotPurpose, UpdateId, UpdateTimeoutBudget,
+    DurableDaemonCreateCommand, SnapshotPurpose, UpdateId, UpdatePreparedMarker,
+    UpdateTimeoutBudget,
 };
 use pa_types::platform::transport::{bind_transport, connect_transport, TransportStream};
 use serde_json::{json, Value};
@@ -41,14 +43,13 @@ use crate::registry::{ResidentWorker, SessionRegistry, WorkerRegistration, Worke
 use crate::session_store::{find_most_recent_session_for_cwd, list_sessions};
 use crate::snapshot_stream::{attach_client_capabilities, stream_attach, wants_chunked};
 use crate::update_prepare::{
-    update_gate_refuses, AbortOutcome, BeginOutcome, MutationDrainLatch, PrepareCoordinator,
-    PrepareOp, UPDATE_PREPARING_MESSAGE,
+    marker_expires_at_iso, update_gate_refuses, write_prepared_artifacts, AbortOutcome,
+    BeginOutcome, MutationDrainLatch, PrepareCoordinator, PrepareOp, UPDATE_PREPARING_MESSAGE,
 };
-use crate::worker::{
-    WORKER_ACTIVE_SESSION_ID_ENV, WORKER_INSTANCE_ID_ENV, WORKER_RECOVERY_JOURNAL_ENV,
-    WORKER_ROLE_ENV, WORKER_SCRIPT_ENV, WORKER_SOCKET_ENV, WORKER_SUPERVISOR_SOCKET_ENV,
-    WORKER_TOKEN_ENV,
+use crate::update_roster::{
+    build_update_roster, supervisor_identity, UpdateRosterInputs, WorkerSnapshot,
 };
+use crate::update_stop::{stop_workers_gracefully, WorkerStopVerdict, WORKER_REQUEST_TIMEOUT_MS};
 use crate::{socket, util};
 
 /// Worker connect budget: socket probes, connect, and the auth handshake
@@ -74,7 +75,6 @@ const LONG_ROUTE_TIMEOUT_MS: u64 = 600_000;
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 const BASE_BACKOFF_MS: u64 = 250;
 const MAX_BACKOFF_MS: u64 = 30_000;
-const WORKER_CWD_ENV: &str = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_CWD";
 
 #[derive(Debug, Clone)]
 pub struct SupervisorOptions {
@@ -531,52 +531,37 @@ impl Supervisor {
         resident: &Arc<ResidentWorker>,
         connect_deadline: tokio::time::Instant,
     ) -> Result<Child> {
-        let descriptor = resident.descriptor.lock().await;
-        let worker_socket = PathBuf::from(&descriptor.socket_path);
-        let token = descriptor.authentication_token.clone();
-        let recovery_journal = PathBuf::from(&descriptor.recovery_journal_path);
-        let cwd = descriptor
-            .create_command
-            .rest
-            .get("cwd")
-            .and_then(Value::as_str)
-            .unwrap_or("/")
-            .to_string();
-        let script = descriptor
-            .create_command
-            .rest
-            .get("script")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let session_dir = descriptor.session_dir.clone();
-        let telemetry_disabled = descriptor.telemetry_disabled == Some(true);
-        drop(descriptor);
+        // One env definition for spawn and for the update roster's
+        // `launch_env` row (spec §8: "env snapshot to respawn the worker
+        // identically").
+        let (worker_socket, cwd, launch_env) = {
+            let descriptor = resident.descriptor.lock().await;
+            (
+                PathBuf::from(&descriptor.socket_path),
+                descriptor
+                    .create_command
+                    .rest
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .unwrap_or("/")
+                    .to_string(),
+                crate::descriptor::worker_launch_env(
+                    &self.options.agent_dir,
+                    &self.options.socket_path.to_string_lossy(),
+                    &uuid::Uuid::new_v4().to_string(),
+                    &descriptor,
+                ),
+            )
+        };
 
         let executable = std::env::current_exe().context("resolve pa-daemon executable")?;
         let mut command = Command::new(&executable);
         command
             .arg("worker")
-            .env(WORKER_ROLE_ENV, "1")
-            .env(WORKER_TOKEN_ENV, &token)
-            .env(WORKER_INSTANCE_ID_ENV, uuid::Uuid::new_v4().to_string())
-            .env(WORKER_ACTIVE_SESSION_ID_ENV, &resident.worker_id)
-            .env(WORKER_SUPERVISOR_SOCKET_ENV, &self.options.socket_path)
-            .env(WORKER_SOCKET_ENV, &worker_socket)
-            .env(WORKER_RECOVERY_JOURNAL_ENV, &recovery_journal)
-            .env(WORKER_CWD_ENV, &cwd)
-            .env(paths::AGENT_DIR_ENV, &self.options.agent_dir)
+            .envs(launch_env)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::inherit());
-        if let Some(script) = script {
-            command.env(WORKER_SCRIPT_ENV, script);
-        }
-        if let Some(dir) = session_dir {
-            command.env(paths::SESSION_DIR_ENV, dir);
-        }
-        if telemetry_disabled {
-            command.env(crate::worker::WORKER_TELEMETRY_DISABLED_ENV, "1");
-        }
         if std::path::Path::new(&cwd).is_dir() {
             command.current_dir(&cwd);
         }
@@ -1405,6 +1390,14 @@ impl Supervisor {
                     .await;
                 (vec![response_line(&response)], false)
             }
+            DaemonCommand::CommitUpdateRestart { .. } => {
+                // The coordinator's commit (spec §5 `Prepared -> Stopping`):
+                // consume the prepared transaction, stop the workers
+                // gracefully in budget, and either exit for the update or
+                // abandon it (sessions untouched).
+                self.handle_commit_update_restart(&command_id, &type_name, command)
+                    .await
+            }
             DaemonCommand::PrepareUpdateRestart { .. } => {
                 // The update-flow coordinator's prepare RPC: accepts (or
                 // idempotently polls) the supervisor-side prepare
@@ -1494,15 +1487,36 @@ impl Supervisor {
                     return response_failure(Some(command_id), type_name, &error.to_string(), None);
                 }
                 match self.update_prepare.drain_complete(&update_id) {
-                    PrepareOp::Applied(state) => response_success(
-                        Some(command_id),
-                        type_name,
-                        Some(json!({
-                            "updateId": update_id,
-                            "state": state.wire_name(),
-                            "acceptedAt": util::iso_from_unix_ms(accepted_at_ms),
-                        })),
-                    ),
+                    PrepareOp::Applied(_) => {
+                        // Fenced: snapshot every resident worker, assemble
+                        // the roster, write the prepared artifacts (fsync),
+                        // and reach Prepared - all inside the remaining
+                        // prepare budget (spec §5, slice 3).
+                        match self
+                            .complete_update_prepare(
+                                &update_id,
+                                command,
+                                accepted_at_ms,
+                                prepare_deadline_ms,
+                            )
+                            .await
+                        {
+                            Ok(data) => response_success(Some(command_id), type_name, Some(data)),
+                            Err(error) => {
+                                // Rollback is the default on any failure:
+                                // abort, delete the artifacts, Serving.
+                                if let Some(abort) = self.update_prepare.abort(&update_id) {
+                                    self.finish_update_abort(abort).await;
+                                }
+                                response_failure(
+                                    Some(command_id),
+                                    type_name,
+                                    &format!("{error:#}"),
+                                    None,
+                                )
+                            }
+                        }
+                    }
                     // The watchdog aborted the transaction while we drained
                     // (the same deadline) - the supervisor is Serving again.
                     PrepareOp::NotActive => response_failure(
@@ -1514,6 +1528,259 @@ impl Supervisor {
                 }
             }
         }
+    }
+
+    /// The snapshot phase of the prepare transaction (spec §5
+    /// `Fenced -> Snapshotted -> Prepared`): collect every resident
+    /// worker's `update_snapshot`, assemble the roster (spec §8), write
+    /// `prepared/<update-id>/{roster,marker}.json` durably, and arm the
+    /// marker self-expiry. Runs within the remaining hard prepare budget;
+    /// any failure aborts the whole transaction (the caller rolls back).
+    async fn complete_update_prepare(
+        self: &Arc<Self>,
+        update_id: &UpdateId,
+        command: &DaemonCommand,
+        accepted_at_ms: u64,
+        prepare_deadline_ms: u64,
+    ) -> Result<Value> {
+        let residents = self.registry.list().await;
+        // TS parity: refuse to snapshot over a worker that is stopping or
+        // disconnected - its state is not collectible.
+        for resident in &residents {
+            let state = if self.is_stopping(resident) {
+                "stopping"
+            } else {
+                "disconnected"
+            };
+            let connected = resident.cmd_tx.lock().await.is_some();
+            if self.is_stopping(resident) || !connected {
+                anyhow::bail!(
+                    "Cannot prepare update restart while resident worker {} is {state}",
+                    resident.worker_id
+                );
+            }
+        }
+        let remaining = prepare_deadline_ms.saturating_sub(util::now_ms());
+        let rpc_timeout = WORKER_REQUEST_TIMEOUT_MS.min(remaining).max(1);
+        let snapshots = join_all(residents.iter().map(|resident| {
+            let resident = Arc::clone(resident);
+            async move {
+                let response = self
+                    .route_command(&resident, "update_snapshot", json!({}), rpc_timeout)
+                    .await?;
+                if !response.success {
+                    anyhow::bail!(
+                        "worker {} refused its snapshot: {}",
+                        resident.worker_id,
+                        response.error.unwrap_or_default()
+                    );
+                }
+                let data = response
+                    .data
+                    .clone()
+                    .ok_or_else(|| anyhow!("worker {} returned no snapshot", resident.worker_id))?;
+                let descriptor = resident.descriptor.lock().await.clone();
+                Ok(WorkerSnapshot {
+                    worker_id: resident.worker_id.clone(),
+                    descriptor,
+                    snapshot: data,
+                })
+            }
+        }))
+        .await
+        .into_iter()
+        .collect::<Result<Vec<WorkerSnapshot>>>()?;
+
+        let to_version = match command {
+            DaemonCommand::PrepareUpdateRestart { rest, .. } => rest
+                .get("toVersion")
+                .and_then(Value::as_str)
+                .unwrap_or(DAEMON_APP_VERSION),
+            _ => DAEMON_APP_VERSION,
+        };
+        let ledger = self.rlm_spawn_ledger_for(None).await?;
+        let now = util::now_ms();
+        let identity = supervisor_identity(format!("sup:{}", std::process::id()));
+        let roster = build_update_roster(
+            UpdateRosterInputs {
+                update_id,
+                socket_path: self.options.socket_path.to_str().unwrap_or_default(),
+                agent_dir: &self.options.agent_dir,
+                supervisor: identity.clone(),
+                from_version: DAEMON_APP_VERSION,
+                to_version,
+                created_at_ms: now,
+                ledger: &ledger,
+            },
+            snapshots,
+        )?;
+        let marker = UpdatePreparedMarker {
+            update_id: update_id.clone(),
+            expires_at: marker_expires_at_iso(now, &self.update_budget),
+            supervisor: identity,
+            rest: Default::default(),
+        };
+        write_prepared_artifacts(&self.update_prepared_dir(update_id), &roster, &marker)?;
+        match self
+            .update_prepare
+            .snapshot_written(update_id, now, &self.update_budget)
+        {
+            PrepareOp::Applied(_) => {}
+            PrepareOp::NotActive => anyhow::bail!("update prepare aborted during the snapshot"),
+        }
+        match self.update_prepare.prepare_acked(update_id) {
+            PrepareOp::Applied(_) => {}
+            PrepareOp::NotActive => anyhow::bail!("update prepare aborted before the ack"),
+        }
+        Ok(json!({
+            "updateId": update_id,
+            "state": "prepared",
+            "acceptedAt": util::iso_from_unix_ms(accepted_at_ms),
+            "expiresAt": marker.expires_at,
+        }))
+    }
+
+    /// `commit_update_restart` (spec §5 `Prepared -> Stopping`): consume the
+    /// prepared transaction and stop every worker gracefully within its
+    /// budget. All workers stopped - the supervisor exits for the update
+    /// (slice 4's coordinator takes over; descriptors survive on disk for
+    /// the new supervisor's create-or-adopt restore). Any refusal
+    /// ABANDONS the update: the supervisor returns to `Serving`, refused
+    /// sessions keep running untouched, and the already-stopped workers
+    /// relaunch (invariant I3 - never a kill).
+    async fn handle_commit_update_restart(
+        self: &Arc<Self>,
+        command_id: &str,
+        type_name: &str,
+        command: &DaemonCommand,
+    ) -> (Vec<Value>, bool) {
+        let DaemonCommand::CommitUpdateRestart { update_id, .. } = command else {
+            return (
+                vec![response_line(&response_failure(
+                    Some(command_id),
+                    type_name,
+                    "not a commit_update_restart command",
+                    None,
+                ))],
+                false,
+            );
+        };
+        let Some(update_id) = update_id.clone().map(UpdateId::from) else {
+            return (
+                vec![response_line(&response_failure(
+                    Some(command_id),
+                    type_name,
+                    "commit_update_restart requires an updateId",
+                    None,
+                ))],
+                false,
+            );
+        };
+        match self.update_prepare.commit(&update_id) {
+            PrepareOp::NotActive => (
+                vec![response_line(&response_failure(
+                    Some(command_id),
+                    type_name,
+                    "No prepared update restart is active for that update id",
+                    None,
+                ))],
+                false,
+            ),
+            PrepareOp::Applied(_) => {
+                let residents = self.registry.list().await;
+                let verdicts = stop_workers_gracefully(self, &residents, &self.update_budget).await;
+                let refused: Vec<&str> = verdicts
+                    .iter()
+                    .filter(|(_, verdict)| *verdict == WorkerStopVerdict::Refused)
+                    .map(|(worker_id, _)| worker_id.as_str())
+                    .collect();
+                if !refused.is_empty() {
+                    // Abandon (I3): the sessions that refused keep running;
+                    // the ones that already stopped relaunch over their own
+                    // session files.
+                    if let Some(abort) = self.update_prepare.abandon_stopping(&update_id) {
+                        self.finish_update_abort(abort).await;
+                    }
+                    for (resident, (_, verdict)) in residents.iter().zip(&verdicts) {
+                        match verdict {
+                            WorkerStopVerdict::Stopped => {
+                                resident.intentional_stop.store(false, Ordering::SeqCst);
+                                match self.relaunch_worker(resident).await {
+                                    Ok(child) => {
+                                        resident.consecutive_failures.store(0, Ordering::SeqCst);
+                                        self.spawn_monitor(Arc::clone(resident), Some(child), 0);
+                                    }
+                                    Err(error) => {
+                                        self.log_line(&format!(
+                                            "worker {} abandon relaunch failed: {error:#}",
+                                            resident.worker_id
+                                        ));
+                                    }
+                                }
+                            }
+                            WorkerStopVerdict::Refused => {
+                                // Restore normal supervision: the stop
+                                // request may still land late, in which case
+                                // the monitor treats the exit as a crash
+                                // and relaunches with backoff - the session
+                                // file is the truth either way.
+                                resident.intentional_stop.store(false, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                    self.log_line(&format!(
+                        "update {update_id} abandoned: worker(s) {refused:?} did not stop in budget; sessions untouched"
+                    ));
+                    return (
+                        vec![response_line(&response_failure(
+                            Some(command_id),
+                            type_name,
+                            &format!(
+                                "Update abandoned: session worker(s) {refused:?} did not stop within the budget; sessions are untouched and the daemon keeps serving"
+                            ),
+                            None,
+                        ))],
+                        false,
+                    );
+                }
+                let stopped = verdicts.len();
+                self.log_line(&format!(
+                    "update {update_id}: all {stopped} worker(s) stopped; exiting for the update"
+                ));
+                // The response is written before the accept loop exits (the
+                // write path is the dispatch channel; the 100ms drain only
+                // orders the exit behind it - the coordinator's Booting
+                // phase recovers a lost ack by design).
+                let supervisor = Arc::clone(self);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    supervisor.exit_for_update();
+                });
+                (
+                    vec![response_line(&response_success(
+                        Some(command_id),
+                        type_name,
+                        Some(json!({
+                            "updateId": update_id,
+                            "state": "stopping",
+                            "stopped": stopped,
+                        })),
+                    ))],
+                    true,
+                )
+            }
+        }
+    }
+
+    /// The update's exit path (spec §5 Stopping, all workers exited): set
+    /// the shutdown flag so the monitors stand down and the accept loop
+    /// falls out, but KEEP the worker descriptors on disk - the new
+    /// supervisor's create-or-adopt restore (spec §6/§8) relaunches the
+    /// workers from them. Contrast `begin_shutdown`, which deletes
+    /// descriptors for a terminal stop.
+    fn exit_for_update(self: &Arc<Self>) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        self.shutdown_notify.notify_one();
     }
 
     /// Apply one abort outcome: delete the prepared artifacts if any, and
@@ -2703,6 +2970,60 @@ fn saved_session_row(info: &crate::session_store::SessionInfo) -> Value {
     }
     row
 }
+
+/// The real graceful-stop transport (spec §5 `Stopping`): the routed
+/// `shutdown` request - the worker's handler is the flush barrier (it
+/// persists the recovery journal and finalizes telemetry before replying) -
+/// and a pid/start-id liveness poll for the exit wait (a foreign process
+/// cannot be waited on directly). The stop is marked intentional before the
+/// request so the monitor never races an exit into a crash-restart.
+impl crate::update_stop::WorkerStopTransport for std::sync::Arc<Supervisor> {
+    async fn request_shutdown(
+        &self,
+        resident: &Arc<ResidentWorker>,
+        timeout: Duration,
+    ) -> Result<()> {
+        resident.intentional_stop.store(true, Ordering::SeqCst);
+        let response = self
+            .route_command(resident, "shutdown", json!({}), timeout.as_millis() as u64)
+            .await?;
+        if !response.success {
+            anyhow::bail!(
+                "worker {} refused the graceful stop: {}",
+                resident.worker_id,
+                response.error.unwrap_or_default()
+            );
+        }
+        Ok(())
+    }
+
+    async fn wait_exit(&self, resident: &Arc<ResidentWorker>, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let (pid, start_id) = {
+                let descriptor = resident.descriptor.lock().await;
+                (descriptor.pid, descriptor.process_start_id.clone())
+            };
+            let alive = is_process_alive(pid as u32).unwrap_or(false)
+                && start_id
+                    .as_deref()
+                    .map(|start| {
+                        crate::protocol::process_start_id(pid as u32).as_deref() == Some(start)
+                    })
+                    .unwrap_or(true);
+            if !alive {
+                return true;
+            }
+            if tokio::time::Instant::now() + WORKER_EXIT_POLL >= deadline {
+                return false;
+            }
+            tokio::time::sleep(WORKER_EXIT_POLL).await;
+        }
+    }
+}
+
+/// How often the graceful-stop exit wait polls worker process liveness.
+const WORKER_EXIT_POLL: Duration = Duration::from_millis(250);
 
 #[cfg(test)]
 mod tests {

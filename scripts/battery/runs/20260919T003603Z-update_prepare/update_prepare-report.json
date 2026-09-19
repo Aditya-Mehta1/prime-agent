@@ -1,0 +1,554 @@
+{
+ "flow": "update_prepare",
+ "ts_bin": "prime-agent",
+ "rust_bin": "/home/ubuntu/lane-worktrees/update-impl/target/release/prime-agent",
+ "verdicts": [
+  {
+   "row": "P1",
+   "description": "list_saved_sessions baseline is byte-identical",
+   "parity": true
+  },
+  {
+   "row": "P2",
+   "description": "gate refusal message parity",
+   "parity": true
+  },
+  {
+   "row": "P3",
+   "description": "reads stay served during the prepare window",
+   "parity": true
+  },
+  {
+   "row": "P3b",
+   "description": "served rows equal the baseline rows",
+   "parity": true
+  },
+  {
+   "row": "P4",
+   "description": "stray prepare: TS stays wedged (bug), Rust self-recovers",
+   "parity": true,
+   "ts_wedged": true,
+   "rust_recovered": true
+  },
+  {
+   "row": "D1",
+   "description": "prepare without updateId: TS runs the flow, Rust requires the key",
+   "divergence": "ts success=True data-keys=['createdAt', 'formatVersion', 'sessions']; rust success=False error='prepare_update_restart requires an updateId'"
+  },
+  {
+   "row": "D2",
+   "description": "prepare with updateId: TS blocking full restart, Rust transaction state",
+   "divergence": "ts data={\"createdAt\": \"2026-09-19T00:35:44.535Z\", \"formatVersion\": 1, \"sessions\": []}; rust data={\"acceptedAt\": \"2026-09-19T00:35:49.790Z\", \"expiresAt\": \"2026-09-19T00:35:52.790Z\", \"state\": \"prepared\", \"updateId\": \"upd-1\"}"
+  },
+  {
+   "row": "D3",
+   "description": "different-id prepare: TS string + typed refusal info",
+   "parity": true
+  },
+  {
+   "row": "D4",
+   "description": "shutdown during the window: TS exempts at prepared, Rust refuses until recovery",
+   "parity": true
+  },
+  {
+   "row": "E1",
+   "description": "prepare: TS kills the session in the RPC, Rust keeps it serving (I3)",
+   "parity": true,
+   "ts_get_state": "Unknown active session: 52e04b4f5210",
+   "rust_get_state": true
+  },
+  {
+   "row": "E2",
+   "description": "commit: worker stopped in budget, supervisor exits for the update",
+   "parity": true
+  },
+  {
+   "row": "E3",
+   "description": "commit_update_restart exists only on Rust (spec \u00a75): TS has no separate commit surface",
+   "divergence": "ts prepare data-keys=['createdAt', 'discardedActiveSessionIds', 'formatVersion', 'sessions']; rust commit data={\"state\": \"stopping\", \"stopped\": 1, \"updateId\": \"upd-live\"}"
+  }
+ ],
+ "raw": {
+  "ts": {
+   "s1": {
+    "id": "s1",
+    "type": "response",
+    "command": "list",
+    "success": true,
+    "data": {
+     "sessions": []
+    }
+   },
+   "s2": {
+    "id": "s2",
+    "type": "response",
+    "command": "prepare_update_restart",
+    "success": true,
+    "data": {
+     "formatVersion": 1,
+     "createdAt": "2026-09-19T00:35:44.535Z",
+     "sessions": []
+    }
+   },
+   "s3": {
+    "id": "s3",
+    "type": "response",
+    "command": "create",
+    "success": false,
+    "error": "Daemon is preparing an update restart"
+   },
+   "s4": {
+    "id": "s4",
+    "type": "response",
+    "command": "list",
+    "success": true,
+    "data": {
+     "sessions": []
+    }
+   },
+   "s5": {
+    "id": "s5",
+    "type": "response",
+    "command": "create",
+    "success": false,
+    "error": "Daemon is preparing an update restart"
+   },
+   "s6": {
+    "id": "s6",
+    "type": "response",
+    "command": "shutdown",
+    "success": true
+   }
+  },
+  "rust": {
+   "s1": {
+    "command": "list",
+    "data": {
+     "sessions": []
+    },
+    "id": "s1",
+    "success": true,
+    "type": "response"
+   },
+   "s2": {
+    "command": "prepare_update_restart",
+    "error": "prepare_update_restart requires an updateId",
+    "id": "s2",
+    "success": false,
+    "type": "response"
+   },
+   "s2b": {
+    "command": "prepare_update_restart",
+    "data": {
+     "acceptedAt": "2026-09-19T00:35:49.790Z",
+     "expiresAt": "2026-09-19T00:35:52.790Z",
+     "state": "prepared",
+     "updateId": "upd-1"
+    },
+    "id": "s2b",
+    "success": true,
+    "type": "response"
+   },
+   "s3": {
+    "command": "create",
+    "error": "Daemon is preparing an update restart",
+    "id": "s3",
+    "success": false,
+    "type": "response"
+   },
+   "s4": {
+    "command": "list",
+    "data": {
+     "sessions": []
+    },
+    "id": "s4",
+    "success": true,
+    "type": "response"
+   },
+   "s2c": {
+    "command": "prepare_update_restart",
+    "error": "Daemon is already preparing an update restart",
+    "errorInfo": {
+     "activeUpdateId": "upd-1",
+     "code": "update_prepare_refused"
+    },
+    "id": "s2c",
+    "success": false,
+    "type": "response"
+   },
+   "s6b": {
+    "command": "shutdown",
+    "error": "Daemon is preparing an update restart",
+    "id": "s6b",
+    "success": false,
+    "type": "response"
+   },
+   "s5": {
+    "command": "create",
+    "data": {
+     "activeSessionId": "514663e2124f",
+     "activity": "idle",
+     "attachedClients": 0,
+     "created": "2026-09-19T00:35:54.885Z",
+     "cwd": "/tmp/upw-s3/rust/work",
+     "hasRegisteredCronJob": false,
+     "id": "514663e2124f",
+     "isBashRunning": false,
+     "isCompacting": false,
+     "isSessionActive": false,
+     "isStreaming": false,
+     "lastActivityAt": "2026-09-19T00:35:54.915Z",
+     "lifecycle": "resident",
+     "messageCount": 0,
+     "modified": "2026-09-19T00:35:54.915Z",
+     "rlmDepth": 0,
+     "runtimeKind": "top-level",
+     "sessionActions": {
+      "followUps": [],
+      "queuedCount": 0,
+      "steering": []
+     },
+     "sessionFile": "/tmp/upw-s3/rust/agent/sessions/01a0b717-5585-72c5-88e8-9401b22c1c10.jsonl",
+     "sessionId": "01a0b717-5585-72c5-88e8-9401b22c1c10",
+     "thinkingLevel": "high",
+     "unfinishedActionCount": 0,
+     "workerPid": 139424,
+     "workerState": "ready"
+    },
+    "id": "s5",
+    "success": true,
+    "type": "response"
+   },
+   "s6": {
+    "command": "shutdown",
+    "id": "s6",
+    "success": true,
+    "type": "response"
+   }
+  }
+ },
+ "raw_live": {
+  "ts": {
+   "c1": {
+    "id": "c1",
+    "type": "response",
+    "command": "create",
+    "success": true,
+    "data": {
+     "id": "52e04b4f5210",
+     "lifecycle": "draft",
+     "activity": "idle",
+     "isSessionActive": false,
+     "lastActivityAt": "2026-09-19T00:35:58.419Z",
+     "runtimeKind": "top-level",
+     "rlmDepth": 0,
+     "activeSessionId": "52e04b4f5210",
+     "sessionId": "01a0b717-624e-756a-afc6-9335c5b4c87d",
+     "sessionFile": "/tmp/upw-s3/ts-live/agent/sessions/01a0b717-624e-756a-afc6-9335c5b4c87d.jsonl",
+     "cwd": "/tmp/upw-s3/ts-live/work",
+     "model": {
+      "id": "z-ai/glm-5.3",
+      "name": "GLM 5.3",
+      "api": "openai-completions",
+      "provider": "prime-inference",
+      "baseUrl": "http://127.0.0.1:40309/v1",
+      "compat": {
+       "supportsStore": false,
+       "supportsDeveloperRole": false,
+       "supportsReasoningEffort": false,
+       "maxTokensField": "max_tokens",
+       "supportsStrictMode": false,
+       "thinkingFormat": "zai"
+      },
+      "reasoning": true,
+      "thinkingLevelMap": {
+       "off": null,
+       "minimal": null,
+       "low": "low",
+       "medium": null,
+       "high": "high",
+       "xhigh": null,
+       "max": "max"
+      },
+      "input": [
+       "text"
+      ],
+      "cost": {
+       "input": 1.4,
+       "output": 4.4,
+       "cacheRead": 0,
+       "cacheWrite": 0
+      },
+      "contextWindow": 1310720,
+      "maxTokens": 262144
+     },
+     "thinkingLevel": "high",
+     "isStreaming": false,
+     "isCompacting": false,
+     "isBashRunning": false,
+     "hasRunningRlmChildren": false,
+     "isRunningTools": false,
+     "attachedClients": 0,
+     "messageCount": 0,
+     "unfinishedActionCount": 0,
+     "created": "2026-09-19T00:35:58.158Z",
+     "modified": "2026-09-19T00:35:58.419Z",
+     "sessionActions": {
+      "queuedCount": 0,
+      "steering": [],
+      "followUps": []
+     },
+     "rosterStatus": "idle",
+     "workerState": "ready",
+     "workerPid": 139493
+    }
+   },
+   "ls1": {
+    "id": "ls1",
+    "type": "response",
+    "command": "list",
+    "success": true,
+    "data": {
+     "sessions": [
+      {
+       "id": "52e04b4f5210",
+       "lifecycle": "draft",
+       "activity": "idle",
+       "isSessionActive": false,
+       "lastActivityAt": "2026-09-19T00:35:58.419Z",
+       "runtimeKind": "top-level",
+       "rlmDepth": 0,
+       "activeSessionId": "52e04b4f5210",
+       "sessionId": "01a0b717-624e-756a-afc6-9335c5b4c87d",
+       "sessionFile": "/tmp/upw-s3/ts-live/agent/sessions/01a0b717-624e-756a-afc6-9335c5b4c87d.jsonl",
+       "cwd": "/tmp/upw-s3/ts-live/work",
+       "model": {
+        "id": "z-ai/glm-5.3",
+        "name": "GLM 5.3",
+        "api": "openai-completions",
+        "provider": "prime-inference",
+        "baseUrl": "http://127.0.0.1:40309/v1",
+        "compat": {
+         "supportsStore": false,
+         "supportsDeveloperRole": false,
+         "supportsReasoningEffort": false,
+         "maxTokensField": "max_tokens",
+         "supportsStrictMode": false,
+         "thinkingFormat": "zai"
+        },
+        "reasoning": true,
+        "thinkingLevelMap": {
+         "off": null,
+         "minimal": null,
+         "low": "low",
+         "medium": null,
+         "high": "high",
+         "xhigh": null,
+         "max": "max"
+        },
+        "input": [
+         "text"
+        ],
+        "cost": {
+         "input": 1.4,
+         "output": 4.4,
+         "cacheRead": 0,
+         "cacheWrite": 0
+        },
+        "contextWindow": 1310720,
+        "maxTokens": 262144
+       },
+       "thinkingLevel": "high",
+       "isStreaming": false,
+       "isCompacting": false,
+       "isBashRunning": false,
+       "hasRunningRlmChildren": false,
+       "isRunningTools": false,
+       "attachedClients": 0,
+       "messageCount": 0,
+       "unfinishedActionCount": 0,
+       "created": "2026-09-19T00:35:58.158Z",
+       "modified": "2026-09-19T00:35:58.419Z",
+       "sessionActions": {
+        "queuedCount": 0,
+        "steering": [],
+        "followUps": []
+       },
+       "rosterStatus": "idle",
+       "workerState": "ready",
+       "workerPid": 139493
+      }
+     ]
+    }
+   },
+   "pre": {
+    "id": "pre",
+    "type": "response",
+    "command": "prepare_update_restart",
+    "success": true,
+    "data": {
+     "formatVersion": 1,
+     "createdAt": "2026-09-19T00:35:58.470Z",
+     "sessions": [],
+     "discardedActiveSessionIds": [
+      "52e04b4f5210"
+     ]
+    }
+   },
+   "st1": {
+    "id": "st1",
+    "type": "response",
+    "command": "get_state",
+    "success": false,
+    "error": "Unknown active session: 52e04b4f5210"
+   },
+   "cm1": {
+    "id": "cm1",
+    "type": "response",
+    "command": "commit_update_restart",
+    "success": false,
+    "error": "Unknown daemon command: commit_update_restart"
+   },
+   "__session_id__": "52e04b4f5210"
+  },
+  "rust": {
+   "c1": {
+    "command": "create",
+    "data": {
+     "activeSessionId": "4f985c12f207",
+     "activity": "idle",
+     "attachedClients": 0,
+     "created": "2026-09-19T00:35:59.403Z",
+     "cwd": "/tmp/upw-s3/rust-live/work",
+     "hasRegisteredCronJob": false,
+     "id": "4f985c12f207",
+     "isBashRunning": false,
+     "isCompacting": false,
+     "isSessionActive": false,
+     "isStreaming": false,
+     "lastActivityAt": "2026-09-19T00:35:59.419Z",
+     "lifecycle": "resident",
+     "messageCount": 0,
+     "modified": "2026-09-19T00:35:59.419Z",
+     "rlmDepth": 0,
+     "runtimeKind": "top-level",
+     "sessionActions": {
+      "followUps": [],
+      "queuedCount": 0,
+      "steering": []
+     },
+     "sessionFile": "/tmp/upw-s3/rust-live/agent/sessions/01a0b717-672b-7760-93fa-3f9f1f6aef13.jsonl",
+     "sessionId": "01a0b717-672b-7760-93fa-3f9f1f6aef13",
+     "thinkingLevel": "high",
+     "unfinishedActionCount": 0,
+     "workerPid": 139525,
+     "workerState": "ready"
+    },
+    "id": "c1",
+    "success": true,
+    "type": "response"
+   },
+   "ls1": {
+    "command": "list",
+    "data": {
+     "sessions": [
+      {
+       "activeSessionId": "4f985c12f207",
+       "activity": "idle",
+       "attachedClients": 0,
+       "created": "2026-09-19T00:35:59.403Z",
+       "cwd": "/tmp/upw-s3/rust-live/work",
+       "hasRegisteredCronJob": false,
+       "id": "4f985c12f207",
+       "isBashRunning": false,
+       "isCompacting": false,
+       "isSessionActive": false,
+       "isStreaming": false,
+       "lastActivityAt": "2026-09-19T00:35:59.419Z",
+       "lifecycle": "resident",
+       "messageCount": 0,
+       "modified": "2026-09-19T00:35:59.419Z",
+       "rlmDepth": 0,
+       "runtimeKind": "top-level",
+       "sessionActions": {
+        "followUps": [],
+        "queuedCount": 0,
+        "steering": []
+       },
+       "sessionFile": "/tmp/upw-s3/rust-live/agent/sessions/01a0b717-672b-7760-93fa-3f9f1f6aef13.jsonl",
+       "sessionId": "01a0b717-672b-7760-93fa-3f9f1f6aef13",
+       "thinkingLevel": "high",
+       "unfinishedActionCount": 0,
+       "workerPid": 139525,
+       "workerState": "ready"
+      }
+     ]
+    },
+    "id": "ls1",
+    "success": true,
+    "type": "response"
+   },
+   "pre": {
+    "command": "prepare_update_restart",
+    "data": {
+     "acceptedAt": "2026-09-19T00:35:59.434Z",
+     "expiresAt": "2026-09-19T00:36:02.435Z",
+     "state": "prepared",
+     "updateId": "upd-live"
+    },
+    "id": "pre",
+    "success": true,
+    "type": "response"
+   },
+   "st1": {
+    "command": "get_state",
+    "data": {
+     "activeSessionId": "4f985c12f207",
+     "activity": "idle",
+     "attachedClients": 0,
+     "created": "2026-09-19T00:35:59.403Z",
+     "cwd": "/tmp/upw-s3/rust-live/work",
+     "hasRegisteredCronJob": false,
+     "id": "4f985c12f207",
+     "isBashRunning": false,
+     "isCompacting": false,
+     "isSessionActive": false,
+     "isStreaming": false,
+     "lastActivityAt": "2026-09-19T00:35:59.419Z",
+     "lifecycle": "resident",
+     "messageCount": 0,
+     "modified": "2026-09-19T00:35:59.419Z",
+     "rlmDepth": 0,
+     "runtimeKind": "top-level",
+     "sessionActions": {
+      "followUps": [],
+      "queuedCount": 0,
+      "steering": []
+     },
+     "sessionFile": "/tmp/upw-s3/rust-live/agent/sessions/01a0b717-672b-7760-93fa-3f9f1f6aef13.jsonl",
+     "sessionId": "01a0b717-672b-7760-93fa-3f9f1f6aef13",
+     "thinkingLevel": "high",
+     "unfinishedActionCount": 0,
+     "workerPid": 139525,
+     "workerState": "ready"
+    },
+    "id": "st1",
+    "success": true,
+    "type": "response"
+   },
+   "cm1": {
+    "command": "commit_update_restart",
+    "data": {
+     "state": "stopping",
+     "stopped": 1,
+     "updateId": "upd-live"
+    },
+    "id": "cm1",
+    "success": true,
+    "type": "response"
+   },
+   "__session_id__": "4f985c12f207",
+   "__supervisor_exited__": true
+  }
+ }
+}

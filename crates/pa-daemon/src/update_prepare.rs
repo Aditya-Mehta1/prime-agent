@@ -71,7 +71,13 @@ impl PrepareState {
     /// Whether `prepared/<update-id>/` artifacts exist on disk for this
     /// state (written at `Snapshotted`, removed on expiry/abort).
     fn has_prepared_artifacts(self) -> bool {
-        matches!(self, PrepareState::Snapshotted | PrepareState::Prepared)
+        // `Stopping` still carries the artifacts written at `Snapshotted`:
+        // an abandoned stop (spec §5 `Aborted`) sweeps them like any other
+        // abort.
+        matches!(
+            self,
+            PrepareState::Snapshotted | PrepareState::Prepared | PrepareState::Stopping
+        )
     }
 }
 
@@ -85,6 +91,11 @@ pub(crate) enum AbortReason {
     /// 45 s): the supervisor resumes `Serving` and the coordinator must
     /// move to `Aborted`, never restore the stale snapshot.
     PreparedExpired,
+    /// The stop driver's abandon: a worker missed its graceful-stop budget
+    /// (spec §5 `Stopping` -> `Aborted`). The supervisor resumes `Serving`
+    /// and the coordinator moves to `Aborted` - sessions were never
+    /// killed.
+    UpdateAbandoned,
 }
 
 impl AbortReason {
@@ -92,6 +103,7 @@ impl AbortReason {
         match self {
             AbortReason::PrepareDeadlineExceeded => "prepare_deadline_exceeded",
             AbortReason::PreparedExpired => "prepared_expired",
+            AbortReason::UpdateAbandoned => "update_abandoned",
         }
     }
 }
@@ -152,11 +164,6 @@ impl PrepareTransaction {
     /// `Fenced -> Snapshotted`: roster + marker written durably. The caller
     /// writes the artifacts (with [`marker_expiry_ms`]) before this call and
     /// acks only after it returns.
-    ///
-    /// Driven by the graceful-stop/roster slice (spec §13 slice 3), which
-    /// fills the roster rows from worker snapshots; until then it is
-    /// exercised by this module's tests.
-    #[allow(dead_code)]
     fn snapshot_written(
         &mut self,
         now_ms: u64,
@@ -167,16 +174,12 @@ impl PrepareTransaction {
     }
 
     /// `Snapshotted -> Prepared`: the coordinator was acked.
-    /// Driver: graceful-stop slice (`#[allow(dead_code)]` until then).
-    #[allow(dead_code)]
     fn prepare_acked(&mut self) -> Result<PrepareState> {
         self.transition(PrepareState::Prepared, "prepare_acked")
     }
 
     /// `Prepared -> Stopping`: the coordinator consumed the roster (the only
     /// consumption of the prepared artifact).
-    /// Driver: graceful-stop slice (`#[allow(dead_code)]` until then).
-    #[allow(dead_code)]
     fn commit(&mut self) -> Result<PrepareState> {
         self.transition(PrepareState::Stopping, "commit")
     }
@@ -215,15 +218,11 @@ impl PrepareTransaction {
 
 /// The marker's `expires_at` (epoch ms) for a snapshot taken at `now_ms`.
 /// One definition shared by the artifact writer and the state transition.
-/// Writer: graceful-stop slice (`#[allow(dead_code)]` until then).
-#[allow(dead_code)]
 pub(crate) fn marker_expiry_ms(now_ms: u64, budget: &UpdateTimeoutBudget) -> u64 {
     now_ms + budget.prepared_expiry_ms
 }
 
 /// ISO timestamp of a marker expiry (the string written into `marker.json`).
-/// Writer: graceful-stop slice (`#[allow(dead_code)]` until then).
-#[allow(dead_code)]
 pub(crate) fn marker_expires_at_iso(now_ms: u64, budget: &UpdateTimeoutBudget) -> String {
     iso_from_unix_ms(marker_expiry_ms(now_ms, budget))
 }
@@ -329,8 +328,6 @@ impl PrepareCoordinator {
 
     /// `Fenced -> Snapshotted` for the named transaction; the caller wrote
     /// the artifacts first.
-    /// Driver: graceful-stop slice (`#[allow(dead_code)]` until then).
-    #[allow(dead_code)]
     pub(crate) fn snapshot_written(
         &self,
         update_id: &UpdateId,
@@ -343,17 +340,44 @@ impl PrepareCoordinator {
     }
 
     /// `Snapshotted -> Prepared` for the named transaction.
-    /// Driver: graceful-stop slice (`#[allow(dead_code)]` until then).
-    #[allow(dead_code)]
     pub(crate) fn prepare_acked(&self, update_id: &UpdateId) -> PrepareOp {
         self.apply(update_id, |transaction| transaction.prepare_acked())
     }
 
-    /// `Prepared -> Stopping` for the named transaction.
-    /// Driver: graceful-stop slice (`#[allow(dead_code)]` until then).
-    #[allow(dead_code)]
+    /// `Prepared -> Stopping` for the named transaction; idempotent while
+    /// already `Stopping` (the coordinator may poll the commit).
     pub(crate) fn commit(&self, update_id: &UpdateId) -> PrepareOp {
-        self.apply(update_id, |transaction| transaction.commit())
+        let mut inner = self.inner.lock().unwrap();
+        let Some(transaction) = inner.as_mut() else {
+            return PrepareOp::NotActive;
+        };
+        if *transaction.update_id() != *update_id {
+            return PrepareOp::NotActive;
+        }
+        if transaction.state() == PrepareState::Stopping {
+            return PrepareOp::Applied(PrepareState::Stopping);
+        }
+        match transaction.commit() {
+            Ok(state) => PrepareOp::Applied(state),
+            Err(_) => PrepareOp::NotActive,
+        }
+    }
+
+    /// `Stopping -> Aborted` (spec §5's `worker budget exceeded -> Aborted`):
+    /// only the stop driver may take the transaction from `Stopping`; the
+    /// prepared artifacts are garbage (the update was abandoned, not
+    /// activated) and must be deleted.
+    pub(crate) fn abandon_stopping(&self, update_id: &UpdateId) -> Option<AbortOutcome> {
+        let mut inner = self.inner.lock().unwrap();
+        match inner.as_ref() {
+            Some(transaction)
+                if *transaction.update_id() == *update_id
+                    && transaction.state() == PrepareState::Stopping =>
+            {
+                take_locked(&mut inner, AbortReason::UpdateAbandoned)
+            }
+            _ => None,
+        }
     }
 
     fn apply(
@@ -380,7 +404,7 @@ impl PrepareCoordinator {
     }
 
     /// The active transaction's update id, if any.
-    /// Reader: graceful-stop slice (`#[allow(dead_code)]` until then).
+    /// Reader: coordinator slice (`#[allow(dead_code)]` until then).
     #[allow(dead_code)]
     pub(crate) fn active_update_id(&self) -> Option<UpdateId> {
         self.inner
@@ -432,8 +456,6 @@ pub(crate) fn prepared_dir(agent_dir: &Path, socket_hash: &str, update_id: &Upda
 /// Write `roster.json` + `marker.json` durably into the prepared dir (one
 /// atomic 0600 write per file, file fsync before rename). Call this between
 /// `Fenced` and the `Snapshotted` transition, then ack.
-/// Writer: graceful-stop slice (`#[allow(dead_code)]` until then).
-#[allow(dead_code)]
 pub(crate) fn write_prepared_artifacts(
     prepared_dir: &Path,
     roster: &UpdateRoster,
@@ -454,8 +476,11 @@ pub(crate) fn write_prepared_artifacts(
 /// Read the prepared marker back (expired markers are the coordinator's
 /// refusal; parsing is the pa-types schema's job). `None` if absent or
 /// unparseable.
-/// Reader: graceful-stop slice (`#[allow(dead_code)]` until then).
-#[allow(dead_code)]
+///
+/// Driver: the update-boot slice (slice 4) reads the marker in the new
+/// supervisor's Booting phase; the prepare/commit drivers here keep their
+/// marker in memory.
+#[allow(dead_code)] // graceful-stop slice wires the writers; boot reads here
 pub(crate) fn read_prepared_marker(prepared_dir: &Path) -> Option<UpdatePreparedMarker> {
     let content = std::fs::read_to_string(prepared_dir.join("marker.json")).ok()?;
     serde_json::from_str(&content).ok()
@@ -647,6 +672,60 @@ mod tests {
             BeginOutcome::Started { .. }
         ));
         assert_eq!(coordinator.active_state(), Some(PrepareState::Draining));
+    }
+
+    #[test]
+    fn commit_is_idempotent_while_stopping_and_abandon_takes_it() {
+        let coordinator = PrepareCoordinator::new();
+        let budget = budget();
+        coordinator.begin(id("u1"), 1_000, &budget);
+        assert_eq!(
+            coordinator.drain_complete(&id("u1")),
+            PrepareOp::Applied(PrepareState::Fenced)
+        );
+        assert_eq!(
+            coordinator.snapshot_written(&id("u1"), 1_050, &budget),
+            PrepareOp::Applied(PrepareState::Snapshotted)
+        );
+        assert_eq!(
+            coordinator.prepare_acked(&id("u1")),
+            PrepareOp::Applied(PrepareState::Prepared)
+        );
+        // A commit poll while already Stopping re-reports the same state.
+        assert_eq!(
+            coordinator.commit(&id("u1")),
+            PrepareOp::Applied(PrepareState::Stopping)
+        );
+        assert_eq!(
+            coordinator.commit(&id("u1")),
+            PrepareOp::Applied(PrepareState::Stopping)
+        );
+        // The stop driver's abandon takes Stopping (and only Stopping).
+        let abort = coordinator
+            .abandon_stopping(&id("u1"))
+            .expect("abandon takes Stopping");
+        assert_eq!(abort.update_id, id("u1"));
+        assert_eq!(abort.reason, AbortReason::UpdateAbandoned);
+        assert!(abort.delete_prepared);
+        assert_eq!(coordinator.active_state(), None);
+        // Once Serving again there is nothing to abandon.
+        assert!(coordinator.abandon_stopping(&id("u1")).is_none());
+        // And a Prepared (not Stopping) transaction is not abandonable by
+        // this op - only the stop driver's path may consume Stopping.
+        coordinator.begin(id("u2"), 2_000, &budget);
+        assert_eq!(
+            coordinator.drain_complete(&id("u2")),
+            PrepareOp::Applied(PrepareState::Fenced)
+        );
+        assert_eq!(
+            coordinator.snapshot_written(&id("u2"), 2_050, &budget),
+            PrepareOp::Applied(PrepareState::Snapshotted)
+        );
+        assert_eq!(
+            coordinator.prepare_acked(&id("u2")),
+            PrepareOp::Applied(PrepareState::Prepared)
+        );
+        assert!(coordinator.abandon_stopping(&id("u2")).is_none());
     }
 
     #[test]

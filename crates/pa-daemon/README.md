@@ -106,10 +106,18 @@ TS abort-family drain commands stay served), the hard prepare deadline
 re-checked on a timer and on any later command — idempotent
 `prepare_update_restart` on `updateId` (a different id is a typed refusal
 the coordinator maps to Join), and `Aborted -> Serving` with prepared-dir
-cleanup as the failure default. Slice note: the wire handler drives accept
-through `Fenced`; the worker graceful-stop snapshot that fills
-`prepared/<id>/{roster,marker}.json` and reaches `Prepared`/`Stopping` is
-the graceful-stop slice.
+cleanup as the failure default. The prepare RPC drives accept
+through the mutation drain to `Fenced`, snapshots every resident worker
+(`update_snapshot`, `worker.rs`), assembles the roster (`update_roster.rs`:
+sessions/workers/subagents from the ledger + displays, heartbeats as a
+read-only `scheduled-jobs.json` projection), writes
+`prepared/<id>/{roster,marker}.json` durably, and acks `Prepared` — all
+inside the prepare budget. `commit_update_restart` consumes the
+transaction (`update_stop.rs`): the acked worker `shutdown` (its handler is
+the flush barrier) with the 30s + 30s budgets, abandon-on-refusal (the
+supervisor resumes `Serving`, refused sessions untouched, stopped workers
+relaunched — never a kill), or the update exit when all workers stopped
+(descriptors survive for the new supervisor's create-or-adopt restore).
 
 ## Non-goals
 No agent behavior inside workers beyond hosting a pa-core engine; no UI.

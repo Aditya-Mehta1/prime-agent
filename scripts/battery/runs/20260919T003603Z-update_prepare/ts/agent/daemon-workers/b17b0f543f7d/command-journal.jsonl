@@ -1,0 +1,4 @@
+{"version":1,"type":"received","key":"[\"52029d8b510d\",\"s2\"]","clientId":"52029d8b510d","commandId":"s2","commandType":"prepare_update_restart","recordedAt":"2026-09-19T00:35:44.532Z"}
+{"version":1,"type":"result","key":"[\"52029d8b510d\",\"s2\"]","response":{"id":"s2","type":"response","command":"prepare_update_restart","success":true,"data":{"formatVersion":1,"createdAt":"2026-09-19T00:35:44.535Z","sessions":[]}},"recordedAt":"2026-09-19T00:35:44.535Z"}
+{"version":1,"type":"received","key":"[\"52029d8b510d\",\"s6\"]","clientId":"52029d8b510d","commandId":"s6","commandType":"shutdown","recordedAt":"2026-09-19T00:35:49.539Z"}
+{"version":1,"type":"result","key":"[\"52029d8b510d\",\"s6\"]","response":{"id":"s6","type":"response","command":"shutdown","success":true},"recordedAt":"2026-09-19T00:35:49.543Z"}

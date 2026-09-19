@@ -40,6 +40,78 @@ pub fn durable_create_command(payload: &Value) -> DurableDaemonCreateCommand {
     }
 }
 
+/// The environment the supervisor spawns a worker with (spec §8's roster
+/// `launch_env`: "env snapshot to respawn the worker identically"). One
+/// definition shared by the spawn path and the update roster, so the
+/// snapshot cannot drift from the real spawn env. `instance_id` is
+/// per-spawn (a fresh uuid at every relaunch; the roster row pins the
+/// current one as the snapshot).
+pub fn worker_launch_env(
+    agent_dir: &Path,
+    supervisor_socket: &str,
+    instance_id: &str,
+    descriptor: &DaemonWorkerDescriptor,
+) -> std::collections::BTreeMap<String, String> {
+    let cwd = descriptor
+        .create_command
+        .rest
+        .get("cwd")
+        .and_then(Value::as_str)
+        .unwrap_or("/")
+        .to_string();
+    let script = descriptor
+        .create_command
+        .rest
+        .get("script")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let mut env = std::collections::BTreeMap::from([
+        (crate::worker::WORKER_ROLE_ENV.to_string(), "1".to_string()),
+        (
+            crate::worker::WORKER_TOKEN_ENV.to_string(),
+            descriptor.authentication_token.clone(),
+        ),
+        (
+            crate::worker::WORKER_INSTANCE_ID_ENV.to_string(),
+            instance_id.to_string(),
+        ),
+        (
+            crate::worker::WORKER_ACTIVE_SESSION_ID_ENV.to_string(),
+            descriptor.root_active_session_id.clone(),
+        ),
+        (
+            crate::worker::WORKER_SUPERVISOR_SOCKET_ENV.to_string(),
+            supervisor_socket.to_string(),
+        ),
+        (
+            crate::worker::WORKER_SOCKET_ENV.to_string(),
+            descriptor.socket_path.clone(),
+        ),
+        (
+            crate::worker::WORKER_RECOVERY_JOURNAL_ENV.to_string(),
+            descriptor.recovery_journal_path.clone(),
+        ),
+        (crate::worker::WORKER_CWD_ENV.to_string(), cwd.clone()),
+        (
+            crate::paths::AGENT_DIR_ENV.to_string(),
+            agent_dir.to_string_lossy().to_string(),
+        ),
+    ]);
+    if let Some(script) = script {
+        env.insert(crate::worker::WORKER_SCRIPT_ENV.to_string(), script);
+    }
+    if let Some(dir) = &descriptor.session_dir {
+        env.insert(crate::paths::SESSION_DIR_ENV.to_string(), dir.clone());
+    }
+    if descriptor.telemetry_disabled == Some(true) {
+        env.insert(
+            crate::worker::WORKER_TELEMETRY_DISABLED_ENV.to_string(),
+            "1".to_string(),
+        );
+    }
+    env
+}
+
 /// Build the worker create payload for a durable create command.
 pub fn create_command_payload(durable: &DurableDaemonCreateCommand) -> Value {
     let mut payload = json!({ "type": "create" });

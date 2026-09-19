@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Wire parity battery for the update-prepare transaction (spec
-`docs/update-flow-state-machine.md` §5, slice 2): the TS binary and the Rust
-binary side by side on the `prepare_update_restart` daemon-command surface.
+`docs/update-flow-state-machine.md` §5/§7/§8): the TS binary and the Rust
+binary side by side on the `prepare_update_restart`/`commit_update_restart`
+daemon-command surface (slices 2-3).
 
 What is compared (same command ids, same sockets, real daemons both sides):
 
@@ -23,7 +24,8 @@ asserted, reported, and explained):
      whole blocking restart flow; Rust requires the idempotency key.
   D2 `prepare_update_restart` with an `updateId`: TS ignores it and runs the
      blocking flow (success + manifest, sessions stop); Rust returns the
-     prepare transaction's state (`fenced`) and keeps serving.
+     prepare transaction's state (`prepared` + the marker `expiresAt`) and
+     keeps serving.
   D3 a second `prepare_update_restart` with a different id while active:
      TS has no such window to stage (its gate refuses inside the blocking
      RPC); Rust answers with the TS string "Daemon is already preparing an
@@ -31,11 +33,22 @@ asserted, reported, and explained):
   D4 `shutdown` during the window: TS exempts shutdown at `prepared`; Rust
      refuses it as a mutation (the coordinator owns the restart).
 
+Phase 2 (slice 3, live session): the graceful-stop divergence with a real
+resident session, same binaries, fresh daemons:
+
+  E1 prepare vs the session's life: TS's blocking prepare returns the
+     manifest AND stops the session (its worker is killed inside the RPC);
+     Rust's prepare returns `prepared` with the session still serving
+     (`get_state` answers) - invariant I3, graceful stops only at commit.
+  E2 Rust `commit_update_restart`: success `{state: "stopping", stopped: N}`,
+     the worker exits within budget, and the supervisor process exits for
+     the update (the socket goes away).
+
 Usage:
     python3 scripts/battery/update_prepare_wire.py \
         --rust-bin /abs/path/prime-agent [--ts-bin prime-agent] [--out DIR]
 
-Exit code is non-zero when any parity row (P*) mismatches.
+Exit code is non-zero when any parity row (P*/E*) mismatches.
 """
 
 import argparse
@@ -86,7 +99,7 @@ def canon(line: dict) -> str:
     return json.dumps(line, sort_keys=True, separators=(",", ":"))
 
 
-def run_flow(side: B.Side) -> tuple[list[dict], dict[str, dict]]:
+def run_empty_flow(side: B.Side) -> tuple[list[dict], dict[str, dict]]:
     """Drive one side; returns (raw response lines in order, by-command map)."""
     side.start_daemon()
     wire = B.Wire(side.daemon_socket)
@@ -136,6 +149,68 @@ def run_flow(side: B.Side) -> tuple[list[dict], dict[str, dict]]:
     return raw, by_id
 
 
+def session_id_of(create_response: dict) -> str | None:
+    data = create_response.get("data") or {}
+    for candidate in (data, data.get("session") or {}):
+        if isinstance(candidate, dict) and candidate.get("activeSessionId"):
+            return candidate["activeSessionId"]
+    return None
+
+
+def run_session_flow(side: B.Side) -> tuple[list[dict], dict[str, dict], str | None]:
+    """Slice 3: one live session, then prepare (both) and commit (Rust)."""
+    side.start_daemon()
+    wire = B.Wire(side.daemon_socket)
+    raw = []
+    by_id = {}
+
+    def step(command_id: str, command: dict, timeout: float = 60.0) -> dict:
+        response = wire.request(command_id, command, timeout=timeout)
+        raw.append(response)
+        by_id[command_id] = response
+        return response
+
+    create = step("c1", {"type": "create", "cwd": str(side.work_dir)})
+    session_id = session_id_of(create)
+    if not session_id:
+        raise RuntimeError(f"{side.name} create returned no activeSessionId: {create}")
+    # The worker registers asynchronously; poll the roster until resident.
+    deadline = time.time() + 30.0
+    while time.time() < deadline:
+        listing = step("ls1", {"type": "list"})
+        sessions = ((listing.get("data") or {}).get("sessions")) or []
+        if sessions:
+            break
+        time.sleep(0.5)
+    if side.name == "ts":
+        # TS prepare: the blocking flow returns the manifest AND stops the
+        # session inside the RPC (spec §2's failure mode this redesign
+        # kills - sessions die at prepare, not at commit).
+        step("pre", {"type": "prepare_update_restart"})
+        # E1: the session worker is gone.
+        step("st1", {"type": "get_state", "activeSessionId": session_id})
+        return raw, by_id, session_id
+    # Rust prepare: a transaction to Prepared; the session keeps serving.
+    step("pre", {"type": "prepare_update_restart", "updateId": "upd-live"})
+    # E1: the session is still alive behind the gate.
+    step("st1", {"type": "get_state", "activeSessionId": session_id})
+    # E2: commit stops the worker and exits the supervisor.
+    step("cm1", {"type": "commit_update_restart", "updateId": "upd-live"})
+    return raw, by_id, session_id
+
+
+def daemon_socket_alive(socket_path: Path) -> bool:
+    import socket as socket_module
+
+    try:
+        with socket_module.socket(socket_module.AF_UNIX, socket_module.SOCK_STREAM) as probe:
+            probe.settimeout(2.0)
+            probe.connect(str(socket_path))
+            return True
+    except OSError:
+        return False
+
+
 def main() -> int:
     default_rust = Path(__file__).resolve().parents[2] / "target/release/prime-agent"
     parser = argparse.ArgumentParser()
@@ -152,17 +227,21 @@ def main() -> int:
     out = Path(args.out) if args.out else Path(__file__).parent / "runs" / f"{stamp}-{FLOW}"
     out.mkdir(parents=True, exist_ok=True)
 
-    # The Rust window must be observable: 3 s prepare budget keeps the gate
-    # active long enough to stage P2/P3/D3, then the recovery row needs the
-    # watchdog to fire before the 5 s wait ends.
-    rust_env = {"PRIME_AGENT_UPDATE_PREPARE_MS": "3000"}
+    # The Rust windows must be observable: a 3 s prepare budget and a 3 s
+    # marker self-expiry keep the gate active long enough to stage
+    # P2/P3/D3/D4, then the recovery row needs the watchdog to fire before
+    # the 5 s wait ends.
+    rust_env = {
+        "PRIME_AGENT_UPDATE_PREPARE_MS": "3000",
+        "PRIME_AGENT_UPDATE_PREPARED_EXPIRY_MS": "3000",
+    }
     sides = {
         "ts": make_side("ts", args.ts_bin, out / "ts", {}),
         "rust": make_side("rust", str(rust_bin), out / "rust", rust_env),
     }
     results = {}
     for name, side in sides.items():
-        raw, by_id = run_flow(side)
+        raw, by_id = run_empty_flow(side)
         results[name] = by_id
         side.evidence(
             FLOW,
@@ -275,12 +354,88 @@ def main() -> int:
             f"[MISMATCH] D4: ts s6={canon(ts['s6'])} rust s6b={canon(rs['s6b'])} rust s6={canon(rs['s6'])}"
         )
 
+    # Phase 2 (slice 3): the live-session prepare/commit divergence with
+    # fresh daemons on fresh agent dirs.
+    live = {}
+    for name, side in sides.items():
+        live_side = make_side(f"{name}-live", side.binary, out / f"{name}-live", rust_env if name == "rust" else {})
+        raw_live, by_id_live, session_id = run_session_flow(live_side)
+        supervisor_exited = False
+        if name == "rust":
+            # E2: commit stops the worker and the supervisor exits for the
+            # update - poll the socket, not a shell ps.
+            exit_deadline = time.time() + 10.0
+            while time.time() < exit_deadline:
+                if not daemon_socket_alive(live_side.daemon_socket):
+                    supervisor_exited = True
+                    break
+                time.sleep(0.25)
+        live_side.evidence(
+            FLOW,
+            "wire-live.jsonl",
+            "\n".join(json.dumps(line) for line in raw_live) + "\n",
+        )
+        live_side.stop_daemon()
+        live_side.mock.stop()
+        live[name] = by_id_live
+        live[name]["__session_id__"] = session_id
+        if name == "rust":
+            live[name]["__supervisor_exited__"] = supervisor_exited
+
+    tls, rls = live["ts"], live["rust"]
+    # E1: prepare vs the session's life. TS stops the session inside the
+    # blocking prepare (get_state fails); Rust leaves it serving.
+    e1_ok = (
+        tls["pre"].get("success") is True
+        and rls["pre"].get("success") is True
+        and (rls["pre"].get("data") or {}).get("state") == "prepared"
+        and tls["st1"].get("success") is False
+        and rls["st1"].get("success") is True
+    )
+    verdicts.append(
+        {
+            "row": "E1",
+            "description": "prepare: TS kills the session in the RPC, Rust keeps it serving (I3)",
+            "parity": e1_ok,
+            "ts_get_state": tls["st1"].get("error"),
+            "rust_get_state": rls["st1"].get("success"),
+        }
+    )
+    if not e1_ok:
+        print(f"[MISMATCH] E1: ts st1={canon(tls['st1'])} rust st1={canon(rls['st1'])}")
+    # E2: Rust commit stops the worker in budget and exits the supervisor.
+    commit_data = rls["cm1"].get("data") or {}
+    e2_ok = (
+        rls["cm1"].get("success") is True
+        and commit_data.get("state") == "stopping"
+        and int(commit_data.get("stopped") or 0) >= 1
+        and live["rust"].get("__supervisor_exited__") is True
+    )
+    verdicts.append(
+        {
+            "row": "E2",
+            "description": "commit: worker stopped in budget, supervisor exits for the update",
+            "parity": e2_ok,
+        }
+    )
+    if not e2_ok:
+        print(f"[MISMATCH] E2: commit={canon(rls['cm1'])} exited={live['rust'].get('__supervisor_exited__')}")
+    divergence(
+        "E3",
+        "commit_update_restart exists only on Rust (spec §5): TS has no separate commit surface",
+        f"ts prepare data-keys={sorted((tls['pre'].get('data') or {}).keys())}; "
+        f"rust commit data={json.dumps(commit_data, sort_keys=True)}",
+    )
+
     report = {
         "flow": FLOW,
         "ts_bin": args.ts_bin,
         "rust_bin": str(rust_bin),
         "verdicts": verdicts,
         "raw": {name: {cmd: line for cmd, line in results[name].items()} for name in results},
+        "raw_live": {
+            name: {cmd: line for cmd, line in live[name].items()} for name in live
+        },
     }
     (out / f"{FLOW}-report.json").write_text(json.dumps(report, indent=1))
     print(f"evidence: {out / f'{FLOW}-report.json'}")

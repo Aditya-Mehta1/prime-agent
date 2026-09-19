@@ -1,4 +1,41 @@
 
+## Update graceful stop + roster (slice 3, 2026-09-19)
+
+The TS-era worker prepare/commit/cancel frames (`worker_prepare_update`/
+`worker_commit_update`/`worker_cancel_update`, `daemon-mode.ts`'s
+`createUpdateRestartSession`) are NOT transcribed. The Rust update flow
+(spec `docs/update-flow-state-machine.md` §5/§8, replacing the TS manifest
+flow) splits them into: a read-only `update_snapshot` worker command (the
+worker reports its queue lanes, in-flight flags, and durable session id,
+and flushes its recovery journal before replying - no freeze, no cancel
+round-trip; a busy session keeps running and the graceful-stop budget owns
+the exit), and the existing acked `shutdown` worker command as the
+graceful-stop frame (its handler is already the flush barrier: journal
+record + telemetry finalize before the reply, then the process exits).
+Key divergences from TS, deliberate:
+- The roster's per-session `next_turn` is empty on this build: the Rust
+  engine has no separate next-turn custom-message lane (pending prompts
+  ride the steering/follow-up lanes, persisted to the worker recovery
+  journal and restored on respawn); `queue.actions` carries the lane
+  snapshot.
+- The roster's `in_flight` granularity is the honest superset: provider
+  streaming, bash work, and retries all live inside a busy turn, so
+  `streaming` = busy and `bash_running`/`retrying`/`prompt_in_flight` are
+  false (restore treats `busy` as the continuation signal). `rlm_children`
+  comes from the spawn ledger (supervisor-side).
+- TS `UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS` (90 s) bounds the
+  supervisor->worker snapshot RPC, always within the remaining prepare
+  deadline.
+- The stop budget maps to the spec §9 table: the acked request gets
+  `worker_stop_ms` (30 s) and the exit wait gets `worker_stop_extension_ms`
+  (30 s); a miss on either ABANDONS the update (the supervisor resumes
+  Serving, refused sessions untouched, stopped workers relaunched) - no
+  SIGKILL of a session, ever.
+- The all-stopped exit keeps worker descriptors on disk (the new
+  supervisor's create-or-adopt restore), unlike `begin_shutdown` which
+  deletes them for a terminal stop.
+
+
 ## Update-prepare transaction (spec redesign over the TS prepare RPC, 2026-09-18)
 
 `pa-daemon/src/update_prepare.rs` is a deliberate divergence from the TS

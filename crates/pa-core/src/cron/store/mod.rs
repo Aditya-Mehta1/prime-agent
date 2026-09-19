@@ -22,6 +22,8 @@ mod rlm_heartbeat;
 mod session_artifacts;
 mod state;
 
+pub use session_artifacts::read_scheduled_jobs_artifact;
+
 pub const SESSION_SCHEDULED_JOBS_FILENAME: &str = "scheduled-jobs.json";
 
 /// One claimed dispatch of a due job.

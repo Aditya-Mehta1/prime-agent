@@ -48,6 +48,8 @@ pub const WORKER_TOKEN_ENV: &str = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN";
 pub const WORKER_INSTANCE_ID_ENV: &str = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_INSTANCE_ID";
 pub const WORKER_ACTIVE_SESSION_ID_ENV: &str =
     "PRIME_AGENT_INTERNAL_DAEMON_WORKER_ACTIVE_SESSION_ID";
+/// Worker process cwd (the create command's `cwd`).
+pub const WORKER_CWD_ENV: &str = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_CWD";
 pub const WORKER_SUPERVISOR_SOCKET_ENV: &str = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET";
 pub const WORKER_RECOVERY_JOURNAL_ENV: &str = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_RECOVERY_JOURNAL";
 /// Scripted-engine script file for faux sessions (integration harness).
@@ -1073,6 +1075,7 @@ impl Worker {
             "abort_and_clear_queue" => self.handle_abort_and_clear_queue(),
             "get_last_assistant_text" => self.handle_get_last_assistant_text(),
             "worker_deliver_message" => self.handle_worker_deliver_message(payload),
+            "update_snapshot" => self.handle_update_snapshot(),
             "kill" => self.handle_kill().await,
             "shutdown" => self.handle_shutdown().await,
             "rename" => self.handle_rename("rename", payload),
@@ -1832,6 +1835,58 @@ impl Worker {
             receipt["from"] = json!(sender);
         }
         response_success(None, "worker_deliver_message", Some(receipt))
+    }
+
+    /// `update_snapshot` (supervisor plane, update flow spec §8): a
+    /// read-only capture of this session for the update roster. The worker
+    /// persists its queue lanes to the recovery journal BEFORE replying, so
+    /// the reported queue and the durable respawn state agree; the snapshot
+    /// itself freezes nothing — a busy session keeps running (the supervisor
+    /// gate already fences new mutations, and the graceful-stop budget owns
+    /// the exit).
+    ///
+    /// In-flight granularity: the Rust engine exposes `busy` (a turn in
+    /// flight) and `compacting` only; provider streaming, tool/bash work,
+    /// and retries all live inside a busy turn and are reported through it
+    /// (the roster's `bash_running`/`retrying`/`prompt_in_flight` flags are
+    /// false on this build for that reason — restore treats `busy` as the
+    /// continuation signal).
+    fn handle_update_snapshot(&self) -> DaemonResponse {
+        let (core_data, lanes) = {
+            let core = self.core.lock().unwrap();
+            let store = core.store.as_ref();
+            let data = json!({
+                "activeSessionId": core.active_session_id,
+                "sessionId": store.map(|s| s.session_id()).unwrap_or_default(),
+                "sessionFile": core
+                    .store
+                    .as_ref()
+                    .map(|s| s.path.to_string_lossy().to_string()),
+                "cwd": core.cwd,
+                "generation": core.generation,
+                "runtimeMetadata": {
+                    "kind": core.runtime_kind,
+                    "rlmChildId": core.rlm_child_id,
+                    "parentSessionId": core.parent_session_id,
+                    "rlmDepth": core.rlm_depth,
+                },
+                "queue": {
+                    "actions": serde_json::to_value(session_snapshot(&core)).ok(),
+                    "steering": core.steering.iter().map(|item| item.message.clone()).collect::<Vec<_>>(),
+                    "followUps": core.follow_up.iter().map(|item| item.message.clone()).collect::<Vec<_>>(),
+                },
+                "busy": core.busy,
+                "compacting": core.compacting,
+            });
+            (data, queue_lanes(&core))
+        };
+        // Journal the lanes after releasing the core lock (record paths take
+        // the locks in the opposite order).
+        self.persist_queue_snapshot(
+            core_data["activeSessionId"].as_str().unwrap_or_default(),
+            &lanes,
+        );
+        response_success(None, "update_snapshot", Some(core_data))
     }
 
     /// Graceful stop: the connection loop exits the process after replying.
@@ -2992,6 +3047,79 @@ fn session_snapshot(core: &SessionCore) -> SessionActionSnapshot {
         } else {
             None
         },
+    }
+}
+
+#[cfg(test)]
+mod update_snapshot_tests {
+    use super::*;
+
+    async fn snapshot_after_create() -> (Arc<Worker>, DaemonResponse) {
+        let dir = std::env::temp_dir().join(format!("pa-worker-us-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "target-session".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({ "responses": ["ack"] })),
+        };
+        let worker = Arc::new(Worker::new(config, None));
+        // The journal is opened in `serve()`; tests open it directly so the
+        // snapshot flush has the same durable sink as production.
+        *worker.recovery.lock().unwrap() =
+            Some(WorkerRecoveryJournal::open(&worker.config.recovery_journal_path).unwrap());
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({ "noSession": true, "cwd": "/tmp", "name": "target" }),
+            )
+            .await;
+        assert!(created.success, "create must succeed: {created:?}");
+        let response = worker.dispatch("update_snapshot", &json!({})).await;
+        (worker, response)
+    }
+
+    #[tokio::test]
+    async fn update_snapshot_reports_the_session_and_flushes_the_journal() {
+        let (worker, response) = snapshot_after_create().await;
+        assert!(response.success, "snapshot must succeed: {response:?}");
+        let data = response.data.expect("snapshot data");
+        // The no-session worker has no durable session file: the active id
+        // still identifies the worker's session.
+        assert_eq!(data["activeSessionId"], "target-session");
+        assert_eq!(data["cwd"], "/tmp");
+        assert_eq!(data["busy"], false);
+        assert_eq!(data["compacting"], false);
+        assert_eq!(data["runtimeMetadata"]["kind"], "top-level");
+        assert!(data["queue"]["actions"].is_object());
+        // The flush happened before the reply: the recovery journal has a
+        // queue snapshot record for this session.
+        let snapshot = WorkerRecoveryJournal::read_queue_snapshot(
+            &worker.config.recovery_journal_path,
+            "target-session",
+        )
+        .expect("journal is readable");
+        assert!(snapshot.is_some(), "the queue lanes were flushed");
+    }
+
+    #[tokio::test]
+    async fn update_snapshot_reflects_queued_work() {
+        let (worker, _) = snapshot_after_create().await;
+        worker
+            .dispatch("steer", &json!({ "message": "finish the build" }))
+            .await;
+        let response = worker.dispatch("update_snapshot", &json!({})).await;
+        let data = response.data.expect("snapshot data");
+        assert_eq!(data["queue"]["steering"][0], "finish the build");
+        assert_eq!(
+            data["queue"]["actions"]["steering"][0], "finish the build",
+            "the lane snapshot and the actions projection agree"
+        );
     }
 }
 

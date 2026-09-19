@@ -1,0 +1,4 @@
+supervisor started pid 139394
+[2026-09-19T00:35:53.605Z] update prepare aborted (upd-1): prepared_expired
+[2026-09-19T00:35:54.834Z] session worker 514663e2124f registered (epoch 1, pid 139424)
+[2026-09-19T00:35:54.932Z] session worker 514663e2124f re-registered (epoch 2, pid 139424)
