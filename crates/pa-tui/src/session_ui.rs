@@ -73,8 +73,9 @@ pub(crate) struct SessionUi {
     pub(crate) turn_active: bool,
     /// The chat index of the assistant message still streaming.
     streaming_index: Option<usize>,
-    /// Streaming token estimate for the loader (activity tracker).
-    working_tokens: u64,
+    /// The loader's token accounting (TS `AgentActivityTracker`), reported
+    /// monotonically within a run.
+    working_tokens: LoaderTokenTracker,
     /// The turn already surfaced its error (a failed assistant message or a
     /// retry-exhausted banner); the turn_end error stays silent then (TS
     /// renders the failure once, through the message or the retry banner).
@@ -144,7 +145,7 @@ impl SessionUi {
             list_rows: Vec::new(),
             turn_active: false,
             streaming_index: None,
-            working_tokens: 0,
+            working_tokens: LoaderTokenTracker::default(),
             turn_error_shown: false,
             last_assistant_text: None,
             exit_requested: false,
@@ -430,8 +431,8 @@ impl SessionUi {
         Ok(())
     }
 
-    /// The working loader starts with a `Waiting` activity and a zero token
-    /// count (stream events accumulate tokens and switch the label).
+    /// The working loader starts with a `Waiting` activity and a zero
+    /// token count (TS `agent_start` resets the tracker).
     fn start_loader(&mut self, view: &mut AgentView) {
         view.working = Some(WorkingState {
             activity: "Waiting",
@@ -440,12 +441,15 @@ impl SessionUi {
             elapsed_secs: 0,
         });
         view.working_since = Some(std::time::Instant::now());
-        self.working_tokens = 0;
+        self.working_tokens.reset();
     }
 
-    /// Update the loader from one provider stream event (the activity
-    /// tracker: thinking/text/toolcall deltas switch the label and
-    /// accumulate the token estimate at 4 chars per token).
+    /// Update the loader's activity label from one provider stream event
+    /// (TS `AgentActivityTracker`: thinking/text/toolcall events switch the
+    /// label and direction). Token counting lives in
+    /// [`Self::track_stream_tokens`]: the event's own delta is only the
+    /// last of possibly many coalesced provider deltas, so the message —
+    /// not the delta — carries the token truth.
     fn track_stream_activity(&mut self, event: &Value, view: &mut AgentView) {
         let (activity, download) = match event.get("type").and_then(Value::as_str) {
             Some("thinking_start") | Some("thinking_delta") => ("Thinking", true),
@@ -453,16 +457,76 @@ impl SessionUi {
             Some("toolcall_start") | Some("toolcall_delta") => ("Writing code", true),
             _ => return,
         };
-        if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-            self.working_tokens += (delta.chars().count() as f64 / 4.0).round() as u64;
-        }
         if let Some(working) = &mut view.working {
             working.activity = activity;
             working.download = download;
-            working.tokens = self.working_tokens;
         }
     }
+}
 
+/// The loader's token accounting (TS `AgentActivityTracker`): the live
+/// count is completed-message output tokens plus max(reported usage, the
+/// content estimate at 4 chars per token), reported monotonically within a
+/// run. The live count derives from the streamed message itself — never
+/// from per-delta sums — because the worker coalesces provider deltas into
+/// latest-snapshot frames and a delta sum would undercount.
+#[derive(Debug, Default)]
+struct LoaderTokenTracker {
+    /// Settled-message output tokens, banked at `message_end` (TS
+    /// `completedTokens`).
+    completed_tokens: u64,
+    /// The streaming message's reported `usage.output` (TS
+    /// `streamingUsageTokens`).
+    streaming_usage: u64,
+    /// The streaming message's content size in chars (TS accumulates the
+    /// same value as a delta sum; the snapshot message carries it directly).
+    streaming_chars: u64,
+}
+
+impl LoaderTokenTracker {
+    /// TS `agent_start`/`reset`: a fresh run counts from zero.
+    fn reset(&mut self) {
+        self.completed_tokens = 0;
+        self.start_message();
+    }
+
+    /// TS `message_start` (assistant): the new message's live state starts
+    /// empty — its reported usage only counts from the first update.
+    fn start_message(&mut self) {
+        self.streaming_usage = 0;
+        self.streaming_chars = 0;
+    }
+
+    /// TS `message_update`: adopt the message's reported usage and size,
+    /// returning the live count.
+    fn apply_streaming(&mut self, usage_output: u64, content_chars: u64) -> u64 {
+        self.streaming_usage = usage_output;
+        self.streaming_chars = content_chars;
+        self.current()
+    }
+
+    /// TS `message_end`: bank the message's tokens into the completed
+    /// count (authoritative usage when reported, else the live estimate)
+    /// and clear the live state.
+    fn settle(&mut self, usage_output: u64) {
+        let estimate = (self.streaming_chars as f64 / 4.0).round() as u64;
+        self.completed_tokens += if usage_output > 0 {
+            usage_output
+        } else {
+            estimate
+        };
+        self.start_message();
+    }
+
+    /// TS `currentTokens`: completed tokens plus max(reported usage, the
+    /// chars/4 estimate).
+    fn current(&self) -> u64 {
+        let estimate = (self.streaming_chars as f64 / 4.0).round() as u64;
+        self.completed_tokens + self.streaming_usage.max(estimate)
+    }
+}
+
+impl SessionUi {
     /// Slash-command dispatch (the TS interactive submission ladder reduced
     /// to this client's surface): local client commands run here, builtin
     /// client commands without a UI yet report unavailability, session
@@ -1173,6 +1237,38 @@ impl SessionUi {
             self.track_stream_activity(event, view);
         }
         let (blocks, tool_calls) = assistant_message_parts(message);
+        // A message_start always opens a new streaming message (the engine
+        // emits one per provider call); later frames update it in place.
+        let starts_message = stream_event
+            .and_then(|event| event.get("type"))
+            .and_then(Value::as_str)
+            == Some("start");
+        let usage_output = message
+            .get("usage")
+            .and_then(|usage| usage.get("output"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if streaming {
+            if starts_message {
+                self.working_tokens.start_message();
+            }
+            let content_chars: u64 = blocks
+                .iter()
+                .map(|block| match block {
+                    MessageBlock::Text(text) | MessageBlock::Thinking(text) => {
+                        text.chars().count() as u64
+                    }
+                })
+                .sum();
+            let current = self
+                .working_tokens
+                .apply_streaming(usage_output, content_chars);
+            if let Some(working) = &mut view.working {
+                working.tokens = working.tokens.max(current);
+            }
+        } else {
+            self.working_tokens.settle(usage_output);
+        }
         if let Some(text) = blocks.iter().rev().find_map(|block| match block {
             MessageBlock::Text(text) => Some(text.clone()),
             _ => None,
@@ -1182,10 +1278,6 @@ impl SessionUi {
         let has_tool_calls = !tool_calls.is_empty();
         // A message_start always opens a new streaming message (the engine
         // emits one per provider call); later frames update it in place.
-        let starts_message = matches!(
-            stream_event.and_then(|event| event.get("type").and_then(Value::as_str)),
-            Some("start")
-        );
         if starts_message {
             self.streaming_index = None;
         }
@@ -1398,4 +1490,55 @@ async fn create_session(
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| anyhow!("the daemon did not report a session id for the new session"))
+}
+
+#[cfg(test)]
+mod loader_token_tests {
+    use super::LoaderTokenTracker;
+
+    /// The live count derives from the streamed message, so coalesced
+    /// frames (one latest-snapshot wire frame per flush tick) count the
+    /// full streamed size — a per-delta sum would undercount them ~20x.
+    #[test]
+    fn coalesced_frames_count_from_the_message_not_deltas() {
+        let mut tracker = LoaderTokenTracker::default();
+        tracker.reset();
+        // A message streams to 400 chars; the coalesced wire frame carries
+        // the full snapshot but only the final provider delta.
+        assert_eq!(tracker.apply_streaming(0, 400), 100);
+        // A provider that reports usage upfront wins over the estimate.
+        assert_eq!(tracker.apply_streaming(600, 400), 600);
+        // Settle banks the reported usage, then the live state is empty.
+        tracker.settle(600);
+        assert_eq!(tracker.current(), 600);
+    }
+
+    /// Settling without reported usage banks the live estimate (TS
+    /// `usage.output > 0 ? usage.output : estimatedStreamingTokens()`).
+    #[test]
+    fn settle_without_usage_banks_the_estimate() {
+        let mut tracker = LoaderTokenTracker::default();
+        tracker.reset();
+        assert_eq!(tracker.apply_streaming(0, 404), 101);
+        tracker.settle(0);
+        assert_eq!(tracker.current(), 101);
+    }
+
+    /// A new message resets the live state but keeps the run's completed
+    /// count; `agent_start` resets the whole tracker (TS `reset`).
+    #[test]
+    fn message_start_resets_the_live_state_and_agent_start_the_run() {
+        let mut tracker = LoaderTokenTracker::default();
+        tracker.reset();
+        assert_eq!(tracker.apply_streaming(0, 800), 200);
+        tracker.settle(0);
+        tracker.start_message();
+        // The live count rides on the run's completed count: 200 banked
+        // plus the new message's reported 50.
+        assert_eq!(tracker.apply_streaming(50, 8), 250);
+        tracker.settle(50);
+        assert_eq!(tracker.current(), 250);
+        tracker.reset();
+        assert_eq!(tracker.current(), 0);
+    }
 }

@@ -613,3 +613,129 @@ async fn tui_dispatches_slash_commands_menu_and_suggestions() {
     );
     drop(supervisor);
 }
+
+/// Streaming-throughput verifier: two big (~12k-token) unpaced faux turns
+/// must render at the producer's rate, not at a fixed frame-rate ceiling.
+/// The worker coalesces provider deltas into latest-snapshot frames (at
+/// most one per flush tick), so a burst of ~3000 deltas lands as a handful
+/// of wire frames and the turn settles within seconds. The pre-fix
+/// regression broadcast one wire frame per delta and the TUI starved at
+/// the tick rate: a single turn rendered for over a minute.
+#[tokio::test]
+async fn tui_big_streamed_turns_render_at_the_producer_rate() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let session_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let supervisor = spawn_supervisor(dir.path());
+
+    // Two ~12k-token fillers (chars/4 estimate), unpaced: the faux provider
+    // streams each as ~3000 full-partial deltas as fast as it can. Every
+    // ~250-word segment carries a MARK-nn marker so mid-turn frames prove
+    // the applied content progressed instead of jumping once at turn end.
+    let mut filler = String::new();
+    for segment in 0..24 {
+        filler.push_str(&format!("MARK-{segment:02} "));
+        filler.push_str(&"history ".repeat(250));
+    }
+    // Paced at 3000 tokens/second so the ~12k-token turn streams for
+    // ~4s: the mid-turn marker-progression assertion needs several wire
+    // updates inside the turn (an unpaced faux finishes in ~0.3s and the
+    // whole stream lands in a handful of frames). The 20s settle bound
+    // still catches the starvation regression (the pre-fix pipeline
+    // applied one ~4-token delta per 50ms tick: 150+ seconds per turn).
+    let script = serde_json::json!({
+        "engine": "faux",
+        "tokensPerSecond": 3_000,
+        "responses": [
+            { "text": filler.clone() },
+            { "text": format!("{filler}second big turn done, tail marker intact") },
+        ],
+    });
+    std::fs::write(dir.path().join("script.json"), script.to_string()).expect("write script");
+    let options = pa_tui::interactive::InteractiveOptions {
+        socket_path: supervisor.socket.clone(),
+        cwd: dir.path().to_path_buf(),
+        session_dir: Some(session_dir.clone()),
+        script_path: Some(dir.path().join("script.json")),
+        model_selection: Default::default(),
+        model_catalog: Vec::new(),
+        no_session: false,
+        session: pa_tui::interactive::SessionSelection::New,
+        initial_message: None,
+        theme: "prime".to_string(),
+        code_block_indent: "  ".to_string(),
+        version: "0.0.0".to_string(),
+        onboarding: None,
+        telemetry_disabled: None,
+        client_auth: None,
+        telemetry: None,
+    };
+    // 20s per turn is the throughput bound: the producer finishes each
+    // turn in seconds, so a longer wait means the render pipeline starved.
+    let plan = pa_tui::interactive::HeadlessPlan {
+        steps: vec![
+            pa_tui::interactive::HeadlessStep::Submit("first".to_string()),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 20_000 },
+            pa_tui::interactive::HeadlessStep::Submit("second".to_string()),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 20_000 },
+        ],
+        width: 100,
+        height: 30,
+    };
+    let started = Instant::now();
+    let outcome =
+        pa_tui::interactive::run_interactive(options, pa_tui::interactive::UiMode::Headless(plan))
+            .await
+            .expect("interactive run");
+    let wall = started.elapsed();
+
+    // Verification seam: dump the captured frames for manual frame-diffing
+    // against the TS product (PA_TUI_DUMP_FRAMES=<dir>).
+    if let Ok(dump) = std::env::var("PA_TUI_DUMP_FRAMES") {
+        for (index, frame) in outcome.frames.iter().enumerate() {
+            let _ = std::fs::write(
+                std::path::Path::new(&dump).join(format!("stream-frame-{index:03}.txt")),
+                frame,
+            );
+        }
+    }
+    let rendered = outcome.frames.join("\n");
+    assert!(
+        !rendered.contains("timed out waiting for the turn to finish"),
+        "a WaitIdle barrier expired; the render starved behind the stream:\n{rendered}"
+    );
+    // Both turns settled with their full text (the window follows the
+    // tail, so the second turn's marker is the strongest full-render proof).
+    assert!(
+        rendered.contains("tail marker intact"),
+        "the second big turn fully rendered:\n{rendered}"
+    );
+    assert_eq!(
+        outcome.last_assistant_text.as_deref(),
+        Some(format!("{filler}second big turn done, tail marker intact").as_str()),
+        "the final assistant text is the full second turn"
+    );
+    // The applied content progressed mid-turn: the tail-following window
+    // showed a growing run of segment markers while the turn streamed (a
+    // starved pipeline shows the whole turn once at its end, so only the
+    // final markers would ever appear).
+    let marks: std::collections::BTreeSet<String> = outcome
+        .frames
+        .iter()
+        .flat_map(|frame| frame.lines())
+        .flat_map(|line| line.split_whitespace())
+        .filter(|word| word.starts_with("MARK-"))
+        .map(|word| word.to_string())
+        .collect();
+    assert!(
+        marks.len() >= 5,
+        "only {len} segment markers ever rendered mid-turn (needs >= 5); the applied stream starved",
+        len = marks.len()
+    );
+    assert!(
+        wall < Duration::from_secs(45),
+        "the whole run took {wall:?}; the turn render must keep up with the producer"
+    );
+    drop(supervisor);
+}

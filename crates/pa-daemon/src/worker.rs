@@ -2539,7 +2539,13 @@ impl TurnRunner {
         // broadcasts at most one parked snapshot per interval, while every
         // other frame goes out directly (flushing the parked update first,
         // so wire order matches event-sequence order exactly).
-        let coalescer = Arc::new(crate::streaming::TurnStreamCoalescer::new());
+        let coalescer = {
+            let core = self.core.lock().unwrap();
+            Arc::new(crate::streaming::TurnStreamCoalescer::new(
+                core.active_session_id.clone(),
+                core.generation.clone(),
+            ))
+        };
         let flusher = {
             let coalescer = Arc::clone(&coalescer);
             let events = self.events.clone();
@@ -2738,11 +2744,45 @@ impl TurnRunner {
                         }
                     }
                 }
-                let mut update_payloads: Vec<Vec<u8>> = Vec::new();
                 let mut direct_payloads: Vec<Vec<u8>> = Vec::new();
                 for event_json in frames {
                     let is_stream_update =
                         event_json.get("type").and_then(Value::as_str) == Some("message_update");
+                    // A block-end stream event (`text_end` and friends)
+                    // settles the parked delta run: it must supersede
+                    // nothing, so it travels direct (flushing the parked
+                    // update first, in order).
+                    let stream_kind = event_json
+                        .get("assistantMessageEvent")
+                        .and_then(|event| event.get("type"))
+                        .and_then(Value::as_str);
+                    let flushes_pending = matches!(
+                        stream_kind,
+                        Some("text_end") | Some("thinking_end") | Some("toolcall_end")
+                    );
+                    if is_stream_update && !flushes_pending {
+                        let sequence = core.last_event_sequence + 1;
+                        core.last_event_sequence = sequence;
+                        // Streaming updates park in the coalescer (the
+                        // newest full-partial snapshot wins, the delta run
+                        // merges); `park_update` only returns false after
+                        // the turn joined, which cannot race this closure.
+                        let delta = event_json
+                            .get("assistantMessageEvent")
+                            .and_then(|event| event.get("delta"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let parked = turn_coalescer.park_update(
+                            event_json.get("message").cloned().unwrap_or(Value::Null),
+                            stream_kind.unwrap_or_default(),
+                            delta,
+                            sequence,
+                        );
+                        if !parked {
+                            return false;
+                        }
+                        continue;
+                    }
                     let sequence = core.last_event_sequence + 1;
                     core.last_event_sequence = sequence;
                     let meta = create_daemon_event_meta(
@@ -2758,24 +2798,16 @@ impl TurnRunner {
                         rest: Default::default(),
                     };
                     let payload = serde_json::to_vec(&outbound).unwrap_or_default();
-                    if is_stream_update {
-                        update_payloads.push(payload);
-                    } else {
-                        direct_payloads.push(payload);
-                    }
+                    direct_payloads.push(payload);
                 }
                 drop(core);
-                // Streaming updates park in the coalescer (each carries the
-                // full partial message, so a superseded snapshot is safe to
-                // drop); every other frame flushes the parked update and
-                // broadcasts directly. `park_update` only returns false
-                // after the turn joined, which cannot race this closure.
-                for payload in update_payloads {
-                    if !turn_coalescer.park_update(payload) {
-                        return false;
-                    }
+                // A batch that carries direct frames goes out immediately
+                // (flushing the parked update first, preserving
+                // event-sequence order); a pure-update batch leaves its
+                // frame parked for the flusher.
+                if !direct_payloads.is_empty() {
+                    turn_coalescer.send_direct(&direct_payloads, &events);
                 }
-                turn_coalescer.send_direct(&direct_payloads, &events);
                 // Resolve `done` only after the turn's final frames are on
                 // the pump: the waiting response must observe their
                 // sequences (see `ConnectionSink`), so the response cannot
@@ -3353,5 +3385,265 @@ mod tests {
         let (steering, _) = restore_queue_snapshot(&compacted, "session-a");
         assert_eq!(steering.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod turn_stream_tests {
+    use super::*;
+    use crate::engine::{
+        CompactionOutcome, CompactionRequest, PromptRequest, SessionEngine, SideQuestionOutcome,
+        SideQuestionRequest,
+    };
+
+    /// One scripted turn that streams `deltas` partial-message updates
+    /// (one full-snapshot `message_update` frame per provider delta, the
+    /// wire shape a fast provider produces on a big turn) and settles
+    /// with one final assistant message. `spacing_ms` paces the deltas so
+    /// the flusher tick can interleave (the realistic case: a provider
+    /// that outruns 20 updates/second).
+    struct BurstStreamEngine {
+        deltas: usize,
+        spacing_ms: u64,
+    }
+
+    impl BurstStreamEngine {
+        fn message_with(text: &str) -> Value {
+            json!({
+                "role": "assistant",
+                "provider": "faux",
+                "model": "faux-1",
+                "content": [{ "type": "text", "text": text }],
+            })
+        }
+
+        fn delta_text(&self, index: usize) -> String {
+            "x".repeat((index + 1) * 4)
+        }
+
+        fn full_text(&self) -> String {
+            self.delta_text(self.deltas)
+        }
+    }
+
+    impl SessionEngine for BurstStreamEngine {
+        fn run_prompt(
+            &self,
+            _prompt_index: usize,
+            _request: PromptRequest,
+            _aborted: &dyn Fn() -> bool,
+            emit: &mut dyn FnMut(EngineEvent) -> bool,
+        ) {
+            for index in 0..=self.deltas {
+                let message = Self::message_with(&self.delta_text(index));
+                let stream_event = if index == 0 {
+                    json!({ "type": "start" })
+                } else {
+                    json!({ "type": "text_delta", "delta": "xxxx" })
+                };
+                if !emit(EngineEvent::AssistantUpdate {
+                    message,
+                    stream_event: Some(stream_event),
+                }) {
+                    return;
+                }
+                if self.spacing_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(self.spacing_ms));
+                }
+            }
+            if !emit(EngineEvent::AssistantMessage(Self::message_with(
+                &self.full_text(),
+            ))) {
+                return;
+            }
+            emit(EngineEvent::Done(Ok(())));
+        }
+
+        fn run_side_question(
+            &self,
+            _request: SideQuestionRequest,
+            _signal: &pa_agent::abort::AbortSignal,
+            _sink: &pa_core::session_engine::side_question::SideQuestionSink,
+        ) -> SideQuestionOutcome {
+            SideQuestionOutcome::Failed {
+                answer: String::new(),
+                error: "unsupported".to_string(),
+            }
+        }
+
+        fn run_compaction(
+            &self,
+            _request: CompactionRequest,
+            _signal: &pa_agent::abort::AbortSignal,
+        ) -> CompactionOutcome {
+            CompactionOutcome::Skipped {
+                message: "nothing to compact".to_string(),
+            }
+        }
+    }
+
+    /// A minimal turn runner over a fresh session core: exactly what
+    /// `run_turn` touches (the store stays `None`, the roster push is a
+    /// no-op link, no supervisor socket).
+    fn burst_runner(engine: Arc<dyn SessionEngine>) -> TurnRunner {
+        let core = Arc::new(Mutex::new(SessionCore {
+            active_session_id: "burst-session".to_string(),
+            generation: "gen".to_string(),
+            last_event_sequence: 0,
+            store: None,
+            cwd: String::new(),
+            steering: VecDeque::new(),
+            follow_up: VecDeque::new(),
+            busy: false,
+            created: false,
+            attached_client_ids: Vec::new(),
+            abort_requested: false,
+            shutdown_requested: false,
+            compacting: false,
+            auto_compaction_enabled: true,
+            last_action_snapshot: Some(SessionActionSnapshot::default()),
+            rlm_depth: 0,
+            runtime_kind: "top-level".to_string(),
+            rlm_child_id: None,
+            parent_active_session_id: None,
+            parent_session_id: None,
+        }));
+        let (status_notify, _status_rx) = tokio::sync::mpsc::unbounded_channel();
+        TurnRunner {
+            core,
+            work_notify: Arc::new(Notify::new()),
+            idle_notify: Arc::new(Notify::new()),
+            events: Arc::new(EventPump::new()),
+            engine,
+            recovery: Arc::new(Mutex::new(None)),
+            active_session_id: "burst-session".to_string(),
+            status_notify,
+            roster_link: Arc::new(crate::supervisor_link::SupervisorLink::new(PathBuf::new())),
+            worker_token: String::new(),
+        }
+    }
+
+    /// Run one scripted turn and return its session-event frames in wire
+    /// order.
+    async fn turn_session_events(engine: Arc<dyn SessionEngine>) -> Vec<Value> {
+        let runner = burst_runner(Arc::clone(&engine));
+        let mut subscription = runner.events.subscribe();
+        runner
+            .run_turn(
+                engine,
+                QueuedItem {
+                    message: "burst".to_string(),
+                    done: None,
+                },
+            )
+            .await;
+        let mut events = Vec::new();
+        while let Ok(frame) = subscription.try_recv() {
+            if frame.outbound_type == "session_event" {
+                if let Ok(outbound) = serde_json::from_slice::<Value>(&frame.payload) {
+                    events.push(outbound["event"].clone());
+                }
+            }
+        }
+        events
+    }
+
+    fn positions_of(events: &[Value], frame_type: &str) -> Vec<usize> {
+        events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.get("type").and_then(Value::as_str) == Some(frame_type))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn texts_at(events: &[Value], positions: &[usize]) -> Vec<String> {
+        positions
+            .iter()
+            .filter_map(|index| {
+                events[*index]["message"]["content"][0]["text"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// A provider that outruns the flush tick still broadcasts at most one
+    /// parked update per tick — never one wire frame per delta (the
+    /// pre-fix path flooded the wire with every delta and the client
+    /// starved at the tick rate; a 12k-token turn took minutes to render).
+    #[tokio::test]
+    async fn a_provider_burst_broadcasts_one_coalesced_update_per_tick_not_per_delta() {
+        const DELTAS: usize = 120;
+        // 1ms spacing: the burst spans ~120ms, so the 50ms flusher tick
+        // flushes at most a handful of mid-burst snapshots.
+        let engine = Arc::new(BurstStreamEngine {
+            deltas: DELTAS,
+            spacing_ms: 1,
+        });
+        let events = turn_session_events(engine).await;
+
+        assert_eq!(
+            positions_of(&events, "message_start").len(),
+            1,
+            "one message_start frame opens the stream"
+        );
+        let updates = positions_of(&events, "message_update");
+        let end = positions_of(&events, "message_end");
+        assert_eq!(end.len(), 1, "the turn settles with one message_end");
+        assert!(
+            !updates.is_empty(),
+            "the parked snapshots must reach the wire"
+        );
+        assert!(
+            updates.len() * 10 < DELTAS,
+            "{DELTAS} spaced deltas must coalesce to a handful of wire updates, saw {}",
+            updates.len()
+        );
+        // The latest snapshot wins: the flushed update carries the full
+        // message so far, and superseded snapshots are dropped.
+        assert_eq!(
+            texts_at(&events, &updates).last().map(String::len),
+            Some((DELTAS + 1) * 4),
+            "the last flushed update must carry the full text"
+        );
+        // Event-sequence order: every update precedes the settle frame.
+        assert!(
+            updates.iter().all(|index| *index < end[0]),
+            "a superseded snapshot must never follow message_end"
+        );
+    }
+
+    /// An instant burst (the provider outruns the tick entirely) parks one
+    /// snapshot at a time; the settle frame flushes the final snapshot
+    /// before message_end, so the client sees the full message without a
+    /// tick waiting period and nothing lands out of order.
+    #[tokio::test]
+    async fn an_instant_burst_flushes_the_final_snapshot_with_its_settle_frame() {
+        const DELTAS: usize = 200;
+        let engine = Arc::new(BurstStreamEngine {
+            deltas: DELTAS,
+            spacing_ms: 0,
+        });
+        let events = turn_session_events(engine).await;
+
+        let updates = positions_of(&events, "message_update");
+        let end = positions_of(&events, "message_end");
+        assert_eq!(end.len(), 1, "the turn settles with one message_end");
+        assert!(
+            updates.len() <= 3,
+            "an instant burst broadcasts at most the settle-flushed snapshot (a mid-burst tick race adds one per 50ms stall), saw {}",
+            updates.len()
+        );
+        assert!(
+            texts_at(&events, &updates)
+                .iter()
+                .any(|text| text.len() == (DELTAS + 1) * 4),
+            "the flushed snapshot must carry the full message"
+        );
+        assert!(
+            updates.iter().all(|index| *index < end[0]),
+            "the flushed snapshot precedes message_end"
+        );
     }
 }
