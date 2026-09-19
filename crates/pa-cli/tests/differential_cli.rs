@@ -323,6 +323,10 @@ fn run(binary: &Path, args: &[&str], sandbox: &Path) -> InvocationOutput {
         // through passwd rather than $HOME, so the env override is the only
         // reliable isolation for both binaries.
         .env("PRIME_AGENT_CODING_AGENT_DIR", sandbox.join("agent"))
+        // Isolate TMPDIR too (batterylib.scrubbed_env parity): without it the
+        // TS daemon census escapes into the box's ambient daemons and
+        // `shutdown --force` kills unrelated sockets (containment contract).
+        .env("TMPDIR", sandbox.join("tmp"))
         // Isolate the socket dir the same way: daemon discovery (status,
         // doctor, shutdown) must never see this box's real sockets under
         // TMPDIR, and `shutdown --force` on the TS binary has no
