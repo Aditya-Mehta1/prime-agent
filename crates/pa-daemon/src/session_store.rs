@@ -306,6 +306,40 @@ impl SessionFile {
         messages
     }
 
+    /// The durable entry id the compaction cut keeps: the same
+    /// `find_cut_point` walk the engine ran over its in-memory entries,
+    /// re-run over this store's branch. The engine's own
+    /// `firstKeptEntryId` references its in-memory entry ids, which never
+    /// exist in the session file (the store mints fresh ids on persist);
+    /// verbatim it retains nothing on the `messages` read. TS has a single
+    /// store so its ids match by construction — the durable re-cut here
+    /// pins the boundary the file read recognizes (TS: one store, ids
+    /// match by construction).
+    pub fn durable_first_kept_entry_id(&self, keep_recent_tokens: u64) -> Option<String> {
+        let branch = self.branch();
+        let entries: Vec<pa_types::session::FileEntry> = branch
+            .iter()
+            .filter_map(|entry| serde_json::to_value(entry).ok())
+            .filter_map(|value| serde_json::from_value(value).ok())
+            .collect();
+        // The header is not a compact candidate (TS `prepareCompaction`).
+        let start = usize::from(matches!(
+            entries.first(),
+            Some(pa_types::session::FileEntry::Header { .. })
+        ));
+        let cut = pa_core::session_engine::compaction::find_cut_point(
+            &entries,
+            start,
+            entries.len(),
+            keep_recent_tokens,
+        );
+        entries
+            .get(cut.first_kept_entry_index)
+            .and_then(|entry| entry.id())
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+    }
+
     pub fn message_count(&self) -> usize {
         self.entries.iter().filter(|e| e.type_ == "message").count()
     }
@@ -690,6 +724,58 @@ mod tests {
             Some(("p", "m"))
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn durable_first_kept_entry_id_pins_the_boundary_the_read_retains() {
+        // The parity scenario the frame diff caught: the engine compacts its
+        // in-memory entries and reports an id that never exists in the
+        // session file. The durable re-cut must pin the boundary the
+        // `messages()` read recognizes, or the retained tail is lost.
+        let mut session = SessionFile::create("/tmp", None, 0);
+        session.append_message(json!({"role": "user", "content": "first", "timestamp": 1u64}));
+        let usage = json!({
+            "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 }
+        });
+        let assistant = |text: String, timestamp: u64| {
+            json!({
+                "role": "assistant",
+                "content": [{ "type": "text", "text": text }],
+                "api": "faux", "provider": "p", "model": "m",
+                "usage": usage, "stopReason": "stop", "timestamp": timestamp
+            })
+        };
+        session.append_message(assistant(format!("history {}", "word ".repeat(40)), 2u64));
+        session
+            .append_message(json!({"role": "user", "content": "second turn", "timestamp": 3u64}));
+        session.append_message(assistant("second turn done".to_string(), 4u64));
+
+        let durable_id = session.durable_first_kept_entry_id(5);
+        // The cut keeps the whole second turn: its user message is the
+        // boundary (estimate: 4 + 2 >= 5 stops at the user entry).
+        let kept = session
+            .branch()
+            .iter()
+            .find(|entry| {
+                entry.fields.get("message").and_then(|m| m.get("content"))
+                    == Some(&json!("second turn"))
+            })
+            .map(|entry| entry.id.clone())
+            .expect("the second-turn user entry");
+        assert_eq!(durable_id, Some(kept));
+
+        let _ = session.persist_entry(
+            "compaction",
+            json!({ "summary": "the story", "firstKeptEntryId": durable_id, "tokensBefore": 12 }),
+        );
+        let messages = session.messages();
+        // Wire order is summary-first (TS `buildSessionContext`); the
+        // retained messages follow.
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].get("role"), Some(&json!("compactionSummary")));
+        assert_eq!(crate::types::message_text(&messages[1]), "second turn");
+        assert_eq!(crate::types::message_text(&messages[2]), "second turn done");
     }
 
     #[test]

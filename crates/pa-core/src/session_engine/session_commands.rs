@@ -62,6 +62,11 @@ pub struct SessionCommandExecution {
     /// A compaction that ran (no result row: the TS `/compact` outcome is
     /// the compaction record itself).
     pub compaction: Option<CompactionExecution>,
+    /// A compaction skipped (TS `CompactionSkippedError`): the message the
+    /// wire `compaction_end` event carries so attached surfaces can warn
+    /// (the durable transcript itself records nothing, matching the TS
+    /// queued-command catch arm that returns silently).
+    pub compaction_skipped: Option<&'static str>,
     /// A follow-up prompt to admit as a turn (goal start/resume). The
     /// durable goal-context row for that turn is already in `messages`.
     pub continuation_prompt: Option<String>,
@@ -89,8 +94,10 @@ fn now_millis() -> u64 {
         .unwrap_or_default()
 }
 
-/// The durable command echo row (`session_slash_command`).
-fn slash_command_echo(command: &SessionSlashCommand) -> CustomMessage {
+/// The durable command echo row (`session_slash_command`). Public for the
+/// host transports that emit the echo before execution (TS
+/// `_executeSelectedSessionCommand` records it before the command runs).
+pub fn session_command_echo_row(command: &SessionSlashCommand) -> CustomMessage {
     CustomMessage {
         custom_type: SESSION_SLASH_COMMAND_CUSTOM_TYPE.to_string(),
         content: pa_types::ai::UserContent::Text(command.text.clone()),
@@ -171,7 +178,7 @@ pub async fn execute_session_command(
     command: &SessionSlashCommand,
 ) -> SessionCommandExecution {
     let mut execution = SessionCommandExecution::default();
-    execution.push_message(slash_command_echo(command));
+    execution.push_message(session_command_echo_row(command));
     // Telemetry adoption seam: builtin session commands carry their usage
     // event from the single dispatch point (canonical name only).
     if let Some(telemetry) = &engine.telemetry {
@@ -213,7 +220,9 @@ async fn execute_compact(
         .await
         .map_err(|error| format!("{error:#}"))?;
     match outcome {
-        CompactOutcome::Skipped(_) => {}
+        CompactOutcome::Skipped(message) => {
+            execution.compaction_skipped = Some(message);
+        }
         CompactOutcome::Ran(run) => {
             if let Some(telemetry) = &engine.telemetry {
                 telemetry.note_compaction();
@@ -399,7 +408,7 @@ mod tests {
 
     #[test]
     fn echo_row_shape_matches_ts() {
-        let echo = slash_command_echo(&command("compact", "focus on tests"));
+        let echo = session_command_echo_row(&command("compact", "focus on tests"));
         assert_eq!(echo.custom_type, "session_slash_command");
         assert_eq!(message_text(&echo), "/compact focus on tests");
         assert!(echo.display);

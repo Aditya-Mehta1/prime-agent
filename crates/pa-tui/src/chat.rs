@@ -72,6 +72,16 @@ pub enum ChatEntry {
     SlashCommand { text: String },
     /// A durable session-command outcome row (`session_slash_command_result`).
     SlashCommandResult { content: String },
+    /// The compaction summary row (TS `CompactionSummaryMessageComponent`):
+    /// `◆ Context compacted` with the summary below.
+    CompactionSummary {
+        /// The summarizer's summary text.
+        summary: String,
+        /// The context size before the compaction (the expanded metadata).
+        tokens_before: u64,
+        /// `/compact <instructions>` focus guidance.
+        custom_instructions: Option<String>,
+    },
     /// One assistant message: ordered content blocks.
     Assistant(Box<AssistantMessage>),
     /// One tool call and its execution state (rendered by
@@ -92,6 +102,11 @@ pub enum ChatEntry {
 // The card types live in `tool_card`; re-exported here because the
 // transcript vocabulary (`ChatEntry`) is this module's.
 pub use crate::tool_card::{render_tool_card, ToolCallCard, ToolResultView};
+// The compaction rows (loader + summary) live in `compaction_row`; same
+// re-export rule as the tool cards.
+pub use crate::compaction_row::{
+    render_compaction_loader, render_compaction_summary, CompactionReason, CompactionState,
+};
 
 /// An assistant message's visible content (tool calls move to cards).
 #[derive(Debug, Clone, PartialEq)]
@@ -160,7 +175,7 @@ impl WorkingState {
 }
 
 /// Spinner frames (TS `Loader` DEFAULT_FRAMES).
-const LOADER_FRAMES: [&str; 10] = [
+pub(crate) const LOADER_FRAMES: [&str; 10] = [
     "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
     "\u{2807}", "\u{280f}",
 ];
@@ -180,7 +195,7 @@ fn spacer() -> Line {
 }
 
 /// Pad a rendered line to the full width with a base style.
-fn pad_to(line: Line, width: usize, base: Style) -> Line {
+pub(crate) fn pad_to(line: Line, width: usize, base: Style) -> Line {
     let used: usize = line.iter().map(|s| str_width(&s.content)).sum();
     let mut out = line;
     if used < width {

@@ -4,13 +4,20 @@
 //! executes them against the engine's session, and translates the durable
 //! rows into engine events (the worker persists and broadcasts them).
 //!
+//! `/compact` runs with the full TS event pair: the echo row and
+//! `compaction_start` go out before the summarizer runs, the settled
+//! `compaction_end` (result, or the skip/failure message with its
+//! severity) after — so attached clients always see the compaction
+//! start and its outcome (TS `_executeSelectedSessionCommand` order,
+//! then `AgentSession.compact`'s events).
+//!
 //! This is the spin fix for session commands: previously a session command
 //! admitted through `run_turn` would wait for an `AgentStart` that never
 //! arrives. Parsing before admission keeps the wait loop reachable only
 //! for real turns.
 
 use pa_core::session_engine::session_commands::{
-    session_command_failure_row, SessionCommandExecution,
+    session_command_echo_row, session_command_failure_row, SessionCommandExecution,
 };
 use pa_core::session_engine::slash_commands::{
     parse_session_command, SessionSlashCommand, SlashCommandRegistry,
@@ -27,28 +34,82 @@ pub(crate) fn run_session_command(
     command: SessionSlashCommand,
     emit: &mut dyn FnMut(EngineEvent) -> bool,
 ) -> Option<SessionCommandExecution> {
+    let is_compact = command.name == "compact";
+    // The durable echo row goes out before execution (TS
+    // `_executeSelectedSessionCommand` records the attempted command
+    // before the queue runs it).
+    if !emit(EngineEvent::CustomMessage(custom_message_value(
+        &session_command_echo_row(&command),
+    ))) {
+        return None;
+    }
+    if is_compact {
+        let custom_instructions = compact_custom_instructions(&command);
+        let start = crate::compaction::compaction_start_event(custom_instructions.as_deref());
+        if !emit(EngineEvent::CompactionStart { event: start }) {
+            return None;
+        }
+    }
     let execution = match engine.execute_session_command(&command) {
         Ok(execution) => execution,
         // Pre-execution failures (model resolution, session build) still
-        // record the attempted command as a failure result row.
+        // record the attempted command as a failure result row (the echo
+        // row above already went out).
         Err(error) => {
             let error = format!("{error:#}");
-            SessionCommandExecution {
+            let execution = SessionCommandExecution {
                 messages: vec![session_command_failure_row(&command, &error)],
                 compaction: None,
+                compaction_skipped: None,
                 continuation_prompt: None,
                 error: Some(error),
                 refinement: None,
                 refinement_failed: None,
+            };
+            if !emit_compact_end(&command, &execution, emit) {
+                return None;
             }
+            for message in &execution.messages {
+                if !emit(EngineEvent::CustomMessage(custom_message_value(message))) {
+                    return None;
+                }
+            }
+            return Some(execution);
         }
     };
-    for message in &execution.messages {
+    // The settled `compaction_end` precedes any failure result row (TS
+    // `compact()` emits the event before the queued-command catch arm
+    // appends `Command failed: ...`).
+    if is_compact && !emit_compact_end(&command, &execution, emit) {
+        return None;
+    }
+    // The executor's first row is the echo (already emitted); the rest of
+    // the durable rows follow in order.
+    for message in execution.messages.iter().skip(1) {
         if !emit(EngineEvent::CustomMessage(custom_message_value(message))) {
             return None;
         }
     }
-    if let Some(compaction) = &execution.compaction {
+    Some(execution)
+}
+
+/// `/compact <args>`: the args are the summary-focus instructions.
+fn compact_custom_instructions(command: &SessionSlashCommand) -> Option<String> {
+    let args = command.args.trim();
+    (!args.is_empty()).then(|| args.to_string())
+}
+
+/// The settled `compaction_end` event for one `/compact` execution (TS
+/// `AgentSession.compact`'s end event): success carries the client-facing
+/// `CompactionResult`; a skip carries its message with warning severity; a
+/// failure carries `Compaction failed: <message>` with error severity.
+fn emit_compact_end(
+    command: &SessionSlashCommand,
+    execution: &SessionCommandExecution,
+    emit: &mut dyn FnMut(EngineEvent) -> bool,
+) -> bool {
+    let custom_instructions = compact_custom_instructions(command);
+    let (entry, event) = if let Some(compaction) = &execution.compaction {
         let entry = serde_json::to_value(&compaction.entry).unwrap_or(serde_json::Value::Null);
         // The client-facing result is the TS `CompactionResult` wire shape.
         let result = serde_json::json!({
@@ -56,21 +117,49 @@ pub(crate) fn run_session_command(
             "firstKeptEntryId": compaction.result.first_kept_entry_id,
             "tokensBefore": compaction.result.tokens_before,
         });
-        if !emit(EngineEvent::Compaction { entry, result }) {
-            return None;
-        }
-    } else if command.name == "compact" && execution.error.is_none() {
-        // A skipped compaction still publishes the TS `compaction_end`
-        // event with an undefined result: the attached surfaces surface
-        // `compaction: {}` for skips (the session is too short to compact).
-        if !emit(EngineEvent::Compaction {
-            entry: serde_json::Value::Null,
-            result: serde_json::Value::Null,
-        }) {
-            return None;
-        }
-    }
-    Some(execution)
+        (
+            entry,
+            crate::compaction::compaction_end_payload(
+                "manual",
+                Some(&result),
+                false,
+                None,
+                None,
+                custom_instructions.as_deref(),
+            ),
+        )
+    } else if let Some(skipped) = execution.compaction_skipped {
+        (
+            serde_json::Value::Null,
+            crate::compaction::compaction_end_payload(
+                "manual",
+                None,
+                false,
+                Some(skipped),
+                Some("warning"),
+                custom_instructions.as_deref(),
+            ),
+        )
+    } else {
+        // A failure (or a pre-execution error): `execution.error` carries
+        // the raw message; the TS event prefixes `Compaction failed: `.
+        let error = execution
+            .error
+            .as_deref()
+            .unwrap_or("compaction did not run");
+        (
+            serde_json::Value::Null,
+            crate::compaction::compaction_end_payload(
+                "manual",
+                None,
+                false,
+                Some(&format!("Compaction failed: {error}")),
+                Some("error"),
+                custom_instructions.as_deref(),
+            ),
+        )
+    };
+    emit(EngineEvent::Compaction { entry, event })
 }
 
 /// Parse a session command out of a prompt, if it is one.

@@ -15,6 +15,7 @@ pub mod chat_slash;
 pub mod chrome;
 pub mod client_auth;
 pub mod code_preview;
+mod compaction_row;
 pub mod config_selector;
 pub mod custom_message;
 pub mod daemon_client;

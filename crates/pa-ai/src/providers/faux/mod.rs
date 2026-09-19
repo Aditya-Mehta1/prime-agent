@@ -130,6 +130,13 @@ pub type FauxResponseFactory = Arc<
 #[allow(clippy::large_enum_variant)] // the TS shape is a tagged union of the same payloads
 pub enum FauxResponseStep {
     Message(AssistantMessage),
+    /// A message whose stream starts after `delay_ms` (harness pacing: the
+    /// delay holds the request in flight so verification harnesses can
+    /// capture mid-turn states). Verification harness only.
+    Delayed {
+        message: AssistantMessage,
+        delay_ms: u64,
+    },
     Factory(FauxResponseFactory),
 }
 
@@ -725,6 +732,16 @@ pub fn register_faux_provider(options: RegisterFauxProviderOptions) -> FauxProvi
 
                 let resolved = match step {
                     FauxResponseStep::Message(message) => Ok(message),
+                    // The harness pacing delay holds the stream closed
+                    // before the first delta: in-flight states (loaders,
+                    // spinners) stay visible for the harness's capture
+                    // window.
+                    FauxResponseStep::Delayed { message, delay_ms } => {
+                        if delay_ms > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        }
+                        Ok(message)
+                    }
                     FauxResponseStep::Factory(factory) => {
                         let call_count = *state.call_count.lock().unwrap();
                         factory(&context, options.as_ref(), call_count, &model)

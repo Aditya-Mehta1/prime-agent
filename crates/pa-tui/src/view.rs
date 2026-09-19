@@ -5,8 +5,8 @@
 //! owns row geometry and scroll behavior only.
 
 use crate::chat::{
-    render_assistant, render_loader, render_text_rows, render_user_block, ChatEntry, Detail,
-    WorkingState,
+    render_assistant, render_loader, render_text_rows, render_user_block, ChatEntry,
+    CompactionState, Detail, WorkingState,
 };
 use crate::chrome::{
     conversation_detail_status, render_prompt_context, render_splash, render_top_bar, render_tray,
@@ -50,6 +50,9 @@ pub struct AgentView {
     pub chat: Vec<ChatEntry>,
     pub detail: Detail,
     pub working: Option<WorkingState>,
+    /// A compaction run in flight (TS `autoCompactionLoader`): replaces the
+    /// working loader from `compaction_start` to `compaction_end`.
+    pub compaction: Option<CompactionState>,
     /// Animation frame for spinners and the working icon.
     pub pulse_frame: usize,
     /// When the current working loader started (elapsed label).
@@ -105,6 +108,7 @@ impl AgentView {
             chat: Vec::new(),
             detail: Detail::Overview,
             working: None,
+            compaction: None,
             pulse_frame: 0,
             working_since: None,
             retry: None,
@@ -282,6 +286,7 @@ impl AgentView {
         match entry {
             ChatEntry::Status { .. } | ChatEntry::User { .. } => true,
             ChatEntry::SlashCommand { .. } | ChatEntry::SlashCommandResult { .. } => true,
+            ChatEntry::CompactionSummary { .. } => true,
             // Spacing-driven rows (agent messages, shell completions) lean
             // on the conversation-spacing scan over PRECEDING entries: a
             // streaming assistant's spacing contribution changes when its
@@ -437,6 +442,29 @@ impl AgentView {
             ChatEntry::SlashCommandResult { content } => {
                 crate::chat_slash::render_slash_command_result(content, &self.theme, width)
             }
+            ChatEntry::CompactionSummary {
+                summary,
+                tokens_before,
+                custom_instructions,
+            } => {
+                // TS `addMessageToChat` conversation spacing: the summary
+                // follows the previous component with `Spacer(1)` when not
+                // first (in the rebuilt transcript it trails the kept
+                // tail's echo row).
+                let mut rows = Vec::new();
+                if !first {
+                    rows.push(Vec::new());
+                }
+                rows.extend(crate::compaction_row::render_compaction_summary(
+                    summary,
+                    *tokens_before,
+                    custom_instructions.as_deref(),
+                    false,
+                    &self.theme,
+                    width,
+                ));
+                rows
+            }
             ChatEntry::Assistant(message) => render_assistant(
                 message,
                 self.detail,
@@ -530,11 +558,27 @@ impl AgentView {
             first = false;
         }
         // While the provider retry loop waits, its countdown loader owns
-        // the status area (TS `stopWorkingLoader` + `retryLoader`).
+        // the status area (TS `stopWorkingLoader` + `retryLoader`); a
+        // compaction run owns it next (TS `startCompactionLoader`); the
+        // working loader renders only when neither is active.
         if let Some(retry) = &self.retry {
             lines.extend(crate::chat::render_retry(
                 retry,
                 self.pulse_frame,
+                &self.theme,
+                width,
+            ));
+        } else if let Some(compaction) = &self.compaction {
+            let cancel_hint = self
+                .editor
+                .keybindings()
+                .first_key("app.clear")
+                .map(|key| crate::keybindings::format_key_text(&key))
+                .unwrap_or_else(|| "Ctrl+C".to_string());
+            lines.extend(crate::compaction_row::render_compaction_loader(
+                compaction,
+                self.pulse_frame,
+                &cancel_hint,
                 &self.theme,
                 width,
             ));
@@ -1064,6 +1108,53 @@ mod tests {
         assert!(!following.iter().any(|l| row_text(l).contains("reply 0")));
         assert!(following.iter().any(|l| row_text(l).contains("reply 29")));
         assert!(!top.iter().any(|l| row_text(l).contains("reply 29")));
+    }
+
+    #[test]
+    fn compaction_loader_replaces_the_working_loader() {
+        // TS `startCompactionLoader`: the compaction loader owns the status
+        // area while a compaction runs, working loader hidden.
+        let mut v = view();
+        v.working = Some(WorkingState {
+            activity: "Waiting",
+            download: false,
+            tokens: 0,
+            elapsed_secs: 0,
+        });
+        v.compaction = Some(crate::chat::CompactionState {
+            reason: crate::chat::CompactionReason::Manual,
+            custom_instructions: None,
+        });
+        let frame = v.render_frame(80, 24);
+        let flat: Vec<String> = frame.iter().map(row_text).collect();
+        assert!(
+            flat.iter()
+                .any(|l| l.contains("Compacting context... (Ctrl+C to cancel)")),
+            "{flat:?}"
+        );
+        assert!(
+            !flat.iter().any(|l| l.contains("Waiting")),
+            "the working loader is hidden during compaction: {flat:?}"
+        );
+        // `compaction_end` clears it; the summary row renders from the
+        // transcript entry.
+        v.compaction = None;
+        v.push_entry(crate::chat::ChatEntry::CompactionSummary {
+            summary: "the story so far".to_string(),
+            tokens_before: 1234,
+            custom_instructions: None,
+        });
+        let frame = v.render_frame(80, 24);
+        let flat: Vec<String> = frame.iter().map(row_text).collect();
+        assert!(
+            flat.iter()
+                .any(|l| l.trim() == "\u{25c6} Context compacted"),
+            "{flat:?}"
+        );
+        assert!(
+            flat.iter().any(|l| l.trim() == "the story so far"),
+            "{flat:?}"
+        );
     }
 
     #[test]

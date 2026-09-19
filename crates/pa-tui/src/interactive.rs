@@ -232,6 +232,9 @@ pub enum HeadlessStep {
     Type(String),
     /// Hold until the current turn finishes (bounded by `timeout_ms`).
     WaitIdle { timeout_ms: u64 },
+    /// Scroll the transcript to its top row (the `tui.viewport.top` key
+    /// path): the verifier's window into the head of the transcript.
+    ScrollTop,
 }
 
 /// One typed string as key events: characters become `Char` presses, `\n`
@@ -352,6 +355,7 @@ enum UiInput {
     WaitIdle {
         timeout_ms: u64,
     },
+    ScrollTop,
     /// The terminal was resized: the next draw repaints the new geometry.
     Resize,
     HeadlessDone,
@@ -475,6 +479,7 @@ pub async fn run_interactive(
                     dispatched?;
                 }
                 UiInput::HeadlessDone => headless_done = true,
+                UiInput::ScrollTop => view.scroll_to_top(),
                 UiInput::Resize => {
                     // The editor lays its window out against the new row
                     // count; the branch's dirty flag repaints the frame at
@@ -521,6 +526,17 @@ pub async fn run_interactive(
                         while let Ok(event) = events.try_recv() {
                             session.apply_client_event(event, &mut view);
                         }
+                        // A succeeded compaction rebuilt the durable
+                        // transcript: replace the view's chat with it, and
+                        // refresh the tray usage the same way a settled
+                        // turn does (TS refreshes after "a turn or
+                        // compaction completes" — post-compaction usage is
+                        // unknown until the next assistant response).
+                        if session.transcript_stale {
+                            session.rebuild_transcript(&mut view).await;
+                            session.refresh_stats().await;
+                            session.rebuild_tray(&mut view);
+                        }
                         // A settled turn refreshes the tray's context usage.
                         if was_active && !session.turn_active {
                             session.refresh_stats().await;
@@ -558,8 +574,9 @@ pub async fn run_interactive(
         // `syncGoalTray`); the label only changes when the state does.
         session.sync_goal_tray(&mut view);
 
-        // Spinner animation: the loader frame advances while a turn runs.
-        if session.turn_active {
+        // Spinner animation: the loader frame advances while a turn or a
+        // compaction runs.
+        if session.turn_active || view.compaction.is_some() {
             view.pulse_frame = view.pulse_frame.wrapping_add(1);
         }
 
@@ -567,7 +584,7 @@ pub async fn run_interactive(
         // idle session re-renders nothing (a full-transcript layout costs
         // linear time, so redrawing an unchanged idle frame burns CPU for
         // every attached session).
-        let animating = session.turn_active || view.retry.is_some();
+        let animating = session.turn_active || view.retry.is_some() || view.compaction.is_some();
         if animating {
             session.dirty = true;
         }
@@ -758,6 +775,11 @@ impl Renderer {
                             }
                             HeadlessStep::WaitIdle { timeout_ms } => {
                                 if ui_tx.send(UiInput::WaitIdle { timeout_ms }).is_err() {
+                                    return;
+                                }
+                            }
+                            HeadlessStep::ScrollTop => {
+                                if ui_tx.send(UiInput::ScrollTop).is_err() {
                                     return;
                                 }
                             }

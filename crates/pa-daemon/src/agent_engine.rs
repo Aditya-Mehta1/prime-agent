@@ -1167,29 +1167,65 @@ impl AgentSessionEngine {
         match consumption.compaction {
             Some(Ok(pa_core::session_engine::compact_session::CompactOutcome::Ran(run))) => {
                 let entry = serde_json::to_value(&run.entry).unwrap_or(Value::Null);
-                // The wire result is the TS `CompactionResult` shape.
+                // The wire result is the TS `CompactionResult` shape; the
+                // event reason is `requested` (TS `_runAutoCompaction`).
                 let result = serde_json::json!({
                     "summary": run.result.summary,
                     "firstKeptEntryId": run.result.first_kept_entry_id,
                     "tokensBefore": run.result.tokens_before,
                 });
-                if !emit(EngineEvent::Compaction { entry, result }) {
+                let event = crate::compaction::compaction_end_payload(
+                    "requested",
+                    Some(&result),
+                    false,
+                    None,
+                    None,
+                    None,
+                );
+                if !emit(EngineEvent::Compaction { entry, event }) {
                     return BoundaryRun::Cancelled;
                 }
                 stopped_for_compaction = true;
             }
-            // A skip consumed the request silently (the Rust `/compact`
-            // contract); failures land in the worker log (the TS wire
-            // carries `compaction_end` with an error payload; the Rust
-            // wire has no failed-compaction event yet).
+            // A skip consumed the request (the Rust `/compact` contract);
+            // the wire carries the TS `compaction_end` warning so attached
+            // surfaces can show it.
             Some(Ok(pa_core::session_engine::compact_session::CompactOutcome::Skipped(
                 message,
             ))) => {
                 eprintln!("pa-daemon: requested compaction skipped: {message}");
+                let event = crate::compaction::compaction_end_payload(
+                    "requested",
+                    None,
+                    false,
+                    Some(&format!("Requested compaction skipped: {message}")),
+                    Some("warning"),
+                    None,
+                );
+                if !emit(EngineEvent::Compaction {
+                    entry: Value::Null,
+                    event,
+                }) {
+                    return BoundaryRun::Cancelled;
+                }
                 stopped_for_compaction = true;
             }
             Some(Err(error)) => {
                 eprintln!("pa-daemon: requested compaction failed: {error:#}");
+                let event = crate::compaction::compaction_end_payload(
+                    "requested",
+                    None,
+                    false,
+                    Some(&format!("Requested compaction failed: {error:#}")),
+                    Some("error"),
+                    None,
+                );
+                if !emit(EngineEvent::Compaction {
+                    entry: Value::Null,
+                    event,
+                }) {
+                    return BoundaryRun::Cancelled;
+                }
                 stopped_for_compaction = true;
             }
             None => {}
@@ -2178,6 +2214,96 @@ fn assistant_updates_stream_live_while_the_turn_runs() {
     // The settled final message arrives too (message_end, not just updates).
     let final_len = lengths.last().copied().unwrap_or(0);
     assert!(final_len >= 40 * 3, "final partial is the full text");
+}
+
+/// The wire events one `/compact` produced, in order: the compaction
+/// event pair around the durable rows.
+#[cfg(test)]
+fn compaction_events(events: &[EngineEvent]) -> Vec<serde_json::Value> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            EngineEvent::CompactionStart { event } | EngineEvent::Compaction { event, .. } => {
+                Some(event.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn compact_session_command_emits_the_ts_event_pair_on_a_skip() {
+    let (_engine, events) = run_prompts(
+        serde_json::json!({ "responses": ["unused"] }),
+        &["/compact"],
+    );
+    // The echo row precedes the events (TS `_executeSelectedSessionCommand`
+    // records it before the queue runs the command); a skip records no
+    // result row.
+    let rows = custom_rows(&events);
+    assert_eq!(rows.len(), 1, "echo only, no result row: {rows:?}");
+    assert_eq!(rows[0]["customType"], "session_slash_command");
+    assert_eq!(rows[0]["content"], "/compact");
+    // The event pair: start, then the settled skip warning.
+    let compaction = compaction_events(&events);
+    assert_eq!(compaction.len(), 2, "start + end: {compaction:?}");
+    assert_eq!(
+        compaction[0],
+        serde_json::json!({ "type": "compaction_start", "reason": "manual" })
+    );
+    assert_eq!(
+        compaction[1],
+        serde_json::json!({
+            "type": "compaction_end",
+            "reason": "manual",
+            "aborted": false,
+            "willRetry": false,
+            "errorMessage": "Session is too short to compact \u{2014} try again once it grows",
+            "errorSeverity": "warning",
+        })
+    );
+    assert_eq!(events.last(), Some(&EngineEvent::Done(Ok(()))));
+}
+
+#[test]
+fn compact_session_command_emits_the_result_on_success() {
+    // Two big turns (each ~12k tokens by the chars/4 estimate) push the
+    // history past the keep-recent budget: the cut keeps the last turn,
+    // the summarizer (the third queued faux response) covers the first.
+    let filler = "history ".repeat(6_000); // ~48k chars = ~12k tokens each
+    let (_engine, events) = run_prompts(
+        serde_json::json!({
+            "responses": [
+                { "text": filler.clone() },
+                { "text": filler.clone() },
+                { "text": "## Summary\nthe session story" },
+            ]
+        }),
+        &["first", "second", "/compact focus on the goal"],
+    );
+    let compaction = compaction_events(&events);
+    assert_eq!(compaction.len(), 2, "{compaction:?}");
+    assert_eq!(
+        compaction[0],
+        serde_json::json!({
+            "type": "compaction_start",
+            "reason": "manual",
+            "customInstructions": "focus on the goal",
+        })
+    );
+    let end = &compaction[1];
+    assert_eq!(end["type"], "compaction_end");
+    assert_eq!(end["reason"], "manual");
+    assert_eq!(end["aborted"], false);
+    assert_eq!(end["customInstructions"], "focus on the goal");
+    let result = end["result"].as_object().expect("the result payload");
+    assert_eq!(result["summary"], "## Summary\nthe session story");
+    assert!(result["tokensBefore"].as_u64().unwrap_or_default() > 0);
+    // The durable rows stay minimal (TS's queued `/compact` catch arm
+    // records no result row): the echo row is the only custom row.
+    let rows = custom_rows(&events);
+    assert_eq!(rows.len(), 1, "the /compact echo only: {rows:?}");
+    assert_eq!(rows[0]["customType"], "session_slash_command");
 }
 
 #[test]

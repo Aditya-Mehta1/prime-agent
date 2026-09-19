@@ -117,13 +117,24 @@ fn parse_script_step(entry: &Value) -> Result<FauxResponseStep, String> {
             StopReason::Stop
         }
     });
-    Ok(FauxResponseStep::Message(faux_assistant_message(
+    // Optional harness pacing: `delayMs` holds the stream closed before
+    // the first delta (verification harness only).
+    let delay_ms = entry
+        .get("delayMs")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let message = faux_assistant_message(
         content,
         FauxAssistantMessageOptions {
             stop_reason: Some(stop_reason),
             ..Default::default()
         },
-    )))
+    );
+    Ok(if delay_ms > 0 {
+        FauxResponseStep::Delayed { message, delay_ms }
+    } else {
+        FauxResponseStep::Message(message)
+    })
 }
 
 /// Parse one scripted content block (thinking, text, or tool call).

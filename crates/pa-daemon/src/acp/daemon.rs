@@ -316,6 +316,17 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
         // must reach the daemon while it is in flight. The state machine
         // (one hosted session, one in-flight close) keeps the concurrency
         // bounded.
+        // Frame-order admission for `session/prompt` (TS ordering parity):
+        // the spawned handlers race each other, but TS runs a request's
+        // synchronous prefix before the next frame's handler. A
+        // `session/cancel` that arrives after the prompt must win, so the
+        // prompt's cancel-flag reset happens here, in read order, instead
+        // of inside the spawned prompt task.
+        if matches!(&incoming, Incoming::Request { method, .. } if method == "session/prompt") {
+            if let Some(hosted) = state.lock().await.session.as_mut() {
+                hosted.cancel_requested = false;
+            }
+        }
         let link = Arc::clone(&link);
         let state = Arc::clone(&state);
         let options = options.clone();
@@ -637,10 +648,12 @@ async fn handle_session_prompt(
             Some(hosted) if hosted.acp_session_id == params.session_id => {
                 // TS `entry.cancelling`: a prompt admitted while a cancel
                 // is in flight is dropped by the cancel and answers the
-                // protocol stop reason instead of running a turn. Clearing
-                // the flag here instead would lose the cancel (the
-                // notification handler may have run first); taking it
-                // settles the cancel so the next prompt runs normally.
+                // protocol stop reason instead of running a turn. Taking
+                // the flag (not clearing it) settles the cancel so the
+                // next prompt runs normally. The reader loop already reset
+                // the flag in frame order when it admitted this prompt, so
+                // this only fires for a cancel that arrived between the
+                // prompt frame's admission and this task starting.
                 if std::mem::take(&mut hosted.cancel_requested) {
                     let _ = tx.send(jsonrpc::response(
                         id,

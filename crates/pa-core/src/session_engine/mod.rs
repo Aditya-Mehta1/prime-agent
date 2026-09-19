@@ -85,6 +85,11 @@ pub struct AgentSession {
     /// The first-turn digest rides the turn's admission (fresh sessions defer
     /// delivery so untouched sessions stay empty, TS `_harnessDigestPending`).
     digest_pending: std::sync::atomic::AtomicBool,
+    /// Compaction settings from the session's settings.json (TS
+    /// `_performCompaction` reads `getCompactionSettings()` on every
+    /// compaction path, `/compact` included); defaults until the engine
+    /// wiring resolves them.
+    compaction: compaction::CompactionSettings,
 }
 
 impl AgentSession {
@@ -129,9 +134,18 @@ impl AgentSession {
             slash_commands: SlashCommandRegistry::builtin(),
             harness_digest,
             digest_pending: std::sync::atomic::AtomicBool::new(false),
+            compaction: compaction::CompactionSettings::default(),
         };
         this.ensure_harness_digest_context().await?;
         Ok(this)
+    }
+
+    /// Override the compaction settings from the session's resolved
+    /// settings (TS `getCompactionSettings`); the engine wiring calls this
+    /// so `/compact` honors `compaction.keepRecentTokens`/`reserveTokens`
+    /// like the TS product instead of the defaults.
+    pub fn set_compaction_settings(&mut self, settings: compaction::CompactionSettings) {
+        self.compaction = settings;
     }
 
     /// Execute `/compact`: summarize the pre-cut prefix, persist the
@@ -152,7 +166,7 @@ impl AgentSession {
                     model: model.clone(),
                     api_key,
                     custom_instructions,
-                    settings: crate::session_engine::compaction::CompactionSettings::default(),
+                    settings: self.compaction,
                 },
             )
             .await?

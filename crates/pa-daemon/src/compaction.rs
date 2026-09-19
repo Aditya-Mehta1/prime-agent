@@ -25,6 +25,7 @@ pub(crate) struct CompactionManager {
     events: Arc<EventPump>,
     core: Arc<Mutex<SessionCore>>,
     active_session_id: String,
+    agent_dir: std::path::PathBuf,
     abort: Mutex<Option<Arc<AbortController>>>,
 }
 
@@ -34,12 +35,14 @@ impl CompactionManager {
         events: Arc<EventPump>,
         core: Arc<Mutex<SessionCore>>,
         active_session_id: String,
+        agent_dir: std::path::PathBuf,
     ) -> Self {
         CompactionManager {
             engine,
             events,
             core,
             active_session_id,
+            agent_dir,
             abort: Mutex::new(None),
         }
     }
@@ -162,6 +165,7 @@ impl CompactionManager {
             .unwrap_or_default()
             .to_string();
         let mut core = self.core.lock().unwrap();
+        let cwd = core.cwd.clone();
         let Some(store) = core.store.as_mut() else {
             return;
         };
@@ -173,7 +177,22 @@ impl CompactionManager {
                 .map(|entry| entry.id.clone())
                 .unwrap_or_default()
         } else {
-            first_kept_entry_id
+            // The engine's id references its in-memory entry list, a
+            // separate id space from the session file: re-pin the boundary
+            // to the durable cut so the file read retains the kept tail
+            // (TS: one store, ids match by construction). An unreadable
+            // durable cut keeps the engine id rather than dropping the
+            // boundary entirely.
+            let keep_recent = pa_core::settings::SettingsManager::create(&cwd, &self.agent_dir)
+                .settings()
+                .compaction
+                .clone()
+                .unwrap_or_default()
+                .keep_recent_tokens
+                .unwrap_or(pa_core::session_engine::compaction::DEFAULT_KEEP_RECENT_TOKENS);
+            store
+                .durable_first_kept_entry_id(keep_recent)
+                .unwrap_or(first_kept_entry_id)
         };
         let mut fields = json!({
             "summary": result.get("summary").cloned().unwrap_or_default(),
@@ -217,9 +236,42 @@ impl CompactionManager {
     }
 }
 
-/// The `compaction_start` event payload (TS `AgentSessionEvent`).
-fn compaction_start_event(custom_instructions: Option<&str>) -> Value {
+/// The `compaction_start` event payload (TS `AgentSessionEvent`). Shared by
+/// every compaction surface: the `compact` RPC and the `/compact` session
+/// command both emit the same shape.
+pub(crate) fn compaction_start_event(custom_instructions: Option<&str>) -> Value {
     let mut event = json!({ "type": "compaction_start", "reason": "manual" });
+    if let Some(custom_instructions) = custom_instructions {
+        event["customInstructions"] = json!(custom_instructions);
+    }
+    event
+}
+
+/// The `compaction_end` event payload (TS `AgentSessionEvent`) from the
+/// outcome fields: success carries `result`; a skip or failure carries its
+/// `errorMessage` with the matching severity; an abort carries `aborted`.
+/// `reason` is the TS `CompactionOutcomeReason` (`manual` for user-initiated
+/// runs, `requested` for model-requested boundary compactions).
+pub(crate) fn compaction_end_payload(
+    reason: &str,
+    result: Option<&Value>,
+    aborted: bool,
+    error_message: Option<&str>,
+    error_severity: Option<&str>,
+    custom_instructions: Option<&str>,
+) -> Value {
+    let mut event = json!({ "type": "compaction_end", "reason": reason });
+    if let Some(result) = result {
+        event["result"] = result.clone();
+    }
+    event["aborted"] = json!(aborted);
+    if let Some(error_message) = error_message {
+        event["errorMessage"] = json!(error_message);
+    }
+    if let Some(error_severity) = error_severity {
+        event["errorSeverity"] = json!(error_severity);
+    }
+    event["willRetry"] = json!(false);
     if let Some(custom_instructions) = custom_instructions {
         event["customInstructions"] = json!(custom_instructions);
     }
@@ -231,32 +283,40 @@ fn compaction_start_event(custom_instructions: Option<&str>) -> Value {
 /// severity; a failure carries `Compaction failed: <message>` with error
 /// severity; an abort carries `aborted` with error severity and no message.
 fn compaction_end_event(outcome: &CompactionOutcome, custom_instructions: Option<&str>) -> Value {
-    let mut event = json!({ "type": "compaction_end", "reason": "manual" });
     match outcome {
-        CompactionOutcome::Compacted { run } => {
-            event["result"] = run.result.clone();
-            event["aborted"] = json!(false);
-        }
-        CompactionOutcome::Skipped { message } => {
-            event["aborted"] = json!(false);
-            event["errorMessage"] = json!(message);
-            event["errorSeverity"] = json!("warning");
-        }
-        CompactionOutcome::Failed { error } => {
-            event["aborted"] = json!(false);
-            event["errorMessage"] = json!(format!("Compaction failed: {error}"));
-            event["errorSeverity"] = json!("error");
-        }
-        CompactionOutcome::Aborted => {
-            event["aborted"] = json!(true);
-            event["errorSeverity"] = json!("error");
-        }
+        CompactionOutcome::Compacted { run } => compaction_end_payload(
+            "manual",
+            Some(&run.result),
+            false,
+            None,
+            None,
+            custom_instructions,
+        ),
+        CompactionOutcome::Skipped { message } => compaction_end_payload(
+            "manual",
+            None,
+            false,
+            Some(message),
+            Some("warning"),
+            custom_instructions,
+        ),
+        CompactionOutcome::Failed { error } => compaction_end_payload(
+            "manual",
+            None,
+            false,
+            Some(&format!("Compaction failed: {error}")),
+            Some("error"),
+            custom_instructions,
+        ),
+        CompactionOutcome::Aborted => compaction_end_payload(
+            "manual",
+            None,
+            true,
+            None,
+            Some("error"),
+            custom_instructions,
+        ),
     }
-    event["willRetry"] = json!(false);
-    if let Some(custom_instructions) = custom_instructions {
-        event["customInstructions"] = json!(custom_instructions);
-    }
-    event
 }
 
 #[cfg(test)]

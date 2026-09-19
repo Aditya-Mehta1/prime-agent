@@ -131,11 +131,48 @@ fn apply_tool_result(chat: &mut [ChatEntry], result: ToolResultReplay) {
 /// `toolResult` messages onto the pending tool cards their ids refer to.
 /// Card ids are unique, so one id-to-index map replaces the per-result
 /// card scan (a replay-scale fold stays linear).
+/// TS `orderMessagesForTranscript`: the wire context is summary-first for
+/// the model, but the transcript presents the compaction summary at its
+/// chronological boundary — after the retained messages
+/// (`retainedMessageCount`), before anything appended after the
+/// compaction. A missing count falls back to the timestamp split (TS
+/// compatibility for pre-count summaries).
+fn order_messages_for_transcript(messages: &[Value]) -> Vec<&Value> {
+    let Some(summary_index) = messages.iter().position(|message| {
+        message.get("role").and_then(Value::as_str) == Some("compactionSummary")
+    }) else {
+        return messages.iter().collect();
+    };
+    let summary = &messages[summary_index];
+    let mut rest: Vec<&Value> = messages
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != summary_index)
+        .map(|(_, message)| message)
+        .collect();
+    let boundary = match summary.get("retainedMessageCount").and_then(Value::as_u64) {
+        Some(retained) => (retained as usize).min(rest.len()),
+        None => {
+            let summary_timestamp = summary.get("timestamp").and_then(Value::as_f64);
+            let retained = rest
+                .iter()
+                .filter(|message| {
+                    message.get("timestamp").and_then(Value::as_f64) < summary_timestamp
+                })
+                .count();
+            retained.min(rest.len())
+        }
+    };
+    rest.insert(boundary, summary);
+    rest
+}
+
 pub fn transcript_to_entries(messages: &[Value]) -> Vec<ChatEntry> {
+    let ordered = order_messages_for_transcript(messages);
     let mut chat: Vec<ChatEntry> = Vec::new();
     let mut tool_results: Vec<ToolResultReplay> = Vec::new();
     let mut card_index: HashMap<String, usize> = HashMap::new();
-    for message in messages {
+    for message in ordered {
         if let Some(result) = tool_result_message_view(message) {
             tool_results.push(result);
             continue;
@@ -281,6 +318,30 @@ pub enum TurnUpdate {
     },
     /// `agent_end`: the prompt queue drained.
     Idle,
+    /// `compaction_start`: a compaction run began (TS compaction loader).
+    CompactionStart {
+        /// Why the compaction runs (`manual`/`requested`/`overflow`/`threshold`).
+        reason: String,
+        /// `/compact <instructions>` focus guidance.
+        custom_instructions: Option<String>,
+    },
+    /// `compaction_end`: the compaction settled. Success carries the result
+    /// (summary + token counts); skip/failure carries the error message and
+    /// its severity (TS shows those for `manual` runs).
+    CompactionEnd {
+        /// Why the compaction ran.
+        reason: String,
+        /// The TS `CompactionResult` on success.
+        result: Option<Value>,
+        /// `/compact <instructions>` focus guidance (the event payload).
+        custom_instructions: Option<String>,
+        /// `true` when the run was cancelled.
+        aborted: bool,
+        /// The skip/failure message.
+        error_message: Option<String>,
+        /// `warning` or `error`.
+        error_severity: Option<String>,
+    },
     /// `goal_update`: the session goal state changed (raw wire `goal`
     /// payload; the session view owns announcement and tray rendering).
     GoalUpdate(Value),
@@ -291,6 +352,44 @@ pub enum TurnUpdate {
 /// Decode the `event` payload of a `session_event` frame.
 pub fn event_to_update(event: &Value) -> Option<TurnUpdate> {
     match event.get("type").and_then(Value::as_str)? {
+        "compaction_start" => Some(TurnUpdate::CompactionStart {
+            reason: event
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("manual")
+                .to_string(),
+            custom_instructions: event
+                .get("customInstructions")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }),
+        "compaction_end" => Some(TurnUpdate::CompactionEnd {
+            reason: event
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("manual")
+                .to_string(),
+            result: event
+                .get("result")
+                .cloned()
+                .filter(|value| !value.is_null()),
+            custom_instructions: event
+                .get("customInstructions")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            aborted: event
+                .get("aborted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            error_message: event
+                .get("errorMessage")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            error_severity: event
+                .get("errorSeverity")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }),
         "agent_start" | "turn_start" => Some(TurnUpdate::TurnStarted),
         "turn_end" => Some(TurnUpdate::TurnEnded {
             error: event
@@ -458,10 +557,33 @@ pub fn message_value_to_entries(message: &Value) -> Vec<ChatEntry> {
         }],
         "assistant" => assistant_value_to_entries(message),
         "custom" => custom_message_entries(message),
+        "compactionSummary" => compaction_summary_entries(message),
         // Other roles (tool results, bookkeeping) have no rendering here:
         // live tool results arrive as tool_execution events instead.
         _ => Vec::new(),
     }
+}
+
+/// The compaction summary row (TS `CompactionSummaryMessageComponent`) from
+/// its wire message: `summary`, `tokensBefore`, and the optional
+/// `customInstructions` that focused it.
+fn compaction_summary_entries(message: &Value) -> Vec<ChatEntry> {
+    let summary = message
+        .get("summary")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    vec![ChatEntry::CompactionSummary {
+        summary,
+        tokens_before: message
+            .get("tokensBefore")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        custom_instructions: message
+            .get("customInstructions")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }]
 }
 
 /// Fold one streamed tool call into the live transcript (TS
@@ -700,6 +822,7 @@ fn content_to_text(content: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat::StatusKind;
     use serde_json::json;
 
     fn test_view() -> crate::view::AgentView {
@@ -733,6 +856,44 @@ mod tests {
     /// on that frame — the named frame routes it to the ipython renderer and
     /// the collapsed line shows the code preview, not the raw arguments
     /// JSON.
+    /// TS `orderMessagesForTranscript`: the wire context is summary-first
+    /// for the model, but the transcript presents the summary at its
+    /// chronological boundary — after the retained messages
+    /// (`retainedMessageCount`), before anything appended after the
+    /// compaction.
+    #[test]
+    fn transcript_presents_the_summary_after_the_retained_tail() {
+        let messages = vec![
+            json!({
+                "role": "compactionSummary", "summary": "the story",
+                "retainedMessageCount": 2, "tokensBefore": 12, "timestamp": 30u64
+            }),
+            json!({"role": "user", "content": "second turn", "timestamp": 20u64}),
+            json!({"role": "assistant", "content": "kept intact", "timestamp": 25u64}),
+            json!({
+                "role": "custom", "customType": "session_slash_command",
+                "content": "/compact focus on the goal", "display": true, "timestamp": 40u64,
+                "details": { "command": {
+                    "name": "compact",
+                    "args": "focus on the goal",
+                    "text": "/compact focus on the goal"
+                } }
+            }),
+        ];
+        let entries = transcript_to_entries(&messages);
+        let order: Vec<String> = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ChatEntry::User { .. } => Some("user".to_string()),
+                ChatEntry::Assistant { .. } => Some("assistant".to_string()),
+                ChatEntry::CompactionSummary { .. } => Some("summary".to_string()),
+                ChatEntry::SlashCommand { .. } => Some("slash".to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, ["user", "assistant", "summary", "slash"]);
+    }
+
     #[test]
     fn unnamed_streamed_tool_call_renders_code_once_named() {
         let mut view = test_view();
@@ -1299,6 +1460,145 @@ mod tests {
         assert!(message.blocks.is_empty());
         assert_eq!(message.error.as_deref(), Some("Operation aborted"));
         assert!(message.aborted);
+    }
+
+    #[test]
+    fn decodes_compaction_events() {
+        // The start pair (TS `AgentSession.compact` event).
+        assert_eq!(
+            event_to_update(&json!({
+                "type": "compaction_start",
+                "reason": "manual",
+                "customInstructions": "focus on the goal",
+            })),
+            Some(TurnUpdate::CompactionStart {
+                reason: "manual".to_string(),
+                custom_instructions: Some("focus on the goal".to_string()),
+            })
+        );
+        assert_eq!(
+            event_to_update(&json!({ "type": "compaction_start", "reason": "manual" })),
+            Some(TurnUpdate::CompactionStart {
+                reason: "manual".to_string(),
+                custom_instructions: None,
+            })
+        );
+        // Success carries the client-facing result.
+        assert_eq!(
+            event_to_update(&json!({
+                "type": "compaction_end",
+                "reason": "manual",
+                "result": { "summary": "s", "firstKeptEntryId": "e1", "tokensBefore": 12 },
+                "aborted": false,
+                "willRetry": false,
+                "customInstructions": "focus",
+            })),
+            Some(TurnUpdate::CompactionEnd {
+                reason: "manual".to_string(),
+                result: Some(
+                    json!({ "summary": "s", "firstKeptEntryId": "e1", "tokensBefore": 12 })
+                ),
+                custom_instructions: Some("focus".to_string()),
+                aborted: false,
+                error_message: None,
+                error_severity: None,
+            })
+        );
+        // A skip carries the warning message; the result stays absent.
+        assert_eq!(
+            event_to_update(&json!({
+                "type": "compaction_end",
+                "reason": "manual",
+                "aborted": false,
+                "willRetry": false,
+                "errorMessage": "Session is too short to compact",
+                "errorSeverity": "warning",
+            })),
+            Some(TurnUpdate::CompactionEnd {
+                reason: "manual".to_string(),
+                result: None,
+                custom_instructions: None,
+                aborted: false,
+                error_message: Some("Session is too short to compact".to_string()),
+                error_severity: Some("warning".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn transcript_replay_renders_the_compaction_outcome_row() {
+        // A skipped auto-compaction warns (TS `CompactionOutcomeMessageComponent`).
+        let items = message_value_to_entries(&json!({
+            "role": "custom",
+            "customType": "compaction_outcome",
+            "content": "Auto-compaction skipped: not enough context",
+            "display": true,
+            "details": { "reason": "threshold", "outcome": "skipped" },
+        }));
+        assert_eq!(
+            items,
+            vec![ChatEntry::Status {
+                text: "Auto-compaction skipped: not enough context".to_string(),
+                kind: StatusKind::Warning,
+            }]
+        );
+        // A failed overflow recovery errors.
+        let items = message_value_to_entries(&json!({
+            "role": "custom",
+            "customType": "compaction_outcome",
+            "content": "Context overflow recovery failed: boom",
+            "display": true,
+            "details": { "reason": "overflow", "outcome": "failed" },
+        }));
+        assert!(matches!(
+            &items[0],
+            ChatEntry::Status { kind: StatusKind::Error, text }
+                if text == "Context overflow recovery failed: boom"
+        ));
+        // An envelope TS `isCompactionOutcomeMessage` rejects renders the
+        // malformed notice (invalid reason and outcome both).
+        for details in [
+            json!({ "reason": "manual", "outcome": "skipped" }),
+            json!({ "reason": "threshold", "outcome": "compacted" }),
+            json!({}),
+        ] {
+            let items = message_value_to_entries(&json!({
+                "role": "custom",
+                "customType": "compaction_outcome",
+                "content": "text",
+                "display": true,
+                "details": details,
+            }));
+            assert_eq!(
+                items,
+                vec![ChatEntry::Status {
+                    text: "[Malformed compaction outcome message]".to_string(),
+                    kind: StatusKind::Error,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_replay_renders_the_compaction_summary() {
+        // The attach snapshot's `role: "compactionSummary"` message (the
+        // session store's fold) renders the summary row with its fields.
+        let items = message_value_to_entries(&json!({
+            "role": "compactionSummary",
+            "summary": "the story so far",
+            "tokensBefore": 1234,
+            "retainedMessageCount": 2,
+            "customInstructions": "tests",
+            "timestamp": 1,
+        }));
+        assert_eq!(items.len(), 1);
+        assert!(matches!(
+            &items[0],
+            ChatEntry::CompactionSummary { summary, tokens_before, custom_instructions }
+            if summary == "the story so far"
+                && *tokens_before == 1234
+                && custom_instructions.as_deref() == Some("tests")
+        ));
     }
 
     /// A settled content-less assistant message renders nothing (TS: the

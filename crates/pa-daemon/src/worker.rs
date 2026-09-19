@@ -569,6 +569,7 @@ impl Worker {
             events.clone(),
             Arc::clone(&core),
             config.active_session_id.clone(),
+            config.agent_dir.clone(),
         );
         // The session-scoped ACP MCP manager: auth storage construction is
         // blocking, so the builder runs off the async runtime (the same
@@ -2308,6 +2309,20 @@ impl Worker {
     }
 }
 
+/// The compaction cut budget the engine ran with
+/// (`compaction.keepRecentTokens` from settings, TS default 20k): the
+/// durable boundary re-cut in the turn callback must walk with the same
+/// budget to pin the same cut.
+fn keep_recent_tokens(cwd: &str, agent_dir: &std::path::Path) -> u64 {
+    pa_core::settings::SettingsManager::create(cwd, agent_dir)
+        .settings()
+        .compaction
+        .clone()
+        .unwrap_or_default()
+        .keep_recent_tokens
+        .unwrap_or(pa_core::session_engine::compaction::DEFAULT_KEEP_RECENT_TOKENS)
+}
+
 fn active_session_id_of(payload: &[u8]) -> String {
     serde_json::from_slice::<Value>(payload)
         .ok()
@@ -2565,16 +2580,42 @@ impl TurnRunner {
         let core = Arc::clone(&self.core);
         let events = self.events.clone();
         let turn_coalescer = Arc::clone(&coalescer);
+        let agent_dir = crate::paths::agent_dir().unwrap_or_default();
         let done = item.done;
         let turn = tokio::task::spawn_blocking(move || {
             let mut done = done;
-            let mut emit = |event: EngineEvent| -> bool {
+            let mut emit = |mut event: EngineEvent| -> bool {
                 // Sequence + persist under the core lock, then broadcast.
                 // The abort flag lives on the session core (`abort` command):
                 // a cancelled turn stops consuming its own events.
                 let mut core = core.lock().unwrap();
                 if core.abort_requested {
                     return false;
+                }
+                // The engine cuts its in-memory entries; its
+                // `firstKeptEntryId` never matches this store's file ids,
+                // so a verbatim copy retains nothing on the durable read.
+                // Re-pin the boundary to the durable cut (TS: one store,
+                // ids match by construction) before persist + broadcast.
+                if let EngineEvent::Compaction {
+                    ref mut entry,
+                    event: ref mut payload,
+                } = event
+                {
+                    if !entry.is_null() {
+                        if let Some(id) = core.store.as_ref().and_then(|store| {
+                            store.durable_first_kept_entry_id(keep_recent_tokens(
+                                &core.cwd, &agent_dir,
+                            ))
+                        }) {
+                            entry["firstKeptEntryId"] = json!(id);
+                            if let Some(result) =
+                                payload.get_mut("result").and_then(Value::as_object_mut)
+                            {
+                                result.insert("firstKeptEntryId".to_string(), json!(id));
+                            }
+                        }
+                    }
                 }
                 match &event {
                     EngineEvent::UserMessage(message) | EngineEvent::AssistantMessage(message) => {
@@ -2692,11 +2733,8 @@ impl TurnRunner {
                         json!({ "type": "message_start", "message": message }),
                         json!({ "type": "message_end", "message": message }),
                     ],
-                    EngineEvent::Compaction { result, .. } => vec![json!({
-                        "type": "compaction_end",
-                        "reason": "manual",
-                        "result": result,
-                    })],
+                    EngineEvent::CompactionStart { event } => vec![event.clone()],
+                    EngineEvent::Compaction { event, .. } => vec![event.clone()],
                     EngineEvent::GoalUpdate { goal } => vec![json!({
                         "type": "goal_update",
                         "goal": goal,

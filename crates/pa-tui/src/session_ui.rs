@@ -10,7 +10,10 @@ use pa_types::daemon::DaemonCommand;
 use pa_types::slash_commands::{SlashCommandExecution, SlashCommandRegistry};
 use serde_json::Value;
 
-use crate::chat::{ChatEntry, MessageBlock, RetryState, StatusKind, ToolResultView, WorkingState};
+use crate::chat::{
+    ChatEntry, CompactionReason, CompactionState, MessageBlock, RetryState, StatusKind,
+    ToolResultView, WorkingState,
+};
 use crate::daemon_client::{DaemonClient, DaemonClientEvent};
 use crate::goal_surface::{format_goal_status, tray_goal_label, GoalView};
 use crate::interactive::{InteractiveOptions, ModelSelection, SessionSelection};
@@ -104,6 +107,9 @@ pub(crate) struct SessionUi {
     /// Notes surfacing from background tasks (the async abort result) into
     /// the UI loop.
     notes: mpsc::UnboundedSender<String>,
+    /// A succeeded compaction replaced the durable transcript (TS
+    /// `rebuildChatFromMessages`): the next loop pass re-fetches it.
+    pub(crate) transcript_stale: bool,
     /// Adoption telemetry (`tui scroll used` / `tui exit`); `None` drops
     /// events.
     pub(crate) telemetry: Option<std::sync::Arc<dyn crate::interactive::InteractionTelemetry>>,
@@ -161,6 +167,7 @@ impl SessionUi {
             ctrl_c_hint_until: None,
             goal_view: GoalView::new(),
             notes,
+            transcript_stale: false,
             telemetry: options.telemetry.clone(),
             scroll_adoption_emitted: false,
             exit_reason: "daemon_closed",
@@ -370,16 +377,18 @@ impl SessionUi {
         else {
             return;
         };
-        if let Some(usage) = data.get("contextUsage") {
-            let tokens = usage.get("tokens").and_then(Value::as_u64);
-            let window = usage.get("contextWindow").and_then(Value::as_u64);
-            if let (Some(tokens), Some(window)) = (tokens, window) {
-                self.context = Some(crate::chrome::ContextUsage {
-                    tokens,
-                    context_window: window,
-                });
-            }
-        }
+        // TS `patchConnectionState` REPLACES the context usage snapshot:
+        // unknown usage (tokens null right after a compaction, or a
+        // response without the field) clears the tray display instead of
+        // keeping the stale one.
+        self.context = data.get("contextUsage").and_then(|usage| {
+            let tokens = usage.get("tokens").and_then(Value::as_u64)?;
+            let window = usage.get("contextWindow").and_then(Value::as_u64)?;
+            Some(crate::chrome::ContextUsage {
+                tokens,
+                context_window: window,
+            })
+        });
         self.cost_usd = data.get("cost").and_then(Value::as_f64);
         self.dirty = true;
     }
@@ -1015,6 +1024,37 @@ impl SessionUi {
         self.note(text, view);
     }
 
+    /// A compaction succeeded and the durable transcript was rebuilt (it
+    /// now starts at the compaction summary): re-fetch it and replace the
+    /// view's chat (TS `rebuildChatFromMessages`). Best effort — a failed
+    /// fetch keeps the pushed outcome row instead of an empty transcript.
+    pub(crate) async fn rebuild_transcript(&mut self, view: &mut AgentView) {
+        self.transcript_stale = false;
+        let Ok(data) = self
+            .bounded_request(
+                Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                DaemonCommand::GetMessages {
+                    id: None,
+                    active_session_id: self.active_session_id.clone(),
+                    rest: Default::default(),
+                },
+            )
+            .await
+        else {
+            return;
+        };
+        let Some(messages) = data.get("messages").and_then(Value::as_array) else {
+            return;
+        };
+        let entries = crate::snapshot::transcript_to_entries(messages);
+        view.clear_chat();
+        for entry in entries {
+            view.push_entry(entry);
+        }
+        view.follow();
+        self.dirty = true;
+    }
+
     /// The `tui exit` reason recorded at the point the loop stopped.
     pub(crate) fn exit_reason(&self) -> &'static str {
         self.exit_reason
@@ -1288,6 +1328,71 @@ impl SessionUi {
                         ),
                         kind: StatusKind::Error,
                     });
+                }
+            }
+            TurnUpdate::CompactionStart {
+                reason,
+                custom_instructions,
+            } => {
+                // TS `startCompactionLoader`: the compaction loader fully
+                // replaces the working loader for the run's duration.
+                view.working = None;
+                view.compaction = Some(CompactionState {
+                    reason: CompactionReason::parse(&reason),
+                    custom_instructions,
+                });
+            }
+            TurnUpdate::CompactionEnd {
+                reason,
+                result,
+                custom_instructions,
+                aborted,
+                error_message,
+                error_severity,
+            } => {
+                view.compaction = None;
+                if let Some(result) = result {
+                    // A succeeded compaction rebuilt the durable transcript
+                    // (it now starts at the compaction summary): show the
+                    // outcome row immediately, then re-fetch the transcript
+                    // so the compacted-away rows drop (TS
+                    // `rebuildChatFromMessages`).
+                    view.push_entry(ChatEntry::CompactionSummary {
+                        summary: result
+                            .get("summary")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        tokens_before: result
+                            .get("tokensBefore")
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default(),
+                        custom_instructions,
+                    });
+                    self.transcript_stale = true;
+                } else if reason == "manual" {
+                    // TS `compaction_end` handling: aborts and error
+                    // messages surface only for user-issued compactions,
+                    // through `showError`/`showWarning` (whose rows carry
+                    // the `⚠ Error: ` / `⚠ ` prefixes).
+                    if aborted {
+                        view.push_entry(ChatEntry::Status {
+                            text: "\u{26a0} Error: Compaction cancelled".to_string(),
+                            kind: StatusKind::Error,
+                        });
+                    } else if let Some(message) = error_message {
+                        if error_severity.as_deref() == Some("warning") {
+                            view.push_entry(ChatEntry::Status {
+                                text: format!("\u{26a0} {message}"),
+                                kind: StatusKind::Warning,
+                            });
+                        } else {
+                            view.push_entry(ChatEntry::Status {
+                                text: format!("\u{26a0} Error: {message}"),
+                                kind: StatusKind::Error,
+                            });
+                        }
+                    }
                 }
             }
             TurnUpdate::Idle => {

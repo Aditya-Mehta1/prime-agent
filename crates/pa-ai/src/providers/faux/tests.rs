@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::event_stream::AssistantMessageEventExt;
-use crate::registry::{get_api_provider, reset_api_providers};
+use crate::registry::get_api_provider;
 use crate::stream::{complete, stream};
 use crate::types::{ErrorStopReason, Tool, UserMessage, UserOrToolContent};
 
@@ -1004,7 +1004,10 @@ async fn supports_aborting_mid_toolcall_stream_when_paced() {
 
 #[tokio::test]
 async fn unregisters_the_provider() {
-    reset_api_providers();
+    // No registry reset here: clearing the process-wide registry races with
+    // the other faux tests' registrations. The registration's api id is
+    // unique (`random_id`) and `unregister` removes by source id, so the
+    // lookup below is deterministic without nuking parallel tests.
     let registration = register();
     registration.set_responses(vec![text_msg("hello")]);
     let api = registration.api.clone();

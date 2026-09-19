@@ -510,13 +510,25 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
 
     let agent = Arc::new(agent);
     let telemetry_agent = std::sync::Arc::clone(&agent);
-    let session = AgentSession::from_session_arc(
+    let mut session = AgentSession::from_session_arc(
         agent.clone(),
         wiring.session.clone(),
         resources.prompts.clone(),
         Some(digest_context),
     )
     .await?;
+    // Every compaction path reads the session's resolved compaction
+    // settings (TS `getCompactionSettings`): `/compact` matches the
+    // `compact.*` turn-boundary tool's `keepRecentTokens`/`reserveTokens`.
+    session.set_compaction_settings(crate::session_engine::compaction::CompactionSettings {
+        enabled: compaction_settings.enabled.unwrap_or(true),
+        reserve_tokens: compaction_settings
+            .reserve_tokens
+            .unwrap_or(crate::session_engine::compaction::DEFAULT_RESERVE_TOKENS),
+        keep_recent_tokens: compaction_settings
+            .keep_recent_tokens
+            .unwrap_or(crate::session_engine::compaction::DEFAULT_KEEP_RECENT_TOKENS),
+    });
 
     // Bind the turn-boundary runtime the `compact.*`/`refine.*` handlers
     // probe (turn-active state, usage estimate, compaction preparation).

@@ -76,9 +76,15 @@ pub enum EngineEvent {
     /// `message_start` + `message_end` pair, matching the TS session's
     /// `_emit` for custom rows.
     CustomMessage(Value),
-    /// A compaction ran: `entry` is the `compaction` record to persist,
-    /// `result` the client-facing compaction result (TS `compaction_end`).
-    Compaction { entry: Value, result: Value },
+    /// A compaction run started (TS `compaction_start` wire event); the
+    /// payload is the complete event. Emitted before the summarizer runs so
+    /// attached clients can swap their loader to the compaction label.
+    CompactionStart { event: Value },
+    /// A compaction settled (TS `compaction_end` wire event): `entry` is the
+    /// `compaction` record to persist (null when the run skipped or
+    /// failed), `event` the complete client-facing event (result on
+    /// success, errorMessage with its severity otherwise).
+    Compaction { entry: Value, event: Value },
     /// The prompt completed (successfully or not).
     Done(std::result::Result<(), String>),
     /// `goal_update`: the session goal state changed (TS wire event; the

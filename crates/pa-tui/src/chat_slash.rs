@@ -17,10 +17,17 @@ fn content_width(width: usize) -> usize {
 }
 
 /// One block row: 2-col padding, spans, padded to the full width on the
-/// block background.
+/// block background. Every content span carries that background: the TS
+/// `Box` paints it over the whole row, so a fg-only styled token must not
+/// open a transparent gap in the block.
 fn block_row(spans: Line, bg: Style, width: usize) -> Line {
     let mut row: Line = vec![Span::styled("  ".to_string(), bg)];
-    row.extend(spans);
+    for mut span in spans {
+        if let Some(color) = bg.bg {
+            span.style = span.style.bg(color);
+        }
+        row.push(span);
+    }
     let used: usize = row.iter().map(|s| str_width(&s.content)).sum();
     row.push(Span::styled(" ".repeat(width.saturating_sub(used)), bg));
     row

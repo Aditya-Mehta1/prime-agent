@@ -16,7 +16,7 @@ pub(crate) mod manager;
 pub(crate) mod patterns;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::path::PathBuf;
 

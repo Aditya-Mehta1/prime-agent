@@ -727,6 +727,9 @@ mod tests {
                 },
                 "onboard-naked": {
                     "baseUrl": "https://naked.test",
+                    // Present (custom models require "apiKey", same as TS)
+                    // but the `!command` resolves to no credential, so the
+                    // provider stays unauthorized.
                     "apiKey": "!exit 1",
                     "api": "openai-completions",
                     "models": [ { "id": "m2", "name": "M2" } ]

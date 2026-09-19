@@ -614,6 +614,232 @@ async fn tui_dispatches_slash_commands_menu_and_suggestions() {
     drop(supervisor);
 }
 
+/// `/compact` on a fresh session: the compaction skips (TS
+/// `CompactionSkippedError`) and the warning reaches the transcript through
+/// the `compaction_end` event, with the durable echo row — TS's live
+/// `showWarning` on the manual compaction path.
+#[tokio::test]
+async fn tui_compact_on_a_short_session_warns_nothing_to_compact() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let session_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let supervisor = spawn_supervisor(dir.path());
+
+    // The real agent engine over the scripted faux provider: the skip path
+    // never reaches the provider, so the script stays unused.
+    let script = serde_json::json!({ "engine": "faux", "responses": [] });
+    std::fs::write(dir.path().join("script.json"), script.to_string()).expect("write script");
+    let options = pa_tui::interactive::InteractiveOptions {
+        socket_path: supervisor.socket.clone(),
+        cwd: dir.path().to_path_buf(),
+        session_dir: Some(session_dir.clone()),
+        script_path: Some(dir.path().join("script.json")),
+        model_selection: Default::default(),
+        model_catalog: Vec::new(),
+        no_session: false,
+        session: pa_tui::interactive::SessionSelection::New,
+        initial_message: None,
+        theme: "prime".to_string(),
+        code_block_indent: "  ".to_string(),
+        version: "0.0.0".to_string(),
+        onboarding: None,
+        telemetry_disabled: None,
+        client_auth: None,
+        telemetry: None,
+    };
+    let plan = pa_tui::interactive::HeadlessPlan {
+        steps: vec![
+            pa_tui::interactive::HeadlessStep::Submit("/compact".to_string()),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+        ],
+        width: 100,
+        height: 30,
+    };
+    let outcome =
+        pa_tui::interactive::run_interactive(options, pa_tui::interactive::UiMode::Headless(plan))
+            .await
+            .expect("interactive run");
+    // Verification seam: dump the captured frames for manual frame-diffing
+    // against the TS product (PA_TUI_DUMP_FRAMES=<dir>).
+    if let Ok(dump) = std::env::var("PA_TUI_DUMP_FRAMES") {
+        for (index, frame) in outcome.frames.iter().enumerate() {
+            let _ = std::fs::write(
+                std::path::Path::new(&dump).join(format!("skip-frame-{index:03}.txt")),
+                frame,
+            );
+        }
+    }
+    let rendered = outcome.frames.join("\n");
+    assert!(
+        rendered.contains("/compact"),
+        "the session-command echo row rendered:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Session is too short to compact"),
+        "the skip warning rendered (TS compaction_end errorMessage):\n{rendered}"
+    );
+    // The skip records no durable result row (TS's queued-command catch arm
+    // stays silent): only the echo row persisted.
+    let mut saw_compaction_entry = false;
+    let mut saw_result_row = false;
+    for entry in std::fs::read_dir(&session_dir)
+        .expect("read session dir")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        saw_compaction_entry |= content.contains("\"type\":\"compaction\"");
+        saw_result_row |= content.contains("\"session_slash_command_result\"");
+    }
+    assert!(
+        !saw_compaction_entry,
+        "a skipped compaction persisted no compaction entry"
+    );
+    assert!(
+        !saw_result_row,
+        "a skipped compaction persisted no result row"
+    );
+    drop(supervisor);
+}
+
+/// `/compact` on a grown session: the compaction loader replaces the working
+/// loader while the summarizer runs (TS `startCompactionLoader`), then the
+/// summary row renders (TS `CompactionSummaryMessageComponent`) at the head
+/// of the rebuilt transcript (TS `rebuildChatFromMessages`).
+#[tokio::test]
+async fn tui_compact_shows_the_loader_then_the_summary_and_rebuilds() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let session_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    // TS `getCompactionSettings` feeds every compaction path, `/compact`
+    // included: the settings-pinned cut budget keeps this run small while
+    // exercising the same keep-recent cut the default budget drives.
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        serde_json::json!({ "compaction": { "keepRecentTokens": 100 } }).to_string(),
+    )
+    .expect("write settings");
+    let supervisor = spawn_supervisor(dir.path());
+
+    // Two ~300-token turns push the history past the pinned keep-recent
+    // budget: the cut keeps the last turn, and the third scripted response
+    // is the summarizer's summary. Its delay holds the compaction in flight
+    // long enough for the loader to paint frames.
+    let filler = "history ".repeat(150);
+    let script = serde_json::json!({
+        "engine": "faux",
+        "responses": [
+            { "text": filler, "delayMs": 20 },
+            { "text": filler },
+            { "text": "## Summary\nthe session story", "delayMs": 300 },
+        ],
+    });
+    std::fs::write(dir.path().join("script.json"), script.to_string()).expect("write script");
+    let options = pa_tui::interactive::InteractiveOptions {
+        socket_path: supervisor.socket.clone(),
+        cwd: dir.path().to_path_buf(),
+        session_dir: Some(session_dir.clone()),
+        script_path: Some(dir.path().join("script.json")),
+        model_selection: Default::default(),
+        model_catalog: Vec::new(),
+        no_session: false,
+        session: pa_tui::interactive::SessionSelection::New,
+        initial_message: None,
+        theme: "prime".to_string(),
+        code_block_indent: "  ".to_string(),
+        version: "0.0.0".to_string(),
+        onboarding: None,
+        telemetry_disabled: None,
+        client_auth: None,
+        telemetry: None,
+    };
+    let plan = pa_tui::interactive::HeadlessPlan {
+        steps: vec![
+            pa_tui::interactive::HeadlessStep::Submit("first".to_string()),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+            pa_tui::interactive::HeadlessStep::Submit(
+                "second, and please keep this second parity turn short and intact".to_string(),
+            ),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+            pa_tui::interactive::HeadlessStep::Submit("/compact focus on the goal".to_string()),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+        ],
+        width: 100,
+        height: 30,
+    };
+    let outcome =
+        pa_tui::interactive::run_interactive(options, pa_tui::interactive::UiMode::Headless(plan))
+            .await
+            .expect("interactive run");
+
+    // Verification seam: dump the captured frames for manual frame-diffing
+    // against the TS product (PA_TUI_DUMP_FRAMES=<dir>).
+    if let Ok(dump) = std::env::var("PA_TUI_DUMP_FRAMES") {
+        for (index, frame) in outcome.frames.iter().enumerate() {
+            let _ = std::fs::write(
+                std::path::Path::new(&dump).join(format!("compact-frame-{index:03}.txt")),
+                frame,
+            );
+        }
+    }
+    let rendered = outcome.frames.join("\n");
+    // The loader: TS `Compacting context (focus: ...)... (Ctrl+C to cancel)`.
+    assert!(
+        rendered.contains("Compacting context (focus: focus on the goal)... (Ctrl+C to cancel)"),
+        "the compaction loader rendered with the focus and cancel hint:\n{rendered}"
+    );
+    // The summary row: the TS header plus the collapsed summary.
+    assert!(
+        rendered.contains("\u{25c6} Context compacted"),
+        "the compaction summary header rendered:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("the session story"),
+        "the summary text rendered:\n{rendered}"
+    );
+    // The rebuilt transcript presents the retained tail first, then the
+    // summary (TS `orderMessagesForTranscript`): the settled bottom-follow
+    // frame shows the retained second turn above the summary row, and the
+    // compacted-away first turn is gone.
+    let last = outcome.frames.last().expect("the settled frame");
+    assert!(
+        last.contains("history history"),
+        "the retained second turn heads the rebuilt transcript:\n{last}"
+    );
+    assert!(
+        last.contains("\u{25c6} Context compacted"),
+        "the summary row follows the retained tail:\n{last}"
+    );
+    assert!(
+        !last.contains("first"),
+        "the compacted-away first turn dropped from the rebuilt transcript:\n{last}"
+    );
+
+    // The compaction entry persisted (the durable `compaction` record).
+    let mut saw_compaction_entry = false;
+    for entry in std::fs::read_dir(&session_dir)
+        .expect("read session dir")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        saw_compaction_entry |= content.contains("\"type\":\"compaction\"");
+    }
+    assert!(
+        saw_compaction_entry,
+        "the compaction entry persisted to the session file"
+    );
+    drop(supervisor);
+}
+
 /// Streaming-throughput verifier: two big (~12k-token) unpaced faux turns
 /// must render at the producer's rate, not at a fixed frame-rate ceiling.
 /// The worker coalesces provider deltas into latest-snapshot frames (at
