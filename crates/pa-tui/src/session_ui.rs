@@ -106,6 +106,9 @@ pub(crate) struct SessionUi {
     scroll_adoption_emitted: bool,
     /// How the client run ended (the `tui exit` reason).
     pub(crate) exit_reason: &'static str,
+    /// The double-Ctrl+C force-quit guard (the run's shared instance is
+    /// installed by the interactive loop after `open`).
+    pub(crate) exit_guard: crate::exit_guard::ExitGuard,
 }
 
 impl SessionUi {
@@ -155,6 +158,7 @@ impl SessionUi {
             telemetry: options.telemetry.clone(),
             scroll_adoption_emitted: false,
             exit_reason: "daemon_closed",
+            exit_guard: crate::exit_guard::ExitGuard::new(),
         };
         session
             .attach_session(&active_session_id)
@@ -804,6 +808,12 @@ impl SessionUi {
         let Some(id) = key_event_to_id(&key) else {
             return Ok(());
         };
+        // The picker consumes Ctrl+C (close, not exit): report the handled
+        // press so the force-quit guard can disarm once the whole pair was
+        // consumed with TS semantics.
+        if id == "ctrl+c" {
+            self.exit_guard.note_ctrl_c_handled();
+        }
         let action = view
             .model_picker
             .as_mut()
@@ -896,6 +906,11 @@ impl SessionUi {
             return self.handle_model_picker_key(key, view).await;
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            // One handled Ctrl+C press: the force-quit guard disarms once
+            // every observed press of the pair was handled without an exit
+            // (abort / autocomplete cancel, TS `handleCtrlC`); an exit keeps
+            // the deadline and re-arms it on the loop break.
+            self.exit_guard.note_ctrl_c_handled();
             if view.editor.is_showing_autocomplete() {
                 view.editor.cancel_autocomplete();
                 self.clear_ctrl_c_hint();

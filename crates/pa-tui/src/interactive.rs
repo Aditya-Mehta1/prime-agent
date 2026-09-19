@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use crate::daemon_client::DaemonClient;
+use crate::exit_guard::ExitGuard;
 use crate::session_ui::SessionUi;
 use crate::view::{AgentView, FlushPlan};
 
@@ -261,6 +262,7 @@ async fn run_onboarding_phase(
     view: &mut AgentView,
     ui_rx: &mut mpsc::UnboundedReceiver<UiInput>,
     renderer: &mut Renderer,
+    exit_guard: &ExitGuard,
 ) -> Result<bool> {
     // TS model-ready branch: a user who already opted into traces sees no
     // flow at all — the flow completes silently and marks itself seen.
@@ -278,6 +280,13 @@ async fn run_onboarding_phase(
                     let Some(key_id) = crate::keys::key_event_to_id(&key) else {
                         continue;
                     };
+                    // The onboarding exit keys include Ctrl+C (`app.clear`):
+                    // report the handled press so the force-quit guard's
+                    // handled counter stays in sync with the reader's
+                    // observations.
+                    if key_id == "ctrl+c" {
+                        exit_guard.note_ctrl_c_handled();
+                    }
                     match screen.handle_key(&key_id, &keybindings) {
                         Some(crate::onboarding::OnboardingDecision::Selected(index)) => {
                             // `Share` opts in; `Not now` keeps traces off
@@ -363,7 +372,12 @@ pub async fn run_interactive(
     // Background notes (a failed abort request) fold into the transcript
     // through the same loop that renders daemon events.
     let (notes_tx, mut notes_rx) = mpsc::unbounded_channel::<String>();
+    // The double-Ctrl+C force-quit guard: the terminal reader observes the
+    // pair even while this loop is wedged in a daemon request, and a plain
+    // std-thread watchdog enforces the exit deadline without the runtime.
+    let exit_guard = ExitGuard::new();
     let mut session = SessionUi::open(client, &options, notes_tx).await?;
+    session.exit_guard = exit_guard.clone();
 
     let theme = crate::app::load_theme(&options.theme);
     let mut view = AgentView::new(theme);
@@ -379,15 +393,18 @@ pub async fn run_interactive(
         session.dirty = true;
     }
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiInput>();
-    let mut renderer = Renderer::setup(ui, ui_tx)?;
+    let mut renderer = Renderer::setup(ui, ui_tx, exit_guard.clone())?;
     // First-run onboarding owns the pane before the session screen (TS
     // `runStartupOnboarding`, model-ready branch: splash + trace question).
     // Headless harness runs have no terminal to draw it on and skip it.
     if let Some(task) = options.onboarding.clone() {
         let exit_requested =
-            run_onboarding_phase(&task, &mut view, &mut ui_rx, &mut renderer).await?;
+            run_onboarding_phase(&task, &mut view, &mut ui_rx, &mut renderer, &exit_guard).await?;
         if exit_requested {
-            let _ = session.detach().await;
+            // The exit deadline is armed from the moment the run decides to
+            // leave: no cleanup below may block past it.
+            exit_guard.arm_for_exit();
+            session.detach_for_exit().await;
             // The user quit at the onboarding screen: still hand the
             // terminal back (raw mode off, alt screen left and flushed)
             // exactly like a session exit.
@@ -557,6 +574,13 @@ pub async fn run_interactive(
         }
     }
 
+    // The run decided to leave: arm the force-quit deadline so every
+    // cleanup step below is best-effort (stats fetch, detach, telemetry,
+    // the exit flush). A wedged shutdown path cannot hold the process
+    // open past it; the healthy path always finishes well inside.
+    if renderer.is_terminal() {
+        exit_guard.arm_for_exit();
+    }
     // TS `shutdown` fetches the session stats while the connection is
     // alive, then prints the resume hint after teardown; pa-cli prints it
     // once the terminal is restored. Bounded best-effort.
@@ -590,6 +614,13 @@ pub async fn run_interactive(
         selection_request: session.pending_selection,
     };
     session.client.close();
+    // A handoff (agents view, `/resume <selector>`) lets the process keep
+    // running: retire the watchdog. Every other completion is a process
+    // exit, where the deadline dies with the process — or fires when the
+    // exit wedged, which is the point.
+    if outcome.return_to_agents_view || outcome.selection_request.is_some() {
+        exit_guard.cancel();
+    }
     Ok(outcome)
 }
 
@@ -652,7 +683,11 @@ enum Renderer {
 }
 
 impl Renderer {
-    fn setup(ui: UiMode, ui_tx: mpsc::UnboundedSender<UiInput>) -> Result<Renderer> {
+    fn setup(
+        ui: UiMode,
+        ui_tx: mpsc::UnboundedSender<UiInput>,
+        exit_guard: ExitGuard,
+    ) -> Result<Renderer> {
         match ui {
             UiMode::Terminal => {
                 terminal::enable_raw_mode()?;
@@ -663,9 +698,15 @@ impl Renderer {
                 crate::altscreen::enter()?;
                 // One reader thread feeds the loop; crossterm events are
                 // process-global, so the reader registry joins the previous
-                // surface's reader before this one starts polling.
+                // surface's reader before this one starts polling. The
+                // reader also observes Ctrl+C pairs for the exit guard:
+                // this thread stays alive when the UI loop is wedged, so
+                // the force-quit contract holds regardless of loop state.
                 crate::input::spawn_terminal_reader(move |event| match event {
-                    crossterm::event::Event::Key(key) => ui_tx.send(UiInput::Key(key)).is_ok(),
+                    crossterm::event::Event::Key(key) => {
+                        exit_guard.observe_key(&key);
+                        ui_tx.send(UiInput::Key(key)).is_ok()
+                    }
                     crossterm::event::Event::Paste(text) => {
                         ui_tx.send(UiInput::Paste(text)).is_ok()
                     }
@@ -799,6 +840,12 @@ impl Renderer {
         out.write_all(buffer.as_bytes())?;
         out.flush()?;
         Ok(())
+    }
+
+    /// Whether this run owns a real terminal (the force-quit guard arms on
+    /// terminal runs; headless verification keeps deterministic teardown).
+    fn is_terminal(&self) -> bool {
+        matches!(self, Renderer::Terminal(_))
     }
 
     fn is_terminal_mut(&mut self) -> Option<&mut Terminal<CrosstermBackend<std::io::Stdout>>> {

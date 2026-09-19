@@ -1601,9 +1601,15 @@ class Battery:
                     gap=False,
                 )
 
-    def ctrl_c_exit_timing(self, side: B.Side, case: str, wedge: bool) -> dict:
+    def ctrl_c_exit_timing(self, side: B.Side, case: str, kill: str | None) -> dict:
         """Launch one interactive session, hold it mid-turn against a
-        delayed mock response, send C-c C-c, and time the client exit."""
+        delayed mock response, send C-c C-c, and time the client exit.
+
+        `kill` wedges the run before the exit gesture: "worker" kills the
+        session worker (SIGKILL, dead worker socket mid-turn), "daemon"
+        kills the supervisor process entirely (the worker is orphaned and
+        the client's supervisor socket dies mid-turn). None keeps the run
+        healthy."""
         self.ensure_daemon(side)
         side.mock.set_responses([{"text": "held reply", "delayMs": 20_000}])
         session = f"{self.runid}-f13-{side.name}-{case}"
@@ -1619,7 +1625,7 @@ class Battery:
         if len(side.mock.requests()) <= mark:
             B.tmux_kill(session)
             return {"case": case, "error": "the held prompt never reached the mock"}
-        if wedge:
+        if kill == "worker":
             # Kill the session worker mid-turn (SIGKILL): the worker socket
             # is dead and cannot answer the abort or the detach.
             children = B.children_of(side.daemon_proc.pid)
@@ -1627,6 +1633,15 @@ class Battery:
                 B.tmux_kill(session)
                 return {"case": case, "error": "no worker process found to wedge"}
             os.kill(children[-1], 9)
+            time.sleep(0.5)
+        if kill == "daemon":
+            # Kill the supervisor process entirely (SIGKILL): the client's
+            # supervisor socket dies mid-turn while the orphaned worker
+            # keeps holding the turn against the mock.
+            if side.daemon_proc is None or side.daemon_proc.poll() is not None:
+                B.tmux_kill(session)
+                return {"case": case, "error": "no daemon process to kill"}
+            os.kill(side.daemon_proc.pid, 9)
             time.sleep(0.5)
         B.tmux_send(session, "C-c", enter=False)
         time.sleep(0.3)
@@ -1671,22 +1686,31 @@ class Battery:
         return rec
 
     def f13_ctrlc_exit(self) -> None:
-        """Double Ctrl+C exit: a long-turn session must exit within 1s of
-        the second press, both with a healthy worker and with the worker
-        killed -9 mid-turn (no deadlock on the dead worker socket)."""
+        """Double Ctrl+C exit: a long-turn session must exit promptly after the
+        second press in all three daemon states — healthy, worker killed
+        -9 mid-turn (dead worker socket), and the daemon process killed
+        entirely (dead supervisor socket). The hard contract is exit
+        within 2s of the second press with code 0; the healthy/wedged
+        Rust cases keep the stricter 1s bound, the daemon-dead case gets
+        the full 2s force-quit window."""
         flow = "f13_ctrlc_exit"
-        for case, sides, wedge in (
-            ("healthy", (self.sides["ts"], self.sides["rust"]), False),
-            ("wedged", (self.sides["rust"],), True),
+        for case, sides, kill in (
+            ("healthy", (self.sides["ts"], self.sides["rust"]), None),
+            ("wedged", (self.sides["rust"],), "worker"),
+            ("daemon_dead", (self.sides["rust"],), "daemon"),
         ):
             for side in sides:
-                rec = self.ctrl_c_exit_timing(side, case, wedge)
+                rec = self.ctrl_c_exit_timing(side, case, kill)
                 side.evidence_json(flow, f"{side.name}-{case}.json", rec)
                 # The exit-latency contract is the Rust client's (exit within
-                # 1s of the second press, exit code 0). The TS reference's
+                # 1s of the second press for the healthy and worker-killed cases,
+                # within the 2s force-quit window when the daemon process itself
+                # died, exit code 0). The TS reference's
                 # timing is recorded as evidence; its shutdown drains input
                 # for up to 1s by design, so only a clean exit is required.
-                bound_s = 1.0 if side.name == "rust" else 10.0
+                bound_s = 10.0
+                if side.name == "rust":
+                    bound_s = 2.0 if case == "daemon_dead" else 1.0
                 # The TS exit code is often unobservable through tmux (the
                 # reaped-late pane leaves no pane_dead_status); the TS source
                 # exits via process.exit(0), so a dead pane inside the bound

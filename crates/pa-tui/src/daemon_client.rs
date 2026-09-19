@@ -143,6 +143,37 @@ impl Shared {
             .remove(id)
             .is_some_and(|tx| tx.send(response).is_ok())
     }
+
+    /// Fail every pending request whose id starts with `prefix` with a
+    /// synthetic error response: the connection that carried them died.
+    ///
+    /// This is what keeps a dead supervisor or worker from leaving the UI
+    /// waiting out the full request timeout — the exit-hang class of bugs:
+    /// the abort was accepted, but the client then hung on a request whose
+    /// socket peer was already gone. The reader task of each connection
+    /// calls this when its socket closes (supervisor reader fails the
+    /// `daemon_`-routed requests, a direct worker pump the `direct_` ones,
+    /// so a live link keeps serving its own in-flight requests).
+    pub(crate) fn fail_pending(&self, prefix: &str, error: &str) {
+        let mut pending = self.pending.lock().unwrap();
+        let dead: Vec<String> = pending
+            .keys()
+            .filter(|id| id.starts_with(prefix))
+            .cloned()
+            .collect();
+        for id in dead {
+            if let Some(tx) = pending.remove(&id) {
+                let _ = tx.send(DaemonResponse {
+                    id: Some(id),
+                    command: String::new(),
+                    success: false,
+                    data: None,
+                    error: Some(error.to_string()),
+                    error_info: None,
+                });
+            }
+        }
+    }
 }
 
 /// A live connection to the daemon supervisor socket, optionally upgraded
@@ -253,6 +284,9 @@ impl DaemonClient {
                     }
                 }
             }
+            // The supervisor socket closed: every supervisor-routed request
+            // in flight fails now instead of riding out its timeout.
+            reader_shared.fail_pending("daemon_", "the daemon connection closed");
         });
 
         // Hello handshake: the supervisor sends daemon_hello immediately on
@@ -959,6 +993,56 @@ mod tests {
         );
         client.close();
         let _ = supervisor.await;
+    }
+
+    #[tokio::test]
+    async fn dead_connection_fails_pending_requests_immediately() {
+        // The supervisor dies after the handshake while a request is in
+        // flight: the reader task must fail the pending request at once
+        // (the exit-hang class: the abort was accepted, but the client
+        // then waited out the full request timeout on a dead socket).
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("d.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut writer = stream;
+            let mut hello = json!({
+                "type": "daemon_hello",
+                "protocol": { "name": "prime-agent.daemon", "version": 7 },
+                "clientId": "srv",
+                "serverCapabilities": [],
+            })
+            .to_string();
+            hello.push('\n');
+            writer.write_all(hello.as_bytes()).await.unwrap();
+            // Hold the accept open until the request is in flight, then
+            // close the socket (the supervisor process dies).
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(writer);
+        });
+        let (client, _events) = DaemonClient::connect(&socket).await.unwrap();
+        // The default timeout is 30s; the failure must land in well under a
+        // second because the socket died, not because a timer fired.
+        let started = std::time::Instant::now();
+        let error = client
+            .request_ok(DaemonCommand::List {
+                id: None,
+                all: None,
+                cwd: None,
+                session_dir: None,
+                include_client_owned: None,
+                rest: Default::default(),
+            })
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            error.to_string().contains("the daemon connection closed"),
+            "unexpected error: {error}"
+        );
+        client.close();
+        let _ = handle.await;
     }
 
     #[tokio::test]

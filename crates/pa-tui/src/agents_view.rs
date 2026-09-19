@@ -94,6 +94,9 @@ struct AgentsViewMode {
     status: Option<String>,
     /// First ctrl+c shows the exit hint; the second exits.
     exit_armed: bool,
+    /// The double-Ctrl+C force-quit guard (the run's shared instance is
+    /// installed by `run_agents_view` after `new`).
+    exit_guard: crate::exit_guard::ExitGuard,
     pulse: usize,
     running: bool,
     selection: Option<SessionSelection>,
@@ -112,6 +115,7 @@ impl AgentsViewMode {
             query: String::new(),
             status: None,
             exit_armed: false,
+            exit_guard: crate::exit_guard::ExitGuard::new(),
             pulse: 0,
             running: true,
             selection: None,
@@ -238,6 +242,11 @@ impl AgentsViewMode {
                 }
             }
             "ctrl+c" => {
+                // One handled Ctrl+C press: the force-quit guard disarms
+                // once the whole observed pair was handled without an
+                // exit (this press armed the state); an exit re-arms from
+                // the run loop's break.
+                self.exit_guard.note_ctrl_c_handled();
                 if self.exit_armed {
                     self.running = false;
                 } else {
@@ -502,7 +511,11 @@ enum Renderer {
 }
 
 impl Renderer {
-    fn setup(ui: AgentsViewUiMode, ui_tx: mpsc::UnboundedSender<UiInput>) -> Result<Renderer> {
+    fn setup(
+        ui: AgentsViewUiMode,
+        ui_tx: mpsc::UnboundedSender<UiInput>,
+        exit_guard: crate::exit_guard::ExitGuard,
+    ) -> Result<Renderer> {
         match ui {
             AgentsViewUiMode::Terminal => {
                 crossterm::terminal::enable_raw_mode()?;
@@ -513,9 +526,13 @@ impl Renderer {
                 crate::altscreen::enter()?;
                 // One reader thread feeds the view; the reader registry
                 // joins the previous surface's reader (the chat it opened)
-                // before this one starts polling.
+                // before this one starts polling. The reader also observes
+                // Ctrl+C pairs for the exit guard: this thread stays alive
+                // when the view loop is wedged in a daemon request, so the
+                // force-quit contract holds regardless of loop state.
                 crate::input::spawn_terminal_reader(move |event| match event {
                     crossterm::event::Event::Key(key) => {
+                        exit_guard.observe_key(&key);
                         let id = crate::keys::key_event_to_id(&key).unwrap_or_default();
                         ui_tx.send(UiInput::Key(id)).is_ok()
                     }
@@ -642,7 +659,11 @@ pub async fn run_agents_view(
         .await
         .with_context(|| "the agents view could not attach to the daemon")?;
 
+    // The double-Ctrl+C force-quit guard: same contract as the session
+    // loop (see `interactive::run_interactive`).
+    let exit_guard = crate::exit_guard::ExitGuard::new();
     let mut mode = AgentsViewMode::new(options.clone());
+    mode.exit_guard = exit_guard.clone();
 
     // The roster snapshot precedes streaming pushes; updates that race the
     // snapshot apply on top (idempotent by agent id, TS roster-store).
@@ -696,7 +717,7 @@ pub async fn run_agents_view(
     mode.rebuild_rows();
 
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiInput>();
-    let mut renderer = Renderer::setup(ui, ui_tx)?;
+    let mut renderer = Renderer::setup(ui, ui_tx, exit_guard.clone())?;
     let mut pending: Vec<UiInput> = Vec::new();
     let mut last_pulse = tokio::time::Instant::now();
 
@@ -743,6 +764,12 @@ pub async fn run_agents_view(
         renderer.draw(&mut mode);
     }
 
+    // The view decided to leave: arm the force-quit deadline so the
+    // teardown below (terminal restore, roster unsubscribe over a possibly
+    // dead daemon) is best-effort and cannot hold the process open.
+    if matches!(renderer, Renderer::Terminal(_)) {
+        exit_guard.arm_for_exit();
+    }
     // A selection hands the pane to the chat it opened (TS `result.type !== "exit"`);
     // exiting releases the alternate screen.
     let frames = renderer.finish(mode.selection.is_some());
@@ -753,6 +780,12 @@ pub async fn run_agents_view(
         })
         .await;
     client.close();
+    // A selection hands the terminal to a session run: the process keeps
+    // going, so retire the watchdog. A selection-less exit ends the
+    // process, where the deadline dies with it — or fires if it wedged.
+    if mode.selection.is_some() {
+        exit_guard.cancel();
+    }
     Ok(AgentsViewOutcome {
         selection: mode.selection,
         frames,

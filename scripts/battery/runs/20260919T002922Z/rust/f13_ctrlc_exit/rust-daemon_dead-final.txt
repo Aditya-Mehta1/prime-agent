@@ -1,0 +1,36 @@
+                  ▗▄▄█▀
+    ███▄       ▗▄███▀
+   ▗█▛▐█▙   ▗▄█▀▗█▀       prime agent v0.1.0
+  ▗█▛ ▟██▙▄██▛ ▟▛         model mock-1
+  ▗▟▌ ▐███▛▘▗▄█▖          cwd ~/lane-worktrees/exit-hang/scripts/battery/runs/20260919T002922Z/rust/work
+ ▟███▄  ▄▄▟███▀
+ ▜█▛▀▘  ▜█▛▀▘
+
+
+  hold the turn
+
+
+ aborting the current turn
+
+ ⠸ Waiting · 1s
+
+                                                                                      Collapsed mode (Ctrl+O to expand)
+
+ >
+
+Press Ctrl+C again to exit                                                                               mock-1 · 0 (0%)
+Resume this session with: prime-agent --resume 01a0b711-8d95-76e8-a5ef-fa3bfbee25a1
+
+
+
+
+
+
+
+
+
+
+
+
+
+Pane is dead (status 0, Sat Sep 19 00:29:37 2026)

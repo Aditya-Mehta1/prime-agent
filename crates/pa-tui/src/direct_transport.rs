@@ -288,6 +288,9 @@ pub(crate) async fn connect_direct(
                     let _ = event_tx.send(event);
                 }
             }
+            // The worker socket closed: every direct-link request in
+            // flight fails now instead of riding out its timeout.
+            shared.fail_pending("direct_", "the session connection closed");
             alive.store(false, Ordering::SeqCst);
         });
     }

@@ -3,7 +3,7 @@
 The terminal UI.
 
 ## Scope
-Rendering (markdown, themes, layout, tool panels, custom-message decorated rows), editor (cursor/kill-ring/undo/history/word ops), keybindings (configurable, TS defaults), autocomplete, fullscreen/scrollback, input handling. Interactive sessions attached through the daemon: the JSONL client socket (hello handshake, command envelopes, session-event loop), slim-attach snapshot reconstruction, prompt submission with streamed assistant output, live session list and switch, and the agents view (the unified live-roster +
+Rendering (markdown, themes, layout, tool panels, custom-message decorated rows), editor (cursor/kill-ring/undo/history/word ops), keybindings (configurable, TS defaults), autocomplete, fullscreen/scrollback, input handling, and the double-Ctrl+C force-quit guard (the exit contract: two in-window Ctrl+C presses end the process within 1.5s of the second press regardless of daemon or loop state; cleanup inside that window is best-effort). Interactive sessions attached through the daemon: the JSONL client socket (hello handshake, command envelopes, session-event loop), slim-attach snapshot reconstruction, prompt submission with streamed assistant output, live session list and switch, and the agents view (the unified live-roster +
 saved-catalog session list: Running/Idle/Inactive sections, inline search,
 open-to-attach/resume, `n`-via-ctrl+n new session, live `roster_subscribe`
 pushes).
