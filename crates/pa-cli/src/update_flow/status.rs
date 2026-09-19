@@ -147,8 +147,16 @@ impl StatusWriter {
     }
 
     /// The atomic status write: temp file in the same directory, `rename`
-    /// over the old file.
+    /// over the old file. The parent directory is (re)created on every
+    /// write: the successor supervisor's boot sweep (spec §6 step 1) deletes
+    /// this socket's scratch dir — including a live coordinator's status
+    /// file — before the coordinator's `Restoring`/`Complete` writes land,
+    /// and the writer must recreate the dir it was handed.
     fn persist(&self) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
         let temporary = self
             .path
             .with_extension(format!("{}.tmp", std::process::id()));

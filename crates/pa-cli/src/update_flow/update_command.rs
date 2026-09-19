@@ -18,6 +18,9 @@ use super::status::{read_status, StatusWriter};
 /// 30 minutes of progress, 3 minutes of heartbeat liveness).
 const TAIL_PROGRESS_TIMEOUT_MS: u64 = 30 * 60_000;
 const TAIL_LIVENESS_TIMEOUT_MS: u64 = 180_000;
+/// Grace for a status file deleted by the successor's boot sweep (spec §6):
+/// the coordinator's next write recreates it inside a normal boot window.
+const TAIL_SWEEP_GRACE_MS: u64 = 60_000;
 const TAIL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// The update command's fixed inputs (parsed by the public command layer).
@@ -199,17 +202,28 @@ async fn tail_status(status_path: &std::path::Path) -> UpdateStatus {
     let started = std::time::Instant::now();
     let mut last_liveness = std::time::Instant::now();
     let mut last_epoch: Option<u64> = None;
+    // The successor's boot sweep (spec §6 step 1) deletes the scratch dir —
+    // including this status file — while the coordinator is still driving
+    // the successor's `Restoring`/`Complete` writes. A file that was seen
+    // and then vanishes is the sweep, not a dead coordinator: grace it
+    // within the liveness budget instead of failing the tail mid-update.
+    let mut missing_since: Option<std::time::Instant> = None;
     loop {
         if let Some(status) = read_status(status_path) {
             if Some(status.epoch) != last_epoch {
                 last_epoch = Some(status.epoch);
                 last_liveness = std::time::Instant::now();
             }
+            missing_since = None;
             if status.state.is_terminal() {
                 return status;
             }
+        } else if missing_since.is_none() && last_epoch.is_some() {
+            missing_since = Some(std::time::Instant::now());
         }
-        if last_liveness.elapsed().as_millis() as u64 >= TAIL_LIVENESS_TIMEOUT_MS {
+        let swept = missing_since
+            .is_some_and(|seen| (seen.elapsed().as_millis() as u64) < TAIL_SWEEP_GRACE_MS);
+        if !swept && last_liveness.elapsed().as_millis() as u64 >= TAIL_LIVENESS_TIMEOUT_MS {
             return unreported(
                 status_path,
                 "the update coordinator stopped reporting liveness",

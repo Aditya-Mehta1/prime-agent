@@ -71,7 +71,7 @@ const WORKER_CONNECT_BACKOFF_MS: u64 = 25;
 #[cfg(not(unix))]
 const WORKER_CONNECT_BACKOFF_MS: u64 = 2_000;
 pub(crate) const ROUTE_TIMEOUT_MS: u64 = 30_000;
-const LONG_ROUTE_TIMEOUT_MS: u64 = 600_000;
+pub(crate) const LONG_ROUTE_TIMEOUT_MS: u64 = 600_000;
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 const BASE_BACKOFF_MS: u64 = 250;
 const MAX_BACKOFF_MS: u64 = 30_000;
@@ -124,6 +124,10 @@ pub struct Supervisor {
     /// Timeout budget of the update flow (`PRIME_AGENT_UPDATE_*_MS`
     /// overridable for CI).
     update_budget: UpdateTimeoutBudget,
+    /// The boot-time restore pass (spec §6, slice 5): sweep + roster
+    /// restore + scheduled-work re-arm. Read by the hello resume contract,
+    /// the `update_restore_status` RPC, and the queued-attach path.
+    pub(crate) restore: crate::update_restore::RestoreProgress,
 }
 
 impl Supervisor {
@@ -162,6 +166,7 @@ impl Supervisor {
             update_prepare: PrepareCoordinator::new(),
             mutation_drain: MutationDrainLatch::new(),
             update_budget: UpdateTimeoutBudget::from_env(),
+            restore: crate::update_restore::RestoreProgress::new(),
         })
     }
 
@@ -203,14 +208,32 @@ impl Supervisor {
         self.log
             .append(&format!("supervisor started pid {}", std::process::id()));
 
+        // Update boot (spec §6): consume the roster from the spawn env
+        // BEFORE the sweep deletes the file it points at, sweep this
+        // socket's update scratch dir unconditionally (invariant I2 by
+        // construction), then run the restore + re-arm pass concurrently
+        // with serving — the accept loop must keep serving hellos so
+        // reconnecting clients see the resume contract (§10.3).
+        let roster = crate::update_restore::consume_roster_env();
+        self.restore
+            .begin(roster.as_ref().map(|roster| roster.update_id.clone()));
+        crate::update_restore::boot_sweep(&self.options.agent_dir, &self.options.socket_path);
         // Descriptor adoption runs concurrently with the accept loop: a
         // supervisor restarted over live sessions must accept their
         // self-registrations immediately, not behind the whole descriptor
-        // scan.
-        {
+        // scan. The restore pass awaits this task (spec §6 step 2's
+        // create-or-adopt order: kept workers relaunch from their
+        // descriptors first, the roster covers the rest).
+        let adoption = {
             let supervisor = Arc::clone(&self);
             tokio::spawn(async move {
                 supervisor.adopt_persisted_workers().await;
+            })
+        };
+        {
+            let supervisor = Arc::clone(&self);
+            tokio::spawn(async move {
+                crate::update_restore::restore_pass(&supervisor, adoption, roster).await;
             });
         }
 
@@ -1071,6 +1094,7 @@ impl Supervisor {
             supervisor_owner_token: Some(uuid::Uuid::new_v4().to_string()),
             supervisor_process_start_id: crate::protocol::process_start_id(std::process::id()),
             supervisor_socket_path: Some(self.options.socket_path.to_string_lossy().to_string()),
+            update_resume: Some(self.restore.hello_resume()),
             client_id: client_id.clone(),
             server_capabilities: default_server_capabilities(),
             rest: Default::default(),
@@ -1408,6 +1432,21 @@ impl Supervisor {
                     .handle_prepare_update_restart(&command_id, &type_name, command)
                     .await;
                 (vec![response_line(&response)], false)
+            }
+            DaemonCommand::UpdateRestoreStatus { .. } => {
+                // The boot restore pass's live snapshot (spec §6/§9): the
+                // successor coordinator's `Restoring` report polls this
+                // for real counts and per-session failures instead of
+                // inferring adoption from the session list.
+                let data = self.restore_status_body();
+                (
+                    vec![response_line(&response_success(
+                        Some(&command_id),
+                        &type_name,
+                        Some(data),
+                    ))],
+                    false,
+                )
             }
             command => {
                 let client_id = effective_client_id.lock().unwrap().clone();
@@ -2338,7 +2377,7 @@ impl Supervisor {
         }
     }
 
-    async fn handle_create(
+    pub(crate) async fn handle_create(
         self: &Arc<Self>,
         command: &DaemonCommand,
         client_id: String,
@@ -2526,16 +2565,34 @@ impl Supervisor {
         let selector = command_active_session_id(command)
             .unwrap_or_default()
             .to_string();
-        let Ok(resident) = self.registry.resolve(&selector).await else {
-            return (
-                vec![response_line(&response_failure(
-                    Some(&command_id),
-                    &type_name,
-                    &format!("Unknown active session: {selector}"),
-                    None,
-                ))],
-                false,
-            );
+        let resident = match self.registry.resolve(&selector).await {
+            Ok(resident) => resident,
+            Err(_) => {
+                // Spec §10.4: attach-by-durable-id at any time. A restore
+                // pass may still be bringing the rostered session up, so
+                // the command queues server-side behind the pass (no
+                // client-visible retry); a settled restore answers with the
+                // per-row failure (session file + manual-resume hint)
+                // instead of the plain unknown-session error.
+                self.await_restore_target(&selector).await;
+                match self.registry.resolve(&selector).await {
+                    Ok(resident) => resident,
+                    Err(_) => {
+                        let message = self
+                            .restore_failure_for(&selector)
+                            .unwrap_or_else(|| format!("Unknown active session: {selector}"));
+                        return (
+                            vec![response_line(&response_failure(
+                                Some(&command_id),
+                                &type_name,
+                                &message,
+                                None,
+                            ))],
+                            false,
+                        );
+                    }
+                }
+            }
         };
         // A delete flows through the kill route with the `rlmLedgerDelete`
         // marker (the parent-side `delete_subagent`). The deletion boundary

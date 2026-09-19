@@ -484,6 +484,7 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::GetDirectWorkerTransport { .. } => "get_direct_worker_transport",
         DaemonCommand::ListSavedSessions { .. } => "list_saved_sessions",
         DaemonCommand::Create { .. } => "create",
+        DaemonCommand::UpdateRestoreStatus { .. } => "update_restore_status",
         DaemonCommand::Attach { .. } => "attach",
         DaemonCommand::Reattach { .. } => "reattach",
         DaemonCommand::Detach { .. } => "detach",

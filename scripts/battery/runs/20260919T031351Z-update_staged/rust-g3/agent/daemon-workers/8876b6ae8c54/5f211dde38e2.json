@@ -1,0 +1,22 @@
+{
+  "version": 2,
+  "workerId": "5f211dde38e2",
+  "pid": 283801,
+  "socketPath": "/tmp/usw-rust-g3-20260919T031120Z/prime-agent-1000/worker-8876b6ae8c54-5f211dde38e2.sock",
+  "recoveryJournalPath": "/tmp/usw-s5c/rust-g3/agent/daemon-workers/8876b6ae8c54/5f211dde38e2.recovery.jsonl",
+  "supervisorSocketPath": "/tmp/usw-rust-g3-20260919T031120Z/prime-agent-1000/daemon.sock",
+  "authenticationToken": "1f0b7436-8913-4239-9238-3dbfab1e3a55",
+  "workerInstanceId": "cc9ea682-605d-4b5e-b1e8-6d6ffa1fd1f3",
+  "rootActiveSessionId": "5f211dde38e2",
+  "ownerClientId": "529995a2071d",
+  "rootSessionId": "01a0b7a7-29dc-7692-a65c-7e13bd32acb7",
+  "sessionFile": "/tmp/usw-s5c/rust-g3/agent/sessions/01a0b7a7-29dc-7692-a65c-7e13bd32acb7.jsonl",
+  "createdAt": "2026-09-19T03:13:00.814Z",
+  "updatedAt": "2026-09-19T03:13:03.012Z",
+  "lifecycle": "starting",
+  "createCommand": {
+    "sessionPath": "/tmp/usw-s5c/rust-g3/agent/sessions/01a0b7a7-29dc-7692-a65c-7e13bd32acb7.jsonl",
+    "cwd": "/tmp/usw-s5c/rust-g3/work"
+  },
+  "consecutiveFailures": 0
+}

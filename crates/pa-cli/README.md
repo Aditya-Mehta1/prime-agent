@@ -53,4 +53,6 @@ live holder, dead-holder steal), the status file keeps the TS schema plus
 (`bin/previous` rollback pointer, `.activation-state` recovery record).
 Mechanism support (version/channel policy, install-root layout, manifest
 fetch, archive staging) lives in pa-core's `update` module; the daemon-side
-prepare/commit/stop drivers are pa-daemon (slices 2-3).
+prepare/commit/stop drivers and the boot restore pass are pa-daemon
+(slices 2-3 and 5): the coordinator's `Restoring` phase polls the
+successor's `update_restore_status` RPC for the real per-session counts.

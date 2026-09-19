@@ -51,7 +51,7 @@ pub struct UpdateRosterQueue {
 /// What one rostered session was doing when the snapshot was taken; the
 /// restore pass uses these to decide continuation treatment (the TS-parity
 /// update marker + continuation prompt for a session that was mid-turn).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct UpdateRosterInFlight {
     pub streaming: bool,
     pub compacting: bool,

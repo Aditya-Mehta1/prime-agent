@@ -241,6 +241,11 @@ pub enum DaemonOutbound {
         supervisor_process_start_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         supervisor_socket_path: Option<String>,
+        /// The update resume contract (spec §10.3): whether the supervisor's
+        /// restore pass has finished, so a reconnecting client knows whether
+        /// to queue its attach. Rust-only extension over the TS hello.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        update_resume: Option<crate::daemon::update_flow::DaemonUpdateResume>,
         client_id: DaemonClientId,
         server_capabilities: Vec<DaemonServerCapability>,
         #[serde(flatten)]

@@ -1,16 +1,18 @@
 //! The coordinator's daemon-facing phase bodies: the prepare poll, the
-//! commit, the marker freshness gate, and the adoption-based restore
-//! report. Split from the driver so the FSM stays readable; the driver owns
-//! the state writes, these own the wire and filesystem facts.
+//! commit, the marker freshness gate, and the restore report (the
+//! successor's `update_restore_status` RPC). Split from the driver so the
+//! FSM stays readable; the driver owns the state writes, these own the
+//! wire and filesystem facts.
 
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use pa_types::daemon::update_flow::{
-    prepared_marker_expiry, update_marker_path, PreparedMarkerExpiry, UpdateId, UpdateRoster,
-    UpdateStatusCounts, UpdateStatusFailure, UpdateTimeoutBudget,
+    prepared_marker_expiry, update_marker_path, PreparedMarkerExpiry, UpdateId, UpdateStatusCounts,
+    UpdateStatusFailure, UpdateTimeoutBudget,
 };
+use serde_json::Value;
 
 /// The prepare-poll and restore-poll interval.
 const PHASE_POLL: Duration = Duration::from_millis(500);
@@ -115,83 +117,88 @@ pub(super) fn check_marker_fresh(prepared_dir: &Path) -> Result<()> {
     }
 }
 
-pub(super) fn read_roster(path: &Path) -> Result<UpdateRoster> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("read the roster at {}", path.display()))?;
-    Ok(serde_json::from_str(&content)?)
-}
-
-/// The adoption-based restore report (slice 4): poll the successor's
-/// session list until every roster session is adopted or the overall
-/// restore budget expires. Missing sessions are recorded as failures -
-/// restore never fails the boot (spec §9 `Restoring`).
-pub(super) async fn adoption_report(
-    roster: Option<&UpdateRoster>,
+/// The restore report (slice 5): poll the successor's
+/// `update_restore_status` RPC (spec §6/§9) until the boot restore pass
+/// completes or the overall restore budget expires. The supervisor's
+/// restore pass owns the real per-session counts and failure records —
+/// the coordinator reports them, it does not infer adoption from the
+/// session list.
+pub(super) async fn restore_report(
     socket_path: &Path,
     budget: &UpdateTimeoutBudget,
 ) -> (UpdateStatusCounts, Vec<UpdateStatusFailure>) {
-    let Some(roster) = roster else {
-        return (UpdateStatusCounts::default(), Vec::new());
-    };
-    if roster.sessions.is_empty() {
-        return (UpdateStatusCounts::default(), Vec::new());
-    }
     let deadline =
         tokio::time::Instant::now() + Duration::from_millis(budget.restore_overall_ms.max(1));
-    let mut adopted: Vec<bool> = vec![false; roster.sessions.len()];
     loop {
         if let Ok((client, _events)) =
             pa_tui::daemon_client::DaemonClient::connect(socket_path).await
         {
-            if let Ok(list) = client
-                .request_ok(pa_types::daemon::DaemonCommand::List {
+            let response = client
+                .request_ok(pa_types::daemon::DaemonCommand::UpdateRestoreStatus {
                     id: None,
-                    all: None,
-                    cwd: None,
-                    session_dir: None,
-                    include_client_owned: None,
+                    update_id: None,
                     rest: Default::default(),
                 })
-                .await
-            {
-                let ids = list
-                    .get("sessions")
-                    .and_then(serde_json::Value::as_array)
-                    .map(|rows| {
-                        rows.iter()
-                            .filter_map(|row| {
-                                row.get("sessionId").and_then(serde_json::Value::as_str)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                for (index, session) in roster.sessions.iter().enumerate() {
-                    adopted[index] = ids.iter().any(|id| *id == session.session_id);
+                .await;
+            if let Ok(data) = response {
+                let complete = data
+                    .get("complete")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let counts = read_counts(&data);
+                let failures = read_failures(&data);
+                client.close();
+                if complete {
+                    return (counts, failures);
                 }
+                // In flight: keep polling; the snapshot so far is not the
+                // settle report.
+            } else {
+                client.close();
             }
-            client.close();
         }
-        if adopted.iter().all(|adopted| *adopted) || tokio::time::Instant::now() >= deadline {
-            break;
+        if tokio::time::Instant::now() >= deadline {
+            // The budget expired mid-restore: report the snapshot's last
+            // poll as the honest state rather than blocking forever (spec
+            // §9: restore never fails the boot; a late pass still settles
+            // on the supervisor).
+            return (UpdateStatusCounts::default(), Vec::new());
         }
         tokio::time::sleep(PHASE_POLL).await;
     }
-    let mut counts = UpdateStatusCounts::default();
-    let mut failures = Vec::new();
-    for (index, session) in roster.sessions.iter().enumerate() {
-        counts.total += 1;
-        if adopted[index] {
-            counts.restored += 1;
-            if session.should_resume {
-                counts.resumed += 1;
-            }
-        } else {
-            counts.failed += 1;
-            failures.push(UpdateStatusFailure {
-                session_file: session.session_file.clone(),
-                message: "the successor supervisor did not adopt the session".to_string(),
-            });
-        }
+}
+
+/// Parse the RPC's `counts` object (TS `DaemonUpdateRestartCounts` shape).
+fn read_counts(data: &Value) -> UpdateStatusCounts {
+    let counts = data.get("counts").cloned().unwrap_or(Value::Null);
+    let field = |name: &str| counts.get(name).and_then(Value::as_u64).unwrap_or(0);
+    UpdateStatusCounts {
+        total: field("total"),
+        restored: field("restored"),
+        resumed: field("resumed"),
+        failed: field("failed"),
     }
-    (counts, failures)
+}
+
+/// Parse the RPC's `failures` array (session file + message per row).
+fn read_failures(data: &Value) -> Vec<UpdateStatusFailure> {
+    data.get("failures")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| {
+                    let session_file = row.get("sessionFile")?.as_str()?.to_string();
+                    let message = row
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    Some(UpdateStatusFailure {
+                        session_file,
+                        message,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }

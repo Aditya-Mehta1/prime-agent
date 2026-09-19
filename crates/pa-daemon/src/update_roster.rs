@@ -240,43 +240,51 @@ fn subagent_rows(
 /// and `paused` jobs project - completed/cancelled jobs are not re-armed -
 /// and the update flow never writes, moves, or archives the files.
 fn heartbeat_rows(agent_dir: &Path) -> Vec<UpdateRosterHeartbeat> {
+    let mut rows = Vec::new();
+    for job in scan_scheduled_jobs(agent_dir) {
+        let status = match job.status {
+            pa_core::cron::JobStatus::Active => UpdateHeartbeatStatus::Active,
+            pa_core::cron::JobStatus::Paused => UpdateHeartbeatStatus::Paused,
+            pa_core::cron::JobStatus::Completed | pa_core::cron::JobStatus::Cancelled => continue,
+        };
+        let schedule = schedule_text(&job);
+        rows.push(UpdateRosterHeartbeat {
+            job_id: job.id,
+            session_id: job.session_id,
+            label: job.label,
+            schedule,
+            delivery_mode: match job.delivery_mode {
+                Some(pa_core::cron::DeliveryMode::FollowUp) => {
+                    UpdateHeartbeatDeliveryMode::FollowUp
+                }
+                Some(pa_core::cron::DeliveryMode::Steer) | None => {
+                    UpdateHeartbeatDeliveryMode::Steer
+                }
+            },
+            status,
+            next_run_at: job.next_run_at,
+            rest: Default::default(),
+        });
+    }
+    rows
+}
+
+/// Every scheduled job in the agent's session artifacts (spec §6 step 3's
+/// scan; spec §8: `scheduled-jobs.json` is the only write path and is never
+/// written, moved, or archived by the update flow). Shared by the roster
+/// projection (heartbeat rows) and the boot re-arm pass.
+pub(crate) fn scan_scheduled_jobs(agent_dir: &Path) -> Vec<pa_core::cron::AgentCronJob> {
     let artifacts_root = agent_dir.join("session-artifacts");
     let Ok(entries) = std::fs::read_dir(&artifacts_root) else {
         return Vec::new();
     };
-    let mut rows = Vec::new();
+    let mut jobs = Vec::new();
     for partition in entries.flatten() {
         for path in scheduled_job_files(&partition.path()) {
-            for job in read_scheduled_jobs_artifact(&path) {
-                let status = match job.status {
-                    pa_core::cron::JobStatus::Active => UpdateHeartbeatStatus::Active,
-                    pa_core::cron::JobStatus::Paused => UpdateHeartbeatStatus::Paused,
-                    pa_core::cron::JobStatus::Completed | pa_core::cron::JobStatus::Cancelled => {
-                        continue
-                    }
-                };
-                let schedule = schedule_text(&job);
-                rows.push(UpdateRosterHeartbeat {
-                    job_id: job.id,
-                    session_id: job.session_id,
-                    label: job.label,
-                    schedule,
-                    delivery_mode: match job.delivery_mode {
-                        Some(pa_core::cron::DeliveryMode::FollowUp) => {
-                            UpdateHeartbeatDeliveryMode::FollowUp
-                        }
-                        Some(pa_core::cron::DeliveryMode::Steer) | None => {
-                            UpdateHeartbeatDeliveryMode::Steer
-                        }
-                    },
-                    status,
-                    next_run_at: job.next_run_at,
-                    rest: Default::default(),
-                });
-            }
+            jobs.extend(read_scheduled_jobs_artifact(&path));
         }
     }
-    rows
+    jobs
 }
 
 /// The `scheduled-jobs.json` files one level under an artifacts partition

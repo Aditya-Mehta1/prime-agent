@@ -112,6 +112,18 @@ pub struct UpdateStatusFailure {
     pub message: String,
 }
 
+/// The successor supervisor's hello resume contract (spec §10.3): tells a
+/// reconnecting client whether the restore pass behind this supervisor has
+/// finished. `update_id` is `None` on a normal boot. Rust-only extension
+/// (the TS close frame carries no resume contract).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonUpdateResume {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_id: Option<UpdateId>,
+    pub complete: bool,
+}
+
 /// `status.json`: the TS coordinator status-file schema (`DaemonUpdateRestartStatus`
 /// parity, camelCase), with the spec's additions — `updateId` (spec; the TS
 /// file's `requestId`) and the monotonic `epoch` owned by the coordinator

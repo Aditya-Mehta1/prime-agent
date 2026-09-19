@@ -1,0 +1,216 @@
+{
+ "flow": "update_staged",
+ "version": "0.1.0",
+ "verdicts": [
+  {
+   "row": "F1",
+   "description": "staged update: complete, launcher swapped, session restored",
+   "parity": true
+  },
+  {
+   "row": "F2",
+   "description": "rollback: launcher restored, session survives, status complete",
+   "parity": true
+  },
+  {
+   "row": "G1",
+   "description": "boot sweep: stale update scratch + legacy names gone, daemon serves (I2)",
+   "parity": true
+  },
+  {
+   "row": "G2",
+   "description": "hello.update_resume: update boot carries the id complete, normal boot carries no id",
+   "parity": true
+  },
+  {
+   "row": "G3",
+   "description": "scheduled-work re-arm: due job wakes its session once, scheduled-jobs.json never archived",
+   "parity": true
+  },
+  {
+   "row": "P1",
+   "description": "unmanaged-install refusal: live Rust text == TS source string (TS cannot run unmanaged on this box)",
+   "parity": true
+  },
+  {
+   "row": "P2",
+   "description": "rollback-without-previous refusal parity (TS message)",
+   "parity": true
+  },
+  {
+   "row": "P3",
+   "description": "TS coordinator status schema + terminal message parity",
+   "parity": true
+  },
+  {
+   "row": "D1",
+   "description": "TS phase names vs the Rust state vocabulary (spec redesign; schema and report strings stay TS-compatible)",
+   "divergence": "ts phases=['complete']; rust states=['complete']"
+  }
+ ],
+ "rows": {
+  "F1": {
+   "exit_code": 0,
+   "stdout": "Restored 1 daemon session\nRestarted the daemon after the update\n",
+   "stderr": "",
+   "current_target": "../releases/0.1.0-linux-x64-15d34f4c501443e9a3e516a58bbf1d6f6461c03cafaa642d7c67bf9ff2ef755b/prime-agent",
+   "previous_target": "../releases/0.1.0-linux-x64-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/prime-agent",
+   "activation_state": false,
+   "restored_session": "01a0b7a7-0007-7782-945b-6d711415a53f",
+   "original_session": "01a0b7a7-0007-7782-945b-6d711415a53f",
+   "status": {
+    "coordinator": {
+     "pid": 282771,
+     "processStartId": "proc:1642147"
+    },
+    "counts": {
+     "failed": 0,
+     "restored": 1,
+     "resumed": 0,
+     "total": 1
+    },
+    "epoch": 19,
+    "heartbeatAt": "2026-09-19T03:12:54.165Z",
+    "message": "Restarted the daemon after the update",
+    "predecessor": {
+     "pid": 282537,
+     "processStartId": "proc:1641809",
+     "supervisorGeneration": "sup:282537",
+     "supervisorOwnerToken": "b1afec9c-9027-443d-b555-6e7b0e0b0620"
+    },
+    "socketPath": "/tmp/usw-rust-f1-20260919T031120Z/prime-agent-1000/daemon.sock",
+    "startedAt": "2026-09-19T03:12:50.247Z",
+    "state": "complete",
+    "successor": {
+     "pid": 282820,
+     "processStartId": "proc:1642208",
+     "supervisorGeneration": "sup:282820",
+     "supervisorOwnerToken": "e713bf55-034c-4cb9-8bdc-2fa4f894b460"
+    },
+    "updateId": "01a0b7a7-0041-70cb-8e59-30a03c46db4e",
+    "updatedAt": "2026-09-19T03:12:54.165Z",
+    "version": 1
+   }
+  },
+  "F2": {
+   "exit_code": 0,
+   "stdout": "Restored 1 daemon session\nRestarted the daemon after the update\n",
+   "stderr": "",
+   "current_target": "../releases/0.1.0-linux-x64-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/prime-agent",
+   "restored_session": "01a0b7a7-1bfe-76bd-998b-818714b1b607",
+   "original_session": "01a0b7a7-1bfe-76bd-998b-818714b1b607",
+   "status": {
+    "coordinator": {
+     "pid": 283197,
+     "processStartId": "proc:1642567"
+    },
+    "counts": {
+     "failed": 0,
+     "restored": 1,
+     "resumed": 0,
+     "total": 1
+    },
+    "epoch": 18,
+    "heartbeatAt": "2026-09-19T03:12:58.363Z",
+    "message": "Restarted the daemon after the update",
+    "predecessor": {
+     "pid": 283125,
+     "processStartId": "proc:1642519",
+     "supervisorGeneration": "sup:283125",
+     "supervisorOwnerToken": "ea439988-79fa-4f5c-b6dd-ca1a5aa0d9c3"
+    },
+    "socketPath": "/tmp/usw-rust-f2-20260919T031120Z/prime-agent-1000/daemon.sock",
+    "startedAt": "2026-09-19T03:12:57.416Z",
+    "state": "complete",
+    "successor": {
+     "pid": 283259,
+     "processStartId": "proc:1642627",
+     "supervisorGeneration": "sup:283259",
+     "supervisorOwnerToken": "0dcaf34b-47a9-445a-ab77-286b0cf91f3d"
+    },
+    "updateId": "01a0b7a7-1c3a-734f-972e-ad5d04b4a33a",
+    "updatedAt": "2026-09-19T03:12:58.363Z",
+    "version": 1
+   }
+  },
+  "G1": {
+   "stale_prepared_gone": true,
+   "legacy_gone": true,
+   "list_served": true,
+   "normal_boot_update_resume": {
+    "complete": true
+   }
+  },
+  "G2": {
+   "update_boot_update_resume": {
+    "complete": true,
+    "updateId": "01a0b7a7-0041-70cb-8e59-30a03c46db4e"
+   },
+   "update_id": "01a0b7a7-0041-70cb-8e59-30a03c46db4e",
+   "normal_boot_update_resume": {
+    "complete": true
+   }
+  },
+  "G3": {
+   "woke_session": "01a0b7a7-29dc-7692-a65c-7e13bd32acb7",
+   "session": "01a0b7a7-29dc-7692-a65c-7e13bd32acb7",
+   "killed_workers_before_boot": 1,
+   "job_file_exists": true
+  },
+  "P1": {
+   "rust": {
+    "stdout": "",
+    "stderr": "Error: This compiled application is not owned by the Prime Agent installer. Update it using its original installer.\n",
+    "exit": 1
+   },
+   "ts_source_contains_refusal": true,
+   "ts_source": "/home/ubuntu/prime-agent/packages/coding-agent/src/cli/native-update.ts"
+  },
+  "P2": {
+   "rust": {
+    "stdout": "",
+    "stderr": "Error: No valid previous compiled release is available.\n"
+   },
+   "ts": {
+    "stdout": "",
+    "stderr": "Error: No valid previous compiled release is available.\n"
+   }
+  },
+  "P3": {
+   "ts_stdout": "",
+   "ts_stderr": "",
+   "ts_status": {
+    "version": 1,
+    "requestId": "284482-1789787590361",
+    "socketPath": "/tmp/usw-s5c/ts-coordinator/daemon.sock",
+    "phase": "complete",
+    "coordinator": {
+     "pid": 284482,
+     "processStartId": "proc:1643768"
+    },
+    "counts": {
+     "total": 0,
+     "restored": 0,
+     "resumed": 0,
+     "failed": 0
+    },
+    "startedAt": "2026-09-19T03:13:10.361Z",
+    "updatedAt": "2026-09-19T03:13:23.026Z",
+    "heartbeatAt": "2026-09-19T03:13:23.026Z",
+    "predecessor": {
+     "pid": 284142,
+     "processStartId": "proc:1643443",
+     "supervisorGeneration": "c6abd731-4c37-4b4d-9e00-8aba19f5c737",
+     "supervisorOwnerToken": "83dab83f-883b-43d3-a8e9-5780c9f1c308"
+    },
+    "successor": {
+     "pid": 285554,
+     "processStartId": "proc:1644886",
+     "supervisorGeneration": "8c7b0e49-c6d1-420d-a57a-68f3c2032122",
+     "supervisorOwnerToken": "43593c0f-d4fd-4e81-8f0f-16efbc1dbd89"
+    },
+    "message": "Restarted the daemon after the update"
+   }
+  }
+ }
+}

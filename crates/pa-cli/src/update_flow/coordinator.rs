@@ -5,25 +5,20 @@
 //!
 //! The activation boundary (spec §7): the coordinator swaps the launcher
 //! symlinks, records `.activation-state`, and deletes it on `Complete`. The
-//! `Restoring` phase in this slice reports adoption-based counts measured
-//! from the live successor (the successor's create-or-adopt of the kept
-//! worker descriptors - real restore of the top-level dimension); the full
-//! roster restore (subagents bottom-up, heartbeats, queue lanes, the
-//! per-session restore RPC) is the boot-sweep slice's and replaces this
-//! phase body. Counts are measured, never faked; the divergence is recorded
-//! in PORTING-NOTES.
+//! `Restoring` phase reports the successor's boot restore pass (spec §6,
+//! slice 5): the supervisor restores the roster rows (create-or-adopt,
+//! bottom-up) and the coordinator polls the `update_restore_status` RPC
+//! for the real per-session counts and failure records.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::phases::{
-    adoption_report, check_marker_fresh, commit_update, prepare_to_prepared, read_roster,
-};
+use super::phases::{check_marker_fresh, commit_update, prepare_to_prepared, restore_report};
 use anyhow::{Context, Result};
 use pa_types::daemon::update_flow::{
-    update_prepared_dir, update_roster_path, UpdateId, UpdateProcessIdentity, UpdateRoster,
-    UpdateState, UpdateStatus, UpdateTimeoutBudget,
+    update_prepared_dir, update_roster_path, UpdateId, UpdateProcessIdentity, UpdateState,
+    UpdateStatus, UpdateTimeoutBudget,
 };
 use tokio::sync::Mutex;
 
@@ -128,7 +123,6 @@ async fn drive(
     };
     let mut predecessor: Option<UpdateProcessIdentity> = None;
     let mut roster_path: Option<PathBuf> = None;
-    let mut roster: Option<UpdateRoster> = None;
     if let Some(client) = &daemon {
         let identity = identity_from_hello(client.hello());
         writer
@@ -147,10 +141,9 @@ async fn drive(
             .map_err(PhaseFailure::before_stop)?;
         let prepared_dir = update_prepared_dir(socket_dir, update_id);
         check_marker_fresh(&prepared_dir).map_err(PhaseFailure::before_stop)?;
+        // The roster artifact is the successor's input (consumed from the
+        // env at its boot, spec §6 step 2); the coordinator never parses it.
         roster_path = Some(update_roster_path(&prepared_dir));
-        roster = Some(
-            read_roster(&update_roster_path(&prepared_dir)).map_err(PhaseFailure::before_stop)?,
-        );
         writer
             .lock()
             .await
@@ -243,13 +236,14 @@ async fn drive(
         .await
         .set_successor(successor)
         .map_err(PhaseFailure::after_stop)?;
-    // `Restoring`: adoption-based report from the live successor.
+    // `Restoring`: the successor's restore pass reports real counts
+    // (the `update_restore_status` poll; spec §9).
     writer
         .lock()
         .await
         .set_state(UpdateState::Restoring)
         .map_err(PhaseFailure::after_stop)?;
-    let (counts, failures) = adoption_report(roster.as_ref(), &options.socket_path, budget).await;
+    let (counts, failures) = restore_report(&options.socket_path, budget).await;
     writer
         .lock()
         .await
@@ -369,8 +363,7 @@ async fn finish_failure(
         Some(identity) => {
             writer.lock().await.set_successor(identity)?;
             writer.lock().await.set_state(UpdateState::Restoring)?;
-            let (counts, _failures) =
-                adoption_report(None, &options.socket_path, &options.budget).await;
+            let (counts, _failures) = restore_report(&options.socket_path, &options.budget).await;
             writer.lock().await.set_counts(counts)?;
             writer.lock().await.set_state(UpdateState::Complete)?;
             writer.lock().await.set_message(Some(format!(

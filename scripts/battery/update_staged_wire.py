@@ -243,6 +243,29 @@ def ts_fixture_root(root: Path, ts_binary: Path) -> Path:
     os.symlink(f"../releases/{release.name}/prime-agent", install / "bin" / "prime-agent")
     return install
 
+def kill_detached_workers_under(root: Path) -> int:
+    """SIGTERM every process whose cwd is under `root` (the battery's own
+    detached session workers; scoped so ambient daemons are never touched)."""
+    killed = 0
+    import signal as _signal
+
+    root_s = str(root)
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            cwd = os.readlink(entry / "cwd")
+        except OSError:
+            continue
+        if cwd.startswith(root_s):
+            try:
+                os.kill(int(entry.name), _signal.SIGTERM)
+                killed += 1
+            except OSError:
+                pass
+    return killed
+
+
 def resident_session_id(wire: B.Wire) -> str | None:
     listing = wire.request("ls", {"type": "list"})
     sessions = ((listing.get("data") or {}).get("sessions")) or []
@@ -340,6 +363,7 @@ def main() -> int:
             restored_id = resident_session_id(new_wire)
         except Exception:
             restored_id = None
+        successor_hello_resume = (new_wire.hello or {}).get("updateResume") if new_wire else None
         rows = {
             "exit_code": update_result["exit_code"],
             "stdout": update_result["stdout"],
@@ -438,6 +462,167 @@ def main() -> int:
         evidence["rows"]["F2"] = f2_rows
         side2.stop_daemon()
         side2.mock.stop()
+
+        # ------------------------------------------------------------------
+        # G1: the boot sweep (spec §6 step 1, invariant I2): stop the update's
+        # successor daemon over the wire (the Side's process handle is the
+        # pre-update supervisor, already gone), plant stale scratch (this
+        # socket's update-restarts subtree + the TS-era legacy names), boot
+        # fresh, and assert the sweep removed it and the daemon serves.
+        # ------------------------------------------------------------------
+        socket_dir = side.agent_dir / "update-restarts"
+        status_files = sorted(socket_dir.glob("*/status.json")) if socket_dir.exists() else []
+        f1_update_id = None
+        stale_prepared = None
+        legacy_dir = side.agent_dir / "daemon-update-restarts"
+        legacy_status = side.agent_dir / "daemon-update-restart.json"
+        sweep_gone = served = False
+        normal_boot_resume = None
+        if status_files:
+            f1_update_id = json.loads(status_files[-1].read_text()).get("updateId")
+            hash_dir = status_files[-1].parent
+            stale_prepared = hash_dir / "prepared" / "stale.json"
+            stale_prepared.parent.mkdir(parents=True, exist_ok=True)
+            stale_prepared.write_text('{"stale": true}')
+            legacy_dir.mkdir(parents=True, exist_ok=True)
+            (legacy_dir / "legacy.json").write_text('{"legacy": true}')
+            legacy_status.write_text('{"legacy": true}')
+            # Stop the successor daemon (a graceful wire shutdown).
+            stop_wire = B.Wire(side.daemon_socket)
+            stop_wire.request("g1-stop", {"type": "shutdown"})
+            deadline = time.time() + 15.0
+            while time.time() < deadline and side.daemon_socket.exists():
+                try:
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                        probe.connect(str(side.daemon_socket))
+                except OSError:
+                    break
+                time.sleep(0.2)
+            # Fresh boot: a new supervisor process, no roster env (normal boot).
+            side.start_daemon()
+            sweep_wire = B.Wire(side.daemon_socket)
+            served = bool(sweep_wire.request("g1-list", {"type": "list", "all": True}).get("success"))
+            sweep_gone = (
+                not stale_prepared.exists()
+                and not stale_prepared.parent.exists()
+                and not legacy_dir.exists()
+                and not legacy_status.exists()
+            )
+            # The §10.3 contract live: the hello first shows the boot's
+            # restore/re-arm pass in flight, then settles with no update id.
+            deadline = time.time() + 20.0
+            while time.time() < deadline:
+                normal_boot_resume = (sweep_wire.hello or {}).get("updateResume")
+                if normal_boot_resume and normal_boot_resume.get("complete"):
+                    break
+                probe_wire = B.Wire(side.daemon_socket)
+                normal_boot_resume = (probe_wire.hello or {}).get("updateResume")
+                probe_wire.sock.close()
+                if normal_boot_resume and normal_boot_resume.get("complete"):
+                    break
+                time.sleep(0.5)
+            side.stop_daemon()
+        verdicts.append({"row": "G1", "description": "boot sweep: stale update scratch + legacy names gone, daemon serves (I2)", "parity": bool(sweep_gone and served)})
+        evidence["rows"]["G1"] = {
+            "stale_prepared_gone": stale_prepared is not None and not stale_prepared.exists(),
+            "legacy_gone": not legacy_dir.exists() and not legacy_status.exists(),
+            "list_served": served,
+            "normal_boot_update_resume": normal_boot_resume,
+        }
+
+        # ------------------------------------------------------------------
+        # G2: the hello resume contract (spec §10.3): the update-boot hello
+        # carries the update id with complete=true; a settled normal boot
+        # (G1's capture) carries no id with complete=true.
+        # ------------------------------------------------------------------
+        g2_ok = (
+            successor_hello_resume is not None
+            and successor_hello_resume.get("updateId") == f1_update_id
+            and successor_hello_resume.get("complete") is True
+            and normal_boot_resume == {"complete": True}
+        )
+        verdicts.append({"row": "G2", "description": "hello.update_resume: update boot carries the id complete, normal boot carries no id", "parity": bool(g2_ok)})
+        evidence["rows"]["G2"] = {
+            "update_boot_update_resume": successor_hello_resume,
+            "update_id": f1_update_id,
+            "normal_boot_update_resume": normal_boot_resume,
+        }
+
+        # ------------------------------------------------------------------
+        # G3: the scheduled-work re-arm (spec §6 step 3): a due active job
+        # of a session with no live worker wakes the session once on the
+        # boot pass, and scheduled-jobs.json is never archived.
+        # ------------------------------------------------------------------
+        g3_root = out / "rust-g3"
+        if g3_root.exists():
+            shutil.rmtree(g3_root)
+        fixture3 = build_fixture_root(g3_root, rust_bin, version)
+        install3 = fixture3["install"]
+        fixture3_bin = install3 / "bin" / "prime-agent"
+        side3 = make_rust_side(
+            f"rust-g3-{stamp}",
+            str(fixture3_bin),
+            g3_root,
+            {},
+        )
+        side3.daemon_socket = default_socket(side3)
+        side3.start_daemon()
+        wire3 = B.Wire(side3.daemon_socket)
+        wire3.request("g3-create", {"type": "create", "cwd": str(side3.work_dir)})
+        deadline = time.time() + 30.0
+        while time.time() < deadline and resident_session_id(wire3) is None:
+            time.sleep(0.5)
+        session3 = resident_session_id(wire3)
+        sessions_dir = side3.agent_dir / "sessions"
+        session3_file = sessions_dir / f"{session3}.jsonl"
+        artifacts = side3.agent_dir / "session-artifacts" / session3
+        artifacts.mkdir(parents=True, exist_ok=True)
+        due_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 60))
+        job = {
+            "id": "job-g3",
+            "status": "active",
+            "activeSessionId": session3,
+            "sessionId": session3,
+            "sessionFile": str(session3_file),
+            "cwd": str(side3.work_dir),
+            "prompt": "heartbeat probe",
+            "schedule": {"kind": "interval", "expression": "every 5m", "intervalMs": 300000},
+            "createdAt": due_at,
+            "updatedAt": due_at,
+            "nextRunAt": due_at,
+        }
+        (artifacts / "scheduled-jobs.json").write_text(json.dumps({"jobs": [job], "dispatches": []}))
+        side3.stop_daemon()
+        # The daemon's stop leaves its detached worker alive (batterylib's
+        # documented behavior); the re-arm row needs the session workerless,
+        # so kill this side's own worker by its cwd (scoped to the fixture).
+        killed_workers = kill_detached_workers_under(g3_root)
+        time.sleep(1.0)
+        # Normal boot (no roster env): the re-arm pass wakes the session.
+        side3.start_daemon()
+        wire3b = B.Wire(side3.daemon_socket)
+        woke = None
+        deadline = time.time() + 20.0
+        while time.time() < deadline:
+            listing = wire3b.request("g3-list", {"type": "list", "all": True})
+            rows3 = listing.get("data", {}).get("sessions", []) if listing.get("success") else []
+            woke = next((row.get("sessionId") for row in rows3 if row.get("sessionId") == session3), None)
+            if woke:
+                break
+            time.sleep(0.5)
+        g3_ok = (
+            woke == session3
+            and (artifacts / "scheduled-jobs.json").exists()
+        )
+        verdicts.append({"row": "G3", "description": "scheduled-work re-arm: due job wakes its session once, scheduled-jobs.json never archived", "parity": bool(g3_ok)})
+        evidence["rows"]["G3"] = {
+            "woke_session": woke,
+            "session": session3,
+            "killed_workers_before_boot": killed_workers,
+            "job_file_exists": (artifacts / "scheduled-jobs.json").exists(),
+        }
+        side3.stop_daemon()
+        side3.mock.stop()
 
         # ------------------------------------------------------------------
         # F3 + P1: the unmanaged-install refusal, both binaries.

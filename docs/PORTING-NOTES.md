@@ -1,3 +1,51 @@
+## Update boot sweep + roster restore + re-arm (slice 5, 2026-09-19)
+
+Reference: `docs/update-flow-state-machine.md` (§6/§8/§10) over the TS
+`restoreDaemonUpdateRestart` (package-manager-cli.ts) and the TS
+supervisor's scheduled-wake machinery (daemon-supervisor.ts).
+
+- The supervisor owns the boot side (spec §3/§6): the sweep, the
+  roster-via-env restore, and the scheduled-work re-arm. TS drove restore
+  from the coordinator over the client wire (`create` replay + a
+  `restore_actions` RPC + a continuation `prompt`); the Rust design keeps
+  the durable truth in the workers' recovery journals and session files, so
+  restore is create-or-adopt in place: kept descriptors relaunch (the
+  slice-3 adoption pass) and the supervisor's restore pass covers the rest
+  from the roster row's captured create command.
+- Divergences (spec, recorded):
+  - The TS `restore_actions`/`resume_queue` RPCs are not transcribed: the
+    worker's create replay rehydrates the session store and the persisted
+    queue snapshot from the recovery journal, which IS the restore for
+    both the relaunch and the roster-row create path.
+  - The boot sweep (§6 step 1) is unconditional - it deletes a live
+    coordinator's `status.json` scratch file too. The pa-cli status writer
+    recreates the parent dir on every persist and the CLI tail graces a
+    mid-tail missing file (`TAIL_SWEEP_GRACE_MS`); the coordinator's epoch
+    keeps rising so late writes cannot regress state.
+  - The scheduled-work re-arm is a boot pass (and a post-restore pass):
+    due active jobs of sessions with no live worker are woken once
+    (create-by-session-file, client id `scheduled-wake`, TS literal).
+    Live sessions need no wake - their in-process scheduler claims due
+    jobs itself. TS's permanent recompute-on-change wake timer
+    (`recomputeScheduledSessionWake` on job mutations) is not transcribed
+    in this slice: it is a general (non-update) daemon feature.
+  - The continuation treatment sends the TS
+    `UPDATE_RESTART_CONTINUATION_PROMPT` verbatim to a restored row that
+    was mid-turn (`in_flight.streaming`); a queued-work row counts as
+    resumed via its journal replay. The TS update-complete
+    `append_custom_message` notice (origin-session marker) is slice 6's
+    UX surface.
+  - `hello.update_resume` (§10.3) is a Rust-only extension over the TS
+    hello (the TS close frame carries no resume contract); TS clients
+    ignore unknown hello fields.
+  - The `update_restore_status` RPC (the coordinator's `Restoring` report
+    input) is Rust-owned wire, like the slice-2/3 prepare/commit RPCs.
+- Ownership: pa-daemon `update_restore.rs` (sweep, RestoreProgress, restore
+  pass, re-arm, queued-attach + status surfaces); pa-cli `update_flow`
+  (status-writer sweep survival, tail grace, restore report poll);
+  pa-types (the `update_restore_status` command, the hello
+  `update_resume` contract type).
+
 ## Update staged activation + coordinator (slice 4, 2026-09-19)
 
 Reference: `docs/update-flow-state-machine.md` (§3/§4/§7/§9) over the TS
@@ -24,12 +72,10 @@ Reference: `docs/update-flow-state-machine.md` (§3/§4/§7/§9) over the TS
     `.install-source` itself and validates the Rust payload list. The
     coordinator owns the symlink swap; the TS install.sh recovery marker
     check is not transcribed.
-  - `Restoring` in this slice reports adoption-based counts measured from
-    the live successor (create-or-adopt of the kept worker descriptors -
-    real restore of the top-level dimension). The full roster restore
-    (subagents bottom-up, heartbeats, queue lanes, per-session restore
-    RPC, per-session failure capture) is the boot-sweep slice (§13.5) and
-    replaces the phase body. Counts are measured, never faked.
+  - `Restoring` first shipped as adoption-based counts measured from the
+    live successor; slice 5 replaced the phase body with the supervisor's
+    restore pass reported over the `update_restore_status` RPC (see the
+    slice-5 section). Counts are measured, never faked.
   - `update --rollback` runs the same FSM with the previous release as the
     candidate (the launcher swap repoints `bin/prime-agent` at
     `bin/previous`'s target; `bin/previous` then names the rolled-back-from

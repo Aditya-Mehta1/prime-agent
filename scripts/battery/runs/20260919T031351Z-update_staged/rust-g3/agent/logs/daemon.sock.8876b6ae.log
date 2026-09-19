@@ -1,0 +1,4 @@
+supervisor started pid 283562
+[2026-09-19T03:13:00.848Z] session worker 5f211dde38e2 registered (epoch 1, pid 283576)
+[2026-09-19T03:13:00.926Z] session worker 5f211dde38e2 re-registered (epoch 2, pid 283576)
+supervisor started pid 283693

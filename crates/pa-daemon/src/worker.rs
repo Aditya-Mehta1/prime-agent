@@ -651,6 +651,9 @@ impl Worker {
             supervisor_owner_token: None,
             supervisor_process_start_id: None,
             supervisor_socket_path: None,
+            // The worker's hello carries no resume contract (the
+            // supervisor owns the boot restore pass).
+            update_resume: None,
             client_id: crate::util::new_display_id(),
             server_capabilities: worker_server_capabilities(),
             rest: Default::default(),

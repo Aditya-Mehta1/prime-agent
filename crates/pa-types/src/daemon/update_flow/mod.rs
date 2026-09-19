@@ -27,9 +27,9 @@ mod state;
 pub use artifact::{
     legacy_update_restart_status, legacy_update_restarts_dir, socket_update_dir,
     update_intent_path, update_marker_path, update_prepared_dir, update_restarts_dir,
-    update_roster_path, update_status_path, UpdateId, UpdateIntent, UpdateProcessIdentity,
-    UpdateStatus, UpdateStatusCounts, UpdateStatusFailure, UPDATE_ROSTER_ENV,
-    UPDATE_STATUS_FORMAT_VERSION,
+    update_roster_path, update_status_path, DaemonUpdateResume, UpdateId, UpdateIntent,
+    UpdateProcessIdentity, UpdateStatus, UpdateStatusCounts, UpdateStatusFailure,
+    UPDATE_ROSTER_ENV, UPDATE_STATUS_FORMAT_VERSION,
 };
 pub use budget::{UpdateTimeoutBudget, UPDATE_ENV_PREFIX};
 pub use marker::{

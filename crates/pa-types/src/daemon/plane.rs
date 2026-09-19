@@ -171,6 +171,7 @@ const READ_ONLY_DAEMON_COMMANDS: &[&str] = &[
     "get_queue",
     "cron_list",
     "heartbeats_list",
+    "update_restore_status",
     "heartbeat_get",
     "get_session_context",
     "get_session_tree",

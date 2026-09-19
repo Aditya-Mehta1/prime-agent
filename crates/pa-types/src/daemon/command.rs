@@ -1065,6 +1065,18 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    /// Query the supervisor's boot-time restore pass (spec §6/§9): the
+    /// successor reports whether the roster restore is in flight and the
+    /// per-session counts/failures so the coordinator's `Restoring` phase
+    /// reports real numbers (the adoption heuristic is gone). Read-only.
+    UpdateRestoreStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        update_id: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
     Restart {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
