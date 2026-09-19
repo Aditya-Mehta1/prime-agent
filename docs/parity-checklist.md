@@ -525,15 +525,23 @@ TS: `modes/daemon/daemon-supervisor.ts` `send_message` block, `daemon-mode.ts`
   transparently reconnects once, the TS close-listener teardown equivalent)
   and the kernel `agent_message.send` / `agent_observe.*` host controllers
   wired through the engine's `extra_host_handlers`
-  (`crates/pa-daemon/src/agent_messaging.rs`).
+  (`crates/pa-daemon/src/agent_messaging.rs`). The family view joins the
+  roster with the session's own RLM children registry (the same registry
+  `rlm.list_subagents` reads): registry children are Child members
+  addressable by name, RLM child id, and persisted session id (alias
+  selectors on the kernel `AgentFamilyMember`), the roster row that
+  spawned a subagent worker is its Parent member, and the rest stay
+  siblings; the `send_message` wake falls back to the spawn ledger's live
+  child edges when the saved-session catalog misses a child selector
+  (`tests/agent_family_e2e.rs` verifies the round trip end to end).
 - done: the kernel `agent_message.send` contract
   (`crates/pa-core/src/session_engine/agent_messaging.rs`, TS
   `createAgentMessageHostHandlers` port): role/name resolution through the
   family roster with the exact TS error strings, `target: "all"` broadcast
   with all-settled receipts, positional-target rejection, and the removed
   `agent_message.list_agents` migration error. The daemon worker's family
-  roster is the supervisor `list` (every other resident session is a
-  sibling); receipts carry the TS target endpoint
+  roster is the family view above (children, parent, then siblings;
+  `tests/agent_family_e2e.rs`); receipts carry the TS target endpoint
   (activeSessionId/sessionId/sessionName/runtimeKind) so the kernel
   sent-message display bridge parses them.
 - done: worker-to-worker peer transport (thin-supervisor stage 3): the

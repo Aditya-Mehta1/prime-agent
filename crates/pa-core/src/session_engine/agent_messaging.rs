@@ -103,12 +103,25 @@ pub struct AgentFamilyMember {
     /// another worker).
     pub id: String,
     pub name: Option<String>,
+    /// Extra selector forms that resolve to this same member (empty for
+    /// the TS shape). The supervisor-backed controller lists a child's
+    /// RLM child id and persisted session id here so every identifier the
+    /// roster exposes addresses the child, while broadcast sends stay
+    /// one-per-member.
+    pub aliases: Vec<String>,
 }
 
 impl AgentFamilyMember {
     /// TS `agentFamilyMemberName`: the name, else the id.
     pub fn member_name(&self) -> &str {
         self.name.as_deref().unwrap_or(&self.id)
+    }
+
+    /// Whether `selector` addresses this member by name, id, or alias.
+    fn matches_selector(&self, selector: &str) -> bool {
+        self.member_name() == selector
+            || self.id == selector
+            || self.aliases.iter().any(|alias| alias == selector)
     }
 }
 
@@ -400,8 +413,9 @@ pub fn register_agent_message_host_handlers<C: AgentMessageController + 'static>
                     .filter(|member| {
                         member.relationship == role
                             && (role == AgentFamilyRelationship::Parent
-                                || member.member_name() == selector.unwrap_or_default()
-                                || selector.is_some_and(|selector| member.id == selector))
+                                || selector.is_some_and(|selector| {
+                                    member.matches_selector(selector)
+                                }))
                     })
                     .collect();
                 // Exactly one match resolves; zero or many keep the TS
@@ -846,26 +860,31 @@ mod tests {
                 relationship: AgentFamilyRelationship::Parent,
                 id: "parent-1".to_string(),
                 name: None,
+                aliases: Vec::new(),
             },
             AgentFamilyMember {
                 relationship: AgentFamilyRelationship::Sibling,
                 id: "sib-1".to_string(),
                 name: Some("scout".to_string()),
+                aliases: Vec::new(),
             },
             AgentFamilyMember {
                 relationship: AgentFamilyRelationship::Sibling,
                 id: "sib-2".to_string(),
                 name: None,
+                aliases: Vec::new(),
             },
             AgentFamilyMember {
                 relationship: AgentFamilyRelationship::Child,
                 id: "kid-1".to_string(),
                 name: Some("dual".to_string()),
+                aliases: vec!["sub-kid1".to_string(), "sess-kid1".to_string()],
             },
             AgentFamilyMember {
                 relationship: AgentFamilyRelationship::Child,
                 id: "kid-2".to_string(),
                 name: Some("dual".to_string()),
+                aliases: Vec::new(),
             },
         ]
     }
@@ -997,6 +1016,21 @@ mod tests {
             "child selector \"dual\" is ambiguous"
         );
 
+        // Aliased members resolve by every alias form (the daemon lists a
+        // child's RLM child id and persisted session id as aliases).
+        let by_child_alias = send_request(
+            &send,
+            json!({ "message": "hi", "receiver_role": "child", "receiver_name": "sub-kid1" }),
+        )
+        .unwrap();
+        assert_eq!(by_child_alias["target"]["activeSessionId"], "kid-1");
+        let by_session_alias = send_request(
+            &send,
+            json!({ "message": "hi", "receiver_role": "child", "receiver_name": "sess-kid1" }),
+        )
+        .unwrap();
+        assert_eq!(by_session_alias["target"]["activeSessionId"], "kid-1");
+
         // Broadcast sends to every family member, all-settled.
         let broadcast =
             send_request(&send, json!({ "target": "all", "message": "  everyone  " })).unwrap();
@@ -1051,6 +1085,7 @@ mod tests {
                     relationship: AgentFamilyRelationship::Sibling,
                     id: "sib-1".to_string(),
                     name: None,
+                    aliases: Vec::new(),
                 }])
             }
             async fn send_agent_message(

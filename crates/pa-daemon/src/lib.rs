@@ -8,7 +8,7 @@
 
 pub mod acp;
 pub mod agent_engine;
-pub(crate) mod agent_messaging;
+pub mod agent_messaging;
 pub(crate) mod agent_roster;
 pub mod compaction;
 pub mod descriptor;

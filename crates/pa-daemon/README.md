@@ -16,14 +16,17 @@ compaction-entry fold for compacted message reads), client attach/detach
 (full-snapshot and chunked `session_snapshot_begin`/`chunk`/`end`
 streaming), direct-attach transport (supervisor-issued single-use tickets
 with a 10s TTL, worker-side peer grants burned on first use, session-plane
-command gating on peer links), worker-to-worker peer messaging (stage 3:
+command gating on peer links), kernel agent_message/agent_observe bridge (`agent_messaging.rs`: the worker-side controllers over the supervisor link; the family view joins the supervisor roster with the session's own RLM children registry - the same registry `rlm.list_subagents` reads - so registry children are Child members addressable by name, RLM child id, and persisted session id, the spawning session is the Parent member for a subagent worker, and everything else stays a sibling; delivery tries the direct peer transport then the supervisor-routed `send_message`), worker-to-worker peer messaging (stage 3:
 `worker`-purpose single-use grants minted by `get_worker_peer_transport`
 for a source worker's kernel `agent_message.send`, direct
 `worker_deliver_message` on the target worker's socket with the supervisor
 routed `send_message` as the never-retried fallback), saved-session wake
 for non-resident `send_message` targets (`session_catalog.rs`: catalog
 resolve by session-id prefix or exact name, cwd-scoped first; a resident
-worker hosting the file is reused, otherwise one spawns over it), wire protocol serve/negotiation (including the
+worker hosting the file is reused, otherwise one spawns over it; RLM
+children fall back to the spawn ledger's live child edges when the catalog
+misses - children persist outside the sessions dir, under the parent's
+session-artifacts tree - and wake over their own session file), wire protocol serve/negotiation (including the
 `compact`/`abort_compaction`/`set_auto_compaction` commands and their
 `compaction_start`/`compaction_end` events), the agent-roster arms
 (`roster_subscribe`/`roster_unsubscribe` with the full snapshot, live
@@ -123,7 +126,7 @@ relaunched — never a kill), or the update exit when all workers stopped
 No agent behavior inside workers beyond hosting a pa-core engine; no UI.
 
 ## Public API
-Supervisor entrypoint, worker entrypoint, `mcp_login::{WorkerMcpLoginUi, wire_worker_mcp_login}` (the worker's browser+callback login behind `mcp.begin_login`; wired by the agent engine before sessions register host handlers), client connection API for pa-tui/pa-cli, `acp::{run_acp_mode, AcpOptions}` (pa-cli dispatches `--mode acp` through it). Supervision internals `pub(crate)`.
+Supervisor entrypoint, worker entrypoint, `mcp_login::{WorkerMcpLoginUi, wire_worker_mcp_login}` (the worker's browser+callback login behind `mcp.begin_login`; wired by the agent engine before sessions register host handlers), client connection API for pa-tui/pa-cli, `acp::{run_acp_mode, AcpOptions}` (pa-cli dispatches `--mode acp` through it), `agent_messaging::LinkAgentMessageController` + `rlm_children::{SupervisorChildSessions, ParentIdentity, RlmChildIdentity}` (e2e verifiers construct the worker-side family controller and the children registry; the engine wires the same types). Supervision internals `pub(crate)`.
 
 
 ## Depends on

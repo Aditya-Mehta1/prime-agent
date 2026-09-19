@@ -227,7 +227,17 @@ impl Supervisor {
         let info =
             match crate::session_catalog::resolve_saved_session(&sessions_dir, selector, &cwd) {
                 Ok(Some(info)) => info,
-                Ok(None) => return WakeOutcome::Unknown,
+                // The saved-session catalog misses RLM children: they
+                // persist in the parent's session-artifacts tree, not the
+                // sessions dir. The spawn ledger still tracks them, so a
+                // child selector falls back to its live edges (child id,
+                // session id, or name) and wakes the child's own file.
+                Ok(None) => {
+                    return match self.wake_ledger_child(selector, &sessions_dir).await {
+                        Some(outcome) => outcome,
+                        None => WakeOutcome::Unknown,
+                    }
+                }
                 Err(error) => return WakeOutcome::Failed(error.to_string()),
             };
         let session_path = info.path.to_string_lossy().to_string();
@@ -262,6 +272,93 @@ impl Supervisor {
             Err(error) => WakeOutcome::Failed(format!("{error:#}")),
         }
     }
+}
+
+impl Supervisor {
+    /// The deferred ledger fallback for the `send_message` wake: resolve
+    /// a selector the saved-session catalog missed against the spawn
+    /// ledger's live child edges (the child id, the child's session-id
+    /// file stem, or the child's name), then wake one worker over the
+    /// child's session file. `None` keeps the caller's unknown-session
+    /// error; `Some(Failed)` carries the wake's own error (an ambiguous
+    /// selector outranks the miss, like the catalog's).
+    async fn wake_ledger_child(
+        self: &Arc<Self>,
+        selector: &str,
+        sessions_dir: &std::path::Path,
+    ) -> Option<WakeOutcome> {
+        let ledger = match self
+            .rlm_spawn_ledger_for(Some(&sessions_dir.to_string_lossy()))
+            .await
+        {
+            Ok(ledger) => ledger,
+            Err(error) => return Some(WakeOutcome::Failed(error.to_string())),
+        };
+        let edges = match ledger.live_edges() {
+            Ok(edges) => edges,
+            Err(error) => return Some(WakeOutcome::Failed(error.to_string())),
+        };
+        let mut matches: Vec<&crate::rlm_ledger::RlmLedgerEdge> = edges
+            .iter()
+            .filter(|edge| ledger_edge_matches(edge, selector))
+            .collect();
+        match matches.len() {
+            0 => None,
+            1 => {
+                let edge = matches.pop().expect("one match");
+                let session_file = edge.child.clone();
+                let cwd =
+                    crate::session_store::read_session_info(std::path::Path::new(&session_file))
+                        .map(|info| info.cwd)
+                        .unwrap_or_else(|| "/".to_string());
+                Some(self.launch_ledger_child_wake(&session_file, cwd).await)
+            }
+            _ => Some(WakeOutcome::Failed(format!(
+                "Ambiguous session selector \"{selector}\""
+            ))),
+        }
+    }
+
+    /// Spawn one worker over a ledger child's session file (the same
+    /// create the saved-session wake uses).
+    async fn launch_ledger_child_wake(
+        self: &Arc<Self>,
+        session_file: &str,
+        cwd: String,
+    ) -> WakeOutcome {
+        let create = DaemonCommand::Create {
+            id: None,
+            session_path: Some(session_file.to_string()),
+            continue_recent: Some(false),
+            no_session: None,
+            name: None,
+            config: Some(json!({ "cwd": cwd })),
+            telemetry_disabled: None,
+            runtime_metadata: None,
+            lifecycle: None,
+            env: None,
+            launch_env: None,
+            rest: Default::default(),
+        };
+        match self.launch_worker(&create, None).await {
+            Ok(resident) => {
+                self.refresh_roster_entry(&resident).await;
+                WakeOutcome::Woken(resident)
+            }
+            Err(error) => WakeOutcome::Failed(format!("{error:#}")),
+        }
+    }
+}
+
+/// Whether a ledger child edge answers a wake selector: by its recorded
+/// name, its RLM child id, or its persisted session id (the session-file
+/// stem).
+fn ledger_edge_matches(edge: &crate::rlm_ledger::RlmLedgerEdge, selector: &str) -> bool {
+    edge.name == selector
+        || edge.child_id == selector
+        || std::path::Path::new(&edge.child)
+            .file_stem()
+            .is_some_and(|stem| stem == selector)
 }
 
 /// Sender endpoint for an agent-origin message: the source session's live
@@ -441,6 +538,26 @@ mod tests {
             response.error.as_deref(),
             Some("Ambiguous session selector \"twin\"")
         );
+    }
+
+    /// The ledger fallback selector: a child edge answers by name, by its
+    /// RLM child id, and by its persisted session id (the file stem), never
+    /// by a partial id.
+    #[test]
+    fn ledger_edges_match_by_name_child_id_and_session_id() {
+        let edge = crate::rlm_ledger::RlmLedgerEdge {
+            child_id: "sub-kid1".to_string(),
+            parent: "/sessions/parent.jsonl".to_string(),
+            child: "/artifacts/parent/sub-kid1/sess-kid.jsonl".to_string(),
+            depth: 1,
+            name: "kid".to_string(),
+            deleted: None,
+        };
+        for selector in ["kid", "sub-kid1", "sess-kid"] {
+            assert!(ledger_edge_matches(&edge, selector), "{selector}");
+        }
+        assert!(!ledger_edge_matches(&edge, "ki"));
+        assert!(!ledger_edge_matches(&edge, "parent.jsonl"));
     }
 
     /// Delivery routes `worker_deliver_message` to the resolved target with

@@ -443,6 +443,7 @@ impl AgentSessionEngine {
             config.active_session_id.clone(),
             config.worker_token.clone(),
             Arc::clone(&self.own_summary),
+            self.children.clone(),
         ));
         let observer = Arc::new(LinkAgentObserveController::new(Arc::clone(&self.link)));
         let mut handlers = HostRequestHandlers::default();

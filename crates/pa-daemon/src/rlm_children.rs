@@ -74,6 +74,17 @@ impl ParentIdentity {
     }
 }
 
+/// One child's family-addressing identity: the same facts the RLM roster
+/// row carries, snapshotted without a worker refresh. The agent-message
+/// family view (and only it) reads children through this shape.
+#[derive(Debug, Clone)]
+pub struct RlmChildIdentity {
+    pub rlm_child_id: String,
+    pub active_session_id: String,
+    pub session_id: Option<String>,
+    pub session_name: String,
+}
+
 /// One tracked child session.
 #[derive(Debug)]
 struct ChildRecord {
@@ -160,6 +171,47 @@ impl SupervisorChildSessions {
     /// session exists).
     pub fn set_identity(&self, identity: ParentIdentity) {
         *self.inner.identity.lock().expect("identity lock") = identity;
+    }
+
+    /// The children registry snapshot behind the `agent_message` family
+    /// view: the same registry `rlm.list_subagents` reads (the resident
+    /// child set of this parent), without the per-child worker refresh -
+    /// addressing never blocks on a status round trip.
+    pub async fn child_identities(&self) -> Vec<RlmChildIdentity> {
+        let children = self.inner.children.lock().await;
+        let mut identities = Vec::with_capacity(children.len());
+        for record in children.iter() {
+            let record = record.lock().await;
+            identities.push(RlmChildIdentity {
+                rlm_child_id: record.rlm_child_id.clone(),
+                active_session_id: record.active_session_id.clone(),
+                session_id: record.session_id.clone(),
+                session_name: record.session_name.clone(),
+            });
+        }
+        identities
+    }
+
+    /// Test seam: admit one child record without the supervisor round trip
+    /// (the controller tests exercise the family join on registry state).
+    #[cfg(test)]
+    pub(crate) async fn push_test_child(&self, identity: RlmChildIdentity) {
+        self.inner
+            .children
+            .lock()
+            .await
+            .push(Arc::new(Mutex::new(ChildRecord {
+                rlm_child_id: identity.rlm_child_id,
+                session_name: identity.session_name,
+                active_session_id: identity.active_session_id,
+                session_id: identity.session_id,
+                session_dir: String::new(),
+                label: String::new(),
+                started_at_ms: 0,
+                settled_status: None,
+                answer_preview: None,
+                answer_captured: false,
+            })));
     }
 
     /// Set only the inherited model selector (the engine resolves its model

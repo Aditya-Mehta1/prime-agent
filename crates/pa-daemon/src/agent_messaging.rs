@@ -25,27 +25,34 @@ use crate::supervisor_link::SupervisorLink;
 /// falls back to the supervisor-routed `send_message` (the TS worker's
 /// `sendRemoteAgentSessionMessage` path). Neither path is retried: daemon
 /// commands are not idempotent.
-pub(crate) struct LinkAgentMessageController {
+/// Exposed for the agent-family e2e verifier (tests/agent_family_e2e.rs):
+/// the same controller construction the worker engine wires.
+pub struct LinkAgentMessageController {
     link: Arc<SupervisorLink>,
     active_session_id: String,
     worker_token: String,
     /// This worker's own session summary, pushed by the worker at create
     /// (and rename); the sender identity block for direct deliveries.
     own_summary: Arc<std::sync::Mutex<Option<Value>>>,
+    /// This session's resident RLM children (the same registry
+    /// `rlm.list_subagents` reads); `None` for standalone workers.
+    children: Option<Arc<crate::rlm_children::SupervisorChildSessions>>,
 }
 
 impl LinkAgentMessageController {
-    pub(crate) fn new(
+    pub fn new(
         link: Arc<SupervisorLink>,
         active_session_id: String,
         worker_token: String,
         own_summary: Arc<std::sync::Mutex<Option<Value>>>,
+        children: Option<Arc<crate::rlm_children::SupervisorChildSessions>>,
     ) -> Self {
         LinkAgentMessageController {
             link,
             active_session_id,
             worker_token,
             own_summary,
+            children,
         }
     }
 }
@@ -74,30 +81,93 @@ async fn roster_summaries(
 impl AgentMessageController for LinkAgentMessageController {
     async fn family(&self) -> anyhow::Result<Vec<AgentFamilyMember>> {
         let sessions = roster_summaries(&self.link).await?;
-        Ok(sessions
-            .into_iter()
-            // The worker's family from the roster: every other resident
-            // session is a sibling (parents and children live inside a
-            // worker and are not roster rows yet).
-            .filter_map(|session| {
-                let active_session_id = session
-                    .get("activeSessionId")
-                    .or_else(|| session.get("id"))
-                    .and_then(Value::as_str)?
-                    .to_string();
-                if active_session_id == self.active_session_id {
-                    return None;
-                }
-                Some(AgentFamilyMember {
-                    relationship: AgentFamilyRelationship::Sibling,
+        // The parent identity (subagent summaries carry their parent's
+        // live and persisted ids); a top-level session has none.
+        let parent = self.parent_identity();
+        // This session's resident children, keyed for the roster join.
+        // The registry is the same source `rlm.list_subagents` reads, so
+        // the family view and the RLM roster can never disagree on which
+        // children exist.
+        let mut children = match &self.children {
+            Some(children) => children.child_identities().await,
+            None => Vec::new(),
+        };
+        let mut parent_member: Option<AgentFamilyMember> = None;
+        let mut siblings: Vec<AgentFamilyMember> = Vec::new();
+        let mut child_members: Vec<AgentFamilyMember> = Vec::new();
+        for session in sessions {
+            let Some(active_session_id) = session
+                .get("activeSessionId")
+                .or_else(|| session.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if active_session_id == self.active_session_id {
+                continue;
+            }
+            let session_id = session
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let name = session
+                .get("sessionName")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string);
+            // A roster row owned by this session's children registry is a
+            // Child member (keyed by its RLM child id and persisted session
+            // id as aliases, so every identifier form the roster exposes
+            // addresses it).
+            if let Some(position) = children
+                .iter()
+                .position(|child| child.active_session_id == active_session_id)
+            {
+                let child = children.swap_remove(position);
+                child_members.push(child_member(&child, name));
+                continue;
+            }
+            // The session that spawned this worker (when this worker is a
+            // subagent): a Parent member, addressed by its live ids.
+            if parent.as_ref().is_some_and(|(active, persisted)| {
+                active.as_deref() == Some(active_session_id.as_str())
+                    || (persisted.is_some() && persisted.as_deref() == Some(session_id))
+            }) {
+                parent_member = Some(AgentFamilyMember {
+                    relationship: AgentFamilyRelationship::Parent,
                     id: active_session_id,
-                    name: session
-                        .get("sessionName")
-                        .and_then(Value::as_str)
-                        .filter(|name| !name.is_empty())
-                        .map(str::to_string),
-                })
-            })
+                    name,
+                    aliases: Vec::new(),
+                });
+                continue;
+            }
+            siblings.push(AgentFamilyMember {
+                relationship: AgentFamilyRelationship::Sibling,
+                id: active_session_id,
+                name,
+                // The persisted session id also addresses a sibling
+                // (TS family entries are keyed by it).
+                aliases: (!session_id.is_empty())
+                    .then(|| session_id.to_string())
+                    .into_iter()
+                    .collect(),
+            });
+        }
+        // Children the roster does not list (a passivating or
+        // mid-registration child worker) stay addressable: the delivery
+        // transports resolve or wake them from their persisted identity.
+        for child in children {
+            child_members.push(child_member(&child, None));
+        }
+        // TS `selectAgentFamily` order: parent, siblings by name, then
+        // children by name.
+        siblings.sort_by(|left, right| left.member_name().cmp(right.member_name()));
+        child_members.sort_by(|left, right| left.member_name().cmp(right.member_name()));
+        Ok(parent_member
+            .into_iter()
+            .chain(siblings)
+            .chain(child_members)
             .collect())
     }
 
@@ -219,6 +289,28 @@ impl LinkAgentMessageController {
             .ok_or_else(|| anyhow::anyhow!("Supervisor returned an invalid agent-message receipt"))
     }
 
+    /// This session's parent identity from its own summary (the subagent
+    /// create metadata carries the parent's live and persisted ids):
+    /// `(active session id, persisted session id)`, `None` when this
+    /// session is not a subagent.
+    fn parent_identity(&self) -> Option<(Option<String>, Option<String>)> {
+        let summary = self
+            .own_summary
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        let non_empty = |key: &str| {
+            summary
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        let active = non_empty("parentActiveSessionId");
+        let persisted = non_empty("parentSessionId");
+        (active.is_some() || persisted.is_some()).then_some((active, persisted))
+    }
+
     /// The TS `createAgentSessionMessageSender` shape for agent-origin
     /// sends: the sending session's endpoint fields plus the `agent`
     /// client identity (the TS daemon attributes kernel sends this way
@@ -254,6 +346,29 @@ impl LinkAgentMessageController {
             }
         }
         sender
+    }
+}
+
+/// One registry child as a family member: a Child relationship keyed by
+/// its live active session id, named by its session name, with the RLM
+/// child id and the persisted session id as alias selectors (every
+/// identifier form `rlm.list_subagents` and the roster expose). `name`
+/// from the roster row overrides the registry's when set (a fresh rename).
+fn child_member(
+    child: &crate::rlm_children::RlmChildIdentity,
+    name: Option<String>,
+) -> AgentFamilyMember {
+    let mut aliases = vec![child.rlm_child_id.clone()];
+    if let Some(session_id) = &child.session_id {
+        if !session_id.is_empty() {
+            aliases.push(session_id.clone());
+        }
+    }
+    AgentFamilyMember {
+        relationship: AgentFamilyRelationship::Child,
+        id: child.active_session_id.clone(),
+        name: name.or_else(|| (!child.session_name.is_empty()).then(|| child.session_name.clone())),
+        aliases,
     }
 }
 
@@ -500,6 +615,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 mod controller_tests {
     use super::*;
     use crate::protocol::{response_failure, response_success};
+    use crate::rlm_children::RlmChildIdentity;
     use crate::supervisor_link::SupervisorLink;
     use pa_core::session_engine::agent_messaging::AgentMessageController;
     use pa_types::platform::transport::bind_transport;
@@ -593,7 +709,36 @@ mod controller_tests {
             active_session_id: "aaa111".to_string(),
             worker_token: "tok-a".to_string(),
             own_summary: Arc::new(std::sync::Mutex::new(own_summary)),
+            children: None,
         }
+    }
+
+    /// A controller whose children registry holds one resident child
+    /// (`sub-kid1`, live id `ddd444`): the same registry shape
+    /// `rlm.list_subagents` reads.
+    fn controller_with_children(
+        socket: std::path::PathBuf,
+        own_summary: Option<Value>,
+    ) -> LinkAgentMessageController {
+        let children = crate::rlm_children::SupervisorChildSessions::new(
+            Arc::new(SupervisorLink::new(socket.clone())),
+            std::path::PathBuf::from("/agent"),
+            "aaa111".to_string(),
+        );
+        let mut controller = controller(socket, own_summary);
+        controller.children = Some(Arc::new(children));
+        controller
+    }
+
+    /// Seed the children registry with one admitted child (the same state
+    /// `rlm.spawn` leaves behind, without the supervisor round trip).
+    async fn admit_child(controller: &LinkAgentMessageController, child: RlmChildIdentity) {
+        controller
+            .children
+            .as_ref()
+            .expect("children registry")
+            .push_test_child(child)
+            .await;
     }
 
     fn own_summary() -> Option<Value> {
@@ -635,6 +780,125 @@ mod controller_tests {
         assert_eq!(family[0].name.as_deref(), Some("beta"));
         assert_eq!(family[1].id, "ccc333");
         assert_eq!(family[1].name, None);
+    }
+
+    /// The family view labels this session's registry children as Child
+    /// members (with the RLM child id and persisted session id as alias
+    /// selectors) and its own parent as the Parent member; the child row
+    /// is not also a sibling.
+    #[tokio::test]
+    async fn family_labels_children_and_parent_from_the_registry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("sup.sock");
+        spawn_fake_supervisor(
+            socket.clone(),
+            json!({ "sessions": [
+                { "activeSessionId": "aaa111", "sessionId": "sess-a", "sessionName": "alpha" },
+                { "activeSessionId": "bbb222", "sessionId": "sess-b", "sessionName": "beta" },
+                { "activeSessionId": "ddd444", "sessionId": "sess-d", "sessionName": "worker-a" },
+                { "activeSessionId": "ppp000", "sessionId": "sess-p", "sessionName": "papa" },
+            ]}),
+            None,
+        )
+        .await;
+        let own_summary = Some(json!({
+            "activeSessionId": "aaa111",
+            "sessionId": "sess-a",
+            "sessionName": "alpha",
+            "parentActiveSessionId": "ppp000",
+            "parentSessionId": "sess-p",
+        }));
+        let controller = controller_with_children(socket, own_summary);
+        admit_child(
+            &controller,
+            RlmChildIdentity {
+                rlm_child_id: "sub-kid1".to_string(),
+                active_session_id: "ddd444".to_string(),
+                session_id: Some("sess-d".to_string()),
+                session_name: "worker-a".to_string(),
+            },
+        )
+        .await;
+        let family = controller.family().await.unwrap();
+        // TS `selectAgentFamily` order: parent, siblings, children.
+        assert_eq!(family.len(), 3, "{family:?}");
+        assert_eq!(family[0].relationship, AgentFamilyRelationship::Parent);
+        assert_eq!(family[0].id, "ppp000");
+        assert_eq!(family[0].name.as_deref(), Some("papa"));
+        assert_eq!(family[1].relationship, AgentFamilyRelationship::Sibling);
+        assert_eq!(family[1].id, "bbb222");
+        assert_eq!(
+            family[2].relationship,
+            AgentFamilyRelationship::Child,
+            "{family:?}"
+        );
+        assert_eq!(family[2].id, "ddd444");
+        assert_eq!(family[2].name.as_deref(), Some("worker-a"));
+        assert_eq!(family[2].aliases, vec!["sub-kid1", "sess-d"]);
+        // No member duplicates the child as a sibling.
+        assert!(!family.iter().any(|member| member.id == "ddd444"
+            && member.relationship == AgentFamilyRelationship::Sibling));
+    }
+
+    /// A child resolves its parent by the persisted session id too (the
+    /// live id can change across a parent worker restart).
+    #[tokio::test]
+    async fn family_resolves_the_parent_by_session_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("sup.sock");
+        spawn_fake_supervisor(
+            socket.clone(),
+            json!({ "sessions": [
+                { "activeSessionId": "aaa111", "sessionId": "sess-a" },
+                { "activeSessionId": "rrr777", "sessionId": "sess-p", "sessionName": "papa" },
+            ]}),
+            None,
+        )
+        .await;
+        let own_summary = Some(json!({
+            "activeSessionId": "aaa111",
+            "sessionId": "sess-a",
+            "parentActiveSessionId": "stale-parent",
+            "parentSessionId": "sess-p",
+        }));
+        let controller = controller(socket, own_summary);
+        let family = controller.family().await.unwrap();
+        assert_eq!(family.len(), 1, "{family:?}");
+        assert_eq!(family[0].relationship, AgentFamilyRelationship::Parent);
+        assert_eq!(family[0].id, "rrr777");
+    }
+
+    /// Registry children the roster does not list stay addressable as Child
+    /// members keyed by their registry identity.
+    #[tokio::test]
+    async fn family_keeps_off_roster_children_addressable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("sup.sock");
+        spawn_fake_supervisor(
+            socket.clone(),
+            json!({ "sessions": [
+                { "activeSessionId": "aaa111", "sessionId": "sess-a" },
+            ]}),
+            None,
+        )
+        .await;
+        let controller = controller_with_children(socket, None);
+        admit_child(
+            &controller,
+            RlmChildIdentity {
+                rlm_child_id: "sub-kid2".to_string(),
+                active_session_id: "eee555".to_string(),
+                session_id: Some("sess-e".to_string()),
+                session_name: "worker-b".to_string(),
+            },
+        )
+        .await;
+        let family = controller.family().await.unwrap();
+        assert_eq!(family.len(), 1, "{family:?}");
+        assert_eq!(family[0].relationship, AgentFamilyRelationship::Child);
+        assert_eq!(family[0].id, "eee555");
+        assert_eq!(family[0].name.as_deref(), Some("worker-b"));
+        assert_eq!(family[0].aliases, vec!["sub-kid2", "sess-e"]);
     }
 
     /// A refused ticket falls back to the supervisor-routed send_message.
