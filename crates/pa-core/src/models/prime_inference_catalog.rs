@@ -309,6 +309,15 @@ pub fn merge_prime_inference_models(
     }
 }
 
+/// Persist the raw catalog payload (TS `writeCache`: atomic temp+rename
+/// write, owner-only mode, best-effort).
+fn write_catalog_cache(cache_path: &Path, payload: &serde_json::Value) {
+    let _ = crate::settings::storage::atomic_write(
+        cache_path,
+        &serde_json::to_string(payload).unwrap_or_default(),
+    );
+}
+
 /// Read the disk cache; the bundled catalog remains available on any failure.
 pub fn read_cached_prime_inference_models(
     cache_path: &Path,
@@ -368,8 +377,7 @@ pub async fn refresh_prime_inference_models(
     match fetch_prime_inference_model_catalog(None, FETCH_TIMEOUT_MS, false).await {
         Ok((payload, entries)) => match build_prime_inference_models(bundled, &entries, false) {
             Some(models) => {
-                let _ =
-                    std::fs::write(cache_path, serde_json::to_vec(&payload).unwrap_or_default());
+                write_catalog_cache(cache_path, &payload);
                 Some(models)
             }
             None => cached,
@@ -438,6 +446,37 @@ mod tests {
             1
         );
         assert_eq!(merge_prime_inference_models(&bundled(), None).len(), 1);
+    }
+
+    #[test]
+    fn cache_write_is_private_and_survives_a_failed_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models-cache.json");
+        write_catalog_cache(
+            &path,
+            &serde_json::json!({ "data": [
+                { "id": "z-ai/glm-5.3", "pricing": { "input_usd_per_mtok": 0.6, "output_usd_per_mtok": 2.2 } }
+            ]}),
+        );
+        // The TS cache write is a 0o600 atomic write; the rename carries
+        // the temp's mode onto the destination.
+        #[cfg(unix)]
+        assert_eq!(crate::platform::perms::file_mode(&path), Some(0o600));
+        // Block the temp slot with a directory: the next write fails and
+        // the previous cache survives intact for the next reader.
+        let temp = dir
+            .path()
+            .join(format!("{}.tmp{}", path.display(), std::process::id()));
+        std::fs::create_dir(&temp).unwrap();
+        write_catalog_cache(
+            &path,
+            &serde_json::json!({ "data": [
+                { "id": "z-ai/glm-5.4", "pricing": { "input_usd_per_mtok": 1, "output_usd_per_mtok": 1 } }
+            ]}),
+        );
+        let models = read_cached_prime_inference_models(&path, &bundled()).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "z-ai/glm-5.3");
     }
 
     #[test]

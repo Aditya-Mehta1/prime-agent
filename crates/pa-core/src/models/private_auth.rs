@@ -146,7 +146,8 @@ pub fn read_private_prime_authorization_cache(
     })
 }
 
-/// Persist the authorization cache (best-effort, 0o600).
+/// Persist the authorization cache (best-effort atomic temp+rename write,
+/// 0o600 like the TS `writeFileAtomicSync` call).
 pub fn write_private_prime_authorization_cache(
     models_json_path: &Path,
     cache: &PrivatePrimeAuthorizationCache,
@@ -179,8 +180,10 @@ pub fn write_private_prime_authorization_cache(
         "refreshedAt": cache.refreshed_at,
     });
     let path = private_prime_authorization_cache_path(models_json_path);
-    let _ = std::fs::write(&path, serde_json::to_vec(&document).unwrap_or_default());
-    let _ = crate::platform::perms::restrict_file(&path);
+    let _ = crate::settings::storage::atomic_write(
+        &path,
+        &serde_json::to_string(&document).unwrap_or_default(),
+    );
 }
 
 /// PI_OFFLINE=1/true/yes disables network refreshes.
@@ -190,5 +193,51 @@ pub fn is_offline_mode_enabled() -> bool {
             value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
         }
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cache(fingerprint: &str) -> PrivatePrimeAuthorizationCache {
+        PrivatePrimeAuthorizationCache {
+            fingerprint: fingerprint.to_string(),
+            models: get_private_prime_inference_models(),
+            refreshed_at: 1,
+        }
+    }
+
+    #[test]
+    fn cache_write_is_private_and_survives_a_failed_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_json = dir.path().join("models.json");
+        let cache_path = private_prime_authorization_cache_path(&models_json);
+        write_private_prime_authorization_cache(&models_json, &cache("fingerprint-a"));
+        // The TS cache write is a 0o600 atomic write; the rename carries
+        // the temp's mode onto the destination.
+        #[cfg(unix)]
+        assert_eq!(crate::platform::perms::file_mode(&cache_path), Some(0o600));
+        assert_eq!(
+            read_private_prime_authorization_cache(&models_json)
+                .expect("cache readable")
+                .fingerprint,
+            "fingerprint-a"
+        );
+        // Block the temp slot with a directory: the next write fails and
+        // the fingerprint-a cache survives for the next reader.
+        let temp = dir.path().join(format!(
+            "{}.tmp{}",
+            cache_path.display(),
+            std::process::id()
+        ));
+        std::fs::create_dir(&temp).unwrap();
+        write_private_prime_authorization_cache(&models_json, &cache("fingerprint-b"));
+        assert_eq!(
+            read_private_prime_authorization_cache(&models_json)
+                .expect("cache readable")
+                .fingerprint,
+            "fingerprint-a"
+        );
     }
 }

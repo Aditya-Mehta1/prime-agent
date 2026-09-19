@@ -838,7 +838,13 @@ pub fn write_rlm_subagent_display(entry: &RlmSubagentDisplayEntry) -> Result<boo
     fs::create_dir_all(dir)?;
     let payload = serde_json::to_string(entry)?;
     let temp = dir.join(format!("rlm-subagent.json.tmp-{}", crate::util::now_ms()));
-    fs::write(&temp, format!("{payload}\n"))?;
+    // The temp carries the TS display writer's 0o600 mode; the rename
+    // preserves it onto the final file.
+    let mut options = fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    pa_core::platform::perms::set_private_mode(&mut options);
+    let mut file = options.open(&temp)?;
+    file.write_all(format!("{payload}\n").as_bytes())?;
     pa_core::platform::rename_onto(&temp, &dir.join("rlm-subagent.json"))
         .with_context(|| format!("persist rlm-subagent display at {}", dir.display()))?;
     Ok(true)
@@ -1108,5 +1114,38 @@ mod tests {
         assert!(write_rlm_subagent_display(&tombstone).unwrap());
         // A resurrection write is refused over a tombstone.
         assert!(!write_rlm_subagent_display(&entry).unwrap());
+    }
+
+    #[test]
+    fn display_entry_file_is_owner_only() {
+        let dir = temp_dir("display-mode");
+        let child_dir = dir.join("sub-1");
+        fs::create_dir_all(&child_dir).unwrap();
+        let entry = RlmSubagentDisplayEntry {
+            type_tag: "rlm_subagent".into(),
+            child_id: "sub-1".into(),
+            session_name: "w".into(),
+            session_dir: child_dir.to_string_lossy().into(),
+            session_file: dir.join("c.jsonl").to_string_lossy().into(),
+            rlm_parent_node_id: None,
+            prompt: None,
+            spawn_code: None,
+            model: None,
+            status: "running".into(),
+            created_at: 1,
+        };
+        assert!(write_rlm_subagent_display(&entry).unwrap());
+        // The TS display writer creates its temp 0o600; the rename carries
+        // that mode onto the visible file.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(child_dir.join("rlm-subagent.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 }
