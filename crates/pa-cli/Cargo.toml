@@ -13,7 +13,7 @@ pa-agent = { path = "../pa-agent" }
 pa-daemon = { path = "../pa-daemon" }
 pa-tui = { path = "../pa-tui" }
 pa-telemetry = { path = "../pa-telemetry" }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v7"] }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }

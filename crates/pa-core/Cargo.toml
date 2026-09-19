@@ -28,7 +28,9 @@ getrandom = "0.3"
 url = "2"
 hmac = "0.12"
 globset = "0.4"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+tar = "0.4"
+flate2 = "1"
 unicode-normalization = "0.1"
 serde_yaml = "0.9"
 ignore = "0.4"

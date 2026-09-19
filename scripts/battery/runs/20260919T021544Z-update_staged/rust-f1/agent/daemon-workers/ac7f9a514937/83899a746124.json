@@ -1,0 +1,22 @@
+{
+  "version": 2,
+  "workerId": "83899a746124",
+  "pid": 215798,
+  "socketPath": "/tmp/usw-rust-f1-20260919T021342Z/prime-agent-1000/worker-ac7f9a514937-83899a746124.sock",
+  "recoveryJournalPath": "/tmp/usw-s4/rust-f1/agent/daemon-workers/ac7f9a514937/83899a746124.recovery.jsonl",
+  "supervisorSocketPath": "/tmp/usw-rust-f1-20260919T021342Z/prime-agent-1000/daemon.sock",
+  "authenticationToken": "d7cb953b-0ad0-47cc-b6ab-9fb01b955423",
+  "workerInstanceId": "404bae6f-2c98-4580-b456-bfeb59bf8b40",
+  "rootActiveSessionId": "83899a746124",
+  "ownerClientId": "ea259d16a7ff",
+  "rootSessionId": "01a0b772-365c-71b9-a290-05bc935472c4",
+  "sessionFile": "/tmp/usw-s4/rust-f1/agent/sessions/01a0b772-365c-71b9-a290-05bc935472c4.jsonl",
+  "createdAt": "2026-09-19T02:15:10.608Z",
+  "updatedAt": "2026-09-19T02:15:45.723Z",
+  "lifecycle": "ready",
+  "createCommand": {
+    "sessionPath": "/tmp/usw-s4/rust-f1/agent/sessions/01a0b772-365c-71b9-a290-05bc935472c4.jsonl",
+    "cwd": "/tmp/usw-s4/rust-f1/work"
+  },
+  "consecutiveFailures": 0
+}

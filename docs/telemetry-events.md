@@ -198,6 +198,20 @@ The interactive transcript viewport's first scroll action per client run
 | `action` | string | `page_up` / `page_down` / `top` / `follow` |
 | `resumed_following` | boolean | the action resumed tail-following |
 
+### `update completed`
+
+The staged-activation update flow (`prime-agent update`), emitted once per
+invocation by the invoking CLI at the terminal status (the coordinator-mode
+process never emits - its invoker owns the event). Terminal outcomes only;
+the privacy contract keeps paths, status messages, and ids out.
+
+| property | type | notes |
+|---|---|---|
+| `outcome` | string | `complete`, `skipped`, `aborted`, `failed` |
+| `sessions_total` | number | roster sessions the update flow carried |
+| `sessions_restored` | number | restored by the successor supervisor |
+| `sessions_failed` | number | recorded restore failures |
+
 ### `tui exit`
 
 How one interactive client run ended.

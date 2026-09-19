@@ -53,4 +53,5 @@ pub mod session_engine;
 pub mod settings;
 pub mod skills;
 pub mod slash_command_args;
+pub mod update;
 pub use kernel::ReplKernelManager;

@@ -88,6 +88,7 @@ struct PackageCommandOptions {
     conflicting_options: Option<String>,
     source: Option<String>,
     restart_coordinator: bool,
+    restart_daemon_socket: Option<String>,
     restart_status_path: Option<String>,
     restart_origin_active_session_id: Option<String>,
 }
@@ -196,6 +197,7 @@ fn parse_package_command(args: &[String]) -> Option<PackageCommandOptions> {
                             });
                         } else {
                             daemon_socket_seen = true;
+                            options.restart_daemon_socket = Some(value.clone());
                         }
                         index += 1;
                     }
@@ -428,13 +430,42 @@ pub fn handle_package_command(args: &[String]) -> PackageCommandOutcome {
         return fail(conflict, Some(&format!("Usage: {}", command.usage())));
     }
     if options.restart_coordinator {
-        // A valid coordinator invocation is validated against the daemon
-        // update-restart directory before running; that needs the daemon
-        // update machinery, which is not linked into this build.
-        return fail(
-            "daemon update restart coordination is not available in this build yet",
-            None,
-        );
+        // The detached coordinator mode (spec §4): this process adopts the
+        // staged status file and drives the FSM to a terminal state. The
+        // invocation is CLI-internal (the update command spawns it).
+        let (Some(socket), Some(status_path)) = (
+            options.restart_daemon_socket.clone(),
+            options.restart_status_path.clone(),
+        ) else {
+            return fail(
+                "Invalid daemon update restart coordinator invocation.",
+                None,
+            );
+        };
+        let socket_path = std::path::PathBuf::from(socket);
+        let status_path = std::path::PathBuf::from(status_path);
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                return fail(
+                    &format!("Could not start the update coordinator runtime: {error}."),
+                    None,
+                );
+            }
+        };
+        let exit_code = runtime.block_on(crate::update_flow::update_command::run_coordinator_mode(
+            socket_path,
+            status_path,
+        ));
+        return match exit_code {
+            Ok(code) => PackageCommandOutcome {
+                exit_code: Some(code),
+            },
+            Err(error) => fail(&format!("{error:#}"), None),
+        };
     }
     if options.restart_status_path.is_some() || options.restart_origin_active_session_id.is_some() {
         return fail(

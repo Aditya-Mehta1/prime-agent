@@ -1,3 +1,50 @@
+## Update staged activation + coordinator (slice 4, 2026-09-19)
+
+Reference: `docs/update-flow-state-machine.md` (§3/§4/§7/§9) over the TS
+`daemon-update-restart.ts`, `native-update.ts`, `version-check.ts`,
+`native-installation.ts`.
+
+- The TS coordinator was a daemon-restart-only helper: TS's `pi update` ran
+  the npm/install.sh self-update first and the coordinator then stopped and
+  restored the daemon (phases starting/preparing/stopping/starting_daemon/
+  restoring/complete, `proper-lockfile` registry). The spec redesign moves
+  the whole flow into one coordinator FSM (`Acquire..Complete`) and makes
+  the binary swap a coordinator phase (`Activating`) instead of an
+  installer side effect. The Rust port keeps the TS surfaces that ARE the
+  contract - the status-file schema (camelCase, plus `updateId`/`state`/
+  `epoch`), the 5 s heartbeat, the Join relay, the `--internal-update-
+  restart-*` flags, the probe messages - and replaces the phase machine.
+- Divergences (spec, recorded):
+  - `intent.json` is the lock (spec §4) - not TS's separate
+    `update-restart-coordinators/` registry with `proper-lockfile`; the
+    joining process reads the holder's `status_path` from the intent
+    record's `status_path` field.
+  - Rust release payloads (installer-ci-design.md §5) do not ship TS's
+    `package.json`/`install.sh`; staging writes `.archive-sha256` and
+    `.install-source` itself and validates the Rust payload list. The
+    coordinator owns the symlink swap; the TS install.sh recovery marker
+    check is not transcribed.
+  - `Restoring` in this slice reports adoption-based counts measured from
+    the live successor (create-or-adopt of the kept worker descriptors -
+    real restore of the top-level dimension). The full roster restore
+    (subagents bottom-up, heartbeats, queue lanes, per-session restore
+    RPC, per-session failure capture) is the boot-sweep slice (§13.5) and
+    replaces the phase body. Counts are measured, never faked.
+  - `update --rollback` runs the same FSM with the previous release as the
+    candidate (the launcher swap repoints `bin/prime-agent` at
+    `bin/previous`'s target; `bin/previous` then names the rolled-back-from
+    release): the spec's `Rollback` state stays reachable only from the
+    after-stop failure paths (`Stopped`/`Activating`/`Booting`), which is
+    exactly the state table pa-types carries.
+  - Telemetry: the `update completed` adoption event is emitted by the
+    invoking CLI at the terminal status (coordinator mode never emits);
+    spec §13.6 wires the remaining update-flow UX events.
+- Ownership: pa-core `update` module (version policy, install-root layout,
+  manifest fetch, staging) is daemon-free client support; pa-cli
+  `update_flow` owns the coordinator FSM, the status/intent writers, and
+  the activation swap; pa-daemon is untouched by this slice (the prepare/
+  commit/stop drivers are slices 2-3).
+
 
 ## Update graceful stop + roster (slice 3, 2026-09-19)
 

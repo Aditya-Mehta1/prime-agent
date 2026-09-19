@@ -514,22 +514,53 @@ fn run_update(args: &[String]) -> PublicCommandResult {
             Some("Use \"prime-agent package update [source]\".".to_string()),
         );
     }
-    let Some(options) = parse_boolean_options(
+    let Some(flags) = parse_boolean_options(
         args,
         &["--force", "--rollback", "--nightly", "--stable"],
         "update",
     ) else {
         return handled_failed();
     };
-    let mut package_args: Vec<String> = vec!["update".to_string(), "--self".to_string()];
-    package_args.extend(options);
-    let result = handle_package_command(&package_args);
-    PublicCommandResult {
-        handled: true,
-        args: vec![],
-        explicit_agents_view: false,
-        attach_agent: None,
-        exit_code: result.exit_code,
+    let channel = if flags.contains("--nightly") && flags.contains("--stable") {
+        return fail(
+            "--nightly and --stable are exclusive.",
+            Some("Pick one update channel.".to_string()),
+        );
+    } else if flags.contains("--nightly") {
+        Some(pa_core::update::version::UpdateChannel::Nightly)
+    } else if flags.contains("--stable") {
+        Some(pa_core::update::version::UpdateChannel::Stable)
+    } else {
+        None
+    };
+    let command_options = crate::update_flow::update_command::UpdateCommandOptions {
+        force: flags.contains("--force"),
+        rollback: flags.contains("--rollback"),
+        channel,
+    };
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return fail(
+                format!("Could not start the update runtime: {error}."),
+                None,
+            );
+        }
+    };
+    match runtime.block_on(crate::update_flow::update_command::run_update_command(
+        &command_options,
+    )) {
+        Ok(code) => PublicCommandResult {
+            handled: true,
+            args: vec![],
+            explicit_agents_view: false,
+            attach_agent: None,
+            exit_code: Some(code),
+        },
+        Err(error) => fail(format!("{error:#}"), None),
     }
 }
 

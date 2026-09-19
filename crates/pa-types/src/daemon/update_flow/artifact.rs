@@ -79,6 +79,12 @@ pub struct UpdateIntent {
     pub rest: JsonMap,
 }
 
+/// `PRIME_AGENT_UPDATE_ROSTER`: the path of the roster snapshot the
+/// coordinator passes to the successor supervisor in its spawn environment
+/// (spec §6: the one update-related input any boot reads - the successor
+/// never discovers a roster file on disk).
+pub const UPDATE_ROSTER_ENV: &str = "PRIME_AGENT_UPDATE_ROSTER";
+
 // ---------------------------------------------------------------------------
 // status.json — the TS status-file schema
 // ---------------------------------------------------------------------------

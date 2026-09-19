@@ -30,6 +30,8 @@ pub(crate) mod public_command;
 /// into the `prime-agent` binary, plus the entry point that drives it.
 pub use mode::{AppMode, MissingSubsystem, RunOptions, Runtime, UnavailableRuntime};
 pub mod print_runtime;
+pub mod update_flow;
+pub mod util_time;
 pub use print_runtime::PrintRuntime;
 
 /// Daemon wiring shared by the interactive runtime and the integration
