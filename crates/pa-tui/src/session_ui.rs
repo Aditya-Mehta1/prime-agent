@@ -1768,19 +1768,27 @@ impl SessionUi {
                 attempt,
                 max_attempts,
                 delay_ms,
+                error_message,
+                reason,
             } => {
                 // The retry countdown loader replaces the working loader
-                // until the loop settles (TS auto_retry_start).
+                // until the loop settles (TS auto_retry_start). A backup
+                // reason is a provider-failover switch: the loader names
+                // the backup provider the turn re-routes to (no countdown;
+                // the switch re-issues immediately).
                 view.retry = Some(RetryState {
                     attempt,
                     max_attempts,
                     ends_at: std::time::Instant::now() + std::time::Duration::from_millis(delay_ms),
+                    error_message,
+                    reason,
                 });
             }
             TurnUpdate::AutoRetryEnd {
                 success: _,
                 attempt,
                 final_error,
+                restored_model,
             } => {
                 view.retry = None;
                 if let Some(final_error) = final_error {
@@ -1790,6 +1798,14 @@ impl SessionUi {
                             "\u{26a0} Error: Retry failed after {attempt} attempts: {final_error}"
                         ),
                         kind: StatusKind::Error,
+                    });
+                }
+                // A settled switch restores the primary provider (TS
+                // `restoredModel` status line).
+                if let Some(restored_model) = restored_model {
+                    view.push_entry(ChatEntry::Status {
+                        text: format!("Primary provider recovered — back on {restored_model}"),
+                        kind: StatusKind::Info,
                     });
                 }
             }

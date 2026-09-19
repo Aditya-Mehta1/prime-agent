@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 use pa_agent::abort::AbortSignal;
-use pa_core::session_engine::provider_retry::ProviderRetryPolicy;
+use pa_core::session_engine::provider_retry::{ProviderRetryPolicy, UNBOUNDED_BACKOFF_MS};
 use pa_core::session_engine::side_question::{SideQuestionSink, SideQuestionTurn};
 use serde_json::{json, Value};
 
@@ -95,18 +95,25 @@ pub enum EngineEvent {
     /// The payload is the TS `GoalState` wire object.
     GoalUpdate { goal: Value },
     /// `auto_retry_start`: a provider failure is being retried (TS wire
-    /// event; the interactive transcript shows the retry countdown).
+    /// event; the interactive transcript shows the retry countdown). A
+    /// `Backup` reason is a provider-failover switch: the failed turn
+    /// re-routes to another configured provider serving the same model and
+    /// re-issues immediately.
     AutoRetryStart {
         attempt: u32,
         max_attempts: u32,
         delay_ms: u64,
         error_message: String,
+        reason: pa_core::session_engine::auto_retry::RetryStartReason,
     },
-    /// `auto_retry_end`: the retry loop settled.
+    /// `auto_retry_end`: the retry loop settled. `restored_model` is the
+    /// `"provider/model-id"` primary restored after a failover switch
+    /// succeeded.
     AutoRetryEnd {
         success: bool,
         attempt: u32,
         final_error: Option<String>,
+        restored_model: Option<String>,
     },
 }
 
@@ -480,6 +487,7 @@ impl ScriptedEngine {
                         .get("maxRetryDelayMs")
                         .and_then(Value::as_u64)
                         .unwrap_or(0),
+                    max_delay_ms: UNBOUNDED_BACKOFF_MS,
                 }),
             })
             .unwrap_or_default();

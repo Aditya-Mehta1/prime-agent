@@ -146,6 +146,7 @@ struct ActiveRun {
     tool_error_count: u64,
     compaction_count: u64,
     retry_count: u64,
+    failover_count: u64,
     usage: UsageTotals,
     last_assistant: Option<AssistantMessage>,
 }
@@ -237,6 +238,16 @@ impl SessionTelemetry {
         let mut state = self.state.lock().expect("telemetry state poisoned");
         if let Some(run) = state.active_run.as_mut() {
             run.retry_count += 1;
+        }
+    }
+
+    /// A provider-failover switch happened (the failed turn re-routed to
+    /// another configured provider serving the same model). Only counts
+    /// inside an active run.
+    pub fn note_provider_failover(&self) {
+        let mut state = self.state.lock().expect("telemetry state poisoned");
+        if let Some(run) = state.active_run.as_mut() {
+            run.failover_count += 1;
         }
     }
 
@@ -348,6 +359,7 @@ fn handle_event(
                 tool_error_count: 0,
                 compaction_count: 0,
                 retry_count: 0,
+                failover_count: 0,
                 usage: UsageTotals::default(),
                 last_assistant: None,
             });
@@ -492,6 +504,7 @@ fn finalize_run_locked(client: &TelemetryClient, execution_mode: &str, state: &m
     properties.set("total_tokens", Value::from(run.usage.total_tokens));
     properties.set("compaction_count", Value::from(run.compaction_count));
     properties.set("retry_count", Value::from(run.retry_count));
+    properties.set("failover_count", Value::from(run.failover_count));
     properties.set(
         "provider_category",
         Value::from(provider_category(

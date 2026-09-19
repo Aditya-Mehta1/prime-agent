@@ -475,6 +475,7 @@ async fn assistant_turns_after(
 
 #[cfg(test)]
 mod tests {
+    use super::super::provider_retry::UNBOUNDED_BACKOFF_MS;
     use super::*;
     use crate::session_engine::tool_bridge::bridge_tool;
     use crate::tools::tool_definition::{ToolDefinition, ToolExecutionResult};
@@ -499,6 +500,7 @@ mod tests {
             max_retries: 3,
             base_delay_ms: 1,
             max_retry_delay_ms: 1000,
+            max_delay_ms: UNBOUNDED_BACKOFF_MS,
         }
     }
 

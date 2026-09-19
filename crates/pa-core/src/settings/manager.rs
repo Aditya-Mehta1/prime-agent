@@ -487,6 +487,34 @@ impl SettingsManager {
                     crate::session_engine::provider_retry::DEFAULT_PROVIDER_RETRY_POLICY
                         .max_retry_delay_ms,
                 ),
+            max_delay_ms: crate::session_engine::provider_retry::UNBOUNDED_BACKOFF_MS,
+        }
+    }
+
+    /// The provider-failover policy from settings (`retry.failover`).
+    pub fn get_provider_failover_policy(
+        &self,
+    ) -> crate::session_engine::provider_failover::ProviderFailoverPolicy {
+        let defaults = crate::session_engine::provider_failover::DEFAULT_PROVIDER_FAILOVER_POLICY;
+        let failover = self
+            .merged
+            .retry
+            .as_ref()
+            .and_then(|retry| retry.failover.as_ref());
+        crate::session_engine::provider_failover::ProviderFailoverPolicy {
+            enabled: failover
+                .and_then(|failover| failover.enabled)
+                .unwrap_or(defaults.enabled),
+            max_retries: failover
+                .and_then(|failover| failover.max_retries)
+                .map(|retries| retries.min(u32::MAX as u64) as u32)
+                .unwrap_or(defaults.max_retries),
+            base_delay_ms: failover
+                .and_then(|failover| failover.base_delay_ms)
+                .unwrap_or(defaults.base_delay_ms),
+            max_delay_ms: failover
+                .and_then(|failover| failover.max_delay_ms)
+                .unwrap_or(defaults.max_delay_ms),
         }
     }
 

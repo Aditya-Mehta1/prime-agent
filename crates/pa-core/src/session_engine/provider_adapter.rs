@@ -35,7 +35,8 @@ pub fn map_thinking_level(level: pa_types::ai::ModelThinkingLevel) -> ThinkingLe
 }
 
 /// The mutable provider target a live session's stream reads per call:
-/// daemon `set_model` swaps it without rebuilding the session.
+/// daemon `set_model` swaps it without rebuilding the session, and the
+/// provider-failover switch swaps it for the switched-to provider.
 #[derive(Debug, Clone)]
 pub struct ProviderTarget {
     pub api_key: Option<String>,
@@ -43,9 +44,9 @@ pub struct ProviderTarget {
 }
 
 /// A real pa-ai provider stream adapter for the agent loop, reading its
-/// target from a shared slot the host can swap live (`set_model`). The
-/// slot is `None` only before the host sets the build-time target; the
-/// adapter never runs before that.
+/// target from a shared slot the host can swap live (`set_model`, provider
+/// failover). The slot is `None` only before the host sets the build-time
+/// target; the adapter never runs before that.
 pub fn switchable_stream_fn(target: Arc<std::sync::RwLock<Option<ProviderTarget>>>) -> StreamFn {
     Arc::new(
         move |_requested: AgentModel, context: LlmContext, options: StreamRequestOptions| {
@@ -54,73 +55,78 @@ pub fn switchable_stream_fn(target: Arc<std::sync::RwLock<Option<ProviderTarget>
                 .expect("provider target lock")
                 .clone()
                 .expect("provider target set before the first stream");
-            Box::pin(async move {
-                let messages: Vec<pa_types::ai::Message> = context
-                    .messages
-                    .iter()
-                    .filter_map(json_round_trip)
-                    .collect();
-                let tools: Vec<pa_types::ai::Tool> =
-                    context.tools.iter().filter_map(json_round_trip).collect();
-                let ai_context = pa_types::ai::Context {
-                    system_prompt: context.system_prompt.clone(),
-                    messages,
-                    tools: Some(tools),
-                };
-                let stream_options = pa_ai::types::SimpleStreamOptions {
-                    base: pa_ai::types::StreamOptions {
-                        temperature: options.temperature,
-                        max_tokens: options.max_tokens,
-                        signal: None,
-                        api_key,
-                        transport: None,
-                        service_tier: None,
-                        cache_retention: None,
-                        session_id: options.session_id.clone(),
-                        on_payload: None,
-                        on_response: None,
-                        headers: None,
-                        metadata: None,
-                        timeout_ms: None,
-                    },
-                    reasoning: Some(match options.reasoning {
-                        ThinkingLevel::Off => pa_types::ai::ModelThinkingLevel::Off,
-                        ThinkingLevel::Minimal => pa_types::ai::ModelThinkingLevel::Minimal,
-                        ThinkingLevel::Low => pa_types::ai::ModelThinkingLevel::Low,
-                        ThinkingLevel::Medium => pa_types::ai::ModelThinkingLevel::Medium,
-                        ThinkingLevel::High => pa_types::ai::ModelThinkingLevel::High,
-                        ThinkingLevel::Xhigh => pa_types::ai::ModelThinkingLevel::Xhigh,
-                        ThinkingLevel::Max => pa_types::ai::ModelThinkingLevel::Max,
-                    }),
-                    thinking_budgets: None,
-                };
-                let stream = pa_ai::stream_simple(&model, &ai_context, Some(stream_options))
-                    .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-                // Pump pa-ai events into a pa-agent event stream (the loop's
-                // ModelStream): each provider event is forwarded verbatim.
-                let (handle, consumer) = pa_agent::stream::event_stream();
-                let forwarder = tokio::spawn(async move {
-                    let mut stream = stream;
-                    while let Some(event) = stream.next_event().await {
-                        if let Some(converted) = convert_stream_event(&event) {
-                            handle.push(converted);
-                        }
-                    }
-                    let result = stream.result().await;
-                    if let Some(converted) =
-                        json_round_trip::<_, pa_agent::types::AssistantMessage>(&result)
-                    {
-                        handle.end(Some(converted));
-                    } else {
-                        handle.end(None);
-                    }
-                });
-                // Keep the pump task alive as long as the stream lives.
-                let (handle2, consumer) = (forwarder, consumer);
-                Ok(consumer_pump(handle2, consumer))
-            })
+            Box::pin(async move { stream_once(model, api_key, context, options) })
         },
     )
+}
+
+/// Stream one completion against `model` with `api_key`.
+fn stream_once(
+    model: Model,
+    api_key: Option<String>,
+    context: LlmContext,
+    options: StreamRequestOptions,
+) -> anyhow::Result<Box<dyn ModelStream>> {
+    let messages: Vec<pa_types::ai::Message> = context
+        .messages
+        .iter()
+        .filter_map(json_round_trip)
+        .collect();
+    let tools: Vec<pa_types::ai::Tool> = context.tools.iter().filter_map(json_round_trip).collect();
+    let ai_context = pa_types::ai::Context {
+        system_prompt: context.system_prompt.clone(),
+        messages,
+        tools: Some(tools),
+    };
+    let stream_options = pa_ai::types::SimpleStreamOptions {
+        base: pa_ai::types::StreamOptions {
+            temperature: options.temperature,
+            max_tokens: options.max_tokens,
+            signal: None,
+            api_key,
+            transport: None,
+            service_tier: None,
+            cache_retention: None,
+            session_id: options.session_id.clone(),
+            on_payload: None,
+            on_response: None,
+            headers: None,
+            metadata: None,
+            timeout_ms: None,
+        },
+        reasoning: Some(match options.reasoning {
+            ThinkingLevel::Off => pa_types::ai::ModelThinkingLevel::Off,
+            ThinkingLevel::Minimal => pa_types::ai::ModelThinkingLevel::Minimal,
+            ThinkingLevel::Low => pa_types::ai::ModelThinkingLevel::Low,
+            ThinkingLevel::Medium => pa_types::ai::ModelThinkingLevel::Medium,
+            ThinkingLevel::High => pa_types::ai::ModelThinkingLevel::High,
+            ThinkingLevel::Xhigh => pa_types::ai::ModelThinkingLevel::Xhigh,
+            ThinkingLevel::Max => pa_types::ai::ModelThinkingLevel::Max,
+        }),
+        thinking_budgets: None,
+    };
+    let stream = pa_ai::stream_simple(&model, &ai_context, Some(stream_options))
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    // Pump pa-ai events into a pa-agent event stream (the loop's
+    // ModelStream): each provider event is forwarded verbatim.
+    let (handle, consumer) = pa_agent::stream::event_stream();
+    let forwarder = tokio::spawn(async move {
+        let mut stream = stream;
+        while let Some(event) = stream.next_event().await {
+            if let Some(converted) = convert_stream_event(&event) {
+                handle.push(converted);
+            }
+        }
+        let result = stream.result().await;
+        if let Some(converted) = json_round_trip::<_, pa_agent::types::AssistantMessage>(&result) {
+            handle.end(Some(converted));
+        } else {
+            handle.end(None);
+        }
+    });
+    // Keep the pump task alive as long as the stream lives.
+    let (forwarder, consumer) = (forwarder, consumer);
+    Ok(consumer_pump(forwarder, consumer))
 }
 
 /// A stream adapter pinned to one target: the headless runtimes (print and

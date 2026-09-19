@@ -478,6 +478,7 @@ impl AgentSessionEngine {
     async fn build_session(&self, model: &Model) -> anyhow::Result<CoreSessionEngine> {
         let agent_model =
             json_round_trip(model).ok_or_else(|| anyhow::anyhow!("model conversion failed"))?;
+
         // The session's stream reads its target from the engine's live slot:
         // `set_model` swaps the slot so the built session follows without a
         // rebuild.
@@ -1107,15 +1108,42 @@ impl AgentSessionEngine {
             Err(error) => return TurnResult::Error(format!("{error:#}")),
         };
         let policy = self.retry_policy();
+        let failover_policy = self.failover_policy();
+        let candidates = self.failover_candidates(&model);
         // The pa-core retry driver owns the attempt loop; this engine owns
         // one turn. The driver awaits each attempt to completion before
         // emitting retry events, so the single `emit` reference is handed
         // through a RefCell slot to whichever closure is currently running.
         let emit_cell = std::cell::RefCell::new(emit);
         let first_attempt = std::cell::Cell::new(true);
+        // Failover switch/restore re-bind the live agent's model and append
+        // the model-change row the TS backup-model retry logs. The primary
+        // (model + thinking level) is captured at the first switch and
+        // restored on every settled outcome.
+        let persistence = {
+            let guard = self.session.blocking_lock();
+            guard
+                .as_ref()
+                .map(|engine| engine.session.shared_persistence())
+        };
+        // Retry/failover adoption telemetry (TS `auto_retry_start` counting):
+        // retries increment `retry_count`, provider switches `failover_count`.
+        let telemetry = {
+            let guard = self.session.blocking_lock();
+            guard.as_ref().and_then(|engine| engine.telemetry.clone())
+        };
+        let primary_state: std::cell::RefCell<
+            Option<(
+                pa_types::ai::Model,
+                pa_agent::types::ThinkingLevel,
+                Option<String>,
+            )>,
+        > = std::cell::RefCell::new(None);
         let result = self.runtime.block_on(
-            pa_core::session_engine::auto_retry::run_turn_with_auto_retry(
+            pa_core::session_engine::provider_failover::run_turn_with_provider_failover(
                 &policy,
+                &failover_policy,
+                &candidates,
                 None,
                 || {
                     let mut emit = emit_cell.borrow_mut();
@@ -1154,7 +1182,21 @@ impl AgentSessionEngine {
                 },
                 |event| {
                     let mut emit = emit_cell.borrow_mut();
+                    let telemetry = telemetry.clone();
                     async move {
+                        if let Some(telemetry) = &telemetry {
+                            telemetry.note_auto_retry();
+                            if matches!(
+                                &event,
+                                pa_core::session_engine::auto_retry::AutoRetryEvent::Start {
+                                    reason:
+                                        pa_core::session_engine::auto_retry::RetryStartReason::Backup { .. },
+                                    ..
+                                }
+                            ) {
+                                telemetry.note_provider_failover();
+                            }
+                        }
                         let engine_event = retry_event_to_engine_event(event);
                         if !emit(engine_event) {
                             anyhow::bail!("emit cancelled");
@@ -1176,6 +1218,92 @@ impl AgentSessionEngine {
                             }
                             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         }
+                    }
+                },
+                |next: &pa_types::ai::Model| {
+                    let agent = agent.clone();
+                    let persistence = persistence.clone();
+                    {
+                        let mut primary = primary_state.borrow_mut();
+                        // Capture the primary model + thinking level + key
+                        // once (TS `_backupModel` state): the level the
+                        // session was built with, restored when the turn
+                        // settles.
+                        if primary.is_none() {
+                            *primary = Some((
+                                model.clone(),
+                                map_thinking_level(self.effective_thinking()),
+                                self.resolve_request_api_key(&model),
+                            ));
+                        }
+                    }
+                    let next = next.clone();
+                    async move {
+                        let agent_model = json_round_trip(&next)
+                            .ok_or_else(|| anyhow::anyhow!("model conversion failed"))?;
+                        // Clamp the requested level to what the switched-to
+                        // model supports (TS `clampThinkingLevel` on the
+                        // backup switch); the primary's level is restored
+                        // with the primary.
+                        let clamped =
+                            pa_ai::models::clamp_thinking_level(&next, self.effective_thinking());
+                        // The stream's provider target follows the switch
+                        // (the same slot `set_model` swaps): the retried
+                        // request hits the switched-to provider with its
+                        // resolved key.
+                        {
+                            let mut target =
+                                self.provider_target.write().expect("provider target lock");
+                            *target = Some(ProviderTarget {
+                                api_key: self.resolve_request_api_key(&next),
+                                model: next.clone(),
+                            });
+                        }
+                        agent.set_model(agent_model).await;
+                        agent
+                            .set_thinking_level(map_thinking_level(clamped))
+                            .await;
+                        if let Some(persistence) = persistence {
+                            let mut session = persistence.lock().await;
+                            session.append_model_change(&next.provider, &next.id);
+                        }
+                        Ok(())
+                    }
+                },
+                || {
+                    let agent = agent.clone();
+                    let persistence = persistence.clone();
+                    let primary = primary_state.borrow().clone();
+                    async move {
+                        let Some((primary_model, thinking_level, primary_api_key)) = primary
+                        else {
+                            return Ok(None);
+                        };
+                        let agent_model = json_round_trip(&primary_model)
+                            .ok_or_else(|| anyhow::anyhow!("model conversion failed"))?;
+                        // Restore the stream's provider target with the
+                        // primary (the slot the build-time target set).
+                        {
+                            let mut target =
+                                self.provider_target.write().expect("provider target lock");
+                            *target = Some(ProviderTarget {
+                                api_key: primary_api_key,
+                                model: primary_model.clone(),
+                            });
+                        }
+                        agent.set_model(agent_model).await;
+                        agent.set_thinking_level(thinking_level).await;
+                        if let Some(persistence) = persistence {
+                            let mut session = persistence.lock().await;
+                            session.append_model_change(
+                                &primary_model.provider,
+                                &primary_model.id,
+                            );
+                        }
+                        Ok(Some(format!(
+                            "{}/{}",
+                            primary_model.provider, primary_model.id
+                        )))
                     }
                 },
             ),
@@ -1473,6 +1601,32 @@ impl AgentSessionEngine {
     fn retry_policy(&self) -> pa_core::session_engine::provider_retry::ProviderRetryPolicy {
         pa_core::settings::SettingsManager::create(&self.config.cwd, &self.config.agent_dir)
             .get_provider_retry_policy()
+    }
+
+    /// The provider-failover policy from settings (`retry.failover`).
+    fn failover_policy(
+        &self,
+    ) -> pa_core::session_engine::provider_failover::ProviderFailoverPolicy {
+        pa_core::settings::SettingsManager::create(&self.config.cwd, &self.config.agent_dir)
+            .get_provider_failover_policy()
+    }
+
+    /// The failover chain for `model`: the other auth-configured providers
+    /// serving the same model id, in catalog order after the current one.
+    /// Faux-script sessions never fail over (their failures are
+    /// deterministic test fixtures, and a second provider would only
+    /// reroute the scripted queue).
+    fn failover_candidates(&self, model: &pa_types::ai::Model) -> Vec<pa_types::ai::Model> {
+        if self.config.faux_script.is_some() {
+            return Vec::new();
+        }
+        let auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
+        let mut registry =
+            pa_core::models::ModelRegistry::create(auth, self.config.agent_dir.join("models.json"));
+        registry.load_private_authorization_from_cache();
+        let available: Vec<pa_types::ai::Model> =
+            registry.get_available().into_iter().cloned().collect();
+        pa_core::models::failover_candidates(model, &available)
     }
 
     /// Run one turn, streaming assistant updates through `emit` as they
@@ -1845,20 +1999,24 @@ fn retry_event_to_engine_event(
             max_attempts,
             delay_ms,
             error_message,
+            reason,
         } => EngineEvent::AutoRetryStart {
             attempt,
             max_attempts,
             delay_ms,
             error_message,
+            reason,
         },
         AutoRetryEvent::End {
             success,
             attempt,
             final_error,
+            restored_model,
         } => EngineEvent::AutoRetryEnd {
             success,
             attempt,
             final_error,
+            restored_model,
         },
     }
 }

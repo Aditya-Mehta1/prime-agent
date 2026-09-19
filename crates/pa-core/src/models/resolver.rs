@@ -506,6 +506,51 @@ pub fn resolve_cli_model(
     result
 }
 
+/// Provider-failover candidates for `current`: the other providers serving
+/// the same model id, in catalog order starting after `current`'s provider,
+/// one per provider.
+///
+/// The list is what the provider-failover loop walks when the current
+/// provider exhausts its retries; the caller passes the auth-configured
+/// catalog (`ModelRegistry::get_available`) so unconfigured providers never
+/// surprise the user with a switch. Rotation keeps the chain stable for
+/// every starting provider: with catalog order A, B, C the candidates for
+/// B are C then A.
+pub fn failover_candidates(current: &Model, available: &[Model]) -> Vec<Model> {
+    // Same model id, other providers: first catalog entry wins per provider.
+    let mut candidates: Vec<&Model> = Vec::new();
+    for model in available
+        .iter()
+        .filter(|model| model.id == current.id && model.provider != current.provider)
+    {
+        if !candidates
+            .iter()
+            .any(|candidate| candidate.provider == model.provider)
+        {
+            candidates.push(model);
+        }
+    }
+    // Rotate so the provider after `current` (by catalog position) leads:
+    // with catalog order A, B, C the candidates for B are C then A.
+    let current_position = available
+        .iter()
+        .position(|model| model.provider == current.provider);
+    if let Some(position) = current_position {
+        candidates.sort_by_key(|candidate| {
+            let candidate_position = available
+                .iter()
+                .position(|model| model.provider == candidate.provider)
+                .unwrap_or(usize::MAX);
+            if candidate_position > position {
+                candidate_position
+            } else {
+                candidate_position + available.len()
+            }
+        });
+    }
+    candidates.into_iter().cloned().collect()
+}
+
 /// Inputs to the startup-model lookup (TS `findInitialModel`, composed with
 /// the `--models`-scope handling from `prepareSessionOptions`).
 #[derive(Clone, Copy)]
@@ -612,6 +657,43 @@ mod tests {
             model("prime-inference", "z-ai/glm-5.3", "GLM"),
             model("openrouter", "openai/gpt-4o", "GPT-4o"),
         ]
+    }
+
+    #[test]
+    fn failover_candidates_order_by_catalog_after_current() {
+        let mut catalog = catalog();
+        catalog.push(model("zai", "z-ai/glm-5.3", "GLM via zai"));
+        catalog.push(model("openrouter", "z-ai/glm-5.3", "GLM via openrouter"));
+        // The prime-inference entry (provider at catalog position 2)
+        // fails over to the providers after it in catalog order
+        // (openrouter's provider first appears at position 3, zai at 4).
+        let current = model("prime-inference", "z-ai/glm-5.3", "GLM");
+        let candidates = failover_candidates(&current, &catalog);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|model| model.provider.as_str())
+                .collect::<Vec<_>>(),
+            vec!["openrouter", "zai"]
+        );
+        // A later provider wraps to the front of the catalog.
+        let current = model("openrouter", "z-ai/glm-5.3", "GLM");
+        let candidates = failover_candidates(&current, &catalog);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|model| model.provider.as_str())
+                .collect::<Vec<_>>(),
+            vec!["zai", "prime-inference"]
+        );
+        // No other provider serves the model: no candidates, no failover.
+        let current = model("anthropic", "claude-sonnet-4-5", "Sonnet");
+        assert!(failover_candidates(&current, &catalog).is_empty());
+        // The current provider itself is never a candidate, even when the
+        // catalog carries a second entry for it.
+        let current = model("zai", "z-ai/glm-5.3", "GLM");
+        let candidates = failover_candidates(&current, &catalog);
+        assert!(candidates.iter().all(|model| model.provider != "zai"));
     }
 
     #[test]

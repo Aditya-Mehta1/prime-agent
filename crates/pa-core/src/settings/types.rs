@@ -132,12 +132,28 @@ pub struct ProviderRetrySettings {
     pub wait_for_usage: Option<ProviderWaitSettings>,
 }
 
+/// Provider-failover settings (`retry.failover`): when another configured
+/// provider serves the same model, a provider that exhausts its quick
+/// retries hands the turn to the next one instead of failing it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryFailoverSettings {
+    pub enabled: Option<bool>,
+    /// Retries per provider before switching (default 5).
+    pub max_retries: Option<u64>,
+    /// First backoff delay, doubling each retry (default 1000ms).
+    pub base_delay_ms: Option<u64>,
+    /// Backoff ceiling per retry (default 30000ms).
+    pub max_delay_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RetrySettings {
     pub enabled: Option<bool>,
     pub max_retries: Option<u64>,
     pub base_delay_ms: Option<u64>,
+    pub failover: Option<RetryFailoverSettings>,
     pub provider: Option<ProviderRetrySettings>,
 }
 

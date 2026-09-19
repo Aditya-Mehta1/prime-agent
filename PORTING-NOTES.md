@@ -1357,6 +1357,45 @@ HEAD
   removal under the family id.
 
 
+
+## Provider failover (lane `provider-failover`)
+
+- The TS quick-retry policy (`core/provider-retry.ts`) was already ported in
+  `pa-core/session_engine/provider_retry.rs`; the failover lane keeps it
+  byte-identical for the no-candidate path (a model served by exactly one
+  configured provider keeps today's retry-exhausted surfacing).
+- TS ground truth for the switch mechanism: `agent-session.ts`
+  `_handleBackupModelRetry` / `_resolveBackupModel` /
+  `_restorePrimaryModelAfterBackup` (a user-configured backup model; TS
+  switches IMMEDIATELY on any transient failure). The Rust lane generalizes
+  it to catalog failover (next configured provider serving the SAME model
+  id, after the current provider exhausts its per-provider retry budget)
+  and reuses the TS wire vocabulary: `auto_retry_start` with
+  `reason: "backup"` + `backupModel`, `auto_retry_end` with
+  `restoredModel`.
+- New behavior (no TS counterpart): `pa-core/session_engine/provider_failover.rs`
+  walks the candidate chain in catalog order; per-provider schedule from
+  settings `retry.failover` (defaults: enabled, 5 retries per provider, 1s
+  doubling backoff capped at 30s). The existing `retry.maxRetries` /
+  `baseDelayMs` (TS defaults 3 / 2000) still govern the single-provider
+  path.
+- The daemon session's stream is request-dynamic through the provider-target
+  slot (`provider_adapter::switchable_stream_fn`, the mechanism the
+  model-picker lane landed for `set_model`): the failover switch/restore
+  closures swap the slot to the switched-to provider (key resolved through
+  the engine's request-key resolution) alongside the agent model re-bind,
+  so the retried request hits the switched provider without a session
+  rebuild; the no-switch path stays byte-identical (the build-time target).
+- Candidate resolution: `pa-core/models/resolver.rs::failover_candidates`
+  (same model id, other providers, auth-configured catalog, rotated to
+  start after the current provider).
+- Verifiers: unit tests on the backoff schedule, the switch order, and the
+  candidate rotation; `pa-daemon/tests/provider_failover_e2e.rs` (primary
+  500s -> switch -> backup answers -> primary restored; all-fail chain);
+  battery flow `f22_provider_failover` (f11 stays unregressed for the
+  single-provider case and the flow records the intentional TS divergence
+  — the TS product has no failover).
+
 ## /model catalog + confirm row + /effort picker (model-picker-2 lane, f17)
 
 - TS ground truth: the interactive `/model` picker sources its rows from the

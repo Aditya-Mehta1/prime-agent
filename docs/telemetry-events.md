@@ -77,6 +77,7 @@ finalizes (agent ends, or the turn action deactivates after the agent ended).
 | `total_tokens` | number | |
 | `compaction_count` | number | completed compactions |
 | `retry_count` | number | auto-retries |
+| `failover_count` | number | provider-failover switches (the failed turn re-routed to another configured provider serving the same model) |
 | `provider_category` | string | `anthropic`, `openai`, `google`, `prime`, `openrouter`, `bedrock`, `vertex`, `mistral`, `groq`, `xai`, `custom`, `unknown` |
 | `model_category` | string | `claude`, `gpt`, `o1`, `o3`, `o4`, `gemini`, `glm`, `kimi`, `qwen`, `deepseek`, `llama`, `mistral`, `custom`, `unknown` |
 | `error_category` | string or null | `authentication`, `rate_limit`, `timeout`, `context_limit`, `network`, `provider_unavailable`, `other`; null when no error |

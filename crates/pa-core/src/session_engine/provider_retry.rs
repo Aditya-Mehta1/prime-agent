@@ -22,7 +22,14 @@ pub struct ProviderRetryPolicy {
     pub base_delay_ms: u64,
     /// Max server-requested retry delay before giving up; 0 disables the cap.
     pub max_retry_delay_ms: u64,
+    /// Ceiling on the exponential backoff itself. The TS quick-retry loop
+    /// grows without bound, so the default is unbounded; the provider
+    /// failover schedule caps its doubling (30s).
+    pub max_delay_ms: u64,
 }
+
+/// No backoff ceiling (the TS quick-retry schedule).
+pub const UNBOUNDED_BACKOFF_MS: u64 = u64::MAX;
 
 /// Default policy (TS `DEFAULT_PROVIDER_RETRY_POLICY`; also the settings
 /// defaults: `retry.enabled` true, `maxRetries` 3, `baseDelayMs` 2000,
@@ -32,6 +39,7 @@ pub const DEFAULT_PROVIDER_RETRY_POLICY: ProviderRetryPolicy = ProviderRetryPoli
     max_retries: 3,
     base_delay_ms: 2000,
     max_retry_delay_ms: 60000,
+    max_delay_ms: UNBOUNDED_BACKOFF_MS,
 };
 
 /// Resolution of one retry-delay decision.
@@ -123,7 +131,8 @@ pub fn provider_retry_delay(
     }
     let exponential = policy
         .base_delay_ms
-        .saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1)));
+        .saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1)))
+        .min(policy.max_delay_ms);
     let delay_ms = exponential
         .max(retry_after_ms.unwrap_or(0))
         .min(MAX_TIMER_DELAY_MS);
@@ -265,6 +274,7 @@ mod tests {
             max_retries: 3,
             base_delay_ms: 2000,
             max_retry_delay_ms: 60000,
+            max_delay_ms: UNBOUNDED_BACKOFF_MS,
         };
         assert_eq!(
             provider_retry_delay(1, None, &policy),
@@ -292,6 +302,7 @@ mod tests {
             max_retries: 3,
             base_delay_ms: 2000,
             max_retry_delay_ms: 60000,
+            max_delay_ms: UNBOUNDED_BACKOFF_MS,
         };
         assert_eq!(
             provider_retry_delay(1, Some(60001), &policy),
@@ -302,6 +313,7 @@ mod tests {
         // Cap disabled (0): the server wait is honored.
         let uncapped = ProviderRetryPolicy {
             max_retry_delay_ms: 0,
+            max_delay_ms: UNBOUNDED_BACKOFF_MS,
             ..policy
         };
         assert_eq!(
@@ -355,6 +367,7 @@ mod tests {
             max_retries: 3,
             base_delay_ms: 5,
             max_retry_delay_ms: 50,
+            max_delay_ms: UNBOUNDED_BACKOFF_MS,
         };
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_attempt = std::sync::Arc::clone(&attempts);
@@ -400,6 +413,7 @@ mod tests {
             max_retries: 2,
             base_delay_ms: 5,
             max_retry_delay_ms: 50,
+            max_delay_ms: UNBOUNDED_BACKOFF_MS,
         };
         let mut attempts = 0;
         let message = complete_with_provider_retry(
@@ -425,6 +439,7 @@ mod tests {
             max_retries: 5,
             base_delay_ms: 5,
             max_retry_delay_ms: 50,
+            max_delay_ms: UNBOUNDED_BACKOFF_MS,
         };
         let mut attempts = 0;
         let message = complete_with_provider_retry(
@@ -449,6 +464,7 @@ mod tests {
             max_retries: 3,
             base_delay_ms: 5,
             max_retry_delay_ms: 50,
+            max_delay_ms: UNBOUNDED_BACKOFF_MS,
         };
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_attempt = std::sync::Arc::clone(&attempts);
@@ -486,6 +502,7 @@ mod tests {
             max_retries: 3,
             base_delay_ms: 5,
             max_retry_delay_ms: 50,
+            max_delay_ms: UNBOUNDED_BACKOFF_MS,
         };
         let controller = pa_agent::abort::AbortController::new();
         controller.abort();
@@ -507,6 +524,7 @@ mod tests {
             max_retries: 3,
             base_delay_ms: 5,
             max_retry_delay_ms: 50,
+            max_delay_ms: UNBOUNDED_BACKOFF_MS,
         };
         let mut attempts = 0;
         let message = complete_with_provider_retry(
@@ -531,6 +549,7 @@ mod tests {
             max_retries: 3,
             base_delay_ms: 5,
             max_retry_delay_ms: 50,
+            max_delay_ms: UNBOUNDED_BACKOFF_MS,
         };
         let mut lifecycle = error_message(None, None, None);
         lifecycle.diagnostics = Some(vec![AssistantMessageDiagnostic {
@@ -580,6 +599,7 @@ mod tests {
             max_retries: 3,
             base_delay_ms: 5,
             max_retry_delay_ms: 50,
+            max_delay_ms: UNBOUNDED_BACKOFF_MS,
         };
         let error = complete_with_provider_retry(
             &policy,

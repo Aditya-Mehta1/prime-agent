@@ -5,6 +5,7 @@
 //! block spacers, and `loader.ts` (`Loader` + `agent-activity.ts` labels).
 //! Tool-call cards live in `crate::tool_card`.
 
+use crate::snapshot::RetryStartReason;
 use crate::theme::{Theme, ThemeBg, ThemeColor};
 use crate::width::str_width;
 use crate::{Line, Span};
@@ -443,6 +444,11 @@ pub struct RetryState {
     pub attempt: u32,
     pub max_attempts: u32,
     pub ends_at: std::time::Instant,
+    /// The provider error that started this retry (TS `errorMessage`).
+    pub error_message: String,
+    /// Why the retry started: a quick retry counts down; a provider
+    /// failover switch names the backup the turn re-routes to.
+    pub reason: RetryStartReason,
 }
 
 impl RetryState {
@@ -452,20 +458,31 @@ impl RetryState {
             .saturating_duration_since(std::time::Instant::now())
             .as_secs()
     }
+
+    /// The loader message for this retry (TS `auto_retry_start` rendering).
+    fn message(&self) -> String {
+        match &self.reason {
+            RetryStartReason::Quick => format!(
+                "Retrying ({}/{}) in {}s...",
+                self.attempt,
+                self.max_attempts,
+                self.seconds_left()
+            ),
+            RetryStartReason::Backup { backup_model } => format!(
+                "Primary model unavailable ({}) — retrying on backup model {backup_model}...",
+                self.error_message
+            ),
+        }
+    }
 }
 
 /// The retry loader rows (TS auto_retry_start rendering: muted spinner +
-/// `Retrying (attempt/maxAttempts) in <seconds>s...`).
+/// the retry message).
 pub fn render_retry(retry: &RetryState, frame: usize, theme: &Theme, width: usize) -> Vec<Line> {
     let accent = theme.fg_style(ThemeColor::Accent);
     let muted = theme.fg_style(ThemeColor::Muted);
     let spinner = LOADER_FRAMES[frame % LOADER_FRAMES.len()];
-    let message = format!(
-        "Retrying ({}/{}) in {}s...",
-        retry.attempt,
-        retry.max_attempts,
-        retry.seconds_left()
-    );
+    let message = retry.message();
     let mut row: Line = vec![Span::styled(" ".to_string(), Style::default())];
     row.push(Span::styled(spinner.to_string(), accent));
     row.push(Span::styled(" ".to_string(), muted));
@@ -483,11 +500,39 @@ mod tests {
     }
 
     #[test]
+    fn backup_switch_loader_renders_the_failover_message() {
+        // TS reason "backup": no countdown — the switch re-issues
+        // immediately on the backup provider.
+        let retry = RetryState {
+            attempt: 3,
+            max_attempts: 5,
+            ends_at: std::time::Instant::now(),
+            error_message: "Connection failed".to_string(),
+            reason: RetryStartReason::Backup {
+                backup_model: "prime-backup/mock-1".to_string(),
+            },
+        };
+        let rows = render_retry(&retry, 0, &theme(), 60);
+        let text = rows[1]
+            .iter()
+            .map(|s| s.content.as_str())
+            .collect::<String>();
+        assert!(
+            text.contains(
+                "Primary model unavailable (Connection failed) — retrying on backup model prime-backup/mock-1..."
+            ),
+            "got: {text}"
+        );
+    }
+
+    #[test]
     fn retry_loader_renders_countdown() {
         let retry = RetryState {
             attempt: 1,
             max_attempts: 2,
             ends_at: std::time::Instant::now() + std::time::Duration::from_millis(1500),
+            error_message: "provider down".to_string(),
+            reason: RetryStartReason::Quick,
         };
         let rows = render_retry(&retry, 0, &theme(), 60);
         let text = rows[1]

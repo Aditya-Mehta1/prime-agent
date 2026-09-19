@@ -45,7 +45,7 @@ import perf as P  # noqa: E402
 
 NL = chr(10)
 
-ALL_FLOWS = ["f1_launch", "f2_prompt", "f3_tool", "f4_commands", "f5_side_questions", "f6_attach", "f7_compaction", "f8_resume", "f9_agents_view", "f10_perf", "f11_provider_failure", "f12_scroll", "f13_ctrlc_exit", "f14_compact", "f15_a2a", "f16_refine", "f17_slash_model", "f18_goal_autonomous", "f19_heartbeat", "f20_subagents", "f21_worker_recovery"]
+ALL_FLOWS = ["f1_launch", "f2_prompt", "f3_tool", "f4_commands", "f5_side_questions", "f6_attach", "f7_compaction", "f8_resume", "f9_agents_view", "f10_perf", "f11_provider_failure", "f12_scroll", "f13_ctrlc_exit", "f14_compact", "f15_a2a", "f16_refine", "f17_slash_model", "f18_goal_autonomous", "f19_heartbeat", "f20_subagents", "f21_worker_recovery", "f22_provider_failover"]
 
 # Real-surface flows (f14-f21): each drives one product surface end to end
 # (the daemon session + the attached interactive TUI), captures the frame
@@ -1551,6 +1551,210 @@ class Battery:
                     f"provider-failure rendering parity: {verdicts['rust']['errorRows']} error row(s) on both sides",
                     gap=False,
                 )
+
+    def f22_provider_failover(self) -> None:
+        """Provider failover (Rust resilience feature; the TS product has no
+        counterpart): a second configured provider serves the same model.
+        When the primary dies mid-session the Rust product re-routes the
+        failed turn to the backup provider and recovers; TS (no failover)
+        exhausts its retries and surfaces the failure. The intentional
+        divergence is recorded, not gapped: the failover surface itself is
+        the assertion."""
+        flow = "f22_provider_failover"
+        BACKUP_TEXT = "recovered on the backup provider"
+        # Bounded, fast retries so the flow settles in seconds: one quick
+        # retry on the primary, then the failover switch; one quick retry
+        # on the backup before its own budget is spent.
+        retry_settings = {
+            "retry": {
+                "enabled": True,
+                "maxRetries": 1,
+                "baseDelayMs": 200,
+                "failover": {
+                    "enabled": True,
+                    "maxRetries": 1,
+                    "baseDelayMs": 200,
+                },
+            }
+        }
+        for side in (self.sides["ts"], self.sides["rust"]):
+            session = f"{self.runid}-f22-{side.name}"
+            # A second provider serving the same model id, on its own mock
+            # process (and its own script file) so the primary can die alone.
+            backup = B.MockProvider(side.root, [])
+            backup.script_path = side.root / "backup-mock-script.json"
+            backup.requests_path = Path(str(backup.script_path) + ".requests.jsonl")
+            backup.set_responses([{"text": BACKUP_TEXT}])
+            backup.start()
+            # Two-provider catalog: prime-inference first (primary),
+            # prime-backup second (failover target).
+            models = {
+                "providers": {
+                    "prime-inference": {
+                        "api": "openai-completions",
+                        "baseUrl": side.base_url,
+                        "apiKey": "sk-battery",
+                        "models": [
+                            {
+                                "id": "mock-1",
+                                "name": "Mock 1",
+                                "api": "openai-completions",
+                                "baseUrl": side.base_url,
+                                "contextWindow": 128000,
+                                "maxTokens": 4096,
+                            }
+                        ],
+                    },
+                    "prime-backup": {
+                        "api": "openai-completions",
+                        "baseUrl": backup.url(),
+                        "apiKey": "sk-backup",
+                        "models": [
+                            {
+                                "id": "mock-1",
+                                "name": "Mock 1 (backup)",
+                                "api": "openai-completions",
+                                "baseUrl": backup.url(),
+                                "contextWindow": 128000,
+                                "maxTokens": 4096,
+                            }
+                        ],
+                    },
+                }
+            }
+            (side.agent_dir / "models.json").write_text(json.dumps(models, indent=1))
+            settings_path = side.agent_dir / "settings.json"
+            prior_settings = (
+                settings_path.read_text() if settings_path.exists() else None
+            )
+            settings_path.write_text(json.dumps(retry_settings))
+            try:
+                argv = [
+                    side.binary,
+                    "--daemon-socket",
+                    str(side.daemon_socket),
+                    "--provider",
+                    "prime-inference",
+                    "--model",
+                    "mock-1",
+                    "--offline",
+                ]
+                B.tmux_launch(session, argv, side.env, side.work_dir)
+                frame = ""
+                deadline = time.time() + 30
+                while time.time() < deadline:
+                    frame = B.tmux_capture(session)
+                    if "Share agent traces" in frame:
+                        break
+                    time.sleep(1.0)
+                if "Share agent traces" in frame:
+                    B.tmux_send(session, "Down")
+                    time.sleep(0.5)
+                    B.tmux_send(session, "Enter")
+                    time.sleep(2.0)
+                stable = False
+                deadline = time.time() + 30
+                while time.time() < deadline and not stable:
+                    first = B.tmux_capture(session)
+                    time.sleep(2.0)
+                    second = B.tmux_capture(session)
+                    stable = first == second and ("manage" in first or ">" in first)
+                # A healthy exchange first (own the primary's queue).
+                side.mock.set_responses([{"text": HELLO_TEXT}])
+                healthy = B.tmux_wait_text(session, HELLO_TEXT, timeout=90)
+                side.evidence(flow, "01-healthy-exchange.txt", healthy)
+                # Kill the primary mid-session, then prompt again: the
+                # failed turn must re-route to the backup provider. The
+                # switch loader is transient (the switch re-issues with no
+                # countdown), so poll fast to catch it; the settled
+                # assertions use the durable transcript rows.
+                side.mock.stop()
+                B.tmux_send(session, "again")
+                switch_loader = ""
+                settled = ""
+                deadline = time.time() + 120
+                while time.time() < deadline:
+                    frame = B.tmux_capture(session)
+                    if "backup model prime-backup/mock-1" in frame and not switch_loader:
+                        switch_loader = frame
+                    if side.name == "rust" and BACKUP_TEXT in frame:
+                        settled = frame
+                        break
+                    if side.name == "ts" and "Retry failed after" in frame:
+                        time.sleep(1.0)
+                        settled = B.tmux_capture(session)
+                        break
+                    time.sleep(0.2)
+                # Let the settled frame finish (the restore status row).
+                time.sleep(2.0)
+                settled = B.tmux_capture(session)
+                side.evidence(flow, "02-provider-failure.txt", settled)
+                if switch_loader:
+                    side.evidence(flow, "03-switch-loader.txt", switch_loader)
+                if side.name == "rust":
+                    recovered = (
+                        "Primary provider recovered — back on prime-inference/mock-1"
+                        in settled
+                    )
+                    answered = BACKUP_TEXT in settled
+                    switch_rows = len(
+                        re.findall(r"backup model prime-backup/mock-1", settled)
+                    ) + (1 if switch_loader else 0)
+                    side.evidence_json(
+                        flow,
+                        "verdict.json",
+                        {
+                            "switchRendered": switch_rows > 0,
+                            "primaryRestored": recovered,
+                            "backupAnswered": answered,
+                        },
+                    )
+                    if recovered and answered:
+                        self.record(
+                            flow,
+                            "behavior",
+                            f"{side.name}: provider failure re-routed to prime-backup/mock-1, the backup answered, and the primary was restored (switch surface rendered: {switch_rows > 0})",
+                            gap=False,
+                        )
+                    else:
+                        self.record(
+                            flow,
+                            "behavior",
+                            f"{side.name}: provider failover is incomplete (primary restored: {recovered}, backup answered: {answered})",
+                            evidence=side.root / flow / "02-provider-failure.txt",
+                        )
+                    if switch_rows == 0:
+                        self.record(
+                            flow,
+                            "visual",
+                            f"{side.name}: the provider-switch loader row was not captured (it is transient; the switch itself settled: primary restored: {recovered}, backup answered: {answered})",
+                            evidence=side.root / flow / "02-provider-failure.txt",
+                            gap=False,
+                        )
+                else:
+                    retry_banner = "Retry failed after" in settled
+                    side.evidence_json(
+                        flow,
+                        "verdict.json",
+                        {"retryBanner": retry_banner, "hasFailover": False},
+                    )
+                    self.record(
+                        flow,
+                        "behavior",
+                        "ts: the TS product has no provider failover — the same flow exhausts its quick retries and surfaces the failure (the resilience feature is Rust-side only; intentional divergence)",
+                        evidence=side.root / flow / "02-provider-failure.txt",
+                        gap=False,
+                    )
+            finally:
+                B.tmux_kill(session)
+                backup.stop()
+                side.mock.start()
+                side.mock.set_responses([{"text": HELLO_TEXT}])
+                side.write_models_json()
+                if prior_settings is None:
+                    settings_path.unlink(missing_ok=True)
+                else:
+                    settings_path.write_text(prior_settings)
 
     # -- scroll + exit-lane verifiers (f12/f13) --------------------------------
 

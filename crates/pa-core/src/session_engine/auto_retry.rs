@@ -25,6 +25,16 @@ use super::provider_retry::{
     ProviderRetryPolicy,
 };
 
+/// Why one `auto_retry_start` fired (the TS wire `reason` field).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetryStartReason {
+    /// Ordinary quick retry on the current provider.
+    Quick,
+    /// The failed turn re-routes to another configured provider serving the
+    /// same model; `backup_model` is the `"provider/model-id"` reference.
+    Backup { backup_model: String },
+}
+
 /// One retry-loop event, in the TS wire vocabulary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutoRetryEvent {
@@ -35,13 +45,18 @@ pub enum AutoRetryEvent {
         max_attempts: u32,
         delay_ms: u64,
         error_message: String,
+        /// Which kind of retry this is (quick retry vs provider switch).
+        reason: RetryStartReason,
     },
     /// `auto_retry_end`: the loop settled. `attempt` is the number of retries
-    /// performed; `final_error` is present exactly when `success` is false.
+    /// performed; `final_error` is present exactly when `success` is false;
+    /// `restored_model` is the `"provider/model-id"` primary restored after
+    /// a provider-switch retry succeeded.
     End {
         success: bool,
         attempt: u32,
         final_error: Option<String>,
+        restored_model: Option<String>,
     },
 }
 
@@ -77,6 +92,7 @@ where
                     success: true,
                     attempt: retries_performed,
                     final_error: None,
+                    restored_model: None,
                 })
                 .await?;
             }
@@ -102,6 +118,7 @@ where
                     success: false,
                     attempt: retries_performed,
                     final_error: Some(final_error_of(&message)),
+                    restored_model: None,
                 })
                 .await?;
             }
@@ -115,6 +132,7 @@ where
                 success: false,
                 attempt: retries_performed - 1,
                 final_error: Some(final_error_of(&message)),
+                restored_model: None,
             })
             .await?;
             return Ok(message);
@@ -130,6 +148,7 @@ where
                 emit(AutoRetryEvent::End {
                     success: false,
                     attempt: retries_performed - 1,
+                    restored_model: None,
                     final_error: Some(format!(
                         "Provider requested a {}s wait before retrying (above retry.provider.maxRetryDelayMs={}ms): {}",
                         retry_after_ms.div_ceil(1000),
@@ -146,6 +165,7 @@ where
             max_attempts: policy.max_retries,
             delay_ms,
             error_message: final_error_of(&message),
+            reason: RetryStartReason::Quick,
         })
         .await?;
         if !wait(std::time::Duration::from_millis(delay_ms)).await {
@@ -153,6 +173,7 @@ where
                 success: false,
                 attempt: retries_performed,
                 final_error: Some("Retry cancelled".to_string()),
+                restored_model: None,
             })
             .await?;
             return Ok(with_stop_reason_aborted(message));
@@ -177,6 +198,7 @@ fn with_stop_reason_aborted(mut message: AssistantMessage) -> AssistantMessage {
 
 #[cfg(test)]
 mod tests {
+    use super::super::provider_retry::UNBOUNDED_BACKOFF_MS;
     use super::*;
     use pa_agent::types::{AssistantContent, AssistantMessageDiagnostic, TextContent, Usage};
     use std::sync::Arc;
@@ -242,6 +264,7 @@ mod tests {
             max_retries: 3,
             base_delay_ms: 5,
             max_retry_delay_ms: 50,
+            max_delay_ms: UNBOUNDED_BACKOFF_MS,
         }
     }
 
@@ -287,17 +310,20 @@ mod tests {
                     max_attempts: 3,
                     delay_ms: 5,
                     error_message: "provider down".to_string(),
+                    reason: RetryStartReason::Quick,
                 },
                 AutoRetryEvent::Start {
                     attempt: 2,
                     max_attempts: 3,
                     delay_ms: 10,
                     error_message: "provider down".to_string(),
+                    reason: RetryStartReason::Quick,
                 },
                 AutoRetryEvent::End {
                     success: true,
                     attempt: 2,
                     final_error: None,
+                    restored_model: None,
                 },
             ]
         );
@@ -339,6 +365,7 @@ mod tests {
                 success: false,
                 attempt: 3,
                 final_error: Some("provider down".to_string()),
+                restored_model: None,
             })
         );
         assert_eq!(events.len(), 4); // three starts + one end
@@ -410,6 +437,7 @@ mod tests {
                 success: false,
                 attempt: 1,
                 final_error: Some("Retry cancelled".to_string()),
+                restored_model: None,
             })
         );
     }
@@ -470,6 +498,7 @@ mod tests {
                     "Provider requested a 1s wait before retrying (above retry.provider.maxRetryDelayMs=50ms): provider down"
                         .to_string(),
                 ),
+                restored_model: None,
             }]
         );
     }

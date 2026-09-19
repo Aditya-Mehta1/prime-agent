@@ -2855,17 +2855,31 @@ impl TurnRunner {
                         max_attempts,
                         delay_ms,
                         error_message,
-                    } => vec![json!({
-                        "type": "auto_retry_start",
-                        "attempt": attempt,
-                        "maxAttempts": max_attempts,
-                        "delayMs": delay_ms,
-                        "errorMessage": error_message,
-                    })],
+                        reason,
+                    } => {
+                        let mut event = json!({
+                            "type": "auto_retry_start",
+                            "attempt": attempt,
+                            "maxAttempts": max_attempts,
+                            "delayMs": delay_ms,
+                            "errorMessage": error_message,
+                        });
+                        match reason {
+                            pa_core::session_engine::auto_retry::RetryStartReason::Quick => {}
+                            pa_core::session_engine::auto_retry::RetryStartReason::Backup {
+                                backup_model,
+                            } => {
+                                event["reason"] = json!("backup");
+                                event["backupModel"] = json!(backup_model);
+                            }
+                        }
+                        vec![event]
+                    }
                     EngineEvent::AutoRetryEnd {
                         success,
                         attempt,
                         final_error,
+                        restored_model,
                     } => {
                         let mut event = json!({
                             "type": "auto_retry_end",
@@ -2874,6 +2888,9 @@ impl TurnRunner {
                         });
                         if let Some(final_error) = final_error {
                             event["finalError"] = json!(final_error);
+                        }
+                        if let Some(restored_model) = restored_model {
+                            event["restoredModel"] = json!(restored_model);
                         }
                         vec![event]
                     }

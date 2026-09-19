@@ -21,6 +21,7 @@ pub mod headless;
 pub mod host_requests;
 pub mod messages;
 pub mod provider_adapter;
+pub mod provider_failover;
 pub mod provider_retry;
 pub mod refine;
 pub mod rlm_host;

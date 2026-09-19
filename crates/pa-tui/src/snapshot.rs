@@ -303,18 +303,24 @@ pub enum TurnUpdate {
     /// echo/result rows, or the malformed-notice fallback).
     CustomRow(ChatEntry),
     /// `auto_retry_start`: a provider failure is being retried after
-    /// `delay_ms` (TS retry loader countdown).
+    /// `delay_ms` (TS retry loader countdown). A `Backup` reason is a
+    /// provider-failover switch: the failed turn re-routes to
+    /// `backup_model` ("provider/model-id") immediately.
     AutoRetryStart {
         attempt: u32,
         max_attempts: u32,
         delay_ms: u64,
+        error_message: String,
+        reason: RetryStartReason,
     },
     /// `auto_retry_end`: the retry loop settled; `final_error` is set when
-    /// the retries were exhausted.
+    /// the retries were exhausted; `restored_model` is the primary model
+    /// restored after a failover switch succeeded.
     AutoRetryEnd {
         success: bool,
         attempt: u32,
         final_error: Option<String>,
+        restored_model: Option<String>,
     },
     /// `agent_end`: the prompt queue drained.
     Idle,
@@ -347,6 +353,16 @@ pub enum TurnUpdate {
     GoalUpdate(Value),
     /// `session_action_update` and other state churn: the footer status only.
     StatusUpdate,
+}
+
+/// Why one `auto_retry_start` fired (the TS wire `reason` field).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetryStartReason {
+    /// Ordinary quick retry on the current provider.
+    Quick,
+    /// Provider-failover switch: the failed turn re-routes to
+    /// `backup_model` ("provider/model-id").
+    Backup { backup_model: String },
 }
 
 /// Decode the `event` payload of a `session_event` frame.
@@ -479,6 +495,21 @@ pub fn event_to_update(event: &Value) -> Option<TurnUpdate> {
                 .get("delayMs")
                 .and_then(Value::as_u64)
                 .unwrap_or_default(),
+            error_message: event
+                .get("errorMessage")
+                .and_then(Value::as_str)
+                .unwrap_or("Unknown error")
+                .to_string(),
+            reason: match event.get("reason").and_then(Value::as_str) {
+                Some("backup") => RetryStartReason::Backup {
+                    backup_model: event
+                        .get("backupModel")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                },
+                _ => RetryStartReason::Quick,
+            },
         }),
         "auto_retry_end" => Some(TurnUpdate::AutoRetryEnd {
             success: event
@@ -491,6 +522,10 @@ pub fn event_to_update(event: &Value) -> Option<TurnUpdate> {
                 .unwrap_or_default() as u32,
             final_error: event
                 .get("finalError")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            restored_model: event
+                .get("restoredModel")
                 .and_then(Value::as_str)
                 .map(str::to_string),
         }),
@@ -1107,6 +1142,30 @@ mod tests {
                 attempt: 1,
                 max_attempts: 2,
                 delay_ms: 50,
+                error_message: "provider down".to_string(),
+                reason: RetryStartReason::Quick,
+            }
+        );
+        let backup = event_to_update(&json!({
+            "type": "auto_retry_start",
+            "attempt": 3,
+            "maxAttempts": 5,
+            "delayMs": 0,
+            "errorMessage": "provider down",
+            "reason": "backup",
+            "backupModel": "prime-inference/glm-5.3",
+        }))
+        .expect("backup switch maps");
+        assert_eq!(
+            backup,
+            TurnUpdate::AutoRetryStart {
+                attempt: 3,
+                max_attempts: 5,
+                delay_ms: 0,
+                error_message: "provider down".to_string(),
+                reason: RetryStartReason::Backup {
+                    backup_model: "prime-inference/glm-5.3".to_string()
+                },
             }
         );
         let end = event_to_update(&json!({
@@ -1122,12 +1181,14 @@ mod tests {
                 success: false,
                 attempt: 2,
                 final_error: Some("provider down".to_string()),
+                restored_model: None,
             }
         );
         let settled = event_to_update(&json!({
             "type": "auto_retry_end",
             "success": true,
             "attempt": 2,
+            "restoredModel": "prime-inference/glm-5.3",
         }))
         .expect("retry success maps");
         assert_eq!(
@@ -1136,6 +1197,7 @@ mod tests {
                 success: true,
                 attempt: 2,
                 final_error: None,
+                restored_model: Some("prime-inference/glm-5.3".to_string()),
             }
         );
     }

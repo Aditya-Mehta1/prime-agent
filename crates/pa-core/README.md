@@ -25,6 +25,16 @@ logic of its own). The RLM recursion host seam
 selector-error vocabulary the daemon implements over the supervisor link.
 Platform wall (`platform`): process control (signals/process groups), file locking, file permissions, and shell selection - every OS-specific behavior in the engine lives there behind cfg-gated implementations. Scheduled jobs (`cron`, the `AgentCronJobStore` port of `core/cron-jobs.ts`): file-backed job state under session artifacts (`scheduled-jobs.json` partitions) with cross-process locking, plus the public read-only scan (`cron::store::read_scheduled_jobs_artifact`) the update flow's roster projection and boot re-arm read. Tools (bash, edit, ipython + internal rename/stdout), file mutation queue, truncation and rendering rules, RLM kernel lifecycle (IPython spawn/execute/revive), skills loading, system prompt assembly, compaction, harness refinement, settings/config, package manager (npm/git/local source install/remove/list/update against settings, plus `resolve()`: precedence-ranked session resource resolution over configured packages, settings arrays, auto-discovery, and bundled skills), session manager (persist/resume). Extension host (stage 1: Node sidecar process lifecycle - spawn/handshake/ping/orderly shutdown, NDJSON RPC client + framing, host script materialized content-addressed under <agentDir>/extension-host/; stage 2: module loading with vendored jiti 2.7.0 + pi API/import shims in the sidecar, registration landing in the registry mirror (first-wins tools, command collision suffixing, flag/shortcut rules), the `ExtensionRunner` facade, extension tools bridged into the loop tool surface over `tool_execute` RPC, session-engine assembly with prompt-guideline injection; docs/extensions-runner-design.md). Extension-runner stages 3-6 are descoped (operator decision 2026-09-17); the landed stages 1-2 remain as harmless machinery. origin/main
 
+Provider resilience policies in `session_engine`: the shared quick-retry
+policy (TS `provider-retry.ts`: permanent-kind classification,
+Retry-After-aware capped delays), the interactive auto-retry loop, and the
+provider-failover driver (when a provider exhausts its quick retries and
+another configured provider serves the same model, the failed turn
+re-routes to the next provider in catalog order; the TS
+`auto_retry_start`/`reason: "backup"` event vocabulary surfaces the
+progression). The drivers are pure decision logic: the host (pa-daemon)
+owns the attempt, the wait, and the model switch.
+
 ## Non-goals
 No provider HTTP (pa-ai), no loop policy (pa-agent), no daemon supervision (pa-daemon), no TUI (pa-tui). No update coordination (the pa-cli coordinator owns the FSM; the update-flow seam here is the daemon-free support layer: `update::version` (semver/channel policy), `update::install` (the managed install-root layout), `update::release` (the channel manifest fetch), `update::download` (sha256-verified archive download + staging) - spec `docs/update-flow-state-machine.md`). Event emission at the session seams, ctx-action binding, slash-command dispatch at the product surface, and reload/stale-ctx semantics are design stages 3+ (docs/extensions-runner-design.md); the package manager installs sources and resolves resource paths only.
 
