@@ -1010,6 +1010,12 @@ async fn tui_compact_shows_the_loader_then_the_summary_and_rebuilds() {
         client_auth: None,
         telemetry: None,
     };
+    let ctrl_o = || {
+        pa_tui::interactive::HeadlessStep::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('o'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ))
+    };
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![
             pa_tui::interactive::HeadlessStep::Submit("first".to_string()),
@@ -1020,6 +1026,16 @@ async fn tui_compact_shows_the_loader_then_the_summary_and_rebuilds() {
             pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
             pa_tui::interactive::HeadlessStep::Submit("/compact focus on the goal".to_string()),
             pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+            // The collapsible block (TS `applyChatExpansion` fanning
+            // `toolOutputExpanded` into `CompactionSummaryMessageComponent`):
+            // Ctrl+O twice walks overview -> details -> all, expanding the
+            // summary into the markdown body plus the token metadata; the
+            // third press wraps back to overview and re-collapses it.
+            ctrl_o(),
+            ctrl_o(),
+            pa_tui::interactive::HeadlessStep::SettleIdle,
+            ctrl_o(),
+            pa_tui::interactive::HeadlessStep::SettleIdle,
         ],
         width: 100,
         height: 30,
@@ -1085,6 +1101,32 @@ async fn tui_compact_shows_the_loader_then_the_summary_and_rebuilds() {
     assert!(
         !last.contains("first"),
         "the compacted-away first turn dropped from the rebuilt transcript:\n{last}"
+    );
+
+    // The collapsible block: the expanded frames show the markdown body and
+    // the dim metadata row (TS `new Markdown(summary, ...)` + the
+    // `Compacted from N tokens \u{b7} focus: ...` row); the wrap back to
+    // overview re-collapses (the `EventSummary` returns, metadata gone).
+    let expanded = outcome
+        .frames
+        .iter()
+        .find(|frame| frame.contains("Compacted from"))
+        .expect("some frame captured the expanded compaction block");
+    assert!(
+        expanded.contains("Compacted from") && expanded.contains("tokens"),
+        "the expanded metadata row:\n{expanded}"
+    );
+    assert!(
+        expanded.contains("\u{b7} focus: focus on the goal"),
+        "the /compact focus rides the expanded metadata:\n{expanded}"
+    );
+    assert!(
+        expanded.contains("Summary") && !expanded.contains("## Summary"),
+        "the expanded body renders the summary markdown, not the EventSummary flatten:\n{expanded}"
+    );
+    assert!(
+        !last.contains("Compacted from"),
+        "the third Ctrl+O re-collapsed the block:\n{last}"
     );
 
     // The compaction entry persisted (the durable `compaction` record).

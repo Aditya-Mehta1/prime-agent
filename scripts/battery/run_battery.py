@@ -2216,6 +2216,11 @@ class Battery:
         text = re.sub(r"prime agent v[0-9][0-9A-Za-z.+-]*", "prime agent <version>", text)
         text = re.sub(r"\b[0-9,]{4,}\b", "<num>", text)
         text = re.sub(r"\b\d+(\.\d+)?s\b", "<dur>", text)
+        # The expanded compaction block's metadata reports the pre-compaction
+        # context size, which each side estimates with its own counter (the
+        # row shape and the focus text are the parity claim; the count is
+        # per-implementation and can be under the 4-digit scrub above).
+        text = re.sub(r"Compacted from [0-9,]+ tokens", "Compacted from <num> tokens", text)
         return text
 
 
@@ -2226,6 +2231,12 @@ class Battery:
         `Auto-compacting...` loader + compacted row when one large turn
         crosses the reserve-token headroom (session B — a manual compact
         first would leave `Already compacted` skips for the auto path).
+        Session A also diffs the collapsed/expanded block states: the
+        summary row is a collapsible block (TS
+        CompactionSummaryMessageComponent over ExpandableEventMessage), so
+        after the settled collapsed frame it presses Ctrl+O twice to the
+        `all` detail (the markdown body + `Compacted from N tokens`
+        metadata), then once more to re-collapse.
         Settings shape both: reserveTokens 127500 leaves a 500-token
         headroom on the 128k mock model (the mock-reported 126k usage
         crosses it), and keepRecentTokens 10 makes the seeded turns
@@ -2289,6 +2300,48 @@ class Battery:
                             evidence=side.root / flow / "02-after-compact.txt",
                             lane=FLOW_LANES[flow],
                         )
+                    # The collapsible block: Ctrl+O twice (overview ->
+                    # details -> all, TS applyChatExpansion ->
+                    # CompactionSummaryMessageComponent) swaps the collapsed
+                    # EventSummary for the markdown body plus the dim
+                    # `Compacted from N tokens` metadata row.
+                    self.tui_send(tui, "C-o", enter=False)
+                    time.sleep(0.5)
+                    self.tui_send(tui, "C-o", enter=False)
+                    B.tmux_wait_text(tui, "Compacted from", timeout=30)
+                    expanded = self.settle_frame(tui, quiet_s=2.0, timeout=60)
+                    side.evidence(flow, "02b-expanded-block.txt", expanded)
+                    frames[side.name]["manual-expanded"] = expanded
+                    if "Compacted from" in expanded and "Context compacted" in expanded:
+                        self.record(
+                            flow, "visual",
+                            f"{side.name}: the Ctrl+O detail cycle expands the compaction summary block",
+                            gap=False,
+                        )
+                    else:
+                        self.record(
+                            flow, "visual",
+                            f"{side.name}: Ctrl+O never expanded the compaction summary block",
+                            evidence=side.root / flow / "02b-expanded-block.txt",
+                            lane=FLOW_LANES[flow],
+                        )
+                    # The third press wraps back to overview: re-collapsed.
+                    self.tui_send(tui, "C-o", enter=False)
+                    recollapsed = self.settle_frame(tui, quiet_s=2.0, timeout=60)
+                    side.evidence(flow, "02c-recollapsed-block.txt", recollapsed)
+                    if "Compacted from" in recollapsed:
+                        self.record(
+                            flow, "visual",
+                            f"{side.name}: the detail cycle back to overview did not re-collapse the block",
+                            evidence=side.root / flow / "02c-recollapsed-block.txt",
+                            lane=FLOW_LANES[flow],
+                        )
+                    else:
+                        self.record(
+                            flow, "visual",
+                            f"{side.name}: the third Ctrl+O re-collapses the compaction summary block",
+                            gap=False,
+                        )
                     B.tmux_kill(tui)
                 self.copy_sessions(side, flow)
             # -- session B: auto-compaction threshold crossing ---------------
@@ -2346,7 +2399,7 @@ class Battery:
             # Restore default compaction settings for the flows that follow.
             settings["compaction"] = {"enabled": True}
             settings_path.write_text(json.dumps(settings))
-        for step in ("manual-compact", "auto-compact"):
+        for step in ("manual-compact", "manual-expanded", "auto-compact"):
             self.frame_diff(
                 flow, step,
                 {name: frames[name].get(step, "") for name in ("ts", "rust")},

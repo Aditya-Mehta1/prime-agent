@@ -11,7 +11,12 @@ sandboxes in tmux at 100x30 (the interactive e2e's headless geometry):
     startCompactionLoader),
   - the settled outcome: the `◆ Context compacted` summary row heading the
     rebuilt transcript (TS CompactionSummaryMessageComponent +
-    rebuildChatFromMessages), with the compacted-away first turn gone.
+    rebuildChatFromMessages), with the compacted-away first turn gone,
+  - the expanded block: Ctrl+O twice (overview -> details -> all) swaps the
+    collapsed two-line EventSummary for the markdown body plus the dim
+    `Compacted from N tokens` metadata row, and the third press re-collapses
+    it (TS applyChatExpansion fanning toolOutputExpanded into
+    CompactionSummaryMessageComponent).
 
 Both sides run the same token-paced faux provider script; the sandbox
 settings.json pins compaction.keepRecentTokens=10 so the kept tail after
@@ -88,6 +93,10 @@ STATES = [
     ("b_loader", "the compaction loader while the summarizer streams"),
     # The settled outcome: summary row heading the rebuilt transcript.
     ("c_post_compact", "the post-compaction rebuilt transcript"),
+    # The expanded block: Ctrl+O twice (overview -> details -> all) turns
+    # the collapsed `EventSummary` into the markdown body + the dim
+    # `Compacted from N tokens` metadata row.
+    ("d_expanded", "the summary block expanded by the Ctrl+O detail cycle"),
 ]
 
 
@@ -133,6 +142,10 @@ def normalize(frame, root):
         frame,
         flags=re.MULTILINE,
     )
+    # The expanded block's metadata reports the pre-compaction context size,
+    # which each side estimates with its own token counter (the shape and
+    # the focus text are the parity claim; the number is per-implementation).
+    frame = re.sub(r"Compacted from [0-9,]+ tokens", "Compacted from <N> tokens", frame)
     return frame
 
 
@@ -268,6 +281,30 @@ def launch(binary, sandbox, shared_cwd, script_path, out_dir):
     pane = capture_plain(session)
     if "history history" in pane:
         raise AssertionError("the compacted-away filler still renders post-compaction")
+
+    # d_expanded: the Ctrl+O detail cycle (overview -> details -> all)
+    # expands the compaction block (TS `applyChatExpansion` fans
+    # `toolOutputExpanded` into `CompactionSummaryMessageComponent`).
+    tmux("send-keys", "-t", session, "C-o")
+    time.sleep(0.5)
+    tmux("send-keys", "-t", session, "C-o")
+    wait_for(session, "Compacted from", timeout=60)
+    time.sleep(1.0)
+    for _ in range(20):
+        if not re.search(SPINNER_CLASS, capture_plain(session)):
+            break
+        time.sleep(0.5)
+    frames["d_expanded"] = capture(session)
+    # The expanded metadata rides below the markdown summary body, and the
+    # block collapses again on the third press (all -> overview).
+    pane = capture_plain(session)
+    if "Context compacted" not in pane:
+        raise AssertionError("the expanded state lost the compaction header")
+    tmux("send-keys", "-t", session, "C-o")
+    time.sleep(1.0)
+    pane = capture_plain(session)
+    if "Compacted from" in pane:
+        raise AssertionError("the detail cycle back to overview did not re-collapse the block")
 
     tmux("send-keys", "-t", session, "C-c")
     time.sleep(0.5)

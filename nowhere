@@ -146,14 +146,12 @@ pub fn render_compaction_summary(
         rows.extend(collapsed_summary_rows(summary, body, width));
         return rows;
     }
-    // The expanded view: the raw summary through the markdown renderer
-    // (TS passes `this.message.summary` untrimmed — the final paragraph row
-    // keeps its trailing space), then the dim token metadata with the
-    // optional focus.
+    // The expanded view: full markdown in the summary color, then the dim
+    // token metadata with the optional focus.
     let content_width = width.saturating_sub(2).max(1);
     let mut md = crate::markdown::MarkdownStyle::from_theme(theme);
     md.body = body;
-    for line in crate::markdown::render_markdown(summary, content_width, &md) {
+    for line in crate::markdown::render_markdown(summary.trim(), content_width, &md) {
         let mut row: Line = vec![Span::raw(" ".to_string())];
         row.extend(line);
         rows.push(crate::chat::pad_to(

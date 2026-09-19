@@ -517,7 +517,12 @@ impl AgentView {
                     summary,
                     *tokens_before,
                     custom_instructions.as_deref(),
-                    false,
+                    // TS `applyChatExpansion` fans `toolOutputExpanded`
+                    // out to every `ExpandableEventMessage` in the chat;
+                    // `CompactionSummaryMessageComponent` renders the
+                    // collapsed `EventSummary` until the Ctrl+O cycle
+                    // reaches detail `all`.
+                    self.detail.tool_output_expanded(),
                     &self.theme,
                     width,
                 ));
@@ -1614,6 +1619,54 @@ mod tests {
         let details = transcript_text(&mut view, 80);
         assert!(!overview.contains("thinking body"));
         assert!(details.contains("thinking body"));
+    }
+
+    /// The compaction summary is a collapsible block (TS
+    /// `CompactionSummaryMessageComponent`, an `ExpandableEventMessage`):
+    /// collapsed until the Ctrl+O detail cycle reaches `all`, expanded
+    /// there, collapsed again when the cycle wraps to `overview`.
+    #[test]
+    fn compaction_summary_block_toggles_with_the_detail_cycle() {
+        let summary = "## Summary\nthe session story, first line\nand a second line that wraps";
+        let mut view = view_with(vec![ChatEntry::CompactionSummary {
+            summary: summary.to_string(),
+            tokens_before: 12345,
+            custom_instructions: Some("the goal".to_string()),
+        }]);
+        // Collapsed at the default `overview`: the header plus the
+        // whitespace-collapsed EventSummary, never the token metadata.
+        let collapsed = transcript_text(&mut view, 80);
+        assert!(collapsed.contains("\u{25c6} Context compacted"));
+        assert!(collapsed.contains("## Summary the session story, first line"));
+        assert!(!collapsed.contains("Compacted from"));
+        // The row is cacheable; the first render stored it. A detail
+        // change must re-flow it (the cache drops wholesale), or the
+        // block would stay collapsed forever.
+        view.detail = view.detail.next();
+        let details = transcript_text(&mut view, 80);
+        assert!(
+            !details.contains("Compacted from"),
+            "detail `details` keeps the block collapsed: {details}"
+        );
+        view.detail = view.detail.next();
+        let expanded = transcript_text(&mut view, 80);
+        assert!(
+            expanded.contains("Compacted from 12,345 tokens \u{b7} focus: the goal"),
+            "the expanded metadata row renders: {expanded}"
+        );
+        // The expanded body is markdown, not the EventSummary collapse:
+        // the heading renders as its own row.
+        assert!(
+            expanded.contains("Summary"),
+            "the expanded markdown body renders: {expanded}"
+        );
+        // The cycle wraps to `overview`: the block collapses again.
+        view.detail = view.detail.next();
+        let collapsed_again = transcript_text(&mut view, 80);
+        assert!(
+            !collapsed_again.contains("Compacted from"),
+            "the cycle back to `overview` collapses the block: {collapsed_again}"
+        );
     }
 
     fn agent_message_row() -> ChatEntry {

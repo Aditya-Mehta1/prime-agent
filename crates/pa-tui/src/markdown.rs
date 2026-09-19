@@ -55,9 +55,19 @@ impl MarkdownStyle {
             quote_border: theme.fg_style(C::MdQuoteBorder),
             hr: theme.fg_style(C::MdHr),
             list_bullet: theme.fg_style(C::MdListBullet),
-            bold: Modifier::BOLD,
-            italic: Modifier::ITALIC,
-            strikethrough: Modifier::CROSSED_OUT,
+            // The TS source styles `**bold**`/`*ital*`/`~~strike~~` (and the
+            // heading taper) through chalk; in the deployed TS binary the
+            // chalk modifiers never reach the wire — only its raw-ANSI
+            // colors render (probe vs the installed 0.9.5 binary: headings
+            // `#`-`######` render in mdHeading alone, inline strong/em/strike
+            // render plain, inline code stays colored). The same evidence
+            // shape as the link label's dropped underline (see
+            // `legacy_link_row_is_underlined_and_shows_the_url`): the
+            // markers survive parsing (run boundaries stay intact) but carry
+            // no modifier.
+            bold: Modifier::empty(),
+            italic: Modifier::empty(),
+            strikethrough: Modifier::empty(),
             code_block_indent: "  ".to_string(),
         }
     }
@@ -109,7 +119,6 @@ enum BlockKind {
 #[derive(Debug, Clone)]
 struct Block {
     kind: BlockKind,
-    depth: usize,
     /// True when a blank line precedes this block (TS emits a `space` token).
     sep_blank: bool,
     /// Raw lines of the block (for code: literal lines; for others: unwrapped content).
@@ -150,7 +159,6 @@ fn parse_blocks(text: &str) -> Vec<Block> {
             i += 1; // skip closing fence
             blocks.push(Block {
                 kind: BlockKind::Code { lang },
-                depth: 0,
                 sep_blank,
                 lines: code,
             });
@@ -161,7 +169,6 @@ fn parse_blocks(text: &str) -> Vec<Block> {
         if hashes > 0 && trimmed.len() > hashes && trimmed.as_bytes()[hashes] == b' ' {
             blocks.push(Block {
                 kind: BlockKind::Heading,
-                depth: hashes,
                 sep_blank,
                 lines: vec![trimmed[hashes + 1..].to_string()],
             });
@@ -172,7 +179,6 @@ fn parse_blocks(text: &str) -> Vec<Block> {
         if is_hr(trimmed) {
             blocks.push(Block {
                 kind: BlockKind::Hr,
-                depth: 0,
                 sep_blank,
                 lines: Vec::new(),
             });
@@ -198,7 +204,6 @@ fn parse_blocks(text: &str) -> Vec<Block> {
             }
             blocks.push(Block {
                 kind: BlockKind::Quote,
-                depth: 0,
                 sep_blank,
                 lines: qlines,
             });
@@ -231,7 +236,6 @@ fn parse_blocks(text: &str) -> Vec<Block> {
             items.push(item);
             blocks.push(Block {
                 kind: BlockKind::List { ordered, start },
-                depth: 0,
                 sep_blank,
                 lines: items,
             });
@@ -246,7 +250,6 @@ fn parse_blocks(text: &str) -> Vec<Block> {
                     header: table.header,
                     rows: table.rows,
                 },
-                depth: 0,
                 sep_blank,
                 lines: table.raw,
             });
@@ -254,6 +257,11 @@ fn parse_blocks(text: &str) -> Vec<Block> {
         }
         // Paragraph: consume until blank line or new block marker
         let mut para = trimmed.to_string();
+        // The block's last source line keeps its trailing whitespace (the
+        // TS lexer's paragraph token carries it; the rendered row ends
+        // `stream. ` with the space inside the styled span — probe vs the
+        // TS binary, the expanded compaction summary).
+        let mut last_raw = line;
         i += 1;
         while i < src_lines.len() {
             let l = src_lines[i];
@@ -270,11 +278,12 @@ fn parse_blocks(text: &str) -> Vec<Block> {
             }
             para.push(' ');
             para.push_str(t);
+            last_raw = l;
             i += 1;
         }
+        para.push_str(&last_raw[last_raw.trim_end().len()..]);
         blocks.push(Block {
             kind: BlockKind::Paragraph,
-            depth: 0,
             sep_blank,
             lines: vec![para],
         });
@@ -337,36 +346,18 @@ fn render_block(
     };
     match &block.kind {
         BlockKind::Heading => {
+            // The TS source tapers headings by level (h1 bold+underline,
+            // h2/h3 bold, h4 bold+italic, h5/h6 italic), all through
+            // chalk; in the deployed TS binary the chalk modifiers never
+            // reach the wire, so every level renders in the heading color
+            // alone (probe vs the installed 0.9.5 binary: `# H1`, `## H2`,
+            // and `### H3` all render bare mdHeading).
             let text = block.lines.first().cloned().unwrap_or_default();
             let mut spans = render_inline(&text, style);
-            match block.depth {
-                1 => {
-                    out.push(spans_with(
-                        spans,
-                        style
-                            .heading
-                            .add_modifier(style.bold | Modifier::UNDERLINED),
-                    ));
-                }
-                d if d >= 5 => {
-                    for s in spans.iter_mut() {
-                        s.style = style.heading.add_modifier(style.italic);
-                    }
-                    out.push(spans);
-                }
-                4 => {
-                    for s in spans.iter_mut() {
-                        s.style = style.heading.add_modifier(style.bold | style.italic);
-                    }
-                    out.push(spans);
-                }
-                _ => {
-                    for s in spans.iter_mut() {
-                        s.style = style.heading.add_modifier(style.bold);
-                    }
-                    out.push(spans);
-                }
+            for s in spans.iter_mut() {
+                s.style = style.heading;
             }
+            out.push(spans);
             if blank_after(false) {
                 out.push(Vec::new());
             }
@@ -438,16 +429,6 @@ fn render_block(
             }
         }
     }
-}
-
-fn spans_with(spans: Line, style: Style) -> Line {
-    spans
-        .into_iter()
-        .map(|mut s| {
-            s.style = style;
-            s
-        })
-        .collect()
 }
 
 /// Inline rendering: bold, italic, strikethrough, code, links.
@@ -804,6 +785,23 @@ mod tests {
         // Adjacent heading + paragraph: heading pushes a blank line.
         let adjacent = render_markdown("# Title\nBody text here", 40, &style);
         assert_eq!(adjacent.len(), 3);
+    }
+
+    #[test]
+    fn paragraph_keeps_final_line_trailing_whitespace() {
+        // The TS lexer's paragraph token carries the block's trailing
+        // whitespace (probe vs the TS binary: the expanded compaction
+        // summary's last row ends "stream. " with the space inside the
+        // styled span).
+        let style = MarkdownStyle::default();
+        let spans = render_markdown("the story\ntail end ", 40, &style);
+        let joined: String = spans[0].iter().map(|s| s.content.as_str()).collect();
+        assert_eq!(joined, "the story tail end ");
+        // Soft line breaks collapse to one space; the final line's
+        // trailing whitespace rides after it.
+        let joined = render_markdown("a\nb ", 40, &style);
+        let flat: String = joined[0].iter().map(|s| s.content.as_str()).collect();
+        assert_eq!(flat, "a b ");
     }
 
     #[test]
