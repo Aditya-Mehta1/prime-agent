@@ -20,7 +20,7 @@ pub fn char_width(c: char) -> usize {
 /// (TS `createAnsiCodeExtractor`): CSI parameter/intermediate/final bytes,
 /// OSC and APC strings ending at BEL or ST, and DCS/PM/SOS ending at ST.
 /// A malformed or unterminated sequence returns `None` and stays visible.
-fn escape_len(s: &str) -> Option<usize> {
+pub(crate) fn escape_len(s: &str) -> Option<usize> {
     let mut chars = s.char_indices();
     let (_, first) = chars.next()?;
     if first != '\x1b' {

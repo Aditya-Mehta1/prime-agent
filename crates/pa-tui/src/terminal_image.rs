@@ -201,6 +201,19 @@ pub fn reset_capabilities_cache() {
     *lock(capabilities_cache()) = None;
 }
 
+/// Test-only mutex serializing every test that touches the process-global
+/// capability and cell-dimension state: the cargo test harness runs tests
+/// on parallel threads, and one test's `set_capabilities`/`reset` would
+/// otherwise race another's (the failures move run to run, which is what
+/// exposes the race). Tests hold this lock for their whole body.
+#[cfg(test)]
+pub fn test_state_lock() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Override the cached capabilities (tests exercise both image paths).
 #[cfg(test)]
 pub fn set_capabilities(caps: TerminalCapabilities) {
@@ -616,6 +629,7 @@ mod tests {
 
     #[test]
     fn capabilities_cache_is_overrideable_and_resettable() {
+        let _state = test_state_lock();
         let original = capabilities();
         set_capabilities(TerminalCapabilities {
             images: Some(ImageProtocol::Kitty),
@@ -629,6 +643,7 @@ mod tests {
 
     #[test]
     fn cell_dimensions_bump_the_version_on_change_only() {
+        let _state = test_state_lock();
         set_cell_dimensions(CellDimensions {
             width_px: 9,
             height_px: 18,
@@ -813,6 +828,7 @@ mod tests {
 
     #[test]
     fn render_image_requires_protocol_support() {
+        let _state = test_state_lock();
         let dims = ImageDimensions {
             width_px: 180,
             height_px: 90,

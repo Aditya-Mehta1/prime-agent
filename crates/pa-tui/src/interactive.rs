@@ -26,7 +26,6 @@ use crate::view::{AgentView, FlushPlan};
 
 use crossterm::event::KeyEvent;
 use crossterm::terminal;
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
@@ -879,7 +878,7 @@ async fn check_tmux_keyboard_setup() -> Option<String> {
 
 /// Rendering sink: the real terminal or headless frame capture.
 enum Renderer {
-    Terminal(Terminal<CrosstermBackend<std::io::Stdout>>),
+    Terminal(Terminal<crate::hyperlinks::LinkBackend>),
     Headless {
         width: u16,
         height: u16,
@@ -921,8 +920,7 @@ impl Renderer {
                     crossterm::event::Event::Resize(..) => ui_tx.send(UiInput::Resize).is_ok(),
                     _ => true,
                 });
-                let backend = CrosstermBackend::new(std::io::stdout());
-                let mut terminal = Terminal::new(backend)?;
+                let mut terminal = Terminal::new(crate::hyperlinks::stdout_backend())?;
                 // The adopted buffer still holds the previous view's frame;
                 // clear it so the first draw is a full repaint of the same
                 // buffer (a fresh alt screen is already blank).
@@ -1063,7 +1061,7 @@ impl Renderer {
         matches!(self, Renderer::Terminal(_))
     }
 
-    fn is_terminal_mut(&mut self) -> Option<&mut Terminal<CrosstermBackend<std::io::Stdout>>> {
+    fn is_terminal_mut(&mut self) -> Option<&mut Terminal<crate::hyperlinks::LinkBackend>> {
         match self {
             Renderer::Terminal(terminal) => Some(terminal),
             Renderer::Headless { .. } => None,

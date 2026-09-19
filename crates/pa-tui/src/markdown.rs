@@ -91,10 +91,19 @@ pub fn render_markdown(text: &str, width: usize, style: &MarkdownStyle) -> Vec<L
 enum BlockKind {
     Heading,
     Paragraph,
-    Code { lang: Option<String> },
-    List { ordered: bool, start: usize },
+    Code {
+        lang: Option<String>,
+    },
+    List {
+        ordered: bool,
+        start: usize,
+    },
     Quote,
     Hr,
+    Table {
+        header: Vec<String>,
+        rows: Vec<Vec<String>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -228,6 +237,21 @@ fn parse_blocks(text: &str) -> Vec<Block> {
             });
             continue;
         }
+        // Table (marked's table rule: header row + delimiter row +
+        // body rows; tried after the other block starts).
+        if crate::markdown_table::is_table_start(trimmed, src_lines.get(i + 1)) {
+            let table = crate::markdown_table::parse_table_block(&src_lines, &mut i);
+            blocks.push(Block {
+                kind: BlockKind::Table {
+                    header: table.header,
+                    rows: table.rows,
+                },
+                depth: 0,
+                sep_blank,
+                lines: table.raw,
+            });
+            continue;
+        }
         // Paragraph: consume until blank line or new block marker
         let mut para = trimmed.to_string();
         i += 1;
@@ -240,6 +264,7 @@ fn parse_blocks(text: &str) -> Vec<Block> {
                 || t.starts_with('#')
                 || list_marker(t).is_some()
                 || is_hr(t)
+                || crate::markdown_table::is_table_start(t, src_lines.get(i + 1))
             {
                 break;
             }
@@ -257,14 +282,14 @@ fn parse_blocks(text: &str) -> Vec<Block> {
     blocks
 }
 
-fn is_hr(t: &str) -> bool {
+pub(crate) fn is_hr(t: &str) -> bool {
     let chars: Vec<char> = t.chars().filter(|&c| c != ' ').collect();
     (chars.len() >= 3)
         && chars.iter().all(|&c| c == '-' || c == '*' || c == '_')
         && (chars[0] == '-' || chars[0] == '*' || chars[0] == '_')
 }
 
-fn list_marker(t: &str) -> Option<(bool, usize)> {
+pub(crate) fn list_marker(t: &str) -> Option<(bool, usize)> {
     if let Some(rest) = t.strip_prefix("- ") {
         let _ = rest;
         return Some((false, 0));
@@ -406,6 +431,12 @@ fn render_block(
             let bar: String = "─".repeat(width.max(1));
             out.push(vec![Span::styled(bar, style.hr)]);
         }
+        BlockKind::Table { header, rows } => {
+            crate::markdown_table::render_table(header, rows, &block.lines, width, style, out);
+            if blank_after(false) {
+                out.push(Vec::new());
+            }
+        }
     }
 }
 
@@ -489,9 +520,36 @@ pub fn render_inline(text: &str, style: &MarkdownStyle) -> Line {
                     if italic {
                         m |= style.italic;
                     }
-                    spans.push(Span::styled(label, style.link.add_modifier(m)));
-                    if !url.is_empty() {
-                        spans.push(Span::styled(format!(" ({url})"), style.link_url));
+                    // The observed TS binary output (0.9.5, the parity ground
+                    // truth) renders the link label with the body color only:
+                    // the link color is shadowed by the body color applied
+                    // inside the label, and the underline wrapper never
+                    // reaches the wire. `m` carries the emphasis context.
+                    let href = crate::hyperlinks::rewrite_drive_path(&url);
+                    let mut label_spans = render_inline(&label, style);
+                    for s in label_spans.iter_mut() {
+                        s.style = s.style.add_modifier(m);
+                    }
+                    if crate::hyperlinks::hyperlinks_enabled() {
+                        // OSC 8: the label is clickable, the URL never
+                        // printed inline (TS `hyperlink()`).
+                        let open = crate::hyperlinks::osc8_open(&href);
+                        if let Some(first) = label_spans.first_mut() {
+                            first.content.insert_str(0, &open);
+                        }
+                        if let Some(last) = label_spans.last_mut() {
+                            last.content.push_str(crate::hyperlinks::OSC8_CLOSE);
+                        }
+                        spans.extend(label_spans);
+                    } else {
+                        spans.extend(label_spans);
+                        // Legacy form: the URL shows after the text unless
+                        // the label is the URL (mailto stripped for the
+                        // comparison, like autolinked emails).
+                        let comparison = url.strip_prefix("mailto:").unwrap_or(url.as_str());
+                        if label != url && label != comparison {
+                            spans.push(Span::styled(format!(" ({url})"), style.link_url));
+                        }
                     }
                     i = k + 1;
                     continue;
@@ -640,19 +698,28 @@ pub fn wrap_spans(spans: &[Span], width: usize, base: Style, out: &mut Vec<Line>
                 continue;
             }
         }
-        // break overlong words
+        // break overlong words; escape sequences copy through atomically
+        // at zero width (OSC 8 sequences must never split mid-sequence)
         let mut rest = text.clone();
         let style = *style;
         while str_width(&rest) + col > width {
             let mut take = String::new();
             let mut tw = 0usize;
-            for c in rest.chars() {
+            let mut taken = 0usize;
+            while taken < rest.len() {
+                if let Some(len) = crate::width::escape_len(&rest[taken..]) {
+                    take.push_str(&rest[taken..taken + len]);
+                    taken += len;
+                    continue;
+                }
+                let c = rest[taken..].chars().next().expect("char at boundary");
                 let cw = crate::width::char_width(c);
                 if tw + cw + col > width {
                     break;
                 }
                 take.push(c);
                 tw += cw;
+                taken += c.len_utf8();
             }
             if take.is_empty() {
                 break;
@@ -660,7 +727,7 @@ pub fn wrap_spans(spans: &[Span], width: usize, base: Style, out: &mut Vec<Line>
             current.push(Span::styled(take.clone(), style));
             out.push(std::mem::take(&mut current));
             col = 0;
-            rest = rest[take.len()..].to_string();
+            rest = rest[taken..].to_string();
         }
         col += str_width(&rest);
         current.push(Span::styled(rest, style));
@@ -704,12 +771,14 @@ fn wrap_quote(spans: &[Span], width: usize, style: &MarkdownStyle, out: &mut Vec
     }
 }
 
-/// Convert our Line type to ratatui text for rendering. OSC zone markers are
-/// stripped: ratatui has no escape-sequence support and would count their
-/// bytes as visible cells (`app::draw` re-emits them per row instead).
+/// Convert our Line type to ratatui text for rendering. OSC zone markers and
+/// OSC 8 hyperlink sequences are stripped: ratatui has no escape-sequence
+/// support and would count their bytes as visible cells (the paint path
+/// re-emits them: zone markers per row, links via `HyperlinkWriter`).
 pub fn to_ratatui_line(line: &Line) -> rt::Line<'static> {
     let mut stripped = line.clone();
     crate::osc133::strip(&mut stripped);
+    crate::hyperlinks::strip_osc8(&mut stripped);
     let spans: Vec<rt::Span<'static>> = stripped
         .iter()
         .map(|s| rt::Span::styled(s.content.clone(), s.style))
@@ -812,10 +881,95 @@ mod tests {
 
     #[test]
     fn inline_bold_code_link() {
+        // Pin the terminal-capability gate: a link renders the legacy
+        // `label (url)` form when OSC 8 hyperlinks are unavailable.
+        crate::hyperlinks::set_hyperlinks_override(Some(false));
         let style = MarkdownStyle::default();
         let spans = render_inline("a **b** `c` [d](http://e)", &style);
         let texts: Vec<&str> = spans.iter().map(|s| s.content.as_str()).collect();
         assert_eq!(texts, vec!["a ", "b", " ", "c", " ", "d", " (http://e)"]);
+        crate::hyperlinks::set_hyperlinks_override(None);
+    }
+
+    #[test]
+    fn legacy_link_row_is_underlined_and_shows_the_url() {
+        crate::hyperlinks::set_hyperlinks_override(Some(false));
+        let style = MarkdownStyle::default();
+        let spans = render_inline("see [docs](https://x.dev/a)", &style);
+        let texts: Vec<String> = spans.iter().map(|s| s.content.clone()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "see ".to_string(),
+                "docs".to_string(),
+                " (https://x.dev/a)".to_string()
+            ]
+        );
+        // The observed TS binary output styles the label with the body
+        // color only (the underline wrapper never reaches the wire).
+        assert!(!spans[1].style.add_modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(spans[1].style.fg, style.body.fg);
+        assert_eq!(spans[2].style.fg, style.link_url.fg);
+        // The URL is not repeated when the label is the URL, and mailto
+        // labels compare with the prefix stripped (autolinked emails).
+        let bare = render_inline("[https://x.dev](https://x.dev)", &style);
+        let joined: String = bare.iter().map(|s| s.content.as_str()).collect();
+        assert_eq!(joined, "https://x.dev");
+        let mail = render_inline("[a@b.dev](mailto:a@b.dev)", &style);
+        let joined: String = mail.iter().map(|s| s.content.as_str()).collect();
+        assert_eq!(joined, "a@b.dev");
+        crate::hyperlinks::set_hyperlinks_override(None);
+    }
+
+    #[test]
+    fn osc8_gated_link_row_wraps_the_label_in_a_hyperlink() {
+        crate::hyperlinks::set_hyperlinks_override(Some(true));
+        let style = MarkdownStyle::default();
+        let spans = render_inline("see [docs](https://x.dev/a)", &style);
+        let joined: String = spans.iter().map(|s| s.content.as_str()).collect();
+        assert_eq!(
+            joined,
+            format!(
+                "see {}docs{}",
+                crate::hyperlinks::osc8_open("https://x.dev/a"),
+                crate::hyperlinks::OSC8_CLOSE
+            )
+        );
+        // The sequences are zero-width: the row measures like the plain text
+        // and never prints the URL inline.
+        assert_eq!(
+            joined.chars().filter(|&c| c == '(').count(),
+            0,
+            "osc8 rows must not inline the url: {joined}"
+        );
+        assert_eq!(str_width(&joined), str_width("see docs"));
+        // Windows drive-letter targets classify as file paths.
+        let drive = render_inline("[c:\\src](c:\\src)", &style);
+        let joined: String = drive.iter().map(|s| s.content.as_str()).collect();
+        assert!(joined.contains("file:///c:/src"), "drive path: {joined}");
+        crate::hyperlinks::set_hyperlinks_override(None);
+    }
+
+    #[test]
+    fn table_block_renders_boxed_rows() {
+        let style = MarkdownStyle::default();
+        let lines = render_markdown("| a | b |\n| --- | --- |\n| 1 | 2 |\n\nafter", 40, &style);
+        let flat: Vec<String> = lines
+            .iter()
+            .map(|line| line.iter().map(|s| s.content.as_str()).collect())
+            .collect();
+        assert_eq!(
+            flat,
+            vec![
+                "┌───┬───┐".to_string(),
+                "│ a │ b │".to_string(),
+                "├───┼───┤".to_string(),
+                "│ 1 │ 2 │".to_string(),
+                "└───┴───┘".to_string(),
+                String::new(),
+                "after".to_string(),
+            ]
+        );
     }
 
     #[test]

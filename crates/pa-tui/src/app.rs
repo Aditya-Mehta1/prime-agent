@@ -10,7 +10,6 @@ use crate::view::AgentView;
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use ratatui::backend::CrosstermBackend;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use std::io::stdout;
 use std::time::Duration;
@@ -54,8 +53,7 @@ pub fn run_app(
     crossterm::style::force_color_output(true);
     terminal::enable_raw_mode()?;
     crossterm::execute!(stdout(), EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout());
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = Terminal::new(crate::hyperlinks::stdout_backend())?;
 
     let theme = load_theme(&options.theme);
     let mut view = AgentView::new(theme);
@@ -205,7 +203,7 @@ pub fn dispatch_events(editor: &mut Editor, on_submit: &mut dyn FnMut(&str)) {
 }
 
 pub(crate) fn draw(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    terminal: &mut Terminal<crate::hyperlinks::LinkBackend>,
     view: &mut AgentView,
 ) -> Result<()> {
     let area = terminal.size()?;
@@ -214,6 +212,10 @@ pub(crate) fn draw(
     let height = area.height as usize;
     let frame = view.render_frame(width, height);
     let cursor = view.frame_cursor();
+    // The frame's embedded OSC 8 sequences drive the paint backend's
+    // hyperlink injection; install the row/column ranges before the draw
+    // (which strips the sequences from the painted cells).
+    crate::hyperlinks::install_frame(&frame);
     // Zone markers ride on the composed rows; plan their emission before
     // the cell paint (which strips them), then write the sequences at their
     // rows after the frame is painted.
@@ -272,6 +274,7 @@ pub fn render_frame_text(view: &mut AgentView, width: u16, height: u16) -> Vec<S
         .map(|line| {
             let mut stripped = line.clone();
             crate::osc133::strip(&mut stripped);
+            crate::hyperlinks::strip_osc8(&mut stripped);
             stripped.iter().map(|s| s.content.as_str()).collect()
         })
         .collect()

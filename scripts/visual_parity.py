@@ -34,6 +34,23 @@ SIZES = [("120", "36"), ("220", "50")]
 # The single turn both binaries run: thinking, a text block, an ipython tool
 # call, then the final answer. Content is identical on both sides so the
 # frames compare content-for-content.
+# The table/link-bearing turn: exercises the GFM table block (header,
+# delimiter row, body rows) and both link forms, including a mixed-width
+# CJK cell so column measurement shows up in the frame diff.
+TABLE_AND_LINKS_TURN = (
+    "Here is the status board:\n"
+    "\n"
+    "| Task | State | Notes |\n"
+    "| --- | --- | --- |\n"
+    "| alpha | done | shipped in v1.0 |\n"
+    "| beta \u6570\u636e | running | wraps when narrow |\n"
+    "| gamma | pending | blocked on upstream |\n"
+    "\n"
+    "See the [docs](https://example.com/docs) and the [changelog](https://example.com/log)."
+)
+
+SECOND_PROMPT = "Show me the status table."
+
 FAUX_SCRIPT = {
     "engine": "faux",
     "modelId": "faux-1",
@@ -57,7 +74,8 @@ FAUX_SCRIPT = {
                 },
             ]
         },
-        {"content": [{"type": "text", "text": "The check printed the expected marker. Anything else?"}]},
+        # Turn 2: markdown table + links (state e_table_and_links).
+        {"content": [{"type": "text", "text": TABLE_AND_LINKS_TURN}]},
     ],
 }
 
@@ -103,6 +121,7 @@ def find_runtime_package_dir():
 STATES = [
     ("a_fresh_start", "fresh splash with model and cwd lines"),
     ("b_turn_with_tool", "idle after a turn containing a tool-call card"),
+    ("e_table_and_links", "idle after a turn rendering a markdown table and links"),
     ("c_thinking_visible", "conversation detail (Ctrl+O): thinking block visible"),
     ("d_spinner", "working loader mid-turn"),
 ]
@@ -202,10 +221,10 @@ def wait_for(session, needle, timeout):
     raise TimeoutError(f"session {session} never showed {needle!r}")
 
 
-def run_session(binary, sandbox, shared_cwd, script_path, size, out_dir):
+def run_session(binary, sandbox, shared_cwd, script_path, size, out_dir, session_prefix):
     """Drive one binary through the defined states, capturing each frame."""
     width, height = size
-    session = f"vplane-vp-{binary}-{width}x{height}"
+    session = f"vplane-{session_prefix}-{binary}-{width}x{height}"
     tmux("kill-session", "-t", session, check=False)
     tmux("new-session", "-d", "-s", session, "-x", width, "-y", height, "-c", shared_cwd)
     env = (
@@ -268,6 +287,19 @@ def run_session(binary, sandbox, shared_cwd, script_path, size, out_dir):
     time.sleep(1.0)
     frames["b_turn_with_tool"] = capture(session)
 
+    # (e) table + links: submit a second turn whose response carries a
+    # markdown table and links; capture the settled frame.
+    tmux("send-keys", "-t", session, SECOND_PROMPT)
+    tmux("send-keys", "-t", session, "Enter")
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        pane = capture(session, escape=False)
+        if "blocked on upstream" in pane and not re.search(SPINNER_CLASS, pane):
+            break
+        time.sleep(0.3)
+    time.sleep(1.0)
+    frames["e_table_and_links"] = capture(session)
+
     # (c) thinking visible: Ctrl+O toggles conversation detail.
     tmux("send-keys", "-t", session, "C-o")
     try:
@@ -301,6 +333,13 @@ def main():
     parser.add_argument(
         "--only", default=None, help="run a single binary (ts|rust) for capture shakedown"
     )
+    parser.add_argument(
+        "--session-prefix",
+        default="vp",
+        help="tmux session-name prefix (vplane-<prefix>-<binary>-WxH); distinct "
+        "prefixes keep concurrent harness runs on the same box from killing "
+        "each other's sessions",
+    )
     args = parser.parse_args()
     sizes = []
     for entry in args.sizes.split(","):
@@ -313,12 +352,24 @@ def main():
     failures = []
     try:
         if args.only:
-            run_session(args.only, sandboxes[args.only], shared_cwd, script_path, sizes[0], out_dir)
+            run_session(
+                args.only,
+                sandboxes[args.only],
+                shared_cwd,
+                script_path,
+                sizes[0],
+                out_dir,
+                args.session_prefix,
+            )
             print(f"captures for {args.only} in {out_dir}")
             return 0
         for size in sizes:
-            ts_frames = run_session("ts", sandboxes["ts"], shared_cwd, script_path, size, out_dir)
-            rust_frames = run_session("rust", sandboxes["rust"], shared_cwd, script_path, size, out_dir)
+            ts_frames = run_session(
+                "ts", sandboxes["ts"], shared_cwd, script_path, size, out_dir, args.session_prefix
+            )
+            rust_frames = run_session(
+                "rust", sandboxes["rust"], shared_cwd, script_path, size, out_dir, args.session_prefix
+            )
             for state, _ in STATES:
                 ts_norm = normalize(ts_frames[state], base)
                 rust_norm = normalize(rust_frames[state], base)

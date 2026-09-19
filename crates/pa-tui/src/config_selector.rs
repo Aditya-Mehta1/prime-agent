@@ -6,7 +6,6 @@
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::stdout;
 use std::time::{Duration, Instant};
@@ -521,8 +520,7 @@ pub fn run_config_selector(
     crossterm::style::force_color_output(true);
     terminal::enable_raw_mode()?;
     crossterm::execute!(stdout(), EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout());
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = Terminal::new(crate::hyperlinks::stdout_backend())?;
     let theme = options.theme;
     let kb = options.keybindings;
     let start = Instant::now();
@@ -535,6 +533,7 @@ pub fn run_config_selector(
         }
         frame.truncate(height as usize);
         let frame_area = ratatui::layout::Rect::new(0, 0, width, height);
+        crate::hyperlinks::install_frame(&frame);
         terminal.draw(|draw_frame| {
             let lines: Vec<ratatui::text::Line<'static>> =
                 frame.iter().map(crate::markdown::to_ratatui_line).collect();

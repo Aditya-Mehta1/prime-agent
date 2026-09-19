@@ -502,7 +502,7 @@ fn truncate_line(line: Line, width: usize) -> Line {
 }
 
 enum Renderer {
-    Terminal(ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>),
+    Terminal(ratatui::Terminal<crate::hyperlinks::LinkBackend>),
     Headless {
         width: u16,
         height: u16,
@@ -538,8 +538,7 @@ impl Renderer {
                     }
                     _ => true,
                 });
-                let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
-                let mut terminal = ratatui::Terminal::new(backend)?;
+                let mut terminal = ratatui::Terminal::new(crate::hyperlinks::stdout_backend())?;
                 // The adopted buffer still holds the previous view's frame;
                 // clear it so the first draw is a full repaint of the same
                 // buffer (a fresh alt screen is already blank).
@@ -589,6 +588,7 @@ impl Renderer {
             Renderer::Terminal(terminal) => {
                 let area = terminal.size().expect("terminal size");
                 let (lines, cursor) = mode.render_frame(area.width as usize, area.height as usize);
+                crate::hyperlinks::install_frame(&lines);
                 terminal
                     .draw(|f| {
                         let area = ratatui::layout::Rect::new(0, 0, area.width, area.height);

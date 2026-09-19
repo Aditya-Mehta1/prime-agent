@@ -338,6 +338,7 @@ mod tests {
 
     #[test]
     fn no_capabilities_renders_the_image_fallback_text() {
+        let _state = crate::terminal_image::test_state_lock();
         no_caps();
         let mut image = ImageComponent::new(
             tiny_png(),
@@ -356,6 +357,7 @@ mod tests {
 
     #[test]
     fn kitty_placement_reserves_rows_and_reuses_the_image_id() {
+        let _state = crate::terminal_image::test_state_lock();
         kitty_caps();
         set_cell_dimensions_default();
         let mut image = ImageComponent::new(
@@ -389,6 +391,7 @@ mod tests {
 
     #[test]
     fn kitty_multi_row_placement_moves_the_cursor_back_down() {
+        let _state = crate::terminal_image::test_state_lock();
         kitty_caps();
         set_cell_dimensions_default();
         let mut image = ImageComponent::new(
@@ -420,6 +423,7 @@ mod tests {
 
     #[test]
     fn fullscreen_guard_forces_fallback_during_compose() {
+        let _state = crate::terminal_image::test_state_lock();
         kitty_caps();
         let mut image = ImageComponent::new(
             tiny_png(),
