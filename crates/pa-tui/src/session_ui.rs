@@ -127,6 +127,9 @@ pub(crate) struct SessionUi {
     last_status_index: Option<usize>,
     /// The `terminal.showImages` setting, carried into `/new` runs.
     show_images: bool,
+    /// The `terminal.fullscreenMouse` setting: whether the interactive
+    /// surface enables mouse tracking; carried into `/new` runs.
+    fullscreen_mouse: bool,
     /// A `/share` gist upload in flight (TS `BorderedLoader` + the gh
     /// spawn): aborting the task kills `gh` (kill-on-drop).
     share: Option<ShareRun>,
@@ -263,6 +266,7 @@ impl SessionUi {
             branch_summary_skip_prompt: options.branch_summary_skip_prompt,
             last_status_index: None,
             show_images: options.show_images,
+            fullscreen_mouse: options.fullscreen_mouse,
             share: None,
             share_notes,
             pasted_images: Default::default(),
@@ -1939,6 +1943,7 @@ impl SessionUi {
             theme: String::new(),
             code_block_indent: self.code_block_indent.clone(),
             show_images: self.show_images,
+            fullscreen_mouse: self.fullscreen_mouse,
             tree_filter_mode: self.tree_filter_mode.wire_name().to_string(),
             branch_summary_skip_prompt: self.branch_summary_skip_prompt,
             version: String::new(),
@@ -2099,6 +2104,33 @@ impl SessionUi {
             None => {}
         }
         Ok(())
+    }
+
+    /// A mouse report (TS `handleFullscreenInput`'s wheel branch): wheel
+    /// turns scroll the transcript window by three lines; while a picker,
+    /// selector, or loader owns the frame (the TS overlay-focus gate) or
+    /// tracking is inactive, reports are consumed without scrolling. Click,
+    /// drag, and release reports are consumed too — the selection surface is
+    /// not ported yet.
+    pub(crate) fn handle_mouse(&mut self, event: crate::mouse::MouseEvent, view: &mut AgentView) {
+        if !crate::mouse_tracking::active() {
+            return;
+        }
+        // TS `isFullscreenOverlayFocused`: the wheel never scrolls while an
+        // overlay (the `/model` and `/effort` pickers, the `/tree` and
+        // `/fork` selectors, the `/share` loader) owns the frame.
+        if view.model_picker.is_some()
+            || view.effort_picker.is_some()
+            || view.tree_selector.is_some()
+            || view.fork_selector.is_some()
+            || view.share_loader.is_some()
+        {
+            return;
+        }
+        if let Some(delta) = crate::mouse::wheel_scroll_delta(&event) {
+            view.scroll_by(delta);
+            self.dirty = true;
+        }
     }
 
     /// A bracketed paste (TS routes terminal paste into the focused input):

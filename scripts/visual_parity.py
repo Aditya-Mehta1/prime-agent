@@ -4,8 +4,9 @@ UI against the installed TS prime-agent binary in tmux.
 
 Drives both binaries to the same defined states (fresh start, one turn with a
 tool call, a second turn rendering a markdown table and links, thinking
-visible via Ctrl+O, and the working spinner mid-turn) at 120x36 and 220x50,
-captures the rendered
+visible via Ctrl+O, the working spinner mid-turn, and the mouse-wheel
+scroll/follow cycle driven by byte-identical SGR wheel reports) at 120x36
+and 220x50, captures the rendered
 panes with escape sequences, normalizes volatile content, and reports
 per-state frame diffs. Exit code is non-zero when any state differs.
 
@@ -142,7 +143,30 @@ STATES = [
     ("f_tree_pane", "the /tree selector pane over the settled session"),
     ("g_fork_pane", "the /fork user-message selector over the settled session"),
     ("f_kernel_boot", "python-kernel boot: the tool-owned loader note mid-turn"),
+    ("h_mouse_scrolled", "mouse wheel-up: SGR reports scroll the transcript off the tail"),
+    ("i_mouse_follow", "mouse wheel-down: back at the tail, following resumed"),
 ]
+
+# SGR wheel press reports, the bytes a real terminal emits with ?1002+?1006
+# tracking active: ESC [ < 64;10;10 M (wheel up) / 65 (wheel down). tmux
+# `send-keys -H` writes the raw bytes into the pane's stdin, so both
+# binaries parse the same report stream a terminal mouse would send.
+WHEEL_UP_HEX = "1b 5b 3c 36 34 3b 31 30 3b 31 30 4d".split()
+WHEEL_DOWN_HEX = "1b 5b 3c 36 35 3b 31 30 3b 31 30 4d".split()
+
+# Wheel turns per scroll state: six ups lift the view eighteen lines off the
+# tail (well past one screen of transcript); eight downs over-scroll back so
+# the clamp at the bottom is the settled state both sides reach.
+MOUSE_WHEEL_UP_TURNS = 6
+MOUSE_WHEEL_DOWN_TURNS = 8
+
+
+def send_wheel_report(session, report_hex, turns):
+    """Send `turns` SGR wheel reports, spaced so each arrives as its own
+    read (a merged chunk would coalesce into one input delivery)."""
+    for _ in range(turns):
+        tmux("send-keys", "-t", session, "-H", *report_hex)
+        time.sleep(0.1)
 
 
 def tmux(*args, check=True):
@@ -414,6 +438,20 @@ def run_session(binary, sandbox, shared_cwd, script_path, size, out_dir, session
         pass
     time.sleep(1.0)
     frames["c_thinking_visible"] = capture(session)
+
+    # (h) mouse wheel-up: byte-identical SGR wheel reports scroll the
+    # transcript window three lines per turn; MOUSE_WHEEL_UP_TURNS turns
+    # lift the view off the tail (the follow hint appears over the last
+    # transcript row).
+    send_wheel_report(session, WHEEL_UP_HEX, MOUSE_WHEEL_UP_TURNS)
+    time.sleep(1.0)
+    frames["h_mouse_scrolled"] = capture(session)
+
+    # (i) mouse wheel-down: scroll back; the clamp at the bottom settles
+    # both binaries at the tail with following resumed.
+    send_wheel_report(session, WHEEL_DOWN_HEX, MOUSE_WHEEL_DOWN_TURNS)
+    time.sleep(1.0)
+    frames["i_mouse_follow"] = capture(session)
 
     # Exit: ctrl+c aborts a running turn, a second press exits when idle.
     tmux("send-keys", "-t", session, "C-c")

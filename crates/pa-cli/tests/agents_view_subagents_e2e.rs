@@ -311,6 +311,7 @@ async fn panel_expand_drill_in_and_back_re_expands_the_tree() {
         session: SessionSelection::Resume(child_path.clone()),
         initial_message: None,
         show_images: true,
+        fullscreen_mouse: true,
         theme: "prime".to_string(),
         code_block_indent: "  ".to_string(),
         tree_filter_mode: String::new(),

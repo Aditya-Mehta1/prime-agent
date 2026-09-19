@@ -162,6 +162,10 @@ pub struct InteractiveOptions {
     /// whether image blocks render their metadata rows or the
     /// `[Image: ...]` placeholders.
     pub show_images: bool,
+    /// The `terminal.fullscreenMouse` setting, default true (TS
+    /// `getFullscreenMouse`): whether the fullscreen surface enables SGR
+    /// mouse tracking and wheel-scrolls the transcript.
+    pub fullscreen_mouse: bool,
     pub theme: String,
     /// The chat markdown fenced-code indent, resolved by the composition
     /// root from `markdown.codeBlockIndent` (TS `getCodeBlockIndent`;
@@ -219,6 +223,7 @@ impl std::fmt::Debug for InteractiveOptions {
             .field("version", &self.version)
             .field("onboarding", &self.onboarding)
             .field("telemetry_disabled", &self.telemetry_disabled)
+            .field("fullscreen_mouse", &self.fullscreen_mouse)
             .field("client_auth", &self.client_auth)
             .field("keybindings", &self.keybindings.get_effective_config())
             .finish()
@@ -286,6 +291,10 @@ pub enum HeadlessStep {
     /// Scroll the transcript to its top row (the `tui.viewport.top` key
     /// path): the verifier's window into the head of the transcript.
     ScrollTop,
+    /// A raw mouse sequence: decoded by the same parser the terminal's SGR
+    /// reports flow through, so the verifier drives the wheel dispatch with
+    /// byte-identical sequences.
+    Mouse(String),
     /// One raw key event: the verifier's window into the selector/picker
     /// surfaces (arrows, escape), which typed text cannot express.
     Key(crossterm::event::KeyEvent),
@@ -409,6 +418,9 @@ pub struct InteractiveOutcome {
 enum UiInput {
     Key(KeyEvent),
     Paste(String),
+    /// A decoded mouse report (wheel turns; other reports are consumed at
+    /// the source).
+    Mouse(crate::mouse::MouseEvent),
     Submit(String),
     /// One materialized input-idle tick (the headless `SettleIdle` step).
     SettleIdle,
@@ -556,7 +568,7 @@ pub async fn run_interactive(
         session.dirty = true;
     }
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiInput>();
-    let mut renderer = Renderer::setup(ui, ui_tx, exit_guard.clone())?;
+    let mut renderer = Renderer::setup(ui, ui_tx, exit_guard.clone(), options.fullscreen_mouse)?;
     // First-run onboarding owns the pane before the session screen (TS
     // `runStartupOnboarding`, model-ready branch: splash + trace question).
     // Headless harness runs have no terminal to draw it on and skip it.
@@ -635,6 +647,12 @@ pub async fn run_interactive(
                 }
                 UiInput::Paste(text) => {
                     session.handle_paste(&text, &mut view);
+                }
+                // A mouse report reaches the transcript scroll dispatch
+                // (TS `handleFullscreenInput`'s wheel branch); non-wheel
+                // reports are consumed inside.
+                UiInput::Mouse(event) => {
+                    session.handle_mouse(event, &mut view);
                 }
                 // The headless plan's pause step: the queued keystroke
                 // batch ahead of this barrier is fully handled, so the
@@ -1093,7 +1111,12 @@ async fn check_tmux_keyboard_setup() -> Option<String> {
 
 /// Rendering sink: the real terminal or headless frame capture.
 enum Renderer {
-    Terminal(Terminal<crate::hyperlinks::LinkBackend>),
+    Terminal {
+        term: Terminal<crate::hyperlinks::LinkBackend>,
+        /// The `terminal.fullscreenMouse` setting: mouse tracking
+        /// re-enables on resume after a suspended client command.
+        mouse: bool,
+    },
     Headless {
         width: u16,
         height: u16,
@@ -1106,6 +1129,7 @@ impl Renderer {
         ui: UiMode,
         ui_tx: mpsc::UnboundedSender<UiInput>,
         exit_guard: ExitGuard,
+        mouse: bool,
     ) -> Result<Renderer> {
         match ui {
             UiMode::Terminal => {
@@ -1115,6 +1139,13 @@ impl Renderer {
                 // surface of the process enters it, so a view switch never
                 // flashes the primary screen.
                 crate::altscreen::enter()?;
+                // SGR mouse tracking follows the fullscreen surface in and
+                // out (TS `enterFullscreen` enables it blind — probing is
+                // not viable under tmux and unsupporting terminals ignore
+                // the mode-sets).
+                if mouse {
+                    crate::mouse_tracking::enable(&mut std::io::stdout())?;
+                }
                 // One reader thread feeds the loop; crossterm events are
                 // process-global, so the reader registry joins the previous
                 // surface's reader before this one starts polling. The
@@ -1133,6 +1164,19 @@ impl Renderer {
                     // widthChanged/heightChanged); the loop repaints on
                     // the dirty flag this sets.
                     crossterm::event::Event::Resize(..) => ui_tx.send(UiInput::Resize).is_ok(),
+                    // Mouse reports are always consumed (nothing
+                    // downstream understands them): wheel turns reach the
+                    // loop only while tracking is active (TS consumes
+                    // reports even when tracking is disabled).
+                    crossterm::event::Event::Mouse(mouse) => {
+                        if !crate::mouse_tracking::active() {
+                            true
+                        } else if let Some(event) = crate::mouse::from_crossterm(&mouse) {
+                            ui_tx.send(UiInput::Mouse(event)).is_ok()
+                        } else {
+                            true
+                        }
+                    }
                     _ => true,
                 });
                 let mut terminal = Terminal::new(crate::hyperlinks::stdout_backend())?;
@@ -1144,9 +1188,18 @@ impl Renderer {
                 // `preserveAltScreen` hides it); this surface wants its own
                 // visible cursor back.
                 crossterm::execute!(std::io::stdout(), crossterm::cursor::Show)?;
-                Ok(Renderer::Terminal(terminal))
+                Ok(Renderer::Terminal {
+                    term: terminal,
+                    mouse,
+                })
             }
             UiMode::Headless(plan) => {
+                // The headless harness drives the same dispatch, so the
+                // tracking state must read active; the sequence write is
+                // gated on a real stdout inside the enable.
+                if mouse {
+                    crate::mouse_tracking::enable(&mut std::io::stdout())?;
+                }
                 let steps = plan.steps;
                 tokio::spawn(async move {
                     for step in steps {
@@ -1178,6 +1231,23 @@ impl Renderer {
                                     return;
                                 }
                             }
+                            HeadlessStep::Mouse(sequence) => {
+                                // Mouse reports are always consumed, like
+                                // the terminal reader: a wheel turn
+                                // reaches the dispatch only while
+                                // tracking is active.
+                                if crate::mouse_tracking::active()
+                                    && crate::mouse::is_mouse_sequence(&sequence)
+                                {
+                                    if let Some(event) =
+                                        crate::mouse::parse_sgr_mouse_event(&sequence)
+                                    {
+                                        if ui_tx.send(UiInput::Mouse(event)).is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
                             HeadlessStep::Key(key) => {
                                 if ui_tx.send(UiInput::Key(key)).is_err() {
                                     return;
@@ -1204,7 +1274,11 @@ impl Renderer {
     /// follows must not sit on a hidden cursor).
     fn suspend(&mut self, view: &mut AgentView) -> Result<()> {
         match self {
-            Renderer::Terminal(_) => {
+            Renderer::Terminal { .. } => {
+                // The surface releases mouse tracking while a client
+                // command prompts on the plain terminal (TS `exitFullscreen`
+                // on suspend).
+                let _ = crate::mouse_tracking::disable(&mut std::io::stdout());
                 self.flush_to_main_screen(view)?;
                 crossterm::execute!(std::io::stdout(), crossterm::cursor::Show)?;
                 terminal::disable_raw_mode()?;
@@ -1217,14 +1291,19 @@ impl Renderer {
     /// Take the terminal back after a suspended client command.
     fn resume(&mut self) -> Result<()> {
         match self {
-            Renderer::Terminal(terminal) => {
+            Renderer::Terminal { term, mouse } => {
                 terminal::enable_raw_mode()?;
                 // The suspension released the alternate screen (the client
                 // command prompted on the primary one); re-enter it.
                 crate::altscreen::enter()?;
+                // The fullscreen surface re-enables mouse tracking with the
+                // terminal (TS `applyFullscreen` on resume).
+                if *mouse {
+                    crate::mouse_tracking::enable(&mut std::io::stdout())?;
+                }
                 // A fresh full redraw: the suspended command left arbitrary
                 // output behind.
-                terminal.clear()?;
+                term.clear()?;
                 Ok(())
             }
             Renderer::Headless { .. } => Ok(()),
@@ -1246,7 +1325,7 @@ impl Renderer {
     fn flush_to_main_screen(&mut self, view: &mut AgentView) -> Result<()> {
         // Only the terminal renderer owns a real screen to flush;
         // headless verification keeps its plain pipes.
-        if !matches!(self, Renderer::Terminal(_)) {
+        if !matches!(self, Renderer::Terminal { .. }) {
             return Ok(());
         }
         crate::altscreen::leave()?;
@@ -1278,12 +1357,12 @@ impl Renderer {
     /// Whether this run owns a real terminal (the force-quit guard arms on
     /// terminal runs; headless verification keeps deterministic teardown).
     fn is_terminal(&self) -> bool {
-        matches!(self, Renderer::Terminal(_))
+        matches!(self, Renderer::Terminal { .. })
     }
 
     fn is_terminal_mut(&mut self) -> Option<&mut Terminal<crate::hyperlinks::LinkBackend>> {
         match self {
-            Renderer::Terminal(terminal) => Some(terminal),
+            Renderer::Terminal { term, .. } => Some(term),
             Renderer::Headless { .. } => None,
         }
     }
@@ -1323,8 +1402,11 @@ impl Renderer {
     /// main screen, show the cursor, restore cooked mode — the resume hint
     /// the composition root prints next lands right below the flushed frame.
     fn finish(mut self, view: &mut AgentView, preserve_alt_screen: bool) -> Vec<String> {
+        // Tracking releases with the surface (TS `TUI.stop` writes the
+        // disable before leaving the alt screen).
+        let _ = crate::mouse_tracking::disable(&mut std::io::stdout());
         match self {
-            Renderer::Terminal(_) => {
+            Renderer::Terminal { .. } => {
                 if preserve_alt_screen {
                     let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide);
                 } else {
@@ -1410,6 +1492,7 @@ mod tests {
             session: SessionSelection::New,
             initial_message: None,
             show_images: true,
+            fullscreen_mouse: true,
             theme: "prime".to_string(),
             code_block_indent: "  ".to_string(),
             tree_filter_mode: String::new(),

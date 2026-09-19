@@ -42,6 +42,8 @@ pub mod markdown;
 pub mod markdown_table;
 mod menu_panel;
 pub mod model_picker;
+pub(crate) mod mouse;
+pub(crate) mod mouse_tracking;
 pub mod onboarding;
 pub mod osc133;
 pub(crate) mod search_input;

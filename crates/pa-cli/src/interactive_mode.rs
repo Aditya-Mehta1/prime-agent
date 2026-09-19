@@ -486,6 +486,7 @@ fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<Inter
     let settings = pa_core::settings::SettingsManager::create(&config.cwd, &config.agent_dir);
     let code_block_indent = settings.get_code_block_indent();
     let show_images = settings.get_show_images();
+    let fullscreen_mouse = settings.get_fullscreen_mouse();
     // The `/tree` selector's initial filter and the branch-summary prompt
     // skip read the same settings the TS interactive mode reads at
     // startup.
@@ -537,6 +538,7 @@ fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<Inter
         session,
         initial_message: options.initial_message.clone(),
         show_images,
+        fullscreen_mouse,
         theme: String::new(),
         version: crate::config::version().to_string(),
         // The startup-model chain (PR lane): the task is built from the full

@@ -255,6 +255,7 @@ async fn tui_export_and_share_surface() {
         no_session: false,
         session: pa_tui::interactive::SessionSelection::Attach(session_id.clone()),
         show_images: false,
+        fullscreen_mouse: true,
         initial_message: None,
         theme: "prime".to_string(),
         code_block_indent: "  ".to_string(),
