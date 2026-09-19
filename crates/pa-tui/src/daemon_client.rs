@@ -60,6 +60,12 @@ pub enum DaemonClientEvent {
         active_session_id: String,
         reason: String,
     },
+    /// The direct worker link for `active_session_id` died (the worker
+    /// process exited). TS `handleTransportClose` with a direct-transport
+    /// loss: "a direct-transport loss is never itself a session loss" —
+    /// the UI re-attaches through the supervisor, which respawns the
+    /// worker and hands out a fresh peer ticket.
+    DirectLinkLost { active_session_id: String },
     /// `session_list_item` progress frame of `list_saved_sessions`.
     SessionListItem { session: Value },
     /// `session_list_progress` progress frame of `list_saved_sessions`.
@@ -166,6 +172,7 @@ pub(crate) fn client_event_from_value(value: &Value) -> Option<DaemonClientEvent
 }
 
 /// Connection state shared between the request side and the reader task.
+#[derive(Default)]
 pub(crate) struct Shared {
     /// Pending requests keyed by envelope id.
     pending: Mutex<HashMap<String, oneshot::Sender<DaemonResponse>>>,

@@ -3235,11 +3235,34 @@ class Battery:
     def f21_worker_recovery(self) -> None:
         """Worker crash recovery: SIGKILL the session's live worker process
         (pid from the daemon's own session summary), then keep using the
-        session through the attached TUI. The supervisor must respawn the
-        worker, restore the transcript, and complete the next turn — the
-        user-visible invariant is that the session survives its worker's
-        death. Frame diff TS vs Rust at the post-kill and post-recovery key
-        moments."""
+        session through the attached TUI. Frame diff TS vs Rust at the
+        post-kill and post-recovery key moments.
+
+        TS ground truth (captured 2026-09-18/19, deterministic across runs):
+        in this scenario's topology — a session created over the daemon wire
+        by a client that then disconnects, with the TUI attached as a
+        NON-owner — the TS daemon parks the dead worker "failed" (its
+        `recoverWorker` can only relaunch a client-owned worker whose owner
+        can re-supply launch env) and the session does NOT survive within
+        the daemon's lifetime: get_state fails with "Session worker is
+        failed", the TUI keeps the transcript, shows "Daemon connection
+        lost; reconnecting…", the follow-up submit fails with
+        "⚠ Error: Session worker is failed" and finally
+        "⚠ Error: Daemon reconnection failed: Session worker is failed",
+        with the typed text preserved in the input. TS's OWNED path (a TUI
+        that created the session, attaching with launch env + recovery
+        config) respawns the worker and re-attaches transparently — that is
+        the behavior contract the ARCHITECTURE.md supervisor redesign
+        generalizes ("workers are supervised, restarted with backoff").
+
+        PARITY RULING (this lane): Rust must recover (not replicate the
+        unowned park): the supervisor owns every worker's create command, so
+        the respawn is always safe, and the attached TUI re-attaches over
+        the supervisor with the TS reconnect surface — the "Daemon
+        connection lost; reconnecting…" warning, the resync, and
+        "Daemon reconnected" on success. The TS rows below stay
+        EXPECTED-FAIL with this ruling documented; the frame diffs differ
+        by design (TS fails the follow-up turn, Rust completes it)."""
         flow = "f21_worker_recovery"
         reply = "f21 recovery fixture reply"
         followup = "f21 post-recovery fixture reply"
@@ -3326,6 +3349,25 @@ class Battery:
                     evidence=side.root / flow / "03-post-kill-settled.txt",
                     lane=FLOW_LANES[flow],
                 )
+            # The reconnection surface (TS `connection_status` rows): the
+            # frame must carry the reconnecting warning while the link is
+            # down, or the reconnected status once the re-attach landed.
+            if (
+                "Daemon connection lost; reconnecting…" in settled
+                or "Daemon reconnected" in settled
+            ):
+                self.record(
+                    flow, "behavior",
+                    f"{side.name}: the worker death surfaces the daemon reconnection status row",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow, "behavior",
+                    f"{side.name}: the worker death never surfaced a reconnection status row",
+                    evidence=side.root / flow / "03-post-kill-settled.txt",
+                    lane=FLOW_LANES[flow],
+                )
             post_kill_wire = B.Wire(side.daemon_socket)
             post_kill_state = post_kill_wire.request(
                 "g21k", {"type": "get_state", "activeSessionId": session_id}, timeout=120
@@ -3349,10 +3391,36 @@ class Battery:
                     f"{side.name}: after the worker is killed the session recovers — the next turn completes with the transcript intact",
                     gap=False,
                 )
+            elif side.name == "ts":
+                # Ground truth, not a Rust parity target: the ruling above.
+                self.record(
+                    flow, "behavior",
+                    "ts ground truth (EXPECTED-FAIL, ruling in the flow docstring): the wire-created (unowned) session "
+                    "does not survive its worker's death — the daemon parks the worker failed and the follow-up submit "
+                    "fails with \"Session worker is failed\"; the owned-path respawn is the behavior Rust ports",
+                    evidence=side.root / flow / "06-recovered-settled.txt",
+                    lane=FLOW_LANES[flow],
+                )
             else:
                 self.record(
                     flow, "behavior",
-                    f"{side.name}: the session did not survive its worker's death (no post-recovery turn)",
+                    "rust: the session did not survive its worker's death (no post-recovery turn) — the re-attach driver must complete the turn",
+                    evidence=side.root / flow / "06-recovered-settled.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            # TS's failed-submit surface is ground truth (documented, not
+            # ported); Rust must never surface it once the re-attach works.
+            if side.name == "ts" and "Session worker is failed" in settled2:
+                self.record(
+                    flow, "behavior",
+                    "ts ground truth: the failed follow-up surfaces the \"⚠ Error: Session worker is failed\" and "
+                    "\"⚠ Error: Daemon reconnection failed: Session worker is failed\" rows with the typed text preserved in the input",
+                    gap=False,
+                )
+            if side.name == "rust" and "Session worker is failed" in settled2:
+                self.record(
+                    flow, "behavior",
+                    "rust: the recovered session surfaces the TS failure rows (\"Session worker is failed\") — the re-attach must recover instead",
                     evidence=side.root / flow / "06-recovered-settled.txt",
                     lane=FLOW_LANES[flow],
                 )
@@ -3375,10 +3443,19 @@ class Battery:
                     f"{side.name}: recovery respawned the worker (pid {worker_pid} -> {rsummary.get('workerPid')}, workerState ready)",
                     gap=False,
                 )
+            elif side.name == "ts":
+                # Ground truth, not a Rust parity target: the ruling above.
+                self.record(
+                    flow, "protocol",
+                    "ts ground truth (EXPECTED-FAIL, ruling in the flow docstring): get_state fails with "
+                    f"\"{recovered_state.get('error') or 'Session worker is failed'}\" — the unowned worker stays parked failed, no new ready worker in this daemon's lifetime",
+                    evidence=side.root / flow / "07-post-recovery-state.json",
+                    lane=FLOW_LANES[flow],
+                )
             else:
                 self.record(
                     flow, "protocol",
-                    f"{side.name}: recovery did not produce a new ready worker (workerState: {rsummary.get('workerState')}, workerPid: {rsummary.get('workerPid')})",
+                    f"rust: recovery did not produce a new ready worker (workerState: {rsummary.get('workerState')}, workerPid: {rsummary.get('workerPid')})",
                     evidence=side.root / flow / "07-post-recovery-state.json",
                     lane=FLOW_LANES[flow],
                 )

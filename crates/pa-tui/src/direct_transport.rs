@@ -261,6 +261,7 @@ pub(crate) async fn connect_direct(
         let shared = Arc::clone(&shared);
         let event_tx = event_tx.clone();
         let alive = Arc::clone(&alive);
+        let active_session_id = ticket.active_session_id.clone();
         tokio::spawn(async move {
             while let Ok(Some(frame)) = reader.read_frame().await {
                 let header_type = frame
@@ -291,7 +292,15 @@ pub(crate) async fn connect_direct(
             // The worker socket closed: every direct-link request in
             // flight fails now instead of riding out its timeout.
             shared.fail_pending("direct_", "the session connection closed");
-            alive.store(false, Ordering::SeqCst);
+            // An intentional close (client `close`, session switch, link
+            // replacement) marks the link dead before its writer's
+            // shutdown reaches this EOF; only an unmarked exit is the
+            // worker's own death, which arms the re-attach loop.
+            if alive.swap(false, Ordering::SeqCst) {
+                let _ = event_tx.send(DaemonClientEvent::DirectLinkLost {
+                    active_session_id: active_session_id.clone(),
+                });
+            }
         });
     }
     Ok(DirectLink {
@@ -440,6 +449,118 @@ mod tests {
             "expiresAt": expires_at,
         });
         (ticket, dir)
+    }
+
+    /// Minimal scripted worker used by the link tests: hello, one
+    /// `peer_auth` response, then the process dies (the socket tears down
+    /// the way a SIGKILLed worker does).
+    async fn spawn_mock_worker(listener: tokio::net::UnixListener) {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let (reader, mut writer) = stream.into_split();
+        let mut reader =
+            framing::PrivateFrameReader::new(reader, framing::DEFAULT_PRIVATE_FRAME_LIMITS);
+        let hello = framing::encode_private_frame(
+            &json!({ "kind": "outbound", "outboundType": "daemon_hello" }),
+            &serde_json::to_vec(&json!({ "type": "daemon_hello" })).unwrap(),
+            framing::DEFAULT_PRIVATE_FRAME_LIMITS,
+        )
+        .unwrap();
+        writer.write_all(&hello).await.unwrap();
+        writer.flush().await.unwrap();
+        let Some(frame) = reader.read_frame().await.unwrap() else {
+            return;
+        };
+        let request_id = frame
+            .header
+            .get("requestId")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let response = json!({
+            "type": "response",
+            "id": request_id,
+            "command": "peer_auth",
+            "success": true,
+            "data": {
+                "workerInstanceId": "inst-1",
+                "activeSessionId": "abc123",
+                "purpose": "session_client",
+            },
+        });
+        let frame = framing::encode_private_frame(
+            &json!({ "kind": "outbound", "outboundType": "response", "requestId": request_id }),
+            &serde_json::to_vec(&response).unwrap(),
+            framing::DEFAULT_PRIVATE_FRAME_LIMITS,
+        )
+        .unwrap();
+        writer.write_all(&frame).await.unwrap();
+        writer.flush().await.unwrap();
+        // The worker process dies.
+        drop(writer);
+    }
+
+    async fn live_link_and_channel() -> (
+        DirectLink,
+        mpsc::UnboundedReceiver<DaemonClientEvent>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("worker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let identity = pa_types::platform::socket_identity(&socket).unwrap();
+        let ticket = DaemonPeerTransportTicket {
+            purpose: "session_client".to_string(),
+            socket_path: socket.to_string_lossy().to_string(),
+            socket_identity: identity,
+            worker_instance_id: "inst-1".to_string(),
+            active_session_id: "abc123".to_string(),
+            grant_id: "g1".to_string(),
+            token: "t".to_string(),
+            expires_at: "2999-01-01T00:00:00.000Z".to_string(),
+        };
+        tokio::spawn(async move { spawn_mock_worker(listener).await });
+        let shared = Arc::new(crate::daemon_client::Shared::default());
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let link = connect_direct(&ticket, shared, event_tx)
+            .await
+            .expect("direct link");
+        (link, event_rx, dir)
+    }
+
+    #[tokio::test]
+    async fn worker_death_emits_direct_link_lost() {
+        let (link, mut events, _dir) = live_link_and_channel().await;
+        assert!(link.is_alive());
+        // The worker socket tears down; the reader pump must report the
+        // lost session so the UI arms its re-attach loop.
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                &event,
+                DaemonClientEvent::DirectLinkLost {
+                    active_session_id
+                } if active_session_id == "abc123"
+            ),
+            "unexpected event: {event:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn intentional_close_does_not_emit_direct_link_lost() {
+        let (link, mut events, _dir) = live_link_and_channel().await;
+        // A session switch marks the link dead before its EOF arrives;
+        // the pump must not arm a re-attach for an intentional close.
+        link.close();
+        let event = tokio::time::timeout(Duration::from_millis(300), events.recv()).await;
+        // The worker's EOF still ends the pump (the channel closes), but no
+        // `DirectLinkLost` may ride it for an intentionally closed link.
+        assert!(
+            !matches!(event, Ok(Some(DaemonClientEvent::DirectLinkLost { .. }))),
+            "intentional close must not emit DirectLinkLost: {event:?}"
+        );
     }
 
     #[test]

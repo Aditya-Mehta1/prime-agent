@@ -433,6 +433,48 @@ const RECONNECT_ATTACH_TIMEOUT_S: u64 = 30;
 /// The reconnect backoff cap.
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(10);
 
+/// TS `DAEMON_RECONNECT_TIMEOUT_MS`: the bounded session-plane reconnect
+/// window after the direct worker link dies.
+const SESSION_RECONNECT_WINDOW: Duration = Duration::from_secs(60);
+/// TS reconnect backoff cap (`min(2000, 100 * 2 ** min(attempt, 5))`).
+const SESSION_RECONNECT_BACKOFF_MAX: Duration = Duration::from_millis(2_000);
+/// One re-attach attempt's budget: the attach carries its own request
+/// timeouts; this bounds a wedged attempt so the loop reschedules instead
+/// of blocking the UI.
+const SESSION_RECONNECT_ATTEMPT_TIMEOUT_S: u64 = 10;
+
+/// The interactive loop's session re-attach driver (TS
+/// `DaemonAgentConnection.reconnect` over a direct-transport loss): the
+/// worker process behind the direct link died, so the attach retries
+/// through the supervisor — which respawns the worker and hands out a
+/// fresh peer ticket — with the TS backoff inside the TS window.
+struct SessionReconnect {
+    active_session_id: String,
+    deadline: tokio::time::Instant,
+    next_attempt: tokio::time::Instant,
+    delay: Duration,
+    last_error: String,
+}
+
+impl SessionReconnect {
+    fn start(active_session_id: &str) -> Self {
+        SessionReconnect {
+            active_session_id: active_session_id.to_string(),
+            deadline: tokio::time::Instant::now() + SESSION_RECONNECT_WINDOW,
+            next_attempt: tokio::time::Instant::now(),
+            delay: Duration::from_millis(100),
+            last_error: String::new(),
+        }
+    }
+
+    /// The next attempt with doubling backoff (capped).
+    fn next_attempt(mut self) -> Self {
+        self.delay = (self.delay * 2).min(SESSION_RECONNECT_BACKOFF_MAX);
+        self.next_attempt = tokio::time::Instant::now() + self.delay;
+        self
+    }
+}
+
 /// The interactive loop's reconnect driver (spec §10.2): attempts with
 /// doubling backoff inside the 10-minute window; the user can leave with
 /// Ctrl+C at any point (UI input keeps flowing through the same loop).
@@ -559,6 +601,10 @@ pub async fn run_interactive(
     // restore still in flight). UI input keeps flowing while reconnecting,
     // so the user can leave with Ctrl+C instead of riding out the window.
     let mut reconnect: Option<ReconnectLoop> = None;
+    // The session re-attach driver: armed when the direct worker link dies
+    // (a killed or crashed worker); it re-attaches through the supervisor
+    // so the respawned worker serves the session again.
+    let mut session_reconnect: Option<SessionReconnect> = None;
 
     while running {
         // The tray override row (the Ctrl+C exit hint) follows the session's
@@ -609,7 +655,14 @@ pub async fn run_interactive(
                     if suspended {
                         renderer.resume()?;
                     }
-                    dispatched?;
+                    if let Err(error) = dispatched {
+                        // TS: a rejected submission surfaces the `⚠ Error`
+                        // row and keeps the client mounted with the draft
+                        // restored — a failed prompt never exits the UI.
+                        session.error_row(&format!("{error:#}"), &mut view);
+                        view.editor.set_text(&text);
+                        session.dirty = true;
+                    }
                 }
                 UiInput::HeadlessDone => headless_done = true,
                 UiInput::ScrollTop => view.scroll_to_top(),
@@ -694,6 +747,21 @@ pub async fn run_interactive(
                                     &mut view,
                                 );
                                 reconnect = Some(ReconnectLoop::start(&update));
+                                session.dirty = true;
+                            }
+                        }
+                        // A dead direct worker link arms the session
+                        // re-attach driver (TS `connection_status:
+                        // "reconnecting"`): the warning row rides the chat
+                        // while the driver retries the attach.
+                        if session_reconnect.is_none() {
+                            if let Some(lost) = session.transport_lost.take() {
+                                session.note_as(
+                                    "Daemon connection lost; reconnecting…",
+                                    crate::chat::StatusKind::Warning,
+                                    &mut view,
+                                );
+                                session_reconnect = Some(SessionReconnect::start(&lost));
                                 session.dirty = true;
                             }
                         }
@@ -805,6 +873,76 @@ pub async fn run_interactive(
                     }
                     Ok(Err(_)) | Err(_) => {
                         reconnect = Some(state.next_attempt());
+                    }
+                }
+            }
+            _session_reconnect_tick = async {
+                match session_reconnect.as_ref() {
+                    Some(state) => tokio::time::sleep_until(state.next_attempt).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                let Some(state) = session_reconnect.take() else {
+                    continue;
+                };
+                // The user switched sessions while the link was down: the
+                // new attach owns its own connection, so this driver stops.
+                if state.active_session_id != session.active_session_id {
+                    continue;
+                }
+                let attempt = tokio::time::timeout(
+                    Duration::from_secs(SESSION_RECONNECT_ATTEMPT_TIMEOUT_S),
+                    session.attach_session(&state.active_session_id),
+                )
+                .await;
+                match attempt {
+                    Ok(Ok(())) => {
+                        // The resynced transcript replaces the chat (TS
+                        // `session_resynced`), then the reconnected status
+                        // lands on the rebuilt chat (TS
+                        // `connection_status: "connected"`).
+                        session.rebuild_view(&mut view);
+                        session.note_as(
+                            "Daemon reconnected",
+                            crate::chat::StatusKind::Info,
+                            &mut view,
+                        );
+                        session.reconnection_failed = None;
+                        session_reconnect = None;
+                        session.dirty = true;
+                    }
+                    Ok(Err(error)) => {
+                        let mut state = state;
+                        state.last_error = format!("{error:#}");
+                        if tokio::time::Instant::now() > state.deadline {
+                            // TS terminal close: the window expired, the
+                            // last error surfaces as the closed event's
+                            // error row, and the UI stays mounted without
+                            // dispatching anything.
+                            let failure =
+                                format!("Daemon reconnection failed: {}", state.last_error);
+                            session.error_row(&failure, &mut view);
+                            session.reconnection_failed = Some(state.last_error.clone());
+                            session_reconnect = None;
+                            session.dirty = true;
+                        } else {
+                            session_reconnect = Some(state.next_attempt());
+                        }
+                    }
+                    Err(_) => {
+                        let mut state = state;
+                        state.last_error =
+                            "the session re-attach attempt timed out".to_string();
+                        if tokio::time::Instant::now() > state.deadline {
+                            let failure =
+                                format!("Daemon reconnection failed: {}", state.last_error);
+                            session.error_row(&failure, &mut view);
+                            session.reconnection_failed = Some(state.last_error.clone());
+                            session_reconnect = None;
+                            session.dirty = true;
+                        } else {
+                            session_reconnect = Some(state.next_attempt());
+                        }
                     }
                 }
             }

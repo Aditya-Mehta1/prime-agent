@@ -209,6 +209,14 @@ pub(crate) struct SessionUi {
     /// The §10 reattach contract: set when a `daemon_closing` update frame
     /// arrived; the interactive loop drives the reconnect from it.
     pub(crate) reconnect: Option<crate::daemon_client::DaemonClosingUpdate>,
+    /// The session whose direct worker link just died; the interactive
+    /// loop arms the re-attach driver from it (TS `connection_status:
+    /// "reconnecting"`).
+    pub(crate) transport_lost: Option<String>,
+    /// The re-attach window expired (TS terminal close after
+    /// `DAEMON_RECONNECT_TIMEOUT_MS`): dispatch is blocked and submits
+    /// surface the error instead of leaving the UI on a silent spinner.
+    pub(crate) reconnection_failed: Option<String>,
     /// The double-Ctrl+C force-quit guard (the run's shared instance is
     /// installed by the interactive loop after `open`).
     pub(crate) exit_guard: crate::exit_guard::ExitGuard,
@@ -289,6 +297,8 @@ impl SessionUi {
             scroll_adoption_emitted: false,
             exit_reason: "daemon_closed",
             reconnect: None,
+            transport_lost: None,
+            reconnection_failed: None,
             exit_guard: crate::exit_guard::ExitGuard::new(),
             escape_repeat_action: None,
             escape_repeat_until: None,
@@ -358,7 +368,7 @@ impl SessionUi {
     /// supervisor issues a ticket (best effort: every failure keeps the
     /// supervisor-routed path, and a failed direct attach retries once over
     /// the supervisor).
-    async fn attach_session(&mut self, active_session_id: &str) -> Result<()> {
+    pub(crate) async fn attach_session(&mut self, active_session_id: &str) -> Result<()> {
         let previous = self.active_session_id.clone();
         if !previous.is_empty() && previous != active_session_id {
             let _ = self.detach().await;
@@ -442,7 +452,20 @@ impl SessionUi {
             });
         self.pending_snapshot = Some(reconstructed.chat);
         self.goal_view.seed(reconstructed.goal.unwrap_or_default());
-        self.turn_active = false;
+        // The resynced state owns the loader (TS `renderResyncedSession`
+        // rebuilds from the snapshot): a turn that is still live behind the
+        // re-attach keeps the spinner, one that died with the old link (or
+        // never ran) does not.
+        let streaming = attach
+            .snapshot
+            .get("state")
+            .map(|state| {
+                ["isStreaming", "isCompacting"]
+                    .iter()
+                    .any(|flag| state.get(flag).and_then(Value::as_bool).unwrap_or(false))
+            })
+            .unwrap_or(false);
+        self.turn_active = streaming;
         self.streaming_index = None;
         Ok(())
     }
@@ -577,7 +600,14 @@ impl SessionUi {
         // the goal state itself carries over (seeded at attach).
         self.goal_view.reset_row_tracking();
         self.sync_goal_tray(view);
-        view.working = None;
+        // The rebuilt chat follows the session's live state: an attached
+        // turn that survived the re-attach keeps its loader (TS
+        // `renderResyncedSession`), and no stale loader survives a rebuild.
+        if self.turn_active {
+            self.start_loader(view);
+        } else {
+            view.working = None;
+        }
         view.follow();
         self.dirty = true;
     }
@@ -699,19 +729,25 @@ impl SessionUi {
     }
 
     pub(crate) fn note(&mut self, text: &str, view: &mut AgentView) {
+        self.note_as(text, StatusKind::Info, view);
+    }
+
+    /// TS `showStatus` with a tone: the same back-to-back in-place rewrite
+    /// as [`Self::note`], with the row's kind following the TS tone.
+    pub(crate) fn note_as(&mut self, text: &str, kind: StatusKind, view: &mut AgentView) {
         // TS `showStatus`: a status emitted back-to-back (nothing else
         // reached the chat since the previous one) rewrites the previous
         // status row in place instead of appending a new one.
         let updated_in_place = match self.last_status_index {
             Some(index) if index + 1 == view.chat_len() => {
-                view.update_status_row(index, text, StatusKind::Info)
+                view.update_status_row(index, text, kind.clone())
             }
             _ => false,
         };
         if !updated_in_place {
             view.push_entry(ChatEntry::Status {
                 text: text.to_string(),
-                kind: StatusKind::Info,
+                kind,
             });
             self.last_status_index = Some(view.chat_len() - 1);
         }
@@ -909,6 +945,15 @@ impl SessionUi {
     }
 
     async fn send_prompt(&mut self, text: &str, view: &mut AgentView) -> Result<()> {
+        if let Some(error) = self.reconnection_failed.clone() {
+            // The re-attach window expired (TS terminal close): the session
+            // connection is closed, so nothing dispatches. The error row
+            // surfaces the terminal cause and the draft returns to the
+            // editor (TS keeps the input buffer on a failed submit).
+            self.error_row(&format!("Daemon reconnection failed: {error}"), view);
+            view.editor.set_text(text);
+            return Ok(());
+        }
         let images = self.collect_images_for(text, view);
         self.bounded_request(
             Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
@@ -1331,7 +1376,7 @@ impl SessionUi {
     // ------------------------------------------------------------------
 
     /// The TS `showError` row: `⚠ Error: <message>` in the error color.
-    fn error_row(&mut self, message: &str, view: &mut AgentView) {
+    pub(crate) fn error_row(&mut self, message: &str, view: &mut AgentView) {
         view.push_entry(ChatEntry::Status {
             text: format!("\u{26a0} Error: {message}"),
             kind: StatusKind::Error,
@@ -2706,6 +2751,16 @@ impl SessionUi {
                     self.turn_active = false;
                     view.working = None;
                     self.note(&format!("session closed ({reason})"), view);
+                }
+            }
+            DaemonClientEvent::DirectLinkLost { active_session_id } => {
+                // TS `handleTransportClose`: a direct-transport loss is
+                // never itself a session loss — the interactive loop
+                // re-attaches through the supervisor. Only the active
+                // session arms the loop; a replaced link (session switch)
+                // reports its old session and is ignored here.
+                if active_session_id == self.active_session_id {
+                    self.transport_lost = Some(active_session_id);
                 }
             }
             DaemonClientEvent::DaemonClosing { reason, update } => {
