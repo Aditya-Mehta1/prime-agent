@@ -145,21 +145,50 @@ pub enum MessageBlock {
     Text(String),
 }
 
-/// The working loader (TS `Loader`): spinner + activity label.
+/// The working loader (TS `Loader`): spinner + activity label, or a
+/// tool-owned working message while one is set (TS `workingMessage`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkingState {
     pub activity: &'static str,
+    /// A transient message owned by the running tool (TS
+    /// `workingMessage`, set by the python-kernel bootstrap): replaces the
+    /// activity label and the token count until the tool clears it.
+    pub message: Option<String>,
     /// Streaming direction: `true` while tokens flow down.
     pub download: bool,
     pub tokens: u64,
-    /// Whole seconds since the loader started (TS `formatWorkingElapsed`).
+    /// Whole seconds since the loader started.
     pub elapsed_secs: u64,
+}
+
+/// TS `formatWorkingElapsed`: "3s", "1m 05s", "1h 02m 03s", "1d 02h 03m 04s".
+pub fn format_working_elapsed(total_secs: u64) -> String {
+    let secs = total_secs % 60;
+    let total_mins = total_secs / 60;
+    let mins = total_mins % 60;
+    let hours = total_mins / 60;
+    if total_mins == 0 {
+        return format!("{secs}s");
+    }
+    if hours == 0 {
+        return format!("{mins}m {:02}s", secs);
+    }
+    let days = hours / 24;
+    if days == 0 {
+        return format!("{hours}h {mins:02}m {secs:02}s");
+    }
+    format!("{days}d {:02}h {mins:02}m {secs:02}s", hours % 24)
 }
 
 impl WorkingState {
     pub fn label(&self) -> String {
+        // Extensions and tool bootstrap own the message: plain
+        // "<message> <elapsed>" (TS `getWorkingLoaderMessage`).
+        if let Some(message) = &self.message {
+            return format!("{message} {}", format_working_elapsed(self.elapsed_secs));
+        }
         let mut parts = vec![self.activity.to_string()];
-        parts.push(format!("{}s", self.elapsed_secs));
+        parts.push(format_working_elapsed(self.elapsed_secs));
         if self.tokens > 0 {
             parts.push(format!(
                 "{} {} tokens",
@@ -181,10 +210,11 @@ pub(crate) const LOADER_FRAMES: [&str; 10] = [
     "\u{2807}", "\u{280f}",
 ];
 
-/// The working pulse icon frames (TS `working-icon.ts`).
-pub const WORKING_ICON_FRAMES: [&str; 8] = [
-    "\u{25f4}", "\u{25f7}", "\u{25f6}", "\u{25f5}", "\u{25cb}", "\u{25f8}", "\u{25fb}", "\u{25fc}",
-];
+/// The working pulse icon frames (TS `theme/working-icon.ts`
+/// `WORKING_ICON_FRAMES`, 250ms interval): the shared "still working"
+/// marker across the agents view, the subagent tray, and in-progress
+/// tool markers.
+pub const WORKING_ICON_FRAMES: [&str; 4] = ["\u{25c7}", "\u{25c8}", "\u{25c6}", "\u{25c8}"];
 
 pub fn working_icon_frame(frame: usize) -> &'static str {
     WORKING_ICON_FRAMES[frame % WORKING_ICON_FRAMES.len()]
@@ -731,6 +761,7 @@ mod tests {
     fn loader_line_shape() {
         let working = WorkingState {
             activity: "Writing",
+            message: None,
             download: true,
             tokens: 72,
             elapsed_secs: 1,
@@ -742,5 +773,40 @@ mod tests {
             .map(|s| s.content.as_str())
             .collect::<String>();
         assert!(text.contains("\u{283c} Writing \u{00b7} 1s \u{00b7} \u{2193} 72 tokens"));
+    }
+
+    /// While a tool owns the working message (python-kernel bootstrap), the
+    /// loader shows "<message> <elapsed>" and drops the activity label and
+    /// the token count (TS `getWorkingLoaderMessage`).
+    #[test]
+    fn loader_working_message_replaces_the_activity_label() {
+        let working = WorkingState {
+            activity: "Executing",
+            message: Some("\u{203a} setting up python kernel (one-time, ~30s)\u{2026}".into()),
+            download: true,
+            tokens: 72,
+            elapsed_secs: 3,
+        };
+        let rows = render_loader(&working, 4, &theme(), 100);
+        let text = rows[1]
+            .iter()
+            .map(|s| s.content.as_str())
+            .collect::<String>();
+        assert!(
+            text.contains("\u{283c} \u{203a} setting up python kernel (one-time, ~30s)\u{2026} 3s"),
+            "got: {text}"
+        );
+        assert!(!text.contains("Executing"));
+        assert!(!text.contains("72 tokens"));
+    }
+
+    /// TS `formatWorkingElapsed`: "3s" below a minute, then "1m 05s",
+    /// "1h 02m 03s", "1d 02h 03m 04s".
+    #[test]
+    fn elapsed_label_formats_like_ts() {
+        assert_eq!(format_working_elapsed(3), "3s");
+        assert_eq!(format_working_elapsed(65), "1m 05s");
+        assert_eq!(format_working_elapsed(3723), "1h 02m 03s");
+        assert_eq!(format_working_elapsed(93784), "1d 02h 03m 04s");
     }
 }

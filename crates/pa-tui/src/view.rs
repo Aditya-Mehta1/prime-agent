@@ -1157,6 +1157,7 @@ mod tests {
         let mut v = view();
         v.working = Some(WorkingState {
             activity: "Waiting",
+            message: None,
             download: false,
             tokens: 0,
             elapsed_secs: 0,

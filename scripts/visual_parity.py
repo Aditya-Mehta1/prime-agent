@@ -139,6 +139,7 @@ STATES = [
     ("e_table_and_links", "idle after a turn rendering a markdown table and links"),
     ("c_thinking_visible", "conversation detail (Ctrl+O): thinking block visible"),
     ("d_spinner", "working loader mid-turn"),
+    ("f_kernel_boot", "python-kernel boot: the tool-owned loader note mid-turn"),
 ]
 
 
@@ -176,7 +177,8 @@ def normalize(frame, root):
     # Spinner and working-icon animation frames.
     spinners = "".join("\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f")
     frame = re.sub("[" + spinners + "]", "<SPIN>", frame)
-    pulses = "".join("\u25f4\u25f7\u25f6\u25f5\u25cb\u25f8\u25fb\u25fc")
+    # TS `WORKING_ICON_FRAMES` (◇◈◆◈) and the pre-parity Rust set.
+    pulses = "".join("\u25c7\u25c8\u25c6\u25f4\u25f7\u25f6\u25f5\u25cb\u25f8\u25fb\u25fc")
     frame = re.sub("[" + pulses + "]", "<PULSE>", frame)
     # tmux places the trailing foreground-reset (\x1b[39m) differently for
     # identical screens: at the end of the row whose styled text just ended,
@@ -301,11 +303,9 @@ def run_session(binary, sandbox, shared_cwd, script_path, size, out_dir, session
     # renders identically on both binaries (a spinner glyph, the activity
     # label, elapsed seconds, and the streaming token count) and lasts ~1s
     # at the scripted 18 tokens/second, so poll for the loader row and
-    # capture immediately, still inside the phase. Later phases differ
-    # across the binaries today (the TS loader shows the kernel-setup
-    # status note; the Rust loader stays on the phase label), and the
-    # Thinking-phase needle must match the row as rendered ("Thinking ·"),
-    # not the activity name alone.
+    # capture immediately, still inside the phase. The Thinking-phase
+    # needle must match the row as rendered ("Thinking ·"), not the
+    # activity name alone.
     deadline = time.time() + 60
     while time.time() < deadline:
         pane = capture(session, escape=False)
@@ -317,6 +317,26 @@ def run_session(binary, sandbox, shared_cwd, script_path, size, out_dir, session
             f"session {session} never showed the Thinking loader row"
         )
     frames["d_spinner"] = capture(session)
+
+    # (f) kernel boot: the first ipython call boots the python kernel
+    # (one-time, ~30s in the fresh sandbox HOME). While it runs, the tool
+    # owns the loader note and both binaries render the same row
+    # ("⠹ › setting up python kernel (one-time, ~30s)…" plus elapsed): TS
+    # via the extension-UI setWorkingMessage request, Rust from the same
+    # stage text carried by the tool's `starting` partials. The phase lasts
+    # as long as the venv bootstrap, so poll for the note and capture
+    # inside the window (spinner frames and elapsed seconds normalize).
+    deadline = time.time() + 240
+    while time.time() < deadline:
+        pane = capture(session, escape=False)
+        if "setting up python kernel" in pane:
+            break
+        time.sleep(0.5)
+    else:
+        raise TimeoutError(
+            f"session {session} never showed the kernel-setup loader note"
+        )
+    frames["f_kernel_boot"] = capture(session)
 
     # (b) idle after the turn: the final answer rendered AND the loader row
     # is gone (the spinner line disappears once the turn ends).

@@ -726,6 +726,7 @@ impl SessionUi {
     fn start_loader(&mut self, view: &mut AgentView) {
         view.working = Some(WorkingState {
             activity: "Waiting",
+            message: None,
             download: false,
             tokens: 0,
             elapsed_secs: 0,
@@ -1735,6 +1736,14 @@ impl SessionUi {
                 tool_call_id,
                 partial,
             } => {
+                // A `starting` partial (python-kernel bootstrap) owns the
+                // loader note (TS `setWorkingMessage`); other updates leave
+                // any current note alone.
+                if let Some(message) = crate::snapshot::working_message_from_update(&partial) {
+                    if let Some(working) = &mut view.working {
+                        working.message = Some(message);
+                    }
+                }
                 self.apply_tool_result(&tool_call_id, partial, false, true, view);
             }
             TurnUpdate::ToolExecutionEnd {
@@ -1744,6 +1753,11 @@ impl SessionUi {
             } => {
                 self.apply_tool_result(&tool_call_id, result, is_error, false, view);
                 self.set_working_activity("Waiting", false, view);
+                // The tool that owned the loader note finished executing
+                // (TS clears `workingMessage` in the tool's `finally`).
+                if let Some(working) = &mut view.working {
+                    working.message = None;
+                }
             }
             TurnUpdate::TurnEnded { error } => {
                 // Only the engine's own turn_end clears the busy state:

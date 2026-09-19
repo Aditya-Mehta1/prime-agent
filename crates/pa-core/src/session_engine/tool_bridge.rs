@@ -25,8 +25,13 @@ impl ToolDefinitionBridge {
 }
 
 fn convert_content(result: ToolExecutionResult) -> Vec<ToolResultContent> {
-    result
-        .content
+    convert_content_blocks(result.content)
+}
+
+fn convert_content_blocks(
+    blocks: Vec<crate::tools::tool_definition::ToolContentBlock>,
+) -> Vec<ToolResultContent> {
+    blocks
         .into_iter()
         .map(|block| match block {
             crate::tools::tool_definition::ToolContentBlock::Text { text } => {
@@ -68,7 +73,7 @@ impl AgentTool for ToolDefinitionBridge {
         tool_call_id: String,
         params: serde_json::Value,
         signal: AbortSignal,
-        _on_update: AgentToolUpdateCallback,
+        on_update: AgentToolUpdateCallback,
     ) -> pa_agent::BoxFut<'static, anyhow::Result<AgentToolResult>> {
         let definition = self.definition.clone();
         Box::pin(async move {
@@ -90,15 +95,22 @@ impl AgentTool for ToolDefinitionBridge {
                     }
                 });
             }
-            let on_update: Option<crate::tools::tool_definition::OnUpdate> =
+            // Streamed tool updates become `tool_execution_update` events:
+            // the same in-flight previews TS forwards to attached clients
+            // (streaming cell/bash output, and the kernel-boot stage notes
+            // the interactive loader mirrors). The loop's callback owns the
+            // accepting/abort gating.
+            let tool_on_update: Option<crate::tools::tool_definition::OnUpdate> =
                 Some(Arc::new(move |update| {
-                    // Tool updates are render-only; the loop's update
-                    // callback expects a result preview, so forward the kind.
-                    let _ = &update;
+                    on_update(AgentToolResult {
+                        content: convert_content_blocks(update.content),
+                        details: update.details.unwrap_or(serde_json::Value::Null),
+                        terminate: None,
+                    });
                 }));
             let f = definition.execute.clone();
             let result: ToolExecutionResult =
-                f(&tool_call_id, params, Some(abort), on_update).await?;
+                f(&tool_call_id, params, Some(abort), tool_on_update).await?;
             let details = result.details.clone().unwrap_or(serde_json::Value::Null);
             let is_error = result.is_error;
             let _ = is_error;
@@ -191,6 +203,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.content.len(), 1);
+    }
+
+    /// Streamed tool updates reach the loop's update callback (TS `onUpdate`
+    /// -> `tool_execution_update`): the interactive loader's kernel-boot
+    /// note and live cell output ride this channel.
+    #[tokio::test]
+    async fn streamed_updates_reach_the_loop_callback() {
+        use std::sync::Mutex;
+        let definition = ToolDefinition {
+            name: "progress".to_string(),
+            label: "Progress".to_string(),
+            description: "Reports progress".to_string(),
+            prompt_snippet: String::new(),
+            parameters: serde_json::json!({ "type": "object" }),
+            execution_mode: None,
+            prepare_arguments: None,
+            execute: Arc::new(|_id, _params, _signal, on_update| {
+                Box::pin(async move {
+                    if let Some(on_update) = on_update {
+                        on_update(crate::tools::tool_definition::ToolUpdate {
+                            content: vec![crate::tools::tool_definition::ToolContentBlock::text(
+                                "starting",
+                            )],
+                            details: Some(serde_json::json!({ "status": "starting" })),
+                        });
+                    }
+                    Ok(ToolExecutionResult::text("done"))
+                })
+            }),
+        };
+        let tool = bridge_tool(definition);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        tool.execute(
+            "call-3".to_string(),
+            serde_json::json!({}),
+            AbortSignal::default(),
+            Arc::new(move |result| sink.lock().unwrap().push(result)),
+        )
+        .await
+        .unwrap();
+        let updates = seen.lock().unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0].details,
+            serde_json::json!({ "status": "starting" })
+        );
+        assert_eq!(
+            updates[0].content,
+            vec![ToolResultContent::text("starting")]
+        );
     }
 
     #[tokio::test]

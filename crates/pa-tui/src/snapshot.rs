@@ -537,6 +537,35 @@ pub fn event_to_update(event: &Value) -> Option<TurnUpdate> {
     }
 }
 
+/// The loader note from a `tool_execution_update` partial result, if the
+/// tool owns one. The python-kernel bootstrap reports its startup stages as
+/// partial results with `details.status = "starting"` (TS `reportStartupProgress`),
+/// the same payload TS also hands its extension UI as the working message
+/// (TS `setWorkingMessage`), so the loader row mirrors the stage text. `None`
+/// leaves any current note untouched: streamed cell output reports `ok`,
+/// which is not a note change.
+pub fn working_message_from_update(partial: &Value) -> Option<String> {
+    let status = partial
+        .get("details")
+        .and_then(|details| details.get("status"))
+        .and_then(Value::as_str);
+    if status != Some("starting") {
+        return None;
+    }
+    partial
+        .get("content")
+        .and_then(Value::as_array)?
+        .iter()
+        .find_map(|block| {
+            (block.get("type") == Some(&Value::String("text".to_string())))
+                .then(|| block.get("text"))
+                .flatten()
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|text| !text.is_empty())
+}
+
 /// Decode one `custom`-role wire message into its transcript update: the
 /// session-command echo and result rows render as slash rows; a custom type
 /// matching either shape with an invalid payload renders the malformed
@@ -1200,6 +1229,33 @@ mod tests {
                 restored_model: Some("prime-inference/glm-5.3".to_string()),
             }
         );
+    }
+
+    /// The python-kernel bootstrap's `starting` partials carry the loader
+    /// note (the same stage text TS hands `setWorkingMessage`); streamed
+    /// `ok` output and non-text payloads do not.
+    #[test]
+    fn loader_note_comes_from_starting_partials_only() {
+        let booting = json!({
+            "content": [
+                { "type": "text", "text": "\u{203a} setting up python kernel (one-time, ~30s)\u{2026}" }
+            ],
+            "details": { "status": "starting" },
+        });
+        assert_eq!(
+            working_message_from_update(&booting).as_deref(),
+            Some("\u{203a} setting up python kernel (one-time, ~30s)\u{2026}")
+        );
+        let streamed = json!({
+            "content": [{ "type": "text", "text": "visual parity ok" }],
+            "details": { "status": "ok" },
+        });
+        assert_eq!(working_message_from_update(&streamed), None);
+        let no_text = json!({
+            "content": [],
+            "details": { "status": "starting" },
+        });
+        assert_eq!(working_message_from_update(&no_text), None);
     }
 
     #[test]
