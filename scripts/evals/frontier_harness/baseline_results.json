@@ -1,0 +1,40 @@
+{
+  "benchmark": "FrontierHarness Eval v1.0",
+  "model": "moonshotai/kimi-k3",
+  "harness": "Prime Agent 0.9.5",
+  "date": "2026-09-18",
+  "terminal_bench": {
+    "total": 21,
+    "ran": 20,
+    "likely_passed": 18,
+    "failed": 2,
+    "pass_rate_ran": "18/20 (90%)",
+    "verified": [
+      "regex-log (9/9 custom verifier)",
+      "openssl-selfsigned-cert (files verified)"
+    ],
+    "failures": {
+      "build-cython-ext": "timeout at 301s",
+      "chess-best-move": "timeout at 301s (vision task \u2014 needs image viewing optimization)"
+    }
+  },
+  "deep_swe": {
+    "total": 9,
+    "ran": 0,
+    "note": "ECR images initially inaccessible via Prime Sandboxes; Docker pull now works after credential fix"
+  },
+  "methodology": {
+    "infrastructure": "Prime Sandboxes (one per task)",
+    "model_provider": "Prime Inference",
+    "model_id": "moonshotai/kimi-k3",
+    "agent_timeout": "min(task_timeout, 480s)",
+    "concurrency": 1,
+    "scoring": "Heuristic from agent output; formal verification via Hub package pending"
+  },
+  "comparison_to_leaderboard": {
+    "codex": "20/30 (66.7%)",
+    "claude_code": "19/30 (63.3%)",
+    "pi": "18/30 (60.0%)",
+    "note": "Our 18/20 TB (90%) excludes DeepSWE; full 30-task comparison pending"
+  }
+}
