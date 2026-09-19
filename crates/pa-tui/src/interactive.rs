@@ -544,8 +544,19 @@ pub async fn run_interactive(
                     session.apply_background_note(&note, &mut view);
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                // The input stream went quiet for a tick: parked editor
+                // autocomplete requests materialize now (TS resolves
+                // suggestions asynchronously after the keystroke batch, so
+                // a typed command plus Enter in one burst submits as typed
+                // and the dropdown opens only once typing pauses).
+                session.materialize_editor_autocomplete(&mut view);
+            }
         }
+
+        // The tray goal label follows the live goal state (TS
+        // `syncGoalTray`); the label only changes when the state does.
+        session.sync_goal_tray(&mut view);
 
         // Spinner animation: the loader frame advances while a turn runs.
         if session.turn_active {

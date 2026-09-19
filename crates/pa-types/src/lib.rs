@@ -16,6 +16,7 @@
 pub mod ai;
 pub mod daemon;
 pub mod extension_rpc;
+pub mod goal;
 pub mod platform;
 pub mod session;
 pub mod slash_commands;

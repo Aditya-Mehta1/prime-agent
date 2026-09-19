@@ -166,6 +166,24 @@ impl AgentView {
         self.entry_layout.push(None);
     }
 
+    /// The number of chat entries (the status-row in-place update checks
+    /// whether its own row is still the transcript's last entry).
+    pub fn chat_len(&self) -> usize {
+        self.chat.len()
+    }
+
+    /// Replace the text of the status entry at `index` (TS `showStatus`
+    /// updates its previous status row in place when nothing followed it).
+    /// Returns `false` when the entry is not a status row.
+    pub fn update_status_text(&mut self, index: usize, text: &str) -> bool {
+        let Some(ChatEntry::Status { text: slot, .. }) = self.chat.get_mut(index) else {
+            return false;
+        };
+        *slot = text.to_string();
+        self.mark_entry_stale(index);
+        true
+    }
+
     /// Append a replay transcript item (mapped onto chat components).
     pub fn push(&mut self, item: TranscriptItem) {
         self.chat.push(item_to_entry(item));

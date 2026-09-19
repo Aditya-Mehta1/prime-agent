@@ -106,7 +106,21 @@ pub struct Editor {
     // Autocomplete
     autocomplete_provider: Option<Box<dyn crate::autocomplete::AutocompleteProvider + Send>>,
     autocomplete: Option<crate::autocomplete::AutocompleteState>,
+    /// A suggestion request waiting to materialize (TS `getSuggestions` is
+    /// async: the dropdown opens after the keystroke batch, so a typed
+    /// command plus Enter in one burst submits as typed instead of hitting
+    /// the dropdown's confirm arm). The host loop materializes it once the
+    /// input queue drains.
+    pending_autocomplete: Option<PendingAutocomplete>,
     events: Vec<EditorEvent>,
+}
+
+/// A deferred suggestion request (TS `requestAutocomplete` -> async
+/// `getSuggestions` resolution).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PendingAutocomplete {
+    pub force: bool,
+    pub explicit_tab: bool,
 }
 
 impl Default for Editor {
@@ -142,6 +156,7 @@ impl Editor {
                 ),
             )),
             autocomplete: None,
+            pending_autocomplete: None,
             events: Vec::new(),
         }
     }

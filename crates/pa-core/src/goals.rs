@@ -11,31 +11,11 @@ pub const GOAL_CONTEXT_PREVIEW_LABEL: &str = "Goal context";
 pub const GOAL_SKILL_NAME: &str = "goal";
 pub const MAX_THREAD_GOAL_OBJECTIVE_CHARS: usize = 4000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GoalStatus {
-    Idle,
-    Active,
-    Paused,
-    BudgetLimited,
-    Complete,
-    Error,
-}
-
-impl GoalStatus {
-    /// The wire/persisted slug (`"active"`, `"budget_limited"`, ...), the
-    /// same string the TS `GoalStatus` union uses in status lines.
-    pub fn slug(self) -> &'static str {
-        match self {
-            GoalStatus::Idle => "idle",
-            GoalStatus::Active => "active",
-            GoalStatus::Paused => "paused",
-            GoalStatus::BudgetLimited => "budget_limited",
-            GoalStatus::Complete => "complete",
-            GoalStatus::Error => "error",
-        }
-    }
-}
+// The wire/persisted `GoalState` and `GoalStatus` vocabulary lives in
+// pa-types (shared with the attached surfaces); this module owns the goal
+// engine: validation, accounting, host responses, and continuation
+// prompts. The slug (`"budget_limited"`) is `GoalStatus::slug`.
+pub use pa_types::goal::{empty_goal_state, GoalState, GoalStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,37 +32,6 @@ impl GoalContextKind {
             GoalContextKind::BudgetLimit => "budget-limit",
             GoalContextKind::ObjectiveUpdated => "objective-updated",
         }
-    }
-}
-
-/// The persisted thread-goal state.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct GoalState {
-    pub active: bool,
-    pub status: GoalStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub goal_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub objective: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub token_budget: Option<u64>,
-    pub tokens_used: u64,
-    pub time_used_seconds: u64,
-    pub continuations_used: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub updated_at: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_error: Option<String>,
-}
-
-impl Default for GoalState {
-    fn default() -> Self {
-        empty_goal_state()
     }
 }
 
@@ -124,23 +73,6 @@ pub struct GoalContextDetails {
     pub status: GoalStatus,
     #[serde(rename = "continuationsUsed")]
     pub continuations_used: u64,
-}
-
-pub fn empty_goal_state() -> GoalState {
-    GoalState {
-        active: false,
-        status: GoalStatus::Idle,
-        goal_id: None,
-        objective: None,
-        token_budget: None,
-        tokens_used: 0,
-        time_used_seconds: 0,
-        continuations_used: 0,
-        created_at: None,
-        updated_at: None,
-        last_reason: None,
-        last_error: None,
-    }
 }
 
 /// Clamp counters and derive `active` from the status.

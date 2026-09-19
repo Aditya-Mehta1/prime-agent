@@ -50,6 +50,9 @@ pub struct Reconstructed {
     pub session_name: Option<String>,
     /// Session id of the persisted session file.
     pub session_id: String,
+    /// The session's goal state (`state.goal`), when the snapshot reports
+    /// one (TS `snapshot.ts: goal: session.goalState`).
+    pub goal: Option<pa_types::goal::GoalState>,
     pub last_event_sequence: u64,
 }
 
@@ -194,11 +197,15 @@ pub fn reconstruct(attach: &AttachData) -> Reconstructed {
         .and_then(Value::as_u64)
         .or(attach.last_event_sequence)
         .unwrap_or_default();
+    let goal = state
+        .and_then(|state| state.get("goal"))
+        .and_then(|goal| serde_json::from_value::<pa_types::goal::GoalState>(goal.clone()).ok());
     Reconstructed {
         chat: messages,
         model_id,
         session_name,
         session_id,
+        goal,
         last_event_sequence,
     }
 }
@@ -274,6 +281,9 @@ pub enum TurnUpdate {
     },
     /// `agent_end`: the prompt queue drained.
     Idle,
+    /// `goal_update`: the session goal state changed (raw wire `goal`
+    /// payload; the session view owns announcement and tray rendering).
+    GoalUpdate(Value),
     /// `session_action_update` and other state churn: the footer status only.
     StatusUpdate,
 }
@@ -380,6 +390,9 @@ pub fn event_to_update(event: &Value) -> Option<TurnUpdate> {
                 .and_then(Value::as_str)
                 .map(str::to_string),
         }),
+        "goal_update" => Some(TurnUpdate::GoalUpdate(
+            event.get("goal").cloned().unwrap_or(Value::Null),
+        )),
         // Queue churn and unknown events only affect the status line.
         _ => Some(TurnUpdate::StatusUpdate),
     }
@@ -1310,5 +1323,82 @@ mod tests {
         }));
         assert_eq!(items.len(), 1);
         assert!(matches!(&items[0], ChatEntry::Tool(card) if card.name == "bash"));
+    }
+
+    /// A `goal_update` event decodes to the wire goal payload (the session
+    /// view owns announcement and tray rendering).
+    #[test]
+    fn goal_update_decodes_the_goal_payload() {
+        let update = event_to_update(&json!({
+            "type": "goal_update",
+            "goal": {
+                "active": false,
+                "status": "complete",
+                "goalId": "g-1",
+                "objective": "ship it",
+                "tokensUsed": 120,
+                "timeUsedSeconds": 3,
+                "continuationsUsed": 2,
+                "lastReason": "Goal achieved"
+            }
+        }))
+        .unwrap();
+        let TurnUpdate::GoalUpdate(goal) = update else {
+            panic!("expected a goal update");
+        };
+        let goal: pa_types::goal::GoalState = serde_json::from_value(goal).unwrap();
+        assert_eq!(goal.status, pa_types::goal::GoalStatus::Complete);
+        assert_eq!(goal.objective.as_deref(), Some("ship it"));
+        assert_eq!(goal.last_reason.as_deref(), Some("Goal achieved"));
+    }
+
+    /// The attach snapshot's `state.goal` rehydrates with the session (TS
+    /// `snapshot.ts: goal: session.goalState`); a null goal stays absent.
+    #[test]
+    fn attach_snapshot_carries_the_goal_state() {
+        let attach = json!({
+            "protocol": { "name": "prime-agent.daemon", "version": 7 },
+            "activeSessionId": "abc123def456",
+            "snapshot": {
+                "activeSessionId": "abc123def456",
+                "summary": { "id": "abc123def456", "cwd": "/tmp" },
+                "state": {
+                    "activeSessionId": "abc123def456",
+                    "cwd": "/tmp",
+                    "sessionId": "0199-sess",
+                    "model": null,
+                    "thinkingLevel": "default",
+                    "serviceTier": "auto",
+                    "isStreaming": false,
+                    "isCompacting": false,
+                    "retryAttempt": 0,
+                    "steeringMode": "all",
+                    "followUpMode": "all",
+                    "autoCompactionEnabled": false,
+                    "messageCount": 0,
+                    "sessionActions": { "queuedCount": 0, "steering": [], "followUps": [] },
+                    "compactionCount": 0,
+                    "goal": {
+                        "active": true,
+                        "status": "active",
+                        "objective": "keep shipping",
+                        "tokensUsed": 10,
+                        "timeUsedSeconds": 1,
+                        "continuationsUsed": 0
+                    },
+                    "scopedModels": [],
+                    "activeToolNames": []
+                },
+                "messages": [],
+                "lastEventSequence": 3,
+                "lastEventCursor": { "generation": 1, "sequence": 3 }
+            },
+            "lastEventSequence": 3
+        });
+        let data = attach_data_from_response(&attach).unwrap();
+        let reconstructed = reconstruct(&data);
+        let goal = reconstructed.goal.expect("snapshot goal");
+        assert_eq!(goal.status, pa_types::goal::GoalStatus::Active);
+        assert_eq!(goal.objective.as_deref(), Some("keep shipping"));
     }
 }

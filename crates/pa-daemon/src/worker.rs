@@ -2211,7 +2211,7 @@ impl Worker {
                         .count() as u32
                 })
                 .unwrap_or(0),
-            goal: Value::Null,
+            goal: self.engine.goal_state_value(),
             scoped_models: Vec::new(),
             active_tool_names: Vec::new(),
             context_usage: None,

@@ -76,6 +76,14 @@ pub struct SupervisorLinkConfig {
     pub worker_token: String,
 }
 
+/// The goal driver and session-manager handles mirrored from the core
+/// session (see `AgentSessionEngine::goal_runtime`).
+#[derive(Clone)]
+struct GoalRuntimeHandles {
+    driver: std::sync::Arc<tokio::sync::Mutex<pa_core::session_engine::goal_driver::GoalDriver>>,
+    session: std::sync::Arc<tokio::sync::Mutex<pa_core::session::manager::SessionManager>>,
+}
+
 /// A [`SessionEngine`] running real agent turns.
 pub struct AgentSessionEngine {
     pub(crate) runtime: tokio::runtime::Runtime,
@@ -88,6 +96,11 @@ pub struct AgentSessionEngine {
     /// emits on state change, so unchanged states (e.g. `/goal status`)
     /// stay silent.
     published_goal: std::sync::Mutex<Option<pa_core::goals::GoalState>>,
+    /// The session's goal driver and session-manager handles, mirrored from
+    /// the core session at build time: the core session's own mutex is held
+    /// across a turn's admission, so goal checks inside emit callbacks
+    /// (which may run in async context) must not lock it.
+    goal_runtime: std::sync::Mutex<Option<GoalRuntimeHandles>>,
     /// The worker-owned session file (conversation-log path), set at create.
     session_file: std::sync::Mutex<Option<std::path::PathBuf>>,
     /// The authoritative model selection. Starts from the process fallback
@@ -230,6 +243,7 @@ impl AgentSessionEngine {
             config,
             mcp,
             published_goal: std::sync::Mutex::new(None),
+            goal_runtime: std::sync::Mutex::new(None),
             session_file,
             selection: std::sync::RwLock::new(selection),
             effective_thinking: std::sync::RwLock::new(None),
@@ -271,6 +285,7 @@ impl AgentSessionEngine {
         let built = self
             .runtime
             .block_on(async { self.build_session(model).await })?;
+        self.mirror_goal_runtime(&built);
         self.session.blocking_lock().replace(built);
         Ok(())
     }
@@ -533,34 +548,93 @@ fn now_millis() -> u64 {
         .unwrap_or_default()
 }
 
-/// Emit the `goal_update` engine event when the session's goal state
-/// changed since the last emission (per-session dedupe: the TS session
-/// listener fires on state change). Returns the emit callback's verdict.
-fn emit_goal_update_if_changed(
-    engine: &AgentSessionEngine,
-    emit: &mut dyn FnMut(EngineEvent) -> bool,
-) -> bool {
-    let goal = {
-        let guard = engine.session.blocking_lock();
-        let core = guard
-            .as_ref()
-            .expect("session built by execute_session_command");
-        let goal = core.goal_driver.blocking_lock().state().clone();
-        goal
-    };
-    {
-        let mut published = engine.published_goal.lock().expect("published goal lock");
-        if published.as_ref() == Some(&goal) {
-            return true;
-        }
-        *published = Some(goal.clone());
+impl AgentSessionEngine {
+    /// Mirror the built session's goal handles: the core session's own
+    /// mutex stays held across a turn's admission, so goal checks in emit
+    /// callbacks read the mirror instead of the session.
+    fn mirror_goal_runtime(&self, core: &CoreSessionEngine) {
+        *self.goal_runtime.lock().expect("goal runtime lock") = Some(GoalRuntimeHandles {
+            driver: core.goal_driver.clone(),
+            session: core.session.shared_persistence(),
+        });
     }
-    emit(EngineEvent::GoalUpdate {
-        goal: serde_json::to_value(&goal).unwrap_or(Value::Null),
-    })
+
+    /// The current goal state for a wire emission, when the driver is free
+    /// to read (an in-flight host request holds it only for its own
+    /// critical section; the next emitted event re-checks).
+    fn current_goal_state(&self) -> Option<pa_core::goals::GoalState> {
+        let handles = self
+            .goal_runtime
+            .lock()
+            .expect("goal runtime lock")
+            .clone()?;
+        let driver = handles.driver.try_lock().ok()?;
+        Some(driver.state().clone())
+    }
+
+    /// Emit the `goal_update` engine event when the session's goal state
+    /// changed since the last emission (per-session dedupe: the TS session
+    /// listener fires on state change). Returns the emit callback's verdict.
+    /// A session without a goal seeds the baseline silently instead of
+    /// emitting an idle-state event TS never sends.
+    pub(crate) fn goal_update_if_changed(&self, emit: &mut dyn FnMut(EngineEvent) -> bool) -> bool {
+        let Some(goal) = self.current_goal_state() else {
+            // No session yet, or the driver is mid-mutation: a later event
+            // re-checks before the turn settles.
+            return true;
+        };
+        {
+            let mut published = self.published_goal.lock().expect("published goal lock");
+            if published.as_ref() == Some(&goal) {
+                return true;
+            }
+            let baseline_only =
+                published.is_none() && goal.status == pa_core::goals::GoalStatus::Idle;
+            *published = Some(goal.clone());
+            if baseline_only {
+                return true;
+            }
+        }
+        emit(EngineEvent::GoalUpdate {
+            goal: serde_json::to_value(&goal).unwrap_or(Value::Null),
+        })
+    }
+
+    /// Wrap one prompt's emit callback so every forwarded event is followed
+    /// by a goal-change check: kernel `goal.complete`/`goal.create` host
+    /// requests and session-command mutations surface as `goal_update` at
+    /// the moment they happen (TS emits from `_setGoalState`), so the
+    /// announcement row lands between the surrounding rows — after the
+    /// echo/tool card, before the result/reply — not after the turn.
+    pub(crate) fn goal_tracking_emit<'a>(
+        &'a self,
+        emit: &'a mut dyn FnMut(EngineEvent) -> bool,
+    ) -> impl FnMut(EngineEvent) -> bool + 'a {
+        move |event: EngineEvent| {
+            if !emit(event) {
+                return false;
+            }
+            self.goal_update_if_changed(emit)
+        }
+    }
 }
 
 impl SessionEngine for AgentSessionEngine {
+    fn goal_state_value(&self) -> Value {
+        if let Some(goal) = self.current_goal_state() {
+            return serde_json::to_value(&goal).unwrap_or(Value::Null);
+        }
+        // The driver is mid-mutation or the session is not built yet (goal
+        // rehydration surfaces with the first prompt/command): fall back to
+        // the last published state, then the empty state.
+        let published = self.published_goal.lock().expect("published goal lock");
+        published
+            .as_ref()
+            .and_then(|goal| serde_json::to_value(goal).ok())
+            .or_else(|| serde_json::to_value(pa_core::goals::empty_goal_state()).ok())
+            .unwrap_or(Value::Null)
+    }
+
     fn autonomous_status(
         &self,
     ) -> std::pin::Pin<
@@ -877,6 +951,10 @@ impl SessionEngine for AgentSessionEngine {
         aborted: &dyn Fn() -> bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) {
+        // Goal-state changes surface as `goal_update` at the moment they
+        // happen (kernel host requests and session-command mutations), so
+        // every emit of this prompt runs through the tracking wrapper.
+        let mut emit = self.goal_tracking_emit(emit);
         // Session commands (compact/refine/goal/autonomous) never admit a
         // model turn and never record a user-message row: the durable echo
         // row replaces it. Execute before admission so the idle-wait loop
@@ -884,8 +962,8 @@ impl SessionEngine for AgentSessionEngine {
         if let Some(command) =
             crate::session_commands::parse_prompt_session_command(&request.message)
         {
-            let command_name = command.name;
-            let Some(execution) = crate::session_commands::run_session_command(self, command, emit)
+            let Some(execution) =
+                crate::session_commands::run_session_command(self, command, &mut emit)
             else {
                 return;
             };
@@ -893,17 +971,13 @@ impl SessionEngine for AgentSessionEngine {
                 emit(EngineEvent::Done(Err(error.clone())));
                 return;
             }
-            // A `/goal` execution changed the durable goal state: the
-            // `goal_update` session event surfaces the new state to
-            // attached clients (TS emits on state change; unchanged
-            // states stay silent).
-            if command_name == "goal" && !emit_goal_update_if_changed(self, emit) {
-                return;
-            }
             // A goal start/resume schedules its continuation context as
             // the turn; the durable goal-context row is already emitted.
+            // An unchanged `/goal` state stays silent (TS emits
+            // goal_update only on state change; the interactive surface
+            // dedupes announcements).
             if let Some(continuation) = execution.continuation_prompt {
-                self.run_turns(&continuation, aborted, emit);
+                self.run_turns(&continuation, aborted, &mut emit);
             } else {
                 emit(EngineEvent::Done(Ok(())));
             }
@@ -917,7 +991,7 @@ impl SessionEngine for AgentSessionEngine {
         }))) {
             return;
         }
-        self.run_turns(&request.message, aborted, emit);
+        self.run_turns(&request.message, aborted, &mut emit);
     }
 }
 
@@ -1255,6 +1329,7 @@ impl AgentSessionEngine {
                 let built = self
                     .runtime
                     .block_on(async { self.build_session(model).await })?;
+                self.mirror_goal_runtime(&built);
                 self.session.blocking_lock().replace(built);
             }
         }
@@ -1283,6 +1358,14 @@ impl AgentSessionEngine {
     ) -> anyhow::Result<TurnOnce> {
         // Stream assistant events while the turn runs.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<EngineEvent>();
+        // Goal usage accounting (TS `_accountGoalUsageForAssistantMessage`
+        // at the message_end hook) shares the same per-message hook: while a
+        // goal is active, each settled non-error assistant message records
+        // its token delta; a budget crossing moves the goal to
+        // `budget_limited` and the next emitted event publishes the
+        // `goal_update`. The handles come from the engine mirror: the core
+        // session's own mutex is held across the turn's admission.
+        let goal_runtime = self.goal_runtime.lock().expect("goal runtime lock").clone();
         let subscription = {
             let tx = tx.clone();
             // Per-message usage accounting runs on every settled assistant
@@ -1301,6 +1384,7 @@ impl AgentSessionEngine {
                     let tx = tx.clone();
                     let autonomous_state = std::sync::Arc::clone(&autonomous_state);
                     let autonomous_driver = std::sync::Arc::clone(&autonomous_driver);
+                    let goal_runtime = goal_runtime.clone();
                     Box::pin(async move {
                         use pa_agent::types::AgentEvent;
                         if let AgentEvent::MessageEnd {
@@ -1315,6 +1399,29 @@ impl AgentSessionEngine {
                             {
                                 let mut state = autonomous_state.lock().await;
                                 autonomous_driver.account_message(&mut state, &message);
+                                // Goal accounting mirrors the TS guard: only
+                                // turns that were neither errors nor aborted
+                                // spend the goal's budget, and only while
+                                // the goal is active.
+                                if let Some(handles) = goal_runtime.as_ref() {
+                                    if !matches!(
+                                        message.stop_reason,
+                                        pa_types::ai::StopReason::Error
+                                            | pa_types::ai::StopReason::Aborted
+                                    ) {
+                                        let mut driver = handles.driver.lock().await;
+                                        let mut session = handles.session.lock().await;
+                                        // The loop does not assign message
+                                        // ids in-process; the timestamp is
+                                        // the double-counting guard identity.
+                                        let message_id = format!("a-{}", message.timestamp);
+                                        driver.record_assistant_usage(
+                                            &mut session,
+                                            &message_id,
+                                            &message.usage,
+                                        );
+                                    }
+                                }
                             }
                         }
                         match &event {

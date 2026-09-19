@@ -249,7 +249,9 @@ impl GoalDriver {
             GoalState {
                 active: next_status == GoalStatus::Active,
                 status: next_status,
-                last_reason: (!exhausted).then_some("Resumed".to_string()),
+                // TS `_resumeGoal`: the reason is only set for an exhausted
+                // budget (which stays budget_limited); a live resume clears it.
+                last_reason: exhausted.then(|| "Goal token budget already reached".to_string()),
                 last_error: None,
                 ..self.state.clone()
             },
@@ -490,6 +492,35 @@ mod tests {
         // Inactive goals produce no continuations.
         driver.pause(&mut session, "Paused by user");
         assert!(driver.next_continuation_message().is_none());
+    }
+
+    /// TS `_resumeGoal` semantics: resume continues the same goal (same
+    /// id and objective, no re-creation) and only sets a reason when the
+    /// budget is already exhausted.
+    #[test]
+    fn resume_resolves_the_existing_goal() {
+        let mut session = persisted_session();
+        let mut driver = GoalDriver::new();
+        driver.start(&mut session, "ship it", None).unwrap();
+        driver.pause(&mut session, "Paused by user");
+        let paused = driver.state().clone();
+        driver.resume(&mut session).unwrap();
+        assert_eq!(driver.state().goal_id, paused.goal_id);
+        assert_eq!(driver.state().objective.as_deref(), Some("ship it"));
+        assert_eq!(driver.state().status, GoalStatus::Active);
+        assert!(driver.state().last_reason.is_none());
+        // An exhausted budget stays budget_limited with the TS reason.
+        let mut limited = persisted_session();
+        let mut driver = GoalDriver::new();
+        driver.start(&mut limited, "ship it", Some(100)).unwrap();
+        driver.record_assistant_usage(&mut limited, "a1", &usage(120, 0));
+        assert_eq!(driver.state().status, GoalStatus::BudgetLimited);
+        assert!(driver.resume(&mut limited).is_none());
+        assert_eq!(driver.state().status, GoalStatus::BudgetLimited);
+        assert_eq!(
+            driver.state().last_reason.as_deref(),
+            Some("Goal token budget already reached")
+        );
     }
 
     #[test]

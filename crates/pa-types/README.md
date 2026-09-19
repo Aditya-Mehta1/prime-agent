@@ -9,6 +9,11 @@ Daemon wire mechanics shared by the serving side (pa-daemon) and clients (pa-tui
 - `daemon::framing`: the private-frame codec of the worker socket (direct-attach clients speak it too).
 - `daemon::plane`: the session/control command-plane table (worker-side peer gating and client-side socket routing both read it).
 - `daemon::{DaemonPeerTransportTicket, DaemonWorkerPeerGrant, DaemonPeerCommand}`: the direct-transport ticket and grant wire shapes.
+- `goal`: the thread-goal wire state (`GoalState`/`GoalStatus`) shared by the
+  goal engine (pa-core), the daemon wire (`goal_update` session events and
+  the attach snapshot's `state.goal`), and the TUI (announcement rows, tray
+  label). The goal *engine* (validation, accounting, continuation prompts)
+  is pa-core's.
 - `slash_commands`: the builtin slash-command table every surface shares
   (the TUI dispatch + autocomplete, the session engine's command admission,
   CLI suggestion help) plus its pure parse/suggestion helpers — the TS

@@ -23,6 +23,7 @@ pub mod editor;
 pub mod error_summary;
 mod exit_guard;
 pub mod fuzzy;
+pub mod goal_surface;
 mod input;
 pub mod interactive;
 pub mod keybindings;

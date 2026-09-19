@@ -90,6 +90,12 @@ pub fn run_app(
             match crossterm::event::read()? {
                 Event::Key(key) => {
                     handle_key(&mut view, key, &mut running, &mut *on_submit);
+                    // The replay surface handles one key per loop turn, so
+                    // a parked suggestion request materializes right after
+                    // its key (the interactive loop batches; see
+                    // `Editor::materialize_autocomplete`).
+                    view.editor.materialize_autocomplete();
+                    let _ = view.editor.take_events();
                 }
                 Event::Paste(text) => {
                     view.editor.handle_paste(&text);

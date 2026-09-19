@@ -104,6 +104,31 @@ impl Editor {
                 return;
             }
         }
+        // TS resolves suggestions asynchronously (a `getSuggestions`
+        // promise): the dropdown only materializes after the current
+        // keystroke batch, so the request parks here and the host loop
+        // materializes it when the input queue drains.
+        self.pending_autocomplete = Some(PendingAutocomplete {
+            force,
+            explicit_tab,
+        });
+    }
+
+    /// Materialize the parked suggestion request (TS
+    /// `runAutocompleteRequest` after the promise resolves). The host loop
+    /// calls this once the input queue drains, so a burst of keystrokes
+    /// never sees a dropdown open mid-batch.
+    pub fn materialize_autocomplete(&mut self) {
+        let Some(pending) = self.pending_autocomplete.take() else {
+            return;
+        };
+        self.run_autocomplete_request(pending.force, pending.explicit_tab);
+    }
+
+    fn run_autocomplete_request(&mut self, force: bool, explicit_tab: bool) {
+        let Some(provider) = self.autocomplete_provider.as_ref() else {
+            return;
+        };
         let Some(suggestions) =
             provider.get_suggestions(&self.lines, self.cursor_line, self.cursor_col, force)
         else {
@@ -181,6 +206,7 @@ impl Editor {
     pub fn cancel_autocomplete(&mut self) {
         let was = self.autocomplete.is_some();
         self.autocomplete = None;
+        self.pending_autocomplete = None;
         if was {
             self.emit(EditorEvent::AutocompleteToggled(false));
         }

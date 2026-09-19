@@ -238,4 +238,51 @@ mod tests {
         e.handle_input("w");
         assert_eq!(e.get_cursor(), (0, 6));
     }
+
+    /// A keystroke burst (typed command + Enter in one batch, the tmux
+    /// send-keys pattern) submits as typed: the suggestion request is
+    /// parked, so the dropdown never opens between the keys.
+    #[test]
+    fn typed_slash_burst_submits_as_typed() {
+        let mut e = ed();
+        for key in ["/", "g", "o", "a", "l"] {
+            e.handle_input(key);
+        }
+        assert!(!e.is_showing_autocomplete(), "dropdown parks its request");
+        e.handle_input("enter");
+        let events = e.take_events();
+        let submitted = events
+            .iter()
+            .filter_map(|event| match event {
+                EditorEvent::Submitted(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(submitted, vec!["/goal"]);
+        assert_eq!(e.get_text(), "");
+    }
+
+    /// Once the parked request materializes (the input queue drained), a
+    /// typed-exact command with an open dropdown completes into the
+    /// argument position on Enter instead of submitting — the TS
+    /// async-suggestion behavior for a command typed character-by-character
+    /// with pauses.
+    #[test]
+    fn materialized_dropdown_enter_completes_into_args() {
+        let mut e = ed();
+        for key in ["/", "g", "o", "a", "l"] {
+            e.handle_input(key);
+        }
+        e.materialize_autocomplete();
+        assert!(
+            e.is_showing_autocomplete(),
+            "dropdown opens after the batch"
+        );
+        e.handle_input("enter");
+        let events = e.take_events();
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, EditorEvent::Submitted(_))));
+        assert_eq!(e.get_text(), "/goal ");
+    }
 }

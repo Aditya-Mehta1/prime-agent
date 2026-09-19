@@ -129,6 +129,13 @@ pub trait SessionEngine: Send + Sync {
         None
     }
 
+    /// The session's current goal state as the wire `GoalState` value (the
+    /// attach snapshot's `state.goal`, TS `snapshot.ts: session.goalState`).
+    /// Engines without thread goals report the empty state.
+    fn goal_state_value(&self) -> Value {
+        serde_json::to_value(pa_core::goals::empty_goal_state()).unwrap_or(Value::Null)
+    }
+
     /// Run one prompt. `prompt_index` counts accepted prompts for this
     /// session. `aborted` is the worker's cancel probe (checked between
     /// retry waits, where no events flow to observe the flag through

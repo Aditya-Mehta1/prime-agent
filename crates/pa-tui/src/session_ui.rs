@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use crate::chat::{ChatEntry, MessageBlock, RetryState, StatusKind, ToolResultView, WorkingState};
 use crate::daemon_client::{DaemonClient, DaemonClientEvent};
+use crate::goal_surface::{format_goal_status, tray_goal_label, GoalView};
 use crate::interactive::{InteractiveOptions, ModelSelection, SessionSelection};
 use crate::keys::key_event_to_id;
 use crate::model_picker::{self, CurrentModel, ModelPickerAction};
@@ -97,6 +98,9 @@ pub(crate) struct SessionUi {
     /// The Ctrl+C exit hint (TS `ctrlCExitHintExpiresAt`): a second press
     /// inside the window terminates the client, regardless of turn state.
     ctrl_c_hint_until: Option<Instant>,
+    /// The session's thread-goal view state (current `goal_update` state,
+    /// announcement dedupe, tray label bookkeeping).
+    pub(crate) goal_view: GoalView,
     /// Notes surfacing from background tasks (the async abort result) into
     /// the UI loop.
     notes: mpsc::UnboundedSender<String>,
@@ -155,6 +159,7 @@ impl SessionUi {
             client_auth: options.client_auth.clone(),
             dirty: true,
             ctrl_c_hint_until: None,
+            goal_view: GoalView::new(),
             notes,
             telemetry: options.telemetry.clone(),
             scroll_adoption_emitted: false,
@@ -245,6 +250,7 @@ impl SessionUi {
                 _ => None,
             });
         self.pending_snapshot = Some(reconstructed.chat);
+        self.goal_view.seed(reconstructed.goal.unwrap_or_default());
         self.turn_active = false;
         self.streaming_index = None;
         Ok(())
@@ -265,9 +271,80 @@ impl SessionUi {
         view.chrome.chat_name = self.session_display();
         view.chrome.context = self.context;
         view.chrome.cost_usd = self.cost_usd;
+        // The rebuilt transcript invalidates the announcement row tracking;
+        // the goal state itself carries over (seeded at attach).
+        self.goal_view.reset_row_tracking();
+        self.sync_goal_tray(view);
         view.working = None;
         view.follow();
         self.dirty = true;
+    }
+
+    /// Materialize parked editor autocomplete requests once the input
+    /// queue drains (the editor defers dropdown materialization past the
+    /// keystroke batch; TS resolves suggestions asynchronously). The
+    /// single-item Tab auto-apply mutates the editor text, so the change
+    /// events dispatch here.
+    pub(crate) fn materialize_editor_autocomplete(&mut self, view: &mut AgentView) {
+        let was_showing = view.editor.is_showing_autocomplete();
+        view.editor.materialize_autocomplete();
+        for event in view.editor.take_events() {
+            if let crate::editor::EditorEvent::Changed(text) = event {
+                // TS onChange: the exit hint clears as soon as the editor
+                // carries text.
+                if !text.is_empty() {
+                    self.clear_ctrl_c_hint();
+                }
+                self.dirty = true;
+            }
+        }
+        if view.editor.is_showing_autocomplete() != was_showing {
+            self.dirty = true;
+        }
+    }
+
+    /// One `goal_update` session event (TS `handleGoalUpdate`): store the
+    /// state, announce as a status row when the dedupe rules say so, and
+    /// sync the tray goal label.
+    fn apply_goal_update(&mut self, goal: Value, view: &mut AgentView) {
+        let Ok(goal) = serde_json::from_value::<pa_types::goal::GoalState>(goal) else {
+            return;
+        };
+        let announce = self.goal_view.apply_update(goal);
+        if announce {
+            self.announce_goal_status(view);
+        }
+        self.sync_goal_tray(view);
+    }
+
+    /// The goal status row (TS `showStatus` via `formatGoalStatus`): a
+    /// consecutive announcement rewrites the previous status row in place
+    /// while it is still the transcript's last entry.
+    fn announce_goal_status(&mut self, view: &mut AgentView) {
+        let columns = terminal_columns();
+        let text = format_goal_status(&self.goal_view.goal, columns);
+        let updated_in_place = match self.goal_view.last_status_index {
+            Some(index) if index + 1 == view.chat_len() => view.update_status_text(index, &text),
+            _ => false,
+        };
+        if !updated_in_place {
+            view.push_entry(ChatEntry::Status {
+                text,
+                kind: StatusKind::Info,
+            });
+            self.goal_view.last_status_index = Some(view.chat_len() - 1);
+        }
+        self.dirty = true;
+    }
+
+    /// The tray goal label follows the current goal state (TS
+    /// `syncGoalTray`; the label itself is `getTrayGoalLabel`).
+    pub(crate) fn sync_goal_tray(&mut self, view: &mut AgentView) {
+        let label = tray_goal_label(&self.goal_view.goal);
+        if view.chrome.goal_label != label {
+            view.chrome.goal_label = label;
+            self.dirty = true;
+        }
     }
 
     fn session_display(&self) -> String {
@@ -1218,6 +1295,9 @@ impl SessionUi {
                     view.working = None;
                 }
             }
+            TurnUpdate::GoalUpdate(goal) => {
+                self.apply_goal_update(goal, view);
+            }
             TurnUpdate::StatusUpdate => {}
         }
         self.dirty = true;
@@ -1411,6 +1491,14 @@ impl SessionUi {
 /// Deterministic list order: most recently active first (missing activity
 /// timestamps last), so `/switch <n>` targets are stable between `/list`
 /// renders.
+/// The terminal's current column count (TS `this.ui.terminal.columns` for
+/// the goal status detail suffix); 80 when the size is unavailable.
+fn terminal_columns() -> usize {
+    crossterm::terminal::size()
+        .map(|(columns, _)| columns as usize)
+        .unwrap_or(80)
+}
+
 fn sorted_session_rows(mut sessions: Vec<Value>) -> Vec<Value> {
     let activity_of = |row: &Value| -> String {
         row.get("lastActivityAt")

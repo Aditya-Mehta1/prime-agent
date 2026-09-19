@@ -63,6 +63,10 @@ pub struct ChromeState {
     pub thinking_suffix: Option<String>,
     /// Startup warning (tmux keyboard setup), rendered as a status row.
     pub tmux_notice: Option<String>,
+    /// The tray's goal label (TS `getTrayGoalLabel`: `Pursuing goal (0s)`
+    /// while active, `Goal paused (0s)`, ...); `None` for idle/complete/error
+    /// goals. Joins the tray context label first, before the model.
+    pub goal_label: Option<String>,
     /// Tray override label (TS `getTrayOverrideLabel`): while the Ctrl+C
     /// exit hint is armed, it replaces the tray's location label.
     pub tray_override: Option<String>,
@@ -347,11 +351,17 @@ pub fn render_tray(state: &ChromeState, theme: &Theme, width: usize) -> Line {
         left.push(Span::styled(" manage".to_string(), muted));
     }
     let mut right: Line = Vec::new();
+    if let Some(goal) = &state.goal_label {
+        right.push(Span::styled(goal.clone(), dim));
+    }
     if let Some(model) = &state.model_id {
         let mut label = model.clone();
         if let Some(suffix) = &state.thinking_suffix {
             label.push(':');
             label.push_str(suffix);
+        }
+        if !right.is_empty() {
+            right.push(Span::styled(" \u{00b7} ".to_string(), dim));
         }
         right.push(Span::styled(label, dim));
     }
@@ -448,6 +458,26 @@ mod tests {
         let text = line.iter().map(|s| s.content.as_str()).collect::<String>();
         assert!(text.starts_with("\u{2190} manage"));
         assert!(text.contains("faux-1 \u{00b7} 6.1k (5%)"));
+        assert_eq!(str_width(&text), 120);
+    }
+
+    /// The tray's goal label joins the context label first (TS
+    /// `getTrayContextLabel`: `[goalLabel, ..., modelContextLabel]`).
+    #[test]
+    fn tray_goal_label_joins_the_context_label() {
+        let state = ChromeState {
+            show_manage: true,
+            model_id: Some("mock-1".to_string()),
+            context: Some(ContextUsage {
+                tokens: 190,
+                context_window: 128_000,
+            }),
+            goal_label: Some("Pursuing goal (0s)".to_string()),
+            ..Default::default()
+        };
+        let line = render_tray(&state, &theme(), 120);
+        let text = line.iter().map(|s| s.content.as_str()).collect::<String>();
+        assert!(text.contains("Pursuing goal (0s) \u{b7} mock-1 \u{b7} 190 (0%)"));
         assert_eq!(str_width(&text), 120);
     }
 
