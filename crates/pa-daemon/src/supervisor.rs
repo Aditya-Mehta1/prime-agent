@@ -36,8 +36,8 @@ use crate::paths;
 use crate::protocol::{
     command_active_session_id, command_type_name, current_protocol_info,
     default_server_capabilities, parse_supervisor_command_line, response_failure, response_line,
-    response_success, DaemonResponse, DaemonRuntimeIdentity, DAEMON_APP_VERSION, DAEMON_SCHEMA_ID,
-    DAEMON_SCHEMA_REVISION,
+    response_success, DaemonResponse, DaemonRuntimeIdentity, EnvelopeParseError,
+    DAEMON_APP_VERSION, DAEMON_SCHEMA_ID, DAEMON_SCHEMA_REVISION,
 };
 use crate::registry::{ResidentWorker, SessionRegistry, WorkerRegistration, WorkerRequest};
 use crate::session_store::{find_most_recent_session_for_cwd, list_sessions};
@@ -1232,10 +1232,24 @@ impl Supervisor {
             Ok(envelope) => envelope,
             Err(error) => {
                 let id = salvage_id(line);
+                // TS has two failure spellings: envelope/protocol failures
+                // answer `command: "parse"` (`failure(salvageDaemonCommandId,
+                // "parse", ...)`), while a known envelope holding an unknown
+                // or malformed command type echoes that type
+                // (`failure(command.id, command.type, ...)`).
+                let salvaged_type = salvage_command_type(line);
+                let type_name = if matches!(
+                    error,
+                    EnvelopeParseError::UnknownCommand(_) | EnvelopeParseError::Invalid(_)
+                ) {
+                    salvaged_type.as_deref().unwrap_or("parse")
+                } else {
+                    "parse"
+                };
                 return (
                     vec![response_line(&response_failure(
                         id.as_deref(),
-                        "parse",
+                        type_name,
                         &error.to_string(),
                         None,
                     ))],
@@ -2630,9 +2644,25 @@ impl Supervisor {
         command_id: String,
         type_name: String,
     ) -> (Vec<Value>, bool) {
-        let selector = command_active_session_id(command)
-            .unwrap_or_default()
-            .to_string();
+        // TS routing gate: the generic forward requires the
+        // `activeSessionId` field (present-but-empty is an unknown session,
+        // the same error TS `findWorkerForClient` produces). A command that
+        // addresses no session and has no supervisor arm here cannot be
+        // routed - the TS arms for the optional-selector commands
+        // (agent_messages_*, cron_*, heartbeats_list, detach-all,
+        // saved-session renames/deletes) land with their breadth waves.
+        let Some(selector) = command_active_session_id(command) else {
+            return (
+                vec![response_line(&response_failure(
+                    Some(&command_id),
+                    &type_name,
+                    &format!("Supervisor cannot route daemon command: {type_name}"),
+                    None,
+                ))],
+                false,
+            );
+        };
+        let selector = selector.to_string();
         let resident = match self.registry.resolve(&selector).await {
             Ok(resident) => resident,
             Err(_) => {
@@ -2967,10 +2997,24 @@ fn streamed_attach_lines(
     }
 }
 
+/// The request id of an unparsable line, so the failure stays matchable by
+/// the client (TS `salvageDaemonCommandId`).
 fn salvage_id(line: &str) -> Option<String> {
     serde_json::from_str::<Value>(line)
         .ok()
         .and_then(|value| value.get("id").and_then(Value::as_str).map(str::to_string))
+}
+
+/// The command type of an unparsable line, salvaged for the failure echo
+/// (bare commands carry the type at the top level; envelopes nest it).
+fn salvage_command_type(line: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    value
+        .get("command")
+        .unwrap_or(&value)
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 async fn write_line<W: AsyncWriteExt + Unpin>(writer: &mut W, value: &Value) -> Result<()> {

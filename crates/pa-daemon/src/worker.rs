@@ -149,18 +149,18 @@ impl Lane {
 }
 
 #[derive(Debug)]
-struct QueuedItem {
-    message: String,
+pub(crate) struct QueuedItem {
+    pub(crate) message: String,
     /// Images attached to the prompt (wire `images`: base64 payload plus
     /// mime type), admitted with the message as multimodal content.
-    images: Vec<pa_agent::types::ImageContent>,
-    done: Option<oneshot::Sender<Result<(), String>>>,
+    pub(crate) images: Vec<pa_agent::types::ImageContent>,
+    pub(crate) done: Option<oneshot::Sender<Result<(), String>>>,
 }
 
 /// Parse the wire `images` array of a prompt-family command (each entry
 /// `{type: "image", data, mimeType}`). Entries that do not carry payload
 /// data or a mime type are dropped, not failed: the text still admits.
-fn parse_prompt_images(payload: &Value) -> Vec<pa_agent::types::ImageContent> {
+pub(crate) fn parse_prompt_images(payload: &Value) -> Vec<pa_agent::types::ImageContent> {
     let Some(images) = payload.get("images").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -189,8 +189,8 @@ pub(crate) struct SessionCore {
     pub(crate) last_event_sequence: u64,
     pub(crate) store: Option<SessionFile>,
     pub(crate) cwd: String,
-    steering: VecDeque<QueuedItem>,
-    follow_up: VecDeque<QueuedItem>,
+    pub(crate) steering: VecDeque<QueuedItem>,
+    pub(crate) follow_up: VecDeque<QueuedItem>,
     pub(crate) busy: bool,
     pub(crate) created: bool,
     attached_client_ids: Vec<String>,
@@ -472,7 +472,7 @@ pub struct Worker {
     pub(crate) supervisor_claims: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) core: Arc<Mutex<SessionCore>>,
     pub(crate) engine: std::sync::Arc<dyn SessionEngine>,
-    work_notify: Arc<Notify>,
+    pub(crate) work_notify: Arc<Notify>,
     idle_notify: Arc<Notify>,
     events: Arc<EventPump>,
     recovery: Arc<Mutex<Option<WorkerRecoveryJournal>>>,
@@ -1128,7 +1128,7 @@ impl Worker {
         }
     }
 
-    async fn dispatch(&self, command_type: &str, payload: &Value) -> DaemonResponse {
+    pub(crate) async fn dispatch(&self, command_type: &str, payload: &Value) -> DaemonResponse {
         match command_type {
             "create" => self.handle_create(payload),
             "attach" => self.handle_attach(payload),
@@ -1175,6 +1175,8 @@ impl Worker {
             "replace_acp_mcp_servers" => self.handle_replace_acp_mcp_servers(payload),
             "set_model" => self.handle_set_model(payload).await,
             "set_thinking_level" => self.handle_set_thinking_level(payload).await,
+            "mutate_queued_message" => self.handle_mutate_queued_message(payload),
+            "resume_queue" => self.handle_resume_queue(),
             other => response_failure(
                 None,
                 command_type,
@@ -1643,7 +1645,7 @@ impl Worker {
         }
     }
 
-    fn snapshot_locked(&self, core: &SessionCore) -> SessionActionSnapshot {
+    pub(crate) fn snapshot_locked(&self, core: &SessionCore) -> SessionActionSnapshot {
         session_snapshot(core)
     }
 
@@ -2329,7 +2331,7 @@ impl Worker {
     /// queue recovery; TS keeps session files free of daemon bookkeeping).
     /// Call after releasing the core lock: `record_recovery` takes the locks
     /// in the opposite order.
-    fn persist_queue_snapshot(&self, active_session_id: &str, lanes: &QueueLanes) {
+    pub(crate) fn persist_queue_snapshot(&self, active_session_id: &str, lanes: &QueueLanes) {
         let mut guard = self.recovery.lock().unwrap();
         let Some(journal) = guard.as_mut() else {
             return;
@@ -2356,7 +2358,7 @@ impl Worker {
     }
 
     /// Sequence and broadcast one session_event for the queue projection.
-    fn emit_action_update(&self, snapshot: &SessionActionSnapshot) -> Result<()> {
+    pub(crate) fn emit_action_update(&self, snapshot: &SessionActionSnapshot) -> Result<()> {
         let mut core = self.core.lock().unwrap();
         // TS `_emitQueueUpdate`: an unchanged projection stays silent (an
         // empty queue before and after a turn is not an update).
@@ -2505,13 +2507,13 @@ fn append_creation_prefix(
 }
 
 /// The pending queue lanes of a session (journal persistence payload).
-struct QueueLanes {
-    steering: Vec<String>,
-    follow_up: Vec<String>,
+pub(crate) struct QueueLanes {
+    pub(crate) steering: Vec<String>,
+    pub(crate) follow_up: Vec<String>,
 }
 
 /// Read the pending lanes off a locked core.
-fn queue_lanes(core: &SessionCore) -> QueueLanes {
+pub(crate) fn queue_lanes(core: &SessionCore) -> QueueLanes {
     QueueLanes {
         steering: core
             .steering

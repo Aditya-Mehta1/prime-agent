@@ -87,6 +87,13 @@ and transcript error verdicts only; respawns seed from the persisted
 verdict). Worker session files carry the TS creation prefix
 (`model_change`/`thinking_level_change`/`service_tier_change`), and queue
 snapshots persist to the worker recovery journal, not the session file.
+Queue-lane command surface (`queue_commands.rs`): the full TS
+`DAEMON_COMMAND_TYPES` accept list with exhaustive router tables in
+`protocol.rs` (see `docs/protocol-breadth-audit.md` for the staged breadth
+plan), plus the worker's `mutate_queued_message`/`resume_queue` arms
+(`AgentSession.mutateQueuedMessage`/`resumeQueuedWork`: preview-addressed
+delete/move/replace over the two lanes with the TS status vocabulary, and
+the empty-queue resume refusal).
 Prompt attachments: the `prompt`/`steer`/`follow_up` wire `images` array
 (base64 payload + mime type) rides the queue item into the session engine
 as multimodal user content (images on a queued prompt do not survive a

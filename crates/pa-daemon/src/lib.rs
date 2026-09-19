@@ -25,6 +25,7 @@ pub(crate) mod peer_client;
 pub(crate) mod peer_tickets;
 pub mod platform;
 pub mod protocol;
+pub(crate) mod queue_commands;
 pub mod registration;
 pub(crate) mod registry;
 pub mod rlm_child_model;
