@@ -391,6 +391,7 @@ async fn tui_attaches_prompts_streams_lists_and_switches() {
         telemetry_disabled: None,
         client_auth: None,
         telemetry: None,
+        keybindings: pa_tui::keybindings::KeybindingsManager::new(),
     };
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![
@@ -541,6 +542,7 @@ async fn ensure_daemon_running_spawns_supervisor_and_tui_attaches() {
         telemetry_disabled: None,
         client_auth: None,
         telemetry: None,
+        keybindings: pa_tui::keybindings::KeybindingsManager::new(),
     };
     // The interactive runtime's own launch sequence, minus the TTY: spawn
     // the real supervisor binary detached and wait for the hello handshake.
@@ -624,6 +626,7 @@ async fn tui_dispatches_slash_commands_menu_and_suggestions() {
         telemetry_disabled: None,
         client_auth: None,
         telemetry: None,
+        keybindings: pa_tui::keybindings::KeybindingsManager::new(),
     };
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![
@@ -817,6 +820,7 @@ async fn tui_model_picker_applies_and_effort_reports() {
         telemetry_disabled: None,
         client_auth: None,
         telemetry: None,
+        keybindings: pa_tui::keybindings::KeybindingsManager::new(),
     };
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![
@@ -911,6 +915,7 @@ async fn tui_compact_on_a_short_session_warns_nothing_to_compact() {
         telemetry_disabled: None,
         client_auth: None,
         telemetry: None,
+        keybindings: pa_tui::keybindings::KeybindingsManager::new(),
     };
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![
@@ -1037,6 +1042,7 @@ async fn tui_compact_shows_the_loader_then_the_summary_and_rebuilds() {
         telemetry_disabled: None,
         client_auth: None,
         telemetry: None,
+        keybindings: pa_tui::keybindings::KeybindingsManager::new(),
     };
     let ctrl_o = || {
         pa_tui::interactive::HeadlessStep::Key(crossterm::event::KeyEvent::new(
@@ -1227,6 +1233,7 @@ async fn tui_session_tree_navigates_forks_and_clones() {
         telemetry_disabled: None,
         client_auth: None,
         telemetry: None,
+        keybindings: pa_tui::keybindings::KeybindingsManager::new(),
     };
     let key = |code: KeyCode| {
         pa_tui::interactive::HeadlessStep::Key(crossterm::event::KeyEvent::new(
@@ -1416,6 +1423,7 @@ async fn tui_big_streamed_turns_render_at_the_producer_rate() {
         telemetry_disabled: None,
         client_auth: None,
         telemetry: None,
+        keybindings: pa_tui::keybindings::KeybindingsManager::new(),
     };
     // 45s per turn is the throughput bound: the producer finishes each
     // turn in ~4s, so 45s tolerates real box load (sibling e2e binaries,
@@ -1484,6 +1492,164 @@ async fn tui_big_streamed_turns_render_at_the_producer_rate() {
     assert!(
         wall < Duration::from_secs(100),
         "the whole run took {wall:?}; the turn render must keep up with the producer"
+    );
+    drop(supervisor);
+}
+
+/// User-keybinding verifier (TS `keybindings.json` parity, roadmap item
+/// "keybinding customization"): a settings fixture rebinding
+/// `app.tools.expand` from `ctrl+o` to `ctrl+alt+x` drives the whole
+/// surface — the prompt-context hint renders the OVERRIDE key, the
+/// override key fires the action, the default key no longer does, and
+/// `/hotkeys` documents the effective binding instead of the default.
+#[tokio::test]
+async fn tui_renders_and_fires_user_keybindings_from_settings() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let session_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    // The settings fixture: one binding overridden exactly like a user's
+    // `~/.prime/agent/keybindings.json` would.
+    std::fs::write(
+        agent_dir.join("keybindings.json"),
+        r#"{ "app.tools.expand": "ctrl+alt+x" }"#,
+    )
+    .expect("write keybindings.json");
+    let supervisor = spawn_supervisor(dir.path());
+    let script = serde_json::json!({
+        "engine": "faux",
+        "responses": [{ "text": "scripted reply", "delayMs": 10 }],
+    });
+    std::fs::write(dir.path().join("script.json"), script.to_string()).expect("write script");
+
+    let options = pa_tui::interactive::InteractiveOptions {
+        socket_path: supervisor.socket.clone(),
+        cwd: dir.path().to_path_buf(),
+        session_dir: Some(session_dir.clone()),
+        script_path: Some(dir.path().join("script.json")),
+        model_selection: Default::default(),
+        model_catalog: Vec::new(),
+        model_configured_providers: std::collections::HashSet::new(),
+        model_recent_models: Vec::new(),
+        default_thinking_level: None,
+        no_session: false,
+        session: pa_tui::interactive::SessionSelection::New,
+        show_images: true,
+        initial_message: None,
+        theme: "prime".to_string(),
+        code_block_indent: "  ".to_string(),
+        tree_filter_mode: String::new(),
+        branch_summary_skip_prompt: false,
+        version: "0.0.0".to_string(),
+        onboarding: None,
+        telemetry_disabled: None,
+        client_auth: None,
+        telemetry: None,
+        // The exact load path the CLI uses: the fixture overrides the
+        // default set.
+        keybindings: pa_tui::keybindings::KeybindingsManager::create(&agent_dir),
+    };
+    let key = |code: KeyCode, modifiers: KeyModifiers| {
+        pa_tui::interactive::HeadlessStep::Key(crossterm::event::KeyEvent::new(code, modifiers))
+    };
+    let ctrl_alt_x = key(
+        KeyCode::Char('x'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    let ctrl_o = key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+    let plan = pa_tui::interactive::HeadlessPlan {
+        steps: vec![
+            // One scripted turn so the transcript holds a rendered reply.
+            pa_tui::interactive::HeadlessStep::Submit("hello".to_string()),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+            // The user's key fires the rebound action: overview -> details.
+            ctrl_alt_x,
+            // The default key must no longer fire it (a second cycle would
+            // reach the "all" mode).
+            ctrl_o,
+            // The documentation surface renders the effective binding.
+            pa_tui::interactive::HeadlessStep::Submit("/hotkeys".to_string()),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+            // The `?` quick-shortcut guide (app.shortcuts) mounts with the
+            // effective bindings; the next submission clears it.
+            pa_tui::interactive::HeadlessStep::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('?'),
+                crossterm::event::KeyModifiers::NONE,
+            )),
+            pa_tui::interactive::HeadlessStep::Submit("done".to_string()),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+        ],
+        width: 120,
+        // Tall enough that the whole `/hotkeys` guide (the expandTools row
+        // ~30 rows in) renders inside the visible transcript window.
+        height: 60,
+    };
+    let outcome =
+        pa_tui::interactive::run_interactive(options, pa_tui::interactive::UiMode::Headless(plan))
+            .await
+            .expect("interactive run");
+    let rendered = outcome.frames.join("\n");
+
+    // The hint renders the user's binding, not the default.
+    assert!(
+        rendered.contains("Collapsed mode (Ctrl+Alt+X to expand)"),
+        "the prompt-context hint renders the override:\n{rendered}"
+    );
+    // The override key fired the action: the detail cycled to Details.
+    assert!(
+        rendered.contains("Details mode (Ctrl+Alt+X to expand)"),
+        "the override key cycled conversation detail:\n{rendered}"
+    );
+    // The default key no longer fires the action: the cycle never reached
+    // the third (all output) mode.
+    assert!(
+        !rendered.contains("All mode ("),
+        "the default ctrl+o must not cycle after the override:\n{rendered}"
+    );
+    // The scripted turn still ran under the custom bindings.
+    assert!(
+        rendered.contains("scripted reply"),
+        "the scripted turn rendered:\n{rendered}"
+    );
+    // `/hotkeys` documents the effective binding. The guide renders as
+    // markdown, so the table is a bordered grid ("| Ctrl+Alt+X | Cycle
+    // overview ..."), not the raw markdown source.
+    assert!(
+        rendered.contains("Ctrl+Alt+X"),
+        "the hotkeys guide renders the override:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Cycle overview"),
+        "the hotkeys guide renders the expand row:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Clear input / cancel autocomplete"),
+        "the hotkeys guide renders the default rows:\n{rendered}"
+    );
+    // The removed default key is gone from the guide (no other default
+    // binding uses ctrl+o).
+    assert!(
+        !rendered.contains("Ctrl+O"),
+        "the hotkeys guide must not show the removed default:\n{rendered}"
+    );
+    // The `?` quick-shortcut guide mounted (TS `showShortcutGuide`): the
+    // effective override renders in its Controls row and the Help line
+    // references `/hotkeys`.
+    assert!(
+        rendered.contains("quick shortcuts \u{b7} /hotkeys full reference"),
+        "the quick-shortcut guide rendered:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Ctrl+Alt+X overview"),
+        "the quick-shortcut guide renders the override in the Controls row:\n{rendered}"
+    );
+    // The final submission cleared the guide (TS `clearShortcutGuide`).
+    let last = outcome.frames.last().expect("frames");
+    assert!(
+        !last.contains("shell mode"),
+        "the submission cleared the quick-shortcut guide:\n{last}"
     );
     drop(supervisor);
 }

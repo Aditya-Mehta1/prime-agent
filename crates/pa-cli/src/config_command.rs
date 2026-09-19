@@ -31,7 +31,10 @@ pub fn run() -> i32 {
     let (rows, items) = selector_rows(&groups);
     let selector = ConfigSelector::new(rows);
     let theme = pa_tui::app::load_theme(&theme_name);
-    let options = ConfigSelectorOptions::new(theme, KeybindingsManager::new());
+    // TS `setKeybindings(KeybindingsManager.create())` in main.ts: the
+    // config selector navigates with the user's effective bindings too.
+    let keybindings = KeybindingsManager::create(&agent_dir);
+    let options = ConfigSelectorOptions::new(theme, keybindings);
     let mut toggle_settings = SettingsManager::create(&cwd, &agent_dir);
     let mut on_toggle = |key: &str, enabled: bool| -> anyhow::Result<()> {
         let index: usize = key

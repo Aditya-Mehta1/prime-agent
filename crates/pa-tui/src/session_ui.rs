@@ -32,7 +32,7 @@ use crate::tree_selector::{TreeSelector, TreeSelectorAction};
 use crate::user_message_selector::{UserMessageSelector, UserMessageSelectorAction};
 use crate::view::{AgentView, ShareLoader};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -182,6 +182,10 @@ pub(crate) struct SessionUi {
     pub(crate) return_to_agents_view: bool,
     /// `/mcp login` / `/mcp logout` (the composition root's auth flows).
     client_auth: Option<crate::client_auth::ClientAuthCommandsHandle>,
+    /// The effective keybindings (user `keybindings.json` over the TS
+    /// defaults): hint labels and app-level handlers dispatch through this
+    /// set, and `/new` runs carry it forward.
+    keybindings: crate::keybindings::KeybindingsManager,
     pub(crate) dirty: bool,
     /// The Ctrl+C exit hint (TS `ctrlCExitHintExpiresAt`): a second press
     /// inside the window terminates the client, regardless of turn state.
@@ -275,6 +279,7 @@ impl SessionUi {
             pending_selection: None,
             return_to_agents_view: !options.no_session,
             client_auth: options.client_auth.clone(),
+            keybindings: options.keybindings.clone(),
             dirty: true,
             ctrl_c_hint_until: None,
             goal_view: GoalView::new(),
@@ -865,6 +870,9 @@ impl SessionUi {
         if text.starts_with('/') {
             return self.handle_slash(text, view).await;
         }
+        // TS `clearShortcutGuide`: every prompt submission dismisses the
+        // `?` quick-shortcut guide (slash commands keep it).
+        view.shortcut_guide = None;
         self.send_prompt(text, view).await
     }
 
@@ -1284,6 +1292,29 @@ impl SessionUi {
                     self.track_command_used("share");
                     self.handle_share_command(view).await?;
                 }
+            }
+            // `/hotkeys` (TS `handleHotkeysCommand` after
+            // `echoLocalCommand`): the typed command echoes as a user
+            // message block, then the full keyboard-shortcut reference
+            // renders from the EFFECTIVE bindings so user
+            // `keybindings.json` overrides show their keys. Client-side
+            // rows only, never durable session entries.
+            "hotkeys" => {
+                self.track_command_used("hotkeys");
+                if !resolved.args.is_empty() {
+                    // TS keeps the text in the editor on the usage error.
+                    view.editor
+                        .set_text(&format!("/{} {}", resolved.original_name, resolved.args));
+                    self.error_row("Usage: /hotkeys", view);
+                    return Ok(());
+                }
+                view.push_entry(ChatEntry::User {
+                    text: "/hotkeys".to_string(),
+                });
+                view.push_entry(ChatEntry::ClientMarkdown {
+                    text: crate::hotkeys::hotkeys_guide(view.editor.keybindings()),
+                });
+                self.dirty = true;
             }
             other => {
                 self.note(
@@ -1869,6 +1900,7 @@ impl SessionUi {
             onboarding: None,
             client_auth: self.client_auth.clone(),
             telemetry: self.telemetry.clone(),
+            keybindings: self.keybindings.clone(),
         }
     }
 
@@ -1975,7 +2007,8 @@ impl SessionUi {
         if !self.ctrl_c_hint_visible() {
             return None;
         }
-        let key = crate::keybindings::KeybindingsManager::new()
+        let key = self
+            .keybindings
             .first_key("app.clear")
             .map(|key| crate::keybindings::format_key_text(&key))
             .unwrap_or_else(|| "Ctrl+C".to_string());
@@ -2422,40 +2455,29 @@ impl SessionUi {
         if view.share_loader.is_some() {
             return self.handle_share_loader_key(key, view).await;
         }
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            // One handled Ctrl+C press: the force-quit guard disarms once
-            // every observed press of the pair was handled without an exit
-            // (abort / autocomplete cancel, TS `handleCtrlC`); an exit keeps
-            // the deadline and re-arms it on the loop break.
-            self.exit_guard.note_ctrl_c_handled();
-            if view.editor.is_showing_autocomplete() {
-                view.editor.cancel_autocomplete();
-                self.clear_ctrl_c_hint();
-                return Ok(());
-            }
-            // TS `handleCtrlC`: the first press interrupts (aborting an
-            // active turn, showing the exit hint); a second press inside
-            // the hint window shuts down unconditionally — no turn wait,
-            // no abort wait — so the client always exits promptly.
-            if self.ctrl_c_hint_visible() {
-                self.exit_reason = "ctrl_c_twice";
-                *running = false;
-                return Ok(());
-            }
-            if self.turn_active {
-                self.abort_turn();
-                self.note("aborting the current turn", view);
-            }
-            self.show_ctrl_c_hint();
-            self.dirty = true;
+        let Some(id) = key_event_to_id(&key) else {
+            return Ok(());
+        };
+        // The dispatch order below mirrors TS `CustomEditor.handleInput`:
+        // paste image, then `app.input.clear`, then `app.exit` (only when
+        // the editor is empty; otherwise ctrl+d falls through to the
+        // editor's delete-char-forward), then the app actions in
+        // registration order (`app.clear` first, `app.tools.expand` next).
+        // Every match goes through the effective bindings, so a user
+        // `keybindings.json` override moves both the handler and the hint.
+        // Image paste (TS `app.clipboard.pasteImage`, default ctrl+v):
+        // reads the clipboard image and inserts its marker into the
+        // editor. The editor's own ctrl+v is unbound otherwise, so the
+        // match is exact before any editor motion.
+        if view
+            .editor
+            .keybindings()
+            .matches(&id, "app.clipboard.pasteImage")
+        {
+            self.handle_clipboard_image_paste(view).await;
             return Ok(());
         }
-        if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.exit_reason = "ctrl_d";
-            *running = false;
-            return Ok(());
-        }
-        if key.code == KeyCode::Esc {
+        if view.editor.keybindings().matches(&id, "app.input.clear") {
             view.editor.cancel_autocomplete();
             self.clear_ctrl_c_hint();
             // Double-Escape (TS `handleEscape`'s repeat window): the second
@@ -2478,26 +2500,56 @@ impl SessionUi {
             self.arm_escape_repeat(action);
             return Ok(());
         }
-        if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            // Ctrl+O cycles conversation detail (TS `app.tools.expand`):
-            // overview -> details -> all -> overview.
-            view.detail = view.detail.next();
+        if view.editor.keybindings().matches(&id, "app.exit") && view.editor.get_text().is_empty() {
+            self.exit_reason = "ctrl_d";
+            *running = false;
+            return Ok(());
+        }
+        if view.editor.keybindings().matches(&id, "app.clear") {
+            // One handled Ctrl+C press: the force-quit guard disarms once
+            // every observed press of the pair was handled without an exit
+            // (abort / autocomplete cancel, TS `handleCtrlC`); an exit keeps
+            // the deadline and re-arms it on the loop break.
+            if id == "ctrl+c" {
+                self.exit_guard.note_ctrl_c_handled();
+            }
+            if view.editor.is_showing_autocomplete() {
+                view.editor.cancel_autocomplete();
+                self.clear_ctrl_c_hint();
+                return Ok(());
+            }
+            // TS `handleCtrlC`: the first press interrupts (aborting an
+            // active turn, showing the exit hint); a second press inside
+            // the hint window shuts down unconditionally — no turn wait,
+            // no abort wait — so the client always exits promptly.
+            if self.ctrl_c_hint_visible() {
+                self.exit_reason = "ctrl_c_twice";
+                *running = false;
+                return Ok(());
+            }
+            if self.turn_active {
+                self.abort_turn();
+                self.note("aborting the current turn", view);
+            }
+            self.show_ctrl_c_hint();
             self.dirty = true;
             return Ok(());
         }
-        let Some(id) = key_event_to_id(&key) else {
-            return Ok(());
-        };
-        // Image paste (TS `app.clipboard.pasteImage`, ctrl+v): reads the
-        // clipboard image and inserts its marker into the editor. The
-        // editor's own ctrl+v is unbound otherwise, so the match is exact
-        // before any editor motion.
-        if view
-            .editor
-            .keybindings()
-            .matches(&id, "app.clipboard.pasteImage")
+        // TS `app.shortcuts` (default `?`, empty editor only — the action
+        // loop's `getText().length === 0` gate): mount the quick-shortcut
+        // guide above the dock until the next submission.
+        if view.editor.keybindings().matches(&id, "app.shortcuts")
+            && view.editor.get_text().is_empty()
         {
-            self.handle_clipboard_image_paste(view).await;
+            view.shortcut_guide = Some(crate::hotkeys::shortcut_guide(view.editor.keybindings()));
+            self.dirty = true;
+            return Ok(());
+        }
+        if view.editor.keybindings().matches(&id, "app.tools.expand") {
+            // TS `app.tools.expand` (default ctrl+o) cycles conversation
+            // detail: overview -> details -> all -> overview.
+            view.detail = view.detail.next();
+            self.dirty = true;
             return Ok(());
         }
         // Transcript viewport keys (TS tui.ts consumes them before the

@@ -255,8 +255,13 @@ fn parse_blocks(text: &str) -> Vec<Block> {
             });
             continue;
         }
-        // Paragraph: consume until blank line or new block marker
-        let mut para = trimmed.to_string();
+        // Paragraph: consume until blank line or new block marker. TS's
+        // marked lexes the whole run as ONE paragraph token but its inline
+        // renderer preserves each soft newline (`applyTextWithNewlines`
+        // joins with `\n`, and the width pass breaks there), so the source
+        // lines are kept — each renders as its own row, still one block
+        // (no `space` rows between them).
+        let mut para_lines = vec![trimmed.to_string()];
         // The block's last source line keeps its trailing whitespace (the
         // TS lexer's paragraph token carries it; the rendered row ends
         // `stream. ` with the space inside the styled span — probe vs the
@@ -276,16 +281,17 @@ fn parse_blocks(text: &str) -> Vec<Block> {
             {
                 break;
             }
-            para.push(' ');
-            para.push_str(t);
+            para_lines.push(t.to_string());
             last_raw = l;
             i += 1;
         }
-        para.push_str(&last_raw[last_raw.trim_end().len()..]);
+        // The trailing whitespace rides on the block's LAST source line.
+        let last = para_lines.last_mut().expect("paragraph has a line");
+        last.push_str(&last_raw[last_raw.trim_end().len()..]);
         blocks.push(Block {
             kind: BlockKind::Paragraph,
             sep_blank,
-            lines: vec![para],
+            lines: para_lines,
         });
     }
     blocks
@@ -363,9 +369,12 @@ fn render_block(
             }
         }
         BlockKind::Paragraph => {
-            let text = block.lines.first().cloned().unwrap_or_default();
-            let spans = render_inline(&text, style);
-            wrap_spans(&spans, width, style.body, out);
+            // Each soft-break line renders and wraps on its own (TS's
+            // paragraph token carries the newlines through the width pass).
+            for text in &block.lines {
+                let spans = render_inline(text, style);
+                wrap_spans(&spans, width, style.body, out);
+            }
             if blank_after(true) {
                 out.push(Vec::new());
             }
@@ -792,16 +801,20 @@ mod tests {
         // The TS lexer's paragraph token carries the block's trailing
         // whitespace (probe vs the TS binary: the expanded compaction
         // summary's last row ends "stream. " with the space inside the
-        // styled span).
+        // styled span). Soft line breaks render one row per line
+        // (`applyTextWithNewlines` + the width pass breaks there), so the
+        // trailing whitespace rides on the block's LAST rendered row.
         let style = MarkdownStyle::default();
-        let spans = render_markdown("the story\ntail end ", 40, &style);
-        let joined: String = spans[0].iter().map(|s| s.content.as_str()).collect();
-        assert_eq!(joined, "the story tail end ");
-        // Soft line breaks collapse to one space; the final line's
-        // trailing whitespace rides after it.
+        let rows = render_markdown("the story\ntail end ", 40, &style);
+        let flat: Vec<String> = rows
+            .iter()
+            .map(|line| line.iter().map(|s| s.content.as_str()).collect())
+            .collect();
+        assert_eq!(flat, vec!["the story".to_string(), "tail end ".to_string()]);
+        // Single-line paragraph: the trailing whitespace stays in the span.
         let joined = render_markdown("a\nb ", 40, &style);
-        let flat: String = joined[0].iter().map(|s| s.content.as_str()).collect();
-        assert_eq!(flat, "a b ");
+        let last: String = joined[1].iter().map(|s| s.content.as_str()).collect();
+        assert_eq!(last, "b ");
     }
 
     #[test]
@@ -825,12 +838,18 @@ mod tests {
     }
 
     #[test]
-    fn single_newline_stays_one_paragraph() {
+    fn soft_breaks_render_one_row_per_line() {
+        // TS ground truth (marked + `applyTextWithNewlines`): the soft
+        // newlines survive into the paragraph's rendered string and the
+        // width pass breaks there — "one\ntwo" is one paragraph, two rows
+        // (verified against the TS product's `?` quick-shortcut guide).
         let style = MarkdownStyle::default();
         let lines = render_markdown("one\ntwo", 40, &style);
-        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.len(), 2);
         let joined: String = lines[0].iter().map(|s| s.content.as_str()).collect();
-        assert_eq!(joined, "one two");
+        assert_eq!(joined, "one");
+        let joined: String = lines[1].iter().map(|s| s.content.as_str()).collect();
+        assert_eq!(joined, "two");
     }
 
     #[test]

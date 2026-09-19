@@ -56,6 +56,7 @@ Rust side no longer needs the env-var model workaround (gap B-1 fixed).
 | f19_heartbeat | `/heartbeat` set status row, the fired `♥ Heartbeat prompt · every <schedule>` row, and the `/heartbeats` manager view | tmux frames (normalized frame diff) |
 | f20_subagents | kernel `rlm.spawn()`: the subagent summary line above the editor (live counts), the child's `RLM child status` no-reply terminal notice, and the scoped agents view opened from the focused summary line (child listed by name) | tmux frames (normalized frame diff), roster/agents-view frames |
 | f21_worker_recovery | worker crash recovery: SIGKILL the session's worker (pid from the daemon session summary), then keep using the session through the attached TUI — the next turn must complete with the transcript intact, and the session summary must show a new ready worker pid | tmux frames (post-kill + recovered, normalized frame diff), get_state wire snapshots |
+| f23_keybindings | user-editable keybindings: a `keybindings.json` fixture rebinding `app.tools.expand` to a plain key; the prompt-context hint renders the override, the override key fires, the default key no longer does, `/hotkeys` documents the effective binding, and the `?` quick-shortcut guide mounts and clears on submission | tmux frames (normalized frame diff) |
 
 Flows f10-f13 (perf, provider failure, scroll, ctrl+c exit) predate this table
 entry; f14-f21 are the real-surface flows: each drives one product surface end

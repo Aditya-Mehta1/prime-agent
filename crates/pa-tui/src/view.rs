@@ -13,7 +13,6 @@ use crate::chrome::{
     ChromeState,
 };
 use crate::editor::Editor;
-use crate::keybindings::KeybindingsManager;
 use crate::session::TranscriptItem;
 use crate::theme::{Theme, ThemeBg, ThemeColor};
 use crate::width::str_width;
@@ -100,6 +99,10 @@ pub struct AgentView {
     /// A `/share` gist upload in flight (TS `BorderedLoader`): while set,
     /// it replaces the editor with the cancellable loader rows.
     pub share_loader: Option<ShareLoader>,
+    /// The `?` quick-shortcut guide (TS `shortcutGuideContainer`): while
+    /// set, its markdown renders at the transcript tail, above the dock;
+    /// the next submission clears it (TS `clearShortcutGuide`).
+    pub shortcut_guide: Option<String>,
     /// The `terminal.showImages` setting (TS `getShowImages`, default
     /// true): image blocks render their metadata rows when set, their
     /// `[Image: ...]` text placeholders otherwise.
@@ -156,6 +159,7 @@ impl AgentView {
             fork_selector: None,
             effort_picker: None,
             share_loader: None,
+            shortcut_guide: None,
             show_images: true,
             scroll_top: 0,
             following: true,
@@ -270,7 +274,9 @@ impl AgentView {
 
     /// The conversation-detail label for the prompt-context row.
     fn detail_label(&self) -> String {
-        let key = crate::keybindings::KeybindingsManager::new()
+        let key = self
+            .editor
+            .keybindings()
             .first_key("app.tools.expand")
             .map(|key| crate::keybindings::format_key_text(&key))
             .unwrap_or_default();
@@ -357,6 +363,7 @@ impl AgentView {
                 .any(|entry| matches!(entry, ChatEntry::Assistant(m) if m.streaming)),
             ChatEntry::InjectedPrompt(_) | ChatEntry::RefinementOutcome(_) => true,
             ChatEntry::CustomPanel(_) => true,
+            ChatEntry::ClientMarkdown { .. } => true,
             ChatEntry::Assistant(message) => !message.streaming,
             ChatEntry::Tool(card) => !matches!(
                 crate::tool_card::panel_status(card),
@@ -590,6 +597,20 @@ impl AgentView {
             ChatEntry::CustomPanel(row) => {
                 crate::custom_message::render::render_custom_panel(row, &self.theme, width)
             }
+            // TS `/hotkeys`: `Spacer(1)` then `new Markdown(guide, 1, 1)`
+            // — the markdown component's `paddingY=1` renders one blank row
+            // above and below the content (one margin column each side,
+            // rows padded to the full width, like the assistant blocks).
+            ChatEntry::ClientMarkdown { text } => {
+                let mut rows: Vec<Line> = Vec::new();
+                rows.push(Vec::new());
+                rows.push(Vec::new());
+                let mut md = crate::markdown::MarkdownStyle::from_theme(&self.theme);
+                md.code_block_indent = self.code_block_indent.clone();
+                rows.extend(crate::chat::render_markdown_block(text, &md, width));
+                rows.push(Vec::new());
+                rows
+            }
         }
     }
 
@@ -631,6 +652,19 @@ impl AgentView {
             lines.extend(rows);
             preceded_by_tool_activity = matches!(entry, ChatEntry::Tool(_));
             first = false;
+        }
+        // The `?` quick-shortcut guide renders right below the chat rows
+        // (TS mounts `shortcutGuideContainer` between the chat and the
+        // status area, inside the scrollable main view): `Spacer(1)` then
+        // `new Markdown(guide, 1, 1)` — one blank, the markdown paddingY
+        // blank, the content, and the closing paddingY blank.
+        if let Some(guide) = &self.shortcut_guide {
+            lines.push(Vec::new());
+            lines.push(Vec::new());
+            let mut md = crate::markdown::MarkdownStyle::from_theme(&self.theme);
+            md.code_block_indent = self.code_block_indent.clone();
+            lines.extend(crate::chat::render_markdown_block(guide, &md, width));
+            lines.push(Vec::new());
         }
         // While the provider retry loop waits, its countdown loader owns
         // the status area (TS `stopWorkingLoader` + `retryLoader`); a
@@ -922,7 +956,9 @@ impl AgentView {
         // window row (TS composites it above the dock, below overlays).
         if !self.following {
             if let Some(row) = frame.get_mut(window_height) {
-                let key = crate::keybindings::KeybindingsManager::new()
+                let key = self
+                    .editor
+                    .keybindings()
                     .first_key("tui.viewport.follow")
                     .unwrap_or_else(|| "ctrl+shift+down".to_string());
                 let label = format!(" {key} to follow ");
@@ -951,7 +987,7 @@ impl AgentView {
         rows.push(vec![Span::raw(String::new())]);
         // TS `keyHint("tui.select.cancel", "cancel")`: every key of the
         // binding, first letter capitalized, then the description.
-        let keys = KeybindingsManager::new().get_keys("tui.select.cancel");
+        let keys = self.editor.keybindings().get_keys("tui.select.cancel");
         let key_text: Vec<String> = keys
             .iter()
             .map(|key| {

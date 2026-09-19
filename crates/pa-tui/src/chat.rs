@@ -98,6 +98,10 @@ pub enum ChatEntry {
     RefinementOutcome(Box<crate::custom_message::RefinementOutcomeRow>),
     /// One generic custom row (TS `CustomMessageComponent` box).
     CustomPanel(Box<crate::custom_message::CustomPanelRow>),
+    /// A client-side markdown block appended to the chat (TS
+    /// `chatContainer.addChild(new Markdown(...))`, e.g. the `/hotkeys`
+    /// guide): not a durable session row.
+    ClientMarkdown { text: String },
 }
 
 // The card types live in `tool_card`; re-exported here because the
@@ -392,7 +396,7 @@ pub fn render_assistant(
 
 /// Markdown rows with TS margins: rendered at `width - 2`, one leading margin
 /// column, padded to the full width.
-fn render_markdown_block(
+pub(crate) fn render_markdown_block(
     text: &str,
     md: &crate::markdown::MarkdownStyle,
     width: usize,

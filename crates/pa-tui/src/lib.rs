@@ -28,6 +28,7 @@ mod exit_guard;
 pub mod export_share;
 pub mod fuzzy;
 pub mod goal_surface;
+pub mod hotkeys;
 pub mod hyperlinks;
 mod image_component;
 mod image_load;

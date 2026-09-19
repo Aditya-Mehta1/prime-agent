@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 
 use crate::daemon_client::DaemonClient;
 use crate::exit_guard::ExitGuard;
+use crate::keybindings::KeybindingsManager;
 use crate::session_ui::SessionUi;
 use crate::view::{AgentView, FlushPlan};
 
@@ -187,6 +188,11 @@ pub struct InteractiveOptions {
     pub client_auth: Option<crate::client_auth::ClientAuthCommandsHandle>,
     /// Adoption telemetry for the interactive view; `None` drops events.
     pub telemetry: Option<std::sync::Arc<dyn InteractionTelemetry>>,
+    /// The effective keybindings (defaults merged with the user's
+    /// `keybindings.json`, loaded by the composition root; TS
+    /// `KeybindingsManager.create()`): every hint and key handler renders
+    /// and dispatches through this set.
+    pub keybindings: KeybindingsManager,
 }
 
 impl std::fmt::Debug for InteractiveOptions {
@@ -207,6 +213,7 @@ impl std::fmt::Debug for InteractiveOptions {
             .field("onboarding", &self.onboarding)
             .field("telemetry_disabled", &self.telemetry_disabled)
             .field("client_auth", &self.client_auth)
+            .field("keybindings", &self.keybindings.get_effective_config())
             .finish()
     }
 }
@@ -314,7 +321,7 @@ async fn run_onboarding_phase(
         return Ok(false);
     }
     let mut screen = crate::onboarding::OnboardingScreen::new();
-    let keybindings = crate::keybindings::KeybindingsManager::new();
+    let keybindings = view.editor.keybindings().clone();
     let mut exit_requested = false;
     loop {
         tokio::select! {
@@ -478,6 +485,10 @@ pub async fn run_interactive(
     let theme = crate::app::load_theme(&options.theme);
     let mut view = AgentView::new(theme);
     view.code_block_indent = options.code_block_indent.clone();
+    // The effective bindings (user `keybindings.json` merged over the TS
+    // defaults) drive the editor, the pickers, and every hint the view
+    // renders (TS `KeybindingsManager.create()` + `setKeybindings`).
+    view.editor.set_keybindings(options.keybindings.clone());
     // The `terminal.showImages` setting rides the startup options (TS
     // `getShowImages`), resolved by the composition root.
     view.show_images = options.show_images;
@@ -1262,6 +1273,7 @@ mod tests {
             telemetry_disabled: None,
             client_auth: None,
             telemetry: None,
+            keybindings: crate::keybindings::KeybindingsManager::new(),
         }
     }
 

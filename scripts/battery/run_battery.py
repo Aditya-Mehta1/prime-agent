@@ -45,7 +45,7 @@ import perf as P  # noqa: E402
 
 NL = chr(10)
 
-ALL_FLOWS = ["f1_launch", "f2_prompt", "f3_tool", "f4_commands", "f5_side_questions", "f6_attach", "f7_compaction", "f8_resume", "f9_agents_view", "f10_perf", "f11_provider_failure", "f12_scroll", "f13_ctrlc_exit", "f14_compact", "f15_a2a", "f16_refine", "f17_slash_model", "f18_goal_autonomous", "f19_heartbeat", "f20_subagents", "f21_worker_recovery", "f22_provider_failover"]
+ALL_FLOWS = ["f1_launch", "f2_prompt", "f3_tool", "f4_commands", "f5_side_questions", "f6_attach", "f7_compaction", "f8_resume", "f9_agents_view", "f10_perf", "f11_provider_failure", "f12_scroll", "f13_ctrlc_exit", "f14_compact", "f15_a2a", "f16_refine", "f17_slash_model", "f18_goal_autonomous", "f19_heartbeat", "f20_subagents", "f21_worker_recovery", "f22_provider_failover", "f23_keybindings"]
 
 # Real-surface flows (f14-f21): each drives one product surface end to end
 # (the daemon session + the attached interactive TUI), captures the frame
@@ -62,6 +62,7 @@ FLOW_LANES = {
     "f19_heartbeat": "heartbeat-tui",
     "f20_subagents": "subagents-tui",
     "f21_worker_recovery": "worker-recovery",
+    "f23_keybindings": "keybindings",
 }
 
 # Heavy flows: opt-in by name (`--flows f12_scale_resume`) plus
@@ -2628,6 +2629,162 @@ class Battery:
             B.tmux_kill(tui)
             self.copy_sessions(side, flow)
         for step in ("refine", "digest"):
+            self.frame_diff(
+                flow, step,
+                {name: frames[name].get(step, "") for name in ("ts", "rust")},
+                self.normalize_transcript_frame,
+            )
+
+    def f23_keybindings(self) -> None:
+        """User-editable keybindings (roadmap item "keybinding
+        customization"): a `keybindings.json` fixture rebinding
+        `app.tools.expand` from ctrl+o to the plain key x. Both sides must render
+        the OVERRIDE in the prompt-context hint, fire the action on the
+        override key, ignore the removed default key, and document the
+        effective binding in `/hotkeys`. Keybindings are client-side only:
+        no wire surface is touched by this flow."""
+        flow = "f23_keybindings"
+        frames: dict[str, dict[str, str]] = {"ts": {}, "rust": {}}
+        for side in (self.sides["ts"], self.sides["rust"]):
+            self.ensure_daemon(side)
+            self.suppress_first_run_notices(side)
+            # The settings fixture, written before launch like a real
+            # user's file (the TS product loads it at TUI start; the Rust
+            # product at the same seam via the composition root). A plain
+            # printable key: both products check app actions before the
+            # editor, and a plain key survives any tmux/terminal encoding
+            # (a modifier combo like ctrl+alt+x depends on kitty/legacy
+            # encodings and would make the frame diff flaky).
+            (side.agent_dir / "keybindings.json").write_text(
+                json.dumps({"app.tools.expand": "x"}, indent=1) + NL
+            )
+            tui, ready = self.launch_tui(side, flow, P.launch_argv(side, side.daemon_socket), ready_marker=">")
+            side.evidence(flow, "00-ready.txt", ready)
+            # 1) The prompt-context hint renders the user's key, not the
+            #    default ("Collapsed mode (X to expand)").
+            hint = B.tmux_wait_text(tui, r"mode \(X to expand\)", timeout=30)
+            side.evidence(flow, "01-detail-hint.txt", hint)
+            frames[side.name]["detail-hint"] = hint
+            if re.search(r"Collapsed mode \(X to expand\)", hint):
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: the prompt-context hint renders the user override (X), not the default",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: the prompt-context hint did not render the user override",
+                    evidence=side.root / flow / "01-detail-hint.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            # 2) The override key fires: overview -> details.
+            self.tui_send(tui, "x", enter=False)
+            time.sleep(1.0)
+            details = B.tmux_wait_text(tui, "Details mode", timeout=20)
+            side.evidence(flow, "02-override-fired.txt", details)
+            frames[side.name]["override-fired"] = details
+            if "Details mode" in details:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: the override key cycled the conversation detail",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: the override key did not fire the action",
+                    evidence=side.root / flow / "02-override-fired.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            # 3) The removed default key no longer fires (the cycle must
+            #    not reach the all-output mode).
+            self.tui_send(tui, "C-o", enter=False)
+            time.sleep(1.0)
+            after_default = self.settle_frame(tui, quiet_s=1.5, timeout=10)
+            side.evidence(flow, "03-default-key.txt", after_default)
+            frames[side.name]["default-key"] = after_default
+            if "All mode" not in after_default:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: the removed default key no longer cycles the detail",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: the default key still fired after the override",
+                    evidence=side.root / flow / "03-default-key.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            # 4) `/hotkeys` documents the effective binding. The guide is
+            #    taller than the default 36-row pane and renders in the
+            #    alternate screen (no tmux scrollback), so the pane grows
+            #    to 80 rows first — both products relayout to the new size
+            #    — and the whole guide renders in one capture.
+            B.tmux("resize-window", "-t", tui, "-x", "120", "-y", "80")
+            time.sleep(1.0)
+            self.tui_send(tui, "/hotkeys")
+            time.sleep(2.5)
+            guide = B.tmux_capture(tui)
+            side.evidence(flow, "04-hotkeys-guide.txt", guide)
+            frames[side.name]["hotkeys-guide"] = guide
+            if "Cycle overview" in guide and "Ctrl+O" not in guide:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: /hotkeys documents the effective override (X row)",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: /hotkeys did not show the effective override",
+                    evidence=side.root / flow / "04-hotkeys-guide.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            # 5) `?` (app.shortcuts, empty editor) mounts the quick-
+            #    shortcut guide; the next submission clears it (TS
+            #    `clearShortcutGuide`). The pane stays at 80 rows: the
+            #    guide renders at the transcript tail below the `/hotkeys`
+            #    block. "shell mode" appears only in the quick guide (not
+            #    the `/hotkeys` tables), so the cleared check is exact.
+            self.tui_send(tui, "?", enter=False)
+            guide2 = B.tmux_wait_text(tui, "shell mode", timeout=30)
+            guide2 = self.settle_frame(tui, quiet_s=1.5, timeout=20)
+            side.evidence(flow, "05-shortcut-guide.txt", guide2)
+            frames[side.name]["shortcut-guide"] = guide2
+            if "shell mode" in guide2 and "full reference" in guide2:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: the ? quick-shortcut guide mounted with the effective bindings",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: the ? quick-shortcut guide did not render",
+                    evidence=side.root / flow / "05-shortcut-guide.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            self.tui_send(tui, "f23 closing turn")
+            cleared = self.settle_frame(tui, quiet_s=2.5, timeout=60)
+            side.evidence(flow, "06-guide-cleared.txt", cleared)
+            frames[side.name]["guide-cleared"] = cleared
+            if "shell mode" not in cleared:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: the submission cleared the quick-shortcut guide",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: the quick-shortcut guide survived the submission",
+                    evidence=side.root / flow / "06-guide-cleared.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            B.tmux_kill(tui)
+        for step in ("detail-hint", "override-fired", "default-key", "hotkeys-guide", "shortcut-guide", "guide-cleared"):
             self.frame_diff(
                 flow, step,
                 {name: frames[name].get(step, "") for name in ("ts", "rust")},

@@ -352,6 +352,7 @@ fn interactive_session_rss_plateaus_over_long_stream() {
         telemetry_disabled: None,
         client_auth: None,
         telemetry: None,
+        keybindings: pa_tui::keybindings::KeybindingsManager::new(),
     };
     let plan = HeadlessPlan {
         steps,

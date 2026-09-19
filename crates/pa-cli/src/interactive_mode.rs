@@ -431,6 +431,17 @@ fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<Inter
         .session_dir
         .clone()
         .or_else(|| Some(config.agent_dir.join("sessions")));
+    // TS startup migrations rewrite legacy keybinding ids in
+    // `keybindings.json` before the manager loads them
+    // (`migrateKeybindingsConfigFile` in `runMigrations`).
+    if let Err(error) = pa_tui::keybindings::migrate_keybindings_file(&config.agent_dir) {
+        // A failed migration never blocks startup: the manager below
+        // falls back to the previous file contents (or the defaults).
+        eprintln!("Warning: could not migrate keybindings: {error:#}");
+    }
+    // TS `KeybindingsManager.create(agentDir)`: the user's
+    // `keybindings.json` merged over the shipped defaults drives the TUI.
+    let keybindings = pa_tui::keybindings::KeybindingsManager::create(&config.agent_dir);
     // Test seam: a scripted faux daemon session (same contract as the print
     // runtime). Verification harness only; never set by the product.
     let script_path = std::env::var_os("PRIME_AGENT_FAUX_SCRIPT").map(PathBuf::from);
@@ -511,6 +522,7 @@ fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<Inter
             cwd: config.cwd.clone(),
             agent_dir: config.agent_dir.clone(),
         })),
+        keybindings,
     })
 }
 
