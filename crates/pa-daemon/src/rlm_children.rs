@@ -118,7 +118,8 @@ struct ChildRecord {
     session_dir: String,
     label: String,
     started_at_ms: u64,
-    /// Terminal state (`done` | `error`); running while absent.
+    /// Terminal state (`done` | `error` | `cancelled`); running while
+    /// absent.
     settled_status: Option<&'static str>,
     answer_preview: Option<String>,
     answer_captured: bool,
@@ -135,19 +136,25 @@ struct ChildRecord {
     /// it is idle with an empty queue by construction, which is exactly
     /// the idle shape a premature settle reads.
     prompt_admitted: bool,
+    /// Terminal error text (TS `run.error`): the cancel reason for a
+    /// cancelled run, the failure text for a failed one.
+    error: Option<String>,
 }
 
 impl ChildRecord {
-    /// Raw run status: `running` | `done` | `error`.
+    /// Raw run status: `running` | `done` | `error` | `cancelled`.
     fn status(&self) -> &'static str {
         self.settled_status.unwrap_or("running")
     }
 
-    /// Kernel-roster status: `running` | `completed` | `error`.
+    /// Kernel-roster status: `running` | `completed` | `error` |
+    /// `cancelled` (TS keeps a cancelled run's status verbatim in the
+    /// registry row).
     fn roster_status(&self) -> &'static str {
         match self.status() {
             "done" => "completed",
             "error" => "error",
+            "cancelled" => "cancelled",
             _ => "running",
         }
     }
@@ -326,6 +333,7 @@ impl SupervisorChildSessions {
                 replied_since_task: false,
                 notice_delivered: false,
                 prompt_admitted: true,
+                error: None,
             })));
     }
 
@@ -333,6 +341,36 @@ impl SupervisorChildSessions {
     /// when it builds the session, after the create command arrived).
     pub fn set_model(&self, model: String) {
         self.inner.identity.lock().expect("identity lock").model = Some(model);
+    }
+
+    /// Set the session's RLM depth bound (TS `setRlmMaxDepth`): the
+    /// registry is the bound every spawn checks, so the override is the
+    /// live limit children respect immediately.
+    pub fn set_rlm_max_depth(&self, max_depth: u32) {
+        self.inner
+            .identity
+            .lock()
+            .expect("identity lock")
+            .rlm_max_depth = max_depth;
+    }
+
+    /// Cancel one live child run by id (TS `cancelRlmChildRun`): abort the
+    /// child worker's in-flight turn and claim its terminal notice (the
+    /// no-reply notice is suppressed, exactly the TS
+    /// `run.suppressTerminalNotice` path). Returns whether a live run was
+    /// cancelled; an unknown or already-settled child id answers `false`.
+    pub async fn cancel_child_run(&self, child_id: &str) -> bool {
+        self.inner.cancel_child_run(child_id).await
+    }
+
+    /// Delete one inactive child by id (TS `deleteInactiveRlmSubagent`):
+    /// `"running"` when the child still has work in flight (the caller
+    /// answers the wire `reason: "running"` refusal), `"deleted"` once the
+    /// child is torn down with its ledger tombstone, `"not_found"` for an
+    /// unknown id. A teardown failure surfaces as `Err` (the TS delete
+    /// throws through the wire arm).
+    pub async fn delete_inactive_subagent(&self, child_id: &str) -> Result<&'static str> {
+        self.inner.delete_inactive_subagent(child_id).await
     }
 
     fn entry(record: &ChildRecord) -> RlmSubagentEntry {
@@ -369,7 +407,7 @@ impl SupervisorChildSessions {
             status: record.status(),
             settled: record.settled_status.is_some(),
             answer_preview: record.answer_preview.clone(),
-            error: None,
+            error: record.error.clone(),
             duration_ms: Some(now_ms().saturating_sub(record.started_at_ms)),
             tool_use_count: None,
             replied_since_task: None,
@@ -820,6 +858,98 @@ impl SupervisorChildSessionsInner {
         }
     }
 
+    /// Abort one child's live run (see
+    /// [`SupervisorChildSessions::cancel_child_run`], the TS
+    /// `cancelRlmChildRun` walk): claim the terminal notice, settle the
+    /// registry row as `cancelled`, then abort the child worker's
+    /// in-flight turn (best-effort: an unreachable child keeps its
+    /// cancelled row - the registry is the user-visible state).
+    async fn cancel_child_run(&self, child_id: &str) -> bool {
+        let children = self.children.lock().await.clone();
+        for record in &children {
+            let (matched, running, active_session_id) = {
+                let record = record.lock().await;
+                (
+                    record.rlm_child_id == child_id,
+                    record.settled_status.is_none(),
+                    record.active_session_id.clone(),
+                )
+            };
+            // A fruitless match keeps walking: child ids are only
+            // mkdir-unique among siblings, so a colliding live run
+            // elsewhere must stay reachable (TS parity).
+            if !matched || !running {
+                continue;
+            }
+            {
+                let mut record = record.lock().await;
+                // The no-reply terminal notice is suppressed for a
+                // cancelled run (TS `run.suppressTerminalNotice = true`);
+                // a settle watcher that already claimed it keeps its claim
+                // (the double-claim race collapses).
+                record.notice_delivered = true;
+                record.settled_status = Some("cancelled");
+                record.error = Some("Cancelled by user".to_string());
+            }
+            let abort = DaemonCommand::Abort {
+                id: None,
+                active_session_id: active_session_id.clone(),
+                rest: Default::default(),
+            };
+            let _ = self
+                .command(&abort, KILL_TIMEOUT_MS)
+                .await
+                .with_context(|| format!("abort RLM child session {active_session_id}"));
+            return true;
+        }
+        false
+    }
+
+    /// Delete one inactive child by id (TS `deleteInactiveRlmSubagent`):
+    /// refresh the registry row first (the TS listing pass), refuse a child
+    /// that still has work in flight, and tear a settled one down with its
+    /// ledger tombstone (the same kill boundary `rlm.delete_subagent`
+    /// uses, so the passive roster row goes with the process).
+    async fn delete_inactive_subagent(&self, child_id: &str) -> Result<&'static str> {
+        let children = self.children.lock().await.clone();
+        for record in &children {
+            let matched = record.lock().await.rlm_child_id == child_id;
+            if !matched {
+                continue;
+            }
+            // Freshness pass (TS `listRlmSubagents` inside the delete): a
+            // child that just went idle settles here and stays deletable.
+            self.refresh_record(record).await;
+            let (running, active_session_id) = {
+                let record = record.lock().await;
+                (
+                    record.settled_status.is_none(),
+                    record.active_session_id.clone(),
+                )
+            };
+            if running {
+                return Ok("running");
+            }
+            let command = DaemonCommand::Kill {
+                id: None,
+                active_session_id: active_session_id.clone(),
+                rest: serde_json::Map::from_iter([
+                    ("rlmLedgerDelete".to_string(), json!("user")),
+                    ("rlmChildId".to_string(), json!(child_id)),
+                ]),
+            };
+            self.command(&command, KILL_TIMEOUT_MS)
+                .await
+                .with_context(|| format!("kill RLM child \"{child_id}\""))?;
+            self.children
+                .lock()
+                .await
+                .retain(|candidate| !Arc::ptr_eq(candidate, record));
+            return Ok("deleted");
+        }
+        Ok("not_found")
+    }
+
     /// The one record matching a selector, or the TS selector errors
     /// (`No direct RLM {kind} matches ...` / `... is ambiguous ...`).
     async fn resolve_record(
@@ -949,6 +1079,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 replied_since_task: false,
                 notice_delivered: false,
                 prompt_admitted: false,
+                error: None,
             };
             let record = Arc::new(Mutex::new(record));
             this.children.lock().await.push(Arc::clone(&record));

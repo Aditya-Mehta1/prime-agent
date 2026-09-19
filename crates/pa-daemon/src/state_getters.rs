@@ -722,8 +722,9 @@ mod tests {
         );
     }
 
-    /// `get_rlm_max_depth_status`: the inherited bound with the settings
-    /// source (TS `getRlmMaxDepthStatus`).
+    /// `get_rlm_max_depth_status`: the TS source vocabulary (the b6 wave
+    /// replaced the provisional "settings" label; an unseeded scripted
+    /// session reports the shared default).
     #[tokio::test]
     async fn rlm_max_depth_status_matches_the_ts_shape() {
         let worker = created_worker().await;
@@ -736,7 +737,7 @@ mod tests {
         assert!(response.success);
         assert_eq!(
             response.data.expect("data"),
-            json!({ "maxDepth": crate::rlm_children::DEFAULT_RLM_MAX_DEPTH, "source": "settings" })
+            json!({ "maxDepth": crate::rlm_children::DEFAULT_RLM_MAX_DEPTH, "source": "default" })
         );
     }
 

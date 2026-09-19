@@ -14,6 +14,13 @@ pub const AGENT_MESSAGE_SOURCE: &str = "agent_message";
 pub const AGENT_MESSAGE_ID_PREFIX: &str = "agentmsg_";
 pub const DEFAULT_AGENT_MESSAGE_MAX_CHARS: usize = 16_384;
 pub const DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION: usize = 20;
+/// The per-sender token bucket capacity (TS
+/// `DEFAULT_AGENT_MESSAGE_RATE_LIMIT_CAPACITY`): three deliveries burst
+/// before the refill paces them.
+pub const DEFAULT_AGENT_MESSAGE_RATE_LIMIT_CAPACITY: usize = 3;
+/// One rate-limit token per sender per this window (TS
+/// `DEFAULT_AGENT_MESSAGE_RATE_LIMIT_REFILL_MS`).
+pub const DEFAULT_AGENT_MESSAGE_RATE_LIMIT_REFILL_MS: u64 = 1_000;
 
 pub const AGENT_OBSERVE_PREVIEW_MAX_CHARS: usize = 240;
 pub const AGENT_OBSERVE_IMPORT_NAME: &str = "agent_observe";

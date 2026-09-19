@@ -150,6 +150,15 @@ pub struct AgentSessionEngine {
     /// stamped by `configure_rlm_identity`. Gates the kernel `refine.*`
     /// host requests (TS `_autoRefineAllowedForSession` depth check).
     rlm_depth: std::sync::atomic::AtomicU32,
+    /// The RLM depth bound's TS source stamp (`default` | `env` | `global`
+    /// | `inherited` | `chat`), seeded by `configure_rlm_identity` (the
+    /// TS `_resolveRlmMaxDepth` precedence) and flipped to `chat` by a
+    /// `set_rlm_max_depth` override.
+    rlm_max_depth_source: std::sync::Mutex<&'static str>,
+    /// A `set_rlm_max_depth` that landed before the first turn built the
+    /// session: the durable `rlm_max_depth_state` custom entry parks here
+    /// and flushes at build, exactly the `pending_branch` pattern.
+    pending_max_depth: std::sync::Mutex<Option<u64>>,
     /// The resolved faux model, registered once per engine so scripted
     /// responses queue across turns instead of replaying per resolution.
     /// Verification harness only; never set by the product.
@@ -270,6 +279,8 @@ impl AgentSessionEngine {
             children,
             autonomous_driver,
             rlm_depth: std::sync::atomic::AtomicU32::new(0),
+            rlm_max_depth_source: std::sync::Mutex::new("default"),
+            pending_max_depth: std::sync::Mutex::new(None),
             faux_model: std::sync::OnceLock::new(),
         })
     }
@@ -583,6 +594,30 @@ impl AgentSessionEngine {
     }
 }
 
+/// The last persisted `rlm_max_depth_state` custom entry in a session
+/// file (TS `_loadPersistedRlmMaxDepthState`): the chat override a
+/// resumed session re-seeds its depth bound from. `None` when the file
+/// carries no override (or cannot be read - an unreadable file keeps the
+/// create-carried bound, exactly the TS fallthrough).
+pub(crate) fn persisted_rlm_max_depth(path: Option<&str>) -> Option<u64> {
+    let path = std::path::Path::new(path?);
+    let content = std::fs::read_to_string(path).ok()?;
+    crate::session_store::parse_session_entries(&content)
+        .iter()
+        .rev()
+        .find_map(|entry| {
+            (entry.get("type").and_then(Value::as_str) == Some("custom")
+                && entry.get("customType").and_then(Value::as_str) == Some("rlm_max_depth_state"))
+            .then(|| {
+                entry
+                    .get("data")
+                    .and_then(|data| data.get("maxDepth"))
+                    .and_then(Value::as_u64)
+            })
+            .flatten()
+        })
+}
+
 /// One artifact reference (TS `createArtifactReference` in
 /// modes/agent-connection/snapshot.ts): the sha256-derived id, the owning
 /// session, the artifact type, and the logical path (cwd-relative when the
@@ -659,6 +694,60 @@ fn now_millis() -> u64 {
 }
 
 impl AgentSessionEngine {
+    /// Write the durable `rlm_max_depth_state` custom entry (TS
+    /// `RLM_MAX_DEPTH_STATE_CUSTOM_TYPE`): straight into the built
+    /// session's persistence handle, or parked for the build when the
+    /// first turn has not built the session yet.
+    fn persist_max_depth_state(&self, max_depth: u64) {
+        let handles = self.goal_runtime.lock().expect("goal runtime lock").clone();
+        match handles {
+            Some(handles) => {
+                let mut manager = self
+                    .runtime
+                    .block_on(async { handles.session.lock().await });
+                manager.append_custom_entry(
+                    "rlm_max_depth_state",
+                    Some(json!({ "maxDepth": max_depth })),
+                );
+            }
+            None => {
+                *self
+                    .pending_max_depth
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(max_depth);
+            }
+        }
+    }
+
+    /// The global settings write behind `set_rlm_max_depth { global: true }`
+    /// (TS `settingsManager.setRlmMaxDepth` + flush + `drainErrors`):
+    /// `Some(message)` when the write failed, mirroring the TS
+    /// `globalError` field.
+    fn write_global_rlm_max_depth(&self, max_depth: u64) -> Option<String> {
+        let mut settings =
+            pa_core::settings::SettingsManager::create(&self.config.cwd, &self.config.agent_dir);
+        match settings.set_rlm_max_depth(max_depth) {
+            Ok(()) => None,
+            Err(error) => Some(error.to_string()),
+        }
+    }
+
+    /// Flush a parked `rlm_max_depth_state` entry once the session built
+    /// (the `pending_branch` pattern's build-site twin).
+    fn flush_pending_max_depth(&self, manager: &mut pa_core::session::manager::SessionManager) {
+        let pending = self
+            .pending_max_depth
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(max_depth) = pending {
+            manager.append_custom_entry(
+                "rlm_max_depth_state",
+                Some(json!({ "maxDepth": max_depth })),
+            );
+        }
+    }
+
     /// Mirror the built session's goal handles: the core session's own
     /// mutex stays held across a turn's admission, so goal checks in emit
     /// callbacks read the mirror instead of the session.
@@ -1140,10 +1229,38 @@ impl SessionEngine for AgentSessionEngine {
             pa_ai::models::thinking_level_from_str(thinking)
                 .ok_or_else(|| anyhow::anyhow!("unknown thinking level \"{thinking}\""))?;
         }
+        // The depth bound's TS precedence (agent-session
+        // `_resolveRlmMaxDepth`): a persisted chat override wins, then the
+        // create-carried bound (inherited), the global setting, the
+        // `RLM_MAX_DEPTH` env, and finally the shared default.
+        let (max_depth, source) = persisted_rlm_max_depth(identity.session_file.as_deref())
+            .map(|depth| (depth, "chat"))
+            .or_else(|| {
+                identity
+                    .rlm_max_depth
+                    .map(|depth| (u64::from(depth), "inherited"))
+            })
+            .or_else(|| {
+                let settings = pa_core::settings::SettingsManager::create(
+                    &self.config.cwd,
+                    &self.config.agent_dir,
+                );
+                settings.get_rlm_max_depth().map(|depth| (depth, "global"))
+            })
+            .or_else(|| {
+                std::env::var("RLM_MAX_DEPTH")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .filter(|value| *value >= 1)
+                    .map(|depth| (depth, "env"))
+            })
+            .unwrap_or((u64::from(DEFAULT_RLM_MAX_DEPTH), "default"));
+        *self.rlm_max_depth_source.lock().expect("depth source lock") = source;
         if let Some(children) = &self.children {
             let parent = ParentIdentity {
                 rlm_depth: identity.rlm_depth,
-                rlm_max_depth: identity.rlm_max_depth.unwrap_or(DEFAULT_RLM_MAX_DEPTH),
+                rlm_max_depth: max_depth.min(u64::from(u32::MAX)) as u32,
                 model: None,
                 cwd: identity.cwd.clone(),
                 session_id: identity.session_id.clone(),
@@ -1467,14 +1584,71 @@ impl SessionEngine for AgentSessionEngine {
     }
 
     fn rlm_max_depth_status(&self) -> Value {
-        let (max_depth, source) = match &self.children {
-            // The depth bound the create command seeded the children
-            // registry with (chat override lands with the `set_rlm_max_depth`
-            // wave; until then every session runs the inherited default).
-            Some(children) => (children.rlm_max_depth(), "settings"),
-            None => (DEFAULT_RLM_MAX_DEPTH, "settings"),
+        let source = *self.rlm_max_depth_source.lock().expect("depth source lock");
+        let max_depth = match &self.children {
+            // The live bound the registry enforces (the chat override and
+            // the inherited/seeded bound both land there).
+            Some(children) => children.rlm_max_depth(),
+            None => DEFAULT_RLM_MAX_DEPTH,
         };
         json!({ "maxDepth": max_depth, "source": source })
+    }
+
+    fn cancel_rlm_child<'a>(
+        &'a self,
+        child_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            match &self.children {
+                Some(children) => children.cancel_child_run(child_id).await,
+                None => false,
+            }
+        })
+    }
+
+    fn delete_rlm_subagent<'a>(
+        &'a self,
+        child_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<&'static str>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            match &self.children {
+                Some(children) => children.delete_inactive_subagent(child_id).await,
+                None => Ok("not_found"),
+            }
+        })
+    }
+
+    fn set_rlm_max_depth(&self, max_depth: u64, global: bool) -> anyhow::Result<Value> {
+        // The live bound every spawn checks (TS updates `_rlmMaxDepth`
+        // and rebuilds the system prompt; the bound itself lives in the
+        // registry here - see PORTING-NOTES for the prompt-text note).
+        if let Some(children) = &self.children {
+            children.set_rlm_max_depth(max_depth.min(u64::from(u32::MAX)) as u32);
+        }
+        *self.rlm_max_depth_source.lock().expect("depth source lock") = "chat";
+        // The durable `rlm_max_depth_state` custom entry (TS
+        // `appendCustomEntryWithRollback`): a resumed session re-seeds
+        // its bound from it. The session that is not built yet parks the
+        // entry for its build (the `pending_branch` pattern).
+        self.persist_max_depth_state(max_depth);
+        // The global settings write (TS `settingsManager.setRlmMaxDepth`
+        // + flush + drain): errors join the TS `globalError` field, they
+        // do not fail the command.
+        let mut result = json!({
+            "maxDepth": max_depth,
+            "source": "chat",
+            "globalSaved": false,
+        });
+        if global {
+            if let Some(error) = self.write_global_rlm_max_depth(max_depth) {
+                result["globalError"] = json!(error);
+            } else {
+                result["globalSaved"] = json!(true);
+            }
+        }
+        Ok(result)
     }
 
     fn run_prompt(
@@ -2058,6 +2232,17 @@ impl AgentSessionEngine {
                     .runtime
                     .block_on(async { self.build_session(model).await })?;
                 self.mirror_goal_runtime(&built);
+                // A `set_rlm_max_depth` that landed before the build parks
+                // its durable entry; the built session owns the store now.
+                {
+                    let handles = self.goal_runtime.lock().expect("goal runtime lock").clone();
+                    if let Some(handles) = handles {
+                        let mut manager = self
+                            .runtime
+                            .block_on(async { handles.session.lock().await });
+                        self.flush_pending_max_depth(&mut manager);
+                    }
+                }
                 // A branch move that landed before the first turn (tree
                 // navigation/fork with no turn yet) re-seeds the session
                 // onto the moved branch.

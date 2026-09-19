@@ -159,6 +159,8 @@ impl Worker {
                         .unwrap_or_default()
                         .to_string(),
                     custom_message: payload.get("customMessage").cloned(),
+                    agent_message: None,
+                    admission_id: None,
                     images: crate::worker::parse_prompt_images(payload),
                     done: None,
                 };

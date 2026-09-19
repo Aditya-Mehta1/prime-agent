@@ -420,13 +420,50 @@ pub trait SessionEngine: Send + Sync {
     }
 
     /// The session's RLM max-depth status (TS `getRlmMaxDepthStatus`):
-    /// `{ maxDepth, source }`. The depth bound comes from settings, so
-    /// engines report the shared default.
+    /// `{ maxDepth, source }` with the TS source vocabulary
+    /// (`default` | `env` | `global` | `inherited` | `chat`). Engines
+    /// without a depth-bound surface report the shared default.
     fn rlm_max_depth_status(&self) -> Value {
         json!({
             "maxDepth": crate::rlm_children::DEFAULT_RLM_MAX_DEPTH,
-            "source": "settings",
+            "source": "default",
         })
+    }
+
+    /// Cancel one live RLM child run by id (TS `cancelRlmChildRun`, the
+    /// daemon `cancel_rlm_child` command): `true` when a live run was
+    /// cancelled. The children registry lock is async, so the engine
+    /// answers through a boxed future; engines without children never
+    /// cancel anything.
+    fn cancel_rlm_child<'a>(
+        &'a self,
+        child_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        let _ = child_id;
+        Box::pin(async { false })
+    }
+
+    /// Delete one inactive RLM child by id (TS `deleteInactiveRlmSubagent`,
+    /// the daemon `delete_rlm_subagent` command). The outcome vocabulary is
+    /// TS-verbatim (`"deleted"` | `"not_found"` | `"running"`); a teardown
+    /// failure surfaces as the command failure.
+    fn delete_rlm_subagent<'a>(
+        &'a self,
+        child_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<&'static str>> + Send + 'a>,
+    > {
+        let _ = child_id;
+        Box::pin(async { Ok("not_found") })
+    }
+
+    /// Set the session's RLM depth bound (TS `setRlmMaxDepth`, the daemon
+    /// `set_rlm_max_depth` command). Returns the TS `SetRlmMaxDepthResult`
+    /// wire object: `{ maxDepth, source, globalSaved }` plus `globalError`
+    /// when the requested global settings write failed.
+    fn set_rlm_max_depth(&self, max_depth: u64, global: bool) -> Result<Value> {
+        let _ = global;
+        Ok(json!({ "maxDepth": max_depth, "source": "chat", "globalSaved": false }))
     }
 }
 

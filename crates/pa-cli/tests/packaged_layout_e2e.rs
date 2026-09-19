@@ -20,6 +20,18 @@ fn repo_root() -> PathBuf {
         .expect("worktree root")
 }
 
+/// These tests stage full packaged layouts and boot the kernel; they are
+/// heavy and contend on a small box, so each one holds this lock for its
+/// whole body.
+static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial_lock() -> std::sync::MutexGuard<'static, ()> {
+    match TEST_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 /// Stage the packaged layout into `dir`: the binary, the version manifest,
 /// and the shipped assets. `with_runtime` controls whether the
 /// prime-agent-runtime sidecar is present (the failure-UX scenario removes
@@ -192,6 +204,7 @@ fn run_json_turn(
 /// staged version manifest reports the pinned version.
 #[test]
 fn packaged_session_boots_kernel_without_pi_package_dir() {
+    let _guard = serial_lock();
     let Some(kernel_python) = kernel_python() else {
         return;
     };
@@ -251,6 +264,7 @@ fn packaged_session_boots_kernel_without_pi_package_dir() {
 /// reads the packaged package.json at runtime).
 #[test]
 fn packaged_binary_reports_manifest_version() {
+    let _guard = serial_lock();
     let dir = tempfile::TempDir::new().expect("stage dir");
     let staged = dir.path();
     stage_packaged_layout(staged, false);
@@ -280,6 +294,7 @@ fn packaged_binary_reports_manifest_version() {
 /// prime-agent-runtime hint, not a raw uv/pip error.
 #[test]
 fn missing_sidecar_reports_actionable_bootstrap_error() {
+    let _guard = serial_lock();
     let dir = tempfile::TempDir::new().expect("stage dir");
     let staged = dir.path();
     stage_packaged_layout(staged, false);
@@ -314,6 +329,7 @@ fn missing_sidecar_reports_actionable_bootstrap_error() {
 /// through the packaged binary).
 #[test]
 fn invalid_kernel_python_override_reports_ts_error() {
+    let _guard = serial_lock();
     let dir = tempfile::TempDir::new().expect("stage dir");
     let staged = dir.path();
     stage_packaged_layout(staged, false);
@@ -338,6 +354,7 @@ fn invalid_kernel_python_override_reports_ts_error() {
 /// must not ride the artifact).
 #[test]
 fn packaging_dry_run_produces_artifact() {
+    let _guard = serial_lock();
     if !Command::new("python3")
         .arg("--version")
         .output()

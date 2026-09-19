@@ -12,7 +12,8 @@ normalized away). The lane contract (docs/protocol-breadth-audit.md):
     mutate_queued_message, get_connection_state, ...) routes exactly like
     TS: same `Unknown active session: <id>` refusal for a bogus selector;
   - selector-less commands whose TS supervisor arms are later waves
-    (agent_messages_status, cron_list) are reported as expected diffs.
+    (cron_list) are reported as expected diffs; the agent_messages_*
+    selector-less arms landed with wave b7 and must match.
 
 Usage: python3 scripts/protocol_breadth_parity.py [path-to-pa-daemon]
 (the default is target/debug/pa-daemon relative to the repo root).
@@ -132,8 +133,12 @@ CASES = [
       "mutation": {"type": "delete"}}),
     ("previously-rejected type now routes (get_connection_state)",
      {"type": "get_connection_state", "activeSessionId": "bogus-1"}),
-    ("no-selector command: TS arm is a later wave (agent_messages_status)",
+    ("no-selector command now matches TS (agent_messages_status)",
      {"type": "agent_messages_status"}),
+    ("no-selector command now matches TS (agent_messages_pause)",
+     {"type": "agent_messages_pause"}),
+    ("no-selector command now matches TS (agent_messages_resume)",
+     {"type": "agent_messages_resume"}),
     ("no-selector command: TS arm is a later wave (cron_list)",
      {"type": "cron_list"}),
     # Waves b2-b5 (worker commands): a bogus selector routes identically
@@ -200,6 +205,43 @@ CASES = [
      {"type": "execute_bash_and_wait", "activeSessionId": "bogus-1", "command": "echo hi"}),
     ("b5 bash routes (abort_bash)",
      {"type": "abort_bash", "activeSessionId": "bogus-1"}),
+    # Waves b6-b9: every new command routes; a bogus selector refuses with
+    # the exact TS error before any worker sees the command. The
+    # selector-less agent_messages_* forms match the TS supervisor arms
+    # (wave b7); the ownership/lifecycle commands (b9) answer the TS
+    # unknown-session error, and retry_worker resolves before its arm.
+    ("b6 rlm routes (cancel_rlm_child)",
+     {"type": "cancel_rlm_child", "activeSessionId": "bogus-1", "childId": "c"}),
+    ("b6 rlm routes (delete_rlm_subagent)",
+     {"type": "delete_rlm_subagent", "activeSessionId": "bogus-1", "childId": "c"}),
+    ("b6 rlm routes (set_rlm_max_depth)",
+     {"type": "set_rlm_max_depth", "activeSessionId": "bogus-1", "maxDepth": 3}),
+    ("b6 rlm routes (get_rlm_max_depth_status)",
+     {"type": "get_rlm_max_depth_status", "activeSessionId": "bogus-1"}),
+    ("b7 clear routes (agent_messages_clear)",
+     {"type": "agent_messages_clear", "activeSessionId": "bogus-1"}),
+    ("b8 pause routes (acquire_session_input_pause)",
+     {"type": "acquire_session_input_pause", "activeSessionId": "bogus-1", "leaseKey": "k"}),
+    ("b8 pause routes (release_session_input_pause)",
+     {"type": "release_session_input_pause", "activeSessionId": "bogus-1", "pauseId": "p"}),
+    ("b9 ownership routes (complete_owned_session)",
+     {"type": "complete_owned_session", "activeSessionId": "bogus-1"}),
+    ("b9 ownership routes (promote_owned_session)",
+     {"type": "promote_owned_session", "activeSessionId": "bogus-1"}),
+    ("b9 navigation routes (new_session)",
+     {"type": "new_session", "activeSessionId": "bogus-1"}),
+    ("b9 navigation routes (switch_session)",
+     {"type": "switch_session", "activeSessionId": "bogus-1", "sessionPath": "/tmp/x.jsonl"}),
+    ("b9 navigation routes (import_jsonl)",
+     {"type": "import_jsonl", "activeSessionId": "bogus-1", "inputPath": "/tmp/in.jsonl"}),
+    ("b9 navigation routes (export_html)",
+     {"type": "export_html", "activeSessionId": "bogus-1", "outputPath": "/tmp/out.html"}),
+    ("b9 navigation routes (export_jsonl)",
+     {"type": "export_jsonl", "activeSessionId": "bogus-1", "outputPath": "/tmp/out.jsonl"}),
+    ("b9 admission routes (cancel_prompt_admission)",
+     {"type": "cancel_prompt_admission", "activeSessionId": "bogus-1", "admissionId": "a1"}),
+    ("b9 recovery routes (retry_worker)",
+     {"type": "retry_worker", "activeSessionId": "bogus-1"}),
 ]
 
 tmp = tempfile.mkdtemp(prefix="pa-parity-")

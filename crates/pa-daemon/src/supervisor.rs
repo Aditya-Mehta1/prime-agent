@@ -33,6 +33,7 @@ use crate::engine::EngineModelSelection;
 use crate::framing::{write_frame, PrivateFrameReader, DEFAULT_PRIVATE_FRAME_LIMITS};
 use crate::lease::is_process_alive;
 use crate::paths;
+use crate::prompt_admission::input_admission_id;
 use crate::protocol::{
     command_active_session_id, command_type_name, current_protocol_info,
     default_server_capabilities, parse_supervisor_command_line, response_failure, response_line,
@@ -128,6 +129,9 @@ pub struct Supervisor {
     /// restore + scheduled-work re-arm. Read by the hello resume contract,
     /// the `update_restore_status` RPC, and the queued-attach path.
     pub(crate) restore: crate::update_restore::RestoreProgress,
+    /// The session input-pause leases (wave b8): pause id -> lease, the
+    /// bookkeeping behind `acquire`/`release_session_input_pause`.
+    pub(crate) input_pauses: crate::input_pause_lease::SupervisorPauseTable,
 }
 
 impl Supervisor {
@@ -167,6 +171,7 @@ impl Supervisor {
             mutation_drain: MutationDrainLatch::new(),
             update_budget: UpdateTimeoutBudget::from_env(),
             restore: crate::update_restore::RestoreProgress::new(),
+            input_pauses: crate::input_pause_lease::SupervisorPauseTable::default(),
         })
     }
 
@@ -515,7 +520,10 @@ impl Supervisor {
     }
 
     /// Spawn a fresh worker process, connect, and replay the durable create.
-    async fn relaunch_worker(self: &Arc<Self>, resident: &Arc<ResidentWorker>) -> Result<Child> {
+    pub(crate) async fn relaunch_worker(
+        self: &Arc<Self>,
+        resident: &Arc<ResidentWorker>,
+    ) -> Result<Child> {
         if self.is_stopping(resident) {
             return Err(anyhow!("supervisor is shutting down"));
         }
@@ -1139,6 +1147,9 @@ impl Supervisor {
         // tasks (`roster_subscribe` flips it; the event arm filters pushes).
         let roster_subscribed: Arc<std::sync::atomic::AtomicBool> =
             Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Per-connection pause-lease state (wave b8): the connection id
+        // lease keys embed, the detach epoch, and the detaching sessions.
+        let connection = Arc::new(crate::input_pause_lease::ClientConnectionState::new());
         // Completed dispatches flow back through this channel so the loop
         // keeps writing: a long command (a turn, a compaction) must not
         // block this client's events or its other commands, like the TS
@@ -1161,6 +1172,7 @@ impl Supervisor {
                     let effective_client_id = Arc::clone(&effective_client_id);
                     let attached = Arc::clone(&attached);
                     let roster_subscribed = Arc::clone(&roster_subscribed);
+                    let connection = Arc::clone(&connection);
                     let dispatch_tx = dispatch_tx.clone();
                     tokio::spawn(async move {
                         let (lines, stop) = supervisor
@@ -1169,6 +1181,7 @@ impl Supervisor {
                                 &effective_client_id,
                                 &attached,
                                 &roster_subscribed,
+                                &connection,
                             )
                             .await;
                         let _ = dispatch_tx.send((lines, stop));
@@ -1216,6 +1229,13 @@ impl Supervisor {
                     .await;
             }
         }
+        // The disconnect's pause-lease cleanup (TS socket `cleanup`):
+        // in-flight acquisitions invalidate and every lease the
+        // connection held releases on its worker. Every waiting prompt
+        // admission cancels so its in-flight prompt fails with the TS
+        // cancellation error.
+        self.release_all_client_pauses(&connection).await;
+        connection.prompt_admissions.cancel_all_waiting();
         Ok(())
     }
 
@@ -1227,6 +1247,7 @@ impl Supervisor {
         effective_client_id: &Arc<std::sync::Mutex<String>>,
         attached: &Arc<std::sync::Mutex<Vec<String>>>,
         roster_subscribed: &Arc<std::sync::atomic::AtomicBool>,
+        connection: &Arc<crate::input_pause_lease::ClientConnectionState>,
     ) -> (Vec<Value>, bool) {
         let envelope = match parse_supervisor_command_line(line) {
             Ok(envelope) => envelope,
@@ -1260,6 +1281,29 @@ impl Supervisor {
         let command_id = envelope.id.clone();
         if let Some(client_id) = envelope.client_id.clone() {
             *effective_client_id.lock().unwrap() = client_id;
+        }
+        // The prompt-admission registration (wave b9, TS parse-time):
+        // a prompt/prompt_and_wait carrying an admissionId reserves it
+        // before dispatch; duplicates and empty ids answer the TS parse
+        // errors with `command: "parse"`.
+        if let Some(admission_id) = crate::prompt_admission::input_admission_id(&envelope.command) {
+            let active_session_id = crate::protocol::command_active_session_id(&envelope.command)
+                .unwrap_or_default()
+                .to_string();
+            if let Err(error) = connection
+                .prompt_admissions
+                .register(&active_session_id, admission_id)
+            {
+                return (
+                    vec![response_line(&response_failure(
+                        Some(&command_id),
+                        "parse",
+                        &error,
+                        None,
+                    ))],
+                    false,
+                );
+            }
         }
         let type_name = command_type_name(&envelope.command).to_string();
         // Update-prepare watchdog on any later command (spec §5): a prepared
@@ -1303,6 +1347,7 @@ impl Supervisor {
                 effective_client_id,
                 attached,
                 roster_subscribed,
+                connection,
                 command_id,
                 type_name,
             )
@@ -1315,12 +1360,14 @@ impl Supervisor {
 
     /// The parsed-command match of [`Self::dispatch_client`], executed under
     /// the mutation-drain latch by that wrapper.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_parsed_command(
         self: &Arc<Self>,
         command: &DaemonCommand,
         effective_client_id: &Arc<std::sync::Mutex<String>>,
         attached: &Arc<std::sync::Mutex<Vec<String>>>,
         roster_subscribed: &Arc<std::sync::atomic::AtomicBool>,
+        connection: &Arc<crate::input_pause_lease::ClientConnectionState>,
         command_id: String,
         type_name: String,
     ) -> (Vec<Value>, bool) {
@@ -1485,6 +1532,160 @@ impl Supervisor {
                     ))],
                     false,
                 )
+            }
+            DaemonCommand::Prompt {
+                active_session_id, ..
+            }
+            | DaemonCommand::PromptAndWait {
+                active_session_id, ..
+            } if input_admission_id(command).is_some_and(|id| !id.is_empty()) => {
+                // An admitted prompt (wave b9): the cancellation checks,
+                // the admission-id rewrite, and the owned commit around
+                // the routed prompt.
+                let client_id = effective_client_id.lock().unwrap().clone();
+                self.route_prompt_with_admission(
+                    connection,
+                    command,
+                    &client_id,
+                    attached,
+                    command_id,
+                    type_name,
+                    active_session_id,
+                )
+                .await
+            }
+            DaemonCommand::CancelPromptAdmission { .. } => {
+                // `cancel_prompt_admission` (wave b9): the supervisor's
+                // status ladder over the admission registry.
+                self.handle_cancel_prompt_admission(connection, command, &command_id, &type_name)
+                    .await
+            }
+            DaemonCommand::CompleteOwnedSession { .. } => {
+                // Wave b9: the owner stops its session worker (TS
+                // supervisor arm).
+                let client_id = effective_client_id.lock().unwrap().clone();
+                self.handle_complete_owned_session(command, &client_id, &command_id, &type_name)
+                    .await
+            }
+            DaemonCommand::PromoteOwnedSession { .. } => {
+                // Wave b9: the owner clears the ownership (TS
+                // `promoteOwnedWorker`).
+                let client_id = effective_client_id.lock().unwrap().clone();
+                self.handle_promote_owned_session(command, &client_id, &command_id, &type_name)
+                    .await
+            }
+            DaemonCommand::RetryWorker { .. } => {
+                // Wave b9 (the audit's retry_worker fix): the recovery is
+                // a supervisor arm - the worker never sees the command.
+                let client_id = effective_client_id.lock().unwrap().clone();
+                self.handle_retry_worker(command, &client_id, &command_id, &type_name)
+                    .await
+            }
+            DaemonCommand::AcquireSessionInputPause { .. } => {
+                // The supervisor-owned lease path (wave b8, TS supervisor
+                // arm): resolve, rewrite the lease key, forward, record.
+                let client_id = effective_client_id.lock().unwrap().clone();
+                self.handle_acquire_session_input_pause(
+                    connection,
+                    command,
+                    &client_id,
+                    &command_id,
+                    &type_name,
+                )
+                .await
+            }
+            DaemonCommand::ReleaseSessionInputPause { .. } => {
+                // The supervisor-owned release (wave b8): the TS outcome
+                // ladder over the lease table.
+                self.handle_release_session_input_pause(
+                    connection,
+                    command,
+                    &command_id,
+                    &type_name,
+                )
+                .await
+            }
+            DaemonCommand::Detach {
+                active_session_id, ..
+            } => {
+                // Detach carries the pause-lease bookkeeping (wave b8):
+                // mark the detaching sessions and bump the epoch BEFORE the
+                // routed detach, then release the client's leases for the
+                // marked sessions once it answered (TS supervisor detach
+                // arm ordering).
+                let client_id = effective_client_id.lock().unwrap().clone();
+                let attached_ids = attached.lock().unwrap().clone();
+                let marked = self
+                    .begin_detach_pause_bookkeeping(
+                        connection,
+                        active_session_id.as_deref(),
+                        &attached_ids,
+                    )
+                    .await;
+                let outcome = self
+                    .route_client_command(command, &client_id, attached, command_id, type_name)
+                    .await;
+                let succeeded = outcome
+                    .0
+                    .first()
+                    .is_some_and(|line| line.get("success").and_then(Value::as_bool) == Some(true));
+                if succeeded {
+                    self.release_client_pauses_for_sessions(connection, &marked)
+                        .await;
+                }
+                outcome
+            }
+            DaemonCommand::Reattach {
+                active_session_id,
+                target_active_session_id,
+                ..
+            } => {
+                // Reattach clears the detach marks for the reattached
+                // sessions (TS reattach arm): a reattached session may
+                // acquire pauses again. The route itself stays the
+                // generic one (streamed attach included).
+                let client_id = effective_client_id.lock().unwrap().clone();
+                let outcome = self
+                    .route_client_command(command, &client_id, attached, command_id, type_name)
+                    .await;
+                let mut cleared = vec![active_session_id.clone(), target_active_session_id.clone()];
+                if let Ok(resident) = self.registry.resolve(target_active_session_id).await {
+                    cleared.push(resident.worker_id.clone());
+                }
+                self.clear_detaching_after_reattach(connection, &cleared);
+                outcome
+            }
+            DaemonCommand::AgentMessagesStatus {
+                active_session_id, ..
+            } if active_session_id.is_none() => {
+                // Selector-less `agent_messages_status` (TS supervisor
+                // arm): the first live worker answers, else the TS
+                // empty-status object.
+                let client_id = effective_client_id.lock().unwrap().clone();
+                self.handle_agent_messages_status_broadcast(
+                    command,
+                    &client_id,
+                    &command_id,
+                    &type_name,
+                )
+                .await
+            }
+            DaemonCommand::AgentMessagesPause {
+                active_session_id, ..
+            }
+            | DaemonCommand::AgentMessagesResume {
+                active_session_id, ..
+            } if active_session_id.is_none() => {
+                // Selector-less pause/resume (TS supervisor arm): the
+                // broadcast to every live worker.
+                let client_id = effective_client_id.lock().unwrap().clone();
+                self.handle_agent_messages_pause_resume_broadcast(
+                    command,
+                    &client_id,
+                    &command_id,
+                    &type_name,
+                )
+                .await
             }
             command => {
                 let client_id = effective_client_id.lock().unwrap().clone();
@@ -2636,7 +2837,7 @@ impl Supervisor {
         Ok(())
     }
 
-    async fn route_client_command(
+    pub(crate) async fn route_client_command(
         self: &Arc<Self>,
         command: &DaemonCommand,
         client_id: &str,
@@ -2885,11 +3086,6 @@ impl Supervisor {
                         }
                     }
                 }
-                if let DaemonCommand::RetryWorker { .. } = command {
-                    if response.success {
-                        let _ = self.relaunch_worker(&resident).await;
-                    }
-                }
                 (vec![response_line(&response)], false)
             }
             Err(error) => (
@@ -2904,7 +3100,7 @@ impl Supervisor {
         }
     }
 
-    async fn stop_worker(self: &Arc<Self>, resident: &Arc<ResidentWorker>) {
+    pub(crate) async fn stop_worker(self: &Arc<Self>, resident: &Arc<ResidentWorker>) {
         resident.intentional_stop.store(true, Ordering::SeqCst);
         let _ = self
             .route_command(resident, "shutdown", json!({}), ROUTE_TIMEOUT_MS)
@@ -3028,7 +3224,7 @@ async fn write_line<W: AsyncWriteExt + Unpin>(writer: &mut W, value: &Value) -> 
 }
 
 /// The worker-side command name plus payload for a routed client command.
-fn client_command_payload(
+pub(crate) fn client_command_payload(
     command: &DaemonCommand,
     client_id: &str,
 ) -> Result<(&'static str, Value)> {

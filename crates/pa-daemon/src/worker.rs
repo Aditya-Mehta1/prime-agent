@@ -155,6 +155,15 @@ pub(crate) struct QueuedItem {
     /// An injected custom row that replaces this turn's user message (the
     /// RLM child terminal notices ride the follow-up lane this way).
     pub(crate) custom_message: Option<Value>,
+    /// The original agent-message text when this item came from an
+    /// `agent_message` delivery (the marker `agent_messages_clear` /
+    /// `agent_messages_pause` remove queued items by); `None` for items a
+    /// client queued directly (steer/follow_up).
+    pub(crate) agent_message: Option<String>,
+    /// The prompt-admission id this admitted prompt registered (the
+    /// `cancel_prompt_admission` bookkeeping); `None` for prompts that
+    /// carried no admission id.
+    pub(crate) admission_id: Option<String>,
     /// Images attached to the prompt (wire `images`: base64 payload plus
     /// mime type), admitted with the message as multimodal content.
     pub(crate) images: Vec<pa_agent::types::ImageContent>,
@@ -554,6 +563,20 @@ pub struct Worker {
     /// The user-bash slot (`execute_bash` / `execute_bash_and_wait` /
     /// `abort_bash`): one command runs at a time, killed on abort.
     pub(crate) user_bash: std::sync::Arc<crate::user_bash::UserBash>,
+    /// Agent-message ingestion state (`agent_messages_*` arms): the pause
+    /// flag the delivery gate checks.
+    pub(crate) agent_messages: crate::agent_message_ingest::AgentMessageIngest,
+    /// Session input-pause leases (`acquire`/`release_session_input_pause`):
+    /// the admission gate the turn runner consults.
+    pub(crate) input_pauses: crate::session_input_pause::InputPauseTable,
+    /// Session navigation (wave b9): `new_session` / `switch_session` /
+    /// `import_jsonl`, the shared replacement flow.
+    pub(crate) navigation: crate::session_navigation::SessionNavigation,
+    /// Worker-side prompt admissions (wave b9): the registry the
+    /// supervisor's forwarded `cancel_prompt_admission` reads; shared with
+    /// the turn runner, which commits a queued admission when its turn
+    /// starts.
+    pub(crate) prompt_admissions: crate::prompt_admission::WorkerAdmissions,
 }
 
 /// Supervisor-link coordinates for a worker's agent engine: where the
@@ -622,6 +645,12 @@ impl Worker {
         tokio::spawn(async move {
             status_runner.run(status_rx).await;
         });
+        // The session input-pause table (the admission gate): shared by
+        // the worker's arms and the turn runner below.
+        let input_pauses = crate::session_input_pause::InputPauseTable::new();
+        // The worker's prompt-admission registry: shared with the turn
+        // runner (the commit happens at turn start).
+        let prompt_admissions = crate::prompt_admission::WorkerAdmissions::new();
         // The turn runner runs for the whole process lifetime. The command
         // dispatcher keeps the engine handle too (model metadata for the
         // stats commands).
@@ -682,6 +711,8 @@ impl Worker {
             let runner = TurnRunner {
                 recovery: Arc::clone(&recovery),
                 core: Arc::clone(&core),
+                input_pauses: input_pauses.clone(),
+                prompt_admissions: prompt_admissions.clone(),
                 work_notify: Arc::clone(&work_notify),
                 idle_notify: Arc::clone(&idle_notify),
                 events: events.clone(),
@@ -731,6 +762,12 @@ impl Worker {
             get_user_servers: Box::new(|| None),
             begin_login: None,
         });
+        let navigation = crate::session_navigation::SessionNavigation::new(
+            std::sync::Arc::clone(&engine),
+            Arc::clone(&core),
+            Arc::clone(&idle_notify),
+        );
+        let prompt_admissions = crate::prompt_admission::WorkerAdmissions::new();
         Worker {
             config,
             registration,
@@ -749,6 +786,10 @@ impl Worker {
             exports,
             acp_mcp: std::sync::Arc::new(std::sync::Mutex::new(acp_mcp)),
             user_bash: std::sync::Arc::new(crate::user_bash::UserBash::new()),
+            agent_messages: crate::agent_message_ingest::AgentMessageIngest::new(),
+            input_pauses,
+            navigation,
+            prompt_admissions,
         }
     }
 
@@ -1301,6 +1342,19 @@ impl Worker {
             "refine" => self.handle_refine(payload).await,
             "reload" => self.handle_reload().await,
             "extension_ui_response" => self.handle_extension_ui_response(payload),
+            "cancel_rlm_child" => self.handle_cancel_rlm_child(payload).await,
+            "delete_rlm_subagent" => self.handle_delete_rlm_subagent(payload).await,
+            "set_rlm_max_depth" => self.handle_set_rlm_max_depth(payload),
+            "acquire_session_input_pause" => self.handle_acquire_session_input_pause(payload),
+            "release_session_input_pause" => self.handle_release_session_input_pause(payload),
+            "cancel_prompt_admission" => self.handle_cancel_prompt_admission(payload),
+            "new_session" => self.handle_new_session(payload).await,
+            "switch_session" => self.handle_switch_session(payload).await,
+            "import_jsonl" => self.handle_import_jsonl(payload).await,
+            "agent_messages_status" => self.handle_agent_messages_status(),
+            "agent_messages_pause" => self.handle_agent_messages_pause(),
+            "agent_messages_resume" => self.handle_agent_messages_resume(),
+            "agent_messages_clear" => self.handle_agent_messages_clear(),
             other => response_failure(
                 None,
                 command_type,
@@ -1897,6 +1951,9 @@ impl Worker {
             .unwrap_or("anonymous")
             .to_string();
         self.side_questions.abort_for_client(&client_id);
+        // The detaching client's input-pause leases go with the detach
+        // (TS worker `detach` arm releases the client's pauses).
+        self.release_input_pauses_for_detach(&client_id);
         let mut core = self.core.lock().unwrap();
         core.attached_client_ids.retain(|id| id != &client_id);
         response_success(None, "detach", None)
@@ -1919,6 +1976,17 @@ impl Worker {
             Err(error) => return response_failure(None, "prompt", &error, None),
         };
         let images = parse_prompt_images(payload);
+        // The prompt-admission bookkeeping (wave b9): a prompt carrying an
+        // admission id registers it worker-side; the queued item carries
+        // it so the turn runner commits the admission when its turn starts.
+        let admission_id = payload
+            .get("admissionId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+        if let Some(admission_id) = &admission_id {
+            self.register_prompt_admission(admission_id);
+        }
         let (done_tx, done_rx) = oneshot::channel();
         let done = if wait { Some(done_tx) } else { None };
         let (snapshot, queued_behind_work) = {
@@ -1927,18 +1995,43 @@ impl Worker {
             // work hand-off, not a queue, so the projection did not change
             // (TS prompt admission with queueIfBusy=false never queues).
             let queued_behind_work = core.busy;
-            match streaming_behavior {
-                Some("steer") => core.steering.push_back(QueuedItem {
+            let lane = match streaming_behavior {
+                Some("steer") => Lane::Steering,
+                // Plain prompts admitted while busy drain when the run goes
+                // idle, like `queueIfBusy` prompt admission; an idle
+                // session's prompt IS the next run, so it takes the
+                // steering lane - otherwise a steering delivery that
+                // arrives in the same window would jump the prompt's turn
+                // (the runner drains steering first).
+                Some(_) => {
+                    if core.busy {
+                        Lane::FollowUp
+                    } else {
+                        Lane::Steering
+                    }
+                }
+                None => {
+                    if core.busy {
+                        Lane::FollowUp
+                    } else {
+                        Lane::Steering
+                    }
+                }
+            };
+            match lane {
+                Lane::Steering => core.steering.push_back(QueuedItem {
                     message: message.to_string(),
                     custom_message,
+                    agent_message: None,
+                    admission_id: admission_id.clone(),
                     images: images.clone(),
                     done,
                 }),
-                // Plain prompts admitted while busy drain when the run goes
-                // idle, like `queueIfBusy` prompt admission.
-                _ => core.follow_up.push_back(QueuedItem {
+                Lane::FollowUp => core.follow_up.push_back(QueuedItem {
                     message: message.to_string(),
                     custom_message,
+                    agent_message: None,
+                    admission_id: admission_id.clone(),
                     images: images.clone(),
                     done,
                 }),
@@ -1985,6 +2078,8 @@ impl Worker {
         .push_back(QueuedItem {
             message: message.to_string(),
             custom_message,
+            agent_message: None,
+            admission_id: None,
             images,
             done: None,
         });
@@ -2021,6 +2116,11 @@ impl Worker {
             pa_core::session_engine::agent_messaging::normalize_agent_session_message(message)
         {
             return response_failure(None, "worker_deliver_message", &error.to_string(), None);
+        }
+        // The paused gate (TS `sendAgentSessionMessage` refuses with the
+        // same error while `agent_messages_pause` holds the flag).
+        if let Err(response) = self.refuse_delivery_if_paused() {
+            return response;
         }
         let sender = payload.get("sender").cloned().unwrap_or(Value::Null);
         // A delivery from one of this session's RLM children counts as the
@@ -2075,6 +2175,10 @@ impl Worker {
             .push_back(QueuedItem {
                 message: prompt,
                 custom_message: None,
+                // The agent-message marker: `agent_messages_clear` /
+                // `agent_messages_pause` remove exactly these items.
+                agent_message: Some(message.to_string()),
+                admission_id: None,
                 images: Vec::new(),
                 done: None,
             });
@@ -2870,6 +2974,8 @@ fn restore_queue_snapshot(
             .map(|message| QueuedItem {
                 message,
                 custom_message: None,
+                agent_message: None,
+                admission_id: None,
                 images: Vec::new(),
                 done: None,
             })
@@ -2888,6 +2994,11 @@ fn restore_queue_snapshot(
 /// engine and emitting the agent-loop event lifecycle.
 struct TurnRunner {
     pub(crate) core: Arc<Mutex<SessionCore>>,
+    /// The input-pause table (the admission gate holds queued input).
+    input_pauses: crate::session_input_pause::InputPauseTable,
+    /// The prompt-admission registry: a queued admitted prompt commits
+    /// when its turn starts and clears when the turn settles.
+    prompt_admissions: crate::prompt_admission::WorkerAdmissions,
     work_notify: Arc<Notify>,
     idle_notify: Arc<Notify>,
     pub(crate) events: Arc<EventPump>,
@@ -2911,7 +3022,13 @@ impl TurnRunner {
                 if core.shutdown_requested {
                     return;
                 }
-                if let Some(item) = core.steering.pop_front() {
+                // The input-admission gate (TS
+                // `_sessionInputAdmissionPauses`): held pauses keep
+                // queued input queued until the release wakes the runner.
+                if self.input_pauses.paused() {
+                    core.busy = false;
+                    None
+                } else if let Some(item) = core.steering.pop_front() {
                     core.busy = true;
                     core.abort_requested = false;
                     core.retry_abort_requested = false;
@@ -2977,6 +3094,11 @@ impl TurnRunner {
     }
 
     async fn run_turn(&self, engine: std::sync::Arc<dyn SessionEngine>, item: QueuedItem) {
+        // An admitted prompt's turn started: its prompt admission commits
+        // (TS `commitAdmission`).
+        if let Some(admission_id) = &item.admission_id {
+            self.prompt_admissions.commit(admission_id);
+        }
         self.emit_turn_event(json!({ "type": "agent_start" }));
         self.emit_turn_event(json!({ "type": "turn_start" }));
 
@@ -3380,6 +3502,11 @@ impl TurnRunner {
         // (the runner debounces a burst into one request).
         let _ = self.status_notify.send(());
         self.idle_notify.notify_waiters();
+        // The settled prompt's admission clears (TS `clearAdmission` in
+        // the prompt arm's finally).
+        if let Some(admission_id) = &item.admission_id {
+            self.prompt_admissions.clear(admission_id);
+        }
     }
 
     /// The post-turn queue projection (TS `_emitQueueUpdate`): an unchanged
@@ -3847,6 +3974,8 @@ mod agent_message_tests {
                 core.follow_up.push_back(QueuedItem {
                     message: "occupied".to_string(),
                     custom_message: None,
+                    agent_message: None,
+                    admission_id: None,
                     images: Vec::new(),
                     done: None,
                 });
@@ -4151,6 +4280,8 @@ mod turn_stream_tests {
         let (status_notify, _status_rx) = tokio::sync::mpsc::unbounded_channel();
         TurnRunner {
             core,
+            input_pauses: crate::session_input_pause::InputPauseTable::new(),
+            prompt_admissions: crate::prompt_admission::WorkerAdmissions::new(),
             work_notify: Arc::new(Notify::new()),
             idle_notify: Arc::new(Notify::new()),
             events: Arc::new(EventPump::new()),
@@ -4174,6 +4305,8 @@ mod turn_stream_tests {
                 QueuedItem {
                     message: "burst".to_string(),
                     custom_message: None,
+                    agent_message: None,
+                    admission_id: None,
                     images: Vec::new(),
                     done: None,
                 },
@@ -4204,6 +4337,8 @@ mod turn_stream_tests {
                 QueuedItem {
                     message: "[child-exited: no-reply child:lane]".to_string(),
                     custom_message: Some(custom_message),
+                    agent_message: None,
+                    admission_id: None,
                     images: Vec::new(),
                     done: None,
                 },

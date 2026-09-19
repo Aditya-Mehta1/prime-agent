@@ -435,6 +435,8 @@ mod tests {
             core.steering.push_back(crate::worker::QueuedItem {
                 message: "waiting prompt".to_string(),
                 custom_message: None,
+                agent_message: None,
+                admission_id: None,
                 images: Vec::new(),
                 done: Some(done_tx),
             });

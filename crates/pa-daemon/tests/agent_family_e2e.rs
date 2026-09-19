@@ -373,6 +373,29 @@ async fn parent_child_agent_message_round_trip_end_to_end() {
     assert_eq!(handle.name, "kid");
     let child_id = handle.rlm_child_id.clone();
 
+    // The detached task prompt waits for the parent's turn boundary (the
+    // spawn admission ordering); this harness owns its own children
+    // registry, separate from the parent worker's engine, so the boundary
+    // the real parent's turn would bump has to be simulated here. Without
+    // it the spawn prompt never fires and the delivered messages consume
+    // the child's scripted spawn response.
+    children.notify_turn_done();
+    // Wait for the spawn prompt's turn to settle before delivering: the
+    // child must run its spawn turn ("kid spawned") before the reply
+    // script begins, or the first delivered message would consume the
+    // spawn response and lose its own reply cell.
+    let spawn_row = loop {
+        let roster = children.list_subagents().await.expect("child roster");
+        let row = roster.first().expect("one child row");
+        // The spawn turn settled once the child went idle with an answer
+        // (or an error); a still-running child keeps polling.
+        if row.status == "completed" || row.status == "error" {
+            break row.clone();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(spawn_row.status, "completed", "spawn turn: {spawn_row:?}");
+
     // The roster row gives the child's live and persisted session ids.
     let roster = children.list_subagents().await.expect("child roster");
     let child_row = roster.first().expect("one child row");
