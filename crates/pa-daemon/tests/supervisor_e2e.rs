@@ -1959,3 +1959,85 @@ fn tool_result_entries_persisted_and_streamed() {
     assert_eq!(tool_result_entry["message"]["isError"], true);
     assert!(tool_result_entry["message"]["timestamp"].is_u64());
 }
+
+#[test]
+fn create_path_duplicate_name_fails_with_current_ts_string() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("daemon.sock");
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let (mut client, hello) = Client::connect(&socket);
+    assert_eq!(hello["type"], "daemon_hello");
+
+    let script_path = dir.path().join("script.json");
+    std::fs::write(
+        &script_path,
+        serde_json::json!({ "responses": [ { "text": "ok" } ] }).to_string(),
+    )
+    .expect("write script");
+
+    // First create reserves the name (worker reports it via get_state).
+    client.send_command(
+        "c1",
+        serde_json::json!({
+            "type": "create",
+            "name": "dup",
+            "config": {
+                "cwd": dir.path().to_string_lossy(),
+                "sessionDir": agent_dir.join("sessions").to_string_lossy(),
+                "script": script_path.to_string_lossy(),
+            },
+        }),
+    );
+    let created = client.read_response("c1");
+    assert_eq!(created["success"], true, "first create failed: {created}");
+
+    // Second create with the same name fails with the current TS string
+    // (`formatAgentSessionNameUnavailable`, agent-messages.ts): the CLI's
+    // auto-rename retry keys off the `Agent name "..." is unavailable`
+    // prefix, so the old `Session name ... is unavailable for depth 0`
+    // phrasing broke both parity and that fallback.
+    client.send_command(
+        "c2",
+        serde_json::json!({
+            "type": "create",
+            "name": "dup",
+            "config": {
+                "cwd": dir.path().to_string_lossy(),
+                "sessionDir": agent_dir.join("sessions").to_string_lossy(),
+                "script": script_path.to_string_lossy(),
+            },
+        }),
+    );
+    let rejected = client.read_response("c2");
+    assert_eq!(
+        rejected["success"], false,
+        "duplicate create succeeded: {rejected}"
+    );
+    assert_eq!(rejected["command"], "create");
+    assert_eq!(
+        rejected["error"],
+        "Agent name \"dup\" is unavailable: an agent of that name already exists at depth 0 under this parent"
+    );
+
+    // An empty name keeps its own error (worker-side parity string).
+    client.send_command(
+        "c3",
+        serde_json::json!({
+            "type": "create",
+            "name": "  ",
+            "config": {
+                "cwd": dir.path().to_string_lossy(),
+                "sessionDir": agent_dir.join("sessions").to_string_lossy(),
+                "script": script_path.to_string_lossy(),
+            },
+        }),
+    );
+    let empty = client.read_response("c3");
+    assert_eq!(
+        empty["success"], false,
+        "empty-name create succeeded: {empty}"
+    );
+    assert_eq!(empty["error"], "Session name cannot be empty");
+}

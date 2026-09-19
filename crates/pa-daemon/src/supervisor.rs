@@ -2948,7 +2948,7 @@ impl Supervisor {
                         .unwrap_or_default();
                     if session_name == name {
                         return Err(anyhow!(
-                            "Session name \"{name}\" is unavailable for depth 0"
+                            "Agent name \"{name}\" is unavailable: an agent of that name already exists at depth 0 under this parent"
                         ));
                     }
                 }
