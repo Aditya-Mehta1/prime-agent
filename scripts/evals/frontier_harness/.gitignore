@@ -1,0 +1,4 @@
+dist/
+.prime/
+__pycache__/
+*.egg-info/
