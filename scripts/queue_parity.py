@@ -16,7 +16,19 @@ sees:
 - the live editor with a slash command and argument tokens typed but not
   submitted — cursor at the end (command segment accented, tokens colored)
   and cursor moved inside the command token (accent suppressed), the
-  editor's text row compared byte-exact.
+  editor's text row compared byte-exact;
+- the transcript prompt-highlight surfaces (TS `PromptTokenMask` +
+  `SlashCommandMessageComponent`): a token-bearing user-message row (the
+  `success`/`mdLink` token colors inside the `userMessageText` body on the
+  `userMessageBg` block), a session-command echo row (accent `/name`,
+  default-fg rest, same block), and a command-bearing user row (`/hotkeys`
+  echoed as a user message with its whole command segment in accent).
+
+The command-bearing user row runs in its own tmux session at 120x130: the
+`/hotkeys` guide rendered under it (markdown tables, one border row per
+table row) is taller than the 120x36 viewport, so the user block would
+scroll off a 36-row capture (the row bytes are width-bound, and the width
+stays 120). Everything else runs at the default size.
 
 Exit code is non-zero when any state's visible rows differ.
 
@@ -47,6 +59,10 @@ QUEUE_FAUX_SCRIPT = {
     "contextWindow": 128000,
     "tokensPerSecond": 6,
     "responses": [
+        # The token-user-row turn answers quickly so the transcript state
+        # settles; the queue turns follow (the first of them streams
+        # slowly).
+        {"content": [{"type": "text", "text": "token user row delivered"}]},
         {
             "content": [
                 {
@@ -84,6 +100,18 @@ SLASH_STEERING_PROMPTS = [
     "/goal finish the port @docs/plan.md --verbose",
     "fix @Cargo.toml --quiet now",
 ]
+
+# Transcript prompt-highlight states (TS `PromptTokenMask` on user rows,
+# `SlashCommandMessageComponent` for the echo): a plain prompt carrying
+# @path/--flag tokens (user row, byte-exact), the same session command the
+# parked lane types (durable echo row, byte-exact — the fresh session skips
+# compaction with the TS warning row), and the /hotkeys client command
+# (command-bearing user row, byte-exact, own 120x80 session).
+USER_TOKEN_PROMPT = "fix @Cargo.toml --quiet now"
+TOKEN_TURN_RESPONSE = "token user row delivered"
+ECHO_COMMAND = "/compact focus the summary on tests"
+HOTKEYS_COMMAND = "/hotkeys"
+HOTKEYS_SIZE = (120, 130)
 
 # Strip rows both binaries must render (the visible queue surface).
 STEERING_ROW = f"Steering: {STEERING_PROMPT}"
@@ -139,6 +167,18 @@ def editor_rows_styled(frame):
     """The editor's typed-text row with its ANSI styling, for byte-exact
     compare (the prompt dock row holding the command)."""
     return styled_rows(frame, ("@docs/plan.md",))
+
+
+def exact_rows_styled(frame, text):
+    """The transcript rows whose ANSI-stripped text equals `text`, ANSI
+    bytes intact, for byte-exact compare (the user block's content row and
+    the session-command echo row)."""
+    frame = normalize_sgr_boundaries(frame)
+    return [
+        line
+        for line in frame.split("\n")
+        if strip_ansi(line).strip() == text
+    ]
 
 
 def prepare_queue_sandbox(base):
@@ -198,6 +238,23 @@ def run_queue_session(binary, sandbox, shared_cwd, script_path, size, out_dir, p
     frames = {}
     # (a) fresh start.
     vp.wait_for(session, "Collapsed mode", timeout=60)
+    # (u) the token-bearing user row: a plain prompt with @path/--flag
+    # tokens submitted while idle renders the TS `PromptTokenMask` colors
+    # inside the user block; the faux turn settles so the frame is stable.
+    vp.tmux("send-keys", "-t", session, USER_TOKEN_PROMPT)
+    vp.tmux("send-keys", "-t", session, "Enter")
+    vp.wait_for(session, TOKEN_TURN_RESPONSE, timeout=60)
+    time.sleep(0.5)
+    frames["u_token_user_row"] = vp.capture(session)
+    # (s) the session-command echo row: the same command the parked lane
+    # types, submitted while idle. The fresh session skips compaction (the
+    # durable TS warning row), and the durable echo row stays on screen —
+    # accent `/compact`, default-fg rest, on the user-message block.
+    vp.tmux("send-keys", "-t", session, ECHO_COMMAND)
+    vp.tmux("send-keys", "-t", session, "Enter")
+    wait_plain(session, "too short to compact", timeout=60)
+    time.sleep(0.5)
+    frames["s_slash_echo_row"] = vp.capture(session)
     # (e1) the editor highlight: type a slash command with argument tokens
     # without submitting, close the autocomplete, capture the editor row.
     vp.tmux("send-keys", "-t", session, EDITOR_COMMAND)
@@ -280,6 +337,62 @@ def run_queue_session(binary, sandbox, shared_cwd, script_path, size, out_dir, p
     return frames
 
 
+def run_hotkeys_session(binary, sandbox, shared_cwd, script_path, out_dir, prefix):
+    """The command-bearing user row (`/hotkeys` echoed as a user message
+    block, TS `echoLocalCommand` + `PromptTokenMask`): its own session at
+    120x80 — the guide rendered under the row is taller than the 36-row
+    viewport, and the row's bytes are width-bound (width stays 120)."""
+    width, height = HOTKEYS_SIZE
+    session = f"vplane-{prefix}-hotkeys-{binary}-{width}x{height}"
+    vp.tmux("kill-session", "-t", session, check=False)
+    vp.tmux(
+        "new-session", "-d", "-s", session, "-x", str(width), "-y", str(height), "-c", shared_cwd
+    )
+    env = (
+        f"HOME={sandbox['home']} "
+        f"PRIME_AGENT_CODING_AGENT_DIR={sandbox['agent']} "
+        f"PRIME_AGENT_FAUX_SCRIPT={script_path} "
+        "PRIME_AGENT_DISABLE_ANALYTICS=1"
+    )
+    if binary == "ts":
+        command = (
+            f"prime-agent --daemon-socket {sandbox['agent']}/daemon.sock "
+            f"--model {vp.TS_SCRIPT_MODEL}"
+        )
+    else:
+        rust = os.environ.get(
+            "PA_RUST_BINARY",
+            os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "..", "target", "debug", "prime-agent"
+            ),
+        )
+        package_dir = os.environ.get("PI_PACKAGE_DIR") or vp.find_runtime_package_dir()
+        command = (
+            f"PI_PACKAGE_DIR={package_dir} "
+            f"{rust} --daemon-socket {sandbox['agent']}/daemon.sock "
+            f"--model {vp.TS_SCRIPT_MODEL}"
+        )
+    vp.tmux("send-keys", "-t", session, f"{env} {command}", "Enter")
+    vp.wait_for(session, "Collapsed mode", timeout=60)
+    vp.tmux("send-keys", "-t", session, HOTKEYS_COMMAND)
+    vp.tmux("send-keys", "-t", session, "Enter")
+    # The guide under the row proves the user block settled.
+    wait_plain(session, "Navigation", timeout=30)
+    time.sleep(0.5)
+    frame = vp.capture(session)
+    vp.tmux("send-keys", "-t", session, "C-c")
+    time.sleep(0.5)
+    vp.tmux("send-keys", "-t", session, "C-c")
+    time.sleep(1.0)
+    vp.tmux("kill-session", "-t", session, check=False)
+    os.makedirs(out_dir, exist_ok=True)
+    with open(
+        os.path.join(out_dir, f"{binary}-u_command_user_row-{width}x{height}.txt"), "w"
+    ) as f:
+        f.write(frame)
+    return {"u_command_user_row": frame}
+
+
 def require_markers(frame, markers, state):
     """Scenario guard: every expected row must be on screen when captured,
     so a too-late capture (delivered before the frame) cannot false-pass."""
@@ -336,6 +449,14 @@ def main():
         rust_frames = run_queue_session(
             "rust", sandboxes["rust"], shared_cwd, script_path, size, out_dir, args.session_prefix
         )
+        ts_hotkeys = run_hotkeys_session(
+            "ts", sandboxes["ts"], shared_cwd, script_path, out_dir, args.session_prefix
+        )
+        rust_hotkeys = run_hotkeys_session(
+            "rust", sandboxes["rust"], shared_cwd, script_path, out_dir, args.session_prefix
+        )
+        ts_frames.update(ts_hotkeys)
+        rust_frames.update(rust_hotkeys)
         # Scenario guards: the strip states must show every parked row when
         # captured (a frame after delivery would compare empty rows).
         require_markers(
@@ -348,6 +469,15 @@ def main():
             [f"Steering: {prompt}" for prompt in SLASH_STEERING_PROMPTS] + [HINT_ROW],
             "q_slash_strip (ts)",
         )
+        # The transcript states must show their rows (an early capture or a
+        # scrolled-off block would compare empty rows).
+        for state, text in (
+            ("u_token_user_row", USER_TOKEN_PROMPT),
+            ("s_slash_echo_row", ECHO_COMMAND),
+            ("u_command_user_row", HOTKEYS_COMMAND),
+        ):
+            require_markers(ts_frames[state], [text], f"{state} (ts)")
+            require_markers(rust_frames[state], [text], f"{state} (rust)")
         failures = []
         # Strip rows compare ANSI byte-exact: the prompt-highlight styling
         # (dim base, accent command segment, colored tokens) is the surface
@@ -366,6 +496,22 @@ def main():
                 strip_rows_styled(rust_frames["q_slash_strip"]),
             )
         )
+        # The transcript rows compare ANSI byte-exact: the TS PromptTokenMask
+        # styling (accent command segment, success/mdLink tokens inside the
+        # userMessageText body) and the echo row's accent command segment
+        # are the surfaces under test.
+        for state, text in (
+            ("u_token_user_row", USER_TOKEN_PROMPT),
+            ("s_slash_echo_row", ECHO_COMMAND),
+            ("u_command_user_row", HOTKEYS_COMMAND),
+        ):
+            failures.append(
+                compare(
+                    f"{state}-{args.size}",
+                    exact_rows_styled(ts_frames[state], text),
+                    exact_rows_styled(rust_frames[state], text),
+                )
+            )
         # The editor's typed-text row compares byte-exact in both cursor
         # positions.
         for state in ("e_editor_slash", "e_editor_cursor_in_command"):

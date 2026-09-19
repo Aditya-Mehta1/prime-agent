@@ -503,14 +503,8 @@ impl AgentView {
                 if !first {
                     rows.push(Vec::new());
                 }
-                let typed = pa_types::slash_commands::parse_slash_command(text)
-                    .map(|(name, _)| name)
-                    .unwrap_or_default();
-                let takes_argument = pa_types::slash_commands::SlashCommandRegistry::builtin()
-                    .takes_argument(&typed);
                 rows.extend(crate::chat_slash::render_slash_command(
                     text,
-                    takes_argument,
                     &self.theme,
                     width,
                 ));

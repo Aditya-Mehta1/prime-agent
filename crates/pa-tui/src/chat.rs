@@ -275,7 +275,12 @@ pub fn render_text_rows(text: &str, style: Style, width: usize) -> Vec<Line> {
 }
 
 /// The user-message block (TS `UserMessageComponent`: Box(2,1) on
-/// `userMessageBg`, markdown inside colored `userMessageText`).
+/// `userMessageBg`, markdown inside colored `userMessageText`). The
+/// prompt-highlight tokens (the accent command segment of a recognized
+/// leading slash command, the `@path`/`--flag` argument tokens) render in
+/// their own colors: TS masks them to same-width placeholders before the
+/// markdown layout and restores them after, so markdown cannot wrap,
+/// emphasize, or eat them (`HighlightedMarkdown` + `PromptTokenMask`).
 pub fn render_user_block(
     text: &str,
     theme: &Theme,
@@ -287,7 +292,11 @@ pub fn render_user_block(
     let body = theme.fg_style(ThemeColor::UserMessageText);
     let mut md = crate::markdown::MarkdownStyle::from_theme(theme);
     md.code_block_indent = code_block_indent.to_string();
-    let rendered = crate::markdown::render_markdown(text, content_width, &md);
+    let (command_end, include_bare_separator) =
+        crate::prompt_highlight::user_message_command_span(text);
+    let mask =
+        crate::prompt_highlight::PromptTokenMask::new(text, command_end, include_bare_separator);
+    let rendered = crate::markdown::render_markdown(&mask.text, content_width, &md);
     let mut rows: Vec<Line> = Vec::new();
     let blank = vec![Span::styled(" ".repeat(width), bg)];
     rows.push(blank.clone());
@@ -300,12 +309,15 @@ pub fn render_user_block(
     }
     for line in rendered {
         let mut row: Line = vec![Span::styled("  ".to_string(), bg)];
-        for span in line {
-            // The user block colors everything `userMessageText` on the
-            // block background; markdown structure (wrapping) is kept, its
-            // own colors are not.
-            row.push(Span::styled(span.content, bg.patch(body)));
-        }
+        // The user block colors everything `userMessageText` on the block
+        // background; markdown structure (wrapping) is kept, its own colors
+        // are not. The masked placeholders restore to their token colors
+        // over that base.
+        let restyled: Line = line
+            .into_iter()
+            .map(|span| Span::styled(span.content, bg.patch(body)))
+            .collect();
+        row.extend(mask.restore_line(theme, &restyled));
         rows.push(pad_to(row, width, bg));
     }
     rows.push(blank);
@@ -607,6 +619,152 @@ mod tests {
             .collect::<String>();
         assert_eq!(text.trim(), "Run a quick check.");
         assert_eq!(text.len(), 60);
+    }
+
+    /// The user block's styling tiers: the row background, the
+    /// `userMessageText` body, and the prompt-highlight token colors.
+    fn user_block_styles() -> (Style, Style, Style, Style, Style) {
+        let theme = theme();
+        let bg = theme.bg_style(ThemeBg::UserMessageBg);
+        let body = theme.fg_style(ThemeColor::UserMessageText);
+        let on_bg = |fg: Style| bg.patch(fg);
+        (
+            bg,
+            on_bg(body),
+            on_bg(theme.fg_style(ThemeColor::Accent)),
+            on_bg(theme.fg_style(ThemeColor::Success)),
+            on_bg(theme.fg_style(ThemeColor::MdLink)),
+        )
+    }
+
+    /// One row's runs with adjacent same-style spans merged: the
+    /// markdown renderer splits words and the restore keeps token runs,
+    /// so the styled runs — not the span segmentation — are the contract.
+    fn row_runs(row: &Line) -> Vec<(String, Style)> {
+        let mut runs: Vec<(String, Style)> = Vec::new();
+        for span in row {
+            if let Some((text, style)) = runs.last_mut() {
+                if *style == span.style {
+                    text.push_str(&span.content);
+                    continue;
+                }
+            }
+            runs.push((span.content.to_string(), span.style));
+        }
+        runs
+    }
+
+    #[test]
+    fn user_block_highlights_argument_tokens() {
+        // TS `PromptTokenMask`: the argument tokens render in their own
+        // colors inside the `userMessageText` body.
+        let (bg, body, _, success, md_link) = user_block_styles();
+        let rows = render_user_block("fix @Cargo.toml --quiet now", &theme(), "  ", 60);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            row_runs(&rows[1]),
+            vec![
+                ("  ".to_string(), bg),
+                ("fix ".to_string(), body),
+                ("@Cargo.toml".to_string(), success),
+                (" ".to_string(), body),
+                ("--quiet".to_string(), md_link),
+                (" now".to_string(), body),
+                (" ".repeat(60 - 2 - 27), bg),
+            ]
+        );
+    }
+
+    #[test]
+    fn user_block_accents_a_recognized_leading_command() {
+        // TS `UserMessageComponent`: a leading `/name` naming a recognized
+        // command masks in accent over the whole command segment; an
+        // unrecognized one renders like any other text.
+        let (bg, body, accent, _, _) = user_block_styles();
+        let rows = render_user_block("/hotkeys", &theme(), "  ", 40);
+        assert_eq!(
+            row_runs(&rows[1]),
+            vec![
+                ("  ".to_string(), bg),
+                ("/hotkeys".to_string(), accent),
+                (" ".repeat(40 - 2 - 8), bg),
+            ]
+        );
+        let rows = render_user_block("/definitely-not-builtin now", &theme(), "  ", 40);
+        let styled = row_runs(&rows[1]);
+        // The unrecognized row stays uniform `userMessageText`.
+        assert_eq!(
+            styled
+                .iter()
+                .map(|(t, _)| t.as_str())
+                .collect::<String>()
+                .trim(),
+            "/definitely-not-builtin now"
+        );
+        assert!(
+            styled
+                .iter()
+                .filter(|(_, s)| s != &bg)
+                .all(|(_, s)| s == &body),
+            "no accent for unrecognized commands: {styled:?}"
+        );
+    }
+
+    #[test]
+    fn user_block_mask_shields_tokens_from_markdown() {
+        // The mask exists so markdown cannot eat or emphasize the token
+        // text: an `@path` full of asterisks renders verbatim in the token
+        // color, and a long token wraps like plain text.
+        let (_, _, _, success, _) = user_block_styles();
+        let rows = render_user_block("use @a*b_c and more", &theme(), "  ", 60);
+        let text: String = rows[1].iter().map(|s| s.content.as_str()).collect();
+        assert!(
+            text.contains("@a*b_c"),
+            "the token renders verbatim: {text:?}"
+        );
+        assert!(
+            row_runs(&rows[1])
+                .iter()
+                .any(|(t, s)| t == "@a*b_c" && *s == success),
+            "the token renders in success color"
+        );
+    }
+
+    #[test]
+    fn user_block_plain_sources_stay_plain() {
+        // A source holding literal mask-range characters (TS
+        // `MASK_LITERAL_PATTERN`) masks nothing at all: the token colors
+        // would alias the literals, so the row renders whole.
+        let (bg, body, _, _, _) = user_block_styles();
+        let rows = render_user_block("look \u{E000} at @file", &theme(), "  ", 60);
+        let styled: Vec<(String, Style)> = rows[1]
+            .iter()
+            .map(|s| (s.content.to_string(), s.style))
+            .collect();
+        assert!(
+            styled
+                .iter()
+                .filter(|(_, s)| s != &bg)
+                .all(|(_, s)| s == &body),
+            "a literal-mask source renders whole: {styled:?}"
+        );
+        // More masked graphemes than the placeholder alphabet holds (TS
+        // MASK_CAPACITY = 0xF8FF - 0xE000 + 1 = 6400) mask nothing. (The
+        // block's OSC zone-marker spans on the first and last rows are
+        // exempt.)
+        let long = format!("fix {} now", "@x".repeat(3300));
+        let rows = render_user_block(&long, &theme(), "  ", 60);
+        let offending: Vec<(String, Style)> = rows
+            .iter()
+            .flatten()
+            .filter(|s| !s.content.contains('\u{1b}'))
+            .filter(|s| s.style != body && s.style != bg)
+            .map(|s| (s.content.clone(), s.style))
+            .collect();
+        assert!(
+            offending.is_empty(),
+            "over-capacity sources render whole: {offending:?}"
+        );
     }
 
     #[test]

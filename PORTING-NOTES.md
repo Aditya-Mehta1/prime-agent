@@ -1629,3 +1629,57 @@ HEAD
   catalog excludes them; and the full restore round-trip: kill → age →
   restart archives the session, `send_message` by name restores it and the
   woken worker answers against the mock provider).
+
+## Transcript prompt highlight: user rows + session-command echo (prompt-token-mask lane)
+
+Extends #195's prompt-highlight engine over the two transcript surfaces it
+deliberately left out (TS `prompt-highlight.ts`):
+
+- User-message rows (TS `UserMessageComponent` + `HighlightedMarkdown` +
+  `PromptTokenMask`): the prompt-highlight applies to EVERY transcript user
+  row. The accent command segment masks only when the row's text opens with
+  a `/name` naming a recognized command (TS `isRecognizedSlashCommand` —
+  builtins plus daemon-registered connection commands; the Rust
+  recognizes builtins, the same reduction the queued-strip preview makes);
+  the argument tokens (`@path` `success`, `--flag` `mdLink`, a bare `--`
+  only for argument-taking commands) mask on every row. Masking is
+  layout-exact: tabs expand to three spaces, each token grapheme is
+  replaced by a private-use base char (U+E000 + index) padded with U+FF9E
+  per extra column so the placeholder measures the grapheme's width; the
+  markdown renders the masked text (so markdown cannot wrap inside, eat,
+  or emphasize token text — e.g. an `@path` full of asterisks renders
+  verbatim), then `restoreLine` swaps the placeholders back in the token
+  colors inside the `userMessageText` body. Sources holding literal
+  U+E000..U+F8FF/U+FF9E chars, or more masked graphemes than the 6400-char
+  placeholder alphabet, mask nothing and render plain (TS `MASK_LITERAL`
+  and capacity bail). TS `restoreText` (selection-copy restore) has no
+  Rust surface yet — mouse text selection is unported.
+- Width mirror: TS `graphemeWidth` counts U+FF9E/U+FF9F (halfwidth
+  katakana sound marks, EastAsianWidth H) as one column each; the Rust
+  `char_width` now does too (unicode-width counted them zero as
+  Grapheme_Extend, which would under-measure the mask's placeholders).
+- Session-command echo rows (TS `SlashCommandMessageComponent` +
+  `styleSlashCommandText`): the accent covers the leading `/name` for ANY
+  typed name (recognized or not — the echo styles the typed text, not the
+  registry), and the WHOLE text when the row is not a slash command (TS
+  `commandEnd = text.length` fallback); the rest is default foreground
+  with the argument tokens colored. The styled line wraps (TS wraps the
+  styled string), so a token split by a line break keeps its color on both
+  halves — the old per-row rescan lost the continuation's color and
+  missed the quoted/backslash token forms.
+- Surfaces kept byte-stable: the queued strip, editor highlight, and the
+  malformed-session-command notice paths are unchanged (`/hotkeys` echoes
+  through the same user-row renderer with the builtin-recognition
+  predicate).
+- Verifiers: unit tests on the mask (placeholder text, width
+  preservation, zero-width literals, tab expansion, literal/capacity
+  bails, restore), the user-row renderers (token colors inside the
+  `userMessageText` body, accent on recognized commands only, markdown
+  shielding, plain fallbacks), and the echo renderer (TS span shape,
+  quoted/bare-separator token forms, wrap color carry-over); frame
+  evidence in `scripts/queue_parity.py`: a token-bearing user row, the
+  `/compact` echo row (fresh-session skip warning flow), and the
+  `/hotkeys` command-bearing user row, each byte-exact vs the TS binary
+  at width 120 (the `/hotkeys` state runs 120x80 in its own tmux session
+  — its guide overflows the 36-row viewport, and the row bytes are
+  width-bound).

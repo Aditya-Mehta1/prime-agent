@@ -5,7 +5,7 @@
 //! `/name` token in `accent` and `@path` / `--flag` argument tokens in
 //! `success` / `mdLink` (prompt-highlight token styling).
 
-use crate::theme::{Theme, ThemeBg, ThemeColor};
+use crate::theme::{Theme, ThemeBg};
 use crate::width::{str_width, wrap_text};
 use crate::{Line, Span};
 use ratatui::style::Style;
@@ -54,76 +54,65 @@ fn wrap_block(
     rows
 }
 
-/// The command echo row: the full typed command. The `/name` token renders
-/// in `accent`; `@path` and `--flag` argument tokens highlight (`success`
-/// and `mdLink`); a bare `--` separator highlights only for argument-taking
-/// commands.
-pub fn render_slash_command(
-    text: &str,
-    takes_argument: bool,
-    theme: &Theme,
-    width: usize,
-) -> Vec<Line> {
-    let accent = theme.fg_style(ThemeColor::Accent);
-    let success = theme.fg_style(ThemeColor::Success);
-    let md_link = theme.fg_style(ThemeColor::MdLink);
-    let style_row = |row: &str| -> Line {
-        let mut spans: Line = Vec::new();
-        let chars: Vec<char> = row.chars().collect();
-        let mut plain_start = 0usize;
-        let mut index = 0usize;
-        while index < chars.len() {
-            let boundary = index == 0 || chars[index - 1].is_whitespace();
-            if !boundary {
-                index += 1;
-                continue;
-            }
-            let (token_end, style) = if chars[index] == '/' {
-                // The command token: through the first whitespace or the
-                // row end.
-                let end = chars[index..]
-                    .iter()
-                    .position(|c| c.is_whitespace())
-                    .map(|p| index + p)
-                    .unwrap_or(chars.len());
-                (end, accent)
-            } else {
-                match argument_token_end(&chars, index, takes_argument) {
-                    Some((end, kind)) => {
-                        let style = match kind {
-                            TokenKind::AtPath => success,
-                            TokenKind::Flag => md_link,
-                        };
-                        (end, style)
-                    }
-                    None => {
-                        index += 1;
-                        continue;
-                    }
-                }
-            };
-            if token_end == index {
-                index += 1;
-                continue;
-            }
-            if plain_start < index {
-                spans.push(Span::raw(
-                    chars[plain_start..index].iter().collect::<String>(),
-                ));
-            }
-            spans.push(Span::styled(
-                chars[index..token_end].iter().collect::<String>(),
-                style,
-            ));
-            plain_start = token_end;
-            index = token_end;
+/// The command echo row: the full typed command, laid out like a user
+/// message. TS `styleSlashCommandText` + `Text`: the `/name` command
+/// segment renders in `accent` (the whole text when the row is not a slash
+/// command); `@path` and `--flag` argument tokens highlight in `success`
+/// and `mdLink`, a bare `--` separator only for argument-taking commands;
+/// the styled text then wraps, so a token split by a line break keeps its
+/// color on both halves.
+pub fn render_slash_command(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
+    let bg = theme.bg_style(ThemeBg::UserMessageBg);
+    // The styled source line: the accent and token spans over the typed
+    // text (default foreground between them, TS `styleOther` identity).
+    let mut styled: Line = Vec::new();
+    let mut offset = 0usize;
+    for span in crate::prompt_highlight::slash_command_source_spans(text) {
+        if span.start > offset {
+            styled.push(Span::raw(crate::prompt_highlight::char_slice(
+                text, offset, span.start,
+            )));
         }
-        if plain_start < chars.len() {
-            spans.push(Span::raw(chars[plain_start..].iter().collect::<String>()));
+        styled.push(theme.fg(
+            span.color,
+            crate::prompt_highlight::char_slice(text, span.start, span.end),
+        ));
+        offset = span.end;
+    }
+    let total = text.chars().count();
+    if offset < total {
+        styled.push(Span::raw(crate::prompt_highlight::char_slice(
+            text, offset, total,
+        )));
+    }
+    // Wrap the styled line (TS wraps the styled string), splitting on the
+    // source newlines like `wrapTextWithAnsi` splits input lines.
+    let mut paragraphs: Vec<Line> = vec![Vec::new()];
+    for span in &styled {
+        for (index, part) in span.content.split('\n').enumerate() {
+            if index > 0 {
+                paragraphs.push(Vec::new());
+            }
+            if !part.is_empty() {
+                paragraphs
+                    .last_mut()
+                    .expect("paragraph list starts non-empty")
+                    .push(Span::styled(part, span.style));
+            }
         }
-        spans
-    };
-    let mut rows = wrap_block(text, theme, width, style_row);
+    }
+    let mut rows = vec![vec![Span::styled(" ".repeat(width), bg)]];
+    let mut wrapped_any = false;
+    for paragraph in &paragraphs {
+        for line in crate::width::wrap_line(paragraph, content_width(width)) {
+            rows.push(block_row(line, bg, width));
+            wrapped_any = true;
+        }
+    }
+    if !wrapped_any {
+        rows.push(block_row(Vec::new(), bg, width));
+    }
+    rows.push(vec![Span::styled(" ".repeat(width), bg)]);
     // Zone markers on the echo block (TS `SlashCommandMessageComponent`);
     // result rows render unmarked.
     if let Some(first) = rows.first_mut() {
@@ -147,58 +136,11 @@ pub fn render_slash_command_result(content: &str, theme: &Theme, width: usize) -
     wrap_block(content, theme, width, style_row)
 }
 
-/// The argument-token kinds and their colors.
-enum TokenKind {
-    /// `@path` token (`success`).
-    AtPath,
-    /// `--flag` token (`mdLink`).
-    Flag,
-}
-
-/// One argument token starting at `index`: an `@path` (a non-whitespace run)
-/// or a `--flag` (letters/digits/dashes). A bare `--` end-of-options
-/// separator counts only for argument-taking commands and only before
-/// whitespace or the row end.
-fn argument_token_end(
-    chars: &[char],
-    index: usize,
-    takes_argument: bool,
-) -> Option<(usize, TokenKind)> {
-    let first = *chars.get(index)?;
-    if first == '@' {
-        let mut end = index + 1;
-        while end < chars.len() && !chars[end].is_whitespace() {
-            end += 1;
-        }
-        return (end > index + 1).then_some((end, TokenKind::AtPath));
-    }
-    if first == '-' && chars.get(index + 1) == Some(&'-') {
-        let mut end = index + 2;
-        if end == chars.len() {
-            // `--` at the row end.
-            return takes_argument.then_some((end, TokenKind::Flag));
-        }
-        let head = chars[end];
-        if !head.is_ascii_alphanumeric() {
-            // Bare `--` before whitespace.
-            if takes_argument && head.is_whitespace() {
-                return Some((end, TokenKind::Flag));
-            }
-            return None;
-        }
-        while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '-') {
-            end += 1;
-        }
-        return Some((end, TokenKind::Flag));
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::osc133;
-    use crate::theme::{ColorMode, Theme};
+    use crate::theme::{ColorMode, Theme, ThemeColor};
 
     fn theme() -> Theme {
         Theme::builtin("prime", ColorMode::TrueColor)
@@ -212,7 +154,7 @@ mod tests {
 
     #[test]
     fn echo_row_uses_block_geometry() {
-        let rows = render_slash_command("/goal status", true, &theme(), 40);
+        let rows = render_slash_command("/goal status", &theme(), 40);
         // The echo block carries the zone markers (TS marks the echo but
         // never the result row).
         assert!(osc133::row_markers(&rows[0]).start);
@@ -229,12 +171,7 @@ mod tests {
 
     #[test]
     fn echo_row_wraps_long_args() {
-        let rows = render_slash_command(
-            "/goal make the verifier pass everywhere",
-            true,
-            &theme(),
-            30,
-        );
+        let rows = render_slash_command("/goal make the verifier pass everywhere", &theme(), 30);
         let text = plain(&rows);
         assert_eq!(text.len(), 4);
         assert!(text[1].starts_with("  /goal make the verifier"));
@@ -247,5 +184,121 @@ mod tests {
         let text = plain(&rows);
         assert_eq!(text.len(), 3);
         assert!(text[1].contains("Goal active: ship it"));
+    }
+
+    fn spans_of(row: &Line) -> Vec<(String, Style)> {
+        row.iter()
+            .map(|s| (s.content.to_string(), s.style))
+            .collect()
+    }
+
+    /// The styled spans of one render at `Style` level: token colors on
+    /// the block background (the block paints the whole row) and the
+    /// default foreground on it between the tokens.
+    fn echo_styles() -> (Style, Style, Style, Style, Style) {
+        let theme = theme();
+        let bg = theme
+            .bg_style(ThemeBg::UserMessageBg)
+            .bg
+            .expect("the user-message background is set");
+        let on_bg = |style: Style| Style::default().bg(bg).patch(style);
+        (
+            on_bg(theme.fg_style(ThemeColor::Accent)),
+            on_bg(theme.fg_style(ThemeColor::Success)),
+            on_bg(theme.fg_style(ThemeColor::MdLink)),
+            Style::default().bg(bg),
+            theme.bg_style(ThemeBg::UserMessageBg),
+        )
+    }
+
+    #[test]
+    fn echo_row_styles_command_and_tokens_like_ts() {
+        // TS `styleSlashCommandText`: accent on the leading `/name`,
+        // default foreground between, `success`/`mdLink` on the tokens.
+        let (accent, success, md_link, plain, pad) = echo_styles();
+        let rows = render_slash_command("/compact fix @Cargo.toml --quiet", &theme(), 60);
+        let styled = spans_of(&rows[1]);
+        assert_eq!(
+            styled,
+            vec![
+                ("  ".to_string(), pad),
+                ("/compact".to_string(), accent),
+                (" fix ".to_string(), plain),
+                ("@Cargo.toml".to_string(), success),
+                (" ".to_string(), plain),
+                ("--quiet".to_string(), md_link),
+                (" ".repeat(26), pad),
+            ]
+        );
+        // The whole text accents when the row is not a slash command (TS
+        // falls back to `commandEnd = text.length`).
+        let rows = render_slash_command("plain echo text", &theme(), 60);
+        let styled = spans_of(&rows[1]);
+        assert_eq!(
+            styled,
+            vec![
+                ("  ".to_string(), pad),
+                ("plain echo text".to_string(), accent),
+                (" ".repeat(43), pad),
+            ]
+        );
+        // An unrecognized leading `/name` still accents (the echo styles
+        // the typed command, not the registry); its bare `--` does not.
+        let rows = render_slash_command("/nope x -- y", &theme(), 60);
+        let styled = spans_of(&rows[1]);
+        assert!(
+            styled.iter().any(|(t, s)| t == "/nope" && *s == accent),
+            "unrecognized commands accent: {styled:?}"
+        );
+        assert!(
+            !styled.iter().any(|(t, _)| t == "--"),
+            "a no-argument command does not get the separator pattern: {styled:?}"
+        );
+    }
+
+    #[test]
+    fn echo_row_token_forms_follow_the_engine_pattern() {
+        let (_, success, md_link, _, _) = echo_styles();
+        // Quoted @-paths keep their spaces.
+        let rows = render_slash_command(r#"/new @"my file" --draft"#, &theme(), 60);
+        let styled = spans_of(&rows[1]);
+        assert!(
+            styled
+                .iter()
+                .any(|(t, s)| t == "@\"my file\"" && *s == success),
+            "quoted @path keeps its spaces: {styled:?}"
+        );
+        assert!(styled.iter().any(|(t, s)| t == "--draft" && *s == md_link));
+        // A bare `--` highlights for argument-taking commands.
+        let rows = render_slash_command("/new x -- y", &theme(), 60);
+        let styled = spans_of(&rows[1]);
+        assert!(styled.iter().any(|(t, s)| t == "--" && *s == md_link));
+    }
+
+    #[test]
+    fn echo_row_keeps_token_color_across_the_wrap() {
+        // A long token split by the wrap keeps its color on both halves
+        // (TS wraps the styled string, not the plain text): at content
+        // width 16 the 23-char token breaks into two colored chunks.
+        let rows = render_slash_command("/new @01234567890123456789012 tail", &theme(), 20);
+        let (_, success, _, _, _) = echo_styles();
+        let styled: Vec<Vec<(String, Style)>> = rows.iter().map(spans_of).collect();
+        let token_parts: Vec<String> = styled
+            .iter()
+            .flatten()
+            .filter(|(_, s)| *s == success)
+            .map(|(t, _)| t.clone())
+            .collect();
+        assert_eq!(
+            token_parts,
+            vec!["@012345678901234".to_string(), "56789012".to_string()]
+        );
+        assert!(
+            styled
+                .iter()
+                .flatten()
+                .any(|(t, s)| t == "tail" && *s != success),
+            "the plain word after the token stays default-fg: {styled:?}"
+        );
     }
 }

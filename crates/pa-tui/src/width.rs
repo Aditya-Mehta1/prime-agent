@@ -11,6 +11,12 @@ use unicode_width::UnicodeWidthChar;
 pub fn char_width(c: char) -> usize {
     match c {
         '\t' => 3,
+        // TS `graphemeWidth` counts the halfwidth katakana sound marks
+        // (EastAsianWidth H) as one column each, both standalone and as
+        // the trailing half of a cluster; `unicode-width` counts them zero
+        // as Grapheme_Extend. The prompt-token mask pads its placeholders
+        // with `FF9E` per extra column, so the layout wrap must count it.
+        '\u{FF9E}' | '\u{FF9F}' => 1,
         c if c.is_control() => 0,
         c => c.width().unwrap_or(0),
     }
@@ -330,4 +336,19 @@ pub fn trim_trailing_empty(lines: &mut Vec<Line>) {
 /// First char width of `s` for overflow checks.
 pub fn base_char_w(c: char) -> usize {
     base_char_width(c)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn halfwidth_sound_marks_count_one_column() {
+        // TS `graphemeWidth` counts U+FF9E/U+FF9F (EastAsianWidth H) as
+        // one column each — the prompt-token mask pads its placeholders
+        // with FF9E per extra column, so the layout wrap must count it.
+        assert_eq!(char_width('\u{FF9E}'), 1);
+        assert_eq!(char_width('\u{FF9F}'), 1);
+        assert_eq!(str_width("a\u{FF9E}b"), 3);
+    }
 }
