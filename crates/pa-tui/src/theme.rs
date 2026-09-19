@@ -396,6 +396,49 @@ impl Theme {
     pub fn editor_background(&self) -> Option<Style> {
         Some(self.bg_style(ThemeBg::UserMessageBg))
     }
+
+    /// Filled effort squares: a pastel purple that reads softer than the
+    /// theme accent (TS `getEffortSquareColor`). The TS theme picks a light
+    /// pastel on light terminal backgrounds; the Rust theme does not yet
+    /// detect the terminal background kind, so the dark pastel is the
+    /// default-terminal match.
+    pub fn effort_square_style(&self) -> Style {
+        const EFFORT_SQUARE_DARK_COLOR: Color = Color::Rgb(0xa7, 0x8b, 0xfa);
+        Style::default().fg(to_terminal_color(EFFORT_SQUARE_DARK_COLOR, self.mode))
+    }
+
+    /// Row-selection highlight for menu rows (TS
+    /// `getSoftSelectionBackgroundColor`): the selection color blended
+    /// halfway toward the editor surface — a softer band than the full
+    /// selection block. Non-RGB palettes have no reliable blend base, so
+    /// they keep the plain selection background.
+    pub fn soft_selection_style(&self) -> Style {
+        let blend = |top: (u16, u16, u16), bottom: (u16, u16, u16), alpha: f32| {
+            Color::Rgb(
+                (top.0 as f32 * alpha + bottom.0 as f32 * (1.0 - alpha)).round() as u8,
+                (top.1 as f32 * alpha + bottom.1 as f32 * (1.0 - alpha)).round() as u8,
+                (top.2 as f32 * alpha + bottom.2 as f32 * (1.0 - alpha)).round() as u8,
+            )
+        };
+        let (Some(Color::Rgb(sr, sg, sb)), Some(surface @ Color::Rgb(ur, ug, ub))) = (
+            self.bg_color(ThemeBg::SelectedBg),
+            self.bg_color(ThemeBg::UserMessageBg),
+        ) else {
+            return self.bg_style(ThemeBg::SelectedBg);
+        };
+        let selection = (sr as u16, sg as u16, sb as u16);
+        let editor_surface = (ur as u16, ug as u16, ub as u16);
+        let surface_ansi = to_terminal_color(surface, self.mode);
+        // Half contrast by default; strengthen the blend only when
+        // quantization would collapse the highlight into the editor surface.
+        for alpha in [0.5, 0.75, 1.0] {
+            let adjusted = to_terminal_color(blend(selection, editor_surface, alpha), self.mode);
+            if adjusted != surface_ansi {
+                return Style::default().bg(adjusted);
+            }
+        }
+        self.bg_style(ThemeBg::SelectedBg)
+    }
 }
 
 fn span_with(span: crate::Span, modifier: Modifier) -> crate::Span {

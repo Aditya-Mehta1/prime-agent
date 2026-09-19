@@ -248,6 +248,10 @@ fn spawn_supervisor(dir: &Path) -> Supervisor {
         .args(["--mode", "daemon", "--daemon-socket"])
         .arg(&socket)
         .env("PRIME_AGENT_CODING_AGENT_DIR", &agent_dir)
+        // The daemon's startup catalog refresh must never reach the network
+        // from a test: PI_OFFLINE keeps it on the bundled/models.json
+        // snapshot (the same fallback the picker renders).
+        .env("PI_OFFLINE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -370,6 +374,9 @@ async fn tui_attaches_prompts_streams_lists_and_switches() {
         script_path: Some(dir.path().join("script.json")),
         model_selection: Default::default(),
         model_catalog: Vec::new(),
+        model_configured_providers: Default::default(),
+        model_recent_models: Vec::new(),
+        default_thinking_level: None,
         no_session: false,
         session: pa_tui::interactive::SessionSelection::New,
         show_images: true,
@@ -517,6 +524,9 @@ async fn ensure_daemon_running_spawns_supervisor_and_tui_attaches() {
         script_path: Some(script_path),
         model_selection: Default::default(),
         model_catalog: Vec::new(),
+        model_configured_providers: Default::default(),
+        model_recent_models: Vec::new(),
+        default_thinking_level: None,
         no_session: false,
         session: pa_tui::interactive::SessionSelection::New,
         show_images: true,
@@ -597,6 +607,9 @@ async fn tui_dispatches_slash_commands_menu_and_suggestions() {
         script_path: Some(dir.path().join("script.json")),
         model_selection: Default::default(),
         model_catalog: Vec::new(),
+        model_configured_providers: Default::default(),
+        model_recent_models: Vec::new(),
+        default_thinking_level: None,
         no_session: false,
         session: pa_tui::interactive::SessionSelection::New,
         show_images: true,
@@ -620,8 +633,6 @@ async fn tui_dispatches_slash_commands_menu_and_suggestions() {
             pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
             // Unknown command: the exact TS suggestion error.
             pa_tui::interactive::HeadlessStep::Submit("/modle".to_string()),
-            // A builtin client command whose UI does not exist yet.
-            pa_tui::interactive::HeadlessStep::Submit("/model".to_string()),
             // The autocomplete menu: typed input like a user keystroke by
             // keystroke, completed with Enter, then submitted.
             pa_tui::interactive::HeadlessStep::Type("/".to_string()),
@@ -635,6 +646,10 @@ async fn tui_dispatches_slash_commands_menu_and_suggestions() {
             // suggestion (`/goal `); the second Enter submits it.
             pa_tui::interactive::HeadlessStep::Type("\n".to_string()),
             pa_tui::interactive::HeadlessStep::Type("\n".to_string()),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+            // `/model` LAST: the inline menu-panel opens and owns the keys
+            // from here on (TS `showConfigurationMenu`).
+            pa_tui::interactive::HeadlessStep::Submit("/model".to_string()),
             pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
         ],
         width: 120,
@@ -669,8 +684,12 @@ async fn tui_dispatches_slash_commands_menu_and_suggestions() {
         "the unknown-command suggestion matched the TS string:\n{rendered}"
     );
     assert!(
-        rendered.contains("No models available. Use /login to log into a provider"),
-        "the /model command surfaced the TS no-models note:\n{rendered}"
+        rendered.contains("Search models"),
+        "the /model command opened the inline menu-panel:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Enter select \u{b7} Esc close"),
+        "the menu-panel hint rendered:\n{rendered}"
     );
     // The menu: the first registry entry is selected at `/`, and `/goa`
     // fuzzy-matches to the goal command.
@@ -781,6 +800,9 @@ async fn tui_model_picker_applies_and_effort_reports() {
         script_path: Some(dir.path().join("script.json")),
         model_selection: Default::default(),
         model_catalog: catalog,
+        model_configured_providers: Default::default(),
+        model_recent_models: Vec::new(),
+        default_thinking_level: None,
         no_session: false,
         session: pa_tui::interactive::SessionSelection::New,
         show_images: true,
@@ -872,6 +894,9 @@ async fn tui_compact_on_a_short_session_warns_nothing_to_compact() {
         script_path: Some(dir.path().join("script.json")),
         model_selection: Default::default(),
         model_catalog: Vec::new(),
+        model_configured_providers: Default::default(),
+        model_recent_models: Vec::new(),
+        default_thinking_level: None,
         no_session: false,
         session: pa_tui::interactive::SessionSelection::New,
         show_images: true,
@@ -995,6 +1020,9 @@ async fn tui_compact_shows_the_loader_then_the_summary_and_rebuilds() {
         script_path: Some(dir.path().join("script.json")),
         model_selection: Default::default(),
         model_catalog: Vec::new(),
+        model_configured_providers: Default::default(),
+        model_recent_models: Vec::new(),
+        default_thinking_level: None,
         no_session: false,
         session: pa_tui::interactive::SessionSelection::New,
         show_images: true,
@@ -1180,6 +1208,9 @@ async fn tui_session_tree_navigates_forks_and_clones() {
         script_path: Some(dir.path().join("script.json")),
         model_selection: Default::default(),
         model_catalog: Vec::new(),
+        model_configured_providers: Default::default(),
+        model_recent_models: Vec::new(),
+        default_thinking_level: None,
         no_session: false,
         session: pa_tui::interactive::SessionSelection::New,
         initial_message: None,
@@ -1368,6 +1399,9 @@ async fn tui_big_streamed_turns_render_at_the_producer_rate() {
         script_path: Some(dir.path().join("script.json")),
         model_selection: Default::default(),
         model_catalog: Vec::new(),
+        model_configured_providers: Default::default(),
+        model_recent_models: Vec::new(),
+        default_thinking_level: None,
         no_session: false,
         session: pa_tui::interactive::SessionSelection::New,
         show_images: true,

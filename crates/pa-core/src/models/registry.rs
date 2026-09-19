@@ -791,6 +791,111 @@ mod tests {
     }
 
     #[test]
+    fn live_catalog_cache_merges_over_the_bundled_prime_inference_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_path = dir.path().join("models.json");
+        std::fs::write(
+            &models_path,
+            r#"{ "providers": { "custom": {
+                "baseUrl": "https://custom.example", "apiKey": "custom-key",
+                "api": "openai-completions", "authHeader": true,
+                "models": [ { "id": "my-model" } ]
+            } } }"#,
+        )
+        .unwrap();
+        // A live-catalog cache: one bundled model repriced, one new entry,
+        // well past the coverage floor so the build accepts it.
+        let bundled = super::ModelRegistry::bundled_prime_inference_models();
+        // The live catalog carries public models only: reprice the first
+        // public bundled entry (private models stay on the bundled table).
+        let repriced_index = bundled
+            .iter()
+            .position(|model| {
+                !super::super::prime_inference::is_private_prime_inference_model_id(&model.id)
+            })
+            .expect("a public bundled model");
+        let mut entries = Vec::new();
+        for (index, model) in bundled.iter().enumerate() {
+            if super::super::prime_inference::is_private_prime_inference_model_id(&model.id) {
+                continue;
+            }
+            entries.push(serde_json::json!({
+                "id": model.id,
+                "display_name": model.name,
+                "pricing": {
+                    "input_usd_per_mtok": if index == repriced_index { 7.0 } else { model.cost.input.as_f64() },
+                    "output_usd_per_mtok": model.cost.output.as_f64(),
+                },
+                "specs": {
+                    "context_window": model.context_window,
+                    "max_output_tokens": model.max_tokens,
+                    "supports_reasoning": model.reasoning,
+                    "modalities": { "input": ["text"], "output": ["text"] },
+                },
+            }));
+        }
+        entries.push(serde_json::json!({
+            "id": "anthropic/live-only-model",
+            "display_name": "Live Only Model",
+            "pricing": { "input_usd_per_mtok": 1.0, "output_usd_per_mtok": 2.0 },
+            "specs": {
+                "context_window": 64000, "max_output_tokens": 8192,
+                "supports_reasoning": false,
+                "modalities": { "input": ["text"], "output": ["text"] },
+            },
+        }));
+        std::fs::write(
+            dir.path().join("prime-inference-models-cache.json"),
+            serde_json::to_vec(&serde_json::json!({ "data": entries })).unwrap(),
+        )
+        .unwrap();
+        let registry = ModelRegistry::create(auth_with(serde_json::json!({})), &models_path);
+        let all = registry.get_all();
+        // The live repriced model replaced its bundled template (other
+        // providers may serve the same id; match the provider too).
+        let repriced = all
+            .iter()
+            .find(|model| {
+                model.id == bundled[repriced_index].id && model.provider == "prime-inference"
+            })
+            .expect("repriced model");
+        assert_eq!(repriced.cost.input.as_f64(), 7.0);
+        assert_eq!(
+            repriced.base_url,
+            super::super::prime_inference::PRIME_INFERENCE_BASE_URL
+        );
+        // The live-only model is present.
+        assert!(all
+            .iter()
+            .any(|model| model.id == "anthropic/live-only-model"));
+        // The custom models.json model survives the merge.
+        assert!(all.iter().any(|model| model.id == "my-model"));
+        // Bundled models of other providers stay.
+        assert!(all
+            .iter()
+            .any(|model| model.provider == "anthropic" && model.id != bundled[0].id));
+    }
+
+    #[test]
+    fn a_missing_or_corrupt_cache_falls_back_to_the_bundled_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_path = dir.path().join("models.json");
+        std::fs::write(&models_path, "{ not json").unwrap();
+        std::fs::write(
+            dir.path().join("prime-inference-models-cache.json"),
+            "{ not json",
+        )
+        .unwrap();
+        let registry = ModelRegistry::create(auth_with(serde_json::json!({})), &models_path);
+        // The bundled public prime-inference models serve the catalog.
+        assert!(registry
+            .get_all()
+            .iter()
+            .any(|model| model.provider == "prime-inference"));
+        assert!(registry.get_error().is_some());
+    }
+
+    #[test]
     fn explicit_private_ids_are_authorized() {
         let registry = ModelRegistry::in_memory(auth_with(serde_json::json!({})));
         let private_model = model("internal/custom-private", "prime-inference");

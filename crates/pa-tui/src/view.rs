@@ -846,15 +846,25 @@ impl AgentView {
         if let Some(screen) = &self.onboarding {
             return screen.render(&self.theme, width, height);
         }
-        if let Some(picker) = &self.model_picker {
-            return picker_pane(picker.render(&self.theme, width), width, height);
-        }
-        if let Some(picker) = &self.effort_picker {
-            return picker_pane(picker.render(&self.theme, width), width, height);
-        }
+        // The `/model` and `/effort` pickers mount in the editor dock (TS
+        // `showConfigurationMenu` replaces the editor container), like the
+        // tree and fork selectors: the prompt context (the detail hint)
+        // stays above the pane and the transcript stays mounted above it.
+        let prompt_context = render_prompt_context(&self.detail_label(), &self.theme, width);
+        let picker_dock: Option<Vec<Line>> = if let Some(picker) = self.model_picker.as_mut() {
+            let mut dock = prompt_context;
+            dock.extend(picker.render(&self.theme, width, self.editor.keybindings()));
+            Some(dock)
+        } else if let Some(picker) = &self.effort_picker {
+            let mut dock = prompt_context;
+            dock.extend(picker.render(&self.theme, width));
+            Some(dock)
+        } else {
+            None
+        };
         // The tree and fork selectors mount in the editor container (TS
         // `showSelector`): an auto-height pane over the dock's rows with the
-        // transcript above it — not the `/model` picker's full-pane overlay.
+        // transcript above it.
         let selector_dock: Option<Vec<Line>> = if self.tree_selector.is_some()
             || self.fork_selector.is_some()
             || self.share_loader.is_some()
@@ -872,7 +882,7 @@ impl AgentView {
             }
             Some(dock)
         } else {
-            None
+            picker_dock
         };
         let top = render_top_bar(&self.chrome, &self.theme, width);
         let transcript = self.render_transcript(width);
@@ -1072,16 +1082,6 @@ fn indicator_row(indicator: &str, bg: Style, border: Style, width: usize) -> Lin
     let used = str_width(indicator);
     row.push(Span::styled(" ".repeat(width.saturating_sub(used)), bg));
     row
-}
-
-/// Fit the model picker's frame to the window (same geometry as the
-/// full-screen selector loop: pad to height, truncate at height).
-fn picker_pane(mut frame: Vec<Line>, width: usize, height: usize) -> Vec<Line> {
-    while frame.len() < height {
-        frame.push(vec![Span::raw(" ".repeat(width.max(1)))]);
-    }
-    frame.truncate(height);
-    frame
 }
 
 /// Pad a rendered row to the full width (default background).

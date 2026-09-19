@@ -24,7 +24,7 @@ use crate::image_markers::{
 };
 use crate::interactive::{InteractiveOptions, ModelSelection, SessionSelection};
 use crate::keys::key_event_to_id;
-use crate::model_picker::{self, CurrentModel, ModelPickerAction};
+use crate::model_picker::{CurrentModel, ModelPicker, ModelPickerAction, ModelPickerOptions};
 use crate::snapshot::{
     assistant_message_parts, attach_data_from_response, event_to_update, reconstruct, TurnUpdate,
 };
@@ -44,6 +44,11 @@ const CTRL_C_EXIT_HINT_MS: u64 = 2_000;
 /// never blocks on these — aborts are fire-and-forget, submissions resolve
 /// off the render path).
 const UI_REQUEST_TIMEOUT_MS: u64 = 10_000;
+
+/// How long a fetched model catalog stays fresh (TS
+/// `MODEL_CATALOG_REFRESH_TTL_MS`); a `/model` open past it refreshes
+/// again in the background.
+const MODEL_CATALOG_REFRESH_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 /// Cap on the detach request during the exit path: the client must exit
 /// promptly even when the worker socket is wedged.
 const EXIT_DETACH_TIMEOUT_MS: u64 = 600;
@@ -57,6 +62,13 @@ const EXIT_STATS_TIMEOUT_MS: u64 = 500;
 /// The `/share` upload task's report: the created gist or the failure
 /// message (TS resolves the same promise from the gh process result).
 pub(crate) type ShareNote = Result<GistOutcome, String>;
+
+/// A landed `get_model_catalog` refresh: the full catalog and the providers
+/// with configured auth (TS `AgentConnectionModelCatalog`).
+pub(crate) struct ModelCatalogUpdate {
+    pub models: Vec<pa_types::ai::Model>,
+    pub configured_providers: std::collections::HashSet<String>,
+}
 
 /// A `/share` upload in flight: the abortable task and the temp export.
 pub(crate) struct ShareRun {
@@ -76,10 +88,21 @@ pub(crate) struct SessionUi {
     session_dir: Option<PathBuf>,
     script_path: Option<PathBuf>,
     model_selection: ModelSelection,
-    /// The available-model catalog for the `/model` picker (the
-    /// composition root resolves it from the model registry at startup;
-    /// entitlement refreshes are daemon-side, so the catalog is a snapshot).
+    /// The model catalog for the `/model` picker: a startup snapshot from
+    /// the composition root (the bundled fallback), replaced by the
+    /// daemon's `get_model_catalog` response once it lands.
     model_catalog: Vec<pa_types::ai::Model>,
+    /// Providers with configured auth (the daemon catalog's
+    /// `configuredProviders`); the picker marks the rest "require sign in".
+    model_configured_providers: std::collections::HashSet<String>,
+    /// The settings recent-model list (`provider/id` keys, newest first).
+    model_recent_models: Vec<String>,
+    /// The settings default thinking level (TS `getDefaultThinkingLevel`)
+    /// — the picker's effort seed for non-reasoning current models.
+    default_thinking_level: Option<String>,
+    /// When the daemon catalog was last refreshed (TS
+    /// `connectionModelsFetchedAt`; the refresh is TTL-gated).
+    models_fetched_at: Option<std::time::Instant>,
     /// Pasted images held for their editor markers, keyed by marker id
     /// (TS `pastedImages`). Insertion order is paste order.
     pasted_images: std::collections::BTreeMap<u64, LoadedImage>,
@@ -110,6 +133,9 @@ pub(crate) struct SessionUi {
     /// Where the upload task reports its outcome (the run loop folds it
     /// into the transcript).
     share_notes: mpsc::UnboundedSender<ShareNote>,
+    /// Where the background catalog refresh delivers `get_model_catalog`
+    /// responses (the run loop folds them into the picker catalog).
+    catalog_updates: mpsc::UnboundedSender<ModelCatalogUpdate>,
     /// Snapshot chat entries to fold into the view on the next rebuild.
     pending_snapshot: Option<Vec<ChatEntry>>,
     /// Snapshot labels (model) for the next rebuild.
@@ -195,6 +221,7 @@ impl SessionUi {
         options: &InteractiveOptions,
         notes: mpsc::UnboundedSender<String>,
         share_notes: mpsc::UnboundedSender<ShareNote>,
+        catalog_updates: mpsc::UnboundedSender<ModelCatalogUpdate>,
     ) -> Result<SessionUi> {
         let active_session_id = match &options.session {
             SessionSelection::New => create_session(&client, options, None).await?,
@@ -213,6 +240,11 @@ impl SessionUi {
             script_path: options.script_path.clone(),
             model_selection: options.model_selection.clone(),
             model_catalog: options.model_catalog.clone(),
+            model_configured_providers: options.model_configured_providers.clone(),
+            model_recent_models: options.model_recent_models.clone(),
+            default_thinking_level: options.default_thinking_level.clone(),
+            models_fetched_at: None,
+            catalog_updates,
             telemetry_disabled: options.telemetry_disabled,
             code_block_indent: options.code_block_indent.clone(),
             tree_filter_mode: crate::tree_list::filter_mode_from_str(&options.tree_filter_mode),
@@ -1114,31 +1146,35 @@ impl SessionUi {
                     }
                 }
             }
-            // `/model [search]` (TS `handleModelCommand`): open the inline
-            // picker over the startup catalog, the search term prefilled
-            // as its filter; Enter applies, Esc cancels.
+            // `/model [search]` (TS `handleModelCommand` →
+            // `showConfigurationMenu("models")`): open the inline menu
+            // panel over the cached catalog, the search term prefilled as
+            // its filter; a refresh fires in the background when the
+            // snapshot is stale (forced when a search argument rides the
+            // command) and lands into the open picker.
             "model" => {
                 self.track_command_used("model");
-                let current = view.chrome.model_id.as_deref().and_then(|model_id| {
-                    self.model_catalog
-                        .iter()
-                        .find(|model| model.id == model_id)
-                        .map(|model| CurrentModel {
-                            provider: model.provider.clone(),
-                            model_id: model_id.to_string(),
-                        })
-                });
-                match model_picker::model_command(
-                    &self.model_catalog,
-                    current.as_ref(),
-                    &resolved.args,
-                ) {
-                    model_picker::ModelCommandOutcome::Open(picker) => {
-                        view.model_picker = Some(picker);
-                    }
-                    model_picker::ModelCommandOutcome::NoModels(message) => {
-                        self.note(&message, view);
-                    }
+                let current = self.current_model(view);
+                let thinking_level = self
+                    .picker_initial_thinking_level(current.as_ref(), view)
+                    .await;
+                let options = ModelPickerOptions {
+                    models: self.model_catalog.clone(),
+                    current,
+                    configured_providers: self.model_configured_providers.clone(),
+                    recent_models: self.model_recent_models.clone(),
+                    thinking_level,
+                    viewport_rows: picker_viewport_rows(view.terminal_rows()),
+                };
+                // TS `handleModelCommand` always opens the menu (an empty
+                // catalog renders the empty panel).
+                let crate::model_picker::ModelCommandOutcome::Open(picker) =
+                    ModelPicker::open(options, &resolved.args);
+                view.model_picker = Some(*picker);
+                // TS `refreshModels(initialModelSearch !== undefined)`.
+                let force = !resolved.args.trim().is_empty();
+                if self.model_refresh_due(force) {
+                    self.spawn_model_catalog_refresh();
                 }
             }
             // `/effort [level]` (TS `handleEffortCommand`): the
@@ -1817,6 +1853,9 @@ impl SessionUi {
             script_path: self.script_path.clone(),
             model_selection: self.model_selection.clone(),
             model_catalog: self.model_catalog.clone(),
+            model_configured_providers: self.model_configured_providers.clone(),
+            model_recent_models: self.model_recent_models.clone(),
+            default_thinking_level: self.default_thinking_level.clone(),
             no_session: false,
             session: SessionSelection::New,
             initial_message: None,
@@ -1965,13 +2004,32 @@ impl SessionUi {
                 view.model_picker = None;
                 self.dirty = true;
             }
-            Some(ModelPickerAction::Apply { provider, model_id }) => {
+            Some(ModelPickerAction::Apply(applied)) => {
                 view.model_picker = None;
-                self.apply_model_selection(&provider, &model_id, view).await;
+                self.apply_model_selection(&applied.provider, &applied.model_id, view)
+                    .await;
+                // A user-edited effort applies after the model switch (TS
+                // `completeModelSelection`: `setModel`, then
+                // `applyThinkingLevel` — the level row only on success).
+                if let Some(level) = applied.effort {
+                    self.apply_thinking_level(&level, view).await;
+                }
             }
             None => {}
         }
         Ok(())
+    }
+
+    /// A bracketed paste (TS routes terminal paste into the focused input):
+    /// an open `/model` picker pastes into its search field; otherwise the
+    /// editor takes it.
+    pub(crate) fn handle_paste(&mut self, text: &str, view: &mut AgentView) {
+        if let Some(picker) = view.model_picker.as_mut() {
+            picker.paste(text);
+            self.dirty = true;
+            return;
+        }
+        let _ = view.editor.handle_paste(text);
     }
 
     /// One key press while the `/effort` picker is open: Esc/Ctrl+C close
@@ -2007,6 +2065,124 @@ impl SessionUi {
             None => {}
         }
         Ok(())
+    }
+
+    /// The session's current model, matched against the picker catalog (the
+    /// daemon state reports the id; the catalog entry supplies the
+    /// provider).
+    fn current_model(&self, view: &AgentView) -> Option<CurrentModel> {
+        let model_id = view.chrome.model_id.as_deref()?;
+        let model = self
+            .model_catalog
+            .iter()
+            .find(|model| model.id == model_id)?;
+        Some(CurrentModel {
+            provider: model.provider.clone(),
+            model_id: model.id.clone(),
+        })
+    }
+
+    /// Fire a background `get_model_catalog` refresh (TS
+    /// `getModelSelectorRefreshPromise` + `getConnectionAvailableModels`):
+    /// the response lands through the run loop's channel, and failures
+    /// leave the current snapshot alone.
+    pub(crate) fn spawn_model_catalog_refresh(&self) {
+        let client = self.client.clone();
+        let active_session_id = self.active_session_id.clone();
+        let updates = self.catalog_updates.clone();
+        tokio::spawn(async move {
+            let Ok(value) = client
+                .request_ok(DaemonCommand::GetModelCatalog {
+                    id: None,
+                    active_session_id,
+                    rest: Default::default(),
+                })
+                .await
+            else {
+                // TS startup fetches fail silently (`getModelCandidates`
+                // catches); the menu-open refresh surfaces the error only
+                // while the menu is open, and the picker catalogs stay as
+                // they are.
+                return;
+            };
+            let models: Vec<pa_types::ai::Model> = value
+                .get("models")
+                .cloned()
+                .and_then(|models| serde_json::from_value(models).ok())
+                .unwrap_or_default();
+            let configured_providers: std::collections::HashSet<String> = value
+                .get("configuredProviders")
+                .and_then(Value::as_array)
+                .map(|providers| {
+                    providers
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let _ = updates.send(ModelCatalogUpdate {
+                models,
+                configured_providers,
+            });
+        });
+    }
+
+    /// Whether the catalog refresh is due (TS `getModelSelectorRefreshPromise`:
+    /// forced, never fetched, or older than the TTL).
+    pub(crate) fn model_refresh_due(&self, force: bool) -> bool {
+        force
+            || match self.models_fetched_at {
+                None => true,
+                Some(fetched) => fetched.elapsed() > MODEL_CATALOG_REFRESH_TTL,
+            }
+    }
+
+    /// Fold a landed catalog refresh into the session and any open picker
+    /// (TS `applyConnectionModelCatalog` + the menu's `updateModels`).
+    pub(crate) fn apply_model_catalog(&mut self, update: ModelCatalogUpdate, view: &mut AgentView) {
+        self.model_catalog = update.models;
+        self.model_configured_providers = update.configured_providers;
+        self.models_fetched_at = Some(std::time::Instant::now());
+        let current = self.current_model(view);
+        if let Some(picker) = view.model_picker.as_mut() {
+            picker.update_state(
+                current,
+                self.model_catalog.clone(),
+                self.model_configured_providers.clone(),
+            );
+        }
+        self.dirty = true;
+    }
+
+    /// The picker's effort seed (TS `showConfigurationMenu`'s `thinkingLevel`
+    /// option): the session's live level for a reasoning current model,
+    /// else the settings default (`"medium"` when unset).
+    async fn picker_initial_thinking_level(
+        &mut self,
+        current: Option<&CurrentModel>,
+        view: &mut AgentView,
+    ) -> Option<pa_types::ai::ModelThinkingLevel> {
+        let reasoning = current.and_then(|current| {
+            self.model_catalog
+                .iter()
+                .find(|model| model.provider == current.provider && model.id == current.model_id)
+                .map(|model| model.reasoning)
+        });
+        if reasoning == Some(true) {
+            let level = self
+                .connection_state(view)
+                .await
+                .as_ref()
+                .and_then(|state| state.get("thinkingLevel"))
+                .and_then(Value::as_str)
+                .and_then(pa_types::ai::thinking_level_from_str);
+            return level;
+        }
+        self.default_thinking_level
+            .as_deref()
+            .and_then(pa_types::ai::thinking_level_from_str)
+            .or(Some(pa_types::ai::ModelThinkingLevel::Medium))
     }
 
     /// Apply a picked model (TS `applySelectedModel` + the
@@ -2974,6 +3150,15 @@ pub(crate) fn resume_hint_from_stats(stats: &Value) -> Option<String> {
 /// Send a `create` command and return the new session's active id. A
 /// non-empty selection picks the reopen form: `continueRecent` or an
 /// explicit saved-session path.
+/// The picker's viewport row budget (TS `showConfigurationMenu` passes
+/// `min(20, rows - 3)` and `ConfigurationMenuComponent` subtracts one more
+/// row for its hint).
+fn picker_viewport_rows(terminal_rows: u16) -> usize {
+    let terminal_rows = terminal_rows as usize;
+    let menu_rows = 20.min(terminal_rows.saturating_sub(3).max(1));
+    menu_rows.saturating_sub(1).max(1)
+}
+
 async fn create_session(
     client: &DaemonClient,
     options: &InteractiveOptions,

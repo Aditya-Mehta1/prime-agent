@@ -43,7 +43,12 @@ session-artifacts tree - and wake over their own session file), wire protocol se
 `set_model`/`set_thinking_level` commands — `model_switch.rs`: registry
 resolution, the durable `model_change`/`thinking_level_change` rows, the
 settings defaults, and the engine's live agent/provider-target/level
-switch), the agent-roster arms
+switch), the `get_model_catalog` command (the TS `refreshModelCatalog`:
+registry refresh — live Prime Inference catalog fetch, disk cache at
+`<agent-dir>/prime-inference-models-cache.json`, bundled fallback — then
+the full catalog minus unauthorized private models plus the configured
+providers; the worker create path fires the same refresh at startup), the
+agent-roster arms
 (`roster_subscribe`/`roster_unsubscribe` with the full snapshot, live
 `roster_update` pushes keyed by the TS roster `agentId` = session id, and
 authenticated `worker_roster_delta` self-reports so live status reaches

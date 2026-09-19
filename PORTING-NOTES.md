@@ -1507,6 +1507,79 @@ HEAD
   daemon fetches 1282 live models; the rust catalog is the 110 bundled
   entries + models.json), which is follow-up lane work.
 
+## /model inline menu-panel + live catalog (model-selector lane, f17 close-out)
+
+- TS ground truth: the interactive `/model` picker is the inline
+  `ModelSelectorComponent` mounted by `showConfigurationMenu("models")` —
+  it replaces the editor in the prompt dock (the prompt context / detail
+  hint stays above it, the transcript stays mounted behind it), never a
+  full-pane overlay. The panel is the TS `menu-panel.ts` inline shape: a
+  full-width border rule, the `> `-prompt search field with the caret cell
+  and dim placeholder, `>`-marker rows whose primary cell is the model name
+  plus the centered effort cluster (`< arrows, effort squares padded to the
+  row's slot count, level label padded to the longest level name), a
+  right-aligned trailing cluster (`current - require sign in - provider`,
+  shrunk from the front and truncated when narrow), the `  (i/n)` scroll
+  indicator, the selected model's price detail block (`Input / Cached input
+  / Output` columns with the `$ / 1M tokens` unit, narrow panes fall back
+  to `Label: $x` rows), and the
+  `↑/↓ model · ←/→ effort · Enter select · Esc close` hint (select/close
+  only below 70 columns). Keys are the TS `handleInput` chain: up/down wrap,
+  page moves step the visible window, left/right adjust the selected row's
+  effort once the filter is empty or the list was navigated into, Enter
+  confirms (the effort rides the apply only when the user edited it), Esc /
+  Ctrl+C / left-at-column-0 cancel, and everything else edits the search
+  field — a full TS `Input` port (undo stack, kill ring with accumulate and
+  yank-pop, word motion, bracketed paste).
+- Rust port: `pa-tui/src/menu_panel.rs` (the inline primitives: search
+  field, `>`-rows with the soft-selection band, trailing budgeting) +
+  `pa-tui/src/search_input.rs` (the single-line input) +
+  `pa-tui/src/model_picker/` (the selector state: the TS `sortModels` chain
+  — configured providers first, signed-in Prime Inference pinned, the
+  current model, recent rank, provider, featured, numeric id — the
+  `scoreModelSearch` quality ladder over `fuzzy_match`, the effort layout
+  ladder, and the frame render). The picker mounts through the shared dock
+  compose in `view.rs` (prompt context above, transcript behind), so the
+  frame keeps the same scroll state as the chat behind it. The effort seed
+  is the session's live level for a reasoning current model, else the
+  settings default (`medium`).
+- Live catalog: TS `get_model_catalog` (daemon-mode) ->
+  `refreshModelCatalog` -> `refreshAvailableModels`, which fetches
+  `https://api.pinference.ai/api/v1/models`, builds the model list over the
+  bundled templates (minimum coverage 50%, failures fall back to the disk
+  cache, then the bundled catalog), and writes the raw payload to
+  `<agent-dir>/prime-inference-models-cache.json`; fresh registries read
+  that cache at load (`PI_OFFLINE` stays on cached/bundled and never
+  writes). The Rust daemon now serves `get_model_catalog` with the same
+  contract (registry refresh, then the full catalog minus unauthorized
+  private models plus `configuredProviders`), and the worker create path
+  fires the same refresh at startup (the session-boot
+  `refreshAvailableModels` trigger). The client fetches the catalog at
+  attach and on `/model` open past the 60s TTL (TS
+  `MODEL_CATALOG_REFRESH_TTL_MS`, forced when a search argument rides the
+  command), folds the landing into the session and any open picker (TS
+  `updateModels` keeps the selection on the surviving model), and the
+  composition-root snapshot (bundled + models.json) serves until then —
+  the offline fallback.
+- Layering notes: the picker needs thinking-level semantics, so
+  `get_supported_thinking_levels`/`clamp_thinking_level`/`models_are_equal`
+  moved to `pa_types::ai::thinking_levels` (pa-tui is pa-types-only;
+  `pa_ai::models` re-exports them). The picker owns the TS sort chain, so
+  pa-core's `order_for_picker` moved into the picker module.
+- Verifiers: `runs/20260919T144043Z` — the f17 flow passes 9/9 including
+  the model-selector frame diff (normalized byte-identical: bordered field,
+  `>` rows with effort squares at the TS columns, `current ·
+  prime-inference` trailing, `(1/<n>)` indicator, price detail, key hint).
+  Unit tests: the picker frame test pins the exact TS capture rows, the
+  sort/filter/effort/key behavior, and the search input's kill ring;
+  pa-core registry tests pin the live-cache merge (repriced entries replace
+  bundled templates, live-only entries land, models.json custom models
+  survive, corrupt cache falls back); `pa-daemon/tests/model_catalog_e2e.rs`
+  is the offline-fallback e2e (PI_OFFLINE supervisor, no auth:
+  `get_model_catalog` serves the bundled catalog + the models.json model,
+  `configuredProviders` is exactly the models.json provider, private models
+  stay out, the cache file is never written).
+
 ## Session archiving (session-archiving lane, roadmap item 4)
 
 - TS ground truth: archiving in the TS product is a session-state marker, not

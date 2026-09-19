@@ -448,41 +448,30 @@ fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<Inter
     // The `/model` picker catalog: a startup snapshot of the available
     // models (same registry and private-authorization cache adoption as
     // the startup-model chain; entitlement refreshes run daemon-side, so
-    // the picker works off the snapshot), ordered like the TS selector —
-    // the startup model first, then the recent rank, the provider, the
-    // featured flag, and the id. models.json entries are part of the
-    // available catalog, so configured custom models list in the picker.
+    // the picker works off the snapshot until the daemon's
+    // `get_model_catalog` response lands). models.json entries are part of
+    // the available catalog, so configured custom models list in the
+    // picker; the picker itself owns the TS selector order.
     let auth = pa_core::auth::AuthStorage::create(&config.agent_dir);
     let mut registry =
         pa_core::models::ModelRegistry::create(auth, config.agent_dir.join("models.json"));
     registry.load_private_authorization_from_cache();
-    let all: Vec<pa_types::ai::Model> = registry.get_all().to_vec();
     let catalog: Vec<pa_types::ai::Model> = registry.get_available().into_iter().cloned().collect();
+    let configured_providers: std::collections::HashSet<String> =
+        catalog.iter().map(|model| model.provider.clone()).collect();
     let settings = pa_core::settings::SettingsManager::create(&config.cwd, &config.agent_dir);
-    let scoped = config
-        .models
-        .as_deref()
-        .map(|patterns| pa_core::models::resolve_model_scope_from_models(patterns, &catalog))
-        .unwrap_or_default();
-    let is_continuing = options.session.resume.is_some() || options.session.continue_recent;
-    let current = pa_core::models::find_initial_model(&pa_core::models::InitialModelOptions {
-        cli_provider: config.provider.as_deref(),
-        cli_model: config.model.as_deref(),
-        scoped_models: &scoped,
-        is_continuing,
-        default_provider: settings.get_default_provider(),
-        default_model_id: settings.get_default_model(),
-        all_models: &all,
-        available_models: &catalog,
-    })
-    .map(|model| pa_core::models::PickerModel::of(&model));
     let recent = settings.get_recent_models();
-    let model_catalog = pa_core::models::order_for_picker(catalog, current.as_ref(), &recent);
+    let default_thinking_level = settings
+        .get_default_thinking_level()
+        .map(|level| level.model_level().wire_name().to_string());
     Ok(InteractiveOptions {
         code_block_indent,
         tree_filter_mode,
         branch_summary_skip_prompt,
-        model_catalog,
+        model_catalog: catalog,
+        model_configured_providers: configured_providers,
+        model_recent_models: recent,
+        default_thinking_level,
         socket_path,
         cwd: config.cwd.clone(),
         session_dir,

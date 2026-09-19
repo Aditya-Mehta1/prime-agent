@@ -1,0 +1,27 @@
+{
+  "version": 2,
+  "workerId": "870dacd059d7",
+  "pid": 137167,
+  "socketPath": "/tmp/vbat20260919T142210Z-rust/prime-agent-1000/worker-64314da69d1d-870dacd059d7.sock",
+  "recoveryJournalPath": "/home/ubuntu/lane-worktrees/model-selector/scripts/battery/runs/20260919T142210Z/rust/agent/daemon-workers/64314da69d1d/870dacd059d7.recovery.jsonl",
+  "supervisorSocketPath": "/home/ubuntu/lane-worktrees/model-selector/scripts/battery/runs/20260919T142210Z/rust/daemon.sock",
+  "authenticationToken": "f447cdcb-4480-405e-b403-4fa9d61ed400",
+  "workerInstanceId": "9d0ad37a-2a7f-48c4-8e2b-ad737547b308",
+  "rootActiveSessionId": "870dacd059d7",
+  "ownerClientId": "daemon-tui:137159",
+  "rootSessionId": "01a0ba0c-1daa-7560-9b0c-e512967c7987",
+  "sessionFile": "/home/ubuntu/lane-worktrees/model-selector/scripts/battery/runs/20260919T142210Z/rust/agent/sessions/01a0ba0c-1daa-7560-9b0c-e512967c7987.jsonl",
+  "sessionDir": "/home/ubuntu/lane-worktrees/model-selector/scripts/battery/runs/20260919T142210Z/rust/agent/sessions",
+  "telemetryDisabled": true,
+  "createdAt": "2026-09-19T14:22:31.303Z",
+  "updatedAt": "2026-09-19T14:22:31.351Z",
+  "lifecycle": "ready",
+  "createCommand": {
+    "sessionPath": "/home/ubuntu/lane-worktrees/model-selector/scripts/battery/runs/20260919T142210Z/rust/agent/sessions/01a0ba0c-1daa-7560-9b0c-e512967c7987.jsonl",
+    "cwd": "/home/ubuntu/lane-worktrees/model-selector/scripts/battery/runs/20260919T142210Z/rust/work",
+    "model": "mock-1",
+    "provider": "prime-inference",
+    "sessionDir": "/home/ubuntu/lane-worktrees/model-selector/scripts/battery/runs/20260919T142210Z/rust/agent/sessions"
+  },
+  "consecutiveFailures": 0
+}

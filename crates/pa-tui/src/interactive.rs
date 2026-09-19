@@ -132,10 +132,18 @@ impl std::fmt::Debug for OnboardingTask {
 pub struct InteractiveOptions {
     pub socket_path: PathBuf,
     pub cwd: PathBuf,
-    /// The available-model catalog for the `/model` picker (a startup
-    /// snapshot resolved by the composition root; pa-tui stays pa-types
-    /// only, so the registry itself lives above this crate).
+    /// The model catalog for the `/model` picker (a startup snapshot
+    /// resolved by the composition root; pa-tui stays pa-types only, so
+    /// the registry itself lives above this crate). The daemon's
+    /// `get_model_catalog` refresh replaces it once it lands.
     pub model_catalog: Vec<pa_types::ai::Model>,
+    /// Providers with configured auth for the picker's sign-in marking.
+    pub model_configured_providers: std::collections::HashSet<String>,
+    /// The settings recent-model list (`provider/id` keys, newest first).
+    pub model_recent_models: Vec<String>,
+    /// The settings default thinking level (the picker's effort seed for
+    /// non-reasoning current models).
+    pub default_thinking_level: Option<String>,
     /// Persistence directory for new sessions (`sessionDir` in the create
     /// config; defaults to the daemon's sessions dir when `None`).
     pub session_dir: Option<PathBuf>,
@@ -456,11 +464,15 @@ pub async fn run_interactive(
     // The `/share` upload task reports here; the loop folds the outcome
     // into the transcript and clears the loader.
     let (share_tx, mut share_rx) = mpsc::unbounded_channel::<crate::session_ui::ShareNote>();
+    // The background model-catalog refresh (`get_model_catalog`) reports
+    // here; the loop folds it into the picker catalog and any open picker.
+    let (catalog_tx, mut catalog_rx) =
+        mpsc::unbounded_channel::<crate::session_ui::ModelCatalogUpdate>();
     // The double-Ctrl+C force-quit guard: the terminal reader observes the
     // pair even while this loop is wedged in a daemon request, and a plain
     // std-thread watchdog enforces the exit deadline without the runtime.
     let exit_guard = ExitGuard::new();
-    let mut session = SessionUi::open(client, &options, notes_tx, share_tx).await?;
+    let mut session = SessionUi::open(client, &options, notes_tx, share_tx, catalog_tx).await?;
     session.exit_guard = exit_guard.clone();
 
     let theme = crate::app::load_theme(&options.theme);
@@ -471,6 +483,10 @@ pub async fn run_interactive(
     view.show_images = options.show_images;
     apply_startup_chrome(&mut view, &options);
     session.refresh_stats().await;
+    // The startup catalog fetch (TS `updateAvailableProviderCount` →
+    // `getConnectionAvailableModels`): failures stay silent and the
+    // composition-root snapshot keeps serving the picker.
+    session.spawn_model_catalog_refresh();
     session.rebuild_view(&mut view);
     if let Some(notice) = check_tmux_keyboard_setup().await {
         view.push_entry(crate::chat::ChatEntry::Status {
@@ -554,7 +570,7 @@ pub async fn run_interactive(
                     session.handle_key(key, &mut view, &mut running).await?;
                 }
                 UiInput::Paste(text) => {
-                    let _ = view.editor.handle_paste(&text);
+                    session.handle_paste(&text, &mut view);
                 }
                 // The headless plan's pause step: the queued keystroke
                 // batch ahead of this barrier is fully handled, so the
@@ -701,6 +717,11 @@ pub async fn run_interactive(
             maybe_share = share_rx.recv() => {
                 if let Some(outcome) = maybe_share {
                     session.apply_share_outcome(outcome, &mut view);
+                }
+            }
+            maybe_catalog = catalog_rx.recv() => {
+                if let Some(update) = maybe_catalog {
+                    session.apply_model_catalog(update, &mut view);
                 }
             }
             _reconnect_tick = async {
@@ -1225,6 +1246,9 @@ mod tests {
             script_path: None,
             model_selection: selection,
             model_catalog: Vec::new(),
+            model_configured_providers: Default::default(),
+            model_recent_models: Vec::new(),
+            default_thinking_level: None,
             no_session: false,
             session: SessionSelection::New,
             initial_message: None,

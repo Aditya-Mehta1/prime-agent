@@ -1246,6 +1246,7 @@ impl Worker {
             "get_messages" => self.handle_get_messages(),
             "get_session_header" => self.handle_get_session_header(),
             "get_session_stats" => self.handle_get_session_stats(),
+            "get_model_catalog" => self.handle_get_model_catalog().await,
             "get_queue" => self.handle_get_queue(),
             "clear_queue" => self.handle_clear_queue(),
             "abort_and_clear_queue" => self.handle_abort_and_clear_queue(),
@@ -1670,6 +1671,19 @@ impl Worker {
         if let Some(registration) = &self.registration {
             registration.notify_session_created(session_id);
         }
+        // TS session boot resolves the initial model through
+        // `refreshAvailableModels`, which also fetches the live Prime
+        // Inference catalog in the background and caches it on disk. Fire
+        // the same refresh here: the effect is the cache file (fresh
+        // registries read it), and failures fall back to the cached or
+        // bundled catalog without touching the session.
+        let agent_dir = self.config.agent_dir.clone();
+        tokio::spawn(async move {
+            let auth = pa_core::auth::AuthStorage::create(&agent_dir);
+            let mut registry =
+                pa_core::models::ModelRegistry::create(auth, agent_dir.join("models.json"));
+            let _ = registry.refresh_available_models().await;
+        });
         self.work_notify.notify_one();
         response_success(
             None,
@@ -2320,6 +2334,60 @@ impl Worker {
         };
         let stats = crate::session_stats::session_stats(store, self.engine.model_context_window());
         response_success(None, "get_session_stats", Some(stats))
+    }
+
+    /// `get_model_catalog` (TS daemon-mode `get_model_catalog` →
+    /// `session.modelRegistry.refreshModelCatalog`): refresh the registry —
+    /// the live Prime Inference catalog fetch plus the private-model
+    /// entitlements — then return the full catalog and the providers with
+    /// configured auth. The fetch itself runs in the background inside the
+    /// refresh (the first response after a daemon boot can still show the
+    /// disk-cache/bundled snapshot; the client refreshes again when the
+    /// menu is open, exactly like TS).
+    async fn handle_get_model_catalog(&self) -> DaemonResponse {
+        if let Err(response) = self.require_created("get_model_catalog") {
+            return response;
+        }
+        let agent_dir = self.config.agent_dir.clone();
+        let auth = pa_core::auth::AuthStorage::create(&agent_dir);
+        let mut registry =
+            pa_core::models::ModelRegistry::create(auth, agent_dir.join("models.json"));
+        let available = registry.refresh_available_models().await;
+        let configured_providers: Vec<String> = {
+            let mut providers: Vec<String> = available
+                .iter()
+                .map(|model| model.provider.clone())
+                .collect();
+            providers.sort();
+            providers.dedup();
+            providers
+        };
+        let available_keys: std::collections::HashSet<String> = available
+            .iter()
+            .map(|model| format!("{}/{}", model.provider, model.id))
+            .collect();
+        // The catalog keeps every model except private Prime Inference
+        // models the current credentials do not authorize.
+        let models: Vec<&pa_types::ai::Model> = registry
+            .get_all()
+            .iter()
+            .filter(|model| {
+                !pa_core::models::is_private_prime_inference_model(model)
+                    || available_keys.contains(&format!("{}/{}", model.provider, model.id))
+            })
+            .collect();
+        let models: Vec<Value> = models
+            .into_iter()
+            .map(|model| serde_json::to_value(model).unwrap_or(Value::Null))
+            .collect();
+        response_success(
+            None,
+            "get_model_catalog",
+            Some(json!({
+                "models": models,
+                "configuredProviders": configured_providers,
+            })),
+        )
     }
 
     fn handle_get_messages(&self) -> DaemonResponse {
