@@ -28,7 +28,11 @@ children fall back to the spawn ledger's live child edges when the catalog
 misses - children persist outside the sessions dir, under the parent's
 session-artifacts tree - and wake over their own session file), wire protocol serve/negotiation (including the
 `compact`/`abort_compaction`/`set_auto_compaction` commands and their
-`compaction_start`/`compaction_end` events), the agent-roster arms
+`compaction_start`/`compaction_end` events, and the live
+`set_model`/`set_thinking_level` commands — `model_switch.rs`: registry
+resolution, the durable `model_change`/`thinking_level_change` rows, the
+settings defaults, and the engine's live agent/provider-target/level
+switch), the agent-roster arms
 (`roster_subscribe`/`roster_unsubscribe` with the full snapshot, live
 `roster_update` pushes keyed by the TS roster `agentId` = session id, and
 authenticated `worker_roster_delta` self-reports so live status reaches

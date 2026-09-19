@@ -21,7 +21,7 @@ use pa_core::session_engine::agent_messaging::{
 };
 use pa_core::session_engine::engine::{SessionEngine as CoreSessionEngine, SessionEngineConfig};
 use pa_core::session_engine::provider_adapter::{
-    json_round_trip, map_thinking_level, real_stream_fn,
+    json_round_trip, map_thinking_level, switchable_stream_fn, ProviderTarget,
 };
 use pa_core::session_engine::session_commands::{
     execute_session_command, SessionCommandExecution, SessionCommandParams,
@@ -114,6 +114,13 @@ pub struct AgentSessionEngine {
     effective_thinking: std::sync::RwLock<Option<pa_types::ai::ModelThinkingLevel>>,
     /// Built once on the first prompt, reused across prompts.
     pub(crate) session: tokio::sync::Mutex<Option<CoreSessionEngine>>,
+    /// The provider target the built session's stream reads per call
+    /// (api key + model), set when the session builds: `set_model` swaps
+    /// the slot so the live session follows the new model without a
+    /// rebuild.
+    provider_target: std::sync::Arc<
+        std::sync::RwLock<Option<pa_core::session_engine::provider_adapter::ProviderTarget>>,
+    >,
     /// One shared supervisor-link client for the worker: agent messaging
     /// and supervisor-backed RLM children multiplex the same connection
     /// (the TS worker's single `SupervisorLink` socket). Unconnected until
@@ -248,6 +255,7 @@ impl AgentSessionEngine {
             selection: std::sync::RwLock::new(selection),
             effective_thinking: std::sync::RwLock::new(None),
             session: tokio::sync::Mutex::new(None),
+            provider_target: std::sync::Arc::new(std::sync::RwLock::new(None)),
             own_summary: std::sync::Arc::new(std::sync::Mutex::new(None)),
             autonomous: std::sync::Arc::new(tokio::sync::Mutex::new(
                 pa_core::autonomous::create_autonomous_runtime_state(None, None),
@@ -470,7 +478,17 @@ impl AgentSessionEngine {
     async fn build_session(&self, model: &Model) -> anyhow::Result<CoreSessionEngine> {
         let agent_model =
             json_round_trip(model).ok_or_else(|| anyhow::anyhow!("model conversion failed"))?;
-        let stream_fn = real_stream_fn(self.resolve_request_api_key(model), model.clone());
+        // The session's stream reads its target from the engine's live slot:
+        // `set_model` swaps the slot so the built session follows without a
+        // rebuild.
+        let stream_fn = switchable_stream_fn(std::sync::Arc::clone(&self.provider_target));
+        {
+            let mut target = self.provider_target.write().expect("provider target lock");
+            *target = Some(ProviderTarget {
+                api_key: self.resolve_request_api_key(model),
+                model: model.clone(),
+            });
+        }
         if let Some(session_dir) = &self.config.session_dir {
             std::fs::create_dir_all(session_dir)?;
         }
@@ -755,6 +773,61 @@ impl SessionEngine for AgentSessionEngine {
         // The first prompt after create builds the session against this
         // selection, so no invalidation is needed here: configure runs at
         // create time, before any turn.
+    }
+
+    fn switch_model(&self, selection: EngineModelSelection) -> bool {
+        self.configure_model(selection);
+        let Ok(model) = self.resolve_model() else {
+            return false;
+        };
+        // The built session follows the new model without a rebuild: the
+        // agent's model (loop context) and the provider stream's target
+        // swap in place (TS `agent.state.model = model`).
+        {
+            let mut target = self.provider_target.write().expect("provider target lock");
+            *target = Some(ProviderTarget {
+                api_key: self.resolve_request_api_key(&model),
+                model: model.clone(),
+            });
+        }
+        let session = self.session.blocking_lock();
+        if let Some(core) = session.as_ref() {
+            let provider = model.provider.clone();
+            let model_id = model.id.clone();
+            let _ = self
+                .runtime
+                .block_on(core.session.set_model(&model, &provider, &model_id));
+        }
+        true
+    }
+
+    fn supported_thinking_levels(&self) -> Option<Vec<String>> {
+        let model = self.resolve_model().ok()?;
+        Some(
+            pa_ai::models::get_supported_thinking_levels(&model)
+                .into_iter()
+                .map(|level| level.wire_name().to_string())
+                .collect(),
+        )
+    }
+
+    fn switch_thinking_level(&self, level: pa_types::ai::ModelThinkingLevel) -> bool {
+        self.configure_model(EngineModelSelection {
+            thinking: Some(level),
+            ..Default::default()
+        });
+        // The effective level is the request clamped to the model's
+        // supported levels (TS `setThinkingLevel`); a built session's
+        // agent follows it on the next turn.
+        let effective = self.effective_thinking();
+        let session = self.session.blocking_lock();
+        if let Some(core) = session.as_ref() {
+            let _ = self.runtime.block_on(
+                core.session
+                    .set_thinking_level(map_thinking_level(effective)),
+            );
+        }
+        true
     }
 
     fn effective_thinking_level(&self) -> Option<String> {

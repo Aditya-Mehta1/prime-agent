@@ -58,6 +58,8 @@ pub enum SelectorKind {
     ResourceConfig,
     /// The `/model` picker: single-select semantics, Enter applies.
     Model,
+    /// The `/effort` picker: single-select semantics, Enter applies.
+    Effort,
 }
 
 impl SelectorKind {
@@ -69,6 +71,10 @@ impl SelectorKind {
                 &[("space", "toggle"), ("escape", "close")],
             ),
             SelectorKind::Model => ("Select Model", &[("enter", "select"), ("escape", "close")]),
+            SelectorKind::Effort => (
+                "Thinking Level",
+                &[("enter", "select"), ("escape", "close")],
+            ),
         }
     }
 }
@@ -446,6 +452,7 @@ impl ConfigSelector {
                 match self.kind {
                     SelectorKind::ResourceConfig => "Type to filter resources",
                     SelectorKind::Model => "Type to filter models",
+                    SelectorKind::Effort => "Type to filter levels",
                 },
             )],
             Vec::new(),

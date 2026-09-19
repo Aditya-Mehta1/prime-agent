@@ -1355,3 +1355,51 @@ HEAD
   parentSessionPath/parentActiveSessionId/rlmDepth/sessionName, its live
   delta arrives under the same key, and `delete_subagent` pushes the
   removal under the family id.
+
+
+## /model catalog + confirm row + /effort picker (model-picker-2 lane, f17)
+
+- TS ground truth: the interactive `/model` picker sources its rows from the
+  model registry's available catalog (models.json entries included, custom
+  providers authenticate through their own `apiKey`), sorted by the
+  `ModelSelectorComponent.sortModels` chain (configured providers first,
+  prime-inference pinned, the current model first, the recent-use rank, the
+  provider name, `featured`, numeric id compare); picking rides
+  `connection.setModel` -> the daemon `set_model` command -> `session.setModel`
+  (agent model swap + `appendModelChange` + `setDefaultModelAndProvider`),
+  and the client records the `Model: <id>` status row after the state
+  refresh. `/effort` reads the connection state's `availableThinkingLevels`
+  (an `off`-only list is no thinking surface), opens the thinking selector
+  or applies directly, and shows `Thinking level: <level>`; failures use
+  `showError` (`⚠ Error: ...`).
+- Rust port: `pa-core::models::order_for_picker` implements the sort chain
+  (the composition root applies it to the catalog snapshot; the picker
+  moves the live current model to the front), `ModelPicker` rows now label
+  by model name with the id as a filter field, and the worker gained the
+  `set_model`/`set_thinking_level` arms (`pa-daemon/src/model_switch.rs`):
+  registry resolution with the TS `Model not found: ...` message, the
+  durable `model_change`/`thinking_level_change` rows (the level row only
+  on a real change, TS `isChanging`), the settings defaults, and the
+  settings-default-level persistence gate. The engine switch
+  (`AgentSessionEngine::switch_model`/`switch_thinking_level`) updates the
+  selection, the live provider-target slot
+  (`provider_adapter::switchable_stream_fn` — the built session's stream
+  reads the slot per call, so a switch never rebuilds the session), and the
+  built session's agent through the `AgentSession` seams. The worker's
+  connection state now reports the resolved model's supported thinking
+  levels (was a `["default"]` placeholder).
+- `SessionUi::note` now implements the TS `showStatus` back-to-back rule: a
+  status emitted with nothing after the previous one rewrites the previous
+  status row in place (the f17 effort frame's `Model: mock-1` row is
+  replaced by `Current model does not support thinking`, exactly like TS).
+- Telemetry: builtin client commands (`/model`, `/effort`) emit
+  `agent command used` from the interactive client (TS
+  `captureAgentCommandUsed`); session commands keep emitting through the
+  worker's session telemetry, so no submission is double-reported.
+- Verifiers: `scripts/battery/runs/20260919T040417Z` — the f17 flow's three
+  rust-side rows plus the `model-selected` and `effort-picker` frame diffs
+  pass (normalized byte-identical); the remaining `model-selector` frame
+  row needs the TS inline menu-panel rendering (search input, effort-square
+  rows, price detail) plus live prime-inference catalog parity (the TS
+  daemon fetches 1282 live models; the rust catalog is the 110 bundled
+  entries + models.json), which is follow-up lane work.

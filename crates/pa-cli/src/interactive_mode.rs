@@ -193,6 +193,21 @@ impl pa_tui::interactive::InteractionTelemetry for CliInteractionTelemetry {
             let _ = client.shutdown().await;
         })
     }
+
+    fn command_used(&self, command: &'static str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        // `agent command used` (TS `captureAgentCommandUsed`): builtin
+        // client commands report from the client; session commands report
+        // through the session telemetry, so the two seams never double-emit.
+        Box::pin(async move {
+            let Some(client) = self.client() else {
+                return;
+            };
+            let mut properties = pa_telemetry::base_properties("interactive");
+            properties.set("command_name", serde_json::Value::from(command));
+            client.track("agent command used", properties);
+            let _ = client.shutdown().await;
+        })
+    }
 }
 
 /// Run the interactive TUI attached to the daemon. Returns the exit code.
@@ -376,13 +391,36 @@ fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<Inter
     // The `/model` picker catalog: a startup snapshot of the available
     // models (same registry and private-authorization cache adoption as
     // the startup-model chain; entitlement refreshes run daemon-side, so
-    // the picker works off the snapshot).
+    // the picker works off the snapshot), ordered like the TS selector —
+    // the startup model first, then the recent rank, the provider, the
+    // featured flag, and the id. models.json entries are part of the
+    // available catalog, so configured custom models list in the picker.
     let auth = pa_core::auth::AuthStorage::create(&config.agent_dir);
     let mut registry =
         pa_core::models::ModelRegistry::create(auth, config.agent_dir.join("models.json"));
     registry.load_private_authorization_from_cache();
-    let model_catalog: Vec<pa_types::ai::Model> =
-        registry.get_available().into_iter().cloned().collect();
+    let all: Vec<pa_types::ai::Model> = registry.get_all().to_vec();
+    let catalog: Vec<pa_types::ai::Model> = registry.get_available().into_iter().cloned().collect();
+    let settings = pa_core::settings::SettingsManager::create(&config.cwd, &config.agent_dir);
+    let scoped = config
+        .models
+        .as_deref()
+        .map(|patterns| pa_core::models::resolve_model_scope_from_models(patterns, &catalog))
+        .unwrap_or_default();
+    let is_continuing = options.session.resume.is_some() || options.session.continue_recent;
+    let current = pa_core::models::find_initial_model(&pa_core::models::InitialModelOptions {
+        cli_provider: config.provider.as_deref(),
+        cli_model: config.model.as_deref(),
+        scoped_models: &scoped,
+        is_continuing,
+        default_provider: settings.get_default_provider(),
+        default_model_id: settings.get_default_model(),
+        all_models: &all,
+        available_models: &catalog,
+    })
+    .map(|model| pa_core::models::PickerModel::of(&model));
+    let recent = settings.get_recent_models();
+    let model_catalog = pa_core::models::order_for_picker(catalog, current.as_ref(), &recent);
     Ok(InteractiveOptions {
         code_block_indent,
         model_catalog,

@@ -66,6 +66,9 @@ pub struct AgentView {
     /// The `/model` inline picker (TS `ModelSelectorComponent` seam):
     /// while set, it owns the whole frame like the onboarding pane.
     pub model_picker: Option<crate::model_picker::ModelPicker>,
+    /// The `/effort` inline picker (TS `ThinkingSelectorComponent` seam):
+    /// while set, it owns the whole frame like the model picker.
+    pub effort_picker: Option<crate::effort_picker::EffortPicker>,
     scroll_top: usize,
     following: bool,
     /// The transcript-tail offset of the last composed frame (TS
@@ -114,6 +117,7 @@ impl AgentView {
             retry: None,
             onboarding: None,
             model_picker: None,
+            effort_picker: None,
             scroll_top: 0,
             following: true,
             last_max_scroll: 0,
@@ -176,14 +180,24 @@ impl AgentView {
         self.chat.len()
     }
 
-    /// Replace the text of the status entry at `index` (TS `showStatus`
-    /// updates its previous status row in place when nothing followed it).
-    /// Returns `false` when the entry is not a status row.
-    pub fn update_status_text(&mut self, index: usize, text: &str) -> bool {
-        let Some(ChatEntry::Status { text: slot, .. }) = self.chat.get_mut(index) else {
+    /// Replace the text and tone of the status entry at `index` (TS
+    /// `showStatus` updates its previous status row in place when nothing
+    /// followed it). Returns `false` when the entry is not a status row.
+    pub fn update_status_row(
+        &mut self,
+        index: usize,
+        text: &str,
+        kind: crate::chat::StatusKind,
+    ) -> bool {
+        let Some(ChatEntry::Status {
+            text: slot,
+            kind: kind_slot,
+        }) = self.chat.get_mut(index)
+        else {
             return false;
         };
         *slot = text.to_string();
+        *kind_slot = kind;
         self.mark_entry_stale(index);
         true
     }
@@ -734,6 +748,9 @@ impl AgentView {
         if let Some(picker) = &self.model_picker {
             return picker_pane(picker.render(&self.theme, width), width, height);
         }
+        if let Some(picker) = &self.effort_picker {
+            return picker_pane(picker.render(&self.theme, width), width, height);
+        }
         let top = render_top_bar(&self.chrome, &self.theme, width);
         let transcript = self.render_transcript(width);
         let dock = self.render_dock(width);
@@ -785,7 +802,8 @@ impl AgentView {
     /// Hardware cursor position within the last composed frame (0-based row,
     /// 0-based column), when the editor surface drew the cursor.
     pub fn frame_cursor(&self) -> Option<(usize, usize)> {
-        if self.onboarding.is_some() || self.model_picker.is_some() {
+        if self.onboarding.is_some() || self.model_picker.is_some() || self.effort_picker.is_some()
+        {
             return None;
         }
         self.dock_cursor

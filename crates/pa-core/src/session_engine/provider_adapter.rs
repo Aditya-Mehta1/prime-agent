@@ -34,12 +34,26 @@ pub fn map_thinking_level(level: pa_types::ai::ModelThinkingLevel) -> ThinkingLe
     }
 }
 
-/// A real pa-ai provider stream adapter for the agent loop.
-pub fn real_stream_fn(api_key: Option<String>, model: Model) -> StreamFn {
+/// The mutable provider target a live session's stream reads per call:
+/// daemon `set_model` swaps it without rebuilding the session.
+#[derive(Debug, Clone)]
+pub struct ProviderTarget {
+    pub api_key: Option<String>,
+    pub model: Model,
+}
+
+/// A real pa-ai provider stream adapter for the agent loop, reading its
+/// target from a shared slot the host can swap live (`set_model`). The
+/// slot is `None` only before the host sets the build-time target; the
+/// adapter never runs before that.
+pub fn switchable_stream_fn(target: Arc<std::sync::RwLock<Option<ProviderTarget>>>) -> StreamFn {
     Arc::new(
         move |_requested: AgentModel, context: LlmContext, options: StreamRequestOptions| {
-            let api_key = api_key.clone();
-            let model = model.clone();
+            let ProviderTarget { api_key, model } = target
+                .read()
+                .expect("provider target lock")
+                .clone()
+                .expect("provider target set before the first stream");
             Box::pin(async move {
                 let messages: Vec<pa_types::ai::Message> = context
                     .messages
@@ -107,6 +121,15 @@ pub fn real_stream_fn(api_key: Option<String>, model: Model) -> StreamFn {
             })
         },
     )
+}
+
+/// A stream adapter pinned to one target: the headless runtimes (print and
+/// json modes) resolve their model once, so the slot never changes.
+pub fn real_stream_fn(api_key: Option<String>, model: Model) -> StreamFn {
+    switchable_stream_fn(Arc::new(std::sync::RwLock::new(Some(ProviderTarget {
+        api_key,
+        model,
+    }))))
 }
 
 /// Convert one pa-ai stream event into the pa-agent loop's event enum.

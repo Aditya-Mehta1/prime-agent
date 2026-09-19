@@ -77,6 +77,10 @@ pub trait InteractionTelemetry: Send + Sync {
         action: &'static str,
         resumed_following: bool,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    /// A builtin client command was submitted (`agent command used`):
+    /// `command` is the canonical name (`model`, `effort`, ...). Session
+    /// commands report through the session telemetry instead.
+    fn command_used(&self, command: &'static str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
     /// How the client run ended: `reason` is `ctrl_c_twice` / `ctrl_d` /
     /// `session_request` / `daemon_closed`, with whether a turn was still
     /// active at exit.

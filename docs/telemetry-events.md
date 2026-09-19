@@ -101,7 +101,11 @@ Session dispose (interactive exit, worker shutdown).
 
 ### `agent command used`
 
-Builtin slash commands only (resolved canonical name).
+Builtin slash commands only (resolved canonical name). Two seams, one event
+per submission: session commands (`compact`, `refine`, `goal`,
+`autonomous`) emit from the worker's session telemetry at execution; client
+commands (`model`, `effort`) emit from the interactive client at dispatch
+(TS `captureAgentCommandUsed`).
 
 | property | type | notes |
 |---|---|---|

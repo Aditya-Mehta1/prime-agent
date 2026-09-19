@@ -154,7 +154,7 @@ Per-lane EXPECTED-FAIL triage (44 rows, run 20260919T011717Z):
 | compact-fb-2 | f14 | 4 | no `◆ Context compacted` row on `/compact`; no auto-compaction outcome on threshold crossing; manual+auto frame diffs (lane fix #501c5a4 not in this base) |
 | decorations-3 | f15 | 4 | sibling message IS delivered (`custom_message` in the session) but no `◆ Agent message received` row renders; sender shows no `◆ Agent message sent` row |
 | decorations-3 | f16 | 5 | the refinement tool call leaves no refinement entry in the rust session and no `◆ Harness refined` row; no `[harness-digest]` row on either side (TS digest expectation needs reconciliation with TS behavior) |
-| model-picker-1 | f17 | 6 | `/model` selector does not list the configured mock model; no `Model: <id>` confirm row; `/effort` shows no thinking-level surface |
+| model-picker-2 | f17 | 1 | `/model` selector, confirm row, and `/effort` surface fixed (run `20260919T040417Z`: 8 of 9 f17 checks pass, the `model-selected` and `effort-picker` frames normalized byte-identical); the remaining `model-selector` frame diff needs the TS inline menu-panel rendering plus live prime-inference catalog parity (TS lists 1282 live-fetched models, rust lists the bundled catalog) |
 | goal-autonomous | f18 | 8 | `goal.complete()` executes (session shows `status: complete`) but no completion row renders; all 7 goal/autonomous frame diffs differ. Note: the completed goal's recorded objective is the literal `/goal resume` text — rust appears to re-create the goal on `/goal resume` instead of resuming it |
 | heartbeat-tui | f19 | 6 | no `Heartbeat set` row on `/heartbeat`; fired heartbeat shows no `♥ Heartbeat prompt` row; `/heartbeats` opens no manager view |
 | subagents-tui | f20 | 6 | `rlm.spawn` works (`RLMSpawnHandle` with `rlm_child_id` in the session) but no spawn summary line, no `RLM child status` terminal notice, and the scoped-agents view does not list the child |
@@ -163,4 +163,9 @@ Per-lane EXPECTED-FAIL triage (44 rows, run 20260919T011717Z):
 Run history for this unit: 20260918T231155Z (first run, committed; found the
 TS goal-loop runaway), 20260919T002527Z (found the sandbox-baked runtime
 path; superseded, not committed), 20260919T011717Z (authoritative,
-committed).
+committed), 20260919T040417Z (f17 only, model-picker-2 lane: 8 of 9 f17
+checks pass — the selector, confirm-row, and effort rows flipped; the
+`model-selected`/`effort-picker` frames are normalized byte-identical after
+the transcript-frame normalizer learned the `~`-form path and the per-build
+version banner), 20260919T042122Z (f17 re-run on the tree merged with #161:
+the same 8 of 9 hold).

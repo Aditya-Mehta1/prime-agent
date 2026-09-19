@@ -21,6 +21,7 @@ pub mod custom_message;
 pub mod daemon_client;
 pub mod direct_transport;
 pub mod editor;
+pub mod effort_picker;
 pub mod error_summary;
 mod exit_guard;
 pub mod fuzzy;

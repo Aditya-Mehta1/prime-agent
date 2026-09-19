@@ -1,0 +1,5 @@
+{"type":"session","version":3,"id":"01a0b7d6-1ed1-77c9-8997-f09654b3d2e3","timestamp":"2026-09-19T04:04:18.257Z","cwd":"/home/ubuntu/lane-worktrees/model-picker-2/scripts/battery/runs/20260919T040417Z/ts/work","rlmDepth":0,"git":{"repoUrl":"https://github.com/kevinjosethomas/prime-agent-rs.git","commit":"e42c03b5ee9306c3751c218a6f897f1ab09c8a48","branch":"lane/model-picker-2"}}
+{"type":"model_change","id":"394d10ae","parentId":null,"timestamp":"2026-09-19T04:04:18.313Z","provider":"prime-inference","modelId":"mock-1"}
+{"type":"thinking_level_change","id":"b6f6fc9e","parentId":"394d10ae","timestamp":"2026-09-19T04:04:18.313Z","thinkingLevel":"off"}
+{"type":"service_tier_change","id":"b9e48dc8","parentId":"b6f6fc9e","timestamp":"2026-09-19T04:04:18.313Z","serviceTier":"default"}
+{"type":"session_state","id":"96fa874b","parentId":"b9e48dc8","timestamp":"2026-09-19T04:04:18.330Z","state":{"status":"active"}}

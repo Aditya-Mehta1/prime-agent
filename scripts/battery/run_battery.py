@@ -57,7 +57,7 @@ FLOW_LANES = {
     "f14_compact": "compact-fb-2",
     "f15_a2a": "decorations-3",
     "f16_refine": "decorations-3",
-    "f17_slash_model": "model-picker-1",
+    "f17_slash_model": "model-picker-2",
     "f18_goal_autonomous": "goal-autonomous",
     "f19_heartbeat": "heartbeat-tui",
     "f20_subagents": "subagents-tui",
@@ -1933,9 +1933,19 @@ class Battery:
         ids, timestamps, token counts, and trailing status lines so the diff
         measures the durable rows, not volatile metadata."""
         text = frame
+        home = str(Path.home())
+        # Both products render the session cwd with a leading `~`, so a
+        # side-specific path can appear in either form.
         for value in (str(side.root), str(side.agent_dir), str(side.work_dir)):
             text = text.replace(value, "<dir>")
+            if value.startswith(home):
+                text = text.replace(value.replace(home, "~", 1), "<dir>")
         text = re.sub(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "<uuid>", text)
+        # The splash banner's product version is per-build metadata (the TS
+        # release reports its pinned manifest, a cargo build reports the
+        # workspace version): scrub it like the other volatile fields so the
+        # diff measures the durable rows.
+        text = re.sub(r"prime agent v[0-9][0-9A-Za-z.+-]*", "prime agent <version>", text)
         text = re.sub(r"\b[0-9,]{4,}\b", "<num>", text)
         text = re.sub(r"\b\d+(\.\d+)?s\b", "<dur>", text)
         return text

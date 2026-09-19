@@ -238,6 +238,32 @@ pub trait SessionEngine: Send + Sync {
         None
     }
 
+    /// Apply a live model switch (the daemon `set_model` command, TS
+    /// `session.setModel`): the selection merges over the current one and
+    /// a built session's agent and provider stream follow the new model on
+    /// the next turn. Returns `false` when the engine cannot switch (the
+    /// scripted harness), so the caller refuses instead of half-applying.
+    fn switch_model(&self, _selection: EngineModelSelection) -> bool {
+        false
+    }
+
+    /// Apply a live thinking-level switch (the daemon `set_thinking_level`
+    /// command, TS `session.setThinkingLevel`): the requested level merges
+    /// over the selection, clamped to the resolved model's supported
+    /// levels, and a built session's agent follows it on the next turn.
+    /// Returns `false` when the engine cannot switch.
+    fn switch_thinking_level(&self, _level: pa_types::ai::ModelThinkingLevel) -> bool {
+        false
+    }
+
+    /// The resolved model's supported thinking levels as wire names (TS
+    /// `getSupportedThinkingLevels` on the connection state). Engines
+    /// without model resolution report `None` (the caller records
+    /// `["off"]`, like the TS non-reasoning shape).
+    fn supported_thinking_levels(&self) -> Option<Vec<String>> {
+        None
+    }
+
     /// The session's autonomous-run status snapshot (`wait_for_headless_completion`;
     /// TS `DaemonAutonomousStatus`), when the engine tracks one. The
     /// accounting lock is async-held (the turn loop's gate evaluation spans

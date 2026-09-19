@@ -15,6 +15,7 @@ use crate::chat::{
     ToolResultView, WorkingState,
 };
 use crate::daemon_client::{DaemonClient, DaemonClientEvent};
+use crate::effort_picker::{self, EffortPickerAction};
 use crate::goal_surface::{format_goal_status, tray_goal_label, GoalView};
 use crate::interactive::{InteractiveOptions, ModelSelection, SessionSelection};
 use crate::keys::key_event_to_id;
@@ -65,6 +66,10 @@ pub(crate) struct SessionUi {
     /// (`markdown.codeBlockIndent`); `/new` re-opens with the same value
     /// instead of resetting it to the default.
     code_block_indent: String,
+    /// The transcript index of the last `note` status row (TS `showStatus`
+    /// tracks its previous row for the back-to-back in-place rewrite; any
+    /// later entry invalidates it through the length check).
+    last_status_index: Option<usize>,
     /// Snapshot chat entries to fold into the view on the next rebuild.
     pending_snapshot: Option<Vec<ChatEntry>>,
     /// Snapshot labels (model) for the next rebuild.
@@ -148,6 +153,7 @@ impl SessionUi {
             model_catalog: options.model_catalog.clone(),
             telemetry_disabled: options.telemetry_disabled,
             code_block_indent: options.code_block_indent.clone(),
+            last_status_index: None,
             pending_snapshot: None,
             pending_model: None,
             context: None,
@@ -267,6 +273,8 @@ impl SessionUi {
     /// labels). Called after attach and after every session switch.
     pub(crate) fn rebuild_view(&mut self, view: &mut AgentView) {
         view.clear_chat();
+        // The rebuilt transcript invalidates the tracked status row.
+        self.last_status_index = None;
         if let Some(items) = self.pending_snapshot.take() {
             for entry in items {
                 view.push_entry(entry);
@@ -331,7 +339,9 @@ impl SessionUi {
         let columns = terminal_columns();
         let text = format_goal_status(&self.goal_view.goal, columns);
         let updated_in_place = match self.goal_view.last_status_index {
-            Some(index) if index + 1 == view.chat_len() => view.update_status_text(index, &text),
+            Some(index) if index + 1 == view.chat_len() => {
+                view.update_status_row(index, &text, StatusKind::Info)
+            }
             _ => false,
         };
         if !updated_in_place {
@@ -402,10 +412,22 @@ impl SessionUi {
     }
 
     pub(crate) fn note(&mut self, text: &str, view: &mut AgentView) {
-        view.push_entry(ChatEntry::Status {
-            text: text.to_string(),
-            kind: StatusKind::Info,
-        });
+        // TS `showStatus`: a status emitted back-to-back (nothing else
+        // reached the chat since the previous one) rewrites the previous
+        // status row in place instead of appending a new one.
+        let updated_in_place = match self.last_status_index {
+            Some(index) if index + 1 == view.chat_len() => {
+                view.update_status_row(index, text, StatusKind::Info)
+            }
+            _ => false,
+        };
+        if !updated_in_place {
+            view.push_entry(ChatEntry::Status {
+                text: text.to_string(),
+                kind: StatusKind::Info,
+            });
+            self.last_status_index = Some(view.chat_len() - 1);
+        }
         self.dirty = true;
     }
 
@@ -732,6 +754,7 @@ impl SessionUi {
             // picker over the startup catalog, the search term prefilled
             // as its filter; Enter applies, Esc cancels.
             "model" => {
+                self.track_command_used("model");
                 let current = view.chrome.model_id.as_deref().and_then(|model_id| {
                     self.model_catalog
                         .iter()
@@ -751,6 +774,60 @@ impl SessionUi {
                     }
                     model_picker::ModelCommandOutcome::NoModels(message) => {
                         self.note(&message, view);
+                    }
+                }
+            }
+            // `/effort [level]` (TS `handleEffortCommand`): the
+            // session's thinking levels drive the outcome — a model
+            // without reasoning reports the TS note, a missing argument
+            // opens the picker, and a valid argument applies directly.
+            "effort" => {
+                self.track_command_used("effort");
+                let Some(state) = self.connection_state(view).await else {
+                    return Ok(());
+                };
+                let levels: Vec<String> = state
+                    .get("availableThinkingLevels")
+                    .and_then(Value::as_array)
+                    .map(|levels| {
+                        levels
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // TS `getAvailableThinkingLevels`: an "off"-only list is
+                // no thinking surface.
+                let levels: Vec<String> = if levels.len() == 1 && levels[0] == "off" {
+                    Vec::new()
+                } else {
+                    levels
+                };
+                let current = state
+                    .get("thinkingLevel")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                match effort_picker::effort_command(&levels, current.as_deref(), &resolved.args) {
+                    effort_picker::EffortCommandOutcome::Open(picker) => {
+                        view.effort_picker = Some(picker);
+                    }
+                    effort_picker::EffortCommandOutcome::Unsupported => {
+                        self.note("Current model does not support thinking", view);
+                    }
+                    effort_picker::EffortCommandOutcome::Unknown { requested, levels } => {
+                        // TS `showError`: the ⚠ Error row, not the muted note.
+                        view.push_entry(ChatEntry::Status {
+                            text: format!(
+                                "\u{26a0} Error: Unknown thinking level '{requested}'. Available: {}",
+                                levels.join(", ")
+                            ),
+                            kind: StatusKind::Error,
+                        });
+                        self.dirty = true;
+                    }
+                    effort_picker::EffortCommandOutcome::Apply { level } => {
+                        self.apply_thinking_level(&level, view).await;
                     }
                 }
             }
@@ -976,26 +1053,167 @@ impl SessionUi {
             }
             Some(ModelPickerAction::Apply { provider, model_id }) => {
                 view.model_picker = None;
-                self.apply_model_selection(&provider, &model_id, view);
+                self.apply_model_selection(&provider, &model_id, view).await;
             }
             None => {}
         }
         Ok(())
     }
 
-    /// Apply a picked model: the `ModelSelection` the create path already
-    /// serializes into every `create` config carries the picked model, so
-    /// `/new` sessions and later creates start on it. (Switching the model
-    /// of the live session rides the daemon `set_model` seam, which the
-    /// worker does not handle yet; until it lands, this is the apply
-    /// surface and the note says so.)
-    fn apply_model_selection(&mut self, provider: &str, model_id: &str, view: &mut AgentView) {
-        self.model_selection.provider = Some(provider.to_string());
-        self.model_selection.model = Some(model_id.to_string());
-        self.note(
-            &format!("Model set: {model_id} (new sessions start on it)"),
-            view,
-        );
+    /// One key press while the `/effort` picker is open: Esc/Ctrl+C close
+    /// it without applying; Enter applies the picked level.
+    async fn handle_effort_picker_key(
+        &mut self,
+        key: KeyEvent,
+        view: &mut AgentView,
+    ) -> Result<()> {
+        let Some(id) = key_event_to_id(&key) else {
+            return Ok(());
+        };
+        // The picker consumes Ctrl+C (close, not exit): report the handled
+        // press so the force-quit guard can disarm once the whole pair was
+        // consumed with TS semantics.
+        if id == "ctrl+c" {
+            self.exit_guard.note_ctrl_c_handled();
+        }
+        let action = view
+            .effort_picker
+            .as_mut()
+            .map(|picker| picker.handle_key(&id, view.editor.keybindings()));
+        match action {
+            Some(EffortPickerAction::None) => {}
+            Some(EffortPickerAction::Cancel) => {
+                view.effort_picker = None;
+                self.dirty = true;
+            }
+            Some(EffortPickerAction::Apply { level }) => {
+                view.effort_picker = None;
+                self.apply_thinking_level(&level, view).await;
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// Apply a picked model (TS `applySelectedModel` + the
+    /// `completeModelSelection` status row): the daemon `set_model` command
+    /// switches the live session — the agent, the provider target, and the
+    /// session's settings default follow — then the client refreshes its
+    /// model label and records the `Model: <id>` status row. A failure
+    /// surfaces as the error note instead.
+    async fn apply_model_selection(
+        &mut self,
+        provider: &str,
+        model_id: &str,
+        view: &mut AgentView,
+    ) {
+        let switched = self
+            .bounded_request(
+                Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                DaemonCommand::SetModel {
+                    id: None,
+                    active_session_id: self.active_session_id.clone(),
+                    provider: provider.to_string(),
+                    model_id: model_id.to_string(),
+                    rest: Default::default(),
+                },
+            )
+            .await;
+        match switched {
+            Ok(_) => {
+                // The create path's runtime config carries the picked model,
+                // so `/new` sessions start on it too (TS settings default).
+                self.model_selection.provider = Some(provider.to_string());
+                self.model_selection.model = Some(model_id.to_string());
+                self.refresh_model_label(view).await;
+                self.note(&format!("Model: {model_id}"), view);
+            }
+            Err(error) => {
+                // TS `showError`: the ⚠ Error row with the error tone.
+                view.push_entry(ChatEntry::Status {
+                    text: format!("\u{26a0} Error: {error:#}"),
+                    kind: StatusKind::Error,
+                });
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Apply a thinking level (TS `applyThinkingLevel`): the daemon
+    /// `set_thinking_level` command switches the session's level (durable
+    /// row and settings default included), then the client records the
+    /// `Thinking level: <level>` status row.
+    async fn apply_thinking_level(&mut self, level: &str, view: &mut AgentView) {
+        let switched = self
+            .bounded_request(
+                Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                DaemonCommand::SetThinkingLevel {
+                    id: None,
+                    active_session_id: self.active_session_id.clone(),
+                    level: level.to_string(),
+                    rest: Default::default(),
+                },
+            )
+            .await;
+        match switched {
+            Ok(_) => self.note(&format!("Thinking level: {level}"), view),
+            Err(error) => {
+                // TS `showError`: the ⚠ Error row with the error tone.
+                view.push_entry(ChatEntry::Status {
+                    text: format!("\u{26a0} Error: {error:#}"),
+                    kind: StatusKind::Error,
+                });
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// The session's connection state (TS `AgentConnectionState`): the
+    /// worker's `get_state` response. `None` surfaces the failure as a
+    /// note; callers keep the transcript unchanged then.
+    async fn connection_state(&mut self, view: &mut AgentView) -> Option<Value> {
+        match self
+            .bounded_request(
+                Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                DaemonCommand::GetState {
+                    id: None,
+                    active_session_id: self.active_session_id.clone(),
+                    rest: Default::default(),
+                },
+            )
+            .await
+        {
+            Ok(data) => Some(data),
+            Err(error) => {
+                self.note(&format!("{error:#}"), view);
+                None
+            }
+        }
+    }
+
+    /// Refresh the chrome model label after a live switch (TS
+    /// `applyModelSwitchUiState` reads the state and patches the footer).
+    async fn refresh_model_label(&mut self, view: &mut AgentView) {
+        let state = self
+            .bounded_request(
+                Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                DaemonCommand::GetState {
+                    id: None,
+                    active_session_id: self.active_session_id.clone(),
+                    rest: Default::default(),
+                },
+            )
+            .await;
+        if let Ok(data) = state {
+            if let Some(model_id) = data
+                .get("model")
+                .and_then(|model| model.get("id"))
+                .and_then(Value::as_str)
+            {
+                view.chrome.model_id = Some(model_id.to_string());
+            }
+            self.dirty = true;
+        }
     }
 
     /// Abort the active turn off the UI loop (TS `interruptOrClearInput`
@@ -1074,6 +1292,17 @@ impl SessionUi {
         }
     }
 
+    /// Report a builtin client-command submission (`agent command used`),
+    /// fire-and-forget like the scroll event: the command's handling never
+    /// waits on the telemetry flush.
+    fn track_command_used(&mut self, command: &'static str) {
+        if let Some(telemetry) = self.telemetry.clone() {
+            tokio::spawn(async move {
+                telemetry.command_used(command).await;
+            });
+        }
+    }
+
     pub(crate) async fn handle_key(
         &mut self,
         key: KeyEvent,
@@ -1085,6 +1314,10 @@ impl SessionUi {
         // cancels the picker instead of aborting a turn).
         if view.model_picker.is_some() {
             return self.handle_model_picker_key(key, view).await;
+        }
+        // The `/effort` picker owns the frame the same way.
+        if view.effort_picker.is_some() {
+            return self.handle_effort_picker_key(key, view).await;
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             // One handled Ctrl+C press: the force-quit guard disarms once

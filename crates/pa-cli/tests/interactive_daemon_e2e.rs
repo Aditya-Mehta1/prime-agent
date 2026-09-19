@@ -614,6 +614,124 @@ async fn tui_dispatches_slash_commands_menu_and_suggestions() {
     drop(supervisor);
 }
 
+/// The `/model` picker + `/effort` surface, end to end through the daemon:
+/// a models.json custom model lists in the picker (name label), Enter
+/// applies it through the daemon `set_model` command (durable `model_change`
+/// row + the TS `Model: <id>` confirm row), and `/effort` on a model without
+/// reasoning reports the TS unsupported note (the thinking-level plumbing:
+/// the worker reports the model's supported levels, the client treats an
+/// `off`-only list as no thinking).
+#[tokio::test]
+async fn tui_model_picker_applies_and_effort_reports() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let session_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    // The battery layout: a custom provider in models.json carries the
+    // model (id, name, endpoint), so it resolves without any network.
+    std::fs::write(
+        agent_dir.join("models.json"),
+        serde_json::json!({
+            "providers": {
+                "test-provider": {
+                    "api": "openai-completions",
+                    "baseUrl": "http://127.0.0.1:9/v1",
+                    "apiKey": "sk-test",
+                    "models": [
+                        { "id": "mock-1", "name": "Mock 1", "api": "openai-completions",
+                          "baseUrl": "http://127.0.0.1:9/v1", "contextWindow": 128000,
+                          "maxTokens": 4096 }
+                    ]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write models.json");
+    let script = serde_json::json!({ "engine": "faux", "responses": [
+        { "text": "scripted reply" },
+    ] });
+    std::fs::write(dir.path().join("script.json"), script.to_string()).expect("write script");
+    let supervisor = spawn_supervisor(dir.path());
+    // The catalog snapshot the composition root injects (available models
+    // over the same registry).
+    let auth = pa_core::auth::AuthStorage::create(&agent_dir);
+    let mut registry = pa_core::models::ModelRegistry::create(auth, agent_dir.join("models.json"));
+    registry.load_private_authorization_from_cache();
+    let catalog: Vec<pa_types::ai::Model> = registry.get_available().into_iter().cloned().collect();
+    assert_eq!(catalog.len(), 1, "the models.json model resolves available");
+
+    let options = pa_tui::interactive::InteractiveOptions {
+        socket_path: supervisor.socket.clone(),
+        cwd: dir.path().to_path_buf(),
+        session_dir: Some(session_dir.clone()),
+        script_path: Some(dir.path().join("script.json")),
+        model_selection: Default::default(),
+        model_catalog: catalog,
+        no_session: false,
+        session: pa_tui::interactive::SessionSelection::New,
+        initial_message: None,
+        theme: "prime".to_string(),
+        code_block_indent: "  ".to_string(),
+        version: "0.0.0".to_string(),
+        onboarding: None,
+        telemetry_disabled: None,
+        client_auth: None,
+        telemetry: None,
+    };
+    let plan = pa_tui::interactive::HeadlessPlan {
+        steps: vec![
+            pa_tui::interactive::HeadlessStep::Submit("/model".to_string()),
+            pa_tui::interactive::HeadlessStep::Type("mock".to_string()),
+            pa_tui::interactive::HeadlessStep::Type("\n".to_string()),
+            pa_tui::interactive::HeadlessStep::Submit("/effort".to_string()),
+        ],
+        width: 120,
+        height: 36,
+    };
+    let outcome =
+        pa_tui::interactive::run_interactive(options, pa_tui::interactive::UiMode::Headless(plan))
+            .await
+            .expect("interactive run");
+    let rendered = outcome.frames.join("\n");
+    assert!(
+        rendered.contains("Mock 1"),
+        "the /model picker listed the models.json model by name:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Model: mock-1"),
+        "picking the model showed the TS confirm row:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Current model does not support thinking"),
+        "the /effort command reported the TS unsupported-model note:\n{rendered}"
+    );
+
+    // The durable rows persisted: the creation-prefix `model_change` plus
+    // the switch's own row (TS `appendModelChange` runs on every switch,
+    // even to the current model).
+    let mut model_changes = 0;
+    for entry in std::fs::read_dir(&session_dir)
+        .expect("read session dir")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        model_changes += content
+            .lines()
+            .filter(|line| line.contains(r#""type":"model_change""#))
+            .count();
+    }
+    assert!(
+        model_changes >= 2,
+        "the set_model switch persisted its model_change row (saw {model_changes})"
+    );
+    drop(supervisor);
+}
+
 /// `/compact` on a fresh session: the compaction skips (TS
 /// `CompactionSkippedError`) and the warning reaches the transcript through
 /// the `compaction_end` event, with the durable echo row — TS's live

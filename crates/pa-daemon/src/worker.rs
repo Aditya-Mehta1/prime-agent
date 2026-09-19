@@ -402,7 +402,7 @@ pub struct Worker {
     /// Supervisor self-registration handle; `None` for standalone workers.
     registration: Option<RegistrationHandle>,
     pub(crate) core: Arc<Mutex<SessionCore>>,
-    engine: std::sync::Arc<dyn SessionEngine>,
+    pub(crate) engine: std::sync::Arc<dyn SessionEngine>,
     work_notify: Arc<Notify>,
     idle_notify: Arc<Notify>,
     events: Arc<EventPump>,
@@ -1085,6 +1085,8 @@ impl Worker {
             "rename" => self.handle_rename("rename", payload),
             "set_session_name" => self.handle_rename("set_session_name", payload),
             "replace_acp_mcp_servers" => self.handle_replace_acp_mcp_servers(payload),
+            "set_model" => self.handle_set_model(payload).await,
+            "set_thinking_level" => self.handle_set_thinking_level(payload).await,
             other => response_failure(
                 None,
                 command_type,
@@ -1095,7 +1097,7 @@ impl Worker {
     }
 
     #[allow(clippy::result_large_err)]
-    fn require_created(&self, command_type: &str) -> Result<(), DaemonResponse> {
+    pub(crate) fn require_created(&self, command_type: &str) -> Result<(), DaemonResponse> {
         let core = self.core.lock().unwrap();
         if !core.created {
             return Err(response_failure(
@@ -2190,7 +2192,13 @@ impl Worker {
                 .effective_thinking_level()
                 .unwrap_or_else(|| "default".to_string()),
             service_tier: "auto".to_string(),
-            available_thinking_levels: vec!["default".to_string()],
+            // The resolved model's supported levels (TS `getSupportedThinkingLevels`
+            // in `getState`): a non-reasoning model reports ["off"], which the
+            // client treats as no thinking surface.
+            available_thinking_levels: self
+                .engine
+                .supported_thinking_levels()
+                .unwrap_or_else(|| vec!["off".to_string()]),
             is_bash_running: false,
             retry_attempt: 0,
             steering_mode: "all".to_string(),

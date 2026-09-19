@@ -18,6 +18,7 @@ pub mod journal;
 pub mod lease;
 pub mod mcp_login;
 pub(crate) mod messaging;
+pub(crate) mod model_switch;
 pub mod paths;
 pub(crate) mod peer;
 pub(crate) mod peer_client;
