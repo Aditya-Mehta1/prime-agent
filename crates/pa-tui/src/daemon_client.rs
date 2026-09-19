@@ -38,6 +38,16 @@ const HELLO_TIMEOUT_MS: u64 = 3_000;
 /// A non-response frame forwarded to the UI event loop. Payloads that are
 /// owned by the session engine stay raw JSON (`Value`) so the client keeps
 /// working across schema revisions.
+/// The update resume contract of a `daemon_closing` frame (spec §10.1).
+#[derive(Debug, Clone)]
+pub struct DaemonClosingUpdate {
+    pub update_id: String,
+    pub est_seconds: u64,
+    /// The stopped sessions `[{sessionId, name}]`: what the client can
+    /// reattach to by durable id after the restart.
+    pub sessions: Vec<Value>,
+}
+
 #[derive(Debug, Clone)]
 pub enum DaemonClientEvent {
     /// `session_event`: one streamed agent/turn event for an attached session.
@@ -54,8 +64,13 @@ pub enum DaemonClientEvent {
     SessionListItem { session: Value },
     /// `session_list_progress` progress frame of `list_saved_sessions`.
     SessionListProgress { loaded: u64, total: u64 },
-    /// `daemon_closing`: the supervisor is going down.
-    DaemonClosing { reason: String },
+    /// `daemon_closing`: the supervisor is going down. An update restart
+    /// carries the resume contract (spec §10.1): the client keeps its UI
+    /// mounted and reconnects instead of exiting.
+    DaemonClosing {
+        reason: String,
+        update: Option<DaemonClosingUpdate>,
+    },
     /// `roster_update`: live roster deltas for subscribers (the agents
     /// view): changed entries upsert by agent id, `removed` deletes, and
     /// `resync` replaces the whole roster.
@@ -107,6 +122,26 @@ pub(crate) fn client_event_from_value(value: &Value) -> Option<DaemonClientEvent
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            update: value.get("payload").cloned().and_then(|payload| {
+                (payload.get("resume").and_then(Value::as_bool) == Some(true)).then(|| {
+                    DaemonClosingUpdate {
+                        update_id: payload
+                            .get("updateId")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        est_seconds: payload
+                            .get("estSeconds")
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default(),
+                        sessions: payload
+                            .get("sessions")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default(),
+                    }
+                })
+            }),
         }),
         "roster_update" => Some(DaemonClientEvent::RosterUpdate {
             changed: value

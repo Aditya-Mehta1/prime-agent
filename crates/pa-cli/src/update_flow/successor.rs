@@ -161,8 +161,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket: PathBuf = dir.path().join("silent.sock");
         let started = Instant::now();
-        let identity = wait_for_hello(&socket, 150).await;
+        // The budget spans at least one poll: the loop gives up when the
+        // next poll would overshoot the deadline, so the elapsed time is
+        // poll-granular - never shorter than one poll, never past two.
+        let identity = wait_for_hello(&socket, (BOOT_POLL * 2).as_millis() as u64).await;
         assert!(identity.is_none());
-        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert!(started.elapsed() >= BOOT_POLL);
     }
 }

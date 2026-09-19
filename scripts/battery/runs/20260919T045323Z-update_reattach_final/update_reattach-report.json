@@ -1,0 +1,114 @@
+{
+ "verdicts": [
+  {
+   "row": "T1",
+   "description": "TUI rides the update: banner, auto-reattach, same durable session",
+   "parity": true
+  },
+  {
+   "row": "G4",
+   "description": "attach-by-durable-id after the update: same session, replayed",
+   "parity": true
+  },
+  {
+   "row": "K1",
+   "description": "kill -9 the coordinator mid-Preparing (RPC in flight): self-expiry to Serving, session survives, re-run completes",
+   "parity": true
+  },
+  {
+   "row": "K2",
+   "description": "kill -9 the coordinator at Prepared (marker present): self-expiry to Serving, session survives, re-run completes",
+   "parity": true
+  }
+ ],
+ "flow": "update_reattach",
+ "version": "0.1.0",
+ "rows": {
+  "T1": {
+   "pre_update_frame": "                                                          work  $0.00\n\n                  \u2597\u2584\u2584\u2588\u2580\n    \u2588\u2588\u2588\u2584       \u2597\u2584\u2588\u2588\u2588\u2580\n   \u2597\u2588\u259b\u2590\u2588\u2599   \u2597\u2584\u2588\u2580\u2597\u2588\u2580       prime agent v0.1.0\n  \u2597\u2588\u259b \u259f\u2588\u2588\u2599\u2584\u2588\u2588\u259b \u259f\u259b         model mock-1\n  \u2597\u259f\u258c \u2590\u2588\u2588\u2588\u259b\u2598\u2597\u2584\u2588\u2596          cwd /tmp/urw-f/rust-t1/work\n \u259f\u2588\u2588\u2588\u2584  \u2584\u2584\u259f\u2588\u2588\u2588\u2580\n \u259c\u2588\u259b\u2580\u2598  \u259c\u2588\u259b\u2580\u2598\n\n\n \u26a0 tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to ~/.tmux.conf and\n restart tmux.\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n                                                                                      Collapsed mode (Ctrl+O to expand)\n\n >\n\n\u2190 manage                                                                                                 mock-1 \u00b7 0 (0%)\n",
+   "update_stdout": "Stopping sessions gracefully\u2026\nActivating \u2192 booting\nRestored 2 daemon sessions\nRestarted the daemon after the update\n",
+   "update_stderr": "",
+   "mid_update_frame": "                                                          work  $0.00\n\n                  \u2597\u2584\u2584\u2588\u2580\n    \u2588\u2588\u2588\u2584       \u2597\u2584\u2588\u2588\u2588\u2580\n   \u2597\u2588\u259b\u2590\u2588\u2599   \u2597\u2584\u2588\u2580\u2597\u2588\u2580       prime agent v0.1.0\n  \u2597\u2588\u259b \u259f\u2588\u2588\u2599\u2584\u2588\u2588\u259b \u259f\u259b         model mock-1\n  \u2597\u259f\u258c \u2590\u2588\u2588\u2588\u259b\u2598\u2597\u2584\u2588\u2596          cwd /tmp/urw-f/rust-t1/work\n \u259f\u2588\u2588\u2588\u2584  \u2584\u2584\u259f\u2588\u2588\u2588\u2580\n \u259c\u2588\u259b\u2580\u2598  \u259c\u2588\u259b\u2580\u2598\n\n\n \u26a0 tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to ~/.tmux.conf and\n restart tmux.\n\n Prime Agent is updating \u2014 restarting the daemon (about 60s). 01a0b801-a60c-733c-ad11-a242a627404f,\n 01a0b801-a700-7481-9242-68138c23eab1 will resume automatically.\n\n the daemon is restarting for an update (about 60s) \u2014 reconnecting\u2026\n\n\n\n\n\n\n\n\n\n\n\n\n\n                                                                                      Collapsed mode (Ctrl+O to expand)\n\n >\n\n\u2190 manage                                                                                                 mock-1 \u00b7 0 (0%)\n",
+   "post_update_frame": "                                                          work  $0.00\n\n                  \u2597\u2584\u2584\u2588\u2580\n    \u2588\u2588\u2588\u2584       \u2597\u2584\u2588\u2588\u2588\u2580\n   \u2597\u2588\u259b\u2590\u2588\u2599   \u2597\u2584\u2588\u2580\u2597\u2588\u2580       prime agent v0.1.0\n  \u2597\u2588\u259b \u259f\u2588\u2588\u2599\u2584\u2588\u2588\u259b \u259f\u259b         model mock-1\n  \u2597\u259f\u258c \u2590\u2588\u2588\u2588\u259b\u2598\u2597\u2584\u2588\u2596          cwd /tmp/urw-f/rust-t1/work\n \u259f\u2588\u2588\u2588\u2584  \u2584\u2584\u259f\u2588\u2588\u2588\u2580\n \u259c\u2588\u259b\u2580\u2598  \u259c\u2588\u259b\u2580\u2598\n\n\n Reconnected to Prime Agent (update 01a0b801-a79c-73e2-b96b-9e51cfc61868) \u2014 your session and queued work resumed.\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n                                                                                      Collapsed mode (Ctrl+O to expand)\n\n >\n\n\u2190 manage                                                                                                 mock-1 \u00b7 0 (0%)\n",
+   "pane_alive": true,
+   "status": {
+    "coordinator": {
+     "pid": 498455,
+     "processStartId": "proc:2236052"
+    },
+    "counts": {
+     "failed": 0,
+     "restored": 2,
+     "resumed": 0,
+     "total": 2
+    },
+    "epoch": 19,
+    "heartbeatAt": "2026-09-19T04:51:53.187Z",
+    "message": "Restarted the daemon after the update",
+    "predecessor": {
+     "pid": 498374,
+     "processStartId": "proc:2235885",
+     "supervisorGeneration": "sup:498374",
+     "supervisorOwnerToken": "89e51ba7-cd1a-4a1b-b963-b86c0d6ab367"
+    },
+    "socketPath": "/tmp/usw-rust-t1-20260919T045106Z/prime-agent-1000/daemon.sock",
+    "startedAt": "2026-09-19T04:51:51.339Z",
+    "state": "complete",
+    "successor": {
+     "pid": 498472,
+     "processStartId": "proc:2236110",
+     "supervisorGeneration": "sup:498472",
+     "supervisorOwnerToken": "98442fc6-1663-4aeb-b28e-42409c374dc7"
+    },
+    "updateId": "01a0b801-a79c-73e2-b96b-9e51cfc61868",
+    "updatedAt": "2026-09-19T04:51:53.187Z",
+    "version": 1
+   },
+   "after_sessions": [
+    "01a0b801-a60c-733c-ad11-a242a627404f",
+    "01a0b801-a700-7481-9242-68138c23eab1"
+   ]
+  },
+  "G4": {
+   "attach_success": true,
+   "attached_session": "01a0b801-a60c-733c-ad11-a242a627404f",
+   "session": "01a0b801-a60c-733c-ad11-a242a627404f"
+  },
+  "K1": {
+   "coordinator_pid": 498745,
+   "prepared_marker_at_kill": null,
+   "status_at_kill": "preparing",
+   "daemon_serving_after_kill": true,
+   "session_survived": true,
+   "rerun_exit": 0,
+   "rerun_status": {
+    "state": "complete",
+    "counts": {
+     "failed": 0,
+     "restored": 2,
+     "resumed": 0,
+     "total": 2
+    },
+    "message": "Restarted the daemon after the update"
+   }
+  },
+  "K2": {
+   "coordinator_pid": 499180,
+   "prepared_marker_at_kill": "/tmp/urw-f/rust-k2/agent/update-restarts/a97e0098b3860b6686a58e503fe861b6108ace0a6f412ca9b448c9c48a5a4cf3/prepared/01a0b801-db1f-76d5-8384-da89292d798e/marker.json",
+   "status_at_kill": "stopping",
+   "daemon_serving_after_kill": true,
+   "session_survived": true,
+   "rerun_exit": 0,
+   "rerun_status": {
+    "state": "complete",
+    "counts": {
+     "failed": 0,
+     "restored": 2,
+     "resumed": 0,
+     "total": 2
+    },
+    "message": "Restarted the daemon after the update"
+   }
+  }
+ }
+}

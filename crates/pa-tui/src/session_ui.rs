@@ -122,6 +122,9 @@ pub(crate) struct SessionUi {
     scroll_adoption_emitted: bool,
     /// How the client run ended (the `tui exit` reason).
     pub(crate) exit_reason: &'static str,
+    /// The §10 reattach contract: set when a `daemon_closing` update frame
+    /// arrived; the interactive loop drives the reconnect from it.
+    pub(crate) reconnect: Option<crate::daemon_client::DaemonClosingUpdate>,
     /// The double-Ctrl+C force-quit guard (the run's shared instance is
     /// installed by the interactive loop after `open`).
     pub(crate) exit_guard: crate::exit_guard::ExitGuard,
@@ -177,6 +180,7 @@ impl SessionUi {
             telemetry: options.telemetry.clone(),
             scroll_adoption_emitted: false,
             exit_reason: "daemon_closed",
+            reconnect: None,
             exit_guard: crate::exit_guard::ExitGuard::new(),
         };
         session
@@ -184,6 +188,57 @@ impl SessionUi {
             .await
             .with_context(|| format!("attaching session {active_session_id}"))?;
         Ok(session)
+    }
+
+    /// Spec §10.2-§10.5: reattach after an update restart. The fresh client
+    /// (connected to the successor supervisor) replaces the dead one; the
+    /// attach goes by DURABLE session id, so the slice-5 queued-attach
+    /// contract absorbs any restore still in flight (the §10.3 hello's
+    /// `update_resume.complete` is surfaced as a banner line). The
+    /// transcript rebuilds from the attach snapshot - the same machinery
+    /// `/switch` uses - and the resumed-work banner lands after it.
+    pub(crate) async fn reattach_after_update(
+        &mut self,
+        client: DaemonClient,
+        view: &mut AgentView,
+    ) -> Result<()> {
+        let hello_resume = client
+            .hello()
+            .get("updateResume")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let complete = hello_resume.get("complete").and_then(Value::as_bool);
+        let update_id = hello_resume
+            .get("updateId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        self.client = client;
+        let durable = self.session_id.clone();
+        if durable.is_empty() {
+            anyhow::bail!("the session's durable id is unknown; cannot reattach");
+        }
+        self.attach_session(&durable)
+            .await
+            .with_context(|| format!("reattaching session {durable} after the update"))?;
+        // Flush the attach snapshot BEFORE the banner lands: `rebuild_view`
+        // replaces the transcript from the snapshot, so the banner must come
+        // after it to survive the rebuild (§10.5's visible end state).
+        self.rebuild_view(view);
+        match complete {
+            Some(false) => view.push_entry(crate::chat::ChatEntry::Status {
+                text: "Reconnected — the daemon is finishing its restore; queued work resumes when the session comes up.".to_string(),
+                kind: crate::chat::StatusKind::Info,
+            }),
+            _ => view.push_entry(crate::chat::ChatEntry::Status {
+                text: format!(
+                    "Reconnected to Prime Agent (update {update_id}) — your session and queued work resumed."
+                ),
+                kind: crate::chat::StatusKind::Info,
+            }),
+        }
+        self.dirty = true;
+        Ok(())
     }
 
     /// Detach the current session and attach `id`, rebuilding the transcript
@@ -1462,8 +1517,43 @@ impl SessionUi {
                     self.note(&format!("session closed ({reason})"), view);
                 }
             }
-            DaemonClientEvent::DaemonClosing { reason } => {
-                self.note(&format!("the daemon is shutting down ({reason})"), view);
+            DaemonClientEvent::DaemonClosing { reason, update } => {
+                match update {
+                    Some(update) => {
+                        // Spec §10: reattach is the default end state. The
+                        // banner carries the resume contract; the reconnect
+                        // loop in the interactive run drives the rest (UI
+                        // stays mounted, retry with backoff up to 10 min,
+                        // reattach by durable id once the successor serves).
+                        let names = update
+                            .sessions
+                            .iter()
+                            .map(|row| {
+                                row.get("name")
+                                    .and_then(|value| value.as_str())
+                                    .filter(|name| !name.is_empty())
+                                    .unwrap_or_else(|| {
+                                        row.get("sessionId")
+                                            .and_then(|value| value.as_str())
+                                            .unwrap_or_default()
+                                    })
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        view.push_entry(crate::chat::ChatEntry::Status {
+                            text: format!(
+                                "Prime Agent is updating — restarting the daemon (about {}s). {} will resume automatically.",
+                                update.est_seconds.max(1),
+                                if names.is_empty() { "Your session".to_string() } else { names }
+                            ),
+                            kind: crate::chat::StatusKind::Info,
+                        });
+                        self.reconnect = Some(update);
+                    }
+                    None => {
+                        self.note(&format!("the daemon is shutting down ({reason})"), view);
+                    }
+                }
             }
             // Saved-session list frames and roster pushes belong to the
             // agents-view UI; the session view only reads its own session.

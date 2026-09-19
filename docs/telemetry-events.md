@@ -216,6 +216,30 @@ the privacy contract keeps paths, status messages, and ids out.
 | `sessions_restored` | number | restored by the successor supervisor |
 | `sessions_failed` | number | recorded restore failures |
 
+### `update download started` / `update staged` / `update prepare started` / `update prepared` / `update stopping` / `update restarting` / `update restoring` / `update complete` / `update rollback` / `update aborted` / `update failed`
+
+The update flow's per-phase events (spec
+`docs/update-flow-state-machine.md` §11): one event per status-file state
+transition, all derived from the same transitions that drive the CLI status
+lines and the client banner. Emitted by the invoking CLI (the same process
+owns `update completed`); the coordinator never emits. Primitives only -
+phase timings and counts; no paths, messages, or ids (privacy contract).
+
+| property | type | notes |
+|---|---|---|
+| `phase` | string | the event's own phase name (`update_prepared`, …) |
+| `duration_ms` | number | observed time since the previous phase event |
+| `sessions_total` | number | terminal events only: roster sessions |
+| `sessions_restored` | number | terminal events only: restored by the successor |
+| `sessions_failed` | number | terminal events only: recorded restore failures |
+
+Emission map: `Downloading` → `update_download_started`, `Staged` →
+`update_staged`, `Preparing` → `update_prepare_started`, `Prepared` →
+`update_prepared`, `Stopping` → `update_stopping`, `Activating`/`Booting` →
+`update_restarting`, `Restoring` → `update_restoring`, `Complete` →
+`update_complete`, `Rollback` → `update_rollback`, `Aborted` →
+`update_aborted`, `Failed` → `update_failed`.
+
 ### `tui exit`
 
 How one interactive client run ended.

@@ -64,6 +64,9 @@ pub async fn run_update_command(options: &UpdateCommandOptions) -> Result<i32> {
         AcquireOutcome::Acquired => {}
     }
     let mut writer = StatusWriter::new(&status_path, &update_id, &socket_path.to_string_lossy())?;
+    // §11 telemetry: one `update_<phase>` event per status transition; the
+    // tail below derives the coordinator-side events from the same file.
+    let mut phases = PhaseTelemetry::open();
     writer.set_state(UpdateState::Planning)?;
     let budget = UpdateTimeoutBudget::from_env();
     let download_base = std::env::var("PRIME_AGENT_DOWNLOAD_BASE_URL").ok();
@@ -85,6 +88,7 @@ pub async fn run_update_command(options: &UpdateCommandOptions) -> Result<i32> {
             // `Downloading`: stream + digest the archive (one wall-clock
             // budget across all attempts, spec §9).
             writer.set_state(UpdateState::Downloading)?;
+            phases.phase(writer.current());
             let archive = agent_dir.join(format!("update-{update_id}.tar.gz"));
             pa_core::update::download::download_archive(
                 &archive_url,
@@ -100,6 +104,7 @@ pub async fn run_update_command(options: &UpdateCommandOptions) -> Result<i32> {
             .with_context(|| "the release download failed; the installed version was kept")?;
             // `Staged`: extract, validate, and probe the candidate.
             writer.set_state(UpdateState::Staged)?;
+            phases.phase(writer.current());
             let release_dir = pa_core::update::download::stage_archive(
                 &archive,
                 &archive_sha256,
@@ -184,7 +189,14 @@ pub async fn run_update_command(options: &UpdateCommandOptions) -> Result<i32> {
     )?;
     drop(child);
 
-    let status = tail_status(&status_path).await;
+    let status = tail_status_with(&status_path, &mut |observed, _fresh| {
+        phases.phase(observed);
+        if let Some(line) = phase_status_line(observed.state) {
+            println!("{line}");
+        }
+    })
+    .await;
+    phases.finish().await;
     track_update_completed(&status).await;
     print_terminal(&status);
     Ok(if status.state == UpdateState::Complete {
@@ -198,9 +210,19 @@ pub async fn run_update_command(options: &UpdateCommandOptions) -> Result<i32> {
 /// `launchDaemonUpdateRestartCoordinator`'s wait loop): progress, liveness,
 /// and the holder's process lifetime all bound the wait.
 async fn tail_status(status_path: &std::path::Path) -> UpdateStatus {
+    tail_status_with(status_path, &mut |_, _| {}).await
+}
+
+/// The tail with per-transition observers (§11: the CLI status line and the
+/// `update_<phase>` telemetry derive from the same status-file transitions).
+async fn tail_status_with(
+    status_path: &std::path::Path,
+    observe: &mut dyn FnMut(&UpdateStatus, bool),
+) -> UpdateStatus {
     let started = std::time::Instant::now();
     let mut last_liveness = std::time::Instant::now();
     let mut last_epoch: Option<u64> = None;
+    let mut last_state: Option<UpdateState> = None;
     // The successor's boot sweep (spec §6 step 1) deletes the scratch dir —
     // including this status file — while the coordinator is still driving
     // the successor's `Restoring`/`Complete` writes. A file that was seen
@@ -214,6 +236,13 @@ async fn tail_status(status_path: &std::path::Path) -> UpdateStatus {
                 last_liveness = std::time::Instant::now();
             }
             missing_since = None;
+            // One observation per NEW state (epoch churn inside a state -
+            // heartbeats - does not re-fire the observers).
+            if last_state != Some(status.state) {
+                let fresh = last_state.is_some();
+                last_state = Some(status.state);
+                observe(&status, fresh);
+            }
             if status.state.is_terminal() {
                 return status;
             }
@@ -262,6 +291,133 @@ fn print_terminal(status: &UpdateStatus) {
             UpdateState::Complete | UpdateState::Skipped => println!("{message}"),
             _ => eprintln!("{message}"),
         }
+    }
+}
+
+/// The §11 CLI status line for one live state (the terminal states print
+/// the TS-parity report instead).
+fn phase_status_line(state: UpdateState) -> Option<&'static str> {
+    match state {
+        UpdateState::Preparing => Some("Preparing the daemon for the update…"),
+        UpdateState::Prepared => Some("Prepared — stopping sessions"),
+        UpdateState::Stopping => Some("Stopping sessions gracefully…"),
+        UpdateState::Activating | UpdateState::Booting => Some("Activating → booting"),
+        UpdateState::Restoring => Some("Restoring sessions…"),
+        UpdateState::Rollback => Some("Rolling back"),
+        // `Acquire`/`Join` precede the coordinator's status file; `Stopped`
+        // is `Stopping`'s own tail (the successor's spawn follows); the
+        // terminal states print the TS-parity report instead.
+        // `Downloading`/`Staged` print their own lines in the invoking
+        // phase (before the coordinator spawns).
+        UpdateState::Acquire
+        | UpdateState::Join
+        | UpdateState::Downloading
+        | UpdateState::Staged
+        | UpdateState::Stopped
+        | UpdateState::Planning
+        | UpdateState::Skipped
+        | UpdateState::Complete
+        | UpdateState::Aborted
+        | UpdateState::Failed => None,
+    }
+}
+
+/// One `update_<phase>` telemetry event per status-file transition (spec
+/// §11: every surface derives from the same transitions; the invoker owns
+/// the emission - coordinator mode never emits). Primitives only: phase
+/// name, observed duration, and the terminal counts. The privacy contract
+/// keeps paths, messages, and ids out.
+struct PhaseTelemetry {
+    client: Option<pa_telemetry::TelemetryClient>,
+    last_observed: Option<std::time::Instant>,
+    /// States already emitted this invocation: the invoking CLI emits its
+    /// own phases directly (Downloading/Staged) and the tail's first
+    /// observation must not duplicate them.
+    emitted: Vec<UpdateState>,
+}
+
+impl PhaseTelemetry {
+    fn open() -> Self {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let agent_dir = crate::config::get_agent_dir();
+        let settings = pa_core::settings::SettingsManager::create(&cwd, &agent_dir);
+        let client = if crate::mode::telemetry_disabled(&settings) {
+            None
+        } else {
+            Some(pa_core::session_engine::telemetry::build_client(
+                &settings, &agent_dir,
+            ))
+        };
+        PhaseTelemetry {
+            client,
+            last_observed: None,
+            emitted: Vec::new(),
+        }
+    }
+
+    fn phase(&mut self, status: &UpdateStatus) {
+        let Some(client) = &self.client else { return };
+        if self.emitted.contains(&status.state) {
+            return;
+        }
+        let Some(event) = phase_event_name(status.state) else {
+            return;
+        };
+        self.emitted.push(status.state);
+        let now = std::time::Instant::now();
+        let duration_ms = self
+            .last_observed
+            .map(|last| now.duration_since(last).as_millis() as u64)
+            .unwrap_or(0);
+        self.last_observed = Some(now);
+        let mut properties = pa_telemetry::base_properties("cli");
+        properties.set("phase", serde_json::Value::from(event));
+        properties.set("duration_ms", serde_json::Value::from(duration_ms));
+        if status.state.is_terminal() {
+            properties.set(
+                "sessions_total",
+                serde_json::Value::from(status.counts.total),
+            );
+            properties.set(
+                "sessions_restored",
+                serde_json::Value::from(status.counts.restored),
+            );
+            properties.set(
+                "sessions_failed",
+                serde_json::Value::from(status.counts.failed),
+            );
+        }
+        client.track(event, properties);
+    }
+
+    async fn finish(self) {
+        if let Some(client) = self.client {
+            let _ = client.shutdown().await;
+        }
+    }
+}
+
+/// The §11 telemetry event for one coordinator state (`None` for states
+/// without their own event: `Planning`, `Skipped`, and the phases the
+/// invoking CLI emits directly around its own work).
+fn phase_event_name(state: UpdateState) -> Option<&'static str> {
+    match state {
+        UpdateState::Downloading => Some("update_download_started"),
+        UpdateState::Staged => Some("update_staged"),
+        UpdateState::Preparing => Some("update_prepare_started"),
+        UpdateState::Prepared => Some("update_prepared"),
+        UpdateState::Stopping => Some("update_stopping"),
+        UpdateState::Activating | UpdateState::Booting => Some("update_restarting"),
+        UpdateState::Restoring => Some("update_restoring"),
+        UpdateState::Complete => Some("update_complete"),
+        UpdateState::Rollback => Some("update_rollback"),
+        UpdateState::Aborted => Some("update_aborted"),
+        UpdateState::Failed => Some("update_failed"),
+        UpdateState::Acquire
+        | UpdateState::Join
+        | UpdateState::Stopped
+        | UpdateState::Planning
+        | UpdateState::Skipped => None,
     }
 }
 

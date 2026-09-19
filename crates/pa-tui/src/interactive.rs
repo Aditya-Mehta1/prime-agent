@@ -373,6 +373,45 @@ enum UiInput {
     HeadlessDone,
 }
 
+/// Spec §10.2: the client reconnect window after an update restart
+/// (10 minutes).
+const RECONNECT_WINDOW: Duration = Duration::from_secs(10 * 60);
+/// One reconnect attempt's connect budget.
+const RECONNECT_ATTEMPT_TIMEOUT_S: u64 = 5;
+/// One reconnect attempt's reattach budget: a queued attach can legitimately
+/// wait out a slow restore (§10.4), so the attempt hands back to the loop
+/// instead of wedging the UI.
+const RECONNECT_ATTACH_TIMEOUT_S: u64 = 30;
+/// The reconnect backoff cap.
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(10);
+
+/// The interactive loop's reconnect driver (spec §10.2): attempts with
+/// doubling backoff inside the 10-minute window; the user can leave with
+/// Ctrl+C at any point (UI input keeps flowing through the same loop).
+struct ReconnectLoop {
+    deadline: tokio::time::Instant,
+    next_attempt: tokio::time::Instant,
+    delay: Duration,
+}
+
+impl ReconnectLoop {
+    fn start(_update: &crate::daemon_client::DaemonClosingUpdate) -> Self {
+        let delay = Duration::from_secs(1);
+        ReconnectLoop {
+            deadline: tokio::time::Instant::now() + RECONNECT_WINDOW,
+            next_attempt: tokio::time::Instant::now() + delay,
+            delay,
+        }
+    }
+
+    /// The next attempt with doubling backoff (capped).
+    fn next_attempt(mut self) -> Self {
+        self.delay = (self.delay * 2).min(RECONNECT_BACKOFF_MAX);
+        self.next_attempt = tokio::time::Instant::now() + self.delay;
+        self
+    }
+}
+
 /// Run the interactive UI until the user exits (terminal) or the plan
 /// completes (headless).
 pub async fn run_interactive(
@@ -446,6 +485,13 @@ pub async fn run_interactive(
     let mut running = true;
     let mut headless_done = false;
     let mut wait_idle_deadline: Option<Instant> = None;
+    // Spec §10.2: the reconnect loop after a `daemon_closing` update frame.
+    // Retry with backoff for up to RECONNECT_WINDOW; each attempt reads the
+    // successor's hello (`update_resume`, §10.3) and reattaches by durable
+    // session id (§10.4 - the supervisor queues the attach behind any
+    // restore still in flight). UI input keeps flowing while reconnecting,
+    // so the user can leave with Ctrl+C instead of riding out the window.
+    let mut reconnect: Option<ReconnectLoop> = None;
 
     while running {
         // The tray override row (the Ctrl+C exit hint) follows the session's
@@ -562,11 +608,46 @@ pub async fn run_interactive(
                             session.refresh_stats().await;
                             session.rebuild_tray(&mut view);
                         }
+                        // An update close frame arms the reconnect driver
+                        // immediately: the doomed connection's reader task is
+                        // gone, but the client struct retains an event
+                        // sender, so the channel itself never closes - the
+                        // frame, not the EOF, is the trigger (spec §10.2).
+                        if reconnect.is_none() {
+                            if let Some(update) = session.reconnect.take() {
+                                session.note(
+                                    &format!(
+                                        "the daemon is restarting for an update (about {}s) — reconnecting…",
+                                        update.est_seconds.max(1)
+                                    ),
+                                    &mut view,
+                                );
+                                reconnect = Some(ReconnectLoop::start(&update));
+                                session.dirty = true;
+                            }
+                        }
                     }
                     None => {
-                        session.note("the daemon connection closed", &mut view);
-                        session.exit_reason = "daemon_closed";
-                        running = false;
+                        if let Some(update) = session.reconnect.take() {
+                            // §10: an update restart closed the daemon; the
+                            // UI stays mounted and reconnects.
+                            session.note(
+                                &format!(
+                                    "the daemon is restarting for an update (about {}s) — reconnecting…",
+                                    update.est_seconds.max(1)
+                                ),
+                                &mut view,
+                            );
+                            reconnect = Some(ReconnectLoop::start(&update));
+                            session.dirty = true;
+                        } else if reconnect.is_some() {
+                            // Already reconnecting: the dead channel's
+                            // terminal None frames are expected.
+                        } else {
+                            session.note("the daemon connection closed", &mut view);
+                            session.exit_reason = "daemon_closed";
+                            running = false;
+                        }
                     }
                 }
             }
@@ -578,6 +659,72 @@ pub async fn run_interactive(
             maybe_note = notes_rx.recv() => {
                 if let Some(note) = maybe_note {
                     session.apply_background_note(&note, &mut view);
+                }
+            }
+            _reconnect_tick = async {
+                match reconnect.as_ref() {
+                    Some(state) => tokio::time::sleep_until(state.next_attempt).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                let Some(state) = reconnect.take() else {
+                    continue;
+                };
+                if tokio::time::Instant::now() > state.deadline {
+                    session.note(
+                        "could not reconnect to the daemon within 10 minutes — the update finished but this window is detached. Run `prime-agent attach` to resume.",
+                        &mut view,
+                    );
+                    session.exit_reason = "update_reconnect_failed";
+                    session.dirty = true;
+                    running = false;
+                    continue;
+                }
+                // One reconnect attempt: bounded connect, hello, reattach
+                // by durable id (§10.4-§10.5).
+                let attempt = tokio::time::timeout(
+                    Duration::from_secs(RECONNECT_ATTEMPT_TIMEOUT_S),
+                    DaemonClient::connect(&options.socket_path),
+                )
+                .await;
+                match attempt {
+                    Ok(Ok((client, fresh_events))) => {
+                        match tokio::time::timeout(
+                            Duration::from_secs(RECONNECT_ATTACH_TIMEOUT_S),
+                            session.reattach_after_update(client, &mut view),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {
+                                events = fresh_events;
+                                session.reconnect = None;
+                                reconnect = None;
+                                session.dirty = true;
+                            }
+                            Ok(Err(error)) => {
+                                session.note(
+                                    &format!("reattach after the update failed: {error:#} — run `prime-agent attach` to resume"),
+                                    &mut view,
+                                );
+                                session.exit_reason = "update_reattach_failed";
+                                session.dirty = true;
+                                running = false;
+                            }
+                            Err(_) => {
+                                // The queued attach outlived this attempt's
+                                // budget (a long restore): schedule another.
+                                session.note(
+                                    "the daemon is still restoring — retrying…",
+                                    &mut view,
+                                );
+                                session.dirty = true;
+                                reconnect = Some(state.next_attempt());
+                            }
+                        }
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        reconnect = Some(state.next_attempt());
+                    }
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(50)) => {

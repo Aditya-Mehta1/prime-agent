@@ -1,0 +1,16 @@
+[2026-09-19T04:25:57.399Z] worker d27613c5db8a relaunch failed: spawn session worker d27613c5db8a: No such file or directory (os error 2)
+[2026-09-19T04:25:57.400Z] session worker d27613c5db8a exited unexpectedly; restarting in 1000ms (failure 3/5)
+[2026-09-19T04:25:57.426Z] worker 4fdcfdc7db85 relaunch failed: spawn session worker 4fdcfdc7db85: No such file or directory (os error 2)
+[2026-09-19T04:25:57.426Z] session worker 4fdcfdc7db85 exited unexpectedly; restarting in 1000ms (failure 3/5)
+[2026-09-19T04:25:58.412Z] worker d27613c5db8a relaunch failed: spawn session worker d27613c5db8a: No such file or directory (os error 2)
+[2026-09-19T04:25:58.412Z] session worker d27613c5db8a exited unexpectedly; restarting in 2000ms (failure 4/5)
+[2026-09-19T04:25:58.439Z] worker 4fdcfdc7db85 relaunch failed: spawn session worker 4fdcfdc7db85: No such file or directory (os error 2)
+[2026-09-19T04:25:58.439Z] session worker 4fdcfdc7db85 exited unexpectedly; restarting in 2000ms (failure 4/5)
+[2026-09-19T04:26:00.424Z] worker d27613c5db8a relaunch failed: spawn session worker d27613c5db8a: No such file or directory (os error 2)
+[2026-09-19T04:26:00.424Z] session worker d27613c5db8a exited unexpectedly; restarting in 4000ms (failure 5/5)
+[2026-09-19T04:26:00.441Z] worker 4fdcfdc7db85 relaunch failed: spawn session worker 4fdcfdc7db85: No such file or directory (os error 2)
+[2026-09-19T04:26:00.441Z] session worker 4fdcfdc7db85 exited unexpectedly; restarting in 4000ms (failure 5/5)
+[2026-09-19T04:26:04.435Z] worker d27613c5db8a relaunch failed: spawn session worker d27613c5db8a: No such file or directory (os error 2)
+[2026-09-19T04:26:04.510Z] session worker d27613c5db8a failed after 6 consecutive failures
+[2026-09-19T04:26:04.510Z] worker 4fdcfdc7db85 relaunch failed: spawn session worker 4fdcfdc7db85: No such file or directory (os error 2)
+[2026-09-19T04:26:04.512Z] session worker 4fdcfdc7db85 failed after 6 consecutive failures
