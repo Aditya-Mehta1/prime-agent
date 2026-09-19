@@ -150,8 +150,9 @@ never session payload.
 
 | property | type | notes |
 |---|---|---|
-| `kind` | string | `worker_spawned`, `worker_exited`, `worker_restarted`, `attach`, `reattach`, `detach` |
+| `kind` | string | `worker_spawned`, `worker_exited`, `worker_restarted`, `attach`, `reattach`, `detach`, `sessions_archived` |
 | `exit_reason` | string | only for `worker_exited`: `normal` / `crash` |
+| `count` | number | only for `sessions_archived`: how many sessions the sweep moved to the archive |
 
 ### `mcp connector used`
 

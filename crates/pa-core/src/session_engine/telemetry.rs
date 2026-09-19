@@ -538,6 +538,15 @@ pub fn track_daemon_event(client: &TelemetryClient, kind: &str, exit_reason: Opt
     client.track("daemon event", properties);
 }
 
+/// Track the disk-archive sweep's `daemon event` (schema v1, kind
+/// `sessions_archived`): a count only, never session payload.
+pub fn track_sessions_archived(client: &TelemetryClient, count: usize) {
+    let mut properties = base_properties("daemon");
+    properties.set("kind", Value::from("sessions_archived"));
+    properties.set("count", Value::from(count));
+    client.track("daemon event", properties);
+}
+
 /// Build the product telemetry client from settings (opt-in already
 /// resolved by the caller): PostHog sink when endpoint+key are configured
 /// (env `PRIME_AGENT_TELEMETRY_ENDPOINT`/`_API_KEY` override settings

@@ -1442,3 +1442,53 @@ HEAD
   rows, price detail) plus live prime-inference catalog parity (the TS
   daemon fetches 1282 live models; the rust catalog is the 110 bundled
   entries + models.json), which is follow-up lane work.
+
+## Session archiving (session-archiving lane, roadmap item 4)
+
+- TS ground truth: archiving in the TS product is a session-state marker, not
+  a disk mechanism — `daemon-mode.ts`'s `archiveSession` appends
+  `session_state { status: "archived" }` (ctrl+x in the session list),
+  `inactiveLifecycleForSession` classifies archived/crash records out of the
+  agents view, and they stay reachable only via `--resume <selector>`
+  (`daemon-session-list.ts`). Idle retirement for RESIDENT workers is
+  `idleEvictionMinutes` (default 90, `"off"` disables, malformed falls back
+  to the default; `settings-manager.ts`), swept at boot plus every 1–5 min
+  (`daemon-supervisor.ts`), with `hasRegisteredCronJob`/`attachedClients`
+  guards (`session-action-store.ts` `canEvictWorker`). There is no TS disk
+  archive; the sessions directory keeps growing — the roadmap item is a new
+  mechanism informed by those rules, not a port.
+- New behavior (no TS counterpart): `pa-daemon/src/session_archive.rs` moves
+  retired sessions (never deletes) into `<agent-dir>/sessions-archive`
+  (same per-`<uuid>.jsonl` layout, one level under the agent dir; moves fall
+  back to copy+delete across filesystems). Two independent settings rules
+  (pa-core `get_session_archive_policy`, the `idleEvictionMinutes` grammar —
+  `number | "off" | "none"`, malformed falls back to the default):
+  `sessionArchiveMaxAgeDays` (default 30; file mtime, inclusive boundary)
+  and `sessionArchiveMaxSessions` (default 200; keep the newest by mtime,
+  ties by path). Resident workers' session files and sessions with ACTIVE
+  scheduled jobs (the `scheduled-jobs.json` artifacts scan) are counted
+  toward the cap but never archived.
+- Sweep seam: supervisor boot sweep plus a periodic re-sweep at the TS max
+  sweep interval (5 min), housekeeping-only (failures log and retry; the
+  sweep never gates serving) — the boot-sweep precedent is update-flow's
+  `boot_sweep`.
+- Catalog integration: archived files are physically out of the sessions
+  dir, so every existing listing path excludes them by construction (the
+  TS archived lifecycle stays a marker for ctrl+x'd sessions; the agents
+  view / saved-session catalog never showed archived rows by default).
+  Restore is the resume path: `resolve_saved_session` falls back to the
+  archive (cwd-scoped first, then global, same prefix/exact-name matching
+  and the same `Ambiguous session selector` error), RESTORES the match into
+  the sessions dir, and returns the live path — the wake spawns over it,
+  so `--resume <selector>` reaches archived sessions exactly like TS
+  archived sessions stay resume-reachable.
+- Telemetry: the sweep emits the `daemon event` kind `sessions_archived`
+  with a `count` property (added to `docs/telemetry-events.md`).
+- Verifiers: policy unit tests (inclusive age boundary, count-cap ranking,
+  protected sparing, rule union), sweep/restore unit tests
+  (`session_archive.rs`), catalog fallback tests (`session_catalog.rs`),
+  and `pa-daemon/tests/session_archive_e2e.rs` (fixture session dir: aged +
+  fresh + job-pinned sessions; boot sweep moves the right ones, the
+  catalog excludes them; and the full restore round-trip: kill → age →
+  restart archives the session, `send_message` by name restores it and the
+  woken worker answers against the mock provider).

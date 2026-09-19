@@ -224,22 +224,27 @@ impl Supervisor {
                 Err(error) => return WakeOutcome::Failed(error.to_string()),
             },
         };
-        let info =
-            match crate::session_catalog::resolve_saved_session(&sessions_dir, selector, &cwd) {
-                Ok(Some(info)) => info,
-                // The saved-session catalog misses RLM children: they
-                // persist in the parent's session-artifacts tree, not the
-                // sessions dir. The spawn ledger still tracks them, so a
-                // child selector falls back to its live edges (child id,
-                // session id, or name) and wakes the child's own file.
-                Ok(None) => {
-                    return match self.wake_ledger_child(selector, &sessions_dir).await {
-                        Some(outcome) => outcome,
-                        None => WakeOutcome::Unknown,
-                    }
+        let archive_dir = crate::session_archive::archive_dir(&self.options.agent_dir);
+        let info = match crate::session_catalog::resolve_saved_session(
+            &sessions_dir,
+            &archive_dir,
+            selector,
+            &cwd,
+        ) {
+            Ok(Some(info)) => info,
+            // The saved-session catalog misses RLM children: they
+            // persist in the parent's session-artifacts tree, not the
+            // sessions dir. The spawn ledger still tracks them, so a
+            // child selector falls back to its live edges (child id,
+            // session id, or name) and wakes the child's own file.
+            Ok(None) => {
+                return match self.wake_ledger_child(selector, &sessions_dir).await {
+                    Some(outcome) => outcome,
+                    None => WakeOutcome::Unknown,
                 }
-                Err(error) => return WakeOutcome::Failed(error.to_string()),
-            };
+            }
+            Err(error) => return WakeOutcome::Failed(error.to_string()),
+        };
         let session_path = info.path.to_string_lossy().to_string();
         // Reuse before spawning (TS `createOrReuseWorker`): a resident
         // worker already hosting the file serves the wake.

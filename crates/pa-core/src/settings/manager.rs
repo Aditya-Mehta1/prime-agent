@@ -14,6 +14,11 @@ use super::types::{
 
 pub const RECENT_MODELS_LIMIT: usize = 20;
 pub const DEFAULT_IDLE_EVICTION_MINUTES: u64 = 90;
+/// Session archiving defaults (roadmap item: the sessions directory must not
+/// grow forever). Age rule mirrors the TS `idleEvictionMinutes` grammar
+/// (`number | "off" | "none"`, malformed falls back to the default).
+pub const DEFAULT_SESSION_ARCHIVE_MAX_AGE_DAYS: u64 = 30;
+pub const DEFAULT_SESSION_ARCHIVE_MAX_SESSIONS: usize = 200;
 
 #[derive(Debug, Clone)]
 pub struct SettingsError {
@@ -541,6 +546,35 @@ impl SettingsManager {
         }
     }
 
+    /// Resolved session-archiving policy: which sessions the daemon's archive
+    /// sweep moves out of the sessions directory. Both rules are independent —
+    /// a session is archived when EITHER fires. `None` on a field disables
+    /// that rule.
+    pub fn get_session_archive_policy(&self) -> SessionArchivePolicy {
+        let max_age_days = match &self.global.session_archive_max_age_days {
+            Some(serde_json::Value::String(text)) if text == "off" || text == "none" => None,
+            Some(serde_json::Value::Number(number)) => Some(
+                number
+                    .as_u64()
+                    .filter(|days| *days > 0)
+                    .unwrap_or(DEFAULT_SESSION_ARCHIVE_MAX_AGE_DAYS),
+            ),
+            _ => Some(DEFAULT_SESSION_ARCHIVE_MAX_AGE_DAYS),
+        };
+        let max_sessions = match &self.global.session_archive_max_sessions {
+            Some(serde_json::Value::String(text)) if text == "off" || text == "none" => None,
+            Some(serde_json::Value::Number(number)) => number
+                .as_u64()
+                .filter(|count| *count > 0)
+                .map(|count| count as usize),
+            _ => Some(DEFAULT_SESSION_ARCHIVE_MAX_SESSIONS),
+        };
+        SessionArchivePolicy {
+            max_age_days,
+            max_sessions,
+        }
+    }
+
     pub fn get_transport(&self) -> TransportSetting {
         self.merged.transport.unwrap_or(TransportSetting::Auto)
     }
@@ -598,6 +632,15 @@ impl SettingsManager {
 pub enum IdleEviction {
     Minutes(u64),
     Off,
+}
+
+/// Resolved session-archiving settings: the age rule (archive sessions
+/// untouched for `max_age_days` days) and the count rule (keep the newest
+/// `max_sessions` sessions). Each field is `None` when its rule is off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionArchivePolicy {
+    pub max_age_days: Option<u64>,
+    pub max_sessions: Option<usize>,
 }
 
 fn strings(array: &[serde_json::Value]) -> Vec<String> {
@@ -736,5 +779,35 @@ mod tests {
         );
         manager.global.idle_eviction_minutes = Some(serde_json::json!(45));
         assert_eq!(manager.get_idle_eviction(), IdleEviction::Minutes(45));
+    }
+
+    #[test]
+    fn session_archive_policy_semantics() {
+        // Absent keys: both rules on with their defaults.
+        let mut manager = SettingsManager::in_memory(Settings::default());
+        assert_eq!(
+            manager.get_session_archive_policy(),
+            SessionArchivePolicy {
+                max_age_days: Some(DEFAULT_SESSION_ARCHIVE_MAX_AGE_DAYS),
+                max_sessions: Some(DEFAULT_SESSION_ARCHIVE_MAX_SESSIONS),
+            }
+        );
+        // "off"/"none" disable a rule; malformed values fall back to the
+        // default (the `idleEvictionMinutes` grammar).
+        manager.global.session_archive_max_age_days = Some(serde_json::json!("off"));
+        assert_eq!(manager.get_session_archive_policy().max_age_days, None);
+        manager.global.session_archive_max_age_days = Some(serde_json::json!(0));
+        assert_eq!(
+            manager.get_session_archive_policy().max_age_days,
+            Some(DEFAULT_SESSION_ARCHIVE_MAX_AGE_DAYS)
+        );
+        manager.global.session_archive_max_age_days = Some(serde_json::json!(14));
+        assert_eq!(manager.get_session_archive_policy().max_age_days, Some(14));
+        manager.global.session_archive_max_sessions = Some(serde_json::json!("none"));
+        assert_eq!(manager.get_session_archive_policy().max_sessions, None);
+        manager.global.session_archive_max_sessions = Some(serde_json::json!(0));
+        assert_eq!(manager.get_session_archive_policy().max_sessions, None);
+        manager.global.session_archive_max_sessions = Some(serde_json::json!(50));
+        assert_eq!(manager.get_session_archive_policy().max_sessions, Some(50));
     }
 }

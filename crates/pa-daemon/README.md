@@ -20,9 +20,20 @@ command gating on peer links), kernel agent_message/agent_observe bridge (`agent
 `worker`-purpose single-use grants minted by `get_worker_peer_transport`
 for a source worker's kernel `agent_message.send`, direct
 `worker_deliver_message` on the target worker's socket with the supervisor
-routed `send_message` as the never-retried fallback), saved-session wake
+routed `send_message` as the never-retried fallback), session archiving
+(`session_archive.rs`: the sessions directory must not grow forever — a
+supervisor boot sweep plus a periodic re-sweep at the TS idle-eviction
+cadence retire sessions by age (settings `sessionArchiveMaxAgeDays`,
+default 30) and count (settings `sessionArchiveMaxSessions`, default 200;
+each rule independently off-able) by MOVING them into
+`<agent-dir>/sessions-archive`; resident-worker sessions and sessions with
+active scheduled jobs are never archived; an archived session stays
+resumable — the catalog resolve falls back to the archive, restores the
+file into the sessions dir, and the wake spawns over the live path),
+saved-session wake
 for non-resident `send_message` targets (`session_catalog.rs`: catalog
-resolve by session-id prefix or exact name, cwd-scoped first; a resident
+resolve by session-id prefix or exact name, cwd-scoped first, archived
+fallback with restore; a resident
 worker hosting the file is reused, otherwise one spawns over it; RLM
 children fall back to the spawn ledger's live child edges when the catalog
 misses - children persist outside the sessions dir, under the parent's

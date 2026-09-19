@@ -170,6 +170,14 @@ impl Supervisor {
         })
     }
 
+    /// Emit the `daemon event` adoption signal for a session-archive sweep
+    /// (best-effort, non-blocking; no-op when the daemon is opted out).
+    pub(crate) fn note_sessions_archived(&self, count: usize) {
+        if let Some(client) = &*self.telemetry.lock().unwrap() {
+            pa_core::session_engine::telemetry::track_sessions_archived(client, count);
+        }
+    }
+
     /// Emit a `daemon event` (best-effort, non-blocking; no-op when the
     /// daemon is opted out).
     fn note_daemon_event(&self, kind: &str, exit_reason: Option<&str>) {
@@ -234,6 +242,16 @@ impl Supervisor {
             let supervisor = Arc::clone(&self);
             tokio::spawn(async move {
                 crate::update_restore::restore_pass(&supervisor, adoption, roster).await;
+            });
+        }
+
+        // Session-archive sweep (roadmap: the sessions directory must not
+        // grow forever): boot sweep, then the periodic re-sweep at the TS
+        // idle-eviction cadence. Housekeeping only — it never gates serving.
+        {
+            let supervisor = Arc::clone(&self);
+            tokio::spawn(async move {
+                crate::session_archive::archive_sweep_loop(&supervisor).await;
             });
         }
 
@@ -488,6 +506,12 @@ impl Supervisor {
     pub(crate) fn is_stopping(&self, resident: &Arc<ResidentWorker>) -> bool {
         self.shutting_down.load(Ordering::SeqCst)
             || resident.intentional_stop.load(Ordering::SeqCst)
+    }
+
+    /// Whether the supervisor is tearing down (long-lived daemon tasks
+    /// poll this instead of holding their own shutdown wiring).
+    pub(crate) fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst)
     }
 
     /// Spawn a fresh worker process, connect, and replay the durable create.
