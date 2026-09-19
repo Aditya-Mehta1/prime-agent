@@ -376,6 +376,9 @@ async fn tui_attaches_prompts_streams_lists_and_switches() {
         initial_message: None,
         theme: "prime".to_string(),
         code_block_indent: "  ".to_string(),
+
+        tree_filter_mode: String::new(),
+        branch_summary_skip_prompt: false,
         version: "0.0.0".to_string(),
         onboarding: None,
         telemetry_disabled: None,
@@ -520,6 +523,9 @@ async fn ensure_daemon_running_spawns_supervisor_and_tui_attaches() {
         initial_message: Some("boot".to_string()),
         theme: "prime".to_string(),
         code_block_indent: "  ".to_string(),
+
+        tree_filter_mode: String::new(),
+        branch_summary_skip_prompt: false,
         version: "0.0.0".to_string(),
         onboarding: None,
         telemetry_disabled: None,
@@ -597,6 +603,9 @@ async fn tui_dispatches_slash_commands_menu_and_suggestions() {
         initial_message: None,
         theme: "prime".to_string(),
         code_block_indent: "  ".to_string(),
+
+        tree_filter_mode: String::new(),
+        branch_summary_skip_prompt: false,
         version: "0.0.0".to_string(),
         onboarding: None,
         telemetry_disabled: None,
@@ -778,6 +787,9 @@ async fn tui_model_picker_applies_and_effort_reports() {
         initial_message: None,
         theme: "prime".to_string(),
         code_block_indent: "  ".to_string(),
+
+        tree_filter_mode: String::new(),
+        branch_summary_skip_prompt: false,
         version: "0.0.0".to_string(),
         onboarding: None,
         telemetry_disabled: None,
@@ -866,6 +878,9 @@ async fn tui_compact_on_a_short_session_warns_nothing_to_compact() {
         initial_message: None,
         theme: "prime".to_string(),
         code_block_indent: "  ".to_string(),
+
+        tree_filter_mode: String::new(),
+        branch_summary_skip_prompt: false,
         version: "0.0.0".to_string(),
         onboarding: None,
         telemetry_disabled: None,
@@ -986,6 +1001,9 @@ async fn tui_compact_shows_the_loader_then_the_summary_and_rebuilds() {
         initial_message: None,
         theme: "prime".to_string(),
         code_block_indent: "  ".to_string(),
+
+        tree_filter_mode: String::new(),
+        branch_summary_skip_prompt: false,
         version: "0.0.0".to_string(),
         onboarding: None,
         telemetry_disabled: None,
@@ -1089,6 +1107,177 @@ async fn tui_compact_shows_the_loader_then_the_summary_and_rebuilds() {
     drop(supervisor);
 }
 
+/// Session-tree verifier: two scripted turns, then `/tree` navigation back
+/// to the first user message, a fork from it, and a clone at the leaf.
+/// Exercises the full loop the TS `/tree` surface owns: the `get_session_tree`
+/// fetch, the selector pane, the "Summarize branch?" choice, `navigate_tree`
+/// (branch move + transcript rebuild + editor text restore), `fork` (new
+/// session file), and the leaf no-op.
+#[tokio::test]
+async fn tui_session_tree_navigates_forks_and_clones() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let session_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let supervisor = spawn_supervisor(dir.path());
+    let script = serde_json::json!({
+        "engine": "faux",
+        "responses": [
+            { "text": "first answer", "delayMs": 10 },
+            { "text": "second answer", "delayMs": 10 },
+            { "text": "post-fork answer", "delayMs": 10 },
+        ],
+    });
+    std::fs::write(dir.path().join("script.json"), script.to_string()).expect("write script");
+    let options = pa_tui::interactive::InteractiveOptions {
+        socket_path: supervisor.socket.clone(),
+        cwd: dir.path().to_path_buf(),
+        session_dir: Some(session_dir.clone()),
+        script_path: Some(dir.path().join("script.json")),
+        model_selection: Default::default(),
+        model_catalog: Vec::new(),
+        no_session: false,
+        session: pa_tui::interactive::SessionSelection::New,
+        initial_message: None,
+        theme: "prime".to_string(),
+        code_block_indent: "  ".to_string(),
+        // The default tree filter keeps every message row visible, and the
+        // branch-summary prompt is skipped so navigation needs no
+        // summarizer call (TS `branchSummary.skipPrompt`).
+        tree_filter_mode: "default".to_string(),
+        branch_summary_skip_prompt: true,
+        show_images: true,
+        version: "0.0.0".to_string(),
+        onboarding: None,
+        telemetry_disabled: None,
+        client_auth: None,
+        telemetry: None,
+    };
+    let key = |code: KeyCode| {
+        pa_tui::interactive::HeadlessStep::Key(crossterm::event::KeyEvent::new(
+            code,
+            KeyModifiers::NONE,
+        ))
+    };
+    let enter = key(KeyCode::Enter);
+    let up = key(KeyCode::Up);
+    let plan = pa_tui::interactive::HeadlessPlan {
+        steps: vec![
+            pa_tui::interactive::HeadlessStep::Submit("first question".to_string()),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+            pa_tui::interactive::HeadlessStep::Submit("second question".to_string()),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+            // `/tree` opens the selector; Enter on the leaf is the TS no-op.
+            pa_tui::interactive::HeadlessStep::Submit("/tree".to_string()),
+            pa_tui::interactive::HeadlessStep::SettleIdle,
+            enter.clone(),
+            pa_tui::interactive::HeadlessStep::SettleIdle,
+            // `/fork` opens the user-message selector; Enter forks before
+            // the selected (latest) user message.
+            pa_tui::interactive::HeadlessStep::Submit("/fork".to_string()),
+            pa_tui::interactive::HeadlessStep::SettleIdle,
+            enter.clone(),
+            pa_tui::interactive::HeadlessStep::SettleIdle,
+            // The fork re-entered the user message in the editor; submit
+            // runs it on the forked session.
+            enter.clone(),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+            // `/tree` again, then navigate two rows up (the first answer)
+            // to cut the branch back to that point.
+            pa_tui::interactive::HeadlessStep::Submit("/tree".to_string()),
+            pa_tui::interactive::HeadlessStep::SettleIdle,
+            up.clone(),
+            up.clone(),
+            enter.clone(),
+            pa_tui::interactive::HeadlessStep::SettleIdle,
+        ],
+        width: 100,
+        height: 34,
+    };
+    let outcome =
+        pa_tui::interactive::run_interactive(options, pa_tui::interactive::UiMode::Headless(plan))
+            .await
+            .expect("interactive run");
+    if let Ok(dump) = std::env::var("PA_TUI_DUMP_FRAMES") {
+        for (index, frame) in outcome.frames.iter().enumerate() {
+            let _ = std::fs::write(
+                std::path::Path::new(&dump).join(format!("tree-frame-{index:03}.txt")),
+                frame,
+            );
+        }
+    }
+    let rendered = outcome.frames.join("\n");
+    // The selector pane (TS `TreeSelectorComponent` layout).
+    assert!(
+        rendered.contains("Session Tree"),
+        "the tree pane rendered:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Type to search:"),
+        "the search line rendered:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("user: first question") && rendered.contains("user: second question"),
+        "the entry rows rendered:\n{rendered}"
+    );
+    // The leaf no-op note (TS `showStatus("Already at this point")`).
+    assert!(
+        rendered.contains("Already at this point"),
+        "the leaf selection was a no-op:\n{rendered}"
+    );
+    // The fork (TS `showUserMessageSelector` + `showStatus("Forked to new
+    // session")`).
+    assert!(
+        rendered.contains("Fork from Message"),
+        "the fork selector rendered:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Forked to new session"),
+        "the fork note rendered:\n{rendered}"
+    );
+    // The forked session kept the pre-fork path and answered the re-entered
+    // user message with its own scripted turn.
+    assert!(
+        rendered.contains("post-fork answer"),
+        "the forked session ran a turn:\n{rendered}"
+    );
+    // The navigation: TS `showStatus("Navigated to selected point")` plus
+    // the transcript rebuilt on the moved branch (the abandoned turn drops
+    // from the settled frame).
+    assert!(
+        rendered.contains("Navigated to selected point"),
+        "the navigation note rendered:\n{rendered}"
+    );
+    let settled = outcome
+        .frames
+        .iter()
+        .rev()
+        .find(|frame| frame.contains("Navigated to selected point"))
+        .expect("the navigation frame");
+    assert!(
+        !settled.contains("post-fork answer"),
+        "the abandoned branch dropped from the rebuilt transcript:\n{settled}"
+    );
+    assert!(
+        settled.contains("first answer"),
+        "the moved branch kept the target path:\n{settled}"
+    );
+    // The fork created a second session file.
+    let session_files: Vec<_> = std::fs::read_dir(&session_dir)
+        .expect("read session dir")
+        .flatten()
+        .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .collect();
+    assert!(
+        session_files.len() >= 2,
+        "the fork wrote a new session file: {} files",
+        session_files.len()
+    );
+    drop(supervisor);
+}
+
 /// Streaming-throughput verifier: two big (~12k-token) unpaced faux turns
 /// must render at the producer's rate, not at a fixed frame-rate ceiling.
 /// The worker coalesces provider deltas into latest-snapshot frames (at
@@ -1143,6 +1332,9 @@ async fn tui_big_streamed_turns_render_at_the_producer_rate() {
         initial_message: None,
         theme: "prime".to_string(),
         code_block_indent: "  ".to_string(),
+
+        tree_filter_mode: String::new(),
+        branch_summary_skip_prompt: false,
         version: "0.0.0".to_string(),
         onboarding: None,
         telemetry_disabled: None,

@@ -27,6 +27,8 @@ use crate::model_picker::{self, CurrentModel, ModelPickerAction};
 use crate::snapshot::{
     assistant_message_parts, attach_data_from_response, event_to_update, reconstruct, TurnUpdate,
 };
+use crate::tree_selector::{TreeSelector, TreeSelectorAction};
+use crate::user_message_selector::{UserMessageSelector, UserMessageSelectorAction};
 use crate::view::AgentView;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -44,6 +46,8 @@ const UI_REQUEST_TIMEOUT_MS: u64 = 10_000;
 /// Cap on the detach request during the exit path: the client must exit
 /// promptly even when the worker socket is wedged.
 const EXIT_DETACH_TIMEOUT_MS: u64 = 600;
+/// The double-Escape repeat window (TS `ESCAPE_REPEAT_WINDOW_MS`).
+const ESCAPE_REPEAT_WINDOW_MS: std::time::Duration = std::time::Duration::from_millis(500);
 /// Cap on the exit-path session-stats fetch (TS `formatResumeHint` inputs):
 /// best-effort like the detach, never able to hold the exit open.
 const EXIT_STATS_TIMEOUT_MS: u64 = 500;
@@ -75,6 +79,12 @@ pub(crate) struct SessionUi {
     /// (`markdown.codeBlockIndent`); `/new` re-opens with the same value
     /// instead of resetting it to the default.
     code_block_indent: String,
+    /// The `/tree` selector's initial filter mode (the `treeFilterMode`
+    /// setting).
+    tree_filter_mode: crate::tree_list::FilterMode,
+    /// The `branchSummary.skipPrompt` setting: navigation skips the
+    /// summarize question.
+    branch_summary_skip_prompt: bool,
     /// The transcript index of the last `note` status row (TS `showStatus`
     /// tracks its previous row for the back-to-back in-place rewrite; any
     /// later entry invalidates it through the length check).
@@ -139,6 +149,10 @@ pub(crate) struct SessionUi {
     /// The double-Ctrl+C force-quit guard (the run's shared instance is
     /// installed by the interactive loop after `open`).
     pub(crate) exit_guard: crate::exit_guard::ExitGuard,
+    /// The armed double-Escape action (TS `escapeRepeatAction`): "tree" or
+    /// "clear", taken by the second press inside the 500ms window.
+    escape_repeat_action: Option<&'static str>,
+    escape_repeat_until: Option<Instant>,
 }
 
 impl SessionUi {
@@ -167,6 +181,8 @@ impl SessionUi {
             model_catalog: options.model_catalog.clone(),
             telemetry_disabled: options.telemetry_disabled,
             code_block_indent: options.code_block_indent.clone(),
+            tree_filter_mode: crate::tree_list::filter_mode_from_str(&options.tree_filter_mode),
+            branch_summary_skip_prompt: options.branch_summary_skip_prompt,
             last_status_index: None,
             show_images: options.show_images,
             pasted_images: Default::default(),
@@ -196,6 +212,8 @@ impl SessionUi {
             exit_reason: "daemon_closed",
             reconnect: None,
             exit_guard: crate::exit_guard::ExitGuard::new(),
+            escape_repeat_action: None,
+            escape_repeat_until: None,
         };
         session
             .attach_session(&active_session_id)
@@ -1014,6 +1032,35 @@ impl SessionUi {
                     }
                 }
             }
+            // `/tree` (TS `showTreeSelector`): the session-tree navigator.
+            "tree" => {
+                if !resolved.args.is_empty() {
+                    self.note("Usage: /tree", view);
+                } else {
+                    self.track_command_used("tree");
+                    self.open_tree_selector(view, None).await?;
+                }
+            }
+            // `/fork` (TS `showUserMessageSelector`): fork from a user
+            // message into a new session.
+            "fork" => {
+                if !resolved.args.is_empty() {
+                    self.note("Usage: /fork", view);
+                } else {
+                    self.track_command_used("fork");
+                    self.open_fork_selector(view).await?;
+                }
+            }
+            // `/clone` (TS `handleCloneCommand`): duplicate the session at
+            // the current position.
+            "clone" => {
+                if !resolved.args.is_empty() {
+                    self.note("Usage: /clone", view);
+                } else {
+                    self.track_command_used("clone");
+                    self.handle_clone_command(view).await?;
+                }
+            }
             // TS `handleMcpCommand`'s login/logout branches: the auth
             // flows run in the client process (the composition root's
             // hook); the other management subcommands surface through the
@@ -1027,6 +1074,330 @@ impl SessionUi {
             }
         }
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Session-tree navigation (/tree, /fork, /clone)
+    // ------------------------------------------------------------------
+
+    /// Open the `/tree` selector over the session tree (TS
+    /// `showTreeSelector`); `initial_selected` re-opens with the previous
+    /// selection after a cancelled branch summary.
+    async fn open_tree_selector(
+        &mut self,
+        view: &mut AgentView,
+        initial_selected: Option<&str>,
+    ) -> Result<()> {
+        let data = self
+            .bounded_request(
+                Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                DaemonCommand::GetSessionTree {
+                    id: None,
+                    active_session_id: self.active_session_id.clone(),
+                    rest: Default::default(),
+                },
+            )
+            .await?;
+        if data
+            .get("flatNodes")
+            .and_then(Value::as_array)
+            .is_none_or(|nodes| nodes.is_empty())
+        {
+            self.note("No entries in session", view);
+            return Ok(());
+        }
+        match TreeSelector::new(
+            &data,
+            view.terminal_rows(),
+            self.branch_summary_skip_prompt,
+            self.tree_filter_mode,
+        ) {
+            Some(mut selector) => {
+                selector.set_initial_selection(initial_selected);
+                view.tree_selector = Some(selector);
+            }
+            None => self.note("No entries in session", view),
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// One key press while the tree selector is open.
+    async fn handle_tree_selector_key(
+        &mut self,
+        key: KeyEvent,
+        view: &mut AgentView,
+    ) -> Result<()> {
+        let Some(id) = key_event_to_id(&key) else {
+            return Ok(());
+        };
+        let action = {
+            let Some(selector) = view.tree_selector.as_mut() else {
+                return Ok(());
+            };
+            let kb = view.editor.keybindings();
+            selector.handle_key(kb, &id)
+        };
+        match action {
+            TreeSelectorAction::None => {}
+            TreeSelectorAction::Cancel => {
+                view.tree_selector = None;
+            }
+            TreeSelectorAction::LabelChange { entry_id, label } => {
+                let request = DaemonCommand::SetSessionEntryLabel {
+                    id: None,
+                    active_session_id: self.active_session_id.clone(),
+                    entry_id: entry_id.clone(),
+                    label: label.clone(),
+                    rest: Default::default(),
+                };
+                match self
+                    .bounded_request(Duration::from_millis(UI_REQUEST_TIMEOUT_MS), request)
+                    .await
+                {
+                    Ok(_) => {
+                        if let Some(selector) = view.tree_selector.as_mut() {
+                            selector.update_label(&entry_id, label.as_deref());
+                        }
+                    }
+                    Err(error) => self.note(&format!("{error:#}"), view),
+                }
+            }
+            TreeSelectorAction::Navigate {
+                target_id,
+                summarize,
+                custom_instructions,
+            } => {
+                // Selecting the current leaf is a no-op (TS).
+                let leaf = view
+                    .tree_selector
+                    .as_ref()
+                    .and_then(|selector| selector.current_leaf_id().map(str::to_string));
+                view.tree_selector = None;
+                if leaf.as_deref() == Some(target_id.as_str()) {
+                    self.note("Already at this point", view);
+                    self.dirty = true;
+                    return Ok(());
+                }
+                self.navigate_tree(&target_id, summarize, custom_instructions, view)
+                    .await?;
+            }
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// The `navigate_tree` request and its rendering (TS
+    /// `_navigateTreeUnderPause` + `renderTreeNavigation`).
+    async fn navigate_tree(
+        &mut self,
+        target_id: &str,
+        summarize: bool,
+        custom_instructions: Option<String>,
+        view: &mut AgentView,
+    ) -> Result<()> {
+        let result = self
+            .bounded_request(
+                Duration::from_millis(UI_REQUEST_TIMEOUT_MS * 3),
+                DaemonCommand::NavigateTree {
+                    id: None,
+                    active_session_id: self.active_session_id.clone(),
+                    target_id: target_id.to_string(),
+                    summarize: Some(summarize),
+                    custom_instructions,
+                    replace_instructions: None,
+                    label: None,
+                    rest: Default::default(),
+                },
+            )
+            .await;
+        let data = match result {
+            Ok(data) => data,
+            Err(error) => {
+                self.note(&format!("{error:#}"), view);
+                return Ok(());
+            }
+        };
+        if data.get("aborted").and_then(Value::as_bool) == Some(true) {
+            // The branch summary was cancelled: re-open the tree selector
+            // with the same selection (TS).
+            self.note("Branch summarization cancelled", view);
+            return self.open_tree_selector(view, Some(target_id)).await;
+        }
+        if data.get("cancelled").and_then(Value::as_bool) == Some(true) {
+            self.note("Navigation cancelled", view);
+            return Ok(());
+        }
+        self.rebuild_transcript(view).await;
+        // A user-message target re-enters its text in the editor when it is
+        // empty (TS `renderTreeNavigation`).
+        if let Some(editor_text) = data.get("editorText").and_then(Value::as_str) {
+            if view.editor.get_text().trim().is_empty() {
+                view.editor.set_text(editor_text);
+            }
+        }
+        self.note("Navigated to selected point", view);
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Open the `/fork` selector over the session's user messages (TS
+    /// `showUserMessageSelector`).
+    async fn open_fork_selector(&mut self, view: &mut AgentView) -> Result<()> {
+        let data = self
+            .bounded_request(
+                Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                DaemonCommand::GetUserMessagesForForking {
+                    id: None,
+                    active_session_id: self.active_session_id.clone(),
+                    rest: Default::default(),
+                },
+            )
+            .await?;
+        let messages: Vec<crate::user_message_selector::UserMessageItem> = data
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(|messages| {
+                messages
+                    .iter()
+                    .filter_map(|message| {
+                        Some(crate::user_message_selector::UserMessageItem {
+                            id: message.get("entryId")?.as_str()?.to_string(),
+                            text: message.get("text")?.as_str()?.to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if messages.is_empty() {
+            self.note("No messages to fork from", view);
+            return Ok(());
+        }
+        view.fork_selector = Some(UserMessageSelector::new(messages));
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// One key press while the fork selector is open.
+    async fn handle_fork_selector_key(
+        &mut self,
+        key: KeyEvent,
+        view: &mut AgentView,
+    ) -> Result<()> {
+        let Some(id) = key_event_to_id(&key) else {
+            return Ok(());
+        };
+        let action = {
+            let Some(selector) = view.fork_selector.as_mut() else {
+                return Ok(());
+            };
+            let kb = view.editor.keybindings();
+            selector.handle_key(kb, &id)
+        };
+        match action {
+            UserMessageSelectorAction::Select(entry_id) => {
+                view.fork_selector = None;
+                self.fork(&entry_id, None, view).await?;
+            }
+            UserMessageSelectorAction::Cancel => {
+                view.fork_selector = None;
+            }
+            UserMessageSelectorAction::None => {}
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// The `fork` request (TS `AgentSessionRuntime.fork`): the worker
+    /// copies the path into a new session and switches to it.
+    async fn fork(
+        &mut self,
+        entry_id: &str,
+        position: Option<pa_types::daemon::ForkPosition>,
+        view: &mut AgentView,
+    ) -> Result<()> {
+        let data = match self
+            .bounded_request(
+                Duration::from_millis(UI_REQUEST_TIMEOUT_MS * 3),
+                DaemonCommand::Fork {
+                    id: None,
+                    active_session_id: self.active_session_id.clone(),
+                    entry_id: entry_id.to_string(),
+                    position,
+                    rest: Default::default(),
+                },
+            )
+            .await
+        {
+            Ok(data) => data,
+            Err(error) => {
+                self.note(&format!("fork failed: {error:#}"), view);
+                return Ok(());
+            }
+        };
+        if data.get("cancelled").and_then(Value::as_bool) == Some(true) {
+            return Ok(());
+        }
+        self.rebuild_transcript(view).await;
+        let selected_text = data.get("selectedText").and_then(Value::as_str);
+        match selected_text {
+            Some(text) => view.editor.set_text(text),
+            None => view.editor.set_text(""),
+        }
+        self.note("Forked to new session", view);
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// `/clone` (TS `handleCloneCommand`): fork at the current leaf.
+    async fn handle_clone_command(&mut self, view: &mut AgentView) -> Result<()> {
+        let data = self
+            .bounded_request(
+                Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                DaemonCommand::GetSessionTree {
+                    id: None,
+                    active_session_id: self.active_session_id.clone(),
+                    rest: Default::default(),
+                },
+            )
+            .await?;
+        let Some(leaf_id) = data.get("leafId").and_then(Value::as_str) else {
+            self.note("Nothing to clone yet", view);
+            return Ok(());
+        };
+        if leaf_id.is_empty() {
+            self.note("Nothing to clone yet", view);
+            return Ok(());
+        }
+        self.fork(leaf_id, Some(pa_types::daemon::ForkPosition::At), view)
+            .await?;
+        self.note("Cloned to new session", view);
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// The armed double-Escape action, taken once inside the window (TS
+    /// `takeEscapeRepeatAction`).
+    fn take_escape_repeat_action(&mut self) -> Option<&'static str> {
+        let action = self.escape_repeat_action;
+        if let Some(until) = self.escape_repeat_until {
+            if Instant::now() < until {
+                self.escape_repeat_action = None;
+                self.escape_repeat_until = None;
+                return action;
+            }
+        }
+        self.escape_repeat_action = None;
+        self.escape_repeat_until = None;
+        None
+    }
+
+    /// Arm the double-Escape action for 500ms (TS `armEscapeRepeat`): the
+    /// tree when the session is idle or the editor empty, the clear action
+    /// otherwise.
+    fn arm_escape_repeat(&mut self, action: &'static str) {
+        self.escape_repeat_action = Some(action);
+        self.escape_repeat_until = Some(Instant::now() + ESCAPE_REPEAT_WINDOW_MS);
     }
 
     /// `/mcp <login|logout> <name>` (TS `handleMcpCommand`): usage errors,
@@ -1096,6 +1467,8 @@ impl SessionUi {
             theme: String::new(),
             code_block_indent: self.code_block_indent.clone(),
             show_images: self.show_images,
+            tree_filter_mode: self.tree_filter_mode.wire_name().to_string(),
+            branch_summary_skip_prompt: self.branch_summary_skip_prompt,
             version: String::new(),
             onboarding: None,
             client_auth: self.client_auth.clone(),
@@ -1503,6 +1876,13 @@ impl SessionUi {
         if view.effort_picker.is_some() {
             return self.handle_effort_picker_key(key, view).await;
         }
+        // The `/tree` and `/fork` selectors own the frame the same way.
+        if view.tree_selector.is_some() {
+            return self.handle_tree_selector_key(key, view).await;
+        }
+        if view.fork_selector.is_some() {
+            return self.handle_fork_selector_key(key, view).await;
+        }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             // One handled Ctrl+C press: the force-quit guard disarms once
             // every observed press of the pair was handled without an exit
@@ -1539,6 +1919,24 @@ impl SessionUi {
         if key.code == KeyCode::Esc {
             view.editor.cancel_autocomplete();
             self.clear_ctrl_c_hint();
+            // Double-Escape (TS `handleEscape`'s repeat window): the second
+            // press within 500ms opens the tree when the session is idle or
+            // the editor empty, and clears the input otherwise.
+            if let Some(action) = self.take_escape_repeat_action() {
+                if action == "tree" {
+                    self.open_tree_selector(view, None).await?;
+                } else {
+                    view.editor.set_text("");
+                }
+                self.dirty = true;
+                return Ok(());
+            }
+            let action = if self.turn_active || view.editor.get_text().trim().is_empty() {
+                "tree"
+            } else {
+                "clear"
+            };
+            self.arm_escape_repeat(action);
             return Ok(());
         }
         if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -1618,6 +2016,21 @@ impl SessionUi {
             }
             self.dirty = true;
             return Ok(());
+        }
+        // `app.session.tree` / `app.session.fork` (TS editor actions): the
+        // bound keys open the surfaces when the editor is empty.
+        if view.editor.get_text().trim().is_empty() {
+            let kb = view.editor.keybindings();
+            if kb.matches(&id, "app.session.tree") {
+                self.open_tree_selector(view, None).await?;
+                self.dirty = true;
+                return Ok(());
+            }
+            if kb.matches(&id, "app.session.fork") {
+                self.open_fork_selector(view).await?;
+                self.dirty = true;
+                return Ok(());
+            }
         }
         view.editor.handle_input(&id);
         // TS clears the exit hint as soon as the editor carries text: the

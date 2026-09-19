@@ -485,6 +485,8 @@ pub struct Worker {
     pub(crate) peer_grants: PeerGrantStore,
     /// Compaction runs: abort slot, events, durable entry persistence.
     compaction: crate::compaction::CompactionManager,
+    /// Session-tree navigation: `/tree` moves, branch summaries, forks.
+    tree_navigation: crate::branch_navigation::TreeNavigation,
     /// Session-scoped ACP MCP servers for engines without their own store
     /// (the scripted harness); the real engine's manager serves the
     /// product path.
@@ -641,6 +643,11 @@ impl Worker {
             config.active_session_id.clone(),
             config.agent_dir.clone(),
         );
+        let tree_navigation = crate::branch_navigation::TreeNavigation::new(
+            std::sync::Arc::clone(&engine),
+            Arc::clone(&core),
+            idle_notify.clone(),
+        );
         // The session-scoped ACP MCP manager: auth storage construction is
         // blocking, so the builder runs off the async runtime (the same
         // pattern as the session engine's MCP gating).
@@ -664,6 +671,7 @@ impl Worker {
             side_questions,
             peer_grants: PeerGrantStore::new(),
             compaction,
+            tree_navigation,
             acp_mcp: std::sync::Arc::new(std::sync::Mutex::new(acp_mcp)),
         }
     }
@@ -1175,6 +1183,15 @@ impl Worker {
             "replace_acp_mcp_servers" => self.handle_replace_acp_mcp_servers(payload),
             "set_model" => self.handle_set_model(payload).await,
             "set_thinking_level" => self.handle_set_thinking_level(payload).await,
+            "get_session_tree" => self.tree_navigation.get_session_tree(),
+            "get_user_messages_for_forking" => self.tree_navigation.get_user_messages_for_forking(),
+            "set_session_entry_label" => self.tree_navigation.set_session_entry_label(payload),
+            "navigate_tree" => self.tree_navigation.navigate_tree(payload).await,
+            "fork" => self.tree_navigation.fork(payload).await,
+            "abort_branch_summary" => {
+                self.tree_navigation.abort();
+                response_success(None, "abort_branch_summary", None)
+            }
             "mutate_queued_message" => self.handle_mutate_queued_message(payload),
             "resume_queue" => self.handle_resume_queue(),
             other => response_failure(
@@ -3739,6 +3756,23 @@ mod turn_stream_tests {
             CompactionOutcome::Skipped {
                 message: "nothing to compact".to_string(),
             }
+        }
+
+        fn run_branch_summary(
+            &self,
+            _request: crate::engine::BranchSummaryRequest,
+            _signal: &pa_agent::abort::AbortSignal,
+        ) -> crate::engine::BranchSummaryOutcome {
+            crate::engine::BranchSummaryOutcome::Failed {
+                error: "unsupported".to_string(),
+            }
+        }
+
+        fn rebuild_session_context(
+            &self,
+            _branch_entries: Vec<pa_types::session::FileEntry>,
+        ) -> anyhow::Result<()> {
+            Ok(())
         }
     }
 

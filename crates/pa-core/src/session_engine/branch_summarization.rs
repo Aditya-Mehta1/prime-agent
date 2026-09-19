@@ -246,6 +246,125 @@ pub fn finalize_branch_summary(
     }
 }
 
+/// Options for one branch-summary generation run (TS
+/// `GenerateBranchSummaryOptions`).
+pub struct GenerateBranchSummaryOptions<'a> {
+    pub model: &'a pa_types::ai::Model,
+    pub api_key: Option<String>,
+    pub custom_instructions: Option<&'a str>,
+    /// Replace the default prompt instead of appending the custom focus.
+    pub replace_instructions: bool,
+    /// Tokens reserved for prompt + response (TS default 16384).
+    pub reserve_tokens: u64,
+}
+
+/// The TS default reserve budget (`reserveTokens`).
+pub const DEFAULT_BRANCH_RESERVE_TOKENS: u64 = 16_384;
+
+/// The summarizer call cap (TS `maxTokens: 2048`).
+const BRANCH_SUMMARY_MAX_TOKENS: u64 = 2048;
+
+/// Generate the abandoned-branch summary (TS `generateBranchSummary`):
+/// prepare the entries under the context budget, run the summarizer with
+/// the shared provider-retry policy, and fold the response into the final
+/// summary text with its file-operation block.
+pub async fn generate_branch_summary(
+    entries: &[FileEntry],
+    options: GenerateBranchSummaryOptions<'_>,
+) -> BranchSummaryResult {
+    let GenerateBranchSummaryOptions {
+        model,
+        api_key,
+        custom_instructions,
+        replace_instructions,
+        reserve_tokens,
+    } = options;
+    let context_window = if model.context_window > 0 {
+        model.context_window
+    } else {
+        128_000
+    };
+    let token_budget = context_window.saturating_sub(reserve_tokens);
+    let (request_messages, preparation) = build_branch_summary_request(
+        entries,
+        token_budget,
+        custom_instructions,
+        replace_instructions,
+    );
+    // Nothing model-visible remains after filtering.
+    if request_messages.is_empty() {
+        let (read_files, modified_files) = compute_file_lists(&preparation.file_ops);
+        return BranchSummaryResult {
+            summary: Some("No content to summarize".to_string()),
+            read_files,
+            modified_files,
+            ..Default::default()
+        };
+    }
+    // The summarizer call follows the compaction precedent
+    // (`execute_compaction`): one `complete_simple` on the session model.
+    let context = pa_types::ai::Context {
+        system_prompt: Some(super::compaction_utils::SUMMARIZATION_SYSTEM_PROMPT.to_string()),
+        messages: convert_to_llm(&request_messages)
+            .into_iter()
+            .filter_map(|message| match message {
+                AgentMessage::User(user) => {
+                    Some(pa_types::ai::Message::User(pa_types::ai::UserMessage {
+                        content: user.content,
+                        timestamp: user.timestamp,
+                        rest: user.rest,
+                    }))
+                }
+                _ => None,
+            })
+            .collect(),
+        tools: None,
+    };
+    let stream_options =
+        pa_ai::types::SimpleStreamOptions::from_base(pa_ai::types::StreamOptions {
+            max_tokens: Some(BRANCH_SUMMARY_MAX_TOKENS),
+            api_key,
+            ..Default::default()
+        });
+    let response = match pa_ai::complete_simple(model, &context, Some(stream_options)).await {
+        Ok(response) => response,
+        Err(error) => {
+            return BranchSummaryResult {
+                error: Some(format!("{error:#}")),
+                ..Default::default()
+            }
+        }
+    };
+    if response.stop_reason == pa_types::ai::StopReason::Aborted {
+        return BranchSummaryResult {
+            aborted: true,
+            ..Default::default()
+        };
+    }
+    if response.stop_reason == pa_types::ai::StopReason::Error {
+        return BranchSummaryResult {
+            error: Some(
+                response
+                    .error_message
+                    .unwrap_or_else(|| "Summarization failed".to_string()),
+            ),
+            ..Default::default()
+        };
+    }
+    let response_text = response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            pa_types::ai::AssistantContentBlock::Text(text) => Some(text.text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut result = finalize_branch_summary(&response_text, &preparation);
+    result.usage = (response.usage.total_tokens > 0).then_some(response.usage);
+    result
+}
+
 /// The presentation message users see for a branch summary.
 pub fn branch_summary_presentation(summary: &str) -> String {
     format!("{BRANCH_SUMMARY_PREFIX}{summary}{BRANCH_SUMMARY_SUFFIX}")
@@ -365,5 +484,72 @@ mod tests {
             }
             _ => panic!("expected compaction summary"),
         }
+    }
+
+    #[tokio::test]
+    async fn generates_summary_through_the_faux_provider() {
+        // One faux provider per test (a process-global registry); the
+        // guard is released before the awaited model call.
+        static FAUX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let registration = {
+            let _guard = FAUX_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pa_ai::faux::register_faux_provider(Default::default())
+        };
+        let model = registration.get_model();
+        let response = pa_ai::faux::faux_assistant_text_message(
+            "## Goal\nexplore the tree",
+            pa_ai::faux::FauxAssistantMessageOptions::default(),
+        );
+        registration.set_responses(vec![pa_ai::faux::FauxResponseStep::Message(response)]);
+        let entries = vec![entry("e0", None, user("explore the widget"))];
+        let result = generate_branch_summary(
+            &entries,
+            GenerateBranchSummaryOptions {
+                model: &model,
+                api_key: None,
+                custom_instructions: Some("focus on x"),
+                replace_instructions: false,
+                reserve_tokens: DEFAULT_BRANCH_RESERVE_TOKENS,
+            },
+        )
+        .await;
+        assert!(!result.aborted, "not aborted");
+        assert!(result.error.is_none(), "error: {:?}", result.error);
+        let summary = result.summary.expect("summary text");
+        assert!(
+            summary.starts_with("The user explored a different conversation branch"),
+            "preamble present: {summary}"
+        );
+        assert!(summary.contains("## Goal"));
+        registration.unregister();
+    }
+
+    #[tokio::test]
+    async fn empty_branch_summarizes_to_a_note() {
+        // No messages survive the budget filter: the TS short-circuit
+        // returns "No content to summarize" without a model call.
+        let model: pa_types::ai::Model = serde_json::from_value(serde_json::json!({
+            "id": "m", "name": "m", "api": "openai-completions", "provider": "test",
+            "baseUrl": "http://localhost", "reasoning": false, "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 1000, "maxTokens": 100
+        }))
+        .unwrap();
+        let result = generate_branch_summary(
+            &[],
+            GenerateBranchSummaryOptions {
+                model: &model,
+                api_key: None,
+                custom_instructions: None,
+                replace_instructions: false,
+                reserve_tokens: DEFAULT_BRANCH_RESERVE_TOKENS,
+            },
+        )
+        .await;
+        assert_eq!(result.summary.as_deref(), Some("No content to summarize"));
+        assert!(!result.aborted);
+        assert!(result.error.is_none());
     }
 }

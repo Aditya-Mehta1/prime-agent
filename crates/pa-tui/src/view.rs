@@ -66,6 +66,10 @@ pub struct AgentView {
     /// The `/model` inline picker (TS `ModelSelectorComponent` seam):
     /// while set, it owns the whole frame like the onboarding pane.
     pub model_picker: Option<crate::model_picker::ModelPicker>,
+    /// The `/tree` selector (owns the frame while open).
+    pub tree_selector: Option<crate::tree_selector::TreeSelector>,
+    /// The `/fork` user-message selector.
+    pub fork_selector: Option<crate::user_message_selector::UserMessageSelector>,
     /// The `/effort` inline picker (TS `ThinkingSelectorComponent` seam):
     /// while set, it owns the whole frame like the model picker.
     pub effort_picker: Option<crate::effort_picker::EffortPicker>,
@@ -121,6 +125,8 @@ impl AgentView {
             retry: None,
             onboarding: None,
             model_picker: None,
+            tree_selector: None,
+            fork_selector: None,
             effort_picker: None,
             show_images: true,
             scroll_top: 0,
@@ -166,6 +172,11 @@ impl AgentView {
             .collect();
         self.osc_last_rows = rows;
         plan
+    }
+
+    /// The terminal height the pickers size themselves against.
+    pub fn terminal_rows(&self) -> u16 {
+        self.terminal_rows
     }
 
     pub fn set_terminal_rows(&mut self, rows: u16) {
@@ -768,9 +779,27 @@ impl AgentView {
         if let Some(picker) = &self.effort_picker {
             return picker_pane(picker.render(&self.theme, width), width, height);
         }
+        // The tree and fork selectors mount in the editor container (TS
+        // `showSelector`): an auto-height pane over the dock's rows with the
+        // transcript above it — not the `/model` picker's full-pane overlay.
+        let selector_dock: Option<Vec<Line>> =
+            if self.tree_selector.is_some() || self.fork_selector.is_some() {
+                // TS's editor container holds the prompt context (the detail
+                // hint) and the editor; `showSelector` replaces only the editor
+                // part, so the hint stays above the pane.
+                let mut dock = render_prompt_context(&self.detail_label(), &self.theme, width);
+                if let Some(selector) = self.tree_selector.as_ref() {
+                    dock.extend(selector.render(&self.theme, width));
+                } else if let Some(selector) = self.fork_selector.as_ref() {
+                    dock.extend(selector.render(&self.theme, width));
+                }
+                Some(dock)
+            } else {
+                None
+            };
         let top = render_top_bar(&self.chrome, &self.theme, width);
         let transcript = self.render_transcript(width);
-        let dock = self.render_dock(width);
+        let dock = selector_dock.unwrap_or_else(|| self.render_dock(width));
         let dock_height = dock
             .len()
             .min(height.saturating_sub(FULLSCREEN_MIN_TRANSCRIPT_ROWS));
@@ -819,7 +848,11 @@ impl AgentView {
     /// Hardware cursor position within the last composed frame (0-based row,
     /// 0-based column), when the editor surface drew the cursor.
     pub fn frame_cursor(&self) -> Option<(usize, usize)> {
-        if self.onboarding.is_some() || self.model_picker.is_some() || self.effort_picker.is_some()
+        if self.onboarding.is_some()
+            || self.model_picker.is_some()
+            || self.effort_picker.is_some()
+            || self.tree_selector.is_some()
+            || self.fork_selector.is_some()
         {
             return None;
         }

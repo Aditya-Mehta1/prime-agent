@@ -29,8 +29,9 @@ use pa_core::session_engine::session_commands::{
 use pa_types::ai::Model;
 
 use crate::engine::{
-    CompactionOutcome, CompactionRequest, CompactionRun, EngineEvent, EngineModelSelection,
-    PromptRequest, SessionEngine, SideQuestionOutcome, SideQuestionRequest,
+    BranchSummaryOutcome, BranchSummaryRequest, BranchSummaryRun, CompactionOutcome,
+    CompactionRequest, CompactionRun, EngineEvent, EngineModelSelection, PromptRequest,
+    SessionEngine, SideQuestionOutcome, SideQuestionRequest,
 };
 use crate::rlm_children::{ParentIdentity, SupervisorChildSessions, DEFAULT_RLM_MAX_DEPTH};
 
@@ -114,6 +115,10 @@ pub struct AgentSessionEngine {
     effective_thinking: std::sync::RwLock<Option<pa_types::ai::ModelThinkingLevel>>,
     /// Built once on the first prompt, reused across prompts.
     pub(crate) session: tokio::sync::Mutex<Option<CoreSessionEngine>>,
+    /// A branch move (tree navigation or fork) that landed before the first
+    /// turn built the session: consumed at build so the session starts on
+    /// the moved branch (TS rebuilds context from the durable branch).
+    pending_branch: std::sync::Mutex<Option<Vec<pa_types::session::FileEntry>>>,
     /// The provider target the built session's stream reads per call
     /// (api key + model), set when the session builds: `set_model` swaps
     /// the slot so the live session follows the new model without a
@@ -255,6 +260,7 @@ impl AgentSessionEngine {
             selection: std::sync::RwLock::new(selection),
             effective_thinking: std::sync::RwLock::new(None),
             session: tokio::sync::Mutex::new(None),
+            pending_branch: std::sync::Mutex::new(None),
             provider_target: std::sync::Arc::new(std::sync::RwLock::new(None)),
             own_summary: std::sync::Arc::new(std::sync::Mutex::new(None)),
             autonomous: std::sync::Arc::new(tokio::sync::Mutex::new(
@@ -924,6 +930,104 @@ impl SessionEngine for AgentSessionEngine {
         }
     }
 
+    fn run_branch_summary(
+        &self,
+        request: BranchSummaryRequest,
+        signal: &pa_agent::abort::AbortSignal,
+    ) -> BranchSummaryOutcome {
+        let model = match self.resolve_model() {
+            Ok(model) => model,
+            Err(error) => {
+                return BranchSummaryOutcome::Failed {
+                    error: error.to_string(),
+                }
+            }
+        };
+        let api_key = self.resolve_request_api_key(&model);
+        let settings =
+            pa_core::settings::SettingsManager::create(&self.config.cwd, &self.config.agent_dir);
+        let reserve_tokens = settings
+            .settings()
+            .branch_summary
+            .as_ref()
+            .and_then(|branch_summary| branch_summary.reserve_tokens)
+            .unwrap_or(
+                pa_core::session_engine::branch_summarization::DEFAULT_BRANCH_RESERVE_TOKENS,
+            );
+        let entries = request.entries;
+        let custom_instructions = request.custom_instructions;
+        let replace_instructions = request.replace_instructions;
+        let run = async {
+            pa_core::session_engine::branch_summarization::generate_branch_summary(
+                &entries,
+                pa_core::session_engine::branch_summarization::GenerateBranchSummaryOptions {
+                    model: &model,
+                    api_key,
+                    custom_instructions: custom_instructions.as_deref(),
+                    replace_instructions,
+                    reserve_tokens,
+                },
+            )
+            .await
+        };
+        match self
+            .runtime
+            .block_on(pa_agent::abort::race_with_abort(run, signal))
+        {
+            Ok(result) => {
+                if result.aborted {
+                    return BranchSummaryOutcome::Aborted;
+                }
+                if let Some(error) = result.error {
+                    return BranchSummaryOutcome::Failed { error };
+                }
+                let summary = result
+                    .summary
+                    .unwrap_or_else(|| "No summary generated".to_string());
+                BranchSummaryOutcome::Complete {
+                    run: BranchSummaryRun {
+                        summary,
+                        usage: result
+                            .usage
+                            .and_then(|usage| serde_json::to_value(usage).ok()),
+                        details: Some(json!({
+                            "readFiles": result.read_files,
+                            "modifiedFiles": result.modified_files,
+                        })),
+                    },
+                }
+            }
+            Err(_) => BranchSummaryOutcome::Aborted,
+        }
+    }
+
+    fn rebuild_session_context(
+        &self,
+        branch_entries: Vec<pa_types::session::FileEntry>,
+    ) -> anyhow::Result<()> {
+        // The caller parks this synchronous engine call on a blocking
+        // thread (see `branch_navigation`), so `blocking_lock` is legal
+        // here; the async session move below then rides the engine
+        // runtime, the same pattern as `run_compaction`.
+        let built = self.session.blocking_lock().is_some();
+        if !built {
+            // The session builds lazily on the first turn; park the branch
+            // so the build consumes it (see `session_agent`).
+            *self
+                .pending_branch
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(branch_entries);
+            return Ok(());
+        }
+        self.runtime.block_on(async move {
+            let guard = self.session.lock().await;
+            let Some(engine) = guard.as_ref() else {
+                return Ok(());
+            };
+            engine.session.rebuild_branch_context(branch_entries).await
+        })
+    }
+
     fn configure_rlm_identity(
         &self,
         identity: crate::engine::RlmSessionIdentity,
@@ -1589,6 +1693,18 @@ impl AgentSessionEngine {
                     .runtime
                     .block_on(async { self.build_session(model).await })?;
                 self.mirror_goal_runtime(&built);
+                // A branch move that landed before the first turn (tree
+                // navigation/fork with no turn yet) re-seeds the session
+                // onto the moved branch.
+                let pending_branch = self
+                    .pending_branch
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+                if let Some(entries) = pending_branch {
+                    self.runtime
+                        .block_on(async { built.session.rebuild_branch_context(entries).await })?;
+                }
                 self.session.blocking_lock().replace(built);
             }
         }

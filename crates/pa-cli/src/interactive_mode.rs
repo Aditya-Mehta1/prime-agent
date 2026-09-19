@@ -408,6 +408,11 @@ fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<Inter
     let settings = pa_core::settings::SettingsManager::create(&config.cwd, &config.agent_dir);
     let code_block_indent = settings.get_code_block_indent();
     let show_images = settings.get_show_images();
+    // The `/tree` selector's initial filter and the branch-summary prompt
+    // skip read the same settings the TS interactive mode reads at
+    // startup.
+    let tree_filter_mode = settings.get_tree_filter_mode();
+    let branch_summary_skip_prompt = settings.get_branch_summary_skip_prompt();
     // The `/model` picker catalog: a startup snapshot of the available
     // models (same registry and private-authorization cache adoption as
     // the startup-model chain; entitlement refreshes run daemon-side, so
@@ -443,6 +448,8 @@ fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<Inter
     let model_catalog = pa_core::models::order_for_picker(catalog, current.as_ref(), &recent);
     Ok(InteractiveOptions {
         code_block_indent,
+        tree_filter_mode,
+        branch_summary_skip_prompt,
         model_catalog,
         socket_path,
         cwd: config.cwd.clone(),

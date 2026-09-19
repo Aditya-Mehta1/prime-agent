@@ -2760,6 +2760,8 @@ impl Supervisor {
                 | DaemonCommand::WaitForHeadlessCompletion { .. }
                 // Compaction runs a summarizer model call, like a turn.
                 | DaemonCommand::Compact { .. }
+                // A tree navigation may run a branch-summary model call.
+                | DaemonCommand::NavigateTree { .. }
         ) {
             LONG_ROUTE_TIMEOUT_MS
         } else {

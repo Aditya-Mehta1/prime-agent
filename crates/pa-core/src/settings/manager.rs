@@ -176,6 +176,28 @@ impl SettingsManager {
             .unwrap_or(true)
     }
 
+    /// `treeFilterMode` (TS `getTreeFilterMode`): the `/tree` selector's
+    /// initial filter; an unset or invalid value falls back to
+    /// `user-only`, like the TS default.
+    pub fn get_tree_filter_mode(&self) -> String {
+        let mode = self.settings().tree_filter_mode.clone().unwrap_or_default();
+        let valid = ["default", "no-tools", "user-only", "labeled-only", "all"];
+        if valid.contains(&mode.as_str()) && !mode.is_empty() {
+            mode
+        } else {
+            "user-only".to_string()
+        }
+    }
+
+    /// `branchSummary.skipPrompt` (TS `getBranchSummarySkipPrompt`).
+    pub fn get_branch_summary_skip_prompt(&self) -> bool {
+        self.settings()
+            .branch_summary
+            .as_ref()
+            .and_then(|branch_summary| branch_summary.skip_prompt)
+            .unwrap_or(false)
+    }
+
     /// Record a model use at the front of `recentModels` (capped at 20).
     pub fn record_model_use(&mut self, provider: &str, model: &str) {
         let key = format!("{provider}/{model}");

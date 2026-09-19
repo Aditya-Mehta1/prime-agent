@@ -191,6 +191,31 @@ impl AgentSession {
         Ok(outcome)
     }
 
+    /// Rebuild the live loop context from a durable branch (TS
+    /// `navigateTree`'s context rebuild: `sessionManager.branch(newLeafId)`
+    /// then `agent.state.messages = buildSessionContext().messages`). The
+    /// session adopts the branch entries and the agent's message list is
+    /// rebuilt from the post-navigation session state.
+    pub async fn rebuild_branch_context(
+        &self,
+        branch_entries: Vec<FileEntry>,
+    ) -> anyhow::Result<()> {
+        let rebuilt = {
+            let mut session = self.session.lock().await;
+            session.adopt_entries(branch_entries);
+            crate::session_engine::compact_session::rebuilt_context_after_compaction(&session)
+        };
+        let loop_messages: Vec<AgentMessage> = rebuilt
+            .into_iter()
+            .filter_map(|message| {
+                let value = serde_json::to_value(&message).ok()?;
+                serde_json::from_value::<AgentMessage>(value).ok()
+            })
+            .collect();
+        self.agent.set_messages(loop_messages).await;
+        Ok(())
+    }
+
     /// Execute `/refine`: plan, re-read, apply, and persist the continual
     /// harness state for this session. The conversation snapshot comes from
     /// the session entries (what the model would see on a rebuild).

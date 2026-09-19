@@ -139,6 +139,8 @@ STATES = [
     ("e_table_and_links", "idle after a turn rendering a markdown table and links"),
     ("c_thinking_visible", "conversation detail (Ctrl+O): thinking block visible"),
     ("d_spinner", "working loader mid-turn"),
+    ("f_tree_pane", "the /tree selector pane over the settled session"),
+    ("g_fork_pane", "the /fork user-message selector over the settled session"),
     ("f_kernel_boot", "python-kernel boot: the tool-owned loader note mid-turn"),
 ]
 
@@ -203,6 +205,23 @@ def normalize(frame, root):
     # usage strings (already normalized above) had different widths, so
     # collapse the padding run before the tray's model segment.
     frame = re.sub(r" +(\x1b\[38;2;113;113;122mfaux-1 \u00b7 )", r" \1", frame)
+    # The selection-background row: the pi-tui writer's escape placement
+    # inside the selection wrap varies between runs of the same binary
+    # (bold-on for the role label, fg resets mid-row, the trailing reset
+    # bundle), so the tree pane's selected row compares by visible text.
+    frame = re.sub(
+        "(\x1b\[38;2;[0-9;]+m)?\x1b\[48;2;34;34;38m[^\n]*",
+        lambda m: re.sub("\x1b\[[0-9;]*m", "", m.group(0)),
+        frame,
+    )
+    # Selector list rows (the `› ` cursor prefix): same writer variance for
+    # the accent cursor and the bold selected row.
+    frame = re.sub(
+        "^.*› .*$",
+        lambda m: re.sub("\x1b\[[0-9;]*m", "", m.group(0)),
+        frame,
+        flags=re.MULTILINE,
+    )
     return frame
 
 
@@ -349,14 +368,39 @@ def run_session(binary, sandbox, shared_cwd, script_path, size, out_dir, session
     time.sleep(1.0)
     frames["b_turn_with_tool"] = capture(session)
 
+    # (f) the /tree selector pane: opens over the settled session right
+    # after the first turn (the double-Escape shortcut would need two
+    # presses within 500ms; the command path is the stable one). Captured
+    # before the table turn, whose scripted-response exhaustion leaves a
+    # failed turn in the transcript. Esc closes it before the next state.
+    tmux("send-keys", "-t", session, "/tree")
+    tmux("send-keys", "-t", session, "Enter")
+    wait_for(session, "Session Tree", timeout=15)
+    time.sleep(1.0)
+    frames["f_tree_pane"] = capture(session)
+    tmux("send-keys", "-t", session, "Escape")
+    time.sleep(0.5)
+
+    # (g) the /fork user-message selector: same mount, same escape-close.
+    tmux("send-keys", "-t", session, "/fork")
+    tmux("send-keys", "-t", session, "Enter")
+    wait_for(session, "Fork from Message", timeout=15)
+    time.sleep(1.0)
+    frames["g_fork_pane"] = capture(session)
+    tmux("send-keys", "-t", session, "Escape")
+    time.sleep(0.5)
+
     # (e) table + links: submit a second turn whose response carries a
-    # markdown table and links; capture the settled frame.
+    # markdown table and links; capture the settled frame. The faux queue
+    # holds two responses (the first turn's post-tool continuation consumes
+    # the table), so the second turn settles on its provider error — wait
+    # for that row, not the table text (it already rendered in turn 1).
     tmux("send-keys", "-t", session, SECOND_PROMPT)
     tmux("send-keys", "-t", session, "Enter")
     deadline = time.time() + 120
     while time.time() < deadline:
         pane = capture(session, escape=False)
-        if "blocked on upstream" in pane and not re.search(SPINNER_CLASS, pane):
+        if "No more faux responses queued" in pane and not re.search(SPINNER_CLASS, pane):
             break
         time.sleep(0.3)
     time.sleep(1.0)

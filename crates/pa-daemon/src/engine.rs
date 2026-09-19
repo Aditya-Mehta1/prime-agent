@@ -182,6 +182,26 @@ pub trait SessionEngine: Send + Sync {
     fn run_compaction(&self, request: CompactionRequest, signal: &AbortSignal)
         -> CompactionOutcome;
 
+    /// Run one branch summary (`navigate_tree` with `summarize`): summarize
+    /// the abandoned branch's entries. The engine owns the model call; the
+    /// worker owns the leaf move, the `branch_summary` entry, and the
+    /// response. `signal` aborts the run.
+    fn run_branch_summary(
+        &self,
+        request: BranchSummaryRequest,
+        signal: &AbortSignal,
+    ) -> BranchSummaryOutcome;
+
+    /// Rebuild the engine's live context from a durable branch (the
+    /// post-navigation/fork state): the worker moves its store first, then
+    /// hands the new branch's entries over so the next turn runs against
+    /// the moved branch. Engines without a persistent model context accept
+    /// and ignore the branch.
+    fn rebuild_session_context(
+        &self,
+        branch_entries: Vec<pa_types::session::FileEntry>,
+    ) -> Result<()>;
+
     /// Context window (tokens) of the engine's resolved model, when known.
     /// Drives the `contextUsage` estimate in `get_session_stats`; engines
     /// without model metadata report `None` and the field is omitted.
@@ -340,6 +360,37 @@ pub enum CompactionOutcome {
     Failed { error: String },
 }
 
+/// One branch-summary request (`navigate_tree` with `summarize`): the
+/// abandoned branch's durable entries (wire `FileEntry` form) and the
+/// summarizer guidance from the client.
+#[derive(Debug, Clone)]
+pub struct BranchSummaryRequest {
+    pub entries: Vec<pa_types::session::FileEntry>,
+    pub custom_instructions: Option<String>,
+    /// Replace the default prompt instead of appending the custom focus.
+    pub replace_instructions: bool,
+}
+
+/// One completed branch summary: the final summary text, the summarizer
+/// usage, and the file-operation details block persisted on the entry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BranchSummaryRun {
+    pub summary: String,
+    pub usage: Option<Value>,
+    pub details: Option<Value>,
+}
+
+/// How one branch-summary run ended (TS `BranchSummaryResult` outcomes).
+#[derive(Debug, Clone, PartialEq)]
+pub enum BranchSummaryOutcome {
+    /// Summary generated; the run carries text, usage, and details.
+    Complete { run: BranchSummaryRun },
+    /// Aborted mid-run (`abort_branch_summary`).
+    Aborted,
+    /// Failed; the string is the user-facing error.
+    Failed { error: String },
+}
+
 /// One side-question request (the `start_side_question` command fields).
 #[derive(Debug, Clone)]
 pub struct SideQuestionRequest {
@@ -438,6 +489,7 @@ pub struct ScriptedEngine {
     responses: Vec<Value>,
     side_question: SideQuestionScript,
     compaction: CompactionScript,
+    branch_summary: CompactionScript,
 }
 
 /// Scripted compaction results, consumed one per run in order; when the
@@ -502,10 +554,22 @@ impl ScriptedEngine {
                 next: std::sync::atomic::AtomicUsize::new(0),
             })
             .unwrap_or_default();
+        let branch_summary = script
+            .get("branchSummary")
+            .map(|branch_summary| CompactionScript {
+                responses: branch_summary
+                    .get("responses")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+                next: std::sync::atomic::AtomicUsize::new(0),
+            })
+            .unwrap_or_default();
         Ok(ScriptedEngine {
             responses,
             side_question,
             compaction,
+            branch_summary,
         })
     }
 
@@ -746,6 +810,73 @@ impl SessionEngine for ScriptedEngine {
                 usage: entry.get("usage").cloned().filter(|usage| !usage.is_null()),
             },
         }
+    }
+
+    fn run_branch_summary(
+        &self,
+        _request: BranchSummaryRequest,
+        signal: &AbortSignal,
+    ) -> BranchSummaryOutcome {
+        // Unscripted branch summaries produce a deterministic result, like
+        // the compaction fallback. Scripted runs consume entries in order
+        // and replay from the top once exhausted.
+        let Some(entry) = (|| {
+            let index = self
+                .branch_summary
+                .next
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |current| {
+                        Some(if current + 1 >= self.branch_summary.responses.len() {
+                            0
+                        } else {
+                            current + 1
+                        })
+                    },
+                )
+                .ok()?;
+            self.branch_summary.responses.get(index)
+        })() else {
+            return BranchSummaryOutcome::Complete {
+                run: BranchSummaryRun {
+                    summary: "scripted branch summary".to_string(),
+                    usage: None,
+                    details: Some(json!({ "readFiles": [], "modifiedFiles": [] })),
+                },
+            };
+        };
+        if let Some(error) = entry.get("error").and_then(Value::as_str) {
+            return BranchSummaryOutcome::Failed {
+                error: error.to_string(),
+            };
+        }
+        let delay_ms = Self::response_delay_ms(entry);
+        if delay_ms > 0 && !abortable_sleep(std::time::Duration::from_millis(delay_ms), signal) {
+            return BranchSummaryOutcome::Aborted;
+        }
+        if signal.is_aborted() {
+            return BranchSummaryOutcome::Aborted;
+        }
+        BranchSummaryOutcome::Complete {
+            run: BranchSummaryRun {
+                summary: entry
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                usage: entry.get("usage").cloned().filter(|usage| !usage.is_null()),
+                details: entry.get("details").cloned().filter(|d| !d.is_null()),
+            },
+        }
+    }
+
+    fn rebuild_session_context(
+        &self,
+        _branch_entries: Vec<pa_types::session::FileEntry>,
+    ) -> Result<()> {
+        // The scripted harness engine carries no durable model context.
+        Ok(())
     }
 }
 

@@ -46,6 +46,11 @@ pub mod snapshot;
 mod terminal_image;
 pub mod theme;
 pub mod tool_card;
+pub mod tree_display;
+pub mod tree_list;
+pub mod tree_nodes;
+pub mod tree_selector;
+pub mod user_message_selector;
 pub mod view;
 pub mod width;
 

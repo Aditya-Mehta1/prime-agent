@@ -27,4 +27,5 @@ path = "src/main.rs"
 tempfile = "3"
 libc = "0.2"
 futures = { workspace = true }
+crossterm = "0.28"
 url = "2"

@@ -709,6 +709,28 @@ impl SessionManager {
         SessionTree::build(&self.file_entries)
     }
 
+    /// Adopt a durable branch as this session's entries (TS
+    /// `createBranchedSession`'s in-memory case, and the engine's
+    /// post-navigation context rebuild): keeps the header, replaces every
+    /// entry with the given chain, and re-indexes so the leaf is the last
+    /// adopted entry. In-memory only — the caller owns any persistence.
+    pub fn adopt_entries(&mut self, entries: Vec<FileEntry>) {
+        let header = self
+            .file_entries
+            .iter()
+            .position(|entry| matches!(entry, FileEntry::Header { .. }));
+        match header {
+            Some(index) => {
+                self.file_entries.truncate(index + 1);
+                self.file_entries.extend(entries);
+            }
+            None => {
+                self.file_entries = entries;
+            }
+        }
+        self.build_index();
+    }
+
     fn persist_entry(&mut self, index: usize) {
         if !self.persist || self.session_file.is_none() {
             return;
@@ -960,6 +982,11 @@ impl SessionManager {
     /// The active label for a target entry id.
     pub fn get_label(&self, target_id: &str) -> Option<String> {
         self.labels_by_id.get(target_id).cloned()
+    }
+
+    /// The timestamp of the label entry that set the target's active label.
+    pub fn get_label_timestamp(&self, target_id: &str) -> Option<String> {
+        self.label_timestamps_by_id.get(target_id).cloned()
     }
 
     /// Move the leaf (used by branch/branchWithSummary).

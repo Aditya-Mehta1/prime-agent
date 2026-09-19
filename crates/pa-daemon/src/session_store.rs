@@ -33,7 +33,7 @@ pub fn new_session_id() -> String {
     uuid::Uuid::now_v7().to_string()
 }
 
-fn new_entry_id(used: &HashMap<String, ()>) -> String {
+pub(crate) fn new_entry_id(used: &HashMap<String, ()>) -> String {
     for _ in 0..100 {
         let id: String = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         if !used.contains_key(&id) {
@@ -82,9 +82,9 @@ impl SessionEntry {
 pub struct SessionFile {
     pub path: PathBuf,
     pub header: SessionHeader,
-    entries: Vec<SessionEntry>,
-    by_id: HashMap<String, usize>,
-    leaf_id: Option<String>,
+    pub(crate) entries: Vec<SessionEntry>,
+    pub(crate) by_id: HashMap<String, usize>,
+    pub(crate) leaf_id: Option<String>,
 }
 
 pub fn session_file_name(session_id: &str) -> String {

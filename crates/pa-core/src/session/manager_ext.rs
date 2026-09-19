@@ -2,8 +2,8 @@
 //! Port of the tail of core/session-manager.ts (getBranch/getTree/branch*).
 
 use pa_types::session::{
-    AgentStatus, AgentStatusEntry, CustomMessageEntry, FileEntry, GitContext, GitStateEntry,
-    LabelEntry, SessionStateStatus,
+    AgentMessage, AgentStatus, AgentStatusEntry, CustomMessageEntry, FileEntry, GitContext,
+    GitStateEntry, LabelEntry, SessionStateStatus,
 };
 
 use super::manager::SessionManager;
@@ -179,6 +179,39 @@ impl SessionManager {
         });
         self.apply_label_entry(target_id, label, &timestamp);
         id
+    }
+
+    /// `getFlatTree`: every entry in file order with its active label and
+    /// label timestamp (the `get_session_tree` wire shape's source).
+    pub fn get_flat_tree(&self) -> Vec<(FileEntry, Option<String>, Option<String>)> {
+        self.get_entries()
+            .into_iter()
+            .map(|entry| {
+                let id = entry.id().map(str::to_string);
+                let label = id.as_deref().and_then(|id| self.get_label(id));
+                let timestamp = id.as_deref().and_then(|id| self.get_label_timestamp(id));
+                (entry, label, timestamp)
+            })
+            .collect()
+    }
+
+    /// `getUserMessagesForForking`: user messages with their text, in file
+    /// order (TS `AgentSession.getUserMessagesForForking`).
+    pub fn get_user_messages_for_forking(&self) -> Vec<(String, String)> {
+        self.get_entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                FileEntry::Message {
+                    message: AgentMessage::User(user),
+                    ..
+                } => {
+                    let text = user.content.text();
+                    let id = entry.id().map(str::to_string)?;
+                    (!text.is_empty()).then_some((id, text))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// The ancestor path (file order) ending at `from_id` (default: leaf).

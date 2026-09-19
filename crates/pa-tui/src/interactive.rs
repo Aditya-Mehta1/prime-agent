@@ -151,6 +151,12 @@ pub struct InteractiveOptions {
     /// root from `markdown.codeBlockIndent` (TS `getCodeBlockIndent`;
     /// default two spaces).
     pub code_block_indent: String,
+    /// The `/tree` selector's initial filter mode, resolved by the
+    /// composition root from the `treeFilterMode` setting (default view).
+    pub tree_filter_mode: String,
+    /// The `branchSummary.skipPrompt` setting: `/tree` navigation skips the
+    /// "Summarize branch?" question and navigates with no summary.
+    pub branch_summary_skip_prompt: bool,
     /// Product version for the brand splash.
     pub version: String,
     /// Run the first-run onboarding flow before the session screen.
@@ -251,6 +257,9 @@ pub enum HeadlessStep {
     /// Scroll the transcript to its top row (the `tui.viewport.top` key
     /// path): the verifier's window into the head of the transcript.
     ScrollTop,
+    /// One raw key event: the verifier's window into the selector/picker
+    /// surfaces (arrows, escape), which typed text cannot express.
+    Key(crossterm::event::KeyEvent),
 }
 
 /// One typed string as key events: characters become `Char` presses, `\n`
@@ -963,6 +972,11 @@ impl Renderer {
                                     return;
                                 }
                             }
+                            HeadlessStep::Key(key) => {
+                                if ui_tx.send(UiInput::Key(key)).is_err() {
+                                    return;
+                                }
+                            }
                         }
                     }
                     let _ = ui_tx.send(UiInput::HeadlessDone);
@@ -1189,6 +1203,8 @@ mod tests {
             show_images: true,
             theme: "prime".to_string(),
             code_block_indent: "  ".to_string(),
+            tree_filter_mode: String::new(),
+            branch_summary_skip_prompt: false,
             version: "0.0.0".to_string(),
             onboarding: None,
             telemetry_disabled: None,
