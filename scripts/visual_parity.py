@@ -3,8 +3,9 @@
 UI against the installed TS prime-agent binary in tmux.
 
 Drives both binaries to the same defined states (fresh start, one turn with a
-tool call, thinking visible via Ctrl+O, the working spinner mid-turn, and
-the idle frame after the turn) at 120x36 and 220x50, captures the rendered
+tool call, a second turn rendering a markdown table and links, thinking
+visible via Ctrl+O, and the working spinner mid-turn) at 120x36 and 220x50,
+captures the rendered
 panes with escape sequences, normalizes volatile content, and reports
 per-state frame diffs. Exit code is non-zero when any state differs.
 
@@ -31,9 +32,12 @@ import time
 TS_SCRIPT_MODEL = "faux-1"
 SIZES = [("120", "36"), ("220", "50")]
 
-# The single turn both binaries run: thinking, a text block, an ipython tool
-# call, then the final answer. Content is identical on both sides so the
-# frames compare content-for-content.
+# The scripted queue both binaries consume, in request order. Turn 1 makes
+# two model requests — the response below (thinking, a text block, an ipython
+# tool call), then a continuation after the tool result — and turn 2 makes
+# one. A toolUse response always consumes the next queued response too, so
+# turn 1 takes two scripted responses. Content is identical on both sides so
+# the frames compare content-for-content.
 # The table/link-bearing turn: exercises the GFM table block (header,
 # delimiter row, body rows) and both link forms, including a mixed-width
 # CJK cell so column measurement shows up in the frame diff.
@@ -50,6 +54,11 @@ TABLE_AND_LINKS_TURN = (
 )
 
 SECOND_PROMPT = "Show me the status table."
+
+# Turn 1's final answer, served to the post-tool continuation request (the
+# daemon re-requests the model after a toolUse response) so state b settles
+# on the tool-call card plus this answer.
+TURN1_FINAL_ANSWER = "The check printed the expected marker. Anything else?"
 
 FAUX_SCRIPT = {
     "engine": "faux",
@@ -74,6 +83,8 @@ FAUX_SCRIPT = {
                 },
             ]
         },
+        # Turn 1 continuation after the ipython tool result (state b).
+        {"content": [{"type": "text", "text": TURN1_FINAL_ANSWER}]},
         # Turn 2: markdown table + links (state e_table_and_links).
         {"content": [{"type": "text", "text": TABLE_AND_LINKS_TURN}]},
     ],
@@ -81,7 +92,11 @@ FAUX_SCRIPT = {
 
 # The TS extension registers the faux provider and scripts its responses from
 # PRIME_AGENT_FAUX_SCRIPT (mirrors the test-suite registerFauxProvider fixture).
-# Shared with tool_card_parity.py: one extension source for every harness.
+# It also serves the daemon's post-turn dashboard status-line request from a
+# canned empty verdict, so a daemon whose status line falls back to the session
+# model cannot consume a scripted response and desync the queue.
+# Shared with tool_card_parity.py and compact_parity.py: one extension source
+# for every harness.
 TS_FAUX_EXTENSION = open(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "ts_faux_extension.js"),
     encoding="utf-8",
@@ -166,9 +181,26 @@ def normalize(frame, root):
     # tmux places the trailing foreground-reset (\x1b[39m) differently for
     # identical screens: at the end of the row whose styled text just ended,
     # or before the next row's default margin. Both describe default-colored
-    # cells, so drop boundary resets before comparing.
+    # cells, so drop boundary resets before comparing. The same applies to
+    # the background-reset (\x1b[49m) the editor line leaves on the blank
+    # rows above a message: tmux attaches it to the end of the last blank
+    # row or to the message row's leading space.
     frame = re.sub("\x1b\[39m\n", "\n", frame)
     frame = re.sub("\n\x1b\[39m(?= )", "\n", frame)
+    frame = re.sub("\x1b\[49m\n", "\n", frame)
+    frame = re.sub("\n\x1b\[49m(?= )", "\n", frame)
+    # The loader row's spinner-to-label gap: TS resets the spinner color and
+    # leaves the separator space default-colored; Rust carries the label
+    # color across the space. A space's foreground is invisible either way,
+    # so canonicalize both to the TS shape (space before the label color).
+    frame = re.sub(r"(?<=<SPIN>)\x1b\[39m (?=\x1b\[38;2;161;161;170m)", " ", frame)
+    frame = re.sub(
+        r"(?<=<SPIN>)\x1b\[38;2;161;161;170m (?=\S)", " \x1b[38;2;161;161;170m", frame
+    )
+    # The right-aligned tray: its padding shifts when the volatile context
+    # usage strings (already normalized above) had different widths, so
+    # collapse the padding run before the tray's model segment.
+    frame = re.sub(r" +(\x1b\[38;2;113;113;122mfaux-1 \u00b7 )", r" \1", frame)
     return frame
 
 
@@ -265,15 +297,25 @@ def run_session(binary, sandbox, shared_cwd, script_path, size, out_dir, session
     tmux("send-keys", "-t", session, PROMPT)
     tmux("send-keys", "-t", session, "Enter")
 
-    # (d) spinner: the thinking block streams first, so both binaries show
-    # the loader with the Thinking activity; poll for it rather than a fixed
-    # delay (kernel startup timing varies).
+    # (d) spinner: the working loader mid-turn. The loader's Thinking phase
+    # renders identically on both binaries (a spinner glyph, the activity
+    # label, elapsed seconds, and the streaming token count) and lasts ~1s
+    # at the scripted 18 tokens/second, so poll for the loader row and
+    # capture immediately, still inside the phase. Later phases differ
+    # across the binaries today (the TS loader shows the kernel-setup
+    # status note; the Rust loader stays on the phase label), and the
+    # Thinking-phase needle must match the row as rendered ("Thinking ·"),
+    # not the activity name alone.
     deadline = time.time() + 60
     while time.time() < deadline:
         pane = capture(session, escape=False)
-        if re.search(r"\u00b7 Thinking \u00b7", pane):
+        if re.search(r"Thinking \u00b7", pane):
             break
         time.sleep(0.1)
+    else:
+        raise TimeoutError(
+            f"session {session} never showed the Thinking loader row"
+        )
     frames["d_spinner"] = capture(session)
 
     # (b) idle after the turn: the final answer rendered AND the loader row

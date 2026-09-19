@@ -1,6 +1,8 @@
-// Visual-parity driver extension: registers the faux provider with scripted
-// responses read from PRIME_AGENT_FAUX_SCRIPT (same harness contract the Rust
-// rewrite uses). Verification harness only; never installed for real users.
+// Shared faux-provider driver extension for the parity harnesses
+// (visual_parity.py, tool_card_parity.py, compact_parity.py): registers the
+// faux provider with scripted responses read from PRIME_AGENT_FAUX_SCRIPT
+// (same harness contract the Rust rewrite uses). Verification harness only;
+// never installed for real users.
 import {
 	registerFauxProvider,
 	fauxAssistantMessage,
@@ -8,8 +10,23 @@ import {
 	fauxThinking,
 	fauxToolCall,
 	getApiProvider,
+	createAssistantMessageEventStream,
 } from "@earendil-works/pi-ai";
 import { readFileSync } from "node:fs";
+
+// The daemon's post-turn dashboard status line (daemon-session-summarizer).
+// It normally resolves to a small prime-inference model, but a daemon whose
+// status-line request falls back to the session model would otherwise
+// consume a scripted response and desync the faux queue mid-script.
+const AGENT_STATUS_SYSTEM_PROMPT_PREFIX =
+	"You generate a status line for an AI coding agent dashboard.";
+
+function isStatusLineRequest(context) {
+	return (
+		typeof context?.systemPrompt === "string" &&
+		context.systemPrompt.startsWith(AGENT_STATUS_SYSTEM_PROMPT_PREFIX)
+	);
+}
 
 export default function registerVisualFaux(pi) {
 	const scriptPath = process.env.PRIME_AGENT_FAUX_SCRIPT;
@@ -52,11 +69,31 @@ export default function registerVisualFaux(pi) {
 	if (!apiProvider) {
 		throw new Error("Faux API provider was not registered");
 	}
+	const scriptedStreamSimple = apiProvider.streamSimple;
+	const streamSimple = (model, context, options) => {
+		if (isStatusLineRequest(context)) {
+			// Serve the dashboard status line from a canned empty verdict that
+			// parses to no recap — the same visible state as the skipped
+			// request — without consuming a scripted response.
+			const stream = createAssistantMessageEventStream();
+			const message = fauxAssistantMessage([fauxText("")], { stopReason: "stop" });
+			message.api = model.api;
+			message.provider = model.provider;
+			message.model = model.id;
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial: { ...message, content: [] } });
+				stream.push({ type: "done", reason: "stop", message });
+				stream.end(message);
+			});
+			return stream;
+		}
+		return scriptedStreamSimple(model, context, options);
+	};
 	pi.registerProvider(provider, {
 		api: faux.api,
 		apiKey: "faux-key",
 		baseUrl: faux.getModel().baseUrl,
-		streamSimple: apiProvider.streamSimple,
+		streamSimple,
 		models: faux.models.map((model) => ({
 			api: model.api,
 			baseUrl: model.baseUrl,
