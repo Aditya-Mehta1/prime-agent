@@ -106,6 +106,10 @@ pub struct Supervisor {
     /// The supervisor's agent roster (classified entries; the roster arms
     /// live in `supervisor_roster.rs`).
     pub(crate) roster: std::sync::Mutex<crate::agent_roster::AgentRoster>,
+    /// In-flight saved-session renames (TS `pendingSessionNames`): one
+    /// reservation per `[depth, parent, name]` scope, so a concurrent
+    /// rename of the same name fails the second caller.
+    pub(crate) pending_session_names: std::sync::Mutex<std::collections::HashSet<String>>,
     shutting_down: AtomicBool,
     /// Wakes the accept loop when [`Supervisor::begin_shutdown`] sets the
     /// flag: a listening socket blocks in `accept` until a client connects,
@@ -163,6 +167,7 @@ impl Supervisor {
             registry: SessionRegistry::new(),
             events,
             roster: std::sync::Mutex::new(crate::agent_roster::AgentRoster::new()),
+            pending_session_names: std::sync::Mutex::new(std::collections::HashSet::new()),
             shutting_down: AtomicBool::new(false),
             shutdown_notify: tokio::sync::Notify::new(),
             log,
@@ -1623,8 +1628,33 @@ impl Supervisor {
                     )
                     .await;
                 let outcome = self
-                    .route_client_command(command, &client_id, attached, command_id, type_name)
+                    .route_client_command(
+                        command,
+                        &client_id,
+                        attached,
+                        command_id.clone(),
+                        type_name.clone(),
+                    )
                     .await;
+                // A selector that resolves to nothing detaches nothing and
+                // still answers success (TS `detachClient` no-ops an id
+                // the client was never attached to).
+                if outcome.0.first().is_some_and(|line| {
+                    line.get("success").and_then(Value::as_bool) == Some(false)
+                        && line
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .is_some_and(|error| error.starts_with("Unknown active session:"))
+                }) {
+                    return (
+                        vec![response_line(&response_success(
+                            Some(&command_id),
+                            &type_name,
+                            None,
+                        ))],
+                        false,
+                    );
+                }
                 let succeeded = outcome
                     .0
                     .first()
@@ -1665,6 +1695,96 @@ impl Supervisor {
                 self.handle_agent_messages_status_broadcast(
                     command,
                     &client_id,
+                    &command_id,
+                    &type_name,
+                )
+                .await
+            }
+            DaemonCommand::ListAgentPeers { .. } => {
+                // `list_agent_peers` (wave b11, TS supervisor arm): the
+                // worker-token-authenticated peer roster.
+                self.handle_list_agent_peers(command, &command_id, &type_name)
+                    .await
+            }
+            DaemonCommand::RenameSavedSession { .. } => {
+                // `rename_saved_session` (wave b11): the reservation ladder
+                // plus the offline catalog rename or the worker forward.
+                let client_id = effective_client_id.lock().unwrap().clone();
+                self.handle_rename_saved_session(
+                    command,
+                    &client_id,
+                    attached,
+                    &command_id,
+                    &type_name,
+                )
+                .await
+            }
+            DaemonCommand::DeleteSavedSession {
+                active_session_id, ..
+            } if active_session_id.is_none() => {
+                // Selector-less `delete_saved_session` (wave b11): the
+                // supervisor's catalog delete (a selector routes to the
+                // owning worker's arm).
+                let client_id = effective_client_id.lock().unwrap().clone();
+                self.handle_delete_saved_session(command, &client_id, &command_id, &type_name)
+                    .await
+            }
+            DaemonCommand::CronList {
+                active_session_id, ..
+            } if active_session_id.is_none() => {
+                // Selector-less `cron_list` (wave b10, TS supervisor arm):
+                // merge the live workers' jobs with the passive ones.
+                let client_id = effective_client_id.lock().unwrap().clone();
+                self.handle_cron_list_catalog(command, &client_id, &command_id, &type_name)
+                    .await
+            }
+            DaemonCommand::HeartbeatsList {
+                active_session_id, ..
+            } if active_session_id.is_none() => {
+                // Selector-less `heartbeats_list` (wave b10): the merged
+                // heartbeat catalog.
+                let client_id = effective_client_id.lock().unwrap().clone();
+                self.handle_heartbeats_list_catalog(command, &client_id, &command_id, &type_name)
+                    .await
+            }
+            DaemonCommand::CronCancel {
+                active_session_id, ..
+            } if active_session_id.is_none() => {
+                // Selector-less `cron_cancel` (wave b10): the owner-worker
+                // search, then the passive store, then the TS error.
+                let client_id = effective_client_id.lock().unwrap().clone();
+                self.handle_cron_cancel_catalog(command, &client_id, &command_id, &type_name)
+                    .await
+            }
+            DaemonCommand::HeartbeatManage { .. } => {
+                // `heartbeat_manage` (wave b10, TS supervisor arm): passive
+                // jobs are managed against their durable store, live ones
+                // route to their worker.
+                let client_id = effective_client_id.lock().unwrap().clone();
+                self.handle_heartbeat_manage_catalog(
+                    command,
+                    &client_id,
+                    attached,
+                    &command_id,
+                    &type_name,
+                )
+                .await
+            }
+            DaemonCommand::CronAdd { .. } => {
+                // `cron_add` (wave b10): the routed add plus the
+                // ownership promotion the command may ask for.
+                let client_id = effective_client_id.lock().unwrap().clone();
+                self.handle_cron_add_catalog(command, &client_id, attached, &command_id, &type_name)
+                    .await
+            }
+            DaemonCommand::HeartbeatSet { .. } => {
+                // `heartbeat_set` (wave b10): the same
+                // forward-and-promote path as `cron_add`.
+                let client_id = effective_client_id.lock().unwrap().clone();
+                self.handle_heartbeat_set_catalog(
+                    command,
+                    &client_id,
+                    attached,
                     &command_id,
                     &type_name,
                 )

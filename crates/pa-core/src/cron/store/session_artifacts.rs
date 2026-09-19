@@ -17,46 +17,69 @@ use super::{
 use crate::cron::AgentCronJob;
 
 impl AgentCronJobStore {
-    pub fn register_session_artifact(&mut self, session_id: &str, artifact_dir: &Path) -> bool {
+    /// Register one session's artifact partition. Idempotent: re-registering
+    /// the same directory is a no-op, so call sites can bind on every read.
+    pub fn register_session_artifact(&self, session_id: &str, artifact_dir: &Path) -> bool {
         if !self.session_artifact_mode {
             return false;
         }
         let path = artifact_dir.join(SESSION_SCHEDULED_JOBS_FILENAME);
-        if self.session_artifact_files.get(session_id) == Some(&path) {
+        let mut files = self
+            .session_artifact_files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if files.get(session_id) == Some(&path) {
             return false;
         }
-        self.session_artifact_files
-            .insert(session_id.to_string(), path);
+        files.insert(session_id.to_string(), path);
         true
     }
 
+    /// Every registered `(session id, artifact file)` pair.
+    pub fn session_artifacts(&self) -> Vec<(String, PathBuf)> {
+        let files = self
+            .session_artifact_files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        files.clone().into_iter().collect()
+    }
+
     pub fn recover_session_artifact(&self, session_id: &str, now: u64) -> Vec<AgentCronJob> {
-        let Some(path) = self.session_artifact_files.get(session_id) else {
+        let Some(path) = self
+            .session_artifacts()
+            .into_iter()
+            .find(|(id, _)| id == session_id)
+            .map(|(_, path)| path)
+        else {
             return Vec::new();
         };
-        with_state_locks(std::slice::from_ref(path), || {
-            let mut state = read_jobs_state(path);
+        with_state_locks(std::slice::from_ref(&path), || {
+            let mut state = read_jobs_state(&path);
             let mut recovered = Vec::new();
             if !state.dispatches.is_empty() {
                 recover_interrupted_in_state(&mut state, now, &mut recovered, None);
-                write_jobs_state(path, &state);
+                write_jobs_state(&path, &state);
             }
             recovered
         })
     }
     pub(crate) fn write_jobs_session_artifacts(&self, jobs: &[AgentCronJob]) {
+        let artifact_files = self
+            .session_artifact_files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let registered: std::collections::HashSet<String> =
-            self.session_artifact_files.keys().cloned().collect();
+            artifact_files.keys().cloned().collect();
         for job in jobs {
             if !registered.contains(&job.session_id) {
                 // Mirror the TS error contract.
                 return;
             }
         }
-        let paths: Vec<PathBuf> = self.session_artifact_files.values().cloned().collect();
+        let paths: Vec<PathBuf> = artifact_files.values().cloned().collect();
         with_state_locks(&paths, || {
-            let current_by_session_id: HashMap<String, CronJobsState> = self
-                .session_artifact_files
+            let current_by_session_id: HashMap<String, CronJobsState> = artifact_files
                 .iter()
                 .map(|(session_id, path)| (session_id.clone(), read_jobs_state(path)))
                 .collect();
@@ -94,7 +117,7 @@ impl AgentCronJobStore {
                 .values()
                 .flat_map(|state| state.dispatches.clone())
                 .collect();
-            for (session_id, path) in &self.session_artifact_files {
+            for (session_id, path) in &artifact_files {
                 let current = current_by_session_id
                     .get(session_id)
                     .cloned()
@@ -139,7 +162,7 @@ mod tests {
     #[test]
     fn session_artifact_partitioning() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut store = AgentCronJobStore::for_session_artifacts();
+        let store = AgentCronJobStore::for_session_artifacts();
         let artifacts_a = dir.path().join("a");
         let artifacts_b = dir.path().join("b");
         std::fs::create_dir_all(&artifacts_a).unwrap();

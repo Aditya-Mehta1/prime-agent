@@ -11,9 +11,11 @@ normalized away). The lane contract (docs/protocol-breadth-audit.md):
   - a previously-rejected TS command type (resume_queue,
     mutate_queued_message, get_connection_state, ...) routes exactly like
     TS: same `Unknown active session: <id>` refusal for a bogus selector;
-  - selector-less commands whose TS supervisor arms are later waves
-    (cron_list) are reported as expected diffs; the agent_messages_*
-    selector-less arms landed with wave b7 and must match.
+  - the waves b10-b11 selector-less arms (cron_list, heartbeats_list,
+    cron_cancel, rename/delete_saved_session, list_agent_peers) match,
+    and the close-out batch covers every remaining TS command type with a
+    deterministic fresh-supervisor error path (a bogus selector refuses
+    with the exact TS error before any worker sees the command).
 
 Usage: python3 scripts/protocol_breadth_parity.py [path-to-pa-daemon]
 (the default is target/debug/pa-daemon relative to the repo root).
@@ -57,10 +59,13 @@ def _start(binary, sock, agent_dir):
         [binary, "supervisor", "--socket", sock, "--agent-dir", agent_dir],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
     )
+    # The TS supervisor's default socket dir is per-user
+    # (prime-agent-<uid>); root runs (sandboxes) land in prime-agent-0.
+    ts_default_socket = os.path.join(
+        env.get("TMPDIR", ""), f"prime-agent-{os.getuid()}", "daemon.sock")
     deadline = time.time() + 15
     while time.time() < deadline:
-        if os.path.exists(sock) or os.path.exists(os.path.join(
-            env.get("TMPDIR", ""), "prime-agent-1000", "daemon.sock")):
+        if os.path.exists(sock) or os.path.exists(ts_default_socket):
             return child
         if child.poll() is not None:
             raise SystemExit(f"{binary} exited with {child.returncode}")
@@ -76,7 +81,8 @@ def start(binary, sock, agent_dir):
     daemons in this run (or on the box) collide.
     """
     child = _start(binary, sock, agent_dir)
-    ts_default = os.path.join(agent_dir + "-tmp", "prime-agent-1000", "daemon.sock")
+    ts_default = os.path.join(
+        agent_dir + "-tmp", f"prime-agent-{os.getuid()}", "daemon.sock")
     return child, (ts_default if binary == TS else sock)
 
 def connect(sock):
@@ -139,8 +145,37 @@ CASES = [
      {"type": "agent_messages_pause"}),
     ("no-selector command now matches TS (agent_messages_resume)",
      {"type": "agent_messages_resume"}),
-    ("no-selector command: TS arm is a later wave (cron_list)",
+    # Waves b10-b11: the scheduling catalog and the saved-session/peer
+    # surface. The selector-less forms are the TS supervisor arms; bogus
+    # selectors resolve through the generic route with the TS refusal.
+    ("b10 scheduling selector-less matches TS (cron_list)",
      {"type": "cron_list"}),
+    ("b10 scheduling selector-less matches TS (heartbeats_list)",
+     {"type": "heartbeats_list"}),
+    ("b10 scheduling selector-less unknown job (cron_cancel)",
+     {"type": "cron_cancel", "jobId": "ghost-job"}),
+    ("b10 scheduling bogus selector routes (cron_add)",
+     {"type": "cron_add", "activeSessionId": "bogus-1",
+      "schedule": "every 10m", "prompt": "hi"}),
+    ("b10 scheduling bogus selector routes (heartbeat_get)",
+     {"type": "heartbeat_get", "activeSessionId": "bogus-1"}),
+    ("b10 scheduling bogus selector routes (heartbeat_set)",
+     {"type": "heartbeat_set", "activeSessionId": "bogus-1",
+      "schedule": "every 5m", "prompt": "hi"}),
+    ("b10 scheduling bogus selector routes (heartbeat_update)",
+     {"type": "heartbeat_update", "activeSessionId": "bogus-1",
+      "action": "pause"}),
+    ("b10 scheduling bogus selector routes (heartbeat_manage)",
+     {"type": "heartbeat_manage", "activeSessionId": "bogus-1",
+      "jobId": "j", "action": "pause"}),
+    ("b11 saved-session rename unknown path (rename_saved_session)",
+     {"type": "rename_saved_session",
+      "sessionPath": "/tmp/does-not-exist-xyz.jsonl", "name": "renamed"}),
+    ("b11 saved-session delete unknown path (delete_saved_session)",
+     {"type": "delete_saved_session",
+      "sessionPath": "/tmp/does-not-exist-xyz.jsonl"}),
+    ("b11 peer roster requires worker auth (list_agent_peers)",
+     {"type": "list_agent_peers"}),
     # Waves b2-b5 (worker commands): a bogus selector routes identically
     # on both supervisors - the exact TS refusal before any worker sees
     # the command.
@@ -242,6 +277,89 @@ CASES = [
      {"type": "cancel_prompt_admission", "activeSessionId": "bogus-1", "admissionId": "a1"}),
     ("b9 recovery routes (retry_worker)",
      {"type": "retry_worker", "activeSessionId": "bogus-1"}),
+    # Audit close-out: every remaining TS command type rides the same
+    # fresh-supervisor comparison with a deterministic envelope (the
+    # empty-catalog reads, and the bogus-selector refusal). Types with
+    # real side effects (create, ack_result, restart, shutdown,
+    # prepare_update_restart) are covered by the e2e suites instead and
+    # are documented in docs/protocol-breadth-audit.md.
+    ("close-out: list answers the empty catalog",
+     {"type": "list"}),
+    ("close-out: list_saved_sessions answers the empty catalog",
+     {"type": "list_saved_sessions"}),
+    ("close-out: roster_subscribe answers the empty roster",
+     {"type": "roster_subscribe"}),
+    ("close-out: roster_unsubscribe answers success",
+     {"type": "roster_unsubscribe"}),
+    ("close-out: transport ticket for a bogus session (get_direct_worker_transport)",
+     {"type": "get_direct_worker_transport", "activeSessionId": "bogus-1"}),
+    ("close-out: attach bogus selector",
+     {"type": "attach", "activeSessionId": "bogus-1"}),
+    # NOTE: `reattach` has no close-out case: the TS supervisor arm
+    # crashes on a minimal reattach ("undefined is not an object (evaluating
+    # 'e.replaceAll')" - a TS bug, fixed-shape reattach is covered by the
+    # direct-attach e2e suite), so the Rust parse refusal is the correct
+    # divergence to keep.
+    ("close-out: detach bogus selector",
+     {"type": "detach", "activeSessionId": "bogus-1"}),
+    ("close-out: kill bogus selector",
+     {"type": "kill", "activeSessionId": "bogus-1"}),
+    ("close-out: rename bogus selector",
+     {"type": "rename", "activeSessionId": "bogus-1", "name": "x"}),
+    ("close-out: set_session_name bogus selector",
+     {"type": "set_session_name", "activeSessionId": "bogus-1", "name": "x"}),
+    ("close-out: prompt bogus selector",
+     {"type": "prompt", "activeSessionId": "bogus-1", "message": "hi"}),
+    ("close-out: prompt_and_wait bogus selector",
+     {"type": "prompt_and_wait", "activeSessionId": "bogus-1", "message": "hi"}),
+    ("close-out: steer bogus selector",
+     {"type": "steer", "activeSessionId": "bogus-1", "message": "hi"}),
+    ("close-out: follow_up bogus selector",
+     {"type": "follow_up", "activeSessionId": "bogus-1", "message": "hi"}),
+    ("close-out: abort bogus selector",
+     {"type": "abort", "activeSessionId": "bogus-1"}),
+    ("close-out: start_side_question bogus selector",
+     {"type": "start_side_question", "activeSessionId": "bogus-1"}),
+    ("close-out: abort_side_question bogus selector",
+     {"type": "abort_side_question", "activeSessionId": "bogus-1"}),
+    ("close-out: send_message bogus target",
+     {"type": "send_message", "targetActiveSessionId": "bogus-1", "message": "hi"}),
+    ("close-out: wait_for_idle bogus selector",
+     {"type": "wait_for_idle", "activeSessionId": "bogus-1"}),
+    ("close-out: wait_for_headless_completion bogus selector",
+     {"type": "wait_for_headless_completion", "activeSessionId": "bogus-1"}),
+    ("close-out: get_session_header bogus selector",
+     {"type": "get_session_header", "activeSessionId": "bogus-1"}),
+    ("close-out: get_state bogus selector",
+     {"type": "get_state", "activeSessionId": "bogus-1"}),
+    ("close-out: get_messages bogus selector",
+     {"type": "get_messages", "activeSessionId": "bogus-1"}),
+    ("close-out: get_session_stats bogus selector",
+     {"type": "get_session_stats", "activeSessionId": "bogus-1"}),
+    ("close-out: get_queue bogus selector",
+     {"type": "get_queue", "activeSessionId": "bogus-1"}),
+    ("close-out: clear_queue bogus selector",
+     {"type": "clear_queue", "activeSessionId": "bogus-1"}),
+    ("close-out: abort_and_clear_queue bogus selector",
+     {"type": "abort_and_clear_queue", "activeSessionId": "bogus-1"}),
+    ("close-out: get_last_assistant_text bogus selector",
+     {"type": "get_last_assistant_text", "activeSessionId": "bogus-1"}),
+    ("close-out: replace_acp_mcp_servers bogus selector",
+     {"type": "replace_acp_mcp_servers", "activeSessionId": "bogus-1",
+      "ownerId": "o", "servers": []}),
+    ("close-out: set_model bogus selector",
+     {"type": "set_model", "activeSessionId": "bogus-1",
+      "provider": "p", "modelId": "m"}),
+    ("close-out: set_thinking_level bogus selector",
+     {"type": "set_thinking_level", "activeSessionId": "bogus-1",
+      "level": "medium"}),
+    ("close-out: set_auto_compaction bogus selector",
+     {"type": "set_auto_compaction", "activeSessionId": "bogus-1",
+      "enabled": True}),
+    ("close-out: compact bogus selector",
+     {"type": "compact", "activeSessionId": "bogus-1"}),
+    ("close-out: abort_compaction bogus selector",
+     {"type": "abort_compaction", "activeSessionId": "bogus-1"}),
 ]
 
 tmp = tempfile.mkdtemp(prefix="pa-parity-")

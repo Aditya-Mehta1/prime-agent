@@ -225,7 +225,7 @@ impl Supervisor {
     /// batches pending mutations into one push; roster writes are low-rate
     /// here, so each mutation pushes immediately and subscribers apply
     /// entries idempotently by agent id.
-    fn push_roster_update(&self, changed: Vec<AgentRosterEntry>, removed: Vec<String>) {
+    pub(crate) fn push_roster_update(&self, changed: Vec<AgentRosterEntry>, removed: Vec<String>) {
         if changed.is_empty() && removed.is_empty() {
             return;
         }

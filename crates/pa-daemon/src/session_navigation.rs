@@ -28,6 +28,9 @@ pub(crate) struct SessionNavigation {
     engine: Arc<dyn SessionEngine>,
     core: Arc<Mutex<SessionCore>>,
     idle_notify: Arc<Notify>,
+    /// The schedule catalog: a replacement session rebinds its scheduled
+    /// jobs (TS `rebindCronJobsToState` on the runtime swap).
+    scheduled: Arc<crate::scheduled_jobs::ScheduledJobs>,
 }
 
 impl SessionNavigation {
@@ -35,11 +38,13 @@ impl SessionNavigation {
         engine: Arc<dyn SessionEngine>,
         core: Arc<Mutex<SessionCore>>,
         idle_notify: Arc<Notify>,
+        scheduled: Arc<crate::scheduled_jobs::ScheduledJobs>,
     ) -> Self {
         SessionNavigation {
             engine,
             core,
             idle_notify,
+            scheduled,
         }
     }
 
@@ -78,6 +83,18 @@ impl SessionNavigation {
             core.store = Some(file);
         }
         self.engine.set_session_file(new_path);
+        // The replacement session rebinds the schedule catalog (TS
+        // `rebindCronJobsToState` on the runtime swap).
+        let binding = {
+            let core = self
+                .core
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            crate::scheduled_jobs::live_binding(&core)
+        };
+        if let Some((binding, artifact_dir)) = binding {
+            self.scheduled.bind_session(binding, artifact_dir).await;
+        }
         rebuild_engine_context(&self.engine, branch_entries).await
     }
 

@@ -37,7 +37,7 @@ impl Supervisor {
 
     /// The live connected residents in creation order (TS walks its
     /// insertion-ordered worker map).
-    async fn live_workers_in_creation_order(&self) -> Vec<Arc<ResidentWorker>> {
+    pub(crate) async fn live_workers_in_creation_order(&self) -> Vec<Arc<ResidentWorker>> {
         let mut residents = Vec::new();
         for resident in self.registry.list().await {
             if self.is_live_connected_worker(&resident).await {

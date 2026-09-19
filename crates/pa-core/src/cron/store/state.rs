@@ -28,11 +28,11 @@ impl AgentCronJobStore {
 
     pub(crate) fn read_states(&self) -> Vec<CronJobsState> {
         if self.session_artifact_mode {
-            return self
+            let files = self
                 .session_artifact_files
-                .values()
-                .map(|path| read_jobs_state(path))
-                .collect();
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            return files.values().map(|path| read_jobs_state(path)).collect();
         }
         vec![read_jobs_state(&self.require_file_path())]
     }
@@ -42,7 +42,12 @@ impl AgentCronJobStore {
         mut mutator: impl FnMut(&mut CronJobsState) -> Vec<AgentCronDispatch>,
     ) -> Vec<AgentCronDispatch> {
         let paths: Vec<PathBuf> = if self.session_artifact_mode {
-            self.session_artifact_files.values().cloned().collect()
+            self.session_artifact_files
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .values()
+                .cloned()
+                .collect()
         } else {
             vec![self.require_file_path()]
         };

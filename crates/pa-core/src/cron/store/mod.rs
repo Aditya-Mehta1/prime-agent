@@ -55,7 +55,10 @@ pub type CronJobRunResult = &'static str; // "ran" | "skipped"
 pub struct AgentCronJobStore {
     file_path: Option<PathBuf>,
     session_artifact_mode: bool,
-    session_artifact_files: HashMap<String, PathBuf>,
+    /// Interior-mutex so a store shared behind `Arc` (the daemon worker
+    /// keeps one store for its whole process) can register a session's
+    /// artifact partition as sessions bind.
+    session_artifact_files: std::sync::Mutex<HashMap<String, PathBuf>>,
     heartbeat_change_listeners: Vec<Box<dyn Fn() + Send + Sync>>,
 }
 
@@ -76,7 +79,7 @@ impl AgentCronJobStore {
         Self {
             file_path: Some(file_path),
             session_artifact_mode: false,
-            session_artifact_files: HashMap::new(),
+            session_artifact_files: std::sync::Mutex::new(HashMap::new()),
             heartbeat_change_listeners: Vec::new(),
         }
     }
@@ -86,7 +89,7 @@ impl AgentCronJobStore {
         Self {
             file_path: None,
             session_artifact_mode: true,
-            session_artifact_files: HashMap::new(),
+            session_artifact_files: std::sync::Mutex::new(HashMap::new()),
             heartbeat_change_listeners: Vec::new(),
         }
     }

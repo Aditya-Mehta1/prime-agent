@@ -61,8 +61,8 @@ the worker dispatch (`Worker::dispatch`).
 | b7 | agent-message ingestion | `agent_messages_status`, `agent_messages_pause`, `agent_messages_resume`, `agent_messages_clear` |
 | b8 | supervisor: session input pause | `acquire_session_input_pause`, `release_session_input_pause` |
 | b9 | supervisor: ownership/lifecycle, session navigation | `complete_owned_session`, `promote_owned_session`, `new_session`, `switch_session`, `fork`, `navigate_tree`, `import_jsonl`, `export_html`, `export_jsonl`, `cancel_prompt_admission` |
-| b10 | supervisor: scheduling catalog | `cron_list`, `cron_add`, `cron_cancel`, `heartbeats_list`, `heartbeat_manage`, `heartbeat_get`, `heartbeat_set`, `heartbeat_update` |
-| b11 | supervisor: saved-session catalog & peer roster | `rename_saved_session`, `delete_saved_session`, `list_agent_peers` |
+| b10 (landed) | supervisor: scheduling catalog | `cron_list`, `cron_add`, `cron_cancel`, `heartbeats_list`, `heartbeat_manage`, `heartbeat_get`, `heartbeat_set`, `heartbeat_update` |
+| b11 (landed) | supervisor: saved-session catalog & peer roster | `rename_saved_session`, `delete_saved_session`, `list_agent_peers` |
 
 Waves b2-b7 are worker commands routed through the generic path
 (`Supervisor::execute_parsed_command` fallback -> `route_client_command` ->
@@ -85,7 +85,7 @@ handled.
 |---|---|---|---|---|
 | `ack_result` | Control | yes | supervisor |  |
 | `list` | Control | yes | supervisor |  |
-| `list_agent_peers` | Control | no | none | b11 supervisor-level: saved-session catalog & peer roster |
+| `list_agent_peers` | Control | yes | supervisor |  |
 | `get_direct_worker_transport` | Control | yes | supervisor |  |
 | `roster_subscribe` | Control | no | supervisor | (a) wave 1 |
 | `roster_unsubscribe` | Control | no | supervisor | (a) wave 1 |
@@ -140,14 +140,14 @@ handled.
 | `abort_and_clear_queue` | Session | yes | worker |  |
 | `acquire_session_input_pause` | Session | no | none | b8 supervisor-level: session input pause |
 | `release_session_input_pause` | Session | no | none | b8 supervisor-level: session input pause |
-| `cron_list` | Control | no | none | b10 supervisor-level: scheduling catalog |
-| `heartbeats_list` | Control | no | none | b10 supervisor-level: scheduling catalog |
-| `heartbeat_manage` | Control | no | none | b10 supervisor-level: scheduling catalog |
-| `cron_add` | Control | no | none | b10 supervisor-level: scheduling catalog |
-| `cron_cancel` | Control | no | none | b10 supervisor-level: scheduling catalog |
-| `heartbeat_get` | Control | no | none | b10 supervisor-level: scheduling catalog |
-| `heartbeat_set` | Control | no | none | b10 supervisor-level: scheduling catalog |
-| `heartbeat_update` | Control | no | none | b10 supervisor-level: scheduling catalog |
+| `cron_list` | Control | yes | supervisor+worker |  |
+| `heartbeats_list` | Control | yes | supervisor+worker |  |
+| `heartbeat_manage` | Control | yes | supervisor+worker |  |
+| `cron_add` | Control | yes | supervisor+worker |  |
+| `cron_cancel` | Control | yes | supervisor+worker |  |
+| `heartbeat_get` | Control | yes | worker |  |
+| `heartbeat_set` | Control | yes | supervisor+worker |  |
+| `heartbeat_update` | Control | yes | worker |  |
 | `set_model` | Session | no | worker | (a) wave 1 |
 | `cycle_model` | Session | no | none | b3 model/setting switches |
 | `set_scoped_models` | Session | no | none | b3 model/setting switches |
@@ -175,8 +175,8 @@ handled.
 | `set_session_name` | Control | yes | worker |  |
 | `get_rlm_max_depth_status` | Session | no | none | b2 read-only state getters |
 | `set_rlm_max_depth` | Session | no | none | b6 rlm surface |
-| `rename_saved_session` | Control | no | none | b11 supervisor-level: saved-session catalog & peer roster |
-| `delete_saved_session` | Control | no | none | b11 supervisor-level: saved-session catalog & peer roster |
+| `rename_saved_session` | Control | yes | supervisor+worker |  |
+| `delete_saved_session` | Control | yes | supervisor+worker |  |
 | `get_session_context` | Session | no | none | b2 read-only state getters |
 | `get_session_tree` | Session | no | none | b2 read-only state getters |
 | `get_user_messages_for_forking` | Session | no | none | b2 read-only state getters |
@@ -215,3 +215,24 @@ handled.
   the TS generic-forward error `Supervisor cannot route daemon command:
   <type>` until its supervisor arm lands. Before wave 1 the no-session
   commands never got that far (the type was rejected as unknown).
+
+
+## Close-out (waves b10-b11)
+
+All 106 TS client command types are now accepted, routed, and handled:
+
+- waves b1-b9 landed in #176/#181/#186; waves b10 (scheduling catalog:
+  `cron_list`, `heartbeats_list`, `heartbeat_manage`, `cron_add`,
+  `cron_cancel`, `heartbeat_get`, `heartbeat_set`, `heartbeat_update`) and
+  b11 (saved-session catalog & peer roster: `rename_saved_session`,
+  `delete_saved_session`, `list_agent_peers`) close the audit.
+- `scripts/protocol_breadth_parity.py` covers every type with a
+  deterministic fresh-supervisor comparison (empty-catalog reads and
+  bogus-selector refusals); the last two EXPECTED-DIFF rows (`cron_list`,
+  `heartbeats_list`) are gone.
+- Types whose fresh-supervisor path is a real side effect are verified by
+  the e2e suites instead of the parity script: `create` and `attach`
+  spawn worker processes (`supervisor_e2e`, `direct_attach_e2e`),
+  `ack_result` answers nothing (command-journal ack, `journal.rs`), and
+  `restart`/`shutdown`/`prepare_update_restart` terminate or fence the
+  supervisor (update-flow e2e and `supervisor_restart_e2e`).

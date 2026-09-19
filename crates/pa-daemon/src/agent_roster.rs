@@ -138,6 +138,23 @@ impl AgentRoster {
         self.agent_id_by_session_file.contains_key(canonical_file)
     }
 
+    /// The entry owning one canonical session file (TS `bySessionFile`).
+    pub(crate) fn by_session_file(&self, canonical_file: &str) -> Option<&AgentRosterEntry> {
+        self.agent_id_by_session_file
+            .get(canonical_file)
+            .and_then(|agent_id| self.entries.get(agent_id))
+    }
+
+    /// The entry keyed by one active session id.
+    pub(crate) fn by_active_session_id(
+        &self,
+        active_session_id: &str,
+    ) -> Option<&AgentRosterEntry> {
+        self.agent_id_by_active_session_id
+            .get(active_session_id)
+            .and_then(|agent_id| self.entries.get(agent_id))
+    }
+
     pub(crate) fn entries_for_worker(&self, worker_id: &str) -> Vec<&AgentRosterEntry> {
         self.entries
             .values()

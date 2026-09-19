@@ -716,12 +716,22 @@ fn wave_b9_prompt_admission_wire_shapes() {
         "c-1",
         json!({ "type": "cancel_prompt_admission", "activeSessionId": session_id, "admissionId": "adm-1" }),
     );
-    let response = client.read_response("c-1");
+    // The cancelled wait's failure response may land before the cancel's
+    // own response (both frames traverse the same worker pipe, and the
+    // dropped queue item settles the wait the moment the cancel removes
+    // it), so the read buffers instead of dropping it.
+    let (response, mut lines) = client.read_response_and_lines("c-1");
     assert_eq!(response["success"], true, "{response}");
     assert_eq!(response["data"], json!({ "status": "cancelled" }));
     // The cancelled prompt_and_wait fails its wait (the dropped queue item
     // never completes).
-    let response = client.read_response("p-2");
+    let response = match lines
+        .iter()
+        .position(|line| line.get("id").and_then(|v| v.as_str()) == Some("p-2"))
+    {
+        Some(index) => lines.remove(index).expect("buffered p-2 response"),
+        None => client.read_response("p-2"),
+    };
     assert_eq!(response["success"], false, "{response}");
 
     // The slow turn settles with no second turn: the cancelled prompt

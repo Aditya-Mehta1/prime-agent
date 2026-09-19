@@ -122,6 +122,10 @@ pub enum DaemonCommand {
     ListAgentPeers {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
+        /// The requester's worker token; optional on the wire (the TS
+        /// supervisor arm reads an absent token as an authentication
+        /// failure, not a parse one).
+        #[serde(default)]
         worker_token: String,
         #[serde(flatten)]
         rest: JsonMap,
@@ -423,7 +427,11 @@ pub enum DaemonCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         active_session_id: String,
+        // Optional on the wire (the TS runtime validates nothing at
+        // parse; a routing miss answers before the payload is read).
+        #[serde(default)]
         side_question_id: String,
+        #[serde(default)]
         question: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         previous_turns: Option<Value>,
@@ -434,6 +442,8 @@ pub enum DaemonCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         active_session_id: String,
+        // Optional on the wire, like `start_side_question`'s payload.
+        #[serde(default)]
         side_question_id: String,
         #[serde(flatten)]
         rest: JsonMap,
@@ -730,6 +740,8 @@ pub enum DaemonCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         active_session_id: String,
+        // Optional on the wire (the TS runtime reads it after routing).
+        #[serde(default)]
         level: String,
         #[serde(flatten)]
         rest: JsonMap,

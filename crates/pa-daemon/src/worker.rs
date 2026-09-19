@@ -160,6 +160,10 @@ pub(crate) struct QueuedItem {
     /// `agent_messages_pause` remove queued items by); `None` for items a
     /// client queued directly (steer/follow_up).
     pub(crate) agent_message: Option<String>,
+    /// The scheduler's queue key (TS `followUpQueueKey`): a heartbeat's
+    /// queued fire carries `heartbeat:<id>`, and a later fire replaces the
+    /// queued item with the same key instead of stacking.
+    pub(crate) queue_key: Option<String>,
     /// The prompt-admission id this admitted prompt registered (the
     /// `cancel_prompt_admission` bookkeeping); `None` for prompts that
     /// carried no admission id.
@@ -219,7 +223,7 @@ pub(crate) struct SessionCore {
     /// This session's RLM recursion depth (children run at depth + 1).
     rlm_depth: u32,
     /// `top-level` | `subagent` (summary `runtimeKind`).
-    runtime_kind: String,
+    pub(crate) runtime_kind: String,
     /// The subagent runtime identity (create `runtimeMetadata`): the child
     /// id under its parent and the parent's live/persisted ids, carried on
     /// every summary so the roster keys children `parentPath#childId`.
@@ -577,6 +581,10 @@ pub struct Worker {
     /// the turn runner, which commits a queued admission when its turn
     /// starts.
     pub(crate) prompt_admissions: crate::prompt_admission::WorkerAdmissions,
+    /// The scheduling surface (wave b10): the session's cron/heartbeat
+    /// artifact store plus the scheduler firing due jobs into the queue;
+    /// shared with the navigation swap flow, which rebinds on replacement.
+    pub(crate) scheduled: std::sync::Arc<crate::scheduled_jobs::ScheduledJobs>,
 }
 
 /// Supervisor-link coordinates for a worker's agent engine: where the
@@ -762,12 +770,19 @@ impl Worker {
             get_user_servers: Box::new(|| None),
             begin_login: None,
         });
+        let prompt_admissions = crate::prompt_admission::WorkerAdmissions::new();
+        let user_bash = std::sync::Arc::new(crate::user_bash::UserBash::new());
+        let scheduled = std::sync::Arc::new(crate::scheduled_jobs::ScheduledJobs::new(
+            Arc::clone(&core),
+            Arc::clone(&work_notify),
+            std::sync::Arc::clone(&user_bash),
+        ));
         let navigation = crate::session_navigation::SessionNavigation::new(
             std::sync::Arc::clone(&engine),
             Arc::clone(&core),
             Arc::clone(&idle_notify),
+            std::sync::Arc::clone(&scheduled),
         );
-        let prompt_admissions = crate::prompt_admission::WorkerAdmissions::new();
         Worker {
             config,
             registration,
@@ -785,11 +800,12 @@ impl Worker {
             tree_navigation,
             exports,
             acp_mcp: std::sync::Arc::new(std::sync::Mutex::new(acp_mcp)),
-            user_bash: std::sync::Arc::new(crate::user_bash::UserBash::new()),
+            user_bash,
             agent_messages: crate::agent_message_ingest::AgentMessageIngest::new(),
             input_pauses,
             navigation,
             prompt_admissions,
+            scheduled,
         }
     }
 
@@ -1255,7 +1271,7 @@ impl Worker {
 
     pub(crate) async fn dispatch(&self, command_type: &str, payload: &Value) -> DaemonResponse {
         match command_type {
-            "create" => self.handle_create(payload),
+            "create" => self.handle_create(payload).await,
             "attach" => self.handle_attach(payload),
             "detach" => self.handle_detach(payload),
             "prompt" => self.handle_prompt(payload, false).await,
@@ -1308,6 +1324,8 @@ impl Worker {
             "shutdown" => self.handle_shutdown().await,
             "rename" => self.handle_rename("rename", payload),
             "set_session_name" => self.handle_rename("set_session_name", payload),
+            "rename_saved_session" => self.handle_rename_saved_session(payload).await,
+            "delete_saved_session" => self.handle_delete_saved_session(payload).await,
             "replace_acp_mcp_servers" => self.handle_replace_acp_mcp_servers(payload),
             "set_model" => self.handle_set_model(payload).await,
             "set_thinking_level" => self.handle_set_thinking_level(payload).await,
@@ -1355,6 +1373,14 @@ impl Worker {
             "agent_messages_pause" => self.handle_agent_messages_pause(),
             "agent_messages_resume" => self.handle_agent_messages_resume(),
             "agent_messages_clear" => self.handle_agent_messages_clear(),
+            "cron_list" => self.handle_cron_list(payload).await,
+            "heartbeats_list" => self.handle_heartbeats_list(),
+            "heartbeat_manage" => self.handle_heartbeat_manage(payload).await,
+            "cron_add" => self.handle_cron_add(payload).await,
+            "cron_cancel" => self.handle_cron_cancel(payload).await,
+            "heartbeat_get" => self.handle_heartbeat_get(payload),
+            "heartbeat_set" => self.handle_heartbeat_set(payload).await,
+            "heartbeat_update" => self.handle_heartbeat_update(payload).await,
             other => response_failure(
                 None,
                 command_type,
@@ -1434,7 +1460,7 @@ impl Worker {
         }
     }
 
-    fn handle_create(&self, payload: &Value) -> DaemonResponse {
+    async fn handle_create(&self, payload: &Value) -> DaemonResponse {
         {
             let core = self.core.lock().unwrap();
             if core.created {
@@ -1682,38 +1708,43 @@ impl Worker {
                 queue_mode(settings.get_follow_up_mode()),
             )
         };
-        let mut core = self.core.lock().unwrap();
-        core.cwd = cwd;
-        core.steering = steering;
-        core.follow_up = follow_up;
-        core.store = Some(store);
-        core.created = true;
-        core.abort_requested = false;
-        core.service_tier = Some(service_tier);
-        core.steering_mode = steering_mode;
-        core.follow_up_mode = follow_up_mode;
-        core.scoped_models = Vec::new();
-        core.retry_abort_requested = false;
-        // The session's depth falls back to the opened file's header (TS
-        // `config.rlmDepth ?? header.rlmDepth`): a resumed saved subagent
-        // session keeps its persisted depth. The runtime kind stays the
-        // create's runtime identity (TS `metadata.kind`) — a resumed
-        // subagent file is a top-level runtime that merely carries its
-        // persisted depth, so the roster does not re-nest it under its
-        // original parent.
-        let rlm_depth = rlm_depth.or_else(|| core.store.as_ref().and_then(SessionFile::rlm_depth));
-        let rlm_depth = rlm_depth.unwrap_or(0);
-        core.rlm_depth = rlm_depth;
-        core.runtime_kind = if rlm_child_id.is_some() {
-            "subagent".to_string()
-        } else {
-            "top-level".to_string()
+        // The core lock stays inside this block: everything after it may
+        // await (the schedule-catalog bind), and a std MutexGuard must
+        // never ride an await point.
+        let (summary, rlm_depth) = {
+            let mut core = self.core.lock().unwrap();
+            core.cwd = cwd;
+            core.steering = steering;
+            core.follow_up = follow_up;
+            core.store = Some(store);
+            core.created = true;
+            core.abort_requested = false;
+            core.service_tier = Some(service_tier);
+            core.steering_mode = steering_mode;
+            core.follow_up_mode = follow_up_mode;
+            core.scoped_models = Vec::new();
+            core.retry_abort_requested = false;
+            // The session's depth falls back to the opened file's header (TS
+            // `config.rlmDepth ?? header.rlmDepth`): a resumed saved subagent
+            // session keeps its persisted depth. The runtime kind stays the
+            // create's runtime identity (TS `metadata.kind`) — a resumed
+            // subagent file is a top-level runtime that merely carries its
+            // persisted depth, so the roster does not re-nest it under its
+            // original parent.
+            let rlm_depth = rlm_depth
+                .or_else(|| core.store.as_ref().and_then(SessionFile::rlm_depth))
+                .unwrap_or(0);
+            core.rlm_depth = rlm_depth;
+            core.runtime_kind = if rlm_child_id.is_some() {
+                "subagent".to_string()
+            } else {
+                "top-level".to_string()
+            };
+            core.rlm_child_id = rlm_child_id;
+            core.parent_active_session_id = parent_active_session_id;
+            core.parent_session_id = parent_session_id;
+            (self.summary_locked(&core), rlm_depth)
         };
-        core.rlm_child_id = rlm_child_id;
-        core.parent_active_session_id = parent_active_session_id;
-        core.parent_session_id = parent_session_id;
-        let summary = self.summary_locked(&core);
-        drop(core);
         // Seed the engine's RLM identity: recursion depth and bound, this
         // session's persistence ids, and the default thinking level its
         // children inherit.
@@ -1735,6 +1766,18 @@ impl Worker {
         // Seed the status line from the latest persisted verdict (a respawned
         // worker resumes with the pre-crash verdict).
         self.status_runner.seed_from_session();
+        // Bind the schedule catalog onto the session (artifact partition,
+        // job rebind, scheduler start) — TS `rebindCronJobsToState`.
+        let scheduled_binding = {
+            let core = self
+                .core
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            crate::scheduled_jobs::live_binding(&core)
+        };
+        if let Some((binding, artifact_dir)) = scheduled_binding {
+            self.scheduled.bind_session(binding, artifact_dir).await;
+        }
         // Recovery journal writes must not happen while holding the core
         // lock: record_recovery locks the core to read the store.
         let _ = self.record_recovery(true, "create");
@@ -1763,7 +1806,7 @@ impl Worker {
         )
     }
 
-    fn summary_locked(&self, core: &SessionCore) -> SessionSummary {
+    pub(crate) fn summary_locked(&self, core: &SessionCore) -> SessionSummary {
         let store = core.store.as_ref();
         let streaming = core.busy;
         let compacting = core.compacting;
@@ -2036,23 +2079,18 @@ impl Worker {
                     }
                 }
             };
+            let item = QueuedItem {
+                message: message.to_string(),
+                custom_message,
+                agent_message: None,
+                queue_key: None,
+                admission_id: admission_id.clone(),
+                images: images.clone(),
+                done,
+            };
             match lane {
-                Lane::Steering => core.steering.push_back(QueuedItem {
-                    message: message.to_string(),
-                    custom_message,
-                    agent_message: None,
-                    admission_id: admission_id.clone(),
-                    images: images.clone(),
-                    done,
-                }),
-                Lane::FollowUp => core.follow_up.push_back(QueuedItem {
-                    message: message.to_string(),
-                    custom_message,
-                    agent_message: None,
-                    admission_id: admission_id.clone(),
-                    images: images.clone(),
-                    done,
-                }),
+                Lane::Steering => core.steering.push_back(item),
+                Lane::FollowUp => core.follow_up.push_back(item),
             }
             let snapshot = self.snapshot_locked(&core);
             let lanes = queue_lanes(&core);
@@ -2097,6 +2135,7 @@ impl Worker {
             message: message.to_string(),
             custom_message,
             agent_message: None,
+            queue_key: None,
             admission_id: None,
             images,
             done: None,
@@ -2196,6 +2235,7 @@ impl Worker {
                 // The agent-message marker: `agent_messages_clear` /
                 // `agent_messages_pause` remove exactly these items.
                 agent_message: Some(message.to_string()),
+                queue_key: None,
                 admission_id: None,
                 images: Vec::new(),
                 done: None,
@@ -2608,7 +2648,7 @@ impl Worker {
         response_success(None, "kill", None)
     }
 
-    fn handle_rename(&self, command: &str, payload: &Value) -> DaemonResponse {
+    pub(crate) fn handle_rename(&self, command: &str, payload: &Value) -> DaemonResponse {
         if let Err(response) = self.require_created(command) {
             return response;
         }
@@ -2993,6 +3033,7 @@ fn restore_queue_snapshot(
                 message,
                 custom_message: None,
                 agent_message: None,
+                queue_key: None,
                 admission_id: None,
                 images: Vec::new(),
                 done: None,
@@ -3993,6 +4034,7 @@ mod agent_message_tests {
                     message: "occupied".to_string(),
                     custom_message: None,
                     agent_message: None,
+                    queue_key: None,
                     admission_id: None,
                     images: Vec::new(),
                     done: None,
@@ -4324,6 +4366,7 @@ mod turn_stream_tests {
                     message: "burst".to_string(),
                     custom_message: None,
                     agent_message: None,
+                    queue_key: None,
                     admission_id: None,
                     images: Vec::new(),
                     done: None,
@@ -4356,6 +4399,7 @@ mod turn_stream_tests {
                     message: "[child-exited: no-reply child:lane]".to_string(),
                     custom_message: Some(custom_message),
                     agent_message: None,
+                    queue_key: None,
                     admission_id: None,
                     images: Vec::new(),
                     done: None,
