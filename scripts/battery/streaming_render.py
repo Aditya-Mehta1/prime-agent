@@ -40,6 +40,8 @@ import sys
 import tempfile
 import time
 
+import ts_identity  # the shared PATH-binary identity guard (same dir)
+
 TS_SCRIPT_MODEL = "faux-1"
 SIZE = ("120", "40")
 SESSION_NAME = "vplane-stream"
@@ -380,6 +382,11 @@ def main():
         "--only", default=None, help="run a single binary (ts|rust) for a shakedown"
     )
     args = parser.parse_args()
+
+    # Fail fast before any launch: a non-TS `prime-agent` on PATH plays a
+    # Rust build as the "ts" side and reports false divergences.
+    if args.only in (None, "ts"):
+        ts_identity.assert_ts_side_is_the_ts_product()
 
     base = tempfile.mkdtemp(prefix="streaming-render-sandbox-")
     out_dir = args.out or tempfile.mkdtemp(prefix="streaming-render-captures-")

@@ -31,6 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "battery"))
 import batterylib as B  # noqa: E402
+import ts_identity  # noqa: E402  (the shared PATH-binary identity guard)
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -283,6 +284,9 @@ def main() -> int:
     # The run root must keep the daemon-socket path under the 107-char
     # AF_UNIX limit (the battery's own stamp run dirs fit with one side
     # directory of margin): a short `-abort` suffix, no more.
+    # Fail fast before any launch: a non-TS `prime-agent` on PATH plays a
+    # Rust build as the "ts" side and reports false divergences.
+    ts_identity.assert_ts_side_is_the_ts_product(ts_binary, rust_binary)
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     run_root = REPO / "scripts" / "battery" / "runs" / f"{stamp}-abort"
     print(f"[parity] run root: {run_root}")

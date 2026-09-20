@@ -61,6 +61,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import batterylib as B
+import ts_identity  # noqa: E402  (the shared PATH-binary identity guard)
 
 FLOW = "update_prepare"
 GATE_MESSAGE = "Daemon is preparing an update restart"
@@ -222,6 +223,9 @@ def main() -> int:
     if not rust_bin.exists():
         print(f"rust binary missing: {rust_bin}", file=sys.stderr)
         return 2
+    # Fail fast before any launch: a non-TS ts binary plays a Rust build as
+    # the "ts" side and reports false parity rows.
+    ts_identity.assert_ts_side_is_the_ts_product(args.ts_bin, str(rust_bin))
 
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     out = Path(args.out) if args.out else Path(__file__).parent / "runs" / f"{stamp}-{FLOW}"

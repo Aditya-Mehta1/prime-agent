@@ -49,6 +49,9 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import visual_parity as vp
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "battery"))
+import ts_identity  # noqa: E402  (the shared PATH-binary identity guard)
+
 # Turn 1/4 stream slowly (6 tokens/s) so the window stays open for the
 # parked submissions; turns 2/3 answer the queued prompts.
 QUEUE_FAUX_SCRIPT = {
@@ -432,6 +435,11 @@ def main():
     args = parser.parse_args()
     width, height = args.size.split("x")
     size = (width, height)
+
+    # Fail fast before any launch: a non-TS `prime-agent` on PATH plays a
+    # Rust build as the "ts" side and reports false divergences.
+    if args.only in (None, "ts"):
+        ts_identity.assert_ts_side_is_the_ts_product()
 
     base = tempfile.mkdtemp(prefix="queue-parity-sandbox-")
     out_dir = args.out or tempfile.mkdtemp(prefix="queue-parity-captures-")

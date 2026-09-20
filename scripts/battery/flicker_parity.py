@@ -38,6 +38,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import batterylib as B  # noqa: E402
+import ts_identity  # noqa: E402  (the shared PATH-binary identity guard)
 
 MARKER = "PRIMARYSCREENMARKER-0123456789"
 REPLY_TEXT = "flicker idle reply"
@@ -281,6 +282,9 @@ def main() -> int:
     if not Path(rust_bin).exists():
         print(f"Rust binary not found: {rust_bin}", file=sys.stderr)
         return 1
+    # Fail fast before any launch: a non-TS ts binary plays a Rust build as
+    # the "ts" side and reports false divergences.
+    ts_identity.assert_ts_side_is_the_ts_product(ts_path, rust_bin)
 
     results: dict[str, dict] = {}
     sides = []

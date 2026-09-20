@@ -31,6 +31,8 @@ import sys
 import time
 from pathlib import Path
 
+import ts_identity  # the shared PATH-binary identity guard (same dir)
+
 sys.path.insert(0, str(Path(__file__).parent))
 import batterylib as B
 
@@ -217,6 +219,10 @@ def main() -> int:
     args = parser.parse_args()
 
     import tempfile
+
+    # Fail fast before any launch: a non-TS ts binary plays a Rust build as
+    # the "ts" side and reports false divergences.
+    ts_identity.assert_ts_side_is_the_ts_product(args.ts_bin, args.rust_bin)
 
     base = Path(tempfile.mkdtemp(prefix="f1framediff-"))
     out = Path(args.out) if args.out else base / "captures"

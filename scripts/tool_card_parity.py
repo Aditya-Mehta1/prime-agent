@@ -33,6 +33,9 @@ import sys
 import tempfile
 import time
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "battery"))
+import ts_identity  # noqa: E402  (the shared PATH-binary identity guard)
+
 SIZES = [("120", "36")]
 
 # One turn: text, a bash call with 12-line output (preview truncation), an
@@ -312,6 +315,11 @@ def main():
     parser.add_argument("--only", default=None, choices=["ts", "rust"])
     args = parser.parse_args()
     sizes = [tuple(entry.split("x")) for entry in args.sizes.split(",")]
+
+    # Fail fast before any launch: a non-TS `prime-agent` on PATH plays a
+    # Rust build as the "ts" side and reports false divergences.
+    if args.only in (None, "ts"):
+        ts_identity.assert_ts_side_is_the_ts_product()
 
     base = tempfile.mkdtemp(prefix="tool-card-parity-")
     out_dir = args.out or tempfile.mkdtemp(prefix="tool-card-captures-")

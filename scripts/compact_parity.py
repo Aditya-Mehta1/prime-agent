@@ -41,6 +41,9 @@ import sys
 import tempfile
 import time
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "battery"))
+import ts_identity  # noqa: E402  (the shared PATH-binary identity guard)
+
 SIZES = [("100", "30")]
 
 WIDTH, HEIGHT = SIZES[0]
@@ -199,63 +202,9 @@ def wait_for(session, needle, timeout):
     raise TimeoutError(f"session {session} never showed {needle!r}")
 
 
-def rust_binary_path():
-    """The Rust build this harness drives (PA_RUST_BINARY or the worktree debug build)."""
-    return os.environ.get(
-        "PA_RUST_BINARY",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "target", "debug", "prime-agent"),
-    )
-
-
-def probe_version(command):
-    """The first line of a prime-agent binary's `--version` output."""
-    try:
-        result = subprocess.run(
-            f"{command} --version", shell=True, capture_output=True, text=True, timeout=60
-        )
-    except subprocess.TimeoutExpired:
-        return ""
-    line = result.stdout.strip().splitlines()
-    return line[0] if line else ""
-
-
-def rust_version():
-    """The Rust side's `--version` line, from the build or the workspace manifest."""
-    rust = rust_binary_path()
-    if os.path.exists(rust):
-        version = probe_version(rust)
-        if version:
-            return version
-    cargo = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "..", "Cargo.toml"
-    )
-    with open(cargo, encoding="utf-8") as manifest:
-        text = manifest.read()
-    section = text.split("[workspace.package]", 1)[-1]
-    match = re.search(r'^version = "([^"]+)"', section, re.MULTILINE)
-    return match.group(1) if match else ""
-
-
-def assert_ts_side_is_the_ts_product():
-    """Fail fast when `prime-agent` on PATH is not the deployed TS build.
-
-    The frame diff is only a parity claim when the two sides are two
-    products. A Rust build symlinked onto the PATH as `prime-agent` (seen
-    in a sandbox harness run) plays a Rust build as the "ts" side and
-    reports false divergences — e.g. a bold-escape d_expanded diff that
-    current main cannot reproduce against the real TS binary.
-    """
-    ts_version = probe_version("prime-agent")
-    if not ts_version:
-        raise SystemExit("no `prime-agent` on PATH: the TS side cannot run")
-    reference = rust_version()
-    if reference and ts_version == reference:
-        raise SystemExit(
-            f"`prime-agent` on PATH reports version {ts_version!r}, the same "
-            f"product as the Rust side ({reference!r}): point PATH at the "
-            "deployed TS binary (e.g. /usr/local/bin/prime-agent from the "
-            "release install)"
-        )
+# The ts-identity guard (refuse when the PATH `prime-agent` is this repo's
+# Rust product) is shared with every PATH-driven parity harness: see
+# scripts/battery/ts_identity.py.
 
 
 def launch(binary, sandbox, shared_cwd, script_path, out_dir):
@@ -275,7 +224,7 @@ def launch(binary, sandbox, shared_cwd, script_path, out_dir):
             f"--model faux-1"
         )
     else:
-        rust = rust_binary_path()
+        rust = ts_identity.default_rust_binary()
         package_dir = os.environ.get("PI_PACKAGE_DIR") or find_runtime_package_dir()
         command = (
             f"PI_PACKAGE_DIR={package_dir} "
@@ -389,8 +338,8 @@ def main():
     try:
         if args.only in (None, "ts"):
             # Fail fast before the scenario: a non-TS `prime-agent` on PATH
-            # produces false parity failures (see the helper's docstring).
-            assert_ts_side_is_the_ts_product()
+            # produces false parity failures (see the guard's docstring).
+            ts_identity.assert_ts_side_is_the_ts_product()
         if args.only:
             launch(args.only, sandboxes[args.only], shared_cwd, script_path, out_dir)
             print(f"captures for {args.only} in {out_dir}")

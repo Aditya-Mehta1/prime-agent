@@ -42,6 +42,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 import batterylib as B  # noqa: E402
 import perf as P  # noqa: E402
+import ts_identity  # noqa: E402  (the shared PATH-binary identity guard)
 from mock_provider import user_message_text  # noqa: E402
 
 NL = chr(10)
@@ -3970,6 +3971,10 @@ class Battery:
 
     def run(self) -> int:
         print(f"battery run dir: {self.run_dir}")
+        # Fail fast before any flow: the battery's parity tables are only a
+        # parity claim when the ts side is the deployed TS product, not this
+        # repo's Rust build masquerading as `prime-agent` on PATH.
+        ts_identity.assert_ts_side_is_the_ts_product(self.ts_bin, self.rust_bin)
         self.make_side("ts", self.ts_bin)
         self.make_side("rust", self.rust_bin)
         order = {

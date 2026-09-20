@@ -40,6 +40,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import ts_identity  # the shared PATH-binary identity guard (same dir)
+
 SCRUB_ENV_PREFIXES = ("PRIME_AGENT", "PI_", "OPENAI_", "ANTHROPIC_", "MISTRAL_", "GOOGLE_", "AWS_")
 SCRUB_ENV_KEYS = {"HOME", "XDG_CONFIG_HOME", "TMPDIR"}
 
@@ -339,6 +341,10 @@ def main() -> int:
     args = parser.parse_args()
 
     out = Path(args.out)
+    if args.side == "ts":
+        # Fail fast: a non-TS ts binary (e.g. a Rust build symlinked onto
+        # PATH as `prime-agent`) would capture the wrong product's errors.
+        ts_identity.assert_ts_side_is_the_ts_product(args.binary)
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True, exist_ok=True)

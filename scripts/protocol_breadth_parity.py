@@ -22,6 +22,9 @@ Usage: python3 scripts/protocol_breadth_parity.py [path-to-pa-daemon]
 """
 import json, os, socket, subprocess, sys, tempfile, time, uuid
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "battery"))
+import ts_identity  # noqa: E402  (the shared PATH-binary identity guard)
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TS = "prime-agent"
 RS = sys.argv[1] if len(sys.argv) > 1 else os.path.join(REPO, "target", "debug", "pa-daemon")
@@ -361,6 +364,10 @@ CASES = [
     ("close-out: abort_compaction bogus selector",
      {"type": "abort_compaction", "activeSessionId": "bogus-1"}),
 ]
+
+# Fail fast before any launch: a non-TS `prime-agent` on PATH plays a
+# Rust build as the "ts" side and reports false protocol diffs.
+ts_identity.assert_ts_side_is_the_ts_product(TS)
 
 tmp = tempfile.mkdtemp(prefix="pa-parity-")
 ts_sock = os.path.join(tmp, "ts.sock")

@@ -38,6 +38,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "battery"))
+import ts_identity  # noqa: E402  (the shared PATH-binary identity guard)
+
 TS_FAUX_EXTENSION = open(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "ts_faux_extension.js"),
     encoding="utf-8",
@@ -335,6 +338,11 @@ def main():
     parser.add_argument("--only", default=None, choices=["ts", "rust"])
     parser.add_argument("--scenario", default=None, choices=sorted(SCENARIOS))
     args = parser.parse_args()
+
+    # Fail fast before any launch: a non-TS `prime-agent` on PATH plays a
+    # Rust build as the "ts" side and reports false divergences.
+    if args.only in (None, "ts"):
+        ts_identity.assert_ts_side_is_the_ts_product()
 
     base = tempfile.mkdtemp(prefix="print-json-parity-")
     out_dir = args.out or tempfile.mkdtemp(prefix="print-json-captures-")

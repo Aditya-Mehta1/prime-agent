@@ -18,7 +18,10 @@ Each run writes `scripts/battery/runs/<UTC stamp>/` with per-side evidence
 `findings.json`. Requires the TS binary `prime-agent` on PATH (ground truth)
 and a built Rust binary (default `target/release/prime-agent`).
 
-Files: `run_battery.py` (driver), `batterylib.py` (shared harness), 
+Files: `run_battery.py` (driver), `batterylib.py` (shared harness),
+`ts_identity.py` (shared ts-identity guard: every PATH-driven parity
+harness refuses to run when its "ts" binary is this repo's Rust product —
+e.g. a stale Rust build symlinked onto PATH as `prime-agent`), 
 `mock_provider.py` (deterministic mock provider; responses are
 session-scoped queues — a queue is selected per request by markers in the
 request's user-message text, so a parent session and a concurrently running

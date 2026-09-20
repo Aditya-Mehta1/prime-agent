@@ -139,6 +139,10 @@ def main():
     import tempfile
     import shutil
 
+    # Fail fast before any launch: a non-TS `prime-agent` on PATH plays a
+    # Rust build as the "ts" side and reports false divergences.
+    vp.ts_identity.assert_ts_side_is_the_ts_product()
+
     base = tempfile.mkdtemp(prefix="osc-parity-sandbox-")
     out_dir = args.raw_out or tempfile.mkdtemp(prefix="osc-parity-raw-")
     os.makedirs(out_dir, exist_ok=True)

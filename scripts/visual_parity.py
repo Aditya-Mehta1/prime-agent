@@ -30,6 +30,9 @@ import sys
 import tempfile
 import time
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "battery"))
+import ts_identity  # noqa: E402  (the shared PATH-binary identity guard)
+
 TS_SCRIPT_MODEL = "faux-1"
 SIZES = [("120", "36"), ("220", "50")]
 
@@ -489,6 +492,12 @@ def main():
     for entry in args.sizes.split(","):
         width, height = entry.split("x")
         sizes.append((width, height))
+
+    # Fail fast before any launch: a non-TS `prime-agent` on PATH (e.g. a
+    # Rust build symlinked there) plays a Rust build as the "ts" side and
+    # reports false divergences (see the guard's docstring).
+    if args.only in (None, "ts"):
+        ts_identity.assert_ts_side_is_the_ts_product()
 
     base = tempfile.mkdtemp(prefix="visual-parity-sandbox-")
     out_dir = args.out or tempfile.mkdtemp(prefix="visual-parity-captures-")

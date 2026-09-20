@@ -24,6 +24,8 @@ import sys
 import tempfile
 import time
 
+import ts_identity  # the shared PATH-binary identity guard (same dir)
+
 SESSION_NAME = "vplane-thru"
 SIZE = ("120", "40")
 
@@ -193,6 +195,11 @@ def main():
     parser.add_argument("--out", default=None, help="captures directory")
     parser.add_argument("--only", default=None, help="run a single binary (ts|rust)")
     args = parser.parse_args()
+
+    # Fail fast before any launch: a non-TS `prime-agent` on PATH plays a
+    # Rust build as the "ts" side and reports false divergences.
+    if args.only in (None, "ts"):
+        ts_identity.assert_ts_side_is_the_ts_product()
 
     base = tempfile.mkdtemp(prefix="stream-throughput-sandbox-")
     out_dir = args.out or tempfile.mkdtemp(prefix="stream-throughput-captures-")
