@@ -7,7 +7,7 @@ import {
 	resolveGate,
 } from "./types.js";
 
-/** fnv1a 16-hex digest for repeated-state detection. */
+/** fnv1a (32-bit, 8 hex chars) digest for repeated-state detection. */
 export function observationDigest(observation: RouterObservation): string {
 	const material = JSON.stringify({ text: observation.text, fields: observation.fields ?? null });
 	let hash = 0x811c9dc5;
@@ -36,6 +36,11 @@ export function compileActionSpace(actions: Record<string, RouterActionSpec>): {
 	byName: Map<string, CompiledAction>;
 } {
 	const byName = new Map<string, CompiledAction>();
+	for (const name of Object.keys(actions)) {
+		if (name === FINISH_ACTION || name === ESCALATE_ACTION) {
+			throw new Error(`action name "${name}" is reserved for the loop itself`);
+		}
+	}
 	for (const [name, spec] of Object.entries(actions)) {
 		byName.set(name, {
 			name,

@@ -106,7 +106,15 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 	});
 
 	try {
-		await options.env.reset(options.goal);
+		try {
+			await options.env.reset(options.goal);
+		} catch (error) {
+			return finish(
+				"failed",
+				"environment_error",
+				`Environment failed resetting at segment start: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
 		for (let step = 0; step < options.maxSteps; step += 1) {
 			if (options.signal?.aborted) {
 				return finish("failed", "aborted", "Router aborted before the current step.");
@@ -139,7 +147,7 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 			const prompt = compileDecisionPrompt({
 				goal: options.goal,
 				observation,
-				history: history.slice(-historySteps),
+				history: historySteps > 0 ? history.slice(-historySteps) : [],
 				actions: byName,
 				observationChars,
 			});
@@ -309,6 +317,7 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 			repeatCount = signature === lastSignature ? repeatCount + 1 : 0;
 			lastSignature = signature;
 			if (repeatCount + 1 >= ROUTER_REPETITION_LIMIT) {
+				refused += 1;
 				trace.push({
 					step,
 					timestampMs: decisionStarted,

@@ -10,7 +10,6 @@ export {
 export {
 	createModelDecisionFunction,
 	parseDecision,
-	RESERVED_ACTION_NAMES,
 	ROUTER_DECISION_MAX_TOKENS,
 	ROUTER_DECISION_SYSTEM_PROMPT,
 	type RouterDecisionContext,
@@ -40,6 +39,7 @@ export {
 	MAX_ROUTER_STEPS,
 	MAX_ROUTER_TIMEOUT_MS,
 	parseActionSpace,
+	parseEnvironmentActions,
 	parseSystemRouterRunSpec,
 	type RouterActionParamSpec,
 	type RouterActionRisk,

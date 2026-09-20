@@ -8,7 +8,6 @@ import {
 } from "@earendil-works/pi-ai";
 import { completeWithProviderRetry, type ProviderRetryPolicy } from "../provider-retry.js";
 import type { CompiledAction } from "./action-space.js";
-import { ESCALATE_ACTION, FINISH_ACTION } from "./types.js";
 
 /** Bounded output: the decision object is a few dozen tokens. */
 /**
@@ -76,19 +75,46 @@ function extractFirstJsonObject(raw: string): Record<string, unknown> | null {
 	const candidates = [fenced?.[1], raw].flatMap((candidate) => (candidate ? [candidate] : []));
 	for (const candidate of candidates) {
 		const trimmed = candidate.trim();
-		const start = trimmed.indexOf("{");
-		const end = trimmed.lastIndexOf("}");
-		if (start === -1 || end <= start) continue;
+		const parsed = parseJsonCandidates(trimmed);
+		if (parsed) return parsed;
+	}
+	return null;
+}
+
+/** Greedy first-brace-to-last-brace slice first, then nearest balanced-brace slices. */
+function parseJsonCandidates(trimmed: string): Record<string, unknown> | null {
+	const start = trimmed.indexOf("{");
+	if (start === -1) return null;
+	const end = trimmed.lastIndexOf("}");
+	if (end > start) {
 		try {
 			const parsed: unknown = JSON.parse(trimmed.slice(start, end + 1));
-			if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-				return parsed as Record<string, unknown>;
-			}
+			if (isJsonObject(parsed)) return parsed;
 		} catch {
-			// Try the next candidate.
+			// Fall through to the balanced scan.
+		}
+	}
+	let depth = 0;
+	for (let index = start; index < trimmed.length; index += 1) {
+		const char = trimmed[index];
+		if (char === "{") depth += 1;
+		else if (char === "}") {
+			depth -= 1;
+			if (depth === 0) {
+				try {
+					const parsed: unknown = JSON.parse(trimmed.slice(start, index + 1));
+					if (isJsonObject(parsed)) return parsed;
+				} catch {
+					// Keep scanning for a later balanced slice.
+				}
+			}
 		}
 	}
 	return null;
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** Validate one decision against the compiled action space. Free text never passes. */
@@ -145,6 +171,16 @@ export function parseDecision(raw: string, actions: Map<string, CompiledAction>)
 			}
 			params[key] = value;
 		}
+	}
+	const missing = Object.keys(action.params).filter((paramName) => !(paramName in params));
+	if (missing.length > 0) {
+		return {
+			action: null,
+			params: {},
+			confidence: null,
+			rawText: raw,
+			parseError: `missing param(s) ${missing.join(", ")} for action "${actionName}"`,
+		};
 	}
 	const confidence = object.confidence;
 	if (typeof confidence !== "number" || !Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
@@ -216,9 +252,17 @@ export function createModelDecisionFunction(context: RouterDecisionContext): Rou
 				usage,
 			};
 		}
+		if (message.stopReason === "length" || message.stopReason === "aborted") {
+			return {
+				action: null,
+				params: {},
+				confidence: null,
+				rawText: "",
+				modelError: `decision model stopped early (${message.stopReason})`,
+				usage,
+			};
+		}
 		const outcome = parseDecision(textOf(message), context.actions);
 		return { ...outcome, usage };
 	};
 }
-
-export const RESERVED_ACTION_NAMES = new Set([FINISH_ACTION, ESCALATE_ACTION]);

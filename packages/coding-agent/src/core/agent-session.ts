@@ -340,7 +340,7 @@ import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-promp
 import {
 	compileActionSpace,
 	createModelDecisionFunction,
-	parseActionSpace,
+	parseEnvironmentActions,
 	parseSystemRouterRunSpec,
 	routerThinkingLevel,
 	runSystemRouterLoop,
@@ -3851,47 +3851,48 @@ export class AgentSession {
 					requestTimeoutMs: spec.environment.stdio.requestTimeoutMs,
 					...(spec.environment.stdio.init !== undefined ? { init: spec.environment.stdio.init } : {}),
 				});
-				let actions: Record<string, import("./system-router/index.js").RouterActionSpec> | undefined = spec.actions;
-				if (!actions) {
-					// The spec declared no action space: the adapter supplies its own defaults.
+				try {
+					// Always init the adapter (it carries the init payload, e.g. the ROM
+					// path); the spec's declared action space wins over the adapter's.
 					const environment = await env.init();
-					const supplied = environment?.actions;
-					if (supplied === undefined) {
+					const actions = parseEnvironmentActions(spec.actions, environment?.actions);
+					if (!actions) {
 						throw new Error(
-							"system_router.run declared no actions and the environment did not supply any; declare an action space or use an adapter that provides one",
+							"system_router.run has no action space: declare one or use an adapter that supplies its own",
 						);
 					}
-					actions = parseActionSpace(supplied) ?? undefined;
+					const { byName } = compileActionSpace(actions);
+					const result = await runSystemRouterLoop({
+						env,
+						goal: spec.goal,
+						actions,
+						decide: createModelDecisionFunction({
+							model: auth.requestModel,
+							apiKey: auth.apiKey,
+							headers: auth.headers,
+							sessionId: this.sessionId,
+							policy: providerRetryPolicy(this.settingsManager),
+							actions: byName,
+						}),
+						model: {
+							id: auth.requestModel.id,
+							provider: auth.requestModel.provider,
+							input: auth.requestModel.input ?? [],
+							thinkingLevel: routerThinkingLevel(auth.requestModel),
+						},
+						gate: spec.gate,
+						maxSteps: spec.maxSteps,
+						timeoutMs: spec.timeoutMs,
+						historySteps: spec.historySteps,
+						observationChars: spec.observationChars,
+					});
+					return result as unknown as Record<string, unknown>;
+				} finally {
+					// The loop closes the env on its own paths; this guards the window
+					// between init and the loop (a bad init payload, a missing action
+					// space) so the adapter process never leaks.
+					await env.close().catch(() => {});
 				}
-				if (!actions) {
-					throw new Error("system_router.run has no action space to run against");
-				}
-				const { byName } = compileActionSpace(actions);
-				const result = await runSystemRouterLoop({
-					env,
-					goal: spec.goal,
-					actions,
-					decide: createModelDecisionFunction({
-						model: auth.requestModel,
-						apiKey: auth.apiKey,
-						headers: auth.headers,
-						sessionId: this.sessionId,
-						policy: providerRetryPolicy(this.settingsManager),
-						actions: byName,
-					}),
-					model: {
-						id: auth.requestModel.id,
-						provider: auth.requestModel.provider,
-						input: auth.requestModel.input ?? [],
-						thinkingLevel: routerThinkingLevel(auth.requestModel),
-					},
-					gate: spec.gate,
-					maxSteps: spec.maxSteps,
-					timeoutMs: spec.timeoutMs,
-					historySteps: spec.historySteps,
-					observationChars: spec.observationChars,
-				});
-				return result as unknown as Record<string, unknown>;
 			}
 			default:
 				throw new Error(`unknown system_router request type "${type}"`);

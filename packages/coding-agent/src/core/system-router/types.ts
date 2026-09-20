@@ -100,10 +100,14 @@ function asString(value: unknown, what: string): string {
 
 function asPortNumber(value: unknown, what: string, fallback: number, max: number): number {
 	if (value === undefined) return fallback;
-	if (typeof value !== "number" || !Number.isFinite(value) || value <= 0 || value > max) {
-		throw new Error(`system_router.run ${what} must be a number in (0, ${max}]`);
+	if (typeof value !== "number" || !Number.isFinite(value) || value < 1 || value > max) {
+		throw new Error(`system_router.run ${what} must be a whole number in [1, ${max}]`);
 	}
-	return Math.floor(value);
+	const floored = Math.floor(value);
+	if (floored < 1) {
+		throw new Error(`system_router.run ${what} must be a whole number in [1, ${max}]`);
+	}
+	return floored;
 }
 
 function parseRisk(value: unknown, what: string): RouterActionRisk {
@@ -182,6 +186,20 @@ export function parseSystemRouterRunSpec(payload: unknown): ParsedSystemRouterRu
 		),
 		gate,
 	};
+}
+
+/**
+ * Resolve the run's action space: the spec's declaration wins; the
+ * environment's supplied defaults are parsed and validated otherwise.
+ * Returns undefined when neither declares one.
+ */
+export function parseEnvironmentActions(
+	declared: unknown,
+	supplied: unknown,
+): Record<string, RouterActionSpec> | undefined {
+	if (declared !== undefined) return parseActionSpace(declared);
+	if (supplied === undefined) return undefined;
+	return parseActionSpace(supplied) ?? undefined;
 }
 
 /** Parse the declared action space. Returns undefined when the environment is expected to supply it. */
@@ -278,8 +296,6 @@ export interface RouterObservation {
 	text: string;
 	/** Structured scalars rendered as "key: value" lines after the text. */
 	fields?: Record<string, string | number | boolean>;
-	/** Candidate lists params may reference by name (not used for direct choices). */
-	candidates?: Record<string, string[]>;
 	/** Base64 PNG screenshot, included only when the action model accepts images. */
 	image?: string;
 	terminal?: boolean;
@@ -312,7 +328,7 @@ export interface RouterStepTrace {
 	params: Record<string, string>;
 	confidence: number | null;
 	gate: { threshold: number; verdict: RouterGateVerdict };
-	/** fnv1a16 digest of the observation for repeated-state detection. */
+	/** fnv1a (32-bit) digest of the observation for repeated-state detection. */
 	observationDigest: string;
 	observationChars: number;
 	/** Execution result text or the refusal reason. */
@@ -326,9 +342,9 @@ export type RouterRunStatus = "done" | "incomplete" | "stuck" | "failed" | "esca
 
 export interface SystemRouterRunResult {
 	status: RouterRunStatus;
-	/** Machine-readable terminal reason (e.g. "environment_terminal", "max_steps", "no_confident_action"). */
+	/** Machine-readable terminal reason (e.g. "environment_terminal", "max_steps", "no_confident_decision"). */
 	reason: string;
-	/** Total decisions taken (executed + refused). */
+	/** Trace entries recorded this segment (executed + refused + terminal entries). */
 	steps: number;
 	executed: number;
 	refused: number;

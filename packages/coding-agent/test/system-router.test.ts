@@ -11,6 +11,7 @@ import {
 	gateThreshold,
 	observationDigest,
 	parseDecision,
+	parseEnvironmentActions,
 	parseSystemRouterRunSpec,
 	type RouterActionSpec,
 	type RouterDecisionOutcome,
@@ -190,11 +191,30 @@ describe("parseSystemRouterRunSpec", () => {
 			"needs a non-empty description",
 		],
 		["gate out of range", { ...valid, gate: { read: 1.5 } }, "gate.read must be a number in [0, 1]"],
-		["maxSteps zero", { ...valid, maxSteps: 0 }, "maxSteps must be a number in (0, 200]"],
-		["maxSteps over cap", { ...valid, maxSteps: 201 }, "maxSteps must be a number in (0, 200]"],
-		["timeoutMs over cap", { ...valid, timeoutMs: 600_001 }, "timeoutMs must be a number in (0, 600000]"],
-		["historySteps over cap", { ...valid, historySteps: 33 }, "historySteps must be a number in (0, 32]"],
-		["observationChars zero", { ...valid, observationChars: 0 }, "observationChars must be a number in (0, 32000]"],
+		["maxSteps zero", { ...valid, maxSteps: 0 }, "maxSteps must be a whole number in [1, 200]"],
+		["maxSteps over cap", { ...valid, maxSteps: 201 }, "maxSteps must be a whole number in [1, 200]"],
+		["timeoutMs over cap", { ...valid, timeoutMs: 600_001 }, "timeoutMs must be a whole number in [1, 600000]"],
+		["historySteps over cap", { ...valid, historySteps: 33 }, "historySteps must be a whole number in [1, 32]"],
+		[
+			"observationChars zero",
+			{ ...valid, observationChars: 0 },
+			"observationChars must be a whole number in [1, 32000]",
+		],
+		[
+			"fractional maxSteps floors to zero",
+			{ ...valid, maxSteps: 0.5 },
+			"maxSteps must be a whole number in [1, 200]",
+		],
+		[
+			"fractional timeoutMs floors to zero",
+			{ ...valid, timeoutMs: 0.5 },
+			"timeoutMs must be a whole number in [1, 600000]",
+		],
+		[
+			"fractional historySteps floors to zero",
+			{ ...valid, historySteps: 0.5 },
+			"historySteps must be a whole number in [1, 32]",
+		],
 	])("%s %s", (_label, payload, errorFragment) => {
 		if (errorFragment === null) {
 			expect(() => parseSystemRouterRunSpec(payload)).not.toThrow();
@@ -250,6 +270,17 @@ describe("parseDecision", () => {
 			'{"action":"press_a","params":"x","confidence":0.9}',
 			{ action: null, parseError: "params must be an object" },
 		],
+		[
+			"missing declared param",
+			'{"action":"set_power","confidence":0.9}',
+			{ action: null, parseError: 'missing param(s) power for action "set_power"' },
+		],
+		[
+			"valid json followed by braced prose",
+			'{"action":"press_a","confidence":0.9} (note: use {"action":"finish"} for done)',
+			{ action: "press_a", confidence: 0.9 },
+		],
+		["stray trailing brace", '{"action":"press_b","confidence":0.7}\n}', { action: "press_b", confidence: 0.7 }],
 		[
 			"missing confidence",
 			'{"action":"press_a"}',
@@ -436,6 +467,37 @@ describe("runSystemRouterLoop", () => {
 		expect(result.status).toBe("stuck");
 		expect(result.reason).toBe("repeated_state");
 		expect(env.executeLog).toHaveLength(1);
+		// The repetition stop is a refusal by the loop, so steps stays consistent.
+		expect(result.refused).toBe(1);
+		expect(result.steps).toBe(result.executed + result.refused);
+	});
+
+	it("fails the run when the environment cannot reset", async () => {
+		const env = {
+			reset: () => Promise.reject(new Error("no savestate")),
+			observe: () => Promise.resolve({ text: "x" }),
+			execute: () => Promise.resolve({ text: "y" }),
+			close: () => Promise.resolve(),
+		};
+		const result = await runLoop(env as unknown as RouterEnvironment, {});
+		expect(result.status).toBe("failed");
+		expect(result.reason).toBe("environment_error");
+		expect(result.summary).toContain("no savestate");
+	});
+
+	it("parseEnvironmentActions prefers the declared space and validates supplied ones", () => {
+		const declared = { press_a: { description: "Declared press." } };
+		expect(parseEnvironmentActions(declared, { press_b: { description: "Supplied." } })).toEqual({
+			press_a: { description: "Declared press.", risk: "write" },
+		});
+		const supplied = { wait: { description: "Wait a bit." } };
+		expect(parseEnvironmentActions(undefined, supplied)).toEqual({
+			wait: { description: "Wait a bit.", risk: "write" },
+		});
+		expect(parseEnvironmentActions(undefined, undefined)).toBeUndefined();
+		expect(() => parseEnvironmentActions(undefined, { finish: { description: "Nope." } })).toThrow(
+			"is reserved for the loop itself",
+		);
 	});
 
 	it("allows the same action twice when the observation moves", async () => {
@@ -555,6 +617,26 @@ describe("runSystemRouterLoop budgets (fake timers)", () => {
 		expect(env.closeCalls).toBe(1);
 	});
 
+	it("ends incomplete when the losing side rejects after the deadline fires", async () => {
+		const env = new FakeEnvironment(["screen"]);
+		// The decide call rejects 25ms after the 5ms deadline; its rejection must
+		// stay handled (the raceDeadline invariant), not crash the host.
+		let lateReject: ((error: Error) => void) | undefined;
+		const decide: (request: unknown) => Promise<RouterDecisionOutcome> = () =>
+			new Promise<RouterDecisionOutcome>((_, reject) => {
+				lateReject = reject;
+			});
+		const run = runLoop(env, { decide, timeoutMs: 5 });
+		run.catch(() => {});
+		await vi.advanceTimersByTimeAsync(5);
+		const result = await run;
+		expect(result.status).toBe("incomplete");
+		expect(result.reason).toBe("timeout");
+		// The losing promise rejects only now; it was already handled by raceDeadline.
+		lateReject?.(new Error("late rejection"));
+		await vi.advanceTimersByTimeAsync(0);
+	});
+
 	it("ends incomplete when the deadline elapses mid-observe", async () => {
 		const env = {
 			reset: () => Promise.resolve(),
@@ -606,14 +688,33 @@ describe("createModelDecisionFunction", () => {
 		expect(context.messages[0].content).toHaveLength(1);
 	});
 
-	it("gives mandatory-reasoning models the larger output cap", async () => {
-		const thinkingModel = { ...textModel, reasoning: true } as unknown as PiAi.Model<PiAi.Api>;
-		completeSimpleMock.mockResolvedValueOnce(assistant('{"action":"press_a","confidence":0.6}'));
-		const decide = createModelDecisionFunction({ model: thinkingModel, actions: byName });
-		const outcome = await decide({ prompt: "p" });
-		expect(outcome.action).toBe("press_a");
-		const options = completeSimpleMock.mock.calls[0][2];
-		expect(options.maxTokens).toBeLessThanOrEqual(4_096);
+	it.each([
+		[4_096, 4_096],
+		[512, 512],
+		[131_072, 4_096],
+	])(
+		"caps decision output at the model ceiling or 4096, whichever is smaller (maxTokens=%d)",
+		async (modelMaxTokens, expectedCap) => {
+			const model = { ...textModel, maxTokens: modelMaxTokens } as unknown as PiAi.Model<PiAi.Api>;
+			completeSimpleMock.mockReset();
+			completeSimpleMock.mockResolvedValueOnce(assistant('{"action":"press_a","confidence":0.6}'));
+			const decide = createModelDecisionFunction({ model, actions: byName });
+			const outcome = await decide({ prompt: "p" });
+			expect(outcome.action).toBe("press_a");
+			expect(completeSimpleMock.mock.calls[0][2].maxTokens).toBe(expectedCap);
+		},
+	);
+
+	it("surfaces length and abort stop reasons as model errors, not parse refusals", async () => {
+		const decide = createModelDecisionFunction({ model: textModel, actions: byName });
+		completeSimpleMock.mockResolvedValueOnce({ ...assistant('{"action":"pre'), stopReason: "length" });
+		const truncated = await decide({ prompt: "p" });
+		expect(truncated.modelError).toContain("stopped early (length)");
+		expect(truncated.action).toBeNull();
+		completeSimpleMock.mockReset();
+		completeSimpleMock.mockResolvedValueOnce({ ...assistant(""), stopReason: "aborted" });
+		const aborted = await decide({ prompt: "p" });
+		expect(aborted.modelError).toContain("stopped early (aborted)");
 	});
 
 	it("attaches the screenshot only for image-capable models", async () => {
@@ -694,6 +795,46 @@ describe("StdioRouterEnvironment (real subprocess)", () => {
 		});
 		await expect(env.init()).rejects.toThrow(/exited early .*adapter blew up/);
 		await env.close();
+	});
+
+	it("closes fast when the adapter already exited, and twice in a row", async () => {
+		const env = new StdioRouterEnvironment({
+			command: [process.execPath, "-e", "process.exit(0);"],
+			requestTimeoutMs: 5_000,
+		});
+		await expect(env.init()).rejects.toThrow(/exited early/);
+		const started = Date.now();
+		await env.close();
+		expect(Date.now() - started).toBeLessThan(500);
+		await env.close();
+	});
+
+	it("tolerates a reply split across two stdout chunks and noise lines", async () => {
+		const script = `
+			const lines = require("readline").createInterface({ input: process.stdin });
+			lines.on("line", (line) => {
+				const msg = JSON.parse(line);
+				if (msg.type === "init") {
+					process.stdout.write('{"id":' + msg.id + ',');
+					setTimeout(() => {
+						process.stdout.write('"ok":true,"environment":{"actions":{"wait":{"description":"Wait."}}}}\\n');
+						process.stdout.write('not json noise\\n');
+						process.stdout.write('{"id":999,"ok":true}\\n');
+					}, 10);
+				} else if (msg.type === "observe") {
+					process.stdout.write(JSON.stringify({ id: msg.id, ok: true, observation: { text: "ok screen" } }) + "\\n");
+				} else if (msg.type === "close") { lines.close(); process.exit(0); }
+			});
+		`;
+		const env = new StdioRouterEnvironment({ command: [process.execPath, "-e", script], requestTimeoutMs: 5_000 });
+		try {
+			const environment = await env.init();
+			expect(environment?.actions).toMatchObject({ wait: { description: "Wait." } });
+			const observation = await env.observe();
+			expect(observation.text).toBe("ok screen");
+		} finally {
+			await env.close();
+		}
 	});
 
 	it("times out requests against a silent adapter", async () => {

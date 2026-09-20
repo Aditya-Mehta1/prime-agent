@@ -169,12 +169,13 @@ export class StdioRouterEnvironment implements RouterEnvironment {
 		this.closed = true;
 		const child = this.child;
 		if (!child) return;
+		if (child.exitCode !== null || child.signalCode !== null) {
+			// The adapter already exited; its exit event was handled at exit time.
+			this.failAll(new Error("environment adapter closed"));
+			return;
+		}
 		// Ask the adapter to exit, then enforce a bounded shutdown.
-		const goodbye = new Promise<void>((resolve) => {
-			child.stdin?.end(`${JSON.stringify({ id: this.nextId, type: "close" })}\n`, () => resolve());
-			resolve();
-		});
-		void goodbye.catch(() => {});
+		child.stdin?.end(`${JSON.stringify({ id: this.nextId, type: "close" })}\n`);
 		const exited = new Promise<void>((resolve) => {
 			child.once("exit", () => resolve());
 		});
