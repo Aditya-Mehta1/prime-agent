@@ -259,7 +259,13 @@ impl Inner {
         });
 
         if let Some(stdout) = stdout {
-            let inner = Arc::clone(self);
+            // Weak, upgraded per event: the readers stay blocked on the
+            // child's pipes for the kernel's whole life, so a strong handle
+            // here would outlive every manager clone and the process would
+            // survive the drop that should have torn it down (#232 hygiene:
+            // a dropped session leaked its live kernel until the runtime's
+            // owner watchdog reaped it, if ever).
+            let inner = Arc::downgrade(self);
             let stdin_for_error = stdin.clone();
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stdout);
@@ -273,6 +279,9 @@ impl Inner {
                             if trimmed.trim().is_empty() {
                                 continue;
                             }
+                            let Some(inner) = inner.upgrade() else {
+                                break;
+                            };
                             match parse_event(trimmed) {
                                 Ok(event) => inner.handle_event(event),
                                 Err(reason) => {
@@ -287,7 +296,9 @@ impl Inner {
         }
 
         if let Some(stderr) = stderr {
-            let inner = Arc::clone(self);
+            // Weak like the stdout reader (same drop semantics), upgraded
+            // per chunk; the log file drains to EOF regardless.
+            let inner = Arc::downgrade(self);
             let log = self.open_stderr_log();
             // Keep the host-side handle so teardown drops its reference; the
             // reader task's handle closes the file when the stream ends.
@@ -309,7 +320,11 @@ impl Inner {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             pending.extend_from_slice(&buffer[..n]);
-                            inner.append_kernel_stderr_text(&decode(&mut pending));
+                            let decoded = decode(&mut pending);
+                            let Some(inner) = inner.upgrade() else {
+                                break;
+                            };
+                            inner.append_kernel_stderr_text(&decoded);
                             if let Some(log) = &log {
                                 let mut log = lock(log);
                                 if log.budget >= n as u64 {
@@ -327,17 +342,24 @@ impl Inner {
                         }
                     }
                 }
-                if !pending.is_empty() {
-                    inner.append_kernel_stderr_text(&decode(&mut pending));
+                if let Some(inner) = inner.upgrade() {
+                    if !pending.is_empty() {
+                        inner.append_kernel_stderr_text(&decode(&mut pending));
+                    }
+                    // Both the natural EOF and the kill path end here; the ready
+                    // handshake waits on this notification for the final tail.
+                    inner.stderr_closed_flag.store(true, Ordering::SeqCst);
+                    inner.stderr_closed.notify_waiters();
                 }
-                // Both the natural EOF and the kill path end here; the ready
-                // handshake waits on this notification for the final tail.
-                inner.stderr_closed_flag.store(true, Ordering::SeqCst);
-                inner.stderr_closed.notify_waiters();
             });
         }
 
-        let inner = Arc::clone(self);
+        // Weak like the readers: the watcher stays blocked on the child's
+        // exit for the kernel's whole life, and owning the manager strongly
+        // would keep the kernel alive past the last manager's drop (the very
+        // retention the readers no longer hold). The child handle stays here
+        // so the exit is still reaped after a teardown kill.
+        let inner = Arc::downgrade(self);
         tokio::spawn(async move {
             let exit = match child.wait().await {
                 Ok(status) => ExitInfo {
@@ -353,6 +375,9 @@ impl Inner {
                 },
             };
             let _ = exit_tx.send(Some(exit));
+            let Some(inner) = inner.upgrade() else {
+                return;
+            };
             if inner.start_stale(generation) {
                 return;
             }

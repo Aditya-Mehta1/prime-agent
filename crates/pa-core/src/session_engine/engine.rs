@@ -126,6 +126,14 @@ pub struct SessionEngine {
     /// Installed session telemetry (agent-event subscriber). `None` when
     /// telemetry is disabled or the session is not depth 0.
     pub telemetry: Option<std::sync::Arc<super::telemetry::SessionTelemetry>>,
+    /// The session's kernel provisioner. The engine is the STRONG owner on
+    /// purpose: the `ipython` tool on the agent and the compaction
+    /// kernel-state probe on the session hold weak references, because the
+    /// kernel's host handlers reach back into the session (goal state,
+    /// turn-boundary requests) — a strong edge anywhere on that return path
+    /// loops the graph and keeps a dropped session's kernel process alive
+    /// until the process exits.
+    pub(crate) provisioner: std::sync::Arc<crate::kernel::provisioner::IpythonKernelProvisioner>,
 }
 
 /// Resolve the MCP gating the resource loader and prompt need: skill
@@ -577,10 +585,15 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // provisioner is the session's kernel whether it added the `ipython`
     // tool itself or the caller supplied one backed by this provisioner.
     // A provisioner whose kernel never started reports no running kernel,
-    // so the notice stays dormant until a kernel exists.
+    // so the notice stays dormant until a kernel exists. The probe holds a
+    // WEAK reference: the engine owns the provisioner (the session is part
+    // of the graph the kernel's host handlers reach, so a strong edge here
+    // would loop the graph and pin a dropped session's kernel).
     let kernel_state_probe: std::sync::Arc<
         dyn crate::session_engine::ipython_state::CompactionKernelProbe,
-    > = provisioner.clone();
+    > = std::sync::Arc::new(crate::session_engine::ipython_state::EngineOwnedProbe::new(
+        std::sync::Arc::downgrade(&provisioner),
+    ));
     session.set_kernel_state_probe(Some(kernel_state_probe));
 
     // Bind the turn-boundary runtime the `compact.*`/`refine.*` handlers
@@ -627,6 +640,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         extension_diagnostics,
         turn_boundary,
         telemetry,
+        provisioner,
     })
 }
 
@@ -638,6 +652,16 @@ impl SessionEngine {
         options: PromptOptions,
     ) -> anyhow::Result<PromptOutcome> {
         self.session.prompt(text, options).await
+    }
+
+    /// Tear the session's kernel down now (a final namespace snapshot,
+    /// like the TS session dispose). Dropping the engine tears the kernel
+    /// down too — this is the explicit seam for a host that ends a
+    /// session but keeps the engine object alive (the daemon worker's
+    /// session disposal), so the kernel process never outlives the
+    /// session that owns it.
+    pub async fn dispose_kernel(&self) {
+        self.provisioner.dispose(None).await;
     }
 }
 

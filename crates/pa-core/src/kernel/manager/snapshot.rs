@@ -152,12 +152,17 @@ impl Inner {
         if let Some(existing) = timer.take() {
             existing.abort();
         }
-        let inner = Arc::clone(self);
+        // Weak so a dropped manager's pending debounce cannot delay the
+        // teardown kill: with no manager left, the scheduled flush is moot
+        // (dispose paths flush explicitly before dropping).
+        let inner = Arc::downgrade(self);
         *timer = Some(tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(debounce)).await;
-            inner
-                .capture_snapshot(Some(SNAPSHOT_EXECUTION_TIMEOUT_MS), false)
-                .await;
+            if let Some(inner) = inner.upgrade() {
+                inner
+                    .capture_snapshot(Some(SNAPSHOT_EXECUTION_TIMEOUT_MS), false)
+                    .await;
+            }
         }));
     }
 

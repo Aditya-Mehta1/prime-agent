@@ -178,11 +178,17 @@ impl ReplKernelManager {
         // Abort watcher: interrupts the kernel out-of-band, then force-aborts
         // after the grace window if the runtime did not settle the cell.
         if let Some(signal) = execution.opts.signal.clone() {
-            let inner = self.inner.clone();
+            // Weak on both sides: a never-fired signal leaves this watcher
+            // pending forever, and a strong manager would pin the kernel
+            // past the last manager's drop (the reader-retention class).
+            let inner = Arc::downgrade(&self.inner);
             let weak_exec = Arc::downgrade(&execution);
             tokio::spawn(async move {
                 signal.cancelled().await;
                 let Some(execution) = weak_exec.upgrade() else {
+                    return;
+                };
+                let Some(inner) = inner.upgrade() else {
                     return;
                 };
                 let _ = inner.interrupt(Some(&execution.request_id)).await;

@@ -56,6 +56,60 @@ pub trait CompactionKernelProbe: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Option<Vec<String>>> + Send + '_>>;
 }
 
+/// The session-held probe: weak over the engine-owned provisioner. The
+/// engine owns the provisioner for exactly the lifetime of the session;
+/// the kernel's host handlers reach the session, so a strong edge here
+/// would loop the ownership graph and keep a dropped session's kernel
+/// process alive until process exit.
+pub struct EngineOwnedProbe {
+    provisioner: std::sync::Weak<crate::kernel::provisioner::IpythonKernelProvisioner>,
+}
+
+impl EngineOwnedProbe {
+    /// Wrap the engine-owned provisioner.
+    pub fn new(
+        provisioner: std::sync::Weak<crate::kernel::provisioner::IpythonKernelProvisioner>,
+    ) -> Self {
+        Self { provisioner }
+    }
+
+    fn owned(
+        &self,
+    ) -> Option<std::sync::Arc<crate::kernel::provisioner::IpythonKernelProvisioner>> {
+        self.provisioner.upgrade()
+    }
+}
+
+impl CompactionKernelProbe for EngineOwnedProbe {
+    fn has_running_kernel(&self) -> bool {
+        self.owned()
+            .as_deref()
+            .map(crate::kernel::provisioner::IpythonKernelProvisioner::has_running_kernel)
+            .unwrap_or(false)
+    }
+
+    fn prune_oversized_variables(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Option<Vec<String>>> + Send + '_>> {
+        let owned = self.owned();
+        Box::pin(async move {
+            let owned = owned?;
+            owned.prune_oversized_variables().await
+        })
+    }
+
+    fn list_namespace_names(
+        &self,
+        signal: Option<crate::kernel::cancellation::AbortSignal>,
+    ) -> Pin<Box<dyn Future<Output = Option<Vec<String>>> + Send + '_>> {
+        let owned = self.owned();
+        Box::pin(async move {
+            let owned = owned?;
+            owned.list_namespace_names(signal).await
+        })
+    }
+}
+
 impl CompactionKernelProbe for crate::kernel::provisioner::IpythonKernelProvisioner {
     fn has_running_kernel(&self) -> bool {
         IpythonKernelProvisioner::has_running_kernel(self)

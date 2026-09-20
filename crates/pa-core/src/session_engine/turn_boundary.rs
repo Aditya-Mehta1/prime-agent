@@ -165,19 +165,27 @@ impl TurnBoundaryRequests {
         handlers: &mut HostRequestHandlers,
         model_info: ModelInfo,
     ) {
-        let requests = Arc::clone(self);
+        // Weak, upgraded at request time: the kernel holds these handlers
+        // for its whole life and its host graph reaches the session, so a
+        // strong capture here loops the ownership graph and pins a dropped
+        // session's kernel process until the process exits. The engine owns
+        // this requests object (see SessionEngine::turn_boundary).
+        let requests = Arc::downgrade(self);
         handlers.register(
             "model.info",
             host_handler(move |_payload| {
-                let requests = Arc::clone(&requests);
+                let requests = requests.clone();
                 let model_info = model_info.clone();
                 Box::pin(async move {
                     // The bound runtime is authoritative once the session
                     // is live; the registration-time facts cover pre-bind
-                    // probes.
+                    // probes AND a dropped session (model.info always
+                    // answers, like the TS default map).
                     let model_info = requests
-                        .bound()
-                        .map(|runtime| runtime.model_info.clone())
+                        .upgrade()
+                        .and_then(|requests| {
+                            requests.bound().map(|runtime| runtime.model_info.clone())
+                        })
                         .unwrap_or(model_info);
                     Ok(json!({
                         "id": model_info.id,
@@ -201,12 +209,17 @@ impl TurnBoundaryRequests {
         handlers: &mut HostRequestHandlers,
         keep_recent_tokens: u64,
     ) {
-        let requests = Arc::clone(self);
+        let requests = Arc::downgrade(self);
         handlers.register(
             "compact.status",
             host_handler(move |_payload| {
-                let requests = Arc::clone(&requests);
+                let requests = requests.clone();
                 Box::pin(async move {
+                    let Some(requests) = requests.upgrade() else {
+                        return Err(anyhow::anyhow!(
+                            "the session ended before the request could be served"
+                        ));
+                    };
                     let usage = match requests.bound() {
                         Some(runtime) => {
                             let entries = runtime.session.lock().await.get_all_entries().to_vec();
@@ -232,12 +245,15 @@ impl TurnBoundaryRequests {
                 })
             }),
         );
-        let requests = Arc::clone(self);
+        let requests = Arc::downgrade(self);
         handlers.register(
             "compact.run",
             host_handler(move |payload| {
-                let requests = Arc::clone(&requests);
+                let requests = requests.clone();
                 Box::pin(async move {
+                    let Some(requests) = requests.upgrade() else {
+                        return Err(anyhow::anyhow!("the session ended before the request could be served"));
+                    };
                     let instructions = string_field(
                         &payload.data,
                         "instructions",
@@ -276,12 +292,17 @@ impl TurnBoundaryRequests {
     /// `_autoRefineAllowedForSession` equivalent (depth 0 with a local
     /// harness state dir); `create_session` decides.
     pub fn register_refine_handlers(self: &Arc<Self>, handlers: &mut HostRequestHandlers) {
-        let requests = Arc::clone(self);
+        let requests = Arc::downgrade(self);
         handlers.register(
             "refine.status",
             host_handler(move |_payload| {
-                let requests = Arc::clone(&requests);
+                let requests = requests.clone();
                 Box::pin(async move {
+                    let Some(requests) = requests.upgrade() else {
+                        return Err(anyhow::anyhow!(
+                            "the session ended before the request could be served"
+                        ));
+                    };
                     let pending = requests.refine_pending().await;
                     // The Rust turn-boundary consumption runs refinement
                     // synchronously between turns, so a cell never observes
@@ -291,12 +312,15 @@ impl TurnBoundaryRequests {
                 })
             }),
         );
-        let requests = Arc::clone(self);
+        let requests = Arc::downgrade(self);
         handlers.register(
             "refine.run",
             host_handler(move |payload| {
-                let requests = Arc::clone(&requests);
+                let requests = requests.clone();
                 Box::pin(async move {
+                    let Some(requests) = requests.upgrade() else {
+                        return Err(anyhow::anyhow!("the session ended before the request could be served"));
+                    };
                     let instructions = string_field(
                         &payload.data,
                         "instructions",

@@ -2,6 +2,13 @@
 //! startup, revives the saved namespace before the runtime bootstrap, and
 //! disposes/kills on demand.
 //!
+//! Teardown contract: the provisioner is the manager's strong owner, and the
+//! manager's reader/watcher tasks hold only weak references — so dropping the
+//! last provisioner handle tears the kernel PROCESS down synchronously
+//! (`Inner::drop` sends the kill). An explicit `dispose()` is still the
+//! product path (it flushes a final namespace snapshot first), but no kernel
+//! can outlive the object graph that created it.
+//!
 //! Ported from `core/tools/ipython.ts` (`IpythonKernelProvisioner`) and
 //! `core/kernel/boot-gate.ts`.
 
@@ -466,25 +473,45 @@ async fn run_startup(
         }
     };
     let duration_ms = started.elapsed().as_millis() as u64;
-    let mut state = inner
-        .state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    state.startup = None;
-    state.startup_listeners.clear();
-    state.last_startup_message = None;
-    match outcome {
-        Ok(manager) => {
-            state.last_startup_failure = None;
-            state.manager = Some(manager);
-        }
-        Err(error) => {
+    let (raced_dispose, dispose_snapshot) = {
+        let mut state = inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.startup = None;
+        state.startup_listeners.clear();
+        state.last_startup_message = None;
+        if let Err(error) = &outcome {
             state.manager = None;
             state.last_startup_failure = Some(StartupFailure {
                 message: format!("{error:#}"),
                 duration_ms,
             });
         }
+        (outcome.is_ok() && state.disposed, state.dispose_snapshot)
+    };
+    if let Ok(manager) = outcome {
+        if raced_dispose {
+            // A dispose raced the boot: the kernel must not be parked
+            // in — or outlive — a disposed provisioner. TS startKernel
+            // runs the whole boot on a dispose-linked abort and its
+            // catch tears the kernel down with the dispose's snapshot
+            // policy; the Rust boot completes and the teardown follows
+            // here with the same policy.
+            let _ = manager
+                .shutdown(KernelShutdownOptions {
+                    snapshot: dispose_snapshot,
+                    drain_host_requests: true,
+                })
+                .await;
+            return;
+        }
+        let mut state = inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.last_startup_failure = None;
+        state.manager = Some(manager);
     }
 }
 
@@ -542,6 +569,9 @@ async fn start_kernel_impl(
     let options = &inner.options;
     let cwd = inner.cwd.clone();
     let dispose_signal = inner.dispose_signal.clone();
+    // The boot-permit closure moves its own clone; the bootstrap below runs
+    // on the same shared signal.
+    let permit_dispose_signal = dispose_signal.clone();
     // Wait for a previous provisioner (e.g. on /reload) to finish disposing —
     // and flushing its final snapshot — before reading that snapshot back.
     if let Some(gate) = options.ready_gate.clone() {
@@ -595,7 +625,7 @@ async fn start_kernel_impl(
     let boot = async {
         with_kernel_boot_permit(move || async move {
             // Disposed while queued for the permit — don't spawn a kernel nobody wants.
-            if dispose_signal.is_aborted() {
+            if permit_dispose_signal.is_aborted() {
                 return Err(anyhow!("Kernel provisioner disposed before start"));
             }
             start.await
@@ -652,10 +682,39 @@ async fn start_kernel_impl(
         }
     }
     emit_startup_progress(inner, on_progress, "Preparing Python runtime...");
+    // The bootstrap runs on the dispose signal (TS startKernel races every
+    // boot stage against the dispose-linked abort): a dispose mid-bootstrap
+    // settles the cell aborted, and the aborted-status arm below tears the
+    // kernel down instead of leaking it into a disposed provisioner.
     let bootstrap = manager
-        .execute(&bootstrap_code, ExecuteOptions::default())
+        .execute(
+            &bootstrap_code,
+            ExecuteOptions {
+                signal: Some(dispose_signal.clone()),
+                ..Default::default()
+            },
+        )
         .await;
     match bootstrap {
+        Ok(bootstrap) if bootstrap.status == ExecuteStatus::Ok && dispose_signal.is_aborted() => {
+            // The cell completed, but the provisioner was disposed under it:
+            // the same teardown as the aborted-status arm, with the honest
+            // disposed-startup cause (TS startKernel's abort error).
+            let snapshot_policy = {
+                inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .dispose_snapshot
+            };
+            let _ = manager
+                .shutdown(KernelShutdownOptions {
+                    snapshot: snapshot_policy,
+                    drain_host_requests: true,
+                })
+                .await;
+            return Err(anyhow!("Kernel provisioner disposed during startup"));
+        }
         Ok(bootstrap) if bootstrap.status == ExecuteStatus::Ok => {}
         Ok(bootstrap) => {
             let details = [bootstrap.stderr.clone()]
@@ -664,9 +723,18 @@ async fn start_kernel_impl(
                 .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n");
+            // TS startKernel's catch shuts the failed boot down with the
+            // dispose snapshot policy (default true), not `false`.
+            let snapshot_policy = {
+                inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .dispose_snapshot
+            };
             let _ = manager
                 .shutdown(KernelShutdownOptions {
-                    snapshot: false,
+                    snapshot: snapshot_policy,
                     drain_host_requests: true,
                 })
                 .await;
@@ -675,9 +743,16 @@ async fn start_kernel_impl(
             ));
         }
         Err(error) => {
+            let snapshot_policy = {
+                inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .dispose_snapshot
+            };
             let _ = manager
                 .shutdown(KernelShutdownOptions {
-                    snapshot: false,
+                    snapshot: snapshot_policy,
                     drain_host_requests: true,
                 })
                 .await;
