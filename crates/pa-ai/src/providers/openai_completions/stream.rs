@@ -14,6 +14,7 @@ use crate::event_stream::{
     AssistantMessageEventWriter,
 };
 use crate::providers::openai_completions::convert::{map_stop_reason, parse_chunk_usage};
+use crate::providers::openai_completions::errors::{openai_http_error, openrouter_raw_metadata};
 use crate::providers::openai_completions::get_compat_cache_control;
 use crate::providers::openai_completions::params::{build_headers, build_params};
 use crate::providers::openai_completions::{
@@ -434,10 +435,16 @@ fn handle_chunk(
 }
 
 fn error_to_message(error: &ProviderError) -> String {
-    match error {
+    let mut message = match error {
         ProviderError::StreamFailure(failure) => failure.message.clone(),
         other => other.to_string(),
+    };
+    // Some providers via OpenRouter give additional information in this field.
+    if let Some(raw_metadata) = openrouter_raw_metadata(error) {
+        message.push('\n');
+        message.push_str(&raw_metadata);
     }
+    message
 }
 
 /// Port of `streamOpenAICompletions`.
@@ -583,9 +590,12 @@ async fn run_stream(
         );
     }
 
-    if response.status >= 400 {
+    // The TS provider goes through the `openai` SDK, which throws on every
+    // non-OK status (2xx only) and whose `APIError` message the provider
+    // surfaces verbatim as the assistant message's error message.
+    if !(200..300).contains(&response.status) {
         let body = response.read_all_text().await.unwrap_or_default();
-        return Err(ProviderError::from_http_status_body(
+        return Err(openai_http_error(
             response.status,
             &body,
             response.headers.clone(),

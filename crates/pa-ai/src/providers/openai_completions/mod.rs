@@ -2,8 +2,9 @@
 //!
 //! Full port of `packages/ai/src/providers/openai-completions.ts`, split
 //! across submodules: compat detection and options here, message/tool/usage
-//! conversion in [`convert`], params and header assembly in [`params`], and
-//! the chunk-driven streaming core in [`stream`]. Compat detection
+//! conversion in [`convert`], params and header assembly in [`params`], the
+//! SDK-shaped user-facing error surface in [`errors`], and the chunk-driven
+//! streaming core in [`stream`]. Compat detection
 //! (provider/baseUrl heuristics plus explicit `model.compat`) and reasoning
 //! effort mapping live here.
 
@@ -22,6 +23,7 @@ use crate::types::{
 };
 
 mod convert;
+mod errors;
 mod params;
 mod stream;
 

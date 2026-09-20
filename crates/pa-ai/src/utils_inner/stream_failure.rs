@@ -654,6 +654,29 @@ mod tests {
         );
     }
 
+    /// The classified shape the anthropic/openai-responses providers surface
+    /// (`formatStreamFailureMessage`): kind text, parenthesized qualifiers
+    /// (provider type and/or status), detail after the colon.
+    #[test]
+    fn classified_message_with_parenthesized_status() {
+        let status_only = StreamFailureInfo {
+            kind: StreamFailureKind::InvalidRequest,
+            provider_error_type: None,
+            status: Some(400),
+            request_id: None,
+            retry_after_ms: None,
+            raw: None,
+        };
+        assert_eq!(
+            stream_failure_message(&status_only, Some("bad request")),
+            "Provider rejected the request (400): bad request"
+        );
+        assert_eq!(
+            stream_failure_message(&status_only, None),
+            "Provider rejected the request (400)"
+        );
+    }
+
     #[test]
     fn stop_reason_failures() {
         let err = stream_failure_from_stop_reason(Some("refusal"), None);
