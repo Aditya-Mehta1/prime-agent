@@ -22,6 +22,11 @@ Files: `run_battery.py` (driver), `batterylib.py` (shared harness),
 `ts_identity.py` (shared ts-identity guard: every PATH-driven parity
 harness refuses to run when its "ts" binary is this repo's Rust product —
 e.g. a stale Rust build symlinked onto PATH as `prime-agent`), 
+`provider_error_probe.py` (provider-error shape probe: scripted
+non-2xx answers, raw-socket h2 and WebSocket mocks, dead-port connection
+probes — one custom provider per scenario; captures the persisted
+errorMessage plus the `provider_stream_failure` / `provider_transport_failure`
+diagnostics per side, TS vs Rust),
 `mock_provider.py` (deterministic mock provider; responses are
 session-scoped queues — a queue is selected per request by markers in the
 request's user-message text, so a parent session and a concurrently running

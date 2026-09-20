@@ -286,9 +286,19 @@ async fn run_stream(
                     if aborted || error.is_non_transport_error() {
                         return Err(error.into_provider_error());
                     }
+                    // Aborts and non-transport errors (API/protocol) were
+                    // handled above; only transport failures reach the SSE
+                    // fallback with their diagnostic.
+                    let transport_error = match &error {
+                        CodexStreamError::Transport(transport) => transport,
+                        CodexStreamError::Api(_) | CodexStreamError::Protocol(_) => {
+                            return Err(error.into_provider_error());
+                        }
+                        CodexStreamError::Aborted => return Err(error.into_provider_error()),
+                    };
                     append_transport_failure_diagnostic(
                         output,
-                        &error,
+                        transport_error,
                         transport_debug_name(transport),
                         websocket_started,
                         body_json.len(),

@@ -90,13 +90,98 @@ impl CodexProtocolError {
     }
 }
 
+/// The TS WebSocket transport-error surface, probe-verified against the TS
+/// binary (bun runtime): close-event failures compose the
+/// `WebSocket closed {code} {reason}` message, carry the numeric close code
+/// the diagnostics record, and record the `WebSocketCloseError` class name;
+/// every other runtime failure (connect, send) is a plain `Error` with no
+/// close code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebSocketTransportError {
+    /// A close-event failure (`WebSocketCloseError` in the TS): the composed
+    /// close message plus the numeric close code.
+    Close { message: String, code: u16 },
+    /// A connect- or send-phase runtime failure (plain `Error` in the TS).
+    Runtime { message: String },
+}
+
+/// Close code the TS runtime reports for a close frame that carries none
+/// (WHATWG `Status`; probe-pinned as "WebSocket closed 1005").
+pub const WEBSOCKET_CLOSE_CODE_STATUS: u16 = 1005;
+/// Close code the runtime reports for a socket death without a close frame.
+pub const WEBSOCKET_CLOSE_CODE_ABNORMAL: u16 = 1006;
+/// Close code the runtime reports for frames it cannot parse.
+pub const WEBSOCKET_CLOSE_CODE_PROTOCOL: u16 = 1002;
+/// Close code for a message the runtime refuses as too big.
+pub const WEBSOCKET_CLOSE_CODE_TOO_BIG: u16 = 1009;
+/// The runtime's close-event reason for an abrupt socket death.
+pub const WEBSOCKET_CONNECTION_ENDED_REASON: &str = "Connection ended";
+
+impl WebSocketTransportError {
+    /// Port of `extractWebSocketCloseError`'s composition:
+    /// `WebSocket closed {code} {reason}` (trimmed), with the 1009 no-reason
+    /// special case (`"message too big"`).
+    pub fn close(code: u16, reason: &str) -> Self {
+        let mut reason_text = if reason.is_empty() {
+            String::new()
+        } else {
+            format!(" {reason}")
+        };
+        if reason_text.is_empty() && code == WEBSOCKET_CLOSE_CODE_TOO_BIG {
+            reason_text = " message too big".to_string();
+        }
+        let message = format!("WebSocket closed {code}{reason_text}")
+            .trim()
+            .to_string();
+        Self::Close { message, code }
+    }
+
+    /// A plain runtime failure (`Error` in the TS) with the given text.
+    pub fn runtime(message: impl Into<String>) -> Self {
+        Self::Runtime {
+            message: message.into(),
+        }
+    }
+
+    /// The TS error class name the diagnostics record (`error.name`).
+    pub fn error_name(&self) -> &'static str {
+        match self {
+            Self::Close { .. } => "WebSocketCloseError",
+            Self::Runtime { .. } => "Error",
+        }
+    }
+
+    /// The numeric close code the TS diagnostic records (`error.code`);
+    /// plain runtime failures carry none.
+    pub fn close_code(&self) -> Option<u16> {
+        match self {
+            Self::Close { code, .. } => Some(*code),
+            Self::Runtime { .. } => None,
+        }
+    }
+
+    /// The user-facing text (TS `error.message`).
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Close { message, .. } | Self::Runtime { message } => message,
+        }
+    }
+}
+
+impl std::fmt::Display for WebSocketTransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
 /// Unified in-band stream error used by the transport loops.
 #[derive(Debug, Clone)]
 pub enum CodexStreamError {
     Api(CodexApiError),
     Protocol(CodexProtocolError),
-    /// Transport-level failure (WebSocket close/connect error).
-    Transport(String),
+    /// Transport-level failure (WebSocket close/connect error) with the TS
+    /// runtime's error surface.
+    Transport(WebSocketTransportError),
     /// Abort requested by the cancellation token.
     Aborted,
 }
@@ -121,7 +206,12 @@ impl CodexStreamError {
         match self {
             CodexStreamError::Api(error) => error.into_provider_error(),
             CodexStreamError::Protocol(error) => error.into_provider_error(),
-            CodexStreamError::Transport(message) => ProviderError::Message(message),
+            CodexStreamError::Transport(error) => ProviderError::Transport(
+                crate::utils_inner::stream_failure::ProviderWsTransportError {
+                    message: error.message().to_string(),
+                    close_code: error.close_code(),
+                },
+            ),
             CodexStreamError::Aborted => ProviderError::Aborted,
         }
     }
@@ -140,7 +230,7 @@ impl std::fmt::Display for CodexStreamError {
         match self {
             CodexStreamError::Api(error) => f.write_str(&error.message),
             CodexStreamError::Protocol(error) => f.write_str(&error.message),
-            CodexStreamError::Transport(message) => f.write_str(message),
+            CodexStreamError::Transport(error) => f.write_str(error.message()),
             CodexStreamError::Aborted => f.write_str("Request was aborted"),
         }
     }
@@ -453,10 +543,14 @@ pub fn resolve_codex_service_tier(
 }
 
 /// Port of the transport-failure diagnostic payload. The TS attaches it via
-/// `appendAssistantMessageDiagnostic(output, createAssistantMessageDiagnostic(...))`.
+/// `appendAssistantMessageDiagnostic(output, createAssistantMessageDiagnostic(...))`,
+/// and `extractDiagnosticError` records the thrown error's runtime class
+/// name (`WebSocketCloseError` for close events, plain `Error` otherwise)
+/// and, for close events, the numeric close code as `error.code`
+/// (TS-binary probe-verified).
 pub fn append_transport_failure_diagnostic(
     output: &mut AssistantMessage,
-    error: &CodexStreamError,
+    error: &WebSocketTransportError,
     configured_transport: &str,
     events_emitted: bool,
     request_bytes: usize,
@@ -464,26 +558,62 @@ pub fn append_transport_failure_diagnostic(
     let diagnostic = crate::utils_inner::diagnostics::create_assistant_message_diagnostic(
         "provider_transport_failure",
         Some(crate::types::DiagnosticErrorInfo {
-            name: Some("CodexTransportError".to_string()),
-            message: error.to_string(),
+            name: Some(error.error_name().to_string()),
+            message: error.message().to_string(),
             stack: None,
-            code: None,
+            code: error.close_code().map(|code| {
+                crate::types::DiagnosticCode::Num(crate::types::JsNumber::from(u64::from(code)))
+            }),
             rest: Default::default(),
         }),
-        Some(json!({
-            "configuredTransport": configured_transport,
-            "fallbackTransport": if events_emitted { Value::Null } else { json!("sse") },
-            "eventsEmitted": events_emitted,
-            "phase": if events_emitted { "after_message_stream_start" } else { "before_message_stream_start" },
-            "requestBytes": request_bytes,
-        })),
+        Some(transport_failure_details(
+            configured_transport,
+            events_emitted,
+            request_bytes,
+        )),
     );
     crate::utils_inner::diagnostics::append_assistant_message_diagnostic(output, diagnostic);
+}
+
+/// Port of the diagnostic's `details`: the TS sets `fallbackTransport:
+/// websocketStarted ? undefined : "sse"`, and `JSON.stringify` omits the
+/// undefined key entirely, so the after-start diagnostic carries no key.
+fn transport_failure_details(
+    configured_transport: &str,
+    events_emitted: bool,
+    request_bytes: usize,
+) -> Value {
+    let mut details = serde_json::Map::new();
+    details.insert(
+        "configuredTransport".to_string(),
+        Value::String(configured_transport.to_string()),
+    );
+    if !events_emitted {
+        details.insert(
+            "fallbackTransport".to_string(),
+            Value::String("sse".to_string()),
+        );
+    }
+    details.insert("eventsEmitted".to_string(), Value::Bool(events_emitted));
+    details.insert(
+        "phase".to_string(),
+        Value::String(
+            if events_emitted {
+                "after_message_stream_start"
+            } else {
+                "before_message_stream_start"
+            }
+            .to_string(),
+        ),
+    );
+    details.insert("requestBytes".to_string(), json!(request_bytes));
+    Value::Object(details)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::openai_codex_responses::API_OPENAI_CODEX_RESPONSES;
 
     #[test]
     fn maps_flat_error_events() {
@@ -693,5 +823,126 @@ mod tests {
                 .expect("plain events pass through");
         assert!(!mapped.done);
         assert_eq!(mapped.event["type"], "response.output_text.delta");
+    }
+
+    /// The transport-failure diagnostic for a close event, before the SSE
+    /// fallback (TS-binary probe ground truth): the `WebSocketCloseError`
+    /// name, the numeric close code as `error.code`, and the fallback
+    /// details; `error.code` is absent for non-close runtime failures.
+    #[test]
+    fn transport_failure_diagnostic_shapes() {
+        let close = WebSocketTransportError::close(1011, "mock server reason");
+        let runtime = WebSocketTransportError::runtime(
+            "WebSocket connection to 'ws://127.0.0.1:1/codex/responses' failed: Failed to connect",
+        );
+
+        let mut output = AssistantMessage {
+            content: Vec::new(),
+            api: API_OPENAI_CODEX_RESPONSES.to_string(),
+            provider: "openai-codex".to_string(),
+            model: "gpt-5-codex".to_string(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            usage: crate::types::Usage::default(),
+            stop_reason: crate::types::StopReason::Stop,
+            stop_reason_raw: None,
+            error_message: None,
+            timestamp: 0,
+            rest: Default::default(),
+        };
+        append_transport_failure_diagnostic(&mut output, &close, "auto", false, 23_377);
+        append_transport_failure_diagnostic(&mut output, &runtime, "auto", true, 23_361);
+        let diagnostics = serde_json::to_value(output.diagnostics.as_deref()).unwrap();
+        assert_eq!(
+            diagnostics,
+            json!([
+                {
+                    "type": "provider_transport_failure",
+                    "timestamp": diagnostics[0]["timestamp"],
+                    "error": {
+                        "name": "WebSocketCloseError",
+                        "message": "WebSocket closed 1011 mock server reason",
+                        "code": 1011
+                    },
+                    "details": {
+                        "configuredTransport": "auto",
+                        "fallbackTransport": "sse",
+                        "eventsEmitted": false,
+                        "phase": "before_message_stream_start",
+                        "requestBytes": 23377
+                    }
+                },
+                {
+                    "type": "provider_transport_failure",
+                    "timestamp": diagnostics[1]["timestamp"],
+                    "error": {
+                        "name": "Error",
+                        "message": "WebSocket connection to 'ws://127.0.0.1:1/codex/responses' failed: Failed to connect"
+                    },
+                    "details": {
+                        "configuredTransport": "auto",
+                        "eventsEmitted": true,
+                        "phase": "after_message_stream_start",
+                        "requestBytes": 23361
+                    }
+                }
+            ])
+        );
+    }
+
+    /// A transport error thrown mid-stream (after events were emitted)
+    /// carries its TS surface through the provider error: the verbatim
+    /// runtime text, the `WebSocketCloseError` name, and the close code —
+    /// exactly what the TS `provider_stream_failure` diagnostic records
+    /// (TS-binary probe ground truth).
+    #[test]
+    fn transport_error_provider_stream_failure_shape() {
+        let error =
+            CodexStreamError::Transport(WebSocketTransportError::close(1011, "mock server reason"))
+                .into_provider_error();
+        assert_eq!(
+            error.to_string(),
+            "WebSocket closed 1011 mock server reason"
+        );
+        let mut output = AssistantMessage {
+            content: Vec::new(),
+            api: API_OPENAI_CODEX_RESPONSES.to_string(),
+            provider: "openai-codex".to_string(),
+            model: "gpt-5-codex".to_string(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            usage: crate::types::Usage::default(),
+            stop_reason: crate::types::StopReason::Error,
+            stop_reason_raw: None,
+            error_message: Some(error.to_string()),
+            timestamp: 0,
+            rest: Default::default(),
+        };
+        crate::utils_inner::stream_failure::record_stream_failure(
+            ("openai-codex", "gpt-5-codex", API_OPENAI_CODEX_RESPONSES),
+            &mut output,
+            &error,
+        );
+        let diagnostics = serde_json::to_value(output.diagnostics.as_deref()).unwrap();
+        assert_eq!(
+            diagnostics,
+            json!([
+                {
+                    "type": "provider_stream_failure",
+                    "timestamp": diagnostics[0]["timestamp"],
+                    "error": {
+                        "name": "WebSocketCloseError",
+                        "message": "WebSocket closed 1011 mock server reason",
+                        "code": 1011
+                    },
+                    "details": {
+                        "kind": "unknown",
+                        "providerErrorType": "WebSocketCloseError"
+                    }
+                }
+            ])
+        );
     }
 }

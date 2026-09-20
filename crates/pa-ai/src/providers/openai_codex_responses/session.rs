@@ -243,6 +243,7 @@ pub fn clear_continuation(session_id: &str, connection_id: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::openai_codex_responses::errors::WebSocketTransportError;
 
     #[test]
     fn sse_fallback_lifecycle() {
@@ -267,7 +268,7 @@ mod tests {
         reset_debug_stats(Some(&session));
         record_websocket_failure(
             Some(&session),
-            &CodexStreamError::Transport("boom".to_string()),
+            &CodexStreamError::Transport(WebSocketTransportError::runtime("boom")),
         );
         assert!(is_websocket_sse_fallback_active(Some(&session)));
         let stats = get_debug_stats(&session).expect("stats recorded");

@@ -15,6 +15,12 @@ binary surfaces for each provider-error class:
                  `Protocol error` against http1-only peers, mid-stream RST /
                  GOAWAY / TCP-reset texts, and the refused-connect stream-cancel
                  text (vs the AWS_BEDROCK_FORCE_HTTP1 http1 surface)
+  - codex ws     the WebSocket transport surface (the provider's default
+                 transport before the SSE fallback): handshake rejections,
+                 close frames, abrupt socket death, invalid frames, and the
+                 mid-stream (after message stream start) twins; the
+                 provider_transport_failure diagnostic (error.name /
+                 error.message / error.code / fallback details)
   - connection   the per-SDK connection texts ("Connection error.", "fetch
                  failed", "Unable to make request: ...")
 
@@ -33,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import itertools
 import json
 import os
@@ -236,11 +243,197 @@ class H2MockServer:
             pass
 
 
+# The WS-mode scenarios: a raw-socket WebSocket mock serves the codex
+# provider's upgrade request with a scripted wire sequence (handshake
+# rejection, close frames, abrupt socket death, invalid frames), and the
+# same listener answers the SSE fallback POST with a successful completion
+# stream, so the provider_transport_failure diagnostic rides the final
+# assistant message (TS-binary verified shape). `ws_action` scripts the
+# sequence; the `start_then_*` twins emit response.created first so the
+# failure lands after the message stream started (no fallback).
+WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+WS_OP_TEXT, WS_OP_CLOSE = 0x1, 0x8
+
+WS_SSE_OK_EVENTS = [
+    {"type": "response.created", "response": {"id": "resp_mock", "status": "in_progress"}},
+    {"type": "response.completed", "response": {"id": "resp_mock", "status": "completed", "output": [],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}}},
+]
+
+
+def ws_accept(key: str) -> str:
+    return base64.b64encode(hashlib.sha1(key.encode() + WS_GUID).digest()).decode()
+
+
+def ws_frame(opcode: int, payload: bytes = b"") -> bytes:
+    """One unmasked server frame (probes use short payloads)."""
+    assert len(payload) < 126
+    return bytes([0x80 | opcode, len(payload)]) + payload
+
+
+def serve_ws_connection(conn: socket.socket, scenario_path: Path) -> None:
+    """One scripted WebSocket connection (plus the SSE fallback answers)."""
+    conn.settimeout(30)
+    try:
+        first = conn.recv(65536)
+        if not first:
+            return
+        if first[0:1] == b"\x16":
+            # A TLS ClientHello at the plain mock: answer HTTP immediately so
+            # both binaries' TLS handshakes fail the same way (fast).
+            conn.sendall(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+            conn.close()
+            return
+        head = first
+        while b"\r\n\r\n" not in head:
+            chunk = conn.recv(65536)
+            if not chunk:
+                return
+            head += chunk
+        if not head.startswith(b"GET"):
+            # SSE fallback POST: a successful completion stream.
+            body = b"".join(
+                b"data: " + json.dumps(event).encode() + b"\n\n" for event in WS_SSE_OK_EVENTS
+            )
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                b"Cache-Control: no-cache\r\nConnection: close\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+            )
+            time.sleep(0.3)
+            return
+
+        scenario = json.loads(scenario_path.read_text())
+        action = scenario.get("ws_action", "reject_401")
+        if action in ("reject_401", "reject_500"):
+            status = 401 if action == "reject_401" else 500
+            reason = "Unauthorized" if status == 401 else "Internal Server Error"
+            conn.sendall(
+                f"HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\n\r\n".encode()
+            )
+            conn.close()
+            return
+
+        key = ""
+        for line in head.split(b"\r\n"):
+            if line.lower().startswith(b"sec-websocket-key:"):
+                key = line.split(b":", 1)[1].strip().decode()
+        accept = ws_accept(key)
+        if action == "bad_accept_key":
+            accept = "aW52YWxpZA=="
+        conn.sendall(
+            (
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                f"Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+            ).encode()
+        )
+        time.sleep(0.05)
+
+        def send_event(event: dict) -> None:
+            conn.sendall(ws_frame(WS_OP_TEXT, json.dumps(event).encode()))
+
+        def close_frame(code: int | None, reason: bytes = b"") -> None:
+            if code is None:
+                conn.sendall(ws_frame(WS_OP_CLOSE))
+            else:
+                conn.sendall(ws_frame(WS_OP_CLOSE, code.to_bytes(2, "big") + reason))
+
+        if action == "close_1011_reason":
+            close_frame(1011, b"mock server reason")
+        elif action == "close_1009_no_reason":
+            close_frame(1009)
+        elif action == "close_1000_done":
+            close_frame(1000, b"done")
+        elif action == "close_no_code":
+            close_frame(None)
+        elif action == "fin_no_close":
+            conn.close()
+            return
+        elif action == "tcp_rst":
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            conn.close()
+            return
+        elif action == "reserved_opcode":
+            conn.sendall(bytes([0x83, 0x00]))
+        elif action == "reserved_control_opcode":
+            conn.sendall(bytes([0x8B, 0x00]))
+        elif action == "rsv_bits":
+            conn.sendall(bytes([0xC1, 0x00]))
+        elif action == "invalid_json":
+            conn.sendall(ws_frame(WS_OP_TEXT, b"not json"))
+        elif action == "error_event_then_close":
+            send_event({"type": "error", "code": "server_error", "message": "mock in-stream error"})
+            close_frame(1011, b"closed after error")
+        elif action == "start_then_close_1011":
+            send_event(WS_SSE_OK_EVENTS[0])
+            time.sleep(0.05)
+            close_frame(1011, b"mock server reason")
+        elif action == "start_then_fin":
+            send_event(WS_SSE_OK_EVENTS[0])
+            time.sleep(0.05)
+            conn.close()
+            return
+        elif action == "start_then_invalid_json":
+            send_event(WS_SSE_OK_EVENTS[0])
+            time.sleep(0.05)
+            conn.sendall(ws_frame(WS_OP_TEXT, b"not json"))
+        else:
+            raise ValueError(f"unknown ws action {action}")
+        time.sleep(0.2)
+        conn.close()
+    except (ConnectionError, OSError):
+        pass
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+class WsMockServer:
+    """Accept-loop front for `serve_ws_connection`; one scenario file per run."""
+
+    def __init__(self, scenario_path: Path):
+        self.scenario_path = scenario_path
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket.bind(("127.0.0.1", 0))
+        self.socket.listen(8)
+        self.port = self.socket.getsockname()[1]
+        self.stop = threading.Event()
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        self.socket.settimeout(0.5)
+        while not self.stop.is_set():
+            try:
+                conn, _ = self.socket.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            threading.Thread(
+                target=serve_ws_connection, args=(conn, self.scenario_path), daemon=True
+            ).start()
+
+    def shutdown(self):
+        self.stop.set()
+        try:
+            self.socket.close()
+        except OSError:
+            pass
+
+
 class ErrorMockHandler(BaseHTTPRequestHandler):
     """Serves scripted non-2xx responses per API path; the scenario file
     (rewritten by the probe between runs) selects status + body. The codex
     provider's websocket handshake (GET) is answered the same way, so every ws
     attempt fails and the provider falls back to SSE."""
+
+    # Real servers answer the WS upgrade over HTTP/1.1 (the TS runtime checks
+    # the status code; transports that check the version first must see a 1.1
+    # response, matching the deployed ChatGPT backend).
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, *args):  # silence
         pass
@@ -456,6 +649,33 @@ CONNECTION_SCENARIOS = [
     {"name": "connection_openai-completions", "api": "openai-completions", "connection": True},
 ]
 
+# Codex WebSocket transport scenarios: the WS mock serves the scripted wire
+# sequence at the upgrade request and a successful SSE fallback at the POST,
+# so the transport failure's diagnostic rides the final assistant message.
+# The `start_then_*` twins fail after response.created (after the message
+# stream started): the error is thrown with no fallback, carrying both the
+# transport and the stream-failure diagnostics.
+WS_SCENARIOS = [
+    {"name": "ws_handshake_reject_401", "api": "openai-codex-responses", "ws_action": "reject_401"},
+    {"name": "ws_handshake_reject_500", "api": "openai-codex-responses", "ws_action": "reject_500"},
+    {"name": "ws_bad_accept_key", "api": "openai-codex-responses", "ws_action": "bad_accept_key"},
+    {"name": "ws_close_1011_reason", "api": "openai-codex-responses", "ws_action": "close_1011_reason"},
+    {"name": "ws_close_1009_no_reason", "api": "openai-codex-responses", "ws_action": "close_1009_no_reason"},
+    {"name": "ws_close_1000_done", "api": "openai-codex-responses", "ws_action": "close_1000_done"},
+    {"name": "ws_close_no_code", "api": "openai-codex-responses", "ws_action": "close_no_code"},
+    {"name": "ws_fin_no_close", "api": "openai-codex-responses", "ws_action": "fin_no_close"},
+    {"name": "ws_tcp_rst", "api": "openai-codex-responses", "ws_action": "tcp_rst"},
+    {"name": "ws_reserved_opcode", "api": "openai-codex-responses", "ws_action": "reserved_opcode"},
+    {"name": "ws_reserved_control_opcode", "api": "openai-codex-responses", "ws_action": "reserved_control_opcode"},
+    {"name": "ws_rsv_bits", "api": "openai-codex-responses", "ws_action": "rsv_bits"},
+    {"name": "ws_wss_to_plain", "api": "openai-codex-responses", "ws_action": "reject_401", "wss": True},
+    {"name": "ws_invalid_json", "api": "openai-codex-responses", "ws_action": "invalid_json"},
+    {"name": "ws_error_event_then_close", "api": "openai-codex-responses", "ws_action": "error_event_then_close"},
+    {"name": "ws_start_then_close_1011", "api": "openai-codex-responses", "ws_action": "start_then_close_1011"},
+    {"name": "ws_start_then_fin", "api": "openai-codex-responses", "ws_action": "start_then_fin"},
+    {"name": "ws_start_then_invalid_json", "api": "openai-codex-responses", "ws_action": "start_then_invalid_json"},
+]
+
 DEAD_PORT = 1  # nothing listens here: every connect() is refused instantly
 
 
@@ -535,14 +755,31 @@ def run_scenario(
         }
 
 
+def transport_diagnostic_shape(diagnostic: dict) -> dict:
+    """Comparable shape of one provider_transport_failure diagnostic: the
+    error surface (name/message/code) and the fallback details, minus
+    requestBytes (the assembled prompt differs per binary) and the
+    runtime-inherent timestamp/stack fields."""
+    details = dict(diagnostic.get("details") or {})
+    details.pop("requestBytes", None)
+    return {
+        "name": (diagnostic.get("error") or {}).get("name"),
+        "message": (diagnostic.get("error") or {}).get("message"),
+        "code": (diagnostic.get("error") or {}).get("code"),
+        "details": details,
+    }
+
+
 def session_evidence(agent_dir: Path) -> dict:
-    """The persisted assistant message (errorMessage + provider_stream_failure
-    diagnostic) from the most recent session file."""
+    """The persisted assistant messages (errorMessage, provider_stream_failure
+    diagnostic, and any provider_transport_failure diagnostics) from the
+    most recent session file."""
     sessions = agent_dir / "sessions"
     files = sorted(sessions.glob("*.jsonl"), key=lambda p: p.stat().st_mtime) if sessions.exists() else []
     if not files:
         return {"session_file": None}
     result: dict = {"session_file": files[-1].name}
+    transport: list[dict] = []
     for line in files[-1].read_text().splitlines():
         try:
             row = json.loads(line)
@@ -551,8 +788,13 @@ def session_evidence(agent_dir: Path) -> dict:
         message = row.get("message") if isinstance(row, dict) else None
         if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
+        diagnostics = message.get("diagnostics") or []
+        transport.extend(
+            transport_diagnostic_shape(d)
+            for d in diagnostics
+            if d.get("type") == "provider_transport_failure"
+        )
         if message.get("errorMessage") is not None or message.get("stopReason") == "error":
-            diagnostics = message.get("diagnostics") or []
             failure = next((d for d in diagnostics if d.get("type") == "provider_stream_failure"), None)
             result["errorMessage"] = message.get("errorMessage")
             result["stopReason"] = message.get("stopReason")
@@ -564,6 +806,8 @@ def session_evidence(agent_dir: Path) -> dict:
                     "providerErrorType": (failure.get("details") or {}).get("providerErrorType"),
                     "retryAfterMs": (failure.get("details") or {}).get("retryAfterMs"),
                 }
+    if transport:
+        result["transportDiagnostics"] = transport
     return result
 
 
@@ -589,9 +833,13 @@ def main() -> int:
     mock_url = f"http://127.0.0.1:{port}"
     h2_server = H2MockServer(scenario_path)
     h2_url = f"http://127.0.0.1:{h2_server.port}"
+    ws_server = WsMockServer(scenario_path)
+    ws_url = f"http://127.0.0.1:{ws_server.port}"
     jwt = mock_codex_jwt()
 
-    scenarios: list[dict] = list(HTTP_SCENARIOS) + H2_SCENARIOS + CONNECTION_SCENARIOS
+    scenarios: list[dict] = (
+        list(HTTP_SCENARIOS) + H2_SCENARIOS + WS_SCENARIOS + CONNECTION_SCENARIOS
+    )
 
     evidence = []
     for scenario in scenarios:
@@ -600,9 +848,13 @@ def main() -> int:
             base_url = f"http://127.0.0.1:{DEAD_PORT}"
         elif scenario.get("transport") == "h2":
             base_url = h2_url
+        elif "ws_action" in scenario:
+            base_url = ws_url
         else:
             base_url = mock_url
-        if "status" in scenario or "h2_action" in scenario:
+        if scenario.get("wss"):
+            base_url = "https://" + base_url.split("://", 1)[1]
+        if "status" in scenario or "h2_action" in scenario or "ws_action" in scenario:
             scenario_path.write_text(json.dumps(scenario))
         api_key = jwt if api == "openai-codex-responses" else "mock-key"
         extra = {}
@@ -624,6 +876,7 @@ def main() -> int:
     (out / "evidence.json").write_text(json.dumps(evidence, indent=1))
     server.shutdown()
     h2_server.shutdown()
+    ws_server.shutdown()
     return 0
 
 

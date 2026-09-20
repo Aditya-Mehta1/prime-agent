@@ -8,6 +8,8 @@
 
 use tokio_util::sync::CancellationToken;
 
+pub use pa_types::JsNumber;
+
 pub use pa_types::ai::{
     AnthropicMessagesCompat, Api, AssistantContentBlock as AssistantContent, AssistantMessage,
     AssistantMessageDiagnostic, AssistantMessageEvent, CacheControlFormat, CacheRetention,

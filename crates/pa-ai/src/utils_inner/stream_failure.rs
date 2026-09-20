@@ -378,12 +378,45 @@ impl ProviderConnectionError {
     }
 }
 
+/// A WebSocket transport failure thrown out of a provider stream (the codex
+/// WS path, after events were emitted): `Display` is the raw runtime text
+/// (verbatim, like the TS), and the TS `provider_stream_failure` diagnostic
+/// records the runtime WS error class name — `WebSocketCloseError` for
+/// close events, plain `Error` otherwise — plus the numeric close code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderWsTransportError {
+    pub message: String,
+    pub close_code: Option<u16>,
+}
+
+impl ProviderWsTransportError {
+    /// The TS runtime/WS error class name recorded in the diagnostic
+    /// (`error.name`); the close-code presence decides it.
+    pub fn error_name(&self) -> &'static str {
+        match self.close_code {
+            Some(_) => "WebSocketCloseError",
+            None => "Error",
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderWsTransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ProviderWsTransportError {}
+
 /// Unified provider error used across the crate.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProviderError {
     StreamFailure(StreamFailureError),
     Http(ProviderHttpError),
     Connection(ProviderConnectionError),
+    /// WebSocket transport failure (codex WS path): raw runtime text plus
+    /// the TS diagnostic's WS error class name and close code.
+    Transport(ProviderWsTransportError),
     /// Plain error message; classified from its text like unrecognized TS errors.
     Message(String),
     Aborted,
@@ -395,6 +428,7 @@ impl std::fmt::Display for ProviderError {
             ProviderError::StreamFailure(e) => write!(f, "{}", e.message),
             ProviderError::Http(e) => write!(f, "{}", e.message),
             ProviderError::Connection(e) => f.write_str(&e.message()),
+            ProviderError::Transport(e) => f.write_str(&e.message),
             ProviderError::Message(m) => f.write_str(m),
             ProviderError::Aborted => f.write_str("Request was aborted"),
         }
@@ -780,6 +814,16 @@ pub fn extract_stream_failure_info(error: &ProviderError) -> StreamFailureInfo {
             provider_error_type: connection.error_code().map(str::to_string),
             ..StreamFailureInfo::unknown()
         },
+        // The TS WS transport errors never classify ("WebSocketCloseError"
+        // matches no kind pattern); the provider error type is the error's
+        // class name, like `err.name !== "Error"` in the TS extraction.
+        ProviderError::Transport(transport) => StreamFailureInfo {
+            provider_error_type: match transport.error_name() {
+                "Error" => None,
+                name => Some(name.to_string()),
+            },
+            ..StreamFailureInfo::unknown()
+        },
         ProviderError::Message(message) => StreamFailureInfo {
             kind: classify_stream_failure(Some(message), None),
             ..StreamFailureInfo::unknown()
@@ -797,6 +841,9 @@ pub fn format_stream_failure_message(error: &ProviderError) -> String {
         ProviderError::StreamFailure(failure) => failure.message.clone(),
         ProviderError::Aborted => "Request was aborted".to_string(),
         ProviderError::Connection(connection) => connection.message(),
+        // The TS WS transport errors classify as "unknown", so the raw
+        // runtime text passes through verbatim.
+        ProviderError::Transport(transport) => transport.message.clone(),
         ProviderError::Http(http) => {
             let parts = extract_parts_from_http(http);
             if parts.info.kind == StreamFailureKind::Unknown {
@@ -833,6 +880,15 @@ pub(crate) fn diagnostic_error_info(error: &ProviderError) -> DiagnosticErrorInf
             Some(connection.error_name().to_string()),
             error.to_string(),
             None,
+        ),
+        // The TS diagnostic records the runtime WS error class name and,
+        // for close events, the numeric close code as `error.code`.
+        ProviderError::Transport(transport) => (
+            Some(transport.error_name().to_string()),
+            transport.message.clone(),
+            transport.close_code.map(|code| {
+                crate::types::DiagnosticCode::Num(crate::types::JsNumber::from(u64::from(code)))
+            }),
         ),
         ProviderError::Message(_) => (None, error.to_string(), None),
         ProviderError::Aborted => (
