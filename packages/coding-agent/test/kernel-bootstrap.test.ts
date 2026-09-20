@@ -414,6 +414,64 @@ describe("kernel bootstrap", () => {
 		expect(log.split("\n").filter((line) => line.startsWith(`venv ${venv} `))).toHaveLength(1);
 	});
 
+	function prepareWarmVenv(): { venv: string; python: string } {
+		const venv = join(tempDir, "kernel-venv");
+		const python = join(venv, "bin", "python");
+		mkdirSync(join(venv, "bin"), { recursive: true });
+		writeFakePython(python, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
+		writeBootstrapVersion(venv);
+		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+		return { venv, python };
+	}
+
+	it("reuses validated venvs across starts, revalidates on change, and never caches the override", async () => {
+		const logPath = installFakeUv();
+		const { venv, python } = prepareWarmVenv();
+		await expect(ensureKernelPython()).resolves.toBe(python);
+
+		// Cached success: a probe-failing interpreter still resolves without re-running the ready check.
+		writeFakePython(python, []);
+		await expect(ensureKernelPython()).resolves.toBe(python);
+		expect(existsSync(logPath)).toBe(false);
+
+		// A rewritten marker invalidates the entry; the rebuild then fails partway
+		// without leaving a resurrectable entry ("dill" is a real install arg).
+		writeBootstrapVersion(venv);
+		process.env.UV_FAIL_ARG = "dill";
+		await expect(ensureKernelPython()).rejects.toThrow(/Failed to set up the Python kernel runtime/);
+
+		delete process.env.UV_FAIL_ARG;
+		await expect(ensureKernelPython()).resolves.toBe(python);
+		expect(JSON.parse(readFileSync(join(venv, ".bootstrap-version"), "utf8")).runtime).toBe(runtimeIdentity);
+
+		// The override has no marker to guard a cached success: it validates every start.
+		const overridePython = join(tempDir, "override-python");
+		writeFakePython(overridePython, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
+		process.env.PRIME_AGENT_KERNEL_PYTHON = overridePython;
+		await expect(ensureKernelPython()).resolves.toBe(overridePython);
+		writeFakePython(overridePython, []);
+		await expect(ensureKernelPython()).rejects.toThrow(/current prime-agent-runtime/);
+	});
+
+	it("revalidates when the venv override or the python skills change after a cached success", async () => {
+		const logPath = installFakeUv();
+		const { python } = prepareWarmVenv();
+		await expect(ensureKernelPython()).resolves.toBe(python);
+
+		// A different venv override is a different key: the new venv bootstraps.
+		const otherVenv = join(tempDir, "kernel-venv-b");
+		process.env.PRIME_AGENT_KERNEL_VENV = otherVenv;
+		const otherPython = join(otherVenv, "bin", "python");
+		await expect(ensureKernelPython()).resolves.toBe(otherPython);
+
+		// New python skills are a different key too: the skill sync runs.
+		const pythonSkill = createPythonSkill();
+		await expect(ensureKernelPython({ pythonSkills: [pythonSkill] })).resolves.toBe(otherPython);
+		const log = readFileSync(logPath, "utf8");
+		expect(log).toContain(`venv ${otherVenv}`);
+		expect(log).toContain(`--editable ${pythonSkill.packagePath}`);
+	});
+
 	it.each([
 		{
 			name: "reuses a current warm venv without invoking uv",

@@ -108,6 +108,24 @@ const BOOTSTRAP_LOCK_STALE_WITHOUT_PID_MS = 30_000;
 
 let inFlightEnsureKernelPython: { key: string; promise: Promise<string> } | null = null;
 
+/** Stat identity of the bootstrap marker: every writer replaces the file and bumps its mtime, so equality means the validated venv is unchanged. */
+interface BootstrapMarkerIdentity {
+	dev: number;
+	ino: number;
+	size: number;
+	mtimeMs: number;
+}
+
+/** A validation that succeeded and may be reused until the key or the marker changes. */
+interface KernelPythonSuccess {
+	key: string;
+	python: string;
+	markerPath: string;
+	marker: BootstrapMarkerIdentity | null;
+}
+
+let kernelPythonSuccess: KernelPythonSuccess | null = null;
+
 export type KernelPythonSkill = PythonSkillRuntimeInfo;
 export type KernelBootstrapProgressHandler = (message: string) => void;
 
@@ -953,6 +971,7 @@ function formatBootstrapFailure(error: unknown): Error {
 async function ensureKernelPythonUncached(
 	options: EnsureKernelPythonOptions,
 	pythonSkills: readonly BootstrapPythonSkill[],
+	resolvedRuntimeIdentity?: string,
 ): Promise<string> {
 	const override = process.env.PRIME_AGENT_KERNEL_PYTHON;
 	if (override) {
@@ -989,7 +1008,7 @@ async function ensureKernelPythonUncached(
 
 	const venv = await resolveWritableKernelVenvDir();
 	const python = kernelVenvPython(venv);
-	const runtimeIdentity = await resolveRuntimeIdentity();
+	const runtimeIdentity = resolvedRuntimeIdentity ?? (await resolveRuntimeIdentity());
 	// No-skill callers (postinstall, runtime-bootstrap, bootstrap-cli) never sync skills;
 	// letting them reach syncPythonSkills would rewrite the marker with an empty list,
 	// wiping the recorded skills and forcing the next real session to re-sync every
@@ -1031,9 +1050,89 @@ export function ensureKernelPython(options: EnsureKernelPythonOptions = {}): Pro
 	const key = ensureKernelPythonKey(pythonSkills);
 	if (inFlightEnsureKernelPython?.key === key) return inFlightEnsureKernelPython.promise;
 
-	const promise = ensureKernelPythonUncached(options, pythonSkills).finally(() => {
+	const promise = ensureKernelPythonWithSuccessCache(options, pythonSkills, key).finally(() => {
 		if (inFlightEnsureKernelPython?.promise === promise) inFlightEnsureKernelPython = null;
 	});
 	inFlightEnsureKernelPython = { key, promise };
 	return promise;
+}
+
+// The venv python sits one level below the venv root on every platform
+// (bin/python, Scripts/python.exe), so the marker lives next to its parent.
+function bootstrapMarkerPath(python: string): string {
+	return path.join(path.dirname(path.dirname(python)), BOOTSTRAP_VERSION_FILE);
+}
+
+async function readBootstrapMarkerIdentity(
+	python: string,
+): Promise<{ markerPath: string; marker: BootstrapMarkerIdentity | null }> {
+	const markerPath = bootstrapMarkerPath(python);
+	try {
+		const stats = await stat(markerPath);
+		return {
+			markerPath,
+			marker: { dev: stats.dev, ino: stats.ino, size: stats.size, mtimeMs: stats.mtimeMs },
+		};
+	} catch {
+		// Without a readable marker there is nothing to guard a cached success with.
+		return { markerPath, marker: null };
+	}
+}
+
+async function bootstrapMarkerUnchanged(success: KernelPythonSuccess): Promise<boolean> {
+	if (!success.marker) return false;
+	try {
+		const stats = await stat(success.markerPath);
+		return (
+			stats.dev === success.marker.dev &&
+			stats.ino === success.marker.ino &&
+			stats.size === success.marker.size &&
+			stats.mtimeMs === success.marker.mtimeMs
+		);
+	} catch {
+		// The marker is gone (or is unreadable): the venv may have been wiped or
+		// rebuilt by another process, so the cached success no longer applies.
+		return false;
+	}
+}
+
+/**
+ * Sequential kernel starts used to re-pay the warm-path validation every time,
+ * including a RUNTIME_READY_CHECK interpreter spawn. A successful validation is
+ * now cached for the process lifetime, keyed by env, python skills, and runtime
+ * identity, and guarded by the bootstrap marker's stat identity: the next start
+ * reuses it until the key changes (skills, venv override, runtime source) or the
+ * marker changes (external rebuild or wipe), and any failure drops the entry so
+ * the following start revalidates from scratch. The key inputs (python-skill
+ * pyproject hashes, runtime source hash) are still computed on every start; they
+ * are what lets a source edit in a dev checkout invalidate the entry.
+ */
+async function ensureKernelPythonWithSuccessCache(
+	options: EnsureKernelPythonOptions,
+	pythonSkills: readonly BootstrapPythonSkill[],
+	key: string,
+): Promise<string> {
+	// The PRIME_AGENT_KERNEL_PYTHON override has no bootstrap marker to guard a
+	// cached success with, and missing skills/imports must surface on every
+	// start: it always runs the full validation.
+	if (process.env.PRIME_AGENT_KERNEL_PYTHON) {
+		return ensureKernelPythonUncached(options, pythonSkills);
+	}
+	const runtimeIdentity = await resolveRuntimeIdentity();
+	const successKey = `${key}\0${runtimeIdentity}`;
+	const success = kernelPythonSuccess;
+	if (success?.key === successKey) {
+		if (await bootstrapMarkerUnchanged(success)) {
+			return success.python;
+		}
+		kernelPythonSuccess = null;
+	}
+	try {
+		const python = await ensureKernelPythonUncached(options, pythonSkills, runtimeIdentity);
+		kernelPythonSuccess = { key: successKey, python, ...(await readBootstrapMarkerIdentity(python)) };
+		return python;
+	} catch (error) {
+		kernelPythonSuccess = null;
+		throw error;
+	}
 }
