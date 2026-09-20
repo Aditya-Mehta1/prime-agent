@@ -192,6 +192,7 @@ fn view_options(
         selected_row_identity,
         selected_key,
         status_message: None,
+        keybindings: pa_tui::keybindings::KeybindingsManager::new(),
     }
 }
 
@@ -405,5 +406,87 @@ async fn panel_expand_drill_in_and_back_re_expands_the_tree() {
     );
 
     drop((grandchild_path, parent_path));
+    drop(supervisor);
+}
+
+/// User-keybinding verifier for the standalone agents view (the #184
+/// follow-up): a `keybindings.json` fixture rebinding the view's open
+/// action (`app.agents.open` right -> ctrl+g) drives the whole surface —
+/// the hint row renders the OVERRIDE key, the override key opens the
+/// selection, and the default key no longer does.
+#[tokio::test]
+async fn agents_view_fires_user_keybindings_from_settings() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let session_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    // The settings fixture: one agents-view binding overridden exactly
+    // like a user's `~/.prime/agent/keybindings.json` would, loaded
+    // through the exact `KeybindingsManager::create` path the CLI uses.
+    std::fs::write(
+        agent_dir.join("keybindings.json"),
+        r#"{ "app.agents.open": "ctrl+g" }"#,
+    )
+    .expect("write keybindings.json");
+    let supervisor = spawn_supervisor(dir.path());
+    let solo_path = write_fixture(
+        &session_dir,
+        "solo",
+        "solo chat",
+        None,
+        0,
+        &[("hello", "ok")],
+    );
+
+    // Run 1: the override opens the selection; the hint row renders it
+    // (TS `renderHints` keyText slots).
+    let plan = AgentsHeadlessPlan {
+        steps: vec![
+            AgentsStep::WaitSettle { timeout_ms: 2_000 },
+            AgentsStep::Key("ctrl+g".to_string()),
+        ],
+        width: 120,
+        height: 36,
+    };
+    let mut options = view_options(&supervisor.socket, &session_dir, Vec::new(), None, None);
+    options.keybindings = pa_tui::keybindings::KeybindingsManager::create(&agent_dir);
+    let view = pa_tui::agents_view::run_agents_view(options, AgentsViewUiMode::Headless(plan))
+        .await
+        .expect("agents view run");
+    assert_eq!(
+        view.selection,
+        Some(SessionSelection::Resume(solo_path.clone())),
+        "the override key opened the saved session"
+    );
+    let hints = first_frame_of(&view.frames, "navigate");
+    assert!(
+        hints.contains("Enter/Ctrl+G open"),
+        "the hint row renders the override key:\n{hints}"
+    );
+    assert!(
+        !hints.contains("Enter/\u{2192} open"),
+        "the default open hint is gone after the override:\n{hints}"
+    );
+
+    // Run 2: the default key is inert — a plan pressing it ends without
+    // an open.
+    let plan = AgentsHeadlessPlan {
+        steps: vec![
+            AgentsStep::WaitSettle { timeout_ms: 2_000 },
+            AgentsStep::Key("right".to_string()),
+        ],
+        width: 120,
+        height: 36,
+    };
+    let mut options = view_options(&supervisor.socket, &session_dir, Vec::new(), None, None);
+    options.keybindings = pa_tui::keybindings::KeybindingsManager::create(&agent_dir);
+    let view = pa_tui::agents_view::run_agents_view(options, AgentsViewUiMode::Headless(plan))
+        .await
+        .expect("agents view run");
+    assert_eq!(
+        view.selection, None,
+        "the default open key no longer opens after the override"
+    );
+
     drop(supervisor);
 }

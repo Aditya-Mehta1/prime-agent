@@ -383,6 +383,10 @@ async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) 
             selected_row_identity: selected_row_identity.clone(),
             selected_key: selected_key.clone(),
             status_message: status_message.take(),
+            // The view dispatches every action through the same effective
+            // bindings as the session it opened from (TS
+            // `AgentsViewMode.keybindings`).
+            keybindings: base.keybindings.clone(),
         };
         let view = pa_tui::agents_view::run_agents_view(
             view_options,

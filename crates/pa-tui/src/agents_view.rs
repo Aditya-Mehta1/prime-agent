@@ -68,6 +68,11 @@ pub struct AgentsViewOptions {
     /// A status message the previous run left for this one (TS
     /// `persistentState.statusMessage`): the unattachable-child fallback.
     pub status_message: Option<String>,
+    /// The effective keybindings (user `keybindings.json` over the TS
+    /// defaults): every action and hint dispatches through this (TS
+    /// `AgentsViewMode` creates its own `KeybindingsManager`), the same
+    /// contract as the session view.
+    pub keybindings: crate::keybindings::KeybindingsManager,
 }
 
 /// The open action the run ended with (TS `AgentsViewRunResult`'s
@@ -203,6 +208,9 @@ struct AgentsViewMode {
     opened: Option<OpenedRow>,
     /// ctrl+n requested a fresh session (TS `app.agents.new`).
     new_session: bool,
+    /// The effective keybindings (TS `AgentsViewMode.keybindings`): every
+    /// action and hint dispatches through this manager.
+    keybindings: crate::keybindings::KeybindingsManager,
 }
 
 impl AgentsViewMode {
@@ -214,9 +222,11 @@ impl AgentsViewMode {
             (!options.expanded_ancestors.is_empty()).then(|| options.expanded_ancestors.clone());
         let selected_identity = options.selected_row_identity.clone();
         let selected_key = options.selected_key.clone();
+        let keybindings = options.keybindings.clone();
         AgentsViewMode {
             options,
             theme,
+            keybindings,
             roster: Vec::new(),
             saved: Vec::new(),
             rows: Vec::new(),
@@ -613,84 +623,133 @@ impl AgentsViewMode {
         self.running = false;
     }
 
-    /// Handle one key id. Returns the status-line override when the caller
-    /// should surface one (none of the PR-2 actions do).
+    /// Handle one key id. Every action dispatches through the effective
+    /// keybindings in TS dispatch order (`AgentsViewMode.handleInput`,
+    /// then `CustomEditor.handleInput`/`Editor.handleInput`), so a user
+    /// `keybindings.json` override moves both the handler and the hint —
+    /// the same contract as the session view (#184).
     fn handle_key(&mut self, key: &str) {
+        let was_armed = self.exit_armed;
+        // Any other key clears the exit hint (TS `clearCtrlCExitHint`).
         self.exit_armed = false;
-        let selected = self.rows.get(self.selected).cloned();
         let has_query = !self.query.is_empty();
-        match key {
-            "up" => self.move_selection(-1),
-            "down" => self.move_selection(1),
-            "pageUp" => self.move_selection(-(self.rows.len() as isize).min(10)),
-            "pageDown" => self.move_selection((self.rows.len() as isize).min(10)),
-            // TS `app.agents.open` (right) and the editor submit (enter)
-            // both open the selection (a non-empty query still opens while
-            // the cursor sits at its end — always true for this editor);
-            // the summary row toggles its list instead.
-            "enter" | "right" => self.open_selected(),
-            // TS `app.agents.expand` (alt+right): toggle the selected
-            // parent's list when it has children.
-            "alt+right" if !has_query => {
-                if let Some(row) = selected {
-                    if row.kind == RowKind::SubagentSummary || row.descendant_count > 0 {
-                        self.toggle_subagent_list(&row);
-                    }
-                }
-            }
-            // TS `app.agents.new`: ctrl+n starts a session; a plain "n" is
-            // search text like any other character.
-            "ctrl+n" => {
-                self.opened = None;
-                self.running = false;
-                self.new_session = true;
-            }
-            // The scoped view's parent key (TS `app.agents.back`): left
-            // hands the terminal back to the scope root's session and pops
-            // the scope; the global view has no hierarchy parent and
-            // consumes left without opening a chat.
-            "left" if !has_query => {
-                if self.scope_active {
-                    self.open_scope_root(true);
-                }
-            }
-            "escape" => {
-                if !self.query.is_empty() {
-                    self.query.clear();
-                    self.rebuild_rows();
-                } else if self.scope_active {
-                    // TS escape reopens the last-opened session (the scope
-                    // root in this flow) without touching the scope frame.
-                    self.open_scope_root(false);
-                } else {
-                    self.running = false;
-                }
-            }
-            "ctrl+c" => {
-                // One handled Ctrl+C press: the force-quit guard disarms
-                // once the whole observed pair was handled without an
-                // exit (this press armed the state); an exit re-arms from
-                // the run loop's break.
+        // TS `app.clear` (default ctrl+c): the first press arms the exit
+        // hint, a second press while armed exits the view (TS
+        // `handleCtrlC`). One handled Ctrl+C press: the force-quit guard
+        // disarms once the whole observed pair was handled without an
+        // exit (this press armed the state); an exit re-arms from the
+        // run loop's break.
+        if self.keybindings.matches(key, "app.clear") {
+            if key == "ctrl+c" {
                 self.exit_guard.note_ctrl_c_handled();
-                if self.exit_armed {
-                    self.running = false;
-                } else {
-                    self.exit_armed = true;
+            }
+            if was_armed {
+                self.running = false;
+            } else {
+                self.exit_armed = true;
+            }
+            return;
+        }
+        // TS `app.agents.new` (default ctrl+n): start a session; a plain
+        // "n" is search text like any other character.
+        if self.keybindings.matches(key, "app.agents.new") {
+            self.opened = None;
+            self.running = false;
+            self.new_session = true;
+            return;
+        }
+        // TS `app.agents.expand` (default alt+right, search empty): toggle
+        // the selected parent's list when it has children.
+        if !has_query && self.keybindings.matches(key, "app.agents.expand") {
+            let selected = self.rows.get(self.selected).cloned();
+            if let Some(row) = selected {
+                if row.kind == RowKind::SubagentSummary || row.descendant_count > 0 {
+                    self.toggle_subagent_list(&row);
                 }
             }
-            "backspace" => {
-                self.query.pop();
-                self.rebuild_rows();
+            return;
+        }
+        // TS `app.agents.open` (right) and the editor submit (enter, the
+        // `tui.select.confirm` slot) both open the selection (a non-empty
+        // query still opens while the cursor sits at its end — always
+        // true for this editor); the summary row toggles its list instead.
+        if self.keybindings.matches(key, "app.agents.open")
+            || self.keybindings.matches(key, "tui.select.confirm")
+        {
+            self.open_selected();
+            return;
+        }
+        // List navigation (TS `handleListNavigation`): the selection keys
+        // and the page keys move the selection.
+        if self.keybindings.matches(key, "tui.select.up") {
+            self.move_selection(-1);
+            return;
+        }
+        if self.keybindings.matches(key, "tui.select.down") {
+            self.move_selection(1);
+            return;
+        }
+        if self.keybindings.matches(key, "tui.select.pageUp") {
+            self.move_selection(-(self.rows.len() as isize).min(10));
+            return;
+        }
+        if self.keybindings.matches(key, "tui.select.pageDown") {
+            self.move_selection((self.rows.len() as isize).min(10));
+            return;
+        }
+        // The scoped view's parent key (TS `app.agents.back`, default
+        // left): with an empty search it hands the terminal back to the
+        // scope root's session and pops the scope; the global view has no
+        // hierarchy parent and consumes the key without opening a chat.
+        if !has_query && self.keybindings.matches(key, "app.agents.back") {
+            if self.scope_active {
+                self.open_scope_root(true);
             }
-            "ctrl+u" => {
+            return;
+        }
+        // TS `app.input.clear` (default escape, the editor's `onEscape`):
+        // clear the search; scoped, reopen the last-opened session (the
+        // scope root in this flow) without touching the scope frame;
+        // otherwise exit.
+        if self.keybindings.matches(key, "app.input.clear") {
+            if !self.query.is_empty() {
                 self.query.clear();
                 self.rebuild_rows();
+            } else if self.scope_active {
+                self.open_scope_root(false);
+            } else {
+                self.running = false;
             }
-            other if other.chars().count() == 1 => {
-                self.query.push_str(other);
-                self.rebuild_rows();
-            }
-            _ => {}
+            return;
+        }
+        // TS `app.exit` (default ctrl+d, empty editor — the editor's
+        // `onCtrlD`): leave the view without opening a session.
+        if !has_query && self.keybindings.matches(key, "app.exit") {
+            self.running = false;
+            return;
+        }
+        // Editor text keys (TS `Editor.handleInput`): backspace deletes the
+        // last character, ctrl+u clears the line, and any single
+        // character is search text.
+        if self
+            .keybindings
+            .matches(key, "tui.editor.deleteCharBackward")
+        {
+            self.query.pop();
+            self.rebuild_rows();
+            return;
+        }
+        if self
+            .keybindings
+            .matches(key, "tui.editor.deleteToLineStart")
+        {
+            self.query.clear();
+            self.rebuild_rows();
+            return;
+        }
+        if key.chars().count() == 1 {
+            self.query.push_str(key);
+            self.rebuild_rows();
         }
     }
 
@@ -962,18 +1021,26 @@ impl AgentsViewMode {
     fn render_hints(&self, width: usize) -> Line {
         let theme = &self.theme;
         if self.exit_armed {
-            return truncate_line(
-                vec![theme.fg(ThemeColor::Muted, "Press ctrl+c again to exit")],
-                width,
-            );
+            // TS `renderHints`: the exit hint renders the effective
+            // `app.clear` key ("Press Ctrl+C again to exit"); a disabled
+            // binding (an empty override) falls back to the plain hint.
+            let hint = match self.keybindings.first_key("app.clear") {
+                Some(key) => format!(
+                    "Press {} again to exit",
+                    crate::keybindings::format_key_text(&key)
+                ),
+                None => "Press again to exit".to_string(),
+            };
+            return truncate_line(vec![theme.fg(ThemeColor::Muted, hint)], width);
         }
         if let Some(status) = &self.status {
             return truncate_line(vec![theme.fg(ThemeColor::Error, status.clone())], width);
         }
-        // TS keyText glyphs: up/down render as arrows, right as →, ctrl+n as
-        // Ctrl+N. The summary row swaps the open action for expand/collapse
-        // (TS `renderHints`'s `rightAction`); the scoped view adds the
-        // parent-back hint.
+        // TS `renderHints`: every hint slot renders the effective binding
+        // (`keyText`, arrows for up/down/left/right), so a user override
+        // moves the hint with the handler. The summary row swaps the open
+        // action for expand/collapse (TS `renderHints`'s `rightAction`);
+        // the scoped view adds the parent-back hint.
         let right_action = match self.rows.get(self.selected) {
             Some(row) if row.kind == RowKind::SubagentSummary => {
                 if row.expanded {
@@ -984,10 +1051,28 @@ impl AgentsViewMode {
             }
             _ => "open",
         };
+        let key_text = |id: &str| {
+            crate::keybindings::format_key_text(&self.keybindings.get_keys(id).join("/"))
+        };
         let hints = if self.scope_active {
-            format!("\u{2191}/\u{2193} navigate   Enter/\u{2192} {right_action}   \u{2190} parent   Ctrl+N new")
+            format!(
+                "{}/{} navigate   {}/{} {right_action}   {} parent   {} new",
+                key_text("tui.select.up"),
+                key_text("tui.select.down"),
+                key_text("tui.select.confirm"),
+                key_text("app.agents.open"),
+                key_text("app.agents.back"),
+                key_text("app.agents.new"),
+            )
         } else {
-            format!("\u{2191}/\u{2193} navigate   Enter/\u{2192} {right_action}   Ctrl+N new")
+            format!(
+                "{}/{} navigate   {}/{} {right_action}   {} new",
+                key_text("tui.select.up"),
+                key_text("tui.select.down"),
+                key_text("tui.select.confirm"),
+                key_text("app.agents.open"),
+                key_text("app.agents.new"),
+            )
         };
         truncate_line(vec![theme.fg(ThemeColor::Muted, hints.to_string())], width)
     }
@@ -1351,6 +1436,7 @@ mod tests {
             selected_row_identity: None,
             selected_key: None,
             status_message: None,
+            keybindings: crate::keybindings::KeybindingsManager::new(),
         });
         let row = |title: &str| AgentsViewRow {
             section: Section::Idle,
@@ -1466,6 +1552,7 @@ mod tests {
             selected_row_identity: None,
             selected_key: None,
             status_message: None,
+            keybindings: crate::keybindings::KeybindingsManager::new(),
         });
         mode.roster = vec![
             roster_entry("p", "idle", parent_summary("p")),
@@ -1492,6 +1579,132 @@ mod tests {
         mode.handle_key("alt+right");
         assert_eq!(mode.rows.len(), 2);
         assert!(!mode.rows[1].expanded);
+    }
+
+    /// A mode over the same live parent/child roster whose user bindings
+    /// replace keys (TS `keybindings.json` parity, the #184 binding-test
+    /// pattern: an override fires, the default goes inert).
+    fn mode_with_user_bindings(bindings: &[(&str, &str)]) -> AgentsViewMode {
+        let mut cfg = crate::keybindings::KeybindingsConfig::new();
+        for (id, key) in bindings {
+            cfg.insert(id.to_string(), vec![key.to_string()]);
+        }
+        let mut mode = AgentsViewMode::new(AgentsViewOptions {
+            socket_path: PathBuf::from("/tmp/agents-view-test.sock"),
+            cwd: PathBuf::from("/tmp"),
+            session_dir: None,
+            theme: "prime".to_string(),
+            version: "0.0.0".to_string(),
+            anchor_session_id: None,
+            scope: None,
+            query: None,
+            expanded_ancestors: Vec::new(),
+            selected_row_identity: None,
+            selected_key: None,
+            status_message: None,
+            keybindings: crate::keybindings::KeybindingsManager::with_user_bindings(cfg),
+        });
+        mode.roster = vec![
+            roster_entry("p", "idle", parent_summary("p")),
+            roster_entry("c", "running", child_summary("c", "p", "worker one")),
+        ];
+        mode.rebuild_rows();
+        mode
+    }
+
+    #[test]
+    fn open_key_override_fires_and_the_default_is_inert() {
+        let mut mode = mode_with_user_bindings(&[("app.agents.open", "ctrl+g")]);
+        mode.handle_key("down");
+        assert_eq!(mode.rows[mode.selected].kind, RowKind::SubagentSummary);
+        // The override fires: the summary row toggles its list.
+        mode.handle_key("ctrl+g");
+        assert_eq!(mode.rows.len(), 3);
+        assert!(mode.rows[1].expanded);
+        // The default key no longer opens (a rebound binding replaces the
+        // default keys outright).
+        mode.handle_key("right");
+        assert_eq!(mode.rows.len(), 3, "right is inert after the override");
+        assert!(mode.rows[1].expanded);
+    }
+
+    #[test]
+    fn expand_and_new_key_overrides_fire_and_defaults_are_inert() {
+        let mut mode =
+            mode_with_user_bindings(&[("app.agents.expand", "alt+x"), ("app.agents.new", "alt+n")]);
+        mode.handle_key("alt+x");
+        assert_eq!(mode.rows.len(), 3, "the expand override fires");
+        mode.handle_key("alt+right");
+        assert_eq!(mode.rows.len(), 3, "the default expand key is inert");
+        // The new-session override ends the run for a fresh session; the
+        // default ctrl+n no longer does.
+        mode.handle_key("alt+n");
+        assert!(!mode.running);
+        assert!(mode.new_session);
+        let mut mode =
+            mode_with_user_bindings(&[("app.agents.expand", "alt+x"), ("app.agents.new", "alt+n")]);
+        mode.handle_key("ctrl+n");
+        assert!(mode.running, "the default new key is inert");
+        assert!(!mode.new_session);
+    }
+
+    #[test]
+    fn second_ctrl_c_exits_and_other_keys_clear_the_hint() {
+        let mut mode = mode_with_parent_and_child();
+        // The first press arms the exit hint (TS `showCtrlCExitHint`).
+        mode.handle_key("ctrl+c");
+        assert!(mode.exit_armed);
+        assert!(mode.running);
+        // A second press exits (TS `handleCtrlC`'s visible-hint arm).
+        mode.handle_key("ctrl+c");
+        assert!(!mode.running);
+        // Any other key clears the hint, so the next press re-arms it.
+        let mut mode = mode_with_parent_and_child();
+        mode.handle_key("ctrl+c");
+        mode.handle_key("down");
+        assert!(!mode.exit_armed);
+        assert!(mode.running);
+        mode.handle_key("ctrl+c");
+        assert!(mode.exit_armed, "the cleared hint re-arms");
+        assert!(mode.running);
+    }
+
+    #[test]
+    fn exit_hint_renders_the_effective_app_clear_key() {
+        let mut mode = mode_with_user_bindings(&[("app.clear", "ctrl+q")]);
+        // The rebound key arms the hint, rendered with the override (TS
+        // `renderHints`: `Press ${keyText("app.clear")} again to exit`).
+        mode.handle_key("ctrl+q");
+        assert!(mode.exit_armed);
+        assert_eq!(flat(&mode.render_hints(120)), "Press Ctrl+Q again to exit");
+        // The default ctrl+c no longer arms the exit flow.
+        mode.exit_armed = false;
+        mode.handle_key("ctrl+c");
+        assert!(!mode.exit_armed);
+        assert!(mode.running);
+        // Two presses of the override exit (the first re-arms the hint).
+        mode.handle_key("ctrl+q");
+        assert!(mode.exit_armed);
+        mode.handle_key("ctrl+q");
+        assert!(!mode.running);
+    }
+
+    #[test]
+    fn hints_render_the_effective_bindings() {
+        // Defaults: TS `renderHints` with the stock keys.
+        let mode = mode_with_parent_and_child();
+        assert_eq!(
+            flat(&mode.render_hints(120)),
+            "\u{2191}/\u{2193} navigate   Enter/\u{2192} open   Ctrl+N new"
+        );
+        // A user override moves the hint with the handler.
+        let mode = mode_with_user_bindings(&[("app.agents.new", "ctrl+t")]);
+        let hints = flat(&mode.render_hints(120));
+        assert_eq!(
+            hints,
+            "\u{2191}/\u{2193} navigate   Enter/\u{2192} open   Ctrl+T new"
+        );
+        assert!(!hints.contains("Ctrl+N"), "the default new hint is gone");
     }
 
     #[test]
@@ -1546,6 +1759,7 @@ mod tests {
                 active_session_id: Some("c-live".to_string()),
             }),
             status_message: None,
+            keybindings: crate::keybindings::KeybindingsManager::new(),
         });
         mode.roster = vec![
             roster_entry("p", "idle", parent_summary("p")),
@@ -1578,6 +1792,7 @@ mod tests {
             selected_row_identity: None,
             selected_key: None,
             status_message: None,
+            keybindings: crate::keybindings::KeybindingsManager::new(),
         });
         mode.roster = vec![
             roster_entry("p", "idle", parent_summary("p")),
