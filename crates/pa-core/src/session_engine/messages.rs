@@ -193,8 +193,15 @@ pub fn convert_to_llm(messages: &[AgentMessage]) -> Vec<AgentMessage> {
                 ) {
                     continue;
                 }
+                // TS wraps a string content into a text-part array and
+                // passes block content through (the request's cacheable
+                // shape is the array either way).
+                let content = match custom.content.clone() {
+                    UserContent::Text(text) => UserContent::Blocks(vec![text_block(text)]),
+                    blocks => blocks,
+                };
                 AgentMessage::User(UserMessage {
-                    content: custom.content.clone(),
+                    content,
                     timestamp: custom.timestamp,
                     rest: Default::default(),
                 })
@@ -236,6 +243,59 @@ pub fn convert_to_llm(messages: &[AgentMessage]) -> Vec<AgentMessage> {
 /// Convenience alias types used by the summarizer call.
 pub type LlmAssistantMessage = AssistantMessage;
 pub type LlmToolResultMessage = ToolResultMessage;
+
+/// The loop-boundary LLM conversion wired into the agent's `convert_to_llm`
+/// seam (TS `convertToLlm` at the agent prompt/request boundary): standard
+/// rows pass through; custom rows cross through the session wire shape so
+/// the session conversion rules apply — bookkeeping custom types and
+/// unknown roles drop, everything else becomes a user turn. This is what
+/// lets the harness-digest row ride the loop (prompt input and agent-end
+/// message list) while still reaching the provider as model context.
+pub fn loop_convert_to_llm(
+    messages: Vec<pa_agent::types::AgentMessage>,
+) -> Vec<pa_agent::types::Message> {
+    let mut out = Vec::new();
+    for message in messages {
+        match message {
+            pa_agent::types::AgentMessage::Standard(message) => out.push(message),
+            pa_agent::types::AgentMessage::Custom(custom) => {
+                let Some(session_message) = custom_message_to_session(&custom) else {
+                    continue;
+                };
+                for converted in convert_to_llm(std::slice::from_ref(&session_message)) {
+                    if let Some(message) = session_llm_row_to_loop(&converted) {
+                        out.push(message);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One loop custom row as its session wire shape, when the row matches a
+/// known session role (`custom`, `bashExecution`, `branchSummary`,
+/// `compactionSummary`). Unknown shapes read as unconvertible (TS drops
+/// them via the exhaustive-switch default).
+fn custom_message_to_session(custom: &pa_agent::types::CustomAgentMessage) -> Option<AgentMessage> {
+    let wire = serde_json::to_value(custom).ok()?;
+    serde_json::from_value(wire).ok()
+}
+
+/// One converted session row back into its loop wire shape (the shared
+/// camelCase wire form crosses the pa-core/pa-agent boundary by JSON
+/// round-trip).
+fn session_llm_row_to_loop(message: &AgentMessage) -> Option<pa_agent::types::Message> {
+    serde_json::from_value(serde_json::to_value(message).ok()?).ok()
+}
+
+/// The `ConvertToLlmFn` handed to the pa-agent loop: infallible by contract
+/// (a failed wire round-trip drops the row, mirroring the TS default arm).
+pub fn engine_convert_to_llm() -> pa_agent::agent_loop::ConvertToLlmFn {
+    std::sync::Arc::new(|messages: Vec<pa_agent::types::AgentMessage>| {
+        Box::pin(async move { Ok(loop_convert_to_llm(messages)) })
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -322,6 +382,64 @@ mod tests {
         assert!(compaction.contains("<harness_state>\ndigest\n</harness_state>"));
         assert!(compaction.contains("[compaction-summary]"));
         assert!(compaction.contains("the story"));
+    }
+
+    #[test]
+    fn loop_conversion_applies_session_rules_to_custom_rows() {
+        let digest_row: pa_agent::types::AgentMessage = serde_json::from_value(serde_json::json!({
+            "role": "custom",
+            "customType": "harness_digest",
+            "content": "[harness-digest]
+
+<harness_state>
+state
+</harness_state>",
+            "display": false,
+            "details": { "digest": "state" },
+            "timestamp": 5
+        }))
+        .unwrap();
+        let outcome_row: pa_agent::types::AgentMessage =
+            serde_json::from_value(serde_json::json!({
+                "role": "custom",
+                "customType": "compaction_outcome",
+                "content": "compacted",
+                "display": true,
+                "details": { "reason": "threshold", "outcome": "failed" },
+                "timestamp": 6
+            }))
+            .unwrap();
+        let unknown_row: pa_agent::types::AgentMessage =
+            serde_json::from_value(serde_json::json!({ "role": "extension", "payload": "x" }))
+                .unwrap();
+        let user = pa_agent::types::AgentMessage::user("keep");
+        let converted = loop_convert_to_llm(vec![digest_row, user, outcome_row, unknown_row]);
+        // The digest row converts to a user turn; bookkeeping custom rows
+        // and unknown roles drop; standard rows pass through.
+        assert_eq!(converted.len(), 2);
+        match &converted[0] {
+            pa_agent::types::Message::User(user) => {
+                // The digest row converts to a text-part array (TS wraps
+                // string custom content), not a bare string.
+                assert!(
+                    matches!(&user.content, pa_agent::types::UserContent::Parts(parts)
+                        if parts.iter().any(|part| matches!(part,
+                            pa_agent::types::UserPart::Text(text)
+                                if text.text.contains("[harness-digest]"))))
+                );
+                assert_eq!(user.timestamp, 5);
+            }
+            _ => panic!("expected user message"),
+        }
+        match &converted[1] {
+            pa_agent::types::Message::User(user) => {
+                assert!(
+                    matches!(&user.content, pa_agent::types::UserContent::Text(text)
+                        if text == "keep")
+                );
+            }
+            _ => panic!("expected user message"),
+        }
     }
 
     #[test]

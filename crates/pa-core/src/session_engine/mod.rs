@@ -477,47 +477,30 @@ impl AgentSession {
                 "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."
             );
         }
-        // The deferred first-turn harness digest rides this admission, so the
-        // model sees it before the prompt (TS commit-time injection). Hosts
-        // that emit the delivery's message pair take the row first (the
-        // print json stream); the first delivery wins, so this is a no-op
-        // for them.
-        self.deliver_pending_harness_digest().await?;
         // User messages persist through the loop's `message_end` event (the
         // persistence subscription in `from_session_arc`), matching the TS
         // reference: `_processAgentEvent` is the only appendMessage path for
         // user prompts. Appending here as well would double-persist.
 
         if busy {
-            // Identical shape to the loop's own prompt normalization
-            // (text part first, image parts after), so the queued message
-            // matches a directly admitted one token for token.
-            let mut parts = vec![pa_agent::types::UserPart::Text(
-                pa_agent::types::TextContent {
-                    text: normalized,
-                    text_signature: None,
-                },
-            )];
-            for image in images {
-                parts.push(pa_agent::types::UserPart::Image(image));
-            }
-            let message = AgentMessage::Standard(pa_agent::types::Message::User(
-                pa_agent::types::UserMessage {
-                    content: pa_agent::types::UserContent::Parts(parts),
-                    timestamp: now_millis() as i64,
-                },
-            ));
+            let message = user_prompt_message(&normalized, &images);
             match options.streaming_behavior {
                 Some(StreamingBehavior::Steer) => self.agent.steer(message),
                 Some(StreamingBehavior::FollowUp) => self.agent.follow_up(message),
                 None => unreachable!("busy without a streaming behavior errors above"),
             }
         } else {
+            // The turn's prompt messages (TS preparedMessages): the deferred
+            // first-turn harness digest rides first when one is due, so the
+            // loop streams its message pair ahead of the user prompt and
+            // carries it on `agent_end` (TS commit-time injection).
+            let mut prompt_messages = Vec::new();
+            if let Some(digest_row) = self.pending_digest_prompt_row().await? {
+                prompt_messages.push(digest_row);
+            }
+            prompt_messages.push(user_prompt_message(&normalized, &images));
             self.agent
-                .prompt(pa_agent::agent::AgentPromptInput::Text {
-                    text: normalized,
-                    images,
-                })
+                .prompt(pa_agent::agent::AgentPromptInput::Messages(prompt_messages))
                 .await?;
         }
         Ok(PromptOutcome::Prompt)
@@ -568,7 +551,19 @@ async fn persist_event(session: &Arc<tokio::sync::Mutex<SessionManager>>, event:
                 return;
             };
             let mut session = session.lock().await;
-            session.append_message(session_message);
+            match session_message {
+                SessionAgentMessage::Custom(custom) => {
+                    session.append_custom_message(
+                        &custom.custom_type,
+                        custom.content.clone(),
+                        custom.display,
+                        custom.details.clone(),
+                    );
+                }
+                other => {
+                    session.append_message(other);
+                }
+            }
         }
         // Git state is captured at both run boundaries, exactly like the TS
         // extension-event path: a commit or branch switch made during the run
@@ -583,11 +578,36 @@ async fn persist_event(session: &Arc<tokio::sync::Mutex<SessionManager>>, event:
 }
 
 /// Convert a loop message to its persisted form via the shared wire shape.
+/// Custom rows persist as session custom messages (TS `_processAgentEvent`:
+/// `message_end` of a `custom` row appends the custom-message entry).
 fn loop_message_to_session(message: &AgentMessage) -> Option<SessionAgentMessage> {
-    let AgentMessage::Standard(inner) = message else {
-        return None;
-    };
-    serde_json::from_value(serde_json::to_value(inner).ok()?).ok()
+    match message {
+        AgentMessage::Standard(inner) => {
+            serde_json::from_value(serde_json::to_value(inner).ok()?).ok()
+        }
+        AgentMessage::Custom(_) => serde_json::from_value(serde_json::to_value(message).ok()?).ok(),
+    }
+}
+
+/// The user prompt message in the loop's own normalized shape (text part
+/// first, image parts after — identical to the loop's text-prompt input), so
+/// a queued message matches a directly admitted one token for token.
+fn user_prompt_message(text: &str, images: &[pa_agent::types::ImageContent]) -> AgentMessage {
+    let mut parts = vec![pa_agent::types::UserPart::Text(
+        pa_agent::types::TextContent {
+            text: text.to_string(),
+            text_signature: None,
+        },
+    )];
+    for image in images {
+        parts.push(pa_agent::types::UserPart::Image(image.clone()));
+    }
+    AgentMessage::Standard(pa_agent::types::Message::User(
+        pa_agent::types::UserMessage {
+            content: pa_agent::types::UserContent::Parts(parts),
+            timestamp: now_millis() as i64,
+        },
+    ))
 }
 
 /// Convert a session message to its loop form via the shared wire shape
@@ -666,6 +686,190 @@ mod tests {
             roles,
             vec!["user:hi there".to_string(), "assistant:m".to_string()]
         );
+    }
+
+    /// A scripted session wired like the engine wires production sessions:
+    /// the engine-level `convert_to_llm` plus a harness-digest context, so
+    /// the deferred first-turn digest rides the first prompt.
+    async fn digest_session(provider: Arc<ScriptedProvider>) -> (AgentSession, tempfile::TempDir) {
+        let agent = Agent::new(AgentOptions {
+            initial_state: AgentInitialState {
+                model: Some(test_model()),
+                ..Default::default()
+            },
+            convert_to_llm: Some(crate::session_engine::messages::engine_convert_to_llm()),
+            stream_fn: Some(provider.stream_fn()),
+            ..Default::default()
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let harness = crate::session_engine::harness_digest::HarnessDigestContext {
+            global_dir: tmp.path().join("harness"),
+            local_dir: None,
+            include_ipython: false,
+            include_shell_examples: false,
+            include_refine: false,
+        };
+        let session = AgentSession::from_session_arc(
+            Arc::new(agent),
+            Arc::new(tokio::sync::Mutex::new(SessionManager::in_memory(
+                tmp.path(),
+            ))),
+            vec![],
+            Some(harness),
+        )
+        .await
+        .unwrap();
+        (session, tmp)
+    }
+
+    fn user_text(message: &pa_agent::types::Message) -> String {
+        let pa_agent::types::Message::User(user) = message else {
+            panic!("expected user message");
+        };
+        match &user.content {
+            pa_agent::types::UserContent::Text(text) => text.clone(),
+            pa_agent::types::UserContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    pa_agent::types::UserPart::Text(text) => Some(text.text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_rides_digest_row_into_the_run() {
+        let provider = Arc::new(ScriptedProvider::new(test_model()));
+        provider.push_text_turn("hello from the model");
+        provider.push_text_turn("second answer");
+        let (session, _tmp) = digest_session(Arc::clone(&provider)).await;
+        let events: Arc<std::sync::Mutex<Vec<AgentEvent>>> = Arc::default();
+        let sink = Arc::clone(&events);
+        session
+            .agent()
+            .subscribe(move |event, _signal| {
+                let sink = Arc::clone(&sink);
+                Box::pin(async move {
+                    sink.lock().unwrap().push(event);
+                    Ok(())
+                })
+            })
+            .await;
+        session
+            .prompt("hi there", PromptOptions::default())
+            .await
+            .unwrap();
+        session.agent().wait_for_idle().await;
+
+        // The run's agent_end carries the digest custom row with the turn's
+        // prompt messages (TS parity: the digest rides `agent_end.messages`).
+        // The lock snapshots the captured events and never crosses an await.
+        let (end_messages, kinds) = {
+            let captured = events.lock().unwrap();
+            let Some(AgentEvent::AgentEnd { messages }) = captured
+                .iter()
+                .rev()
+                .find(|event| matches!(event, AgentEvent::AgentEnd { .. }))
+            else {
+                panic!("no agent_end event");
+            };
+            let kinds: Vec<String> = captured
+                .iter()
+                .filter_map(|event| match event {
+                    AgentEvent::TurnStart => Some("turn_start".to_string()),
+                    AgentEvent::MessageStart { message } => Some(message.role().to_string()),
+                    AgentEvent::MessageEnd { message } => Some(message.role().to_string()),
+                    _ => None,
+                })
+                .collect();
+            (messages.clone(), kinds)
+        };
+        let roles: Vec<&str> = end_messages.iter().map(|message| message.role()).collect();
+        assert_eq!(roles, vec!["custom", "user", "assistant"]);
+        let AgentMessage::Custom(custom) = &end_messages[0] else {
+            panic!("expected digest custom row");
+        };
+        assert_eq!(
+            custom
+                .payload
+                .get("customType")
+                .and_then(serde_json::Value::as_str),
+            Some(crate::session_engine::headless::HARNESS_DIGEST_CUSTOM_TYPE)
+        );
+        // The message pair streamed ahead of the user prompt's pair.
+        assert_eq!(
+            kinds,
+            vec![
+                "turn_start",
+                "custom",
+                "custom",
+                "user",
+                "user",
+                "assistant",
+                "assistant"
+            ]
+        );
+
+        // The provider request carries the digest as a user turn ahead of
+        // the prompt (the engine-level conversion at the LLM boundary).
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(user_text(&calls[0].messages[0]).contains("[harness-digest]"));
+        assert_eq!(user_text(&calls[0].messages[1]), "hi there");
+
+        // The digest persisted exactly once (the loop's message_end), ahead
+        // of the user row.
+        let entries = session.entries().await;
+        let digest_rows = entries
+            .iter()
+            .filter(|entry| {
+                matches!(entry, FileEntry::CustomMessage { payload, .. }
+                    if payload.custom_type
+                        == crate::session_engine::headless::HARNESS_DIGEST_CUSTOM_TYPE)
+            })
+            .count();
+        assert_eq!(digest_rows, 1);
+
+        // The second prompt does not re-deliver: the flag is consumed and the
+        // delivered row is the newest in-context digest.
+        session
+            .prompt("again", PromptOptions::default())
+            .await
+            .unwrap();
+        session.agent().wait_for_idle().await;
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(user_text(calls[1].messages.last().unwrap()), "again");
+        // The second run's agent_end carries no digest row.
+        let second_end_roles: Vec<String> = {
+            let captured = events.lock().unwrap();
+            captured
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    AgentEvent::AgentEnd { messages } => Some(
+                        messages
+                            .iter()
+                            .map(|message| message.role().to_string())
+                            .collect::<Vec<String>>(),
+                    ),
+                    _ => None,
+                })
+                .expect("no second agent_end event")
+        };
+        assert_eq!(second_end_roles, vec!["user", "assistant"]);
+        let entries = session.entries().await;
+        let digest_rows = entries
+            .iter()
+            .filter(|entry| {
+                matches!(entry, FileEntry::CustomMessage { payload, .. }
+                    if payload.custom_type
+                        == crate::session_engine::headless::HARNESS_DIGEST_CUSTOM_TYPE)
+            })
+            .count();
+        assert_eq!(digest_rows, 1);
     }
 
     #[tokio::test]

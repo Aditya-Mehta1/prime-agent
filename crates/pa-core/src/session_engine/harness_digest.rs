@@ -1,12 +1,14 @@
 //! Harness digest delivery: compose the continual-harness state into the
 //! model-facing `[harness-digest]` context message and deliver it at cold
-//! context boundaries (session start, resume, compaction head). Port of the
-//! `_harnessDigest` half of core/agent-session.ts over
-//! `format_harness_state_for_prompt`.
+//! context boundaries (session start, resume, compaction head). The
+//! deferred first-turn row rides the turn's prompt messages, so the loop
+//! carries it on `agent_end` and persists it through its `message_end`
+//! (TS commit-time injection). Port of the `_harnessDigest` half of
+//! core/agent-session.ts over `format_harness_state_for_prompt`.
 
 use std::path::PathBuf;
 
-use pa_agent::types::{AgentMessage, Message, TextContent, UserContent, UserMessage, UserPart};
+use pa_agent::types::{AgentMessage, Message, UserContent, UserPart};
 use pa_types::session::{AgentMessage as SessionAgentMessage, FileEntry};
 
 use crate::refinement::ranking::{
@@ -106,10 +108,25 @@ pub fn harness_digest_message_text(digest: &str) -> String {
     format!("{HARNESS_DIGEST_PREFIX}{digest}{HARNESS_DIGEST_SUFFIX}")
 }
 
-/// The digest as a loop message: a user turn whose text is the framed digest
-/// (session custom messages enter LLM context as user turns).
-pub fn harness_digest_loop_message(digest: &str, timestamp: i64) -> AgentMessage {
-    AgentMessage::Standard(Message::User(digest_user_message(digest, timestamp)))
+/// The digest as the loop's custom prompt row (TS `createHarnessDigestMessage`
+/// riding the turn's prompt messages): role `custom`, the `harness_digest`
+/// tag, framed text content, `display: false`, and the raw digest in
+/// `details`. The row rides the run's prompt messages (so it appears in
+/// `agent_end.messages` and persists through its `message_end`) and converts
+/// to a user turn at the loop's LLM boundary.
+pub fn harness_digest_prompt_row(digest: &str, timestamp: u64) -> AgentMessage {
+    let custom = pa_types::session::CustomMessage {
+        custom_type: super::headless::HARNESS_DIGEST_CUSTOM_TYPE.to_string(),
+        content: pa_types::ai::UserContent::Text(harness_digest_message_text(digest)),
+        display: false,
+        details: Some(serde_json::json!({ "digest": digest })),
+        timestamp,
+        rest: Default::default(),
+    };
+    AgentMessage::Custom(pa_agent::types::CustomAgentMessage {
+        role: "custom".to_string(),
+        payload: serde_json::to_value(&custom).expect("digest row payload serializes"),
+    })
 }
 
 /// The digest as a session message payload for persistence
@@ -124,16 +141,6 @@ pub fn persist_digest(
         false,
         Some(serde_json::json!({ "digest": digest })),
     )
-}
-
-fn digest_user_message(digest: &str, timestamp: i64) -> UserMessage {
-    UserMessage {
-        content: UserContent::Parts(vec![UserPart::Text(TextContent {
-            text: harness_digest_message_text(digest),
-            text_signature: None,
-        })]),
-        timestamp,
-    }
 }
 
 /// The raw digest carried by one loop-context user row, when it carries the
@@ -153,32 +160,62 @@ fn digest_from_frame(text: &str) -> Option<&str> {
 }
 
 /// The newest digest recorded in the live loop context (TS
-/// `_latestContextHarnessDigest`): digest rows and compaction-summary digest
-/// blocks, both of which are user turns after context conversion. Recency is
-/// by timestamp, not position - retained pre-compaction rows follow the
-/// compaction head, and out-of-context file entries must never suppress a
-/// cold-boundary delivery.
+/// `_latestContextHarnessDigest`). A delivered digest row rides the loop as
+/// its custom wire shape (details.digest, TS custom rows) or as the user turn
+/// it converts to at a context rebuild (the digest frame, plus the digest
+/// block that leads a compaction-summary row). Recency is by timestamp, not
+/// position - retained pre-compaction rows follow the compaction head, and
+/// out-of-context file entries must never suppress a cold-boundary delivery.
 pub fn latest_context_digest(messages: &[AgentMessage]) -> Option<String> {
     let mut latest: Option<(i64, &str)> = None;
+    fn consider<'a>(latest: &mut Option<(i64, &'a str)>, timestamp: i64, digest: &'a str) {
+        if latest.is_none_or(|(kept, _)| timestamp > kept) {
+            *latest = Some((timestamp, digest));
+        }
+    }
     for message in messages {
-        let AgentMessage::Standard(Message::User(user)) = message else {
-            continue;
-        };
-        let text = match &user.content {
-            UserContent::Text(text) => text.as_str(),
-            UserContent::Parts(parts) => parts
-                .iter()
-                .find_map(|part| match part {
-                    UserPart::Text(text) => Some(text.text.as_str()),
-                    _ => None,
-                })
-                .unwrap_or(""),
-        };
-        let Some(digest) = digest_from_frame(text) else {
-            continue;
-        };
-        if latest.is_none_or(|(timestamp, _)| user.timestamp > timestamp) {
-            latest = Some((user.timestamp, digest));
+        match message {
+            AgentMessage::Standard(Message::User(user)) => {
+                let text = match &user.content {
+                    UserContent::Text(text) => text.as_str(),
+                    UserContent::Parts(parts) => parts
+                        .iter()
+                        .find_map(|part| match part {
+                            UserPart::Text(text) => Some(text.text.as_str()),
+                            _ => None,
+                        })
+                        .unwrap_or(""),
+                };
+                let Some(digest) = digest_from_frame(text) else {
+                    continue;
+                };
+                consider(&mut latest, user.timestamp, digest);
+            }
+            AgentMessage::Custom(custom) => {
+                let payload = &custom.payload;
+                if payload
+                    .get("customType")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(super::headless::HARNESS_DIGEST_CUSTOM_TYPE)
+                {
+                    continue;
+                }
+                let Some(digest) = payload
+                    .pointer("/details/digest")
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                consider(
+                    &mut latest,
+                    payload
+                        .get("timestamp")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0),
+                    digest,
+                );
+            }
+            _ => continue,
         }
     }
     latest.map(|(_, digest)| digest.to_string())
@@ -219,19 +256,8 @@ pub fn digest_session_message(entry: &FileEntry) -> Option<SessionAgentMessage> 
 
 // Delivery mechanics live with the digest composition (cold-boundary
 // delivery is one invariant, TS `_ensureHarnessDigestContext` /
-// `_appendHarnessDigestIfStale`): the placement enum plus the
-// `AgentSession` methods that drive it. Private `AgentSession` fields are
-// reachable from this child module.
-/// Where a delivered digest message lands in the loop context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DigestPlacement {
-    /// Resume/context-rebuild boundaries: the digest follows the context.
-    Append,
-    /// The deferred first-turn digest leads the (empty or rolled-back)
-    /// context so it precedes the first user prompt in the request.
-    PrependToEmptyContext,
-}
-
+// `_appendHarnessDigestIfStale`): the `AgentSession` methods that drive
+// it. Private `AgentSession` fields are reachable from this child module.
 impl super::AgentSession {
     /// Cold-boundary digest delivery (session start / resume): empty contexts
     /// defer to the first committed turn; non-empty contexts append only when
@@ -245,38 +271,31 @@ impl super::AgentSession {
             self.digest_pending
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         } else {
-            self.append_stale_harness_digest(DigestPlacement::Append)
-                .await?;
+            self.append_stale_harness_digest().await?;
         }
         Ok(())
     }
 
-    /// Deliver the pending first-turn digest before the prompt rides the turn,
-    /// returning the delivered row when one landed (the TS wire custom
-    /// message; `None` when nothing was pending or the digest was current).
-    pub(crate) async fn deliver_pending_harness_digest(
-        &self,
-    ) -> anyhow::Result<Option<pa_types::session::CustomMessage>> {
+    /// The deferred first-turn digest as the prompt row that rides the turn's
+    /// admission (TS commit-time injection): the caller prepends it to the
+    /// turn's prompt messages, so the loop streams its `message_start` /
+    /// `message_end` pair ahead of the user prompt, carries it into the
+    /// context and the run's `agent_end` message list, and persists it
+    /// through its `message_end`. `None` when nothing was pending or the
+    /// digest is current against the live context; the pending flag is
+    /// consumed either way (TS clears `_harnessDigestPending` before the
+    /// staleness check).
+    pub(crate) async fn pending_digest_prompt_row(&self) -> anyhow::Result<Option<AgentMessage>> {
         if !self
             .digest_pending
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
             return Ok(None);
         }
-        self.append_stale_harness_digest(DigestPlacement::PrependToEmptyContext)
+        Ok(self
+            .stale_digest()
             .await
-    }
-
-    /// Perform the deferred first-turn digest delivery and hand the
-    /// delivered row to the caller (the print json stream emits its
-    /// `message_start`/`message_end` pair, TS commit-time injection). The
-    /// delivery itself — placement plus persistence — is unchanged; the
-    /// first caller wins, so a host that takes the row leaves nothing for
-    /// the prompt path to deliver twice.
-    pub async fn take_pending_harness_digest(
-        &self,
-    ) -> anyhow::Result<Option<pa_types::session::CustomMessage>> {
-        self.deliver_pending_harness_digest().await
+            .map(|digest| harness_digest_prompt_row(&digest, super::now_millis())))
     }
 
     /// The digest inputs captured from the live session (TS `_harnessDigest`
@@ -300,47 +319,32 @@ impl super::AgentSession {
         Some(HarnessDigestInputs { context, terms })
     }
 
-    /// Compute the digest and, when it differs from the newest in-context
-    /// digest, persist it and place the message in the loop context,
-    /// returning the delivered row.
-    async fn append_stale_harness_digest(
-        &self,
-        placement: DigestPlacement,
-    ) -> anyhow::Result<Option<pa_types::session::CustomMessage>> {
-        let Some(inputs) = self.harness_digest_inputs().await else {
-            return Ok(None);
-        };
-        let digest = inputs.render();
-        // Staleness is against the live loop context only (TS
-        // `_latestContextHarnessDigest`): pruned file entries are not
-        // in-context digests and must not suppress delivery.
+    /// The digest to deliver at this boundary, when it differs from the
+    /// newest in-context digest (TS `_appendHarnessDigestIfStale`'s
+    /// staleness check): stale against the live loop context only (TS
+    /// `_latestContextHarnessDigest`) — pruned file entries are not
+    /// in-context digests and must not suppress delivery.
+    async fn stale_digest(&self) -> Option<String> {
+        let digest = self.harness_digest_inputs().await?.render();
         let latest = latest_context_digest(&self.agent.state().await.messages);
-        if latest.as_deref() == Some(digest.as_str()) {
-            return Ok(None);
-        }
-        let timestamp = super::now_millis();
-        let message = harness_digest_loop_message(&digest, timestamp as i64);
+        (latest.as_deref() != Some(digest.as_str())).then_some(digest)
+    }
+
+    /// Deliver a stale digest onto an already-populated loop context (TS
+    /// `_appendHarnessDigestIfStale` from `_ensureHarnessDigestContext`):
+    /// no run carries the row, so it is pushed directly onto the context
+    /// and persisted eagerly, without events.
+    async fn append_stale_harness_digest(&self) -> anyhow::Result<()> {
+        let Some(digest) = self.stale_digest().await else {
+            return Ok(());
+        };
+        let message = harness_digest_prompt_row(&digest, super::now_millis());
         let mut messages = self.agent.state().await.messages;
-        match placement {
-            DigestPlacement::Append => messages.push(message),
-            // A cancelled first turn can leave non-empty context; the digest
-            // still leads whatever is present.
-            DigestPlacement::PrependToEmptyContext => messages.insert(0, message),
-        }
+        messages.push(message);
         self.agent.set_messages(messages).await;
         let mut session = self.session.lock().await;
         persist_digest(&mut session, &digest);
-        // The delivered row in the session custom-message wire shape (TS
-        // `createHarnessDigestMessage`: the framed text, `display: false`,
-        // the raw digest in `details`).
-        Ok(Some(pa_types::session::CustomMessage {
-            custom_type: super::headless::HARNESS_DIGEST_CUSTOM_TYPE.to_string(),
-            content: pa_types::ai::UserContent::Text(harness_digest_message_text(&digest)),
-            display: false,
-            details: Some(serde_json::json!({ "digest": digest })),
-            timestamp,
-            rest: Default::default(),
-        }))
+        Ok(())
     }
 
     /// The last four user/assistant texts, newest first (digest ranking).
@@ -392,6 +396,8 @@ fn loop_user_text(content: &pa_agent::types::UserContent) -> String {
 mod tests {
     use super::*;
     use crate::session::manager::SessionManager;
+    use pa_agent::types::UserMessage;
+    use serde_json::Value;
 
     #[test]
     fn empty_state_digest_renders_placeholder() {
@@ -450,30 +456,47 @@ mod tests {
         assert_eq!(custom.custom_type, "harness_digest");
         assert!(!custom.display);
         assert!(matches!(custom.content, pa_types::ai::UserContent::Text(_)));
-        // The loop message is a user turn carrying the framed text.
-        let loop_message = harness_digest_loop_message("digest body", 0);
-        let AgentMessage::Standard(Message::User(user)) = &loop_message else {
-            panic!("expected user message");
+        // The loop prompt row is the custom wire shape: role `custom`, the
+        // `harness_digest` tag, framed text, `display: false`, the raw
+        // digest in `details` (TS `createHarnessDigestMessage`).
+        let loop_row = harness_digest_prompt_row("digest body", 0);
+        let AgentMessage::Custom(custom) = &loop_row else {
+            panic!("expected custom row");
         };
-        match &user.content {
-            UserContent::Text(text) => assert!(text.contains("[harness-digest]")),
-            UserContent::Parts(parts) => assert!(parts.iter().any(
-                |part| matches!(part, UserPart::Text(text) if text.text.contains("[harness-digest]"))
-            )),
-        }
-        // The loop-context staleness view reads the digest out of the frame,
+        assert_eq!(custom.role, "custom");
+        assert_eq!(
+            custom.payload.get("customType").and_then(Value::as_str),
+            Some("harness_digest")
+        );
+        assert_eq!(
+            custom.payload.get("content").and_then(Value::as_str),
+            Some(harness_digest_message_text("digest body").as_str())
+        );
+        assert_eq!(
+            custom.payload.get("display").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            custom
+                .payload
+                .pointer("/details/digest")
+                .and_then(Value::as_str),
+            Some("digest body")
+        );
+        // The row round-trips to its session wire shape (persistence reads
+        // it back through the shared wire form).
+        let session_view: SessionAgentMessage =
+            serde_json::from_value(serde_json::to_value(&loop_row).unwrap()).unwrap();
+        assert!(matches!(session_view, SessionAgentMessage::Custom(_)));
+        // The loop-context staleness view reads the digest out of the row,
         // so a delivered digest row suppresses re-delivery while it is the
         // newest (TS `_latestContextHarnessDigest`).
-        let mut context = vec![loop_message.clone()];
+        let mut context = vec![loop_row.clone()];
         assert_eq!(
             latest_context_digest(&context).as_deref(),
             Some("digest body")
         );
-        let mut later = harness_digest_loop_message("newer digest", 2);
-        if let AgentMessage::Standard(Message::User(user)) = &mut later {
-            user.timestamp = 2;
-        }
-        context.push(later);
+        context.push(harness_digest_prompt_row("newer digest", 2));
         assert_eq!(
             latest_context_digest(&context).as_deref(),
             Some("newer digest")
@@ -487,22 +510,20 @@ mod tests {
         // A compaction-summary user row carries its digest block first; the
         // frame reader extracts that digest, and a compaction row without a
         // digest block contributes nothing.
-        let summary = harness_digest_loop_message("compaction head digest", 5);
-        let mut wrapped = match summary {
-            AgentMessage::Standard(Message::User(mut user)) => {
-                user.content = UserContent::Text(format!(
-                    "{HARNESS_DIGEST_PREFIX}compaction head digest{HARNESS_DIGEST_SUFFIX}\n\n[compaction] summary text"
-                ));
-                AgentMessage::Standard(Message::User(user))
-            }
-            other => other,
-        };
-        if let AgentMessage::Standard(Message::User(user)) = &mut wrapped {
-            user.timestamp = 5;
-        }
+        let wrapped = AgentMessage::Standard(Message::User(UserMessage {
+            content: UserContent::Text(format!(
+                "{HARNESS_DIGEST_PREFIX}compaction head digest{HARNESS_DIGEST_SUFFIX}\n\n[compaction] summary text"
+            )),
+            timestamp: 5,
+        }));
         assert_eq!(
             latest_context_digest(&[wrapped]).as_deref(),
             Some("compaction head digest")
         );
+        let no_digest = AgentMessage::Standard(Message::User(UserMessage {
+            content: UserContent::Text("[compaction] summary text".to_string()),
+            timestamp: 6,
+        }));
+        assert_eq!(latest_context_digest(&[no_digest]), None);
     }
 }

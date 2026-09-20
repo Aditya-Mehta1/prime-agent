@@ -508,6 +508,10 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             messages: initial_messages,
         },
         stream_fn: Some(stream_fn),
+        // The session conversion rules apply at the loop's LLM boundary
+        // (TS `convertToLlm`): bookkeeping custom rows drop, everything
+        // else (the harness digest included) becomes a user turn.
+        convert_to_llm: Some(super::messages::engine_convert_to_llm()),
         ..Default::default()
     });
 

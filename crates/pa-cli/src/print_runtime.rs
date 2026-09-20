@@ -769,43 +769,18 @@ async fn run_prompts_and_emit(
 ) -> Result<i32, String> {
     let json_mode = options.app_mode == AppMode::Json;
     let mut unsubscribe: Option<pa_agent::agent::Subscription> = None;
-    // The pending first-turn harness digest, taken before the prompt that
-    // rides it: TS commits the digest into the turn's prompt messages, so
-    // its `message_start`/`message_end` pair streams between `turn_start`
-    // and the user message pair.
-    let pending_digest = std::sync::Arc::new(std::sync::Mutex::new(None::<serde_json::Value>));
     if json_mode {
         if let Some(header) = session_header_json(engine).await {
             println!("{header}");
         }
-        let digest_slot = Arc::clone(&pending_digest);
         unsubscribe = Some(
             engine
                 .session
                 .agent()
-                .subscribe(move |event, _signal| {
-                    let digest_slot = Arc::clone(&digest_slot);
+                .subscribe(|event, _signal| {
                     Box::pin(async move {
                         if let Some(json) = agent_event_json(&event) {
                             println!("{json}");
-                        }
-                        // The deferred digest rides the first turn: its
-                        // pair follows the run's first `turn_start` and
-                        // precedes the prompt's message pair (TS
-                        // commit-time injection into the turn's prompt
-                        // messages).
-                        if matches!(event, pa_agent::types::AgentEvent::TurnStart) {
-                            if let Some(digest) = digest_slot.lock().unwrap().take() {
-                                for event_type in ["message_start", "message_end"] {
-                                    println!(
-                                        "{}",
-                                        serde_json::json!({
-                                            "type": event_type,
-                                            "message": digest,
-                                        })
-                                    );
-                                }
-                            }
                         }
                         Ok(())
                     })
@@ -832,22 +807,6 @@ async fn run_prompts_and_emit(
         .iter()
         .chain(options.messages.iter())
     {
-        // The deferred first-turn harness digest: take the delivery before
-        // the prompt so the subscriber emits its message pair at the turn
-        // start (TS commit-time injection rides the turn's prompt
-        // messages; the pair streams between `turn_start` and the user
-        // message pair). Text mode leaves the delivery to the prompt path.
-        if json_mode {
-            if let Some(row) = engine
-                .session
-                .take_pending_harness_digest()
-                .await
-                .map_err(|error| format!("{error:#}"))?
-            {
-                *pending_digest.lock().unwrap() =
-                    Some(crate::headless_autonomous::stop_row_wire_value(&row));
-            }
-        }
         // The pre-turn boundary (TS `_runPreTurnCompaction`): a stale
         // overflow error from a previous run gets its recovery attempt
         // before the admitted prompt.

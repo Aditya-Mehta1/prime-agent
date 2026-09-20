@@ -17,18 +17,15 @@ Scenarios (each a fresh isolated HOME + agent dir + daemon socket per side):
     compaction arm's compaction_start/compaction_end pair (reason, result,
     willRetry=false) at the settled turn boundary.
 
-Known residuals (documented, asserted narrowly, never ignored wholesale):
-the TS run's `agent_end.messages` includes the harness digest row (it rides
-the turn's prompt messages); the Rust run does not (the digest enters the
-loop context at prompt admission, not as a prompt message). The comparison
-accepts exactly that one role-level difference inside agent_end and fails
-on anything else.
+The Rust run rides the harness digest row through the loop's prompt input
+(the same TS design), so `agent_end.messages` includes it on both sides and
+the comparison is full parity: any event difference fails.
 
 Both sides run with RLM_DEPTH unset (root sessions are depth 0; the TS
 daemon strips the env for its workers, the Rust print run is in-process).
 
-Exit code is non-zero when any event sequence differs beyond the accepted
-residuals. Use --keep to keep the sandbox trees, --out to pin captures.
+Exit code is non-zero when any event sequence differs. Use --keep to keep
+the sandbox trees, --out to pin captures.
 """
 
 import argparse
@@ -268,21 +265,8 @@ def normalize_message(message, sandbox_root):
     return out
 
 
-def accepted_residual(ts_event, rust_event):
-    """The one documented difference: TS's agent_end carries the digest row."""
-    if not (isinstance(ts_event, dict) and isinstance(rust_event, dict)):
-        return False
-    if ts_event.get("type") != "agent_end" or rust_event.get("type") != "agent_end":
-        return False
-    ts_rows = ts_event.get("messages", [])
-    rust_rows = rust_event.get("messages", [])
-    ts_no_digest = [row for row in ts_rows if row.get("customType") != "harness_digest"]
-    return ts_no_digest == rust_rows and len(ts_rows) == len(rust_rows) + 1
-
-
 def diff_events(ts_events, rust_events):
-    """Compare sequences; returns (failure text, residual notes). The
-    accepted agent_end digest residual is reported but never fails."""
+    """Compare the normalized event sequences; returns the failure text."""
     if len(ts_events) != len(rust_events):
         return (
             f"event count differs: ts={len(ts_events)} rust={len(rust_events)}\n"
@@ -295,24 +279,17 @@ def diff_events(ts_events, rust_events):
                     lineterm="",
                     n=1,
                 )
-            ),
-            [],
+            )
         )
     failures = []
-    residuals = []
     for index, (ts_event, rust_event) in enumerate(zip(ts_events, rust_events)):
         if ts_event == rust_event:
-            continue
-        if accepted_residual(ts_event, rust_event):
-            residuals.append(
-                f"event {index}: accepted residual (TS agent_end carries the harness_digest row)"
-            )
             continue
         failures.append(
             f"event {index} differs:\n  ts:   {json.dumps(ts_event, sort_keys=True)}\n"
             f"  rust: {json.dumps(rust_event, sort_keys=True)}\n"
         )
-    return "".join(failures), residuals
+    return "".join(failures)
 
 
 SCENARIOS = {
@@ -385,9 +362,7 @@ def main():
             captures[binary] = normalize_events(stdout, os.path.join(base, name))
         if "ts" not in captures or "rust" not in captures:
             continue
-        diff, residuals = diff_events(captures["ts"], captures["rust"])
-        for residual in residuals:
-            print(residual)
+        diff = diff_events(captures["ts"], captures["rust"])
         if diff:
             failures.append(name)
             print(diff)
