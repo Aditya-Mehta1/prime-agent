@@ -113,6 +113,16 @@ impl AgentSessionEngine {
         };
         match &outcome {
             Ok(Ok(CompactOutcome::Ran(run))) => {
+                // Adoption telemetry (TS `compaction_end` handling counts
+                // every completed compaction into the active run).
+                {
+                    let guard = self.session.blocking_lock();
+                    if let Some(telemetry) =
+                        guard.as_ref().and_then(|engine| engine.telemetry.as_ref())
+                    {
+                        telemetry.note_compaction();
+                    }
+                }
                 // The wire result is the TS `CompactionResult` shape
                 // (`_performCompaction`'s return, details included).
                 let result = crate::compaction::compaction_result_value(&run.result, &run.entry);

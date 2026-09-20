@@ -75,7 +75,7 @@ finalizes (agent ends, or the turn action deactivates after the agent ended).
 | `cache_read_tokens` | number | |
 | `cache_write_tokens` | number | |
 | `total_tokens` | number | |
-| `compaction_count` | number | completed compactions |
+| `compaction_count` | number | completed compactions (every arm: manual `/compact` and wire `compact`, model-requested, threshold, overflow; skipped/failed/cancelled runs do not count) |
 | `retry_count` | number | auto-retries |
 | `failover_count` | number | provider-failover switches (the failed turn re-routed to another configured provider serving the same model) |
 | `provider_category` | string | `anthropic`, `openai`, `google`, `prime`, `openrouter`, `bedrock`, `vertex`, `mistral`, `groq`, `xai`, `custom`, `unknown` |
@@ -96,7 +96,7 @@ Session dispose (interactive exit, worker shutdown).
 | `failed_run_count` | number | |
 | `aborted_run_count` | number | |
 | `tool_call_count` | number | session total |
-| `compaction_count` | number | session total |
+| `compaction_count` | number | session total across all compaction arms (same counting as the run property) |
 | `model_call_count` | number | session total |
 | `input_tokens` / `output_tokens` / `cache_read_tokens` / `cache_write_tokens` / `total_tokens` | number | session totals |
 

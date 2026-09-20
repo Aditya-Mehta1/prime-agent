@@ -1166,6 +1166,17 @@ impl SessionEngine for AgentSessionEngine {
                 }
             }
             pa_core::session_engine::compact_session::CompactOutcome::Ran(run) => {
+                // Adoption telemetry (TS `compaction_end` handling counts
+                // every completed compaction into the active run; the
+                // manual wire run counts like the `/compact` command).
+                {
+                    let guard = self.session.blocking_lock();
+                    if let Some(telemetry) =
+                        guard.as_ref().and_then(|engine| engine.telemetry.as_ref())
+                    {
+                        telemetry.note_compaction();
+                    }
+                }
                 CompactionOutcome::Compacted {
                     run: CompactionRun {
                         // The wire result is the TS `CompactionResult` shape
@@ -2178,6 +2189,16 @@ impl AgentSessionEngine {
         let mut stopped_for_compaction = false;
         match consumption.compaction {
             Some(Ok(pa_core::session_engine::compact_session::CompactOutcome::Ran(run))) => {
+                // Adoption telemetry (TS `compaction_end` handling counts
+                // every completed compaction into the active run).
+                {
+                    let guard = self.session.blocking_lock();
+                    if let Some(telemetry) =
+                        guard.as_ref().and_then(|engine| engine.telemetry.as_ref())
+                    {
+                        telemetry.note_compaction();
+                    }
+                }
                 let entry = serde_json::to_value(&run.entry).unwrap_or(Value::Null);
                 // The wire result is the TS `CompactionResult` shape
                 // (`_performCompaction`'s return, details included); the
@@ -3192,6 +3213,213 @@ pub(crate) mod tests {
             .filter(|event| matches!(event, EngineEvent::Compaction { .. }))
             .count();
         assert_eq!((start_count, end_count), (1, 1));
+    }
+
+    /// End the session telemetry (flushing every queued event through the
+    /// local mirror sink) and read one named event's properties: the
+    /// transparency mirror is the product's own observable surface for the
+    /// run counters.
+    fn mirror_telemetry_properties(
+        engine: &AgentSessionEngine,
+        dir: &std::path::Path,
+        name: &str,
+    ) -> Vec<Value> {
+        {
+            let guard = engine.session.blocking_lock();
+            let telemetry = guard
+                .as_ref()
+                .and_then(|core| core.telemetry.as_ref())
+                .expect("the faux engine has telemetry installed");
+            engine
+                .runtime
+                .block_on(async { telemetry.end().await })
+                .expect("telemetry end flushes");
+        }
+        let mirror = std::fs::read_to_string(dir.join("agent").join("telemetry.jsonl"))
+            .expect("the telemetry mirror exists");
+        mirror
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| event["name"] == name)
+            .map(|event| event["properties"].clone())
+            .collect()
+    }
+
+    /// The threshold arm feeds the compaction telemetry seam: the crossing
+    /// turn's compaction counts into the open run's `compaction_count` and
+    /// the session total (TS `compaction_end` handling).
+    #[test]
+    fn threshold_compaction_counts_into_the_run_telemetry() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Probe: the baseline turn's total usage (system prompt included).
+        let (probe, _probe_dir) = faux_engine_with_settings(
+            serde_json::json!({ "responses": [{"text": "seed reply"}] }),
+            1,
+        );
+        let mut probe_events: Vec<EngineEvent> = Vec::new();
+        admit(&probe, "seed turn".to_string(), &mut probe_events);
+        let baseline = probe_events
+            .iter()
+            .find_map(|event| match event {
+                EngineEvent::AssistantMessage(message) => message["usage"]["totalTokens"].as_u64(),
+                _ => None,
+            })
+            .expect("probe turn produced usage");
+        drop(probe);
+
+        let big_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
+        let big_tokens = (48_000 + "seed turn  crossing".len() as u64).div_ceil(4);
+        let headroom = baseline + big_tokens / 2;
+        let (engine, dir) = faux_engine_with_settings(
+            serde_json::json!({
+                "responses": [
+                    {"text": "seed reply"},
+                    {"text": "crossing reply"},
+                    {"text": "the summary"},
+                ],
+            }),
+            128_000u64.saturating_sub(headroom).max(1),
+        );
+        let mut events: Vec<EngineEvent> = Vec::new();
+        admit(&engine, "seed turn".to_string(), &mut events);
+        admit(&engine, big_prompt, &mut events);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Compaction { .. })),
+            "the crossing turn compacted"
+        );
+        let runs = mirror_telemetry_properties(&engine, dir.path(), "agent run completed");
+        assert_eq!(runs.len(), 2, "one run per admitted prompt");
+        assert_eq!(runs[0]["compaction_count"], serde_json::json!(0));
+        assert_eq!(
+            runs[1]["compaction_count"],
+            serde_json::json!(1),
+            "the threshold compaction counted into the open run"
+        );
+        let ended = mirror_telemetry_properties(&engine, dir.path(), "agent session ended");
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0]["compaction_count"], serde_json::json!(1));
+    }
+
+    /// The requested arm feeds the same seam: the boundary compaction the
+    /// kernel's `compact.run` scheduled counts into the open run.
+    #[test]
+    fn requested_compaction_counts_into_the_run_telemetry() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A tiny reserve keeps the threshold arm silent (TS reserve 1 means
+        // the context must nearly fill the window).
+        let (engine, dir) = faux_engine_with_settings(
+            serde_json::json!({
+                "responses": [
+                    {"text": "seed reply"},
+                    {"text": "second reply"},
+                    {"text": "the summary"},
+                ]
+            }),
+            1,
+        );
+        let mut events: Vec<EngineEvent> = Vec::new();
+        admit(
+            &engine,
+            format!("turn one {}", "x".repeat(48_000)),
+            &mut events,
+        );
+        {
+            let guard = engine.session.blocking_lock();
+            let core = guard.as_ref().expect("session built");
+            engine
+                .runtime
+                .block_on(async { core.turn_boundary.schedule_compaction(None).await });
+        }
+        // The second turn carries enough tokens that the keep-recent cut
+        // leaves the first turn summarizable (a tiny prompt cuts past it
+        // and the compaction skips as too short).
+        admit(
+            &engine,
+            format!("turn two {}", "x".repeat(2_000)),
+            &mut events,
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EngineEvent::Compaction { event, .. } if event["reason"] == "requested"
+            )),
+            "the requested compaction ran"
+        );
+        let runs = mirror_telemetry_properties(&engine, dir.path(), "agent run completed");
+        assert_eq!(runs.len(), 2, "one run per admitted prompt");
+        assert_eq!(runs[0]["compaction_count"], serde_json::json!(0));
+        assert_eq!(
+            runs[1]["compaction_count"],
+            serde_json::json!(1),
+            "the requested compaction counted into the open run"
+        );
+        let ended = mirror_telemetry_properties(&engine, dir.path(), "agent session ended");
+        assert_eq!(ended[0]["compaction_count"], serde_json::json!(1));
+    }
+
+    /// The manual wire `compact` command (TS daemon-mode `compact`) feeds
+    /// the same seam: the compaction the CompactionManager runs counts
+    /// into the still-open run it interrupts.
+    #[test]
+    fn manual_wire_compaction_counts_into_the_run_telemetry() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (engine, dir) = faux_engine_with_settings(
+            serde_json::json!({
+                "responses": [
+                    {"text": "seed reply"},
+                    {"text": "second reply"},
+                    {"text": "the summary"},
+                ]
+            }),
+            1,
+        );
+        let mut events: Vec<EngineEvent> = Vec::new();
+        admit(
+            &engine,
+            format!("turn one {}", "x".repeat(48_000)),
+            &mut events,
+        );
+        // A second, small-but-not-tiny turn: the keep-recent cut keeps it
+        // (with turn one's tiny tail it would cut past everything and the
+        // compaction would skip as too short).
+        admit(
+            &engine,
+            format!("turn two {}", "x".repeat(2_000)),
+            &mut events,
+        );
+        // The wire `compact` command: the CompactionManager's engine call
+        // (the run happens between turns, so it counts into the deferred
+        // run exactly like TS `compact()` between agent runs).
+        let controller = std::sync::Arc::new(pa_agent::abort::AbortController::new());
+        let signal = controller.signal();
+        let outcome = engine.run_compaction(
+            crate::engine::CompactionRequest {
+                custom_instructions: None,
+            },
+            &signal,
+        );
+        assert!(
+            matches!(outcome, crate::engine::CompactionOutcome::Compacted { .. }),
+            "the manual compaction ran"
+        );
+        let runs = mirror_telemetry_properties(&engine, dir.path(), "agent run completed");
+        assert_eq!(runs.len(), 2, "one run per admitted prompt");
+        assert_eq!(runs[0]["compaction_count"], serde_json::json!(0));
+        assert_eq!(
+            runs[1]["compaction_count"],
+            serde_json::json!(1),
+            "the manual wire compaction counted into the open run"
+        );
+        let ended = mirror_telemetry_properties(&engine, dir.path(), "agent session ended");
+        assert_eq!(ended[0]["compaction_count"], serde_json::json!(1));
     }
 
     /// The `compaction_outcome` rows an unsuccessful auto-compaction

@@ -536,6 +536,11 @@ impl TurnBoundary {
             .await
         {
             Some(Ok(CompactOutcome::Ran(run))) => {
+                // Adoption telemetry (TS `compaction_end` handling counts
+                // every completed compaction into the active run).
+                if let Some(telemetry) = engine.telemetry.as_ref() {
+                    telemetry.note_compaction();
+                }
                 // TS `_scheduleAutoRefineAfterCompaction`: every successful
                 // compaction schedules the compact-trigger auto-refine for
                 // the next serialized checkpoint (or the disposal drain).
@@ -594,6 +599,12 @@ impl TurnBoundary {
                     ));
                     match engine.session.compact(None, model, api_key, None).await {
                         Ok(CompactOutcome::Ran(run)) => {
+                            // Adoption telemetry (TS `compaction_end`
+                            // handling counts every completed compaction
+                            // into the active run).
+                            if let Some(telemetry) = engine.telemetry.as_ref() {
+                                telemetry.note_compaction();
+                            }
                             // TS `_scheduleAutoRefineAfterCompaction`: every
                             // successful compaction schedules the
                             // compact-trigger auto-refine for the next
@@ -939,6 +950,44 @@ mod tests {
         settings: Value,
         session_manager: Option<SessionManager>,
     ) -> (SessionEngine, tempfile::TempDir, Model) {
+        faux_engine_with_telemetry(script, settings, session_manager, None).await
+    }
+
+    /// The same faux engine with session telemetry wired to a mock sink
+    /// (batch-per-event flush, like the pa-core telemetry fixture): the
+    /// arm tests read the run counters straight off the recorded events.
+    async fn faux_engine_with_mock_telemetry(
+        script: Value,
+        settings: Value,
+    ) -> (
+        SessionEngine,
+        tempfile::TempDir,
+        Model,
+        std::sync::Arc<pa_telemetry::MockSink>,
+    ) {
+        let mock = std::sync::Arc::new(pa_telemetry::MockSink::new());
+        let mut config = pa_telemetry::TelemetryClientConfig::new("install-1");
+        config.batch_size = 1;
+        config.flush_interval = std::time::Duration::from_secs(600);
+        config.sinks = vec![mock.clone() as std::sync::Arc<dyn pa_telemetry::TelemetrySink>];
+        let client = pa_telemetry::TelemetryClient::spawn(config).expect("spawn client");
+        let telemetry = pa_core::session_engine::telemetry::TelemetryWiring {
+            client,
+            execution_mode: Some("print".to_string()),
+            now: None,
+        };
+        let (engine, dir, model) =
+            faux_engine_with_telemetry(script, settings, None, Some(telemetry)).await;
+        (engine, dir, model, mock)
+    }
+
+    /// The engine builder both faux helpers share.
+    async fn faux_engine_with_telemetry(
+        script: Value,
+        settings: Value,
+        session_manager: Option<SessionManager>,
+        telemetry: Option<pa_core::session_engine::telemetry::TelemetryWiring>,
+    ) -> (SessionEngine, tempfile::TempDir, Model) {
         let dir = tempfile::TempDir::new().unwrap();
         let agent_dir = dir.path().join("agent");
         std::fs::create_dir_all(&agent_dir).unwrap();
@@ -964,7 +1013,7 @@ mod tests {
             })
             .expect("a session manager");
         let engine = create_session(SessionEngineConfig {
-            telemetry: None,
+            telemetry,
             cwd: dir.path().to_path_buf(),
             agent_dir,
             mcp_manager: None,
@@ -991,6 +1040,28 @@ mod tests {
         .await
         .expect("the faux session assembles");
         (engine, dir, model)
+    }
+
+    /// Finalize the open run, emit the session totals, and flush the mock
+    /// sink (TS session dispose). Idempotent: a second call is a no-op.
+    async fn end_telemetry(engine: &SessionEngine) {
+        engine
+            .telemetry
+            .as_ref()
+            .expect("the faux engine has telemetry installed")
+            .end()
+            .await
+            .expect("telemetry end flushes");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    /// One named event's recorded properties from the mock sink.
+    fn mock_properties(mock: &std::sync::Arc<pa_telemetry::MockSink>, name: &str) -> Vec<Value> {
+        mock.events()
+            .iter()
+            .filter(|event| event.name == name)
+            .map(|event| serde_json::to_value(&event.properties).expect("properties serialize"))
+            .collect()
     }
 
     /// Admit one prompt through the production flow: the pre-turn check,
@@ -1551,6 +1622,230 @@ mod tests {
             "Requested compaction skipped: Session is too short to compact — try again once it grows"
         );
         assert_eq!(events[end_at]["errorSeverity"], "warning");
+    }
+
+    /// The requested arm feeds the run counter (TS `compaction_end`
+    /// handling counts every completed compaction): the boundary
+    /// compaction counts into the still-open run it settles, exactly
+    /// like the overflow arm.
+    #[tokio::test]
+    async fn requested_compaction_counts_into_the_run_telemetry() {
+        let _faux = FAUX_TEST_LOCK.lock().await;
+        let (engine, _dir, model, mock) = faux_engine_with_mock_telemetry(
+            json!({
+                "responses": [
+                    {"text": "seed reply"},
+                    {"text": "second reply"},
+                    {"text": "the summary"},
+                ]
+            }),
+            compactable_settings(),
+        )
+        .await;
+        let mut boundary = TurnBoundary::new(false);
+        admit(
+            &mut boundary,
+            &engine,
+            &model,
+            format!("seed turn {}", "x".repeat(48_000)),
+        )
+        .await
+        .unwrap();
+        engine.turn_boundary.schedule_compaction(None).await;
+        admit_turn_with_scheduled_request(
+            &mut boundary,
+            &engine,
+            &model,
+            format!("second turn {}", "x".repeat(2_000)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(compaction_count(&engine).await, 1, "the compaction ran");
+        end_telemetry(&engine).await;
+        let runs = mock_properties(&mock, "agent run completed");
+        assert_eq!(runs.len(), 2, "one run per admitted prompt");
+        assert_eq!(runs[0]["compaction_count"], json!(0));
+        assert_eq!(
+            runs[1]["compaction_count"],
+            json!(1),
+            "the requested compaction counted into the open run"
+        );
+        let ended = mock_properties(&mock, "agent session ended");
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0]["compaction_count"], json!(1));
+    }
+
+    /// The threshold arm feeds the same run counter: the crossing turn's
+    /// boundary compaction counts into that turn's run.
+    #[tokio::test]
+    async fn threshold_compaction_counts_into_the_run_telemetry() {
+        let _faux = FAUX_TEST_LOCK.lock().await;
+        // Probe: one settled turn's measured usage (no telemetry needed).
+        let (probe, _dir, probe_model) = faux_engine_with_settings(
+            json!({ "responses": [{"text": "seed reply"}] }),
+            compactable_settings(),
+            None,
+        )
+        .await;
+        let mut probe_boundary = TurnBoundary::new(false);
+        admit(
+            &mut probe_boundary,
+            &probe,
+            &probe_model,
+            "seed turn".to_string(),
+        )
+        .await
+        .unwrap();
+        let baseline = last_assistant(&probe)
+            .await
+            .map(|message| message.usage.total_tokens)
+            .expect("probe turn produced usage");
+        drop(probe);
+
+        // The crossing prompt adds ~12k tokens; the headroom sits halfway.
+        let big_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
+        let big_tokens = (48_000 + "seed turn  crossing".len() as u64).div_ceil(4);
+        let headroom = baseline + big_tokens / 2;
+        let (engine, _dir, model, mock) = faux_engine_with_mock_telemetry(
+            json!({
+                "responses": [
+                    {"text": "seed reply"},
+                    {"text": "crossing reply"},
+                    {"text": "the summary"},
+                ]
+            }),
+            json!({
+                "compaction": {
+                    "enabled": true,
+                    "reserveTokens": 128_000u64.saturating_sub(headroom).max(1),
+                    "keepRecentTokens": 10
+                }
+            }),
+        )
+        .await;
+        let mut boundary = TurnBoundary::new(false);
+        admit(&mut boundary, &engine, &model, "seed turn".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            compaction_count(&engine).await,
+            0,
+            "no compaction below the headroom"
+        );
+        admit(&mut boundary, &engine, &model, big_prompt)
+            .await
+            .unwrap();
+        assert_eq!(
+            compaction_count(&engine).await,
+            1,
+            "the crossing turn compacted"
+        );
+        end_telemetry(&engine).await;
+        let runs = mock_properties(&mock, "agent run completed");
+        assert_eq!(runs.len(), 2, "one run per admitted prompt");
+        assert_eq!(runs[0]["compaction_count"], json!(0));
+        assert_eq!(
+            runs[1]["compaction_count"],
+            json!(1),
+            "the threshold compaction counted into the open run"
+        );
+        let ended = mock_properties(&mock, "agent session ended");
+        assert_eq!(ended[0]["compaction_count"], json!(1));
+    }
+
+    /// A multi-compaction scenario across arms: the run property counts
+    /// each arm's completed compaction, and the session total equals the
+    /// number of compactions that ran (TS counts every completed
+    /// `compaction_end`, whichever arm fired it).
+    #[tokio::test]
+    async fn multi_compaction_run_counts_every_arm() {
+        let _faux = FAUX_TEST_LOCK.lock().await;
+        // Probe: one settled turn's measured usage.
+        let (probe, _dir, probe_model) = faux_engine_with_settings(
+            json!({ "responses": [{"text": "seed reply"}] }),
+            compactable_settings(),
+            None,
+        )
+        .await;
+        let mut probe_boundary = TurnBoundary::new(false);
+        admit(
+            &mut probe_boundary,
+            &probe,
+            &probe_model,
+            "seed turn".to_string(),
+        )
+        .await
+        .unwrap();
+        let baseline = last_assistant(&probe)
+            .await
+            .map(|message| message.usage.total_tokens)
+            .expect("probe turn produced usage");
+        drop(probe);
+
+        let big_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
+        let big_tokens = (48_000 + "seed turn  crossing".len() as u64).div_ceil(4);
+        let headroom = baseline + big_tokens / 2;
+        let (engine, _dir, model, mock) = faux_engine_with_mock_telemetry(
+            json!({
+                "responses": [
+                    {"text": "seed reply"},
+                    {"text": "second reply"},
+                    {"text": "requested summary"},
+                    {"text": "crossing reply"},
+                    {"text": "threshold summary"},
+                ]
+            }),
+            json!({
+                "compaction": {
+                    "enabled": true,
+                    "reserveTokens": 128_000u64.saturating_sub(headroom).max(1),
+                    "keepRecentTokens": 10
+                },
+                "autoRefine": { "enabled": false }
+            }),
+        )
+        .await;
+        let mut boundary = TurnBoundary::new(false);
+        // Run 1: a small seed turn, below the headroom.
+        admit(&mut boundary, &engine, &model, "seed turn".to_string())
+            .await
+            .unwrap();
+        // Run 2: the requested compaction at the settled boundary (the
+        // request consumes the check, so the threshold never fires there).
+        engine.turn_boundary.schedule_compaction(None).await;
+        admit_turn_with_scheduled_request(
+            &mut boundary,
+            &engine,
+            &model,
+            format!("second turn {}", "x".repeat(48_000)),
+        )
+        .await
+        .unwrap();
+        // Run 3: the threshold arm on the re-crossed context.
+        admit(&mut boundary, &engine, &model, big_prompt)
+            .await
+            .unwrap();
+        assert_eq!(compaction_count(&engine).await, 2, "both arms compacted");
+        end_telemetry(&engine).await;
+        let runs = mock_properties(&mock, "agent run completed");
+        assert_eq!(runs.len(), 3, "one run per admitted prompt");
+        assert_eq!(runs[0]["compaction_count"], json!(0));
+        assert_eq!(
+            runs[1]["compaction_count"],
+            json!(1),
+            "the requested compaction counted into its run"
+        );
+        assert_eq!(
+            runs[2]["compaction_count"],
+            json!(1),
+            "the threshold compaction counted into its run"
+        );
+        let ended = mock_properties(&mock, "agent session ended");
+        assert_eq!(
+            ended[0]["compaction_count"],
+            json!(2),
+            "the session total matches the arm count"
+        );
     }
 
     /// The threshold arm (TS `_checkCompaction` Case 3): a settled turn whose

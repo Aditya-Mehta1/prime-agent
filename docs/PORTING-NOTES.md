@@ -1,3 +1,25 @@
+## compaction_count telemetry for all arms (lane compaction-telemetry)
+
+Reference: TS `core/telemetry.ts` (`compaction_end` handling:
+`activeRun.compactionCount++` when the event carries a result and was not
+aborted) — every arm's completed compaction counts into the open run and
+the session totals, whichever arm fired it.
+
+- The Rust seam is `SessionTelemetry::note_compaction` (pa-core); the arms
+  feed it per call site: manual `/compact` (pa-core session_commands) and
+  the daemon wire `compact` command (pa-daemon `run_compaction`), the
+  model-requested boundary arm (pa-daemon `run_turn_boundary` +
+  pa-cli `requested_and_threshold_arms`), the threshold arm (pa-daemon
+  `run_auto_compaction` + the same pa-cli helper), and the overflow
+  compact-and-retry (already fed since #208/#211). A compaction outside an
+  open run never counts, matching the TS activeRun guard.
+- Verifiers: per-arm counter tests read the recorded `agent run completed`
+  `compaction_count` — pa-cli injects a MockSink-backed telemetry client;
+  pa-daemon ends the session telemetry and reads the local transparency
+  mirror (`<agentDir>/telemetry.jsonl`, the product's own observability
+  surface). The multi-compaction scenario asserts the session total equals
+  the number of arms that fired (requested + threshold = 2).
+
 ### Merge with #207 (durable compaction_outcome seam)
 
 - #207's typed `CompactionOutcomeReason`/`CompactionOutcomeKind` + the
