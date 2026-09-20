@@ -62,7 +62,10 @@ export default function registerVisualFaux(pi) {
 		const stopReason =
 			entry.stopReason ||
 			(content.some((block) => block.type === "toolCall") ? "toolUse" : "stop");
-		return fauxAssistantMessage(content, { stopReason });
+		// Optional scripted error text (the Rust faux script's contract):
+		// rides the message with `stopReason: "error"`, so overflow-recovery
+		// harnesses can script provider overflow responses.
+		return fauxAssistantMessage(content, { stopReason, errorMessage: entry.errorMessage });
 	});
 	faux.setResponses(responses);
 	const apiProvider = getApiProvider(faux.api);

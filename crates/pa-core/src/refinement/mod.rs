@@ -47,7 +47,10 @@ pub enum HarnessScope {
     Global,
 }
 
-/// One editable continual harness entry.
+/// One editable continual harness entry. The TS entry schema keeps
+/// `created_at`/`updated_at` snake-cased (the rest of the fields are
+/// single words); the wire result and the saved state file both carry the
+/// TS naming.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HarnessEntry {
@@ -63,7 +66,9 @@ pub struct HarnessEntry {
     pub arguments: serde_json::Map<String, serde_json::Value>,
     pub metadata: serde_json::Map<String, serde_json::Value>,
     pub source: String,
+    #[serde(rename = "created_at")]
     pub created_at: String,
+    #[serde(rename = "updated_at")]
     pub updated_at: String,
     pub version: u64,
 }
@@ -77,6 +82,9 @@ pub struct HarnessRefinementEvent {
     pub changes: Vec<String>,
     pub evidence: String,
     pub outcome: String,
+    /// The TS event schema keeps the snake-cased `created_at` (the rest of
+    /// the fields are single words).
+    #[serde(rename = "created_at")]
     pub created_at: String,
 }
 
@@ -253,13 +261,28 @@ pub struct RefinementResult {
     pub scope: Option<HarnessScope>,
 }
 
-/// One applied (or failed) edit with before/after snapshots.
+/// One applied (or failed) edit with before/after snapshots. The wire shape
+/// is the TS `AppliedRefinementEdit extends RefinementEdit`: the planned
+/// edit's own fields (title, content, path, reference, arguments,
+/// metadata) ride along with the snapshots.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppliedRefinementEdit {
     pub action: RefinementAction,
     pub kind: RefinementKind,
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before: Option<HarnessEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -269,6 +292,36 @@ pub struct AppliedRefinementEdit {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+impl AppliedRefinementEdit {
+    /// Start one applied-edit row from a planned edit: the TS wire shape
+    /// (`AppliedRefinementEdit extends RefinementEdit`) carries the plan's
+    /// own fields; the applying branch fills the action/kind/id resolution
+    /// and the outcome fields (before/after, applied, error).
+    fn planned(
+        edit: &planner::RefinementEdit,
+        action: RefinementAction,
+        kind: RefinementKind,
+        id: String,
+    ) -> Self {
+        Self {
+            action,
+            kind,
+            id,
+            title: edit.title.clone(),
+            content: edit.content.clone(),
+            path: edit.path.clone(),
+            reference: edit.reference.clone(),
+            arguments: edit.arguments.clone(),
+            metadata: edit.metadata.clone(),
+            before: None,
+            after: None,
+            applied: false,
+            error: None,
+            reason: edit.reason.clone(),
+        }
+    }
 }
 
 /// Infer a result scope from its edits' before/after scopes.
@@ -585,6 +638,12 @@ mod tests {
                 applied: true,
                 error: None,
                 reason: None,
+                title: None,
+                content: None,
+                path: None,
+                reference: None,
+                arguments: None,
+                metadata: None,
             }],
             harness_state_path: String::new(),
             rollback_of: None,

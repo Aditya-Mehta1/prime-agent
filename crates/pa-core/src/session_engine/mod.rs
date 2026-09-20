@@ -112,6 +112,15 @@ pub struct AgentSession {
     /// compaction path, `/compact` included); defaults until the engine
     /// wiring resolves them.
     compaction: compaction::CompactionSettings,
+    /// Whether the session may run auto-refinement at all (TS
+    /// `_autoRefineAllowedForSession`: depth 0 with a local harness state
+    /// dir — the same gate that registers the `refine.*` host requests).
+    /// Defaults off; the engine wiring resolves it once the session is
+    /// assembled.
+    auto_refine_allowed: bool,
+    /// The resolved auto-refine gates (TS `getAutoRefineSettings`); the
+    /// turn-boundary compact trigger reads them.
+    auto_refine: refine::AutoRefineGates,
 }
 
 impl AgentSession {
@@ -157,6 +166,8 @@ impl AgentSession {
             harness_digest,
             digest_pending: std::sync::atomic::AtomicBool::new(false),
             compaction: compaction::CompactionSettings::default(),
+            auto_refine_allowed: false,
+            auto_refine: refine::AutoRefineGates::default(),
         };
         this.ensure_harness_digest_context().await?;
         Ok(this)
@@ -168,6 +179,27 @@ impl AgentSession {
     /// like the TS product instead of the defaults.
     pub fn set_compaction_settings(&mut self, settings: compaction::CompactionSettings) {
         self.compaction = settings;
+    }
+
+    /// Bind the auto-refine surface for this session (the engine wiring
+    /// resolves both once the session is assembled): whether the session
+    /// may auto-refine (TS `_autoRefineAllowedForSession`: depth 0 with a
+    /// local harness state dir) and the resolved gates (TS
+    /// `getAutoRefineSettings`).
+    pub fn set_auto_refine(&mut self, allowed: bool, gates: refine::AutoRefineGates) {
+        self.auto_refine_allowed = allowed;
+        self.auto_refine = gates;
+    }
+
+    /// Whether the session may run auto-refinement (TS
+    /// `_autoRefineAllowedForSession`).
+    pub fn auto_refine_allowed(&self) -> bool {
+        self.auto_refine_allowed
+    }
+
+    /// The resolved auto-refine gates (TS `getAutoRefineSettings`).
+    pub fn auto_refine_gates(&self) -> refine::AutoRefineGates {
+        self.auto_refine
     }
 
     /// Whether automatic compaction is enabled for this session (the TS

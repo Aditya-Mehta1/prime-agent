@@ -44,6 +44,14 @@ use serde_json::{json, Value};
 /// the turn (`_checkCompaction`'s reported state).
 const OVERFLOW_RECOVERY_FAILED_MESSAGE: &str = "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.";
 
+/// Wall-clock milliseconds (the review-cooldown stamps, TS `Date.now()`).
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
 /// The `compaction_start` event (TS `_runAutoCompaction`): the reason plus
 /// the consumed request's instructions when it carried any.
 fn compaction_start_event(reason: &str, custom_instructions: Option<&str>) -> Value {
@@ -128,10 +136,39 @@ enum OverflowOutcome {
 /// buffer in tests.
 type EventSink = std::sync::Arc<dyn Fn(&serde_json::Value) + Send + Sync>;
 
-/// The print loop's turn-boundary state: the one-attempt overflow machine
-/// plus the json/text output mode the surfaces depend on.
+/// Where the compact-trigger auto-refine surfaces (TS: the serialized
+/// checkpoint runs mid-run, so its events stream; the disposal drain runs
+/// after the print client tore its subscription down, so its events land
+/// nowhere — only the durable rows persist).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefineSurface {
+    /// The serialized checkpoint at a turn boundary (`shouldStopAfterTurn`).
+    Checkpoint,
+    /// The session disposal drain (TS `dispose`: best-effort, silent).
+    Dispose,
+}
+
+/// The print loop's turn-boundary state: the one-attempt overflow machine,
+/// the compact-trigger auto-refine machine (TS `_compactAutoRefinePending`
+/// and its review bookkeeping), plus the json/text output mode the
+/// surfaces depend on.
 pub(crate) struct TurnBoundary {
     recovery: OverflowRecovery,
+    /// TS `_compactAutoRefinePending`: a successful compaction schedules
+    /// the compact-trigger auto-refine review for the next serialized
+    /// checkpoint (or the disposal drain).
+    compact_auto_refine_pending: bool,
+    /// TS `_lastAutoRefineReviewAt` (millis): every review attempt —
+    /// decline, success, or failure — stamps the cooldown window.
+    last_auto_refine_review_at: Option<u64>,
+    /// TS `_assistantTurnsSinceAutoRefine`: the settled non-error,
+    /// non-aborted assistant turns since the run's start or the last
+    /// review, the count the review prompt's trigger line carries.
+    assistant_turns_since_review: u32,
+    /// The entry-count baseline the turn counter diffs against (set at the
+    /// first pre-turn check, so resumed history never counts — the TS
+    /// counter is per-session-instance).
+    entry_baseline: Option<usize>,
     /// json mode streams the TS session events on stdout; text mode reads
     /// the durable rows through the headless terminal result.
     json_mode: bool,
@@ -142,6 +179,10 @@ impl TurnBoundary {
     pub(crate) fn new(json_mode: bool) -> Self {
         Self {
             recovery: OverflowRecovery::Idle,
+            compact_auto_refine_pending: false,
+            last_auto_refine_review_at: None,
+            assistant_turns_since_review: 0,
+            entry_baseline: None,
             json_mode,
             sink: std::sync::Arc::new(|event| println!("{event}")),
         }
@@ -153,6 +194,10 @@ impl TurnBoundary {
     pub(crate) fn with_sink(json_mode: bool, sink: EventSink) -> Self {
         Self {
             recovery: OverflowRecovery::Idle,
+            compact_auto_refine_pending: false,
+            last_auto_refine_review_at: None,
+            assistant_turns_since_review: 0,
+            entry_baseline: None,
             json_mode,
             sink,
         }
@@ -205,6 +250,12 @@ impl TurnBoundary {
         let outcome = self
             .overflow_recovery_attempt(engine, model, api_key.clone(), OverflowBoundary::PreTurn)
             .await?;
+        // The auto-refine turn counter's baseline: the entries present
+        // when the first prompt of this run admits (the TS counter is
+        // per-session-instance, so resumed history never counts).
+        if self.entry_baseline.is_none() {
+            self.entry_baseline = Some(engine.session.entries().await.len());
+        }
         if matches!(outcome, OverflowOutcome::NotApplicable) {
             self.requested_and_threshold_arms(engine, model, api_key)
                 .await?;
@@ -213,13 +264,18 @@ impl TurnBoundary {
         Ok(())
     }
 
-    /// The settled-turn boundary (TS `agent_end`): the overflow arm with its
-    /// retry loop first, then — when the arm did not fire — the
-    /// model-requested compaction and the threshold arm (the order TS keeps
-    /// inside `_checkCompaction`: a requested run consumes the check, so the
-    /// threshold is not re-evaluated after it), then the requested
-    /// refinement (TS `_consumePendingRequestedRefine`, which runs whenever
-    /// the turn did not re-issue).
+    /// The settled-turn boundary (TS `agent_end`): the serialized
+    /// checkpoint's compact-trigger auto-refine consumption for a trigger
+    /// an earlier boundary scheduled, then the overflow arm with its retry
+    /// loop (a retry's newly settled turn drains its own trigger at the
+    /// TS `shouldStopAfterTurn` position, before the arm re-checks), then
+    /// — when the arm did not fire — the model-requested compaction and
+    /// the threshold arm (the order TS keeps inside `_checkCompaction`: a
+    /// requested run consumes the check, so the threshold is not
+    /// re-evaluated after it), then the requested refinement (TS
+    /// `_consumePendingRequestedRefine`, which runs whenever the turn did
+    /// not re-issue). A compaction that runs here and has no further turn
+    /// leaves its trigger to the disposal drain.
     pub(crate) async fn run_at_settled_turn(
         &mut self,
         engine: &SessionEngine,
@@ -227,6 +283,15 @@ impl TurnBoundary {
         api_key: Option<String>,
         global_harness_dir: PathBuf,
     ) -> Result<(), String> {
+        self.count_settled_turns(engine).await;
+        self.consume_compact_auto_refine(
+            engine,
+            model,
+            api_key.clone(),
+            global_harness_dir.clone(),
+            RefineSurface::Checkpoint,
+        )
+        .await?;
         let arm_finished = loop {
             match self
                 .overflow_recovery_attempt(
@@ -237,7 +302,20 @@ impl TurnBoundary {
                 )
                 .await?
             {
-                OverflowOutcome::RetryTurn => continue,
+                // The retried turn settled: its serialized checkpoint
+                // drains the trigger the overflow compaction scheduled
+                // before the arm re-checks the new turn.
+                OverflowOutcome::RetryTurn => {
+                    self.consume_compact_auto_refine(
+                        engine,
+                        model,
+                        api_key.clone(),
+                        global_harness_dir.clone(),
+                        RefineSurface::Checkpoint,
+                    )
+                    .await?;
+                    continue;
+                }
                 outcome => break matches!(outcome, OverflowOutcome::Finished),
             }
         };
@@ -250,12 +328,155 @@ impl TurnBoundary {
         // durable rows' message pairs plus `refine_complete` on success and
         // `refine_failed` on failure; text mode keeps the stderr diagnostic.
         let entries_before = engine.session.entries().await.len();
-        match engine
+        if let Some(outcome) = engine
             .consume_pending_refinement(model, api_key, global_harness_dir)
             .await
         {
-            Some(Ok(result)) => {
-                if self.json_mode {
+            self.stream_refinement_outcome(engine, &outcome, entries_before, true, "requested")
+                .await;
+        }
+        Ok(())
+    }
+
+    /// TS `_assistantTurnsSinceAutoRefine` (the message_end increments): the
+    /// settled non-error, non-aborted assistant turns appended since the
+    /// last boundary call, added to the counter the review prompt's trigger
+    /// line carries.
+    async fn count_settled_turns(&mut self, engine: &SessionEngine) {
+        let Some(baseline) = self.entry_baseline else {
+            return;
+        };
+        let entries = engine.session.entries().await;
+        let settled = entries
+            .iter()
+            .skip(baseline)
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    pa_types::session::FileEntry::Message {
+                        message: SessionAgentMessage::Assistant(assistant),
+                        ..
+                    } if assistant.stop_reason != pa_types::ai::StopReason::Error
+                        && assistant.stop_reason != pa_types::ai::StopReason::Aborted
+                )
+            })
+            .count();
+        self.assistant_turns_since_review += settled as u32;
+        self.entry_baseline = Some(entries.len());
+    }
+
+    /// The disposal drain (TS `dispose`: "a serialized compaction can finish
+    /// without another model turn — drain its pending review here so
+    /// disposal does not silently lose the trigger"). The print client's
+    /// event subscription is already torn down at this point, so the
+    /// round's surface stays off the stream: only the durable rows and
+    /// the harness state persist. Best-effort, like the TS drain.
+    pub(crate) async fn drain_compact_auto_refine_at_disposal(
+        &mut self,
+        engine: &SessionEngine,
+        model: &Model,
+        api_key: Option<String>,
+        global_harness_dir: PathBuf,
+    ) {
+        let _ = self
+            .consume_compact_auto_refine(
+                engine,
+                model,
+                api_key,
+                global_harness_dir,
+                RefineSurface::Dispose,
+            )
+            .await;
+    }
+
+    /// The compact-trigger auto-refine consumption (TS
+    /// `_runSerializedRefineCheckpointAfterBackground`'s compact arm plus
+    /// `_runSerializedAutoRefineReview`): gates first — the session's
+    /// refine surface, the `enabled`/`compact` settings, and the review
+    /// cooldown — then the review, and only an approving review runs the
+    /// refinement. The checkpoint surface preserves the trigger while the
+    /// cooldown runs (TS keeps it for a later boundary); the disposal
+    /// surface clears it. Every review attempt — decline, success, or
+    /// failure — stamps the cooldown and resets the turn counter.
+    async fn consume_compact_auto_refine(
+        &mut self,
+        engine: &SessionEngine,
+        model: &Model,
+        api_key: Option<String>,
+        global_harness_dir: PathBuf,
+        surface: RefineSurface,
+    ) -> Result<(), String> {
+        if !self.compact_auto_refine_pending {
+            return Ok(());
+        }
+        // TS `_autoRefineAllowedForSession`: sessions without the refine
+        // surface drop the trigger outright.
+        if !engine.session.auto_refine_allowed() {
+            self.compact_auto_refine_pending = false;
+            return Ok(());
+        }
+        let gates = engine.session.auto_refine_gates();
+        if !gates.enabled || !gates.compact {
+            self.compact_auto_refine_pending = false;
+            return Ok(());
+        }
+        let under_cooldown = self
+            .last_auto_refine_review_at
+            .is_some_and(|last| now_millis().saturating_sub(last) < gates.cooldown_ms);
+        if under_cooldown && surface == RefineSurface::Checkpoint {
+            // Preserve the compact trigger for a later boundary (TS keeps
+            // the pending flag while the cooldown is active).
+            return Ok(());
+        }
+        self.compact_auto_refine_pending = false;
+        if under_cooldown {
+            // The disposal drain clears a cooled-down trigger without a
+            // review (TS dispose).
+            return Ok(());
+        }
+        let entries_before = engine.session.entries().await.len();
+        let turns = self.assistant_turns_since_review;
+        let outcome = engine
+            .session
+            .auto_refine_after_compaction(model, api_key, global_harness_dir, turns)
+            .await;
+        // Every review attempt stamps the cooldown and resets the turn
+        // counter (TS stamps decline, success, and failure alike).
+        self.last_auto_refine_review_at = Some(now_millis());
+        self.assistant_turns_since_review = 0;
+        // The reviewer declined: no refinement, nothing surfaces.
+        let streamed = match outcome {
+            Ok(None) => return Ok(()),
+            Ok(Some(result)) => Ok(result),
+            Err(error) => Err(error),
+        };
+        self.stream_refinement_outcome(
+            engine,
+            &streamed,
+            entries_before,
+            surface == RefineSurface::Checkpoint,
+            "automatic",
+        )
+        .await;
+        Ok(())
+    }
+
+    /// One refinement outcome's TS surface: the durable rows' message
+    /// pairs plus `refine_complete` on success, the `refine_failed` event
+    /// on failure. `emit` false (the disposal drain) keeps the stream
+    /// quiet — the rows still persist. Text mode prints the failure's
+    /// stderr diagnostic.
+    async fn stream_refinement_outcome(
+        &self,
+        engine: &SessionEngine,
+        outcome: &anyhow::Result<pa_core::refinement::RefinementResult>,
+        entries_before: usize,
+        emit: bool,
+        kind: &str,
+    ) {
+        match outcome {
+            Ok(result) => {
+                if emit && self.json_mode {
                     // The refinement rows this run appended (TS
                     // `_appendDurableRefineMessage`: the outcome row always,
                     // the model-facing notice when edits applied).
@@ -267,21 +488,24 @@ impl TurnBoundary {
                     }
                     self.emit_json(json!({
                         "type": "refine_complete",
-                        "result": serde_json::to_value(&result)
+                        "result": serde_json::to_value(result)
                             .unwrap_or(serde_json::Value::Null),
                     }));
                 }
             }
-            Some(Err(error)) => {
-                if self.json_mode {
-                    self.emit_json(json!({ "type": "refine_failed", "error": format!("{error}") }));
-                } else {
-                    eprintln!("pa-cli: requested refinement failed: {error:#}");
+            Err(error) => {
+                if emit {
+                    if self.json_mode {
+                        self.emit_json(json!({
+                            "type": "refine_failed",
+                            "error": format!("{error}"),
+                        }));
+                    } else {
+                        eprintln!("pa-cli: {kind} refinement failed: {error:#}");
+                    }
                 }
             }
-            None => {}
         }
-        Ok(())
     }
 
     /// The requested and threshold arms (TS `_checkCompaction` after Case
@@ -312,6 +536,10 @@ impl TurnBoundary {
             .await
         {
             Some(Ok(CompactOutcome::Ran(run))) => {
+                // TS `_scheduleAutoRefineAfterCompaction`: every successful
+                // compaction schedules the compact-trigger auto-refine for
+                // the next serialized checkpoint (or the disposal drain).
+                self.compact_auto_refine_pending = true;
                 self.emit_json(compaction_end_success_event(
                     CompactionOutcomeReason::Requested.wire(),
                     &run,
@@ -366,6 +594,11 @@ impl TurnBoundary {
                     ));
                     match engine.session.compact(None, model, api_key, None).await {
                         Ok(CompactOutcome::Ran(run)) => {
+                            // TS `_scheduleAutoRefineAfterCompaction`: every
+                            // successful compaction schedules the
+                            // compact-trigger auto-refine for the next
+                            // serialized checkpoint (or the disposal drain).
+                            self.compact_auto_refine_pending = true;
                             self.emit_json(compaction_end_success_event(
                                 CompactionOutcomeReason::Threshold.wire(),
                                 &run,
@@ -541,6 +774,7 @@ impl TurnBoundary {
             .await;
         match outcome {
             Ok(CompactOutcome::Ran(run)) => {
+                self.compact_auto_refine_pending = true;
                 // Adoption telemetry (TS `compaction_end` handling counts
                 // every completed compaction into the active run).
                 if let Some(telemetry) = engine.telemetry.as_ref() {
@@ -1788,6 +2022,409 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].custom_type, "refinement_outcome");
         assert_eq!(rows[1].custom_type, "refinement_notice");
+    }
+
+    /// The compact-trigger auto-refine at the next serialized checkpoint (TS
+    /// `_runSerializedRefineCheckpointAfterBackground`'s compact arm): a
+    /// compaction at one boundary schedules the review, and the next
+    /// boundary's checkpoint consumes it — the review gate first (an LLM
+    /// call), then the approved refinement run streaming the durable rows'
+    /// pairs and `refine_complete` exactly like the requested path.
+    #[tokio::test]
+    async fn compact_trigger_auto_refine_streams_at_the_next_boundary() {
+        let _faux = FAUX_TEST_LOCK.lock().await;
+        let review = r#"{"shouldRefine": true, "rationale": "the crossing turn shows a reusable tactic", "instructions": "record the tactic"}"#;
+        let plan = r#"{"summary":"note it","rationale":"repeated","expectedOutcome":"recall","edits":[{"action":"create","kind":"memory","id":"m1","title":"Tactic","content":"Use tactic A"}]}"#;
+        let (engine, _dir, model) = faux_engine_with_settings(
+            json!({
+                "responses": [
+                    {"text": "seed reply"},
+                    {"text": "second reply"},
+                    {"text": "the summary"},
+                    {"text": "third reply"},
+                    {"text": review},
+                    {"text": plan},
+                ]
+            }),
+            compactable_settings(),
+            None,
+        )
+        .await;
+        let global_dir = tempfile::TempDir::new().unwrap().keep();
+        let (sink, events) = capture_sink();
+        let mut boundary = TurnBoundary::with_sink(true, sink);
+        admit_with_harness_dir(
+            &mut boundary,
+            &engine,
+            &model,
+            format!("seed turn {}", "x".repeat(48_000)),
+            global_dir.clone(),
+        )
+        .await
+        .unwrap();
+        // A requested compaction at the second boundary (the #214 shape):
+        // the trigger is scheduled with no further turn to consume it here.
+        engine.turn_boundary.schedule_compaction(None).await;
+        // The mid-turn-request shape (#223's contract: a `compact.run`
+        // scheduled during a turn consumes at that turn's settled boundary;
+        // a pending request never survives to a pre-turn check in the
+        // product flow — the pre-turn arm would skip it here, the seed
+        // turn alone is too short to compact).
+        admit_turn_with_scheduled_request(
+            &mut boundary,
+            &engine,
+            &model,
+            format!("second turn {}", "x".repeat(2_000)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(compaction_count(&engine).await, 1, "the compaction ran");
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| event["type"] != "refine_complete"),
+            "no auto-refine before the next boundary"
+        );
+        // The next boundary's checkpoint consumes the trigger: the review
+        // approves and the refinement streams the TS surface.
+        admit_with_harness_dir(
+            &mut boundary,
+            &engine,
+            &model,
+            "third turn".to_string(),
+            global_dir,
+        )
+        .await
+        .unwrap();
+        let events = events.lock().unwrap().clone();
+        let outcome_at = events
+            .iter()
+            .position(|event| {
+                event["type"] == "message_start"
+                    && event["message"]["customType"] == "refinement_outcome"
+            })
+            .expect("the outcome row pair");
+        let notice_at = events
+            .iter()
+            .position(|event| {
+                event["type"] == "message_start"
+                    && event["message"]["customType"] == "refinement_notice"
+            })
+            .expect("the notice row pair");
+        let complete_at = events
+            .iter()
+            .position(|event| event["type"] == "refine_complete")
+            .expect("the refine_complete event");
+        assert!(outcome_at < notice_at && notice_at < complete_at);
+        assert_eq!(events[complete_at]["result"]["summary"], "note it");
+        // The source is the auto review (the notice's details).
+        assert_eq!(events[notice_at]["message"]["details"]["source"], "auto");
+        let rows = refine_rows(&engine).await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].custom_type, "refinement_outcome");
+        assert_eq!(rows[1].custom_type, "refinement_notice");
+    }
+
+    /// The overflow compact-and-retry's checkpoint (the observed TS surface):
+    /// the compaction schedules the trigger, the retried turn settles, and
+    /// its serialized checkpoint runs the review and — on approval — the
+    /// refinement, streaming mid-run before the boundary re-checks the
+    /// retried turn.
+    #[tokio::test]
+    async fn overflow_retry_compact_trigger_streams_the_ts_surface() {
+        let _faux = FAUX_TEST_LOCK.lock().await;
+        let review = r#"{"shouldRefine": true, "rationale": "the overflow recovery is reusable"}"#;
+        let plan = r#"{"summary":"note it","rationale":"repeated","expectedOutcome":"recall","edits":[{"action":"create","kind":"memory","id":"m1","title":"Tactic","content":"Use tactic A"}]}"#;
+        let (engine, _dir, model) = faux_engine_with_settings(
+            json!({
+                "responses": [
+                    {"text": "seed reply"},
+                    overflow_error(0),
+                    {"text": "the summary"},
+                    {"text": "recovered reply"},
+                    {"text": review},
+                    {"text": plan},
+                ]
+            }),
+            compactable_settings(),
+            None,
+        )
+        .await;
+        let global_dir = tempfile::TempDir::new().unwrap().keep();
+        let (sink, events) = capture_sink();
+        let mut boundary = TurnBoundary::with_sink(true, sink);
+        admit_with_harness_dir(
+            &mut boundary,
+            &engine,
+            &model,
+            format!("seed turn {}", "x".repeat(48_000)),
+            global_dir,
+        )
+        .await
+        .unwrap();
+        admit_with_harness_dir(
+            &mut boundary,
+            &engine,
+            &model,
+            format!("overflow probe {}", "x".repeat(48_000)),
+            std::path::PathBuf::new(),
+        )
+        .await
+        .unwrap();
+        let events = events.lock().unwrap().clone();
+        // The compaction pair re-issues (willRetry true), the retried turn
+        // settles, and its checkpoint drains the trigger: the row pairs,
+        // then refine_complete.
+        let end_at = events
+            .iter()
+            .position(|event| event["type"] == "compaction_end")
+            .expect("the compaction_end event");
+        assert_eq!(events[end_at]["willRetry"], true);
+        let outcome_at = events
+            .iter()
+            .position(|event| {
+                event["type"] == "message_start"
+                    && event["message"]["customType"] == "refinement_outcome"
+            })
+            .expect("the outcome row pair");
+        let complete_at = events
+            .iter()
+            .position(|event| event["type"] == "refine_complete")
+            .expect("the refine_complete event");
+        assert!(end_at < outcome_at && outcome_at < complete_at);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "compaction_start")
+                .count(),
+            1,
+            "exactly one compaction"
+        );
+        assert_eq!(refine_rows(&engine).await.len(), 2);
+    }
+
+    /// The disposal drain (TS `dispose`): a compaction at the final settled
+    /// boundary schedules a trigger no later boundary consumes; the print
+    /// client's subscription is already torn down, so the drain's review and
+    /// refinement stay off the event stream while the durable rows persist.
+    #[tokio::test]
+    async fn compact_trigger_drains_at_disposal_off_the_stream() {
+        let _faux = FAUX_TEST_LOCK.lock().await;
+        let review =
+            r#"{"shouldRefine": true, "rationale": "the seed turn shows a reusable tactic"}"#;
+        let plan = r#"{"summary":"note it","rationale":"repeated","expectedOutcome":"recall","edits":[{"action":"create","kind":"memory","id":"m1","title":"Tactic","content":"Use tactic A"}]}"#;
+        let (engine, _dir, model) = faux_engine_with_settings(
+            json!({
+                "responses": [
+                    {"text": "seed reply"},
+                    {"text": "second reply"},
+                    {"text": "the summary"},
+                    {"text": review},
+                    {"text": plan},
+                ]
+            }),
+            compactable_settings(),
+            None,
+        )
+        .await;
+        let global_dir = tempfile::TempDir::new().unwrap().keep();
+        let (sink, events) = capture_sink();
+        let mut boundary = TurnBoundary::with_sink(true, sink);
+        admit_with_harness_dir(
+            &mut boundary,
+            &engine,
+            &model,
+            format!("seed turn {}", "x".repeat(48_000)),
+            global_dir.clone(),
+        )
+        .await
+        .unwrap();
+        engine.turn_boundary.schedule_compaction(None).await;
+        // The mid-turn-request shape (#223's contract: a `compact.run`
+        // scheduled during a turn consumes at that turn's settled boundary;
+        // a pending request never survives to a pre-turn check in the
+        // product flow — the pre-turn arm would skip it here, the seed
+        // turn alone is too short to compact).
+        admit_turn_with_scheduled_request(
+            &mut boundary,
+            &engine,
+            &model,
+            format!("second turn {}", "x".repeat(2_000)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(compaction_count(&engine).await, 1);
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| event["type"] != "refine_complete"),
+            "no auto-refine before disposal"
+        );
+        // The print runtime's disposal order: the terminal output is done,
+        // the subscription is gone, and the drain runs the round silently.
+        boundary
+            .drain_compact_auto_refine_at_disposal(&engine, &model, None, global_dir)
+            .await;
+        let rows = refine_rows(&engine).await;
+        assert_eq!(rows.len(), 2, "the durable rows persisted");
+        assert_eq!(rows[0].custom_type, "refinement_outcome");
+        assert_eq!(rows[1].custom_type, "refinement_notice");
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| event["type"] != "refine_complete"),
+            "the drain stays off the event stream"
+        );
+    }
+
+    /// A declining review surfaces nothing (TS: the decline only stamps the
+    /// cooldown): no refinement rows, no events.
+    #[tokio::test]
+    async fn auto_refine_review_decline_surfaces_nothing() {
+        let _faux = FAUX_TEST_LOCK.lock().await;
+        let review = r#"{"shouldRefine": false, "rationale": "one-off tool output"}"#;
+        let (engine, _dir, model) = faux_engine_with_settings(
+            json!({
+                "responses": [
+                    {"text": "seed reply"},
+                    {"text": "second reply"},
+                    {"text": "the summary"},
+                    {"text": "third reply"},
+                    {"text": review},
+                ]
+            }),
+            compactable_settings(),
+            None,
+        )
+        .await;
+        let global_dir = tempfile::TempDir::new().unwrap().keep();
+        let (sink, events) = capture_sink();
+        let mut boundary = TurnBoundary::with_sink(true, sink);
+        admit_with_harness_dir(
+            &mut boundary,
+            &engine,
+            &model,
+            format!("seed turn {}", "x".repeat(48_000)),
+            global_dir.clone(),
+        )
+        .await
+        .unwrap();
+        engine.turn_boundary.schedule_compaction(None).await;
+        // The mid-turn-request shape (#223's contract: a `compact.run`
+        // scheduled during a turn consumes at that turn's settled boundary;
+        // a pending request never survives to a pre-turn check in the
+        // product flow — the pre-turn arm would skip it here, the seed
+        // turn alone is too short to compact).
+        admit_turn_with_scheduled_request(
+            &mut boundary,
+            &engine,
+            &model,
+            format!("second turn {}", "x".repeat(2_000)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(compaction_count(&engine).await, 1, "the compaction ran");
+        admit_with_harness_dir(
+            &mut boundary,
+            &engine,
+            &model,
+            "third turn".to_string(),
+            global_dir,
+        )
+        .await
+        .unwrap();
+        assert!(refine_rows(&engine).await.is_empty(), "no refinement ran");
+        let events = events.lock().unwrap().clone();
+        assert!(
+            events
+                .iter()
+                .all(|event| event["type"] != "refine_complete"
+                    && event["type"] != "refine_failed"),
+            "the decline surfaces nothing"
+        );
+        // The unconsumed review response stays queued (the reviewer ran
+        // exactly once).
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "compaction_start")
+                .count(),
+            1
+        );
+    }
+
+    /// The settings gate (TS `autoRefine.enabled`): a disabled auto-refine
+    /// drops the compaction trigger without a review call.
+    #[tokio::test]
+    async fn auto_refine_disabled_settings_drop_the_trigger() {
+        let _faux = FAUX_TEST_LOCK.lock().await;
+        let (engine, _dir, model) = faux_engine_with_settings(
+            json!({
+                "responses": [
+                    {"text": "seed reply"},
+                    {"text": "second reply"},
+                    {"text": "the summary"},
+                    {"text": "third reply"},
+                ]
+            }),
+            json!({
+                "compaction": { "enabled": true, "reserveTokens": 1, "keepRecentTokens": 10 },
+                "autoRefine": { "enabled": false }
+            }),
+            None,
+        )
+        .await;
+        let global_dir = tempfile::TempDir::new().unwrap().keep();
+        let (sink, events) = capture_sink();
+        let mut boundary = TurnBoundary::with_sink(true, sink);
+        admit_with_harness_dir(
+            &mut boundary,
+            &engine,
+            &model,
+            format!("seed turn {}", "x".repeat(48_000)),
+            global_dir.clone(),
+        )
+        .await
+        .unwrap();
+        engine.turn_boundary.schedule_compaction(None).await;
+        // The mid-turn-request shape (#223's contract: a `compact.run`
+        // scheduled during a turn consumes at that turn's settled boundary;
+        // a pending request never survives to a pre-turn check in the
+        // product flow — the pre-turn arm would skip it here, the seed
+        // turn alone is too short to compact).
+        admit_turn_with_scheduled_request(
+            &mut boundary,
+            &engine,
+            &model,
+            format!("second turn {}", "x".repeat(2_000)),
+        )
+        .await
+        .unwrap();
+        admit_with_harness_dir(
+            &mut boundary,
+            &engine,
+            &model,
+            "third turn".to_string(),
+            global_dir,
+        )
+        .await
+        .unwrap();
+        assert_eq!(compaction_count(&engine).await, 1, "the compaction ran");
+        assert!(refine_rows(&engine).await.is_empty(), "no refinement ran");
+        let events = events.lock().unwrap().clone();
+        assert!(
+            events
+                .iter()
+                .all(|event| event["type"] != "refine_complete"
+                    && event["type"] != "refine_failed"),
+            "the disabled trigger surfaces nothing"
+        );
     }
 
     /// A plain provider error is not an overflow: the arm never fires and

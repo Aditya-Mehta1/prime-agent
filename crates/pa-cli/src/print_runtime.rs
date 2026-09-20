@@ -885,6 +885,16 @@ async fn run_prompts_and_emit(
             exit_code = 1;
         }
     }
+    // The TS disposal order: print mode returns its exit code first, then
+    // the connection teardown disposes the session — which drains a
+    // compact-trigger auto-refine that no later boundary consumed (TS
+    // `dispose`: "a serialized compaction can finish without another model
+    // turn"). The event subscription is already gone at this point, so the
+    // round's surface stays off the stream; the durable rows and the
+    // harness state persist.
+    boundary
+        .drain_compact_auto_refine_at_disposal(engine, model, api_key, global_harness_dir)
+        .await;
     Ok(exit_code)
 }
 
@@ -909,13 +919,14 @@ async fn build_faux_engine_parts(
     let config = &options.config;
     let script: serde_json::Value = serde_json::from_str(script)
         .map_err(|error| format!("invalid PRIME_AGENT_FAUX_SCRIPT: {error}"))?;
-    // Response entries: a plain string (or `{"text": ...}`) answers with
-    // fixed text; `{"systemPrompt": true}` answers with the request's system
-    // prompt (binary-level verification of session assembly; never used by
-    // the product); `{"content": [...]}` entries carry content blocks
-    // (thinking, text, tool calls) through the shared faux-script parser the
-    // daemon worker seam uses, so binary-level tests can script full turns
-    // (e.g. an `ipython` kernel cell).
+    // Response entries: a plain string answers with fixed text;
+    // `{"systemPrompt": true}` answers with the request's system prompt
+    // (binary-level verification of session assembly; never used by the
+    // product); any other object goes through the shared faux-script
+    // parser the daemon worker seam uses — `{"text": ...}`,
+    // `{"content": [...]}` blocks (thinking, text, tool calls), and the
+    // scripted `stopReason`/`errorMessage`/`delayMs` fields the
+    // overflow-recovery harnesses script provider error turns with.
     let response_steps: Vec<pa_ai::faux::FauxResponseStep> = script
         .get("responses")
         .and_then(serde_json::Value::as_array)
@@ -942,7 +953,7 @@ async fn build_faux_engine_parts(
                             },
                         )))
                     }
-                    serde_json::Value::Object(map) if map.contains_key("content") => {
+                    serde_json::Value::Object(_) => {
                         pa_ai::faux::script::parse_faux_script(&serde_json::json!({
                             "responses": [entry]
                         }))
@@ -950,20 +961,12 @@ async fn build_faux_engine_parts(
                             let mut steps = parsed.responses.into_iter();
                             let first = steps
                                 .next()
-                                .expect("a content entry parses into one response step");
+                                .expect("an object entry parses into one response step");
                             debug_assert!(steps.next().is_none());
                             first
                         })
                         .map_err(|error| error.to_string())
                     }
-                    serde_json::Value::Object(map) => Ok(pa_ai::faux::FauxResponseStep::Message(
-                        pa_ai::faux::faux_assistant_text_message(
-                            map.get("text")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or_default(),
-                            pa_ai::faux::FauxAssistantMessageOptions::default(),
-                        ),
-                    )),
                     _ => Ok(pa_ai::faux::FauxResponseStep::Message(
                         pa_ai::faux::faux_assistant_text_message(
                             "",

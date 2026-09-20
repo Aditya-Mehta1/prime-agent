@@ -189,8 +189,11 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     let settings = crate::settings::SettingsManager::create(&cwd, &config.agent_dir);
     let service_tier_preference = settings.get_default_service_tier();
     // Captured before `settings` moves into the resource loader: the
-    // compaction scheduling budget (`compact.run` prepare check).
+    // compaction scheduling budget (`compact.run` prepare check) and the
+    // auto-refine gates (TS `getAutoRefineSettings`).
     let compaction_settings = settings.settings().compaction.clone().unwrap_or_default();
+    let auto_refine_gates =
+        super::refine::AutoRefineGates::from_settings(settings.settings().auto_refine.as_ref());
     let (mcp_skill_overrides, mcp_generic_servers, built_manager) =
         mcp_gating(&settings, config.agent_dir.clone()).await?;
     let mcp_manager = config
@@ -297,7 +300,12 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
                 .as_deref()
                 .and_then(super::harness_digest::local_harness_dir_for_log)
         });
-    if config.rlm_depth.unwrap_or(0) == 0 && local_harness_dir.is_some() {
+    // The refine surface gate (TS `_autoRefineAllowedForSession`): depth 0
+    // with a local harness state dir — the sessions whose `refine.*` host
+    // requests register, and the only sessions the compact-trigger
+    // auto-refine may run for.
+    let auto_refine_allowed = config.rlm_depth.unwrap_or(0) == 0 && local_harness_dir.is_some();
+    if auto_refine_allowed {
         turn_boundary.register_refine_handlers(&mut handlers);
     }
     // `kernel bootstrap` telemetry: the provisioner reports every actual
@@ -524,6 +532,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         Some(digest_context),
     )
     .await?;
+    session.set_auto_refine(auto_refine_allowed, auto_refine_gates);
     // Every compaction path reads the session's resolved compaction
     // settings (TS `getCompactionSettings`): `/compact` matches the
     // `compact.*` turn-boundary tool's `keepRecentTokens`/`reserveTokens`.

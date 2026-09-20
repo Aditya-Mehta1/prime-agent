@@ -286,29 +286,25 @@ pub fn apply_refinement_proposal(
         let id = computed_id.clone().unwrap_or_default();
         let validation_error = validate_edit(edit, computed_id.as_deref());
         let Some(kind) = edit.kind else {
-            applied_edits.push(AppliedRefinementEdit {
-                action: RefinementAction::Create,
-                kind: RefinementKind::Memory,
-                id: id.clone(),
-                before: None,
-                after: None,
-                applied: false,
-                error: validation_error,
-                reason: edit.reason.clone(),
-            });
+            let mut row = AppliedRefinementEdit::planned(
+                edit,
+                RefinementAction::Create,
+                RefinementKind::Memory,
+                id.clone(),
+            );
+            row.error = validation_error;
+            applied_edits.push(row);
             continue;
         };
         if let Some(error) = validation_error {
-            applied_edits.push(AppliedRefinementEdit {
-                action: edit.action.unwrap_or(RefinementAction::Create),
+            let mut row = AppliedRefinementEdit::planned(
+                edit,
+                edit.action.unwrap_or(RefinementAction::Create),
                 kind,
-                id: id.clone(),
-                before: None,
-                after: None,
-                applied: false,
-                error: Some(error),
-                reason: edit.reason.clone(),
-            });
+                id.clone(),
+            );
+            row.error = Some(error);
+            applied_edits.push(row);
             continue;
         }
         let action = edit.action.unwrap();
@@ -325,70 +321,38 @@ pub fn apply_refinement_proposal(
             && !proposal_modified_keys.contains(&entry_key)
             && serde_json::to_value(&before).ok() != serde_json::to_value(&baseline).ok()
         {
-            applied_edits.push(AppliedRefinementEdit {
-                action,
-                kind,
-                id: id.clone(),
-                before,
-                after: None,
-                applied: false,
-                error: Some("entry changed during refinement planning".to_string()),
-                reason: edit.reason.clone(),
-            });
+            let mut row = AppliedRefinementEdit::planned(edit, action, kind, id.clone());
+            row.before = before;
+            row.error = Some("entry changed during refinement planning".to_string());
+            applied_edits.push(row);
             continue;
         }
         if action == RefinementAction::Delete {
             if before.is_none() {
-                applied_edits.push(AppliedRefinementEdit {
-                    action,
-                    kind,
-                    id: id.clone(),
-                    before: None,
-                    after: None,
-                    applied: false,
-                    error: Some("entry not found".to_string()),
-                    reason: edit.reason.clone(),
-                });
+                let mut row = AppliedRefinementEdit::planned(edit, action, kind, id.clone());
+                row.error = Some("entry not found".to_string());
+                applied_edits.push(row);
                 continue;
             }
             records.remove(&id);
             proposal_modified_keys.insert(entry_key);
-            applied_edits.push(AppliedRefinementEdit {
-                action,
-                kind,
-                id,
-                before,
-                after: None,
-                applied: true,
-                error: None,
-                reason: edit.reason.clone(),
-            });
+            let mut row = AppliedRefinementEdit::planned(edit, action, kind, id);
+            row.before = before;
+            row.applied = true;
+            applied_edits.push(row);
             continue;
         }
         if action == RefinementAction::Create && before.is_some() {
-            applied_edits.push(AppliedRefinementEdit {
-                action,
-                kind,
-                id: id.clone(),
-                before,
-                after: None,
-                applied: false,
-                error: Some("entry already exists".to_string()),
-                reason: edit.reason.clone(),
-            });
+            let mut row = AppliedRefinementEdit::planned(edit, action, kind, id.clone());
+            row.before = before;
+            row.error = Some("entry already exists".to_string());
+            applied_edits.push(row);
             continue;
         }
         if action == RefinementAction::Update && before.is_none() {
-            applied_edits.push(AppliedRefinementEdit {
-                action,
-                kind,
-                id: id.clone(),
-                before: None,
-                after: None,
-                applied: false,
-                error: Some("entry not found".to_string()),
-                reason: edit.reason.clone(),
-            });
+            let mut row = AppliedRefinementEdit::planned(edit, action, kind, id.clone());
+            row.error = Some("entry not found".to_string());
+            applied_edits.push(row);
             continue;
         }
         let after = HarnessEntry {
@@ -439,16 +403,11 @@ pub fn apply_refinement_proposal(
         };
         records.insert(id.clone(), after.clone());
         proposal_modified_keys.insert(entry_key);
-        applied_edits.push(AppliedRefinementEdit {
-            action,
-            kind,
-            id,
-            before,
-            after: Some(after),
-            applied: true,
-            error: None,
-            reason: edit.reason.clone(),
-        });
+        let mut row = AppliedRefinementEdit::planned(edit, action, kind, id);
+        row.before = before;
+        row.after = Some(after);
+        row.applied = true;
+        applied_edits.push(row);
     }
     let changes: Vec<String> = applied_edits
         .iter()

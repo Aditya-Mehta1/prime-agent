@@ -16,7 +16,10 @@ one or more sequential runs over the same shared session store):
   - threshold: a small seed turn then a ~12k-token crossing turn over a
     16k context window with reserveTokens=1. Covers the threshold
     compaction arm's compaction_start/compaction_end pair (reason, result,
-    willRetry=false) at the settled turn boundary.
+    willRetry=false) at the settled turn boundary. The compact-trigger
+    auto-refine the compaction schedules stays off the stream on both
+    sides: the disposal drain runs after the client's subscription is torn
+    down (only the durable rows persist).
   - resume: two runs over one session. Run one ends above the reserve
     headroom with compaction disabled (nothing fires, either boundary);
     run two resumes with compaction enabled (`--continue`, its own daemon
@@ -24,6 +27,14 @@ one or more sequential runs over the same shared session store):
     pre-turn boundary (TS `_runPreTurnCompaction`) fires the threshold
     arm before the admitted prompt: the compaction_start/compaction_end
     pair precedes the prompt's turn events on both sides.
+  - compact-refine: the overflow compact-and-retry arm whose retried turn
+    settles, then the serialized checkpoint's compact-trigger auto-refine:
+    the review gate approves and the refinement runs mid-run, streaming
+    the refinement rows' message pairs and refine_complete (the #214
+    residue: TS print mode auto-refines after compactions; probed against
+    the TS binary).
+  - compact-refine-decline: the same overflow shape with a declining
+    review - no refinement rows, no refine events, identical streams.
 
 The Rust run rides the harness digest row through the loop's prompt input
 (the same TS design), so `agent_end.messages` includes it on both sides and
@@ -31,13 +42,13 @@ the comparison is full parity: any event difference fails.
 
 Both sides run with RLM_DEPTH unset (root sessions are depth 0; the TS
 daemon strips the env for its workers, the Rust print run is in-process).
-All scenarios pin `autoRefine: {enabled: false}` in the sandbox settings:
-the TS session schedules a harness-state review after every compaction and
-at turn intervals (auto-refine, `_scheduleAutoRefine`), a surface the Rust
-print runtime does not host yet (owned elsewhere); with the review enabled
-the TS side of a compaction scenario consumes extra scripted responses and
-emits refine rows the comparison would misattribute to the compaction
-arms. The settings gate is the product's own switch, so nothing else
+The compaction scenarios that stay about the compaction arms (`threshold`,
+`resume`) pin `autoRefine: {enabled: false}` in the sandbox settings so
+the review rounds never enter their streams; the compact-refine scenarios
+leave the gate at its enabled default - the compact-trigger review IS the
+surface under test there (the threshold scenario scripts the drain's
+decline, so its disposal round stays silent on both sides at the enabled
+default). The settings gate is the product's own switch, so nothing else
 differs.
 
 Exit code is non-zero when any event sequence differs. Use --keep to keep
@@ -165,7 +176,11 @@ def normalize_value(key, item, sandbox_root):
             return "<ID>"
         if key == "timestamp":
             return "<TS>"
-        if key in ("firstKeptEntryId", "id"):
+        if key in ("created_at", "updated_at"):
+            # Harness-entry timestamps (the refinement result's before/after
+            # snapshots): volatile, normalized to a placeholder.
+            return "<TS>"
+        if key in ("firstKeptEntryId", "id", "refinementId"):
             return "<ID>"
         return item
     if isinstance(item, list):
@@ -195,6 +210,38 @@ def normalize_events(stdout, sandbox_root):
         ):
             continue
         events.append(event)
+    return float_checkpoint_agent_end(events)
+
+
+def is_refinement_event(event):
+    """One serialized-checkpoint refinement event (the compact-trigger
+    auto-refine surface): the durable rows' message pairs or the
+    refine_complete/refine_failed terminal events."""
+    if event.get("type") in ("refine_complete", "refine_failed"):
+        return True
+    message = event.get("message", {})
+    return event.get("type") in ("message_start", "message_end") and message.get(
+        "customType"
+    ) in ("refinement_outcome", "refinement_notice")
+
+
+def float_checkpoint_agent_end(events):
+    """Hoist the overflow-retry continuation run's trailing agent_end across
+    the serialized checkpoint's refinement events (one narrow reordering):
+    the TS checkpoint runs inside the agent loop's stop decision - refine
+    events first, then the run's agent_end - while the Rust print boundary
+    runs post-idle, after the run's agent_end. An agent_end that directly
+    follows a turn_end and is followed ONLY by refinement events moves to
+    the tail; every other position is untouched."""
+    for index, event in enumerate(events):
+        if (
+            event.get("type") == "agent_end"
+            and index > 0
+            and events[index - 1].get("type") == "turn_end"
+            and events[index + 1 :]
+            and all(is_refinement_event(item) for item in events[index + 1 :])
+        ):
+            return events[:index] + events[index + 1 :] + [event]
     return events
 
 
@@ -340,8 +387,20 @@ SCENARIOS = {
                     "onboardingCompleted": True,
                     "compaction": {"enabled": True, "reserveTokens": 7000, "keepRecentTokens": 10},
                 },
+                # The fourth response serves the disposal drain's auto-refine
+                # review (the compaction scheduled the trigger; no further
+                # turn consumed it): a decline, so the drain's surface is
+                # silence on both sides - the compact-trigger round itself
+                # stays off the stream (TS dispose runs it after the
+                # subscription teardown).
                 "script": faux_script(
-                    ["seed reply", "crossing reply", "the compaction summary"], 20000
+                    [
+                        "seed reply",
+                        "crossing reply",
+                        "the compaction summary",
+                        '{"shouldRefine": false, "rationale": "one-off tool output"}',
+                    ],
+                    20000,
                 ),
                 "prompts": ["seed turn", "crossing turn " + "x" * 24000],
                 "args": [],
@@ -397,6 +456,61 @@ SCENARIOS = {
                 "prompts": ["next prompt"],
                 "args": ["--continue"],
             },
+        ]
+    },
+    "compact-refine": {
+        "runs": [
+            {
+                # The overflow compact-and-retry (willRetry=true) whose
+                # retried turn settles, then the serialized checkpoint's
+                # compact-trigger auto-refine: the scripted review approves,
+                # the scripted refinement plan applies one memory edit, and
+                # the refine events stream mid-run on both sides. The
+                # overflow response is scripted (the classifier reads the
+                # error text), the way the #211/#214 unit harnesses do.
+                "settings": {
+                    "onboardingCompleted": True,
+                    "compaction": {"enabled": True, "reserveTokens": 1, "keepRecentTokens": 10},
+                },
+                "script": faux_script(
+                    [
+                        "seed reply",
+                        {"text": "", "stopReason": "error", "errorMessage": "prompt is too long: 213462 tokens > 200000 maximum"},
+                        "the compaction summary",
+                        "recovered reply",
+                        '{"shouldRefine": true, "rationale": "the overflow recovery tactic is reusable", "instructions": "record the tactic"}',
+                        '{"summary":"note it","rationale":"repeated","expectedOutcome":"recall","edits":[{"action":"create","kind":"memory","id":"m1","title":"Tactic","content":"Use tactic A"}]}',
+                    ],
+                    200000,
+                ),
+                "prompts": ["seed turn " + "x" * 48000, "overflow probe " + "x" * 48000],
+                "args": [],
+            }
+        ]
+    },
+    "compact-refine-decline": {
+        "runs": [
+            {
+                # The same overflow shape with a declining review: the
+                # cooldown stamps, no refinement rows, no refine events -
+                # identical streams.
+                "settings": {
+                    "onboardingCompleted": True,
+                    "compaction": {"enabled": True, "reserveTokens": 1, "keepRecentTokens": 10},
+                },
+                "script": faux_script(
+                    [
+                        "seed reply",
+                        {"text": "", "stopReason": "error", "errorMessage": "prompt is too long: 213462 tokens > 200000 maximum"},
+                        "the compaction summary",
+                        "recovered reply",
+                        '{"shouldRefine": false, "rationale": "one-off tool output"}',
+                    ],
+                    200000,
+                ),
+                "prompts": ["seed turn " + "x" * 48000, "overflow probe " + "x" * 48000],
+                "args": [],
+            }
         ]
     },
 }
