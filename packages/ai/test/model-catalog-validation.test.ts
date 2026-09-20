@@ -1,9 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-	type CatalogLike,
-	type CatalogRowLike,
-	validateModelCatalog,
-} from "../scripts/validate-model-catalog.js";
+import { type CatalogLike, type CatalogRowLike, validateModelCatalog } from "../scripts/validate-model-catalog.js";
 import { MODELS } from "../src/models.generated.js";
 
 function row(overrides: Partial<CatalogRowLike> & { id: string; provider: string }): CatalogRowLike {
@@ -42,7 +38,10 @@ describe("model catalog validation", () => {
 		],
 		[
 			"unclassified and misrouted GitHub Copilot models",
-			catalogOf(row({ id: "novel-model-x", provider: "github-copilot" }), row({ id: "grok-9", provider: "github-copilot" })),
+			catalogOf(
+				row({ id: "novel-model-x", provider: "github-copilot" }),
+				row({ id: "grok-9", provider: "github-copilot" }),
+			),
 			[
 				"github-copilot/novel-model-x: unclassified model family; add it to copilotModelApi in validate-model-catalog.ts",
 				"github-copilot/grok-9: api openai-completions does not match classification openai-responses",
@@ -70,7 +69,13 @@ describe("model catalog validation", () => {
 		[
 			"selectable levels on a transport that cannot send reasoning effort, without crashing on a missing baseUrl",
 			catalogOf(
-				row({ id: "model-z", provider: "moonshotai", reasoning: true, thinkingLevelMap: NULL_MAP, baseUrl: undefined }),
+				row({
+					id: "model-z",
+					provider: "moonshotai",
+					reasoning: true,
+					thinkingLevelMap: NULL_MAP,
+					baseUrl: undefined,
+				}),
 			),
 			["moonshotai/model-z: thinkingLevelMap offers [max] but the transport cannot send reasoning effort"],
 		],
