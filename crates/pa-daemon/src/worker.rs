@@ -2357,8 +2357,13 @@ impl Worker {
     }
 
     fn handle_abort(&self) -> DaemonResponse {
-        let mut core = self.core.lock().unwrap();
-        core.abort_requested = true;
+        {
+            let mut core = self.core.lock().unwrap();
+            core.abort_requested = true;
+        }
+        // TS `requestAbort()` also aborts the compaction in flight (manual
+        // and automatic): the interrupt key cancels a compacting session.
+        self.compaction.abort();
         response_success(None, "abort", None)
     }
 

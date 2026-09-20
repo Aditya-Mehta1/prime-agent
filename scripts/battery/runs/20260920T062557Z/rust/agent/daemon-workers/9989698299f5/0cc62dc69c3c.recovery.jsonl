@@ -1,0 +1,8 @@
+{"activeSessionId":"0cc62dc69c3c","busy":true,"operation":"create","recordedAt":"2026-09-20T06:26:38.368Z","sessionFile":"/home/ubuntu/lane-worktrees/compaction-abort/scripts/battery/runs/20260920T062557Z/rust/agent/sessions/01a0bd7e-ca8d-7432-bcb8-f3c5c382d8ec.jsonl","sessionId":"01a0bd7e-ca8d-7432-bcb8-f3c5c382d8ec"}
+{"active_session_id":"0cc62dc69c3c","follow_up":[],"recorded_at":"2026-09-20T06:26:38.384Z","steering":["f14 seed turn 1 of the parity battery with deterministic content"],"type":"queue_snapshot","version":1}
+{"active_session_id":"0cc62dc69c3c","follow_up":[],"recorded_at":"2026-09-20T06:26:38.426Z","steering":["f14 seed turn 2 of the parity battery with deterministic content"],"type":"queue_snapshot","version":1}
+{"active_session_id":"0cc62dc69c3c","follow_up":[],"recorded_at":"2026-09-20T06:26:38.428Z","steering":["f14 seed turn 2 of the parity battery with deterministic content"],"type":"queue_snapshot","version":1}
+{"active_session_id":"0cc62dc69c3c","follow_up":[],"recorded_at":"2026-09-20T06:26:38.504Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"0cc62dc69c3c","follow_up":[],"recorded_at":"2026-09-20T06:26:46.094Z","steering":["/compact"],"type":"queue_snapshot","version":1}
+{"active_session_id":"0cc62dc69c3c","follow_up":[],"recorded_at":"2026-09-20T06:26:46.131Z","steering":[],"type":"queue_snapshot","version":1}
+{"activeSessionId":"0cc62dc69c3c","busy":false,"operation":"shutdown","recordedAt":"2026-09-20T06:27:17.058Z","sessionFile":"/home/ubuntu/lane-worktrees/compaction-abort/scripts/battery/runs/20260920T062557Z/rust/agent/sessions/01a0bd7e-ca8d-7432-bcb8-f3c5c382d8ec.jsonl","sessionId":"01a0bd7e-ca8d-7432-bcb8-f3c5c382d8ec"}

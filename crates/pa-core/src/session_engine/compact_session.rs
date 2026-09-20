@@ -25,6 +25,12 @@ pub struct CompactOptions<'a> {
     pub custom_instructions: Option<&'a str>,
     /// Compaction settings (reserve/keep budgets).
     pub settings: super::compaction::CompactionSettings,
+    /// The run's abort signal (TS `AbortSignal` threaded through
+    /// `_performCompaction` -> `compact`): checked before the summarizer
+    /// request and again after it resolves, before the compaction commits —
+    /// a late abort never lands a committed compaction. `None` for
+    /// surfaces without an abort trigger (headless runs).
+    pub abort: Option<&'a pa_agent::abort::AbortSignal>,
 }
 
 /// The model-visible message produced by a session entry (summarizer input).
@@ -231,6 +237,9 @@ pub async fn execute_compaction(
         timestamp: 0,
         rest: Default::default(),
     })];
+    // A run aborted before the summarizer request never starts one (TS
+    // `throwIfAborted` at the top of the provider call).
+    pa_agent::abort::throw_if_aborted_signal(options.abort)?;
     let max_tokens = options.settings.reserve_tokens / 5 * 4; // floor(0.8 * reserve)
     let context = pa_types::ai::Context {
         system_prompt: Some(
@@ -247,6 +256,16 @@ pub async fn execute_compaction(
         });
     let assistant = pa_ai::complete_simple(&options.model, &context, Some(stream_options)).await?;
     let assistant: AssistantMessage = assistant;
+
+    // The summarizer resolved while the run was aborted: the compaction is
+    // cancelled before it commits (TS `_performCompaction`'s
+    // `if (signal.aborted) throw` between the summary and the ledger).
+    if options
+        .abort
+        .is_some_and(pa_agent::abort::AbortSignal::is_aborted)
+    {
+        return Err(pa_agent::abort::aborted_error());
+    }
 
     // An error-stop summarizer response is a failed compaction, never an
     // empty-summary success (TS throws `Summarization failed: ...`).
@@ -439,6 +458,7 @@ mod tests {
                     keep_recent_tokens: 20,
                     ..Default::default()
                 },
+                abort: None,
             },
         )
         .await
@@ -492,6 +512,7 @@ mod tests {
                     keep_recent_tokens: 20,
                     ..Default::default()
                 },
+                abort: None,
             },
         )
         .await
@@ -505,6 +526,97 @@ mod tests {
             .get_entries()
             .iter()
             .all(|entry| !matches!(entry, FileEntry::Compaction { .. })));
+        registration.unregister();
+    }
+
+    /// An already-aborted signal cancels the run before any summarizer
+    /// request (TS `throwIfAborted` at the top of the provider call):
+    /// the abort marker error surfaces and nothing commits.
+    #[tokio::test]
+    async fn execute_compaction_with_pre_aborted_signal_never_runs_the_summarizer() {
+        let registration = faux_registration();
+        let model = registration.get_model();
+        let controller = pa_agent::abort::AbortController::new();
+        controller.abort();
+        let signal = controller.signal();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut session = session_with_turns(tmp.path(), 3);
+        let error = execute_compaction(
+            &mut session,
+            CompactOptions {
+                model,
+                api_key: None,
+                custom_instructions: None,
+                settings: super::super::compaction::CompactionSettings {
+                    keep_recent_tokens: 20,
+                    ..Default::default()
+                },
+                abort: Some(&signal),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(pa_agent::abort::is_abort_error(&error), "{error:#}");
+        assert!(session
+            .get_entries()
+            .iter()
+            .all(|entry| !matches!(entry, FileEntry::Compaction { .. })));
+        registration.unregister();
+    }
+
+    /// A signal that aborts while the summarizer is in flight cancels the
+    /// run before it commits (TS `_performCompaction`'s
+    /// `if (signal.aborted) throw` between the summary and the ledger):
+    /// the summarizer's resolved summary never lands as a compaction
+    /// entry.
+    #[tokio::test]
+    async fn execute_compaction_with_late_abort_cancels_before_the_commit() {
+        let registration = faux_registration();
+        let model = registration.get_model();
+        // The delayed response holds the summarizer in flight while the
+        // abort lands mid-run.
+        registration.set_responses(vec![pa_ai::faux::FauxResponseStep::Delayed {
+            message: pa_ai::faux::faux_assistant_text_message(
+                "## Goal\nsummarized goal",
+                pa_ai::faux::FauxAssistantMessageOptions::default(),
+            ),
+            delay_ms: 200,
+        }]);
+        let controller = pa_agent::abort::AbortController::new();
+        let signal = controller.signal();
+        let aborter = {
+            let controller = controller.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                controller.abort();
+            })
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let mut session = session_with_turns(tmp.path(), 3);
+        let error = execute_compaction(
+            &mut session,
+            CompactOptions {
+                model,
+                api_key: None,
+                custom_instructions: None,
+                settings: super::super::compaction::CompactionSettings {
+                    keep_recent_tokens: 20,
+                    ..Default::default()
+                },
+                abort: Some(&signal),
+            },
+        )
+        .await
+        .unwrap_err();
+        aborter.await.unwrap();
+        assert!(pa_agent::abort::is_abort_error(&error), "{error:#}");
+        assert!(
+            session
+                .get_entries()
+                .iter()
+                .all(|entry| !matches!(entry, FileEntry::Compaction { .. })),
+            "the late abort never commits the compaction"
+        );
         registration.unregister();
     }
 
@@ -523,6 +635,7 @@ mod tests {
                 api_key: None,
                 custom_instructions: None,
                 settings: super::super::compaction::CompactionSettings::default(),
+                abort: None,
             },
         )
         .await
@@ -555,6 +668,7 @@ mod tests {
                     keep_recent_tokens: 200,
                     ..Default::default()
                 },
+                abort: None,
             },
         )
         .await

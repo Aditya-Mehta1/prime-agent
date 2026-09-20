@@ -258,12 +258,15 @@ impl AgentSession {
     /// Execute `/compact`: summarize the pre-cut prefix, persist the
     /// compaction entry, and rebuild the loop context summary-first. A skip
     /// (already compacted, or nothing to summarize) leaves the session
-    /// untouched, matching the TS `CompactionSkippedError` flow.
+    /// untouched, matching the TS `CompactionSkippedError` flow. `abort`
+    /// is the run's abort signal (TS `_performCompaction`'s `signal`):
+    /// an aborted run returns the abort error and never commits.
     pub async fn compact(
         &self,
         custom_instructions: Option<&str>,
         model: &pa_types::ai::Model,
         api_key: Option<String>,
+        abort: Option<&pa_agent::abort::AbortSignal>,
     ) -> anyhow::Result<CompactOutcome> {
         let outcome = {
             let mut session = self.session.lock().await;
@@ -274,6 +277,7 @@ impl AgentSession {
                     api_key,
                     custom_instructions,
                     settings: self.compaction,
+                    abort,
                 },
             )
             .await?

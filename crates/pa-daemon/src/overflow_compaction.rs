@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 
 use crate::agent_engine::AgentSessionEngine;
 use crate::engine::EngineEvent;
+use pa_agent::abort::AbortController;
 use pa_core::session_engine::compact_session::CompactOutcome;
 use pa_core::session_engine::messages::CompactionOutcomeKind;
 use pa_core::session_engine::messages::CompactionOutcomeReason;
@@ -203,7 +204,6 @@ impl AgentSessionEngine {
                         CompactionOutcomeKind::Failed,
                         OVERFLOW_RECOVERY_FAILED_MESSAGE,
                         None,
-                        None,
                         emit,
                     ) {
                         return OverflowAttempt::Cancelled;
@@ -245,21 +245,43 @@ impl AgentSessionEngine {
         }) {
             return OverflowAttempt::Cancelled;
         }
+        // TS `_runAutoCompaction` assigns `_autoCompactionAbortController`
+        // for the overflow run too: an `abort_compaction` command lands in
+        // the shared slot and cancels the in-flight summarizer.
+        let controller = std::sync::Arc::new(AbortController::new());
+        let signal = controller.signal();
+        {
+            *self
+                .auto_compaction_abort
+                .lock()
+                .expect("auto compaction abort lock") = Some(std::sync::Arc::clone(&controller));
+        }
         let api_key = self.resolve_request_api_key(&model);
         let outcome = {
             let guard = self.session.blocking_lock();
             let Some(engine) = guard.as_ref() else {
+                self.clear_auto_compaction_abort(&controller);
                 return OverflowAttempt::None;
             };
-            self.runtime.block_on(async {
+            let compact = async {
                 engine
                     .session
-                    .compact(custom_instructions.as_deref(), &model, api_key)
+                    .compact(
+                        custom_instructions.as_deref(),
+                        &model,
+                        api_key,
+                        Some(&signal),
+                    )
                     .await
-            })
+            };
+            let outcome = self
+                .runtime
+                .block_on(pa_agent::abort::race_with_abort(compact, &signal));
+            self.clear_auto_compaction_abort(&controller);
+            outcome
         };
         match outcome {
-            Ok(CompactOutcome::Ran(run)) => {
+            Ok(Ok(CompactOutcome::Ran(run))) => {
                 // Adoption telemetry (TS `compaction_end` handling counts
                 // every completed compaction into the active run).
                 {
@@ -305,12 +327,11 @@ impl AgentSessionEngine {
             }
             // A skipped overflow recovery does not re-issue (TS excludes
             // overflow from `resumeAfterFailure`).
-            Ok(CompactOutcome::Skipped(message)) => {
+            Ok(Ok(CompactOutcome::Skipped(message))) => {
                 if !self.emit_unsuccessful_compaction(
                     CompactionOutcomeReason::Overflow,
                     CompactionOutcomeKind::Skipped,
                     &format!("Auto-compaction skipped: {message}"),
-                    Some("warning"),
                     custom_instructions.as_deref(),
                     emit,
                 ) {
@@ -318,12 +339,28 @@ impl AgentSessionEngine {
                 }
                 OverflowAttempt::Finished
             }
-            Err(error) => {
+            // An abort from either layer — the race dropped the in-flight
+            // summarizer request, or the compaction's pre-commit signal
+            // check fired — the run cancelled (TS `_runAutoCompaction`'s
+            // aborted arm, before the failure arms); the cancelled
+            // recovery does not re-issue the overflowing request.
+            Ok(Err(error)) | Err(error) if pa_agent::abort::is_abort_error(&error) => {
+                if !self.emit_unsuccessful_compaction(
+                    CompactionOutcomeReason::Overflow,
+                    CompactionOutcomeKind::Cancelled,
+                    "Compaction cancelled",
+                    custom_instructions.as_deref(),
+                    emit,
+                ) {
+                    return OverflowAttempt::Cancelled;
+                }
+                OverflowAttempt::Finished
+            }
+            Ok(Err(error)) | Err(error) => {
                 if !self.emit_unsuccessful_compaction(
                     CompactionOutcomeReason::Overflow,
                     CompactionOutcomeKind::Failed,
                     &format!("Context overflow recovery failed: {error:#}"),
-                    None,
                     custom_instructions.as_deref(),
                     emit,
                 ) {
@@ -341,6 +378,7 @@ mod tests {
     use crate::agent_engine::FAUX_TEST_LOCK;
     use crate::agent_engine::{AgentEngineConfig, AgentSessionEngine};
     use crate::engine::EngineEvent;
+    use crate::engine::SessionEngine;
     use serde_json::{json, Value};
 
     /// The TS overflow error shape: an Anthropic token-overflow message.
@@ -753,6 +791,88 @@ mod tests {
 
     /// The settings gate (TS `settings.enabled`): with automatic
     /// compaction disabled, an overflow error ends the run with no recovery.
+    /// The aborted arm on the overflow recovery (TS `_runAutoCompaction`'s
+    /// `aborted` check): an in-flight overflow summarizer cancelled by
+    /// `abort_compaction` records the durable `cancelled` row with the
+    /// `Compaction cancelled` disclosure, emits the aborted
+    /// `compaction_end` (no error message, no re-issue — the cancelled
+    /// recovery never retries the overflowing request), and commits
+    /// nothing.
+    #[test]
+    fn overflow_recovery_aborted_mid_run_records_the_cancelled_outcome() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (engine, _dir) = faux_engine_with_settings(
+            json!({
+                "responses": [
+                    {"text": "seed reply"},
+                    overflow_error(0),
+                    // The summarizer held in flight: the abort lands while
+                    // the request is open.
+                    {"text": "the summary", "delayMs": 30_000},
+                ]
+            }),
+            1,
+        );
+        let engine = std::sync::Arc::new(engine);
+        let mut seed_events: Vec<EngineEvent> = Vec::new();
+        // A large seed turn, so the overflow recovery has pre-cut history
+        // to summarize (the `keepRecentTokens` cut keeps ~10 tokens).
+        crate::agent_engine::tests::admit(
+            &engine,
+            format!("seed turn {}", "x".repeat(48_000)),
+            &mut seed_events,
+        );
+
+        let events: std::sync::Arc<std::sync::Mutex<Vec<EngineEvent>>> = Default::default();
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let admission = crate::agent_engine::tests::admit_parked(
+            &engine,
+            format!("overflow probe {}", "x".repeat(48_000)),
+            std::sync::Arc::clone(&events),
+            std::sync::Arc::clone(&started),
+        );
+        crate::agent_engine::tests::wait_for_compaction_start(&started);
+        engine.abort_auto_compaction();
+        admission.join().expect("the aborted admission settles");
+
+        let events = events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let starts = compaction_starts(&events);
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0]["reason"], "overflow");
+        // The cancelled outcome row and the aborted end event (TS
+        // `_endCompactionUnsuccessfully`'s `{ aborted: true }`).
+        crate::agent_engine::tests::assert_cancelled_end_event(
+            &events,
+            "overflow",
+            "Compaction cancelled",
+        );
+        assert!(crate::agent_engine::tests::outcome_row_in_entries(&engine));
+        assert!(crate::agent_engine::tests::outcome_row_in_live_context(
+            &engine
+        ));
+        assert!(
+            !crate::agent_engine::tests::compaction_entry_in_entries(&engine),
+            "the aborted overflow recovery never commits"
+        );
+        // The cancelled recovery does not re-issue: exactly the one
+        // overflow error turn settled, and the run ends with the turn's
+        // original error (the failed request, not a re-issued one).
+        let assistant = assistant_messages(&events);
+        assert_eq!(assistant.len(), 1, "no retried turn after the cancel");
+        assert_eq!(assistant[0]["stopReason"], "error");
+        assert_eq!(
+            done_result(&events),
+            Some(&Err(
+                "prompt is too long: 213462 tokens > 200000 maximum".to_string()
+            ))
+        );
+    }
+
     #[test]
     fn overflow_error_with_compaction_disabled_ends_without_recovery() {
         let _faux = FAUX_TEST_LOCK

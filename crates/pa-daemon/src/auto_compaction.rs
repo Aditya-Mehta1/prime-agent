@@ -14,6 +14,7 @@
 //! the outcome shapes: the client-facing result on success, the TS skip /
 //! failure messages with their severities otherwise.
 
+use pa_agent::abort::AbortController;
 use serde_json::{json, Value};
 
 use crate::agent_engine::AgentSessionEngine;
@@ -77,17 +78,41 @@ impl AgentSessionEngine {
         }) {
             return AutoCompactionRun::Cancelled;
         }
+        // TS assigns `_autoCompactionAbortController` for the run's
+        // duration: an `abort_compaction` command lands in the slot and
+        // cancels the in-flight summarizer.
+        let controller = std::sync::Arc::new(AbortController::new());
+        let signal = controller.signal();
+        {
+            *self
+                .auto_compaction_abort
+                .lock()
+                .expect("auto compaction abort lock") = Some(std::sync::Arc::clone(&controller));
+        }
         let api_key = self.resolve_request_api_key(&model);
         let outcome = {
             let guard = self.session.blocking_lock();
             let Some(engine) = guard.as_ref() else {
+                self.clear_auto_compaction_abort(&controller);
                 return AutoCompactionRun::NotDue;
             };
-            self.runtime
-                .block_on(async { engine.session.compact(None, &model, api_key).await })
+            // The abort race drops the summarizer request in flight (TS
+            // cancels the provider stream through the signal); the signal
+            // also lands the pre-commit check inside the compaction.
+            let compact = async {
+                engine
+                    .session
+                    .compact(None, &model, api_key, Some(&signal))
+                    .await
+            };
+            let outcome = self
+                .runtime
+                .block_on(pa_agent::abort::race_with_abort(compact, &signal));
+            self.clear_auto_compaction_abort(&controller);
+            outcome
         };
         match &outcome {
-            Ok(CompactOutcome::Ran(run)) => {
+            Ok(Ok(CompactOutcome::Ran(run))) => {
                 // The wire result is the TS `CompactionResult` shape.
                 let result = json!({
                     "summary": run.result.summary,
@@ -104,12 +129,27 @@ impl AgentSessionEngine {
             // A skip consumed the check (TS `CompactionSkippedError`): the
             // durable disclosure row goes out with its message pair, then
             // the end event carries the warning.
-            Ok(CompactOutcome::Skipped(message)) => {
+            Ok(Ok(CompactOutcome::Skipped(message))) => {
                 if !self.emit_unsuccessful_compaction(
                     CompactionOutcomeReason::Threshold,
                     CompactionOutcomeKind::Skipped,
                     &format!("Auto-compaction skipped: {message}"),
-                    Some("warning"),
+                    None,
+                    emit,
+                ) {
+                    return AutoCompactionRun::Cancelled;
+                }
+            }
+            // An abort from either layer — the race dropped the in-flight
+            // summarizer request (the outer error, always the abort
+            // marker), or the compaction's pre-commit signal check fired —
+            // the run cancelled (TS `_runAutoCompaction`'s aborted arm,
+            // checked before the skip and failure arms).
+            Ok(Err(error)) | Err(error) if pa_agent::abort::is_abort_error(error) => {
+                if !self.emit_unsuccessful_compaction(
+                    CompactionOutcomeReason::Threshold,
+                    CompactionOutcomeKind::Cancelled,
+                    "Compaction cancelled",
                     None,
                     emit,
                 ) {
@@ -117,14 +157,14 @@ impl AgentSessionEngine {
                 }
             }
             // A failed run persists the durable disclosure row and emits
-            // the `compaction_end` failure (TS `_endCompactionUnsuccessfully`:
-            // automatic failures carry no `errorSeverity` on the wire).
-            Err(error) => {
+            // the `compaction_end` failure (TS
+            // `_endCompactionUnsuccessfully`: automatic failures carry no
+            // `errorSeverity` on the wire).
+            Ok(Err(error)) | Err(error) => {
                 if !self.emit_unsuccessful_compaction(
                     CompactionOutcomeReason::Threshold,
                     CompactionOutcomeKind::Failed,
                     &format!("Auto-compaction failed: {error:#}"),
-                    None,
                     None,
                     emit,
                 ) {

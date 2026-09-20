@@ -187,6 +187,14 @@ pub trait SessionEngine: Send + Sync {
     fn run_compaction(&self, request: CompactionRequest, signal: &AbortSignal)
         -> CompactionOutcome;
 
+    /// Abort the in-flight automatic compaction (threshold or requested
+    /// turn-boundary run), if one is running — TS `abortCompaction` also
+    /// aborts the `_autoCompactionAbortController`, not just the manual
+    /// run. Engines without automatic compaction runs (the scripted
+    /// harness engines) do nothing; aborting with no run in flight is a
+    /// silent no-op like the TS controller being `undefined`.
+    fn abort_auto_compaction(&self) {}
+
     /// Run one branch summary (`navigate_tree` with `summarize`): summarize
     /// the abandoned branch's entries. The engine owns the model call; the
     /// worker owns the leaf move, the `branch_summary` entry, and the

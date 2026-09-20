@@ -2513,6 +2513,30 @@ impl SessionUi {
         });
     }
 
+    /// Cancel the in-flight compaction off the UI loop (TS
+    /// `interruptOrClearInput` fires `abortCompaction()` when the
+    /// compaction loader is up — the agent is not streaming during a
+    /// compaction, so the interrupt cancels the run, not a turn): the
+    /// request never blocks key handling, and a failure surfaces later
+    /// as a transcript note.
+    fn abort_compaction(&self) {
+        let client = self.client.clone();
+        let active_session_id = self.active_session_id.clone();
+        let notes = self.notes.clone();
+        tokio::spawn(async move {
+            let result = client
+                .request_ok(DaemonCommand::AbortCompaction {
+                    id: None,
+                    active_session_id,
+                    rest: Default::default(),
+                })
+                .await;
+            if let Err(error) = result {
+                let _ = notes.send(format!("the compaction abort failed: {error:#}"));
+            }
+        });
+    }
+
     /// Apply one background note (a failed abort request) to the transcript.
     pub(crate) fn apply_background_note(&mut self, text: &str, view: &mut AgentView) {
         self.note(text, view);
@@ -2713,7 +2737,13 @@ impl SessionUi {
                 *running = false;
                 return Ok(());
             }
-            if self.turn_active {
+            if view.compaction.is_some() {
+                // The compaction loader is up (TS `isAgentCompacting()`):
+                // the interrupt cancels the compaction run only — the agent
+                // is not streaming, so no turn abort goes out, exactly like
+                // the TS interrupt key.
+                self.abort_compaction();
+            } else if self.turn_active {
                 self.abort_turn();
                 self.note("aborting the current turn", view);
             }

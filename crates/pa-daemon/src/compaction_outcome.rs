@@ -17,17 +17,21 @@ use pa_core::session_engine::messages::{CompactionOutcomeKind, CompactionOutcome
 
 impl AgentSessionEngine {
     /// Record and broadcast one unsuccessful-compaction outcome, then emit
-    /// the `compaction_end` event carrying the same message (TS
-    /// `_endCompactionUnsuccessfully`: the disclosure row's message pair
-    /// goes out first, the end event second; both carry `willRetry: false`).
+    /// the `compaction_end` event (TS `_endCompactionUnsuccessfully`: the
+    /// disclosure row's message pair goes out first, the end event second).
+    /// The event's shape derives from the outcome kind exactly like the TS
+    /// call sites: a skip carries `errorMessage` with `warning` severity, an
+    /// automatic failure carries it with no `errorSeverity`, and a cancel
+    /// carries `aborted` with no message (aborts are user-initiated; the
+    /// durable row owns the disclosure). `custom_instructions` rides the
+    /// event when the run carried any (TS threads the consumed pending
+    /// request's instructions). Both events carry `willRetry: false`.
     /// Returns `false` when the emitter asked to stop.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn emit_unsuccessful_compaction(
         &self,
         reason: CompactionOutcomeReason,
         outcome: CompactionOutcomeKind,
         message: &str,
-        error_severity: Option<&str>,
         custom_instructions: Option<&str>,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) -> bool {
@@ -50,10 +54,20 @@ impl AgentSessionEngine {
                 return false;
             }
         }
+        let (aborted, error_message, error_severity) = match outcome {
+            CompactionOutcomeKind::Skipped => (false, Some(message), Some("warning")),
+            // Automatic failures carry no `errorSeverity` on the wire (TS
+            // `_endCompactionUnsuccessfully` passes none for the auto arms).
+            CompactionOutcomeKind::Failed => (false, Some(message), None),
+            // Aborts are user-initiated; the event carries no error message
+            // (TS `_endCompactionUnsuccessfully`'s `{ aborted: true }`; the
+            // durable row owns the disclosure).
+            CompactionOutcomeKind::Cancelled => (true, None, None),
+        };
         let event = compaction_end_unsuccessful(
             reason.wire(),
-            false,
-            Some(message),
+            aborted,
+            error_message,
             error_severity,
             custom_instructions,
         );

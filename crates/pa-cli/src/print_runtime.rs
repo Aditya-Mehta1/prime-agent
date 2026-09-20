@@ -642,6 +642,9 @@ async fn run_prompts_and_emit(
                 model,
                 api_key.clone(),
                 pa_core::refinement::get_global_harness_state_dir(&options.config.agent_dir),
+                // The headless run has no abort trigger (TS print runtime
+                // compactions run unsignaled).
+                None,
             )
             .await;
         if let Some(Err(error)) = &consumption.compaction {
@@ -661,7 +664,11 @@ async fn run_prompts_and_emit(
             .auto_compaction_due(model.context_window)
             .await
         {
-            if let Err(error) = engine.session.compact(None, model, api_key.clone()).await {
+            if let Err(error) = engine
+                .session
+                .compact(None, model, api_key.clone(), None)
+                .await
+            {
                 eprintln!("pa-cli: auto-compaction failed: {error:#}");
             }
         }

@@ -1814,6 +1814,19 @@ mod tests {
             ChatEntry::Status { kind: StatusKind::Error, text }
                 if text == "Context overflow recovery failed: boom"
         ));
+        // A cancelled compaction errors too (TS: only `skipped` warns).
+        let items = message_value_to_entries(&json!({
+            "role": "custom",
+            "customType": "compaction_outcome",
+            "content": "Compaction cancelled",
+            "display": true,
+            "details": { "reason": "threshold", "outcome": "cancelled" },
+        }));
+        assert!(matches!(
+            &items[0],
+            ChatEntry::Status { kind: StatusKind::Error, text }
+                if text == "Compaction cancelled"
+        ));
         // An envelope TS `isCompactionOutcomeMessage` rejects renders the
         // malformed notice (invalid reason and outcome both).
         for details in [

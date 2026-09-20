@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 
 use crate::agent_messaging::{LinkAgentMessageController, LinkAgentObserveController};
 use crate::overflow_compaction::{OverflowArmRun, OverflowRecovery};
+use pa_agent::abort::AbortController;
 use pa_agent::types::StopReason;
 use pa_core::autonomous::AutonomousFollowUp;
 use pa_core::kernel::shared::HostRequestHandlers;
@@ -168,6 +169,12 @@ pub struct AgentSessionEngine {
     /// One compact-and-retry attempt per context overflow (TS
     /// `_overflowRecovery`): the state machine the overflow arm walks.
     pub(crate) overflow_recovery: std::sync::Mutex<OverflowRecovery>,
+    /// The live automatic-compaction abort slot (TS
+    /// `_autoCompactionAbortController`): the threshold and requested
+    /// turn-boundary runs each register their controller here for the
+    /// run's duration, and [`SessionEngine::abort_auto_compaction`]
+    /// aborts whatever run holds it.
+    pub(crate) auto_compaction_abort: std::sync::Mutex<Option<std::sync::Arc<AbortController>>>,
 }
 
 impl AgentSessionEngine {
@@ -288,6 +295,7 @@ impl AgentSessionEngine {
             pending_max_depth: std::sync::Mutex::new(None),
             faux_model: std::sync::OnceLock::new(),
             overflow_recovery: std::sync::Mutex::new(OverflowRecovery::default()),
+            auto_compaction_abort: std::sync::Mutex::new(None),
         })
     }
 
@@ -1081,6 +1089,21 @@ impl SessionEngine for AgentSessionEngine {
     /// rebuilds the loop context; the worker persists the durable entry.
     /// The abort races the run: the summarizer call is cancelled by
     /// dropping the future (the entry write happens inside it).
+    fn abort_auto_compaction(&self) {
+        // TS `abortCompaction` aborts the auto controller in flight and is a
+        // silent no-op otherwise; the run itself clears its slot when it
+        // settles (only its own controller clears, so a stale abort cannot
+        // clear a newer run's slot).
+        let controller = self
+            .auto_compaction_abort
+            .lock()
+            .expect("auto compaction abort lock")
+            .clone();
+        if let Some(controller) = controller {
+            controller.abort();
+        }
+    }
+
     fn run_compaction(
         &self,
         request: CompactionRequest,
@@ -1108,7 +1131,15 @@ impl SessionEngine for AgentSessionEngine {
             };
             engine
                 .session
-                .compact(custom_instructions.as_deref(), &model, api_key)
+                .compact(
+                    custom_instructions.as_deref(),
+                    &model,
+                    api_key,
+                    // The run's own signal: a summarizer that resolved while
+                    // the abort raced still lands the pre-commit check (TS
+                    // `_performCompaction`'s `if (signal.aborted) throw`).
+                    Some(signal),
+                )
                 .await
         };
         let result = self
@@ -2033,6 +2064,23 @@ impl AgentSessionEngine {
         }
     }
 
+    /// Clear the automatic-compaction abort slot when `controller`'s run
+    /// settles (TS `_runAutoCompaction`'s `finally`: only the run that
+    /// assigned the controller clears it, so a stale run cannot clear a
+    /// newer run's slot).
+    pub(crate) fn clear_auto_compaction_abort(&self, controller: &std::sync::Arc<AbortController>) {
+        let mut slot = self
+            .auto_compaction_abort
+            .lock()
+            .expect("auto compaction abort lock");
+        if slot
+            .as_ref()
+            .is_some_and(|live| std::sync::Arc::ptr_eq(live, controller))
+        {
+            *slot = None;
+        }
+    }
+
     /// Drop pending turn-boundary requests (aborted turns; TS `_checkCompaction`
     /// abort arm clears both the compaction and the refine request).
     fn drop_turn_boundary_requests(&self) {
@@ -2074,16 +2122,57 @@ impl AgentSessionEngine {
         };
         let api_key = self.resolve_request_api_key(&model);
         let global_harness_dir = self.config.agent_dir.clone();
+        // TS `_runAutoCompaction("requested")` emits the start event before
+        // the summarizer runs (the `Agent requested compaction, compacting
+        // context...` loader swap), carrying the pending instructions.
+        let scheduled = {
+            let guard = self.session.blocking_lock();
+            match guard.as_ref() {
+                Some(engine) => self
+                    .runtime
+                    .block_on(async { engine.turn_boundary.scheduled_compaction().await }),
+                None => None,
+            }
+        };
+        if let Some(pending) = scheduled {
+            if !emit(EngineEvent::CompactionStart {
+                event: crate::compaction::compaction_start_event(
+                    "requested",
+                    pending.instructions.as_deref(),
+                ),
+            }) {
+                return BoundaryRun::Cancelled;
+            }
+        }
+        // TS `_runAutoCompaction` assigns `_autoCompactionAbortController`
+        // for the requested run's duration: an `abort_compaction` command
+        // lands in the slot and cancels the in-flight summarizer.
+        let controller = std::sync::Arc::new(AbortController::new());
+        let signal = controller.signal();
+        {
+            *self
+                .auto_compaction_abort
+                .lock()
+                .expect("auto compaction abort lock") = Some(std::sync::Arc::clone(&controller));
+        }
         let consumption = {
             let guard = self.session.blocking_lock();
             let Some(engine) = guard.as_ref() else {
+                self.clear_auto_compaction_abort(&controller);
                 return BoundaryRun::Proceed;
             };
-            self.runtime.block_on(async {
+            let consumed = self.runtime.block_on(async {
                 engine
-                    .consume_turn_boundary_requests(&model, api_key, global_harness_dir)
+                    .consume_turn_boundary_requests(
+                        &model,
+                        api_key,
+                        global_harness_dir,
+                        Some(&signal),
+                    )
                     .await
-            })
+            });
+            self.clear_auto_compaction_abort(&controller);
+            consumed
         };
         let mut stopped_for_compaction = false;
         match consumption.compaction {
@@ -2114,7 +2203,6 @@ impl AgentSessionEngine {
                     pa_core::session_engine::messages::CompactionOutcomeReason::Requested,
                     pa_core::session_engine::messages::CompactionOutcomeKind::Skipped,
                     &format!("Requested compaction skipped: {message}"),
-                    Some("warning"),
                     None,
                     emit,
                 ) {
@@ -2123,14 +2211,26 @@ impl AgentSessionEngine {
                 stopped_for_compaction = true;
             }
             Some(Err(error)) => {
-                eprintln!("pa-daemon: requested compaction failed: {error:#}");
-                // TS `_endCompactionUnsuccessfully` passes no
-                // `errorSeverity` for automatic failures.
+                // An aborted run is user-initiated, not a failure (TS
+                // `_runAutoCompaction`'s `aborted` check before the skip and
+                // failure arms): the request is consumed either way, so the
+                // run stops like a completed requested compaction.
+                let cancelled = pa_agent::abort::is_abort_error(&error);
+                let message = if cancelled {
+                    "Requested compaction cancelled".to_string()
+                } else {
+                    eprintln!("pa-daemon: requested compaction failed: {error:#}");
+                    format!("Requested compaction failed: {error:#}")
+                };
+                let outcome = if cancelled {
+                    pa_core::session_engine::messages::CompactionOutcomeKind::Cancelled
+                } else {
+                    pa_core::session_engine::messages::CompactionOutcomeKind::Failed
+                };
                 if !self.emit_unsuccessful_compaction(
                     pa_core::session_engine::messages::CompactionOutcomeReason::Requested,
-                    pa_core::session_engine::messages::CompactionOutcomeKind::Failed,
-                    &format!("Requested compaction failed: {error:#}"),
-                    None,
+                    outcome,
+                    &message,
                     None,
                     emit,
                 ) {
@@ -3146,7 +3246,7 @@ pub(crate) mod tests {
     }
 
     /// The engine session's durable entry chain carries the outcome row.
-    fn outcome_row_in_entries(engine: &AgentSessionEngine) -> bool {
+    pub(crate) fn outcome_row_in_entries(engine: &AgentSessionEngine) -> bool {
         let guard = engine.session.blocking_lock();
         let Some(core) = guard.as_ref() else {
             return false;
@@ -3164,7 +3264,7 @@ pub(crate) mod tests {
     /// The live loop context carries the outcome row (TS
     /// `agent.state.messages.push`); the loop's converter keeps it out of
     /// the provider request.
-    fn outcome_row_in_live_context(engine: &AgentSessionEngine) -> bool {
+    pub(crate) fn outcome_row_in_live_context(engine: &AgentSessionEngine) -> bool {
         let guard = engine.session.blocking_lock();
         let Some(core) = guard.as_ref() else {
             return false;
@@ -3307,6 +3407,302 @@ pub(crate) mod tests {
         );
         assert!(outcome_row_in_entries(&engine));
         assert!(outcome_row_in_live_context(&engine));
+    }
+
+    /// The engine session's durable entry chain carries a compaction
+    /// entry (an aborted run must never commit one).
+    pub(crate) fn compaction_entry_in_entries(engine: &AgentSessionEngine) -> bool {
+        let guard = engine.session.blocking_lock();
+        let Some(core) = guard.as_ref() else {
+            return false;
+        };
+        let persistence = core.session.shared_persistence();
+        let entries = engine
+            .runtime
+            .block_on(async { persistence.lock().await.get_entries() });
+        entries
+            .iter()
+            .any(|entry| matches!(entry, pa_types::session::FileEntry::Compaction { .. }))
+    }
+
+    /// Admit one prompt on a parked thread, sharing its events; `started`
+    /// flips on the first compaction start event so the caller can abort
+    /// the run mid-flight. Returns the join handle.
+    pub(crate) fn admit_parked(
+        engine: &std::sync::Arc<AgentSessionEngine>,
+        message: String,
+        events: std::sync::Arc<std::sync::Mutex<Vec<EngineEvent>>>,
+        started: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        let engine = std::sync::Arc::clone(engine);
+        std::thread::spawn(move || {
+            engine.run_prompt(
+                0,
+                PromptRequest {
+                    images: Vec::new(),
+                    message,
+                    source: "user".to_string(),
+                    agent_message_id: None,
+                    custom_message: None,
+                },
+                &|| false,
+                &mut |event| {
+                    if matches!(event, EngineEvent::CompactionStart { .. }) {
+                        started.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    events
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(event);
+                    true
+                },
+            );
+        })
+    }
+
+    /// Wait until the parked admission's compaction started (a deadline
+    /// instead of a hang when the run never reaches the summarizer).
+    pub(crate) fn wait_for_compaction_start(started: &std::sync::atomic::AtomicBool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !started.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the auto compaction never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// The aborted `compaction_end` event for a cancelled auto compaction:
+    /// `aborted` with no `errorMessage`, no `errorSeverity`, and no
+    /// `result` (TS `_endCompactionUnsuccessfully`'s `{ aborted: true }`).
+    pub(crate) fn assert_cancelled_end_event(
+        events: &[EngineEvent],
+        expected_reason: &str,
+        expected_row_message: &str,
+    ) {
+        let row_index = events
+            .iter()
+            .position(|event| {
+                matches!(event, EngineEvent::CustomMessage(row) if row["customType"] == "compaction_outcome")
+            })
+            .expect("the cancelled outcome row was broadcast");
+        let EngineEvent::CustomMessage(row) = &events[row_index] else {
+            unreachable!("matched above");
+        };
+        assert_eq!(row["customType"], "compaction_outcome");
+        assert_eq!(row["content"], serde_json::json!(expected_row_message));
+        assert_eq!(
+            row["details"],
+            serde_json::json!({
+                "reason": expected_reason,
+                "outcome": "cancelled",
+            })
+        );
+        assert_eq!(row["display"], serde_json::json!(true));
+        let EngineEvent::Compaction { event, .. } = events
+            .iter()
+            .rev()
+            .find(|event| {
+                matches!(event, EngineEvent::Compaction { event, .. }
+                    if event["type"] == "compaction_end" && event["reason"] == expected_reason)
+            })
+            .expect("the aborted compaction_end follows the row")
+        else {
+            unreachable!("matched above");
+        };
+        assert_eq!(event["aborted"], serde_json::json!(true));
+        assert_eq!(event["willRetry"], serde_json::json!(false));
+        assert!(
+            event.get("errorMessage").is_none(),
+            "aborts carry no error message: {event}"
+        );
+        assert!(
+            event.get("errorSeverity").is_none(),
+            "aborts carry no error severity: {event}"
+        );
+        assert!(
+            event.get("result").is_none(),
+            "an aborted run has no result: {event}"
+        );
+    }
+
+    /// TS `_runAutoCompaction`'s aborted arm at the threshold call site: a
+    /// threshold compaction aborted while the summarizer is in flight
+    /// records the durable cancelled outcome row (`Compaction cancelled`,
+    /// `{threshold, cancelled}`), broadcasts the aborted `compaction_end`
+    /// (no error message — the row owns the disclosure), and never commits
+    /// a compaction entry; the turn still settles.
+    #[test]
+    fn threshold_compaction_aborted_mid_run_records_the_cancelled_outcome() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Probe: the baseline turn's total usage (the same shape as the
+        // threshold crossing test; the headroom sits between the two
+        // turns' usage).
+        let (probe, _probe_dir) = faux_engine_with_settings(
+            serde_json::json!({ "responses": [{"text": "seed reply"}] }),
+            1,
+        );
+        let mut probe_events: Vec<EngineEvent> = Vec::new();
+        admit(&probe, "seed turn".to_string(), &mut probe_events);
+        let baseline = probe_events
+            .iter()
+            .find_map(|event| match event {
+                EngineEvent::AssistantMessage(message) => message["usage"]["totalTokens"].as_u64(),
+                _ => None,
+            })
+            .expect("probe turn produced usage");
+        drop(probe);
+
+        let big_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
+        let big_tokens = (48_000 + "seed turn  crossing".len() as u64).div_ceil(4);
+        let headroom = baseline + big_tokens / 2;
+        let (engine, _engine_dir) = faux_engine_with_settings(
+            serde_json::json!({
+                "responses": [
+                    {"text": "seed reply"},
+                    {"text": "crossing reply"},
+                    // The summarizer held in flight: the abort lands while
+                    // the request is open.
+                    {"text": "the summary", "delayMs": 30_000},
+                ],
+            }),
+            128_000u64.saturating_sub(headroom).max(1),
+        );
+        let engine = std::sync::Arc::new(engine);
+        let mut seed_events: Vec<EngineEvent> = Vec::new();
+        admit(&engine, "seed turn".to_string(), &mut seed_events);
+        assert!(
+            !seed_events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::CompactionStart { .. })),
+            "the seed turn stays below the headroom"
+        );
+
+        let events: std::sync::Arc<std::sync::Mutex<Vec<EngineEvent>>> = Default::default();
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let admission = admit_parked(
+            &engine,
+            big_prompt,
+            std::sync::Arc::clone(&events),
+            std::sync::Arc::clone(&started),
+        );
+        wait_for_compaction_start(&started);
+        engine.abort_auto_compaction();
+        admission.join().expect("the aborted admission settles");
+
+        let events = events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_cancelled_end_event(&events, "threshold", "Compaction cancelled");
+        assert!(outcome_row_in_entries(&engine));
+        assert!(outcome_row_in_live_context(&engine));
+        assert!(
+            !compaction_entry_in_entries(&engine),
+            "the aborted threshold compaction never commits"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Done(Ok(())))),
+            "the turn settles after the cancelled compaction"
+        );
+    }
+
+    /// The aborted arm at the requested call site (the turn-boundary
+    /// consumption): a `compact.run` request aborted mid-summarizer
+    /// records the `Requested compaction cancelled` row with the
+    /// `requested` reason, broadcasts the aborted `compaction_end`
+    /// (`compaction_start` carries the run's reason), consumes the
+    /// pending request, and never commits.
+    #[test]
+    fn requested_compaction_aborted_mid_run_records_the_cancelled_outcome() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A tiny reserve keeps the threshold check silent (the headroom is
+        // the whole window) while the 10-token keep-recent budget leaves
+        // the turns summarizable for the requested run.
+        let (engine, _engine_dir) = faux_engine_with_settings(
+            serde_json::json!({
+                "responses": [
+                    {"text": "seed reply"},
+                    {"text": "second reply"},
+                    // The summarizer held in flight for the abort.
+                    {"text": "the summary", "delayMs": 30_000},
+                ],
+            }),
+            1_000,
+        );
+        let engine = std::sync::Arc::new(engine);
+        let mut seed_events: Vec<EngineEvent> = Vec::new();
+        admit(&engine, "turn one".to_string(), &mut seed_events);
+        // Schedule a requested compaction (the `compact.run` write path):
+        // the boundary consumes it after the next turn settles.
+        {
+            let guard = engine.session.blocking_lock();
+            let core = guard.as_ref().expect("session built");
+            engine
+                .runtime
+                .block_on(async { core.turn_boundary.schedule_compaction(None).await });
+        }
+
+        let events: std::sync::Arc<std::sync::Mutex<Vec<EngineEvent>>> = Default::default();
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // A padded second turn keeps the cut's kept tail over the 10-token
+        // keep-recent budget, leaving the first turn as summarizable
+        // history for the requested run.
+        let padded_turn_two = format!("turn two {}", "y".repeat(400));
+        let admission = admit_parked(
+            &engine,
+            padded_turn_two,
+            std::sync::Arc::clone(&events),
+            std::sync::Arc::clone(&started),
+        );
+        wait_for_compaction_start(&started);
+        let start_reason = events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find_map(|event| match event {
+                EngineEvent::CompactionStart { event } => Some(event["reason"].clone()),
+                _ => None,
+            })
+            .expect("the requested compaction_start event");
+        assert_eq!(start_reason, serde_json::json!("requested"));
+        engine.abort_auto_compaction();
+        admission.join().expect("the aborted admission settles");
+
+        let events = events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_cancelled_end_event(&events, "requested", "Requested compaction cancelled");
+        assert!(outcome_row_in_entries(&engine));
+        assert!(outcome_row_in_live_context(&engine));
+        assert!(
+            !compaction_entry_in_entries(&engine),
+            "the aborted requested compaction never commits"
+        );
+        // The pending request was consumed: no stale compaction runs at
+        // the next boundary (TS `_runAutoCompaction` takes it before the
+        // run).
+        {
+            let guard = engine.session.blocking_lock();
+            let core = guard.as_ref().expect("session built");
+            assert!(!engine
+                .runtime
+                .block_on(async { core.turn_boundary.compaction_scheduled().await }));
+        }
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Done(Ok(())))),
+            "the turn settles after the cancelled compaction"
+        );
     }
 
     /// Below the headroom nothing fires: the threshold check stays silent

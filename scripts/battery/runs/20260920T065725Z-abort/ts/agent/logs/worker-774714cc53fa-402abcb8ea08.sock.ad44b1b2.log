@@ -1,0 +1,4 @@
+[2026-09-20T06:57:26.717Z] Prime Agent daemon listening on /tmp/compaction-abort-ts-819104/prime-agent-1000/worker-774714cc53fa-402abcb8ea08.sock
+[2026-09-20T06:57:41.235Z] replacement supervisor 819199 left running without a current authenticated supervisor
+[2026-09-20T06:59:37.390Z] received SIGTERM; shutting down
+[2026-09-20T06:59:37.390Z] shutting down (exit 143); closing 1 active session(s)

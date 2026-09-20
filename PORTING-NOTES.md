@@ -1803,3 +1803,67 @@ deliberately left out (TS `prompt-highlight.ts`):
     the terminal reader in this harness, and a real shell cannot produce
     it anyway (Ctrl+C goes to the shell, the foreground process), so the
     shield window is unit-covered instead of e2e-covered.
+## Compaction abort lane (compaction-abort, the #207 cancelled follow-up)
+
+- TS ground truth (agent-session.ts): `abortCompaction()` aborts BOTH the
+  manual `_compactionAbortController` and `_autoCompactionAbortController`
+  (threshold/overflow/requested runs). Reaches the session from the
+  daemon wire command `abort_compaction`, and from `requestAbort()` (the
+  daemon `abort` command; TS daemon-mode calls `session.requestAbort()`
+  which calls `abortCompaction()` last). The TUI interrupt key (Ctrl+C)
+  fires `abortCompaction()` when `isAgentCompacting()` — the agent is NOT
+  streaming during a compaction, so no turn abort accompanies it.
+- `_runAutoCompaction`'s catch maps an abort to
+  `_endCompactionUnsuccessfully(reason, "cancelled",
+  reason === "requested" ? "Requested compaction cancelled" : "Compaction
+  cancelled", { aborted: true })`: the durable `compaction_outcome` row
+  carries the message; the `compaction_end` event carries `aborted: true`
+  with NO errorMessage/errorSeverity (aborts are user-initiated). The
+  aborted arm precedes the skip and failure arms, and the pending request
+  stays consumed (taken before the run).
+- `_performCompaction` re-checks `signal.aborted` AFTER the summarizer
+  resolves and BEFORE the ledger commit: a summarizer that finished while
+  the abort raced never lands a committed compaction. Ported as the
+  `abort: Option<&AbortSignal>` on `CompactOptions`
+  (`throw_if_aborted` before the provider call + `is_aborted` between the
+  summary and `append_compaction`); the in-flight cancellation drops the
+  request through `race_with_abort` (the daemon layer), mirroring the TS
+  provider-stream cancel.
+- Rust seams: `AgentSessionEngine.auto_compaction_abort` (the
+  `_autoCompactionAbortController` slot; each run registers, only its own
+  controller clears), `SessionEngine::abort_auto_compaction()` trait
+  method (default no-op for scripted engines), `CompactionManager::abort`
+  (manual slot + engine slot), `handle_abort` now aborts the compaction
+  like TS `requestAbort`, `run_turn_boundary`/`run_auto_compaction`
+  register + race + record the cancelled row through the #207
+  `record_compaction_outcome` seam (the `Cancelled` enum arm).
+- Requested-run start event: TS `_runAutoCompaction("requested")` emits
+  `compaction_start` with the pending instructions before the summarizer;
+  the Rust boundary now emits it too (the
+  `Agent requested compaction, compacting context... (Ctrl+C to cancel)`
+  loader was previously unreachable on the requested path — added
+  `TurnBoundaryRequests::scheduled_compaction()` to read the pending
+  instructions without consuming).
+- TUI: Ctrl+C with the compaction loader up sends `abort_compaction`
+  (TS `isAgentCompacting()` -> `abortCompaction()`), not the turn abort —
+  the compaction runs between turns, so the interrupt cancels the run
+  only. The cancelled outcome row renders as an error status (TS
+  CompactionOutcomeMessageComponent: only `skipped` warns).
+- Known adjacent deviation (documented, not fixed here): during a session
+  `abort` mid-auto-compaction, the worker's existing abort gate
+  (`abort_requested` stops consuming engine events) suppresses the live
+  row-pair + `compaction_end` broadcasts, while the durable row still
+  records (TS broadcasts them; the row is visible on reattach/rebuild).
+  The dedicated `abort_compaction` path (the TUI interrupt) has no gate
+  and is fully at parity. Also `isCompacting` in the worker's state flag
+  is not set during in-turn auto compactions (it is set for manual runs);
+  the agents-view roster shows busy instead of compacting there.
+- Verifiers: pa-core unit tests (pre-aborted signal never requests;
+  late abort cancels before the commit), pa-daemon engine unit tests
+  (threshold + requested mid-flight aborts: the cancelled row pair, the
+  aborted end event shape, no committed entry, request consumed),
+  pa-daemon `tests/compaction_abort_e2e.rs` (real supervisor + worker +
+  HTTP mock holding the summarizer; `abort_compaction` over the wire),
+  `scripts/compaction_abort_parity.py` (TS vs Rust daemon wire
+  differential over the battery mock: compaction_start, the row pair,
+  the aborted compaction_end, and the durable rows, normalized diff).

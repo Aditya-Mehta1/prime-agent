@@ -47,14 +47,18 @@ impl CompactionManager {
         }
     }
 
-    /// `abort_compaction` (TS `abortCompaction`): abort the live compaction.
-    /// Succeeds whether or not a run is in flight; the TS handler always
-    /// replies success.
+    /// `abort_compaction` (TS `abortCompaction`): abort the live
+    /// compaction — the manual run's controller (TS
+    /// `_compactionAbortController`) and the automatic threshold /
+    /// requested run (TS `_autoCompactionAbortController`, owned by the
+    /// engine). Succeeds whether or not a run is in flight; the TS handler
+    /// always replies success.
     pub(crate) fn abort(&self) {
         let controller = self.abort.lock().unwrap().clone();
         if let Some(controller) = controller {
             controller.abort();
         }
+        self.engine.abort_auto_compaction();
     }
 
     /// Run one compaction (`compact` command): emits the TS event pair,

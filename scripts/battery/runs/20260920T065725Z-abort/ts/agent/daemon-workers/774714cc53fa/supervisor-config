@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "socketPath": "/home/ubuntu/lane-worktrees/compaction-abort/scripts/battery/runs/20260920T065725Z-abort/ts/daemon.sock",
+  "defaultSessionConfig": {
+    "cwd": "/home/ubuntu/lane-worktrees/compaction-abort/scripts/battery/runs/20260920T065725Z-abort/ts/work",
+    "agentDir": "/home/ubuntu/lane-worktrees/compaction-abort/scripts/battery/runs/20260920T065725Z-abort/ts/agent"
+  }
+}
