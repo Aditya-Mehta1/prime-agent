@@ -1,5 +1,12 @@
-import { spawn } from "node:child_process";
-import { isRecord, type RouterEnvironment, type RouterExecution, type RouterObservation } from "./types.js";
+import type { ChildProcess } from "node:child_process";
+import { signalProcessGroupOrProcess, spawnHidden } from "../../utils/child-process.js";
+import {
+	isRecord,
+	type RouterCloseOptions,
+	type RouterEnvironment,
+	type RouterExecution,
+	type RouterObservation,
+} from "./types.js";
 
 /**
  * JSON-lines adapter protocol (the documented environment boundary):
@@ -19,7 +26,7 @@ interface PendingRequest {
 const MAX_REPLY_LINE_CHARS = 1_000_000;
 
 export class StdioRouterEnvironment implements RouterEnvironment {
-	private child: ReturnType<typeof spawn> | undefined;
+	private child: ChildProcess | undefined;
 	private nextId = 0;
 	private readonly pending = new Map<number, PendingRequest>();
 	private stderrTail = "";
@@ -34,15 +41,24 @@ export class StdioRouterEnvironment implements RouterEnvironment {
 		},
 	) {}
 
-	private ensureChild(): ReturnType<typeof spawn> {
+	private ensureChild(): ChildProcess {
 		if (this.child) return this.child;
 		const [command, ...args] = this.options.command;
-		const child = spawn(command, args, {
+		const child = spawnHidden(command, args, {
 			cwd: this.options.cwd,
 			stdio: ["pipe", "pipe", "pipe"],
+			// Own process group on POSIX: forced cleanup can signal a launcher's
+			// (`sh -c ...`, docker wrapper) descendants, not only the direct child.
+			...(process.platform === "win32" ? {} : { detached: true }),
 			// Adapter commands such as `docker run` need the environment they were given.
 		});
 		this.child = child;
+		// An EPIPE while writing (the adapter died mid-request or closed its
+		// stdin) must fail the pending requests, not crash the host as an
+		// unhandled stream "error" event.
+		child.stdin?.on("error", (error: Error) => {
+			this.failAll(new Error(`environment adapter stdin failed: ${error.message}`));
+		});
 		let buffer = "";
 		child.stdout?.setEncoding("utf8");
 		child.stdout?.on("data", (chunk: string) => {
@@ -157,7 +173,9 @@ export class StdioRouterEnvironment implements RouterEnvironment {
 
 	/** Initialize the adapter and merge its default action space, if it supplies one. */
 	async init(): Promise<Record<string, unknown> | undefined> {
-		const reply = await this.request("init", this.options.init ? { init: this.options.init } : {});
+		// Only an omitted init payload is absent; a provided falsy one (false,
+		// 0, "", null) is the caller's value and must reach the adapter.
+		const reply = await this.request("init", this.options.init !== undefined ? { init: this.options.init } : {});
 		return reply.environment as Record<string, unknown> | undefined;
 	}
 
@@ -191,7 +209,12 @@ export class StdioRouterEnvironment implements RouterEnvironment {
 		return { text: reply.text, ...(reply.terminal === true ? { terminal: true } : {}) };
 	}
 
-	async close(): Promise<void> {
+	/**
+	 * Stop the adapter. `budgetMs` bounds the graceful waits (SIGTERM, then
+	 * SIGKILL, always dispatched) so cleanup cannot extend a timed-out
+	 * segment past its wall-clock budget; the default waits up to 2.5s.
+	 */
+	async close(options: RouterCloseOptions = {}): Promise<void> {
 		this.closed = true;
 		const child = this.child;
 		if (!child) return;
@@ -200,6 +223,9 @@ export class StdioRouterEnvironment implements RouterEnvironment {
 			this.failAll(new Error("environment adapter closed"));
 			return;
 		}
+		const budgetEndsAt =
+			Date.now() + (options.budgetMs === undefined ? Number.POSITIVE_INFINITY : Math.max(0, options.budgetMs));
+		const remainingBudget = (waitMs: number) => Math.min(waitMs, Math.max(0, budgetEndsAt - Date.now()));
 		// Ask the adapter to exit, then enforce a bounded shutdown.
 		child.stdin?.end(`${JSON.stringify({ id: this.nextId, type: "close" })}\n`);
 		const exited = new Promise<void>((resolve) => {
@@ -208,7 +234,7 @@ export class StdioRouterEnvironment implements RouterEnvironment {
 		await Promise.race([
 			exited,
 			new Promise<void>((resolve) => {
-				const timer = setTimeout(() => resolve(), 1_500);
+				const timer = setTimeout(() => resolve(), remainingBudget(1_500));
 				if (typeof timer === "object" && "unref" in timer) timer.unref();
 			}),
 		]);
@@ -216,19 +242,22 @@ export class StdioRouterEnvironment implements RouterEnvironment {
 			// SIGTERM first: for a container-wrapped adapter (docker run), a
 			// SIGKILL would hit only the client process and leak the container;
 			// a forwardable SIGTERM lets the container stop and --rm reap it.
-			child.kill("SIGTERM");
+			// The whole process group is signaled so a launcher's descendants
+			// (the docker wrapper case) cannot outlive the shutdown.
+			const pid = child.pid;
+			if (pid) signalProcessGroupOrProcess(pid, "SIGTERM");
 			const terminated = new Promise<void>((resolve) => {
 				child.once("exit", () => resolve());
 			});
 			await Promise.race([
 				terminated,
 				new Promise<void>((resolve) => {
-					const timer = setTimeout(() => resolve(), 1_000);
+					const timer = setTimeout(() => resolve(), remainingBudget(1_000));
 					if (typeof timer === "object" && "unref" in timer) timer.unref();
 				}),
 			]);
-			if (child.exitCode === null && child.signalCode === null) {
-				child.kill("SIGKILL");
+			if (child.exitCode === null && child.signalCode === null && pid) {
+				signalProcessGroupOrProcess(pid, "SIGKILL");
 			}
 		}
 		this.failAll(new Error("environment adapter closed"));

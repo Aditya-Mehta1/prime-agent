@@ -25,11 +25,21 @@ export const ROUTER_REFUSAL_STREAK_LIMIT = 3;
 /** The same action with the same params on the same observation, this many times, is stuck. */
 export const ROUTER_REPETITION_LIMIT = 2;
 
-/** Race work against a deadline without leaking a late rejection from the losing side. */
-async function raceDeadline<T>(work: Promise<T>, deadline: Promise<"deadline">): Promise<T | "deadline"> {
+/**
+ * Race work against a deadline without leaking a late rejection from the losing
+ * side. Work starts through the thunk only while the wall-clock budget remains:
+ * the deadline promise resolves no earlier than deadlineAt, and a timer-lag gap
+ * between the two must not start a new operation (or its side effects).
+ */
+async function raceDeadline<T>(
+	start: () => Promise<T>,
+	deadlineAt: number,
+	deadline: Promise<"deadline">,
+): Promise<T | "deadline"> {
+	if (Date.now() >= deadlineAt) return "deadline";
 	// Both losers are marked handled: attach handlers to the promises themselves
 	// before the race, never after it resolves.
-	const handledWork = work.finally(() => {});
+	const handledWork = start().finally(() => {});
 	void handledWork.catch(() => {});
 	const result = (await Promise.race([handledWork, deadline])) as T | "deadline";
 	if (result === "deadline") {
@@ -86,8 +96,8 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 	let executed = 0;
 	let refused = 0;
 	let refusalStreak = 0;
-	let repeatCount = 0;
-	let lastSignature: string | null = null;
+	let repeatDigest: string | null = null;
+	const repeatCounts = new Map<string, number>();
 
 	const finish = (status: RouterRunStatus, reason: string, summary: string): SystemRouterRunResult => ({
 		status,
@@ -107,7 +117,7 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 
 	try {
 		try {
-			const resetResult = await raceDeadline(options.env.reset(options.goal), deadline);
+			const resetResult = await raceDeadline(() => options.env.reset(options.goal), deadlineAt, deadline);
 			if (resetResult === "deadline") {
 				return finish(
 					"incomplete",
@@ -128,7 +138,7 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 			}
 			let observation: Awaited<ReturnType<RouterEnvironment["observe"]>> | "deadline";
 			try {
-				observation = await raceDeadline(options.env.observe(), deadline);
+				observation = await raceDeadline(() => options.env.observe(), deadlineAt, deadline);
 			} catch (error) {
 				return finish(
 					"failed",
@@ -162,10 +172,12 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 			let decision: Awaited<ReturnType<RouterDecisionFunction>> | "deadline";
 			try {
 				decision = await raceDeadline(
-					options.decide({
-						prompt,
-						...(observation.image ? { image: observation.image } : {}),
-					}),
+					() =>
+						options.decide({
+							prompt,
+							...(observation.image ? { image: observation.image } : {}),
+						}),
+					deadlineAt,
 					deadline,
 				);
 			} catch (error) {
@@ -319,14 +331,26 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 				);
 			}
 
-			// Repeated-state detection: the same action with the same params on the same observation.
-			const canonicalParams = Object.keys(decision.params)
-				.sort()
-				.map((key) => `${key}=${decision.params[key]}`)
-				.join("&");
+			// Repeated-state detection: the same action with the same params on
+			// the same observation, whether adjacent or interleaved with other
+			// repeats. JSON of the sorted entries cannot collide the way
+			// key=value&... can (params {a: "x&b=y"} vs {a: "x", b: "y"} would
+			// otherwise match).
+			const canonicalParams = JSON.stringify(
+				Object.fromEntries(
+					Object.keys(decision.params)
+						.sort()
+						.map((key) => [key, decision.params[key]]),
+				),
+			);
 			const signature = `${digest}:${action.name}:${canonicalParams}`;
-			repeatCount = signature === lastSignature ? repeatCount + 1 : 0;
-			lastSignature = signature;
+			if (digest !== repeatDigest) {
+				// The observation moved: past counts are stale.
+				repeatCounts.clear();
+				repeatDigest = digest;
+			}
+			const repeatCount = repeatCounts.get(signature) ?? 0;
+			repeatCounts.set(signature, repeatCount + 1);
 			if (repeatCount + 1 >= ROUTER_REPETITION_LIMIT) {
 				refused += 1;
 				trace.push({
@@ -351,9 +375,22 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 				);
 			}
 
+			// Execute only while the wall-clock budget remains: a dispatched
+			// action applies a side effect the loop cannot take back.
+			if (Date.now() >= deadlineAt) {
+				return finish(
+					"incomplete",
+					"timeout",
+					`Stopped at step ${step}: the segment timeout of ${options.timeoutMs}ms elapsed before execution.`,
+				);
+			}
 			let executionResult: RouterExecution | "deadline";
 			try {
-				executionResult = await raceDeadline(options.env.execute(action.name, decision.params), deadline);
+				executionResult = await raceDeadline(
+					() => options.env.execute(action.name, decision.params),
+					deadlineAt,
+					deadline,
+				);
 			} catch (error) {
 				return finish(
 					"failed",
@@ -362,10 +399,30 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 				);
 			}
 			if (executionResult === "deadline") {
+				// The dispatch already reached the adapter and the request is
+				// not cancelled, so the outcome is unknown: record it (and
+				// count the execution) instead of letting a supervisor retry
+				// the action believing nothing ran.
+				executed += 1;
+				trace.push({
+					step,
+					timestampMs: decisionStarted,
+					latencyMs,
+					action: action.name,
+					params: decision.params,
+					confidence: decision.confidence,
+					gate: { threshold, verdict: "pass" },
+					observationDigest: digest,
+					observationChars: observation.text.length,
+					result: `dispatched ${action.name}; outcome unknown (segment timeout elapsed mid-execution)`,
+					terminal: false,
+					thinkingLevel: options.model.thinkingLevel,
+					...(decision.usage ? { usage: decision.usage } : {}),
+				});
 				return finish(
 					"incomplete",
 					"timeout",
-					`Stopped at step ${step}: the segment timeout of ${options.timeoutMs}ms elapsed mid-execution.`,
+					`Stopped at step ${step}: the segment timeout of ${options.timeoutMs}ms elapsed mid-execution; the dispatched action's outcome is unknown.`,
 				);
 			}
 			executed += 1;
@@ -402,6 +459,8 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 		);
 	} finally {
 		if (deadlineTimer) clearTimeout(deadlineTimer);
-		await options.env.close().catch(() => {});
+		// Adapter cleanup must not extend the segment past its wall-clock
+		// budget: hand close() whatever budget is left.
+		await options.env.close({ budgetMs: Math.max(0, deadlineAt - Date.now()) }).catch(() => {});
 	}
 }

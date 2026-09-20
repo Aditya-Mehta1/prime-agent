@@ -60,10 +60,17 @@ const env = new StdioRouterEnvironment({
   ...(adapterCommand[0] === "docker" ? {} : { init: { romPath } }),
 });
 
-const environment = await env.init();
-const actions = parseActionSpace(environment?.actions);
-if (!actions) {
-  throw new Error("the adapter did not supply a default action space");
+let actions;
+try {
+  const environment = await env.init();
+  actions = parseActionSpace(environment?.actions);
+  if (!actions) {
+    throw new Error("the adapter did not supply a default action space");
+  }
+} finally {
+  // Pre-loop failures (no action space, an invalid one) must not leave the
+  // spawned adapter — including a docker container — running.
+  if (!actions) await env.close();
 }
 
 const { byName } = compileActionSpace(actions);

@@ -1,3 +1,4 @@
+import type { ChildProcess } from "node:child_process";
 import type * as PiAi from "@earendil-works/pi-ai";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -23,6 +24,7 @@ import {
 	StdioRouterEnvironment,
 	truncateObservation,
 } from "../src/core/system-router/index.js";
+import { isProcessAlive, waitForChildProcess } from "../src/utils/child-process.js";
 
 const { completeSimpleMock } = vi.hoisted(() => ({
 	completeSimpleMock: vi.fn(),
@@ -43,7 +45,7 @@ const PRESS_ACTIONS: Record<string, RouterActionSpec> = {
 	set_power: {
 		description: "Set the power level.",
 		risk: "write",
-		params: { power: { choices: { low: "Slow but safe", high: "Fast but risky" } } },
+		params: { power: { choices: { low: "Slow but safe", high: "Fast but risky", "low}": "Brace-bearing." } } },
 	},
 };
 
@@ -106,6 +108,7 @@ interface LoopOverrides {
 	goal?: string;
 	maxSteps?: number;
 	timeoutMs?: number;
+	actions?: Record<string, RouterActionSpec>;
 	gate?: { read?: number; write?: number; destructive?: number; finish?: number };
 }
 
@@ -114,7 +117,7 @@ function runLoop(env: RouterEnvironment, overrides: LoopOverrides = {}) {
 	return runSystemRouterLoop({
 		env,
 		goal: overrides.goal ?? "Finish the demo",
-		actions: PRESS_ACTIONS,
+		actions: overrides.actions ?? PRESS_ACTIONS,
 		decide: overrides.decide ?? scriptedDecide([decision({ action: "press_a", confidence: 0.9 })]),
 		model,
 		...(overrides.gate ? { gate: overrides.gate } : {}),
@@ -289,6 +292,11 @@ describe("parseDecision", () => {
 			{ action: "press_a", confidence: 0.9 },
 		],
 		["stray trailing brace", '{"action":"press_b","confidence":0.7}\n}', { action: "press_b", confidence: 0.7 }],
+		[
+			"brace in a choice with braced prose",
+			'Sure! {"action":"set_power","params":{"power":"low}"},"confidence":0.7} (or {"action":"finish"} later)',
+			{ action: "set_power", params: { power: "low}" }, confidence: 0.7 },
+		],
 		[
 			"missing confidence",
 			'{"action":"press_a"}',
@@ -506,6 +514,27 @@ describe("runSystemRouterLoop", () => {
 		// The repetition stop is a refusal by the loop, so steps stays consistent.
 		expect(result.refused).toBe(1);
 		expect(result.steps).toBe(result.executed + result.refused);
+	});
+
+	it("flags interleaved repeats without treating colliding distinct param sets as repeats", async () => {
+		const env = new FakeEnvironment(["same screen", "same screen", "same screen"]);
+		const decide = scriptedDecide([
+			decision({ action: "combo", params: { a: "x&b=y" }, confidence: 0.9 }),
+			decision({ action: "combo", params: { a: "x", b: "y" }, confidence: 0.9 }),
+			decision({ action: "combo", params: { a: "x&b=y" }, confidence: 0.9 }),
+		]);
+		const actions = {
+			combo: {
+				description: "Combo.",
+				params: { a: { choices: { "x&b=y": "Collide.", x: "Plain x." } }, b: { choices: { y: "Plain y." } } },
+			},
+		};
+		const result = await runLoop(env, { decide, actions });
+		expect(result).toMatchObject({ status: "stuck", reason: "repeated_state" });
+		expect(env.executeLog).toEqual([
+			["combo", { a: "x&b=y" }],
+			["combo", { a: "x", b: "y" }],
+		]);
 	});
 
 	it("fails the run when the environment cannot reset", async () => {
@@ -745,7 +774,7 @@ describe("runRouterSegment wiring", () => {
 			environment: { stdio: { command: ["true"] } },
 		});
 		await expect(runRouterSegment(spec, { model, env: segmentEnv(log, supplied, initError) })).rejects.toThrow(
-			initError ? "rom not found" : "no action space",
+			initError ? "environment adapter init failed: rom not found" : "no action space",
 		);
 		expect(log).toEqual(["init", "close"]);
 	});
@@ -823,6 +852,40 @@ describe("runSystemRouterLoop budgets (fake timers)", () => {
 		const result = await run;
 		expect(result.status).toBe("incomplete");
 		expect(result.reason).toBe("timeout");
+	});
+
+	it("records the dispatched execution with an unknown outcome when the deadline fires mid-execution", async () => {
+		const env = {
+			reset: () => Promise.resolve(),
+			observe: () => Promise.resolve({ text: "screen" }),
+			execute: () => new Promise(() => {}),
+			close: () => Promise.resolve(),
+		};
+		const decide = scriptedDecide([decision({ action: "press_a", confidence: 0.9 })]);
+		const run = runLoop(env as unknown as RouterEnvironment, { decide, timeoutMs: 5_000 });
+		run.catch(() => {});
+		await vi.advanceTimersByTimeAsync(5_000);
+		const result = await run;
+		expect(result).toMatchObject({ status: "incomplete", reason: "timeout", executed: 1 });
+		expect(result.trace[0]).toMatchObject({ action: "press_a", result: expect.stringContaining("outcome unknown") });
+	});
+
+	it("does not dispatch or record an execution once the wall-clock deadline has passed", async () => {
+		const env = new FakeEnvironment(["screen"]);
+		let resolveDecide: ((value: RouterDecisionOutcome) => void) | undefined;
+		const decide = () =>
+			new Promise<RouterDecisionOutcome>((resolve) => {
+				resolveDecide = resolve;
+			});
+		const run = runLoop(env, { decide, timeoutMs: 5_000 });
+		run.catch(() => {});
+		await vi.advanceTimersByTimeAsync(0); // reset + observe + decide started
+		// Clock past the deadline without firing the timer: no post-deadline dispatch.
+		vi.setSystemTime(Date.now() + 5_001);
+		resolveDecide?.(decision({ action: "press_a", confidence: 0.9 }));
+		const result = await run;
+		expect(result).toMatchObject({ status: "incomplete", reason: "timeout", executed: 0, steps: 0 });
+		expect(env.executeLog).toEqual([]);
 	});
 });
 
@@ -1056,6 +1119,59 @@ describe("StdioRouterEnvironment (real subprocess)", () => {
 			await expect(env.init()).rejects.toThrow(/init timed out after 50ms/);
 		} finally {
 			await env.close();
+		}
+	});
+
+	it("forwards a falsy init payload and fails the next request instead of crashing on EPIPE", async () => {
+		if (process.platform !== "win32") {
+			const script = `
+				process.stdin.on("error", () => {});
+				require("readline").createInterface({ input: process.stdin }).on("line", (line) => {
+					const msg = JSON.parse(line);
+					if (msg.type === "init") {
+						require("fs").closeSync(0);
+						console.log(JSON.stringify({ id: msg.id, ok: true, environment: { echo: line } }));
+					}
+				});
+				setInterval(() => {}, 1000);
+			`;
+			const env = new StdioRouterEnvironment({ command: echoAdapter(script), requestTimeoutMs: 2_000, init: false });
+			try {
+				const environment = await env.init();
+				expect(environment?.echo).toContain('"init":false');
+				// No stdin error listener -> the stream "error" event crashes the host.
+				await expect(env.observe()).rejects.toThrow(/EPIPE/);
+			} finally {
+				await env.close({ budgetMs: 250 });
+			}
+		}
+	});
+
+	it("ends the segment at its wall-clock budget and kills the adapter tree, descendants included", async () => {
+		if (process.platform !== "win32") {
+			const script = `
+				process.on("SIGTERM", () => {});
+				const { spawn } = require("node:child_process");
+				const grandchild = spawn(process.execPath, ["-e", "setInterval(() => {}, 60000);"], { stdio: "ignore" });
+				const reply = (payload) => console.log(JSON.stringify(payload));
+				require("readline").createInterface({ input: process.stdin }).on("line", (line) => {
+					const msg = JSON.parse(line);
+					if (msg.type === "init") reply({ id: msg.id, ok: true, environment: { grandchildPid: grandchild.pid } });
+					else if (msg.type === "reset") reply({ id: msg.id, ok: true });
+					else if (msg.type === "observe") reply({ id: msg.id, ok: true, observation: { text: "screen" } });
+				});
+				setInterval(() => {}, 1000);
+			`;
+			const env = new StdioRouterEnvironment({ command: echoAdapter(script), requestTimeoutMs: 2_000 });
+			const grandchildPid = Number((await env.init())?.grandchildPid);
+			const decide = scriptedDecide([decision({ action: FINISH_ACTION, confidence: 1 })]);
+			const started = Date.now();
+			const result = await runLoop(env, { decide, timeoutMs: 200 });
+			// Old code: unbounded cleanup (+~2.5s) and an orphaned grandchild.
+			expect(result.status).toBe("done");
+			expect(Date.now() - started).toBeLessThan(2_000);
+			await waitForChildProcess((env as unknown as { child: ChildProcess }).child);
+			expect(isProcessAlive(grandchildPid)).toBe(false);
 		}
 	});
 });

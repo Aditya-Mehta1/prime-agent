@@ -303,13 +303,23 @@ export interface RouterExecution {
 	terminal?: boolean;
 }
 
+/** Options for stopping an adapter: `budgetMs` bounds the graceful shutdown wait. */
+export interface RouterCloseOptions {
+	budgetMs?: number;
+}
+
 /** The environment adapter contract: load (constructor/init), reset, observe, execute, close. */
 export interface RouterEnvironment {
 	/** Restore the environment to the start of this segment. Called once before the first observe. */
 	reset(goal: string): Promise<void>;
 	observe(): Promise<RouterObservation>;
 	execute(action: string, params: Record<string, string>): Promise<RouterExecution>;
-	close(): Promise<void>;
+	/**
+	 * Stop the adapter. `budgetMs` bounds the graceful shutdown wait so cleanup
+	 * cannot extend a timed-out segment past its wall-clock budget; callers
+	 * pass the remaining segment budget on timeout paths.
+	 */
+	close(options?: RouterCloseOptions): Promise<void>;
 }
 
 export type RouterGateVerdict = "pass" | "refused" | "parse_failure";

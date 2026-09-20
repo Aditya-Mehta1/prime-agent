@@ -1,1 +1,2 @@
 - Added a System 1 / System 2 router: the bundled `system-router` skill runs an action-only sub-model (one single-choice decision per step, thinking disabled, confidence-gated) against a declared environment adapter, with a Game Boy Advance node-mgba example.
+- Hardened the router from review findings: brace-aware decision parsing, falsy `init` forwarding, budget-bounded adapter cleanup with POSIX process-group shutdown, an EPIPE-safe stdin, deadline-checked dispatches with unknown-outcome trace records, and per-signature repeat detection.

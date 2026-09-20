@@ -49,6 +49,7 @@ export {
 	type RouterActionParamSpec,
 	type RouterActionRisk,
 	type RouterActionSpec,
+	type RouterCloseOptions,
 	type RouterEnvironment,
 	type RouterEnvironmentSpec,
 	type RouterExecution,

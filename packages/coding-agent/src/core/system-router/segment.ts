@@ -53,9 +53,10 @@ export async function runRouterSegment(
 			// The segment timeout bounds the whole segment, adapter init included.
 			environment = await raceInitAgainstSegmentTimeout(env.init(), spec.timeoutMs, segmentStartedAt);
 		} catch (error) {
-			throw new Error(
-				`environment adapter init exceeded the segment timeout of ${spec.timeoutMs}ms: ${error instanceof Error ? error.message : String(error)}`,
-			);
+			// Timeout errors keep the budget message (System 2 may raise the
+			// timeout); an adapter failure must not masquerade as one.
+			if (error instanceof RouterSegmentInitTimeoutError) throw error;
+			throw new Error(`environment adapter init failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
 		const actions = parseEnvironmentActions(spec.actions, environment?.actions);
 		if (!actions) {
@@ -90,20 +91,33 @@ export async function runRouterSegment(
 	} finally {
 		// The loop closes the env on its own paths; this guards the window
 		// between init and the loop so the adapter process never leaks.
-		await env.close().catch(() => {});
+		await env.close({ budgetMs: Math.max(0, spec.timeoutMs - (Date.now() - segmentStartedAt)) }).catch(() => {});
 	}
 }
+
+/** Timeout marker: keeps the budget message; other init errors are adapter failures. */
+class RouterSegmentInitTimeoutError extends Error {}
 
 /** Race adapter init against the segment budget without leaking a late rejection. */
 async function raceInitAgainstSegmentTimeout<T>(work: Promise<T>, timeoutMs: number, startedAt: number): Promise<T> {
 	const remaining = timeoutMs - (Date.now() - startedAt);
 	if (remaining <= 0) {
 		void work.catch(() => {});
-		throw new Error("segment budget already exhausted before init");
+		throw new RouterSegmentInitTimeoutError(
+			`environment adapter init exceeded the segment timeout of ${timeoutMs}ms: segment budget already exhausted before init`,
+		);
 	}
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	const timeout = new Promise<never>((_, reject) => {
-		timer = setTimeout(() => reject(new Error("init timed out")), remaining);
+		timer = setTimeout(
+			() =>
+				reject(
+					new RouterSegmentInitTimeoutError(
+						`environment adapter init exceeded the segment timeout of ${timeoutMs}ms`,
+					),
+				),
+			remaining,
+		);
 		if (timer && typeof timer === "object" && "unref" in timer) timer.unref();
 	});
 	void timeout.catch(() => {});

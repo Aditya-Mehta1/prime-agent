@@ -95,9 +95,20 @@ function parseJsonCandidates(trimmed: string): Record<string, unknown> | null {
 		}
 	}
 	let depth = 0;
+	let inString = false;
+	let escaped = false;
 	for (let index = start; index < trimmed.length; index += 1) {
 		const char = trimmed[index];
-		if (char === "{") depth += 1;
+		if (inString) {
+			if (escaped) escaped = false;
+			else if (char === "\\") escaped = true;
+			else if (char === '"') inString = false;
+			continue;
+		}
+		if (char === '"') inString = true;
+		// Braces inside quoted strings (e.g. a parameter choice value) are
+		// content, not structure; counting them misreads the object boundary.
+		else if (char === "{") depth += 1;
 		else if (char === "}") {
 			depth -= 1;
 			if (depth === 0) {

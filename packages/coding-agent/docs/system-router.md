@@ -38,7 +38,9 @@ goal ──► observe ──► decide (ONE call, thinking off) ──► gate 
 
 `finish` and `escalate` are actions the space always appends: `finish` declares the
 goal reached, `escalate` hands control back to System 2. The same action with the
-same parameters on the same observation twice ends the segment as `stuck`.
+same parameters on the same observation twice — adjacent or interleaved with other
+repeats — ends the segment as `stuck`. A step dispatched when the timeout fires is
+recorded with an unknown outcome, so a retried segment can see what may have run.
 
 ## Running a segment
 
@@ -104,7 +106,11 @@ request is one line; each reply is one line:
   base64 PNG `image`, and `terminal`.
 - `execute`: reply with `text` and optional `terminal`. A soft failure is an
   honest `text` result; an `ok: false` error fails the run.
-- Requests time out after `environment.stdio.requestTimeoutMs` (default 30s).
+- Requests time out after `environment.stdio.requestTimeoutMs` (default 30s). At
+segment end the adapter is asked to close and then signaled (SIGTERM, then
+SIGKILL) within the segment's remaining budget, so a wedged adapter cannot extend
+a timed-out segment; on POSIX the whole process group is signaled so a launcher's
+descendants go down with it.
 
 Adapters can be written in any language. Because the adapter is a subprocess, it
 also crosses machine boundaries: the same `command` can wrap a container.
