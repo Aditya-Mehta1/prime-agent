@@ -211,6 +211,10 @@ struct AgentsViewMode {
     /// The effective keybindings (TS `AgentsViewMode.keybindings`): every
     /// action and hint dispatches through this manager.
     keybindings: crate::keybindings::KeybindingsManager,
+    /// The terminal height of the last rendered frame (TS reads
+    /// `ui.terminal.rows` live at key time); 0 before the first render,
+    /// where `page_step` floors to the 4-row minimum anyway.
+    last_height: usize,
 }
 
 impl AgentsViewMode {
@@ -227,6 +231,7 @@ impl AgentsViewMode {
             options,
             theme,
             keybindings,
+            last_height: 0,
             roster: Vec::new(),
             saved: Vec::new(),
             rows: Vec::new(),
@@ -623,6 +628,14 @@ impl AgentsViewMode {
         self.running = false;
     }
 
+    /// The selection page step (TS `handleListNavigation`: the page keys
+    /// move by `Math.max(1, visibleListRows())`, where `visibleListRows()`
+    /// is the terminal rows minus the fixed frame chrome — splash, search
+    /// prompt, hints — floored at 4 rows).
+    fn page_step(&self) -> usize {
+        self.last_height.saturating_sub(9).max(4).max(1)
+    }
+
     /// Handle one key id. Every action dispatches through the effective
     /// keybindings in TS dispatch order (`AgentsViewMode.handleInput`,
     /// then `CustomEditor.handleInput`/`Editor.handleInput`), so a user
@@ -690,11 +703,11 @@ impl AgentsViewMode {
             return;
         }
         if self.keybindings.matches(key, "tui.select.pageUp") {
-            self.move_selection(-(self.rows.len() as isize).min(10));
+            self.move_selection(-(self.page_step() as isize));
             return;
         }
         if self.keybindings.matches(key, "tui.select.pageDown") {
-            self.move_selection((self.rows.len() as isize).min(10));
+            self.move_selection(self.page_step() as isize);
             return;
         }
         // The scoped view's parent key (TS `app.agents.back`, default
@@ -755,6 +768,9 @@ impl AgentsViewMode {
 
     /// Compose one frame (splash, search prompt, sectioned list, hints).
     fn render_frame(&mut self, width: usize, height: usize) -> (Vec<Line>, Option<(usize, usize)>) {
+        // The frame height feeds the page step (TS reads
+        // `ui.terminal.rows` live at key time instead).
+        self.last_height = height;
         let theme = &self.theme;
         let mut lines: Vec<Line> = Vec::new();
         // TS `getAgentCountsText` rides the splash as extra metadata.
@@ -1626,6 +1642,34 @@ mod tests {
         mode.handle_key("right");
         assert_eq!(mode.rows.len(), 3, "right is inert after the override");
         assert!(mode.rows[1].expanded);
+    }
+
+    #[test]
+    fn page_keys_step_by_visible_list_rows() {
+        let (mut mode, _) = mode_with_row("paged", "mock-1");
+        // 40 extra selectable rows: every step below lands inside the
+        // list instead of clamping at an edge.
+        let template = mode.rows[0].clone();
+        for i in 0..40 {
+            let mut row = template.clone();
+            row.identity = format!("row-{i}");
+            row.title = row.identity.clone();
+            row.summary = serde_json::json!({ "sessionName": row.identity.clone() });
+            mode.rows.push(row);
+        }
+        // TS `visibleListRows()` is `max(4, terminal rows - 9)` and the
+        // page keys move by `max(1, visibleListRows())`: the terminal
+        // height of the last frame sets the step, with the 4-row floor
+        // covering short terminals and the pre-render height 0.
+        for (height, step) in [(40usize, 31usize), (24, 15), (12, 4), (5, 4), (0, 4)] {
+            mode.render_frame(120, height);
+            assert_eq!(mode.page_step(), step, "step at terminal height {height}");
+            mode.selected = 0;
+            mode.handle_key("pageDown");
+            assert_eq!(mode.selected, step, "pageDown at terminal height {height}");
+            mode.handle_key("pageUp");
+            assert_eq!(mode.selected, 0, "pageUp at terminal height {height}");
+        }
     }
 
     #[test]
