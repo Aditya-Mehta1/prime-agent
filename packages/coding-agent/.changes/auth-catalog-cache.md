@@ -1,0 +1,1 @@
+- Perf: model resolution no longer re-fingerprints auth sources per model, re-reads and re-parses the private Prime Inference authorization cache per call, or rebuilds the catalog when nothing changed; external models.json edits are still picked up via a stat-identity guard.
