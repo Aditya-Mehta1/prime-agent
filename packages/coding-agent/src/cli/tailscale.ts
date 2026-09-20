@@ -46,7 +46,11 @@ function runTailscale(args: string[]): { code: number; stdout: string; stderr: s
 	return { code: result.status ?? -1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
 
-/** Detect the CLI and, when present, this node's tailnet state. */
+/**
+ * Detect the CLI and, when present, this node's tailnet state.
+ * Exported as a test seam: production code calls it inside the command functions
+ * below, and it is not part of the package's public API (src/index.ts).
+ */
 export function probeTailscale(): TailscaleProbe {
 	// Node's own ENOENT detection - no `which` binary needed (absent on Windows shells).
 	const version = spawnSyncHidden("tailscale", ["version"], {
