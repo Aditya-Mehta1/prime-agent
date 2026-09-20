@@ -142,6 +142,25 @@ impl CompactSkip {
     }
 }
 
+/// A prepared compaction (TS `prepareCompaction`'s `CompactionPreparation`):
+/// the resolved cut plus the iterative-update anchors derived from the prior
+/// compaction — the retained boundary the new summary covers and the
+/// previous summary the update-mode summarizer merges into.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactionPreparation {
+    /// The chosen cut point.
+    pub cut: CutPointResult,
+    /// TS `boundaryStart`: the prior compaction's first kept entry (or the
+    /// entry after the compaction when its boundary is gone — session
+    /// migration). Everything before it is already summarized by the prior
+    /// compaction; the new summary covers only what follows.
+    pub boundary_start: usize,
+    /// TS `previousSummary`: the prior compaction's summary, wired into the
+    /// history summarizer request so it updates the existing summary instead
+    /// of re-summarizing from scratch.
+    pub previous_summary: Option<String>,
+}
+
 /// Resolve the compaction cut and the skip guards without a model call
 /// (TS `prepareCompaction`): a branch that already ends in a compaction has
 /// nothing new to summarize, and a branch with no summarizable history has
@@ -149,23 +168,47 @@ impl CompactSkip {
 pub fn prepare_compaction(
     entries: &[FileEntry],
     keep_recent_tokens: u64,
-) -> Result<CutPointResult, CompactSkip> {
-    // The header is not a compact candidate.
-    let start = usize::from(matches!(entries.first(), Some(FileEntry::Header { .. })));
-    let cut = find_cut_point(entries, start, entries.len(), keep_recent_tokens);
+) -> Result<CompactionPreparation, CompactSkip> {
     // Skip guard (TS prepareCompaction): a branch that already ends in a
     // compaction has nothing new to summarize.
     if matches!(entries.last(), Some(FileEntry::Compaction { .. })) {
         return Err(CompactSkip::AlreadyCompacted);
     }
-    // Messages the summarizer would see (TS prepareCompaction): everything
-    // before the cut, plus the prefix of a split turn.
+    // The header is not a compact candidate.
+    let start = usize::from(matches!(entries.first(), Some(FileEntry::Header { .. })));
+    // Iterative update mode (TS prepareCompaction): a prior compaction is
+    // the update anchor. Its summary becomes `previousSummary` (the
+    // update-in-place mode for the history summarizer), and its first kept
+    // entry becomes the boundary the new compaction covers — the new
+    // summary summarizes only the retained conversation since, never the
+    // already-summarized history before it.
+    let prev_compaction_index = entries
+        .iter()
+        .rposition(|entry| matches!(entry, FileEntry::Compaction { .. }));
+    let (boundary_start, previous_summary) = match prev_compaction_index {
+        Some(index) => {
+            let FileEntry::Compaction { payload, .. } = &entries[index] else {
+                unreachable!("rposition matched a compaction entry")
+            };
+            let first_kept_index = entries
+                .iter()
+                .position(|entry| entry.id() == Some(payload.first_kept_entry_id.as_str()));
+            // TS boundaryStart: the retained entry when it still exists,
+            // else the entry after the compaction (session migration).
+            let boundary_start = first_kept_index.unwrap_or(index + 1);
+            (boundary_start, Some(payload.summary.clone()))
+        }
+        None => (start, None),
+    };
+    let cut = find_cut_point(entries, boundary_start, entries.len(), keep_recent_tokens);
+    // Messages the summarizer would see (TS prepareCompaction): the
+    // conversation since the boundary, plus the prefix of a split turn.
     let history_end = if cut.is_split_turn {
         cut.turn_start_index.unwrap_or(cut.first_kept_entry_index)
     } else {
         cut.first_kept_entry_index
     };
-    let messages: Vec<AgentMessage> = entries[..history_end]
+    let messages: Vec<AgentMessage> = entries[boundary_start..history_end]
         .iter()
         .filter_map(message_from_entry)
         .collect();
@@ -173,15 +216,16 @@ pub fn prepare_compaction(
         .iter()
         .filter_map(message_from_entry)
         .collect();
-    let has_previous_summary = entries[..cut.first_kept_entry_index]
-        .iter()
-        .rev()
-        .any(|entry| matches!(entry, FileEntry::Compaction { .. }));
-    // Avoid a compaction that would summarize no history (TS prepareCompaction).
-    if messages.is_empty() && turn_prefix_messages.is_empty() && !has_previous_summary {
+    // Avoid a compaction that would summarize no history (TS prepareCompaction
+    // — a prior summary alone is enough to run: the update merges it).
+    if messages.is_empty() && turn_prefix_messages.is_empty() && previous_summary.is_none() {
         return Err(CompactSkip::TooShort);
     }
-    Ok(cut)
+    Ok(CompactionPreparation {
+        cut,
+        boundary_start,
+        previous_summary,
+    })
 }
 
 /// Run compaction over the session: summarize the pre-cut prefix, persist the
@@ -191,24 +235,27 @@ pub async fn execute_compaction(
     options: CompactOptions<'_>,
 ) -> anyhow::Result<CompactOutcome> {
     let entries = session.get_all_entries().to_vec();
-    let cut = match prepare_compaction(&entries, options.settings.keep_recent_tokens) {
-        Ok(cut) => cut,
+    let preparation = match prepare_compaction(&entries, options.settings.keep_recent_tokens) {
+        Ok(preparation) => preparation,
         Err(skip) => return Ok(CompactOutcome::Skipped(skip.user_message())),
     };
+    let cut = preparation.cut;
+    let previous_summary = preparation.previous_summary;
     let first_kept_entry = entries
         .get(cut.first_kept_entry_index)
         .and_then(|entry| entry.id())
         .unwrap_or_default()
         .to_string();
 
-    // Messages the summarizer sees (TS prepareCompaction): everything before
-    // the cut, plus the prefix of a split turn (turnPrefixMessages).
+    // Messages the summarizer sees (TS prepareCompaction): the conversation
+    // since the prior compaction's retained boundary, plus the prefix of a
+    // split turn (turnPrefixMessages).
     let history_end = if cut.is_split_turn {
         cut.turn_start_index.unwrap_or(cut.first_kept_entry_index)
     } else {
         cut.first_kept_entry_index
     };
-    let history: Vec<AgentMessage> = entries[..history_end]
+    let history: Vec<AgentMessage> = entries[preparation.boundary_start..history_end]
         .iter()
         .filter_map(message_from_entry)
         .collect();
@@ -238,13 +285,18 @@ pub async fn execute_compaction(
     // tokens) — concurrently; a non-split cut makes the single history
     // call. A split with no summarizable history makes no history wire
     // call at all and stands in the literal "No prior history.". The
-    // previous-summary update mode (TS passes the prior compaction's
-    // summary to the history call) is not ported yet; both paths pass
-    // None, the behavior this lane inherited.
+    // history call carries the previous-summary update mode on both paths
+    // (TS passes the prior compaction's summary to `generateSummary`; the
+    // turn-prefix call never gets it) — a non-split cut with no new
+    // history still makes the update wire call.
     let history_max_tokens = options.settings.reserve_tokens / 5 * 4; // floor(0.8 * reserve)
     let turn_prefix_max_tokens = options.settings.reserve_tokens / 2; // floor(0.5 * reserve)
     let history_call = async {
-        if history.is_empty() {
+        // The stand-in applies only inside the split arm (TS
+        // `messagesToSummarize.length > 0 ? generateSummary(...) : "No
+        // prior history."` — the arm runs when a turn prefix exists); a
+        // cut without a turn prefix makes the history call below.
+        if cut.is_split_turn && !turn_prefix_messages.is_empty() && history.is_empty() {
             return Ok(SummarySlice {
                 summary: NO_PRIOR_HISTORY.to_string(),
                 usage: None,
@@ -253,7 +305,7 @@ pub async fn execute_compaction(
         let request = build_summarization_request(
             &history,
             options.custom_instructions,
-            None,
+            previous_summary.as_deref(),
             options.settings.reserve_tokens,
         );
         complete_summary_call(
@@ -817,9 +869,11 @@ mod tests {
         }));
         session.append_message(user("small"));
         let entries = session.get_all_entries().to_vec();
-        let cut = prepare_compaction(&entries, 10).expect("split compaction prepares");
-        assert!(cut.is_split_turn);
-        assert_eq!(cut.turn_start_index, Some(1));
+        let preparation = prepare_compaction(&entries, 10).expect("split compaction prepares");
+        assert!(preparation.cut.is_split_turn);
+        assert_eq!(preparation.cut.turn_start_index, Some(1));
+        // No prior compaction: no update-mode anchors.
+        assert_eq!(preparation.previous_summary, None);
         // A fresh small session with no cut history still skips.
         let mut small = SessionManager::in_memory(tmp.path());
         small.append_message(user("one small turn"));
@@ -828,6 +882,389 @@ mod tests {
             prepare_compaction(&entries, 10_000),
             Err(CompactSkip::TooShort)
         );
+    }
+
+    /// A raw entry builder for prepare-level tests (explicit ids).
+    fn raw_user_entry(id: &str, text: &str) -> FileEntry {
+        FileEntry::Message {
+            message: AgentMessage::User(pa_types::ai::UserMessage {
+                content: UserContent::Text(text.to_string()),
+                timestamp: 0,
+                rest: Default::default(),
+            }),
+            base: EntryBase {
+                id: Some(id.to_string()),
+                parent_id: None,
+                timestamp: Some("2024-01-01T00:00:00.000Z".to_string()),
+                rest: Default::default(),
+            },
+        }
+    }
+
+    fn raw_compaction_entry(id: &str, first_kept: &str, summary: &str) -> FileEntry {
+        FileEntry::Compaction {
+            payload: pa_types::session::CompactionEntry {
+                summary: summary.to_string(),
+                first_kept_entry_id: first_kept.to_string(),
+                tokens_before: 100,
+                ..Default::default()
+            },
+            base: EntryBase {
+                id: Some(id.to_string()),
+                parent_id: None,
+                timestamp: Some("2024-01-01T00:00:00.000Z".to_string()),
+                rest: Default::default(),
+            },
+        }
+    }
+
+    /// The iterative update mode activates from a prior compaction (TS
+    /// `prepareCompaction`): the prior summary becomes `previousSummary`
+    /// and the prior compaction's first kept entry becomes the
+    /// summarization boundary — the cut walks only the retained
+    /// conversation, and the new history covers the messages since the
+    /// boundary, never the already-summarized prefix.
+    #[test]
+    fn prepare_compaction_update_mode_anchors_on_the_prior_compaction() {
+        let entries = vec![
+            raw_user_entry("m0", "turn zero"),
+            raw_user_entry("m1", "turn one"),
+            raw_user_entry("m2", "turn two"),
+            raw_compaction_entry("c1", "m1", "the prior summary"),
+            raw_user_entry("m3", "turn three"),
+            raw_user_entry("m4", "turn four"),
+        ];
+        let preparation = prepare_compaction(&entries, 2).expect("update compaction prepares");
+        // The boundary is the prior compaction's first kept entry.
+        assert_eq!(preparation.boundary_start, 1);
+        assert_eq!(
+            preparation.previous_summary,
+            Some("the prior summary".to_string())
+        );
+        // The cut walks only the retained region (the budget counts the
+        // post-boundary messages, so it lands at the last small turn).
+        assert_eq!(preparation.cut.first_kept_entry_index, 5);
+        assert!(!preparation.cut.is_split_turn);
+        // Without a prior compaction there are no update anchors.
+        let fresh = vec![
+            raw_user_entry("m0", "turn zero"),
+            raw_user_entry("m1", "turn one"),
+        ];
+        let preparation = prepare_compaction(&fresh, 2).expect("fresh compaction prepares");
+        assert_eq!(preparation.previous_summary, None);
+        assert_eq!(preparation.boundary_start, 0);
+    }
+
+    /// The boundary fallback (TS `boundaryStart = prevCompactionIndex + 1`
+    /// when the retained entry is gone — session migration) and the guard
+    /// (TS: `!previousSummary` — a prior summary alone is enough to run).
+    #[test]
+    fn prepare_compaction_boundary_fallback_and_prior_summary_guard() {
+        // The retained entry id no longer exists: the boundary falls back
+        // to the entry after the compaction.
+        let entries = vec![
+            raw_compaction_entry("c1", "gone-entry", "the prior summary"),
+            raw_user_entry("m1", "turn one"),
+        ];
+        let preparation = prepare_compaction(&entries, 2).expect("fallback boundary prepares");
+        assert_eq!(preparation.boundary_start, 1);
+        assert_eq!(
+            preparation.previous_summary,
+            Some("the prior summary".to_string())
+        );
+        // A huge keep budget leaves nothing new to summarize, but the
+        // prior summary alone keeps the compaction runnable (TS: the skip
+        // guard fires only without a previousSummary).
+        let preparation = prepare_compaction(&entries, 10_000).expect("prior summary runs");
+        assert_eq!(preparation.cut.first_kept_entry_index, 1);
+        // The same shape WITHOUT a prior compaction skips as too short.
+        let fresh = vec![raw_user_entry("m1", "turn one")];
+        assert_eq!(
+            prepare_compaction(&fresh, 10_000),
+            Err(CompactSkip::TooShort)
+        );
+    }
+
+    /// A session compacted twice (the iterative update mode, TS `compact`
+    /// passing `previousSummary` into the history call): the second
+    /// compaction's summarizer request carries the update prompt with the
+    /// prior summary in `<previous-summary>` tags and summarizes only the
+    /// conversation since the first compaction's boundary — never the
+    /// history the first compaction already summarized.
+    #[tokio::test]
+    async fn second_compaction_updates_the_prior_summary_over_new_history() {
+        let registration = faux_registration();
+        let model = registration.get_model();
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let make_step = |response: &'static str| {
+            let seen = seen.clone();
+            pa_ai::faux::FauxResponseStep::Factory(std::sync::Arc::new(
+                move |context: &pa_types::ai::Context,
+                      _options: Option<&pa_ai::types::StreamOptions>,
+                      _call: u64,
+                      _model: &pa_types::ai::Model| {
+                    let text = match &context.messages[0] {
+                        pa_types::ai::Message::User(user) => user.content.text(),
+                        _ => panic!("expected a user request"),
+                    };
+                    seen.lock().unwrap().push(text);
+                    Ok(pa_ai::faux::faux_assistant_text_message(
+                        response,
+                        pa_ai::faux::FauxAssistantMessageOptions::default(),
+                    ))
+                },
+            ))
+        };
+        registration.set_responses(vec![
+            make_step("the first summary"),
+            make_step("the second summary"),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut session = SessionManager::in_memory(tmp.path());
+        let user = |text: &str| {
+            AgentMessage::User(pa_types::ai::UserMessage {
+                content: UserContent::Text(text.to_string()),
+                timestamp: 0,
+                rest: Default::default(),
+            })
+        };
+        session.append_message(user("turn zero"));
+        session.append_message(user("turn one"));
+        session.append_message(user("turn two"));
+        let settings = super::super::compaction::CompactionSettings {
+            keep_recent_tokens: 2,
+            ..Default::default()
+        };
+        // First compaction: the initial checkpoint prompt over turns zero
+        // and one, keeping turn two.
+        let outcome = execute_compaction(
+            &mut session,
+            CompactOptions {
+                model: model.clone(),
+                api_key: None,
+                custom_instructions: None,
+                settings,
+                abort: None,
+                harness_digest: None,
+            },
+        )
+        .await
+        .unwrap();
+        let CompactOutcome::Ran(first) = outcome else {
+            panic!("expected the first compaction to run")
+        };
+        assert_eq!(first.result.summary, "the first summary");
+        let mut requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("Create a structured context checkpoint summary"));
+        assert!(requests[0].contains("[User]: turn zero"));
+        assert!(!requests[0].contains("<previous-summary>"));
+
+        // New turns after the first compaction.
+        session.append_message(user("turn three"));
+        session.append_message(user("turn four"));
+        let outcome = execute_compaction(
+            &mut session,
+            CompactOptions {
+                model,
+                api_key: None,
+                custom_instructions: None,
+                settings,
+                abort: None,
+                harness_digest: None,
+            },
+        )
+        .await
+        .unwrap();
+        let CompactOutcome::Ran(second) = outcome else {
+            panic!("expected the second compaction to run")
+        };
+        // One update-mode wire call: the update prompt, the prior summary
+        // in <previous-summary> tags, and only the conversation since the
+        // first compaction's boundary (turn two was RETAINED by the first
+        // compaction, so it is new history; turn zero was summarized away).
+        assert_eq!(registration.call_count(), 2);
+        requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        let request = &requests[1];
+        assert!(request.contains("NEW conversation messages to incorporate"));
+        assert!(request.contains("<previous-summary>\nthe first summary\n</previous-summary>"));
+        assert!(request.contains("[User]: turn two"));
+        assert!(request.contains("[User]: turn three"));
+        assert!(!request.contains("[User]: turn zero"));
+        assert!(!request.contains("[User]: turn one"));
+        // The merged durable entry: the updated summary, the new cut.
+        assert_eq!(second.result.summary, "the second summary");
+        let kept_id = session
+            .get_all_entries()
+            .iter()
+            .rev()
+            .find(|entry| matches!(entry, FileEntry::Message { .. }))
+            .and_then(|entry| entry.id())
+            .expect("kept entry id")
+            .to_string();
+        assert_eq!(second.result.first_kept_entry_id, kept_id);
+        // Both compactions persisted.
+        let compactions = session
+            .get_entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                FileEntry::Compaction { payload, .. } => Some(payload.summary.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(compactions, vec!["the first summary", "the second summary"]);
+        registration.unregister();
+    }
+
+    /// A split-turn cut after a prior compaction (the iterative update
+    /// mode on the split path, #225's note): the history call runs in
+    /// update mode over the conversation since the boundary, while the
+    /// turn-prefix call stays a plain prefix summary — never the previous
+    /// summary.
+    #[tokio::test]
+    async fn second_compaction_split_turn_history_updates_prefix_does_not() {
+        let registration = faux_registration();
+        let model = registration.get_model();
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let make_step = |response: &'static str| {
+            let seen = seen.clone();
+            pa_ai::faux::FauxResponseStep::Factory(std::sync::Arc::new(
+                move |context: &pa_types::ai::Context,
+                      _options: Option<&pa_ai::types::StreamOptions>,
+                      _call: u64,
+                      _model: &pa_types::ai::Model| {
+                    let text = match &context.messages[0] {
+                        pa_types::ai::Message::User(user) => user.content.text(),
+                        _ => panic!("expected a user request"),
+                    };
+                    seen.lock().unwrap().push(text);
+                    Ok(pa_ai::faux::faux_assistant_text_message(
+                        response,
+                        pa_ai::faux::FauxAssistantMessageOptions::default(),
+                    ))
+                },
+            ))
+        };
+        registration.set_responses(vec![
+            make_step("the first summary"),
+            make_step("the updated history summary"),
+            make_step("the turn prefix summary"),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut session = SessionManager::in_memory(tmp.path());
+        let user = |text: &str| {
+            AgentMessage::User(pa_types::ai::UserMessage {
+                content: UserContent::Text(text.to_string()),
+                timestamp: 0,
+                rest: Default::default(),
+            })
+        };
+        let reply = |text: &str| {
+            AgentMessage::Assistant(AssistantMessage {
+                content: vec![pa_types::ai::AssistantContentBlock::Text(
+                    pa_types::ai::TextContent {
+                        text: text.to_string(),
+                        text_signature: None,
+                        rest: Default::default(),
+                    },
+                )],
+                api: "faux".to_string(),
+                provider: "faux".to_string(),
+                model: "compact-m".to_string(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                usage: pa_types::ai::Usage::default(),
+                stop_reason: pa_types::ai::StopReason::Stop,
+                stop_reason_raw: None,
+                error_message: None,
+                timestamp: 0,
+                rest: Default::default(),
+            })
+        };
+        session.append_message(user("turn zero"));
+        session.append_message(user("turn one"));
+        let settings = super::super::compaction::CompactionSettings {
+            keep_recent_tokens: 1,
+            ..Default::default()
+        };
+        let outcome = execute_compaction(
+            &mut session,
+            CompactOptions {
+                model: model.clone(),
+                api_key: None,
+                custom_instructions: None,
+                settings,
+                abort: None,
+                harness_digest: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, CompactOutcome::Ran(_)));
+
+        // A small retained turn, then a big turn the cut splits: the cut
+        // lands mid big turn (keep budget 10), with the first compaction's
+        // retained turns as the history and the big turn's user message as
+        // the split prefix.
+        session.append_message(user("kept small turn"));
+        session.append_message(reply("small kept reply"));
+        session.append_message(user(&format!("big turn {}", "x".repeat(4_000))));
+        session.append_message(reply(&format!("reply {}", "y".repeat(4_000))));
+        session.append_message(user("final small turn"));
+        session.append_message(reply("final reply"));
+        let outcome = execute_compaction(
+            &mut session,
+            CompactOptions {
+                model,
+                api_key: None,
+                custom_instructions: None,
+                settings: super::super::compaction::CompactionSettings {
+                    keep_recent_tokens: 10,
+                    ..Default::default()
+                },
+                abort: None,
+                harness_digest: None,
+            },
+        )
+        .await
+        .unwrap();
+        let CompactOutcome::Ran(second) = outcome else {
+            panic!("expected the second compaction to run")
+        };
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 3);
+        // The history call: update mode over the conversation since the
+        // first compaction's boundary (turn one was retained, kept small
+        // turn, small kept reply) — with the previous summary; turn zero
+        // was summarized away and never reappears.
+        let history_request = requests
+            .iter()
+            .find(|text| text.contains("NEW conversation messages to incorporate"))
+            .expect("history call in update mode");
+        assert!(
+            history_request.contains("<previous-summary>\nthe first summary\n</previous-summary>")
+        );
+        assert!(history_request.contains("[User]: turn one"));
+        assert!(history_request.contains("[User]: kept small turn"));
+        assert!(!history_request.contains("[User]: turn zero"));
+        // The turn-prefix call: its own instruction, never the update
+        // prompt or the previous summary.
+        let prefix_request = requests
+            .iter()
+            .find(|text| text.contains("PREFIX of a turn"))
+            .expect("turn-prefix call");
+        assert!(prefix_request.contains("[User]: big turn"));
+        assert!(!prefix_request.contains("<previous-summary>"));
+        assert!(!prefix_request.contains("NEW conversation messages to incorporate"));
+        // The merged summary carries the split marker behind the updated
+        // history summary.
+        assert_eq!(
+            second.result.summary,
+            "the updated history summary\n\n---\n\n**Turn Context (split turn):**\n\nthe turn prefix summary"
+        );
+        registration.unregister();
     }
 
     #[tokio::test]

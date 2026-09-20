@@ -45,6 +45,10 @@ import perf as P  # noqa: E402
 import ts_identity  # noqa: E402  (the shared PATH-binary identity guard)
 from mock_provider import user_message_text  # noqa: E402
 
+# The scripted summaries of the f7 second-compaction differential (the
+# durable rows are scoped to them; other f7 sessions compact too).
+ITERATIVE_SUMMARIES = ("the first compaction summary", "the second compaction summary")
+
 NL = chr(10)
 
 ALL_FLOWS = ["f1_launch", "f2_prompt", "f3_tool", "f4_commands", "f5_side_questions", "f6_attach", "f7_compaction", "f8_resume", "f9_agents_view", "f10_perf", "f11_provider_failure", "f12_scroll", "f13_ctrlc_exit", "f14_compact", "f15_a2a", "f16_refine", "f17_slash_model", "f18_goal_autonomous", "f19_heartbeat", "f20_subagents", "f21_worker_recovery", "f22_provider_failover", "f23_keybindings"]
@@ -1233,14 +1237,30 @@ class Battery:
                     )
                     wire.close()
                     continue
+                # The two summarizer calls race the provider concurrently
+                # (TS Promise.all / Rust tokio::join), so their arrival
+                # order at the shared mock is not deterministic: route
+                # each by its prompt marker (content-matched queues) so
+                # each call deterministically gets its own scripted
+                # response regardless of arrival order.
                 side.mock.set_responses(
                     [
                         {"text": "seed reply"},
                         {"text": "reply two padded more"},
                         {"text": "k3"},
-                        {"text": "the history summary"},
-                        {"text": "the turn prefix summary"},
-                    ]
+                    ],
+                    queues=[
+                        {
+                            "name": "split-history",
+                            "match": ["Create a structured context checkpoint summary"],
+                            "responses": [{"text": "the history summary"}],
+                        },
+                        {
+                            "name": "split-turn-prefix",
+                            "match": ["PREFIX of a turn that was too large to keep"],
+                            "responses": [{"text": "the turn prefix summary"}],
+                        },
+                    ],
                 )
                 for index, message in enumerate(("seed turn", "turn two", "turn three"), start=1):
                     prompt = wire.request(
@@ -1315,11 +1335,17 @@ class Battery:
                 else:
                     settings_path.write_text(prior_settings)
         if split_rows.get("ts") is not None and split_rows.get("rust") is not None:
-            # Two summarizer wire calls on both sides, history first, with
-            # byte-identical prompt shapes (the checkpoint instruction on
-            # the history call, the turn-prefix instruction on the prefix
-            # call).
-            if len(split_requests.get("ts", [])) == 2 and split_requests.get("ts") == split_requests.get("rust"):
+            # Two summarizer wire calls on both sides with byte-identical
+            # prompt shapes (the checkpoint instruction on the history
+            # call, the turn-prefix instruction on the prefix call). The
+            # calls race the provider concurrently (TS Promise.all / Rust
+            # tokio::join), so arrival order is not a parity claim: compare
+            # the request set, not the order.
+            split_set = lambda side_name: sorted(  # noqa: E731
+                json.dumps(request, sort_keys=True)
+                for request in split_requests.get(side_name, [])
+            )
+            if len(split_requests.get("ts", [])) == 2 and split_set("ts") == split_set("rust"):
                 self.record(
                     flow,
                     "behavior",
@@ -1350,6 +1376,238 @@ class Battery:
                     f"split-turn durable compaction row differs: ts={json.dumps(split_rows['ts'])[:400]} "
                     f"rust={json.dumps(split_rows['rust'])[:400]}",
                     evidence=[side.root / flow / "split-compact-response.json" for side in self.sides.values()],
+                )
+
+        # Iterative/second-compaction differential (the
+        # iterative-compaction lane): TS compaction runs in UPDATE mode on
+        # subsequent compactions — the prior compaction's summary wires
+        # into the history summarizer request inside <previous-summary>
+        # tags under the update instruction, and the new history covers
+        # only the conversation since the prior compaction's boundary
+        # (its first kept entry), never the already-summarized prefix. A
+        # session compacted twice: the second compaction's summarizer
+        # wire requests must be byte-identical on both sides, and both
+        # durable compaction rows must match.
+        iterative_requests: dict[str, list] = {}
+        iterative_rows: dict[str, list] = {}
+        for side in (self.sides["ts"], self.sides["rust"]):
+            self.ensure_daemon(side)
+            settings_path = side.agent_dir / "settings.json"
+            prior_settings = (
+                settings_path.read_text() if settings_path.exists() else None
+            )
+            # autoRefine off (the split differential's pin): the TS daemon
+            # would otherwise schedule a harness-state review after each
+            # compaction and consume mock responses past the summarizer
+            # calls this differential counts.
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "compaction": {"keepRecentTokens": 10, "reserveTokens": 1000},
+                        "autoRefine": {"enabled": False},
+                    }
+                )
+            )
+            try:
+                wire = B.Wire(side.daemon_socket)
+                create = wire.request(
+                    "ic1",
+                    {
+                        "type": "create",
+                        "name": "battery-iterative",
+                        "config": self.session_config(side),
+                    },
+                    timeout=120,
+                )
+                side.evidence_json(flow, "iterative-create-response.json", create)
+                session_id = (
+                    create.get("data", {}).get("activeSessionId") or create.get("data", {}).get("id") or ""
+                )
+                if create.get("success") is not True:
+                    self.record(
+                        flow,
+                        "protocol",
+                        f"{side.name}: iterative session create failed: {json.dumps(create)[:300]}",
+                    )
+                    wire.close()
+                    continue
+                # Two turns, compact #1 (checkpoint prompt over the first
+                # turn, keeping the second), one more turn, then compact
+                # #2: the update-mode call over the conversation the first
+                # compaction retained plus the new turn. A turn between
+                # the compacts keeps both sides' compact #2 preparing
+                # identically (TS appends an ipython_state custom message
+                # after each compaction — a kernel-persistence feature not
+                # yet ported to Rust — which is what keeps TS's path from
+                # ending on the compaction row; the turn-in-between shape
+                # exercises the update mode on both sides regardless).
+                side.mock.set_responses(
+                    [
+                        {"text": "seed reply"},
+                        {"text": "second reply"},
+                        {"text": "the first compaction summary"},
+                        {"text": "third reply"},
+                        {"text": "the second compaction summary"},
+                    ]
+                )
+                for index, message in enumerate(
+                    (
+                        "history turn one to be summarized by the first compact",
+                        "history turn two kept by the first compact",
+                    ),
+                    start=1,
+                ):
+                    prompt = wire.request(
+                        f"ip{index}",
+                        {
+                            "type": "prompt_and_wait",
+                            "activeSessionId": session_id,
+                            "message": message,
+                        },
+                        timeout=240,
+                    )
+                    side.evidence_json(flow, f"iterative-prompt-{index}-response.json", prompt)
+                compact_one = wire.request(
+                    "ik1",
+                    {"type": "compact", "activeSessionId": session_id},
+                    timeout=240,
+                )
+                side.evidence_json(flow, "iterative-compact-one-response.json", compact_one)
+                # The TUI's default submission behavior: steer resumes the
+                # post-compaction input suspension (TS compact() aborts,
+                # which suspends queued-input admission; a plain daemon
+                # prompt_and_wait is rejected while suspended — the TUI
+                # always submits steer, which carries resumeIfIdle).
+                prompt_three = wire.request(
+                    "ip3",
+                    {
+                        "type": "prompt_and_wait",
+                        "activeSessionId": session_id,
+                        "message": "turn three after the first compaction",
+                        "streamingBehavior": "steer",
+                    },
+                    timeout=240,
+                )
+                side.evidence_json(flow, "iterative-prompt-3-response.json", prompt_three)
+                # The mark rides after the turn: the second compact's
+                # summarizer call is the only request past it.
+                mark = len(side.mock.requests())
+                compact_two = wire.request(
+                    "ik2",
+                    {"type": "compact", "activeSessionId": session_id},
+                    timeout=240,
+                )
+                side.evidence_json(flow, "iterative-compact-two-response.json", compact_two)
+                wire.close()
+                requests = self.new_mock_requests(side, mark)
+                iterative_requests[side.name] = [
+                    {
+                        "user_text": [
+                            block.get("text", "")
+                            if isinstance(block, dict)
+                            else ""
+                            for message_entry in (request.get("body", {}).get("messages") or [])
+                            if message_entry.get("role") == "user"
+                            for block in (
+                                message_entry.get("content")
+                                if isinstance(message_entry.get("content"), list)
+                                else [{"text": message_entry.get("content", "")}]
+                            )
+                        ],
+                    }
+                    for request in requests
+                ]
+                side.evidence_json(flow, "iterative-mock-requests.json", requests)
+                # Both durable compaction rows (the checkpoint summary and
+                # the updated one), scoped to this scenario's scripted
+                # summaries (the other f7 sessions compact too).
+                rows: list[dict] = []
+                sessions_dir = side.sessions_dir()
+                for path in sorted(sessions_dir.glob("*.jsonl")) if sessions_dir.exists() else []:
+                    for line in path.read_text().splitlines():
+                        try:
+                            entry = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if (
+                            entry.get("type") == "compaction"
+                            and entry.get("summary", "") in ITERATIVE_SUMMARIES
+                        ):
+                            rows.append(
+                                {
+                                    key: entry.get(key)
+                                    for key in (
+                                        "summary",
+                                        "tokensBefore",
+                                        "details",
+                                        "fromHook",
+                                        "usage",
+                                        "harnessDigest",
+                                    )
+                                }
+                            )
+                iterative_rows[side.name] = rows
+                self.copy_sessions(side, flow)
+            finally:
+                if prior_settings is None:
+                    settings_path.unlink(missing_ok=True)
+                else:
+                    settings_path.write_text(prior_settings)
+        if iterative_rows.get("ts") is not None and iterative_rows.get("rust") is not None:
+            # One update-mode history wire call: the prior summary in
+            # <previous-summary> tags under the update instruction, the
+            # conversation since the prior compaction's boundary only,
+            # byte-identical on both sides.
+            iterative_ok = (
+                len(iterative_requests.get("ts", [])) == 1
+                and iterative_requests.get("ts") == iterative_requests.get("rust")
+                and any(
+                    "<previous-summary>" in text
+                    for request in iterative_requests.get("ts", [])
+                    for text in request.get("user_text", [])
+                )
+            )
+            if iterative_ok:
+                self.record(
+                    flow,
+                    "behavior",
+                    "second-compaction update-mode summarizer request identical (previous-summary merge, new history only): "
+                    + "; ".join(
+                        text[:200]
+                        for request in iterative_requests["ts"]
+                        for text in request.get("user_text", [])
+                    ),
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow,
+                    "behavior",
+                    f"second-compaction summarizer request differs: ts={json.dumps(iterative_requests.get('ts'))[:400]} "
+                    f"rust={json.dumps(iterative_requests.get('rust'))[:400]}",
+                    evidence=[
+                        side.root / flow / "iterative-mock-requests.json"
+                        for side in self.sides.values()
+                    ],
+                )
+            if iterative_rows["ts"] == iterative_rows["rust"] and iterative_rows["ts"]:
+                self.record(
+                    flow,
+                    "behavior",
+                    "iterative compaction durable rows identical (checkpoint + updated summary): "
+                    f"{json.dumps(iterative_rows['ts'])[:300]}",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow,
+                    "behavior",
+                    f"iterative compaction durable rows differ: ts={json.dumps(iterative_rows['ts'])[:400]} "
+                    f"rust={json.dumps(iterative_rows['rust'])[:400]}",
+                    evidence=[
+                        self.sides[name].root / flow / "iterative-compact-two-response.json"
+                        for name in ("ts", "rust")
+                    ],
                 )
 
         # Durable compaction-entry wire-diff: both sides write a
