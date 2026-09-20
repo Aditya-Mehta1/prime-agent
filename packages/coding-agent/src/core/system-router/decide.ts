@@ -11,7 +11,13 @@ import type { CompiledAction } from "./action-space.js";
 import { ESCALATE_ACTION, FINISH_ACTION } from "./types.js";
 
 /** Bounded output: the decision object is a few dozen tokens. */
-export const ROUTER_DECISION_MAX_TOKENS = 512;
+/**
+ * Output cap for one decision call. The decision object itself is a few dozen
+ * tokens, but models that keep reasoning even when "off" is requested
+ * (mandatory-reasoning models map "off" to their minimum effort) spend output
+ * tokens on reasoning content first; a small cap would truncate the decision.
+ */
+export const ROUTER_DECISION_MAX_TOKENS = 4_096;
 
 export const ROUTER_DECISION_SYSTEM_PROMPT = [
 	"You are the action model inside a System 1 control loop.",

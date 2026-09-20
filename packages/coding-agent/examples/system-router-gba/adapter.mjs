@@ -124,6 +124,7 @@ async function handle(message) {
       tickCount = BOOT_FRAMES;
       resetHandle = await emu.states.save();
       lastDigest = await ewramDigest();
+      lastResultDigest = lastDigest;
       return { environment: { actions: actionSpace() } };
     }
     case "reset": {
@@ -131,6 +132,7 @@ async function handle(message) {
       await emu.states.restore(resetHandle);
       tickCount = BOOT_FRAMES;
       lastDigest = await ewramDigest();
+      lastResultDigest = lastDigest;
       return {};
     }
     case "observe": {

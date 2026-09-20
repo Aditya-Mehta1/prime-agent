@@ -600,10 +600,20 @@ describe("createModelDecisionFunction", () => {
 		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
 		const [_model, context, options] = completeSimpleMock.mock.calls[0];
 		expect(options.reasoning).toBe("off");
-		expect(options.maxTokens).toBeLessThanOrEqual(512);
+		expect(options.maxTokens).toBeLessThanOrEqual(4_096);
 		expect(context.systemPrompt).toContain("action model");
 		expect(context.messages[0].content[0].text).toBe("go");
 		expect(context.messages[0].content).toHaveLength(1);
+	});
+
+	it("gives mandatory-reasoning models the larger output cap", async () => {
+		const thinkingModel = { ...textModel, reasoning: true } as unknown as PiAi.Model<PiAi.Api>;
+		completeSimpleMock.mockResolvedValueOnce(assistant('{"action":"press_a","confidence":0.6}'));
+		const decide = createModelDecisionFunction({ model: thinkingModel, actions: byName });
+		const outcome = await decide({ prompt: "p" });
+		expect(outcome.action).toBe("press_a");
+		const options = completeSimpleMock.mock.calls[0][2];
+		expect(options.maxTokens).toBeLessThanOrEqual(4_096);
 	});
 
 	it("attaches the screenshot only for image-capable models", async () => {
