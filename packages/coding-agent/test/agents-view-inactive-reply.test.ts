@@ -619,6 +619,7 @@ describe("agents view slash commands", () => {
 		const self: Record<string, unknown> = {
 			options: {},
 			requireClient: () => ({ request }),
+			connectDedicatedClient: vi.fn(async () => ({ request, close: vi.fn() })),
 			editor,
 			setStatusMessage: vi.fn(),
 			setReplyTarget,
@@ -641,8 +642,8 @@ describe("agents view slash commands", () => {
 			completeRename(s: unknown, pending: unknown) {
 				return invoke("completeRename", self, s, pending);
 			},
-			writeRename(s: unknown, n: string) {
-				return invoke("writeRename", self, s, n);
+			writeRename(s: unknown, n: string, c: unknown) {
+				return invoke("writeRename", self, s, n, c);
 			},
 		};
 		self.replyTarget = { key: "active-1", summary: live };
@@ -666,7 +667,10 @@ describe("agents view slash commands", () => {
 		(self.pendingRenames as Map<string, { name: string }>).clear();
 
 		(self.persistentState as { savedCatalogLoaded?: boolean }).savedCatalogLoaded = true;
-		self.requireClient = () => ({ request: vi.fn(async () => ({ success: false, error: "name taken" })) });
+		self.connectDedicatedClient = vi.fn(async () => ({
+			request: vi.fn(async () => ({ success: false, error: "name taken" })),
+			close: vi.fn(),
+		}));
 		await expect(invoke("renameSession", self, live, "Fresher Name")).resolves.toBe(true);
 		await new Promise((resolve) => setImmediate(resolve));
 		expect(self.setStatusMessage).toHaveBeenCalledWith(expect.stringContaining("Failed to rename agent: name taken"));

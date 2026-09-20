@@ -353,6 +353,7 @@ describe("#502 unified session view regressions", () => {
 			refreshSessions: vi.fn(async () => true),
 			refreshSavedSessionsIfLoaded: vi.fn(),
 			requireClient: () => ({ request }),
+			connectDedicatedClient: vi.fn(async () => ({ request, close: vi.fn() })),
 			renameSession: Reflect.get(AgentsViewMode.prototype, "renameSession"),
 			applyOptimisticSessionName: Reflect.get(AgentsViewMode.prototype, "applyOptimisticSessionName"),
 			completeRename: Reflect.get(AgentsViewMode.prototype, "completeRename"),

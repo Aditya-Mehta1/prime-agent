@@ -1674,8 +1674,12 @@ export class AgentsViewMode implements Component, Focusable {
 		// One writer per session: two concurrent writes can land in either order, so
 		// an older name could overwrite the newest one the user asked for.
 		if (idle) {
-			const pending = this.pendingRenames.get(summary.sessionId)!;
-			pending.write = this.completeRename(summary, pending);
+			const pending = this.pendingRenames.get(summary.sessionId);
+			// Reconciling a name truth already carries confirms that rename; the
+			// overlay is gone, so there is nothing left to write.
+			if (pending && pending.write === undefined) {
+				pending.write = this.completeRename(summary, pending);
+			}
 		}
 		return true;
 	}
@@ -1709,10 +1713,24 @@ export class AgentsViewMode implements Component, Focusable {
 	/** Writes the newest requested name until none is left; the only rename writer for this session. */
 	private async completeRename(summary: SessionSummary, pending: PendingRename): Promise<void> {
 		let written: string | undefined;
+		// The shared roster client closes on exit and would reject an in-flight
+		// write; a dedicated connection keeps a confirmed rename from being lost.
+		let client: DaemonClient | undefined;
 		try {
 			while (pending.name !== written && this.pendingRenames.get(summary.sessionId) === pending) {
 				const name = pending.name;
-				if (!(await this.writeRename(summary, name))) {
+				if (client === undefined) {
+					try {
+						client = await this.connectDedicatedClient();
+					} catch (error) {
+						this.setStatusMessage(formatError("Failed to rename agent", error));
+					}
+				}
+				if (client === undefined || !(await this.writeRename(summary, name, client))) {
+					// A newer name arrived during the failed write; it still needs its turn.
+					if (pending.name !== name) {
+						continue;
+					}
 					// Only the failing owner clears its entry; success waits for truth to match.
 					if (this.pendingRenames.get(summary.sessionId) === pending) {
 						this.pendingRenames.delete(summary.sessionId);
@@ -1722,25 +1740,19 @@ export class AgentsViewMode implements Component, Focusable {
 				written = name;
 			}
 		} finally {
+			client?.close();
 			pending.write = undefined;
 			await this.refreshSessions();
 			this.refreshSavedSessionsIfLoaded();
 		}
 	}
 
-	private async writeRename(summary: SessionSummary, name: string): Promise<boolean> {
+	private async writeRename(summary: SessionSummary, name: string, client: DaemonClient): Promise<boolean> {
 		try {
 			if (summary.activeSessionId) {
-				requireDaemonData(
-					await this.requireClient().request({ type: "rename", activeSessionId: summary.activeSessionId, name }),
-				);
+				requireDaemonData(await client.request({ type: "rename", activeSessionId: summary.activeSessionId, name }));
 			} else {
-				await renameDaemonSavedSession(
-					this.requireClient(),
-					this.getSavedSessionCatalogContext(),
-					summary.sessionFile!,
-					name,
-				);
+				await renameDaemonSavedSession(client, this.getSavedSessionCatalogContext(), summary.sessionFile!, name);
 			}
 			this.setStatusMessage(`Renamed to ${name}`);
 			return true;

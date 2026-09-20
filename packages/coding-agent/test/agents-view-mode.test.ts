@@ -1083,6 +1083,11 @@ describe("AgentsViewMode", () => {
 				?.summary.sessionName;
 		try {
 			Reflect.set(view, "client", { request, isConnected: true });
+			Reflect.set(
+				view,
+				"connectDedicatedClient",
+				vi.fn(async () => ({ request, close: vi.fn() })),
+			);
 			Reflect.set(view, "rosterStore", { summaries: () => [] });
 			Reflect.set(view, "savedSessions", [savedInfo]);
 			invoke("reconcileCatalogs", view);
@@ -1146,6 +1151,11 @@ describe("AgentsViewMode", () => {
 				.sessionName;
 		try {
 			Reflect.set(view, "client", { request, isConnected: true });
+			Reflect.set(
+				view,
+				"connectDedicatedClient",
+				vi.fn(async () => ({ request, close: vi.fn() })),
+			);
 			Reflect.set(view, "rosterStore", { summaries: () => [live] });
 			Reflect.set(view, "savedSessions", [savedInfo]);
 			invoke("applySessionList", view, [live], true);
@@ -1195,6 +1205,11 @@ describe("AgentsViewMode", () => {
 				.sessionName;
 		try {
 			Reflect.set(view, "client", { request, isConnected: true });
+			Reflect.set(
+				view,
+				"connectDedicatedClient",
+				vi.fn(async () => ({ request, close: vi.fn() })),
+			);
 			Reflect.set(view, "rosterStore", { summaries: () => [live] });
 			invoke("applySessionList", view, [live], true);
 			await invoke("renameSession", view, live, "Fresh Name");
@@ -1243,6 +1258,11 @@ describe("AgentsViewMode", () => {
 				.sessionName;
 		try {
 			Reflect.set(view, "client", { request, isConnected: true });
+			Reflect.set(
+				view,
+				"connectDedicatedClient",
+				vi.fn(async () => ({ request, close: vi.fn() })),
+			);
 			Reflect.set(view, "rosterStore", { summaries: () => [live] });
 			invoke("applySessionList", view, [live], true);
 			await invoke("renameSession", view, live, "Fresh Name");
@@ -1294,6 +1314,7 @@ describe("AgentsViewMode", () => {
 			persistentState: {},
 			ui: { requestRender: vi.fn() },
 			requireClient: () => ({ request }),
+			connectDedicatedClient: vi.fn(async () => ({ request, close: vi.fn() })),
 			getSavedSessionCatalogContext: () => ({ cwd: "/tmp" }),
 			setStatusMessage: vi.fn(),
 			reconcileCatalogs: vi.fn(),
@@ -1314,8 +1335,8 @@ describe("AgentsViewMode", () => {
 			completeRename(s: unknown, pending: unknown) {
 				return invoke("completeRename", self, s, pending);
 			},
-			writeRename(s: unknown, n: string) {
-				return invoke("writeRename", self, s, n);
+			writeRename(s: unknown, n: string, c: unknown) {
+				return invoke("writeRename", self, s, n, c);
 			},
 		};
 
@@ -1328,6 +1349,106 @@ describe("AgentsViewMode", () => {
 		settleRename({ success: true, data: {} });
 		await deleting;
 		expect(sent).toEqual(["rename_saved_session", "list", "delete_saved_session"]);
+	});
+
+	it("PR #2099: confirming a name the catalog already carries is a no-op, not a crash", async () => {
+		const live = summary({ sessionName: "Fresh Name" });
+		const request = vi.fn(async () => ({ success: true as const, data: {} }));
+		const view = new AgentsViewMode({ config: {}, uiServices: createUiServices() }, {});
+		try {
+			Reflect.set(view, "client", { request, isConnected: true });
+			Reflect.set(view, "rosterStore", { summaries: () => [live] });
+			invoke("applySessionList", view, [live], true);
+			// Confirming the prefilled name must settle without a write, not reject.
+			await expect(invoke("renameSession", view, live, "Fresh Name")).resolves.toBe(true);
+			expect(request).not.toHaveBeenCalled();
+			expect((Reflect.get(view, "pendingRenames") as Map<string, unknown>).size).toBe(0);
+		} finally {
+			stopThemeWatcher();
+		}
+	});
+
+	it("PR #2099: a failed rename write still gives the newer name its turn", async () => {
+		const live = summary({ sessionName: "Old Name" });
+		const settles: Array<(value: { success: boolean; data?: unknown; error?: string }) => void> = [];
+		const request = vi.fn(
+			() =>
+				new Promise((resolve) => {
+					settles.push(resolve);
+				}),
+		);
+		const view = new AgentsViewMode({ config: {}, uiServices: createUiServices() }, {});
+		const rowName = () =>
+			(Reflect.get(view, "rows") as AgentsViewRow[]).find((row) => row.summary.sessionId === live.sessionId)?.summary
+				.sessionName;
+		try {
+			Reflect.set(view, "client", { request, isConnected: true });
+			Reflect.set(
+				view,
+				"connectDedicatedClient",
+				vi.fn(async () => ({ request, close: vi.fn() })),
+			);
+			Reflect.set(view, "rosterStore", { summaries: () => [live] });
+			invoke("applySessionList", view, [live], true);
+			await invoke("renameSession", view, live, "First Name");
+			// A newer name arrives while the first write is still in flight.
+			await invoke("renameSession", view, live, "Second Name");
+			expect(request).toHaveBeenCalledTimes(1);
+			settles.shift()?.({ success: false, error: "rename rejected" });
+			await new Promise((resolve) => setImmediate(resolve));
+			expect(request).toHaveBeenLastCalledWith({
+				type: "rename",
+				activeSessionId: live.activeSessionId,
+				name: "Second Name",
+			});
+			settles.shift()?.({ success: true, data: {} });
+			await new Promise((resolve) => setImmediate(resolve));
+			expect(rowName()).toBe("Second Name");
+		} finally {
+			stopThemeWatcher();
+		}
+	});
+
+	it("PR #2099: rename writes ride a dedicated client that outlives the shared roster client", async () => {
+		const live = summary({ sessionName: "Old Name" });
+		const settles: Array<(value: { success: boolean; data?: unknown }) => void> = [];
+		const dedicatedRequest = vi.fn(
+			() =>
+				new Promise((resolve) => {
+					settles.push(resolve);
+				}),
+		);
+		const dedicatedClose = vi.fn();
+		const sharedClient = { request: vi.fn(), isConnected: true, close: vi.fn() };
+		const view = new AgentsViewMode({ config: {}, uiServices: createUiServices() }, {});
+		const rowName = () =>
+			(Reflect.get(view, "rows") as AgentsViewRow[]).find((row) => row.summary.sessionId === live.sessionId)?.summary
+				.sessionName;
+		try {
+			Reflect.set(view, "client", sharedClient);
+			Reflect.set(
+				view,
+				"connectDedicatedClient",
+				vi.fn(async () => ({ request: dedicatedRequest, close: dedicatedClose })),
+			);
+			Reflect.set(view, "rosterStore", { summaries: () => [live] });
+			invoke("applySessionList", view, [live], true);
+			await invoke("renameSession", view, live, "Fresh Name");
+			// Leaving the view closes the shared roster client while the write is in flight.
+			sharedClient.close();
+			settles.shift()?.({ success: true, data: {} });
+			await new Promise((resolve) => setImmediate(resolve));
+			expect(sharedClient.request).not.toHaveBeenCalled();
+			expect(dedicatedRequest).toHaveBeenCalledWith({
+				type: "rename",
+				activeSessionId: live.activeSessionId,
+				name: "Fresh Name",
+			});
+			expect(dedicatedClose).toHaveBeenCalledOnce();
+			expect(rowName()).toBe("Fresh Name");
+		} finally {
+			stopThemeWatcher();
+		}
 	});
 
 	it("shows running-subagent counts only while collapsed and work remains", () => {
