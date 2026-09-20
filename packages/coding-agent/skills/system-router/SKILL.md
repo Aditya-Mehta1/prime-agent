@@ -1,6 +1,6 @@
 ---
 name: system-router
-description: Run a System 1 / System 2 harness router loop in the Python REPL. The session model (System 2) declares a finite action space, an environment adapter command, and an action-only sub-model that answers ONE single-choice decision per step with thinking disabled. Use for games, emulators, devices, or workflows where every step is one choice from a known set and full LLM turns are too slow or too expensive.
+description: Run a System 1 / System 2 harness router loop in the Python REPL. The session model (System 2) declares a finite action space, an environment adapter command, and an action-only sub-model that answers ONE single-choice decision per step with thinking off. Use for games, emulators, devices, or workflows where every step is one choice from a known set and full LLM turns are too slow or too expensive.
 ---
 
 # System Router
