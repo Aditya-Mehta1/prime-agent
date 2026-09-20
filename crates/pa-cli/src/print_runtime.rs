@@ -832,7 +832,13 @@ async fn run_prompts_and_emit(
             .await?;
         if let Some(run) = &autonomous {
             if let Some(row) = run
-                .drive(engine)
+                .drive(
+                    engine,
+                    &mut boundary,
+                    model,
+                    api_key.clone(),
+                    global_harness_dir.clone(),
+                )
                 .await
                 .map_err(|error| format!("{error:#}"))?
             {

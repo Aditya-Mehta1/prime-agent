@@ -23,6 +23,13 @@
 //! check. A pre-turn compaction never re-issues: the admitted prompt
 //! continues the loop on the compacted context.
 //!
+//! Every turn the print loop issues crosses the boundary pair, not just
+//! the CLI prompts: the autonomous continuation loop admits its follow-up
+//! turns through [`TurnBoundary::admit_continuation`] (TS: the session
+//! admits an owed continuation through its own turn loop, so the arms
+//! fire on continuation turns exactly like on prompt turns — #229's
+//! print flag was reconciled here; see docs/PORTING-NOTES.md).
+//!
 //! Output surfaces: json mode streams the TS session events (the
 //! `compaction_start`/`compaction_end` pair and the outcome row's message
 //! pair) on stdout; text mode stays quiet here — the durable rows surface
@@ -336,6 +343,40 @@ impl TurnBoundary {
                 .await;
         }
         Ok(())
+    }
+
+    /// Admit one autonomous continuation turn through the same boundary
+    /// pair the CLI prompts run (TS: the session admits an owed
+    /// continuation through `_createPreparedTurnAction("followUp", ...)`,
+    /// so it crosses `_prepareForCommit` -> `_runPreTurnCompaction` before
+    /// the prompt and the `agent_end` checks after it — the arms are part
+    /// of the session loop, not the CLI prompt loop). The `followUp`
+    /// streaming behavior and the queue-if-busy admission match the
+    /// autonomous driver seam the print loop calls.
+    pub(crate) async fn admit_continuation(
+        &mut self,
+        engine: &SessionEngine,
+        model: &Model,
+        api_key: Option<String>,
+        prompt: &str,
+        global_harness_dir: PathBuf,
+    ) -> Result<(), String> {
+        self.run_pre_turn(engine, model, api_key.clone()).await?;
+        engine
+            .session
+            .prompt(
+                prompt,
+                pa_core::session_engine::PromptOptions {
+                    streaming_behavior: Some(pa_core::session_engine::StreamingBehavior::FollowUp),
+                    queue_if_busy: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        engine.session.agent().wait_for_idle().await;
+        self.run_at_settled_turn(engine, model, api_key, global_harness_dir)
+            .await
     }
 
     /// TS `_assistantTurnsSinceAutoRefine` (the message_end increments): the
@@ -1468,6 +1509,83 @@ mod tests {
         let last = last_assistant(&engine_b).await.expect("a settled turn");
         assert_eq!(last.stop_reason, pa_types::ai::StopReason::Stop);
         assert_eq!(user_texts(&engine_b).await.len(), 3);
+    }
+
+    /// The autonomous continuation loop crosses the same boundary arms the
+    /// CLI prompts do (TS: the session admits an owed continuation through
+    /// its own turn loop, so the overflow recovery fires on a continuation
+    /// turn too). A continuation turn that overflows gets its
+    /// compact-and-retry at the settled boundary — the #229 print-arms
+    /// reconciliation: without the boundary the drive loop admitted
+    /// continuations raw, the overflow error surfaced as the run's final
+    /// turn, and no recovery ran.
+    #[tokio::test]
+    async fn autonomous_continuation_turns_cross_the_boundary_arms() {
+        let _faux = FAUX_TEST_LOCK.lock().await;
+        let (engine, dir, model) = faux_engine_with_settings(
+            json!({
+                "responses": [
+                    {"text": "seed reply"},
+                    overflow_error(0),
+                    {"text": "the summary"},
+                    {"text": "recovered reply"},
+                ]
+            }),
+            compactable_settings(),
+            None,
+        )
+        .await;
+        let mut boundary = TurnBoundary::new(false);
+        admit(
+            &mut boundary,
+            &engine,
+            &model,
+            format!("seed turn {}", "x".repeat(48_000)),
+        )
+        .await
+        .unwrap();
+        // One continuation, no gates: the first decision injects the
+        // continuation turn, the second hits the max-continuations limit
+        // and stops (the durable `autonomous_status` row).
+        let run = crate::headless_autonomous::HeadlessAutonomous::from_cli(
+            &crate::args::AutonomousConfig {
+                max_continuations: Some(1),
+                ..Default::default()
+            },
+            dir.path(),
+        );
+        let row = run
+            .drive(
+                &engine,
+                &mut boundary,
+                &model,
+                None,
+                std::path::PathBuf::new(),
+            )
+            .await
+            .unwrap()
+            .expect("the limit stop row");
+        assert_eq!(row.custom_type, "autonomous_status");
+
+        // The continuation turn overflowed and the settled boundary
+        // recovered it: one compaction, the retry settled, no failure rows.
+        assert_eq!(compaction_count(&engine).await, 1);
+        assert!(outcome_rows(&engine).await.is_empty());
+        let last = last_assistant(&engine).await.expect("a settled turn");
+        assert_eq!(last.stop_reason, pa_types::ai::StopReason::Stop);
+        let text = last
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                pa_types::ai::AssistantContentBlock::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(text, "recovered reply");
+        // The CLI prompt plus the injected continuation; the overflow
+        // retry re-issued without re-adding a user message.
+        assert_eq!(user_texts(&engine).await.len(), 2);
     }
 
     /// A capturing sink for json-mode event verification.

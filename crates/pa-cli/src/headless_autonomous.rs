@@ -19,7 +19,7 @@ use pa_core::autonomous::{
 };
 use pa_core::session_engine::engine::SessionEngine;
 use pa_core::session_engine::provider_adapter::json_round_trip;
-use pa_core::session_engine::{PromptOptions, StreamingBehavior};
+use pa_types::ai::Model;
 use pa_types::session::CustomMessage;
 
 use crate::args::AutonomousConfig;
@@ -100,9 +100,21 @@ impl HeadlessAutonomous {
 
     /// Drive the continuation loop after a settled prompt: the driver
     /// decides after every settled turn — inject the continuation text as
-    /// the next turn, or stop. Returns the durable stop row when the run
-    /// stopped (`None` when autonomous mode was inactive for the turn).
-    pub async fn drive(&self, engine: &SessionEngine) -> anyhow::Result<Option<CustomMessage>> {
+    /// the next turn, or stop. Each admitted continuation crosses the
+    /// print boundary pair (TS: the session admits an owed continuation
+    /// through its own turn loop, so `_runPreTurnCompaction` runs before
+    /// the prompt and the `agent_end` compaction/refine arms after it —
+    /// the arms fire on continuation turns exactly like CLI-prompt turns).
+    /// Returns the durable stop row when the run stopped (`None` when
+    /// autonomous mode was inactive for the turn).
+    pub async fn drive(
+        &self,
+        engine: &SessionEngine,
+        boundary: &mut crate::print_boundary::TurnBoundary,
+        model: &Model,
+        api_key: Option<String>,
+        global_harness_dir: PathBuf,
+    ) -> anyhow::Result<Option<CustomMessage>> {
         loop {
             let Some(message) = latest_assistant(engine).await else {
                 return Ok(None);
@@ -114,18 +126,16 @@ impl HeadlessAutonomous {
             match follow_up {
                 AutonomousFollowUp::Inactive => return Ok(None),
                 AutonomousFollowUp::Continue { text } => {
-                    engine
-                        .session
-                        .prompt(
+                    boundary
+                        .admit_continuation(
+                            engine,
+                            model,
+                            api_key.clone(),
                             &text,
-                            PromptOptions {
-                                streaming_behavior: Some(StreamingBehavior::FollowUp),
-                                queue_if_busy: true,
-                                ..Default::default()
-                            },
+                            global_harness_dir.clone(),
                         )
-                        .await?;
-                    engine.session.agent().wait_for_idle().await;
+                        .await
+                        .map_err(anyhow::Error::msg)?;
                 }
                 AutonomousFollowUp::Stop { reason, status } => {
                     let row = autonomous_stop_row(&reason, &status);

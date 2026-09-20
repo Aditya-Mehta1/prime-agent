@@ -1,3 +1,84 @@
+## Compaction arms coverage matrix — print/ACP/daemon reconciliation (lane print-arms-audit, 2026-09-20)
+
+### The #229 flag, reconciled
+
+#229's close-out said: *"Print mode shares the headless engine and also
+lacks arms — out of this lane's scope, flagged for a follow-up lane."*
+
+**Verdict: the wording was stale, but the flag pointed at a real gap.**
+Print mode did NOT lack arms at the time #229 merged — #211 (overflow
+compact-and-retry), #223 (pre-turn abort/requested/threshold), and #224
+(compact-trigger auto-refine + requested refinement) had landed
+`pa-cli/src/print_boundary.rs`, the print runtime's OWN `TurnBoundary`,
+hours earlier the same day (08:15/14:35/16:25 vs #229's 20:19 UTC). What
+print mode DID lack: one seam bypassed the boundary — the headless
+autonomous continuation loop (`HeadlessAutonomous::drive`) admitted its
+follow-up turns straight through `engine.session.prompt`, so continuation
+turns crossed no arm. In TS the arms live inside the session's turn loop
+(`agent-session.ts`), and an owed continuation is admitted through
+`_createPreparedTurnAction("followUp", ...)` → `_prepareForCommit` →
+`_runPreTurnCompaction` before the prompt, with the `agent_end` checks
+after it — so every continuation turn ran the arms.
+
+**Fixed in this lane**: `TurnBoundary::admit_continuation` (pre-turn check
+→ followUp prompt → settled-turn checks); `drive()` routes every
+continuation through it. Unit test:
+`autonomous_continuation_turns_cross_the_boundary_arms`
+(a continuation turn that overflows gets its compact-and-retry at the
+settled boundary; without the fix the overflow error was the run's final
+turn and no recovery ran).
+
+### Coverage matrix (arm × surface)
+
+TS `agent-session.ts` hosts the arms in the session loop, so every
+transport gets them; the Rust port hosts them per transport. Surfaces:
+
+- **daemon worker** — the daemon session turn loop
+  (`pa-daemon/src/agent_engine.rs` + `auto_compaction.rs` +
+  `overflow_compaction.rs`): interactive TUI, daemon-attached ACP, every
+  daemon-owned session.
+- **ACP** — the in-process ACP transport fallback
+  (`pa-daemon/src/acp/compaction_arms.rs`, #229;
+  `PRIME_AGENT_FAUX_SCRIPT` forces this transport).
+- **print** — the in-process print/json runtime
+  (`pa-cli/src/print_boundary.rs`, #211/#223/#224 + this lane).
+
+| Arm (TS `_checkCompaction` family) | daemon worker | ACP in-process | print |
+|---|---|---|---|
+| Case 1 overflow compact-and-retry (settled turn) | ✓ `overflow_compaction.rs` | ✓ #229 | ✓ #211 |
+| Case 1 stale-overflow recovery (pre-turn) | ✓ `run_pre_turn_overflow_compaction` | ✓ #229 | ✓ #211/#223 |
+| Abort arm: aborted trailing turn drops pending compact/refine (TS `skipAbortedCheck=false` pass) | ✓ `drop_turn_boundary_requests` on aborted turns | ✓ #229 | ✓ #223 |
+| Model-requested compaction (`compact.run`), settled turn | ✓ `run_turn_boundary` | ✓ #229 | ✓ #223 |
+| Model-requested compaction, pre-turn | — (settled only; TS `compact.run` refuses to schedule on an idle session, so a pending never survives to a pre-turn check — reachable-state note from #229) | ✓ #229 | ✓ #223 |
+| Case 3 threshold compaction, settled turn | ✓ `run_auto_compaction` | ✓ #229 | ✓ #223 |
+| Case 3 threshold compaction, pre-turn | ✓ (loop head, every admitted prompt) | ✓ #229 | ✓ #223 |
+| Requested-refinement consumption (`_consumePendingRequestedRefine`) | ✓ `run_turn_boundary` | ✓ #229 | ✓ #224 |
+| Compact-trigger auto-refine review (`_scheduleAutoRefineAfterCompaction` + checkpoint/`dispose` drain) | **✗ gap** | **✗ gap** | ✓ #224 (serialized checkpoint + disposal drain) |
+| In-flight compaction abort (`abortCompaction`) | ✓ abort slot (cancel/interrupt) | ✓ #229 abort slot | n/a (TS print mode has no abort trigger; signal handlers exit) |
+| Overflow recovery reset points (agent-run start + settled non-error turn) | ✓ | ✓ #229 | ✓ #211/#223 |
+| Autonomous continuation turns cross the arms | ✓ (continuations hosted inside the armed `run_turns` loop) | ✓ #229 (`run_pre_turn_compaction` before each injected continuation) | ✓ **this lane** (`admit_continuation`; was the gap) |
+
+### Gaps flagged for follow-up lanes (pa-daemon owned)
+
+1. **Compact-trigger auto-refine (daemon worker + ACP).** TS schedules the
+   compact-trigger auto-refine review after every successful compaction
+   for every transport (print/headless consumes it synchronously at the
+   `shouldStopAfterTurn` checkpoint and the `dispose` drain;
+   `serializedRefine: false` transports run it in the background after
+   `agent_end` via `_scheduleAutoRefineAfterAgentEnd`). The Rust daemon
+   worker and ACP arms complete compactions without scheduling the
+   review at all, so a compacted daemon/ACP session silently loses the
+   trigger. Gate seam exists in pa-core
+   (`auto_refine_allowed`/`auto_refine_gates`/
+   `auto_refine_after_compaction`, used by print #224); the daemon lanes
+   own the wiring.
+2. Pre-existing, noted, not an arms gap: the daemon worker reaches the
+   requested-compaction arm only post-turn (#229's reachable-state
+   note), and print prompts are not classified against session commands
+   (a `/compact`-looking print prompt goes to the model as text; TS
+   print executes the command) — the print command surface is a separate
+   parity lane.
+
 ## compaction_count telemetry for all arms (lane compaction-telemetry)
 
 Reference: TS `core/telemetry.ts` (`compaction_end` handling:

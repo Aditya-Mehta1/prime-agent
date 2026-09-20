@@ -21,6 +21,10 @@ checks (`print_boundary.rs` — the overflow compact-and-retry arm, the
 model-requested compaction/refinement consumption, and the threshold arm,
 the TS `_checkCompaction` flow), the json event stream, and the headless
 terminal selection (stdout/stderr/exit code) mirroring modes/print-mode.ts.
+Every turn the loop issues crosses the boundary pair: the autonomous
+continuation loop (`headless_autonomous.rs`) admits its follow-up turns
+through `TurnBoundary::admit_continuation`, so continuation turns run the
+same arms CLI prompts do (TS: the session loop owns the arms).
 The json stream emits the TS session-event surface byte-for-shape: the
 session header row (version 3), the `message_update` streaming deltas with
 the slim `assistantMessageEvent` (the daemon wire drops the nested
