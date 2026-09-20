@@ -51,6 +51,51 @@ def scrubbed_env(agent_dir: Path, tmpdir: Path, extra: dict | None = None) -> di
     return env
 
 
+def rust_binary_staleness(binary: Path, repo_root: Path) -> str | None:
+    """Why a built Rust binary cannot include this checkout's current
+    product code (`None` = fresh or unknown). A stale build reports false
+    divergences against the TS ground truth (run 20260920: the
+    compaction-abort harness "failed" on main only because the checkout's
+    target/release binary predates the auto-compaction merge), so the
+    harnesses fail fast instead of wasting a run. The binary's mtime must
+    postdate the newest commit touching the product sources; set
+    PA_BATTERY_ALLOW_STALE_RUST=1 to skip the guard (deliberate
+    old-build testing).
+    """
+    if os.environ.get("PA_BATTERY_ALLOW_STALE_RUST") == "1":
+        return None
+    try:
+        binary = Path(binary)
+        if not binary.exists():
+            return None  # a missing binary is the caller's own error
+        out = subprocess.run(
+            ["git", "log", "-1", "--format=%ct", "--", "crates", "prime-agent-runtime"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip()
+        if not out:
+            return None
+        newest_product_commit = int(out)
+        built = binary.stat().st_mtime
+        # One minute of slack: a build started at the commit's timestamp
+        # still includes it.
+        if built + 60 < newest_product_commit:
+            age_min = int((newest_product_commit - built) / 60)
+            return (
+                f"{binary} predates the newest product commit in {repo_root} "
+                f"(binary built ~{age_min} min before the newest crates/ or "
+                "prime-agent-runtime/ change): a stale build reports false "
+                "divergences. Rebuild (cargo build --release -p pa-cli) or "
+                "point --rust-bin/PA_PARITY_RUST at a current build; set "
+                "PA_BATTERY_ALLOW_STALE_RUST=1 to override."
+            )
+    except Exception:
+        return None
+    return None
+
+
 def run_cmd(
     argv: list[str],
     env: dict,
@@ -250,14 +295,78 @@ class Side:
         raise RuntimeError(f"{self.name} daemon socket never appeared")
 
     def stop_daemon(self) -> None:
+        """Shut this side's daemon down and reap its whole tree.
+
+        A bare terminate() leaks: the TS product runs a per-run supervisor
+        (its own `--mode daemon` process on a socket under the side's
+        TMPDIR) that RESPAWNS a killed main daemon, so SIGTERM alone
+        leaves the pair behind (run 20260920: every wire-harness pass
+        leaked two daemons). The graceful `sd` wire shutdown (both
+        products implement it) goes first; the sweep then kills anything
+        still holding this side's unique socket paths — a respawned main
+        or a detached supervisor. Only processes whose argv references
+        those paths are touched, never unrelated daemons."""
+        try:
+            wire = Wire(self.daemon_socket)
+            wire.send_command("sd", {"type": "shutdown"})
+            wire.close()
+            time.sleep(2)
+        except Exception:
+            pass
         if self.daemon_proc and self.daemon_proc.poll() is None:
             self.daemon_proc.terminate()
             try:
                 self.daemon_proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 self.daemon_proc.kill()
-        # Detached workers spawned by the daemon may outlive it; the next
-        # battery run uses a fresh TMPDIR so stale sockets cannot collide.
+        # Sweep: SIGTERM first, escalate to SIGKILL, re-check for a
+        # respawned main until the supervisor is gone.
+        for _ in range(3):
+            pids = self.own_daemon_pids()
+            if not pids:
+                return
+            for pid in pids:
+                try:
+                    os.kill(pid, 15)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            time.sleep(1.0)
+            for pid in self.own_daemon_pids():
+                try:
+                    os.kill(pid, 9)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            time.sleep(0.5)
+
+    def own_daemon_pids(self) -> list[int]:
+        """Daemon processes whose argv references this side's daemon
+        socket or its TMPDIR (the supervisor's socket lives there)."""
+        needles = [str(self.daemon_socket)]
+        tmpdir = self.env.get("TMPDIR")
+        if tmpdir:
+            needles.append(tmpdir.rstrip("/"))
+        mine: list[int] = []
+        for proc_dir in Path("/proc").iterdir():
+            if not proc_dir.name.isdigit():
+                continue
+            pid = int(proc_dir.name)
+            if pid in (1, os.getpid()) or (
+                self.daemon_proc and pid == self.daemon_proc.pid
+            ):
+                continue
+            try:
+                argv = [
+                    part.decode(errors="replace")
+                    for part in (proc_dir / "cmdline").read_bytes().split(b"\0")
+                    if part
+                ]
+            except OSError:
+                continue
+            if "--mode" not in argv or "daemon" not in argv:
+                continue
+            if any(needle in part for part in argv for needle in needles):
+                mine.append(pid)
+        return mine
 
 
 class Wire:

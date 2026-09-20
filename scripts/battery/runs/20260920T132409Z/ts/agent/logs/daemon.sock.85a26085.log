@@ -1,0 +1,9 @@
+[2026-09-20T13:24:10.966Z] supervisor: Prime Agent daemon supervisor 8bbb94ba-d779-4d90-9b3d-9406be985527 listening on /home/ubuntu/lane-worktrees/harness-debt/scripts/battery/runs/20260920T132409Z/ts/daemon.sock
+[2026-09-20T13:24:11.583Z] supervisor: Session worker 8cef769b4ee1 stderr: Prime Agent daemon listening on /tmp/vbat20260920T132409Z-ts/prime-agent-1000/worker-85a260850f0a-8cef769b4ee1.sock
+[2026-09-20T13:24:14.016Z] supervisor: Session worker d91ab0190e56 stderr: Prime Agent daemon listening on /tmp/vbat20260920T132409Z-ts/prime-agent-1000/worker-85a260850f0a-d91ab0190e56.sock
+[2026-09-20T13:24:31.352Z] supervisor: Session worker 512f050047c8 stderr: Prime Agent daemon listening on /tmp/vbat20260920T132409Z-ts/prime-agent-1000/worker-85a260850f0a-512f050047c8.sock
+[2026-09-20T13:24:56.525Z] supervisor: Session worker d0b91cb18fdf stderr: Prime Agent daemon listening on /tmp/vbat20260920T132409Z-ts/prime-agent-1000/worker-85a260850f0a-d0b91cb18fdf.sock
+[2026-09-20T13:25:42.748Z] supervisor: Session worker 512f050047c8 stderr: shutting down (exit 0); closing 0 active session(s)
+[2026-09-20T13:25:42.753Z] supervisor: Session worker d0b91cb18fdf stderr: shutting down (exit 0); closing 0 active session(s)
+[2026-09-20T13:25:42.757Z] supervisor: Session worker d91ab0190e56 stderr: shutting down (exit 0); closing 0 active session(s)
+[2026-09-20T13:25:42.779Z] supervisor: Session worker 8cef769b4ee1 stderr: shutting down (exit 0); closing 0 active session(s)

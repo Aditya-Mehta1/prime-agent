@@ -1,0 +1,2 @@
+Prime Agent daemon supervisor 8bec0ed5-ace3-4885-8ac4-3220daaeeb72 listening on /home/ubuntu/lane-worktrees/harness-debt/scripts/battery/runs/20260920T131706Z-abort/ts/daemon.sock
+Session worker 90d1ec8f6832 stderr: Prime Agent daemon listening on /tmp/compaction-abort-ts-1133506/prime-agent-1000/worker-f9283a4a7979-90d1ec8f6832.sock

@@ -169,8 +169,7 @@ class Battery:
         return side
 
     def record(self, flow: str, category: str, summary: str, evidence="", gap: bool = True, lane: str | None = None) -> None:
-        if isinstance(evidence, Path):
-            evidence = str(evidence.relative_to(self.run_dir))
+        evidence = self.json_evidence(evidence)
         self.findings.append(
             {
                 "flow": flow,
@@ -181,6 +180,22 @@ class Battery:
                 "expectedFail": lane,
             }
         )
+
+    def json_evidence(self, value):
+        """Serialize Path values (and containers holding them) so
+        findings.json stays JSON-serializable: a bare Path evidence row
+        and a list-of-Paths row (the f7 overflow projections) both record
+        run-relative strings."""
+        if isinstance(value, Path):
+            try:
+                return str(value.relative_to(self.run_dir))
+            except ValueError:
+                return str(value)
+        if isinstance(value, list):
+            return [self.json_evidence(item) for item in value]
+        if isinstance(value, dict):
+            return {key: self.json_evidence(item) for key, item in value.items()}
+        return value
 
     def new_mock_requests(self, side: B.Side, mark: int) -> list[dict]:
         return side.mock.requests()[mark:]
@@ -4012,6 +4027,13 @@ def main() -> int:
     for flow in flows:
         if flow not in ALL_FLOWS and flow not in HEAVY_FLOWS:
             parser.error(f"unknown flow {flow}; valid: {ALL_FLOWS + HEAVY_FLOWS}")
+    # Fail fast on a stale rust build: a binary older than the checkout's
+    # newest product commit produces false gap rows (the 20260920 f7+f14
+    # run crashed at report-write with a stale binary in the checkout).
+    stale = B.rust_binary_staleness(Path(args.rust_bin), repo)
+    if stale:
+        print(f"STALE RUST BINARY: {stale}", file=sys.stderr)
+        return 2
     battery = Battery(Path(args.runs_root), args.ts_bin, args.rust_bin, flows)
     return battery.run()
 

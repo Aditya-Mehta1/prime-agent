@@ -1,0 +1,43 @@
+{
+ "command": "create",
+ "data": {
+  "activeSessionId": "aa5c4ba29299",
+  "activity": "idle",
+  "attachedClients": 0,
+  "created": "2026-09-20T13:24:12.800Z",
+  "cwd": "/home/ubuntu/lane-worktrees/harness-debt/scripts/battery/runs/20260920T132409Z/rust/work",
+  "hasRegisteredCronJob": false,
+  "id": "aa5c4ba29299",
+  "isBashRunning": false,
+  "isCompacting": false,
+  "isSessionActive": false,
+  "isStreaming": false,
+  "lastActivityAt": "2026-09-20T13:24:12.822Z",
+  "lifecycle": "draft",
+  "messageCount": 0,
+  "model": {
+   "id": "mock-1",
+   "name": "Mock 1",
+   "provider": "prime-inference",
+   "reasoning": false
+  },
+  "modified": "2026-09-20T13:24:12.822Z",
+  "rlmDepth": 0,
+  "runtimeKind": "top-level",
+  "sessionActions": {
+   "followUps": [],
+   "queuedCount": 0,
+   "steering": []
+  },
+  "sessionFile": "/home/ubuntu/lane-worktrees/harness-debt/scripts/battery/runs/20260920T132409Z/rust/agent/sessions/01a0befd-1780-74f2-8bf3-5aec58e7c5fa.jsonl",
+  "sessionId": "01a0befd-1780-74f2-8bf3-5aec58e7c5fa",
+  "sessionName": "battery-compact",
+  "thinkingLevel": "off",
+  "unfinishedActionCount": 0,
+  "workerPid": 1148193,
+  "workerState": "ready"
+ },
+ "id": "c1",
+ "success": true,
+ "type": "response"
+}

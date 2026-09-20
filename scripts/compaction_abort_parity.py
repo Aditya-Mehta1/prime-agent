@@ -287,6 +287,14 @@ def main() -> int:
     # Fail fast before any launch: a non-TS `prime-agent` on PATH plays a
     # Rust build as the "ts" side and reports false divergences.
     ts_identity.assert_ts_side_is_the_ts_product(ts_binary, rust_binary)
+    # Fail fast on a stale rust build: a binary older than the checkout's
+    # newest product commit reproduces "summarizer request never arrived"
+    # class false failures (the 20260920 main run: the checkout's binary
+    # predated the auto-compaction merge).
+    stale = B.rust_binary_staleness(Path(rust_binary), REPO)
+    if stale:
+        print(f"[parity] STALE RUST BINARY: {stale}")
+        return 2
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     run_root = REPO / "scripts" / "battery" / "runs" / f"{stamp}-abort"
     print(f"[parity] run root: {run_root}")
