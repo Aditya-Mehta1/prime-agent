@@ -9,7 +9,11 @@ import {
 
 /** fnv1a (32-bit, 8 hex chars) digest for repeated-state detection. */
 export function observationDigest(observation: RouterObservation): string {
-	const material = JSON.stringify({ text: observation.text, fields: observation.fields ?? null });
+	const material = JSON.stringify({
+		text: observation.text,
+		fields: observation.fields ?? null,
+		...(observation.image ? { image: observation.image } : {}),
+	});
 	let hash = 0x811c9dc5;
 	for (let i = 0; i < material.length; i += 1) {
 		hash ^= material.charCodeAt(i);
@@ -105,10 +109,23 @@ export function compileDecisionPrompt(input: {
 	actions: Map<string, CompiledAction>;
 	observationChars: number;
 }): string {
-	const fields = Object.entries(input.observation.fields ?? {}).map(([key, value]) => `${key}: ${String(value)}`);
-	const observationText = [truncateObservation(input.observation.text, input.observationChars), ...fields]
-		.filter(Boolean)
-		.join("\n");
+	const fieldLines = Object.entries(input.observation.fields ?? {}).map(([key, value]) => `${key}: ${String(value)}`);
+	// The budget bounds the whole rendered observation (text plus fields), not
+	// just the text: both halves ride the same prompt the model reads.
+	const text = truncateObservation(input.observation.text, Math.max(200, Math.floor(input.observationChars / 2)));
+	const fieldsBudget = input.observationChars - text.length;
+	const keptFields: string[] = [];
+	let fieldsUsed = 0;
+	for (const line of fieldLines) {
+		if (fieldsUsed + line.length + 1 > Math.max(0, fieldsBudget - 40)) break;
+		keptFields.push(line);
+		fieldsUsed += line.length + 1;
+	}
+	const fieldsBlock =
+		keptFields.length === fieldLines.length
+			? keptFields.join("\n")
+			: `${keptFields.join("\n")}${keptFields.length ? "\n" : ""}<${fieldLines.length - keptFields.length} more fields truncated>`;
+	const observationText = [text, fieldsBlock].filter(Boolean).join("\n");
 	const history = input.history.length > 0 ? input.history.join("\n") : "<no steps yet>";
 	const actions = [...input.actions.values()].map(renderAction).join("\n");
 	return [

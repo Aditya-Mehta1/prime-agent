@@ -15,6 +15,9 @@ interface PendingRequest {
 	reject: (error: Error) => void;
 }
 
+/** A reply line longer than this is a protocol violation, not a message to buffer. */
+const MAX_REPLY_LINE_CHARS = 1_000_000;
+
 export class StdioRouterEnvironment implements RouterEnvironment {
 	private child: ReturnType<typeof spawn> | undefined;
 	private nextId = 0;
@@ -51,6 +54,14 @@ export class StdioRouterEnvironment implements RouterEnvironment {
 				if (line) this.dispatchLine(line);
 				newline = buffer.indexOf("\n");
 			}
+			// An unterminated line is buffered until its newline arrives; a
+			// protocol-violating line that never ends must not grow without bound.
+			if (buffer.length > MAX_REPLY_LINE_CHARS) {
+				const overflow = `environment adapter wrote an unterminated reply line over ${MAX_REPLY_LINE_CHARS} chars`;
+				buffer = "";
+				this.appendKernelAdapterDiagnostic(overflow);
+				this.failAll(new Error(overflow));
+			}
 		});
 		child.stderr?.setEncoding("utf8");
 		child.stderr?.on("data", (chunk: string) => {
@@ -85,7 +96,8 @@ export class StdioRouterEnvironment implements RouterEnvironment {
 		if (record.ok === true) {
 			pending.resolve(record);
 		} else {
-			pending.reject(new Error(typeof record.error === "string" ? record.error : "adapter error"));
+			const detail = typeof record.error === "string" ? record.error.slice(0, 2_000) : "adapter error";
+			pending.reject(new Error(detail));
 		}
 	}
 
@@ -93,6 +105,11 @@ export class StdioRouterEnvironment implements RouterEnvironment {
 		const pending = [...this.pending.values()];
 		this.pending.clear();
 		for (const request of pending) request.reject(error);
+	}
+
+	/** Keep a bounded tail of protocol violations alongside the stderr tail. */
+	private appendKernelAdapterDiagnostic(message: string): void {
+		this.stderrTail = `${this.stderrTail}\n${message}`.slice(-2_000);
 	}
 
 	private async request(type: string, payload: Record<string, unknown> = {}): Promise<Record<string, unknown>> {

@@ -313,7 +313,11 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 			}
 
 			// Repeated-state detection: the same action with the same params on the same observation.
-			const signature = `${digest}:${action.name}:${JSON.stringify(decision.params)}`;
+			const canonicalParams = Object.keys(decision.params)
+				.sort()
+				.map((key) => `${key}=${decision.params[key]}`)
+				.join("&");
+			const signature = `${digest}:${action.name}:${canonicalParams}`;
 			repeatCount = signature === lastSignature ? repeatCount + 1 : 0;
 			lastSignature = signature;
 			if (repeatCount + 1 >= ROUTER_REPETITION_LIMIT) {

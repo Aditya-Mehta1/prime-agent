@@ -337,15 +337,7 @@ import {
 } from "./slash-commands.js";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.js";
-import {
-	compileActionSpace,
-	createModelDecisionFunction,
-	parseEnvironmentActions,
-	parseSystemRouterRunSpec,
-	routerThinkingLevel,
-	runSystemRouterLoop,
-	StdioRouterEnvironment,
-} from "./system-router/index.js";
+import { parseSystemRouterRunSpec, runRouterSegment } from "./system-router/index.js";
 import { THINKING_LEVELS } from "./thinking-levels.js";
 import { acpMcpToolNames, createAcpMcpToolDefinitions } from "./tools/acp-mcp.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
@@ -3827,11 +3819,11 @@ export class AgentSession {
 	 *
 	 * The session model (System 2) declares the environment (stdio adapter
 	 * command + init payload), the finite action space (its own or the
-	 * adapter's defaults), and the System 1 action model; the loop then runs
-	 * observe -> decide (ONE call per step, thinking off, single choice from
-	 * the declared action space + confidence) -> gate -> execute -> record
-	 * until a terminal state, and returns the complete trace for System 2 to
-	 * review and steer.
+	 * adapter's defaults), and the System 1 action model; the segment runner
+	 * then runs observe -> decide (ONE call per step, thinking off, single
+	 * choice from the declared action space + confidence) -> gate -> execute
+	 * -> record until a terminal state, and returns the complete trace for
+	 * System 2 to review and steer.
 	 */
 	async handleSystemRouterHostRequest(
 		type: string,
@@ -3845,54 +3837,14 @@ export class AgentSession {
 					"system-router",
 				);
 				const auth = await this._getRequiredRequestAuth(model);
-				const env = new StdioRouterEnvironment({
-					command: spec.environment.stdio.command,
-					...(spec.environment.stdio.cwd ? { cwd: spec.environment.stdio.cwd } : {}),
-					requestTimeoutMs: spec.environment.stdio.requestTimeoutMs,
-					...(spec.environment.stdio.init !== undefined ? { init: spec.environment.stdio.init } : {}),
+				const result = await runRouterSegment(spec, {
+					model: auth.requestModel,
+					apiKey: auth.apiKey,
+					headers: auth.headers,
+					sessionId: this.sessionId,
+					policy: providerRetryPolicy(this.settingsManager),
 				});
-				try {
-					// Always init the adapter (it carries the init payload, e.g. the ROM
-					// path); the spec's declared action space wins over the adapter's.
-					const environment = await env.init();
-					const actions = parseEnvironmentActions(spec.actions, environment?.actions);
-					if (!actions) {
-						throw new Error(
-							"system_router.run has no action space: declare one or use an adapter that supplies its own",
-						);
-					}
-					const { byName } = compileActionSpace(actions);
-					const result = await runSystemRouterLoop({
-						env,
-						goal: spec.goal,
-						actions,
-						decide: createModelDecisionFunction({
-							model: auth.requestModel,
-							apiKey: auth.apiKey,
-							headers: auth.headers,
-							sessionId: this.sessionId,
-							policy: providerRetryPolicy(this.settingsManager),
-							actions: byName,
-						}),
-						model: {
-							id: auth.requestModel.id,
-							provider: auth.requestModel.provider,
-							input: auth.requestModel.input ?? [],
-							thinkingLevel: routerThinkingLevel(auth.requestModel),
-						},
-						gate: spec.gate,
-						maxSteps: spec.maxSteps,
-						timeoutMs: spec.timeoutMs,
-						historySteps: spec.historySteps,
-						observationChars: spec.observationChars,
-					});
-					return result as unknown as Record<string, unknown>;
-				} finally {
-					// The loop closes the env on its own paths; this guards the window
-					// between init and the loop (a bad init payload, a missing action
-					// space) so the adapter process never leaks.
-					await env.close().catch(() => {});
-				}
+				return result as unknown as Record<string, unknown>;
 			}
 			default:
 				throw new Error(`unknown system_router request type "${type}"`);

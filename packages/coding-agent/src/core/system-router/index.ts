@@ -25,6 +25,11 @@ export {
 	runSystemRouterLoop,
 	type SystemRouterLoopOptions,
 } from "./loop.js";
+export {
+	type RouterSegmentEnvironment,
+	type RouterSegmentOptions,
+	runRouterSegment,
+} from "./segment.js";
 export { StdioRouterEnvironment } from "./stdio-environment.js";
 export {
 	DEFAULT_ROUTER_GATE,
@@ -58,6 +63,3 @@ export {
 	type SystemRouterRunResult,
 	type SystemRouterRunSpec,
 } from "./types.js";
-
-/** The bundled kernel skill name (skills/system-router). */
-export const SYSTEM_ROUTER_SKILL_NAME = "system-router";

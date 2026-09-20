@@ -86,7 +86,7 @@ An adapter is a program speaking newline-delimited JSON over stdin/stdout. Each
 request is one line; each reply is one line:
 
 ```json
-{"id": 1, "type": "init"}
+{"id": 1, "type": "init", "init": {"romPath": "/roms/game.gba"}}
 {"id": 1, "ok": true, "environment": {"actions": {"press_a": {"description": "Press A."}}}}
 {"id": 2, "type": "reset", "goal": "..."}
 {"id": 2, "ok": true}
@@ -124,9 +124,16 @@ stay on the host:
 
 ```sh
 docker run --rm -i --platform linux/amd64 \
-  -v "$SYSTEM_ROUTER_ROM_DIR":/roms:ro -e SYSTEM_ROUTER_ROM=/roms/game.gba \
-  node:22-slim sh -c "npm i -g npm@latest >/dev/null 2>&1; cd /app && npm install node-mgba@0.2.9 && node adapter.mjs"
+  -v "/path/to/rom-dir:/roms:ro" \
+  -v "/path/to/repo/packages/coding-agent/examples/system-router-gba:/adapter-src:ro" \
+  -e "SYSTEM_ROUTER_ROM=/roms/game.gba" \
+  node:22-trixie-slim sh -c "apt-get update >/dev/null 2>&1; apt-get install -y --no-install-recommends libpng16-16 libepoxy0 libsqlite3-0 zlib1g libfreetype6 libelf1 libbz2-1.0 libjson-c5 libxml2 >/dev/null 2>&1; cp /adapter-src/adapter.mjs /tmp/adapter.mjs && cd /tmp && npm install --no-audit --no-fund node-mgba@0.2.9 >/dev/null 2>&1 && node /tmp/adapter.mjs"
 ```
+
+That exact command is the one this PR was demoed with on darwin-arm64: the
+vendored libmGBA build needs glibc 2.38+ (Debian trixie or newer) plus
+libpng16/libepoxy/libsqlite3/zlib/freetype/elf/bz2/json-c/libxml2, and the
+ROM directory and adapter directory are mounted read-only.
 
 The ROM never enters the repository; it is passed by path (`SYSTEM_ROUTER_ROM`
 or the `init` payload) and mounted read-only. Nothing in CI installs node-mgba

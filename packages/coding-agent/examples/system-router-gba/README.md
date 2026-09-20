@@ -9,7 +9,8 @@ reads, PNG capture).
 - `adapter.mjs` — the environment adapter: loads the ROM, saves a reset state,
   observes memory (EWRAM digest + configurable reads), presses buttons, optional
   PNG screenshots. It speaks the router's JSON-lines adapter protocol and
-  supplies the default GBA action space (the 11 buttons plus `wait`).
+  supplies the default GBA action space (`press_a`, `press_b`, `press_l`, `press_r`,
+`press_up`, `press_down`, `press_left`, `press_right`, `press_start`, `press_select`, plus `wait`).
 - `demo.mjs` — a local demo driver that runs the real router loop (compiled
   `dist/`) with a scripted decision plan, so the full plumbing — emulator,
   adapter protocol, budgets, trace — runs without a model.
@@ -28,12 +29,15 @@ the adapter is a subprocess, so the boundary is the container command.
 ## Run (Linux x64)
 
 ```sh
-npm run build               # once, from the repository root
-cd examples/system-router-gba
-npm install node-mgba@0.2.9 # keep this out of the repository's package.json
-node adapter.mjs &           # or skip: the demo spawns the adapter itself
-node demo.mjs --rom /path/to/your.gba --plan press_a,wait,press_start,finish
+npm run build   # once, from the repository root
+cd packages/coding-agent/examples/system-router-gba
+npm install node-mgba@0.2.9   # keep this out of the repository's package.json
+cd ../../..   # back to the repository root: the default adapter path is root-relative
+node packages/coding-agent/examples/system-router-gba/demo.mjs \
+  --rom /path/to/your.gba --plan press_a,wait,press_start,finish
 ```
+
+(The demo spawns the adapter itself via the default `node,examples/system-router-gba/adapter.mjs` command.)
 
 ## Run (macOS, adapter in a Linux container)
 

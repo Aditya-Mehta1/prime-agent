@@ -17,6 +17,8 @@ import {
 	type RouterDecisionOutcome,
 	type RouterEnvironment,
 	type RouterObservation,
+	type RouterSegmentEnvironment,
+	runRouterSegment,
 	runSystemRouterLoop,
 	StdioRouterEnvironment,
 	truncateObservation,
@@ -351,6 +353,20 @@ describe("action space compilation", () => {
 		expect(prompt).toContain('"confidence"');
 	});
 
+	it("bounds the rendered observation (text plus fields) by the budget", () => {
+		const fields = Object.fromEntries(Array.from({ length: 200 }, (_, i) => [`field_${i}`, "x".repeat(500)]));
+		const prompt = compileDecisionPrompt({
+			goal: "g",
+			observation: { text: "y".repeat(10_000), fields },
+			history: [],
+			actions: compileActionSpace({ press_a: { description: "d" } }).byName,
+			observationChars: 6_000,
+		});
+		expect(prompt.length).toBeLessThan(6_000 + 3_000);
+		expect(prompt).toContain("more fields truncated");
+		expect(prompt).toContain("field_0:");
+	});
+
 	it("truncates the observation to the budget", () => {
 		const long = "x".repeat(100);
 		expect(truncateObservation(long, 50).length).toBeLessThanOrEqual(50);
@@ -593,6 +609,106 @@ describe("runSystemRouterLoop", () => {
 	});
 });
 
+describe("runRouterSegment wiring", () => {
+	const model = {
+		id: "seg-model",
+		provider: "faux",
+		api: "openai-completions",
+		reasoning: false,
+		maxTokens: 4_096,
+		input: ["text"],
+	} as unknown as PiAi.Model<PiAi.Api>;
+
+	function segmentEnv(log: string[], supplied: unknown, initError?: Error): RouterSegmentEnvironment {
+		let observations = 0;
+		return {
+			init: async () => {
+				log.push("init");
+				if (initError) throw initError;
+				return supplied === undefined ? undefined : { actions: supplied };
+			},
+			reset: async () => {
+				log.push("reset");
+			},
+			observe: async () => {
+				observations += 1;
+				return { text: `seg screen ${observations}` };
+			},
+			execute: async (action: string) => {
+				log.push(`execute:${action}`);
+				return { text: `${action} ok` };
+			},
+			close: async () => {
+				log.push("close");
+			},
+		};
+	}
+
+	function queueDecisions(replies: string[]): void {
+		for (const reply of replies) {
+			completeSimpleMock.mockResolvedValueOnce({
+				role: "assistant",
+				content: [{ type: "text", text: reply }],
+				stopReason: "stop",
+				timestamp: Date.now(),
+			});
+		}
+	}
+
+	it("always inits the adapter and prefers the declared action space", async () => {
+		const log: string[] = [];
+		const spec = parseSystemRouterRunSpec({
+			goal: "seg goal",
+			actions: { press_a: { description: "Declared." } },
+			environment: { stdio: { command: ["true"] } },
+			maxSteps: 2,
+		});
+		queueDecisions(['{"action":"press_a","confidence":0.9}', '{"action":"press_a","confidence":0.9}']);
+		const result = await runRouterSegment(spec, {
+			model,
+			env: segmentEnv(log, { wait: { description: "Supplied." } }),
+		});
+		expect(log[0]).toBe("init");
+		expect(log[log.length - 1]).toBe("close");
+		expect(result.status).toBe("incomplete");
+		expect(result.reason).toBe("max_steps");
+		expect(result.executed).toBe(2);
+	});
+
+	it("uses the adapter-supplied action space when the spec declares none", async () => {
+		const log: string[] = [];
+		const spec = parseSystemRouterRunSpec({
+			goal: "seg goal",
+			environment: { stdio: { command: ["true"] } },
+			maxSteps: 2,
+		});
+		queueDecisions(['{"action":"wait","confidence":0.9}', '{"action":"wait","confidence":0.9}']);
+		const result = await runRouterSegment(spec, {
+			model,
+			env: segmentEnv(log, { wait: { description: "Wait a bit." } }),
+		});
+		expect(result.status).toBe("incomplete");
+		expect(log).toContain("init");
+		expect(log[log.length - 1]).toBe("close");
+		expect(log).toContain("execute:wait");
+	});
+
+	it.each([
+		["init fails", undefined, new Error("rom not found")],
+		["no action space anywhere", undefined, undefined],
+	])("closes the adapter when %s", async (_label, supplied, initError) => {
+		const log: string[] = [];
+		const spec = parseSystemRouterRunSpec({
+			goal: "seg goal",
+			environment: { stdio: { command: ["true"] } },
+		});
+		await expect(runRouterSegment(spec, { model, env: segmentEnv(log, supplied, initError) })).rejects.toThrow(
+			initError ? "rom not found" : "no action space",
+		);
+		expect(log).toEqual(["init", "close"]);
+	});
+});
+
 describe("runSystemRouterLoop budgets (fake timers)", () => {
 	beforeEach(() => {
 		vi.useFakeTimers();
@@ -832,6 +948,23 @@ describe("StdioRouterEnvironment (real subprocess)", () => {
 			expect(environment?.actions).toMatchObject({ wait: { description: "Wait." } });
 			const observation = await env.observe();
 			expect(observation.text).toBe("ok screen");
+		} finally {
+			await env.close();
+		}
+	});
+
+	it("fails fast when the adapter writes an unterminated oversized line", async () => {
+		const script = `
+			process.stdout.write("x".repeat(1_100_000));
+			process.stdout.write(JSON.stringify({ id: 1, ok: true }) + "\\n");
+			process.stdin.on("end", () => process.exit(0));
+		`;
+		const env = new StdioRouterEnvironment({
+			command: [process.execPath, "-e", script],
+			requestTimeoutMs: 5_000,
+		});
+		try {
+			await expect(env.init()).rejects.toThrow(/unterminated reply line over/);
 		} finally {
 			await env.close();
 		}
