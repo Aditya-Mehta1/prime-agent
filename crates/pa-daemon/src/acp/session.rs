@@ -9,10 +9,11 @@ use std::sync::Arc;
 
 use pa_agent::agent::{Agent, Subscription};
 use pa_agent::stream::AssistantMessageEvent;
-use pa_agent::types::{AgentEvent, AgentMessage, Message, StopReason};
+use pa_agent::types::{AgentEvent, AgentMessage, Message};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
+use super::compaction_arms::CompactionArms;
 use super::events::{acp_updates_for_event, AcpEngineEvent, MappingState};
 use super::jsonrpc;
 use super::meta::{
@@ -39,6 +40,11 @@ pub struct AcpSession {
     /// The last goal state published as `_meta.goal`, to detect changes.
     /// Shared with the event subscription so mid-turn changes publish too.
     last_published_goal: Arc<Mutex<pa_core::goals::GoalState>>,
+    /// The automatic compaction arm state (the overflow recovery machine
+    /// and the in-flight compaction abort slot), TS session-lifetime
+    /// state. Shared with the arm implementation
+    /// (compaction_arms.rs).
+    pub(super) arms: Arc<CompactionArms>,
 }
 
 impl AcpSession {
@@ -55,6 +61,10 @@ impl AcpSession {
         let mapping = Arc::new(Mutex::new(MappingState::default()));
         let last_published_goal =
             Arc::new(Mutex::new(engine.goal_driver.lock().await.state().clone()));
+        // The compaction arm state is shared with the event subscription:
+        // a user row that starts an agent run resets the overflow
+        // recovery machine at its `message_start` (TS `startsAgentRun`).
+        let arms = Arc::new(CompactionArms::new());
         let subscription = subscribe_engine_events(
             &engine,
             producer.clone(),
@@ -62,6 +72,7 @@ impl AcpSession {
             autonomous.clone(),
             autonomous_driver.clone(),
             last_published_goal.clone(),
+            arms.clone(),
         )
         .await;
         AcpSession {
@@ -74,6 +85,7 @@ impl AcpSession {
             autonomous_driver,
             engine,
             last_published_goal,
+            arms,
         }
     }
 
@@ -173,6 +185,7 @@ async fn subscribe_engine_events(
     autonomous: Arc<Mutex<pa_core::autonomous::AutonomousRuntimeState>>,
     autonomous_driver: Arc<dyn pa_core::autonomous::AutonomousDriver>,
     last_published_goal: Arc<Mutex<pa_core::goals::GoalState>>,
+    arms: Arc<CompactionArms>,
 ) -> Subscription {
     let agent = engine.session.agent().clone();
     let goal_driver = engine.goal_driver.clone();
@@ -186,7 +199,18 @@ async fn subscribe_engine_events(
             let goal_driver = goal_driver.clone();
             let session = session.clone();
             let last_published_goal = last_published_goal.clone();
+            let arms = arms.clone();
             Box::pin(async move {
+                // A user row that starts an agent run resets the overflow
+                // recovery machine (TS `startsAgentRun` at
+                // `message_start`): the stale attempt state from the
+                // previous run never suppresses a fresh overflow.
+                if let AgentEvent::MessageStart {
+                    message: AgentMessage::Standard(Message::User(_)),
+                } = &event
+                {
+                    arms.reset();
+                }
                 let turn_id = producer.active_prompt_turn().await;
                 let engine_events: Vec<AcpEngineEvent> = project_event(&event);
                 for engine_event in engine_events {
@@ -328,8 +352,21 @@ impl TurnBoundary {
         }
     }
 
-    fn contains(&self, message: &AgentMessage) -> bool {
-        message_key(message).is_some_and(|key| self.keys.contains(&key))
+    /// Membership check for the wire shape of an assistant message (the
+    /// turn loop classifies the latest assistant against the pre-turn
+    /// transcript; the key composition is the one `message_key` builds —
+    /// compaction drops messages, it does not rewrite them, so the keys
+    /// survive the compaction rebuild).
+    pub fn contains_wire(&self, assistant: &pa_types::ai::AssistantMessage) -> bool {
+        let stop_reason = serde_json::to_value(assistant.stop_reason).unwrap_or(Value::Null);
+        let key = json!([
+            "assistant",
+            assistant.timestamp,
+            stop_reason,
+            assistant.error_message,
+        ])
+        .to_string();
+        self.keys.contains(&key)
     }
 }
 
@@ -349,36 +386,6 @@ fn message_key(message: &AgentMessage) -> Option<String> {
         ])
         .to_string(),
     )
-}
-
-/// Error text from an assistant message this turn produced, when it failed.
-///
-/// Only messages that were not in the transcript before the turn are
-/// considered: scanning the whole transcript would let an earlier failed
-/// turn reject a later turn that never called the model, reporting a stale
-/// error.
-pub async fn turn_failure(agent: &Agent, boundary: &TurnBoundary) -> Option<String> {
-    let state = agent.state().await;
-    for message in state.messages.iter().rev() {
-        let AgentMessage::Standard(Message::Assistant(assistant)) = message else {
-            continue;
-        };
-        // The newest assistant message predates the turn, so the turn
-        // appended none.
-        if boundary.contains(message) {
-            return None;
-        }
-        if assistant.stop_reason != StopReason::Error {
-            return None;
-        }
-        return Some(
-            assistant
-                .error_message
-                .clone()
-                .unwrap_or_else(|| "the model request failed".to_string()),
-        );
-    }
-    None
 }
 
 /// The newest assistant message of the transcript, when one exists (the

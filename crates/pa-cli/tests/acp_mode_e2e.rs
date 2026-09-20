@@ -1247,3 +1247,218 @@ fn acp_daemon_attached_reports_autonomous_accounting_and_limit_stop_reason() {
     drop(client);
     shutdown_sandboxed_daemon(&socket);
 }
+
+/// Spawn with compaction settings written into the agent dir (the
+/// in-process session resolves them at session assembly).
+fn spawn_with_compaction_settings(
+    args: &[&str],
+    script: &serde_json::Value,
+    reserve_tokens: u64,
+    keep_recent_tokens: u64,
+) -> AcpChild {
+    let home = tempfile::TempDir::new().unwrap();
+    let agent_dir = home.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        json!({
+            "compaction": {
+                "enabled": true,
+                "reserveTokens": reserve_tokens,
+                "keepRecentTokens": keep_recent_tokens,
+            }
+        })
+        .to_string(),
+    )
+    .expect("write settings.json");
+    let bin = env!("CARGO_BIN_EXE_prime-agent");
+    let mut child = Command::new(bin)
+        .args(args)
+        .env("HOME", home.path())
+        .env("PRIME_AGENT_CODING_AGENT_DIR", &agent_dir)
+        .env("PRIME_AGENT_FAUX_SCRIPT", script.to_string())
+        .current_dir(home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary present");
+    let stdin = child.stdin.take().expect("stdin piped");
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+    let (tx, lines) = channel();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            match line {
+                Ok(line) => {
+                    if tx.send(line).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    AcpChild {
+        child,
+        stdin,
+        lines,
+        next_id: 0,
+        _home: home,
+        spawn_stderr: Some(stderr),
+    }
+}
+
+/// The compaction metas among a turn's updates (the ACP `compaction_end`
+/// mapping; a ran compaction carries `tokensBefore`/`summary`, every
+/// skipped, failed, or cancelled run the empty payload).
+fn compaction_metas(updates: &[Value]) -> Vec<Value> {
+    updates
+        .iter()
+        .filter_map(|update| {
+            let meta = &update["params"]["update"]["_meta"]["ai.primeintellect.prime-agent"];
+            Some(meta["compaction"].clone()).filter(|value| !value.is_null())
+        })
+        .collect()
+}
+
+/// The threshold arm on the ACP turn path: a settled turn whose usage
+/// crosses the reserve headroom compacts at the boundary and publishes
+/// the `compaction` meta with the summarizer's text (TS `_checkCompaction`
+/// threshold arm, binary level).
+///
+/// Two turns over a 500-token headroom (the f14 battery shape): the
+/// single-turn compaction skips (nothing before the turn to summarize —
+/// the skip publishes the empty payload, proving the arm ran), then the
+/// second turn's boundary compaction summarizes turn one and publishes
+/// its result.
+#[test]
+fn acp_threshold_auto_compaction_publishes_the_compaction_meta() {
+    let script = json!({
+        "contextWindow": 128_000,
+        "responses": [
+            { "text": "turn one reply" },
+            { "text": "turn two reply" },
+            { "text": "the auto summary" },
+        ]
+    });
+    let mut client =
+        spawn_with_compaction_settings(&["--mode", "acp", "--no-session"], &script, 127_500, 10);
+    let init = client.request("initialize", initialize_params());
+    let _ = client.wait_response(init, TIMEOUT);
+    let new = client.request("session/new", json!({ "mcpServers": [] }));
+    let (new_response, _) = client.wait_response(new, TIMEOUT);
+    let session_id = new_response["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Turn one crosses the headroom: the boundary arm ran and the
+    // single-turn skip published the empty payload.
+    let prompt = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{ "type": "text", "text": format!("turn one {}", "x".repeat(8_000)) }],
+        }),
+    );
+    let (prompt_response, updates) = client.wait_response(prompt, TIMEOUT);
+    assert_eq!(prompt_response["result"]["stopReason"], "end_turn");
+    let metas = compaction_metas(&updates);
+    assert!(!metas.is_empty(), "the threshold arm ran: {updates:?}");
+    assert!(
+        metas
+            .iter()
+            .all(|meta| meta.as_object().map(|o| o.is_empty()).unwrap_or(false)),
+        "the single-turn compaction skipped: {metas:?}"
+    );
+
+    // Turn two's boundary: the compaction summarizes turn one and
+    // publishes its result.
+    let prompt = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{ "type": "text", "text": "turn two" }],
+        }),
+    );
+    let (prompt_response, updates) = client.wait_response(prompt, TIMEOUT);
+    assert_eq!(prompt_response["result"]["stopReason"], "end_turn");
+    let metas = compaction_metas(&updates);
+    let ran = metas
+        .iter()
+        .find(|meta| {
+            meta["summary"]
+                .as_str()
+                .is_some_and(|summary| summary.contains("the auto summary"))
+        })
+        .unwrap_or_else(|| panic!("the compaction ran and published: {metas:?}"));
+    assert!(ran["tokensBefore"].as_u64().unwrap() > 0);
+}
+
+/// The overflow arm on the ACP turn path: a provider context-overflow
+/// error runs one compact-and-retry at the boundary and the retried turn
+/// settles the prompt with `end_turn` instead of the error (TS
+/// `_checkCompaction` Case 1, binary level).
+#[test]
+fn acp_overflow_recovery_compacts_and_retries_the_turn() {
+    let script = json!({
+        "contextWindow": 128_000,
+        "responses": [
+            { "text": "seed reply" },
+            {
+                "text": "",
+                "stopReason": "error",
+                "errorMessage": "prompt is too long: 213462 tokens > 200000 maximum",
+            },
+            { "text": "the summary" },
+            { "text": "recovered reply" },
+        ]
+    });
+    let mut client =
+        spawn_with_compaction_settings(&["--mode", "acp", "--no-session"], &script, 1, 10);
+    let init = client.request("initialize", initialize_params());
+    let _ = client.wait_response(init, TIMEOUT);
+    let new = client.request("session/new", json!({ "mcpServers": [] }));
+    let (new_response, _) = client.wait_response(new, TIMEOUT);
+    let session_id = new_response["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The seed turn: nothing fires (context far below the headroom).
+    let prompt = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{ "type": "text", "text": format!("seed turn {}", "x".repeat(48_000)) }],
+        }),
+    );
+    let (prompt_response, updates) = client.wait_response(prompt, TIMEOUT);
+    assert_eq!(prompt_response["result"]["stopReason"], "end_turn");
+    assert!(
+        compaction_metas(&updates).is_empty(),
+        "nothing fires below the headroom"
+    );
+
+    // The overflow probe: the arm compacts once (the summarizer consumed
+    // the third scripted response) and the retried turn recovers.
+    let prompt = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{ "type": "text", "text": format!("overflow probe {}", "x".repeat(2_000)) }],
+        }),
+    );
+    let (prompt_response, updates) = client.wait_response(prompt, TIMEOUT);
+    assert_eq!(
+        prompt_response["result"],
+        json!({ "stopReason": "end_turn" }),
+        "the retry recovered the turn: {prompt_response}"
+    );
+    let metas = compaction_metas(&updates);
+    assert_eq!(metas.len(), 1, "one compaction meta: {metas:?}");
+    assert_eq!(metas[0]["summary"], "the summary");
+    assert!(metas[0]["tokensBefore"].as_u64().unwrap() > 0);
+}

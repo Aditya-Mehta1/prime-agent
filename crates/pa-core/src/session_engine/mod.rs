@@ -482,6 +482,17 @@ impl AgentSession {
         self.prompt_with_images(text, Vec::new(), options).await
     }
 
+    /// Classify a prompt as a session command without admitting it: the
+    /// same expansion-plus-grammar parse `prompt` applies. Host turn loops
+    /// use this to keep their pre-turn compaction arms off the
+    /// session-command path (TS session commands never reach
+    /// `_prepareForCommit`, so `_runPreTurnCompaction` never fires for
+    /// them).
+    pub fn classify_session_command(&self, text: &str) -> Option<SessionSlashCommand> {
+        let normalized = crate::skills::expand_prompt_template(text, &self.prompt_templates);
+        parse_session_command(&self.slash_commands, &normalized)
+    }
+
     /// Prompt with images attached (the ACP prompt-capability path). Busy
     /// sessions queue the text and images together as one follow-up batch,
     /// so an admitted prompt never loses its images to a queue race.

@@ -31,7 +31,7 @@ use pa_core::session_engine::TrailingAssistantFilter;
 
 /// The TS failure text when one compact-and-retry attempt could not save
 /// the turn (`_checkCompaction`'s reported state).
-const OVERFLOW_RECOVERY_FAILED_MESSAGE: &str = "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.";
+pub(crate) const OVERFLOW_RECOVERY_FAILED_MESSAGE: &str = "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.";
 
 /// One recovery attempt per overflow (TS `_overflowRecovery`): "attempted"
 /// marks a compact-and-retry in flight; "reported" dedups the failure

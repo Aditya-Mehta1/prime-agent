@@ -8,6 +8,7 @@
 //! interleave exactly in publication order. The process exits when stdin
 //! closes.
 
+mod compaction_arms;
 pub mod daemon;
 mod events;
 mod jsonrpc;
@@ -167,6 +168,7 @@ async fn teardown(state: &Arc<Mutex<ConnectionState>>) {
     let Some(mut entry) = entry else {
         return;
     };
+    entry.session.abort_auto_compaction();
     entry.session.agent().abort();
     entry.session.agent().clear_all_queues();
     entry.session.agent().wait_for_idle().await;
@@ -285,6 +287,10 @@ async fn handle_notification(method: String, params: Value, state: Arc<Mutex<Con
         entry.session.clone()
     };
     session.request_cancel();
+    // TS `requestAbort` aborts the in-flight auto-compaction too, not
+    // just the agent loop: an arm summarizer must not outlive the turn
+    // it was cancelling.
+    session.abort_auto_compaction();
     session.agent().abort();
     session.agent().clear_all_queues();
 }
@@ -430,6 +436,7 @@ async fn handle_session_close(
         ));
         return;
     };
+    entry.session.abort_auto_compaction();
     entry.session.agent().abort();
     entry.session.agent().clear_all_queues();
     entry.session.agent().wait_for_idle().await;

@@ -7,7 +7,16 @@ ACP stdio transport (`acp`): the JSON-RPC serve surface for Agent
 Client Protocol clients - a thin transport over the pa-core session engine
 (initialize, session/new, session/prompt, session/close, session/cancel,
 and the outgoing session/update notification with namespaced `_meta`
-correlation), owned by this crate because wire-protocol serving is its area.
+correlation), owned by this crate because wire-protocol serving is its area;
+the in-process transport hosts the automatic compaction arms at its turn
+boundaries (`acp/compaction_arms.rs`: the TS `_checkCompaction` /
+`_runPreTurnCompaction` / `_consumePendingRequestedRefine` flows — the
+overflow compact-and-retry, the model-requested arm, and the threshold
+arm, publishing the ACP `compaction_end` mapping and aborting an in-flight
+run on session/cancel+close; the daemon-attached transport runs the
+worker turn loop's arms instead), because the TS arms live in the session
+turn loop every transport shares and the in-process ACP path drives the
+pa-core engine directly.
 Supervisor process (one worker process per active session), restart/backoff
 supervision, session registry/roster + worker self-registration (session
 identity survives supervisor restarts: workers re-register with backoff and
