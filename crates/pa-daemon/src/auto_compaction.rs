@@ -113,6 +113,17 @@ impl AgentSessionEngine {
         };
         match &outcome {
             Ok(Ok(CompactOutcome::Ran(run))) => {
+                // The post-compaction kernel notice goes out before the
+                // settled end (TS `_syncKernelStateAfterCompaction` runs
+                // inside `_performCompaction`): its `message_start` /
+                // `message_end` pair precedes `compaction_end`.
+                if let Some(message) = &run.ipython_state {
+                    if !emit(EngineEvent::CustomMessage(
+                        crate::session_commands::custom_message_value(message),
+                    )) {
+                        return AutoCompactionRun::Cancelled;
+                    }
+                }
                 // Adoption telemetry (TS `compaction_end` handling counts
                 // every completed compaction into the active run).
                 {

@@ -1,0 +1,43 @@
+{
+ "command": "create",
+ "data": {
+  "activeSessionId": "2e24c4598303",
+  "activity": "idle",
+  "attachedClients": 0,
+  "created": "2026-09-20T19:24:18.721Z",
+  "cwd": "/home/ubuntu/lane-worktrees/ipython-state/scripts/battery/runs/20260920T192358Z/rust/work",
+  "hasRegisteredCronJob": false,
+  "id": "2e24c4598303",
+  "isBashRunning": false,
+  "isCompacting": false,
+  "isSessionActive": false,
+  "isStreaming": false,
+  "lastActivityAt": "2026-09-20T19:24:18.731Z",
+  "lifecycle": "draft",
+  "messageCount": 0,
+  "model": {
+   "id": "mock-1",
+   "name": "Mock 1",
+   "provider": "prime-inference",
+   "reasoning": false
+  },
+  "modified": "2026-09-20T19:24:18.731Z",
+  "rlmDepth": 0,
+  "runtimeKind": "top-level",
+  "sessionActions": {
+   "followUps": [],
+   "queuedCount": 0,
+   "steering": []
+  },
+  "sessionFile": "/home/ubuntu/lane-worktrees/ipython-state/scripts/battery/runs/20260920T192358Z/rust/agent/sessions/01a0c046-c5a1-70d4-a2d0-51313fe7f819.jsonl",
+  "sessionId": "01a0c046-c5a1-70d4-a2d0-51313fe7f819",
+  "sessionName": "battery-iterative",
+  "thinkingLevel": "off",
+  "unfinishedActionCount": 0,
+  "workerPid": 1332820,
+  "workerState": "ready"
+ },
+ "id": "ic1",
+ "success": true,
+ "type": "response"
+}

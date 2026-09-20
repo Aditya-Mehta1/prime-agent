@@ -51,6 +51,10 @@ pub struct SessionCommandParams<'a> {
 pub struct CompactionExecution {
     pub entry: pa_types::session::CompactionEntry,
     pub result: super::compaction_exec::CompactionResult,
+    /// The post-compaction `ipython_state` notice row when a kernel was
+    /// running (already durable; hosts broadcast its `message_start` /
+    /// `message_end` pair).
+    pub ipython_state: Option<CustomMessage>,
 }
 
 /// What one execution produced.
@@ -230,6 +234,7 @@ async fn execute_compact(
             execution.compaction = Some(CompactionExecution {
                 entry: run.entry,
                 result: run.result,
+                ipython_state: run.ipython_state,
             });
         }
     }

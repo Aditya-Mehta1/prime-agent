@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "socketPath": "/home/ubuntu/lane-worktrees/ipython-state/scripts/battery/runs/20260920T192847Z/rust/daemon.sock",
+  "defaultSessionDir": "/home/ubuntu/lane-worktrees/ipython-state/scripts/battery/runs/20260920T192847Z/rust/agent/sessions"
+}

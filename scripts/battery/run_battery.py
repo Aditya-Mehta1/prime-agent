@@ -1437,10 +1437,12 @@ class Battery:
                 # compaction retained plus the new turn. A turn between
                 # the compacts keeps both sides' compact #2 preparing
                 # identically (TS appends an ipython_state custom message
-                # after each compaction — a kernel-persistence feature not
-                # yet ported to Rust — which is what keeps TS's path from
-                # ending on the compaction row; the turn-in-between shape
-                # exercises the update mode on both sides regardless).
+                # after each compaction when its prewarmed kernel is running —
+                # ported to Rust, but the Rust daemon does not prewarm the
+                # kernel at session creation yet, so a battery session (no
+                # ipython tool use) has no running kernel and no notice row;
+                # the turn-in-between shape exercises the update mode on both
+                # sides regardless).
                 side.mock.set_responses(
                     [
                         {"text": "seed reply"},
@@ -1663,6 +1665,260 @@ class Battery:
                     f"rust={json.dumps(durable_rows['rust'])[:400]}",
                     evidence=[
                         self.sides[name].root / flow / "sessions"
+                        for name in ("ts", "rust")
+                    ],
+                )
+
+        # Kernel-notice differential (the #227 residue): a session whose
+        # kernel is running (one scripted ipython tool call) appends the
+        # hidden `ipython_state` notice row after EVERY compaction, so a
+        # back-to-back second `compact` wire command with nothing in
+        # between runs again (update mode) instead of skipping "Already
+        # compacted". Both sides must keep the kernel through compaction,
+        # land the notice row on the durable branch after each compaction
+        # entry, and succeed on the second back-to-back compact. The
+        # notice's live-names detail depends on each side's kernel
+        # namespace, so the compared shape is the row envelope plus the
+        # persistence sentence, never the name list.
+        notice: dict[str, dict] = {}
+        for side in (self.sides["ts"], self.sides["rust"]):
+            self.ensure_daemon(side)
+            settings_path = side.agent_dir / "settings.json"
+            prior_settings = (
+                settings_path.read_text() if settings_path.exists() else None
+            )
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "compaction": {"keepRecentTokens": 10, "reserveTokens": 1000},
+                        "autoRefine": {"enabled": False},
+                    }
+                )
+            )
+            try:
+                wire = B.Wire(side.daemon_socket)
+                create = wire.request(
+                    "nc1",
+                    {
+                        "type": "create",
+                        "name": "battery-ipython-notice",
+                        "config": self.session_config(side),
+                    },
+                    timeout=120,
+                )
+                side.evidence_json(flow, "notice-create-response.json", create)
+                session_id = (
+                    create.get("data", {}).get("activeSessionId")
+                    or create.get("data", {}).get("id")
+                    or ""
+                )
+                if create.get("success") is not True:
+                    self.record(
+                        flow,
+                        "protocol",
+                        f"{side.name}: kernel-notice session create failed: {json.dumps(create)[:300]}",
+                    )
+                    wire.close()
+                    continue
+                # One tool-call turn boots the kernel (the only way the
+                # Rust daemon gets a running kernel today; TS prewarms),
+                # then a history turn the first compaction summarizes.
+                # Model-routed queue (same shape as the overflow probe
+                # below): the session-model calls (turns + compaction
+                # summarizers) draw their scripted responses in order, while
+                # the daemon status-line model falls through to the default
+                # queue — background calls must not shift the scripted
+                # cursors (a shifted turn reply changes the cut and with it
+                # the whole differential).
+                side.mock.set_responses(
+                    [{"text": "statusline filler"}],
+                    queues=[
+                        {
+                            "name": "notice",
+                            "matchModels": ["mock-1"],
+                            "responses": [
+                                {
+                                    "toolCall": {
+                                        "name": "ipython",
+                                        "arguments": {
+                                            "code": "notice_var = 'kept through compaction'"
+                                        },
+                                    }
+                                },
+                                {"text": "kernel started"},
+                                {"text": "history turn the first compaction summarizes"},
+                                {"text": "the notice first compaction summary"},
+                                {"text": "the notice second compaction summary"},
+                            ],
+                        }
+                    ],
+                )
+                tool_turn = wire.request(
+                    "np1",
+                    {
+                        "type": "prompt_and_wait",
+                        "activeSessionId": session_id,
+                        "message": "start the kernel and define notice_var",
+                    },
+                    timeout=240,
+                )
+                side.evidence_json(flow, "notice-tool-turn-response.json", tool_turn)
+                history_turn = wire.request(
+                    "np2",
+                    {
+                        "type": "prompt_and_wait",
+                        "activeSessionId": session_id,
+                        "message": "history turn for the summary",
+                    },
+                    timeout=240,
+                )
+                side.evidence_json(flow, "notice-history-turn-response.json", history_turn)
+                first = wire.request(
+                    "nk1",
+                    {"type": "compact", "activeSessionId": session_id},
+                    timeout=240,
+                )
+                side.evidence_json(flow, "notice-compact-one-response.json", first)
+                # Back-to-back: nothing between the two compacts.
+                mark = len(side.mock.requests())
+                second = wire.request(
+                    "nk2",
+                    {"type": "compact", "activeSessionId": session_id},
+                    timeout=240,
+                )
+                side.evidence_json(flow, "notice-compact-two-response.json", second)
+                wire.close()
+                # Only the session-model requests (the `notice` queue):
+                # background status-line calls fall through to the default
+                # queue and differ in count between the products.
+                second_requests = [
+                    request
+                    for request in self.new_mock_requests(side, mark)
+                    if request.get("queue") == "notice"
+                ]
+                side.evidence_json(flow, "notice-second-requests.json", second_requests)
+                # Private sessions copy: the shared `sessions` evidence
+                # belongs to the durable wire-diff above, and this
+                # session's tool rows must not pollute it.
+                dst = side.root / flow / "notice-sessions"
+                if dst.exists():
+                    shutil.rmtree(dst)
+                src = side.sessions_dir()
+                if src.exists():
+                    shutil.copytree(src, dst)
+                rows = []
+                ordered_tail = []
+                for path in sorted(dst.glob("*.jsonl")) if dst.exists() else []:
+                    body = path.read_text()
+                    # The TS daemon prewarms its kernel, so EVERY session in
+                    # the copy carries notice rows; scope to this scenario's
+                    # session (the only one that ran the notice_var turn).
+                    if "notice_var" not in body:
+                        continue
+                    for line in body.splitlines():
+                        try:
+                            entry = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        entry_type = entry.get("type")
+                        ordered_tail.append(entry_type)
+                        if (
+                            entry_type == "custom_message"
+                            and entry.get("customType") == "ipython_state"
+                        ):
+                            content = entry.get("content")
+                            if isinstance(content, list):
+                                content = "".join(
+                                    block.get("text", "")
+                                    for block in content
+                                    if isinstance(block, dict)
+                                )
+                            rows.append(
+                                {
+                                    "customType": entry.get("customType"),
+                                    "display": entry.get("display"),
+                                    "content": content,
+                                }
+                            )
+                notice[side.name] = {
+                    "first_success": first.get("success") is True,
+                    "second": second,
+                    "second_success": second.get("success") is True,
+                    "notice_rows": rows,
+                    "ordered_tail": ordered_tail[-6:],
+                    "second_requests": second_requests,
+                }
+            finally:
+                if prior_settings is None:
+                    settings_path.unlink(missing_ok=True)
+                else:
+                    settings_path.write_text(prior_settings)
+        if notice.get("ts") and notice.get("rust"):
+            def notice_shape(rows: list) -> list:
+                shaped = []
+                for row in rows:
+                    content = row.get("content") or ""
+                    shaped.append(
+                        {
+                            "customType": row.get("customType"),
+                            "display": row.get("display"),
+                            # The kernel-namespace detail (pruned names,
+                            # live names) is side-dependent: compare the
+                            # row envelope and the persistence sentence.
+                            "content_shape": content.split("available.")[0] + "available.",
+                        }
+                    )
+                return shaped
+
+            second_ok = notice["ts"]["second_success"] and notice["rust"]["second_success"]
+            shapes = {
+                name: notice_shape(notice[name]["notice_rows"]) for name in ("ts", "rust")
+            }
+            requests = {
+                name: [
+                    block.get("text", "")
+                    if isinstance(block, dict)
+                    else ""
+                    for request in notice[name]["second_requests"]
+                    for message_entry in (request.get("body", {}).get("messages") or [])
+                    if message_entry.get("role") == "user"
+                    for block in (
+                        message_entry.get("content")
+                        if isinstance(message_entry.get("content"), list)
+                        else [{"text": message_entry.get("content", "")}]
+                    )
+                ]
+                for name in ("ts", "rust")
+            }
+            if (
+                second_ok
+                and len(shapes["ts"]) == 2
+                and shapes["ts"] == shapes["rust"]
+                and requests["ts"] == requests["rust"]
+                and any(
+                    "<previous-summary>" in text
+                    for text in requests["ts"]
+                )
+            ):
+                self.record(
+                    flow,
+                    "behavior",
+                    "kernel-notice parity: ipython_state row after each compaction, back-to-back second compact runs (update mode): "
+                    + json.dumps(shapes["ts"])[:300],
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow,
+                    "behavior",
+                    "kernel-notice differential differs: "
+                    f"second_compact ts={notice['ts']['second_success']} rust={notice['rust']['second_success']} "
+                    f"row_counts ts={len(shapes['ts'])} rust={len(shapes['rust'])} "
+                    f"rows ts={json.dumps(shapes['ts'])[:400]} rust={json.dumps(shapes['rust'])[:400]} "
+                    f"second-requests-equal={requests['ts'] == requests['rust']} "
+                    f"ts={json.dumps(requests['ts'])[:150]} rust={json.dumps(requests['rust'])[:150]}",
+                    evidence=[
+                        self.sides[name].root / flow / "notice-compact-two-response.json"
                         for name in ("ts", "rust")
                     ],
                 )

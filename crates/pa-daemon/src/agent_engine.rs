@@ -1192,6 +1192,13 @@ impl SessionEngine for AgentSessionEngine {
                             .usage
                             .and_then(|usage| serde_json::to_value(usage).ok()),
                         entry: serde_json::to_value(&run.entry).unwrap_or(Value::Null),
+                        // The post-compaction kernel notice in its wire
+                        // message form (`role: "custom"`), when the session's
+                        // kernel was running.
+                        ipython_state: run
+                            .ipython_state
+                            .as_ref()
+                            .map(crate::session_commands::custom_message_value),
                     },
                 }
             }
@@ -2189,6 +2196,17 @@ impl AgentSessionEngine {
         let mut stopped_for_compaction = false;
         match consumption.compaction {
             Some(Ok(pa_core::session_engine::compact_session::CompactOutcome::Ran(run))) => {
+                // The post-compaction kernel notice goes out before the
+                // settled end (TS `_syncKernelStateAfterCompaction` runs
+                // inside `_performCompaction`): its `message_start` /
+                // `message_end` pair precedes `compaction_end`.
+                if let Some(message) = &run.ipython_state {
+                    if !emit(EngineEvent::CustomMessage(
+                        crate::session_commands::custom_message_value(message),
+                    )) {
+                        return BoundaryRun::Cancelled;
+                    }
+                }
                 // Adoption telemetry (TS `compaction_end` handling counts
                 // every completed compaction into the active run).
                 {

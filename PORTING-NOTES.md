@@ -1943,3 +1943,64 @@ deliberately left out (TS `prompt-highlight.ts`):
   compaction enabled — the pre-turn `threshold` compaction_start/end pair
   precedes the prompt's turn events on both sides, normalized full-stream
   diff), f7/f14 battery unregressed (musl build).
+
+
+## ipython_state compaction notice (kernel persistence)
+
+- TS ground truth (`AgentSession._syncKernelStateAfterCompaction`, called at the
+  end of `_performCompaction` — so every compaction surface: `/compact`, the
+  `compact` skill, threshold auto-compaction, overflow recovery): when the
+  session's kernel is running (`_ipythonKernelProvisioner.hasRunningKernel`),
+  the session (1) prunes variables above the per-variable snapshot limit
+  (`pruneOversizedVariables`, `.catch(() => null)`), (2) lists the live
+  user-defined names under a 5s abort (`KERNEL_STATE_LISTING_TIMEOUT_MS`,
+  `listNamespaceNames`), (3) appends a hidden `ipython_state` custom message
+  — `display: false`, no details — with the content
+  `[python-state]\n\nYour Python kernel persisted through compaction; its
+  remaining variables, imports, and helpers are still available.` + the prune
+  sentence (` Variables above the per-variable snapshot limit were removed:
+  <names>.`) + the names detail (` These names are still defined: <names>.`
+  / ` You have not defined any names yet.`; a failed listing on a
+  still-running kernel lands the notice with no detail arm, and a listing that
+  failed because the kernel stopped mid-probe lands nothing). The row is
+  model context (TS `convertToLlm` keeps it as a user turn — the model is
+  told its kernel survived), never rendered (display false), and pushed onto
+  `agent.state.messages` BEFORE a trailing error assistant turn (splice, not
+  push). `sessionManager.appendCustomMessageEntry` makes it durable, and the
+  session `_emit`s its `message_start`/`message_end` pair before
+  `compaction_end`.
+- The #227 residue: because the notice follows every compaction, the session
+  branch never ends on the compaction row while a kernel runs — a
+  back-to-back `/compact` with nothing in between prepares again (update
+  mode, `previousSummary` merge over empty new history) instead of skipping
+  "Already compacted". Without a running kernel the branch does end on the
+  compaction row and the skip fires (both products).
+- Rust port: `pa-core::session_engine::ipython_state` owns the notice — the
+  `CompactionKernelProbe` view of the kernel provisioner (the concrete
+  `IpythonKernelProvisioner` implements it; `Arc<dyn>` so tests inject a
+  scripted probe), the TS-exact content builder, and the sync (durable row +
+  live-context insert-before-error + the row returned on `CompactRun`).
+  `AgentSession::compact` runs it after the rebuild; every surface
+  broadcasts the pair: the daemon wire `compact` (`CompactionManager`:
+  store persist + `session_event` frames), the daemon `/compact` session
+  command, the turn-boundary requested arm, threshold auto-compaction, the
+  overflow arm (all `EngineEvent::CustomMessage`, which the worker persists
+  + frames), and pa-cli print json mode (`message_start`/`message_end`
+  before `compaction_end`).
+- Known adjacent gap (documented, not fixed here): TS `createDefaultRuntimeFactory`
+  sets `prewarmIpythonKernel: true` — every daemon-hosted main session boots
+  its kernel in the background at creation (subagents stay lazy) — so a TS
+  daemon session has a running kernel even without ipython tool use, while
+  the Rust daemon keeps the lazy first-call start. A battery session (no
+  ipython turn) therefore lands no notice row on the Rust side; a session
+  that ran the ipython tool behaves identically on both. Kernel prewarm is a
+  separate lane (kernel lifecycle/telemetry timing).
+- Verifiers: pa-core unit tests (content shape arms, row wire shape,
+  capture guards, the append point after the compaction entry + live
+  context, the back-to-back second compaction RUNNING again with a running
+  kernel and skipping "Already compacted" without one), the battery f7
+  kernel-notice differential (daemon + mock provider: one scripted ipython
+  tool call boots the kernel, two back-to-back wire `compact` commands —
+  both sides must land the notice rows after each compaction entry and
+  succeed on the second compact, with identical update-mode summarizer
+  requests).

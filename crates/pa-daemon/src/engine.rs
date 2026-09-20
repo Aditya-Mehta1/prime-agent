@@ -541,6 +541,12 @@ pub struct CompactionRun {
     /// digest snapshot), serialized from the engine's compaction entry.
     /// Null for scripted engines (a test seam with no real entry).
     pub entry: Value,
+    /// The post-compaction `ipython_state` notice in its wire message form
+    /// (`role: "custom"`) when the engine's kernel was running (TS
+    /// `_syncKernelStateAfterCompaction`): already durable in the engine
+    /// session and the live context; the worker persists it to the session
+    /// store and broadcasts its `message_start`/`message_end` pair.
+    pub ipython_state: Option<Value>,
 }
 
 /// How one compaction run ended (TS `compact` outcomes: result, skip,
@@ -983,6 +989,7 @@ impl SessionEngine for ScriptedEngine {
                     }),
                     usage: None,
                     entry: Value::Null,
+                    ipython_state: None,
                 },
             };
         };
@@ -1017,6 +1024,7 @@ impl SessionEngine for ScriptedEngine {
                 result,
                 usage: entry.get("usage").cloned().filter(|usage| !usage.is_null()),
                 entry: Value::Null,
+                ipython_state: None,
             },
         }
     }

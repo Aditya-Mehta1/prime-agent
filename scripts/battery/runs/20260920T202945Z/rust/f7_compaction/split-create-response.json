@@ -1,0 +1,43 @@
+{
+ "command": "create",
+ "data": {
+  "activeSessionId": "b621a7dc065a",
+  "activity": "idle",
+  "attachedClients": 0,
+  "created": "2026-09-20T20:30:14.294Z",
+  "cwd": "/home/ubuntu/lane-worktrees/ipython-state/scripts/battery/runs/20260920T202945Z/rust/work",
+  "hasRegisteredCronJob": false,
+  "id": "b621a7dc065a",
+  "isBashRunning": false,
+  "isCompacting": false,
+  "isSessionActive": false,
+  "isStreaming": false,
+  "lastActivityAt": "2026-09-20T20:30:14.395Z",
+  "lifecycle": "draft",
+  "messageCount": 0,
+  "model": {
+   "id": "mock-1",
+   "name": "Mock 1",
+   "provider": "prime-inference",
+   "reasoning": false
+  },
+  "modified": "2026-09-20T20:30:14.395Z",
+  "rlmDepth": 0,
+  "runtimeKind": "top-level",
+  "sessionActions": {
+   "followUps": [],
+   "queuedCount": 0,
+   "steering": []
+  },
+  "sessionFile": "/home/ubuntu/lane-worktrees/ipython-state/scripts/battery/runs/20260920T202945Z/rust/agent/sessions/01a0c083-2116-7391-9da9-5fa9b3f778f2.jsonl",
+  "sessionId": "01a0c083-2116-7391-9da9-5fa9b3f778f2",
+  "sessionName": "battery-split",
+  "thinkingLevel": "off",
+  "unfinishedActionCount": 0,
+  "workerPid": 1368208,
+  "workerState": "ready"
+ },
+ "id": "sc1",
+ "success": true,
+ "type": "response"
+}

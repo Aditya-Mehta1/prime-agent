@@ -384,7 +384,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     if !tools.iter().any(|tool| tool.name() == "ipython") {
         let definition = crate::tools::ipython::create_ipython_tool_definition(
             &cwd.to_string_lossy(),
-            super::runtime_wiring::ipython_tool_options(provisioner),
+            super::runtime_wiring::ipython_tool_options(provisioner.clone()),
         );
         tools.push(Arc::new(
             crate::session_engine::tool_bridge::ToolDefinitionBridge::new(definition),
@@ -545,6 +545,16 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             .keep_recent_tokens
             .unwrap_or(crate::session_engine::compaction::DEFAULT_KEEP_RECENT_TOKENS),
     });
+    // The kernel-state probe behind the post-compaction `ipython_state`
+    // notice (TS `AgentSession._ipythonKernelProvisioner`): the engine's
+    // provisioner is the session's kernel whether it added the `ipython`
+    // tool itself or the caller supplied one backed by this provisioner.
+    // A provisioner whose kernel never started reports no running kernel,
+    // so the notice stays dormant until a kernel exists.
+    let kernel_state_probe: std::sync::Arc<
+        dyn crate::session_engine::ipython_state::CompactionKernelProbe,
+    > = provisioner.clone();
+    session.set_kernel_state_probe(Some(kernel_state_probe));
 
     // Bind the turn-boundary runtime the `compact.*`/`refine.*` handlers
     // probe (turn-active state, usage estimate, compaction preparation).

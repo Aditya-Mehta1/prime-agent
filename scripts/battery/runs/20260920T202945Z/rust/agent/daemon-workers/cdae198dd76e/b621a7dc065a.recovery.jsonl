@@ -1,0 +1,8 @@
+{"activeSessionId":"b621a7dc065a","busy":true,"operation":"create","recordedAt":"2026-09-20T20:30:14.450Z","sessionFile":"/home/ubuntu/lane-worktrees/ipython-state/scripts/battery/runs/20260920T202945Z/rust/agent/sessions/01a0c083-2116-7391-9da9-5fa9b3f778f2.jsonl","sessionId":"01a0c083-2116-7391-9da9-5fa9b3f778f2"}
+{"active_session_id":"b621a7dc065a","follow_up":[],"recorded_at":"2026-09-20T20:30:14.518Z","steering":["seed turn"],"type":"queue_snapshot","version":1}
+{"active_session_id":"b621a7dc065a","follow_up":["turn two"],"recorded_at":"2026-09-20T20:30:14.734Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"b621a7dc065a","follow_up":["turn two"],"recorded_at":"2026-09-20T20:30:14.744Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"b621a7dc065a","follow_up":["turn three"],"recorded_at":"2026-09-20T20:30:14.919Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"b621a7dc065a","follow_up":["turn three"],"recorded_at":"2026-09-20T20:30:14.943Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"b621a7dc065a","follow_up":[],"recorded_at":"2026-09-20T20:30:15.229Z","steering":[],"type":"queue_snapshot","version":1}
+{"activeSessionId":"b621a7dc065a","busy":false,"operation":"shutdown","recordedAt":"2026-09-20T20:30:43.839Z","sessionFile":"/home/ubuntu/lane-worktrees/ipython-state/scripts/battery/runs/20260920T202945Z/rust/agent/sessions/01a0c083-2116-7391-9da9-5fa9b3f778f2.jsonl","sessionId":"01a0c083-2116-7391-9da9-5fa9b3f778f2"}

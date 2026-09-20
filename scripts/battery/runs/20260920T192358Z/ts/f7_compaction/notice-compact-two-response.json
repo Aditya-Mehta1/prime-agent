@@ -1,0 +1,15 @@
+{
+ "id": "nk2",
+ "type": "response",
+ "command": "compact",
+ "success": true,
+ "data": {
+  "summary": "the notice second compaction summary",
+  "firstKeptEntryId": "e0c60ccb",
+  "tokensBefore": 179,
+  "details": {
+   "readFiles": [],
+   "modifiedFiles": []
+  }
+ }
+}

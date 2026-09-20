@@ -19,6 +19,7 @@ pub mod goal_driver;
 pub mod harness_digest;
 pub mod headless;
 pub mod host_requests;
+pub mod ipython_state;
 pub mod messages;
 pub mod provider_adapter;
 pub mod provider_failover;
@@ -121,6 +122,10 @@ pub struct AgentSession {
     /// The resolved auto-refine gates (TS `getAutoRefineSettings`); the
     /// turn-boundary compact trigger reads them.
     auto_refine: refine::AutoRefineGates,
+    /// The kernel-state probe behind the post-compaction `ipython_state`
+    /// notice (TS `_ipythonKernelProvisioner`): `None` in sessions without
+    /// a kernel (verification harnesses) — no notice lands.
+    kernel_state: Option<std::sync::Arc<dyn ipython_state::CompactionKernelProbe>>,
 }
 
 impl AgentSession {
@@ -168,6 +173,7 @@ impl AgentSession {
             compaction: compaction::CompactionSettings::default(),
             auto_refine_allowed: false,
             auto_refine: refine::AutoRefineGates::default(),
+            kernel_state: None,
         };
         this.ensure_harness_digest_context().await?;
         Ok(this)
@@ -189,6 +195,18 @@ impl AgentSession {
     pub fn set_auto_refine(&mut self, allowed: bool, gates: refine::AutoRefineGates) {
         self.auto_refine_allowed = allowed;
         self.auto_refine = gates;
+    }
+
+    /// Bind the kernel-state probe behind the post-compaction
+    /// `ipython_state` notice (the engine wiring hands over the session's
+    /// kernel provisioner, TS `AgentSession._ipythonKernelProvisioner`).
+    /// Without a probe no notice lands: sessions without a kernel keep
+    /// the pre-notice compaction flow.
+    pub fn set_kernel_state_probe(
+        &mut self,
+        probe: Option<std::sync::Arc<dyn ipython_state::CompactionKernelProbe>>,
+    ) {
+        self.kernel_state = probe;
     }
 
     /// Whether the session may run auto-refinement (TS
@@ -304,7 +322,7 @@ impl AgentSession {
         // commit: relevance terms from the live (pre-compaction) context,
         // harness state read fresh from disk when the snapshot renders.
         let digest_inputs = self.harness_digest_inputs().await;
-        let outcome = {
+        let mut outcome = {
             let mut session = self.session.lock().await;
             crate::session_engine::compact_session::execute_compaction(
                 &mut session,
@@ -335,6 +353,24 @@ impl AgentSession {
             })
             .collect();
         self.agent.set_messages(loop_messages).await;
+        // TS `_performCompaction` ends with
+        // `_syncKernelStateAfterCompaction()`: a kernel that survived the
+        // compaction gets its persistence notice — a durable
+        // `ipython_state` row that is also model context, and the row that
+        // keeps a back-to-back second `/compact` preparing (update mode)
+        // instead of skipping as already compacted. The row rides the run
+        // so each surface broadcasts it as a `message_start` /
+        // `message_end` pair.
+        let kernel_state = match self.kernel_state.as_ref() {
+            Some(probe) => {
+                ipython_state::sync_after_compaction(probe.as_ref(), &self.session, &self.agent)
+                    .await
+            }
+            None => None,
+        };
+        if let CompactOutcome::Ran(run) = &mut outcome {
+            run.ipython_state = kernel_state;
+        }
         Ok(outcome)
     }
 
@@ -656,7 +692,7 @@ fn user_prompt_message(text: &str, images: &[pa_agent::types::ImageContent]) -> 
 /// Convert a session message to its loop form via the shared wire shape
 /// (custom rows ride the loop's custom variant; its converter filters them
 /// out of the provider request).
-fn session_message_to_loop(message: &SessionAgentMessage) -> Option<AgentMessage> {
+pub(crate) fn session_message_to_loop(message: &SessionAgentMessage) -> Option<AgentMessage> {
     serde_json::from_value(serde_json::to_value(message).ok()?).ok()
 }
 

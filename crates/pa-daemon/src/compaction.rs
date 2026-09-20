@@ -110,6 +110,14 @@ impl CompactionManager {
         }
         if let CompactionOutcome::Compacted { run } = &outcome {
             self.persist_compaction(run, custom_instructions.as_deref());
+            // The post-compaction kernel notice (TS
+            // `_syncKernelStateAfterCompaction` runs inside
+            // `_performCompaction`, so its `message_start`/`message_end`
+            // pair precedes `compaction_end` on the wire): persist the
+            // durable row and broadcast the pair.
+            if let Some(message) = &run.ipython_state {
+                self.persist_and_emit_ipython_state(message);
+            }
         }
         let end = compaction_end_event(&outcome, custom_instructions.as_deref());
         let _ = self.emit_session_event(end);
@@ -225,6 +233,34 @@ impl CompactionManager {
         };
         fields["firstKeptEntryId"] = json!(first_kept_entry_id);
         let _ = store.persist_entry("compaction", fields);
+    }
+
+    /// Persist the post-compaction `ipython_state` row to the session store
+    /// and broadcast its `message_start`/`message_end` pair (TS
+    /// `appendCustomMessageEntry` + the `_emit` pair inside
+    /// `_performCompaction`). The engine's in-memory session already holds
+    /// the row; the worker's store owns the durable file.
+    fn persist_and_emit_ipython_state(&self, message: &Value) {
+        {
+            let mut core = self.core.lock().unwrap();
+            if let Some(store) = core.store.as_mut() {
+                let _ = store.persist_entry(
+                    "custom_message",
+                    json!({
+                        "customType": message.get("customType").cloned().unwrap_or(Value::Null),
+                        "content": message.get("content").cloned().unwrap_or(Value::Null),
+                        "display": message.get("display").cloned().unwrap_or(Value::Bool(true)),
+                        "details": message.get("details").cloned().unwrap_or(Value::Null),
+                    }),
+                );
+            }
+        }
+        for event_type in ["message_start", "message_end"] {
+            let _ = self.emit_session_event(json!({
+                "type": event_type,
+                "message": message,
+            }));
+        }
     }
 
     /// Sequence and broadcast one compaction `session_event` frame.
@@ -432,6 +468,7 @@ mod tests {
             }),
             usage: None,
             entry: Value::Null,
+            ipython_state: None,
         };
         assert_eq!(
             compaction_start_event("manual", Some("focus on the goal")),

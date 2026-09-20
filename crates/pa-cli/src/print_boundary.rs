@@ -545,6 +545,7 @@ impl TurnBoundary {
                 // compaction schedules the compact-trigger auto-refine for
                 // the next serialized checkpoint (or the disposal drain).
                 self.compact_auto_refine_pending = true;
+                self.emit_ipython_state_row(&run);
                 self.emit_json(compaction_end_success_event(
                     CompactionOutcomeReason::Requested.wire(),
                     &run,
@@ -610,6 +611,7 @@ impl TurnBoundary {
                             // compact-trigger auto-refine for the next
                             // serialized checkpoint (or the disposal drain).
                             self.compact_auto_refine_pending = true;
+                            self.emit_ipython_state_row(&run);
                             self.emit_json(compaction_end_success_event(
                                 CompactionOutcomeReason::Threshold.wire(),
                                 &run,
@@ -786,6 +788,7 @@ impl TurnBoundary {
         match outcome {
             Ok(CompactOutcome::Ran(run)) => {
                 self.compact_auto_refine_pending = true;
+                self.emit_ipython_state_row(&run);
                 // Adoption telemetry (TS `compaction_end` handling counts
                 // every completed compaction into the active run).
                 if let Some(telemetry) = engine.telemetry.as_ref() {
@@ -849,6 +852,24 @@ impl TurnBoundary {
                 .await;
                 Ok(OverflowOutcome::Finished)
             }
+        }
+    }
+
+    /// The post-compaction kernel notice (TS
+    /// `_syncKernelStateAfterCompaction` runs inside `_performCompaction`):
+    /// json mode streams its `message_start`/`message_end` pair before the
+    /// `compaction_end` event, exactly like the TS session's `_emit` pair;
+    /// text mode keeps the row as durable bookkeeping (`display: false`).
+    fn emit_ipython_state_row(&self, run: &CompactRun) {
+        if !self.json_mode {
+            return;
+        }
+        let Some(row) = &run.ipython_state else {
+            return;
+        };
+        let value = crate::headless_autonomous::stop_row_wire_value(row);
+        for event_type in ["message_start", "message_end"] {
+            (self.sink)(&json!({ "type": event_type, "message": value }));
         }
     }
 

@@ -103,6 +103,11 @@ fn to_llm_messages(messages: &[AgentMessage]) -> Vec<Message> {
 pub struct CompactRun {
     pub result: CompactionResult,
     pub entry: pa_types::session::CompactionEntry,
+    /// The post-compaction `ipython_state` kernel-persistence notice, when a
+    /// kernel was running (TS `_syncKernelStateAfterCompaction`): the row is
+    /// already durable and in the live context; surfaces broadcast it as a
+    /// `message_start`/`message_end` pair.
+    pub ipython_state: Option<pa_types::session::CustomMessage>,
 }
 
 /// What `/compact` did. `Skipped` carries the TS `CompactionSkippedError`
@@ -387,7 +392,11 @@ pub async fn execute_compaction(
     // snapshot ride on the durable row alongside the summary, boundary,
     // and token count.
     session.append_compaction(entry.clone());
-    Ok(CompactOutcome::Ran(Box::new(CompactRun { result, entry })))
+    Ok(CompactOutcome::Ran(Box::new(CompactRun {
+        result,
+        entry,
+        ipython_state: None,
+    })))
 }
 
 /// Rebuild the agent's message list after compaction (summary-first context).

@@ -78,6 +78,20 @@ pub(crate) fn run_session_command(
             return Some(execution);
         }
     };
+    // The post-compaction kernel notice goes out between the compaction
+    // start and its settled end (TS `_syncKernelStateAfterCompaction` runs
+    // inside `_performCompaction`, so the `message_start`/`message_end`
+    // pair precedes `compaction_end` on the wire); the worker persists
+    // the row with the event.
+    if let Some(message) = execution
+        .compaction
+        .as_ref()
+        .and_then(|compaction| compaction.ipython_state.as_ref())
+    {
+        if !emit(EngineEvent::CustomMessage(custom_message_value(message))) {
+            return None;
+        }
+    }
     // The settled `compaction_end` precedes any failure result row (TS
     // `compact()` emits the event before the queued-command catch arm
     // appends `Command failed: ...`).

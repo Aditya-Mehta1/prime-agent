@@ -1,0 +1,15 @@
+{
+ "command": "compact",
+ "data": {
+  "details": {
+   "modifiedFiles": [],
+   "readFiles": []
+  },
+  "firstKeptEntryId": "ccb1e2bb",
+  "summary": "the notice first compaction summary\n\n---\n\n**Turn Context (split turn):**\n\nthe notice second compaction summary",
+  "tokensBefore": 110
+ },
+ "id": "nk1",
+ "success": true,
+ "type": "response"
+}
