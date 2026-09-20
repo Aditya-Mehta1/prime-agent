@@ -257,6 +257,12 @@ pub(crate) struct SessionUi {
     /// "clear", taken by the second press inside the 500ms window.
     escape_repeat_action: Option<&'static str>,
     escape_repeat_until: Option<Instant>,
+    /// `app.suspend` (default ctrl+z, TS `handleCtrlZ`) requested the
+    /// process-group suspend: the interactive loop performs the cycle
+    /// right after dispatch, because the renderer is the loop's terminal.
+    suspend_requested: bool,
+    /// Whether this run already reported its first suspend cycle.
+    suspend_adoption_emitted: bool,
 }
 
 impl SessionUi {
@@ -338,6 +344,8 @@ impl SessionUi {
             exit_guard: crate::exit_guard::ExitGuard::new(),
             escape_repeat_action: None,
             escape_repeat_until: None,
+            suspend_requested: false,
+            suspend_adoption_emitted: false,
         };
         session
             .attach_session(&active_session_id)
@@ -2560,6 +2568,29 @@ impl SessionUi {
         }
     }
 
+    /// Take a pending `app.suspend` request (TS `handleCtrlZ`): the
+    /// interactive loop performs the process-group suspend cycle; only
+    /// the loop owns the renderer that hands the terminal over.
+    pub(crate) fn take_suspend_request(&mut self) -> bool {
+        std::mem::take(&mut self.suspend_requested)
+    }
+
+    /// Report the run's first suspend cycle (`tui suspend used`),
+    /// fire-and-forget like the scroll event: the keypress never waits on
+    /// the telemetry flush. `outcome` is `resumed` (the SIGCONT
+    /// continuation restored the terminal) or `failed` (the cycle errored).
+    pub(crate) fn track_suspend_used(&mut self, outcome: &'static str) {
+        if self.suspend_adoption_emitted {
+            return;
+        }
+        self.suspend_adoption_emitted = true;
+        if let Some(telemetry) = self.telemetry.clone() {
+            tokio::spawn(async move {
+                telemetry.suspend_used(outcome).await;
+            });
+        }
+    }
+
     /// Report a builtin client-command submission (`agent command used`),
     /// fire-and-forget like the scroll event: the command's handling never
     /// waits on the telemetry flush.
@@ -2698,6 +2729,21 @@ impl SessionUi {
         {
             view.shortcut_guide = Some(crate::hotkeys::shortcut_guide(view.editor.keybindings()));
             self.dirty = true;
+            return Ok(());
+        }
+        // TS `app.suspend` (default ctrl+z, `handleCtrlZ`): hand the
+        // terminal to the shell and stop the process group; the loop
+        // performs the cycle right after dispatch, and the SIGCONT
+        // continuation re-applies raw mode, the alt screen, and SGR
+        // mouse tracking (TS `ui.start()` + `applyFullscreen(true)`).
+        // Platforms without a stoppable process group show the TS win32
+        // status instead of suspending.
+        if view.editor.keybindings().matches(&id, "app.suspend") {
+            if crate::suspend::supported() {
+                self.suspend_requested = true;
+            } else {
+                self.note("Suspend to background is not supported on Windows", view);
+            }
             return Ok(());
         }
         if view.editor.keybindings().matches(&id, "app.tools.expand") {

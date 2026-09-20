@@ -52,6 +52,12 @@ fn write_disable(out: &mut Stdout) -> Result<()> {
     Ok(())
 }
 
+/// The tracking flag is process-global state, so every test that
+/// toggles it serializes through one lock (the suspend-cycle tests share
+/// it; the headless e2e binaries hold their own locks, one per process).
+#[cfg(test)]
+pub(crate) static STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -61,6 +67,10 @@ mod tests {
         // stdout under `cargo test` is not a terminal (or is, depending on
         // the harness); the sequence write is gated on `is_terminal`, so
         // the round-trip asserts state only.
+        let _lock = match STATE_TEST_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let mut out = std::io::stdout();
         let was_active = active();
         if was_active {

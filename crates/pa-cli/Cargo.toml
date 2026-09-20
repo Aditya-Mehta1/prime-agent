@@ -29,4 +29,5 @@ base64 = "0.22"
 libc = "0.2"
 futures = { workspace = true }
 crossterm = "0.28"
+nix = { version = "0.29", features = ["term", "signal", "fs"] }
 url = "2"

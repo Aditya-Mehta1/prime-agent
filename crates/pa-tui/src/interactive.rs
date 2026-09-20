@@ -102,6 +102,10 @@ pub trait InteractionTelemetry: Send + Sync {
     /// A submission parked in the follow-up queue behind a running turn:
     /// `lane` is `steering` (Enter) / `follow_up` (the follow-up key).
     fn queued_input(&self, lane: &'static str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    /// The run's first `app.suspend` cycle (`tui suspend used`): `outcome`
+    /// is `resumed` (the SIGCONT continuation restored the terminal) /
+    /// `failed` (the cycle errored).
+    fn suspend_used(&self, outcome: &'static str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 /// Persistence for the first-run onboarding answers. The TUI crate owns
@@ -654,6 +658,34 @@ pub async fn run_interactive(
             match input {
                 UiInput::Key(key) => {
                     session.handle_key(key, &mut view, &mut running).await?;
+                    // TS `handleCtrlZ` (`app.suspend`, default ctrl+z):
+                    // hand the terminal to the shell and stop the process
+                    // group; execution continues here once the user
+                    // foregrounds the process (SIGCONT), where the cycle
+                    // re-applies raw mode, the alt screen, and SGR mouse
+                    // tracking (TS `ui.start()` + `applyFullscreen(true)`).
+                    // Headless runs keep no terminal renderer (TS never
+                    // registers the action without one), so the request is
+                    // observed and dropped.
+                    if session.take_suspend_request() && renderer.is_terminal_mut().is_some() {
+                        match crate::suspend::suspend_cycle(
+                            &mut crate::suspend::ProcessSignals,
+                            &mut TerminalHandoff {
+                                renderer: &mut renderer,
+                                view: &mut view,
+                            },
+                        ) {
+                            Ok(()) => session.track_suspend_used("resumed"),
+                            Err(error) => {
+                                session.track_suspend_used("failed");
+                                session.error_row(&format!("{error:#}"), &mut view);
+                                // Try to take the terminal back so the run
+                                // stays usable; if that also fails, the
+                                // draw below surfaces the broken frame.
+                                let _ = renderer.resume();
+                            }
+                        }
+                    }
                 }
                 UiInput::Paste(text) => {
                     session.handle_paste(&text, &mut view);
@@ -1133,6 +1165,25 @@ enum Renderer {
         height: u16,
         frames: Vec<String>,
     },
+}
+
+/// The renderer handoff of one suspend cycle (TS `handleCtrlZ`):
+/// `stop` hands the terminal to the shell (SGR mouse tracking off, alt
+/// screen left and flushed into native scrollback, raw mode off);
+/// `resume` takes it back after SIGCONT with every mode re-applied.
+struct TerminalHandoff<'a> {
+    renderer: &'a mut Renderer,
+    view: &'a mut AgentView,
+}
+
+impl crate::suspend::SuspendTerminal for TerminalHandoff<'_> {
+    fn stop(&mut self) -> Result<()> {
+        self.renderer.suspend(self.view)
+    }
+
+    fn resume(&mut self) -> Result<()> {
+        self.renderer.resume()
+    }
 }
 
 impl Renderer {

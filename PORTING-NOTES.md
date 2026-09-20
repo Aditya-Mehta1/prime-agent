@@ -1731,3 +1731,75 @@ deliberately left out (TS `prompt-highlight.ts`):
   tools section (structurally equal, `ipython` registered), the
   `renderedTools` omission, and `systemPrompt` presence (content
   superseded by the layered prompt).
+## Suspend-to-background (`app.suspend`, default ctrl+z) — TS `handleCtrlZ`
+
+- TS ground truth (interactive-mode.ts `handleCtrlZ`, tui.ts `stop`/
+  `enterFullscreen`): Ctrl+Z installs a no-op `SIGINT` listener for the
+  suspended window (Ctrl+C at the shell must not kill the backgrounded
+  app), stops the TUI (`ui.stop()`: fullscreen flush to native
+  scrollback, mouse tracking released through
+  `syncFullscreenMouseTracking`, alt screen left), then
+  `process.kill(0, "SIGTSTP")` stops the process group. The one-shot
+  `SIGCONT` handler removes the SIGINT listener, restarts the TUI
+  (`ui.start()`), re-enters fullscreen (`applyFullscreen(true)` — which
+  re-applies SGR mouse tracking), and forces a full render. win32 shows
+  the status "Suspend to background is not supported on Windows". No
+  other state is restored (no focus bookkeeping).
+- Port: `pa-tui/src/suspend.rs` owns the cycle
+  (`suspend_cycle(signals, terminal)`): SIGINT shielded → terminal stop
+  → `kill(0, SIGTSTP)` → (the process stops; SIGCONT resumes execution
+  inside the same call) → shield restored → terminal resume. Execution
+  resuming inside the call replaces TS's persistent SIGCONT listener
+  (Rust has no event-loop keep-alive requirement). The terminal side is
+  the renderer's existing suspend/resume pair (the same one
+  `/mcp login` uses): mouse tracking off + flush + raw-mode-off, then
+  raw mode + alt screen + mouse tracking (per the `terminal.fullscreenMouse`
+  setting) + full repaint. The session key dispatch requests the cycle
+  (`session_ui` sets the flag; the loop owns the renderer); failure
+  surfaces an error row and re-attempts the resume instead of the TS
+  throw (a broken terminal state is the worse outcome), tracked as
+  `tui suspend used` outcome `failed`.
+- SIGINT shield subtlety (real port bug found by the e2e): TS installs a
+  no-op *handler*, not `SIG_IGN`. The kernel queues a signal sent to a
+  *stopped* process and evaluates the disposition at delivery, so a
+  `SIG_IGN` shield would let a pending SIGINT kill the process right
+  after the resume restored the default disposition mid-resume. The
+  pa-types platform wall (`platform::process::{ignore_sigint_for_suspend,
+  restore_default_sigint}`) installs a no-op handler; unit-tested by
+  querying the disposition through `sigaction` itself (the sandbox
+  kernel — gVisor — does not surface /proc's signal-mask lines at all,
+  which is also why /proc-based evidence from an earlier probe run was
+  taken on the box).
+- Heartbeat-manager note (owner of the overlay): TS's `suspendFullscreenMouse`
+  overlay option disables mouse tracking while the overlay is visible and
+  re-applies it through the same `syncFullscreenMouseTracking` seam; when
+  the heartbeat manager overlay is ported, route it through
+  `mouse_tracking::{enable,disable}` the same way (out of scope here).
+- Verifiers:
+  - pa-tui unit tests: the cycle's sequencing (SIGINT bracket, cleanup
+    on failure) and the mouse-tracking release/re-apply through the real
+    seam (a real SIGTSTP cannot stop the test process itself).
+  - pa-types unit test: the shield dispositions are really installed and
+    restored (handler while suspended, default after).
+  - pa-cli `tests/suspend_signal_e2e.rs`: the real product path on a pty
+    in a child process group — startup mouse enable, Ctrl+Z releasing
+    tracking + flushing scrollback, a real SIGTSTP group stop
+    (waitpid-verified), SIGCONT resuming the process and repainting, and
+    the resumed editor rendering typed text.
+  - strace evidence (recorded during the harness bring-up): the child's
+    post-continue resume writes the alt-screen-enter + mouse-enable
+    sequences byte-for-byte before its repaint.
+  - Harness findings worth keeping (pa-cli test doc-comment): the child
+    is a session leader in its own group with no controlling terminal,
+    runs a current-thread runtime (a multithreaded runtime's parked
+    workers can lose futex wakeups across a stop/continue), the pty is
+    drained to silence before SIGCONT (the suspend's 2.5KB scrollback
+    flush can fill the kernel-side pty buffer and the pty driver silently
+    drops writes that find it full), and the post-continue assertion
+    pins the repaint rather than the first re-apply bytes (this sandbox's
+    pty still nondeterministically eats the first post-continue writes).
+    A SIGINT sent to the *stopped* child queues until SIGCONT and is
+    delivered while the app is mid-resume — that interaction destabilizes
+    the terminal reader in this harness, and a real shell cannot produce
+    it anyway (Ctrl+C goes to the shell, the foreground process), so the
+    shield window is unit-covered instead of e2e-covered.

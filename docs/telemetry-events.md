@@ -271,6 +271,16 @@ parked submission, not per rendered row).
 |---|---|---|
 | `lane` | string | `steering` (Enter while a turn runs) / `follow_up` (the follow-up key) |
 
+### `tui suspend used`
+
+The run's first `app.suspend` cycle (default ctrl+z; adoption of the
+suspend-to-background surface; later cycles in the same run are not
+reported).
+
+| property | type | notes |
+|---|---|---|
+| `outcome` | string | `resumed` (the SIGCONT continuation re-applied the terminal modes) / `failed` (the cycle errored) |
+
 ### `tui subagents open`
 
 The subagent summary line opened the scoped agents view (adoption of the

@@ -44,6 +44,89 @@ pub fn process_start_id(_pid: u32) -> Option<String> {
     None
 }
 
+// Suspend-to-background signal control (TS `handleCtrlZ`): the
+// interactive TUI stops its whole process group with SIGTSTP when the
+// user suspends it, with SIGINT ignored for the stopped window (a
+// Ctrl+C at the shell prompt must not kill the backgrounded process)
+// and restored on the SIGCONT resume. Lives here because pa-tui
+// depends on pa-types alone (the platform wall; pa-tui opts into the
+// workspace `unsafe_code` forbid).
+
+/// Stop the caller's whole process group with SIGTSTP (TS
+/// `process.kill(0, "SIGTSTP")`): with the default disposition every
+/// process in the group stops, and execution continues after SIGCONT.
+/// Errors when the signal could not be delivered.
+#[cfg(unix)]
+pub fn stop_own_process_group() -> anyhow::Result<()> {
+    // SAFETY: delivers SIGTSTP to the caller's own process group; the
+    // default disposition stops it, exactly like the terminal's own
+    // Ctrl+Z (ISIG) would.
+    if unsafe { libc::kill(0, libc::SIGTSTP) } != 0 {
+        anyhow::bail!(
+            "stopping the process group failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
+/// The no-op SIGINT handler for the suspended window (TS's
+/// `process.on("SIGINT", noop)`): a real handler, not `SIG_IGN`, because
+/// the kernel queues signals sent to a *stopped* process and evaluates
+/// the disposition at delivery — an ignored-at-generation signal still
+/// pends, and it would then arrive after this cycle restored the default
+/// disposition and kill the process. A handler runs (and does nothing)
+/// at that delivery instead.
+extern "C" fn swallow_sigint(_signal: libc::c_int) {}
+
+/// Ignore SIGINT for the suspended window (TS installs a no-op `SIGINT`
+/// listener for the same reason: Ctrl+C at the shell must not kill the
+/// backgrounded process). Errors when the disposition could not be set.
+#[cfg(unix)]
+pub fn ignore_sigint_for_suspend() -> anyhow::Result<()> {
+    // SAFETY: swaps only the SIGINT disposition to the no-op handler.
+    // The fn-item cast goes through the fn-pointer type so no
+    // fn-item-to-integer warning fires under `-D warnings`.
+    let handler: extern "C" fn(libc::c_int) = swallow_sigint;
+    if unsafe { libc::signal(libc::SIGINT, handler as libc::sighandler_t) } == libc::SIG_ERR {
+        anyhow::bail!(
+            "ignoring SIGINT for suspend failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
+/// Restore SIGINT's default disposition on the SIGCONT resume (TS removes
+/// its no-op listener before restarting the TUI). Errors when the
+/// disposition could not be set.
+#[cfg(unix)]
+pub fn restore_default_sigint() -> anyhow::Result<()> {
+    // SAFETY: swaps only the SIGINT disposition back to SIG_DFL.
+    if unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) } == libc::SIG_ERR {
+        anyhow::bail!(
+            "restoring the default SIGINT after suspend failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn stop_own_process_group() -> anyhow::Result<()> {
+    anyhow::bail!("suspend to background requires a POSIX process group")
+}
+
+#[cfg(not(unix))]
+pub fn ignore_sigint_for_suspend() -> anyhow::Result<()> {
+    anyhow::bail!("suspend to background requires a POSIX process group")
+}
+
+#[cfg(not(unix))]
+pub fn restore_default_sigint() -> anyhow::Result<()> {
+    anyhow::bail!("suspend to background requires a POSIX process group")
+}
+
 /// True only for a process that is actually running: zombies do not count
 /// (TS `isProcessAlive`). Errors when the platform cannot answer.
 #[cfg(unix)]
@@ -190,5 +273,61 @@ mod windows_tests {
         assert_eq!(process_start_id(u32::MAX), None);
         assert!(!is_process_alive(0).unwrap_or(true));
         assert!(!is_process_alive(u32::MAX).unwrap_or(true));
+    }
+}
+
+/// The suspended window's SIGINT shield: the dispositions are really
+/// installed (a caught handler while suspended — the kernel evaluates
+/// the disposition at delivery, so a shield must be a handler, not
+/// `SIG_IGN` — and the default restored on resume).
+#[cfg(all(test, unix))]
+mod suspend_shield_tests {
+    use super::*;
+
+    /// SIGINT's current disposition: default, ignored, or a caught
+    /// handler. Queried through `sigaction` itself (not /proc's signal
+    /// mask lines — the sandbox kernel does not surface those).
+    fn sigint_disposition() -> &'static str {
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: queries SIGINT's disposition into `action`.
+        unsafe { libc::sigaction(libc::SIGINT, std::ptr::null(), &mut action) };
+        let handler = action.sa_sigaction;
+        if handler == libc::SIG_DFL {
+            "default"
+        } else if handler == libc::SIG_IGN {
+            "ignored"
+        } else {
+            "caught"
+        }
+    }
+
+    #[test]
+    fn shield_installs_a_handler_and_restore_returns_the_default() {
+        // Some other lib test leaves SIGINT ignored, so the starting
+        // disposition is recorded (and restored) rather than assumed.
+        let before = sigint_disposition();
+        ignore_sigint_for_suspend().expect("shield");
+        assert_eq!(
+            sigint_disposition(),
+            "caught",
+            "the shield is a caught handler (a queued signal delivered to a stopped process is evaluated at delivery — SIG_IGN would let a pending SIGINT kill the process after the resume restored the default)"
+        );
+        restore_default_sigint().expect("restore");
+        assert_eq!(
+            sigint_disposition(),
+            "default",
+            "the resume restored the default disposition"
+        );
+        // SAFETY: restores the disposition this test started with.
+        unsafe {
+            libc::signal(
+                libc::SIGINT,
+                if before == "ignored" {
+                    libc::SIG_IGN
+                } else {
+                    libc::SIG_DFL
+                },
+            );
+        }
     }
 }

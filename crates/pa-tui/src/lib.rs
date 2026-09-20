@@ -53,6 +53,7 @@ pub mod session;
 pub mod session_ui;
 pub mod snapshot;
 pub mod subagents;
+mod suspend;
 mod terminal_image;
 pub mod theme;
 pub mod tool_card;
