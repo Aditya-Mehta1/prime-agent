@@ -84,9 +84,11 @@ async function observation() {
   const digest = await ewramDigest();
   const changed = digest !== lastDigest;
   lastDigest = digest;
-  const fields = { ticks: tickCount, ram_digest: digest, ...(await readMemoryFields()) };
+  // No frame/tick counter in the observation: a monotonic counter would make
+  // every observation digest unique and defeat repeated-state detection.
+  const fields = { ram_digest: digest, ...(await readMemoryFields()) };
   const text = [
-    `Frame ${tickCount}. EWRAM digest ${digest} (${changed ? "changed since last look" : "unchanged since last look"}).`,
+    `EWRAM digest ${digest} (${changed ? "changed since last look" : "unchanged since last look"}).`,
     ...config.memoryReads.map((read) => `${read.label}: ${fields[read.label]}`),
     "Game screen reference: the adapter can capture PNG screenshots; the action model here works from RAM signals and history.",
   ]

@@ -41,14 +41,18 @@ node packages/coding-agent/examples/system-router-gba/demo.mjs \
 
 ## Run (macOS, adapter in a Linux container)
 
+From the repository root, with the ROM copied or symlinked to `game.gba` in its directory:
+
 ```sh
 npm run build
 ROM_DIR=$(dirname "$SYSTEM_ROUTER_ROM")
-node demo.mjs \
-  --rom "$SYSTEM_ROUTER_ROM" \
+node packages/coding-agent/examples/system-router-gba/demo.mjs \
+  --rom /roms/game.gba \
   --plan press_a,wait,press_start,finish \
-  --adapter "$(printf '["docker","run","--rm","-i","--platform","linux/amd64","-v","%s:/roms:ro","-e","SYSTEM_ROUTER_ROM=/roms/game.gba","-v","%s:/app","-w","/app","node:22-slim","sh","-c","cd /app/examples/system-router-gba && npm install node-mgba@0.2.9 && node adapter.mjs"]' "$ROM_DIR" "$PWD")"
+  --adapter "$(printf '["docker","run","--rm","-i","--platform","linux/amd64","-v","%s:/roms:ro","-e","SYSTEM_ROUTER_ROM=/roms/game.gba","-v","%s:/adapter-src:ro","node:22-trixie-slim","sh","-c","apt-get update >/dev/null 2>&1; apt-get install -y --no-install-recommends libpng16-16 libepoxy0 libsqlite3-0 zlib1g libfreetype6 libelf1 libbz2-1.0 libjson-c5 libxml2 >/dev/null 2>&1; cp /adapter-src/adapter.mjs /tmp/adapter.mjs && cd /tmp && npm install --no-audit --no-fund node-mgba@0.2.9 >/dev/null 2>&1 && node /tmp/adapter.mjs"]' "$ROM_DIR" "$PWD/packages/coding-agent/examples/system-router-gba")"
 ```
+
+`--rom` is the path as the adapter sees it (inside the container, `/roms/game.gba`, set via `SYSTEM_ROUTER_ROM`); the host path never crosses the boundary, and the demo omits `init.romPath` for docker adapter commands. The vendored libmGBA needs glibc 2.38+ (Debian trixie) plus the apt packages above.
 
 ## Model-driven steering (the real System 1 / System 2 split)
 

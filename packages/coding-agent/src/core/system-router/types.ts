@@ -100,14 +100,10 @@ function asString(value: unknown, what: string): string {
 
 function asPortNumber(value: unknown, what: string, fallback: number, max: number): number {
 	if (value === undefined) return fallback;
-	if (typeof value !== "number" || !Number.isFinite(value) || value < 1 || value > max) {
+	if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value) || value < 1 || value > max) {
 		throw new Error(`system_router.run ${what} must be a whole number in [1, ${max}]`);
 	}
-	const floored = Math.floor(value);
-	if (floored < 1) {
-		throw new Error(`system_router.run ${what} must be a whole number in [1, ${max}]`);
-	}
-	return floored;
+	return value;
 }
 
 function parseRisk(value: unknown, what: string): RouterActionRisk {

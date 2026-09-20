@@ -150,7 +150,9 @@ export function parseDecision(raw: string, actions: Map<string, CompiledAction>)
 			};
 		}
 		for (const [key, value] of Object.entries(rawParams as Record<string, unknown>)) {
-			const allowed = action.params[key];
+			// Own-property checks only: inherited names like "constructor" must not
+			// resolve against Object.prototype and crash the parse.
+			const allowed = Object.hasOwn(action.params, key) ? action.params[key] : undefined;
 			if (!allowed) {
 				return {
 					action: null,
@@ -160,7 +162,7 @@ export function parseDecision(raw: string, actions: Map<string, CompiledAction>)
 					parseError: `unknown param "${key}" for action "${actionName}"`,
 				};
 			}
-			if (typeof value !== "string" || !(value in allowed.choices)) {
+			if (typeof value !== "string" || !Object.hasOwn(allowed.choices, value)) {
 				return {
 					action: null,
 					params: {},

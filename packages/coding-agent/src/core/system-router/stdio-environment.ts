@@ -49,9 +49,18 @@ export class StdioRouterEnvironment implements RouterEnvironment {
 			buffer += chunk;
 			let newline = buffer.indexOf("\n");
 			while (newline !== -1) {
-				const line = buffer.slice(0, newline).trim();
+				const rawLine = buffer.slice(0, newline);
 				buffer = buffer.slice(newline + 1);
-				if (line) this.dispatchLine(line);
+				const line = rawLine.trim();
+				if (rawLine.length > MAX_REPLY_LINE_CHARS) {
+					// A terminated oversized line is the same protocol violation as an
+					// unterminated one; reject it before parsing can allocate.
+					const overflow = `environment adapter wrote a reply line over ${MAX_REPLY_LINE_CHARS} chars`;
+					this.appendKernelAdapterDiagnostic(overflow);
+					this.failAll(new Error(overflow));
+				} else if (line) {
+					this.dispatchLine(line);
+				}
 				newline = buffer.indexOf("\n");
 			}
 			// An unterminated line is buffered until its newline arrives; a
@@ -204,7 +213,23 @@ export class StdioRouterEnvironment implements RouterEnvironment {
 			}),
 		]);
 		if (child.exitCode === null && child.signalCode === null) {
-			child.kill("SIGKILL");
+			// SIGTERM first: for a container-wrapped adapter (docker run), a
+			// SIGKILL would hit only the client process and leak the container;
+			// a forwardable SIGTERM lets the container stop and --rm reap it.
+			child.kill("SIGTERM");
+			const terminated = new Promise<void>((resolve) => {
+				child.once("exit", () => resolve());
+			});
+			await Promise.race([
+				terminated,
+				new Promise<void>((resolve) => {
+					const timer = setTimeout(() => resolve(), 1_000);
+					if (typeof timer === "object" && "unref" in timer) timer.unref();
+				}),
+			]);
+			if (child.exitCode === null && child.signalCode === null) {
+				child.kill("SIGKILL");
+			}
 		}
 		this.failAll(new Error("environment adapter closed"));
 	}

@@ -207,6 +207,12 @@ describe("parseSystemRouterRunSpec", () => {
 			{ ...valid, maxSteps: 0.5 },
 			"maxSteps must be a whole number in [1, 200]",
 		],
+		["fractional maxSteps 1.9 rejected", { ...valid, maxSteps: 1.9 }, "maxSteps must be a whole number in [1, 200]"],
+		[
+			"fractional timeoutMs 1000.5 rejected",
+			{ ...valid, timeoutMs: 1_000.5 },
+			"timeoutMs must be a whole number in [1, 600000]",
+		],
 		[
 			"fractional timeoutMs floors to zero",
 			{ ...valid, timeoutMs: 0.5 },
@@ -353,6 +359,17 @@ describe("action space compilation", () => {
 		expect(prompt).toContain('"confidence"');
 	});
 
+	it("honors a tiny observationChars budget", () => {
+		const prompt = compileDecisionPrompt({
+			goal: "g",
+			observation: { text: "y".repeat(10_000) },
+			history: [],
+			actions: compileActionSpace({ press_a: { description: "d" } }).byName,
+			observationChars: 1,
+		});
+		expect(prompt).not.toContain("yyyyyy");
+	});
+
 	it("bounds the rendered observation (text plus fields) by the budget", () => {
 		const fields = Object.fromEntries(Array.from({ length: 200 }, (_, i) => [`field_${i}`, "x".repeat(500)]));
 		const prompt = compileDecisionPrompt({
@@ -377,6 +394,9 @@ describe("action space compilation", () => {
 	it("observation digest changes with content and history lines stay bounded", () => {
 		expect(observationDigest({ text: "a" })).not.toBe(observationDigest({ text: "b" }));
 		expect(observationDigest({ text: "a" })).toBe(observationDigest({ text: "a" }));
+		expect(observationDigest({ text: "s", fields: { x: 1, y: 2 } })).toBe(
+			observationDigest({ text: "s", fields: { y: 2, x: 1 } }),
+		);
 		expect(formatHistoryEntry("press_a", {}, "r".repeat(300))).toBe(`press_a() -> ${"r".repeat(157)}...`);
 		expect(formatHistoryEntry("set_power", { power: "low" }, "ok")).toBe('set_power(power="low") -> ok');
 	});
@@ -693,6 +713,28 @@ describe("runRouterSegment wiring", () => {
 		expect(log).toContain("execute:wait");
 	});
 
+	it("bounds adapter init by the segment timeout and still closes the adapter", async () => {
+		const spec = parseSystemRouterRunSpec({
+			goal: "seg goal",
+			environment: { stdio: { command: ["true"] } },
+			timeoutMs: 5,
+		});
+		const log: string[] = [];
+		const env: RouterSegmentEnvironment = {
+			init: () => new Promise(() => {}),
+			reset: async () => {},
+			observe: async () => ({ text: "x" }),
+			execute: async () => ({ text: "y" }),
+			close: async () => {
+				log.push("close");
+			},
+		};
+		await expect(runRouterSegment(spec, { model, env })).rejects.toThrow(
+			/environment adapter init exceeded the segment timeout of 5ms/,
+		);
+		expect(log).toEqual(["close"]);
+	});
+
 	it.each([
 		["init fails", undefined, new Error("rom not found")],
 		["no action space anywhere", undefined, undefined],
@@ -731,6 +773,21 @@ describe("runSystemRouterLoop budgets (fake timers)", () => {
 		expect(result.reason).toBe("timeout");
 		expect(result.summary).toContain("timeout");
 		expect(env.closeCalls).toBe(1);
+	});
+
+	it("ends incomplete when the deadline elapses during reset", async () => {
+		const env = {
+			reset: () => new Promise<void>(() => {}),
+			observe: () => Promise.resolve({ text: "x" }),
+			execute: () => Promise.resolve({ text: "y" }),
+			close: () => Promise.resolve(),
+		};
+		const run = runLoop(env as unknown as RouterEnvironment, { timeoutMs: 5 });
+		run.catch(() => {});
+		await vi.advanceTimersByTimeAsync(5);
+		const result = await run;
+		expect(result.status).toBe("incomplete");
+		expect(result.reason).toBe("timeout");
 	});
 
 	it("ends incomplete when the losing side rejects after the deadline fires", async () => {
@@ -948,6 +1005,22 @@ describe("StdioRouterEnvironment (real subprocess)", () => {
 			expect(environment?.actions).toMatchObject({ wait: { description: "Wait." } });
 			const observation = await env.observe();
 			expect(observation.text).toBe("ok screen");
+		} finally {
+			await env.close();
+		}
+	});
+
+	it("fails fast when the adapter writes an oversized terminated reply line", async () => {
+		const script = `
+			process.stdout.write(JSON.stringify({ id: 1, ok: true }) + "|" + "x".repeat(1_100_000) + "\\n");
+			process.stdin.on("end", () => process.exit(0));
+		`;
+		const env = new StdioRouterEnvironment({
+			command: [process.execPath, "-e", script],
+			requestTimeoutMs: 5_000,
+		});
+		try {
+			await expect(env.init()).rejects.toThrow(/reply line over/);
 		} finally {
 			await env.close();
 		}

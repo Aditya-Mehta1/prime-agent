@@ -107,7 +107,14 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 
 	try {
 		try {
-			await options.env.reset(options.goal);
+			const resetResult = await raceDeadline(options.env.reset(options.goal), deadline);
+			if (resetResult === "deadline") {
+				return finish(
+					"incomplete",
+					"timeout",
+					`Stopped before the first step: the segment timeout of ${options.timeoutMs}ms elapsed during reset.`,
+				);
+			}
 		} catch (error) {
 			return finish(
 				"failed",

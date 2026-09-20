@@ -56,7 +56,8 @@ if (!romPath) {
 const env = new StdioRouterEnvironment({
   command: adapterCommand,
   requestTimeoutMs: 30_000,
-  init: { romPath },
+  // A container-wrapped adapter cannot see the host path; it reads SYSTEM_ROUTER_ROM.
+  ...(adapterCommand[0] === "docker" ? {} : { init: { romPath } }),
 });
 
 const environment = await env.init();

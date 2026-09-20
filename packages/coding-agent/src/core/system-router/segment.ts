@@ -46,8 +46,17 @@ export async function runRouterSegment(
 			requestTimeoutMs: spec.environment.stdio.requestTimeoutMs,
 			...(spec.environment.stdio.init !== undefined ? { init: spec.environment.stdio.init } : {}),
 		});
+	const segmentStartedAt = Date.now();
 	try {
-		const environment = await env.init();
+		let environment: Awaited<ReturnType<RouterSegmentEnvironment["init"]>>;
+		try {
+			// The segment timeout bounds the whole segment, adapter init included.
+			environment = await raceInitAgainstSegmentTimeout(env.init(), spec.timeoutMs, segmentStartedAt);
+		} catch (error) {
+			throw new Error(
+				`environment adapter init exceeded the segment timeout of ${spec.timeoutMs}ms: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
 		const actions = parseEnvironmentActions(spec.actions, environment?.actions);
 		if (!actions) {
 			throw new Error("system_router.run has no action space: declare one or use an adapter that supplies its own");
@@ -73,7 +82,8 @@ export async function runRouterSegment(
 			},
 			gate: spec.gate,
 			maxSteps: spec.maxSteps,
-			timeoutMs: spec.timeoutMs,
+			// The loop's deadline covers the remaining segment budget after init.
+			timeoutMs: Math.max(1, spec.timeoutMs - (Date.now() - segmentStartedAt)),
 			historySteps: spec.historySteps,
 			observationChars: spec.observationChars,
 		});
@@ -81,5 +91,28 @@ export async function runRouterSegment(
 		// The loop closes the env on its own paths; this guards the window
 		// between init and the loop so the adapter process never leaks.
 		await env.close().catch(() => {});
+	}
+}
+
+/** Race adapter init against the segment budget without leaking a late rejection. */
+async function raceInitAgainstSegmentTimeout<T>(work: Promise<T>, timeoutMs: number, startedAt: number): Promise<T> {
+	const remaining = timeoutMs - (Date.now() - startedAt);
+	if (remaining <= 0) {
+		void work.catch(() => {});
+		throw new Error("segment budget already exhausted before init");
+	}
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const timeout = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => reject(new Error("init timed out")), remaining);
+		if (timer && typeof timer === "object" && "unref" in timer) timer.unref();
+	});
+	void timeout.catch(() => {});
+	void work.catch(() => {});
+	try {
+		return await Promise.race([work, timeout]);
+	} catch (error) {
+		throw error instanceof Error ? error : new Error(String(error));
+	} finally {
+		if (timer) clearTimeout(timer);
 	}
 }

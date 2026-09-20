@@ -9,11 +9,23 @@ import {
 
 /** fnv1a (32-bit, 8 hex chars) digest for repeated-state detection. */
 export function observationDigest(observation: RouterObservation): string {
-	const material = JSON.stringify({
-		text: observation.text,
-		fields: observation.fields ?? null,
-		...(observation.image ? { image: observation.image } : {}),
-	});
+	// Canonicalized (recursively key-sorted) so identical observations with
+	// differently-ordered fields produce the same digest.
+	const material = JSON.stringify(
+		{
+			text: observation.text,
+			fields: observation.fields ?? null,
+			...(observation.image ? { image: observation.image } : {}),
+		},
+		(_key, value) =>
+			value !== null && typeof value === "object" && !Array.isArray(value)
+				? Object.fromEntries(
+						Object.keys(value)
+							.sort()
+							.map((key) => [key, value[key]]),
+					)
+				: value,
+	);
 	let hash = 0x811c9dc5;
 	for (let i = 0; i < material.length; i += 1) {
 		hash ^= material.charCodeAt(i);
@@ -112,7 +124,7 @@ export function compileDecisionPrompt(input: {
 	const fieldLines = Object.entries(input.observation.fields ?? {}).map(([key, value]) => `${key}: ${String(value)}`);
 	// The budget bounds the whole rendered observation (text plus fields), not
 	// just the text: both halves ride the same prompt the model reads.
-	const text = truncateObservation(input.observation.text, Math.max(200, Math.floor(input.observationChars / 2)));
+	const text = truncateObservation(input.observation.text, Math.max(0, Math.floor(input.observationChars / 2)));
 	const fieldsBudget = input.observationChars - text.length;
 	const keptFields: string[] = [];
 	let fieldsUsed = 0;
