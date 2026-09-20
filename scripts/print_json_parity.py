@@ -5,7 +5,8 @@ same scripted faux provider, normalize the volatile event fields, and diff
 the full event sequences (the #211 parity-evidence pattern, headless: no
 tmux, stdout json lines only).
 
-Scenarios (each a fresh isolated HOME + agent dir + daemon socket per side):
+Scenarios (each a fresh isolated HOME + agent dir per side; a scenario is
+one or more sequential runs over the same shared session store):
 
   - stream: one prompt, one streamed text answer. Covers the session
     header row, the harness digest's message pair (TS commit-time
@@ -16,6 +17,13 @@ Scenarios (each a fresh isolated HOME + agent dir + daemon socket per side):
     16k context window with reserveTokens=1. Covers the threshold
     compaction arm's compaction_start/compaction_end pair (reason, result,
     willRetry=false) at the settled turn boundary.
+  - resume: two runs over one session. Run one ends above the reserve
+    headroom with compaction disabled (nothing fires, either boundary);
+    run two resumes with compaction enabled (`--continue`, its own daemon
+    socket so the first run's worker never pins the session), and the
+    pre-turn boundary (TS `_runPreTurnCompaction`) fires the threshold
+    arm before the admitted prompt: the compaction_start/compaction_end
+    pair precedes the prompt's turn events on both sides.
 
 The Rust run rides the harness digest row through the loop's prompt input
 (the same TS design), so `agent_end.messages` includes it on both sides and
@@ -23,6 +31,14 @@ the comparison is full parity: any event difference fails.
 
 Both sides run with RLM_DEPTH unset (root sessions are depth 0; the TS
 daemon strips the env for its workers, the Rust print run is in-process).
+All scenarios pin `autoRefine: {enabled: false}` in the sandbox settings:
+the TS session schedules a harness-state review after every compaction and
+at turn intervals (auto-refine, `_scheduleAutoRefine`), a surface the Rust
+print runtime does not host yet (owned elsewhere); with the review enabled
+the TS side of a compaction scenario consumes extra scripted responses and
+emits refine rows the comparison would misattribute to the compaction
+arms. The settings gate is the product's own switch, so nothing else
+differs.
 
 Exit code is non-zero when any event sequence differs. Use --keep to keep
 the sandbox trees, --out to pin captures.
@@ -67,8 +83,7 @@ def prepare_sandbox(base, binary, settings):
     os.makedirs(home, exist_ok=True)
     os.makedirs(os.path.join(agent, "sessions"), exist_ok=True)
     os.makedirs(os.path.join(agent, "extensions"), exist_ok=True)
-    with open(os.path.join(agent, "settings.json"), "w") as handle:
-        json.dump(settings, handle)
+    write_settings(agent, settings)
     if binary == "ts":
         # The TS binary runs its session in a daemon worker; the faux
         # provider is a sandbox extension.
@@ -77,7 +92,12 @@ def prepare_sandbox(base, binary, settings):
     return {"home": home, "agent": agent}
 
 
-def run_scenario(binary, sandbox, script_path, prompts, cwd, settings_note):
+def write_settings(agent, settings):
+    with open(os.path.join(agent, "settings.json"), "w") as handle:
+        json.dump(settings, handle)
+
+
+def run_scenario(binary, sandbox, script_path, prompts, cwd, extra_args, socket_path):
     """Run the binary in print json mode; return (exit, stdout, stderr)."""
     env = {key: value for key, value in os.environ.items()}
     # Root sessions are depth 0 on both sides; ambient harness env stays out.
@@ -93,15 +113,7 @@ def run_scenario(binary, sandbox, script_path, prompts, cwd, settings_note):
         }
     )
     if binary == "ts":
-        command = [
-            "prime-agent",
-            "--daemon-socket",
-            os.path.join(sandbox["agent"], "daemon.sock"),
-            "--model",
-            "faux-1",
-            "--mode",
-            "json",
-        ]
+        command = ["prime-agent", "--daemon-socket", socket_path, "--model", "faux-1", "--mode", "json"]
     else:
         rust = os.environ.get(
             "PA_RUST_BINARY",
@@ -112,17 +124,11 @@ def run_scenario(binary, sandbox, script_path, prompts, cwd, settings_note):
         # is the JSON, not a path).
         with open(script_path) as handle:
             env["PRIME_AGENT_FAUX_SCRIPT"] = handle.read()
-        command = [
-            rust,
-            "--daemon-socket",
-            os.path.join(sandbox["agent"], "daemon.sock"),
-            "--model",
-            "faux-1",
-            "--mode",
-            "json",
-        ]
+        command = [rust, "--daemon-socket", socket_path, "--model", "faux-1", "--mode", "json"]
+    # The resume flags ride ahead of the prompts (both parsers accept
+    # positionals only last).
     result = subprocess.run(
-        command + ["-p"] + prompts,
+        command + extra_args + ["-p"] + prompts,
         capture_output=True,
         text=True,
         env=env,
@@ -295,38 +301,103 @@ def diff_events(ts_events, rust_events):
     return "".join(failures)
 
 
+def faux_script(responses, context_window):
+    return {
+        "engine": "faux",
+        "modelId": "faux-1",
+        "modelName": "Faux Model",
+        "reasoning": False,
+        "contextWindow": context_window,
+        "responses": responses,
+    }
+
+
+# One run of a scenario: its own settings (written into the shared agent
+# dir), faux script (written to its own script file), prompt list, and
+# extra CLI args (the resume run passes --continue). Every run gets its
+# own daemon socket so a previous run's worker never pins the session.
 SCENARIOS = {
     "stream": {
-        "settings": {"onboardingCompleted": True},
-        "script": {
-            "engine": "faux",
-            "modelId": "faux-1",
-            "modelName": "Faux Model",
-            "reasoning": False,
-            "contextWindow": 128000,
-            "responses": ["a streamed parity answer"],
-        },
-        "prompts": ["hello parity"],
+        "runs": [
+            {
+                "settings": {"onboardingCompleted": True},
+                "script": faux_script(["a streamed parity answer"], 128000),
+                "prompts": ["hello parity"],
+                "args": [],
+            }
+        ]
     },
     "threshold": {
-        # Both sides' small-prompt context estimates sit under the 13k
-        # headroom (ts ~11.4k, rust ~8.3k - each side estimates its own
-        # prompt) and the ~6k-token crossing turn pushes both past it
-        # without overflowing the 20k window: the seed turn must stay
-        # below, the crossing turn must cross, on both sides.
-        "settings": {
-            "onboardingCompleted": True,
-            "compaction": {"enabled": True, "reserveTokens": 7000, "keepRecentTokens": 10},
-        },
-        "script": {
-            "engine": "faux",
-            "modelId": "faux-1",
-            "modelName": "Faux Model",
-            "reasoning": False,
-            "contextWindow": 20000,
-            "responses": ["seed reply", "crossing reply", "the compaction summary"],
-        },
-        "prompts": ["seed turn", "crossing turn " + "x" * 24000],
+        "runs": [
+            {
+                # Both sides' small-prompt context estimates sit under the 13k
+                # headroom (ts ~11.4k, rust ~8.3k - each side estimates its
+                # own prompt) and the ~6k-token crossing turn pushes both
+                # past it without overflowing the 20k window: the seed turn
+                # must stay below, the crossing turn must cross, on both
+                # sides.
+                "settings": {
+                    "onboardingCompleted": True,
+                    "compaction": {"enabled": True, "reserveTokens": 7000, "keepRecentTokens": 10},
+                },
+                "script": faux_script(
+                    ["seed reply", "crossing reply", "the compaction summary"], 20000
+                ),
+                "prompts": ["seed turn", "crossing turn " + "x" * 24000],
+                "args": [],
+            }
+        ]
+    },
+    "resume": {
+        "runs": [
+            {
+                # Run one: a big seed turn pushes the settled usage past the
+                # 18k headroom on both sides (each side estimates its own
+                # context: ts ~2x its serialized input via cacheWrite, rust
+                # ~23k), the small trailing turns keep the cut tail small,
+                # and compaction is disabled - neither boundary fires, so
+                # the session persists above the headroom.
+                "settings": {
+                    "onboardingCompleted": True,
+                    "compaction": {"enabled": False, "reserveTokens": 7000, "keepRecentTokens": 10},
+                    "autoRefine": {"enabled": False},
+                },
+                "script": faux_script(["seed reply", "k2", "k3", "k4"], 25000),
+                # The trailing turn texts are sized so the keep-recent walk
+                # (10 tokens) absorbs its budget at a USER message ("turn
+                # two"), not an assistant one: a cut inside a turn is a
+                # split-turn compaction, which TS backs with a SECOND
+                # summarizer call + a "**Turn Context (split turn):**"
+                # suffix the Rust compaction core does not produce yet
+                # (a pa-core gap owned by the compaction lane, out of this
+                # scenario's claim).
+                "prompts": [
+                    "big seed turn " + "x" * 60000,
+                    "turn two",
+                    "turn three",
+                    "turn four",
+                ],
+                "args": [],
+            },
+            {
+                # Run two: resume (`--continue`, fresh daemon socket) with
+                # compaction enabled - the pre-turn boundary fires the
+                # threshold arm before the admitted prompt, and the
+                # compacted context (summary + the small kept tail) sits
+                # back under the headroom, so the resumed turn's settled
+                # boundary stays quiet on both sides.
+                "settings": {
+                    "onboardingCompleted": True,
+                    "compaction": {"enabled": True, "reserveTokens": 7000, "keepRecentTokens": 10},
+                    "autoRefine": {"enabled": False},
+                },
+                "script": faux_script(
+                    ["the compaction summary", "recovered after the resume"], 25000
+                ),
+                "prompts": ["next prompt"],
+                "args": ["--continue"],
+            },
+        ]
     },
 }
 
@@ -352,33 +423,48 @@ def main():
         if args.scenario and name != args.scenario:
             continue
         print(f"== scenario {name}")
-        script_path = os.path.join(base, f"{name}-faux-script.json")
-        with open(script_path, "w") as handle:
-            json.dump(scenario["script"], handle)
         shared_cwd = os.path.join(base, f"{name}-cwd")
         os.makedirs(shared_cwd, exist_ok=True)
-        captures = {}
+        # captures[binary][run_index] = the normalized events of that run.
+        captures = {"ts": [], "rust": []}
         for binary in ("ts", "rust"):
             if args.only and binary != args.only:
                 continue
-            sandbox = prepare_sandbox(os.path.join(base, name), binary, scenario["settings"])
-            code, stdout, stderr = run_scenario(binary, sandbox, script_path, scenario["prompts"], shared_cwd, scenario["settings"])
-            with open(os.path.join(out_dir, f"{binary}-{name}.jsonl"), "w") as handle:
-                handle.write(stdout)
-            with open(os.path.join(out_dir, f"{binary}-{name}.stderr"), "w") as handle:
-                handle.write(stderr)
-            captures[binary] = normalize_events(stdout, os.path.join(base, name))
-        if "ts" not in captures or "rust" not in captures:
+            sandbox = prepare_sandbox(os.path.join(base, name), binary, scenario["runs"][0]["settings"])
+            for index, run in enumerate(scenario["runs"]):
+                # A later run may change the settings (the resume scenario
+                # enables compaction for run two); the agent dir - and its
+                # session store - stays shared across the runs.
+                if index > 0:
+                    write_settings(sandbox["agent"], run["settings"])
+                script_path = os.path.join(base, f"{name}-run{index}-faux-script.json")
+                with open(script_path, "w") as handle:
+                    json.dump(run["script"], handle)
+                # One daemon socket per run: a previous run's worker must
+                # not pin the session the next run resumes.
+                socket_path = os.path.join(sandbox["agent"], f"daemon-run{index}.sock")
+                code, stdout, stderr = run_scenario(
+                    binary, sandbox, script_path, run["prompts"], shared_cwd, run["args"], socket_path
+                )
+                suffix = "" if index == 0 else f"-run{index}"
+                with open(os.path.join(out_dir, f"{binary}-{name}{suffix}.jsonl"), "w") as handle:
+                    handle.write(stdout)
+                with open(os.path.join(out_dir, f"{binary}-{name}{suffix}.stderr"), "w") as handle:
+                    handle.write(stderr)
+                captures[binary].append(normalize_events(stdout, os.path.join(base, name)))
+        if not (captures["ts"] and captures["rust"]):
             continue
-        diff = diff_events(captures["ts"], captures["rust"])
-        if diff:
-            failures.append(name)
-            print(diff)
-            with open(os.path.join(out_dir, f"{name}-diff.txt"), "w") as handle:
-                handle.write(diff)
-            print(f"FAIL {name} (captures in {out_dir})")
-        else:
-            print(f"PASS {name} ({len(captures['ts'])} events, both sides)")
+        for index in range(len(scenario["runs"])):
+            label = name if index == 0 else f"{name}/run{index}"
+            diff = diff_events(captures["ts"][index], captures["rust"][index])
+            if diff:
+                failures.append(label)
+                print(diff)
+                with open(os.path.join(out_dir, f"{label.replace('/', '-')}-diff.txt"), "w") as handle:
+                    handle.write(diff)
+                print(f"FAIL {label} (captures in {out_dir})")
+            else:
+                print(f"PASS {label} ({len(captures['ts'][index])} events, both sides)")
     if not args.keep:
         shutil.rmtree(base, ignore_errors=True)
     if failures:

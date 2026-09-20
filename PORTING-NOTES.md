@@ -1867,3 +1867,79 @@ deliberately left out (TS `prompt-highlight.ts`):
   `scripts/compaction_abort_parity.py` (TS vs Rust daemon wire
   differential over the battery mock: compaction_start, the row pair,
   the aborted compaction_end, and the durable rows, normalized diff).
+
+## Print pre-turn compaction arms (print-pre-turn lane, the #214 residue)
+
+- TS `_runPreTurnCompaction` (agent-session.ts) is the FULL
+  `_checkCompaction` pass over the last assistant message, called before
+  every admitted prompt (`_prepareForCommit` policies: `beforeModelSelection`
+  for queued/injected, `afterModelSelection` for direct prompts), not just
+  the overflow Case 1 #211 ported. Parameters
+  `skipAbortedCheck=false, queueAutonomousContinuation=false` give the
+  pre-prompt pass two behaviors the settled boundary does not have:
+  - abort arm first: an aborted trailing assistant drops
+    `_pendingRequestedCompaction` AND `_pendingRequestedRefine` (the turn
+    that would service them never ran; a stale request must not leak into
+    the admitted turn), and the check CONTINUES to the later arms.
+  - no autonomous-continuation queueing on the threshold arm.
+- Arm order in the shared `_checkCompaction` body: Case 1 (overflow, with
+  the sameModel / not-before-compaction / enabled-or-pending guards) — any
+  Case 1 path returns, so the requested/threshold arms never run in the
+  same pass (the overflow run itself consumes a pending model request);
+  then `pendingRequestedCompaction !== undefined` ->
+  `_runAutoCompaction("requested", false)` with NO enabled/settings guard;
+  then the threshold arm (gated on `settings.enabled` and
+  `assistantIsFromBeforeCompaction`, tokens via
+  `_getThresholdContextTokens` — the full-session estimate with the
+  stale-usage guard).
+- Rust port (pa-cli `print_boundary.rs`): `run_pre_turn` now runs the
+  complete pass — the abort arm (`TurnBoundaryRequests::clear_pending`;
+  the TS serialized-refine-plan cancel is daemon-side machinery the print
+  runtime does not host), the #211 overflow attempt, and — when Case 1
+  stayed silent — the requested and threshold arms. The requested/threshold
+  body is shared with the settled boundary
+  (`requested_and_threshold_arms`), so both boundaries run the identical
+  arms (TS reaches both through the same `_checkCompaction`). A pre-turn
+  compaction never re-issues: the admitted prompt continues the loop on
+  the compacted context (TS `resumeAfterFailure` / `_runPreTurnCompaction`
+  never call `agent.continue()`).
+- Resume is the observable surface: a session that ended above the reserve
+  headroom (run one, compaction disabled) compacts BEFORE its first
+  resumed prompt (run two, `--continue`, compaction enabled) — both
+  boundaries settle a crossing turn inside one process, so only a resumed
+  session can bring a crossing to a pre-turn check. Pending model requests
+  are in-memory only on both sides (TS `_pendingRequestedCompaction`, Rust
+  `TurnBoundaryRequests`), so the pre-turn requested arm is a fidelity arm:
+  the product flow consumes a `compact.run` schedule at the scheduling
+  turn's own settled boundary.
+- Known adjacent gaps (documented, not fixed here; the first two surfaced
+  by the resume parity scenario, the rest from the code read):
+  (1) TS `_scheduleAutoRefineAfterCompaction`/`_scheduleAutoRefineAfterAgentEnd`
+  run a harness-state review after every compaction and at turn intervals
+  (`autoRefine` settings, default on) — the Rust print runtime hosts no
+  auto-refine at all; the parity harness pins `autoRefine: {enabled:
+  false}` in its sandbox settings (the product's own switch) so the
+  comparison stays scoped to the compaction arms. (2) A split-turn
+  compaction (cut inside a turn) makes TWO TS summarizer calls and
+  concatenates `summary + "\n\n---\n\n**Turn Context (split turn):**\n\n" +
+  prefix`; the Rust pa-core `execute_compaction` folds the prefix into the
+  single call — pa-core compaction owns that gap. (3) the settled
+  boundary does not run TS's abort-drop (`skipAbortedCheck=true` clears
+  the pending requests and returns) — in the print runtime an aborted turn
+  never reaches `run_at_settled_turn` in-process (no abort source), and a
+  resumed aborted session hits the pre-turn abort arm first; (4) the
+  requested/threshold compactions do not note adoption telemetry
+  (`note_compaction`) on the print or daemon threshold/requested arms —
+  only the overflow arm does; TS counts every `compaction_end` into the
+  run's `compactionCount`.
+- Verifiers: pa-cli unit tests (the full `_checkCompaction` pre-turn pass
+  — the requested arm consuming before the prompt with the TS event pair,
+  the threshold arm compacting a resumed session before its first prompt,
+  the abort arm dropping pending compaction+refine then continuing; the
+  existing settled-boundary tests moved to the faithful mid-turn-request
+  shape), `scripts/print_json_parity.py` new `resume` scenario (two runs
+  over one session store: run one ends above the headroom with compaction
+  disabled, run two resumes `--continue` on its own daemon socket with
+  compaction enabled — the pre-turn `threshold` compaction_start/end pair
+  precedes the prompt's turn events on both sides, normalized full-stream
+  diff), f7/f14 battery unregressed (musl build).

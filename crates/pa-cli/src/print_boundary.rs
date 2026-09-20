@@ -14,6 +14,15 @@
 //! before the next admitted prompt, so a stale overflow error left by a
 //! previous run gets its recovery attempt on the resumed context.
 //!
+//! The pre-turn check is the full TS `_checkCompaction` call, not just the
+//! overflow arm: an aborted trailing turn drops any pending
+//! model-requested compaction/refinement (the `skipAbortedCheck=false`
+//! pass), and when Case 1 stays silent the requested and threshold arms
+//! run too — a session resumed above the reserve headroom compacts before
+//! its first admitted prompt, and a pending model request consumes the
+//! check. A pre-turn compaction never re-issues: the admitted prompt
+//! continues the loop on the compacted context.
+//!
 //! Output surfaces: json mode streams the TS session events (the
 //! `compaction_start`/`compaction_end` pair and the outcome row's message
 //! pair) on stdout; text mode stays quiet here — the durable rows surface
@@ -156,22 +165,50 @@ impl TurnBoundary {
         self.recovery = OverflowRecovery::Idle;
     }
 
-    /// The pre-turn check before an admitted prompt (TS
-    /// `_runPreTurnCompaction`, which runs the same Case 1 over the last
-    /// assistant message of the loop context): a stale overflow error from
-    /// the previous run gets its compact-and-retry attempt here, so the new
-    /// prompt runs on the compacted context. The prompt proceeds regardless
-    /// of the compaction outcome (TS `resumeAfterFailure` never re-issues
-    /// for overflow). The admitted prompt resets the recovery state right
-    /// after the check (TS resets at the agent run's message start).
+    /// The pre-turn check before an admitted prompt: the full TS
+    /// `_runPreTurnCompaction` -> `_checkCompaction(lastAssistant,
+    /// skipAbortedCheck=false, queueAutonomousContinuation=false)`. An
+    /// aborted trailing turn first drops any pending model request (the
+    /// turn that would service it never ran); then the same arm order as
+    /// the settled boundary: the overflow recovery first (a stale overflow
+    /// error from a previous run gets its compact-and-retry attempt here),
+    /// and — only when Case 1 stayed silent — the model-requested
+    /// compaction and the threshold arm (a resumed session above the
+    /// reserve headroom compacts before its first admitted prompt). A
+    /// pre-turn compaction never re-issues (TS
+    /// `resumeAfterFailure`/`_runPreTurnCompaction` leave the loop to the
+    /// admitted prompt, which continues on the compacted context). The
+    /// admitted prompt resets the recovery state right after the check
+    /// (TS resets at the agent run's message start).
     pub(crate) async fn run_pre_turn(
         &mut self,
         engine: &SessionEngine,
         model: &Model,
         api_key: Option<String>,
     ) -> Result<(), String> {
-        self.overflow_recovery_attempt(engine, model, api_key, OverflowBoundary::PreTurn)
+        // TS abort arm (skipAbortedCheck=false): an aborted trailing
+        // assistant drops any pending model-requested compaction and
+        // refinement — the turn that would service them never ran, and a
+        // stale request must not leak into the admitted turn. The check
+        // then continues to the later arms (the pre-prompt path never
+        // returns early).
+        if matches!(
+            engine.session.last_assistant_message().await,
+            Some(SessionAgentMessage::Assistant(wire))
+                if wire.stop_reason == pa_types::ai::StopReason::Aborted
+        ) {
+            engine.turn_boundary.clear_pending().await;
+        }
+        // Case 1 (overflow): when it fires, TS returns from the check and
+        // the requested/threshold arms never run in the same pass (the
+        // overflow run itself consumes a pending model request).
+        let outcome = self
+            .overflow_recovery_attempt(engine, model, api_key.clone(), OverflowBoundary::PreTurn)
             .await?;
+        if matches!(outcome, OverflowOutcome::NotApplicable) {
+            self.requested_and_threshold_arms(engine, model, api_key)
+                .await?;
+        }
         self.reset();
         Ok(())
     }
@@ -205,112 +242,8 @@ impl TurnBoundary {
             }
         };
         if !arm_finished {
-            // The requested arm: a pending model-requested compaction runs
-            // as `requested` (the overflow arm's own runs consume the
-            // request, so it only reaches here when Case 1 stayed silent).
-            // TS `_runAutoCompaction` emits the start event before the
-            // summarizer runs, carrying the pending instructions.
-            let scheduled = engine.turn_boundary.scheduled_compaction().await;
-            if let Some(pending) = &scheduled {
-                self.emit_json(compaction_start_event(
-                    CompactionOutcomeReason::Requested.wire(),
-                    pending.instructions.as_deref(),
-                ));
-            }
-            match engine
-                .consume_pending_compaction(model, api_key.clone(), None)
-                .await
-            {
-                Some(Ok(CompactOutcome::Ran(run))) => {
-                    self.emit_json(compaction_end_success_event(
-                        CompactionOutcomeReason::Requested.wire(),
-                        &run,
-                        false,
-                        scheduled
-                            .as_ref()
-                            .and_then(|pending| pending.instructions.as_deref()),
-                    ));
-                }
-                // A skip consumed the request: the durable warning row plus
-                // the `compaction_end` event (TS
-                // `Requested compaction skipped: ...`, warning severity).
-                Some(Ok(CompactOutcome::Skipped(message))) => {
-                    self.end_unsuccessfully(
-                        engine,
-                        CompactionOutcomeReason::Requested,
-                        CompactionOutcomeKind::Skipped,
-                        &format!("Requested compaction skipped: {message}"),
-                        scheduled
-                            .as_ref()
-                            .and_then(|pending| pending.instructions.as_deref()),
-                    )
-                    .await;
-                }
-                Some(Err(error)) => {
-                    self.end_unsuccessfully(
-                        engine,
-                        CompactionOutcomeReason::Requested,
-                        CompactionOutcomeKind::Failed,
-                        &format!("Requested compaction failed: {error:#}"),
-                        scheduled
-                            .as_ref()
-                            .and_then(|pending| pending.instructions.as_deref()),
-                    )
-                    .await;
-                }
-                None => {
-                    // The threshold arm (TS `_checkCompaction` Case 3): the
-                    // settled turn's usage crossing the reserve headroom
-                    // compacts before the next prompt. The `compaction_start`
-                    // / `compaction_end` pair streams in json mode (the
-                    // outcome persists in the session entries the headless
-                    // terminal result reads in text mode).
-                    if engine
-                        .session
-                        .auto_compaction_due(model.context_window)
-                        .await
-                    {
-                        self.emit_json(compaction_start_event(
-                            CompactionOutcomeReason::Threshold.wire(),
-                            None,
-                        ));
-                        match engine
-                            .session
-                            .compact(None, model, api_key.clone(), None)
-                            .await
-                        {
-                            Ok(CompactOutcome::Ran(run)) => {
-                                self.emit_json(compaction_end_success_event(
-                                    CompactionOutcomeReason::Threshold.wire(),
-                                    &run,
-                                    false,
-                                    None,
-                                ));
-                            }
-                            Ok(CompactOutcome::Skipped(message)) => {
-                                self.end_unsuccessfully(
-                                    engine,
-                                    CompactionOutcomeReason::Threshold,
-                                    CompactionOutcomeKind::Skipped,
-                                    &format!("Auto-compaction skipped: {message}"),
-                                    None,
-                                )
-                                .await;
-                            }
-                            Err(error) => {
-                                self.end_unsuccessfully(
-                                    engine,
-                                    CompactionOutcomeReason::Threshold,
-                                    CompactionOutcomeKind::Failed,
-                                    &format!("Auto-compaction failed: {error:#}"),
-                                    None,
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                }
-            }
+            self.requested_and_threshold_arms(engine, model, api_key.clone())
+                .await?;
         }
         // The requested refinement runs whenever the turn did not re-issue
         // (a retried turn consumes it at its own boundary). TS emits the
@@ -347,6 +280,122 @@ impl TurnBoundary {
                 }
             }
             None => {}
+        }
+        Ok(())
+    }
+
+    /// The requested and threshold arms (TS `_checkCompaction` after Case
+    /// 1 stayed silent): a pending model-requested compaction consumes the
+    /// check — TS `_runAutoCompaction` emits the start event before the
+    /// summarizer runs, carrying the pending instructions — else the
+    /// threshold arm compacts when the live context crossed the reserve
+    /// headroom (Case 3: the settled turn's usage at `agent_end`, or the
+    /// resumed context before an admitted prompt). Both boundaries share
+    /// the body: the settled turn and the pre-turn check run the identical
+    /// arms (TS `_runPreTurnCompaction` is the same `_checkCompaction`
+    /// call; only the overflow arm's re-issue differs by boundary).
+    async fn requested_and_threshold_arms(
+        &mut self,
+        engine: &SessionEngine,
+        model: &Model,
+        api_key: Option<String>,
+    ) -> Result<(), String> {
+        let scheduled = engine.turn_boundary.scheduled_compaction().await;
+        if let Some(pending) = &scheduled {
+            self.emit_json(compaction_start_event(
+                CompactionOutcomeReason::Requested.wire(),
+                pending.instructions.as_deref(),
+            ));
+        }
+        match engine
+            .consume_pending_compaction(model, api_key.clone(), None)
+            .await
+        {
+            Some(Ok(CompactOutcome::Ran(run))) => {
+                self.emit_json(compaction_end_success_event(
+                    CompactionOutcomeReason::Requested.wire(),
+                    &run,
+                    false,
+                    scheduled
+                        .as_ref()
+                        .and_then(|pending| pending.instructions.as_deref()),
+                ));
+            }
+            // A skip consumed the request: the durable warning row plus the
+            // `compaction_end` event (TS `Requested compaction skipped:
+            // ...`, warning severity).
+            Some(Ok(CompactOutcome::Skipped(message))) => {
+                self.end_unsuccessfully(
+                    engine,
+                    CompactionOutcomeReason::Requested,
+                    CompactionOutcomeKind::Skipped,
+                    &format!("Requested compaction skipped: {message}"),
+                    scheduled
+                        .as_ref()
+                        .and_then(|pending| pending.instructions.as_deref()),
+                )
+                .await;
+            }
+            Some(Err(error)) => {
+                self.end_unsuccessfully(
+                    engine,
+                    CompactionOutcomeReason::Requested,
+                    CompactionOutcomeKind::Failed,
+                    &format!("Requested compaction failed: {error:#}"),
+                    scheduled
+                        .as_ref()
+                        .and_then(|pending| pending.instructions.as_deref()),
+                )
+                .await;
+            }
+            None => {
+                // The threshold arm (TS `_checkCompaction` Case 3): the
+                // live context crossing the reserve headroom compacts
+                // before the next prompt. The `compaction_start` /
+                // `compaction_end` pair streams in json mode (the outcome
+                // persists in the session entries the headless terminal
+                // result reads in text mode).
+                if engine
+                    .session
+                    .auto_compaction_due(model.context_window)
+                    .await
+                {
+                    self.emit_json(compaction_start_event(
+                        CompactionOutcomeReason::Threshold.wire(),
+                        None,
+                    ));
+                    match engine.session.compact(None, model, api_key, None).await {
+                        Ok(CompactOutcome::Ran(run)) => {
+                            self.emit_json(compaction_end_success_event(
+                                CompactionOutcomeReason::Threshold.wire(),
+                                &run,
+                                false,
+                                None,
+                            ));
+                        }
+                        Ok(CompactOutcome::Skipped(message)) => {
+                            self.end_unsuccessfully(
+                                engine,
+                                CompactionOutcomeReason::Threshold,
+                                CompactionOutcomeKind::Skipped,
+                                &format!("Auto-compaction skipped: {message}"),
+                                None,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            self.end_unsuccessfully(
+                                engine,
+                                CompactionOutcomeReason::Threshold,
+                                CompactionOutcomeKind::Failed,
+                                &format!("Auto-compaction failed: {error:#}"),
+                                None,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -737,6 +786,29 @@ mod tests {
         engine.session.agent().wait_for_idle().await;
         boundary
             .run_at_settled_turn(engine, model, None, global_harness_dir)
+            .await
+    }
+
+    /// The mid-turn-request shape: a `compact.run` scheduled DURING a turn
+    /// is consumed at that same turn's settled boundary (TS `compact.run`
+    /// refuses to schedule on an idle session, so a pending request never
+    /// survives to a pre-turn check in the product flow). No `run_pre_turn`
+    /// precedes the prompt — the schedule happened after the turn's
+    /// admission, mid-turn.
+    async fn admit_turn_with_scheduled_request(
+        boundary: &mut TurnBoundary,
+        engine: &SessionEngine,
+        model: &Model,
+        prompt: String,
+    ) -> Result<(), String> {
+        engine
+            .session
+            .prompt(&prompt, Default::default())
+            .await
+            .expect("the prompt admits");
+        engine.session.agent().wait_for_idle().await;
+        boundary
+            .run_at_settled_turn(engine, model, None, std::path::PathBuf::new())
             .await
     }
 
@@ -1142,14 +1214,14 @@ mod tests {
         .await
         .unwrap();
         events.lock().unwrap().clear();
-        // A pending model request consumed at the next turn's boundary: the
+        // A mid-turn request consumed at that turn's settled boundary: the
         // events pair with the `requested` reason (the requested arm
         // consumes the check, so the threshold never re-evaluates).
         engine
             .turn_boundary
             .schedule_compaction(Some("focus on the goal".to_string()))
             .await;
-        admit(
+        admit_turn_with_scheduled_request(
             &mut boundary,
             &engine,
             &model,
@@ -1218,7 +1290,7 @@ mod tests {
         let (sink, events) = capture_sink();
         let mut boundary = TurnBoundary::with_sink(true, sink);
         engine.turn_boundary.schedule_compaction(None).await;
-        admit(&mut boundary, &engine, &model, "seed turn".to_string())
+        admit_turn_with_scheduled_request(&mut boundary, &engine, &model, "seed turn".to_string())
             .await
             .unwrap();
         let events = events.lock().unwrap().clone();
@@ -1344,6 +1416,264 @@ mod tests {
             "the threshold arm carries no request instructions"
         );
         assert_eq!(compaction_count(&engine).await, 1, "the compaction ran");
+    }
+
+    /// The pre-turn requested arm (TS `_runPreTurnCompaction` ->
+    /// `_checkCompaction`'s pending-request branch): a request left pending
+    /// before an admitted prompt consumes at the pre-turn check — the
+    /// `requested` event pair with the request's instructions — so the
+    /// prompt runs on the compacted context, and no second compaction
+    /// fires at its settled boundary.
+    #[tokio::test]
+    async fn pre_turn_check_consumes_a_pending_request_before_the_prompt() {
+        let _faux = FAUX_TEST_LOCK.lock().await;
+        let (engine, _dir, model) = faux_engine_with_settings(
+            json!({
+                "responses": [
+                    {"text": "seed reply"},
+                    {"text": "second reply"},
+                    {"text": "the summary"},
+                    {"text": "next reply"},
+                ]
+            }),
+            compactable_settings(),
+            None,
+        )
+        .await;
+        let (sink, events) = capture_sink();
+        let mut boundary = TurnBoundary::with_sink(true, sink);
+        // A large seed turn, so the pre-turn compaction has pre-cut history
+        // to summarize (the `keepRecentTokens` cut keeps ~10 tokens).
+        admit(
+            &mut boundary,
+            &engine,
+            &model,
+            format!("seed turn {}", "x".repeat(48_000)),
+        )
+        .await
+        .unwrap();
+        // The second turn absorbs the keep-recent budget on its own, so
+        // the cut leaves the seed turn as summarizable history.
+        admit(
+            &mut boundary,
+            &engine,
+            &model,
+            format!("second turn {}", "x".repeat(2_000)),
+        )
+        .await
+        .unwrap();
+        // A pending request (e.g. a previous run's schedule that its turn
+        // never serviced) consumes at the next prompt's pre-turn check.
+        engine
+            .turn_boundary
+            .schedule_compaction(Some("focus on the goal".to_string()))
+            .await;
+        events.lock().unwrap().clear();
+        boundary.run_pre_turn(&engine, &model, None).await.unwrap();
+        let captured = events.lock().unwrap().clone();
+        assert_eq!(
+            captured[0],
+            json!({
+                "type": "compaction_start",
+                "reason": "requested",
+                "customInstructions": "focus on the goal",
+            })
+        );
+        assert_eq!(captured[1]["type"], "compaction_end");
+        assert_eq!(captured[1]["reason"], "requested");
+        assert_eq!(captured[1]["result"]["summary"], "the summary");
+        assert_eq!(captured[1]["willRetry"], false);
+        assert_eq!(
+            captured
+                .iter()
+                .filter(|event| event["type"] == "compaction_start")
+                .count(),
+            1,
+            "exactly one compaction pair"
+        );
+        assert_eq!(compaction_count(&engine).await, 1);
+        // The admitted prompt runs on the compacted context; its settled
+        // boundary finds nothing pending and no threshold crossing.
+        admit(&mut boundary, &engine, &model, "next prompt".to_string())
+            .await
+            .unwrap();
+        let events = events.lock().unwrap().clone();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "compaction_start")
+                .count(),
+            1,
+            "no second compaction"
+        );
+        assert_eq!(compaction_count(&engine).await, 1);
+        assert_eq!(user_texts(&engine).await.len(), 3);
+        let last = last_assistant(&engine).await.expect("a settled turn");
+        let text = last
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                pa_types::ai::AssistantContentBlock::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(text, "next reply");
+    }
+
+    /// The pre-turn threshold arm (TS `_runPreTurnCompaction` Case 3): a
+    /// session that ended above the reserve headroom (run one, compaction
+    /// disabled) compacts before its first resumed prompt (run two, the
+    /// `--continue` shape with compaction enabled) — the `threshold` event
+    /// pair streams, and the admitted prompt runs on the compacted
+    /// context.
+    #[tokio::test]
+    async fn pre_turn_threshold_arm_compacts_a_resumed_session_before_the_prompt() {
+        let _faux = FAUX_TEST_LOCK.lock().await;
+        // Run one: compaction disabled, the crossing turn settles above
+        // the headroom (20000-token window, reserve 1) with no compaction.
+        let (engine_a, dir_a, _model_a) = faux_engine_with_settings(
+            json!({
+                "contextWindow": 20000,
+                "responses": [{"text": "seed reply"}, {"text": "crossing reply"}],
+            }),
+            json!({
+                "compaction": { "enabled": false, "reserveTokens": 1, "keepRecentTokens": 10 }
+            }),
+            None,
+        )
+        .await;
+        let mut boundary = TurnBoundary::new(false);
+        admit(&mut boundary, &engine_a, &_model_a, "seed turn".to_string())
+            .await
+            .unwrap();
+        admit(
+            &mut boundary,
+            &engine_a,
+            &_model_a,
+            format!("crossing turn {}", "x".repeat(100_000)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(compaction_count(&engine_a).await, 0);
+        assert!(outcome_rows(&engine_a).await.is_empty());
+
+        // Run two: a fresh boundary over the persisted session with
+        // compaction enabled — the pre-turn arm compacts above the
+        // headroom before the admitted prompt.
+        let session_file = dir_a
+            .path()
+            .join("sessions")
+            .read_dir()
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.extension().and_then(|extension| extension.to_str()) == Some("jsonl"))
+            .expect("the run-one session file");
+        let resumed =
+            SessionManager::open(dir_a.path(), &dir_a.path().join("sessions"), &session_file);
+        let (engine_b, _dir_b, model_b) = faux_engine_with_settings(
+            json!({
+                "contextWindow": 20000,
+                "responses": [{"text": "the resumed summary"}, {"text": "recovered after the resume"}],
+            }),
+            json!({
+                "compaction": { "enabled": true, "reserveTokens": 1, "keepRecentTokens": 10 }
+            }),
+            Some(resumed),
+        )
+        .await;
+        let (sink, events) = capture_sink();
+        let mut boundary = TurnBoundary::with_sink(true, sink);
+        boundary
+            .run_pre_turn(&engine_b, &model_b, None)
+            .await
+            .unwrap();
+        let events = events.lock().unwrap().clone();
+        assert_eq!(
+            events[0],
+            json!({"type": "compaction_start", "reason": "threshold"})
+        );
+        assert_eq!(events[1]["type"], "compaction_end");
+        assert_eq!(events[1]["reason"], "threshold");
+        assert_eq!(events[1]["result"]["summary"], "the resumed summary");
+        assert_eq!(events[1]["willRetry"], false);
+        assert_eq!(compaction_count(&engine_b).await, 1);
+        assert!(outcome_rows(&engine_b).await.is_empty());
+        // The admitted prompt runs on the compacted context; its settled
+        // boundary stays quiet (the stale-usage guard holds).
+        admit(
+            &mut boundary,
+            &engine_b,
+            &model_b,
+            "next prompt".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(compaction_count(&engine_b).await, 1);
+        let last = last_assistant(&engine_b).await.expect("a settled turn");
+        assert_eq!(last.stop_reason, pa_types::ai::StopReason::Stop);
+        assert_eq!(user_texts(&engine_b).await.len(), 3);
+    }
+
+    /// The pre-turn abort arm (TS `_checkCompaction`'s aborted branch with
+    /// `skipAbortedCheck=false`): an aborted trailing turn drops any
+    /// pending model-requested compaction and refinement — the turn that
+    /// would service them never ran — and the check continues without
+    /// firing (no compaction entries, no outcome rows); the next prompt
+    /// proceeds normally.
+    #[tokio::test]
+    async fn pre_turn_abort_arm_drops_pending_requests_and_continues() {
+        let _faux = FAUX_TEST_LOCK.lock().await;
+        let (engine, _dir, model) = faux_engine_with_settings(
+            json!({
+                "responses": [
+                    {"text": "seed reply"},
+                    {"text": "", "stopReason": "aborted"},
+                    {"text": "next reply"},
+                ]
+            }),
+            compactable_settings(),
+            None,
+        )
+        .await;
+        let (sink, events) = capture_sink();
+        let mut boundary = TurnBoundary::with_sink(true, sink);
+        admit(&mut boundary, &engine, &model, "seed turn".to_string())
+            .await
+            .unwrap();
+        admit(&mut boundary, &engine, &model, "abort me".to_string())
+            .await
+            .unwrap();
+        let last = last_assistant(&engine).await.expect("a settled turn");
+        assert_eq!(last.stop_reason, pa_types::ai::StopReason::Aborted);
+        // Requests pending against the aborted turn: the pre-turn check
+        // drops both.
+        engine
+            .turn_boundary
+            .schedule_compaction(Some("stale request".to_string()))
+            .await;
+        engine
+            .turn_boundary
+            .schedule_refine(pa_core::session_engine::turn_boundary::PendingRefine {
+                instructions: None,
+                global: false,
+            })
+            .await;
+        events.lock().unwrap().clear();
+        boundary.run_pre_turn(&engine, &model, None).await.unwrap();
+        assert!(!engine.turn_boundary.compaction_scheduled().await);
+        assert!(!engine.turn_boundary.refine_pending().await);
+        assert!(events.lock().unwrap().is_empty(), "no compaction events");
+        assert_eq!(compaction_count(&engine).await, 0);
+        assert!(outcome_rows(&engine).await.is_empty());
+        // The check continued: the next prompt admits normally.
+        admit(&mut boundary, &engine, &model, "next prompt".to_string())
+            .await
+            .unwrap();
+        assert_eq!(compaction_count(&engine).await, 0);
+        let last = last_assistant(&engine).await.expect("a settled turn");
+        assert_eq!(last.stop_reason, pa_types::ai::StopReason::Stop);
     }
 
     /// A failed requested refinement emits the TS `refine_failed` event

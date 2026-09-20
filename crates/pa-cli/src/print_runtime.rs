@@ -807,9 +807,12 @@ async fn run_prompts_and_emit(
         .iter()
         .chain(options.messages.iter())
     {
-        // The pre-turn boundary (TS `_runPreTurnCompaction`): a stale
-        // overflow error from a previous run gets its recovery attempt
-        // before the admitted prompt.
+        // The pre-turn boundary (TS `_runPreTurnCompaction`, the full
+        // `_checkCompaction` pass): an aborted trailing turn drops pending
+        // requests, a stale overflow error from a previous run gets its
+        // recovery attempt, and a resumed context above the reserve
+        // headroom (or a pending model request) compacts before the
+        // admitted prompt runs on the compacted context.
         boundary
             .run_pre_turn(engine, model, api_key.clone())
             .await?;
