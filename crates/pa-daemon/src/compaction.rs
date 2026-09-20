@@ -121,7 +121,9 @@ impl CompactionManager {
         outcome
     }
 
-    /// `set_auto_compaction`: update the connection-state flag.
+    /// `set_auto_compaction`: update the connection-state flag. The
+    /// settings write that persists the toggle lives in the
+    /// `set_auto_compaction` handler (`setting_switches`).
     pub(crate) fn set_auto_compaction(&self, enabled: bool) {
         let mut core = self.core.lock().unwrap();
         core.auto_compaction_enabled = enabled;

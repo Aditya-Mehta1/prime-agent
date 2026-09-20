@@ -555,7 +555,7 @@ pub struct Worker {
     /// Single-use peer-transport grants (worker memory only).
     pub(crate) peer_grants: PeerGrantStore,
     /// Compaction runs: abort slot, events, durable entry persistence.
-    compaction: crate::compaction::CompactionManager,
+    pub(crate) compaction: crate::compaction::CompactionManager,
     /// Session-tree navigation: `/tree` moves, branch summaries, forks.
     tree_navigation: crate::branch_navigation::TreeNavigation,
     /// Session export: the `/export` HTML and JSONL branches.
@@ -1692,9 +1692,12 @@ impl Worker {
             self.engine.set_session_file(store.path.clone());
         }
         // The session's settings-seeded switches (TS createAgentSession:
-        // the service tier and the queue delivery modes come from the
-        // settings manager; the durable prefix records the same tier).
-        let (service_tier, steering_mode, follow_up_mode) = {
+        // the service tier, the queue delivery modes, and the auto-compaction
+        // toggle come from the settings manager; the durable prefix records
+        // the same tier). The TS connection state reads the settings value,
+        // so a restarted session re-seeds its flag from the persisted
+        // `compaction.enabled`.
+        let (service_tier, steering_mode, follow_up_mode, auto_compaction_enabled) = {
             let settings = pa_core::settings::SettingsManager::create(&cwd, &self.config.agent_dir);
             let queue_mode = |mode: pa_core::settings::QueueModeSetting| -> String {
                 match mode {
@@ -1706,6 +1709,7 @@ impl Worker {
                 settings.get_default_service_tier(),
                 queue_mode(settings.get_steering_mode()),
                 queue_mode(settings.get_follow_up_mode()),
+                settings.get_compaction_enabled(),
             )
         };
         // The core lock stays inside this block: everything after it may
@@ -1719,6 +1723,7 @@ impl Worker {
             core.store = Some(store);
             core.created = true;
             core.abort_requested = false;
+            core.auto_compaction_enabled = auto_compaction_enabled;
             core.service_tier = Some(service_tier);
             core.steering_mode = steering_mode;
             core.follow_up_mode = follow_up_mode;
@@ -2385,20 +2390,6 @@ impl Worker {
                 response_failure(None, "compact", &error, None)
             }
         }
-    }
-
-    /// `set_auto_compaction` (TS handler): update the connection state and
-    /// answer success without data.
-    fn handle_set_auto_compaction(&self, payload: &Value) -> DaemonResponse {
-        if let Err(response) = self.require_created("set_auto_compaction") {
-            return response;
-        }
-        let enabled = payload
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        self.compaction.set_auto_compaction(enabled);
-        response_success(None, "set_auto_compaction", None)
     }
 
     async fn handle_wait_for_idle(&self) -> DaemonResponse {

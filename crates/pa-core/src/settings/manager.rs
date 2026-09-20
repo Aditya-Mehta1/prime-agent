@@ -257,6 +257,18 @@ impl SettingsManager {
         self.save_global()
     }
 
+    /// TS `setCompactionEnabled`: the auto-compaction toggle
+    /// (`compaction.enabled` in the global settings file). The connection
+    /// state's `autoCompactionEnabled` is this value in TS, so a daemon
+    /// restart re-seeds the flag from the persisted setting.
+    pub fn set_compaction_enabled(&mut self, enabled: bool) -> Result<()> {
+        self.global
+            .compaction
+            .get_or_insert_with(Default::default)
+            .enabled = Some(enabled);
+        self.save_global()
+    }
+
     pub fn set_transport(&mut self, transport: TransportSetting) -> Result<()> {
         self.global.transport = Some(transport);
         self.save_global()
@@ -296,6 +308,16 @@ impl SettingsManager {
             .onboarding_shown
             .or(self.merged.onboarding_completed)
             .unwrap_or(false)
+    }
+
+    /// TS `getCompactionEnabled`: the auto-compaction toggle, on until the
+    /// user opts out (the merged view, like every TS settings getter).
+    pub fn get_compaction_enabled(&self) -> bool {
+        self.merged
+            .compaction
+            .as_ref()
+            .and_then(|compaction| compaction.enabled)
+            .unwrap_or(true)
     }
 
     /// TS `getAgentTracesEnabled`: default off until the user opts in.
@@ -838,6 +860,20 @@ mod tests {
         );
         manager.global.idle_eviction_minutes = Some(serde_json::json!(45));
         assert_eq!(manager.get_idle_eviction(), IdleEviction::Minutes(45));
+    }
+
+    #[test]
+    fn compaction_toggle_defaults_on_and_persists() {
+        // TS getCompactionEnabled: absent -> true (auto-compaction is on
+        // until the user opts out); setCompactionEnabled writes the global
+        // scope, so the value survives a reload (a restarted session
+        // re-seeds its flag from it).
+        let mut manager = SettingsManager::in_memory(Settings::default());
+        assert!(manager.get_compaction_enabled());
+        manager.set_compaction_enabled(false).unwrap();
+        assert!(!manager.get_compaction_enabled());
+        manager.reload().unwrap();
+        assert!(!manager.get_compaction_enabled());
     }
 
     #[test]

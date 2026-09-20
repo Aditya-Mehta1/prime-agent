@@ -2,7 +2,8 @@
 //! for the daemon commands that flip live session settings — `cycle_model`,
 //! `set_scoped_models`, `cycle_thinking_level`, `set_service_tier`,
 //! `set_transport`, `set_steering_mode`, `set_follow_up_mode`,
-//! `set_auto_retry`, `abort_retry` (TS daemon-mode cases). The wire
+//! `set_auto_compaction`, `set_auto_retry`, `abort_retry` (TS daemon-mode
+//! cases). The wire
 //! contracts are TS-verbatim; the durable rows and settings defaults follow
 //! the same TS session methods the existing `set_model` /
 //! `set_thinking_level` arms port.
@@ -504,6 +505,31 @@ impl Worker {
         response_success(None, "set_auto_retry", None)
     }
 
+    /// `set_auto_compaction { enabled }` (TS `session.setAutoCompactionEnabled`
+    /// → `settingsManager.setCompactionEnabled`): the connection-state flag
+    /// and the settings value change together — TS's connection state reads
+    /// the settings manager, so the persisted write is the change and a
+    /// restarted session re-seeds its flag from it. A failed settings save
+    /// fails the command without flipping the flag.
+    pub(crate) fn handle_set_auto_compaction(&self, payload: &Value) -> DaemonResponse {
+        if let Err(response) = self.require_created("set_auto_compaction") {
+            return response;
+        }
+        let enabled = payload
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let core = self.core.lock().unwrap();
+        let cwd = core.cwd.clone();
+        drop(core);
+        let mut settings = pa_core::settings::SettingsManager::create(&cwd, &self.config.agent_dir);
+        if let Err(error) = settings.set_compaction_enabled(enabled) {
+            return response_failure(None, "set_auto_compaction", &error.to_string(), None);
+        }
+        self.compaction.set_auto_compaction(enabled);
+        response_success(None, "set_auto_compaction", None)
+    }
+
     /// `abort_retry` (TS `session.abortRetry`): stop an in-flight retry.
     /// The turn's abort probe reads the flag (the retry wait loop polls
     /// it); the next turn start clears it.
@@ -854,6 +880,102 @@ mod tests {
         let settings = pa_core::settings::SettingsManager::create(&dir, dir.join("agent"));
         let policy = settings.get_provider_retry_policy();
         assert!(!policy.enabled);
+    }
+
+    /// `set_auto_compaction` flips the connection-state flag and persists
+    /// the settings value; a session created afterwards re-seeds its flag
+    /// from the persisted toggle (TS: the connection state reads the
+    /// settings manager, so the value survives a daemon restart).
+    #[tokio::test]
+    async fn set_auto_compaction_persists_the_toggle() {
+        let dir = std::env::temp_dir().join(format!("pa-worker-ac-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("agent")).unwrap();
+        let worker = Arc::new(Worker::new(worker_config(&dir), None));
+        let created = worker
+            .dispatch("create", &json!({ "noSession": true, "cwd": dir }))
+            .await;
+        assert!(created.success);
+        let state = worker
+            .dispatch(
+                "get_connection_state",
+                &json!({ "activeSessionId": "switch-session" }),
+            )
+            .await;
+        // TS default: auto-compaction is on until the user opts out.
+        assert_eq!(
+            state.data.expect("data")["autoCompactionEnabled"],
+            json!(true)
+        );
+        let response = worker
+            .dispatch(
+                "set_auto_compaction",
+                &json!({ "activeSessionId": "switch-session", "enabled": false }),
+            )
+            .await;
+        assert!(response.success, "failed: {response:?}");
+        let state = worker
+            .dispatch(
+                "get_connection_state",
+                &json!({ "activeSessionId": "switch-session" }),
+            )
+            .await;
+        assert_eq!(
+            state.data.expect("data")["autoCompactionEnabled"],
+            json!(false)
+        );
+        let settings = pa_core::settings::SettingsManager::create(&dir, dir.join("agent"));
+        assert!(!settings.get_compaction_enabled());
+        // A restarted session on the same dirs re-seeds the flag from the
+        // persisted setting (the `create` settings-seeded switches).
+        let worker = Arc::new(Worker::new(worker_config(&dir), None));
+        let created = worker
+            .dispatch("create", &json!({ "noSession": true, "cwd": dir }))
+            .await;
+        assert!(created.success);
+        let state = worker
+            .dispatch(
+                "get_connection_state",
+                &json!({ "activeSessionId": "switch-session" }),
+            )
+            .await;
+        assert_eq!(
+            state.data.expect("data")["autoCompactionEnabled"],
+            json!(false)
+        );
+    }
+
+    /// A failed settings write fails the command and leaves the flag
+    /// unchanged (TS: the connection state is the settings value, so a
+    /// thrown save flips nothing).
+    #[tokio::test]
+    async fn set_auto_compaction_fails_without_flipping_on_a_failed_save() {
+        let dir = std::env::temp_dir().join(format!("pa-worker-acf-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A file where the agent dir would be: the settings save cannot
+        // create agent/settings.json.
+        std::fs::write(dir.join("agent"), b"not a directory").unwrap();
+        let worker = Arc::new(Worker::new(worker_config(&dir), None));
+        let created = worker
+            .dispatch("create", &json!({ "noSession": true, "cwd": dir }))
+            .await;
+        assert!(created.success);
+        let response = worker
+            .dispatch(
+                "set_auto_compaction",
+                &json!({ "activeSessionId": "switch-session", "enabled": false }),
+            )
+            .await;
+        assert!(!response.success, "must fail: {response:?}");
+        let state = worker
+            .dispatch(
+                "get_connection_state",
+                &json!({ "activeSessionId": "switch-session" }),
+            )
+            .await;
+        assert_eq!(
+            state.data.expect("data")["autoCompactionEnabled"],
+            json!(true)
+        );
     }
 
     /// `abort_retry` always answers success (TS aborts only an in-flight
