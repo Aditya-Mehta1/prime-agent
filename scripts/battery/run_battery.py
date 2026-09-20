@@ -1588,6 +1588,15 @@ class Battery:
                     )
             finally:
                 B.tmux_kill(session)
+                # The failure scenario kills the provider; the mock is
+                # per-run shared state, so bring it back (new port) and
+                # republish models.json — the f22_provider_failover restore
+                # precedent. Without this, every later flow (f12_scroll runs
+                # right after this one) drives its turns against a dead
+                # provider and fails on error-row transcript geometry.
+                side.mock.start()
+                side.mock.set_responses([{"text": HELLO_TEXT}])
+                side.write_models_json()
                 if prior_settings is None:
                     settings_path.unlink(missing_ok=True)
                 else:
@@ -2216,7 +2225,11 @@ class Battery:
         # diff measures the durable rows.
         text = re.sub(r"prime agent v[0-9][0-9A-Za-z.+-]*", "prime agent <version>", text)
         text = re.sub(r"\b[0-9,]{4,}\b", "<num>", text)
-        text = re.sub(r"\b\d+(\.\d+)?s\b", "<dur>", text)
+        # Tool-execution summary rows report their wall time (`· 43ms` under
+        # one second, `· 1.2s` above it; the same row shape on both
+        # products): scrub both units so per-execution timing noise cannot
+        # fail the frame diff.
+        text = re.sub(r"\b\d+(\.\d+)?m?s\b", "<dur>", text)
         # The expanded compaction block's metadata reports the pre-compaction
         # context size, which each side estimates with its own counter (the
         # row shape and the focus text are the parity claim; the count is
