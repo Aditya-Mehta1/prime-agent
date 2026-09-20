@@ -235,7 +235,8 @@ pub(crate) enum DigestPlacement {
 impl super::AgentSession {
     /// Cold-boundary digest delivery (session start / resume): empty contexts
     /// defer to the first committed turn; non-empty contexts append only when
-    /// the newest in-context digest is stale against disk.
+    /// the newest in-context digest is stale against disk. The row lands
+    /// silently (TS `_appendHarnessDigestIfStale` pushes without events).
     pub(crate) async fn ensure_harness_digest_context(&self) -> anyhow::Result<()> {
         let state = self.agent.state().await;
         let empty = state.messages.is_empty();
@@ -250,16 +251,32 @@ impl super::AgentSession {
         Ok(())
     }
 
-    /// Deliver the pending first-turn digest before the prompt rides the turn.
-    pub(crate) async fn deliver_pending_harness_digest(&self) -> anyhow::Result<()> {
+    /// Deliver the pending first-turn digest before the prompt rides the turn,
+    /// returning the delivered row when one landed (the TS wire custom
+    /// message; `None` when nothing was pending or the digest was current).
+    pub(crate) async fn deliver_pending_harness_digest(
+        &self,
+    ) -> anyhow::Result<Option<pa_types::session::CustomMessage>> {
         if !self
             .digest_pending
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            return Ok(());
+            return Ok(None);
         }
         self.append_stale_harness_digest(DigestPlacement::PrependToEmptyContext)
             .await
+    }
+
+    /// Perform the deferred first-turn digest delivery and hand the
+    /// delivered row to the caller (the print json stream emits its
+    /// `message_start`/`message_end` pair, TS commit-time injection). The
+    /// delivery itself — placement plus persistence — is unchanged; the
+    /// first caller wins, so a host that takes the row leaves nothing for
+    /// the prompt path to deliver twice.
+    pub async fn take_pending_harness_digest(
+        &self,
+    ) -> anyhow::Result<Option<pa_types::session::CustomMessage>> {
+        self.deliver_pending_harness_digest().await
     }
 
     /// The digest inputs captured from the live session (TS `_harnessDigest`
@@ -284,10 +301,14 @@ impl super::AgentSession {
     }
 
     /// Compute the digest and, when it differs from the newest in-context
-    /// digest, persist it and place the message in the loop context.
-    async fn append_stale_harness_digest(&self, placement: DigestPlacement) -> anyhow::Result<()> {
+    /// digest, persist it and place the message in the loop context,
+    /// returning the delivered row.
+    async fn append_stale_harness_digest(
+        &self,
+        placement: DigestPlacement,
+    ) -> anyhow::Result<Option<pa_types::session::CustomMessage>> {
         let Some(inputs) = self.harness_digest_inputs().await else {
-            return Ok(());
+            return Ok(None);
         };
         let digest = inputs.render();
         // Staleness is against the live loop context only (TS
@@ -295,9 +316,10 @@ impl super::AgentSession {
         // in-context digests and must not suppress delivery.
         let latest = latest_context_digest(&self.agent.state().await.messages);
         if latest.as_deref() == Some(digest.as_str()) {
-            return Ok(());
+            return Ok(None);
         }
-        let message = harness_digest_loop_message(&digest, super::now_millis() as i64);
+        let timestamp = super::now_millis();
+        let message = harness_digest_loop_message(&digest, timestamp as i64);
         let mut messages = self.agent.state().await.messages;
         match placement {
             DigestPlacement::Append => messages.push(message),
@@ -308,7 +330,17 @@ impl super::AgentSession {
         self.agent.set_messages(messages).await;
         let mut session = self.session.lock().await;
         persist_digest(&mut session, &digest);
-        Ok(())
+        // The delivered row in the session custom-message wire shape (TS
+        // `createHarnessDigestMessage`: the framed text, `display: false`,
+        // the raw digest in `details`).
+        Ok(Some(pa_types::session::CustomMessage {
+            custom_type: super::headless::HARNESS_DIGEST_CUSTOM_TYPE.to_string(),
+            content: pa_types::ai::UserContent::Text(harness_digest_message_text(&digest)),
+            display: false,
+            details: Some(serde_json::json!({ "digest": digest })),
+            timestamp,
+            rest: Default::default(),
+        }))
     }
 
     /// The last four user/assistant texts, newest first (digest ranking).

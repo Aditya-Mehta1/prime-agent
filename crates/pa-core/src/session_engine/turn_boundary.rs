@@ -137,6 +137,14 @@ impl TurnBoundaryRequests {
         self.refine.lock().await.take()
     }
 
+    /// Schedule a refinement for the next turn boundary (the `refine.run`
+    /// write path's slot assignment). The caller owns the merge contract
+    /// (an absent field keeps the pending request's value), exactly like
+    /// the host handler does before it stores the merged request.
+    pub async fn schedule_refine(&self, pending: PendingRefine) {
+        *self.refine.lock().await = Some(pending);
+    }
+
     /// Drop both pending requests (TS `_checkCompaction` abort arm: an
     /// aborted turn never services them, and a stale request must not leak
     /// into the next turn).

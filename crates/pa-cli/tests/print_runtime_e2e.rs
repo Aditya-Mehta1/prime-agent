@@ -13,6 +13,7 @@ fn run(args: &[&str], script: &serde_json::Value) -> (String, String, i32) {
         .env("HOME", home.path())
         .env("PRIME_AGENT_AGENT_DIR", home.path().join("agent"))
         .env("PRIME_AGENT_FAUX_SCRIPT", script.to_string())
+        .env_remove("RLM_DEPTH")
         .current_dir(home.path())
         .output()
         .expect("binary present");
@@ -53,7 +54,9 @@ fn print_mode_json_streams_ts_shaped_events() {
         .unwrap();
     // Header first, then the loop lifecycle.
     assert_eq!(lines[0]["type"], "session");
-    assert_eq!(lines[0]["version"], 2);
+    assert_eq!(lines[0]["version"], 3);
+    assert!(lines[0]["timestamp"].is_string());
+    assert_eq!(lines[0]["rlmDepth"], 0);
     let types: Vec<&str> = lines
         .iter()
         .map(|line| line["type"].as_str().unwrap_or_default())
@@ -112,6 +115,7 @@ fn run_in_home(
         .env_remove("PRIME_AGENT_CODING_AGENT_DIR")
         .env_remove("PRIME_AGENT_SESSION_DIR")
         .env_remove("PRIME_AGENT_CODING_AGENT_SESSION_DIR")
+        .env_remove("RLM_DEPTH")
         .current_dir(home)
         .output()
         .expect("binary present");
@@ -624,4 +628,218 @@ fn print_mode_stale_overflow_recovers_before_the_next_prompt_after_a_resume() {
         .filter(|entry| entry["type"] == "compaction")
         .count();
     assert_eq!(compactions, 1, "the pre-turn recovery compacted");
+}
+
+// ---------------------------------------------------------------------------
+// The json event stream's TS parity surface (message_update, harness
+// digest, threshold compaction; verified against the TS binary's print
+// json stream over the same scripted faux provider).
+// ---------------------------------------------------------------------------
+
+/// The harness digest pair (TS commit-time injection): the fresh session's
+/// first turn streams the digest's `message_start`/`message_end` pair as a
+/// `custom` message between `turn_start` and the user message pair.
+#[test]
+fn print_mode_json_streams_the_harness_digest_pair() {
+    let home = isolated_home();
+    let script = serde_json::json!({ "responses": ["json answer"] });
+    let (stdout, stderr, code) = run_in_home(home.path(), &["--mode", "json", "-p", "hi"], &script);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let events: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let digest_at = events
+        .iter()
+        .position(|event| {
+            event["type"] == "message_start"
+                && event["message"]["role"] == "custom"
+                && event["message"]["customType"] == "harness_digest"
+        })
+        .expect("the digest message_start event");
+    // The pair rides the first turn: after turn_start, before the user pair.
+    let turn_start_at = events
+        .iter()
+        .position(|event| event["type"] == "turn_start")
+        .expect("turn_start");
+    let user_at = events
+        .iter()
+        .position(|event| event["type"] == "message_start" && event["message"]["role"] == "user")
+        .expect("the user message pair");
+    assert!(turn_start_at < digest_at && digest_at < user_at);
+    // The TS wire shape: the framed text content, display false, the raw
+    // digest in details.
+    let digest = &events[digest_at]["message"];
+    assert!(digest["content"].is_string());
+    assert!(digest["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("[harness-digest]"));
+    assert!(digest["content"]
+        .as_str()
+        .unwrap()
+        .ends_with("</harness_state>"));
+    assert_eq!(digest["display"], false);
+    assert!(digest["details"]["digest"].is_string());
+    assert!(digest["details"]["digest"]
+        .as_str()
+        .unwrap()
+        .contains("# Continual Harness State"));
+    // The end event carries the same message.
+    let digest_end_at = events
+        .iter()
+        .position(|event| {
+            event["type"] == "message_end"
+                && event["message"]["role"] == "custom"
+                && event["message"]["customType"] == "harness_digest"
+        })
+        .expect("the digest message_end event");
+    assert_eq!(
+        events[digest_at]["message"],
+        events[digest_end_at]["message"]
+    );
+}
+
+/// The streaming deltas (TS `message_update`): between the assistant's
+/// `message_start` and `message_end`, the wire carries the slim
+/// `assistantMessageEvent` deltas (`partial` never rides the wire) and the
+/// partial assistant message accumulating per delta.
+#[test]
+fn print_mode_json_streams_the_message_update_deltas() {
+    let home = isolated_home();
+    let script = serde_json::json!({ "responses": ["a streamed answer"] });
+    let (stdout, stderr, code) = run_in_home(home.path(), &["--mode", "json", "-p", "hi"], &script);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let events: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let start_at = events
+        .iter()
+        .position(|event| {
+            event["type"] == "message_start" && event["message"]["role"] == "assistant"
+        })
+        .expect("the assistant message_start");
+    let end_at = events
+        .iter()
+        .position(|event| event["type"] == "message_end" && event["message"]["role"] == "assistant")
+        .expect("the assistant message_end");
+    let updates: Vec<&serde_json::Value> = events[start_at..end_at]
+        .iter()
+        .filter(|event| event["type"] == "message_update")
+        .collect();
+    assert!(!updates.is_empty(), "the stream carries the deltas");
+    // The delta protocol: text_start, text_delta..., text_end, each with
+    // the content index, and no nested `partial` copy on the wire.
+    assert_eq!(updates[0]["assistantMessageEvent"]["type"], "text_start");
+    let last = updates.last().unwrap();
+    assert_eq!(last["assistantMessageEvent"]["type"], "text_end");
+    assert_eq!(
+        last["assistantMessageEvent"]["content"],
+        "a streamed answer"
+    );
+    for update in &updates {
+        assert_eq!(update["assistantMessageEvent"]["contentIndex"], 0);
+        assert!(update["assistantMessageEvent"].get("partial").is_none());
+        assert_eq!(update["message"]["role"], "assistant");
+    }
+    // The partial message accumulates: the first delta's message is the
+    // empty partial; the end delta carries the full text.
+    assert_eq!(updates[0]["message"]["content"][0]["text"], "");
+    assert_eq!(last["message"]["content"][0]["text"], "a streamed answer");
+    // The event field order matches the TS stream (type, message,
+    // assistantMessageEvent) — the wire object carries exactly those keys.
+    let keys: Vec<&str> = updates[0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, ["assistantMessageEvent", "message", "type"]);
+}
+
+/// The threshold compaction arm (TS `_checkCompaction` Case 3): a settled
+/// turn whose usage crosses the reserve headroom streams the
+/// `compaction_start`/`compaction_end` pair with the `threshold` reason,
+/// the client-facing result, and `willRetry: false`.
+#[test]
+fn print_mode_json_streams_the_threshold_compaction_pair() {
+    let home = isolated_home();
+    write_compaction_settings(
+        home.path(),
+        &serde_json::json!({
+            "compaction": { "enabled": true, "reserveTokens": 1, "keepRecentTokens": 10 }
+        }),
+    );
+    // A small context window so the crossing turn exceeds the headroom:
+    // the small seed turn stays below 16k - 1; the ~12k-token crossing
+    // turn pushes the context past it (the faux provider estimates usage
+    // from the serialized context).
+    let script = serde_json::json!({
+        "contextWindow": 16000,
+        "responses": [
+            {"text": "seed reply"},
+            {"text": "crossing reply"},
+            {"text": "the compaction summary"},
+        ]
+    });
+    let first = "seed turn".to_string();
+    let second = format!("crossing turn {}", "x".repeat(48_000));
+    let (stdout, stderr, code) = run_in_home(
+        home.path(),
+        &["--mode", "json", "-p", &first, &second],
+        &script,
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let events: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let start_at = events
+        .iter()
+        .position(|event| event["type"] == "compaction_start")
+        .expect("the compaction_start event");
+    assert_eq!(
+        events[start_at],
+        serde_json::json!({ "type": "compaction_start", "reason": "threshold" })
+    );
+    // The pair fires at the crossing turn's settled boundary (TS
+    // `agent_end` order): after the second run ends, with no third run.
+    let last_agent_end = events
+        .iter()
+        .rposition(|event| event["type"] == "agent_end")
+        .expect("the last agent_end");
+    assert!(last_agent_end < start_at);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "turn_start")
+            .count(),
+        2,
+        "exactly two runs"
+    );
+    let end_at = events
+        .iter()
+        .position(|event| event["type"] == "compaction_end")
+        .expect("the compaction_end event");
+    assert!(start_at < end_at);
+    assert_eq!(events[end_at]["reason"], "threshold");
+    assert_eq!(
+        events[end_at]["result"]["summary"],
+        "the compaction summary"
+    );
+    assert_eq!(events[end_at]["aborted"], false);
+    assert_eq!(events[end_at]["willRetry"], false);
+    assert!(events[end_at].get("errorMessage").is_none());
+    // The compaction entry is durable.
+    let files = session_files(home.path());
+    assert_eq!(files.len(), 1);
+    let entries = read_entries(&files[0]);
+    assert!(
+        entries.iter().any(|entry| entry["type"] == "compaction"),
+        "the compaction persisted"
+    );
 }

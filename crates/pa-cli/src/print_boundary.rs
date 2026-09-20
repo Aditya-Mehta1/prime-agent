@@ -21,7 +21,7 @@
 
 use std::path::PathBuf;
 
-use pa_core::session_engine::compact_session::CompactOutcome;
+use pa_core::session_engine::compact_session::{CompactOutcome, CompactRun};
 use pa_core::session_engine::engine::SessionEngine;
 use pa_core::session_engine::messages::{CompactionOutcomeKind, CompactionOutcomeReason};
 use pa_core::session_engine::provider_adapter::json_round_trip;
@@ -34,6 +34,51 @@ use serde_json::{json, Value};
 /// The TS failure text when one compact-and-retry attempt could not save
 /// the turn (`_checkCompaction`'s reported state).
 const OVERFLOW_RECOVERY_FAILED_MESSAGE: &str = "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.";
+
+/// The `compaction_start` event (TS `_runAutoCompaction`): the reason plus
+/// the consumed request's instructions when it carried any.
+fn compaction_start_event(reason: &str, custom_instructions: Option<&str>) -> Value {
+    let mut event = json!({ "type": "compaction_start", "reason": reason });
+    if let Some(instructions) = custom_instructions {
+        event["customInstructions"] = json!(instructions);
+    }
+    event
+}
+
+/// The successful `compaction_end` event (TS `_runAutoCompaction`): the TS
+/// `CompactionResult` wire shape plus `willRetry` (true only for the
+/// overflow compact-and-retry arm).
+fn compaction_end_success_event(
+    reason: &str,
+    run: &CompactRun,
+    will_retry: bool,
+    custom_instructions: Option<&str>,
+) -> Value {
+    // The wire result is the TS `CompactionResult` shape: the client-facing
+    // summary fields plus the persisted entry's `details` (the TS default
+    // when the entry carried none).
+    let result = json!({
+        "summary": run.result.summary,
+        "firstKeptEntryId": run.result.first_kept_entry_id,
+        "tokensBefore": run.result.tokens_before,
+        "details": run
+            .entry
+            .details
+            .clone()
+            .unwrap_or(json!({ "readFiles": [], "modifiedFiles": [] })),
+    });
+    let mut event = json!({
+        "type": "compaction_end",
+        "reason": reason,
+        "result": result,
+        "aborted": false,
+        "willRetry": will_retry,
+    });
+    if let Some(instructions) = custom_instructions {
+        event["customInstructions"] = json!(instructions);
+    }
+    event
+}
 
 /// One recovery attempt per overflow (TS `_overflowRecovery`): "attempted"
 /// marks a compact-and-retry in flight; "reported" dedups the failure
@@ -70,6 +115,10 @@ enum OverflowOutcome {
     Finished,
 }
 
+/// Where the boundary's json events go: stdout in the product, a captured
+/// buffer in tests.
+type EventSink = std::sync::Arc<dyn Fn(&serde_json::Value) + Send + Sync>;
+
 /// The print loop's turn-boundary state: the one-attempt overflow machine
 /// plus the json/text output mode the surfaces depend on.
 pub(crate) struct TurnBoundary {
@@ -77,6 +126,7 @@ pub(crate) struct TurnBoundary {
     /// json mode streams the TS session events on stdout; text mode reads
     /// the durable rows through the headless terminal result.
     json_mode: bool,
+    sink: EventSink,
 }
 
 impl TurnBoundary {
@@ -84,6 +134,18 @@ impl TurnBoundary {
         Self {
             recovery: OverflowRecovery::Idle,
             json_mode,
+            sink: std::sync::Arc::new(|event| println!("{event}")),
+        }
+    }
+
+    /// A boundary with an explicit event sink (json-mode event-capture
+    /// verifiers; the product path always uses [`TurnBoundary::new`]).
+    #[cfg(test)]
+    pub(crate) fn with_sink(json_mode: bool, sink: EventSink) -> Self {
+        Self {
+            recovery: OverflowRecovery::Idle,
+            json_mode,
+            sink,
         }
     }
 
@@ -146,42 +208,186 @@ impl TurnBoundary {
             // The requested arm: a pending model-requested compaction runs
             // as `requested` (the overflow arm's own runs consume the
             // request, so it only reaches here when Case 1 stayed silent).
-            if let Some(outcome) = engine
+            // TS `_runAutoCompaction` emits the start event before the
+            // summarizer runs, carrying the pending instructions.
+            let scheduled = engine.turn_boundary.scheduled_compaction().await;
+            if let Some(pending) = &scheduled {
+                self.emit_json(compaction_start_event(
+                    CompactionOutcomeReason::Requested.wire(),
+                    pending.instructions.as_deref(),
+                ));
+            }
+            match engine
                 .consume_pending_compaction(model, api_key.clone(), None)
                 .await
             {
-                if let Err(error) = outcome {
-                    eprintln!("pa-cli: requested compaction failed: {error:#}");
+                Some(Ok(CompactOutcome::Ran(run))) => {
+                    self.emit_json(compaction_end_success_event(
+                        CompactionOutcomeReason::Requested.wire(),
+                        &run,
+                        false,
+                        scheduled
+                            .as_ref()
+                            .and_then(|pending| pending.instructions.as_deref()),
+                    ));
                 }
-            } else {
-                // The threshold arm (TS `_checkCompaction` Case 3): the
-                // settled turn's usage crossing the reserve headroom
-                // compacts before the next prompt. The outcome persists in
-                // the session entries the headless terminal result reads.
-                if engine
-                    .session
-                    .auto_compaction_due(model.context_window)
-                    .await
-                {
-                    if let Err(error) = engine
+                // A skip consumed the request: the durable warning row plus
+                // the `compaction_end` event (TS
+                // `Requested compaction skipped: ...`, warning severity).
+                Some(Ok(CompactOutcome::Skipped(message))) => {
+                    self.end_unsuccessfully(
+                        engine,
+                        CompactionOutcomeReason::Requested,
+                        CompactionOutcomeKind::Skipped,
+                        &format!("Requested compaction skipped: {message}"),
+                        scheduled
+                            .as_ref()
+                            .and_then(|pending| pending.instructions.as_deref()),
+                    )
+                    .await;
+                }
+                Some(Err(error)) => {
+                    self.end_unsuccessfully(
+                        engine,
+                        CompactionOutcomeReason::Requested,
+                        CompactionOutcomeKind::Failed,
+                        &format!("Requested compaction failed: {error:#}"),
+                        scheduled
+                            .as_ref()
+                            .and_then(|pending| pending.instructions.as_deref()),
+                    )
+                    .await;
+                }
+                None => {
+                    // The threshold arm (TS `_checkCompaction` Case 3): the
+                    // settled turn's usage crossing the reserve headroom
+                    // compacts before the next prompt. The `compaction_start`
+                    // / `compaction_end` pair streams in json mode (the
+                    // outcome persists in the session entries the headless
+                    // terminal result reads in text mode).
+                    if engine
                         .session
-                        .compact(None, model, api_key.clone(), None)
+                        .auto_compaction_due(model.context_window)
                         .await
                     {
-                        eprintln!("pa-cli: auto-compaction failed: {error:#}");
+                        self.emit_json(compaction_start_event(
+                            CompactionOutcomeReason::Threshold.wire(),
+                            None,
+                        ));
+                        match engine
+                            .session
+                            .compact(None, model, api_key.clone(), None)
+                            .await
+                        {
+                            Ok(CompactOutcome::Ran(run)) => {
+                                self.emit_json(compaction_end_success_event(
+                                    CompactionOutcomeReason::Threshold.wire(),
+                                    &run,
+                                    false,
+                                    None,
+                                ));
+                            }
+                            Ok(CompactOutcome::Skipped(message)) => {
+                                self.end_unsuccessfully(
+                                    engine,
+                                    CompactionOutcomeReason::Threshold,
+                                    CompactionOutcomeKind::Skipped,
+                                    &format!("Auto-compaction skipped: {message}"),
+                                    None,
+                                )
+                                .await;
+                            }
+                            Err(error) => {
+                                self.end_unsuccessfully(
+                                    engine,
+                                    CompactionOutcomeReason::Threshold,
+                                    CompactionOutcomeKind::Failed,
+                                    &format!("Auto-compaction failed: {error:#}"),
+                                    None,
+                                )
+                                .await;
+                            }
+                        }
                     }
                 }
             }
         }
         // The requested refinement runs whenever the turn did not re-issue
-        // (a retried turn consumes it at its own boundary).
-        if let Some(Err(error)) = engine
+        // (a retried turn consumes it at its own boundary). TS emits the
+        // durable rows' message pairs plus `refine_complete` on success and
+        // `refine_failed` on failure; text mode keeps the stderr diagnostic.
+        let entries_before = engine.session.entries().await.len();
+        match engine
             .consume_pending_refinement(model, api_key, global_harness_dir)
             .await
         {
-            eprintln!("pa-cli: requested refinement failed: {error:#}");
+            Some(Ok(result)) => {
+                if self.json_mode {
+                    // The refinement rows this run appended (TS
+                    // `_appendDurableRefineMessage`: the outcome row always,
+                    // the model-facing notice when edits applied).
+                    for row in Self::refinement_rows_since(engine, entries_before).await {
+                        let value = crate::headless_autonomous::stop_row_wire_value(&row);
+                        for event_type in ["message_start", "message_end"] {
+                            (self.sink)(&json!({ "type": event_type, "message": value }));
+                        }
+                    }
+                    self.emit_json(json!({
+                        "type": "refine_complete",
+                        "result": serde_json::to_value(&result)
+                            .unwrap_or(serde_json::Value::Null),
+                    }));
+                }
+            }
+            Some(Err(error)) => {
+                if self.json_mode {
+                    self.emit_json(json!({ "type": "refine_failed", "error": format!("{error}") }));
+                } else {
+                    eprintln!("pa-cli: requested refinement failed: {error:#}");
+                }
+            }
+            None => {}
         }
         Ok(())
+    }
+
+    /// The durable refinement rows appended after an entry count (the
+    /// outcome row, then the model-facing notice when edits applied; both
+    /// land in that order, so the tail scan reads them in TS emission
+    /// order).
+    async fn refinement_rows_since(
+        engine: &SessionEngine,
+        entries_before: usize,
+    ) -> Vec<pa_types::session::CustomMessage> {
+        engine
+            .session
+            .entries()
+            .await
+            .into_iter()
+            .skip(entries_before)
+            .filter_map(|entry| match entry {
+                pa_types::session::FileEntry::CustomMessage { payload, base }
+                    if payload.custom_type
+                        == pa_core::session_engine::refine::REFINEMENT_OUTCOME_CUSTOM_TYPE
+                        || payload.custom_type
+                            == pa_core::session_engine::refine::REFINEMENT_NOTICE_CUSTOM_TYPE =>
+                {
+                    Some(pa_types::session::CustomMessage {
+                        custom_type: payload.custom_type.clone(),
+                        content: payload.content.clone(),
+                        display: payload.display,
+                        details: payload.details.clone(),
+                        timestamp: base
+                            .timestamp
+                            .as_deref()
+                            .map(pa_core::session::timestamp_to_millis)
+                            .unwrap_or_default(),
+                        rest: payload.rest.clone(),
+                    })
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// The shared Case-1 body (TS `_checkCompaction` Case 1). Guard order is
@@ -250,8 +456,10 @@ impl TurnBoundary {
                 // severity on the wire — TS passes none for the auto arms).
                 self.end_unsuccessfully(
                     engine,
+                    CompactionOutcomeReason::Overflow,
                     CompactionOutcomeKind::Failed,
                     OVERFLOW_RECOVERY_FAILED_MESSAGE,
+                    None,
                 )
                 .await;
                 return Ok(OverflowOutcome::Finished);
@@ -272,11 +480,10 @@ impl TurnBoundary {
             .take_compaction()
             .await
             .and_then(|pending| pending.instructions);
-        let mut start = json!({ "type": "compaction_start", "reason": "overflow" });
-        if let Some(instructions) = custom_instructions.as_deref() {
-            start["customInstructions"] = json!(instructions);
-        }
-        self.emit_json(start);
+        self.emit_json(compaction_start_event(
+            CompactionOutcomeReason::Overflow.wire(),
+            custom_instructions.as_deref(),
+        ));
         // Headless compactions run unsignaled (TS print-mode compactions
         // have no abort trigger), so no abort race wraps the run.
         let outcome = engine
@@ -292,27 +499,12 @@ impl TurnBoundary {
                 }
                 // The wire result is the TS `CompactionResult` shape; the
                 // end event carries `willRetry: true` (the turn re-issues).
-                let result = json!({
-                    "summary": run.result.summary,
-                    "firstKeptEntryId": run.result.first_kept_entry_id,
-                    "tokensBefore": run.result.tokens_before,
-                    "details": run
-                        .entry
-                        .details
-                        .clone()
-                        .unwrap_or(json!({ "readFiles": [], "modifiedFiles": [] })),
-                });
-                let mut end = json!({
-                    "type": "compaction_end",
-                    "reason": "overflow",
-                    "result": result,
-                    "aborted": false,
-                    "willRetry": true,
-                });
-                if let Some(instructions) = custom_instructions.as_deref() {
-                    end["customInstructions"] = json!(instructions);
-                }
-                self.emit_json(end);
+                self.emit_json(compaction_end_success_event(
+                    CompactionOutcomeReason::Overflow.wire(),
+                    &run,
+                    true,
+                    custom_instructions.as_deref(),
+                ));
                 // The compaction rebuild re-adds the error turn from the
                 // kept tail: drop it again so the retried request is free
                 // of it (TS will-retry branch).
@@ -344,8 +536,10 @@ impl TurnBoundary {
             Ok(CompactOutcome::Skipped(message)) => {
                 self.end_unsuccessfully(
                     engine,
+                    CompactionOutcomeReason::Overflow,
                     CompactionOutcomeKind::Skipped,
                     &format!("Auto-compaction skipped: {message}"),
+                    custom_instructions.as_deref(),
                 )
                 .await;
                 Ok(OverflowOutcome::Finished)
@@ -353,8 +547,10 @@ impl TurnBoundary {
             Err(error) => {
                 self.end_unsuccessfully(
                     engine,
+                    CompactionOutcomeReason::Overflow,
                     CompactionOutcomeKind::Failed,
                     &format!("Context overflow recovery failed: {error:#}"),
+                    custom_instructions.as_deref(),
                 )
                 .await;
                 Ok(OverflowOutcome::Finished)
@@ -373,22 +569,24 @@ impl TurnBoundary {
     async fn end_unsuccessfully(
         &self,
         engine: &SessionEngine,
+        reason: CompactionOutcomeReason,
         outcome: CompactionOutcomeKind,
         message: &str,
+        custom_instructions: Option<&str>,
     ) {
         let row = engine
             .session
-            .record_compaction_outcome(CompactionOutcomeReason::Overflow, outcome, message)
+            .record_compaction_outcome(reason, outcome, message)
             .await;
         if self.json_mode {
             let value = crate::headless_autonomous::stop_row_wire_value(&row);
             for event_type in ["message_start", "message_end"] {
-                println!("{}", json!({ "type": event_type, "message": value }));
+                (self.sink)(&json!({ "type": event_type, "message": value }));
             }
         }
         let mut event = json!({
             "type": "compaction_end",
-            "reason": "overflow",
+            "reason": reason.wire(),
             "aborted": false,
             "willRetry": false,
             "errorMessage": message,
@@ -396,13 +594,16 @@ impl TurnBoundary {
         if outcome == CompactionOutcomeKind::Skipped {
             event["errorSeverity"] = json!("warning");
         }
+        if let Some(instructions) = custom_instructions {
+            event["customInstructions"] = json!(instructions);
+        }
         self.emit_json(event);
     }
 
     /// Stream one session event in json mode (text mode stays quiet here).
     fn emit_json(&self, event: Value) {
         if self.json_mode {
-            println!("{event}");
+            (self.sink)(&event);
         }
     }
 }
@@ -517,6 +718,16 @@ mod tests {
         model: &Model,
         prompt: String,
     ) -> Result<(), String> {
+        admit_with_harness_dir(boundary, engine, model, prompt, std::path::PathBuf::new()).await
+    }
+
+    async fn admit_with_harness_dir(
+        boundary: &mut TurnBoundary,
+        engine: &SessionEngine,
+        model: &Model,
+        prompt: String,
+        global_harness_dir: std::path::PathBuf,
+    ) -> Result<(), String> {
         boundary.run_pre_turn(engine, model, None).await?;
         engine
             .session
@@ -525,7 +736,7 @@ mod tests {
             .expect("the prompt admits");
         engine.session.agent().wait_for_idle().await;
         boundary
-            .run_at_settled_turn(engine, model, None, std::path::PathBuf::new())
+            .run_at_settled_turn(engine, model, None, global_harness_dir)
             .await
     }
 
@@ -859,6 +1070,394 @@ mod tests {
         let last = last_assistant(&engine_b).await.expect("a settled turn");
         assert_eq!(last.stop_reason, pa_types::ai::StopReason::Stop);
         assert_eq!(user_texts(&engine_b).await.len(), 3);
+    }
+
+    /// A capturing sink for json-mode event verification.
+    fn capture_sink() -> (EventSink, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink: EventSink = {
+            let events = std::sync::Arc::clone(&events);
+            std::sync::Arc::new(move |event: &Value| events.lock().unwrap().push(event.clone()))
+        };
+        (sink, events)
+    }
+
+    /// The durable `refinement_outcome` / `refinement_notice` rows, in order.
+    async fn refine_rows(engine: &SessionEngine) -> Vec<pa_types::session::CustomMessage> {
+        engine
+            .session
+            .entries()
+            .await
+            .into_iter()
+            .filter_map(|entry| match entry {
+                FileEntry::CustomMessage { payload, base } => {
+                    let row = pa_types::session::CustomMessage {
+                        custom_type: payload.custom_type.clone(),
+                        content: payload.content.clone(),
+                        display: payload.display,
+                        details: payload.details.clone(),
+                        timestamp: base
+                            .timestamp
+                            .as_deref()
+                            .map(pa_core::session::timestamp_to_millis)
+                            .unwrap_or_default(),
+                        rest: payload.rest.clone(),
+                    };
+                    (row.custom_type == "refinement_outcome"
+                        || row.custom_type == "refinement_notice")
+                        .then_some(row)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The requested compaction (TS `_runAutoCompaction("requested")`): the
+    /// `compaction_start` event carries the consumed request's
+    /// instructions, and the successful run ends with the client-facing
+    /// result and `willRetry: false` (only the overflow arm re-issues).
+    #[tokio::test]
+    async fn requested_compaction_streams_the_ts_event_pair() {
+        let _faux = FAUX_TEST_LOCK.lock().await;
+        let (engine, _dir, model) = faux_engine_with_settings(
+            json!({
+                "responses": [
+                    {"text": "seed reply"},
+                    {"text": "second reply"},
+                    {"text": "the summary"},
+                ]
+            }),
+            compactable_settings(),
+            None,
+        )
+        .await;
+        let (sink, events) = capture_sink();
+        let mut boundary = TurnBoundary::with_sink(true, sink);
+        admit(
+            &mut boundary,
+            &engine,
+            &model,
+            format!("seed turn {}", "x".repeat(48_000)),
+        )
+        .await
+        .unwrap();
+        events.lock().unwrap().clear();
+        // A pending model request consumed at the next turn's boundary: the
+        // events pair with the `requested` reason (the requested arm
+        // consumes the check, so the threshold never re-evaluates).
+        engine
+            .turn_boundary
+            .schedule_compaction(Some("focus on the goal".to_string()))
+            .await;
+        admit(
+            &mut boundary,
+            &engine,
+            &model,
+            format!("second turn {}", "x".repeat(2_000)),
+        )
+        .await
+        .unwrap();
+        let events = events.lock().unwrap().clone();
+        let start_at = events
+            .iter()
+            .position(|event| event["type"] == "compaction_start")
+            .expect("the compaction_start event");
+        assert_eq!(
+            events[start_at],
+            json!({
+                "type": "compaction_start",
+                "reason": "requested",
+                "customInstructions": "focus on the goal",
+            })
+        );
+        let end_at = events
+            .iter()
+            .position(|event| event["type"] == "compaction_end")
+            .expect("the compaction_end event");
+        assert!(start_at < end_at);
+        assert_eq!(events[end_at]["reason"], "requested");
+        assert_eq!(events[end_at]["result"]["summary"], "the summary");
+        assert_eq!(events[end_at]["aborted"], false);
+        assert_eq!(events[end_at]["willRetry"], false);
+        assert_eq!(events[end_at]["customInstructions"], "focus on the goal");
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["type"] == "refine_complete"),
+            "no refinement ran"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "compaction_start")
+                .count(),
+            1,
+            "exactly one compaction pair"
+        );
+        assert_eq!(compaction_count(&engine).await, 1, "the compaction ran");
+    }
+
+    /// A skipped requested compaction surfaces the durable outcome row (its
+    /// `message_start`/`message_end` pair) before the `compaction_end`
+    /// warning, exactly like the TS `_endCompactionUnsuccessfully` order.
+    #[tokio::test]
+    async fn requested_compaction_skip_streams_the_warning_row_and_end_event() {
+        let _faux = FAUX_TEST_LOCK.lock().await;
+        // `keepRecentTokens` beyond the whole session: the compaction has
+        // no history to summarize.
+        let (engine, _dir, model) = faux_engine_with_settings(
+            json!({ "responses": [{"text": "seed reply"}] }),
+            json!({
+                "compaction": {
+                    "enabled": true, "reserveTokens": 1, "keepRecentTokens": 100000
+                }
+            }),
+            None,
+        )
+        .await;
+        let (sink, events) = capture_sink();
+        let mut boundary = TurnBoundary::with_sink(true, sink);
+        engine.turn_boundary.schedule_compaction(None).await;
+        admit(&mut boundary, &engine, &model, "seed turn".to_string())
+            .await
+            .unwrap();
+        let events = events.lock().unwrap().clone();
+        let row_at = events
+            .iter()
+            .position(|event| {
+                event["type"] == "message_start"
+                    && event["message"]["customType"] == "compaction_outcome"
+            })
+            .expect("the outcome row's message pair");
+        assert_eq!(
+            events[row_at]["message"]["details"],
+            json!({ "reason": "requested", "outcome": "skipped" })
+        );
+        let end_at = events
+            .iter()
+            .position(|event| event["type"] == "compaction_end")
+            .expect("the compaction_end event");
+        assert!(row_at < end_at, "the row pair precedes the end event");
+        assert_eq!(events[end_at]["reason"], "requested");
+        assert_eq!(events[end_at]["willRetry"], false);
+        assert_eq!(
+            events[end_at]["errorMessage"],
+            "Requested compaction skipped: Session is too short to compact — try again once it grows"
+        );
+        assert_eq!(events[end_at]["errorSeverity"], "warning");
+    }
+
+    /// The threshold arm (TS `_checkCompaction` Case 3): a settled turn whose
+    /// usage crosses the reserve headroom emits the `threshold` event pair —
+    /// the start without instructions, the end with the client-facing
+    /// result and `willRetry: false`. The faux provider estimates usage
+    /// from the serialized context, so the headroom is measured from a
+    /// baseline probe turn and placed between the seed turn and the
+    /// crossing turn (the f14 battery shape; environment-independent
+    /// margins on both sides).
+    #[tokio::test]
+    async fn threshold_compaction_streams_the_ts_event_pair() {
+        let _faux = FAUX_TEST_LOCK.lock().await;
+        // Probe: one settled turn's measured usage.
+        let (probe, _probe_dir, probe_model) = faux_engine_with_settings(
+            json!({ "responses": [{"text": "seed reply"}] }),
+            compactable_settings(),
+            None,
+        )
+        .await;
+        let mut probe_boundary = TurnBoundary::new(false);
+        admit(
+            &mut probe_boundary,
+            &probe,
+            &probe_model,
+            "seed turn".to_string(),
+        )
+        .await
+        .unwrap();
+        let baseline = last_assistant(&probe)
+            .await
+            .map(|message| message.usage.total_tokens)
+            .expect("probe turn produced usage");
+        assert!(baseline < 100_000, "implausible baseline: {baseline}");
+
+        // The crossing prompt adds ~12k tokens; the headroom sits halfway.
+        let big_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
+        let big_tokens = (48_000 + "seed turn  crossing".len() as u64).div_ceil(4);
+        let headroom = baseline + big_tokens / 2;
+        let settings = json!({
+            "compaction": {
+                "enabled": true,
+                "reserveTokens": 128_000u64.saturating_sub(headroom).max(1),
+                "keepRecentTokens": 10,
+            }
+        });
+        let (engine, _dir, model) = faux_engine_with_settings(
+            json!({
+                "responses": [
+                    {"text": "seed reply"},
+                    {"text": "crossing reply"},
+                    {"text": "the summary"},
+                ]
+            }),
+            settings,
+            None,
+        )
+        .await;
+        let (sink, events) = capture_sink();
+        let mut boundary = TurnBoundary::with_sink(true, sink);
+        // The seed turn stays below the headroom: no compaction events.
+        admit(&mut boundary, &engine, &model, "seed turn".to_string())
+            .await
+            .unwrap();
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| event["type"] != "compaction_start"),
+            "no compaction below the headroom"
+        );
+        // The crossing turn: the settled usage fires the pair.
+        admit(&mut boundary, &engine, &model, big_prompt)
+            .await
+            .unwrap();
+        let events = events.lock().unwrap().clone();
+        let start_at = events
+            .iter()
+            .position(|event| event["type"] == "compaction_start")
+            .expect("the compaction_start event");
+        assert_eq!(
+            events[start_at],
+            json!({"type": "compaction_start", "reason": "threshold"})
+        );
+        let end_at = events
+            .iter()
+            .position(|event| event["type"] == "compaction_end")
+            .expect("the compaction_end event");
+        assert!(start_at < end_at);
+        assert_eq!(events[end_at]["reason"], "threshold");
+        assert_eq!(events[end_at]["result"]["summary"], "the summary");
+        assert_eq!(events[end_at]["aborted"], false);
+        assert_eq!(events[end_at]["willRetry"], false);
+        assert!(
+            events[end_at].get("customInstructions").is_none(),
+            "the threshold arm carries no request instructions"
+        );
+        assert_eq!(compaction_count(&engine).await, 1, "the compaction ran");
+    }
+
+    /// A failed requested refinement emits the TS `refine_failed` event
+    /// with the failure's message; text mode keeps the stderr diagnostic.
+    #[tokio::test]
+    async fn requested_refinement_failure_emits_the_refine_failed_event() {
+        let _faux = FAUX_TEST_LOCK.lock().await;
+        // The refiner consumes the next faux response; a non-JSON reply
+        // fails the plan parse.
+        let (engine, _dir, model) = faux_engine_with_settings(
+            json!({ "responses": [{"text": "seed reply"}, {"text": "not a plan"}] }),
+            compactable_settings(),
+            None,
+        )
+        .await;
+        let global_dir = tempfile::TempDir::new().unwrap().keep();
+        let (sink, events) = capture_sink();
+        let mut boundary = TurnBoundary::with_sink(true, sink);
+        engine
+            .turn_boundary
+            .schedule_refine(pa_core::session_engine::turn_boundary::PendingRefine {
+                instructions: None,
+                global: true,
+            })
+            .await;
+        admit_with_harness_dir(
+            &mut boundary,
+            &engine,
+            &model,
+            "seed turn".to_string(),
+            global_dir,
+        )
+        .await
+        .unwrap();
+        let events = events.lock().unwrap().clone();
+        let failed = events
+            .iter()
+            .find(|event| event["type"] == "refine_failed")
+            .expect("the refine_failed event");
+        let error = failed["error"].as_str().unwrap_or_default();
+        assert!(!error.is_empty(), "the failure message rides the event");
+        assert!(
+            events
+                .iter()
+                .all(|event| event["type"] != "compaction_start"),
+            "no compaction ran"
+        );
+    }
+
+    /// A successful requested refinement streams the TS surface: the
+    /// durable outcome row's message pair, the model-facing notice's pair
+    /// (edits applied), then the `refine_complete` event carrying the
+    /// wire-shaped result.
+    #[tokio::test]
+    async fn requested_refinement_streams_rows_and_refine_complete() {
+        let _faux = FAUX_TEST_LOCK.lock().await;
+        let plan = r#"{"summary":"note it","rationale":"repeated","expectedOutcome":"recall","edits":[{"action":"create","kind":"memory","id":"m1","title":"Tactic","content":"Use tactic A"}]}"#;
+        let (engine, _dir, model) = faux_engine_with_settings(
+            json!({ "responses": [{"text": "seed reply"}, {"text": plan}] }),
+            compactable_settings(),
+            None,
+        )
+        .await;
+        let global_dir = tempfile::TempDir::new().unwrap().keep();
+        let (sink, events) = capture_sink();
+        let mut boundary = TurnBoundary::with_sink(true, sink);
+        engine
+            .turn_boundary
+            .schedule_refine(pa_core::session_engine::turn_boundary::PendingRefine {
+                instructions: None,
+                global: true,
+            })
+            .await;
+        admit_with_harness_dir(
+            &mut boundary,
+            &engine,
+            &model,
+            "seed turn".to_string(),
+            global_dir,
+        )
+        .await
+        .unwrap();
+        let events = events.lock().unwrap().clone();
+        // The durable rows first: the outcome row's pair, then the notice.
+        let outcome_at = events
+            .iter()
+            .position(|event| {
+                event["type"] == "message_start"
+                    && event["message"]["customType"] == "refinement_outcome"
+            })
+            .expect("the outcome row pair");
+        let notice_at = events
+            .iter()
+            .position(|event| {
+                event["type"] == "message_start"
+                    && event["message"]["customType"] == "refinement_notice"
+            })
+            .expect("the notice row pair");
+        assert!(outcome_at < notice_at);
+        assert_eq!(events[outcome_at]["message"]["display"], true);
+        assert_eq!(events[notice_at]["message"]["display"], false);
+        // Then the completion event with the wire-shaped result.
+        let complete_at = events
+            .iter()
+            .position(|event| event["type"] == "refine_complete")
+            .expect("the refine_complete event");
+        assert!(notice_at < complete_at);
+        assert_eq!(events[complete_at]["result"]["summary"], "note it");
+        assert_eq!(events[complete_at]["result"]["appliedEdits"][0]["id"], "m1");
+        // The durable rows persisted in the session file.
+        let rows = refine_rows(&engine).await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].custom_type, "refinement_outcome");
+        assert_eq!(rows[1].custom_type, "refinement_notice");
     }
 
     /// A plain provider error is not an overflow: the arm never fires and

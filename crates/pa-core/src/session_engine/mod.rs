@@ -478,7 +478,10 @@ impl AgentSession {
             );
         }
         // The deferred first-turn harness digest rides this admission, so the
-        // model sees it before the prompt (TS commit-time injection).
+        // model sees it before the prompt (TS commit-time injection). Hosts
+        // that emit the delivery's message pair take the row first (the
+        // print json stream); the first delivery wins, so this is a no-op
+        // for them.
         self.deliver_pending_harness_digest().await?;
         // User messages persist through the loop's `message_end` event (the
         // persistence subscription in `from_session_arc`), matching the TS

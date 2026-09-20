@@ -295,21 +295,172 @@ async fn build_headless_engine(options: &RunOptions) -> Result<HeadlessEngine, S
     build_headless_engine_parts(options).await
 }
 
-/// The session header line (TS `AgentConnectionSessionHeader` shape).
+/// The session header line: the session file's `type: "session"` entry in
+/// the TS wire shape and field order (`getSessionHeader` ->
+/// `JSON.stringify`), so a fresh run reports the same identity row the TS
+/// json stream leads with.
 async fn session_header_json(
     engine: &pa_core::session_engine::engine::SessionEngine,
-    cwd: &std::path::Path,
-) -> String {
-    // The header carries session identity fields; emit what the engine
-    // exposes today (id + cwd) with the TS envelope shape.
-    let session_id = engine.session.session_id().await;
-    serde_json::json!({
-        "type": "session",
-        "version": 2,
-        "id": session_id,
-        "cwd": cwd.display().to_string(),
+) -> Option<String> {
+    let persistence = engine.session.shared_persistence();
+    let session = persistence.lock().await;
+    let header = session.get_header()?;
+    // The TS field order, optional fields only when present.
+    let mut object = serde_json::Map::new();
+    let field = |map: &mut serde_json::Map<String, serde_json::Value>,
+                 key: &str,
+                 value: Option<serde_json::Value>| {
+        if let Some(value) = value {
+            map.insert(key.to_string(), value);
+        }
+    };
+    field(&mut object, "type", Some(serde_json::json!("session")));
+    field(
+        &mut object,
+        "version",
+        header.version.map(serde_json::Value::from),
+    );
+    field(&mut object, "id", Some(serde_json::json!(header.id)));
+    field(
+        &mut object,
+        "timestamp",
+        Some(serde_json::json!(header.timestamp)),
+    );
+    field(&mut object, "cwd", Some(serde_json::json!(header.cwd)));
+    field(
+        &mut object,
+        "parentSession",
+        header
+            .parent_session
+            .as_ref()
+            .map(|parent| serde_json::json!(parent)),
+    );
+    field(
+        &mut object,
+        "rlmDepth",
+        header.rlm_depth.map(serde_json::Value::from),
+    );
+    field(
+        &mut object,
+        "git",
+        header
+            .git
+            .as_ref()
+            .map(|git| serde_json::to_value(git).unwrap_or(serde_json::Value::Null)),
+    );
+    Some(serde_json::Value::Object(object).to_string())
+}
+
+/// The wire shape of one streaming delta (the TS `AssistantMessageEvent`
+/// as the daemon wire carries it: `partial` dropped — the partial
+/// assistant message rides the event's `message` field already). Terminal
+/// `start`/`done`/`error` events never ride a `message_update` (the loop
+/// emits `message_start`/`message_end` for those), so they map to `None`.
+fn assistant_message_event_json(
+    event: &pa_agent::stream::AssistantMessageEvent,
+) -> Option<serde_json::Value> {
+    use pa_agent::stream::AssistantMessageEvent as StreamEvent;
+    Some(match event {
+        StreamEvent::TextStart { content_index, .. } => serde_json::json!({
+            "type": "text_start",
+            "contentIndex": content_index,
+        }),
+        StreamEvent::TextDelta {
+            content_index,
+            delta,
+            ..
+        } => serde_json::json!({
+            "type": "text_delta",
+            "contentIndex": content_index,
+            "delta": delta,
+        }),
+        StreamEvent::TextEnd {
+            content_index,
+            content,
+            ..
+        } => serde_json::json!({
+            "type": "text_end",
+            "contentIndex": content_index,
+            "content": content,
+        }),
+        StreamEvent::ThinkingStart { content_index, .. } => serde_json::json!({
+            "type": "thinking_start",
+            "contentIndex": content_index,
+        }),
+        StreamEvent::ThinkingDelta {
+            content_index,
+            delta,
+            ..
+        } => serde_json::json!({
+            "type": "thinking_delta",
+            "contentIndex": content_index,
+            "delta": delta,
+        }),
+        StreamEvent::ThinkingEnd {
+            content_index,
+            partial,
+            ..
+        } => serde_json::json!({
+            "type": "thinking_end",
+            "contentIndex": content_index,
+            "content": thinking_block_text(partial, *content_index),
+        }),
+        StreamEvent::ToolCallStart { content_index, .. } => serde_json::json!({
+            "type": "toolcall_start",
+            "contentIndex": content_index,
+        }),
+        StreamEvent::ToolCallDelta {
+            content_index,
+            delta,
+            ..
+        } => serde_json::json!({
+            "type": "toolcall_delta",
+            "contentIndex": content_index,
+            "delta": delta,
+        }),
+        StreamEvent::ToolCallEnd {
+            content_index,
+            tool_call,
+            ..
+        } => {
+            // The TS tool-call block carries its `type: "toolCall"` tag in
+            // the event payload.
+            let mut value = serde_json::json!({
+                "type": "toolCall",
+                "id": tool_call.id,
+                "name": tool_call.name,
+                "arguments": tool_call.arguments,
+            });
+            if let Some(signature) = &tool_call.thought_signature {
+                value["thoughtSignature"] = serde_json::json!(signature);
+            }
+            serde_json::json!({
+                "type": "toolcall_end",
+                "contentIndex": content_index,
+                "toolCall": value,
+            })
+        }
+        StreamEvent::Start { .. } | StreamEvent::Done { .. } | StreamEvent::Error { .. } => {
+            return None;
+        }
     })
-    .to_string()
+}
+
+/// The thinking text of one partial message block (the loop's thinking-end
+/// event drops the content when the pa-ai event crosses the crate
+/// boundary; the partial still carries the accumulated text).
+fn thinking_block_text(
+    partial: &pa_agent::types::AssistantMessage,
+    content_index: usize,
+) -> String {
+    partial
+        .content
+        .get(content_index)
+        .map(|block| match block {
+            pa_agent::types::AssistantContent::Thinking(thinking) => thinking.thinking.clone(),
+            _ => String::new(),
+        })
+        .unwrap_or_default()
 }
 
 /// Serialize one loop event to the TS session_event wire shape.
@@ -337,7 +488,19 @@ fn agent_event_json(event: &pa_agent::types::AgentEvent) -> Option<String> {
             "type": "message_start",
             "message": message_value(m),
         }),
-        AgentEvent::MessageUpdate { .. } => return None,
+        AgentEvent::MessageUpdate {
+            message,
+            assistant_message_event,
+        } => {
+            // The TS wire carries the slimmed delta event (the daemon drops
+            // the nested `partial` copy; `message` already carries it).
+            let delta = assistant_message_event_json(assistant_message_event)?;
+            serde_json::json!({
+                "type": "message_update",
+                "message": message_value(message),
+                "assistantMessageEvent": delta,
+            })
+        }
         AgentEvent::MessageEnd { message: m } => serde_json::json!({
             "type": "message_end",
             "message": message_value(m),
@@ -352,7 +515,18 @@ fn agent_event_json(event: &pa_agent::types::AgentEvent) -> Option<String> {
             "toolName": tool_name,
             "args": args,
         }),
-        AgentEvent::ToolExecutionUpdate { .. } => return None,
+        AgentEvent::ToolExecutionUpdate {
+            tool_call_id,
+            tool_name,
+            args,
+            partial_result,
+        } => serde_json::json!({
+            "type": "tool_execution_update",
+            "toolCallId": tool_call_id,
+            "toolName": tool_name,
+            "args": args,
+            "partialResult": json_round_trip(partial_result).unwrap_or(serde_json::Value::Null),
+        }),
         AgentEvent::ToolExecutionEnd {
             tool_call_id,
             tool_name,
@@ -595,17 +769,43 @@ async fn run_prompts_and_emit(
 ) -> Result<i32, String> {
     let json_mode = options.app_mode == AppMode::Json;
     let mut unsubscribe: Option<pa_agent::agent::Subscription> = None;
+    // The pending first-turn harness digest, taken before the prompt that
+    // rides it: TS commits the digest into the turn's prompt messages, so
+    // its `message_start`/`message_end` pair streams between `turn_start`
+    // and the user message pair.
+    let pending_digest = std::sync::Arc::new(std::sync::Mutex::new(None::<serde_json::Value>));
     if json_mode {
-        let header = session_header_json(engine, &options.config.cwd).await;
-        println!("{header}");
+        if let Some(header) = session_header_json(engine).await {
+            println!("{header}");
+        }
+        let digest_slot = Arc::clone(&pending_digest);
         unsubscribe = Some(
             engine
                 .session
                 .agent()
                 .subscribe(move |event, _signal| {
+                    let digest_slot = Arc::clone(&digest_slot);
                     Box::pin(async move {
                         if let Some(json) = agent_event_json(&event) {
                             println!("{json}");
+                        }
+                        // The deferred digest rides the first turn: its
+                        // pair follows the run's first `turn_start` and
+                        // precedes the prompt's message pair (TS
+                        // commit-time injection into the turn's prompt
+                        // messages).
+                        if matches!(event, pa_agent::types::AgentEvent::TurnStart) {
+                            if let Some(digest) = digest_slot.lock().unwrap().take() {
+                                for event_type in ["message_start", "message_end"] {
+                                    println!(
+                                        "{}",
+                                        serde_json::json!({
+                                            "type": event_type,
+                                            "message": digest,
+                                        })
+                                    );
+                                }
+                            }
                         }
                         Ok(())
                     })
@@ -632,6 +832,22 @@ async fn run_prompts_and_emit(
         .iter()
         .chain(options.messages.iter())
     {
+        // The deferred first-turn harness digest: take the delivery before
+        // the prompt so the subscriber emits its message pair at the turn
+        // start (TS commit-time injection rides the turn's prompt
+        // messages; the pair streams between `turn_start` and the user
+        // message pair). Text mode leaves the delivery to the prompt path.
+        if json_mode {
+            if let Some(row) = engine
+                .session
+                .take_pending_harness_digest()
+                .await
+                .map_err(|error| format!("{error:#}"))?
+            {
+                *pending_digest.lock().unwrap() =
+                    Some(crate::headless_autonomous::stop_row_wire_value(&row));
+            }
+        }
         // The pre-turn boundary (TS `_runPreTurnCompaction`): a stale
         // overflow error from a previous run gets its recovery attempt
         // before the admitted prompt.
@@ -803,6 +1019,12 @@ async fn build_faux_engine_parts(
         .get("reasoning")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    // The script pins the context window (the TS faux-extension contract):
+    // threshold/overflow verifiers size it to the probe they run.
+    let context_window = script
+        .get("contextWindow")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(100_000);
     let registration =
         pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
             models: Some(vec![pa_ai::faux::FauxModelDefinition {
@@ -811,7 +1033,7 @@ async fn build_faux_engine_parts(
                 reasoning: Some(reasoning),
                 input: Some(vec![pa_types::ai::ModelInput::Text]),
                 cost: None,
-                context_window: Some(100_000),
+                context_window: Some(context_window),
                 max_tokens: Some(4_096),
             }]),
             ..Default::default()
@@ -867,4 +1089,204 @@ async fn build_faux_engine_parts(
         model,
         api_key: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pa_agent::stream::AssistantMessageEvent;
+    use pa_agent::types::{
+        AgentEvent, AssistantContent, AssistantMessage, TextContent, ToolCall, Usage,
+    };
+
+    /// A minimal partial assistant message (the faux wire fields).
+    fn partial(content: Vec<AssistantContent>) -> AssistantMessage {
+        AssistantMessage {
+            content,
+            api: "faux".to_string(),
+            provider: "faux".to_string(),
+            model: "faux-1".to_string(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            usage: Usage::zero(),
+            stop_reason: pa_agent::types::StopReason::Stop,
+            error_message: None,
+            stop_reason_raw: None,
+            timestamp: 0,
+        }
+    }
+
+    /// The wire shapes of the streaming deltas (TS `AssistantMessageEvent`
+    /// as the daemon wire carries it — no nested `partial` copy).
+    #[test]
+    fn assistant_message_event_wire_shapes_match_ts() {
+        let message = partial(Vec::new());
+        let cases: Vec<(AssistantMessageEvent, serde_json::Value)> = vec![
+            (
+                AssistantMessageEvent::TextStart {
+                    content_index: 0,
+                    partial: message.clone(),
+                },
+                serde_json::json!({"type": "text_start", "contentIndex": 0}),
+            ),
+            (
+                AssistantMessageEvent::TextDelta {
+                    content_index: 0,
+                    delta: "first reply".to_string(),
+                    partial: message.clone(),
+                },
+                serde_json::json!({
+                    "type": "text_delta",
+                    "contentIndex": 0,
+                    "delta": "first reply",
+                }),
+            ),
+            (
+                AssistantMessageEvent::TextEnd {
+                    content_index: 0,
+                    content: "first reply".to_string(),
+                    partial: message.clone(),
+                },
+                serde_json::json!({
+                    "type": "text_end",
+                    "contentIndex": 0,
+                    "content": "first reply",
+                }),
+            ),
+            (
+                AssistantMessageEvent::ThinkingStart {
+                    content_index: 1,
+                    partial: message.clone(),
+                },
+                serde_json::json!({"type": "thinking_start", "contentIndex": 1}),
+            ),
+            (
+                AssistantMessageEvent::ThinkingDelta {
+                    content_index: 1,
+                    delta: "think".to_string(),
+                    partial: message.clone(),
+                },
+                serde_json::json!({
+                    "type": "thinking_delta",
+                    "contentIndex": 1,
+                    "delta": "think",
+                }),
+            ),
+            (
+                AssistantMessageEvent::ThinkingEnd {
+                    content_index: 1,
+                    partial: partial(vec![
+                        AssistantContent::Text(TextContent {
+                            text: "answer".to_string(),
+                            text_signature: None,
+                        }),
+                        AssistantContent::Thinking(pa_agent::types::ThinkingContent {
+                            thinking: "the reasoning".to_string(),
+                            thinking_signature: None,
+                            redacted: None,
+                        }),
+                    ]),
+                },
+                serde_json::json!({
+                    "type": "thinking_end",
+                    "contentIndex": 1,
+                    "content": "the reasoning",
+                }),
+            ),
+            (
+                AssistantMessageEvent::ToolCallStart {
+                    content_index: 0,
+                    partial: message.clone(),
+                },
+                serde_json::json!({"type": "toolcall_start", "contentIndex": 0}),
+            ),
+            (
+                AssistantMessageEvent::ToolCallDelta {
+                    content_index: 0,
+                    delta: r#"{"code""#.to_string(),
+                    partial: message.clone(),
+                },
+                serde_json::json!({
+                    "type": "toolcall_delta",
+                    "contentIndex": 0,
+                    "delta": "{\"code\"",
+                }),
+            ),
+            (
+                AssistantMessageEvent::ToolCallEnd {
+                    content_index: 0,
+                    tool_call: ToolCall {
+                        id: "call-1".to_string(),
+                        name: "ipython".to_string(),
+                        arguments: serde_json::json!({"code": "1 + 1"}),
+                        thought_signature: None,
+                    },
+                    partial: message.clone(),
+                },
+                serde_json::json!({
+                    "type": "toolcall_end",
+                    "contentIndex": 0,
+                    "toolCall": {
+                        "type": "toolCall",
+                        "id": "call-1",
+                        "name": "ipython",
+                        "arguments": {"code": "1 + 1"},
+                    },
+                }),
+            ),
+        ];
+        for (event, expected) in cases {
+            assert_eq!(
+                assistant_message_event_json(&event).as_ref(),
+                Some(&expected),
+                "wire shape of {:?}",
+                event
+            );
+        }
+        // Terminal events never ride a message_update.
+        assert!(assistant_message_event_json(&AssistantMessageEvent::Start {
+            partial: message.clone(),
+        })
+        .is_none());
+        assert!(assistant_message_event_json(&AssistantMessageEvent::Done {
+            reason: pa_agent::types::StopReason::Stop,
+            message: message.clone(),
+        })
+        .is_none());
+        assert!(assistant_message_event_json(&AssistantMessageEvent::Error {
+            reason: pa_agent::types::StopReason::Error,
+            error: message,
+        })
+        .is_none());
+    }
+
+    /// The `message_update` event wraps the partial message plus the slim
+    /// delta, in the TS field order.
+    #[test]
+    fn message_update_event_json_wraps_the_partial_and_delta() {
+        let message = partial(vec![AssistantContent::Text(TextContent {
+            text: "first reply".to_string(),
+            text_signature: None,
+        })]);
+        let event = AgentEvent::MessageUpdate {
+            message: pa_agent::types::AgentMessage::Standard(pa_agent::types::Message::Assistant(
+                message.clone(),
+            )),
+            assistant_message_event: Box::new(AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "first reply".to_string(),
+                partial: message,
+            }),
+        };
+        let json = agent_event_json(&event).expect("a message_update json line");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["type"], "message_update");
+        assert_eq!(value["message"]["role"], "assistant");
+        assert_eq!(value["message"]["content"][0]["text"], "first reply");
+        assert_eq!(
+            value["assistantMessageEvent"],
+            serde_json::json!({"type": "text_delta", "contentIndex": 0, "delta": "first reply"})
+        );
+    }
 }

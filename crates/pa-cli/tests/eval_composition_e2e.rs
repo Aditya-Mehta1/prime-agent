@@ -162,7 +162,7 @@ fn verifier_gate_pass_stops_the_run_with_structured_events_and_durable_rows() {
 
     // Header first.
     assert_eq!(events[0]["type"], "session");
-    assert_eq!(events[0]["version"], 2);
+    assert_eq!(events[0]["version"], 3);
 
     // Both scripted turns ran, in order.
     let assistant_texts: Vec<String> = events

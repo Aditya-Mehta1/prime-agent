@@ -21,6 +21,14 @@ checks (`print_boundary.rs` — the overflow compact-and-retry arm, the
 model-requested compaction/refinement consumption, and the threshold arm,
 the TS `_checkCompaction` flow), the json event stream, and the headless
 terminal selection (stdout/stderr/exit code) mirroring modes/print-mode.ts.
+The json stream emits the TS session-event surface byte-for-shape: the
+session header row (version 3), the `message_update` streaming deltas with
+the slim `assistantMessageEvent` (the daemon wire drops the nested
+`partial`), `tool_execution_update`, the harness digest's message pair at
+the first-turn boundary, the compaction `compaction_start`/`compaction_end`
+pairs with their durable outcome rows, and the refinement rows with
+`refine_complete`/`refine_failed`. Verifier: `scripts/print_json_parity.py`
+(the TS binary differential) plus the `print_runtime_e2e` rows.
 
 ## Daemon client
 The daemon-backed public commands (`list`, `stop`, `rename`, `send`, `schedule`) talk to the
