@@ -15,7 +15,7 @@
 //! failure messages with their severities otherwise.
 
 use pa_agent::abort::AbortController;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::agent_engine::AgentSessionEngine;
 use crate::engine::EngineEvent;
@@ -113,12 +113,9 @@ impl AgentSessionEngine {
         };
         match &outcome {
             Ok(Ok(CompactOutcome::Ran(run))) => {
-                // The wire result is the TS `CompactionResult` shape.
-                let result = json!({
-                    "summary": run.result.summary,
-                    "firstKeptEntryId": run.result.first_kept_entry_id,
-                    "tokensBefore": run.result.tokens_before,
-                });
+                // The wire result is the TS `CompactionResult` shape
+                // (`_performCompaction`'s return, details included).
+                let result = crate::compaction::compaction_result_value(&run.result, &run.entry);
                 let entry = serde_json::to_value(&run.entry).unwrap_or(Value::Null);
                 let event =
                     crate::compaction::compaction_end_success("threshold", &result, false, None);

@@ -242,8 +242,10 @@ returning `CompactionResult`; `abort_compaction`; `set_auto_compaction`.
   decision logic in `compaction.rs`.
 - verifier: battery flow f7 against the live mock provider (run
   `scripts/battery/runs/20260917T062810Z`: both sides answer `compact`
-  with summary/firstKeptEntryId/tokensBefore; known shape delta: TS adds
-  `details{readFiles, modifiedFiles}` which Rust omits).
+  with summary/firstKeptEntryId/tokensBefore; the historical shape delta —
+  TS adds `details{readFiles, modifiedFiles}` which Rust omitted — is
+  fixed: the Rust response now mirrors the TS dataKeys, `details` verbatim
+  from the durable entry).
 - remaining (kernel half): the model-facing `compact.status`/`compact.run`
   host requests (TS `agent-session.ts` L3703-3731) have no registered Rust
   product-path handler, so the model cannot trigger compaction of its own
@@ -441,10 +443,11 @@ Categories: visual/behavior/protocol/timing.
   (headless TUI over a live faux-engine session: echo/result rows, menu,
   suggestion, unavailable note, persisted session rows). Historical
   evidence: `runs/20260916T210320Z/rust/f4_commands/01-slash-menu.txt`.
-- B-10 (protocol, f7): FIXED (#85, item 5 above is now `done`). Both sides
-  answer `compact` with `{summary, firstKeptEntryId, tokensBefore}`; the TS
-  response additionally carries `details{readFiles, modifiedFiles}` which the
-  Rust response omits (known shape delta). Verified by run
+- B-10 (protocol, f7): FIXED (#85, item 5 above is now `done`); the known
+  shape delta is also fixed (lane compact-datakeys). Both sides answer
+  `compact` with `{summary, firstKeptEntryId, tokensBefore,
+  details{readFiles, modifiedFiles}}` — the Rust response mirrors the TS
+  dataKeys, `details` verbatim from the durable entry. Verified by run
   `runs/20260917T062810Z` f7 (both compacts succeed). Historical evidence:
   `runs/20260916T210320Z/{ts,rust}/f7_compaction/compact-response.json`.
 - B-11 (behavior, f8): FIXED. TS print `-c` refuses while the session is

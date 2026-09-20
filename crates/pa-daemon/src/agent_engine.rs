@@ -1168,15 +1168,14 @@ impl SessionEngine for AgentSessionEngine {
             pa_core::session_engine::compact_session::CompactOutcome::Ran(run) => {
                 CompactionOutcome::Compacted {
                     run: CompactionRun {
-                        // The wire result is the TS `CompactionResult` shape:
-                        // summary, firstKeptEntryId, tokensBefore. Usage,
-                        // file-op details, and the harnessDigest snapshot
-                        // live on the persisted entry, handed over verbatim.
-                        result: json!({
-                            "summary": run.result.summary,
-                            "firstKeptEntryId": run.result.first_kept_entry_id,
-                            "tokensBefore": run.result.tokens_before,
-                        }),
+                        // The wire result is the TS `CompactionResult` shape
+                        // (`_performCompaction`'s return): summary,
+                        // firstKeptEntryId, tokensBefore, and the file-op
+                        // `details` verbatim from the durable entry. Usage and
+                        // the harnessDigest snapshot live on the persisted
+                        // entry, handed over verbatim, never on the wire
+                        // result.
+                        result: crate::compaction::compaction_result_value(&run.result, &run.entry),
                         usage: run
                             .result
                             .usage
@@ -2180,13 +2179,10 @@ impl AgentSessionEngine {
         match consumption.compaction {
             Some(Ok(pa_core::session_engine::compact_session::CompactOutcome::Ran(run))) => {
                 let entry = serde_json::to_value(&run.entry).unwrap_or(Value::Null);
-                // The wire result is the TS `CompactionResult` shape; the
+                // The wire result is the TS `CompactionResult` shape
+                // (`_performCompaction`'s return, details included); the
                 // event reason is `requested` (TS `_runAutoCompaction`).
-                let result = serde_json::json!({
-                    "summary": run.result.summary,
-                    "firstKeptEntryId": run.result.first_kept_entry_id,
-                    "tokensBefore": run.result.tokens_before,
-                });
+                let result = crate::compaction::compaction_result_value(&run.result, &run.entry);
                 let event =
                     crate::compaction::compaction_end_success("requested", &result, false, None);
                 if !emit(EngineEvent::Compaction { entry, event }) {
@@ -3177,6 +3173,12 @@ pub(crate) mod tests {
         assert!(compaction_index > start_index);
         assert_eq!(event["reason"], "threshold");
         assert_eq!(event["result"]["summary"], "the summary");
+        // The threshold event's result carries the TS dataKeys too: the
+        // file-op `details` verbatim from the durable entry.
+        assert_eq!(
+            event["result"]["details"],
+            serde_json::json!({ "readFiles": [], "modifiedFiles": [] })
+        );
         assert!(entry["firstKeptEntryId"].is_string());
         // Exactly one pair for the admission: the pre-turn check on the
         // first iteration sees no built session (nothing to compact), and
@@ -4259,6 +4261,22 @@ fn compact_session_command_emits_the_result_on_success() {
     let result = end["result"].as_object().expect("the result payload");
     assert_eq!(result["summary"], "## Summary\nthe session story");
     assert!(result["tokensBefore"].as_u64().unwrap_or_default() > 0);
+    // The TS dataKeys on the wire result (the live golden,
+    // `tests/goldens/compaction-live-ts.json`): summary, firstKeptEntryId,
+    // tokensBefore, details — the file-op lists verbatim from the durable
+    // entry, and the summarizer usage never rides the wire.
+    let mut result_keys: Vec<&str> = result.keys().map(String::as_str).collect();
+    result_keys.sort_unstable();
+    assert_eq!(
+        result_keys,
+        ["details", "firstKeptEntryId", "summary", "tokensBefore"],
+        "CompactionResult key set"
+    );
+    assert_eq!(
+        result["details"],
+        serde_json::json!({ "readFiles": [], "modifiedFiles": [] })
+    );
+    assert!(result.get("usage").is_none());
     // The durable rows stay minimal (TS's queued `/compact` catch arm
     // records no result row): the echo row is the only custom row.
     let rows = custom_rows(&events);

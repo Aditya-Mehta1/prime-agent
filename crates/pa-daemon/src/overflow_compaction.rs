@@ -18,7 +18,7 @@
 //! (TS resets `_overflowRecovery` at agent-run message starts and at
 //! non-error assistant message ends).
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::agent_engine::AgentSessionEngine;
 use crate::engine::EngineEvent;
@@ -292,13 +292,10 @@ impl AgentSessionEngine {
                         telemetry.note_compaction();
                     }
                 }
-                // The wire result is the TS `CompactionResult` shape; the
+                // The wire result is the TS `CompactionResult` shape
+                // (`_performCompaction`'s return, details included); the
                 // end event carries `willRetry: true` (the turn re-issues).
-                let result = json!({
-                    "summary": run.result.summary,
-                    "firstKeptEntryId": run.result.first_kept_entry_id,
-                    "tokensBefore": run.result.tokens_before,
-                });
+                let result = crate::compaction::compaction_result_value(&run.result, &run.entry);
                 let entry = serde_json::to_value(&run.entry).unwrap_or(Value::Null);
                 let event = crate::compaction::compaction_end_success(
                     "overflow",
@@ -563,6 +560,12 @@ mod tests {
         assert_eq!(ends[0]["reason"], "overflow");
         assert_eq!(ends[0]["willRetry"], true);
         assert_eq!(ends[0]["result"]["summary"], "the summary");
+        // The overflow result carries the TS dataKeys too: the file-op
+        // `details` verbatim from the durable entry.
+        assert_eq!(
+            ends[0]["result"]["details"],
+            json!({ "readFiles": [], "modifiedFiles": [] })
+        );
         let reported = "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.";
         assert_eq!(
             ends[1],

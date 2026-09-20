@@ -112,12 +112,10 @@ fn emit_compact_end(
     let custom_instructions = compact_custom_instructions(command);
     let (entry, event) = if let Some(compaction) = &execution.compaction {
         let entry = serde_json::to_value(&compaction.entry).unwrap_or(serde_json::Value::Null);
-        // The client-facing result is the TS `CompactionResult` wire shape.
-        let result = serde_json::json!({
-            "summary": compaction.result.summary,
-            "firstKeptEntryId": compaction.result.first_kept_entry_id,
-            "tokensBefore": compaction.result.tokens_before,
-        });
+        // The client-facing result is the TS `CompactionResult` wire shape
+        // (`_performCompaction`'s return, details included).
+        let result =
+            crate::compaction::compaction_result_value(&compaction.result, &compaction.entry);
         (
             entry,
             crate::compaction::compaction_end_success(
