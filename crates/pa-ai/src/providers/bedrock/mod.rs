@@ -39,8 +39,7 @@ use crate::types::{
 use crate::utils_inner::diagnostics::now_ms;
 use crate::utils_inner::http::{send, HttpResponse, RequestOptions};
 use crate::utils_inner::stream_failure::{
-    format_stream_failure_message, record_stream_failure, stream_failure_from_stop_reason,
-    ProviderError,
+    record_stream_failure, stream_failure_from_stop_reason, ProviderError, ProviderHttpError,
 };
 
 pub const API_BEDROCK_CONVERSE_STREAM: &str = "bedrock-converse-stream";
@@ -106,6 +105,76 @@ pub(crate) fn bedrock_error_prefix(exception_name: &str) -> String {
     exception_name.to_string()
 }
 
+/// Port of `formatBedrockError`'s composed form for an AWS SDK exception:
+/// `{prefix}: {message}` with the human-readable prefix for known exception
+/// names (`prefix` falls back to the raw SDK exception name).
+pub(crate) fn bedrock_exception_message(exception_name: &str, message: &str) -> String {
+    format!("{}: {}", bedrock_error_prefix(exception_name), message)
+}
+
+/// The endpoint's connection port (explicit, else the scheme default).
+fn bedrock_endpoint_port(endpoint: &str) -> u16 {
+    url::Url::parse(endpoint)
+        .ok()
+        .and_then(|url| url.port())
+        .unwrap_or(443)
+}
+
+/// Port of the AWS SDK error deserialization for a non-2xx HTTP response:
+/// the error name comes from the body `__type`/`code` (after the `#`
+/// namespace separator, like the SDK's error-code parser) and the message
+/// from the body `message` (defaulting to "UnknownError", like
+/// `decorateServiceException`); unknown names fall through
+/// `throwDefaultError`'s `parsedBody.code || errorCode || statusCode` chain.
+/// The result is what `formatBedrockError` composes for it.
+fn bedrock_http_error(
+    status: u16,
+    body: &str,
+    headers: &std::collections::HashMap<String, String>,
+) -> ProviderError {
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+    let body_code = parsed
+        .as_ref()
+        .and_then(|parsed| {
+            let code = parsed
+                .get("code")
+                .or_else(|| parsed.get("Code"))
+                .and_then(serde_json::Value::as_str);
+            let typed = parsed
+                .get("__type")
+                .or_else(|| parsed.get("errorType"))
+                .and_then(serde_json::Value::as_str);
+            code.or(typed)
+        })
+        .map(|raw| raw.rsplit('#').next().unwrap_or(raw).to_string());
+    let header_code = headers
+        .get("x-amzn-errortype")
+        .map(|value| value.split(':').next().unwrap_or(value).to_string());
+    // The generic fallback names the error by the raw status code text.
+    let exception_name = body_code
+        .or(header_code)
+        .unwrap_or_else(|| status.to_string());
+    let message = parsed
+        .as_ref()
+        .and_then(|parsed| parsed.get("message").or_else(|| parsed.get("Message")))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        // `decorateServiceException`: `message || Message || "UnknownError"`
+        .unwrap_or_else(|| "UnknownError".to_string());
+    ProviderError::Http(ProviderHttpError {
+        message: bedrock_exception_message(&exception_name, &message),
+        // AWS SDK exceptions carry no `.status` field for the TS classifier
+        // (`$metadata.httpStatusCode` is not read).
+        status: None,
+        body: None,
+        headers: Default::default(),
+        request_id: None,
+        sdk_name: Some(exception_name),
+        retry_after_ms: None,
+        provider_error_type: None,
+    })
+}
+
 /// Port of `streamBedrock`.
 pub fn stream_bedrock(
     model: &Model,
@@ -149,7 +218,9 @@ pub fn stream_bedrock(
                 } else {
                     StopReason::Error
                 };
-                output.error_message = Some(format_stream_failure_message(&error));
+                // TS surfaces `formatBedrockError(error)`: the SDK exception
+                // name prefix form, not the classified stream-failure rewrite.
+                output.error_message = Some(error.to_string());
                 record_stream_failure(
                     (&model.provider, &model.id, &model.api),
                     &mut output,
@@ -425,6 +496,13 @@ async fn run_stream(
         }
     }
 
+    // The connection profile carries the endpoint address so the
+    // refused-connect text names the target (node-style
+    // `connect ECONNREFUSED <host>:<port>`).
+    let connection = crate::utils_inner::stream_failure::ConnectionErrorProfile::AwsHttp1 {
+        host: host.clone(),
+        port: bedrock_endpoint_port(&url),
+    };
     let mut response: HttpResponse = send(RequestOptions {
         method: reqwest::Method::POST,
         url,
@@ -432,6 +510,7 @@ async fn run_stream(
         body: Some(payload.to_string()),
         signal: options.base.signal.clone(),
         timeout_ms: options.base.timeout_ms,
+        connection,
     })
     .await?;
 
@@ -447,10 +526,10 @@ async fn run_stream(
 
     if response.status >= 400 {
         let body = response.read_all_text().await.unwrap_or_default();
-        return Err(ProviderError::from_http_status_body(
+        return Err(bedrock_http_error(
             response.status,
             &body,
-            response.headers.clone(),
+            &response.headers,
         ));
     }
 
@@ -647,6 +726,89 @@ mod tests {
     use crate::providers::bedrock::auth::{
         get_standard_bedrock_endpoint_region, should_use_explicit_bedrock_endpoint,
     };
+
+    /// The TS `formatBedrockError` shape for an HTTP-level failure: the AWS
+    /// SDK exception name (from the body `__type` after the namespace) maps to
+    /// a stable human-readable prefix; unknown names keep the raw name.
+    #[test]
+    fn bedrock_http_error_prefix_shape() {
+        let error = bedrock_http_error(
+            400,
+            "{\"__type\":\"com.amazonaws.bedrock#ValidationException\",\"message\":\"model id is invalid\"}",
+            &Default::default(),
+        );
+        assert_eq!(error.to_string(), "Validation error: model id is invalid");
+        let info = crate::utils_inner::stream_failure::extract_stream_failure_info(&error);
+        assert_eq!(
+            info.provider_error_type.as_deref(),
+            Some("ValidationException")
+        );
+        // AWS exceptions carry no HTTP status to the TS classifier.
+        assert_eq!(info.status, None);
+        assert_eq!(
+            info.kind,
+            crate::utils_inner::stream_failure::StreamFailureKind::Unknown
+        );
+        let diagnostic = crate::utils_inner::stream_failure::diagnostic_error_info(&error);
+        assert_eq!(diagnostic.name.as_deref(), Some("ValidationException"));
+    }
+
+    /// Throttling exceptions keep their name as the classification key
+    /// ("throttl" -> rate_limit), like the TS rethrown stream exception.
+    #[test]
+    fn bedrock_throttling_error_classifies() {
+        let error = bedrock_http_error(
+            429,
+            "{\"__type\":\"ThrottlingException\",\"message\":\"too many\"}",
+            &Default::default(),
+        );
+        assert_eq!(error.to_string(), "Throttling error: too many");
+        let info = crate::utils_inner::stream_failure::extract_stream_failure_info(&error);
+        assert_eq!(
+            info.kind,
+            crate::utils_inner::stream_failure::StreamFailureKind::RateLimit
+        );
+    }
+
+    /// An unrecognized error body names the generic fallback by the raw
+    /// status text (smithy `throwDefaultError`: `parsedBody.code ||
+    /// errorCode || statusCode || "UnknownError"`), and a missing message
+    /// defaults to "UnknownError" like `decorateServiceException`.
+    #[test]
+    fn bedrock_http_error_generic_fallback() {
+        let error = bedrock_http_error(400, "{\"foo\":1}", &Default::default());
+        assert_eq!(error.to_string(), "400: UnknownError");
+    }
+
+    /// Connection failures surface undici's raw `TypeError` message, like the
+    /// codex raw-`fetch` path (the AWS SDK does not wrap them).
+    /// The in-stream exception message composition (`{prefix}: {message}`).
+    #[test]
+    fn bedrock_exception_message_shape() {
+        assert_eq!(
+            bedrock_exception_message("ModelStreamErrorException", "stream died"),
+            "Model stream error: stream died"
+        );
+        assert_eq!(
+            bedrock_exception_message("SomeUnknownException", "boom"),
+            "SomeUnknownException: boom"
+        );
+    }
+
+    #[test]
+    fn bedrock_connection_error_text() {
+        let connect = ProviderError::Connection(
+            crate::utils_inner::stream_failure::ProviderConnectionError {
+                kind: crate::utils_inner::stream_failure::ConnectionErrorKind::Connect,
+                profile: crate::utils_inner::stream_failure::ConnectionErrorProfile::AwsHttp1 {
+                    host: "127.0.0.1".to_string(),
+                    port: 1,
+                },
+                cause: "http2 connect error".to_string(),
+            },
+        );
+        assert_eq!(connect.to_string(), "connect ECONNREFUSED 127.0.0.1:1");
+    }
 
     #[test]
     fn parses_standard_endpoint_regions() {

@@ -288,6 +288,7 @@ async fn run_stream(
         body: Some(params.to_string()),
         signal: options.base.signal.clone(),
         timeout_ms: options.base.timeout_ms,
+        connection: crate::utils_inner::stream_failure::ConnectionErrorProfile::RawFetch,
     })
     .await?;
 
@@ -303,11 +304,17 @@ async fn run_stream(
 
     if response.status >= 400 {
         let body = response.read_all_text().await.unwrap_or_default();
-        return Err(ProviderError::from_http_status_body(
-            response.status,
-            &body,
-            response.headers.clone(),
-        ));
+        // The genai `ApiError` carries no `.error` object for the TS
+        // classifier (its `code` is numeric): the class name is the
+        // provider error type and the classified form carries no detail.
+        let mut error =
+            ProviderError::from_http_status_body(response.status, &body, response.headers.clone());
+        if let ProviderError::Http(http) = &mut error {
+            http.sdk_name = Some("ApiError".to_string());
+            http.body = None;
+            http.request_id = None;
+        }
+        return Err(error);
     }
 
     writer.push(AssistantMessageEvent::Start {

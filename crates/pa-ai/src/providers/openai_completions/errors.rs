@@ -65,6 +65,11 @@ pub fn openai_http_error(
         body: Some(body.to_string()),
         headers,
         request_id: None,
+        // The openai SDK errors do not set `error.name`: the TS diagnostic
+        // records the inherited plain JS "Error".
+        sdk_name: None,
+        retry_after_ms: None,
+        provider_error_type: None,
     })
 }
 

@@ -3,13 +3,17 @@
 //! Providers in the TS reference go through SDK clients configured with
 //! `maxRetries: 0`; here each provider issues one streaming HTTP request
 //! through a shared `reqwest` client. Aborts are surfaced as
-//! [`ProviderError::Aborted`]; HTTP failures as [`ProviderError::Http`].
+//! [`ProviderError::Aborted`]; HTTP failures as [`ProviderError::Http`];
+//! request-send failures as [`ProviderError::Connection`].
 
 use std::sync::OnceLock;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::utils::stream_failure::{ProviderError, ProviderHttpError};
+use crate::utils::stream_failure::{
+    ConnectionErrorKind, ConnectionErrorProfile, ProviderConnectionError, ProviderError,
+    ProviderHttpError,
+};
 
 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
@@ -61,6 +65,9 @@ impl HttpResponse {
                 body: None,
                 headers: self.headers.clone(),
                 request_id: None,
+                sdk_name: None,
+                retry_after_ms: None,
+                provider_error_type: None,
             })),
         }
     }
@@ -95,6 +102,9 @@ impl HttpResponse {
                 body: None,
                 headers: self.headers.clone(),
                 request_id: None,
+                sdk_name: None,
+                retry_after_ms: None,
+                provider_error_type: None,
             })),
         }
     }
@@ -116,6 +126,25 @@ pub struct RequestOptions {
     pub body: Option<String>,
     pub signal: Option<CancellationToken>,
     pub timeout_ms: Option<u64>,
+    /// The provider family's connection-error shape (fixed texts, names,
+    /// and error codes the TS binary surfaces per SDK); the openai/anthropic
+    /// `Sdk` default covers the Stainless-generated SDK family.
+    pub connection: ConnectionErrorProfile,
+}
+
+impl RequestOptions {
+    /// Request options with the openai/anthropic `Sdk` connection profile.
+    pub fn new(method: reqwest::Method, url: String) -> Self {
+        Self {
+            method,
+            url,
+            headers: Vec::new(),
+            body: None,
+            signal: None,
+            timeout_ms: None,
+            connection: ConnectionErrorProfile::Sdk,
+        }
+    }
 }
 
 /// Issue a request and return the response with a streaming body. No retries:
@@ -153,12 +182,10 @@ pub async fn send(request: RequestOptions) -> Result<HttpResponse, ProviderError
             {
                 Ok(result) => result,
                 Err(_) => {
-                    return Err(ProviderError::Http(ProviderHttpError {
-                        message: format!("Request timed out after {timeout_ms}ms"),
-                        status: None,
-                        body: None,
-                        headers: Default::default(),
-                        request_id: None,
+                    return Err(ProviderError::Connection(ProviderConnectionError {
+                        kind: ConnectionErrorKind::Timeout,
+                        profile: request.connection.clone(),
+                        cause: format!("request exceeded the {timeout_ms}ms timeout"),
                     }))
                 }
             }
@@ -166,26 +193,23 @@ pub async fn send(request: RequestOptions) -> Result<HttpResponse, ProviderError
         (None, None) => send_future.await,
     };
 
+    // The TS SDKs surface request-send failures as their fixed connection
+    // error texts: the openai/anthropic SDK family throws
+    // `APIConnectionError` ("Connection error.") / `APIConnectionTimeoutError`
+    // ("Request timed out.") for every fetch failure; providers whose SDK
+    // appends the raw cause (mistral) or surfaces undici's raw text (codex,
+    // bedrock, google: "fetch failed") rewrite it at their catch site.
     let response = response.map_err(|error| {
-        if error.is_timeout() {
-            ProviderError::Http(ProviderHttpError {
-                message: format!("Request timed out: {error}"),
-                status: None,
-                body: None,
-                headers: Default::default(),
-                request_id: None,
-            })
-        } else if error.is_connect() {
-            ProviderError::Http(ProviderHttpError {
-                message: format!("Connection failed: {error}"),
-                status: None,
-                body: None,
-                headers: Default::default(),
-                request_id: None,
-            })
+        let kind = if error.is_timeout() {
+            ConnectionErrorKind::Timeout
         } else {
-            ProviderError::Message(format!("Request failed: {error}"))
-        }
+            ConnectionErrorKind::Connect
+        };
+        ProviderError::Connection(ProviderConnectionError {
+            kind,
+            profile: request.connection.clone(),
+            cause: error.to_string(),
+        })
     })?;
 
     let status = response.status().as_u16();
@@ -213,12 +237,11 @@ pub async fn post_json(
     signal: Option<CancellationToken>,
 ) -> Result<(u16, serde_json::Value), ProviderError> {
     let mut response = send(RequestOptions {
-        method: reqwest::Method::POST,
-        url: url.to_string(),
         headers,
         body: Some(body.to_string()),
         signal,
         timeout_ms: Some(30_000),
+        ..RequestOptions::new(reqwest::Method::POST, url.to_string())
     })
     .await?;
     let status = response.status;

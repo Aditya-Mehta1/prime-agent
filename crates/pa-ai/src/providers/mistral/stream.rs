@@ -27,8 +27,7 @@ use crate::utils_inner::json_parse::{parse_json_with_repair, parse_streaming_jso
 use crate::utils_inner::sanitize_unicode::sanitize_surrogates;
 use crate::utils_inner::sse::SseDecoder;
 use crate::utils_inner::stream_failure::{
-    format_stream_failure_message, record_stream_failure, stream_failure_from_stop_reason,
-    ProviderError,
+    record_stream_failure, stream_failure_from_stop_reason, ProviderError, ProviderHttpError,
 };
 
 const MAX_MISTRAL_ERROR_BODY_CHARS: usize = 4000;
@@ -76,7 +75,9 @@ pub fn stream_mistral(
                 } else {
                     StopReason::Error
                 };
-                output.error_message = Some(format_stream_failure_message(&error));
+                // TS surfaces `formatMistralError(error)`: the SDK's
+                // statusCode/body composition, not the classified rewrite.
+                output.error_message = Some(error.to_string());
                 record_stream_failure(
                     (&model.provider, &model.id, &model.api),
                     &mut output,
@@ -115,15 +116,114 @@ fn map_chat_stop_reason(reason: Option<&str>) -> StopReason {
     }
 }
 
+/// JS `String.prototype.length` semantics (UTF-16 code units) so the
+/// truncation limit and the reported remainder match the TS binary
+/// byte-for-byte on the body text.
 fn truncate_error_text(text: &str, max_chars: usize) -> String {
-    if text.len() <= max_chars {
+    let total: usize = text.chars().map(char::len_utf16).sum();
+    if total <= max_chars {
         return text.to_string();
+    }
+    let mut consumed = 0usize;
+    let mut end = text.len();
+    for (index, char) in text.char_indices() {
+        if consumed >= max_chars {
+            end = index;
+            break;
+        }
+        consumed += char.len_utf16();
+        if consumed > max_chars {
+            end = index;
+            break;
+        }
     }
     format!(
         "{}... [truncated {} chars]",
-        &text[..max_chars],
-        text.len() - max_chars
+        &text[..end],
+        total - max_chars
     )
+}
+
+/// The `@mistralai/mistralai` SDK error class name for HTTP failures
+/// (`SDKError`, the fallback class the stream error matcher throws).
+const MISTRAL_SDK_ERROR_NAME: &str = "SDKError";
+
+/// The `SDKError` message the mistral SDK composes
+/// (`"{prefix}: Status {N}[ Content-Type ...]. |\nBody: {body}"`), used both
+/// where TS surfaces it verbatim (empty-body error path) and in diagnostics.
+fn mistral_sdk_error_message(status: u16, content_type: Option<&str>, body: &str) -> String {
+    let mut message = format!("API error occurred: Status {status}");
+    // The SDK reads the raw content-type header; a missing one renders as
+    // the literal string `""`.
+    let content_type = content_type.unwrap_or(r#""""#);
+    if content_type != "application/json" {
+        let quoted = if content_type.contains(' ') {
+            format!("\"{content_type}\"")
+        } else {
+            content_type.to_string()
+        };
+        message.push_str(&format!(" Content-Type {quoted}"));
+    }
+    let body_utf16_len: usize = body.chars().map(char::len_utf16).sum();
+    let body_display = if body_utf16_len > 10_000 {
+        // JS `substring(0, 10000)` cuts on UTF-16 code units; walk to the
+        // enclosing char boundary and report the remainder in code units.
+        let mut consumed = 0usize;
+        let mut end = body.len();
+        for (index, char) in body.char_indices() {
+            if consumed + char.len_utf16() > 10_000 {
+                end = index;
+                break;
+            }
+            consumed += char.len_utf16();
+        }
+        format!(
+            "{}...and {} more chars",
+            &body[..end],
+            body_utf16_len - 10_000
+        )
+    } else if body.is_empty() {
+        // `httpMeta.body || `""``
+        r#""""#.to_string()
+    } else {
+        body.to_string()
+    };
+    message.push_str(if body_utf16_len > 100 { "\n" } else { ". " });
+    message.push_str(&format!("Body: {body_display}"));
+    message.trim().to_string()
+}
+
+/// Port of the error the mistral SDK throws for a 4XX/5XX response
+/// (`SDKError` carrying `statusCode` and the raw body), with the
+/// user-facing message pre-composed through `formatMistralError`.
+fn mistral_http_error(status: u16, body: &str, headers: &HashMap<String, String>) -> ProviderError {
+    let body_text = body.trim();
+    let content_type = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.clone());
+    let message = if body_text.is_empty() {
+        // TS falls back to the SDK error's own message when the body is empty.
+        format!(
+            "Mistral API error ({status}): {}",
+            mistral_sdk_error_message(status, content_type.as_deref(), body)
+        )
+    } else {
+        format!(
+            "Mistral API error ({status}): {}",
+            truncate_error_text(body_text, MAX_MISTRAL_ERROR_BODY_CHARS)
+        )
+    };
+    ProviderError::Http(ProviderHttpError {
+        message,
+        status: Some(status),
+        body: Some(body.to_string()),
+        headers: headers.clone(),
+        request_id: None,
+        sdk_name: Some(MISTRAL_SDK_ERROR_NAME.to_string()),
+        retry_after_ms: None,
+        provider_error_type: None,
+    })
 }
 
 async fn run_stream(
@@ -187,6 +287,7 @@ async fn run_stream(
         body: Some(payload.to_string()),
         signal: options.base.signal.clone(),
         timeout_ms: options.base.timeout_ms,
+        connection: crate::utils_inner::stream_failure::ConnectionErrorProfile::MistralSdk,
     })
     .await?;
 
@@ -202,23 +303,10 @@ async fn run_stream(
 
     if response.status >= 400 {
         let body = response.read_all_text().await.unwrap_or_default();
-        let body_text = body.trim();
-        let message = if body_text.is_empty() {
-            format!("Mistral API error ({}): request failed", response.status)
-        } else if body_text.len() > MAX_MISTRAL_ERROR_BODY_CHARS {
-            format!(
-                "Mistral API error ({}): {}",
-                response.status,
-                truncate_error_text(body_text, MAX_MISTRAL_ERROR_BODY_CHARS)
-            )
-        } else {
-            format!("Mistral API error ({})", response.status)
-        };
-        let _ = message;
-        return Err(ProviderError::from_http_status_body(
+        return Err(mistral_http_error(
             response.status,
             &body,
-            response.headers.clone(),
+            &response.headers,
         ));
     }
 
@@ -611,6 +699,95 @@ impl MistralStreamState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The TS `formatMistralError` shape: "Mistral API error (N): <body>",
+    /// truncated at 4000 chars (UTF-16 units) with the JS remainder count.
+    #[test]
+    fn mistral_http_error_body_shape() {
+        let headers = HashMap::new();
+        let error = mistral_http_error(400, "{\"message\":\"bad request\"}", &headers);
+        assert_eq!(
+            error.to_string(),
+            "Mistral API error (400): {\"message\":\"bad request\"}"
+        );
+        // The TS diagnostic records the SDK error class name and status.
+        let info = crate::utils_inner::stream_failure::extract_stream_failure_info(&error);
+        assert_eq!(info.status, Some(400));
+        assert_eq!(
+            info.provider_error_type.as_deref(),
+            Some(MISTRAL_SDK_ERROR_NAME)
+        );
+        assert_eq!(
+            info.kind,
+            crate::utils_inner::stream_failure::StreamFailureKind::InvalidRequest
+        );
+    }
+
+    /// An empty error body falls back to the SDK's own composed message, per
+    /// `formatMistralError`'s statusCode-without-body branch.
+    #[test]
+    fn mistral_http_error_empty_body_falls_back_to_sdk_message() {
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        let error = mistral_http_error(400, "", &headers);
+        assert_eq!(
+            error.to_string(),
+            "Mistral API error (400): API error occurred: Status 400. Body: \"\""
+        );
+
+        let mut headers = HashMap::new();
+        headers.insert(
+            "content-type".to_string(),
+            "text/html; charset=utf-8".to_string(),
+        );
+        let error = mistral_http_error(500, "", &headers);
+        assert_eq!(
+            error.to_string(),
+            "Mistral API error (500): API error occurred: Status 500 Content-Type \"text/html; charset=utf-8\". Body: \"\""
+        );
+    }
+
+    /// Bodies longer than 4000 chars truncate with the JS-char count.
+    #[test]
+    fn mistral_error_body_truncation() {
+        let error = mistral_http_error(400, &"x".repeat(4100), &HashMap::new());
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Mistral API error (400): {}... [truncated 100 chars]",
+                "x".repeat(4000)
+            )
+        );
+    }
+
+    /// Connection-level failures carry the mistral SDK's wrapper shape: the
+    /// `UnexpectedClientError` fixed prefix over the runtime's refused-connect
+    /// text, and the `RequestTimeoutError` fixed prefix with the raw cause.
+    #[test]
+    fn mistral_connection_error_texts() {
+        let connect = ProviderError::Connection(
+            crate::utils_inner::stream_failure::ProviderConnectionError {
+                kind: crate::utils_inner::stream_failure::ConnectionErrorKind::Connect,
+                profile: crate::utils_inner::stream_failure::ConnectionErrorProfile::MistralSdk,
+                cause: "tcp connect error: Connection refused".to_string(),
+            },
+        );
+        assert_eq!(
+            connect.to_string(),
+            "Unexpected HTTP client error: TypeError: Unable to connect. Is the computer able to access the url?"
+        );
+        let timeout = ProviderError::Connection(
+            crate::utils_inner::stream_failure::ProviderConnectionError {
+                kind: crate::utils_inner::stream_failure::ConnectionErrorKind::Timeout,
+                profile: crate::utils_inner::stream_failure::ConnectionErrorProfile::MistralSdk,
+                cause: "request exceeded the 30000ms timeout".to_string(),
+            },
+        );
+        assert_eq!(
+            timeout.to_string(),
+            "Request timed out: request exceeded the 30000ms timeout"
+        );
+    }
 
     #[test]
     fn maps_chat_stop_reasons() {

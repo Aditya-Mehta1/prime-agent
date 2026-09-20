@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::event_stream::{AssistantMessageEvent, AssistantMessageEventWriter};
 use crate::models::calculate_cost;
-use crate::providers::bedrock::{bedrock_error_prefix, map_stop_reason};
+use crate::providers::bedrock::{bedrock_exception_message, map_stop_reason};
 use crate::types::{
     AssistantContent, AssistantMessage, Model, StopReason, TextContent, ThinkingContent, ToolCall,
 };
@@ -47,16 +47,27 @@ pub(crate) fn handle_event(
     let parsed: Value = serde_json::from_str(payload.trim()).unwrap_or(Value::Null);
 
     // Exception events carry :exception-type and a JSON payload with message.
+    // TS rethrows the modeled SDK exception, so `formatBedrockError` composes
+    // `{prefix}: {message}` and the diagnostic records the exception name.
     if let Some(exception_type) = &message.exception_type {
         let detail = parsed
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("no detail");
-        return Err(ProviderError::Message(format!(
-            "{}: {}",
-            bedrock_error_prefix(exception_type),
-            detail
-        )));
+        return Err(ProviderError::Http(
+            crate::utils_inner::stream_failure::ProviderHttpError {
+                message: bedrock_exception_message(exception_type, detail),
+                // AWS SDK stream exceptions carry no HTTP status for the
+                // classifier; the exception name is the classification key.
+                status: None,
+                body: None,
+                headers: Default::default(),
+                request_id: request_id.clone(),
+                sdk_name: Some(exception_type.clone()),
+                retry_after_ms: None,
+                provider_error_type: None,
+            },
+        ));
     }
 
     if let Some(message_start) = parsed.get("messageStart") {

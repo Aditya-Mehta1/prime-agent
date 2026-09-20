@@ -36,21 +36,23 @@ impl CodexApiError {
         }
     }
 
+    /// The TS provider surfaces `CodexApiError.message` verbatim (its catch
+    /// sets `output.errorMessage = error.message`, keeping the usage-limit
+    /// friendly text); the structured pieces ride along for the
+    /// `provider_stream_failure` diagnostic and retry classification.
     pub fn into_provider_error(self) -> ProviderError {
-        match self.status {
-            // HTTP-level failures flow through the shared classification path
-            // (structured body, retry-after headers) like other providers.
-            Some(status) => ProviderError::from_http_status_body(
-                status,
-                &self
-                    .payload
-                    .as_ref()
-                    .map(|payload| payload.to_string())
-                    .unwrap_or_else(|| self.message.clone()),
-                HashMap::new(),
-            ),
-            None => ProviderError::Message(self.message),
-        }
+        ProviderError::Http(crate::utils_inner::stream_failure::ProviderHttpError {
+            message: self.message,
+            status: self.status,
+            // The TS error carries its wire `code` and no body/error field:
+            // the classification reads the code, not a parsed body.
+            body: None,
+            headers: HashMap::new(),
+            request_id: None,
+            sdk_name: Some("CodexApiError".to_string()),
+            retry_after_ms: self.retry_after_ms,
+            provider_error_type: self.code,
+        })
     }
 }
 
@@ -64,19 +66,27 @@ impl std::fmt::Display for CodexApiError {
 #[derive(Debug, Clone)]
 pub struct CodexProtocolError {
     pub message: String,
+    /// The invalid frame the TS error keeps for debugging; user-facing text
+    /// never embeds it.
+    #[allow(dead_code)] // full TS error surface; parity helper for debugging
     pub payload: Option<Value>,
 }
 
 impl CodexProtocolError {
     pub fn into_provider_error(self) -> ProviderError {
-        // The raw payload is attached as context after the message so the
-        // classification pipeline can inspect it (TS keeps it on the error).
-        match self.payload {
-            Some(payload) if !payload.is_null() => {
-                ProviderError::Message(format!("{}: {payload}", self.message))
-            }
-            _ => ProviderError::Message(self.message),
-        }
+        // TS surfaces `CodexProtocolError.message` verbatim; the payload
+        // stays on the error (here: nowhere user-facing), and the class name
+        // is recorded for the diagnostic.
+        ProviderError::Http(crate::utils_inner::stream_failure::ProviderHttpError {
+            message: self.message,
+            status: None,
+            body: None,
+            headers: HashMap::new(),
+            request_id: None,
+            sdk_name: Some("CodexProtocolError".to_string()),
+            retry_after_ms: None,
+            provider_error_type: None,
+        })
     }
 }
 
@@ -223,7 +233,17 @@ pub async fn parse_error_response(response: &mut HttpResponse) -> CodexApiError 
     let mut retry_after_ms = parse_retry_after_ms(&response.headers);
 
     let raw = response.read_all_text().await.unwrap_or_default();
-    message = raw.clone();
+    // TS: `raw || response.statusText || "Request failed"`. The HTTP reason
+    // phrase is the canonical one (what real servers send).
+    message = if raw.is_empty() {
+        reqwest::StatusCode::from_u16(status)
+            .ok()
+            .and_then(|status| status.canonical_reason())
+            .unwrap_or("Request failed")
+            .to_string()
+    } else {
+        raw.clone()
+    };
 
     if let Ok(parsed) = serde_json::from_str::<Value>(&raw) {
         if let Some(err) = parsed.get("error") {
@@ -565,6 +585,105 @@ mod tests {
             Some("priority".to_string())
         );
         assert_eq!(resolve_codex_service_tier(None, None), None);
+    }
+
+    /// The TS provider surfaces `CodexApiError.message` verbatim — the
+    /// usage-limit friendly text included — instead of the classified
+    /// stream-failure rewrite, while the diagnostic keeps the structured
+    /// classification (kind, provider type, status, retry delay).
+    #[test]
+    fn api_error_message_stays_verbatim_with_structured_info() {
+        let api_error = CodexApiError {
+            message: "You have hit your ChatGPT usage limit (free plan).".to_string(),
+            code: Some("usage_limit_reached".to_string()),
+            status: Some(429),
+            retry_after_ms: Some(60_000),
+            payload: None,
+        };
+        let error = api_error.into_provider_error();
+        assert_eq!(
+            error.to_string(),
+            "You have hit your ChatGPT usage limit (free plan)."
+        );
+        let info = crate::utils_inner::stream_failure::extract_stream_failure_info(&error);
+        assert_eq!(
+            info.provider_error_type.as_deref(),
+            Some("usage_limit_reached")
+        );
+        assert_eq!(info.status, Some(429));
+        assert_eq!(info.retry_after_ms, Some(60_000));
+        assert_eq!(
+            crate::utils_inner::stream_failure::StreamFailureKind::RateLimit,
+            info.kind
+        );
+        // The diagnostic records the TS SDK error class name.
+        let diagnostic = crate::utils_inner::stream_failure::diagnostic_error_info(&error);
+        assert_eq!(diagnostic.name.as_deref(), Some("CodexApiError"));
+    }
+
+    /// A plain HTTP-level codex error keeps the server's error message text
+    /// (the classified rewrite would turn it into
+    /// "Provider rejected the request (400): ...").
+    #[test]
+    fn api_error_http_message_stays_verbatim() {
+        let api_error = CodexApiError {
+            message: "The requested model does not exist".to_string(),
+            code: Some("not_found_error".to_string()),
+            status: Some(400),
+            retry_after_ms: None,
+            payload: None,
+        };
+        let error = api_error.into_provider_error();
+        assert_eq!(error.to_string(), "The requested model does not exist");
+        let info = crate::utils_inner::stream_failure::extract_stream_failure_info(&error);
+        assert_eq!(info.provider_error_type.as_deref(), Some("not_found_error"));
+        assert_eq!(
+            info.kind,
+            crate::utils_inner::stream_failure::StreamFailureKind::InvalidRequest
+        );
+    }
+
+    /// A flat mid-stream error event keeps its "Codex error: ..." composed
+    /// message through the provider error.
+    #[test]
+    fn flat_error_event_message_survives_provider_error() {
+        let error = map_codex_event(json!({
+            "type": "error",
+            "code": "server_error",
+            "message": "upstream exploded",
+        }))
+        .expect_err("error event")
+        .into_provider_error();
+        assert_eq!(error.to_string(), "Codex error: upstream exploded");
+        let info = crate::utils_inner::stream_failure::extract_stream_failure_info(&error);
+        assert_eq!(info.provider_error_type.as_deref(), Some("server_error"));
+        assert_eq!(
+            info.kind,
+            crate::utils_inner::stream_failure::StreamFailureKind::ServerError
+        );
+    }
+
+    /// Protocol errors surface their message verbatim and record the TS
+    /// `CodexProtocolError` class name.
+    #[test]
+    fn protocol_error_message_and_name() {
+        let error = CodexStreamError::Protocol(CodexProtocolError {
+            message: "Invalid Codex SSE JSON: unexpected token".to_string(),
+            payload: Some(Value::String("{oops".to_string())),
+        })
+        .into_provider_error();
+        assert_eq!(
+            error.to_string(),
+            "Invalid Codex SSE JSON: unexpected token"
+        );
+        let diagnostic = crate::utils_inner::stream_failure::diagnostic_error_info(&error);
+        assert_eq!(diagnostic.name.as_deref(), Some("CodexProtocolError"));
+        // The class name is the classification key; it never classifies.
+        let info = crate::utils_inner::stream_failure::extract_stream_failure_info(&error);
+        assert_eq!(
+            info.kind,
+            crate::utils_inner::stream_failure::StreamFailureKind::Unknown
+        );
     }
 
     #[test]

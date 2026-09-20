@@ -46,9 +46,7 @@ use crate::utils_inner::diagnostics::now_ms;
 use crate::utils_inner::http::{send, HttpResponse, RequestOptions};
 use crate::utils_inner::json_parse::parse_json_with_repair;
 use crate::utils_inner::sse::SseDecoder;
-use crate::utils_inner::stream_failure::{
-    format_stream_failure_message, record_stream_failure, ProviderError,
-};
+use crate::utils_inner::stream_failure::{record_stream_failure, ProviderError};
 
 mod errors;
 pub(crate) mod request;
@@ -152,7 +150,10 @@ pub fn stream_openai_codex_responses(
                 } else {
                     StopReason::Error
                 };
-                output.error_message = Some(format_stream_failure_message(&error));
+                // The TS provider surfaces `error.message` verbatim (including
+                // the usage-limit friendly text), not the classified
+                // stream-failure rewrite other providers apply.
+                output.error_message = Some(error.to_string());
                 record_stream_failure(
                     (&model.provider, &model.id, &model.api),
                     &mut output,
@@ -321,6 +322,7 @@ async fn run_stream(
         body: Some(body_json),
         signal: options.base.signal.clone(),
         timeout_ms: options.base.timeout_ms,
+        connection: crate::utils_inner::stream_failure::ConnectionErrorProfile::RawFetch,
     })
     .await?;
 
@@ -776,6 +778,41 @@ impl Provider for OpenAICodexResponsesProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The user-facing text for a failed codex stream is the verbatim error
+    /// message; the raw-`fetch` SSE connection failure surfaces the
+    /// runtime's own refused-connect text (the codex provider uses no HTTP
+    /// SDK).
+    #[test]
+    fn codex_error_message_shapes() {
+        let usage_limit =
+            ProviderError::Http(crate::utils_inner::stream_failure::ProviderHttpError {
+                message: "You have hit your ChatGPT usage limit (pro plan).".to_string(),
+                status: Some(429),
+                body: None,
+                headers: Default::default(),
+                request_id: None,
+                sdk_name: Some("CodexApiError".to_string()),
+                retry_after_ms: Some(60_000),
+                provider_error_type: Some("usage_limit_reached".to_string()),
+            });
+        assert_eq!(
+            usage_limit.to_string(),
+            "You have hit your ChatGPT usage limit (pro plan)."
+        );
+        let connect = ProviderError::Connection(
+            crate::utils_inner::stream_failure::ProviderConnectionError {
+                kind: crate::utils_inner::stream_failure::ConnectionErrorKind::Connect,
+                profile: crate::utils_inner::stream_failure::ConnectionErrorProfile::RawFetch,
+                cause: "tcp connect error".to_string(),
+            },
+        );
+        assert_eq!(
+            connect.to_string(),
+            "Unable to connect. Is the computer able to access the url?"
+        );
+        assert_eq!(ProviderError::Aborted.to_string(), "Request was aborted");
+    }
 
     #[test]
     fn additional_headers_override_model_headers() {

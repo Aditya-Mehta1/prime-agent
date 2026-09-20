@@ -80,6 +80,38 @@ impl std::fmt::Display for StreamFailureError {
 
 impl std::error::Error for StreamFailureError {}
 
+/// Connection-level transport failure kinds: connect failures and request
+/// timeouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionErrorKind {
+    Connect,
+    Timeout,
+}
+
+/// Connection-error shapes per provider family, verified against the TS
+/// binary (0.9.5, refused-connect probes): each family surfaces a fixed
+/// text and records a fixed diagnostic `error.name` / `err.code`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionErrorProfile {
+    /// The openai/anthropic SDK family (openai-completions,
+    /// openai-responses, azure, anthropic): the SDK's fixed texts
+    /// ("Connection error." / "Request timed out.") and a plain `Error`
+    /// name with no error code.
+    Sdk,
+    /// Raw `fetch` providers (openai-codex-responses, google): the
+    /// runtime's own error text (bun's refused-connect message), `TypeError`
+    /// name, `ConnectionRefused` code.
+    RawFetch,
+    /// The mistral SDK's `UnexpectedClientError` wrapper shape.
+    MistralSdk,
+    /// The AWS node/http1 handler: the node `connect ECONNREFUSED
+    /// <host>:<port>` text with the `ECONNREFUSED` code. (The TS binary's
+    /// default HTTP/2 handler surfaces `ERR_HTTP2_STREAM_CANCEL` texts
+    /// instead; the Rust client speaks HTTP/1.1, so the http1 surface —
+    /// the TS `AWS_BEDROCK_FORCE_HTTP1` mode — is the comparable one.)
+    AwsHttp1 { host: String, port: u16 },
+}
+
 /// Errors raised by provider HTTP/SSE plumbing, carrying the raw pieces the TS
 /// reference extracts from provider SDK exceptions.
 #[derive(Debug, Clone, PartialEq)]
@@ -89,6 +121,18 @@ pub struct ProviderHttpError {
     pub body: Option<String>,
     pub headers: std::collections::HashMap<String, String>,
     pub request_id: Option<String>,
+    /// The TS SDK error class name recorded in the `provider_stream_failure`
+    /// diagnostic (e.g. "BadRequestError", "CodexApiError", "SDKError"); the
+    /// `ProviderHttpError` internal fallback when unset.
+    pub sdk_name: Option<String>,
+    /// Server-requested wait already resolved by the provider (Retry-After
+    /// header, resets_at body); overrides header re-parsing, like the TS
+    /// `err.retryAfterMs` field takes precedence over `parseRetryAfterMs`.
+    pub retry_after_ms: Option<u64>,
+    /// The provider error's own wire `code` (TS `err.code`), which the
+    /// classification prefers over the class name when the body carries no
+    /// error type.
+    pub provider_error_type: Option<String>,
 }
 
 impl std::fmt::Display for ProviderHttpError {
@@ -99,11 +143,87 @@ impl std::fmt::Display for ProviderHttpError {
 
 impl std::error::Error for ProviderHttpError {}
 
+/// A connection-level transport failure. `Display` is the user-facing text
+/// the TS binary surfaces for the provider's SDK/runtime connection error
+/// (fixed strings per provider family, verified against the installed TS
+/// binary); the raw `cause` is kept for logging.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderConnectionError {
+    pub kind: ConnectionErrorKind,
+    pub profile: ConnectionErrorProfile,
+    pub cause: String,
+}
+
+/// The runtime's refused-connect message the TS binary (bun `fetch`) surfaces
+/// verbatim on the raw-`fetch` providers (codex, google).
+pub const RUNTIME_CONNECT_REFUSED_MESSAGE: &str =
+    "Unable to connect. Is the computer able to access the url?";
+
+impl ProviderConnectionError {
+    /// The user-facing text the TS binary surfaces for this failure.
+    pub fn message(&self) -> String {
+        match (&self.profile, self.kind) {
+            (ConnectionErrorProfile::Sdk, ConnectionErrorKind::Connect) => {
+                "Connection error.".to_string()
+            }
+            (ConnectionErrorProfile::Sdk, ConnectionErrorKind::Timeout) => {
+                "Request timed out.".to_string()
+            }
+            // Raw `fetch` (bun) and the mistral `RequestTimeoutError` append
+            // the raw cause to a fixed timeout prefix; the refused-connect
+            // text is the runtime's own fixed message.
+            (ConnectionErrorProfile::RawFetch, ConnectionErrorKind::Connect) => {
+                RUNTIME_CONNECT_REFUSED_MESSAGE.to_string()
+            }
+            (ConnectionErrorProfile::RawFetch, ConnectionErrorKind::Timeout) => {
+                format!("Request timed out: {}", self.cause)
+            }
+            (ConnectionErrorProfile::MistralSdk, ConnectionErrorKind::Connect) => format!(
+                "Unexpected HTTP client error: TypeError: {RUNTIME_CONNECT_REFUSED_MESSAGE}"
+            ),
+            (ConnectionErrorProfile::MistralSdk, ConnectionErrorKind::Timeout) => {
+                format!("Request timed out: {}", self.cause)
+            }
+            (ConnectionErrorProfile::AwsHttp1 { host, port }, ConnectionErrorKind::Connect) => {
+                format!("connect ECONNREFUSED {host}:{port}")
+            }
+            (ConnectionErrorProfile::AwsHttp1 { .. }, ConnectionErrorKind::Timeout) => {
+                "Request timed out.".to_string()
+            }
+        }
+    }
+
+    /// The TS runtime/SDK error class name recorded in the
+    /// `provider_stream_failure` diagnostic.
+    pub fn error_name(&self) -> &'static str {
+        match self.profile {
+            ConnectionErrorProfile::Sdk => "Error",
+            ConnectionErrorProfile::RawFetch => "TypeError",
+            ConnectionErrorProfile::MistralSdk => "UnexpectedClientError",
+            ConnectionErrorProfile::AwsHttp1 { .. } => "Error",
+        }
+    }
+
+    /// The TS `err.code` the classification uses as the provider error type
+    /// (bun's `ConnectionRefused` for raw `fetch`, the SDK class name for
+    /// mistral, node's `ECONNREFUSED` for the AWS http1 handler; the
+    /// openai/anthropic SDK family records none).
+    pub fn error_code(&self) -> Option<&'static str> {
+        match self.profile {
+            ConnectionErrorProfile::Sdk => None,
+            ConnectionErrorProfile::RawFetch => Some("ConnectionRefused"),
+            ConnectionErrorProfile::MistralSdk => Some("UnexpectedClientError"),
+            ConnectionErrorProfile::AwsHttp1 { .. } => Some("ECONNREFUSED"),
+        }
+    }
+}
+
 /// Unified provider error used across the crate.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProviderError {
     StreamFailure(StreamFailureError),
     Http(ProviderHttpError),
+    Connection(ProviderConnectionError),
     /// Plain error message; classified from its text like unrecognized TS errors.
     Message(String),
     Aborted,
@@ -114,6 +234,7 @@ impl std::fmt::Display for ProviderError {
         match self {
             ProviderError::StreamFailure(e) => write!(f, "{}", e.message),
             ProviderError::Http(e) => write!(f, "{}", e.message),
+            ProviderError::Connection(e) => f.write_str(&e.message()),
             ProviderError::Message(m) => f.write_str(m),
             ProviderError::Aborted => f.write_str("Request was aborted"),
         }
@@ -144,6 +265,9 @@ impl ProviderError {
             body: Some(body.to_string()),
             headers,
             request_id: None,
+            sdk_name: None,
+            retry_after_ms: None,
+            provider_error_type: None,
         };
         let parts = extract_parts_from_http(&http_error);
         if parts.info.kind == StreamFailureKind::Unknown {
@@ -444,9 +568,19 @@ fn extract_parts_from_http(error: &ProviderHttpError) -> ExtractedParts {
     let header_request_id = header_value(&error.headers, "request-id")
         .or_else(|| header_value(&error.headers, "x-request-id"));
     let request_id = error.request_id.clone().or(header_request_id);
-    let retry_after_ms = parse_retry_after_ms(&error.headers);
+    // An error-resolved wait (Retry-After vs resets_at maximum) overrides the
+    // raw header, like the TS `err.retryAfterMs` field takes precedence.
+    let retry_after_ms = error
+        .retry_after_ms
+        .or_else(|| parse_retry_after_ms(&error.headers));
 
-    let provider_error_type = body_type.clone();
+    // TS `extractStreamFailureParts`: the SDK error's own `code` field and
+    // then its class `name` stand in for the provider error type when the
+    // body does not carry one.
+    let provider_error_type = body_type
+        .clone()
+        .or_else(|| error.provider_error_type.clone())
+        .or_else(|| error.sdk_name.clone());
     let mut kind = classify_stream_failure(
         provider_error_type
             .as_deref()
@@ -478,6 +612,14 @@ pub fn extract_stream_failure_info(error: &ProviderError) -> StreamFailureInfo {
     match error {
         ProviderError::StreamFailure(failure) => failure.info.clone(),
         ProviderError::Http(http) => extract_parts_from_http(http).info,
+        // The TS connection errors never classify (their names/codes —
+        // "Error", "TypeError", "UnexpectedClientError", "ConnectionRefused",
+        // "ECONNREFUSED" — match no kind pattern); the provider error type
+        // is the recorded err.code (if any).
+        ProviderError::Connection(connection) => StreamFailureInfo {
+            provider_error_type: connection.error_code().map(str::to_string),
+            ..StreamFailureInfo::unknown()
+        },
         ProviderError::Message(message) => StreamFailureInfo {
             kind: classify_stream_failure(Some(message), None),
             ..StreamFailureInfo::unknown()
@@ -494,6 +636,7 @@ pub fn format_stream_failure_message(error: &ProviderError) -> String {
     match error {
         ProviderError::StreamFailure(failure) => failure.message.clone(),
         ProviderError::Aborted => "Request was aborted".to_string(),
+        ProviderError::Connection(connection) => connection.message(),
         ProviderError::Http(http) => {
             let parts = extract_parts_from_http(http);
             if parts.info.kind == StreamFailureKind::Unknown {
@@ -506,15 +649,28 @@ pub fn format_stream_failure_message(error: &ProviderError) -> String {
     }
 }
 
-fn diagnostic_error_info(error: &ProviderError) -> DiagnosticErrorInfo {
+pub(crate) fn diagnostic_error_info(error: &ProviderError) -> DiagnosticErrorInfo {
     let (name, message, code) = match error {
         ProviderError::StreamFailure(_) => (
             Some("StreamFailureError".to_string()),
             error.to_string(),
             None,
         ),
-        ProviderError::Http(_) => (
-            Some("ProviderHttpError".to_string()),
+        // The TS diagnostic records the provider SDK's error class name
+        // ("BadRequestError", "APIError", "SDKError", ...); the provider sets
+        // it where it builds the HTTP error, falling back to the internal
+        // name for raw plumbing errors.
+        // The TS Stainless-generated SDK errors (openai, anthropic, azure)
+        // do not set `error.name`, so JS records the inherited plain "Error";
+        // providers whose SDK names the class record it (mistral "SDKError",
+        // codex "CodexApiError", google "ApiError", AWS exception names).
+        ProviderError::Http(http) => (
+            Some(http.sdk_name.clone().unwrap_or_else(|| "Error".to_string())),
+            error.to_string(),
+            None,
+        ),
+        ProviderError::Connection(connection) => (
+            Some(connection.error_name().to_string()),
             error.to_string(),
             None,
         ),
@@ -706,5 +862,192 @@ mod tests {
         headers.clear();
         headers.insert("retry-after".to_string(), "3".to_string());
         assert_eq!(parse_retry_after_ms(&headers), Some(3000));
+    }
+
+    /// Connection-level failures carry the per-family texts the TS binary
+    /// surfaces (verified by the provider-error probe), never classify, and
+    /// record the family's `error.name` / `err.code`.
+    #[test]
+    fn connection_error_texts() {
+        let connect = ProviderError::Connection(ProviderConnectionError {
+            kind: ConnectionErrorKind::Connect,
+            profile: ConnectionErrorProfile::Sdk,
+            cause: "tcp connect error".to_string(),
+        });
+        let timeout = ProviderError::Connection(ProviderConnectionError {
+            kind: ConnectionErrorKind::Timeout,
+            profile: ConnectionErrorProfile::Sdk,
+            cause: "request exceeded the 10000ms timeout".to_string(),
+        });
+        assert_eq!(connect.to_string(), "Connection error.");
+        assert_eq!(timeout.to_string(), "Request timed out.");
+        // The classified-format providers surface them verbatim too.
+        assert_eq!(format_stream_failure_message(&connect), "Connection error.");
+        // The classification is unknown, like the TS SDK connection errors,
+        // and the openai/anthropic family records no error code.
+        assert_eq!(
+            extract_stream_failure_info(&connect),
+            StreamFailureInfo::unknown()
+        );
+        // The TS Stainless SDK errors do not set `error.name`: JS records
+        // the inherited plain "Error".
+        assert_eq!(
+            diagnostic_error_info(&connect).name.as_deref(),
+            Some("Error")
+        );
+
+        let raw_connect = ProviderError::Connection(ProviderConnectionError {
+            kind: ConnectionErrorKind::Connect,
+            profile: ConnectionErrorProfile::RawFetch,
+            cause: "tcp connect error".to_string(),
+        });
+        assert_eq!(
+            raw_connect.to_string(),
+            "Unable to connect. Is the computer able to access the url?"
+        );
+        let raw_info = extract_stream_failure_info(&raw_connect);
+        assert_eq!(
+            raw_info.provider_error_type.as_deref(),
+            Some("ConnectionRefused")
+        );
+        assert_eq!(raw_info.kind, StreamFailureKind::Unknown);
+        assert_eq!(
+            diagnostic_error_info(&raw_connect).name.as_deref(),
+            Some("TypeError")
+        );
+
+        let mistral_connect = ProviderError::Connection(ProviderConnectionError {
+            kind: ConnectionErrorKind::Connect,
+            profile: ConnectionErrorProfile::MistralSdk,
+            cause: "tcp connect error".to_string(),
+        });
+        assert_eq!(
+            mistral_connect.to_string(),
+            "Unexpected HTTP client error: TypeError: Unable to connect. Is the computer able to access the url?"
+        );
+        assert_eq!(
+            diagnostic_error_info(&mistral_connect).name.as_deref(),
+            Some("UnexpectedClientError")
+        );
+        assert_eq!(
+            extract_stream_failure_info(&mistral_connect)
+                .provider_error_type
+                .as_deref(),
+            Some("UnexpectedClientError")
+        );
+
+        let aws_connect = ProviderError::Connection(ProviderConnectionError {
+            kind: ConnectionErrorKind::Connect,
+            profile: ConnectionErrorProfile::AwsHttp1 {
+                host: "127.0.0.1".to_string(),
+                port: 1,
+            },
+            cause: "tcp connect error".to_string(),
+        });
+        assert_eq!(aws_connect.to_string(), "connect ECONNREFUSED 127.0.0.1:1");
+        assert_eq!(
+            diagnostic_error_info(&aws_connect).name.as_deref(),
+            Some("Error")
+        );
+        assert_eq!(
+            extract_stream_failure_info(&aws_connect)
+                .provider_error_type
+                .as_deref(),
+            Some("ECONNREFUSED")
+        );
+    }
+
+    /// The TS `extractStreamFailureParts` fallback chain: a body without an
+    /// error type takes the SDK error's own class name, and an error-resolved
+    /// retry wait overrides the raw header.
+    #[test]
+    fn http_error_name_fallback_and_retry_override() {
+        let error = ProviderError::Http(ProviderHttpError {
+            // A type-less 429 body, like a google `ApiError` (its error
+            // `code` is numeric): the qualifiers show the class name.
+            message: "429 {\"error\":{\"code\":429}}".to_string(),
+            status: Some(429),
+            body: Some("{\"error\":{\"code\":429}}".to_string()),
+            headers: Default::default(),
+            request_id: None,
+            sdk_name: Some("ApiError".to_string()),
+            retry_after_ms: None,
+            provider_error_type: None,
+        });
+        let info = extract_stream_failure_info(&error);
+        assert_eq!(info.provider_error_type.as_deref(), Some("ApiError"));
+        assert_eq!(info.kind, StreamFailureKind::RateLimit);
+        assert_eq!(
+            format_stream_failure_message(&error),
+            "Provider rate limit exceeded (ApiError, 429)"
+        );
+        assert_eq!(
+            diagnostic_error_info(&error).name.as_deref(),
+            Some("ApiError")
+        );
+
+        // An explicit `err.code` beats both the body type and the class name,
+        // and the error-resolved wait beats the header.
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("retry-after".to_string(), "1".to_string());
+        let error = ProviderError::Http(ProviderHttpError {
+            message: "boom".to_string(),
+            status: Some(429),
+            body: None,
+            headers,
+            request_id: None,
+            sdk_name: Some("CodexApiError".to_string()),
+            retry_after_ms: Some(60_000),
+            provider_error_type: Some("usage_limit_reached".to_string()),
+        });
+        let info = extract_stream_failure_info(&error);
+        assert_eq!(
+            info.provider_error_type.as_deref(),
+            Some("usage_limit_reached")
+        );
+        assert_eq!(info.retry_after_ms, Some(60_000));
+        assert_eq!(
+            diagnostic_error_info(&error).name.as_deref(),
+            Some("CodexApiError")
+        );
+    }
+
+    /// The google `ApiError` carrier: the class name is the qualifier and
+    /// the classified form carries no detail (the genai `ApiError` exposes
+    /// no `.error` object to the TS classifier); unnamed plumbing errors
+    /// fall back to the plain JS "Error" the Stainless SDK family records.
+    #[test]
+    fn http_error_records_sdk_name() {
+        let mut named = ProviderError::from_http_status_body(
+            400,
+            "{\"error\":{\"code\":400,\"message\":\"bad\"}}",
+            Default::default(),
+        );
+        if let ProviderError::Http(http) = &mut named {
+            http.sdk_name = Some("ApiError".to_string());
+            http.body = None;
+        }
+        assert_eq!(
+            diagnostic_error_info(&named).name.as_deref(),
+            Some("ApiError")
+        );
+        assert_eq!(
+            format_stream_failure_message(&named),
+            "Provider rejected the request (ApiError, 400)"
+        );
+
+        let unnamed = ProviderError::from_http_status_body(
+            400,
+            "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad\"}}",
+            Default::default(),
+        );
+        assert_eq!(
+            diagnostic_error_info(&unnamed).name.as_deref(),
+            Some("Error")
+        );
+        assert_eq!(
+            format_stream_failure_message(&unnamed),
+            "Provider rejected the request (invalid_request_error, 400): bad"
+        );
     }
 }
