@@ -1164,6 +1164,54 @@ class Battery:
                     ],
                 )
 
+        # Durable compaction-entry wire-diff: both sides write a
+        # `compaction` row to the session file (TS `appendCompaction`). The
+        # compared shape is the TS `CompactionEntry` record minus
+        # per-session values (ids, timestamps, `firstKeptEntryId` —
+        # separate id spaces) and the `harnessDigest` snapshot (a known
+        # Rust residue: the daemon compaction seams do not attach it yet).
+        # `tokensBefore` is the probe-measured pre-compaction estimate and
+        # `fromHook` the TS built-in origin (false) — both must match.
+        durable_rows: dict[str, list[dict]] = {}
+        for side_name in ("ts", "rust"):
+            side = self.sides[side_name]
+            rows: list[dict] = []
+            sessions_dir = side.root / flow / "sessions"
+            for path in sorted(sessions_dir.glob("*.jsonl")) if sessions_dir.exists() else []:
+                for line in path.read_text().splitlines():
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if entry.get("type") == "compaction":
+                        rows.append(
+                            {
+                                key: entry.get(key)
+                                for key in ("summary", "tokensBefore", "details", "fromHook", "usage")
+                            }
+                        )
+            durable_rows[side_name] = sorted(rows, key=lambda row: json.dumps(row, sort_keys=True))
+        if durable_rows["ts"] and durable_rows["rust"]:
+            if durable_rows["ts"] == durable_rows["rust"]:
+                self.record(
+                    flow,
+                    "behavior",
+                    "durable compaction entries identical (tokensBefore, fromHook, details, usage; normalized ids/timestamps/harnessDigest): "
+                    f"{json.dumps(durable_rows['ts'])[:300]}",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow,
+                    "behavior",
+                    f"durable compaction entries differ: ts={json.dumps(durable_rows['ts'])[:400]} "
+                    f"rust={json.dumps(durable_rows['rust'])[:400]}",
+                    evidence=[
+                        self.sides[name].root / flow / "sessions"
+                        for name in ("ts", "rust")
+                    ],
+                )
+
     def f8_resume(self) -> None:
         """Exit + resume: headless session persisted, then continued in both."""
         flow = "f8_resume"

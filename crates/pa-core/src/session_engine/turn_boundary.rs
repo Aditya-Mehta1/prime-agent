@@ -603,7 +603,12 @@ mod tests {
                 .id()
                 .unwrap_or_default()
                 .to_string();
-            session.append_compaction("summary", &first_kept, 10);
+            session.append_compaction(pa_types::session::CompactionEntry {
+                summary: "summary".to_string(),
+                first_kept_entry_id: first_kept.clone(),
+                tokens_before: 10,
+                ..Default::default()
+            });
         }
         session
     }
@@ -1106,7 +1111,12 @@ mod tests {
             .id()
             .unwrap_or_default()
             .to_string();
-        session.append_compaction("summary", &first_kept, 10);
+        session.append_compaction(pa_types::session::CompactionEntry {
+            summary: "summary".to_string(),
+            first_kept_entry_id: first_kept.clone(),
+            tokens_before: 10,
+            ..Default::default()
+        });
         let entries = session.get_all_entries().to_vec();
         let usage = context_usage(&entries, Some(100_000)).unwrap();
         assert_eq!(usage.tokens, None);

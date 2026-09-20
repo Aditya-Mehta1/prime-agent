@@ -156,6 +156,13 @@ pub async fn compact_with(
 }
 
 /// The compaction entry to persist for a result.
+///
+/// `fromHook` carries the TS `fromExtension` origin: whether a compaction
+/// extension produced the summary (`agent-session.ts` passes its
+/// `fromExtension` flag into `appendCompaction`). The Rust engine has no
+/// extension seam yet, so every built-in compaction records `fromHook:
+/// false`, the exact durable value TS writes for its built-in path — never
+/// a missing key.
 pub fn compaction_entry_for(
     result: &CompactionResult,
     details: &CompactionDetails,
@@ -166,7 +173,7 @@ pub fn compaction_entry_for(
         first_kept_entry_id: result.first_kept_entry_id.clone(),
         tokens_before: result.tokens_before,
         details: Some(serde_json::to_value(details).unwrap_or_default()),
-        from_hook: None,
+        from_hook: Some(false),
         custom_instructions: custom_instructions.map(str::to_string),
         usage: result.usage,
         harness_digest: None,
@@ -225,6 +232,47 @@ mod tests {
             timestamp: 0,
             rest: Default::default(),
         }
+    }
+
+    /// The entry records the TS wire record: `fromHook: false` (the
+    /// built-in origin — TS passes `fromExtension`), the file-operation
+    /// details, the summarizer usage, and the custom instructions.
+    #[test]
+    fn compaction_entry_records_the_ts_wire_fields() {
+        let usage = pa_types::ai::Usage {
+            input: 20,
+            output: 10,
+            cache_read: 80,
+            cache_write: 0,
+            total_tokens: 110,
+            cost: Default::default(),
+        };
+        let result = CompactionResult {
+            summary: "the overflow summary".to_string(),
+            first_kept_entry_id: "e4".to_string(),
+            tokens_before: 214,
+            usage: Some(usage),
+        };
+        let details = CompactionDetails {
+            read_files: vec!["a.rs".to_string()],
+            modified_files: vec![],
+        };
+        assert_eq!(
+            compaction_entry_for(&result, &details, Some("focus")),
+            CompactionEntry {
+                summary: "the overflow summary".to_string(),
+                first_kept_entry_id: "e4".to_string(),
+                tokens_before: 214,
+                details: Some(serde_json::json!({
+                    "readFiles": ["a.rs"],
+                    "modifiedFiles": [],
+                })),
+                from_hook: Some(false),
+                custom_instructions: Some("focus".to_string()),
+                usage: Some(usage),
+                harness_digest: None,
+            }
+        );
     }
 
     #[tokio::test]

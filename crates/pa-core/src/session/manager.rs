@@ -853,27 +853,14 @@ impl SessionManager {
         id
     }
 
-    pub fn append_compaction(
-        &mut self,
-        summary: &str,
-        first_kept_entry_id: &str,
-        tokens_before: u64,
-    ) -> String {
+    /// `appendCompaction`: persist the compaction record. The full typed
+    /// payload is stored (TS keeps `details`, `fromHook`,
+    /// `customInstructions`, `usage`, and `harnessDigest` on the durable
+    /// row; later compactions and branch summarization read them back).
+    pub fn append_compaction(&mut self, payload: pa_types::session::CompactionEntry) -> String {
         let base = self.next_base();
         let id = base.id.clone().unwrap_or_default();
-        self.append_entry(FileEntry::Compaction {
-            payload: pa_types::session::CompactionEntry {
-                summary: summary.to_string(),
-                first_kept_entry_id: first_kept_entry_id.to_string(),
-                tokens_before,
-                details: None,
-                from_hook: None,
-                custom_instructions: None,
-                usage: None,
-                harness_digest: None,
-            },
-            base,
-        });
+        self.append_entry(FileEntry::Compaction { payload, base });
         id
     }
 
@@ -1054,6 +1041,46 @@ fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The durable compaction line is the full TS `CompactionEntry` record:
+    /// `fromHook: false` is present (never a missing key), and the details
+    /// and usage ride along.
+    #[test]
+    fn append_compaction_serializes_the_full_ts_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut manager = SessionManager::in_memory(tmp.path());
+        manager.append_compaction(pa_types::session::CompactionEntry {
+            summary: "the overflow summary".to_string(),
+            first_kept_entry_id: "e4".to_string(),
+            tokens_before: 214,
+            details: Some(serde_json::json!({
+                "readFiles": [],
+                "modifiedFiles": [],
+            })),
+            from_hook: Some(false),
+            custom_instructions: None,
+            usage: Some(pa_types::ai::Usage {
+                input: 20,
+                output: 10,
+                cache_read: 80,
+                cache_write: 0,
+                total_tokens: 110,
+                cost: Default::default(),
+            }),
+            harness_digest: None,
+        });
+        let line = serialize_entry(
+            manager
+                .get_entries()
+                .iter()
+                .rev()
+                .find(|entry| matches!(entry, FileEntry::Compaction { .. }))
+                .expect("compaction entry appended"),
+        );
+        assert!(line.contains("\"fromHook\":false"));
+        assert!(line.contains("\"tokensBefore\":214"));
+        assert!(line.contains("\"usage\":"));
+    }
 
     #[test]
     fn persist_appends_after_first_assistant() {

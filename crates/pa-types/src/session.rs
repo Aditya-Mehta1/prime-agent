@@ -178,7 +178,7 @@ pub struct ModelChangeEntry {
 }
 
 /// `type: "compaction"`: compaction performed at this point in the tree.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactionEntry {
     pub summary: String,

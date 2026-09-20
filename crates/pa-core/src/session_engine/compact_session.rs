@@ -5,8 +5,7 @@ use pa_types::ai::{AssistantMessage, Message, UserContent};
 use pa_types::session::{AgentMessage, FileEntry};
 
 use super::compaction::{
-    build_summarization_prompt, calculate_context_tokens, estimate_tokens, find_cut_point,
-    CutPointResult,
+    build_summarization_prompt, estimate_context_tokens, find_cut_point, CutPointResult,
 };
 use super::compaction_exec::{
     compaction_entry_for, details_for, CompactionDetails, CompactionResult,
@@ -67,24 +66,17 @@ fn message_from_entry(entry: &FileEntry) -> Option<AgentMessage> {
     }
 }
 
-fn context_tokens(entries: &[FileEntry]) -> u64 {
-    entries
-        .iter()
-        .rev()
-        .find_map(|entry| match entry {
-            FileEntry::Message {
-                message: AgentMessage::Assistant(assistant),
-                ..
-            } => Some(calculate_context_tokens(&assistant.usage)),
-            _ => None,
-        })
-        .unwrap_or_else(|| {
-            entries
-                .iter()
-                .filter_map(message_from_entry)
-                .map(|message: AgentMessage| estimate_tokens(&message))
-                .sum()
-        })
+/// The pre-compaction context estimate the compaction entry records as
+/// `tokensBefore` (TS `prepareCompaction`:
+/// `estimateContextTokens(buildSessionContext(pathEntries).messages)`): the
+/// last non-error/aborted assistant usage — the probe-measured context of
+/// the live provider — plus a chars/4 estimate of the messages that trail
+/// it, or a full chars/4 estimate when no valid usage exists yet. Error
+/// and aborted turns never anchor the estimate: their usage is not a real
+/// measurement, and TS `getLastAssistantUsageInfo` skips them too.
+fn context_tokens(entries: &[FileEntry], leaf_id: Option<&str>) -> u64 {
+    let context = crate::session::build_session_context(entries, leaf_id);
+    estimate_context_tokens(&context.messages).tokens
 }
 
 /// Session AgentMessage -> LLM Message (post convertToLlm).
@@ -218,7 +210,7 @@ pub async fn execute_compaction(
         .iter()
         .filter_map(message_from_entry)
         .collect();
-    let tokens_before = context_tokens(&entries);
+    let tokens_before = context_tokens(&entries, session.get_leaf_id());
     let prev_compaction_index = entries[..cut.first_kept_entry_index]
         .iter()
         .rposition(|entry| matches!(entry, FileEntry::Compaction { .. }));
@@ -296,11 +288,10 @@ pub async fn execute_compaction(
         usage: Some(assistant.usage),
     };
     let entry = compaction_entry_for(&result, &details, options.custom_instructions);
-    session.append_compaction(
-        &entry.summary,
-        &entry.first_kept_entry_id,
-        entry.tokens_before,
-    );
+    // TS `appendCompaction` persists the full record: `details`,
+    // `fromHook`, `customInstructions`, and the summarizer `usage` ride on
+    // the durable row alongside the summary, boundary, and token count.
+    session.append_compaction(entry.clone());
     Ok(CompactOutcome::Ran(Box::new(CompactRun { result, entry })))
 }
 
@@ -316,7 +307,7 @@ pub fn compute_cut(session: &SessionManager, keep_recent_tokens: u64) -> (CutPoi
     let entries = session.get_all_entries();
     let start = usize::from(matches!(entries.first(), Some(FileEntry::Header { .. })));
     let cut = find_cut_point(entries, start, entries.len(), keep_recent_tokens);
-    let tokens = context_tokens(entries);
+    let tokens = context_tokens(entries, session.get_leaf_id());
     (cut, tokens)
 }
 
@@ -657,7 +648,12 @@ mod tests {
         let model = registration.get_model();
         let tmp = tempfile::tempdir().unwrap();
         let mut session = session_with_turns(tmp.path(), 3);
-        session.append_compaction("summary", "e1", 100);
+        session.append_compaction(pa_types::session::CompactionEntry {
+            summary: "summary".to_string(),
+            first_kept_entry_id: "e1".to_string(),
+            tokens_before: 100,
+            ..Default::default()
+        });
         let outcome = execute_compaction(
             &mut session,
             CompactOptions {
@@ -675,5 +671,121 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, CompactOutcome::Skipped("Already compacted"));
         registration.unregister();
+    }
+
+    /// A usage-less error turn never anchors `tokensBefore`: the estimate
+    /// uses the last settled (probe-measured) usage plus a chars/4
+    /// estimate of everything that trails it — the exact TS overflow-row
+    /// scenario (`getLastAssistantUsageInfo` skips error turns).
+    #[test]
+    fn tokens_before_anchors_on_last_valid_usage_plus_trailing() {
+        let reply = |usage: pa_types::ai::Usage, error: bool| {
+            // A failed request carries no content: the failure lives in
+            // `errorMessage` (the TS and Rust durable error turns both
+            // record an empty content list).
+            let content = if error {
+                Vec::new()
+            } else {
+                vec![pa_types::ai::AssistantContentBlock::Text(
+                    pa_types::ai::TextContent {
+                        text: "seed reply".to_string(),
+                        text_signature: None,
+                        rest: Default::default(),
+                    },
+                )]
+            };
+            AgentMessage::Assistant(AssistantMessage {
+                content,
+                api: "openai-completions".to_string(),
+                provider: "test".to_string(),
+                model: "m".to_string(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                usage,
+                stop_reason: if error {
+                    pa_types::ai::StopReason::Error
+                } else {
+                    pa_types::ai::StopReason::Stop
+                },
+                stop_reason_raw: None,
+                error_message: None,
+                timestamp: 0,
+                rest: Default::default(),
+            })
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let mut session = SessionManager::in_memory(tmp.path());
+        let settled = pa_types::ai::Usage {
+            input: 20,
+            output: 10,
+            cache_read: 80,
+            cache_write: 0,
+            total_tokens: 110,
+            cost: Default::default(),
+        };
+        let probe = |text: &str| {
+            AgentMessage::User(pa_types::ai::UserMessage {
+                content: UserContent::Text(text.to_string()),
+                timestamp: 0,
+                rest: Default::default(),
+            })
+        };
+        session.append_message(probe("seed turn"));
+        session.append_message(reply(settled, false));
+        session.append_message(probe(&("overflow probe ".to_string() + &"x".repeat(400))));
+        // The overflow error turn: stopReason "error" with zeroed usage
+        // (what the provider returns for a failed request).
+        session.append_message(reply(Default::default(), true));
+        // TS: 110 (last valid usage) + ceil(415/4) (the probe turn) = 214.
+        assert_eq!(
+            context_tokens(session.get_all_entries(), session.get_leaf_id()),
+            214
+        );
+    }
+
+    /// The durable row carries the full TS `CompactionEntry` record:
+    /// `fromHook: false` (the built-in origin), the summarizer usage, and
+    /// the file-operation details — not just the summary boundary.
+    #[tokio::test]
+    async fn durable_compaction_row_carries_the_ts_record() {
+        let registration = faux_registration();
+        let model = registration.get_model();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut session = session_with_turns(tmp.path(), 3);
+        let before = context_tokens(session.get_all_entries(), session.get_leaf_id());
+        let outcome = execute_compaction(
+            &mut session,
+            CompactOptions {
+                model,
+                api_key: None,
+                custom_instructions: None,
+                settings: super::super::compaction::CompactionSettings {
+                    keep_recent_tokens: 20,
+                    ..Default::default()
+                },
+                abort: None,
+            },
+        )
+        .await
+        .unwrap();
+        let CompactOutcome::Ran(run) = outcome else {
+            panic!("expected the compaction to run");
+        };
+        assert_eq!(run.entry.from_hook, Some(false));
+        assert_eq!(run.entry.usage, run.result.usage);
+        assert_eq!(run.entry.tokens_before, before);
+        // The persisted session record is the full entry, byte-for-byte
+        // (TS `appendCompaction` stores the same record it returns).
+        let persisted = session
+            .get_entries()
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                FileEntry::Compaction { payload, .. } => Some(payload.clone()),
+                _ => None,
+            })
+            .expect("compaction entry persisted");
+        assert_eq!(persisted, run.entry);
     }
 }
