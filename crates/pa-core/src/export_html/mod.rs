@@ -16,6 +16,7 @@
 //! the data shape (`SessionExportData`) and the file write.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use base64::Engine as _;
@@ -27,7 +28,13 @@ use pa_types::session::FileEntry;
 
 use self::theme::resolve_export_theme;
 
+pub mod ansi_to_html;
 mod theme;
+pub mod tool_render;
+
+pub use self::tool_render::{
+    pre_render_custom_tools, RenderedToolHtml, RenderedToolResult, ToolHtmlRenderer,
+};
 
 /// The app name in generated export file names.
 pub const EXPORT_APP_NAME: &str = "prime-agent";
@@ -59,10 +66,11 @@ pub struct SessionExportData {
     /// when the exporter knows them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Value>>,
-    /// Pre-rendered HTML for custom tool calls, keyed by tool-call id.
-    /// Not produced by this port; the template falls back to its generic
-    /// tool rendering for entries without an entry here. Omitted (not
-    /// `null`) like the TS `JSON.stringify` drops undefined fields.
+    /// Pre-rendered HTML for custom tool calls/results, keyed by
+    /// tool-call id ([`pre_render_custom_tools`] output). The template
+    /// falls back to its generic tool rendering for entries without an
+    /// entry here. Omitted (not `null`) like the TS `JSON.stringify`
+    /// drops undefined fields.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rendered_tools: Option<Value>,
 }
@@ -151,6 +159,23 @@ pub fn export_from_file(
     let theme = resolve_export_theme(None, agent_dir)?;
     let html = generate_html(&data, &theme);
     write_export(&html, input_path, output_path)
+}
+
+/// The export's tools section: each tool's model-facing contract
+/// (name/description/JSON-schema parameters), exactly the TS exporter's
+/// `state.tools.map` — the template renders these into its
+/// "Available Tools" list.
+pub fn tools_section(tools: &[Arc<dyn pa_agent::types::AgentTool>]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "name": tool.name(),
+                "description": tool.description(),
+                "parameters": tool.parameters(),
+            })
+        })
+        .collect()
 }
 
 /// Build the export data from a session file: the header entry, every other
@@ -285,6 +310,56 @@ mod tests {
         assert!(
             error.to_string().starts_with("File not found:"),
             "unexpected: {error}"
+        );
+    }
+
+    /// The tools section maps each tool to its model-facing contract,
+    /// with the template's `name`/`description`/`parameters` keys.
+    #[test]
+    fn tools_section_wire_shape() {
+        use pa_agent::types::{AgentTool, AgentToolResult};
+        struct EchoTool {
+            schema: serde_json::Value,
+        }
+        impl AgentTool for EchoTool {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn description(&self) -> &str {
+                "Echoes input."
+            }
+            fn parameters(&self) -> &serde_json::Value {
+                &self.schema
+            }
+            fn execute(
+                self: Arc<Self>,
+                _id: String,
+                _params: serde_json::Value,
+                _signal: pa_agent::abort::AbortSignal,
+                _on_update: pa_agent::types::AgentToolUpdateCallback,
+            ) -> pa_agent::BoxFut<'static, anyhow::Result<AgentToolResult>> {
+                unreachable!("no test executes the export registry")
+            }
+        }
+        let tools: Vec<Arc<dyn AgentTool>> = vec![Arc::new(EchoTool {
+            schema: serde_json::json!({
+                "type": "object",
+                "required": ["text"],
+                "properties": { "text": { "type": "string" } },
+            }),
+        })];
+        let section = tools_section(&tools);
+        assert_eq!(
+            serde_json::to_value(&section).unwrap(),
+            serde_json::json!([{
+                "name": "echo",
+                "description": "Echoes input.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["text"],
+                    "properties": { "text": { "type": "string" } },
+                },
+            }])
         );
     }
 

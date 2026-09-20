@@ -205,7 +205,9 @@ async fn tui_export_and_share_surface() {
     std::env::set_var("PATH", format!("{}:{}", stub_dir.display(), previous_path));
 
     // A live scripted session: one prompt, one scripted answer.
-    let script = serde_json::json!({ "responses": [
+    // The faux engine (`engine: "faux"`) drives the real agent engine, so
+    // the export embeds the real session's tools section.
+    let script = serde_json::json!({ "engine": "faux", "responses": [
         { "text": "hello from scripted" },
     ] });
     let script_path = dir.path().join("script.json");
@@ -318,12 +320,32 @@ async fn tui_export_and_share_surface() {
     let data: serde_json::Value = serde_json::from_slice(&decoded).expect("session data");
     assert_eq!(data["header"]["type"], "session");
     let entries = data["entries"].as_array().expect("entries");
+    // The faux engine normalizes the user message into content blocks
+    // (the plain string form stays valid for scripted-harness sessions).
+    let user_turn_present = |entry: &serde_json::Value| {
+        entry["message"]["role"] == "user"
+            && (entry["message"]["content"] == "say hi"
+                || entry["message"]["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|block| block["text"] == "say hi")))
+    };
     assert!(
-        entries
-            .iter()
-            .any(|entry| entry["message"]["role"] == "user"
-                && entry["message"]["content"] == "say hi"),
+        entries.iter().any(user_turn_present),
         "user message in export: {data}"
+    );
+    // The tools section: the session's registered tool contracts (TS
+    // `state.tools` in the live-session export).
+    let tools = data["tools"].as_array().expect("tools section");
+    assert!(
+        tools.iter().any(|tool| tool["name"] == "ipython"
+            && tool["description"].is_string()
+            && tool["parameters"].is_object()),
+        "ipython contract in export tools: {data}"
+    );
+    // No custom tool ran: the pre-render section is omitted, not null.
+    assert!(
+        data.get("renderedTools").is_none(),
+        "renderedTools omitted without custom-tool renders: {data}"
     );
 
     // The JSONL branch export: the success row plus a linear session file

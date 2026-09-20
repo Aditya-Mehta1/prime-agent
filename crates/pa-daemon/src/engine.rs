@@ -281,6 +281,31 @@ pub trait SessionEngine: Send + Sync {
         None
     }
 
+    /// The session's registered tools for the export's tools section (TS
+    /// `state.tools` mapped to name/description/parameters). An engine
+    /// whose session is not yet built builds it now — the TS state
+    /// exists from create, so an export before the first turn still
+    /// carries the section; a mid-turn engine reports `None` and the
+    /// export omits it (async like `tool_definition`: the build and the
+    /// registry read await).
+    fn export_tools(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<Value>>> + Send + '_>> {
+        Box::pin(async { None })
+    }
+
+    /// Pre-rendered HTML for custom-tool calls/results, keyed by
+    /// tool-call id (TS `preRenderCustomTools`): the engine builds its
+    /// registry-backed renderer over the session's tools and the
+    /// exporter walks the entries. `None` when nothing rendered or the
+    /// engine is busy; the export omits the section.
+    fn export_rendered_tools(
+        &self,
+        _entries: &[Value],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Value>> + Send + '_>> {
+        Box::pin(async { None })
+    }
+
     /// The engine's resolved model as connection-state wire data
     /// (`{ id, provider, reasoning }`), when known. Drives the interactive
     /// splash and tray labels.

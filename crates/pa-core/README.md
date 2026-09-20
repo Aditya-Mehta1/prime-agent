@@ -39,17 +39,24 @@ Session HTML export (`export_html`): the standalone viewer file for
 `/export` and `session export` - the embedded product template
 (assets/export-html, vendored marked/highlight.js attributed in its
 NOTICE.md) plus the theme-to-CSS resolution over the bundled theme data
-(pa-types) and custom themes under `<agent-dir>/themes/`, and the two
-entry points (`export_session_to_html` for the daemon worker's
-`export_html` command, `export_from_file` for the CLI). Terminal theme
-rendering stays pa-tui's; the share-viewer flow (gist creation) is the
-caller's.
+(pa-types) and custom themes under `<agent-dir>/themes/`, the tools
+section mapping (`tools_section`: the session's tool registry to the
+template's name/description/parameters list), and the custom-tool
+pre-render pipeline (`ToolHtmlRenderer`/`pre_render_custom_tools` +
+`ansi_to_html`: the exporter walks the entries, the session layer's
+renderer produces line-oriented output, ANSI converts to inline-styled
+HTML at the export step), and the two entry points
+(`export_session_to_html` for the daemon worker's `export_html`
+command, `export_from_file` for the CLI). Terminal theme rendering stays
+pa-tui's; tool renderers live with the session's tool surface (extension
+renderers cannot cross the sidecar - docs/extensions-runner-design.md);
+the share-viewer flow (gist creation) is the caller's.
 
 ## Non-goals
 No provider HTTP (pa-ai), no loop policy (pa-agent), no daemon supervision (pa-daemon), no TUI (pa-tui). No update coordination (the pa-cli coordinator owns the FSM; the update-flow seam here is the daemon-free support layer: `update::version` (semver/channel policy), `update::install` (the managed install-root layout), `update::release` (the channel manifest fetch), `update::download` (sha256-verified archive download + staging) - spec `docs/update-flow-state-machine.md`). Event emission at the session seams, ctx-action binding, slash-command dispatch at the product surface, and reload/stale-ctx semantics are design stages 3+ (docs/extensions-runner-design.md); the package manager installs sources and resolves resource paths only.
 
 ## Public API
-`SessionEngine` (message in -> events out), `ToolRegistry`, kernel manager, settings (`SettingsManager`), packages (`packages::PackageManager` + source types), extensions (`extensions::ExtensionRunner` + the sidecar RPC client + the registration registry), `platform` (process control, file locking, permissions, shell selection - usable by higher crates, e.g. pa-cli's detached spawn), `session_engine::rlm_host::RlmSubagentHost` (implemented by pa-daemon for supervisor-backed children; the default is no children), `mcp::McpManager` (the session's host-side MCP manager, exposed as `SessionEngine.mcp_manager`: auth gating for built-in integrations, the `mcpServers` setting seam, and the `mcp.*` host-request handlers - `mcp.config`/`mcp.refresh`/optional `mcp.begin_login` - the kernel's generic MCP client resolves through), `models` (the registry and resolver, plus `models::order_for_picker`: the picker-catalog order the composition root applies to its snapshot), `session_engine::provider_adapter` (`switchable_stream_fn`/`ProviderTarget`: the live provider-target slot a host swaps on `set_model`). All subsystem internals `pub(crate)`; the engine is the only facade - subsystems must not import each other directly (the package manager consumes the public settings API only).
+`SessionEngine` (message in -> events out), `export_html` (the HTML exporter plus its renderer seam: `tools_section`, `pre_render_custom_tools` + `ToolHtmlRenderer`/`RenderedToolHtml`/`RenderedToolResult`, and `ansi_to_html::ansi_lines_to_html`/`tool_render::trim_rendered_result_lines` for renderer implementers), `ToolRegistry`, kernel manager, settings (`SettingsManager`), packages (`packages::PackageManager` + source types), extensions (`extensions::ExtensionRunner` + the sidecar RPC client + the registration registry), `platform` (process control, file locking, permissions, shell selection - usable by higher crates, e.g. pa-cli's detached spawn), `session_engine::rlm_host::RlmSubagentHost` (implemented by pa-daemon for supervisor-backed children; the default is no children), `mcp::McpManager` (the session's host-side MCP manager, exposed as `SessionEngine.mcp_manager`: auth gating for built-in integrations, the `mcpServers` setting seam, and the `mcp.*` host-request handlers - `mcp.config`/`mcp.refresh`/optional `mcp.begin_login` - the kernel's generic MCP client resolves through), `models` (the registry and resolver, plus `models::order_for_picker`: the picker-catalog order the composition root applies to its snapshot), `session_engine::provider_adapter` (`switchable_stream_fn`/`ProviderTarget`: the live provider-target slot a host swaps on `set_model`). All subsystem internals `pub(crate)`; the engine is the only facade - subsystems must not import each other directly (the package manager consumes the public settings API only).
 
 ## Depends on
 pa-types, pa-ai, pa-agent (one-way).

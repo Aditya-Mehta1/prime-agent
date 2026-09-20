@@ -1016,11 +1016,48 @@ impl SessionEngine for AgentSessionEngine {
     }
 
     /// The built core session's assembled prompt (the export embeds it).
-    /// Best-effort: mid-turn the session lock is held, and the export omits
-    /// the section rather than blocking the command.
+    /// Best-effort: the caller's `export_tools` read (which builds an
+    /// absent session, the TS create-time state) runs first; a still
+    /// unbuilt or busy session omits the section.
     fn export_system_prompt(&self) -> Option<String> {
         let session = self.session.try_lock().ok()?;
         session.as_ref().map(|core| core.system_prompt.clone())
+    }
+
+    /// The built session's live tool registry mapped to the export's tools
+    /// section (TS `state.tools`). An export that precedes the first turn
+    /// builds the session now (the TS state exists from create); a
+    /// mid-turn engine reports `None` and the export omits the section.
+    fn export_tools(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<Value>>> + Send + '_>> {
+        Box::pin(async move {
+            let model = self.resolve_model().ok()?;
+            self.ensure_core_session_async(&model).await.ok()?;
+            let session = self.session.try_lock().ok()?;
+            let state = session.as_ref()?.session.agent().state().await;
+            Some(pa_core::export_html::tools_section(&state.tools))
+        })
+    }
+
+    /// The export's custom-tool pre-render: walk the entries through the
+    /// registry-backed renderer (TS `preRenderCustomTools`), against the
+    /// same built-session registry as [`Self::export_tools`].
+    fn export_rendered_tools(
+        &self,
+        entries: &[Value],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Value>> + Send + '_>> {
+        let entries = entries.to_vec();
+        Box::pin(async move {
+            let model = self.resolve_model().ok()?;
+            self.ensure_core_session_async(&model).await.ok()?;
+            let session = self.session.try_lock().ok()?;
+            let state = session.as_ref()?.session.agent().state().await;
+            let renderer = crate::session_export::ExportToolRenderer {
+                tools: &state.tools,
+            };
+            pa_core::export_html::pre_render_custom_tools(&entries, &renderer)
+        })
     }
 
     fn model_metadata(&self) -> Option<Value> {

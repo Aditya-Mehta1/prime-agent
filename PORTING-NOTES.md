@@ -1683,3 +1683,51 @@ deliberately left out (TS `prompt-highlight.ts`):
   at width 120 (the `/hotkeys` state runs 120x80 in its own tmux session
   — its guide overflows the 36-row viewport, and the row bytes are
   width-bound).
+
+## Session export fidelity (PR: tools section + custom-tool pre-render)
+
+- TS ground truth (export-html/index.ts): the live-session export
+  (`exportSessionToHtml`, reached by the daemon worker's `export_html`
+  command) embeds `state.tools` mapped to
+  `{ name, description, parameters }` and pre-renders custom-tool
+  calls/results through the session's tool renderers
+  (`createToolHtmlRenderer` + `preRenderCustomTools`): tool-call blocks
+  outside `{bash, edit}` ask the tool definition's `renderCall`/
+  `renderResult` (pi-tui components, rendered at width 100), the ANSI
+  lines convert to inline-styled HTML (`ansi-to-html.ts`), and the map
+  is keyed by tool-call id (`{ callHtml, resultHtmlCollapsed,
+  resultHtmlExpanded }`; an empty map serializes away entirely). The CLI
+  `session export` path (`exportFromFile`) embeds neither section — both
+  stay omitted there.
+- Which layer runs the renderer at export time: the SESSION layer
+  (agent-session's `exportToHtml` builds the renderer from
+  `this.getToolDefinition` + theme + cwd and passes it to the exporter);
+  the TUI-app layer's special cases (interactive-mode's ipython card) are
+  NOT consulted — the TS `ipython` tool definition carries no
+  `renderCall`/`renderResult`, so exported ipython calls render through
+  the template's generic fallback in TS too. The Rust port mirrors this:
+  pa-core owns the walk + ANSI->HTML at the export step, the daemon
+  engine's `ExportToolRenderer` resolves tools against the session's live
+  registry (TS `getToolDefinition`), and a stock session therefore omits
+  `renderedTools` in BOTH products — an unregistered custom-tool call
+  falls back to the template's generic card identically (pinned by
+  `export_live_differential.rs`).
+- Extension tools' renderers cannot cross the Rust sidecar boundary
+  (components are process-local; docs/extensions-runner-design.md
+  §2.3/R3 "line-oriented subset" is designed but not landed), so a Rust
+  session with extension tools omits the pre-render for them — the same
+  degradation the design doc specifies for the TUI side; the exporter
+  seam (`ToolHtmlRenderer`) is where a future line-oriented renderer
+  lands without re-architecting.
+- Export data sections now build lazily when an export precedes the
+  first turn (the daemon engine builds the core session at the export
+  read — the TS state exists from create); mid-turn exports omit them
+  (best-effort try-lock, the pre-existing `export_system_prompt` rule).
+- Verifier: `differential_live_export_matches_ts_binary`
+  (pa-cli/tests/export_live_differential.rs) resumes the same fixture
+  session (custom-tool call + result) on the TS daemon and the Rust
+  daemon, runs the `export_html` wire command on both, and compares the
+  exported files' decoded session data: header, fixture entries, the
+  tools section (structurally equal, `ipython` registered), the
+  `renderedTools` omission, and `systemPrompt` presence (content
+  superseded by the layered prompt).

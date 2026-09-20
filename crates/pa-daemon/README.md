@@ -43,7 +43,12 @@ session-artifacts tree - and wake over their own session file), wire protocol se
 `set_model`/`set_thinking_level` commands — `model_switch.rs`: registry
 resolution, the durable `model_change`/`thinking_level_change` rows, the
 settings defaults, and the engine's live agent/provider-target/level
-switch), the `get_model_catalog` command (the TS `refreshModelCatalog`:
+switch), session export commands (`session_export.rs`: the worker-side
+`export_html`/`export_jsonl` handlers; the HTML data carries the engine's
+tools section and custom-tool pre-render through the
+`SessionEngine::export_tools`/`export_rendered_tools` seams, built
+lazily when an export precedes the first turn - the TS state exists from
+create), the `get_model_catalog` command (the TS `refreshModelCatalog`:
 registry refresh — live Prime Inference catalog fetch, disk cache at
 `<agent-dir>/prime-inference-models-cache.json`, bundled fallback — then
 the full catalog minus unauthorized private models plus the configured

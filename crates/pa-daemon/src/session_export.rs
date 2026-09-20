@@ -38,57 +38,74 @@ impl ExportCommands {
 
     /// `export_html`: render the session to a standalone HTML file; the
     /// response carries the written path (TS `{ path }`).
-    pub(crate) fn export_html(&self, payload: &Value) -> DaemonResponse {
+    pub(crate) async fn export_html(&self, payload: &Value) -> DaemonResponse {
         let output_path = payload
             .get("outputPath")
             .and_then(Value::as_str)
             .map(str::to_string);
-        match self.export_html_impl(output_path.as_deref()) {
+        match self.export_html_impl(output_path.as_deref()).await {
             Ok(path) => response_success(None, "export_html", Some(json!({ "path": path }))),
             Err(error) => response_failure(None, "export_html", &format!("{error:#}"), None),
         }
     }
 
-    fn export_html_impl(&self, output_path: Option<&str>) -> Result<String> {
-        let core = self.core.lock().unwrap();
-        let store = core
-            .store
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Session is still initializing"))?;
-        let theme_name = self
-            .resolved_theme_name(&core)
-            .context("resolving the export theme")?;
-        let header = serde_json::to_value(&store.header)?;
-        let header = match header {
-            Value::Object(map) => {
-                // The export's header is the `type: "session"` file line,
-                // not just the typed struct.
-                let mut with_type = serde_json::Map::new();
-                with_type.insert("type".to_string(), Value::String("session".to_string()));
-                with_type.extend(map);
-                Value::Object(with_type)
-            }
-            other => other,
+    async fn export_html_impl(&self, output_path: Option<&str>) -> Result<String> {
+        // The store snapshot under the core lock: the std guard is not
+        // `Send`, so the engine reads below await outside the lock (the
+        // TS exporter reads its state without holding anything either).
+        let (header, entries, leaf_id, session_file, theme_name) = {
+            let core = self.core.lock().unwrap();
+            let store = core
+                .store
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Session is still initializing"))?;
+            let theme_name = self
+                .resolved_theme_name(&core)
+                .context("resolving the export theme")?;
+            let header = serde_json::to_value(&store.header)?;
+            let header = match header {
+                Value::Object(map) => {
+                    // The export's header is the `type: "session"` file line,
+                    // not just the typed struct.
+                    let mut with_type = serde_json::Map::new();
+                    with_type.insert("type".to_string(), Value::String("session".to_string()));
+                    with_type.extend(map);
+                    Value::Object(with_type)
+                }
+                other => other,
+            };
+            let entries: Vec<Value> = store
+                .entries()
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<Result<_, serde_json::Error>>()
+                .context("serializing session entries")?;
+            (
+                header,
+                entries,
+                store.leaf_id().map(str::to_string),
+                store.path.clone(),
+                theme_name,
+            )
         };
-        let entries: Vec<Value> = store
-            .entries()
-            .iter()
-            .map(serde_json::to_value)
-            .collect::<Result<_, serde_json::Error>>()
-            .context("serializing session entries")?;
+        // The tools read comes first: an absent session builds here (the
+        // TS state exists from create), so the best-effort prompt read
+        // below then sees it too.
+        let tools = self.engine.export_tools().await;
+        let rendered_tools = self.engine.export_rendered_tools(&entries).await;
         let data = pa_core::export_html::SessionExportData {
             header,
             entries,
-            leaf_id: store.leaf_id().map(str::to_string),
+            leaf_id,
             system_prompt: self.engine.export_system_prompt(),
-            tools: None,
-            rendered_tools: None,
+            tools,
+            rendered_tools,
         };
         pa_core::export_html::export_session_to_html(
             &data,
             theme_name.as_deref(),
             &self.agent_dir,
-            &store.path,
+            &session_file,
             output_path,
         )
     }
@@ -178,6 +195,42 @@ impl ExportCommands {
     }
 }
 
+/// The export's custom-tool renderer (the TS `createToolHtmlRenderer`
+/// seam): resolves a tool by name against the session's live registry at
+/// render time. The Rust tool surface carries no render functions —
+/// extension tools' pi-tui components cannot cross the sidecar boundary
+/// (extensions-runner-design §2.3/R3) and the built-in `ipython` has none
+/// in either product — so a resolved tool reports no renderable
+/// representation and the export falls back to the template's generic
+/// tool rendering, exactly like the TS renderer for a tool without
+/// `renderCall`. The seam stays wired at the registry so a future
+/// line-oriented renderer slots in without touching the exporter.
+pub(crate) struct ExportToolRenderer<'a> {
+    /// The session's live tool registry (TS `getToolDefinition` source).
+    pub tools: &'a [std::sync::Arc<dyn pa_agent::types::AgentTool>],
+}
+
+impl pa_core::export_html::ToolHtmlRenderer for ExportToolRenderer<'_> {
+    fn render_call(&self, _tool_call_id: &str, tool_name: &str, _args: &Value) -> Option<String> {
+        // Registry lookup first (TS `getToolDefinition`): an unregistered
+        // tool never renders; a registered one has no render function.
+        self.tools.iter().find(|tool| tool.name() == tool_name)?;
+        None
+    }
+
+    fn render_result(
+        &self,
+        _tool_call_id: &str,
+        tool_name: &str,
+        _result: &[Value],
+        _details: &Value,
+        _is_error: bool,
+    ) -> Option<pa_core::export_html::RenderedToolResult> {
+        self.tools.iter().find(|tool| tool.name() == tool_name)?;
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,7 +263,7 @@ mod tests {
         let exports = ExportCommands::new(engine, core, dir.path().join("agent"));
         let out = dir.path().join("export.html");
         let payload = json!({ "outputPath": out.display().to_string() });
-        let response = exports.export_html(&payload);
+        let response = exports.export_html(&payload).await;
         assert!(response.success, "export failed: {:?}", response.error);
         let path = response
             .data
@@ -267,7 +320,7 @@ mod tests {
         let engine: Arc<dyn SessionEngine> = Arc::new(crate::engine::ScriptedEngine::default());
         let exports =
             ExportCommands::new(engine, Arc::new(Mutex::new(core)), dir.path().join("agent"));
-        let response = exports.export_html(&json!({}));
+        let response = exports.export_html(&json!({})).await;
         assert!(!response.success);
         assert_eq!(
             response.error.as_deref(),
