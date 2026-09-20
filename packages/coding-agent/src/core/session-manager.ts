@@ -21,7 +21,7 @@ import { v7 as uuidv7 } from "uuid";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
 import { realpathIfPresentSync, writeFileAtomicSync } from "../utils/atomic-file.js";
 import { readBytesSync, readFirstLineSync, readLinesAsBuffers } from "../utils/file-lines.js";
-import { captureGitContext, type GitContext, gitContextsEqual } from "../utils/git.js";
+import { captureGitContext, captureGitContextAsync, type GitContext, gitContextsEqual } from "../utils/git.js";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
@@ -1153,6 +1153,44 @@ function isMessageWithContent(message: AgentMessage): message is Message {
 	return typeof (message as Message).role === "string" && "content" in message;
 }
 
+/**
+ * True when a session entry implies that agent-side code (a tool, a !bash
+ * execution, an RLM child, or an extension acting through the session) ran
+ * since the previous git capture. Captures are skipped between entries that
+ * cannot have touched the repo; repo changes that leave no entry (the user's
+ * terminal, an extension handler that only runs git) are observed at the next
+ * capture after such an entry.
+ */
+function entryMayHaveRunTool(entry: SessionEntry): boolean {
+	switch (entry.type) {
+		case "child_usage_attributed":
+		case "custom":
+			return true;
+		case "message":
+			break;
+		default:
+			return false;
+	}
+	const message = entry.message;
+	switch (message.role) {
+		case "assistant":
+			return message.content.some((item) => item.type === "toolCall");
+		case "toolResult":
+			return true;
+		case "user":
+			return false;
+		default:
+			// Custom roles (!bash executions, extension-injected messages) are app
+			// code; conservatively assume they could have touched the repo.
+			return true;
+	}
+}
+
+function gitContextOptionallyEqual(a: GitContext | undefined, b: GitContext | undefined): boolean {
+	if (a === undefined || b === undefined) return a === b;
+	return gitContextsEqual(a, b);
+}
+
 function extractTextContent(message: Message): string {
 	const content = message.content;
 	if (typeof content === "string") {
@@ -1756,6 +1794,13 @@ export class SessionManager {
 	// and must not hold it across an append.
 	private leafBranchCache: { leafId: string | null; entries: SessionEntry[] } | null = null;
 	private persistListeners = new Set<SessionPersistListener>();
+	// Git capture state: captures are async and serialized per session, and are
+	// skipped entirely while no agent-side code (see entryMayHaveRunTool) has run
+	// since the last capture and the active path still holds the captured context.
+	private gitCaptureChain: Promise<void> = Promise.resolve();
+	private toolsRanSinceGitCapture = false;
+	private lastGitCapture: GitContext | null | undefined = undefined;
+	private gitCaptureActiveContext: GitContext | undefined = undefined;
 
 	private constructor(
 		cwd: string,
@@ -2052,6 +2097,9 @@ export class SessionManager {
 		if (entry.type === "message" && entry.message.role === "assistant") {
 			this.hasAssistantEntry = true;
 		}
+		if (entryMayHaveRunTool(entry)) {
+			this.toolsRanSinceGitCapture = true;
+		}
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
 		this._persist(entry);
@@ -2285,13 +2333,45 @@ export class SessionManager {
 		return entry.id;
 	}
 
-	recordGitStateIfChanged(): string | undefined {
-		if (!this.persist) return undefined;
-		const git = captureGitContext(this.cwd);
-		if (!git) return undefined;
-		const last = this.getActiveGitContext();
-		if (last && gitContextsEqual(last, git)) return undefined;
-		return this.appendGitState(git);
+	/**
+	 * Capture the repo state and append a git_state entry when it differs from
+	 * the active path's context. Async and serialized per session: the git
+	 * invocation never blocks the event loop and captures cannot interleave.
+	 * Skipped while no agent-side code (see entryMayHaveRunTool) has run since
+	 * the last capture and the active path still holds that capture's context:
+	 * without a tool, the repo cannot have moved.
+	 */
+	recordGitStateIfChanged(): Promise<string | undefined> {
+		if (!this.persist) return Promise.resolve(undefined);
+		const run = this.gitCaptureChain.then(() => this.recordGitStateUncached());
+		this.gitCaptureChain = run.then(
+			() => undefined,
+			() => undefined,
+		);
+		return run;
+	}
+
+	private async recordGitStateUncached(): Promise<string | undefined> {
+		if (
+			this.lastGitCapture !== undefined &&
+			!this.toolsRanSinceGitCapture &&
+			gitContextOptionallyEqual(this.gitCaptureActiveContext, this.getActiveGitContext())
+		) {
+			return undefined;
+		}
+		// A capture is in flight from here; tool activity that lands while it
+		// runs must still invalidate the next skip check.
+		this.toolsRanSinceGitCapture = false;
+		try {
+			const git = await captureGitContextAsync(this.cwd);
+			this.lastGitCapture = git;
+			if (!git) return undefined;
+			const last = this.getActiveGitContext();
+			if (last && gitContextsEqual(last, git)) return undefined;
+			return this.appendGitState(git);
+		} finally {
+			this.gitCaptureActiveContext = this.getActiveGitContext();
+		}
 	}
 
 	private getActiveGitContext(): GitContext | undefined {

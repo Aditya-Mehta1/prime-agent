@@ -3145,6 +3145,10 @@ export class AgentSession {
 	}
 
 	private async _shouldStopAfterTurn(context: ShouldStopAfterTurnContext): Promise<boolean> {
+		// Drain the agent-event queue first so this turn's message_end handlers (persistence,
+		// goal accounting, plan kickoff) have landed before anything decided here is persisted;
+		// an instant model turn can otherwise outrun an async handler like the agent_start git capture.
+		await this._agentEventQueue;
 		if (this._stopGoalContinuationForTerminalMessage(context.message)) {
 			return true;
 		}
@@ -3167,9 +3171,6 @@ export class AgentSession {
 		// compaction model call from overlapping an in-flight refine
 		// plan/apply that was started at message_end.
 		if (this._serializedRefine) {
-			// Ensure the preceding message_end processing (counter increment,
-			// background plan kickoff) has completed before the checkpoint.
-			await this._agentEventQueue;
 			await this._runSerializedRefineCheckpoint();
 		}
 		if (await this._shouldStopForThresholdCompaction(context)) {
@@ -4708,11 +4709,11 @@ export class AgentSession {
 	private async _emitExtensionEvent(event: AgentEvent): Promise<void> {
 		if (event.type === "agent_start") {
 			this._turnIndex = 0;
-			this.sessionManager.recordGitStateIfChanged();
+			await this.sessionManager.recordGitStateIfChanged();
 			await this._extensionRunner.emit({ type: "agent_start" });
 		} else if (event.type === "agent_end") {
 			// Also capture at end of turn so commits made during the run (e.g. via a bash tool) land.
-			this.sessionManager.recordGitStateIfChanged();
+			await this.sessionManager.recordGitStateIfChanged();
 			await this._extensionRunner.emit({
 				type: "agent_end",
 				messages: event.messages,

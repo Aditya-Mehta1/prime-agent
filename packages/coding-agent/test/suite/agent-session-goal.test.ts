@@ -510,11 +510,12 @@ describe("AgentSession goals", () => {
 		]);
 
 		const promptPromise = harness.session.prompt("/goal --budget 10 do work");
-		try {
-			await waitForCondition(() => harness.session.goalState.status === "budget_limited");
-		} finally {
-			releaseMessageEnd?.();
-		}
+		// The turn boundary drains the agent-event queue before deciding the
+		// budget: while the turn's message_end handler is still blocked, no
+		// decision has been made and no continuation has started.
+		await waitForCondition(() => harness.getPendingResponseCount() === 2);
+		expect(harness.session.goalState.status).toBe("active");
+		releaseMessageEnd?.();
 		await promptPromise;
 		await harness.session.waitForIdle();
 		await vi.waitFor(() => expect(visibleAssistantTexts(harness)).toHaveLength(2));
