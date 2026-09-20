@@ -32,7 +32,7 @@ the adapter is a subprocess, so the boundary is the container command.
 npm run build   # once, from the repository root
 cd packages/coding-agent/examples/system-router-gba
 npm install node-mgba@0.2.9   # keep this out of the repository's package.json
-cd ../../..   # back to the repository root: the default adapter path is root-relative
+cd ../../../..   # back to the repository root: the default adapter path is root-relative
 node packages/coding-agent/examples/system-router-gba/demo.mjs \
   --rom /path/to/your.gba --plan press_a,wait,press_start,finish
 ```
