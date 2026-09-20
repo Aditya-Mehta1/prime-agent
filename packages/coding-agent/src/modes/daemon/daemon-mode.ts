@@ -94,10 +94,12 @@ import type {
 	CreateRlmRootSessionOptions,
 	CreateRlmSubagentRuntimeOptions,
 	RlmCreateSessionResult,
+	RlmSubagentRuntime,
 	SubagentRuntimeHost,
 } from "../../core/rlm-runtime.js";
 import {
 	canPassivateSession,
+	canPassivateSettledSession,
 	type IdleEvictionMinutes,
 	type SessionPassivationSnapshot,
 } from "../../core/session-action-store.js";
@@ -2687,6 +2689,8 @@ export class AgentDaemon {
 					createdAt: metadata.createdAt,
 				});
 			},
+			passivateRlmSubagentRuntime: (childId, runtime) =>
+				this.passivateSettledRlmSubagent(parentState, childId, runtime),
 			releaseRlmSubagentRuntime: async (runtime, options, status) => {
 				// Persist the deletion boundary first, but never let a registry failure
 				// strand the cancelled child as a stale resident session.
@@ -3168,6 +3172,68 @@ export class AgentDaemon {
 		try {
 			await passivation;
 			return this.sessions.get(state.activeSessionId) !== state;
+		} finally {
+			if (this.passivatingSessions.get(sessionKey) === passivation) {
+				this.passivatingSessions.delete(sessionKey);
+			}
+		}
+	}
+
+	/**
+	 * Eagerly passivate a just-settled RLM child: the same graceful close the
+	 * idle sweep performs (shutdown keeps the resume entry, registry row, and
+	 * heartbeats; the kernel snapshot flushes before teardown), without waiting
+	 * out the idle window. Skips leave the child resident for the idle sweep:
+	 * attached clients, in-flight closes or hydration, resident descendants
+	 * (e.g. a rehydrated grandchild), or non-heartbeat cron jobs. The parent's
+	 * retained entry is intentionally kept: listing extras and collects serve
+	 * from it until the child is rehydrated or deleted.
+	 */
+	private async passivateSettledRlmSubagent(
+		parentState: ActiveSessionState,
+		childId: string,
+		runtime: RlmSubagentRuntime,
+	): Promise<void> {
+		if (this.shuttingDown || this.updateRestart !== undefined) return;
+		const state = [...this.sessions.values()].find(
+			(candidate) =>
+				candidate.runtime.metadata.kind === "subagent" &&
+				candidate.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
+				candidate.runtime.metadata.rlmChildId === childId &&
+				candidate.runtime.session === runtime.session,
+		);
+		const sessionFile = state?.runtime.session.sessionFile;
+		if (!state || !sessionFile) return;
+		if (this.sessions.get(state.activeSessionId) !== state) return;
+		if (this.sessions.get(parentState.activeSessionId) !== parentState) return;
+		if (this.closingSessions.has(state.activeSessionId) || this.bindingSessions.has(state.activeSessionId)) return;
+		const sessionKey = resolve(sessionFile);
+		const existing = this.passivatingSessions.get(sessionKey);
+		if (existing) {
+			await existing;
+			return;
+		}
+		// Fence inside the passivation like the idle sweep: attachment or activity
+		// changes between admission and close must keep the child resident.
+		const passivation = Promise.resolve().then(async () => {
+			if (this.shuttingDown || this.updateRestart !== undefined) return;
+			if (this.sessions.get(state.activeSessionId) !== state) return;
+			if (!canPassivateSettledSession(await this.sessionPassivationSnapshot(state))) return;
+			try {
+				await this.closeSession(state, "shutdown", true, false);
+				this.log(`Passivated settled child sessionId=${state.runtime.session.sessionId} childId=${childId}`);
+			} catch (error) {
+				this.log(
+					`failed to passivate settled child sessionId=${state.runtime.session.sessionId} childId=${childId}: ${
+						error instanceof Error ? error.message : String(error)
+					}`,
+				);
+				throw error;
+			}
+		});
+		this.passivatingSessions.set(sessionKey, passivation);
+		try {
+			await passivation;
 		} finally {
 			if (this.passivatingSessions.get(sessionKey) === passivation) {
 				this.passivatingSessions.delete(sessionKey);

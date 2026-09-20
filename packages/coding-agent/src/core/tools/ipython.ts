@@ -355,11 +355,22 @@ export class IpythonKernelProvisioner {
 
 	/** Dispose the kernel owned by this provisioner, including one still starting up. */
 	async dispose(options?: { snapshot?: boolean }): Promise<void> {
-		this.disposeSnapshot = options?.snapshot ?? true;
 		// Drops a still-queued boot out of the semaphore and short-circuits an
 		// in-flight startKernel before it spawns, so a disposed session's boot
-		// doesn't waste a slot during a fan-out.
+		// doesn't waste a slot during a fan-out. Terminal: a later ensure()
+		// rejects "Kernel provisioner disposed before start".
 		this.disposeController.abort();
+		await this.stopKernel(options);
+	}
+
+	/**
+	 * Stop the kernel owned by this provisioner without marking the provisioner
+	 * disposed: the next ensure() starts a fresh kernel and revives the prior
+	 * namespace from the snapshot. Settled-child retention uses this so a
+	 * follow-up turn keeps working after the kernel was released.
+	 */
+	async stopKernel(options?: { snapshot?: boolean }): Promise<void> {
+		this.disposeSnapshot = options?.snapshot ?? true;
 		const pending = this.managerPromise;
 		this.managerPromise = undefined;
 		this.startedManager = undefined;

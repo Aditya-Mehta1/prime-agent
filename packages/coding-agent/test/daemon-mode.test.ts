@@ -226,9 +226,11 @@ describe("daemon mode helpers", () => {
 		const closeSession = vi.fn(async () => {});
 		const internals = daemon as unknown as {
 			sessions: Map<string, ActiveSessionState>;
+			sessionPassivationSnapshot: (state: ActiveSessionState) => Promise<unknown>;
 			closeSession: typeof closeSession;
 			createSubagentRuntimeHost(parent: ActiveSessionState): {
 				deleteRlmSubagentRuntime(childId: string, session: ActiveSessionState["runtime"]["session"]): Promise<void>;
+				passivateRlmSubagentRuntime(childId: string, runtime: { session: unknown }): Promise<void>;
 			};
 		};
 		internals.sessions.set(childState.activeSessionId, childState);
@@ -254,6 +256,18 @@ describe("daemon mode helpers", () => {
 		} as unknown as ActiveSessionState["runtime"]["session"];
 		await host.deleteRlmSubagentRuntime("missing-child", missingSession);
 		expect(missingSession.disposeAsync).toHaveBeenCalledOnce();
+
+		// Settled-child retention: the hook closes through the daemon exactly like
+		// an idle passivation, while the policy gate and identity guard skip.
+		internals.sessions.set(parentState.activeSessionId, parentState);
+		Reflect.set(childState.runtime, "session", { ...childSession, sessionFile: "/tmp/prime-agent-child.jsonl" });
+		internals.sessionPassivationSnapshot = vi.fn(async () => ({ hasParent: true, attachedClients: 0 }));
+		await host.passivateRlmSubagentRuntime("child-1", { session: childState.runtime.session });
+		expect(closeSession).toHaveBeenCalledWith(childState, "shutdown", true, false);
+		internals.sessionPassivationSnapshot = vi.fn(async () => ({ hasParent: true, attachedClients: 1 }));
+		await host.passivateRlmSubagentRuntime("child-1", { session: childState.runtime.session });
+		await host.passivateRlmSubagentRuntime("child-1", { session: foreignSession });
+		expect(closeSession).toHaveBeenCalledTimes(2);
 	});
 
 	it("cancels child jobs when deletion joins an in-flight passivation close", async () => {

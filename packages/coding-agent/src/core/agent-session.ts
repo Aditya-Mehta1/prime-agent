@@ -11556,6 +11556,38 @@ export class AgentSession {
 		};
 	}
 
+	/**
+	 * Release a settled, retained child's kernel: flush its snapshot and stop the
+	 * kernel process so finished children stop pinning one CPython kernel each.
+	 * A host that owns residency (the daemon) closes the whole runtime so its
+	 * maps, registry row, and lazy rehydration stay consistent. Without such a
+	 * host there is no rehydration path, so the child session itself stays live:
+	 * transcript reads, follow-up prompts, and nested spawns keep working, and
+	 * the next kernel use revives from the snapshot. Best-effort — a failure
+	 * leaves the child resident, as before.
+	 */
+	private async _passivateSettledRlmChildRuntime(
+		run: RlmChildRun,
+		childRuntime: RlmSubagentRuntime | undefined,
+		child: AgentSession,
+	): Promise<void> {
+		if (childRuntime && this._subagentRuntimeHost?.passivateRlmSubagentRuntime) {
+			try {
+				// try/catch (not .catch): a synchronous host throw must not flip
+				// the settled run to "error" in the spawn lifecycle's catch.
+				await this._subagentRuntimeHost.passivateRlmSubagentRuntime(run.id, childRuntime);
+			} catch {
+				// A skipped or failed eager passivation leaves the child resident;
+				// the host's idle sweep owns the fallback.
+			}
+			return;
+		}
+		// Same-instance private access: stopKernel flushes the final snapshot
+		// and stops the kernel without marking the provisioner disposed, so a
+		// follow-up turn revives the kernel from the snapshot.
+		await child._ipythonKernelProvisioner?.stopKernel({ snapshot: true }).catch(() => undefined);
+	}
+
 	private _rlmChildSnapshotForRun(
 		run: RlmChildRun,
 		child = run.session ?? this._rlmChildSessions.get(run.id)?.session,
@@ -12315,6 +12347,14 @@ export class AgentSession {
 					} else {
 						await child.disposeAsync().catch(() => undefined);
 					}
+				} else if (this._rlmChildSessions.get(run.id)?.session === child) {
+					// The run settled (quiescence + terminal status) and its terminal
+					// signal is durable: the notice was admitted above, a reply since
+					// the task served as the answer, or the notice was suppressed.
+					// Release the child's kernel now; the retained entry keeps the
+					// child addressable for listings, transcript reads, collects,
+					// and explicit deletion.
+					await this._passivateSettledRlmChildRuntime(run, childRuntime, child);
 				}
 			} catch (error) {
 				const runError = error instanceof Error ? error : new Error(String(error));
