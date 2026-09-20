@@ -1,0 +1,21 @@
+{
+ "scenario": "bedrock_400_validation_http1",
+ "api": "bedrock-converse-stream",
+ "run": {
+  "exit_code": 1,
+  "stdout": "",
+  "stderr": "Validation error: mock bedrock bad request\n",
+  "duration_s": 2.19,
+  "timeout": false
+ },
+ "session_file": "01a0bee1-0c61-7005-bbfc-8381c6fdd982.jsonl",
+ "errorMessage": "Validation error: mock bedrock bad request",
+ "stopReason": "error",
+ "diagnostic": {
+  "name": "ValidationException",
+  "kind": "unknown",
+  "status": null,
+  "providerErrorType": "ValidationException",
+  "retryAfterMs": null
+ }
+}

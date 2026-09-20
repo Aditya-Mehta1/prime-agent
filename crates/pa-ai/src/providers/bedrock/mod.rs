@@ -16,6 +16,8 @@ mod auth;
 mod convert;
 mod events;
 mod eventstream;
+mod goaway;
+mod h2;
 
 use crate::env_api_keys::get_env_api_key;
 use crate::event_stream::{
@@ -39,7 +41,8 @@ use crate::types::{
 use crate::utils_inner::diagnostics::now_ms;
 use crate::utils_inner::http::{send, HttpResponse, RequestOptions};
 use crate::utils_inner::stream_failure::{
-    record_stream_failure, stream_failure_from_stop_reason, ProviderError, ProviderHttpError,
+    record_stream_failure, stream_failure_from_stop_reason, ConnectionErrorProfile, ProviderError,
+    ProviderHttpError,
 };
 
 pub const API_BEDROCK_CONVERSE_STREAM: &str = "bedrock-converse-stream";
@@ -172,6 +175,76 @@ fn bedrock_http_error(
         sdk_name: Some(exception_name),
         retry_after_ms: None,
         provider_error_type: None,
+    })
+}
+
+/// The opened bedrock response, whichever transport produced it: the reqwest
+/// path (http1 handler, https ALPN) or the direct h2c prior-knowledge path
+/// (the TS default cleartext transport).
+enum BedrockResponse {
+    Http(HttpResponse),
+    H2(crate::providers::bedrock::h2::H2Response),
+}
+
+impl BedrockResponse {
+    fn status(&self) -> u16 {
+        match self {
+            BedrockResponse::Http(response) => response.status,
+            BedrockResponse::H2(response) => response.status,
+        }
+    }
+
+    fn header(&self, name: &str) -> Option<String> {
+        match self {
+            BedrockResponse::Http(response) => response.headers.get(name).cloned(),
+            BedrockResponse::H2(response) => response.headers.get(name).cloned(),
+        }
+    }
+
+    fn headers(&self) -> std::collections::HashMap<String, String> {
+        match self {
+            BedrockResponse::Http(response) => response.headers.clone(),
+            BedrockResponse::H2(response) => response.headers.clone(),
+        }
+    }
+
+    async fn next_bytes(&mut self) -> Result<Option<Vec<u8>>, ProviderError> {
+        match self {
+            BedrockResponse::Http(response) => response.next_bytes().await,
+            BedrockResponse::H2(response) => response.next_bytes().await,
+        }
+    }
+
+    async fn read_all_text(&mut self) -> Result<String, ProviderError> {
+        match self {
+            BedrockResponse::Http(response) => response.read_all_text().await,
+            BedrockResponse::H2(response) => response.read_all_text().await,
+        }
+    }
+}
+
+/// Port of the TS `AWS_BEDROCK_FORCE_HTTP1` request-handler switch.
+fn bedrock_force_http1() -> bool {
+    std::env::var("AWS_BEDROCK_FORCE_HTTP1").as_deref() == Ok("1")
+}
+
+/// Port of the TS proxy-env request-handler switch: any configured proxy
+/// environment variable selects the node http1 handler with the proxy
+/// agent (reqwest honors the proxy environment natively).
+fn bedrock_proxy_configured() -> bool {
+    [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    ]
+    .iter()
+    .any(|key| {
+        std::env::var(key)
+            .map(|value| !value.is_empty())
+            .unwrap_or(false)
     })
 }
 
@@ -496,48 +569,92 @@ async fn run_stream(
         }
     }
 
-    // The connection profile carries the endpoint address so the
-    // refused-connect text names the target (node-style
-    // `connect ECONNREFUSED <host>:<port>`).
-    let connection = crate::utils_inner::stream_failure::ConnectionErrorProfile::AwsHttp1 {
-        host: host.clone(),
-        port: bedrock_endpoint_port(&url),
+    // The TS request-handler selection: NodeHttp2Handler (http2) by default,
+    // NodeHttpHandler (http1) for AWS_BEDROCK_FORCE_HTTP1 or a proxy
+    // environment. Cleartext endpoints speak h2c prior-knowledge HTTP/2
+    // directly (bun's node:http2 surface); https endpoints negotiate h2 via
+    // TLS ALPN through reqwest. The connection profile carries the endpoint
+    // address so the failure texts name the target.
+    let scheme = url::Url::parse(&url)
+        .map(|parsed| parsed.scheme().to_string())
+        .unwrap_or_default();
+    let endpoint_port = bedrock_endpoint_port(&url);
+    let transport = crate::providers::bedrock::h2::select_transport(
+        &scheme,
+        bedrock_force_http1(),
+        bedrock_proxy_configured(),
+    );
+    let mut response: BedrockResponse = match transport {
+        crate::providers::bedrock::h2::BedrockTransport::Http1Handler => BedrockResponse::Http(
+            send(RequestOptions {
+                method: reqwest::Method::POST,
+                url,
+                headers,
+                body: Some(payload.to_string()),
+                signal: options.base.signal.clone(),
+                timeout_ms: options.base.timeout_ms,
+                connection: ConnectionErrorProfile::AwsHttp1 {
+                    host: host.clone(),
+                    port: endpoint_port,
+                },
+                transport: crate::utils_inner::http::Transport::Http1,
+            })
+            .await?,
+        ),
+        crate::providers::bedrock::h2::BedrockTransport::H2TlsAlpn => BedrockResponse::Http(
+            send(RequestOptions {
+                method: reqwest::Method::POST,
+                url,
+                headers,
+                body: Some(payload.to_string()),
+                signal: options.base.signal.clone(),
+                timeout_ms: options.base.timeout_ms,
+                connection: ConnectionErrorProfile::AwsHttp2 {
+                    host: host.clone(),
+                    port: endpoint_port,
+                },
+                transport: crate::utils_inner::http::Transport::H2Alpn,
+            })
+            .await?,
+        ),
+        crate::providers::bedrock::h2::BedrockTransport::H2Cleartext => BedrockResponse::H2(
+            crate::providers::bedrock::h2::send_h2(
+                crate::providers::bedrock::h2::H2RequestOptions {
+                    url,
+                    headers,
+                    body: payload.to_string().into_bytes(),
+                    signal: options.base.signal.clone(),
+                    timeout_ms: options.base.timeout_ms,
+                    connection: ConnectionErrorProfile::AwsHttp2 {
+                        host: host.clone(),
+                        port: endpoint_port,
+                    },
+                },
+            )
+            .await?,
+        ),
     };
-    let mut response: HttpResponse = send(RequestOptions {
-        method: reqwest::Method::POST,
-        url,
-        headers,
-        body: Some(payload.to_string()),
-        signal: options.base.signal.clone(),
-        timeout_ms: options.base.timeout_ms,
-        connection,
-    })
-    .await?;
 
     if let Some(on_response) = &options.base.on_response {
         on_response(
             crate::types::ProviderResponse {
-                status: response.status,
-                headers: response.headers.clone(),
+                status: response.status(),
+                headers: response.headers(),
             },
             model,
         );
     }
 
-    if response.status >= 400 {
+    if response.status() >= 400 {
         let body = response.read_all_text().await.unwrap_or_default();
-        return Err(bedrock_http_error(
-            response.status,
-            &body,
-            &response.headers,
-        ));
+        let status = response.status();
+        let headers = response.headers();
+        return Err(bedrock_http_error(status, &body, &headers));
     }
 
     let request_id = response
-        .headers
-        .get("x-amzn-requestid")
-        .or_else(|| response.headers.get("x-amzn-request-id"))
-        .cloned();
+        .header("x-amzn-requestid")
+        .or_else(|| response.header("x-amzn-request-id"));
 
     let mut state = BedrockStreamState::new();
     let mut decoder = EventStreamDecoder::new();

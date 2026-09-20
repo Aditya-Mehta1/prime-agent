@@ -14,7 +14,20 @@ thiserror = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+# `http2` enables ALPN-negotiated HTTP/2 for providers whose TS transport
+# speaks it (bedrock); every other provider stays pinned to HTTP/1.1 via the
+# shared client's `http1_only()`.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "gzip",
+    "http2",
+] }
+# h2/bytes: the bedrock cleartext transport speaks h2c prior-knowledge HTTP/2
+# directly (the TS default transport — the AWS SDK's NodeHttp2Handler — is
+# http2 there); the same version the graph resolves for reqwest/hyper.
+h2 = { version = "0.4", features = ["stream"] }
+bytes = "1"
 regex = "1"
 rand = "0.8"
 base64 = "0.22"

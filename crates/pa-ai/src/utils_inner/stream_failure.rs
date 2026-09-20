@@ -80,12 +80,45 @@ impl std::fmt::Display for StreamFailureError {
 
 impl std::error::Error for StreamFailureError {}
 
-/// Connection-level transport failure kinds: connect failures and request
-/// timeouts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Connection-level transport failure kinds: connect failures, request
+/// timeouts, and the post-connection transport failures (AWS handler
+/// surfaces: http1 reset, http2 stream/session/protocol failures).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionErrorKind {
+    /// The transport could not be established (refused, unreachable, DNS).
     Connect,
+    /// The request exceeded its configured deadline.
     Timeout,
+    /// The peer closed or reset the connection before a response arrived.
+    /// For the AWS http1 handler surface this is node's `read ECONNRESET`.
+    Reset,
+    /// An http2-level failure before any response arrived (bedrock's default
+    /// transport): the `H2Failure` text without the deserialization hint.
+    H2Request(H2Failure),
+    /// An http2-level failure inside a received response body (bedrock's
+    /// default transport): the AWS SDK's event-stream reader fails, so the
+    /// message carries its deserialization hint.
+    H2MidStream(H2Failure),
+}
+
+/// The http2 transport failure detail, with the byte-exact user-facing text
+/// the TS bedrock client (bun's node:http2 behind the AWS SDK's
+/// NodeHttp2Handler) surfaces for it. Verified against the TS binary by the
+/// provider-error probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum H2Failure {
+    /// A RST_STREAM received from the peer: "Stream closed with error code
+    /// NGHTTP2_<NAME>" with the nghttp2 name of the carried code.
+    StreamReset { nghttp2_code: String },
+    /// A GOAWAY received from the peer: "Session closed with error code N"
+    /// with the numeric code.
+    SessionClosed { code: u32 },
+    /// A stream/socket failure (peer reset or closed mid-stream):
+    /// "The pending stream has been canceled".
+    Canceled,
+    /// Any other http2 protocol violation (e.g. an HTTP/1.1 answer at a
+    /// prior-knowledge h2 peer): "Protocol error".
+    Protocol,
 }
 
 /// Connection-error shapes per provider family, verified against the TS
@@ -105,11 +138,44 @@ pub enum ConnectionErrorProfile {
     /// The mistral SDK's `UnexpectedClientError` wrapper shape.
     MistralSdk,
     /// The AWS node/http1 handler: the node `connect ECONNREFUSED
-    /// <host>:<port>` text with the `ECONNREFUSED` code. (The TS binary's
-    /// default HTTP/2 handler surfaces `ERR_HTTP2_STREAM_CANCEL` texts
-    /// instead; the Rust client speaks HTTP/1.1, so the http1 surface —
-    /// the TS `AWS_BEDROCK_FORCE_HTTP1` mode — is the comparable one.)
+    /// <host>:<port>` text with the `ECONNREFUSED` code — the TS
+    /// `AWS_BEDROCK_FORCE_HTTP1` surface (and the proxy-env handler mode).
+    /// A peer close before the response is node's `read ECONNRESET`
+    /// (`TimeoutError` name, TS-binary verified).
     AwsHttp1 { host: String, port: u16 },
+    /// The AWS NodeHttp2Handler surface — the TS default bedrock transport
+    /// (http2 with h2c prior knowledge over cleartext): the bun node:http2
+    /// failure texts and `ERR_HTTP2_*` codes, TS-binary verified.
+    AwsHttp2 { host: String, port: u16 },
+}
+
+/// The AWS SDK's deserialization hint the TS binary appends to failures
+/// inside a received response body (the event-stream reader has a response
+/// to lose). Byte-exact, TS-binary verified.
+pub const AWS_DESERIALIZATION_HINT: &str =
+    "\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object.";
+
+/// The base failure text of an http2 transport failure (without the
+/// deserialization hint).
+pub fn h2_failure_text(failure: &H2Failure) -> String {
+    match failure {
+        H2Failure::StreamReset { nghttp2_code } => {
+            format!("Stream closed with error code {nghttp2_code}")
+        }
+        H2Failure::SessionClosed { code } => format!("Session closed with error code {code}"),
+        H2Failure::Canceled => "The pending stream has been canceled".to_string(),
+        H2Failure::Protocol => "Protocol error".to_string(),
+    }
+}
+
+/// The user-facing failure text, with the AWS SDK deserialization hint for
+/// mid-body failures.
+pub fn h2_failure_message(failure: &H2Failure, mid_stream: bool) -> String {
+    let mut message = h2_failure_text(failure);
+    if mid_stream {
+        message.push_str(AWS_DESERIALIZATION_HINT);
+    }
+    message
 }
 
 /// Errors raised by provider HTTP/SSE plumbing, carrying the raw pieces the TS
@@ -162,58 +228,152 @@ pub const RUNTIME_CONNECT_REFUSED_MESSAGE: &str =
 impl ProviderConnectionError {
     /// The user-facing text the TS binary surfaces for this failure.
     pub fn message(&self) -> String {
-        match (&self.profile, self.kind) {
-            (ConnectionErrorProfile::Sdk, ConnectionErrorKind::Connect) => {
-                "Connection error.".to_string()
-            }
+        // A peer reset before the response carries the same fixed text as the
+        // connect failure for the raw-fetch/SDK families (the TS binary
+        // surfaces one per-family connection error; reset-vs-refused is only
+        // distinguishable on the AWS handler surfaces, which have dedicated
+        // texts below).
+        match (&self.profile, &self.kind) {
+            (
+                ConnectionErrorProfile::Sdk,
+                ConnectionErrorKind::Connect | ConnectionErrorKind::Reset,
+            ) => "Connection error.".to_string(),
             (ConnectionErrorProfile::Sdk, ConnectionErrorKind::Timeout) => {
                 "Request timed out.".to_string()
             }
+            (
+                ConnectionErrorProfile::Sdk,
+                ConnectionErrorKind::H2Request(_) | ConnectionErrorKind::H2MidStream(_),
+            ) => "Connection error.".to_string(),
             // Raw `fetch` (bun) and the mistral `RequestTimeoutError` append
             // the raw cause to a fixed timeout prefix; the refused-connect
             // text is the runtime's own fixed message.
-            (ConnectionErrorProfile::RawFetch, ConnectionErrorKind::Connect) => {
-                RUNTIME_CONNECT_REFUSED_MESSAGE.to_string()
-            }
+            (
+                ConnectionErrorProfile::RawFetch,
+                ConnectionErrorKind::Connect | ConnectionErrorKind::Reset,
+            ) => RUNTIME_CONNECT_REFUSED_MESSAGE.to_string(),
             (ConnectionErrorProfile::RawFetch, ConnectionErrorKind::Timeout) => {
                 format!("Request timed out: {}", self.cause)
             }
-            (ConnectionErrorProfile::MistralSdk, ConnectionErrorKind::Connect) => format!(
+            (
+                ConnectionErrorProfile::RawFetch,
+                ConnectionErrorKind::H2Request(_) | ConnectionErrorKind::H2MidStream(_),
+            ) => RUNTIME_CONNECT_REFUSED_MESSAGE.to_string(),
+            (
+                ConnectionErrorProfile::MistralSdk,
+                ConnectionErrorKind::Connect | ConnectionErrorKind::Reset,
+            ) => format!(
                 "Unexpected HTTP client error: TypeError: {RUNTIME_CONNECT_REFUSED_MESSAGE}"
             ),
             (ConnectionErrorProfile::MistralSdk, ConnectionErrorKind::Timeout) => {
                 format!("Request timed out: {}", self.cause)
             }
+            (
+                ConnectionErrorProfile::MistralSdk,
+                ConnectionErrorKind::H2Request(_) | ConnectionErrorKind::H2MidStream(_),
+            ) => format!(
+                "Unexpected HTTP client error: TypeError: {RUNTIME_CONNECT_REFUSED_MESSAGE}"
+            ),
             (ConnectionErrorProfile::AwsHttp1 { host, port }, ConnectionErrorKind::Connect) => {
                 format!("connect ECONNREFUSED {host}:{port}")
+            }
+            (ConnectionErrorProfile::AwsHttp1 { .. }, ConnectionErrorKind::Reset) => {
+                "read ECONNRESET".to_string()
             }
             (ConnectionErrorProfile::AwsHttp1 { .. }, ConnectionErrorKind::Timeout) => {
                 "Request timed out.".to_string()
             }
+            (
+                ConnectionErrorProfile::AwsHttp1 { .. },
+                ConnectionErrorKind::H2Request(_) | ConnectionErrorKind::H2MidStream(_),
+            ) => "read ECONNRESET".to_string(),
+            (ConnectionErrorProfile::AwsHttp2 { host, port }, ConnectionErrorKind::Connect) => {
+                // The refused connect surfaces as a canceled pending stream
+                // with the node-style connect cause embedded.
+                format!(
+                    "The pending stream has been canceled (caused by: connect ECONNREFUSED {host}:{port})"
+                )
+            }
+            (ConnectionErrorProfile::AwsHttp2 { .. }, ConnectionErrorKind::Timeout) => {
+                // No TS ground truth: the TS client configures no transport
+                // timeout (NodeHttp2Handler without requestTimeout).
+                "Request timed out.".to_string()
+            }
+            (ConnectionErrorProfile::AwsHttp2 { .. }, ConnectionErrorKind::Reset) => {
+                // A pre-response non-connect failure at a cleartext prior-
+                // knowledge h2 peer (HTTP/1.1 answer): bun's protocol error.
+                "Protocol error".to_string()
+            }
+            (ConnectionErrorProfile::AwsHttp2 { .. }, ConnectionErrorKind::H2Request(failure)) => {
+                h2_failure_message(failure, false)
+            }
+            (
+                ConnectionErrorProfile::AwsHttp2 { .. },
+                ConnectionErrorKind::H2MidStream(failure),
+            ) => h2_failure_message(failure, true),
         }
     }
 
     /// The TS runtime/SDK error class name recorded in the
     /// `provider_stream_failure` diagnostic.
     pub fn error_name(&self) -> &'static str {
-        match self.profile {
-            ConnectionErrorProfile::Sdk => "Error",
-            ConnectionErrorProfile::RawFetch => "TypeError",
-            ConnectionErrorProfile::MistralSdk => "UnexpectedClientError",
-            ConnectionErrorProfile::AwsHttp1 { .. } => "Error",
+        if matches!(self.profile, ConnectionErrorProfile::RawFetch) {
+            return "TypeError";
         }
+        if matches!(self.profile, ConnectionErrorProfile::MistralSdk) {
+            return "UnexpectedClientError";
+        }
+        // bun records the http1 pre-response reset as a TimeoutError
+        // (TS-binary verified); every other AWS handler failure is a plain
+        // Error.
+        if matches!(self.profile, ConnectionErrorProfile::AwsHttp1 { .. })
+            && matches!(self.kind, ConnectionErrorKind::Reset)
+        {
+            return "TimeoutError";
+        }
+        "Error"
     }
 
     /// The TS `err.code` the classification uses as the provider error type
     /// (bun's `ConnectionRefused` for raw `fetch`, the SDK class name for
-    /// mistral, node's `ECONNREFUSED` for the AWS http1 handler; the
-    /// openai/anthropic SDK family records none).
+    /// mistral, node's `ECONNREFUSED` for the AWS http1 handler and bun's
+    /// `ERR_HTTP2_*` codes for the AWS http2 handler; the openai/anthropic
+    /// SDK family records none).
     pub fn error_code(&self) -> Option<&'static str> {
-        match self.profile {
-            ConnectionErrorProfile::Sdk => None,
-            ConnectionErrorProfile::RawFetch => Some("ConnectionRefused"),
-            ConnectionErrorProfile::MistralSdk => Some("UnexpectedClientError"),
-            ConnectionErrorProfile::AwsHttp1 { .. } => Some("ECONNREFUSED"),
+        match (&self.profile, &self.kind) {
+            (ConnectionErrorProfile::Sdk, _) => None,
+            (ConnectionErrorProfile::RawFetch, _) => Some("ConnectionRefused"),
+            (ConnectionErrorProfile::MistralSdk, _) => Some("UnexpectedClientError"),
+            (ConnectionErrorProfile::AwsHttp1 { .. }, ConnectionErrorKind::Connect) => {
+                Some("ECONNREFUSED")
+            }
+            (ConnectionErrorProfile::AwsHttp1 { .. }, ConnectionErrorKind::Reset) => {
+                Some("ECONNRESET")
+            }
+            // The TS client configures no AWS transport timeout, so there is
+            // no ground-truth code; the classification records none.
+            (ConnectionErrorProfile::AwsHttp1 { .. }, ConnectionErrorKind::Timeout) => None,
+            (
+                ConnectionErrorProfile::AwsHttp1 { .. },
+                ConnectionErrorKind::H2Request(_) | ConnectionErrorKind::H2MidStream(_),
+            ) => None,
+            (ConnectionErrorProfile::AwsHttp2 { .. }, ConnectionErrorKind::Connect) => {
+                Some("ERR_HTTP2_STREAM_CANCEL")
+            }
+            (ConnectionErrorProfile::AwsHttp2 { .. }, ConnectionErrorKind::Timeout) => None,
+            (ConnectionErrorProfile::AwsHttp2 { .. }, ConnectionErrorKind::Reset) => {
+                Some("ERR_HTTP2_ERROR")
+            }
+            (
+                ConnectionErrorProfile::AwsHttp2 { .. },
+                ConnectionErrorKind::H2Request(ref failure)
+                | ConnectionErrorKind::H2MidStream(ref failure),
+            ) => match failure {
+                H2Failure::StreamReset { .. } => Some("ERR_HTTP2_STREAM_ERROR"),
+                H2Failure::SessionClosed { .. } => Some("ERR_HTTP2_SESSION_ERROR"),
+                H2Failure::Canceled => Some("ERR_HTTP2_STREAM_CANCEL"),
+                H2Failure::Protocol => Some("ERR_HTTP2_ERROR"),
+            },
         }
     }
 }
@@ -955,6 +1115,132 @@ mod tests {
                 .as_deref(),
             Some("ECONNREFUSED")
         );
+    }
+
+    /// The AWS http2 transport failure texts (TS-binary verified, bedrock
+    /// http2 mode): connect-refused stream cancel, pre-response protocol
+    /// error, and the mid-stream classes carrying the AWS SDK deserialization
+    /// hint.
+    #[test]
+    fn aws_http2_transport_texts() {
+        let profile = || ConnectionErrorProfile::AwsHttp2 {
+            host: "127.0.0.1".to_string(),
+            port: 1,
+        };
+        let error = |kind| {
+            ProviderError::Connection(ProviderConnectionError {
+                kind,
+                profile: profile(),
+                cause: "transport".to_string(),
+            })
+        };
+
+        // Refused connect: the canceled pending stream embeds the node-style
+        // connect cause.
+        let connect = error(ConnectionErrorKind::Connect);
+        assert_eq!(
+            connect.to_string(),
+            "The pending stream has been canceled (caused by: connect ECONNREFUSED 127.0.0.1:1)"
+        );
+        let info = extract_stream_failure_info(&connect);
+        assert_eq!(info.kind, StreamFailureKind::Unknown);
+        assert_eq!(
+            info.provider_error_type.as_deref(),
+            Some("ERR_HTTP2_STREAM_CANCEL")
+        );
+        assert_eq!(
+            diagnostic_error_info(&connect).name.as_deref(),
+            Some("Error")
+        );
+
+        // An HTTP/1.1 answer at a prior-knowledge h2 peer.
+        let protocol = error(ConnectionErrorKind::H2Request(H2Failure::Protocol));
+        assert_eq!(protocol.to_string(), "Protocol error");
+        let info = extract_stream_failure_info(&protocol);
+        assert_eq!(info.provider_error_type.as_deref(), Some("ERR_HTTP2_ERROR"));
+        assert_eq!(
+            diagnostic_error_info(&protocol).name.as_deref(),
+            Some("Error")
+        );
+
+        // RST_STREAM mid-body: the nghttp2 code name plus the AWS SDK's
+        // deserialization hint.
+        let reset = error(ConnectionErrorKind::H2MidStream(H2Failure::StreamReset {
+            nghttp2_code: "NGHTTP2_INTERNAL_ERROR".to_string(),
+        }));
+        assert_eq!(
+            reset.to_string(),
+            "Stream closed with error code NGHTTP2_INTERNAL_ERROR\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object."
+        );
+        let info = extract_stream_failure_info(&reset);
+        assert_eq!(
+            info.provider_error_type.as_deref(),
+            Some("ERR_HTTP2_STREAM_ERROR")
+        );
+
+        // GOAWAY mid-body: the numeric session code plus the hint.
+        let session = error(ConnectionErrorKind::H2MidStream(H2Failure::SessionClosed {
+            code: 1,
+        }));
+        assert_eq!(
+            session.to_string(),
+            "Session closed with error code 1\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object."
+        );
+        let info = extract_stream_failure_info(&session);
+        assert_eq!(
+            info.provider_error_type.as_deref(),
+            Some("ERR_HTTP2_SESSION_ERROR")
+        );
+
+        // Socket reset/close mid-body: the canceled pending stream plus the
+        // hint (no connect cause — the request had already gone out).
+        let canceled = error(ConnectionErrorKind::H2MidStream(H2Failure::Canceled));
+        assert_eq!(
+            canceled.to_string(),
+            "The pending stream has been canceled\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object."
+        );
+        let info = extract_stream_failure_info(&canceled);
+        assert_eq!(
+            info.provider_error_type.as_deref(),
+            Some("ERR_HTTP2_STREAM_CANCEL")
+        );
+    }
+
+    /// The AWS http1 handler's pre-response reset text (TS-binary verified):
+    /// node's `read ECONNRESET` recorded under a TimeoutError name with the
+    /// `ECONNRESET` code.
+    #[test]
+    fn aws_http1_reset_text() {
+        let reset = ProviderError::Connection(ProviderConnectionError {
+            kind: ConnectionErrorKind::Reset,
+            profile: ConnectionErrorProfile::AwsHttp1 {
+                host: "127.0.0.1".to_string(),
+                port: 1,
+            },
+            cause: "connection closed".to_string(),
+        });
+        assert_eq!(reset.to_string(), "read ECONNRESET");
+        let info = extract_stream_failure_info(&reset);
+        assert_eq!(info.provider_error_type.as_deref(), Some("ECONNRESET"));
+        assert_eq!(info.kind, StreamFailureKind::Unknown);
+        assert_eq!(
+            diagnostic_error_info(&reset).name.as_deref(),
+            Some("TimeoutError")
+        );
+    }
+
+    /// Mid-stream protocol failures (h2 framing errors inside the body)
+    /// surface the deserialization hint too, like every failure the AWS
+    /// SDK's event-stream reader can hit.
+    #[test]
+    fn h2_mid_stream_protocol_hint() {
+        let failure = H2Failure::Protocol;
+        assert_eq!(
+            h2_failure_message(&failure, true),
+            "Protocol error\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object."
+        );
+        // Pre-response failures carry no hint (no response to deserialize).
+        assert_eq!(h2_failure_message(&failure, false), "Protocol error");
     }
 
     /// The TS `extractStreamFailureParts` fallback chain: a body without an

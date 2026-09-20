@@ -221,6 +221,7 @@ async fn run_stream(
         signal: base_options.signal.clone(),
         timeout_ms: base_options.timeout_ms,
         connection: crate::utils_inner::stream_failure::ConnectionErrorProfile::Sdk,
+        transport: crate::utils_inner::http::Transport::Http1,
     })
     .await?;
 

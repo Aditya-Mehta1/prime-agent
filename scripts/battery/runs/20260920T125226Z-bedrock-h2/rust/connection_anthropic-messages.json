@@ -1,0 +1,21 @@
+{
+ "scenario": "connection_anthropic-messages",
+ "api": "anthropic-messages",
+ "run": {
+  "exit_code": 1,
+  "stdout": "",
+  "stderr": "Connection error.\n",
+  "duration_s": 0.22,
+  "timeout": false
+ },
+ "session_file": "01a0bee1-9bdc-7641-b67e-750aed2ef338.jsonl",
+ "errorMessage": "Connection error.",
+ "stopReason": "error",
+ "diagnostic": {
+  "name": "Error",
+  "kind": "unknown",
+  "status": null,
+  "providerErrorType": null,
+  "retryAfterMs": null
+ }
+}

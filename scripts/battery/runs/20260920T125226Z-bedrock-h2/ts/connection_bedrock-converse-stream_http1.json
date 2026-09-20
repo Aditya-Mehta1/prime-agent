@@ -1,0 +1,21 @@
+{
+ "scenario": "connection_bedrock-converse-stream_http1",
+ "api": "bedrock-converse-stream",
+ "run": {
+  "exit_code": 1,
+  "stdout": "",
+  "stderr": "connect ECONNREFUSED 127.0.0.1:1\n",
+  "duration_s": 2.38,
+  "timeout": false
+ },
+ "session_file": "01a0bee1-77e4-7034-b032-ad5f16b25bf3.jsonl",
+ "errorMessage": "connect ECONNREFUSED 127.0.0.1:1",
+ "stopReason": "error",
+ "diagnostic": {
+  "name": "Error",
+  "kind": "unknown",
+  "status": null,
+  "providerErrorType": "ECONNREFUSED",
+  "retryAfterMs": null
+ }
+}

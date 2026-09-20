@@ -1,0 +1,21 @@
+{
+ "scenario": "connection_openai-codex-responses",
+ "api": "openai-codex-responses",
+ "run": {
+  "exit_code": 1,
+  "stdout": "",
+  "stderr": "Unable to connect. Is the computer able to access the url?\n",
+  "duration_s": 0.17,
+  "timeout": false
+ },
+ "session_file": "01a0bee1-9d87-7743-baee-814b45bff97e.jsonl",
+ "errorMessage": "Unable to connect. Is the computer able to access the url?",
+ "stopReason": "error",
+ "diagnostic": {
+  "name": "TypeError",
+  "kind": "unknown",
+  "status": null,
+  "providerErrorType": "ConnectionRefused",
+  "retryAfterMs": null
+ }
+}

@@ -16,14 +16,43 @@ use crate::utils::stream_failure::{
 };
 
 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+static H2_ALPN_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
+/// The HTTP/1.1 client every provider shares (the transport all TS SDK
+/// clients but bedrock's default NodeHttp2Handler speak). Pinned with
+/// `http1_only()` so that enabling the reqwest `http2` feature (bedrock)
+/// cannot change the transport of any other provider.
 fn client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
+            .http1_only()
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .build()
             .expect("reqwest client")
     })
+}
+
+/// The TLS-ALPN client for bedrock https endpoints: HTTP/2 preferred
+/// (ALPN-negotiated), like the TS default transport. Cleartext bedrock
+/// endpoints do not go through reqwest at all — the bedrock provider
+/// drives h2c prior-knowledge HTTP/2 directly there (see
+/// `providers/bedrock/h2.rs`).
+fn h2_alpn_client() -> &'static reqwest::Client {
+    H2_ALPN_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .build()
+            .expect("reqwest h2 client")
+    })
+}
+
+/// The wire transport a request is issued with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transport {
+    /// HTTP/1.1 (the default; all providers but bedrock https).
+    Http1,
+    /// HTTP/2 preferred over TLS ALPN (bedrock https endpoints).
+    H2Alpn,
 }
 
 /// An opened HTTP response: status, headers, and the byte stream.
@@ -32,6 +61,9 @@ pub struct HttpResponse {
     pub headers: std::collections::HashMap<String, String>,
     body: reqwest::Response,
     signal: Option<CancellationToken>,
+    /// The request's connection-error profile: body-read failures on the AWS
+    /// http2 profile surface the TS bedrock transport's mid-stream texts.
+    pub(crate) connection: ConnectionErrorProfile,
 }
 
 impl HttpResponse {
@@ -59,16 +91,7 @@ impl HttpResponse {
         match chunk {
             Ok(Some(bytes)) => Ok(Some(String::from_utf8_lossy(&bytes).to_string())),
             Ok(None) => Ok(None),
-            Err(error) => Err(ProviderError::Http(ProviderHttpError {
-                message: format!("Failed to read provider response body: {error}"),
-                status: Some(self.status),
-                body: None,
-                headers: self.headers.clone(),
-                request_id: None,
-                sdk_name: None,
-                retry_after_ms: None,
-                provider_error_type: None,
-            })),
+            Err(error) => Err(self.body_error(error)),
         }
     }
 
@@ -96,17 +119,33 @@ impl HttpResponse {
         match chunk {
             Ok(Some(bytes)) => Ok(Some(bytes.to_vec())),
             Ok(None) => Ok(None),
-            Err(error) => Err(ProviderError::Http(ProviderHttpError {
-                message: format!("Failed to read provider response body: {error}"),
-                status: Some(self.status),
-                body: None,
-                headers: self.headers.clone(),
-                request_id: None,
-                sdk_name: None,
-                retry_after_ms: None,
-                provider_error_type: None,
-            })),
+            Err(error) => Err(self.body_error(error)),
         }
+    }
+
+    /// Classify a body-read failure. The AWS bedrock http2 profile surfaces
+    /// the TS transport's mid-stream failure texts (the event-stream reader
+    /// fails, so the AWS SDK appends its deserialization hint); every other
+    /// provider keeps the generic body-read error.
+    fn body_error(&self, error: reqwest::Error) -> ProviderError {
+        if let ConnectionErrorProfile::AwsHttp2 { .. } = self.connection {
+            let failure = crate::utils_inner::h2_classify::classify_reqwest_error(&error);
+            return ProviderError::Connection(ProviderConnectionError {
+                kind: ConnectionErrorKind::H2MidStream(failure),
+                profile: self.connection.clone(),
+                cause: error.to_string(),
+            });
+        }
+        ProviderError::Http(ProviderHttpError {
+            message: format!("Failed to read provider response body: {error}"),
+            status: Some(self.status),
+            body: None,
+            headers: self.headers.clone(),
+            request_id: None,
+            sdk_name: None,
+            retry_after_ms: None,
+            provider_error_type: None,
+        })
     }
 
     /// Read the entire body as text (for error responses and small payloads).
@@ -130,6 +169,9 @@ pub struct RequestOptions {
     /// and error codes the TS binary surfaces per SDK); the openai/anthropic
     /// `Sdk` default covers the Stainless-generated SDK family.
     pub connection: ConnectionErrorProfile,
+    /// The wire transport (HTTP/1.1 by default; bedrock https requests use
+    /// ALPN-negotiated HTTP/2).
+    pub transport: Transport,
 }
 
 impl RequestOptions {
@@ -143,6 +185,7 @@ impl RequestOptions {
             signal: None,
             timeout_ms: None,
             connection: ConnectionErrorProfile::Sdk,
+            transport: Transport::Http1,
         }
     }
 }
@@ -160,7 +203,11 @@ pub async fn send(request: RequestOptions) -> Result<HttpResponse, ProviderError
         return Err(ProviderError::Aborted);
     }
 
-    let mut builder = client().request(request.method, &request.url);
+    let client = match request.transport {
+        Transport::Http1 => client(),
+        Transport::H2Alpn => h2_alpn_client(),
+    };
+    let mut builder = client.request(request.method, &request.url);
     for (name, value) in &request.headers {
         builder = builder.header(name, value);
     }
@@ -202,8 +249,19 @@ pub async fn send(request: RequestOptions) -> Result<HttpResponse, ProviderError
     let response = response.map_err(|error| {
         let kind = if error.is_timeout() {
             ConnectionErrorKind::Timeout
-        } else {
+        } else if error.is_connect() {
             ConnectionErrorKind::Connect
+        } else if matches!(request.connection, ConnectionErrorProfile::AwsHttp2 { .. }) {
+            // Pre-response http2 failure on the bedrock https transport: the
+            // h2 failure detail (no deserialization hint — no response yet).
+            ConnectionErrorKind::H2Request(crate::utils_inner::h2_classify::classify_reqwest_error(
+                &error,
+            ))
+        } else {
+            // The peer closed or reset after the connection was established
+            // but before the response arrived (only distinguishable from
+            // refused connects on the AWS handler surfaces).
+            ConnectionErrorKind::Reset
         };
         ProviderError::Connection(ProviderConnectionError {
             kind,
@@ -225,6 +283,7 @@ pub async fn send(request: RequestOptions) -> Result<HttpResponse, ProviderError
         headers,
         body: response,
         signal,
+        connection: request.connection,
     })
 }
 

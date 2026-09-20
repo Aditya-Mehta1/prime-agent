@@ -2,6 +2,7 @@
 //! tolerance, SSE decoding, HTTP plumbing, and logging.
 
 pub mod diagnostics;
+pub mod h2_classify;
 pub mod hash;
 pub mod headers;
 pub mod http;
