@@ -4,14 +4,17 @@ The state model is intentionally small: it records prompt notes, memory,
 skills, subagent specs, and refinement events in the session-local harness
 store by default; pass ``global_=True`` for the cross-session global store.
 Execution still belongs to Prime Agent's TypeScript host and the existing
-``rlm.run`` recursion bridge.
+``rlm.spawn`` recursion bridge.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import stat
+import unicodedata
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +38,76 @@ def _slug(raw: str, fallback: str) -> str:
     normalized = "".join(ch.lower() if ch.isalnum() else "_" for ch in raw.strip())
     normalized = "_".join(part for part in normalized.split("_") if part)
     return (normalized or fallback)[:80]
+
+
+_CJK_TERM_CHARS = re.compile(
+    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af"
+    r"\U00020000-\U0002a6df\U0002a700-\U0002b73f\U0002b740-\U0002b81f"
+    r"\U0002b820-\U0002ceaf\U0002ceb0-\U0002ebef\U0002ebf0-\U0002ee5f"
+    r"\U0002f800-\U0002fa1f\U00030000-\U0003134f\U00031350-\U000323af"
+    r"\U000323b0-\U0003347f]"
+)
+
+
+def _harness_query_runs(text: str) -> list[str]:
+    """Split lowercase text into word runs.
+
+    Letters, digits, and combining marks of any script share a run;
+    punctuation and symbols end it. Runs break only at CJK boundaries:
+    accented Latin stays whole (naïve) while spacing-free CJK is cut
+    apart from adjacent words it would otherwise swallow (修复login).
+    """
+    runs: list[str] = []
+    run: list[str] = []
+    run_is_cjk = False
+    for ch in text:
+        if unicodedata.category(ch).startswith("M") or ch.isalnum():
+            ch_is_cjk = bool(_CJK_TERM_CHARS.match(ch))
+            if run and ch_is_cjk != run_is_cjk:
+                runs.append("".join(run))
+                run = []
+            run_is_cjk = ch_is_cjk
+            run.append(ch)
+        elif run:
+            runs.append("".join(run))
+            run = []
+    if run:
+        runs.append("".join(run))
+    return runs
+
+
+def _harness_query_terms(query: str) -> list[str]:
+    """Tokenize a search query into lowercase substring terms.
+
+    Letters and digits of every script form terms; punctuation and symbols
+    only separate them, so ``worktree?`` never ranks entries by question
+    marks. CJK runs carry no spaces between words, so each run becomes
+    overlapping bigrams: ``修复登录`` yields ``修复``/``复登``/``登录`` and
+    still matches an entry containing ``登录故障``. Each term counts once.
+    Minimum lengths stay below the digest builder's four-character cut
+    because ``search`` tokenizes explicit queries, not mined conversation:
+    three ASCII characters keep real terms (rlm, api, cli), two characters
+    keep short words of other scripts (мир), and single characters are
+    terms only for CJK, where one character is a word.
+    """
+    terms: list[str] = []
+    seen: set[str] = set()
+    for run in _harness_query_runs(query.lower()):
+        if _CJK_TERM_CHARS.search(run):
+            # Bigrams keep whitespace-free CJK findable without single
+            # characters matching too loosely.
+            candidates = [run[i : i + 2] for i in range(len(run) - 1)] or [run]
+        elif run.isascii():
+            candidates = [run] if len(run) >= 3 else []
+        else:
+            # Other scripts space out words: lone characters match too
+            # broadly, so two characters is the floor.
+            candidates = [run] if len(run) >= 2 else []
+        for term in candidates:
+            if term not in seen:
+                seen.add(term)
+                terms.append(term)
+    return terms
 
 
 def _agent_dir() -> Path:
@@ -746,7 +819,7 @@ class HarnessState:
             "Call contract: installed Python skills use await <skill_import>(...) or a matching shell CLI; "
             "harness skill entries are Python REPL skills and must include a Python reference plus arguments. "
             "Spawn a subagent spec by composing a concise task prompt and calling "
-            "handle = await rlm('sub-task'); admission returns immediately with rlm_child_id, name, session_dir, "
+            "handle = await rlm.spawn('sub-task', name='worker'); admission returns immediately with rlm_child_id, name, session_dir, "
             "and model, never the child's answer. Results arrive only through explicit agent_message replies or "
             "files; children reply with await agent_message.send(message, receiver_role='parent'). Use "
             "await rlm.list_subagents() to recover direct child handles and await agent_message.send(..., "
@@ -785,6 +858,73 @@ class HarnessState:
         else:
             lines.append("refinements: 0")
         return "\n".join(lines)
+
+    def search(
+        self,
+        query: str,
+        kind: HarnessKind | None = None,
+        limit: int = 10,
+        *,
+        global_: bool = False,
+        **kwargs: Any,
+    ) -> list[HarnessEntry]:
+        """Return harness entries ranked by weighted term overlap with *query*.
+
+        Terms are scored against an entry's title, content, path, and id;
+        matches in more distinct fields count more. Each matched term is
+        discounted by its document frequency across the ranked corpus
+        (tf-idf style, ``weight * log(1 + N / df)``), so a rare,
+        distinctive term outranks terms present in most entries.
+        """
+        if target := self._global_target(global_, kwargs):
+            return target.search(query, kind=kind, limit=limit)
+        self._sync_from_disk()
+        if not isinstance(query, str):
+            raise TypeError(f"query must be str, got {type(query).__name__}")
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise TypeError("limit must be a positive int")
+        terms = _harness_query_terms(query)
+        if not terms:
+            return []
+
+        entries = self.list(kind, **kwargs) if kind is not None else self.list(None, **kwargs)
+
+        # Document frequency per term over the ranked corpus: a term in
+        # every entry weighs log(2), a term in one entry of N weighs
+        # log(1 + N), so rare distinctive terms outrank ubiquitous ones.
+        matches: dict[str, int] = {term: 0 for term in terms}
+        for entry in entries:
+            title = entry.title.lower()
+            content = entry.content.lower()
+            path_and_id = f"{entry.path} {entry.id}".lower()
+            for term in terms:
+                if term in title or term in content or term in path_and_id:
+                    matches[term] += 1
+        term_idf = {
+            term: math.log(1 + len(entries) / count)
+            for term, count in matches.items()
+            if count > 0
+        }
+
+        def score(entry: HarnessEntry) -> float:
+            title = entry.title.lower()
+            content = entry.content.lower()
+            path_and_id = f"{entry.path} {entry.id}".lower()
+            total = 0.0
+            for term, idf in term_idf.items():
+                fields = (1 if term in title else 0) + (1 if term in content else 0) + (
+                    1 if term in path_and_id else 0
+                )
+                if fields:
+                    total += idf * (1 + (fields - 1) * 0.5)
+            return total
+
+        def recency(entry: HarnessEntry) -> str:
+            return entry.updated_at if isinstance(entry.updated_at, str) else ""
+
+        ranked = sorted(entries, key=lambda e: (score(e), recency(e)), reverse=True)
+        ranked = [e for e in ranked if score(e) > 0]
+        return ranked[:limit]
 
     def snapshot(self, *, global_: bool = False, **kwargs: Any) -> dict[str, Any]:
         if target := self._global_target(global_, kwargs):
