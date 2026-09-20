@@ -211,6 +211,9 @@ export function parseActionSpace(value: unknown): Record<string, RouterActionSpe
 		if (!/^[a-z0-9_]{1,32}$/.test(name)) {
 			throw new Error(`system_router.run action name "${name}" must be lowercase snake_case (max 32 chars)`);
 		}
+		if (name === "__proto__") {
+			throw new Error(`system_router.run action name "${name}" is reserved`);
+		}
 		if (name === FINISH_ACTION || name === ESCALATE_ACTION) {
 			throw new Error(`system_router.run action name "${name}" is reserved for the loop itself`);
 		}
@@ -232,6 +235,9 @@ export function parseActionSpace(value: unknown): Record<string, RouterActionSpe
 					throw new Error(
 						`system_router.run action "${name}" param name "${paramName}" must be lowercase snake_case (max 32 chars)`,
 					);
+				}
+				if (paramName === "__proto__") {
+					throw new Error(`system_router.run action "${name}" param name "${paramName}" is reserved`);
 				}
 				if (!isRecord(rawParam) || !isRecord(rawParam.choices) || Object.keys(rawParam.choices).length === 0) {
 					throw new Error(

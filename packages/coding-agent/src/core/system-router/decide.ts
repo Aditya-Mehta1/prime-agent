@@ -185,7 +185,9 @@ export function parseDecision(raw: string, actions: Map<string, CompiledAction>)
 			params[key] = value;
 		}
 	}
-	const missing = Object.keys(action.params).filter((paramName) => !(paramName in params));
+	// Own-property check only: an inherited name like "constructor" must not
+	// mask a missing required parameter.
+	const missing = Object.keys(action.params).filter((paramName) => !Object.hasOwn(params, paramName));
 	if (missing.length > 0) {
 		return {
 			action: null,

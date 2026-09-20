@@ -1,5 +1,5 @@
 import type { ChildProcess } from "node:child_process";
-import { signalProcessGroupOrProcess, spawnHidden } from "../../utils/child-process.js";
+import { signalProcessGroupOrProcess, spawnHidden, spawnSyncHidden } from "../../utils/child-process.js";
 import {
 	isRecord,
 	type RouterCloseOptions,
@@ -245,19 +245,27 @@ export class StdioRouterEnvironment implements RouterEnvironment {
 			// The whole process group is signaled so a launcher's descendants
 			// (the docker wrapper case) cannot outlive the shutdown.
 			const pid = child.pid;
-			if (pid) signalProcessGroupOrProcess(pid, "SIGTERM");
-			const terminated = new Promise<void>((resolve) => {
-				child.once("exit", () => resolve());
-			});
-			await Promise.race([
-				terminated,
-				new Promise<void>((resolve) => {
-					const timer = setTimeout(() => resolve(), remainingBudget(1_000));
-					if (typeof timer === "object" && "unref" in timer) timer.unref();
-				}),
-			]);
-			if (child.exitCode === null && child.signalCode === null && pid) {
-				signalProcessGroupOrProcess(pid, "SIGKILL");
+			if (pid) {
+				if (process.platform === "win32") {
+					// Windows has no signalable process groups; taskkill /T /F
+					// takes the launcher's descendants down with it.
+					spawnSyncHidden("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
+				} else {
+					signalProcessGroupOrProcess(pid, "SIGTERM");
+					const terminated = new Promise<void>((resolve) => {
+						child.once("exit", () => resolve());
+					});
+					await Promise.race([
+						terminated,
+						new Promise<void>((resolve) => {
+							const timer = setTimeout(() => resolve(), remainingBudget(1_000));
+							if (typeof timer === "object" && "unref" in timer) timer.unref();
+						}),
+					]);
+					if (child.exitCode === null && child.signalCode === null) {
+						signalProcessGroupOrProcess(pid, "SIGKILL");
+					}
+				}
 			}
 		}
 		this.failAll(new Error("environment adapter closed"));

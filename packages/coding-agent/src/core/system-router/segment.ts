@@ -2,7 +2,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ProviderRetryPolicy } from "../provider-retry.js";
 import { compileActionSpace } from "./action-space.js";
 import { createModelDecisionFunction, routerThinkingLevel } from "./decide.js";
-import { runSystemRouterLoop } from "./loop.js";
+import { ROUTER_CLOSE_GRACE_MS, runSystemRouterLoop } from "./loop.js";
 import { StdioRouterEnvironment } from "./stdio-environment.js";
 import {
 	type ParsedSystemRouterRunSpec,
@@ -90,8 +90,13 @@ export async function runRouterSegment(
 		});
 	} finally {
 		// The loop closes the env on its own paths; this guards the window
-		// between init and the loop so the adapter process never leaks.
-		await env.close({ budgetMs: Math.max(0, spec.timeoutMs - (Date.now() - segmentStartedAt)) }).catch(() => {});
+		// between init and the loop so the adapter process never leaks. The
+		// grace keeps a wedged-but-forwardable container adapter stoppable.
+		await env
+			.close({
+				budgetMs: Math.max(0, spec.timeoutMs - (Date.now() - segmentStartedAt)) + ROUTER_CLOSE_GRACE_MS,
+			})
+			.catch(() => {});
 	}
 }
 

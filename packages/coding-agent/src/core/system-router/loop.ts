@@ -1,4 +1,5 @@
 import {
+	type CompiledAction,
 	compileActionSpace,
 	compileDecisionPrompt,
 	formatHistoryEntry,
@@ -24,6 +25,13 @@ import {
 export const ROUTER_REFUSAL_STREAK_LIMIT = 3;
 /** The same action with the same params on the same observation, this many times, is stuck. */
 export const ROUTER_REPETITION_LIMIT = 2;
+/**
+ * Bounded cleanup grace handed to close() past the deadline: long enough for a
+ * container-wrapped adapter (docker run) to relay the close request or
+ * SIGTERM and stop (--rm reaps), bounded so a wedged adapter cannot extend a
+ * timed-out segment the way the old unbounded waits did.
+ */
+export const ROUTER_CLOSE_GRACE_MS = 500;
 
 /**
  * Race work against a deadline without leaking a late rejection from the losing
@@ -64,6 +72,16 @@ export interface SystemRouterLoopOptions {
 	signal?: AbortSignal;
 }
 
+/** Validate the declared space; called inside the loop's cleanup scope so a
+ * reserved name or an empty space cannot leak the adapter process. */
+function validateAndCompileActionSpace(actions: Record<string, RouterActionSpec>) {
+	const declaredActions = Object.keys(actions);
+	if (declaredActions.length === 0) {
+		throw new Error("system router action space is empty (finish and escalate are always appended)");
+	}
+	return compileActionSpace(actions).byName;
+}
+
 /**
  * The System 1 step loop: observe -> decide (ONE call) -> gate -> execute -> record.
  * Mirrors the SystemOneHarness controller: a probability on every transition,
@@ -71,11 +89,7 @@ export interface SystemRouterLoopOptions {
  * stuck, explicit budgets, and a complete trace.
  */
 export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Promise<SystemRouterRunResult> {
-	const declaredActions = Object.keys(options.actions);
-	if (declaredActions.length === 0) {
-		throw new Error("system router action space is empty (finish and escalate are always appended)");
-	}
-	const { byName } = compileActionSpace(options.actions);
+	let byName: Map<string, CompiledAction>;
 	const historySteps = options.historySteps ?? DEFAULT_ROUTER_HISTORY_STEPS;
 	const observationChars = options.observationChars ?? 6_000;
 	const startedAt = Date.now();
@@ -116,6 +130,7 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 	});
 
 	try {
+		byName = validateAndCompileActionSpace(options.actions);
 		try {
 			const resetResult = await raceDeadline(() => options.env.reset(options.goal), deadlineAt, deadline);
 			if (resetResult === "deadline") {
@@ -459,8 +474,11 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 		);
 	} finally {
 		if (deadlineTimer) clearTimeout(deadlineTimer);
-		// Adapter cleanup must not extend the segment past its wall-clock
-		// budget: hand close() whatever budget is left.
-		await options.env.close({ budgetMs: Math.max(0, deadlineAt - Date.now()) }).catch(() => {});
+		// Adapter cleanup must not extend the segment the way the old
+		// unbounded waits did: hand close() the remaining budget plus the
+		// bounded grace, never the old 2.5s.
+		await options.env
+			.close({ budgetMs: Math.max(0, deadlineAt - Date.now()) + ROUTER_CLOSE_GRACE_MS })
+			.catch(() => {});
 	}
 }

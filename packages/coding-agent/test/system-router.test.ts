@@ -174,6 +174,12 @@ describe("parseSystemRouterRunSpec", () => {
 			{ ...valid, actions: { escalate: { description: "x" } } },
 			"is reserved for the loop itself",
 		],
+		["proto action name", { ...valid, actions: JSON.parse('{"__proto__":{"description":"x"}}') }, "is reserved"],
+		[
+			"proto param name",
+			{ ...valid, actions: JSON.parse('{"p":{"description":"x","params":{"__proto__":{"choices":{"v":"d"}}}}}') },
+			"is reserved",
+		],
 		["missing action description", { ...valid, actions: { press_a: {} } }, "description must be a non-empty string"],
 		[
 			"bad risk",
@@ -286,6 +292,7 @@ describe("parseDecision", () => {
 			'{"action":"set_power","confidence":0.9}',
 			{ action: null, parseError: 'missing param(s) power for action "set_power"' },
 		],
+
 		[
 			"valid json followed by braced prose",
 			'{"action":"press_a","confidence":0.9} (note: use {"action":"finish"} for done)',
@@ -320,6 +327,15 @@ describe("parseDecision", () => {
 			confidence: outcome.confidence,
 			parseError: outcome.parseError,
 		}).toMatchObject(expected);
+	});
+
+	it("reports an omitted parameter named like a prototype member as missing", () => {
+		const { byName: own } = compileActionSpace({
+			press_a: { description: "P.", params: { constructor: { choices: { v: "Pick." } } } },
+		});
+		const outcome = parseDecision('{"action":"press_a","confidence":0.9}', own);
+		expect(outcome.action).toBeNull();
+		expect(outcome.parseError).toBe('missing param(s) constructor for action "press_a"');
 	});
 });
 
@@ -642,19 +658,13 @@ describe("runSystemRouterLoop", () => {
 		expect(env.closeCalls).toBe(1);
 	});
 
-	it("rejects an empty action space", async () => {
+	it.each([
+		["an empty action space", {}, "action space is empty"],
+		["a reserved action name", { finish: { description: "Reserved." } }, "is reserved for the loop itself"],
+	])("closes the environment on %s validation errors", async (_label, actions, error) => {
 		const env = new FakeEnvironment(["x"]);
-		await expect(
-			runSystemRouterLoop({
-				env,
-				goal: "g",
-				actions: {},
-				decide: scriptedDecide([decision({ action: "press_a", confidence: 0.9 })]),
-				model: { id: "m", provider: "p", input: [], thinkingLevel: "off" },
-				maxSteps: 3,
-				timeoutMs: 30_000,
-			}),
-		).rejects.toThrow("action space is empty");
+		await expect(runLoop(env, { actions })).rejects.toThrow(error);
+		expect(env.closeCalls).toBe(1);
 	});
 });
 
