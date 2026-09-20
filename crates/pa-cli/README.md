@@ -14,6 +14,14 @@ The `prime-agent` executable surface (flags, subcommands, exit codes). Internal 
 ## Depends on
 pa-types, pa-ai, pa-agent, pa-core, pa-daemon, pa-tui (one-way, composition root).
 
+## Print runtime
+The headless print/json modes (`print_runtime.rs`) drive the in-process
+session engine directly: prompt admission, the turn-boundary compaction
+checks (`print_boundary.rs` — the overflow compact-and-retry arm, the
+model-requested compaction/refinement consumption, and the threshold arm,
+the TS `_checkCompaction` flow), the json event stream, and the headless
+terminal selection (stdout/stderr/exit code) mirroring modes/print-mode.ts.
+
 ## Daemon client
 The daemon-backed public commands (`list`, `stop`, `rename`, `send`, `schedule`) talk to the
 pa-daemon supervisor over its JSONL Unix socket through the crate-private client module

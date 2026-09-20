@@ -61,6 +61,62 @@ classifier, already ported in pa-ai).
   battery rows (B-31: the scripted overflow probe drives both binaries and
   diffs the projected wire surface).
 
+## Print-mode overflow compact-and-retry (lane print-overflow, 2026-09-20)
+
+Reference: TS `core/agent-session.ts` `_checkCompaction` Case 1 (ported for
+the interactive daemon path in the overflow-compact lane) driven by
+`modes/print-mode.ts`'s `InProcessAgentConnection` — the TS print mode runs
+the session's own turn-boundary checks, so the compact-and-retry recovery
+applies there unchanged. Ground truth captured with the TS binary against
+`scripts/battery/mock_provider.py` (scripted 400 `prompt is too long`
+probes, isolated agent dirs, `--mode json`/text):
+
+- Full cycle: `compaction_start` (reason "overflow") -> `compaction_end`
+  (`willRetry: true`, result with `details`) -> the retried turn without a
+  new user message -> the reported row pair (`message_start`/`message_end`
+  custom `compaction_outcome`) then `compaction_end` (`willRetry: false`,
+  the TS failure text, NO `errorSeverity`). Text mode: the assistant error
+  line then the outcome row on stderr, exit 1. json mode: exit 0 — TS print
+  mode never derives the json exit code from the terminal selection (only
+  the autonomous gates or a thrown error do).
+- Skip (nothing compactable): the dropped error turn leaves no primary —
+  TS text mode prints ONLY the warning row and exits 0 (the Rust
+  "No response produced." branch was an invented surface, removed here).
+- Pre-turn recovery (`_runPreTurnCompaction`): a fresh process resuming a
+  session whose context ends with an unresolved overflow (compaction was
+  disabled in the earlier run) compacts BEFORE the admitted prompt, with
+  `willRetry: true` on the end event — verified with `--continue`.
+- In-process stale state: after a skip/failure the error turn is dropped
+  from the loop context, so the next prompt's pre-turn arm no-ops (TS
+  verified); a reported double-overflow leaves state `reported`, which
+  no-ops the pre-turn arm without a second row.
+- TS multi-prompt + retry race (not ported): TS `promptAndWait` can submit
+  the next message while the retry's re-issued turn still streams
+  (`Agent is already processing` error, exit 1). The Rust print loop awaits
+  the retry to quiescence at the boundary, so the sequential print loop has
+  no equivalent race; deliberately not replicated.
+
+Port shape: `crates/pa-cli/src/print_boundary.rs` (`TurnBoundary`) owns the
+print loop's boundary checks — the overflow arm (same guards as the daemon
+arm: not-predating, enabled-or-pending-request, same-model, the shared
+classifier; one attempt; the `continue_run` re-issue; the durable
+`compaction_outcome` surface; json-mode events), the requested
+compaction/refinement consumption, and the threshold arm. pa-core's
+`consume_turn_boundary_requests` split into
+`consume_pending_compaction`/`consume_pending_refinement` so the print
+loop mirrors the TS `_checkCompaction` ordering exactly (the overflow arm
+consumes a pending requested compaction when it runs; a reported arm
+leaves it pending for the next boundary — TS-exact).
+
+Known residues left to other lanes (verified against the TS binary, out of
+this lane's scope): the print json stream has no `compaction_start`/
+`compaction_end` events for the THRESHOLD and REQUESTED arms (only the
+overflow arm emits them now); the threshold arm's skip/failure surface in
+print mode still logs to stderr without the durable
+`compaction_outcome` row the daemon records; TS print mode also emits
+`refine_failed` (auto-refine after settled turns) which the Rust print
+loop does not run.
+
 ## PR/git context (roadmap item 5, 2026-09-19)
 
 Reference: TS `packages/coding-agent/src/utils/git.ts` (`captureGitContext`,

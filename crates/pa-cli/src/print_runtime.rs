@@ -579,10 +579,14 @@ fn builtin_tools(_cwd: &std::path::Path) -> Vec<Arc<dyn pa_agent::types::AgentTo
 
 /// Admit prompts, stream json events when requested, and decide the exit code
 /// from the headless terminal result plus the autonomous gate contract.
-/// Shared by the real and faux paths. When autonomous flags are present the
-/// gate loop runs after every settled prompt: continuations stream like any
-/// other turn, and a stop surfaces the durable `autonomous_status` row as a
-/// `message_end` event before the process exits.
+/// Shared by the real and faux paths. The turn-boundary compaction checks
+/// (the overflow compact-and-retry arm, the requested compaction/refinement
+/// consumption, and the threshold arm) run through
+/// [`crate::print_boundary::TurnBoundary`] at every prompt's quiescent
+/// boundaries. When autonomous flags are present the gate loop runs after
+/// every settled prompt: continuations stream like any other turn, and a
+/// stop surfaces the durable `autonomous_status` row as a `message_end`
+/// event before the process exits.
 async fn run_prompts_and_emit(
     engine: &pa_core::session_engine::engine::SessionEngine,
     model: &Model,
@@ -620,58 +624,34 @@ async fn run_prompts_and_emit(
     if let Some(run) = &autonomous {
         accounting = Some(run.wire_accounting(engine.session.agent()).await);
     }
+    let global_harness_dir =
+        pa_core::refinement::get_global_harness_state_dir(&options.config.agent_dir);
+    let mut boundary = crate::print_boundary::TurnBoundary::new(json_mode);
     for prompt in options
         .initial_message
         .iter()
         .chain(options.messages.iter())
     {
+        // The pre-turn boundary (TS `_runPreTurnCompaction`): a stale
+        // overflow error from a previous run gets its recovery attempt
+        // before the admitted prompt.
+        boundary
+            .run_pre_turn(engine, model, api_key.clone())
+            .await?;
         engine
             .session
             .prompt(prompt, Default::default())
             .await
             .map_err(|error| format!("{error:#}"))?;
         engine.session.agent().wait_for_idle().await;
-        // Turn-boundary requests the kernel scheduled mid-turn
-        // (`compact.run` / `refine.run`): consume them at the quiescent
-        // boundary between turns (TS serialized checkpoint order —
-        // compaction, then refine — before any continuation driving). The
-        // outcomes persist in the session entries the terminal result
-        // reads.
-        let consumption = engine
-            .consume_turn_boundary_requests(
-                model,
-                api_key.clone(),
-                pa_core::refinement::get_global_harness_state_dir(&options.config.agent_dir),
-                // The headless run has no abort trigger (TS print runtime
-                // compactions run unsignaled).
-                None,
-            )
-            .await;
-        if let Some(Err(error)) = &consumption.compaction {
-            eprintln!("pa-cli: requested compaction failed: {error:#}");
-        }
-        if let Some(Err(error)) = &consumption.refinement {
-            eprintln!("pa-cli: requested refinement failed: {error:#}");
-        }
-        // The automatic threshold compaction at the same quiescent
-        // boundary (TS `_checkCompaction` threshold arm at `agent_end`):
-        // the settled turn's usage crossing the reserve headroom
-        // compacts before the next prompt. The outcome persists in the
-        // session entries the headless terminal result reads
-        // (compaction outcomes surface like `/compact` runs).
-        if engine
-            .session
-            .auto_compaction_due(model.context_window)
-            .await
-        {
-            if let Err(error) = engine
-                .session
-                .compact(None, model, api_key.clone(), None)
-                .await
-            {
-                eprintln!("pa-cli: auto-compaction failed: {error:#}");
-            }
-        }
+        // The settled-turn boundary (TS `agent_end`): the overflow
+        // compact-and-retry arm, the turn-boundary requests the kernel
+        // scheduled mid-turn (`compact.run` / `refine.run`), and the
+        // threshold arm. The outcomes persist in the session entries the
+        // terminal result reads.
+        boundary
+            .run_at_settled_turn(engine, model, api_key.clone(), global_harness_dir.clone())
+            .await?;
         if let Some(run) = &autonomous {
             if let Some(row) = run
                 .drive(engine)
@@ -692,31 +672,25 @@ async fn run_prompts_and_emit(
     let messages: Vec<pa_types::session::AgentMessage> =
         state.messages.iter().filter_map(json_round_trip).collect();
     let result = pa_core::session_engine::headless::select_headless_terminal_result(&messages);
+    // The TS print-mode exit contract (modes/print-mode.ts): json mode
+    // never derives the exit code from the terminal selection — the event
+    // stream carries everything, and only the autonomous gates (or a thrown
+    // error) exit non-zero. Text mode prints the primary message (an error
+    // primary to stderr with exit 1, a settled answer to stdout) and the
+    // trailing compaction-outcome disclosures to stderr. A run with no
+    // terminal message — e.g. an overflow turn dropped by the
+    // compact-and-retry recovery whose outcome row is the only surface —
+    // prints nothing and leaves the exit code to the outcome rows.
     let mut exit_code = 0;
-    if json_mode {
-        if let Some(primary) = &result.primary {
-            primary.stderr_text(&mut exit_code);
-        }
-        for outcome in &result.compaction_outcomes {
-            if outcome.outcome == "failed" {
-                exit_code = 1;
+    if !json_mode {
+        if let Some(primary) = result.primary {
+            if let Some(stderr) = primary.stderr_text(&mut exit_code) {
+                eprintln!("{stderr}");
             }
-        }
-    } else {
-        match result.primary {
-            Some(primary) => {
-                if let Some(stderr) = primary.stderr_text(&mut exit_code) {
-                    eprintln!("{stderr}");
+            if exit_code == 0 {
+                if let Some(text) = primary.stdout_text() {
+                    println!("{text}");
                 }
-                if exit_code == 0 {
-                    if let Some(text) = primary.stdout_text() {
-                        println!("{text}");
-                    }
-                }
-            }
-            None => {
-                eprintln!("No response produced.");
-                exit_code = 1;
             }
         }
         for outcome in result.compaction_outcomes {

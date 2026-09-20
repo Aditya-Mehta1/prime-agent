@@ -348,13 +348,75 @@ pub struct TurnBoundaryConsumption {
 }
 
 impl SessionEngine {
-    /// Consume pending turn-boundary requests after a settled turn (the TS
-    /// `_checkCompaction` requested arm, then `_consumePendingRequestedRefine`):
-    /// run the compaction first, then the refinement, each with the captured
-    /// instructions. Requests are taken regardless of outcome, so a failed
-    /// run is not silently re-run on the next boundary. `abort` cancels the
-    /// compaction run only (TS `_runAutoCompaction`'s auto controller
-    /// signal): an aborted compaction surfaces as the abort marker error.
+    /// Consume a pending model-requested compaction at a turn boundary (the
+    /// TS `_checkCompaction` requested arm, which TS reaches only when the
+    /// overflow arm did not fire — the overflow run consumes the request
+    /// itself): taken regardless of outcome, so a failed run is not silently
+    /// re-run on the next boundary. `abort` cancels the run (TS
+    /// `_runAutoCompaction`'s auto controller signal): an aborted compaction
+    /// surfaces as the abort marker error for the consumer to map to its
+    /// cancelled outcome.
+    pub async fn consume_pending_compaction(
+        &self,
+        model: &pa_types::ai::Model,
+        api_key: Option<String>,
+        abort: Option<&pa_agent::abort::AbortSignal>,
+    ) -> Option<anyhow::Result<super::compact_session::CompactOutcome>> {
+        let pending = self.turn_boundary.take_compaction().await?;
+        let compact = async {
+            self.session
+                .compact(pending.instructions.as_deref(), model, api_key, abort)
+                .await
+        };
+        Some(match abort {
+            // An in-flight abort drops the summarizer request (TS cancels
+            // the provider stream through the signal); the abort surfaces
+            // as the marker error for the consumer to map to its cancelled
+            // outcome. The refinement is not raced — TS `abortCompaction`
+            // never aborts it.
+            Some(signal) => match pa_agent::abort::race_with_abort(compact, signal).await {
+                Ok(inner) => inner,
+                Err(error) => Err(error),
+            },
+            None => compact.await,
+        })
+    }
+
+    /// Consume a pending model-requested refinement at a turn boundary (TS
+    /// `_consumePendingRequestedRefine`, which runs after `_checkCompaction`
+    /// returns): taken regardless of outcome, so a failed run is not
+    /// silently re-run on the next boundary.
+    pub async fn consume_pending_refinement(
+        &self,
+        model: &pa_types::ai::Model,
+        api_key: Option<String>,
+        global_harness_dir: std::path::PathBuf,
+    ) -> Option<anyhow::Result<crate::refinement::RefinementResult>> {
+        let pending = self.turn_boundary.take_refine().await?;
+        let options = super::refine::RefineOptions {
+            global: pending.global,
+            instructions: pending.instructions,
+            rollback_id: None,
+        };
+        Some(
+            self.session
+                .refine(
+                    &options,
+                    super::refine::RefinementSource::SelfRefine,
+                    model,
+                    api_key,
+                    global_harness_dir,
+                )
+                .await,
+        )
+    }
+
+    /// Consume pending turn-boundary requests after a settled turn: run the
+    /// requested compaction first, then the refinement. The pieces are also
+    /// exposed separately (`consume_pending_compaction` /
+    /// `consume_pending_refinement`) for hosts that mirror the TS
+    /// `_checkCompaction` sequencing exactly (the overflow arm interleaves
+    /// with the requested arms).
     pub async fn consume_turn_boundary_requests(
         &self,
         model: &pa_types::ai::Model,
@@ -366,48 +428,12 @@ impl SessionEngine {
             compaction: None,
             refinement: None,
         };
-        if let Some(pending) = self.turn_boundary.take_compaction().await {
-            let compact = async {
-                self.session
-                    .compact(
-                        pending.instructions.as_deref(),
-                        model,
-                        api_key.clone(),
-                        abort,
-                    )
-                    .await
-            };
-            // An in-flight abort drops the summarizer request (TS cancels
-            // the provider stream through the signal); the abort surfaces
-            // as the marker error for the consumer to map to its cancelled
-            // outcome. The refinement is not raced — TS `abortCompaction`
-            // never aborts it.
-            consumption.compaction = Some(match abort {
-                Some(signal) => match pa_agent::abort::race_with_abort(compact, signal).await {
-                    Ok(inner) => inner,
-                    Err(error) => Err(error),
-                },
-                None => compact.await,
-            });
-        }
-        if let Some(pending) = self.turn_boundary.take_refine().await {
-            let options = super::refine::RefineOptions {
-                global: pending.global,
-                instructions: pending.instructions,
-                rollback_id: None,
-            };
-            consumption.refinement = Some(
-                self.session
-                    .refine(
-                        &options,
-                        super::refine::RefinementSource::SelfRefine,
-                        model,
-                        api_key,
-                        global_harness_dir,
-                    )
-                    .await,
-            );
-        }
+        consumption.compaction = self
+            .consume_pending_compaction(model, api_key.clone(), abort)
+            .await;
+        consumption.refinement = self
+            .consume_pending_refinement(model, api_key, global_harness_dir)
+            .await;
         consumption
     }
 }
