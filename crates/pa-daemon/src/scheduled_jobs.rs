@@ -101,6 +101,11 @@ impl AgentCronSchedulerHooks for QueueHooks {
             if !core.created || core.shutdown_requested || job.status != JobStatus::Active {
                 return Ok(Some("skipped"));
             }
+            // TS cron fires resume the suspension before admission
+            // (`promptHeartbeat`/`promptUntilAccepted` carry
+            // `resumeIfIdle: true`): a fire on a post-abort/post-compact
+            // session is a resume site.
+            core.queued_input_suspended = false;
             let queue_key = is_heartbeat_cron_job(job).then(|| format!("heartbeat:{}", job.id));
             // The TS `heartbeat:<id>` queue key: a later fire replaces the
             // queued one instead of stacking.

@@ -222,6 +222,9 @@ mod tests {
                 model_info: Some(model.clone()),
                 cli_extension_sources: Vec::new(),
                 extension_tool_allow_list: None,
+                // The settings default (no prewarm); the ACP autorefine
+                // tests do not exercise kernel boot paths.
+                prewarm_ipython_kernel: None,
             })
             .await
             .unwrap(),

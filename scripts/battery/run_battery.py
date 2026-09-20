@@ -1612,6 +1612,206 @@ class Battery:
                     ],
                 )
 
+        # Post-compact queued-input suspension lifecycle (the #227/#233
+        # ruling): a manual daemon `compact` aborts first (TS `compact()` ->
+        # `abort()` -> `requestAbort()`), which suspends queued-input
+        # admission indefinitely (no timeout). While suspended, a plain
+        # `prompt_and_wait` (daemon `resumeIfIdle: streamingBehavior !==
+        # undefined` -> false) is rejected with the TS admission error;
+        # a `steer` (resumeIfIdle: true) resumes the suspension and its
+        # turn runs; afterwards a plain prompt is admitted again. `abort`
+        # re-arms the suspension, and `resume_queue` clears it even while
+        # answering "No queued work to resume" (TS `resumeQueuedWork()`
+        # resumes admission first). Every wire response is compared
+        # (success + error string, byte-equal).
+        suspension_replies: dict[str, dict | None] = {}
+        for side in (self.sides["ts"], self.sides["rust"]):
+            self.ensure_daemon(side)
+            settings_path = side.agent_dir / "settings.json"
+            prior_settings = (
+                settings_path.read_text() if settings_path.exists() else None
+            )
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "compaction": {"keepRecentTokens": 10, "reserveTokens": 1000},
+                        "autoRefine": {"enabled": False},
+                    }
+                )
+            )
+            try:
+                wire = B.Wire(side.daemon_socket)
+                create = wire.request(
+                    "zc1",
+                    {
+                        "type": "create",
+                        "name": "battery-suspension",
+                        "config": self.session_config(side),
+                    },
+                    timeout=120,
+                )
+                side.evidence_json(flow, "suspension-create-response.json", create)
+                session_id = (
+                    create.get("data", {}).get("activeSessionId") or create.get("data", {}).get("id") or ""
+                )
+                if create.get("success") is not True:
+                    self.record(
+                        flow,
+                        "protocol",
+                        f"{side.name}: suspension session create failed: {json.dumps(create)[:300]}",
+                    )
+                    wire.close()
+                    continue
+                # Model-routed queue (the overflow section's pattern): the
+                # session's `mock-1` turns draw their scripted replies in
+                # order; the dashboard status-line model falls through to
+                # the default filler queue.
+                side.mock.set_responses(
+                    [{"text": "statusline filler"}],
+                    queues=[
+                        {
+                            "name": "suspension",
+                            "matchModels": ["mock-1"],
+                            "responses": [
+                                {"text": "seed reply"},
+                                {"text": "the suspension compaction summary"},
+                                {"text": "steered reply after resumption"},
+                                {"text": "plain reply after resumption"},
+                                {"text": "plain reply after resume_queue"},
+                            ],
+                        }
+                    ],
+                )
+                projection: dict[str, dict] = {}
+
+                def suspend_step(key: str, response: dict) -> None:
+                    side.evidence_json(flow, f"suspension-{key}.json", response)
+                    projection[key] = {
+                        "success": response.get("success"),
+                        "error": response.get("error"),
+                    }
+
+                seed = wire.request(
+                    "zs1",
+                    {
+                        "type": "prompt_and_wait",
+                        "activeSessionId": session_id,
+                        "message": "suspension seed turn with enough history for the compaction to summarize",
+                    },
+                    timeout=240,
+                )
+                side.evidence_json(flow, "suspension-seed-response.json", seed)
+                compact = wire.request(
+                    "zk1",
+                    {"type": "compact", "activeSessionId": session_id},
+                    timeout=240,
+                )
+                suspend_step("compact", compact)
+                # The suspension gate: a plain prompt_and_wait on the
+                # post-compact session must be rejected with the exact TS
+                # admission error.
+                plain_after_compact = wire.request(
+                    "zp1",
+                    {
+                        "type": "prompt_and_wait",
+                        "activeSessionId": session_id,
+                        "message": "plain prompt while suspended",
+                    },
+                    timeout=120,
+                )
+                suspend_step("plain_after_compact", plain_after_compact)
+                # A steer is a resume site (TS daemon steer passes
+                # resumeIfIdle: true): admitted, and its turn runs.
+                steer = wire.request(
+                    "zst",
+                    {
+                        "type": "steer",
+                        "activeSessionId": session_id,
+                        "message": "steer resumes the suspension",
+                    },
+                    timeout=120,
+                )
+                suspend_step("steer", steer)
+                settled = wire.request(
+                    "zwi1",
+                    {"type": "wait_for_idle", "activeSessionId": session_id},
+                    timeout=240,
+                )
+                side.evidence_json(flow, "suspension-wait-one-response.json", settled)
+                plain_after_resume = wire.request(
+                    "zp2",
+                    {
+                        "type": "prompt_and_wait",
+                        "activeSessionId": session_id,
+                        "message": "plain prompt after the steer resumed the session",
+                    },
+                    timeout=240,
+                )
+                suspend_step("plain_after_resume", plain_after_resume)
+                # abort re-arms the suspension (TS requestAbort).
+                abort = wire.request(
+                    "zab",
+                    {"type": "abort", "activeSessionId": session_id},
+                    timeout=120,
+                )
+                suspend_step("abort", abort)
+                plain_after_abort = wire.request(
+                    "zp3",
+                    {
+                        "type": "prompt_and_wait",
+                        "activeSessionId": session_id,
+                        "message": "plain prompt while suspended again",
+                    },
+                    timeout=120,
+                )
+                suspend_step("plain_after_abort", plain_after_abort)
+                # resume_queue clears the suspension before answering the
+                # empty queue with the TS failure.
+                resume_queue = wire.request(
+                    "zrq",
+                    {"type": "resume_queue", "activeSessionId": session_id},
+                    timeout=120,
+                )
+                suspend_step("resume_queue", resume_queue)
+                plain_after_resume_queue = wire.request(
+                    "zp4",
+                    {
+                        "type": "prompt_and_wait",
+                        "activeSessionId": session_id,
+                        "message": "plain prompt after resume_queue cleared the suspension",
+                    },
+                    timeout=240,
+                )
+                suspend_step("plain_after_resume_queue", plain_after_resume_queue)
+                suspension_replies[side.name] = projection
+                wire.close()
+                self.copy_sessions(side, flow)
+            finally:
+                if prior_settings is None:
+                    settings_path.unlink(missing_ok=True)
+                else:
+                    settings_path.write_text(prior_settings)
+        if suspension_replies.get("ts") is not None and suspension_replies.get("rust") is not None:
+            if suspension_replies["ts"] == suspension_replies["rust"]:
+                self.record(
+                    flow,
+                    "behavior",
+                    "post-compact suspension lifecycle identical (plain prompts rejected with the TS admission error, steer/resume_queue resume): "
+                    f"{json.dumps(suspension_replies['ts'])[:400]}",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow,
+                    "behavior",
+                    f"post-compact suspension lifecycle differs: ts={json.dumps(suspension_replies.get('ts'))[:500]} "
+                    f"rust={json.dumps(suspension_replies.get('rust'))[:500]}",
+                    evidence=[
+                        side.root / flow / "suspension-plain-after-compact.json"
+                        for side in self.sides.values()
+                    ],
+                )
+
         # Durable compaction-entry wire-diff: both sides write a
         # `compaction` row to the session file (TS `appendCompaction`). The
         # compared shape is the TS `CompactionEntry` record minus

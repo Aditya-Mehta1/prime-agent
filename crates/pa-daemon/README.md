@@ -125,7 +125,16 @@ Prompt attachments: the `prompt`/`steer`/`follow_up` wire `images` array
 (base64 payload + mime type) rides the queue item into the session engine
 as multimodal user content (images on a queued prompt do not survive a
 worker respawn - the recovery journal keeps the text lanes only, the TS
-command-recovery shape). Platform wall
+command-recovery shape).
+Queued-input suspension (TS `_sessionInputPumpSuspended`, the #227/#233
+ruling — see PORTING-NOTES.md): `abort`/`abort_and_clear_queue`/manual
+`compact` suspend queued-input admission indefinitely; while suspended a
+plain `prompt`/`prompt_and_wait` is rejected with the TS admission error
+and the lanes park. Resume sites: a prompt carrying `streamingBehavior`,
+`steer`/`follow_up`, `resume_queue` (even on the empty queue), an applied
+`mutate_queued_message`, a cron/heartbeat fire, and a successful compact
+with an active goal. Agent-message delivery is rejected while suspended
+and idle (TS `acceptAgentMessagePrompt` runs with `resumeIfIdle: false`). Platform wall
 (`platform`): per-OS endpoint naming and socket identity; the transport itself
 is the shared trait in `pa_types::platform::transport`, and the private-frame
 codec plus command planes are the shared wire contract in

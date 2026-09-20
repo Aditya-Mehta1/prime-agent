@@ -127,6 +127,12 @@ impl Worker {
                 (status, true)
             }
         };
+        // Every applied mutation resumes the suspension (TS
+        // `mutateQueuedMessage` ends with `resumeQueuedWork()`; the delete
+        // arm calls it directly).
+        if status == "applied" {
+            self.resume_queued_input();
+        }
         let response = response_success(
             None,
             "mutate_queued_message",
@@ -159,6 +165,10 @@ impl Worker {
         if let Err(response) = self.require_created("resume_queue") {
             return response;
         }
+        // TS `resumeQueuedWork()` clears the queued-input suspension first
+        // and only then reports the empty queue, so `resume_queue` is a
+        // resume site even when it answers "No queued work to resume".
+        self.resume_queued_input();
         let has_queued_work = {
             let core = self.core.lock().unwrap();
             !core.steering.is_empty() || !core.follow_up.is_empty()

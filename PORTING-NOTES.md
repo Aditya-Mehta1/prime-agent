@@ -2033,3 +2033,64 @@ deliberately left out (TS `prompt-highlight.ts`):
   turns; both sides must land the notice rows after each compaction
   entry, succeed on the second compact, and send identical update-mode
   summarizer requests).
+
+## Post-compact queued-input suspension (compact-suspension lane, the #227/#233 ruling)
+
+RULING (designed surface, not an artifact): the TS suspension is an
+intentional admission gate with a defined, never-timeout lifecycle —
+parity requires the same gate and rejection error in Rust; the Rust
+worker's previous answer-immediately behavior was a parity bug (#227's
+battery already encoded the TS shape with its steer workaround, so the
+surface was already half-known).
+
+Ground truth (`agent-session.ts`):
+
+- The flag `_sessionInputPumpSuspended` is set by `requestAbort()` (the
+  public `abort`, `abort_and_clear_queue`, and manual `compact()` — which
+  aborts first: `await this.abort()`) and by `abortForUpdateRestart()`
+  (with a separate `_sessionInputSuspendedForUpdateRestart` marker that
+  keeps trigger-turn messages queued during the restart prep; a Rust
+  worker restart is a fresh process, so no marker is needed).
+- There is no timeout and no next-turn auto-clear. The suspension ends
+  only at a resume site: `_resumeSessionInputAdmission()` runs from
+  `resumeQueuedWork()` (the daemon `resume_queue` command — which clears
+  the suspension BEFORE answering "No queued work to resume" — and every
+  applied `mutate_queued_message`), a prompt admitted with
+  `resumeIfIdle` (the daemon maps `prompt`/`prompt_and_wait`
+  `resumeIfIdle` to `streamingBehavior !== undefined`, and the dedicated
+  `steer`/`follow_up` commands pass `resumeIfIdle: true`), cron/heartbeat
+  fires (`promptHeartbeat`/`promptUntilAccepted` carry `resumeIfIdle`), and
+  the `compact()` success-with-active-goal branch (`resumeQueuedWork()` in
+  the `didCompact` finally, `_goalState.status === "active"`).
+- While suspended and not streaming, a plain prompt hits
+  `_assertSessionActionAdmissionAvailable()` and is rejected with the
+  byte-verbatim error `Cannot admit a session action while queued session
+  input is suspended.` — the observed "100+ seconds of rejections" was the
+  harness retrying plain `prompt_and_wait` with no resume site in between;
+  a `steer`/`follow_up` (the TUI's submission path) resumes immediately.
+- Agent-message delivery (`acceptAgentMessagePrompt`) runs with
+  `resumeIfIdle: false`: on a suspended idle session it is rejected with
+  the same error; only the busy carve-out queues it parked
+  (`_isBusyForSessionInput`).
+- Queued lanes park while suspended (the TS session-input pump refuses to
+  schedule): items queued before the abort survive undelivered until a
+  resume site fires.
+- Auto-compaction (`_runAutoCompaction`: overflow/threshold/requested)
+  never aborts, so it never suspends.
+
+Rust port (pa-daemon worker, `SessionCore::queued_input_suspended`):
+`abort`/`abort_and_clear_queue`/manual `compact` set it; the turn runner
+drains nothing while set; plain `prompt`/`prompt_and_wait` on a not-busy
+session is rejected with the TS error; prompts carrying `streamingBehavior`
+resume; `steer`/`follow_up`, `resume_queue` (before the empty-queue
+failure), applied `mutate_queued_message`, cron/heartbeat fires, and a
+successful compact with an active goal resume; agent-message delivery
+(`worker_deliver_message`) is rejected while suspended and idle, parked
+while busy/compacting.
+
+Verifiers: the f7 suspension-lifecycle differential (wire responses for
+compact -> plain-rejected (error byte-equal) -> steer-admitted ->
+plain-admitted -> abort -> plain-rejected -> resume_queue ("No queued work
+to resume") -> plain-admitted), pa-daemon unit tests for the same surface,
+and the existing f7 iterative rows (whose steer-after-compact step is the
+TUI's real submission path and doubles as the no-regression check).

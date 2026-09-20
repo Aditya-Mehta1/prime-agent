@@ -149,6 +149,11 @@ impl Lane {
     }
 }
 
+/// The TS `_assertSessionActionAdmissionAvailable` rejection while the
+/// queued-input pump is suspended (agent-session.ts).
+pub(crate) const QUEUED_INPUT_SUSPENDED: &str =
+    "Cannot admit a session action while queued session input is suspended.";
+
 #[derive(Debug)]
 pub(crate) struct QueuedItem {
     pub(crate) message: String,
@@ -244,6 +249,18 @@ pub(crate) struct SessionCore {
     /// A retry in flight was aborted (`abort_retry`); the turn's abort
     /// probe reads it and the next turn start clears it.
     pub(crate) retry_abort_requested: bool,
+    /// TS `_sessionInputPumpSuspended`: `requestAbort`/`abortForUpdateRestart`
+    /// (and manual `compact()`, which aborts first) suspend queued-input
+    /// admission. While set, the turn runner drains nothing and a plain
+    /// prompt (`prompt`/`prompt_and_wait` without `streamingBehavior`, TS
+    /// `resumeIfIdle: command.streamingBehavior !== undefined`) is rejected
+    /// with the TS admission error. Cleared by the TS resume sites: a
+    /// `steer`/`follow_up` command or a prompt carrying
+    /// `streamingBehavior`, `resume_queue`, an applied queued-message
+    /// mutation, a cron/heartbeat fire (TS `promptHeartbeat` passes
+    /// `resumeIfIdle: true`), and a successful compact with an active
+    /// goal (TS `compact()`'s `resumeQueuedWork()` branch).
+    pub(crate) queued_input_suspended: bool,
     /// Restored next-turn rows (TS `_pendingNextTurnMessages`,
     /// `restore_next_turn`): delivered as prefix rows with the next turn.
     pub(crate) pending_next_turn: Vec<Value>,
@@ -290,6 +307,7 @@ impl SessionCore {
             follow_up_mode: "all".to_string(),
             scoped_models: Vec::new(),
             retry_abort_requested: false,
+            queued_input_suspended: false,
             pending_next_turn: Vec::new(),
         }
     }
@@ -635,6 +653,7 @@ impl Worker {
             follow_up_mode: "all".to_string(),
             scoped_models: Vec::new(),
             retry_abort_requested: false,
+            queued_input_suspended: false,
             pending_next_turn: Vec::new(),
         };
         let active_session_id = config.active_session_id.clone();
@@ -2079,6 +2098,28 @@ impl Worker {
             Err(error) => return response_failure(None, "prompt", &error, None),
         };
         let images = parse_prompt_images(payload);
+        // TS daemon prompts map `resumeIfIdle` to
+        // `command.streamingBehavior !== undefined`: while the queued-input
+        // suspension is set (post `abort`/manual `compact`), a plain prompt
+        // on an idle session is rejected with the TS admission error and a
+        // prompt carrying `streamingBehavior` resumes the suspension
+        // (TS `_prompt`'s `_resumeSessionInputAdmission()` +
+        // `_assertSessionActionAdmissionAvailable()` pair).
+        {
+            let mut core = self.core.lock().unwrap();
+            if core.queued_input_suspended && !core.busy {
+                if streaming_behavior.is_none() {
+                    drop(core);
+                    return response_failure(
+                        None,
+                        if wait { "prompt_and_wait" } else { "prompt" },
+                        QUEUED_INPUT_SUSPENDED,
+                        None,
+                    );
+                }
+                core.queued_input_suspended = false;
+            }
+        }
         // The prompt-admission bookkeeping (wave b9): a prompt carrying an
         // admission id registers it worker-side; the queued item carries
         // it so the turn runner commits the admission when its turn starts.
@@ -2159,6 +2200,10 @@ impl Worker {
         if let Err(response) = self.require_created(lane.as_str()) {
             return response;
         }
+        // TS daemon `steer`/`follow_up` pass `resumeIfIdle: true`, and an
+        // admitted turn with `wake: "immediate"` resumes the suspension:
+        // these commands are resume sites.
+        self.resume_queued_input();
         let message = payload
             .get("message")
             .and_then(Value::as_str)
@@ -2220,6 +2265,22 @@ impl Worker {
         // same error while `agent_messages_pause` holds the flag).
         if let Err(response) = self.refuse_delivery_if_paused() {
             return response;
+        }
+        // TS `acceptAgentMessagePrompt` runs with `resumeIfIdle: false`: on
+        // a suspended idle session the delivery is rejected with the same
+        // admission error as a plain prompt, and only the busy carve-out
+        // (`_isBusyForSessionInput`) queues it parked.
+        {
+            let core = self.core.lock().unwrap();
+            if core.queued_input_suspended && !core.busy && !core.compacting {
+                drop(core);
+                return response_failure(
+                    None,
+                    "worker_deliver_message",
+                    QUEUED_INPUT_SUSPENDED,
+                    None,
+                );
+            }
         }
         let sender = payload.get("sender").cloned().unwrap_or(Value::Null);
         // A delivery from one of this session's RLM children counts as the
@@ -2392,10 +2453,28 @@ impl Worker {
         response_success(None, "shutdown", None)
     }
 
+    /// Clear the queued-input suspension (TS `_resumeSessionInputAdmission`,
+    /// reached through `resumeQueuedWork()` and the resume sites) and wake
+    /// the turn runner so parked lanes drain.
+    pub(crate) fn resume_queued_input(&self) {
+        {
+            let mut core = self.core.lock().unwrap();
+            if !core.queued_input_suspended {
+                return;
+            }
+            core.queued_input_suspended = false;
+        }
+        self.work_notify.notify_one();
+    }
+
     fn handle_abort(&self) -> DaemonResponse {
         {
             let mut core = self.core.lock().unwrap();
             core.abort_requested = true;
+            // TS `requestAbort()` suspends queued-input admission: the
+            // queue parks and a plain prompt is rejected until a resume
+            // site fires.
+            core.queued_input_suspended = true;
         }
         // TS `requestAbort()` also aborts the compaction in flight (manual
         // and automatic): the interrupt key cancels a compacting session.
@@ -2414,10 +2493,33 @@ impl Worker {
             .get("customInstructions")
             .and_then(Value::as_str)
             .map(str::to_string);
+        {
+            // TS `compact()` aborts first (`await this.abort()` ->
+            // `requestAbort()`), which suspends queued-input admission:
+            // the suspension outlives skip/failure/abort outcomes and is
+            // cleared below only for the TS `didCompact` + active-goal
+            // branch.
+            let mut core = self.core.lock().unwrap();
+            core.queued_input_suspended = true;
+        }
         let outcome = self
             .compaction
             .run(custom_instructions, &self.idle_notify)
             .await;
+        if let crate::engine::CompactionOutcome::Compacted { .. } = &outcome {
+            // TS `compact()`'s `didCompact` branch resumes queued work when
+            // a goal is active (`this._goalState.status === "active"`),
+            // so goal continuations keep flowing after a compact.
+            let goal_active = self
+                .engine
+                .goal_state_value()
+                .get("status")
+                .and_then(Value::as_str)
+                == Some("active");
+            if goal_active {
+                self.resume_queued_input();
+            }
+        }
         match outcome {
             crate::engine::CompactionOutcome::Compacted { run } => {
                 // TS `compact()` schedules the compact-trigger auto-refine
@@ -2685,6 +2787,8 @@ impl Worker {
         }
         let mut core = self.core.lock().unwrap();
         core.abort_requested = true;
+        // The same TS `requestAbort()` suspension as the bare `abort`.
+        core.queued_input_suspended = true;
         drop(core);
         response_success(None, "abort_and_clear_queue", cleared.data)
     }
@@ -3163,7 +3267,11 @@ impl TurnRunner {
                 // The input-admission gate (TS
                 // `_sessionInputAdmissionPauses`): held pauses keep
                 // queued input queued until the release wakes the runner.
-                if self.input_pauses.paused() {
+                // The abort-suspension gate (TS `_sessionInputPumpSuspended`,
+                // which parks the pump after `requestAbort`/manual `compact`):
+                // already-queued items survive parked until a resume site
+                // clears the flag.
+                if self.input_pauses.paused() || core.queued_input_suspended {
                     core.busy = false;
                     None
                 } else if let Some(item) = core.steering.pop_front() {
@@ -4289,6 +4397,159 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- post-abort/post-compact queued-input suspension (TS parity) ---
+
+    /// A created worker over the scripted engine (the dispatch surface the
+    /// suspension tests drive).
+    async fn created_dispatch_worker() -> std::sync::Arc<Worker> {
+        let dir = std::env::temp_dir().join(format!("pa-worker-susp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: std::path::PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "suspension-session".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({ "responses": ["ack"] })),
+        };
+        let worker = std::sync::Arc::new(Worker::new(config, None));
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({ "noSession": true, "cwd": "/tmp", "name": "suspension" }),
+            )
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        worker
+    }
+
+    /// `abort` (TS `requestAbort`) suspends queued-input admission: a plain
+    /// prompt is rejected with the TS admission error until a resume site
+    /// fires (a `steer` carries `resumeIfIdle: true`), after which a plain
+    /// prompt is admitted again.
+    #[tokio::test]
+    async fn abort_suspends_plain_prompts_until_steer_resumes() {
+        let worker = created_dispatch_worker().await;
+        let aborted = worker.dispatch("abort", &json!({})).await;
+        assert!(aborted.success, "abort failed: {aborted:?}");
+        let rejected = worker
+            .dispatch(
+                "prompt_and_wait",
+                &json!({ "activeSessionId": "suspension-session", "message": "hi" }),
+            )
+            .await;
+        assert!(!rejected.success, "admitted while suspended: {rejected:?}");
+        assert_eq!(rejected.command, "prompt_and_wait");
+        assert_eq!(rejected.error.as_deref(), Some(QUEUED_INPUT_SUSPENDED));
+        let rejected_prompt = worker
+            .dispatch(
+                "prompt",
+                &json!({ "activeSessionId": "suspension-session", "message": "hi" }),
+            )
+            .await;
+        assert_eq!(
+            rejected_prompt.error.as_deref(),
+            Some(QUEUED_INPUT_SUSPENDED)
+        );
+        // A prompt carrying streamingBehavior is a resume site (TS
+        // `resumeIfIdle: command.streamingBehavior !== undefined`).
+        let admitted_with_behavior = worker
+            .dispatch(
+                "prompt_and_wait",
+                &json!({
+                    "activeSessionId": "suspension-session",
+                    "message": "steered",
+                    "streamingBehavior": "steer"
+                }),
+            )
+            .await;
+        assert!(
+            admitted_with_behavior.success,
+            "steer not admitted: {admitted_with_behavior:?}"
+        );
+        let plain = worker
+            .dispatch(
+                "prompt_and_wait",
+                &json!({ "activeSessionId": "suspension-session", "message": "plain again" }),
+            )
+            .await;
+        assert!(plain.success, "still suspended after steer: {plain:?}");
+    }
+
+    /// A manual `compact` aborts first (TS `compact()`), so the
+    /// suspension is set whatever the compaction outcome (the scripted
+    /// engine always compacts; TS skips only "Session is too short" and
+    /// the skip path leaves the suspension set too);
+    /// `resume_queue` clears it before answering the empty queue (TS
+    /// `resumeQueuedWork()` runs `_resumeSessionInputAdmission()`
+    /// unconditionally).
+    #[tokio::test]
+    async fn compact_suspends_and_resume_queue_clears() {
+        let worker = created_dispatch_worker().await;
+        let compact = worker
+            .dispatch(
+                "compact",
+                &json!({ "activeSessionId": "suspension-session" }),
+            )
+            .await;
+        assert!(compact.success, "scripted compact failed: {compact:?}");
+        let rejected = worker
+            .dispatch(
+                "prompt_and_wait",
+                &json!({ "activeSessionId": "suspension-session", "message": "hi" }),
+            )
+            .await;
+        assert_eq!(rejected.error.as_deref(), Some(QUEUED_INPUT_SUSPENDED));
+        let resumed = worker.dispatch("resume_queue", &json!({})).await;
+        assert!(
+            !resumed.success,
+            "resume_queue on the empty queue must still answer the TS failure: {resumed:?}"
+        );
+        assert_eq!(resumed.error.as_deref(), Some("No queued work to resume"));
+        let plain = worker
+            .dispatch(
+                "prompt_and_wait",
+                &json!({ "activeSessionId": "suspension-session", "message": "after resume" }),
+            )
+            .await;
+        assert!(
+            plain.success,
+            "still suspended after resume_queue: {plain:?}"
+        );
+    }
+
+    /// `abort_and_clear_queue` suspends like the bare `abort` (TS
+    /// `requestAbort` in that arm): a plain prompt is rejected afterwards
+    /// and a `follow_up` (a resume site) is admitted.
+    #[tokio::test]
+    async fn abort_and_clear_queue_suspends_plain_prompts() {
+        let worker = created_dispatch_worker().await;
+        let cleared = worker.dispatch("abort_and_clear_queue", &json!({})).await;
+        assert!(cleared.success, "abort_and_clear_queue failed: {cleared:?}");
+        let rejected = worker
+            .dispatch(
+                "prompt_and_wait",
+                &json!({ "activeSessionId": "suspension-session", "message": "hi" }),
+            )
+            .await;
+        assert_eq!(rejected.error.as_deref(), Some(QUEUED_INPUT_SUSPENDED));
+        let resumed = worker
+            .dispatch(
+                "follow_up",
+                &json!({
+                    "activeSessionId": "suspension-session",
+                    "message": "queued resume"
+                }),
+            )
+            .await;
+        assert!(resumed.success, "follow_up failed: {resumed:?}");
+        let idle = worker.dispatch("wait_for_idle", &json!({})).await;
+        assert!(idle.success, "never went idle: {idle:?}");
+    }
+
     #[test]
     fn display_ids_are_twelve_hex() {
         let id = crate::util::new_display_id();
@@ -4469,6 +4730,7 @@ mod turn_stream_tests {
             follow_up_mode: "all".to_string(),
             scoped_models: Vec::new(),
             retry_abort_requested: false,
+            queued_input_suspended: false,
             pending_next_turn: Vec::new(),
         }));
         let (status_notify, _status_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -4490,6 +4752,54 @@ mod turn_stream_tests {
 
     /// Run one scripted turn and return its session-event frames in wire
     /// order.
+    /// The suspension parks the turn runner (TS `_scheduleSessionInputPump`
+    /// refuses while `_sessionInputPumpSuspended`): a queued steering item
+    /// survives undelivered until the flag clears, then runs.
+    #[tokio::test]
+    async fn suspended_runner_parks_a_queued_item_until_resumed() {
+        let engine = ScriptedEngine::default();
+        let runner = burst_runner(Arc::new(engine));
+        let (done_tx, mut done_rx) = oneshot::channel();
+        {
+            let mut core = runner.core.lock().unwrap();
+            core.queued_input_suspended = true;
+            core.steering.push_back(QueuedItem {
+                message: "parked steer".to_string(),
+                custom_message: None,
+                agent_message: None,
+                queue_key: None,
+                admission_id: None,
+                images: Vec::new(),
+                done: Some(done_tx),
+            });
+        }
+        let parked = std::sync::Arc::clone(&runner.core);
+        let work_notify = std::sync::Arc::clone(&runner.work_notify);
+        let running = tokio::spawn(async move { runner.run().await });
+        // The runner idles through the suspension window without
+        // starting the queued turn.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        {
+            let core = parked.lock().unwrap();
+            assert!(!core.busy, "the runner started a turn while suspended");
+            assert_eq!(
+                core.steering.len(),
+                1,
+                "the queued item was consumed while suspended"
+            );
+        }
+        // A resume site clears the flag and wakes the runner: the parked
+        // turn completes.
+        {
+            let mut core = parked.lock().unwrap();
+            core.queued_input_suspended = false;
+        }
+        work_notify.notify_one();
+        let done = tokio::time::timeout(std::time::Duration::from_secs(5), &mut done_rx).await;
+        assert!(done.is_ok(), "the parked turn never ran after resume");
+        running.abort();
+    }
+
     async fn turn_session_events(engine: Arc<dyn SessionEngine>) -> Vec<Value> {
         let runner = burst_runner(Arc::clone(&engine));
         let mut subscription = runner.events.subscribe();
