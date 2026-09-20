@@ -1168,10 +1168,12 @@ class Battery:
         # `compaction` row to the session file (TS `appendCompaction`). The
         # compared shape is the TS `CompactionEntry` record minus
         # per-session values (ids, timestamps, `firstKeptEntryId` —
-        # separate id spaces) and the `harnessDigest` snapshot (a known
-        # Rust residue: the daemon compaction seams do not attach it yet).
-        # `tokensBefore` is the probe-measured pre-compaction estimate and
-        # `fromHook` the TS built-in origin (false) — both must match.
+        # separate id spaces). `tokensBefore` is the probe-measured
+        # pre-compaction estimate, `fromHook` the TS built-in origin
+        # (false), and `harnessDigest` the `_harnessDigest()` snapshot
+        # attached at every compaction commit (same harness dirs, same
+        # scripted turns, same empty harness state on both sides, so the
+        # rendered digest must match byte-for-byte) — all must match.
         durable_rows: dict[str, list[dict]] = {}
         for side_name in ("ts", "rust"):
             side = self.sides[side_name]
@@ -1187,7 +1189,14 @@ class Battery:
                         rows.append(
                             {
                                 key: entry.get(key)
-                                for key in ("summary", "tokensBefore", "details", "fromHook", "usage")
+                                for key in (
+                                    "summary",
+                                    "tokensBefore",
+                                    "details",
+                                    "fromHook",
+                                    "usage",
+                                    "harnessDigest",
+                                )
                             }
                         )
             durable_rows[side_name] = sorted(rows, key=lambda row: json.dumps(row, sort_keys=True))
@@ -1196,7 +1205,7 @@ class Battery:
                 self.record(
                     flow,
                     "behavior",
-                    "durable compaction entries identical (tokensBefore, fromHook, details, usage; normalized ids/timestamps/harnessDigest): "
+                    "durable compaction entries identical (tokensBefore, fromHook, details, usage, harnessDigest; normalized ids/timestamps): "
                     f"{json.dumps(durable_rows['ts'])[:300]}",
                     gap=False,
                 )

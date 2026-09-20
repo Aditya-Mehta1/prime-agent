@@ -30,6 +30,13 @@ pub struct CompactOptions<'a> {
     /// a late abort never lands a committed compaction. `None` for
     /// surfaces without an abort trigger (headless runs).
     pub abort: Option<&'a pa_agent::abort::AbortSignal>,
+    /// Harness digest inputs captured from the live session (TS
+    /// `_harnessDigest`): the snapshot rides the durable row as
+    /// `harnessDigest`. The merged harness-state disk read happens at the
+    /// commit, so state written mid-run is a fresh read. `None` for
+    /// sessions without harness state (verification harnesses building
+    /// the loop directly; the engine always wires one).
+    pub harness_digest: Option<super::harness_digest::HarnessDigestInputs>,
 }
 
 /// The model-visible message produced by a session entry (summarizer input).
@@ -287,10 +294,25 @@ pub async fn execute_compaction(
         tokens_before,
         usage: Some(assistant.usage),
     };
-    let entry = compaction_entry_for(&result, &details, options.custom_instructions);
+    // TS `_performCompaction` passes `this._harnessDigest()` into
+    // `appendCompaction`: the snapshot is attached mechanically at the
+    // commit and never flows through the summarizer. The harness-state
+    // read happens here, after the summarizer resolved, so harness state
+    // written during the run is a fresh read.
+    let harness_digest = options
+        .harness_digest
+        .as_ref()
+        .map(super::harness_digest::HarnessDigestInputs::render);
+    let entry = compaction_entry_for(
+        &result,
+        &details,
+        options.custom_instructions,
+        harness_digest,
+    );
     // TS `appendCompaction` persists the full record: `details`,
-    // `fromHook`, `customInstructions`, and the summarizer `usage` ride on
-    // the durable row alongside the summary, boundary, and token count.
+    // `fromHook`, `customInstructions`, `usage`, and the `harnessDigest`
+    // snapshot ride on the durable row alongside the summary, boundary,
+    // and token count.
     session.append_compaction(entry.clone());
     Ok(CompactOutcome::Ran(Box::new(CompactRun { result, entry })))
 }
@@ -450,6 +472,7 @@ mod tests {
                     ..Default::default()
                 },
                 abort: None,
+                harness_digest: None,
             },
         )
         .await
@@ -472,6 +495,116 @@ mod tests {
             Message::User(user) => assert!(user.content.text().contains("[compaction-summary]")),
             other => panic!("expected summary user message, got {other:?}"),
         }
+        registration.unregister();
+    }
+
+    /// The harness digest snapshot rides the durable compaction row (TS
+    /// `_performCompaction` -> `appendCompaction(..., this._harnessDigest())`):
+    /// the harness-state disk read happens at the commit, so state written
+    /// after the inputs were captured (mid-run, the TS test's "written
+    /// before compaction" memory) is a fresh read, the digest never flows
+    /// through the summarizer, and the rebuilt context leads with the
+    /// digest block before the compaction summary.
+    #[tokio::test]
+    async fn execute_compaction_attaches_harness_digest_snapshot() {
+        let registration = faux_registration();
+        let model = registration.get_model();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut session = session_with_turns(tmp.path(), 3);
+        let global_dir = tmp.path().join("agent").join("harness");
+        let local_dir = tmp
+            .path()
+            .join("session-artifacts")
+            .join("s1")
+            .join("harness");
+        // Inputs captured before the run (the live-session half); no
+        // harness state exists yet.
+        let inputs = super::super::harness_digest::HarnessDigestInputs {
+            context: super::super::harness_digest::HarnessDigestContext {
+                global_dir: global_dir.clone(),
+                local_dir: Some(local_dir.clone()),
+                include_ipython: true,
+                include_shell_examples: true,
+                include_refine: true,
+            },
+            terms: super::super::harness_digest::digest_query_terms(None, &[]),
+        };
+        // Harness state written after the inputs were captured — the
+        // digest must still see it (fresh disk read at the commit).
+        let mut state = crate::refinement::empty_harness_state();
+        state
+            .entries
+            .get_mut(&crate::refinement::RefinementKind::Memory)
+            .unwrap()
+            .insert(
+                "compaction_test_memory".to_string(),
+                crate::refinement::HarnessEntry {
+                    id: "compaction_test_memory".to_string(),
+                    kind: crate::refinement::RefinementKind::Memory,
+                    title: "Compaction test memory".to_string(),
+                    content: "Written before compaction.".to_string(),
+                    path: "general".to_string(),
+                    scope: Some(crate::refinement::HarnessScope::Local),
+                    reference: Default::default(),
+                    arguments: Default::default(),
+                    metadata: Default::default(),
+                    source: "refine".to_string(),
+                    created_at: "2026-09-07T00:00:00.000Z".to_string(),
+                    updated_at: "2026-09-07T00:00:00.000Z".to_string(),
+                    version: 1,
+                },
+            );
+        crate::refinement::save_harness_state(&local_dir, &state).unwrap();
+        let result = execute_compaction(
+            &mut session,
+            CompactOptions {
+                model,
+                api_key: None,
+                custom_instructions: None,
+                settings: super::super::compaction::CompactionSettings {
+                    keep_recent_tokens: 20,
+                    ..Default::default()
+                },
+                abort: None,
+                harness_digest: Some(inputs),
+            },
+        )
+        .await
+        .unwrap();
+        let CompactOutcome::Ran(run) = result else {
+            panic!("expected the compaction to run");
+        };
+        let digest = run
+            .entry
+            .harness_digest
+            .as_deref()
+            .expect("digest snapshot");
+        assert!(digest.contains("Compaction test memory"));
+        // Mechanical attachment: the digest never flows through the summarizer.
+        assert!(!run.entry.summary.contains("# Continual Harness State"));
+        // The durable row carries the TS wire shape (`harnessDigest`).
+        let serialized = serde_json::to_value(&run.entry).unwrap();
+        assert_eq!(
+            serialized
+                .get("harnessDigest")
+                .and_then(|value| value.as_str()),
+            Some(digest)
+        );
+        // The rebuilt context leads with the digest block before the
+        // compaction summary (TS `convertToLlm` on the compaction head).
+        let rebuilt = rebuilt_context_after_compaction(&session);
+        let Message::User(user) = &rebuilt[0] else {
+            panic!("expected compaction head user message");
+        };
+        let text = user.content.text();
+        let digest_at = text
+            .find("[harness-digest]")
+            .expect("digest block leads the compaction head");
+        let summary_at = text
+            .find("[compaction-summary]")
+            .expect("compaction summary follows");
+        assert!(digest_at < summary_at);
+        assert!(text.contains("Compaction test memory"));
         registration.unregister();
     }
 
@@ -504,6 +637,7 @@ mod tests {
                     ..Default::default()
                 },
                 abort: None,
+                harness_digest: None,
             },
         )
         .await
@@ -543,6 +677,7 @@ mod tests {
                     ..Default::default()
                 },
                 abort: Some(&signal),
+                harness_digest: None,
             },
         )
         .await
@@ -595,6 +730,7 @@ mod tests {
                     ..Default::default()
                 },
                 abort: Some(&signal),
+                harness_digest: None,
             },
         )
         .await
@@ -627,6 +763,7 @@ mod tests {
                 custom_instructions: None,
                 settings: super::super::compaction::CompactionSettings::default(),
                 abort: None,
+                harness_digest: None,
             },
         )
         .await
@@ -665,6 +802,7 @@ mod tests {
                     ..Default::default()
                 },
                 abort: None,
+                harness_digest: None,
             },
         )
         .await
@@ -765,6 +903,7 @@ mod tests {
                     ..Default::default()
                 },
                 abort: None,
+                harness_digest: None,
             },
         )
         .await

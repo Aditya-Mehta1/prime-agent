@@ -167,6 +167,7 @@ pub fn compaction_entry_for(
     result: &CompactionResult,
     details: &CompactionDetails,
     custom_instructions: Option<&str>,
+    harness_digest: Option<String>,
 ) -> CompactionEntry {
     CompactionEntry {
         summary: result.summary.clone(),
@@ -176,7 +177,7 @@ pub fn compaction_entry_for(
         from_hook: Some(false),
         custom_instructions: custom_instructions.map(str::to_string),
         usage: result.usage,
-        harness_digest: None,
+        harness_digest,
     }
 }
 
@@ -258,7 +259,7 @@ mod tests {
             modified_files: vec![],
         };
         assert_eq!(
-            compaction_entry_for(&result, &details, Some("focus")),
+            compaction_entry_for(&result, &details, Some("focus"), None),
             CompactionEntry {
                 summary: "the overflow summary".to_string(),
                 first_kept_entry_id: "e4".to_string(),
@@ -338,7 +339,7 @@ mod tests {
         assert_eq!(result.tokens_before, 1_000);
         // The persisted entry carries the summary + details.
         let details = details_for(&messages, &entries, None);
-        let entry = compaction_entry_for(&result, &details, Some("focus"));
+        let entry = compaction_entry_for(&result, &details, Some("focus"), None);
         assert_eq!(entry.summary, "## Goal\nship it");
         assert_eq!(entry.custom_instructions.as_deref(), Some("focus"));
     }

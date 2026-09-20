@@ -1169,8 +1169,9 @@ impl SessionEngine for AgentSessionEngine {
                 CompactionOutcome::Compacted {
                     run: CompactionRun {
                         // The wire result is the TS `CompactionResult` shape:
-                        // summary, firstKeptEntryId, tokensBefore. Usage and
-                        // file-op details live on the persisted entry.
+                        // summary, firstKeptEntryId, tokensBefore. Usage,
+                        // file-op details, and the harnessDigest snapshot
+                        // live on the persisted entry, handed over verbatim.
                         result: json!({
                             "summary": run.result.summary,
                             "firstKeptEntryId": run.result.first_kept_entry_id,
@@ -1180,6 +1181,7 @@ impl SessionEngine for AgentSessionEngine {
                             .result
                             .usage
                             .and_then(|usage| serde_json::to_value(usage).ok()),
+                        entry: serde_json::to_value(&run.entry).unwrap_or(Value::Null),
                     },
                 }
             }

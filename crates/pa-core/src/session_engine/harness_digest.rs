@@ -83,6 +83,24 @@ pub fn harness_digest_text(
     )
 }
 
+/// Digest inputs captured from the live session (interface flags plus
+/// relevance terms); the merged harness-state disk read happens when the
+/// digest is rendered, so a render at the compaction commit is a fresh
+/// read of harness state written mid-run (TS `_harnessDigest` at the
+/// `appendCompaction` call site).
+#[derive(Debug, Clone)]
+pub struct HarnessDigestInputs {
+    pub context: HarnessDigestContext,
+    pub terms: HarnessQueryTerms,
+}
+
+impl HarnessDigestInputs {
+    /// Render the digest body (the `<harness_state>` content).
+    pub fn render(&self) -> String {
+        harness_digest_text(&self.context, self.terms.clone())
+    }
+}
+
 /// Full digest message text (prefix + state + suffix).
 pub fn harness_digest_message_text(digest: &str) -> String {
     format!("{HARNESS_DIGEST_PREFIX}{digest}{HARNESS_DIGEST_SUFFIX}")
@@ -244,12 +262,15 @@ impl super::AgentSession {
             .await
     }
 
-    /// Compute the digest and, when it differs from the newest in-context
-    /// digest, persist it and place the message in the loop context.
-    async fn append_stale_harness_digest(&self, placement: DigestPlacement) -> anyhow::Result<()> {
-        let Some(context) = self.harness_digest.clone() else {
-            return Ok(());
-        };
+    /// The digest inputs captured from the live session (TS `_harnessDigest`
+    /// sources): the interface flags plus relevance terms from the goal
+    /// objective and the last few user/assistant texts. `None` when the
+    /// session carries no harness state. The harness-state disk read is
+    /// deferred to render time so a snapshot taken before a long-running
+    /// operation (the compaction summarizer) still reads fresh state at
+    /// its commit.
+    pub(crate) async fn harness_digest_inputs(&self) -> Option<HarnessDigestInputs> {
+        let context = self.harness_digest.clone()?;
         let recent_texts = self.recent_message_texts_newest_first().await;
         let goal = {
             let session = self.session.lock().await;
@@ -259,7 +280,16 @@ impl super::AgentSession {
                 .clone()
         };
         let terms = digest_query_terms(goal.as_deref(), &recent_texts);
-        let digest = harness_digest_text(&context, terms);
+        Some(HarnessDigestInputs { context, terms })
+    }
+
+    /// Compute the digest and, when it differs from the newest in-context
+    /// digest, persist it and place the message in the loop context.
+    async fn append_stale_harness_digest(&self, placement: DigestPlacement) -> anyhow::Result<()> {
+        let Some(inputs) = self.harness_digest_inputs().await else {
+            return Ok(());
+        };
+        let digest = inputs.render();
         // Staleness is against the live loop context only (TS
         // `_latestContextHarnessDigest`): pruned file entries are not
         // in-context digests and must not suppress delivery.

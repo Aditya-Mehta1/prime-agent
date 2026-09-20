@@ -536,6 +536,11 @@ pub struct CompactionRun {
     pub result: Value,
     /// Usage billed by the summarizer call(s), for the persisted entry.
     pub usage: Option<Value>,
+    /// The full durable `compaction` record (TS `CompactionEntry`:
+    /// details, fromHook, customInstructions, usage, and the harness
+    /// digest snapshot), serialized from the engine's compaction entry.
+    /// Null for scripted engines (a test seam with no real entry).
+    pub entry: Value,
 }
 
 /// How one compaction run ended (TS `compact` outcomes: result, skip,
@@ -977,6 +982,7 @@ impl SessionEngine for ScriptedEngine {
                         "details": { "readFiles": [], "modifiedFiles": [] },
                     }),
                     usage: None,
+                    entry: Value::Null,
                 },
             };
         };
@@ -1010,6 +1016,7 @@ impl SessionEngine for ScriptedEngine {
             run: CompactionRun {
                 result,
                 usage: entry.get("usage").cloned().filter(|usage| !usage.is_null()),
+                entry: Value::Null,
             },
         }
     }

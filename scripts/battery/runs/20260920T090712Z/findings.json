@@ -1,0 +1,122 @@
+[
+ {
+  "flow": "f7_compaction",
+  "category": "protocol",
+  "gap": false,
+  "summary": "ts: daemon 'compact' succeeded: {\"summary\": \"pre-compaction reply 6\", \"firstKeptEntryId\": \"74118e45\", \"tokensBefore\": 110, \"details\": {\"readFiles\": [], \"modifiedFiles\": []}}",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f7_compaction",
+  "category": "protocol",
+  "gap": false,
+  "summary": "rust: daemon 'compact' succeeded: {\"firstKeptEntryId\": \"336c62c2\", \"summary\": \"pre-compaction reply 6\", \"tokensBefore\": 110}",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f7_compaction",
+  "category": "behavior",
+  "gap": false,
+  "summary": "overflow compact-and-retry wire surface identical: [{\"type\": \"assistant_error\", \"overflow\": true}, {\"type\": \"assistant_error\", \"overflow\": true}, {\"type\": \"compaction_start\", \"reason\": \"overflow\"}, {\"type\": \"compaction_end\", \"reason\": \"overflow\", \"willRetry\": true, \"hasResult\": true, \"errorMessage\": null, \"errorSeverity\": null}, {\"type\": \"assistant_",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f7_compaction",
+  "category": "behavior",
+  "gap": false,
+  "summary": "durable compaction entries identical (tokensBefore, fromHook, details, usage, harnessDigest; normalized ids/timestamps): [{\"summary\": \"pre-compaction reply 6\", \"tokensBefore\": 110, \"details\": {\"readFiles\": [], \"modifiedFiles\": []}, \"fromHook\": false, \"usage\": {\"input\": 20, \"output\": 10, \"cacheRead\": 80, \"cacheWrite\": 0, \"totalTokens\": 110, \"cost\": {\"input\": 0, \"output\": 0, \"cacheRead\": 0, \"cacheWrite\": 0, \"total\": 0}}",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f14_compact",
+  "category": "visual",
+  "gap": false,
+  "summary": "ts: /compact shows the durable '\u25c6 Context compacted' summary row",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f14_compact",
+  "category": "visual",
+  "gap": false,
+  "summary": "ts: the Ctrl+O detail cycle expands the compaction summary block",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f14_compact",
+  "category": "visual",
+  "gap": false,
+  "summary": "ts: the third Ctrl+O re-collapses the compaction summary block",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f14_compact",
+  "category": "behavior",
+  "gap": false,
+  "summary": "ts: crossing the compaction threshold auto-compacts and shows the summary row",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f14_compact",
+  "category": "visual",
+  "gap": false,
+  "summary": "rust: /compact shows the durable '\u25c6 Context compacted' summary row",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f14_compact",
+  "category": "visual",
+  "gap": false,
+  "summary": "rust: the Ctrl+O detail cycle expands the compaction summary block",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f14_compact",
+  "category": "visual",
+  "gap": false,
+  "summary": "rust: the third Ctrl+O re-collapses the compaction summary block",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f14_compact",
+  "category": "behavior",
+  "gap": false,
+  "summary": "rust: crossing the compaction threshold auto-compacts and shows the summary row",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f14_compact",
+  "category": "visual",
+  "gap": false,
+  "summary": "manual-compact: frames identical TS vs Rust (normalized)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f14_compact",
+  "category": "visual",
+  "gap": false,
+  "summary": "manual-expanded: frames identical TS vs Rust (normalized)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f14_compact",
+  "category": "visual",
+  "gap": false,
+  "summary": "auto-compact: frames identical TS vs Rust (normalized)",
+  "evidence": "",
+  "expectedFail": null
+ }
+]

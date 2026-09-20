@@ -1,0 +1,550 @@
+[
+ {
+  "activeSessionId": "ca66a140fe76",
+  "event": {
+   "type": "agent_start"
+  },
+  "meta": {
+   "activeSessionId": "ca66a140fe76",
+   "cursor": {
+    "generation": "ebaf457dbec4",
+    "sequence": 13
+   },
+   "emittedAt": "2026-09-20T08:45:07.150Z",
+   "id": "ca66a140fe76:13",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 13
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "ca66a140fe76",
+  "event": {
+   "type": "turn_start"
+  },
+  "meta": {
+   "activeSessionId": "ca66a140fe76",
+   "cursor": {
+    "generation": "ebaf457dbec4",
+    "sequence": 14
+   },
+   "emittedAt": "2026-09-20T08:45:07.150Z",
+   "id": "ca66a140fe76:14",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 14
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "ca66a140fe76",
+  "event": {
+   "message": {
+    "content": [
+     {
+      "text": "overflow probe xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "type": "text"
+     }
+    ],
+    "role": "user",
+    "timestamp": 1789893907150
+   },
+   "type": "message_start"
+  },
+  "meta": {
+   "activeSessionId": "ca66a140fe76",
+   "cursor": {
+    "generation": "ebaf457dbec4",
+    "sequence": 15
+   },
+   "emittedAt": "2026-09-20T08:45:07.152Z",
+   "id": "ca66a140fe76:15",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 15
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "ca66a140fe76",
+  "event": {
+   "message": {
+    "content": [
+     {
+      "text": "overflow probe xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "type": "text"
+     }
+    ],
+    "role": "user",
+    "timestamp": 1789893907150
+   },
+   "type": "message_end"
+  },
+  "meta": {
+   "activeSessionId": "ca66a140fe76",
+   "cursor": {
+    "generation": "ebaf457dbec4",
+    "sequence": 16
+   },
+   "emittedAt": "2026-09-20T08:45:07.152Z",
+   "id": "ca66a140fe76:16",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 16
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "ca66a140fe76",
+  "event": {
+   "assistantMessageEvent": {
+    "type": "start"
+   },
+   "message": {
+    "api": "openai-completions",
+    "content": [],
+    "diagnostics": [
+     {
+      "details": {
+       "kind": "invalid_request",
+       "status": 400
+      },
+      "error": {
+       "message": "Provider rejected the request (400): prompt is too long: 213462 tokens > 200000 maximum",
+       "name": "ProviderHttpError"
+      },
+      "timestamp": 1789893907175,
+      "type": "provider_stream_failure"
+     }
+    ],
+    "errorMessage": "Provider rejected the request (400): prompt is too long: 213462 tokens > 200000 maximum",
+    "model": "mock-1",
+    "provider": "prime-inference",
+    "role": "assistant",
+    "stopReason": "error",
+    "timestamp": 1789893907173,
+    "usage": {
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "cost": {
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "input": 0,
+      "output": 0,
+      "total": 0
+     },
+     "input": 0,
+     "output": 0,
+     "totalTokens": 0
+    }
+   },
+   "type": "message_start"
+  },
+  "meta": {
+   "activeSessionId": "ca66a140fe76",
+   "cursor": {
+    "generation": "ebaf457dbec4",
+    "sequence": 17
+   },
+   "emittedAt": "2026-09-20T08:45:07.176Z",
+   "id": "ca66a140fe76:17",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 17
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "ca66a140fe76",
+  "event": {
+   "message": {
+    "api": "openai-completions",
+    "content": [],
+    "diagnostics": [
+     {
+      "details": {
+       "kind": "invalid_request",
+       "status": 400
+      },
+      "error": {
+       "message": "Provider rejected the request (400): prompt is too long: 213462 tokens > 200000 maximum",
+       "name": "ProviderHttpError"
+      },
+      "timestamp": 1789893907175,
+      "type": "provider_stream_failure"
+     }
+    ],
+    "errorMessage": "Provider rejected the request (400): prompt is too long: 213462 tokens > 200000 maximum",
+    "model": "mock-1",
+    "provider": "prime-inference",
+    "role": "assistant",
+    "stopReason": "error",
+    "timestamp": 1789893907173,
+    "usage": {
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "cost": {
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "input": 0,
+      "output": 0,
+      "total": 0
+     },
+     "input": 0,
+     "output": 0,
+     "totalTokens": 0
+    }
+   },
+   "type": "message_end"
+  },
+  "meta": {
+   "activeSessionId": "ca66a140fe76",
+   "cursor": {
+    "generation": "ebaf457dbec4",
+    "sequence": 18
+   },
+   "emittedAt": "2026-09-20T08:45:07.177Z",
+   "id": "ca66a140fe76:18",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 18
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "ca66a140fe76",
+  "event": {
+   "reason": "overflow",
+   "type": "compaction_start"
+  },
+  "meta": {
+   "activeSessionId": "ca66a140fe76",
+   "cursor": {
+    "generation": "ebaf457dbec4",
+    "sequence": 19
+   },
+   "emittedAt": "2026-09-20T08:45:07.187Z",
+   "id": "ca66a140fe76:19",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 19
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "ca66a140fe76",
+  "event": {
+   "aborted": false,
+   "reason": "overflow",
+   "result": {
+    "firstKeptEntryId": "e39abe6e",
+    "summary": "the overflow summary",
+    "tokensBefore": 214
+   },
+   "type": "compaction_end",
+   "willRetry": true
+  },
+  "meta": {
+   "activeSessionId": "ca66a140fe76",
+   "cursor": {
+    "generation": "ebaf457dbec4",
+    "sequence": 20
+   },
+   "emittedAt": "2026-09-20T08:45:07.237Z",
+   "id": "ca66a140fe76:20",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 20
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "ca66a140fe76",
+  "event": {
+   "assistantMessageEvent": {
+    "type": "start"
+   },
+   "message": {
+    "api": "openai-completions",
+    "content": [],
+    "diagnostics": [
+     {
+      "details": {
+       "kind": "invalid_request",
+       "status": 400
+      },
+      "error": {
+       "message": "Provider rejected the request (400): prompt is too long: 213462 tokens > 200000 maximum",
+       "name": "ProviderHttpError"
+      },
+      "timestamp": 1789893907296,
+      "type": "provider_stream_failure"
+     }
+    ],
+    "errorMessage": "Provider rejected the request (400): prompt is too long: 213462 tokens > 200000 maximum",
+    "model": "mock-1",
+    "provider": "prime-inference",
+    "role": "assistant",
+    "stopReason": "error",
+    "timestamp": 1789893907253,
+    "usage": {
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "cost": {
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "input": 0,
+      "output": 0,
+      "total": 0
+     },
+     "input": 0,
+     "output": 0,
+     "totalTokens": 0
+    }
+   },
+   "type": "message_start"
+  },
+  "meta": {
+   "activeSessionId": "ca66a140fe76",
+   "cursor": {
+    "generation": "ebaf457dbec4",
+    "sequence": 21
+   },
+   "emittedAt": "2026-09-20T08:45:07.296Z",
+   "id": "ca66a140fe76:21",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 21
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "ca66a140fe76",
+  "event": {
+   "message": {
+    "api": "openai-completions",
+    "content": [],
+    "diagnostics": [
+     {
+      "details": {
+       "kind": "invalid_request",
+       "status": 400
+      },
+      "error": {
+       "message": "Provider rejected the request (400): prompt is too long: 213462 tokens > 200000 maximum",
+       "name": "ProviderHttpError"
+      },
+      "timestamp": 1789893907296,
+      "type": "provider_stream_failure"
+     }
+    ],
+    "errorMessage": "Provider rejected the request (400): prompt is too long: 213462 tokens > 200000 maximum",
+    "model": "mock-1",
+    "provider": "prime-inference",
+    "role": "assistant",
+    "stopReason": "error",
+    "timestamp": 1789893907253,
+    "usage": {
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "cost": {
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "input": 0,
+      "output": 0,
+      "total": 0
+     },
+     "input": 0,
+     "output": 0,
+     "totalTokens": 0
+    }
+   },
+   "type": "message_end"
+  },
+  "meta": {
+   "activeSessionId": "ca66a140fe76",
+   "cursor": {
+    "generation": "ebaf457dbec4",
+    "sequence": 22
+   },
+   "emittedAt": "2026-09-20T08:45:07.298Z",
+   "id": "ca66a140fe76:22",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 22
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "ca66a140fe76",
+  "event": {
+   "message": {
+    "content": "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
+    "customType": "compaction_outcome",
+    "details": {
+     "outcome": "failed",
+     "reason": "overflow"
+    },
+    "display": true,
+    "role": "custom",
+    "timestamp": 1789893907304
+   },
+   "type": "message_start"
+  },
+  "meta": {
+   "activeSessionId": "ca66a140fe76",
+   "cursor": {
+    "generation": "ebaf457dbec4",
+    "sequence": 23
+   },
+   "emittedAt": "2026-09-20T08:45:07.305Z",
+   "id": "ca66a140fe76:23",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 23
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "ca66a140fe76",
+  "event": {
+   "message": {
+    "content": "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
+    "customType": "compaction_outcome",
+    "details": {
+     "outcome": "failed",
+     "reason": "overflow"
+    },
+    "display": true,
+    "role": "custom",
+    "timestamp": 1789893907304
+   },
+   "type": "message_end"
+  },
+  "meta": {
+   "activeSessionId": "ca66a140fe76",
+   "cursor": {
+    "generation": "ebaf457dbec4",
+    "sequence": 24
+   },
+   "emittedAt": "2026-09-20T08:45:07.305Z",
+   "id": "ca66a140fe76:24",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 24
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "ca66a140fe76",
+  "event": {
+   "aborted": false,
+   "errorMessage": "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
+   "reason": "overflow",
+   "type": "compaction_end",
+   "willRetry": false
+  },
+  "meta": {
+   "activeSessionId": "ca66a140fe76",
+   "cursor": {
+    "generation": "ebaf457dbec4",
+    "sequence": 25
+   },
+   "emittedAt": "2026-09-20T08:45:07.305Z",
+   "id": "ca66a140fe76:25",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 25
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "ca66a140fe76",
+  "event": {
+   "error": "Provider rejected the request (400): prompt is too long: 213462 tokens > 200000 maximum",
+   "type": "turn_end"
+  },
+  "meta": {
+   "activeSessionId": "ca66a140fe76",
+   "cursor": {
+    "generation": "ebaf457dbec4",
+    "sequence": 26
+   },
+   "emittedAt": "2026-09-20T08:45:07.305Z",
+   "id": "ca66a140fe76:26",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 26
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "ca66a140fe76",
+  "event": {
+   "type": "agent_end"
+  },
+  "meta": {
+   "activeSessionId": "ca66a140fe76",
+   "cursor": {
+    "generation": "ebaf457dbec4",
+    "sequence": 27
+   },
+   "emittedAt": "2026-09-20T08:45:07.310Z",
+   "id": "ca66a140fe76:27",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 27
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "ca66a140fe76",
+  "meta": {
+   "activeSessionId": "ca66a140fe76",
+   "cursor": {
+    "generation": "ebaf457dbec4",
+    "sequence": 28
+   },
+   "emittedAt": "2026-09-20T08:45:09.314Z",
+   "id": "ca66a140fe76:28",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 28
+  },
+  "recap": "Model request failed: Provider rejected the request (400): prompt is too long: 213462 tokens > 200000 maximum",
+  "type": "session_status"
+ }
+]

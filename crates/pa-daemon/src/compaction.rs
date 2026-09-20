@@ -156,25 +156,54 @@ impl CompactionManager {
         }
     }
 
-    /// Append the durable compaction entry to the worker's session store.
-    /// An empty `firstKeptEntryId` (the scripted default) keeps from the
-    /// first branch entry, so the compacted read retains the transcript.
+    /// Append the durable compaction entry to the worker's session store
+    /// (TS `appendCompaction`). A real engine hands over its full durable
+    /// record, so `details`, `fromHook`, `customInstructions`, `usage`, and
+    /// the `harnessDigest` snapshot persist verbatim; a scripted engine (a
+    /// test seam with no real entry) builds the record from the scripted
+    /// wire result. An empty `firstKeptEntryId` (the scripted default)
+    /// keeps from the first branch entry, so the compacted read retains
+    /// the transcript.
     fn persist_compaction(
         &self,
         run: &crate::engine::CompactionRun,
         custom_instructions: Option<&str>,
     ) {
         let result = &run.result;
-        let first_kept_entry_id = result
-            .get("firstKeptEntryId")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
         let mut core = self.core.lock().unwrap();
         let cwd = core.cwd.clone();
         let Some(store) = core.store.as_mut() else {
             return;
         };
+        let mut fields = if run.entry.is_object() {
+            run.entry.clone()
+        } else {
+            let mut fields = json!({
+                "summary": result.get("summary").cloned().unwrap_or_default(),
+                "tokensBefore": result.get("tokensBefore").cloned().unwrap_or(json!(0)),
+                "details": result.get("details").cloned().unwrap_or_else(|| json!({
+                    "readFiles": [], "modifiedFiles": [],
+                })),
+                "fromHook": false,
+            });
+            if let Some(custom_instructions) = custom_instructions {
+                fields["customInstructions"] = json!(custom_instructions);
+            }
+            if let Some(usage) = &run.usage {
+                fields["usage"] = usage.clone();
+            }
+            fields
+        };
+        // The engine's id references its in-memory entry list, a separate
+        // id space from the session file: re-pin the boundary to the
+        // durable cut so the file read retains the kept tail (TS: one
+        // store, ids match by construction). An unreadable durable cut
+        // keeps the engine id rather than dropping the boundary entirely.
+        let first_kept_entry_id = fields
+            .get("firstKeptEntryId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         let first_kept_entry_id = if first_kept_entry_id.is_empty() {
             store
                 .branch()
@@ -183,12 +212,6 @@ impl CompactionManager {
                 .map(|entry| entry.id.clone())
                 .unwrap_or_default()
         } else {
-            // The engine's id references its in-memory entry list, a
-            // separate id space from the session file: re-pin the boundary
-            // to the durable cut so the file read retains the kept tail
-            // (TS: one store, ids match by construction). An unreadable
-            // durable cut keeps the engine id rather than dropping the
-            // boundary entirely.
             let keep_recent = pa_core::settings::SettingsManager::create(&cwd, &self.agent_dir)
                 .settings()
                 .compaction
@@ -200,21 +223,7 @@ impl CompactionManager {
                 .durable_first_kept_entry_id(keep_recent)
                 .unwrap_or(first_kept_entry_id)
         };
-        let mut fields = json!({
-            "summary": result.get("summary").cloned().unwrap_or_default(),
-            "firstKeptEntryId": first_kept_entry_id,
-            "tokensBefore": result.get("tokensBefore").cloned().unwrap_or(json!(0)),
-            "details": result.get("details").cloned().unwrap_or_else(|| json!({
-                "readFiles": [], "modifiedFiles": [],
-            })),
-            "fromHook": false,
-        });
-        if let Some(custom_instructions) = custom_instructions {
-            fields["customInstructions"] = json!(custom_instructions);
-        }
-        if let Some(usage) = &run.usage {
-            fields["usage"] = usage.clone();
-        }
+        fields["firstKeptEntryId"] = json!(first_kept_entry_id);
         let _ = store.persist_entry("compaction", fields);
     }
 
@@ -352,6 +361,7 @@ mod tests {
                 "details": { "readFiles": ["a.rs"], "modifiedFiles": [] },
             }),
             usage: None,
+            entry: Value::Null,
         };
         assert_eq!(
             compaction_start_event("manual", Some("focus on the goal")),

@@ -268,6 +268,10 @@ impl AgentSession {
         api_key: Option<String>,
         abort: Option<&pa_agent::abort::AbortSignal>,
     ) -> anyhow::Result<CompactOutcome> {
+        // TS `_performCompaction` captures `this._harnessDigest()` at the
+        // commit: relevance terms from the live (pre-compaction) context,
+        // harness state read fresh from disk when the snapshot renders.
+        let digest_inputs = self.harness_digest_inputs().await;
         let outcome = {
             let mut session = self.session.lock().await;
             crate::session_engine::compact_session::execute_compaction(
@@ -278,6 +282,7 @@ impl AgentSession {
                     custom_instructions,
                     settings: self.compaction,
                     abort,
+                    harness_digest: digest_inputs,
                 },
             )
             .await?
