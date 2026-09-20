@@ -164,6 +164,13 @@ pub fn reconcile_unified_sessions(roster: &[Value], saved: &[Value]) -> Vec<Unif
 
     for entry in roster {
         let summary = entry.get("summary").cloned().unwrap_or(Value::Null);
+        // TS `shouldShowAgentsViewSession`: only live rows render. A
+        // message-less top-level draft (lifecycle "draft") never surfaces a
+        // conversation-less roster row; subagent workers are live before
+        // their first message and the ledger seeds carry live.
+        if get_str(&summary, "lifecycle") != Some("live") {
+            continue;
+        }
         let status = entry
             .get("status")
             .and_then(Value::as_str)
@@ -784,7 +791,7 @@ mod tests {
         let roster = vec![roster_entry(
             "s1",
             "idle",
-            json!({ "sessionId": "s1", "activeSessionId": "a1", "sessionFile": "/x/s1.jsonl", "firstMessage": "fix the bug" }),
+            json!({ "sessionId": "s1", "lifecycle": "live", "activeSessionId": "a1", "sessionFile": "/x/s1.jsonl", "firstMessage": "fix the bug" }),
         )];
         let saved = vec![json!({
             "id": "s1",
@@ -800,6 +807,43 @@ mod tests {
         let summary = summary_for_record(&records[0]);
         assert_eq!(summary["firstMessage"], "fix the bug");
         assert_eq!(summary["sessionName"], "Bug fix");
+    }
+
+    /// TS `shouldShowAgentsViewSession`: only live roster rows render — a
+    /// message-less top-level draft (lifecycle "draft") never surfaces a
+    /// roster row, and a message-less subagent worker is live and visible.
+    #[test]
+    fn reconcile_hides_draft_roster_rows() {
+        let roster = vec![
+            roster_entry(
+                "draft",
+                "idle",
+                json!({
+                    "sessionId": "draft",
+                    "lifecycle": "draft",
+                    "activeSessionId": "d1",
+                    "sessionFile": "/x/draft.jsonl",
+                }),
+            ),
+            roster_entry(
+                "child",
+                "idle",
+                json!({
+                    "sessionId": "child",
+                    "lifecycle": "live",
+                    "runtimeKind": "subagent",
+                    "rlmChildId": "kid",
+                    "parentSessionPath": "/x/parent.jsonl",
+                    "messageCount": 0,
+                }),
+            ),
+        ];
+        let records = reconcile_unified_sessions(&roster, &[]);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            get_str(records[0].daemon.as_ref().unwrap(), "sessionId"),
+            Some("child")
+        );
     }
 
     #[test]
@@ -827,9 +871,13 @@ mod tests {
             roster_entry(
                 "idle-old",
                 "idle",
-                json!({ "sessionId": "i", "created": "2024-01-01T00:00:00.000Z" }),
+                json!({ "sessionId": "i", "lifecycle": "live", "created": "2024-01-01T00:00:00.000Z" }),
             ),
-            roster_entry("run", "running", json!({ "sessionId": "r" })),
+            roster_entry(
+                "run",
+                "running",
+                json!({ "sessionId": "r", "lifecycle": "live" }),
+            ),
         ];
         let saved = vec![json!({
             "id": "arch",
@@ -927,6 +975,7 @@ mod tests {
             "idle",
             json!({
                 "sessionId": "s1",
+                "lifecycle": "live",
                 "activeSessionId": "a1",
                 "sessionFile": "/x/s1.jsonl",
                 "summary": "tuned the retry policy",
@@ -1049,7 +1098,11 @@ mod tests {
         let roster = vec![roster_entry(
             "s1",
             "running",
-            json!({ "sessionId": "s1", "usage": { "cost": 1.5 } }),
+            json!({
+                "sessionId": "s1",
+                "lifecycle": "live",
+                "usage": { "cost": 1.5 },
+            }),
         )];
         let records = reconcile_unified_sessions(&roster, &[]);
         let rows = crate::agents_view_forest::build_rows(

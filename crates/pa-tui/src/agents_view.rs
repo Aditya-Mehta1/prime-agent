@@ -773,20 +773,19 @@ impl AgentsViewMode {
         self.last_height = height;
         let theme = &self.theme;
         let mut lines: Vec<Line> = Vec::new();
-        // TS `getAgentCountsText` rides the splash as extra metadata.
+        // TS `getAgentCountsText` rides the splash as extra metadata. Like
+        // TS `countRowsBySection`, it counts agent-kind rows only — nested
+        // subagent and summary rows never inflate the header.
+        let count_agents = |section: Section| {
+            self.rows
+                .iter()
+                .filter(|row| row.kind == RowKind::Agent && row.section == section)
+                .count()
+        };
         let (running, idle, inactive) = (
-            self.rows
-                .iter()
-                .filter(|row| row.section == Section::Running)
-                .count(),
-            self.rows
-                .iter()
-                .filter(|row| row.section == Section::Idle)
-                .count(),
-            self.rows
-                .iter()
-                .filter(|row| row.section == Section::Inactive)
-                .count(),
+            count_agents(Section::Running),
+            count_agents(Section::Idle),
+            count_agents(Section::Inactive),
         );
         let mut extra_metadata = vec![(
             "agents".to_string(),
@@ -1528,6 +1527,7 @@ mod tests {
     fn parent_summary(id: &str) -> serde_json::Value {
         serde_json::json!({
             "sessionId": id,
+            "lifecycle": "live",
             "activeSessionId": format!("{id}-live"),
             "sessionFile": format!("/x/{id}.jsonl"),
             "runtimeKind": "top-level",
@@ -1540,6 +1540,7 @@ mod tests {
     fn child_summary(id: &str, parent: &str, name: &str) -> serde_json::Value {
         serde_json::json!({
             "sessionId": id,
+            "lifecycle": "live",
             "activeSessionId": format!("{id}-live"),
             "sessionFile": format!("/x/{id}.jsonl"),
             "runtimeKind": "subagent",
@@ -1576,6 +1577,28 @@ mod tests {
         ];
         mode.rebuild_rows();
         mode
+    }
+
+    /// TS `countRowsBySection` (the splash header counts) counts agent-kind
+    /// rows only: a nested running subagent never inflates the header.
+    #[test]
+    fn header_counts_exclude_nested_rows() {
+        let mut mode = mode_with_parent_and_child();
+        mode.handle_key("alt+right");
+        assert_eq!(mode.rows.len(), 3);
+        assert_eq!(mode.rows[2].kind, RowKind::Subagent);
+        let (lines, _) = mode.render_frame(120, 36);
+        let header = lines
+            .iter()
+            .map(flat)
+            .find(|line| line.contains("running,"))
+            .expect("the splash carries the agents count line");
+        // The count rides the art line (the splash paints them together):
+        // assert the count, not the full line.
+        assert!(
+            header.contains("agents 0 running, 1 idle, 0 inactive"),
+            "header: {header}"
+        );
     }
 
     #[test]
@@ -1868,6 +1891,7 @@ mod tests {
         // top-level ancestor (TS `createUnattachableChildOpenResult`).
         let unattachable = serde_json::json!({
             "sessionId": "gc",
+            "lifecycle": "live",
             "runtimeKind": "subagent",
             "rlmChildId": "child-gc",
             "rlmDepth": 2,

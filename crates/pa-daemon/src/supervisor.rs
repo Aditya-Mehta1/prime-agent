@@ -3385,7 +3385,14 @@ struct ResidentRoot {
 fn saved_session_summary(info: &crate::session_store::SessionInfo) -> Value {
     json!({
         "id": info.id,
-        "lifecycle": "resident",
+        // TS `inactiveLifecycleForSession`: archived/crash markers stay
+        // archived; everything else is live once a message exists, draft
+        // otherwise.
+        "lifecycle": match info.state.as_deref() {
+            Some("archived") | Some("crash") => "archived",
+            _ if info.message_count > 0 => "live",
+            _ => "draft",
+        },
         "activity": "idle",
         "isSessionActive": false,
         "activeSessionId": info.id,

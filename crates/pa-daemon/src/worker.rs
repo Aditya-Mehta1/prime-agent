@@ -1875,7 +1875,8 @@ impl Worker {
         );
         SessionSummary {
             id: core.active_session_id.clone(),
-            lifecycle: "resident".to_string(),
+            lifecycle: active_lifecycle(&core.runtime_kind, messages.is_empty(), streaming)
+                .to_string(),
             activity: if streaming || compacting {
                 "working"
             } else {
@@ -3643,6 +3644,23 @@ pub async fn run_worker() -> Result<()> {
 /// shared shape `get_state`, the roster, and list rows all serve. Free so
 /// the turn runner can push roster deltas without the worker handle; the
 /// thinking level rides in from the engine (the core has no engine access).
+/// TS `activeLifecycleForSession`: lifecycle drives agents-view visibility
+/// and is message-based. A resident subagent is a spawned worker, visible
+/// before its first message lands; a message-less top-level session is a
+/// draft the view hides (config like a renamed model is preserved on disk,
+/// it just never surfaces a conversation-less row). A busy turn is live
+/// even before the store flushes its user message: TS computes the same
+/// summary from the runtime's in-memory messages, which hold the prompt
+/// the moment the turn starts, so the busy-flip roster delta a mid-turn
+/// view reads must never classify the running session as a draft.
+fn active_lifecycle(runtime_kind: &str, messageless: bool, busy: bool) -> &'static str {
+    if runtime_kind == "subagent" || !messageless || busy {
+        "live"
+    } else {
+        "draft"
+    }
+}
+
 fn session_summary(
     core: &SessionCore,
     thinking_level: &str,
@@ -3711,7 +3729,7 @@ fn session_summary(
     );
     SessionSummary {
         id: core.active_session_id.clone(),
-        lifecycle: "resident".to_string(),
+        lifecycle: active_lifecycle(&core.runtime_kind, messages.is_empty(), streaming).to_string(),
         activity: if streaming || compacting {
             "working"
         } else {
@@ -4145,6 +4163,44 @@ mod prompt_image_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A message-less top-level session is a draft (hidden from the agents
+    /// view); a session with messages is live; a resident subagent is live
+    /// before its first message (TS `activeLifecycleForSession`).
+    #[test]
+    fn summary_lifecycle_is_message_based() {
+        let empty = SessionCore::test_core(None, "/tmp".to_string());
+        assert_eq!(session_summary(&empty, "default", None).lifecycle, "draft");
+        let mut subagent = SessionCore::test_core(None, "/tmp".to_string());
+        subagent.runtime_kind = "subagent".to_string();
+        assert_eq!(
+            session_summary(&subagent, "default", None).lifecycle,
+            "live"
+        );
+        // The busy-flip roster delta fires before the store flushes the
+        // admitted prompt; a busy turn is live at that wire moment (TS
+        // reads the runtime's in-memory messages, which already hold it).
+        let mut busy = SessionCore::test_core(None, "/tmp".to_string());
+        busy.busy = true;
+        assert_eq!(session_summary(&busy, "default", None).lifecycle, "live");
+        let dir = std::env::temp_dir().join(format!("pa-worker-lc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut session = crate::session_store::SessionFile::create("/tmp", None, 0);
+        let path = dir.join(crate::session_store::session_file_name(
+            session.session_id(),
+        ));
+        session.set_path(path.clone());
+        session.append_message(serde_json::json!({
+            "role": "user", "content": "hi", "timestamp": 1u64
+        }));
+        session.rewrite().unwrap();
+        let with_message = SessionCore::test_core(Some(session), "/tmp".to_string());
+        assert_eq!(
+            session_summary(&with_message, "default", None).lifecycle,
+            "live"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn display_ids_are_twelve_hex() {

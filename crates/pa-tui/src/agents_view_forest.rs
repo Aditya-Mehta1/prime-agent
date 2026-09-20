@@ -1044,6 +1044,7 @@ mod tests {
     fn parent_summary(id: &str) -> serde_json::Value {
         json!({
             "sessionId": id,
+            "lifecycle": "live",
             "activeSessionId": format!("{id}-live"),
             "sessionFile": format!("/x/{id}.jsonl"),
             "runtimeKind": "top-level",
@@ -1055,6 +1056,7 @@ mod tests {
     fn child_summary(id: &str, parent: &str, name: &str) -> serde_json::Value {
         json!({
             "sessionId": id,
+            "lifecycle": "live",
             "activeSessionId": format!("{id}-live"),
             "sessionFile": format!("/x/{id}.jsonl"),
             "runtimeKind": "subagent",
@@ -1297,7 +1299,7 @@ mod tests {
                 "p",
                 "idle",
                 json!({
-                    "sessionId": "p", "activeSessionId": "p-live",
+                    "sessionId": "p", "lifecycle": "live", "activeSessionId": "p-live",
                     "sessionFile": "/x/p.jsonl", "runtimeKind": "top-level",
                     "messageCount": 1, "usage": { "cost": 0.5 },
                 }),
@@ -1306,7 +1308,7 @@ mod tests {
                 "c",
                 "idle",
                 json!({
-                    "sessionId": "c", "activeSessionId": "c-live",
+                    "sessionId": "c", "lifecycle": "live", "activeSessionId": "c-live",
                     "sessionFile": "/x/c.jsonl", "runtimeKind": "subagent",
                     "rlmChildId": "child-c",
                     "parentActiveSessionId": "p-live",
