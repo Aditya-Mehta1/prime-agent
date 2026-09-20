@@ -4232,7 +4232,14 @@ fn compact_session_command_emits_the_result_on_success() {
     // Two big turns (each ~12k tokens by the chars/4 estimate) push the
     // history past the keep-recent budget: the cut keeps the last turn,
     // the summarizer (the third queued faux response) covers the first.
+    // The second turn's user message carries the crossing: the
+    // keep-recent walk (the 20k default budget) must absorb its budget at
+    // the USER message of the last turn — a cut inside a turn (an
+    // assistant crossing) is a split-turn compaction that makes TWO
+    // summarizer wire calls (TS parity), which this single-summary script
+    // does not serve.
     let filler = "history ".repeat(6_000); // ~48k chars = ~12k tokens each
+    let big_second = format!("second {}", "padded ".repeat(6_000)); // ~10.5k tokens
     let (_engine, events) = run_prompts(
         serde_json::json!({
             "responses": [
@@ -4241,7 +4248,7 @@ fn compact_session_command_emits_the_result_on_success() {
                 { "text": "## Summary\nthe session story" },
             ]
         }),
-        &["first", "second", "/compact focus on the goal"],
+        &["first", &big_second, "/compact focus on the goal"],
     );
     let compaction = compaction_events(&events);
     assert_eq!(compaction.len(), 2, "{compaction:?}");

@@ -1010,25 +1010,31 @@ async fn tui_compact_shows_the_loader_then_the_summary_and_rebuilds() {
     // exercising the same keep-recent cut the default budget drives.
     std::fs::write(
         agent_dir.join("settings.json"),
-        serde_json::json!({ "compaction": { "keepRecentTokens": 100 } }).to_string(),
+        serde_json::json!({ "compaction": { "keepRecentTokens": 10 } }).to_string(),
     )
     .expect("write settings");
     let supervisor = spawn_supervisor(dir.path());
 
-    // Two ~300-token turns push the history past the pinned keep-recent
-    // budget: the cut keeps the last turn, and the third scripted response
-    // is the summarizer's summary. Its delay holds the compaction in flight
-    // for the loader window: 1.5s is the load-realistic bound (the healthy
-    // loop paints hundreds of frames in that window, so the loader evidence
-    // below still captures on the mission box's ambient daemon load — at
-    // the original 300ms the loop stalled past the window in ~half the
-    // runs, batching the start and finish events into one iteration).
+    // The compact_parity.py session shape (TS-binary-verified): a large
+    // first turn gives the compactor history to summarize, the small
+    // second turn crosses the 10-token keep-recent budget AT its user
+    // message — a non-split cut that keeps the whole second turn — and
+    // the third scripted response is the summarizer's summary. Its delay
+    // holds the compaction in flight for the loader window: 1.5s is the
+    // load-realistic bound (the healthy loop paints hundreds of frames
+    // in that window, so the loader evidence below still captures on the
+    // mission box's ambient daemon load — at the original 300ms the loop
+    // stalled past the window in ~half the runs, batching the start and
+    // finish events into one iteration). The cut must stay on the user
+    // message: a mid-turn (assistant) cut is a split-turn compaction that
+    // makes TWO summarizer wire calls (TS parity), which this
+    // single-summary script does not serve.
     let filler = "history ".repeat(150);
     let script = serde_json::json!({
         "engine": "faux",
         "responses": [
             { "text": filler, "delayMs": 20 },
-            { "text": filler },
+            { "text": "second turn done, kept intact" },
             { "text": "## Summary\nthe session story", "delayMs": 1500 },
         ],
     });
@@ -1143,7 +1149,7 @@ async fn tui_compact_shows_the_loader_then_the_summary_and_rebuilds() {
     // compacted-away first turn is gone.
     let last = outcome.frames.last().expect("the settled frame");
     assert!(
-        last.contains("history history"),
+        last.contains("kept intact"),
         "the retained second turn heads the rebuilt transcript:\n{last}"
     );
     assert!(

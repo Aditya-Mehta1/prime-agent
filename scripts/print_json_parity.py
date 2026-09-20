@@ -421,15 +421,21 @@ SCENARIOS = {
                     "compaction": {"enabled": False, "reserveTokens": 7000, "keepRecentTokens": 10},
                     "autoRefine": {"enabled": False},
                 },
-                "script": faux_script(["seed reply", "k2", "k3", "k4"], 25000),
+                "script": faux_script(["seed reply", "reply two padded", "k3", "k4"], 25000),
                 # The trailing turn texts are sized so the keep-recent walk
-                # (10 tokens) absorbs its budget at a USER message ("turn
-                # two"), not an assistant one: a cut inside a turn is a
-                # split-turn compaction, which TS backs with a SECOND
-                # summarizer call + a "**Turn Context (split turn):**"
-                # suffix the Rust compaction core does not produce yet
-                # (a pa-core gap owned by the compaction lane, out of this
-                # scenario's claim).
+                # (10 tokens) absorbs its budget at the ASSISTANT reply of
+                # "turn two" (its 16 chars push the trailing accumulation
+                # over the budget; the replies around it do not), not a
+                # user message: the resumed run's pre-turn compaction cuts
+                # INSIDE a turn — a split-turn compaction. TS backs it with
+                # TWO summarizer calls (the history checkpoint + the
+                # turn-prefix call) and a "**Turn Context (split turn):**"
+                # suffix; the merged summary rides the compaction_end
+                # result, so this scenario diffs the split shape
+                # byte-for-byte. The replies stay small: the TS print
+                # client rides the daemon wire, whose delta stream cannot
+                # be compared under a ~1000-delta burst (observed TS-side
+                # event loss; the Rust print run is in-process).
                 "prompts": [
                     "big seed turn " + "x" * 60000,
                     "turn two",
@@ -450,8 +456,17 @@ SCENARIOS = {
                     "compaction": {"enabled": True, "reserveTokens": 7000, "keepRecentTokens": 10},
                     "autoRefine": {"enabled": False},
                 },
+                # Two summarizer responses for the split-turn compaction
+                # (history, then turn prefix - both sides pop the scripted
+                # queue at call time, history first), then the resumed
+                # turn's reply.
                 "script": faux_script(
-                    ["the compaction summary", "recovered after the resume"], 25000
+                    [
+                        "the history summary",
+                        "the turn prefix summary",
+                        "recovered after the resume",
+                    ],
+                    25000,
                 ),
                 "prompts": ["next prompt"],
                 "args": ["--continue"],

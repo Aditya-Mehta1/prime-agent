@@ -67,6 +67,134 @@ pub fn build_summarization_request(
     })]
 }
 
+/// One resolved summarizer wire call (TS `SummarySlice`): the summary text
+/// and what the call billed. The no-history split arm has no wire call, so
+/// its slice carries `usage: None`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SummarySlice {
+    pub summary: String,
+    pub usage: Option<pa_types::ai::Usage>,
+}
+
+/// The literal history stand-in for a split turn whose kept cut leaves no
+/// history to summarize (TS `Promise.resolve({ summary: "No prior history." })`
+/// — no wire call).
+pub const NO_PRIOR_HISTORY: &str = "No prior history.";
+
+/// The merged summary of a split turn (TS `compact`'s split join): the
+/// history summary, the split marker, then the turn-prefix summary.
+pub fn split_summary(history: &str, turn_prefix: &str) -> String {
+    format!("{history}\n\n---\n\n**Turn Context (split turn):**\n\n{turn_prefix}")
+}
+
+/// The turn-prefix summarization request (TS `generateTurnPrefixSummary`):
+/// the serialized prefix conversation under the turn-prefix instruction —
+/// no custom instructions, no previous summary, no kernel note.
+pub fn build_turn_prefix_request(messages: &[AgentMessage]) -> Vec<AgentMessage> {
+    let llm_messages = convert_to_llm(messages);
+    let conversation_text = super::compaction_utils::serialize_conversation(&llm_messages);
+    let prompt_text = format!(
+        "<conversation>\n{conversation_text}\n</conversation>\n\n{}",
+        super::compaction::TURN_PREFIX_SUMMARIZATION_PROMPT
+    );
+    vec![AgentMessage::User(UserMessage {
+        content: UserContent::Blocks(vec![UserContentBlock::Text(TextContent {
+            text: prompt_text,
+            text_signature: None,
+            rest: Default::default(),
+        })]),
+        timestamp: 0,
+        rest: Default::default(),
+    })]
+}
+
+/// Run one summarizer wire call through `pa_ai::complete_simple` (TS
+/// `completeSimple` under `SUMMARIZATION_SYSTEM_PROMPT`). `failure` labels
+/// the error-stop bail exactly like the TS throw sites: "Summarization
+/// failed" for the history call, "Turn prefix summarization failed" for
+/// the turn-prefix call.
+pub async fn complete_summary_call(
+    model: &pa_types::ai::Model,
+    api_key: Option<String>,
+    max_tokens: u64,
+    request_messages: Vec<AgentMessage>,
+    failure: &'static str,
+) -> anyhow::Result<SummarySlice> {
+    let messages = request_messages
+        .into_iter()
+        .filter_map(|message| match message {
+            AgentMessage::User(user) => Some(pa_types::ai::Message::User(user)),
+            AgentMessage::Assistant(assistant) => Some(pa_types::ai::Message::Assistant(assistant)),
+            _ => None,
+        })
+        .collect();
+    let context = pa_types::ai::Context {
+        system_prompt: Some(super::compaction_utils::SUMMARIZATION_SYSTEM_PROMPT.to_string()),
+        messages,
+        tools: None,
+    };
+    let stream_options =
+        pa_ai::types::SimpleStreamOptions::from_base(pa_ai::types::StreamOptions {
+            max_tokens: Some(max_tokens),
+            api_key,
+            ..Default::default()
+        });
+    let assistant = pa_ai::complete_simple(model, &context, Some(stream_options)).await?;
+    if assistant.stop_reason == pa_types::ai::StopReason::Error {
+        anyhow::bail!(
+            "{failure}: {}",
+            assistant
+                .error_message
+                .as_deref()
+                .unwrap_or("Unknown error")
+        );
+    }
+    let summary = assistant
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            pa_types::ai::AssistantContentBlock::Text(text) => Some(text.text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(SummarySlice {
+        summary,
+        usage: Some(assistant.usage),
+    })
+}
+
+/// Sum one wire call's billed usage into a total (TS `addAssistantUsage`).
+pub fn add_assistant_usage(total: &mut pa_types::ai::Usage, usage: &pa_types::ai::Usage) {
+    total.input += usage.input;
+    total.output += usage.output;
+    total.cache_read += usage.cache_read;
+    total.cache_write += usage.cache_write;
+    total.total_tokens += usage.total_tokens;
+    let add_cost = |left: pa_types::JsNumber, right: pa_types::JsNumber| {
+        pa_types::JsNumber::from(left.as_f64() + right.as_f64())
+    };
+    total.cost.input = add_cost(total.cost.input, usage.cost.input);
+    total.cost.output = add_cost(total.cost.output, usage.cost.output);
+    total.cost.cache_read = add_cost(total.cost.cache_read, usage.cost.cache_read);
+    total.cost.cache_write = add_cost(total.cost.cache_write, usage.cost.cache_write);
+    total.cost.total = add_cost(total.cost.total, usage.cost.total);
+}
+
+/// The compaction's billed usage summed over its wire calls (TS `compact`'s
+/// slice loop: `usage ??= emptyUsage(); addAssistantUsage(...)`). A run with
+/// no wire calls (the no-history split arm) records no usage.
+pub fn summed_usage(slices: &[SummarySlice]) -> Option<pa_types::ai::Usage> {
+    let mut total: Option<pa_types::ai::Usage> = None;
+    for slice in slices {
+        if let Some(usage) = &slice.usage {
+            let total = total.get_or_insert_with(pa_types::ai::Usage::default);
+            add_assistant_usage(total, usage);
+        }
+    }
+    total
+}
+
 /// File operations preserved across prior compactions plus current messages.
 fn extract_file_operations(
     messages: &[AgentMessage],
@@ -342,6 +470,82 @@ mod tests {
         let entry = compaction_entry_for(&result, &details, Some("focus"), None);
         assert_eq!(entry.summary, "## Goal\nship it");
         assert_eq!(entry.custom_instructions.as_deref(), Some("focus"));
+    }
+
+    /// The turn-prefix request (TS `generateTurnPrefixSummary`): the
+    /// serialized prefix under the turn-prefix instruction — never the
+    /// checkpoint prompt, a previous summary, or the kernel note.
+    #[test]
+    fn turn_prefix_request_shape() {
+        let messages = vec![user("big turn"), user("more of the turn")];
+        let request = build_turn_prefix_request(&messages);
+        let AgentMessage::User(user) = &request[0] else {
+            panic!("expected user request");
+        };
+        let text = user.content.text();
+        assert!(text.starts_with(
+            "<conversation>\n[User]: big turn\n\n[User]: more of the turn\n</conversation>\n\n"
+        ));
+        assert!(text.contains("This is the PREFIX of a turn that was too large to keep."));
+        assert!(text.ends_with("Be concise. Focus on what's needed to understand the kept suffix."));
+        assert!(!text.contains("Create a structured context checkpoint summary"));
+        assert!(!text.contains("<previous-summary>"));
+        assert!(!text.contains("the Python kernel keeps running"));
+    }
+
+    /// The split join (TS `compact`'s merged summary) and the no-history
+    /// literal stand-in.
+    #[test]
+    fn split_summary_marker_format() {
+        assert_eq!(
+            split_summary("history summary", "turn prefix summary"),
+            "history summary\n\n---\n\n**Turn Context (split turn):**\n\nturn prefix summary"
+        );
+        assert_eq!(NO_PRIOR_HISTORY, "No prior history.");
+    }
+
+    /// Usage sums across the compaction's wire calls (TS `compact`'s slice
+    /// loop with `addAssistantUsage`): a call without usage (the no-history
+    /// arm) contributes nothing, and no calls means no recorded usage.
+    #[test]
+    fn usage_summing_over_slices() {
+        let usage = |input: u64, output: u64, cost: f64| pa_types::ai::Usage {
+            input,
+            output,
+            cache_read: 0,
+            cache_write: 0,
+            total_tokens: input + output,
+            cost: pa_types::ai::UsageCost {
+                input: pa_types::JsNumber::from(cost),
+                output: 0.0.into(),
+                cache_read: 0.0.into(),
+                cache_write: 0.0.into(),
+                total: pa_types::JsNumber::from(cost),
+            },
+        };
+        // Binary-exact costs so the sum assertion compares exactly.
+        let (first_cost, second_cost) = (0.25, 0.5);
+        let slice = |summary: &str, usage: Option<pa_types::ai::Usage>| SummarySlice {
+            summary: summary.to_string(),
+            usage,
+        };
+        // Two billed calls sum (tokens and cost).
+        let summed = summed_usage(&[
+            slice("a", Some(usage(10, 5, first_cost))),
+            slice("b", Some(usage(3, 2, second_cost))),
+        ])
+        .expect("usage recorded");
+        assert_eq!(summed.input, 13);
+        assert_eq!(summed.output, 7);
+        assert_eq!(summed.total_tokens, 20);
+        assert_eq!(summed.cost.input.as_f64(), 0.75);
+        assert_eq!(summed.cost.total.as_f64(), 0.75);
+        // A no-usage slice (the no-history arm) contributes nothing.
+        let mixed = summed_usage(&[slice("a", None), slice("b", Some(usage(3, 2, 0.0)))])
+            .expect("usage recorded");
+        assert_eq!(mixed.total_tokens, 5);
+        // No wire calls at all means no recorded usage.
+        assert_eq!(summed_usage(&[slice("a", None)]), None);
     }
 
     #[test]

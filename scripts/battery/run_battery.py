@@ -1180,6 +1180,178 @@ class Battery:
                     ],
                 )
 
+        # Split-turn differential (the pa-core split-turn lane): a cut
+        # inside a turn is a split-turn compaction. Turn two's assistant
+        # reply ("reply two padded more", 6 tokens under the chars/4
+        # estimate) pushes the keep-recent walk (10 tokens) over the
+        # budget at an ASSISTANT message, so the cut lands mid-turn: the
+        # seed turn is the history to summarize, turn two's user message
+        # is the split turn start, and the compact makes TWO summarizer
+        # wire calls (history, then turn prefix) writing the merged
+        # "**Turn Context (split turn):**" summary with the summed usage
+        # onto the durable row.
+        split_rows: dict[str, dict | None] = {}
+        split_requests: dict[str, list] = {}
+        for side in (self.sides["ts"], self.sides["rust"]):
+            self.ensure_daemon(side)
+            settings_path = side.agent_dir / "settings.json"
+            prior_settings = (
+                settings_path.read_text() if settings_path.exists() else None
+            )
+            # autoRefine off (the print_json_parity pin): the TS daemon
+            # schedules a harness-state review request after every
+            # compaction, which would consume a mock response past the
+            # two summarizer calls this differential counts.
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "compaction": {"keepRecentTokens": 10, "reserveTokens": 1000},
+                        "autoRefine": {"enabled": False},
+                    }
+                )
+            )
+            try:
+                wire = B.Wire(side.daemon_socket)
+                create = wire.request(
+                    "sc1",
+                    {
+                        "type": "create",
+                        "name": "battery-split",
+                        "config": self.session_config(side),
+                    },
+                    timeout=120,
+                )
+                side.evidence_json(flow, "split-create-response.json", create)
+                session_id = (
+                    create.get("data", {}).get("activeSessionId") or create.get("data", {}).get("id") or ""
+                )
+                if create.get("success") is not True:
+                    self.record(
+                        flow,
+                        "protocol",
+                        f"{side.name}: split session create failed: {json.dumps(create)[:300]}",
+                    )
+                    wire.close()
+                    continue
+                side.mock.set_responses(
+                    [
+                        {"text": "seed reply"},
+                        {"text": "reply two padded more"},
+                        {"text": "k3"},
+                        {"text": "the history summary"},
+                        {"text": "the turn prefix summary"},
+                    ]
+                )
+                for index, message in enumerate(("seed turn", "turn two", "turn three"), start=1):
+                    prompt = wire.request(
+                        f"sp{index}",
+                        {
+                            "type": "prompt_and_wait",
+                            "activeSessionId": session_id,
+                            "message": message,
+                        },
+                        timeout=240,
+                    )
+                    side.evidence_json(flow, f"split-prompt-{index}-response.json", prompt)
+                # The mark rides after the turn requests: the compact's
+                # summarizer calls are the only requests past it.
+                mark = len(side.mock.requests())
+                compact = wire.request(
+                    "sk1",
+                    {"type": "compact", "activeSessionId": session_id},
+                    timeout=240,
+                )
+                side.evidence_json(flow, "split-compact-response.json", compact)
+                wire.close()
+                # The summarizer wire requests of the compact: the two
+                # call bodies (history checkpoint prompt, turn-prefix
+                # prompt) land on the mock in that order.
+                requests = self.new_mock_requests(side, mark)
+                split_requests[side.name] = [
+                    {
+                        "user_text": [
+                            block.get("text", "")
+                            if isinstance(block, dict)
+                            else ""
+                            for message_entry in (request.get("body", {}).get("messages") or [])
+                            if message_entry.get("role") == "user"
+                            for block in (
+                                message_entry.get("content")
+                                if isinstance(message_entry.get("content"), list)
+                                else [{"text": message_entry.get("content", "")}]
+                            )
+                        ],
+                    }
+                    for request in requests
+                ]
+                side.evidence_json(flow, "split-mock-requests.json", requests)
+                # The durable split compaction row.
+                split_rows[side.name] = None
+                sessions_dir = side.sessions_dir()
+                for path in sorted(sessions_dir.glob("*.jsonl")) if sessions_dir.exists() else []:
+                    for line in path.read_text().splitlines():
+                        try:
+                            entry = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if entry.get("type") == "compaction" and "Turn Context (split turn)" in str(
+                            entry.get("summary", "")
+                        ):
+                            split_rows[side.name] = {
+                                key: entry.get(key)
+                                for key in (
+                                    "summary",
+                                    "tokensBefore",
+                                    "details",
+                                    "fromHook",
+                                    "usage",
+                                    "harnessDigest",
+                                )
+                            }
+                self.copy_sessions(side, flow)
+            finally:
+                if prior_settings is None:
+                    settings_path.unlink(missing_ok=True)
+                else:
+                    settings_path.write_text(prior_settings)
+        if split_rows.get("ts") is not None and split_rows.get("rust") is not None:
+            # Two summarizer wire calls on both sides, history first, with
+            # byte-identical prompt shapes (the checkpoint instruction on
+            # the history call, the turn-prefix instruction on the prefix
+            # call).
+            if len(split_requests.get("ts", [])) == 2 and split_requests.get("ts") == split_requests.get("rust"):
+                self.record(
+                    flow,
+                    "behavior",
+                    "split-turn compaction: two summarizer requests with identical prompt shapes: "
+                    f"{json.dumps(split_requests['ts'])[:300]}",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow,
+                    "behavior",
+                    f"split-turn compaction summarizer requests differ: ts={json.dumps(split_requests.get('ts'))[:400]} "
+                    f"rust={json.dumps(split_requests.get('rust'))[:400]}",
+                    evidence=[side.root / flow / "split-mock-requests.json" for side in self.sides.values()],
+                )
+            if split_rows["ts"] == split_rows["rust"]:
+                self.record(
+                    flow,
+                    "behavior",
+                    "split-turn durable compaction row identical (merged summary, summed usage): "
+                    f"{json.dumps(split_rows['ts'])[:300]}",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow,
+                    "behavior",
+                    f"split-turn durable compaction row differs: ts={json.dumps(split_rows['ts'])[:400]} "
+                    f"rust={json.dumps(split_rows['rust'])[:400]}",
+                    evidence=[side.root / flow / "split-compact-response.json" for side in self.sides.values()],
+                )
+
         # Durable compaction-entry wire-diff: both sides write a
         # `compaction` row to the session file (TS `appendCompaction`). The
         # compared shape is the TS `CompactionEntry` record minus

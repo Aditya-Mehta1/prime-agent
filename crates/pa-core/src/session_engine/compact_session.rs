@@ -1,16 +1,15 @@
 //! `/compact` execution: resolve the cut over session entries, run the
 //! summarizer, persist the compaction entry, and rebuild the agent context.
 
-use pa_types::ai::{AssistantMessage, Message, UserContent};
+use pa_types::ai::Message;
 use pa_types::session::{AgentMessage, FileEntry};
 
-use super::compaction::{
-    build_summarization_prompt, estimate_context_tokens, find_cut_point, CutPointResult,
-};
+use super::compaction::{estimate_context_tokens, find_cut_point, CutPointResult};
 use super::compaction_exec::{
-    compaction_entry_for, details_for, CompactionDetails, CompactionResult,
+    build_summarization_request, build_turn_prefix_request, compaction_entry_for,
+    complete_summary_call, details_for, file_ops_block, split_summary, summed_usage,
+    CompactionDetails, CompactionResult, SummarySlice, NO_PRIOR_HISTORY,
 };
-use super::compaction_utils::serialize_conversation;
 use super::messages::convert_to_llm;
 use crate::session::manager::SessionManager;
 
@@ -209,7 +208,7 @@ pub async fn execute_compaction(
     } else {
         cut.first_kept_entry_index
     };
-    let mut messages: Vec<AgentMessage> = entries[..history_end]
+    let history: Vec<AgentMessage> = entries[..history_end]
         .iter()
         .filter_map(message_from_entry)
         .collect();
@@ -221,40 +220,69 @@ pub async fn execute_compaction(
     let prev_compaction_index = entries[..cut.first_kept_entry_index]
         .iter()
         .rposition(|entry| matches!(entry, FileEntry::Compaction { .. }));
-    messages.extend(turn_prefix_messages);
-    let details: CompactionDetails = details_for(&messages, &entries, prev_compaction_index);
+    // Split turns retain their suffix, but their prefix file operations
+    // still belong in the summary details (TS prepareCompaction extracts
+    // from messagesToSummarize plus turnPrefixMessages).
+    let mut file_op_messages = history.clone();
+    file_op_messages.extend(turn_prefix_messages.iter().cloned());
+    let details: CompactionDetails =
+        details_for(&file_op_messages, &entries, prev_compaction_index);
 
-    // The summarization request (conversation + prompt).
-    let conversation_text = serialize_conversation(&convert_to_llm(&messages));
-    let mut prompt_text = format!("<conversation>\n{conversation_text}\n</conversation>\n\n");
-    prompt_text.push_str(&build_summarization_prompt(
-        options.custom_instructions,
-        None,
-    ));
-    let request_messages = vec![Message::User(pa_types::ai::UserMessage {
-        content: UserContent::Text(prompt_text),
-        timestamp: 0,
-        rest: Default::default(),
-    })];
     // A run aborted before the summarizer request never starts one (TS
     // `throwIfAborted` at the top of the provider call).
     pa_agent::abort::throw_if_aborted_signal(options.abort)?;
-    let max_tokens = options.settings.reserve_tokens / 5 * 4; // floor(0.8 * reserve)
-    let context = pa_types::ai::Context {
-        system_prompt: Some(
-            crate::session_engine::compaction_utils::SUMMARIZATION_SYSTEM_PROMPT.to_string(),
-        ),
-        messages: request_messages,
-        tools: None,
+
+    // TS `compact`: a split-turn cut runs TWO summarizer calls — the
+    // history summary (the normal summarizer, floor(0.8*reserve) tokens)
+    // and the turn-prefix summary (its own instruction, floor(0.5*reserve)
+    // tokens) — concurrently; a non-split cut makes the single history
+    // call. A split with no summarizable history makes no history wire
+    // call at all and stands in the literal "No prior history.". The
+    // previous-summary update mode (TS passes the prior compaction's
+    // summary to the history call) is not ported yet; both paths pass
+    // None, the behavior this lane inherited.
+    let history_max_tokens = options.settings.reserve_tokens / 5 * 4; // floor(0.8 * reserve)
+    let turn_prefix_max_tokens = options.settings.reserve_tokens / 2; // floor(0.5 * reserve)
+    let history_call = async {
+        if history.is_empty() {
+            return Ok(SummarySlice {
+                summary: NO_PRIOR_HISTORY.to_string(),
+                usage: None,
+            });
+        }
+        let request = build_summarization_request(
+            &history,
+            options.custom_instructions,
+            None,
+            options.settings.reserve_tokens,
+        );
+        complete_summary_call(
+            &options.model,
+            options.api_key.clone(),
+            history_max_tokens,
+            request,
+            "Summarization failed",
+        )
+        .await
     };
-    let stream_options =
-        pa_ai::types::SimpleStreamOptions::from_base(pa_ai::types::StreamOptions {
-            max_tokens: Some(max_tokens),
-            api_key: options.api_key,
-            ..Default::default()
-        });
-    let assistant = pa_ai::complete_simple(&options.model, &context, Some(stream_options)).await?;
-    let assistant: AssistantMessage = assistant;
+    let turn_prefix_call = async {
+        if !(cut.is_split_turn && !turn_prefix_messages.is_empty()) {
+            return Ok::<Option<SummarySlice>, anyhow::Error>(None);
+        }
+        let request = build_turn_prefix_request(&turn_prefix_messages);
+        let slice = complete_summary_call(
+            &options.model,
+            options.api_key.clone(),
+            turn_prefix_max_tokens,
+            request,
+            "Turn prefix summarization failed",
+        )
+        .await?;
+        Ok(Some(slice))
+    };
+    let (history_slice, turn_prefix_slice) = tokio::join!(history_call, turn_prefix_call);
+    let history_slice = history_slice?;
+    let turn_prefix_slice = turn_prefix_slice?;
 
     // The summarizer resolved while the run was aborted: the compaction is
     // cancelled before it commits (TS `_performCompaction`'s
@@ -266,33 +294,26 @@ pub async fn execute_compaction(
         return Err(pa_agent::abort::aborted_error());
     }
 
-    // An error-stop summarizer response is a failed compaction, never an
-    // empty-summary success (TS throws `Summarization failed: ...`).
-    if assistant.stop_reason == pa_types::ai::StopReason::Error {
-        anyhow::bail!(
-            "Summarization failed: {}",
-            assistant
-                .error_message
-                .as_deref()
-                .unwrap_or("Unknown error")
-        );
+    // Result + persistence (TS `compact`): the split join carries the
+    // turn-prefix summary behind the history summary under the TS marker,
+    // and the file-operation block rides the summary on both paths.
+    let mut summary = match &turn_prefix_slice {
+        Some(prefix) => split_summary(&history_slice.summary, &prefix.summary),
+        None => history_slice.summary.clone(),
+    };
+    summary.push_str(&file_ops_block(
+        &details.read_files,
+        &details.modified_files,
+    ));
+    let mut slices = vec![history_slice];
+    if let Some(prefix) = turn_prefix_slice {
+        slices.push(prefix);
     }
-
-    // Result + persistence.
-    let summary = assistant
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            pa_types::ai::AssistantContentBlock::Text(text) => Some(text.text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
     let result = CompactionResult {
         summary,
         first_kept_entry_id: first_kept_entry.clone(),
         tokens_before,
-        usage: Some(assistant.usage),
+        usage: summed_usage(&slices),
     };
     // TS `_performCompaction` passes `this._harnessDigest()` into
     // `appendCompaction`: the snapshot is attached mechanically at the
@@ -336,6 +357,7 @@ pub fn compute_cut(session: &SessionManager, keep_recent_tokens: u64) -> (CutPoi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pa_types::ai::{AssistantMessage, UserContent};
     use pa_types::session::EntryBase;
 
     fn session_with_turns(cwd: &std::path::Path, turns: usize) -> SessionManager {
@@ -455,6 +477,359 @@ mod tests {
         registration
     }
 
+    /// A turn-spanning cut is a split turn: the compaction runs TWO
+    /// summarizer calls — the history checkpoint call and the turn-prefix
+    /// call under its own instruction — and the merged summary carries the
+    /// turn context behind the TS split marker, with both calls' usage
+    /// summed onto the durable row (TS `compact`'s split arm).
+    #[tokio::test]
+    async fn split_turn_compaction_runs_two_summarizer_calls_and_merges_the_turn_context() {
+        let registration = faux_registration();
+        let model = registration.get_model();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut session = SessionManager::in_memory(tmp.path());
+        let user = |text: &str| {
+            AgentMessage::User(pa_types::ai::UserMessage {
+                content: UserContent::Text(text.to_string()),
+                timestamp: 0,
+                rest: Default::default(),
+            })
+        };
+        let reply = |text: &str| {
+            AgentMessage::Assistant(AssistantMessage {
+                content: vec![pa_types::ai::AssistantContentBlock::Text(
+                    pa_types::ai::TextContent {
+                        text: text.to_string(),
+                        text_signature: None,
+                        rest: Default::default(),
+                    },
+                )],
+                api: "faux".to_string(),
+                provider: "faux".to_string(),
+                model: "compact-m".to_string(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                usage: pa_types::ai::Usage::default(),
+                stop_reason: pa_types::ai::StopReason::Stop,
+                stop_reason_raw: None,
+                error_message: None,
+                timestamp: 0,
+                rest: Default::default(),
+            })
+        };
+        session.append_message(user("turn one"));
+        session.append_message(reply("reply one"));
+        session.append_message(user(&format!("big turn {}", "x".repeat(4_000))));
+        session.append_message(reply(&format!("reply {}", "y".repeat(4_000))));
+        session.append_message(user("turn three"));
+        session.append_message(reply("reply three"));
+        // The tiny keep-recent budget lands the cut on the big turn's
+        // assistant reply — a mid-turn cut.
+        let (cut, _) = compute_cut(&session, 10);
+        assert!(cut.is_split_turn);
+        assert_eq!(cut.turn_start_index, Some(3));
+        assert_eq!(cut.first_kept_entry_index, 4);
+        let kept_id = session.get_all_entries()[4]
+            .id()
+            .expect("entry id")
+            .to_string();
+
+        // Scripted summaries: each factory call records its request and
+        // answers with its scripted response, so both wire calls are
+        // captured regardless of issue order.
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
+        let make_step = |response: &'static str| {
+            let seen = seen.clone();
+            pa_ai::faux::FauxResponseStep::Factory(std::sync::Arc::new(
+                move |context: &pa_types::ai::Context,
+                      _options: Option<&pa_ai::types::StreamOptions>,
+                      _call: u64,
+                      _model: &pa_types::ai::Model| {
+                    let text = match &context.messages[0] {
+                        pa_types::ai::Message::User(user) => user.content.text(),
+                        _ => panic!("expected a user request"),
+                    };
+                    seen.lock().unwrap().push((text, response.to_string()));
+                    Ok(pa_ai::faux::faux_assistant_text_message(
+                        response,
+                        pa_ai::faux::FauxAssistantMessageOptions::default(),
+                    ))
+                },
+            ))
+        };
+        registration.set_responses(vec![
+            make_step("the history summary"),
+            make_step("the turn prefix summary"),
+        ]);
+        let outcome = execute_compaction(
+            &mut session,
+            CompactOptions {
+                model,
+                api_key: None,
+                custom_instructions: None,
+                settings: super::super::compaction::CompactionSettings {
+                    keep_recent_tokens: 10,
+                    ..Default::default()
+                },
+                abort: None,
+                harness_digest: None,
+            },
+        )
+        .await
+        .unwrap();
+        let CompactOutcome::Ran(run) = outcome else {
+            panic!("expected the compaction to run");
+        };
+        // Two wire calls: the history checkpoint and the turn prefix.
+        assert_eq!(registration.call_count(), 2);
+        let calls = seen.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2);
+        let (history_request, history_response) = calls
+            .iter()
+            .find(|(text, _)| text.contains("Create a structured context checkpoint summary"))
+            .expect("history call");
+        assert!(history_request.contains("[User]: turn one"));
+        assert!(history_request.contains("[Assistant]: reply one"));
+        assert!(!history_request.contains("big turn"));
+        assert!(!history_request.contains("PREFIX of a turn"));
+        assert_eq!(history_response, "the history summary");
+        let (prefix_request, prefix_response) = calls
+            .iter()
+            .find(|(text, _)| text.contains("PREFIX of a turn"))
+            .expect("turn-prefix call");
+        assert!(prefix_request.contains("[User]: big turn"));
+        assert!(prefix_request.contains("This is the PREFIX of a turn that was too large to keep."));
+        assert!(prefix_request
+            .ends_with("Be concise. Focus on what's needed to understand the kept suffix."));
+        assert!(!prefix_request.contains("checkpoint summary"));
+        assert_eq!(prefix_response, "the turn prefix summary");
+        // The merged summary: history, the split marker, the turn context.
+        assert_eq!(
+            run.result.summary,
+            "the history summary\n\n---\n\n**Turn Context (split turn):**\n\nthe turn prefix summary"
+        );
+        assert_eq!(run.result.first_kept_entry_id, kept_id);
+        // The usage is the sum of the two wire calls (faux estimates each
+        // call as ceil(chars/4) over the serialized prompt plus response).
+        let est = |text: &str| (text.chars().count() as f64 / 4.0).ceil() as u64;
+        let usage_of = |request: &str, response: &str| {
+            let prompt = format!(
+                "system:{}\n\nuser:{request}",
+                super::super::compaction_utils::SUMMARIZATION_SYSTEM_PROMPT
+            );
+            let input = est(&prompt);
+            let output = est(response);
+            pa_types::ai::Usage {
+                input,
+                output,
+                cache_read: 0,
+                cache_write: 0,
+                total_tokens: input + output,
+                cost: Default::default(),
+            }
+        };
+        let mut expected = usage_of(history_request, history_response);
+        super::super::compaction_exec::add_assistant_usage(
+            &mut expected,
+            &usage_of(prefix_request, prefix_response),
+        );
+        assert_eq!(run.result.usage, Some(expected));
+        assert_eq!(run.entry.usage, run.result.usage);
+        assert_eq!(run.entry.summary, run.result.summary);
+        // The persisted durable row is the full merged entry.
+        let persisted = session
+            .get_entries()
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                FileEntry::Compaction { payload, .. } => Some(payload.clone()),
+                _ => None,
+            })
+            .expect("compaction entry persisted");
+        assert_eq!(persisted, run.entry);
+        registration.unregister();
+    }
+
+    /// A split turn with no history to summarize makes only the
+    /// turn-prefix wire call and stands the literal "No prior history."
+    /// in for the history half (TS
+    /// `Promise.resolve({ summary: "No prior history." })` — no history
+    /// wire call), billing only the prefix call.
+    #[tokio::test]
+    async fn split_turn_without_history_makes_only_the_prefix_call() {
+        let registration = faux_registration();
+        let model = registration.get_model();
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let recorder = seen.clone();
+        registration.set_responses(vec![pa_ai::faux::FauxResponseStep::Factory(
+            std::sync::Arc::new(
+                move |context: &pa_types::ai::Context,
+                      _options: Option<&pa_ai::types::StreamOptions>,
+                      _call: u64,
+                      _model: &pa_types::ai::Model| {
+                    let text = match &context.messages[0] {
+                        pa_types::ai::Message::User(user) => user.content.text(),
+                        _ => panic!("expected a user request"),
+                    };
+                    recorder.lock().unwrap().push(text);
+                    Ok(pa_ai::faux::faux_assistant_text_message(
+                        "the turn prefix summary",
+                        pa_ai::faux::FauxAssistantMessageOptions::default(),
+                    ))
+                },
+            ),
+        )]);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut session = SessionManager::in_memory(tmp.path());
+        let user = |text: &str| {
+            AgentMessage::User(pa_types::ai::UserMessage {
+                content: UserContent::Text(text.to_string()),
+                timestamp: 0,
+                rest: Default::default(),
+            })
+        };
+        let reply = |text: &str| {
+            AgentMessage::Assistant(AssistantMessage {
+                content: vec![pa_types::ai::AssistantContentBlock::Text(
+                    pa_types::ai::TextContent {
+                        text: text.to_string(),
+                        text_signature: None,
+                        rest: Default::default(),
+                    },
+                )],
+                api: "faux".to_string(),
+                provider: "faux".to_string(),
+                model: "compact-m".to_string(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                usage: pa_types::ai::Usage::default(),
+                stop_reason: pa_types::ai::StopReason::Stop,
+                stop_reason_raw: None,
+                error_message: None,
+                timestamp: 0,
+                rest: Default::default(),
+            })
+        };
+        // One big turn only: the cut splits it, and nothing precedes the
+        // turn start, so there is no history to summarize.
+        session.append_message(user(&format!("big turn {}", "x".repeat(4_000))));
+        session.append_message(reply(&format!("reply {}", "y".repeat(4_000))));
+        session.append_message(user("small"));
+        session.append_message(reply("small reply"));
+        let (cut, _) = compute_cut(&session, 10);
+        assert!(cut.is_split_turn);
+        assert_eq!(cut.turn_start_index, Some(1));
+        let kept_id = session.get_all_entries()[2]
+            .id()
+            .expect("entry id")
+            .to_string();
+        let outcome = execute_compaction(
+            &mut session,
+            CompactOptions {
+                model,
+                api_key: None,
+                custom_instructions: None,
+                settings: super::super::compaction::CompactionSettings {
+                    keep_recent_tokens: 10,
+                    ..Default::default()
+                },
+                abort: None,
+                harness_digest: None,
+            },
+        )
+        .await
+        .unwrap();
+        let CompactOutcome::Ran(run) = outcome else {
+            panic!("expected the compaction to run");
+        };
+        // One wire call: only the turn-prefix summary was requested.
+        assert_eq!(registration.call_count(), 1);
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("[User]: big turn"));
+        assert!(requests[0].contains("PREFIX of a turn that was too large to keep"));
+        // The merged summary stands the literal in for the history half.
+        assert_eq!(
+            run.result.summary,
+            "No prior history.\n\n---\n\n**Turn Context (split turn):**\n\nthe turn prefix summary"
+        );
+        assert_eq!(run.result.first_kept_entry_id, kept_id);
+        // Only the prefix call billed.
+        let est = |text: &str| (text.chars().count() as f64 / 4.0).ceil() as u64;
+        let prompt = format!(
+            "system:{}\n\nuser:{}",
+            super::super::compaction_utils::SUMMARIZATION_SYSTEM_PROMPT,
+            requests[0]
+        );
+        let input = est(&prompt);
+        let output = est("the turn prefix summary");
+        assert_eq!(
+            run.result.usage,
+            Some(pa_types::ai::Usage {
+                input,
+                output,
+                cache_read: 0,
+                cache_write: 0,
+                total_tokens: input + output,
+                cost: Default::default(),
+            })
+        );
+        registration.unregister();
+    }
+
+    /// The split arm of the skip guard (TS `prepareCompaction`): a
+    /// mid-turn cut with no history still has the turn prefix to
+    /// summarize, so the compaction prepares instead of skipping.
+    #[test]
+    fn prepare_compaction_split_arm_counts_the_turn_prefix_as_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut session = SessionManager::in_memory(tmp.path());
+        let user = |text: &str| {
+            AgentMessage::User(pa_types::ai::UserMessage {
+                content: UserContent::Text(text.to_string()),
+                timestamp: 0,
+                rest: Default::default(),
+            })
+        };
+        session.append_message(user(&format!("big turn {}", "x".repeat(4_000))));
+        session.append_message(AgentMessage::Assistant(AssistantMessage {
+            content: vec![pa_types::ai::AssistantContentBlock::Text(
+                pa_types::ai::TextContent {
+                    text: format!("reply {}", "y".repeat(4_000)),
+                    text_signature: None,
+                    rest: Default::default(),
+                },
+            )],
+            api: "faux".to_string(),
+            provider: "faux".to_string(),
+            model: "compact-m".to_string(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            usage: pa_types::ai::Usage::default(),
+            stop_reason: pa_types::ai::StopReason::Stop,
+            stop_reason_raw: None,
+            error_message: None,
+            timestamp: 0,
+            rest: Default::default(),
+        }));
+        session.append_message(user("small"));
+        let entries = session.get_all_entries().to_vec();
+        let cut = prepare_compaction(&entries, 10).expect("split compaction prepares");
+        assert!(cut.is_split_turn);
+        assert_eq!(cut.turn_start_index, Some(1));
+        // A fresh small session with no cut history still skips.
+        let mut small = SessionManager::in_memory(tmp.path());
+        small.append_message(user("one small turn"));
+        let entries = small.get_all_entries().to_vec();
+        assert_eq!(
+            prepare_compaction(&entries, 10_000),
+            Err(CompactSkip::TooShort)
+        );
+    }
+
     #[tokio::test]
     async fn execute_compaction_persists_and_rebuilds() {
         let registration = faux_registration();
@@ -483,6 +858,10 @@ mod tests {
         assert!(run.result.summary.contains("summarized goal"));
         assert!(run.result.usage.is_some());
         assert_eq!(run.entry.summary, run.result.summary);
+        // A user-message cut is not a split turn: exactly one summarizer
+        // wire call, and no split marker in the merged summary.
+        assert_eq!(registration.call_count(), 1);
+        assert!(!run.result.summary.contains("Turn Context (split turn)"));
         // The compaction entry persisted on the session.
         assert!(session
             .get_entries()
