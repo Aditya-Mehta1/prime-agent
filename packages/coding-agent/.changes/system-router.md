@@ -1,0 +1,1 @@
+- Added a System 1 / System 2 router: the bundled `system-router` skill runs an action-only sub-model (one single-choice decision per step, thinking disabled, confidence-gated) against a declared environment adapter, with a Game Boy Advance node-mgba example.
