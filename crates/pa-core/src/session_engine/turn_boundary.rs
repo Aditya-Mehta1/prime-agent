@@ -104,6 +104,21 @@ impl TurnBoundaryRequests {
         self.compaction.lock().await.take()
     }
 
+    /// Schedule a compaction for the next turn boundary (the `compact.run`
+    /// write path): the request's instructions win over a pending one's,
+    /// an absent instruction keeps what was already scheduled (TS
+    /// `handleCompactionHostRequest`'s slot assignment).
+    pub async fn schedule_compaction(&self, instructions: Option<String>) {
+        let mut slot = self.compaction.lock().await;
+        let merged = PendingCompaction {
+            instructions: instructions.or_else(|| {
+                slot.as_ref()
+                    .and_then(|current| current.instructions.clone())
+            }),
+        };
+        *slot = Some(merged);
+    }
+
     /// Whether a compaction is scheduled (TS `compact.status` `scheduled`).
     pub async fn compaction_scheduled(&self) -> bool {
         self.compaction.lock().await.is_some()
@@ -231,12 +246,7 @@ impl TurnBoundaryRequests {
                     {
                         return Ok(json!({ "scheduled": false, "reason": reason }));
                     }
-                    let mut slot = requests.compaction.lock().await;
-                    let merged = PendingCompaction {
-                        instructions: instructions
-                            .or_else(|| slot.as_ref().and_then(|current| current.instructions.clone())),
-                    };
-                    *slot = Some(merged);
+                    requests.schedule_compaction(instructions).await;
                     Ok(json!({
                         "scheduled": true,
                         "note": "Compaction runs when the current turn ends; you resume automatically afterwards. Continue working normally.",

@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use crate::agent_engine::AgentSessionEngine;
 use crate::engine::EngineEvent;
 use pa_core::session_engine::compact_session::CompactOutcome;
+use pa_core::session_engine::messages::{CompactionOutcomeKind, CompactionOutcomeReason};
 
 /// The outcome of one turn-boundary threshold check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,7 +86,7 @@ impl AgentSessionEngine {
             self.runtime
                 .block_on(async { engine.session.compact(None, &model, api_key).await })
         };
-        let event = match &outcome {
+        match &outcome {
             Ok(CompactOutcome::Ran(run)) => {
                 // The wire result is the TS `CompactionResult` shape.
                 let result = json!({
@@ -93,40 +94,44 @@ impl AgentSessionEngine {
                     "firstKeptEntryId": run.result.first_kept_entry_id,
                     "tokensBefore": run.result.tokens_before,
                 });
-                crate::compaction::compaction_end_payload(
+                let event = crate::compaction::compaction_end_payload(
                     "threshold",
                     Some(&result),
                     false,
                     None,
                     None,
                     None,
-                )
+                );
+                let entry = serde_json::to_value(&run.entry).unwrap_or(Value::Null);
+                if !emit(EngineEvent::Compaction { entry, event }) {
+                    return AutoCompactionRun::Cancelled;
+                }
             }
             // A skip consumed the check (TS `CompactionSkippedError`): the
-            // wire carries the warning so attached surfaces can show it.
-            Ok(CompactOutcome::Skipped(message)) => crate::compaction::compaction_end_payload(
-                "threshold",
-                None,
-                false,
-                Some(&format!("Auto-compaction skipped: {message}")),
-                Some("warning"),
-                None,
-            ),
-            Err(error) => crate::compaction::compaction_end_payload(
-                "threshold",
-                None,
-                false,
-                Some(&format!("Auto-compaction failed: {error:#}")),
-                Some("error"),
-                None,
-            ),
-        };
-        let entry = match &outcome {
-            Ok(CompactOutcome::Ran(run)) => serde_json::to_value(&run.entry).unwrap_or(Value::Null),
-            _ => Value::Null,
-        };
-        if !emit(EngineEvent::Compaction { entry, event }) {
-            return AutoCompactionRun::Cancelled;
+            // durable disclosure row goes out with its message pair, then
+            // the end event carries the warning.
+            Ok(CompactOutcome::Skipped(message)) => {
+                if !self.emit_unsuccessful_compaction(
+                    CompactionOutcomeReason::Threshold,
+                    CompactionOutcomeKind::Skipped,
+                    &format!("Auto-compaction skipped: {message}"),
+                    Some("warning"),
+                    emit,
+                ) {
+                    return AutoCompactionRun::Cancelled;
+                }
+            }
+            Err(error) => {
+                if !self.emit_unsuccessful_compaction(
+                    CompactionOutcomeReason::Threshold,
+                    CompactionOutcomeKind::Failed,
+                    &format!("Auto-compaction failed: {error:#}"),
+                    Some("error"),
+                    emit,
+                ) {
+                    return AutoCompactionRun::Cancelled;
+                }
+            }
         }
         AutoCompactionRun::Ran
     }

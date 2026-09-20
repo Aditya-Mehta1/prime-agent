@@ -371,3 +371,36 @@ model-surface row still compares against the TS binary:
   the shared `pa_ai::faux::script::parse_faux_script` (the daemon worker
   seam already used it), so binary-level e2e can script full kernel turns.
 
+## Compaction outcome rows (2026-09-20)
+
+Reference: TS `core/messages.ts` (`createCompactionOutcomeMessage`,
+`convertToLlm`), `core/agent-session.ts` (`_endCompactionUnsuccessfully`,
+`_persistCompactionOutcome`, `_mergeUnpersistedOutcomes`, `compact`), and the
+TS suite pin `agent-session-compaction.test.ts`
+("emits a warning and persists the outcome outside model context").
+
+- The durable `compaction_outcome` row is a user-facing disclosure, NEVER
+  model context: TS `convertToLlm` filters it (the TS test asserts
+  `convertToLlm([outcome]) === []`), so the KV-cacheable provider prefix is
+  unaffected. The Rust `convert_to_llm` had the exclusion already; the seam
+  (`AgentSession::record_compaction_outcome`) pins it in tests. The live
+  push mirrors TS `agent.state.messages.push` (the loop's default converter
+  filters custom rows out of the provider request).
+- Manual `/compact` records NO outcome row (TS `compact()` emits
+  `compaction_end` and throws to the caller; only `_runAutoCompaction` ->
+  `_endCompactionUnsuccessfully` persists). The Rust manual paths
+  (compaction.rs, the `/compact` session command) stay event-only by design.
+- The TS `_unpersistedOutcomes` fallback (a failed session-file append keeps
+  the row in memory, timestamp-merged into rebuilt contexts) is held
+  structurally in Rust: `SessionManager` keeps fire-and-forthing persistence
+  (a failed disk write cannot remove the in-memory entry), and every
+  in-process rebuild reads that entry chain. The failed-write test pins the
+  guarantee.
+- Parity fix found by this lane: TS throws `Summarization failed: <error>`
+  when the compaction summarizer returns an error-stop assistant message
+  (compaction.ts); the Rust `execute_compaction` ignored `stop_reason` and
+  "succeeded" with an empty summary. The check is now ported (the failure
+  arm of every auto-compaction path).
+- The overflow arm stays unported (no Rust overflow recovery path yet); the
+  reason vocabulary (`threshold`/`overflow`/`requested`,
+  `skipped`/`cancelled`/`failed`) rides the row details exactly like TS.

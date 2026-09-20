@@ -21,6 +21,83 @@ pub const REFINEMENT_OUTCOME_CUSTOM_TYPE: &str = "refinement_outcome";
 pub const REFINEMENT_NOTICE_CUSTOM_TYPE: &str = "refinement_notice";
 pub const HEARTBEAT_PROMPT_CUSTOM_TYPE: &str = "heartbeat_prompt";
 
+/// Why an unsuccessful compaction ran (TS `CompactionOutcomeReason`): the
+/// automatic threshold trigger, the overflow recovery, or the model's
+/// `compact.run` request consumed at a turn boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionOutcomeReason {
+    /// The context crossed the auto-compaction threshold.
+    Threshold,
+    /// A context-overflow recovery attempt.
+    Overflow,
+    /// The model requested the compaction (`compact.run`).
+    Requested,
+}
+
+impl CompactionOutcomeReason {
+    /// The wire `reason` string: the outcome row's `details.reason` and the
+    /// `compaction_end` event's `reason`.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Threshold => "threshold",
+            Self::Overflow => "overflow",
+            Self::Requested => "requested",
+        }
+    }
+}
+
+/// How an unsuccessful compaction ended (TS `CompactionOutcome`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionOutcomeKind {
+    /// Nothing to summarize (TS `CompactionSkippedError`).
+    Skipped,
+    /// Aborted mid-run.
+    Cancelled,
+    /// The summarization failed.
+    Failed,
+}
+
+impl CompactionOutcomeKind {
+    /// The wire `outcome` string: the outcome row's `details.outcome`.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Skipped => "skipped",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The durable disclosure row for an unsuccessful compaction (TS
+/// `createCompactionOutcomeMessage`): a `compaction_outcome` custom message
+/// carrying the outcome message and `{reason, outcome}` details. It is a
+/// user-facing disclosure, never model context — `convert_to_llm` drops it,
+/// so the KV-cacheable prefix is unaffected.
+pub fn create_compaction_outcome_message(
+    content: &str,
+    reason: CompactionOutcomeReason,
+    outcome: CompactionOutcomeKind,
+) -> pa_types::session::CustomMessage {
+    pa_types::session::CustomMessage {
+        custom_type: COMPACTION_OUTCOME_CUSTOM_TYPE.to_string(),
+        content: UserContent::Text(content.to_string()),
+        display: true,
+        details: Some(serde_json::json!({
+            "reason": reason.wire(),
+            "outcome": outcome.wire(),
+        })),
+        timestamp: now_millis(),
+        rest: Default::default(),
+    }
+}
+
 /// Bash output rendered as a fenced block with a fence longer than any
 /// backtick run inside the output.
 fn bash_output_to_text(

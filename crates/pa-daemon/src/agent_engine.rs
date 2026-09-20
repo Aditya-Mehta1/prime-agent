@@ -2084,43 +2084,33 @@ impl AgentSessionEngine {
                 }
                 stopped_for_compaction = true;
             }
-            // A skip consumed the request (the Rust `/compact` contract);
-            // the wire carries the TS `compaction_end` warning so attached
-            // surfaces can show it.
+            // A skip consumed the request (the Rust `/compact` contract):
+            // the durable disclosure row goes out with its message pair,
+            // then the end event carries the TS warning.
             Some(Ok(pa_core::session_engine::compact_session::CompactOutcome::Skipped(
                 message,
             ))) => {
                 eprintln!("pa-daemon: requested compaction skipped: {message}");
-                let event = crate::compaction::compaction_end_payload(
-                    "requested",
-                    None,
-                    false,
-                    Some(&format!("Requested compaction skipped: {message}")),
+                if !self.emit_unsuccessful_compaction(
+                    pa_core::session_engine::messages::CompactionOutcomeReason::Requested,
+                    pa_core::session_engine::messages::CompactionOutcomeKind::Skipped,
+                    &format!("Requested compaction skipped: {message}"),
                     Some("warning"),
-                    None,
-                );
-                if !emit(EngineEvent::Compaction {
-                    entry: Value::Null,
-                    event,
-                }) {
+                    emit,
+                ) {
                     return BoundaryRun::Cancelled;
                 }
                 stopped_for_compaction = true;
             }
             Some(Err(error)) => {
                 eprintln!("pa-daemon: requested compaction failed: {error:#}");
-                let event = crate::compaction::compaction_end_payload(
-                    "requested",
-                    None,
-                    false,
-                    Some(&format!("Requested compaction failed: {error:#}")),
+                if !self.emit_unsuccessful_compaction(
+                    pa_core::session_engine::messages::CompactionOutcomeReason::Requested,
+                    pa_core::session_engine::messages::CompactionOutcomeKind::Failed,
+                    &format!("Requested compaction failed: {error:#}"),
                     Some("error"),
-                    None,
-                );
-                if !emit(EngineEvent::Compaction {
-                    entry: Value::Null,
-                    event,
-                }) {
+                    emit,
+                ) {
                     return BoundaryRun::Cancelled;
                 }
                 stopped_for_compaction = true;
@@ -3009,6 +2999,225 @@ mod tests {
             .filter(|event| matches!(event, EngineEvent::Compaction { .. }))
             .count();
         assert_eq!((start_count, end_count), (1, 1));
+    }
+
+    /// The `compaction_outcome` rows an unsuccessful auto-compaction
+    /// records, with the indices of the disclosure pair and the end event
+    /// within the event list (the disclosure goes out first, the end event
+    /// second — TS `_endCompactionUnsuccessfully`).
+    fn outcome_row_and_end_event(
+        events: &[EngineEvent],
+        expected_reason: &str,
+        expected_outcome: &str,
+        expected_message: &str,
+        expected_severity: &str,
+    ) -> (usize, Value) {
+        let row_index = events
+            .iter()
+            .position(|event| {
+                matches!(event, EngineEvent::CustomMessage(row) if row["customType"] == "compaction_outcome")
+            })
+            .expect("the outcome row was broadcast as a custom message");
+        let row = match &events[row_index] {
+            EngineEvent::CustomMessage(row) => row.clone(),
+            _ => unreachable!("matched above"),
+        };
+        assert_eq!(row["role"], "custom", "the row is a custom message");
+        assert_eq!(row["customType"], "compaction_outcome");
+        assert_eq!(row["content"], serde_json::json!(expected_message));
+        assert_eq!(row["display"], serde_json::json!(true));
+        assert_eq!(
+            row["details"],
+            serde_json::json!({
+                "reason": expected_reason,
+                "outcome": expected_outcome,
+            })
+        );
+        let end_index = events[row_index + 1..]
+            .iter()
+            .position(|event| {
+                matches!(event, EngineEvent::Compaction { event, .. } if event["type"] == "compaction_end")
+            })
+            .map(|offset| offset + row_index + 1)
+            .expect("the settled compaction_end follows the row");
+        let event = match &events[end_index] {
+            EngineEvent::Compaction { event, .. } => event.clone(),
+            _ => unreachable!("matched above"),
+        };
+        assert_eq!(event["reason"], serde_json::json!(expected_reason));
+        assert_eq!(event["errorMessage"], serde_json::json!(expected_message));
+        assert_eq!(event["errorSeverity"], serde_json::json!(expected_severity));
+        assert_eq!(event["aborted"], serde_json::json!(false));
+        assert_eq!(event["willRetry"], serde_json::json!(false));
+        assert!(
+            event.get("result").is_none(),
+            "no result on an unsuccessful compaction"
+        );
+        (row_index, event)
+    }
+
+    /// The engine session's durable entry chain carries the outcome row.
+    fn outcome_row_in_entries(engine: &AgentSessionEngine) -> bool {
+        let guard = engine.session.blocking_lock();
+        let Some(core) = guard.as_ref() else {
+            return false;
+        };
+        let persistence = core.session.shared_persistence();
+        let entries = engine
+            .runtime
+            .block_on(async { persistence.lock().await.get_entries() });
+        entries.iter().any(|entry| {
+            matches!(entry, pa_types::session::FileEntry::CustomMessage { payload, .. }
+                if payload.custom_type == "compaction_outcome")
+        })
+    }
+
+    /// The live loop context carries the outcome row (TS
+    /// `agent.state.messages.push`); the loop's converter keeps it out of
+    /// the provider request.
+    fn outcome_row_in_live_context(engine: &AgentSessionEngine) -> bool {
+        let guard = engine.session.blocking_lock();
+        let Some(core) = guard.as_ref() else {
+            return false;
+        };
+        engine.runtime.block_on(async {
+            let state = core.session.agent().state().await;
+            state
+                .messages
+                .last()
+                .is_some_and(|message| message.role() == "custom")
+        })
+    }
+
+    /// The threshold call site (TS `_runAutoCompaction` -> the
+    /// `CompactionSkippedError` arm): a threshold compaction that skips
+    /// records the durable `compaction_outcome` row, broadcasts its
+    /// message pair before the settled `compaction_end` warning, keeps it
+    /// in the live context, and never persists a compaction entry.
+    #[test]
+    fn threshold_skip_records_the_durable_outcome_row() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Probe: the baseline turn's total usage (system prompt included).
+        let (probe, _probe_dir) = faux_engine_with_settings(
+            serde_json::json!({ "responses": [{"text": "seed reply"}] }),
+            1,
+        );
+        let mut probe_events: Vec<EngineEvent> = Vec::new();
+        admit(&probe, "seed turn".to_string(), &mut probe_events);
+        let baseline = probe_events
+            .iter()
+            .find_map(|event| match event {
+                EngineEvent::AssistantMessage(message) => message["usage"]["totalTokens"].as_u64(),
+                _ => None,
+            })
+            .expect("probe turn produced usage");
+        drop(probe);
+
+        // One big crossing turn whose only summarizable history is itself:
+        // the threshold fires, and the compaction skips (too short).
+        let big_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
+        let big_tokens = (48_000 + "seed turn  crossing".len() as u64).div_ceil(4);
+        let headroom = baseline + big_tokens / 2;
+        let (engine, _engine_dir) = faux_engine_with_settings(
+            serde_json::json!({ "responses": [{"text": "crossing reply"}] }),
+            128_000u64.saturating_sub(headroom).max(1),
+        );
+        let mut events: Vec<EngineEvent> = Vec::new();
+        admit(&engine, big_prompt, &mut events);
+        assert_eq!(
+            assistant_texts(&events),
+            vec!["crossing reply".to_string()],
+            "the crossing turn answered"
+        );
+        let skip_message =
+            "Auto-compaction skipped: Session is too short to compact — try again once it grows";
+        let (row_index, _) =
+            outcome_row_and_end_event(&events, "threshold", "skipped", skip_message, "warning");
+        let start_index = events
+            .iter()
+            .position(|event| {
+                matches!(event, EngineEvent::CompactionStart { event } if event["reason"] == "threshold")
+            })
+            .expect("threshold compaction_start emitted");
+        assert!(
+            row_index > start_index,
+            "the disclosure pair goes out after the start event"
+        );
+        // The engine's durable entry chain and the live context both carry
+        // the row; no compaction entry was written for the skip.
+        assert!(outcome_row_in_entries(&engine));
+        assert!(outcome_row_in_live_context(&engine));
+        let guard = engine.session.blocking_lock();
+        let core = guard.as_ref().expect("session built");
+        let persistence = core.session.shared_persistence();
+        let has_compaction_entry = engine.runtime.block_on(async {
+            persistence
+                .lock()
+                .await
+                .get_entries()
+                .iter()
+                .any(|entry| matches!(entry, pa_types::session::FileEntry::Compaction { .. }))
+        });
+        assert!(
+            !has_compaction_entry,
+            "a skipped compaction persists no compaction entry"
+        );
+    }
+
+    /// The requested call site (the turn-boundary consumption): a scheduled
+    /// `compact.run` request that skips at consumption records the same
+    /// durable disclosure with the `requested` reason.
+    #[test]
+    fn requested_compaction_skip_records_the_durable_outcome_row() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir: dir.path().join("agent"),
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: None,
+            faux_script: Some(
+                serde_json::json!({ "responses": [{"text": "seed reply"}, {"text": "second reply"}] })
+                    .to_string(),
+            ),
+            supervisor_link: None,
+            telemetry_disabled: None,
+        })
+        .unwrap();
+        let mut events: Vec<EngineEvent> = Vec::new();
+        admit(&engine, "turn one".to_string(), &mut events);
+        // Schedule a requested compaction (the `compact.run` write path):
+        // the boundary consumes it after the next turn settles.
+        {
+            let guard = engine.session.blocking_lock();
+            let core = guard.as_ref().expect("session built");
+            engine
+                .runtime
+                .block_on(async { core.turn_boundary.schedule_compaction(None).await });
+        }
+        admit(&engine, "turn two".to_string(), &mut events);
+        assert_eq!(
+            assistant_texts(&events),
+            vec!["seed reply".to_string(), "second reply".to_string()],
+            "both turns answered"
+        );
+        outcome_row_and_end_event(
+            &events,
+            "requested",
+            "skipped",
+            "Requested compaction skipped: Session is too short to compact — try again once it grows",
+            "warning",
+        );
+        assert!(outcome_row_in_entries(&engine));
+        assert!(outcome_row_in_live_context(&engine));
     }
 
     /// Below the headroom nothing fires: the threshold check stays silent

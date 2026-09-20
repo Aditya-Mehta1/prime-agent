@@ -248,6 +248,18 @@ pub async fn execute_compaction(
     let assistant = pa_ai::complete_simple(&options.model, &context, Some(stream_options)).await?;
     let assistant: AssistantMessage = assistant;
 
+    // An error-stop summarizer response is a failed compaction, never an
+    // empty-summary success (TS throws `Summarization failed: ...`).
+    if assistant.stop_reason == pa_types::ai::StopReason::Error {
+        anyhow::bail!(
+            "Summarization failed: {}",
+            assistant
+                .error_message
+                .as_deref()
+                .unwrap_or("Unknown error")
+        );
+    }
+
     // Result + persistence.
     let summary = assistant
         .content
@@ -449,6 +461,50 @@ mod tests {
             Message::User(user) => assert!(user.content.text().contains("[compaction-summary]")),
             other => panic!("expected summary user message, got {other:?}"),
         }
+        registration.unregister();
+    }
+
+    /// An error-stop summarizer response fails the compaction (TS throws
+    /// `Summarization failed: ...`), never an empty-summary success.
+    #[tokio::test]
+    async fn execute_compaction_fails_on_an_error_summarizer_response() {
+        let registration = faux_registration();
+        let model = registration.get_model();
+        registration.set_responses(vec![pa_ai::faux::FauxResponseStep::Message(
+            pa_ai::faux::faux_assistant_text_message(
+                "",
+                pa_ai::faux::FauxAssistantMessageOptions {
+                    stop_reason: Some(pa_types::ai::StopReason::Error),
+                    error_message: Some("summarizer exploded".to_string()),
+                    ..Default::default()
+                },
+            ),
+        )]);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut session = session_with_turns(tmp.path(), 3);
+        let error = execute_compaction(
+            &mut session,
+            CompactOptions {
+                model,
+                api_key: None,
+                custom_instructions: None,
+                settings: super::super::compaction::CompactionSettings {
+                    keep_recent_tokens: 20,
+                    ..Default::default()
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Summarization failed: summarizer exploded"
+        );
+        // No compaction entry persisted for the failed run.
+        assert!(session
+            .get_entries()
+            .iter()
+            .all(|entry| !matches!(entry, FileEntry::Compaction { .. })));
         registration.unregister();
     }
 
