@@ -8,6 +8,7 @@
 //! interleave exactly in publication order. The process exits when stdin
 //! closes.
 
+mod autorefine;
 mod compaction_arms;
 pub mod daemon;
 mod events;
@@ -152,7 +153,7 @@ pub async fn run_acp_mode(options: AcpOptions) -> Result<i32> {
 
     // Exit when the client disconnects: stop the resident work, release the
     // subscription, fence the producer, and let the writer drain.
-    teardown(&state).await;
+    teardown(&state, &mode).await;
     drop(tx);
     let _ = writer.await;
     Ok(0)
@@ -160,7 +161,7 @@ pub async fn run_acp_mode(options: AcpOptions) -> Result<i32> {
 
 /// Stop the hosted session after stdin closes: abort work, settle the prompt
 /// task, release the subscription, and fence the producer.
-async fn teardown(state: &Arc<Mutex<ConnectionState>>) {
+async fn teardown(state: &Arc<Mutex<ConnectionState>>, mode: &AcpModeState) {
     let entry = {
         let mut state = state.lock().await;
         state.session.take()
@@ -175,6 +176,11 @@ async fn teardown(state: &Arc<Mutex<ConnectionState>>) {
     if let Some(task) = entry.prompt_task.take() {
         let _ = task.await;
     }
+    // The serialized dispose drain (TS `dispose`): a compaction can arm
+    // the compact-trigger review with no further turn to service it —
+    // close runs the round one last time, best-effort, before the
+    // subscription tears down.
+    entry.session.drain_compact_auto_refine_at_close(mode).await;
     entry.session.unsubscribe().await;
     entry.session.close_producer().await;
 }
@@ -445,6 +451,14 @@ async fn handle_session_close(
     if let Some(task) = entry.prompt_task.take() {
         let _ = task.await;
     }
+    // The serialized dispose drain (TS `dispose`): a compaction can arm
+    // the compact-trigger review with no further turn to service it —
+    // close runs the round one last time, best-effort, before the
+    // subscription tears down.
+    entry
+        .session
+        .drain_compact_auto_refine_at_close(&mode)
+        .await;
     entry.session.unsubscribe().await;
     // Keep the backing session fenced until a replacement ACP session is
     // admitted.

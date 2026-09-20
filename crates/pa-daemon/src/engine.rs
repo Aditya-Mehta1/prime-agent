@@ -195,6 +195,19 @@ pub trait SessionEngine: Send + Sync {
     /// silent no-op like the TS controller being `undefined`.
     fn abort_auto_compaction(&self) {}
 
+    /// Consume a pending compact-trigger auto-refine review (TS
+    /// `_maybeAutoRefine("compact")` after a successful compaction): the
+    /// engine resolves the model and runs the gated round (busy gates
+    /// keep the trigger armed); the caller owns the outcome surface.
+    /// `Ok(None)` is every silent outcome — no trigger armed, a gate
+    /// dropping it, the cooldown holding it, or a declined review.
+    /// Engines without the compact-trigger machine never arm one.
+    fn consume_compact_auto_refine(
+        &self,
+    ) -> anyhow::Result<Option<pa_core::refinement::RefinementResult>> {
+        Ok(None)
+    }
+
     /// Run one branch summary (`navigate_tree` with `summarize`): summarize
     /// the abandoned branch's entries. The engine owns the model call; the
     /// worker owns the leaf move, the `branch_summary` entry, and the

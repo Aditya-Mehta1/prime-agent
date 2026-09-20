@@ -303,6 +303,11 @@ impl AgentSessionEngine {
                         return OverflowAttempt::Cancelled;
                     }
                 }
+                // TS `_scheduleAutoRefineAfterCompaction`: the compaction
+                // arms the compact-trigger review; the retried turn's
+                // settled boundary services it (TS defers behind the
+                // will-retry continuation).
+                self.mark_compact_auto_refine_pending();
                 // The wire result is the TS `CompactionResult` shape
                 // (`_performCompaction`'s return, details included); the
                 // end event carries `willRetry: true` (the turn re-issues).

@@ -933,6 +933,16 @@ impl SessionEngine for AgentSessionEngine {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path);
     }
 
+    /// The `compact` command path (TS `compact()`'s background
+    /// `_scheduleAutoRefine("compact")` on an idle session): the round
+    /// runs right after the compaction answered, through the same gated
+    /// body the turn boundaries use (compact_autorefine.rs).
+    fn consume_compact_auto_refine(
+        &self,
+    ) -> anyhow::Result<Option<pa_core::refinement::RefinementResult>> {
+        self.consume_compact_auto_refine_round()
+    }
+
     /// The worker's live session summary (the TS
     /// `createAgentSessionMessageSender` source): rendered into the
     /// sender identity block of direct worker-to-worker deliveries.
@@ -1182,6 +1192,11 @@ impl SessionEngine for AgentSessionEngine {
                         telemetry.note_compaction();
                     }
                 }
+                // TS `compact()` schedules the compact-trigger auto-refine
+                // review after every successful compaction (the manual path
+                // included); the `compact` command consumes the round once
+                // the run settled.
+                self.mark_compact_auto_refine_pending();
                 CompactionOutcome::Compacted {
                     run: CompactionRun {
                         // The wire result is the TS `CompactionResult` shape
@@ -1304,6 +1319,10 @@ impl SessionEngine for AgentSessionEngine {
             let Some(engine) = guard.as_ref() else {
                 return Ok(());
             };
+            // TS `_invalidatePendingAutoRefineForBranchChange`: the moved
+            // branch invalidates the conversation an armed compact-trigger
+            // review would read, so the trigger drops.
+            engine.session.discard_compact_auto_refine();
             engine.session.rebuild_branch_context(branch_entries).await
         })
     }
@@ -2222,6 +2241,10 @@ impl AgentSessionEngine {
                         telemetry.note_compaction();
                     }
                 }
+                // TS `_scheduleAutoRefineAfterCompaction`: the compaction
+                // arms the compact-trigger review; the run stops on
+                // purpose, so the round services it before the `Done`.
+                self.mark_compact_auto_refine_pending();
                 let entry = serde_json::to_value(&run.entry).unwrap_or(Value::Null);
                 // The wire result is the TS `CompactionResult` shape
                 // (`_performCompaction`'s return, details included); the
@@ -2362,8 +2385,12 @@ impl AgentSessionEngine {
                 TurnResult::Message(assistant) => {
                     // A settled non-error turn resets the overflow
                     // recovery state (TS resets at every non-error
-                    // assistant message end).
+                    // assistant message end) and counts into the
+                    // auto-refine review prompt's turn line (TS
+                    // `_assistantTurnsSinceAutoRefine`'s message_end
+                    // increment).
                     self.reset_overflow_recovery();
+                    self.note_settled_turn_since_auto_refine_review();
                     assistant
                 }
                 // An aborted turn never services boundary requests (TS
@@ -2401,6 +2428,14 @@ impl AgentSessionEngine {
             match self.run_turn_boundary(emit) {
                 BoundaryRun::Cancelled => return,
                 BoundaryRun::StoppedForCompaction => {
+                    // The requested compaction armed the trigger; the run
+                    // stops here, so the round services it before the
+                    // `Done` reaches attached clients (TS agent_end's
+                    // background scheduling, mapped onto the quiescent
+                    // boundary).
+                    if !self.run_compact_auto_refine(emit) {
+                        return;
+                    }
                     emit(EngineEvent::Done(Ok(())));
                     return;
                 }
@@ -2413,6 +2448,15 @@ impl AgentSessionEngine {
             // continuation the driver queues continues after the
             // compaction like the TS queued continuation.
             if self.run_auto_compaction(emit) == AutoCompactionRun::Cancelled {
+                return;
+            }
+            // The compact-trigger round at the settled boundary (TS
+            // `_scheduleAutoRefineAfterAgentEnd`'s background review after
+            // the agent_end arms ran): a compaction armed earlier — the
+            // pre-turn arm, an overflow compact-and-retry, or this
+            // boundary's arms — services its review here, before the
+            // autonomous decision may queue a continuation.
+            if !self.run_compact_auto_refine(emit) {
                 return;
             }
             match self.autonomous_follow_up(&assistant) {

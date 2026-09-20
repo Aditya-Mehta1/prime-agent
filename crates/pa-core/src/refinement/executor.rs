@@ -5,7 +5,7 @@
 use super::planner::{
     apply_refinement_proposal, parse_proposal, refinement_request, rollback_proposal, ApplyOptions,
     RefinementProposal, AUTO_REFINE_REVIEW_MAX_OUTPUT_TOKENS, AUTO_REFINE_REVIEW_SYSTEM_PROMPT,
-    REFINEMENT_MAX_OUTPUT_TOKENS,
+    REFINEMENT_MAX_OUTPUT_TOKENS, REFINEMENT_SYSTEM_PROMPT,
 };
 use super::{
     infer_refinement_result_scope, merge_refinement_history, HarnessScope, HarnessState,
@@ -125,11 +125,15 @@ pub fn history_for_prompt(history: &[RefinementResult]) -> String {
         .join("\n\n")
 }
 
-/// Model-call seam (test seam over pa-ai completion): takes the request model
-/// (output budget pre-clamped) and the user prompt, returns the reply text.
+/// Model-call seam (test seam over pa-ai completion): takes the request
+/// model (output budget pre-clamped), the call's system prompt (TS sends
+/// the review-gate prompt for the auto-refine review and the `/refine`
+/// subsystem prompt for the plan), and the user prompt, returns the
+/// reply text.
 pub type RefinerFn = Box<
     dyn FnOnce(
             pa_types::ai::Model,
+            &'static str,
             String,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = anyhow::Result<AssistantMessage>> + Send>,
@@ -250,7 +254,7 @@ pub async fn plan_refinement(
     let mut request_model = model.clone();
     request_model.max_tokens = request_max_tokens.min(REFINEMENT_MAX_OUTPUT_TOKENS);
 
-    let reply = refine_call(request_model, user_prompt).await?;
+    let reply = refine_call(request_model, REFINEMENT_SYSTEM_PROMPT, user_prompt).await?;
     let text = assistant_text(&reply);
     Ok(RefinementPlan {
         proposal: parse_proposal(&text).map_err(anyhow::Error::msg)?,
@@ -365,7 +369,7 @@ pub async fn review_auto_refine(
     )?;
     let mut request_model = model.clone();
     request_model.max_tokens = request_max_tokens.min(AUTO_REFINE_REVIEW_MAX_OUTPUT_TOKENS);
-    let reply = review_call(request_model, user_prompt).await?;
+    let reply = review_call(request_model, AUTO_REFINE_REVIEW_SYSTEM_PROMPT, user_prompt).await?;
     parse_auto_refine_review(&assistant_text(&reply))
 }
 
@@ -398,10 +402,73 @@ mod tests {
 
     fn seam(text: &str) -> RefinerFn {
         let text = text.to_string();
-        Box::new(move |_model, _prompt| {
+        Box::new(move |_model, _system, _prompt| {
             let text = text.clone();
             Box::pin(async move { Ok(text_message(&text)) })
         })
+    }
+
+    /// The two refiner calls carry their own system prompts (TS sends the
+    /// review-gate prompt for the auto-refine review, the `/refine`
+    /// subsystem prompt for the plan).
+    #[tokio::test]
+    async fn review_and_plan_carry_their_own_system_prompts() {
+        let model = test_model();
+        // The review seam records its system prompt in a shared cell.
+        let review_systems: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let review_recorder = std::sync::Arc::clone(&review_systems);
+        let review_call: RefinerFn = Box::new(move |_model, system, _prompt| {
+            review_recorder.lock().unwrap().push(system);
+            Box::pin(async move {
+                Ok(text_message(
+                    r#"{"shouldRefine": false, "rationale": "no"}"#,
+                ))
+            })
+        });
+        let review = review_auto_refine(
+            &[],
+            &super::super::empty_harness_state(),
+            &[],
+            &model,
+            &AutoRefineReviewContext {
+                reason: "compact".to_string(),
+                turns_since_last_review: 0,
+            },
+            review_call,
+        )
+        .await
+        .unwrap();
+        assert!(!review.should_refine);
+        assert_eq!(
+            *review_systems.lock().unwrap(),
+            vec![AUTO_REFINE_REVIEW_SYSTEM_PROMPT]
+        );
+        // The plan seam likewise.
+        let plan_systems: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let plan_recorder = std::sync::Arc::clone(&plan_systems);
+        let reply = r#"{"summary":"s","edits":[]}"#.to_string();
+        let plan_call: RefinerFn = Box::new(move |_model, system, _prompt| {
+            plan_recorder.lock().unwrap().push(system);
+            let reply = reply.clone();
+            Box::pin(async move { Ok(text_message(&reply)) })
+        });
+        let state = super::super::empty_harness_state();
+        plan_refinement(
+            &[],
+            &state,
+            &[],
+            &model,
+            &RefineOptions::default(),
+            plan_call,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *plan_systems.lock().unwrap(),
+            vec![REFINEMENT_SYSTEM_PROMPT]
+        );
     }
 
     #[test]

@@ -248,9 +248,14 @@ async fn run_prompt_turn(
         }
         // A settled non-error assistant message resets the overflow
         // machine (TS resets `_overflowRecovery` at every non-error
-        // assistant `message_end`), then the boundary check runs.
+        // assistant `message_end`) and counts into the auto-refine
+        // review prompt's turn line (TS `_assistantTurnsSinceAutoRefine`'s
+        // message_end increment), then the boundary check runs.
         if final_message.stop_reason != pa_types::ai::StopReason::Error {
             session.reset_overflow_recovery().await;
+            mode.engine
+                .session
+                .note_settled_turn_since_auto_refine_review();
         }
         // TS `_checkCompaction` at `agent_end`: the overflow arm (Case 1,
         // with its compact-and-retry), then the requested arm (which
@@ -272,8 +277,10 @@ async fn run_prompt_turn(
         }
         // TS consumes the requested refinement whenever the compaction
         // check did not report a will-retry (`_consumePendingRequestedRefine`
-        // at `agent_end`).
+        // at `agent_end`), then the serialized checkpoint's compact step
+        // services an armed compact-trigger review (autorefine.rs).
         session.consume_requested_refine(&mode).await;
+        session.consume_compact_auto_refine(&mode).await;
         // A failed turn ends the run with its error once the boundary
         // check could not save it (an overflow recovery that re-issued
         // handled it above).
@@ -390,6 +397,13 @@ async fn run_session_command_segment(
     };
     if let Some(event) = compaction_event {
         publish_engine_event(session, &event).await;
+    }
+    // TS `compact()` schedules the compact-trigger auto-refine review
+    // after every successful compaction: a session command never runs a
+    // turn, so the armed trigger waits for the next serialized checkpoint
+    // or the session-close drain (autorefine.rs).
+    if command.name == "compact" && execution.compaction.is_some() {
+        mode.engine.session.mark_compact_auto_refine_pending();
     }
 
     // Refinement outcomes publish complete/failed events; option-parse

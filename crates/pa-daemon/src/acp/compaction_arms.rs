@@ -221,27 +221,8 @@ impl AcpSession {
         };
         match refinement {
             Ok(result) => {
-                let changes = result
-                    .applied_edits
-                    .iter()
-                    .filter(|edit| edit.applied)
-                    .map(|edit| {
-                        let action = serde_json::to_value(edit.action)
-                            .ok()
-                            .and_then(|value| value.as_str().map(str::to_string))
-                            .unwrap_or_default();
-                        let kind = serde_json::to_value(edit.kind)
-                            .ok()
-                            .and_then(|value| value.as_str().map(str::to_string))
-                            .unwrap_or_default();
-                        format!("{action} {kind}:{}", edit.id)
-                    })
-                    .collect();
-                self.publish_engine_event(&AcpEngineEvent::RefineComplete {
-                    summary: result.summary.clone(),
-                    changes,
-                })
-                .await;
+                let event = super::autorefine::refine_complete_event(&result);
+                self.publish_engine_event(&event).await;
             }
             Err(error) => {
                 self.publish_engine_event(&AcpEngineEvent::RefineFailed {
@@ -330,6 +311,10 @@ impl AcpSession {
                 if let Some(telemetry) = &engine.telemetry {
                     telemetry.note_compaction();
                 }
+                // TS `_scheduleAutoRefineAfterCompaction`: the compaction
+                // arms the compact-trigger review; the serialized
+                // checkpoint consumes it (autorefine.rs).
+                engine.session.mark_compact_auto_refine_pending();
                 publish_compaction_end(self, Some(&run.result)).await;
             }
             Ok(CompactOutcome::Skipped(message)) => {
@@ -480,6 +465,11 @@ impl AcpSession {
                 if let Some(telemetry) = &engine.telemetry {
                     telemetry.note_compaction();
                 }
+                // TS `_scheduleAutoRefineAfterCompaction`: the compaction
+                // arms the compact-trigger review; the retried turn's
+                // serialized checkpoint consumes it (TS defers behind the
+                // will-retry continuation).
+                engine.session.mark_compact_auto_refine_pending();
                 publish_compaction_end(self, Some(&run.result)).await;
                 // The compaction rebuild re-adds the error turn from the
                 // kept tail: drop it again so the retried request is

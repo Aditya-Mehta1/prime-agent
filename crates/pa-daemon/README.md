@@ -16,7 +16,15 @@ arm, publishing the ACP `compaction_end` mapping and aborting an in-flight
 run on session/cancel+close; the daemon-attached transport runs the
 worker turn loop's arms instead), because the TS arms live in the session
 turn loop every transport shares and the in-process ACP path drives the
-pa-core engine directly.
+pa-core engine directly. The compact-trigger auto-refine scheduling owns
+its surface here (`compact_autorefine.rs` for the daemon worker: every
+compaction arm plus the manual `compact` command arm the pa-core
+trigger, and the quiescent turn boundaries / the command path consume
+the gated review - TS `_scheduleAutoRefineAfterCompaction` plus the
+background `_maybeAutoRefine("compact")`; `acp/autorefine.rs` for ACP:
+the serialized checkpoint consumes the armed trigger after the
+requested refine.run and session close drains what no turn serviced -
+TS's serialized scheduling for the acp app mode).
 Supervisor process (one worker process per active session), restart/backoff
 supervision, session registry/roster + worker self-registration (session
 identity survives supervisor restarts: workers re-register with backoff and

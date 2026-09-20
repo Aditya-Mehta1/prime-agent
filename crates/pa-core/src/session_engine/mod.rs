@@ -8,6 +8,7 @@
 //! decides admission and persists what the loop produces.
 
 pub mod agent_messaging;
+pub mod auto_refine_trigger;
 pub mod auto_retry;
 pub mod branch_summarization;
 pub mod compact_session;
@@ -122,6 +123,13 @@ pub struct AgentSession {
     /// The resolved auto-refine gates (TS `getAutoRefineSettings`); the
     /// turn-boundary compact trigger reads them.
     auto_refine: refine::AutoRefineGates,
+    /// The compact-trigger auto-refine machine (TS
+    /// `_compactAutoRefinePending` / `_lastAutoRefineReviewAt` /
+    /// `_assistantTurnsSinceAutoRefine`): the session-side state the
+    /// transport surfaces arm and consume through
+    /// [`AgentSession::mark_compact_auto_refine_pending`] and
+    /// [`AgentSession::consume_compact_auto_refine`].
+    compact_auto_refine: std::sync::Mutex<auto_refine_trigger::CompactAutoRefineState>,
     /// The kernel-state probe behind the post-compaction `ipython_state`
     /// notice (TS `_ipythonKernelProvisioner`): `None` in sessions without
     /// a kernel (verification harnesses) — no notice lands.
@@ -173,6 +181,7 @@ impl AgentSession {
             compaction: compaction::CompactionSettings::default(),
             auto_refine_allowed: false,
             auto_refine: refine::AutoRefineGates::default(),
+            compact_auto_refine: std::sync::Mutex::default(),
             kernel_state: None,
         };
         this.ensure_harness_digest_context().await?;

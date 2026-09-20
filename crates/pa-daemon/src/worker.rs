@@ -2420,6 +2420,52 @@ impl Worker {
             .await;
         match outcome {
             crate::engine::CompactionOutcome::Compacted { run } => {
+                // TS `compact()` schedules the compact-trigger auto-refine
+                // review after every successful compaction and the
+                // background round runs while the session is idle: the
+                // command consumed it here (the busy gates keep it armed
+                // for the next turn boundary when work is queued), and
+                // the outcome surfaces through the same rows the
+                // `refine` command emits.
+                // The engine round runs on a blocking thread like every
+                // other engine call (it takes the engine session lock and
+                // blocks on the engine runtime).
+                let engine = std::sync::Arc::clone(&self.engine);
+                let refined =
+                    tokio::task::spawn_blocking(move || engine.consume_compact_auto_refine())
+                        .await
+                        .unwrap_or_else(|error| {
+                            Err(anyhow::anyhow!("auto-refinement task failed: {error}"))
+                        });
+                match refined {
+                    Ok(Some(result)) => {
+                        let outcome_row =
+                            pa_core::session_engine::refine::create_refinement_outcome_message(
+                                &result,
+                            );
+                        if let Ok(value) = serde_json::to_value(
+                            pa_types::session::AgentMessage::Custom(outcome_row),
+                        ) {
+                            self.emit_custom_row(value);
+                        }
+                        if result.applied_edits.iter().any(|edit| edit.applied) {
+                            let notice =
+                                pa_core::session_engine::refine::create_refinement_notice_message(
+                                    &result,
+                                    pa_core::session_engine::refine::RefinementSource::Auto,
+                                );
+                            if let Ok(value) = serde_json::to_value(
+                                pa_types::session::AgentMessage::Custom(notice),
+                            ) {
+                                self.emit_custom_row(value);
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("pa-daemon: auto-refinement after compaction failed: {error:#}");
+                    }
+                }
                 response_success(None, "compact", Some(run.result))
             }
             crate::engine::CompactionOutcome::Skipped { message } => {

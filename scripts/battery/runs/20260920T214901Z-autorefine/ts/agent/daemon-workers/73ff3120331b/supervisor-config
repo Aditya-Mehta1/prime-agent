@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "socketPath": "/home/ubuntu/lane-worktrees/daemon-acp-autorefine/scripts/battery/runs/20260920T214901Z-autorefine/ts/daemon.sock",
+  "defaultSessionConfig": {
+    "cwd": "/home/ubuntu/lane-worktrees/daemon-acp-autorefine/scripts/battery/runs/20260920T214901Z-autorefine/ts/work",
+    "agentDir": "/home/ubuntu/lane-worktrees/daemon-acp-autorefine/scripts/battery/runs/20260920T214901Z-autorefine/ts/agent"
+  }
+}

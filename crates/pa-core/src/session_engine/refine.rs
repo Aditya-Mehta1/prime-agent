@@ -111,7 +111,7 @@ impl RefinementSource {
     }
 }
 
-fn now_millis() -> u64 {
+pub(crate) fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
@@ -407,13 +407,11 @@ impl AgentSession {
 
 /// The default model seam over pa-ai completion.
 pub fn default_refiner_call(api_key: Option<String>) -> crate::refinement::executor::RefinerFn {
-    Box::new(move |model, prompt| {
+    Box::new(move |model, system_prompt, prompt| {
         let api_key = api_key.clone();
         Box::pin(async move {
             let context = pa_types::ai::Context {
-                system_prompt: Some(
-                    crate::refinement::planner::REFINEMENT_SYSTEM_PROMPT.to_string(),
-                ),
+                system_prompt: Some(system_prompt.to_string()),
                 messages: vec![pa_types::ai::Message::User(UserMessage {
                     content: UserContent::Text(prompt),
                     timestamp: 0,
@@ -462,7 +460,7 @@ mod tests {
 
     fn seam(text: &str) -> RefinerFn {
         let text = text.to_string();
-        Box::new(move |_model, _prompt| {
+        Box::new(move |_model, _system, _prompt| {
             let text = text.clone();
             Box::pin(async move { Ok(text_assistant(&text)) })
         })

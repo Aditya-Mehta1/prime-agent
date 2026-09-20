@@ -134,6 +134,11 @@ impl AgentSessionEngine {
                         telemetry.note_compaction();
                     }
                 }
+                // TS `_scheduleAutoRefineAfterCompaction`: the compaction
+                // arms the compact-trigger review; the turn loop's
+                // settled-boundary consumption services it once this
+                // arm finishes.
+                self.mark_compact_auto_refine_pending();
                 // The wire result is the TS `CompactionResult` shape
                 // (`_performCompaction`'s return, details included).
                 let result = crate::compaction::compaction_result_value(&run.result, &run.entry);

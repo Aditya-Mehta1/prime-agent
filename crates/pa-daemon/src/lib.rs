@@ -14,6 +14,7 @@ pub mod agent_messaging;
 pub(crate) mod agent_roster;
 mod auto_compaction;
 pub mod branch_navigation;
+mod compact_autorefine;
 pub mod compaction;
 mod compaction_outcome;
 pub mod descriptor;

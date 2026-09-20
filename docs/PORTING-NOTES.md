@@ -53,25 +53,37 @@ transport gets them; the Rust port hosts them per transport. Surfaces:
 | Case 3 threshold compaction, settled turn | ✓ `run_auto_compaction` | ✓ #229 | ✓ #223 |
 | Case 3 threshold compaction, pre-turn | ✓ (loop head, every admitted prompt) | ✓ #229 | ✓ #223 |
 | Requested-refinement consumption (`_consumePendingRequestedRefine`) | ✓ `run_turn_boundary` | ✓ #229 | ✓ #224 |
-| Compact-trigger auto-refine review (`_scheduleAutoRefineAfterCompaction` + checkpoint/`dispose` drain) | **✗ gap** | **✗ gap** | ✓ #224 (serialized checkpoint + disposal drain) |
+| Compact-trigger auto-refine review (`_scheduleAutoRefineAfterCompaction` + checkpoint/`dispose` drain) | ✓ **this lane** (`compact_autorefine.rs`: every arm + the manual command arm the trigger, the quiescent boundaries consume the gated review — the interactive background `_maybeAutoRefine` mapping) | ✓ **this lane** (`acp/autorefine.rs`: serialized checkpoint consumption after the requested refine.run + the session-close drain) | ✓ #224 (serialized checkpoint + disposal drain) |
 | In-flight compaction abort (`abortCompaction`) | ✓ abort slot (cancel/interrupt) | ✓ #229 abort slot | n/a (TS print mode has no abort trigger; signal handlers exit) |
 | Overflow recovery reset points (agent-run start + settled non-error turn) | ✓ | ✓ #229 | ✓ #211/#223 |
 | Autonomous continuation turns cross the arms | ✓ (continuations hosted inside the armed `run_turns` loop) | ✓ #229 (`run_pre_turn_compaction` before each injected continuation) | ✓ **this lane** (`admit_continuation`; was the gap) |
 
 ### Gaps flagged for follow-up lanes (pa-daemon owned)
 
-1. **Compact-trigger auto-refine (daemon worker + ACP).** TS schedules the
-   compact-trigger auto-refine review after every successful compaction
-   for every transport (print/headless consumes it synchronously at the
-   `shouldStopAfterTurn` checkpoint and the `dispose` drain;
-   `serializedRefine: false` transports run it in the background after
-   `agent_end` via `_scheduleAutoRefineAfterAgentEnd`). The Rust daemon
-   worker and ACP arms complete compactions without scheduling the
-   review at all, so a compacted daemon/ACP session silently loses the
-   trigger. Gate seam exists in pa-core
-   (`auto_refine_allowed`/`auto_refine_gates`/
-   `auto_refine_after_compaction`, used by print #224); the daemon lanes
-   own the wiring.
+1. **Compact-trigger auto-refine (daemon worker + ACP) — CLOSED by the
+   daemon-acp-autorefine lane.** The machine lives in pa-core
+   (`session_engine::auto_refine_trigger`: the arm/discard/increment
+   accessors and one `consume_compact_auto_refine` with the
+   gate/review/stamp sequence; every attempt — decline, success, or
+   failure — stamps the cooldown, the surface parameter carrying the
+   checkpoint-vs-disposal behavioral difference). The worker arms plus
+   the manual `compact` command arm the trigger and the quiescent
+   boundaries / the command path consume it (TS's interactive
+   background `_maybeAutoRefine("compact")`, mapped onto the worker's
+   synchronous turn loop); ACP consumes it at the serialized checkpoint
+   after the requested `refine.run` and drains what no turn serviced at
+   session close (`session/close` + stdin teardown). Differential:
+   `scripts/daemon_autorefine_parity.py` (both sides schedule exactly
+   one review after the `compact` command, identical trigger line,
+   review-gate system prompt, and harness-state block; the seam fix in
+   the same lane made the Rust review request carry the review-gate
+   system prompt instead of the `/refine` subsystem prompt). Known
+   constraint carried over (not introduced here): the worker hosts its
+   pa-core session in memory, so an APPROVED round's apply step fails
+   the local-refinement persisted-session gate exactly like the merged
+   wire `refine` command and the kernel-requested refinement — the
+   review fires and the cooldown stamps either way; the apply path
+   waits on the worker-session persistence follow-up.
 2. Pre-existing, noted, not an arms gap: the daemon worker reaches the
    requested-compaction arm only post-turn (#229's reachable-state
    note), and print prompts are not classified against session commands
