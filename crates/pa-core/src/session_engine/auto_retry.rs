@@ -19,7 +19,7 @@ use pa_agent::abort::AbortSignal;
 use pa_agent::types::{AssistantMessage, StopReason};
 
 use super::provider_retry::{
-    is_agent_lifecycle_failure, is_faux_provider_queue_exhausted,
+    is_agent_lifecycle_failure, is_context_overflow_failure, is_faux_provider_queue_exhausted,
     is_permanent_provider_failure_kind, provider_retry_delay, provider_stream_failure_kind,
     provider_stream_failure_retry_after_ms, provider_stream_failure_status, ProviderRetryDelay,
     ProviderRetryPolicy,
@@ -70,6 +70,7 @@ pub enum AutoRetryEvent {
 /// not — so the caller renders it like every other outcome.
 pub async fn run_turn_with_auto_retry<A, AF, E, EF, W, WF>(
     policy: &ProviderRetryPolicy,
+    context_window: u64,
     signal: Option<&AbortSignal>,
     mut attempt: A,
     mut emit: E,
@@ -107,6 +108,9 @@ where
         // closes the active retry (`_finishActiveRetryWithFailure`).
         let non_retryable = is_agent_lifecycle_failure(&message)
             || is_faux_provider_queue_exhausted(&message)
+            // A context overflow can never succeed unchanged (TS
+            // `_isRetryableError`): the compact-and-retry recovery owns it.
+            || is_context_overflow_failure(&message, context_window)
             || is_permanent_provider_failure_kind(
                 provider_stream_failure_kind(&message).as_deref(),
                 retries_performed,
@@ -275,6 +279,7 @@ mod tests {
         let events_for_emit = Arc::clone(&events);
         let message = run_turn_with_auto_retry(
             &fast_policy(),
+            0,
             None,
             || {
                 let attempts = Arc::clone(&attempts);
@@ -336,6 +341,7 @@ mod tests {
         let events_for_emit = Arc::clone(&events);
         let message = run_turn_with_auto_retry(
             &fast_policy(),
+            0,
             None,
             || {
                 let attempts = Arc::clone(&attempts);
@@ -378,6 +384,7 @@ mod tests {
         let events_for_emit = Arc::clone(&events);
         let message = run_turn_with_auto_retry(
             &fast_policy(),
+            0,
             None,
             || {
                 let attempts = Arc::clone(&attempts);
@@ -405,6 +412,45 @@ mod tests {
         assert!(events.lock().unwrap().is_empty());
     }
 
+    /// A context overflow can never succeed unchanged (TS
+    /// `_isRetryableError`'s overflow guard): the turn surfaces the error
+    /// immediately so the compact-and-retry recovery owns it.
+    #[tokio::test]
+    async fn context_overflow_never_enters_the_retry_loop() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_for_emit = Arc::clone(&events);
+        let message = run_turn_with_auto_retry(
+            &fast_policy(),
+            200_000,
+            None,
+            || {
+                let attempts = Arc::clone(&attempts);
+                async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut overflow = error_message(None, None, None);
+                    overflow.diagnostics = None;
+                    overflow.error_message =
+                        Some("prompt is too long: 213462 tokens > 200000 maximum".to_string());
+                    Ok(overflow)
+                }
+            },
+            move |event| {
+                let events = Arc::clone(&events_for_emit);
+                async move {
+                    events.lock().unwrap().push(event);
+                    Ok(())
+                }
+            },
+            |_| async { true },
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(message.stop_reason, StopReason::Error);
+        assert!(events.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn cancelled_wait_aborts_with_retry_cancelled() {
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -412,6 +458,7 @@ mod tests {
         let mut attempts = 0;
         let message = run_turn_with_auto_retry(
             &fast_policy(),
+            0,
             None,
             || {
                 attempts += 1;
@@ -448,6 +495,7 @@ mod tests {
         controller.abort();
         let message = run_turn_with_auto_retry(
             &fast_policy(),
+            0,
             Some(&controller.signal()),
             || async { Ok(error_message(Some("server_error"), None, None)) },
             |_| async { Ok(()) },
@@ -465,6 +513,7 @@ mod tests {
         let events_for_emit = Arc::clone(&events);
         let message = run_turn_with_auto_retry(
             &fast_policy(),
+            0,
             None,
             || {
                 let attempts = Arc::clone(&attempts);
@@ -514,6 +563,7 @@ mod tests {
         let events_for_emit = Arc::clone(&events);
         let message = run_turn_with_auto_retry(
             &policy,
+            0,
             None,
             || {
                 let attempts = Arc::clone(&attempts);
@@ -542,6 +592,7 @@ mod tests {
     async fn attempt_errors_propagate() {
         let error = run_turn_with_auto_retry(
             &fast_policy(),
+            0,
             None,
             || async { Err(anyhow::anyhow!("turn crashed")) },
             |_| async { Ok(()) },

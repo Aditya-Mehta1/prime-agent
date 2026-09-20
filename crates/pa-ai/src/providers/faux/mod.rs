@@ -371,6 +371,12 @@ fn clone_message(
     cloned.api = api.to_string();
     cloned.provider = provider.to_string();
     cloned.model = model_id.to_string();
+    // The served message is produced at serve time — a real provider stamps
+    // its assistant messages when the stream starts, while a scripted
+    // template carries its parse-time stamp. Harness pacing (`delayMs`)
+    // resolves before this, so a delayed response lands with its post-delay
+    // timestamp.
+    cloned.timestamp = now_ms();
     cloned
 }
 

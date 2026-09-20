@@ -13,6 +13,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::agent_messaging::{LinkAgentMessageController, LinkAgentObserveController};
+use crate::overflow_compaction::{OverflowArmRun, OverflowRecovery};
 use pa_agent::types::StopReason;
 use pa_core::autonomous::AutonomousFollowUp;
 use pa_core::kernel::shared::HostRequestHandlers;
@@ -164,6 +165,9 @@ pub struct AgentSessionEngine {
     /// responses queue across turns instead of replaying per resolution.
     /// Verification harness only; never set by the product.
     faux_model: std::sync::OnceLock<Model>,
+    /// One compact-and-retry attempt per context overflow (TS
+    /// `_overflowRecovery`): the state machine the overflow arm walks.
+    pub(crate) overflow_recovery: std::sync::Mutex<OverflowRecovery>,
 }
 
 impl AgentSessionEngine {
@@ -283,6 +287,7 @@ impl AgentSessionEngine {
             rlm_max_depth_source: std::sync::Mutex::new("default"),
             pending_max_depth: std::sync::Mutex::new(None),
             faux_model: std::sync::OnceLock::new(),
+            overflow_recovery: std::sync::Mutex::new(OverflowRecovery::default()),
         })
     }
 
@@ -1771,6 +1776,7 @@ impl AgentSessionEngine {
     /// `Done` is owned by the caller (`run_turns`).
     fn run_model_turn(
         &self,
+        admission: TurnAdmission,
         prompt: &str,
         images: &[pa_agent::types::ImageContent],
         aborted: &dyn Fn() -> bool,
@@ -1782,11 +1788,21 @@ impl AgentSessionEngine {
         // TS loop only classifies provider stream failures).
         let model = match self.resolve_model() {
             Ok(model) => model,
-            Err(error) => return TurnResult::Error(error.to_string()),
+            Err(error) => {
+                return TurnResult::Error {
+                    error: error.to_string(),
+                    assistant: None,
+                }
+            }
         };
         let agent = match self.session_agent(&model) {
             Ok(agent) => agent,
-            Err(error) => return TurnResult::Error(format!("{error:#}")),
+            Err(error) => {
+                return TurnResult::Error {
+                    error: format!("{error:#}"),
+                    assistant: None,
+                }
+            }
         };
         let policy = self.retry_policy();
         let failover_policy = self.failover_policy();
@@ -1796,7 +1812,11 @@ impl AgentSessionEngine {
         // emitting retry events, so the single `emit` reference is handed
         // through a RefCell slot to whichever closure is currently running.
         let emit_cell = std::cell::RefCell::new(emit);
-        let first_attempt = std::cell::Cell::new(true);
+        // The overflow compact-and-retry re-issues the loop without a new
+        // user message, so its turn starts as a continuation (TS
+        // `agent.continue()`); an ordinary turn starts fresh and only the
+        // retry driver's re-issues continue.
+        let first_attempt = std::cell::Cell::new(matches!(admission, TurnAdmission::FreshPrompt));
         // Failover switch/restore re-bind the live agent's model and append
         // the model-change row the TS backup-model retry logs. The primary
         // (model + thinking level) is captured at the first switch and
@@ -1825,6 +1845,7 @@ impl AgentSessionEngine {
                 &policy,
                 &failover_policy,
                 &candidates,
+                model.context_window,
                 None,
                 || {
                     let mut emit = emit_cell.borrow_mut();
@@ -1994,17 +2015,21 @@ impl AgentSessionEngine {
                 // The failure already reached the transcript as the final
                 // assistant message; the turn error still travels to
                 // headless callers through the turn result.
-                StopReason::Error => TurnResult::Error(
-                    message
+                StopReason::Error => TurnResult::Error {
+                    error: message
                         .error_message
                         .clone()
                         .filter(|error| !error.is_empty())
                         .unwrap_or_else(|| "Assistant response failed".to_string()),
-                ),
+                    assistant: Some(Box::new(message)),
+                },
                 StopReason::Aborted => TurnResult::Aborted,
                 _ => TurnResult::Message(Box::new(message)),
             },
-            Err(error) => TurnResult::Error(error.to_string()),
+            Err(error) => TurnResult::Error {
+                error: error.to_string(),
+                assistant: None,
+            },
         }
     }
 
@@ -2071,14 +2096,8 @@ impl AgentSessionEngine {
                     "firstKeptEntryId": run.result.first_kept_entry_id,
                     "tokensBefore": run.result.tokens_before,
                 });
-                let event = crate::compaction::compaction_end_payload(
-                    "requested",
-                    Some(&result),
-                    false,
-                    None,
-                    None,
-                    None,
-                );
+                let event =
+                    crate::compaction::compaction_end_success("requested", &result, false, None);
                 if !emit(EngineEvent::Compaction { entry, event }) {
                     return BoundaryRun::Cancelled;
                 }
@@ -2096,6 +2115,7 @@ impl AgentSessionEngine {
                     pa_core::session_engine::messages::CompactionOutcomeKind::Skipped,
                     &format!("Requested compaction skipped: {message}"),
                     Some("warning"),
+                    None,
                     emit,
                 ) {
                     return BoundaryRun::Cancelled;
@@ -2104,11 +2124,14 @@ impl AgentSessionEngine {
             }
             Some(Err(error)) => {
                 eprintln!("pa-daemon: requested compaction failed: {error:#}");
+                // TS `_endCompactionUnsuccessfully` passes no
+                // `errorSeverity` for automatic failures.
                 if !self.emit_unsuccessful_compaction(
                     pa_core::session_engine::messages::CompactionOutcomeReason::Requested,
                     pa_core::session_engine::messages::CompactionOutcomeKind::Failed,
                     &format!("Requested compaction failed: {error:#}"),
-                    Some("error"),
+                    None,
+                    None,
                     emit,
                 ) {
                     return BoundaryRun::Cancelled;
@@ -2164,27 +2187,67 @@ impl AgentSessionEngine {
         // regenerates from the loop state, never re-sending attachments).
         let mut prompt = first_prompt.to_string();
         let mut first = true;
+        let mut overflow_retry = false;
+        // TS resets `_overflowRecovery` when a message that starts an agent
+        // run enters the loop: the admitted prompt here.
+        self.reset_overflow_recovery();
         loop {
             let images: &[pa_agent::types::ImageContent] = if first { first_images } else { &[] };
             first = false;
             // TS `_runPreTurnCompaction` (`beforeModelSelection` for queued
-            // prompts): a threshold crossing that predates this admission
-            // compacts before the turn runs; the turn then proceeds.
+            // prompts): a stale overflow error from the previous run gets
+            // its compact-and-retry attempt on the newly admitted prompt
+            // (Case 1 runs before the threshold arm), then a threshold
+            // crossing that predates this admission compacts before the
+            // turn runs; the turn then proceeds either way.
+            if !self.run_pre_turn_overflow_compaction(emit) {
+                return;
+            }
             if self.run_auto_compaction(emit) == AutoCompactionRun::Cancelled {
                 return;
             }
-            let turn = self.run_model_turn(&prompt, images, aborted, emit);
+            // The overflow compact-and-retry re-issues the loop without a
+            // new user message; every other iteration runs a fresh prompt
+            // (autonomous continuations are real user rows).
+            let admission = if overflow_retry {
+                overflow_retry = false;
+                TurnAdmission::Continue
+            } else {
+                TurnAdmission::FreshPrompt
+            };
+            let turn = self.run_model_turn(admission, &prompt, images, aborted, emit);
             let assistant = match turn {
-                TurnResult::Message(assistant) => assistant,
+                TurnResult::Message(assistant) => {
+                    // A settled non-error turn resets the overflow
+                    // recovery state (TS resets at every non-error
+                    // assistant message end).
+                    self.reset_overflow_recovery();
+                    assistant
+                }
                 // An aborted turn never services boundary requests (TS
                 // `_checkCompaction` abort arm): drop any pending ones so
                 // a stale request cannot leak into the next turn.
                 TurnResult::Aborted => {
+                    self.reset_overflow_recovery();
                     self.drop_turn_boundary_requests();
                     emit(EngineEvent::Done(Err("No response produced.".to_string())));
                     return;
                 }
-                TurnResult::Error(error) => {
+                TurnResult::Error { error, assistant } => {
+                    // TS `_checkCompaction` Case 1 at `agent_end`: a
+                    // context-overflow error triggers one compact-and-retry
+                    // attempt before the run ends.
+                    let arm = assistant
+                        .map(|assistant| self.run_overflow_compaction(&assistant, emit))
+                        .unwrap_or(OverflowArmRun::NotApplicable);
+                    match arm {
+                        OverflowArmRun::RetryTurn => {
+                            overflow_retry = true;
+                            continue;
+                        }
+                        OverflowArmRun::NotApplicable | OverflowArmRun::Finished => {}
+                        OverflowArmRun::Cancelled => return,
+                    }
                     emit(EngineEvent::Done(Err(error)));
                     return;
                 }
@@ -2629,8 +2692,25 @@ enum TurnResult {
     Message(Box<pa_agent::types::AssistantMessage>),
     /// The turn was aborted before a settled message.
     Aborted,
-    /// The turn failed before or during the model call.
-    Error(String),
+    /// The turn failed before or during the model call. `assistant` is the
+    /// failed turn's settled message when one exists (provider failures:
+    /// the overflow arm inspects it); model-resolution and session-build
+    /// failures never reached the provider and carry none.
+    Error {
+        error: String,
+        assistant: Option<Box<pa_agent::types::AssistantMessage>>,
+    },
+}
+
+/// How one turn is admitted to the agent loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnAdmission {
+    /// A fresh user prompt: the loop context gains the user message.
+    FreshPrompt,
+    /// Re-issue the loop without a new user message (TS `agent.continue()`):
+    /// the overflow compact-and-retry path after the failed turn's error
+    /// message left the loop context.
+    Continue,
 }
 
 /// What the turn-boundary consumption did to the run.
@@ -2730,8 +2810,13 @@ fn retry_event_to_engine_event(
     }
 }
 
+/// The faux provider registry is process-global; faux-driven tests must
+/// not register concurrently (each registration replaces the queue).
 #[cfg(test)]
-mod tests {
+pub(crate) static FAUX_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) mod tests {
     use super::*;
 
     /// A models.json custom provider (name has no env-key mapping), with an
@@ -2837,7 +2922,7 @@ mod tests {
 
     /// One faux-driven engine over its own tempdir (settings written before
     /// the first prompt so the session build resolves them).
-    fn faux_engine_with_settings(
+    pub(crate) fn faux_engine_with_settings(
         script: serde_json::Value,
         reserve_tokens: u64,
     ) -> (AgentSessionEngine, tempfile::TempDir) {
@@ -2861,7 +2946,11 @@ mod tests {
     }
 
     /// Admit one prompt through the engine, collecting its events.
-    fn admit(engine: &AgentSessionEngine, message: String, events: &mut Vec<EngineEvent>) {
+    pub(crate) fn admit(
+        engine: &AgentSessionEngine,
+        message: String,
+        events: &mut Vec<EngineEvent>,
+    ) {
         engine.run_prompt(
             0,
             PromptRequest {
@@ -3511,11 +3600,6 @@ fn faux_model_from_script(script: &str) -> anyhow::Result<Model> {
     let registration = pa_ai::faux::script::register_faux_provider_from_script(&parsed);
     Ok(registration.get_model())
 }
-
-#[cfg(test)]
-/// The faux provider registry is process-global; faux-driven tests must
-/// not register concurrently (each registration replaces the queue).
-static FAUX_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A driver loop test harness: faux script + collected events. Holds the
 /// faux lock while the engine runs.

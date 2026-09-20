@@ -71,6 +71,21 @@ pub fn is_faux_provider_queue_exhausted(message: &AssistantMessage) -> bool {
         && message.error_message.as_deref() == Some("No more faux responses queued")
 }
 
+/// A context-overflow failure (TS `_isRetryableError`'s overflow guard): the
+/// request itself is too large, so re-issuing it unchanged can never succeed.
+/// The session-level compact-and-retry recovery owns it instead.
+pub fn is_context_overflow_failure(message: &AssistantMessage, context_window: u64) -> bool {
+    // The shared overflow classifier works over the wire message shape;
+    // a round-trip failure means no usage/error fields to inspect.
+    let Some(wire) = serde_json::to_value(message)
+        .ok()
+        .and_then(|value| serde_json::from_value::<pa_types::ai::AssistantMessage>(value).ok())
+    else {
+        return false;
+    };
+    pa_ai::is_context_overflow(&wire, (context_window > 0).then_some(context_window))
+}
+
 /// The `details` payload of the `provider_stream_failure` diagnostic.
 pub fn provider_stream_failure_details(message: &AssistantMessage) -> Option<&Value> {
     message

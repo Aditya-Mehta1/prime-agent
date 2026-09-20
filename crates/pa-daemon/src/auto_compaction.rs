@@ -94,15 +94,9 @@ impl AgentSessionEngine {
                     "firstKeptEntryId": run.result.first_kept_entry_id,
                     "tokensBefore": run.result.tokens_before,
                 });
-                let event = crate::compaction::compaction_end_payload(
-                    "threshold",
-                    Some(&result),
-                    false,
-                    None,
-                    None,
-                    None,
-                );
                 let entry = serde_json::to_value(&run.entry).unwrap_or(Value::Null);
+                let event =
+                    crate::compaction::compaction_end_success("threshold", &result, false, None);
                 if !emit(EngineEvent::Compaction { entry, event }) {
                     return AutoCompactionRun::Cancelled;
                 }
@@ -116,17 +110,22 @@ impl AgentSessionEngine {
                     CompactionOutcomeKind::Skipped,
                     &format!("Auto-compaction skipped: {message}"),
                     Some("warning"),
+                    None,
                     emit,
                 ) {
                     return AutoCompactionRun::Cancelled;
                 }
             }
+            // A failed run persists the durable disclosure row and emits
+            // the `compaction_end` failure (TS `_endCompactionUnsuccessfully`:
+            // automatic failures carry no `errorSeverity` on the wire).
             Err(error) => {
                 if !self.emit_unsuccessful_compaction(
                     CompactionOutcomeReason::Threshold,
                     CompactionOutcomeKind::Failed,
                     &format!("Auto-compaction failed: {error:#}"),
-                    Some("error"),
+                    None,
+                    None,
                     emit,
                 ) {
                     return AutoCompactionRun::Cancelled;

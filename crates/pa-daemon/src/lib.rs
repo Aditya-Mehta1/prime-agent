@@ -25,6 +25,7 @@ pub mod lease;
 pub mod mcp_login;
 pub(crate) mod messaging;
 pub(crate) mod model_switch;
+mod overflow_compaction;
 pub mod ownership;
 pub mod paths;
 pub(crate) mod peer;

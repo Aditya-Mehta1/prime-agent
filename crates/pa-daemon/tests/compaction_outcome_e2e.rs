@@ -505,7 +505,10 @@ fn forced_failed_auto_compaction_records_the_durable_outcome_row() {
     );
     let end_event = client.events[compaction_end_index].clone();
     assert_eq!(end_event["errorMessage"], json!(failure_message));
-    assert_eq!(end_event["errorSeverity"], "error");
+    // TS `_endCompactionUnsuccessfully` passes no `errorSeverity` for
+    // automatic failures (the options carry customInstructions only), so
+    // the wire carries no key at all.
+    assert_eq!(end_event["errorSeverity"], json!(null));
     assert_eq!(end_event["aborted"], false);
     assert_eq!(end_event["willRetry"], false);
 

@@ -1,3 +1,66 @@
+### Merge with #207 (durable compaction_outcome seam)
+
+- #207's typed `CompactionOutcomeReason`/`CompactionOutcomeKind` + the
+  `record_compaction_outcome` seam supersede this lane's string-constant
+  row factory; the overflow arm now records through it (durable append +
+  live-context push + broadcast), like the threshold/requested arms.
+- `emit_unsuccessful_compaction` gained a `custom_instructions` parameter:
+  TS `_endCompactionUnsuccessfully` threads the consumed pending
+  compaction's instructions onto the `compaction_end` event, which the
+  overflow arm honors.
+- Severity reconciliation (TS-exact, kept from this lane): automatic-arm
+  failures carry NO `errorSeverity` on the wire (TS passes none); #207's
+  e2e expectation encoded the pre-fix divergence and was updated.
+- `AgentSession::last_assistant_message` skips trailing non-assistant rows
+  (a compaction outcome disclosure) instead of matching them — without the
+  fix, #207's live-context row push hid the stale overflow error from the
+  pre-turn recovery arm.
+
+## Overflow compact-and-retry arm (lane overflow-compact)
+
+Reference: TS `core/agent-session.ts` (`_checkCompaction` Case 1,
+`_runAutoCompaction` overflow/will-retry branches, `_endCompactionUnsuccessfully`,
+`_overflowRecovery` resets) + `packages/ai/src/utils/overflow.ts` (the
+classifier, already ported in pa-ai).
+
+- The overflow arm fires at both TS boundaries: the settled-turn error path
+  (`agent_end`) and before the next admitted prompt
+  (`_runPreTurnCompaction`, whose Case 1 covers a stale overflow error from
+  the previous run). The Rust turn loop (pa-daemon `run_turns`) wires the
+  same two points around the #204 threshold arm.
+- One recovery attempt per overflow (`_overflowRecovery`: idle → attempted
+  → reported). Resets: prompt admission and every settled non-error
+  assistant turn (TS resets at agent-run message starts and non-error
+  assistant message ends). The retry re-issues the loop WITHOUT a new user
+  message (TS `agent.continue()`): `run_model_turn` gains a `TurnAdmission`
+  (fresh prompt vs continuation).
+- Guards in TS order: the message may not predate the latest compaction
+  boundary, `settings.enabled` (or a pending model-requested compaction,
+  which the run consumes with its instructions), same-model, and the shared
+  overflow classifier. The error turn leaves the loop context before the
+  compaction and again after the rebuild (the kept tail re-adds it), both
+  TS-exact drops.
+- Failure surface (shared `_endCompactionUnsuccessfully` port, now also
+  used by the threshold and requested arms): the durable `compaction_outcome`
+  custom row first, then the `compaction_end` event; automatic-arm failures
+  carry NO `errorSeverity` on the wire (TS passes none — the pre-existing
+  threshold/requested `error` severity was a wire divergence, fixed here).
+  Skip keeps the TS `warning`. The reported-overflow text is TS-verbatim:
+  "Context overflow recovery failed after one compact-and-retry attempt.
+  Try reducing context or switching to a larger-context model."
+- Boundary with the quick-retry/failover loops (TS `_isRetryableError`
+  excludes overflow): both pa-core drivers classify context-overflow
+  failures as non-retryable and hand them to the compact-and-retry recovery.
+- Residues left to other lanes: the pa-cli print path's own threshold loop
+  (`print_runtime.rs`) has no overflow arm yet; the threshold/requested
+  compaction arms do not feed `note_compaction` (adoption-telemetry seam)
+  — the overflow arm does, matching the TS compaction_end counting.
+- Verification: faux-driven daemon tests (the compact-and-retry cycle,
+  retry recovery, skip warning, pre-turn stale-overflow recovery,
+  non-overflow and disabled-settings negatives) and the f7_compaction
+  battery rows (B-31: the scripted overflow probe drives both binaries and
+  diffs the projected wire surface).
+
 ## PR/git context (roadmap item 5, 2026-09-19)
 
 Reference: TS `packages/coding-agent/src/utils/git.ts` (`captureGitContext`,

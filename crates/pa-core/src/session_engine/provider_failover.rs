@@ -28,7 +28,7 @@ use pa_types::ai::Model;
 
 use super::auto_retry::{run_turn_with_auto_retry, AutoRetryEvent, RetryStartReason};
 use super::provider_retry::{
-    is_agent_lifecycle_failure, is_faux_provider_queue_exhausted,
+    is_agent_lifecycle_failure, is_context_overflow_failure, is_faux_provider_queue_exhausted,
     is_permanent_provider_failure_kind, provider_retry_delay, provider_stream_failure_kind,
     provider_stream_failure_retry_after_ms, provider_stream_failure_status, ProviderRetryDelay,
     ProviderRetryPolicy,
@@ -114,6 +114,7 @@ pub async fn run_turn_with_provider_failover<A, AF, E, EF, W, WF, S, SF, R, RF>(
     quick_policy: &ProviderRetryPolicy,
     failover: &ProviderFailoverPolicy,
     candidates: &[Model],
+    context_window: u64,
     signal: Option<&AbortSignal>,
     mut attempt: A,
     mut emit: E,
@@ -134,7 +135,8 @@ where
     RF: Future<Output = anyhow::Result<Option<String>>>,
 {
     if !failover.enabled || candidates.is_empty() {
-        return run_turn_with_auto_retry(quick_policy, signal, attempt, emit, wait).await;
+        return run_turn_with_auto_retry(quick_policy, context_window, signal, attempt, emit, wait)
+            .await;
     }
     let mut total_retries = 0u32;
     let mut retries_on_provider = 0u32;
@@ -174,6 +176,9 @@ where
         // lifecycle/faux failures are not provider failures at all.
         let non_retryable = is_agent_lifecycle_failure(&message)
             || is_faux_provider_queue_exhausted(&message)
+            // A context overflow fails identically on every provider (TS
+            // `_isRetryableError`): the compact-and-retry recovery owns it.
+            || is_context_overflow_failure(&message, context_window)
             || is_permanent_provider_failure_kind(
                 provider_stream_failure_kind(&message).as_deref(),
                 total_retries,
@@ -404,6 +409,7 @@ mod tests {
             &quick_policy(),
             failover,
             candidates,
+            0,
             None,
             {
                 let script = Arc::clone(&script);
@@ -670,6 +676,23 @@ mod tests {
     async fn success_without_retries_emits_no_events() {
         let candidates = vec![model("backup-a")];
         let harness = drive(&fast_failover(), &candidates, vec![ok_message("done")]).await;
+        assert_eq!(harness.attempts, 1);
+        assert!(harness.events.is_empty());
+        assert!(harness.switches.is_empty());
+        assert!(harness.restores.is_empty());
+    }
+
+    /// A context overflow fails identically on every provider (TS
+    /// `_isRetryableError`'s overflow guard): the failure surfaces without
+    /// walking the chain, leaving the compact-and-retry recovery to own it.
+    #[tokio::test]
+    async fn context_overflow_never_walks_the_provider_chain() {
+        let candidates = vec![model("backup-a"), model("backup-b")];
+        let mut overflow = error_message(None, None, "prompt is too long");
+        overflow.diagnostics = None;
+        overflow.error_message =
+            Some("prompt is too long: 213462 tokens > 200000 maximum".to_string());
+        let harness = drive(&fast_failover(), &candidates, vec![overflow]).await;
         assert_eq!(harness.attempts, 1);
         assert!(harness.events.is_empty());
         assert!(harness.switches.is_empty());

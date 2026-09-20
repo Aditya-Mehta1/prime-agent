@@ -107,6 +107,13 @@ fn parse_script_step(entry: &Value) -> Result<FauxResponseStep, String> {
         Some(other) => return Err(format!("unknown faux script stopReason {other}")),
         None => None,
     };
+    // Optional scripted error text (verification harness only): rides the
+    // message with `stopReason: "error"`, so overflow-recovery harnesses can
+    // script provider overflow responses.
+    let error_message = entry
+        .get("errorMessage")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let stop_reason = stop_reason.unwrap_or({
         let has_tool_call = content
             .iter()
@@ -127,6 +134,7 @@ fn parse_script_step(entry: &Value) -> Result<FauxResponseStep, String> {
         content,
         FauxAssistantMessageOptions {
             stop_reason: Some(stop_reason),
+            error_message,
             ..Default::default()
         },
     );

@@ -120,21 +120,18 @@ fn emit_compact_end(
         });
         (
             entry,
-            crate::compaction::compaction_end_payload(
+            crate::compaction::compaction_end_success(
                 "manual",
-                Some(&result),
+                &result,
                 false,
-                None,
-                None,
                 custom_instructions.as_deref(),
             ),
         )
     } else if let Some(skipped) = execution.compaction_skipped {
         (
             serde_json::Value::Null,
-            crate::compaction::compaction_end_payload(
+            crate::compaction::compaction_end_unsuccessful(
                 "manual",
-                None,
                 false,
                 Some(skipped),
                 Some("warning"),
@@ -150,9 +147,8 @@ fn emit_compact_end(
             .unwrap_or("compaction did not run");
         (
             serde_json::Value::Null,
-            crate::compaction::compaction_end_payload(
+            crate::compaction::compaction_end_unsuccessful(
                 "manual",
-                None,
                 false,
                 Some(&format!("Compaction failed: {error}")),
                 Some("error"),

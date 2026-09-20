@@ -251,31 +251,54 @@ pub(crate) fn compaction_start_event(reason: &str, custom_instructions: Option<&
     event
 }
 
-/// The `compaction_end` event payload (TS `AgentSessionEvent`) from the
-/// outcome fields: success carries `result`; a skip or failure carries its
-/// `errorMessage` with the matching severity; an abort carries `aborted`.
+/// The `compaction_end` event payload of a successful compaction (TS
+/// `AgentSessionEvent`): the client-facing `CompactionResult` plus whether
+/// the session retries the failed turn on the compacted context (the
+/// overflow compact-and-retry arm is the only `willRetry: true` source).
 /// `reason` is the TS `CompactionOutcomeReason` (`manual` for user-initiated
 /// runs, `requested` for model-requested boundary compactions).
-pub(crate) fn compaction_end_payload(
+pub(crate) fn compaction_end_success(
     reason: &str,
-    result: Option<&Value>,
+    result: &Value,
+    will_retry: bool,
+    custom_instructions: Option<&str>,
+) -> Value {
+    let mut event = json!({
+        "type": "compaction_end",
+        "reason": reason,
+        "result": result,
+        "aborted": false,
+        "willRetry": will_retry,
+    });
+    if let Some(custom_instructions) = custom_instructions {
+        event["customInstructions"] = json!(custom_instructions);
+    }
+    event
+}
+
+/// The `compaction_end` event payload of an unsuccessful compaction (TS
+/// `_endCompactionUnsuccessfully`'s event shape): `aborted` marks a
+/// cancelled run; a skip or failure carries its `errorMessage` with the
+/// matching `errorSeverity`.
+pub(crate) fn compaction_end_unsuccessful(
+    reason: &str,
     aborted: bool,
     error_message: Option<&str>,
     error_severity: Option<&str>,
     custom_instructions: Option<&str>,
 ) -> Value {
-    let mut event = json!({ "type": "compaction_end", "reason": reason });
-    if let Some(result) = result {
-        event["result"] = result.clone();
-    }
-    event["aborted"] = json!(aborted);
+    let mut event = json!({
+        "type": "compaction_end",
+        "reason": reason,
+        "aborted": aborted,
+        "willRetry": false,
+    });
     if let Some(error_message) = error_message {
         event["errorMessage"] = json!(error_message);
     }
     if let Some(error_severity) = error_severity {
         event["errorSeverity"] = json!(error_severity);
     }
-    event["willRetry"] = json!(false);
     if let Some(custom_instructions) = custom_instructions {
         event["customInstructions"] = json!(custom_instructions);
     }
@@ -288,38 +311,26 @@ pub(crate) fn compaction_end_payload(
 /// severity; an abort carries `aborted` with error severity and no message.
 fn compaction_end_event(outcome: &CompactionOutcome, custom_instructions: Option<&str>) -> Value {
     match outcome {
-        CompactionOutcome::Compacted { run } => compaction_end_payload(
+        CompactionOutcome::Compacted { run } => {
+            compaction_end_success("manual", &run.result, false, custom_instructions)
+        }
+        CompactionOutcome::Skipped { message } => compaction_end_unsuccessful(
             "manual",
-            Some(&run.result),
-            false,
-            None,
-            None,
-            custom_instructions,
-        ),
-        CompactionOutcome::Skipped { message } => compaction_end_payload(
-            "manual",
-            None,
             false,
             Some(message),
             Some("warning"),
             custom_instructions,
         ),
-        CompactionOutcome::Failed { error } => compaction_end_payload(
+        CompactionOutcome::Failed { error } => compaction_end_unsuccessful(
             "manual",
-            None,
             false,
             Some(&format!("Compaction failed: {error}")),
             Some("error"),
             custom_instructions,
         ),
-        CompactionOutcome::Aborted => compaction_end_payload(
-            "manual",
-            None,
-            true,
-            None,
-            Some("error"),
-            custom_instructions,
-        ),
+        CompactionOutcome::Aborted => {
+            compaction_end_unsuccessful("manual", true, None, Some("error"), custom_instructions)
+        }
     }
 }
 

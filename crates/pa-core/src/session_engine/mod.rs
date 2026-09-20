@@ -75,6 +75,26 @@ pub struct PromptOptions {
     pub queue_if_busy: bool,
 }
 
+/// Which trailing assistant messages [`AgentSession::drop_trailing_assistant`]
+/// removes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrailingAssistantFilter {
+    /// Any trailing assistant message (the TS overflow arm's pre-compaction
+    /// drop).
+    Any,
+    /// Only an error assistant message (the TS will-retry branch's drop
+    /// after the compaction rebuild).
+    ErrorOnly,
+}
+
+/// The standard message inside an agent message, when it is one.
+fn standard_message(message: &pa_agent::types::AgentMessage) -> Option<&pa_agent::types::Message> {
+    let pa_agent::types::AgentMessage::Standard(message) = message else {
+        return None;
+    };
+    Some(message)
+}
+
 /// The session-bound agent: admission rules + persistence over the loop.
 pub struct AgentSession {
     agent: Arc<Agent>,
@@ -150,6 +170,30 @@ impl AgentSession {
         self.compaction = settings;
     }
 
+    /// Whether automatic compaction is enabled for this session (the TS
+    /// `getCompactionSettings().enabled` gate the automatic arms check
+    /// before any trigger).
+    pub fn auto_compaction_enabled(&self) -> bool {
+        self.compaction.enabled
+    }
+
+    /// The latest compaction boundary in the live loop context, if any
+    /// (the TS `getLatestCompactionEntry` guard source): the timestamp of
+    /// the newest compaction summary in the agent state.
+    pub async fn latest_compaction_timestamp(&self) -> Option<u64> {
+        let state = self.agent.state().await;
+        state
+            .messages
+            .iter()
+            .filter_map(|message| serde_json::to_value(message).ok())
+            .filter_map(|value| serde_json::from_value::<SessionAgentMessage>(value).ok())
+            .filter_map(|message| match message {
+                SessionAgentMessage::CompactionSummary(summary) => Some(summary.timestamp),
+                _ => None,
+            })
+            .max()
+    }
+
     /// Whether an automatic threshold compaction is due at a turn boundary
     /// (the TS `_checkCompaction` threshold arm, fired at `agent_end` and
     /// before the next admitted prompt): the live loop context over the
@@ -166,6 +210,49 @@ impl AgentSession {
             .filter_map(|value| serde_json::from_value(value).ok())
             .collect();
         compaction::threshold_compaction_due(&messages, context_window, &self.compaction)
+    }
+
+    /// Remove the trailing assistant message from the loop context (TS retry:
+    /// `messages.slice(0, -1)`), so a re-issued request does not re-send the
+    /// failed turn's error message. The session history keeps it (it already
+    /// persisted through the message-end hook).
+    ///
+    /// [`TrailingAssistantFilter::ErrorOnly`] matches the TS
+    /// compact-and-retry will-retry branch: only an error assistant message
+    /// drops (a compaction rebuild may leave any other trailing assistant
+    /// in place).
+    pub async fn drop_trailing_assistant(&self, filter: TrailingAssistantFilter) {
+        let state = self.agent.state().await;
+        let mut messages = state.messages;
+        let matches_filter = |message: &pa_agent::types::AgentMessage| {
+            let Some(pa_agent::types::Message::Assistant(assistant)) = standard_message(message)
+            else {
+                return false;
+            };
+            match filter {
+                TrailingAssistantFilter::Any => true,
+                TrailingAssistantFilter::ErrorOnly => {
+                    assistant.stop_reason == pa_agent::types::StopReason::Error
+                }
+            }
+        };
+        if messages.last().is_some_and(&matches_filter) {
+            messages.pop();
+            self.agent.set_messages(messages).await;
+        }
+    }
+
+    /// The last assistant message in the live loop context (TS
+    /// `_findLastAssistantMessage`), in the session wire shape: trailing
+    /// non-assistant rows (a compaction outcome disclosure, a compaction
+    /// summary) are skipped, not matched.
+    pub async fn last_assistant_message(&self) -> Option<SessionAgentMessage> {
+        let state = self.agent.state().await;
+        state.messages.iter().rev().find_map(|message| {
+            let value = serde_json::to_value(message).ok()?;
+            let message: SessionAgentMessage = serde_json::from_value(value).ok()?;
+            matches!(message, SessionAgentMessage::Assistant(_)).then_some(message)
+        })
     }
 
     /// Execute `/compact`: summarize the pre-cut prefix, persist the

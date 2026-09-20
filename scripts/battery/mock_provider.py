@@ -11,24 +11,29 @@ Script file format:
       "responses": [
         {"text": "hello"},
         {"toolCall": {"name": "bash", "arguments": {"command": "echo hi"}}},
+        {"error": "prompt is too long: 213462 tokens > 200000 maximum", "status": 400},
         {"text": "done", "delayMs": 500, "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110, "prompt_tokens_details": {"cached_tokens": 80}}}
       ],
       "queues": [
-        {"name": "child", "match": ["child task text"], "responses": [{"text": "child reply"}]}
+        {"name": "child", "match": ["child task text"], "matchModels": ["mock-1"], "responses": [{"text": "child reply"}]}
       ]
     }
-Optional per-response keys: `delayMs` (stream starts after the delay) and
-`usage` (overrides the reported token usage, so a flow can push the session
-past a context/compaction threshold deterministically).
+Optional per-response keys: `delayMs` (stream starts after the delay), `usage`
+(overrides the reported token usage, so a flow can push the session past a
+context/compaction threshold deterministically), and `error`/`status` (a
+scripted provider failure: the non-2xx answer carries the OpenAI error body,
+so a flow can script overflow probes identically for both binaries).
 
 Responses are SESSION-SCOPED, not global. The chat-completions wire carries
-no session id, so a queue is selected per request by its `match` markers
-against the concatenated text of the request's user-role messages: the first
-queue whose marker appears there serves the request; a request that matches
-no queue falls through to the default `responses` queue. This keeps a parent
-session and a spawned child session (which race the provider concurrently)
-on independent scripted response cursors instead of popping one shared
-queue in arrival order. User-role text is the discriminator because a
+no session id, so a queue is selected per request: the first queue whose
+`matchModels` entry equals the request's model id, or whose `match` marker
+appears in the concatenated text of the request's user-role messages, serves
+the request; a request that matches no queue falls through to the default
+`responses` queue. This keeps a parent session and a spawned child session
+(which race the provider concurrently) on independent scripted response
+cursors instead of popping one shared queue in arrival order, and keeps
+model-routed flows (a scripted turn model vs a dashboard status-line model)
+off each other's cursors. User-role text is the discriminator because a
 parent's post-tool continuation embeds the child's task text in tool-call
 arguments and tool results; matching those would misroute the parent.
 Each queue pops its next scripted response per matching request
@@ -95,6 +100,7 @@ class MockState:
                     {
                         "name": queue["name"],
                         "match": queue.get("match", []),
+                        "matchModels": queue.get("matchModels", []),
                         "responses": queue["responses"],
                         "index": 0,
                     }
@@ -102,14 +108,17 @@ class MockState:
 
     def next_response(self, body: dict):
         """Pop the next scripted response for this request's session: the
-        first queue whose markers appear in the request's user-message
-        text serves it; no match falls through to the default queue.
-        Returns the serving queue's name and the scripted entry."""
+        first queue whose model id or user-text markers match serves it;
+        no match falls through to the default queue. Returns the serving
+        queue's name and the scripted entry."""
         with self.lock:
             self._reload_if_changed()
             user_text = user_message_text(body)
+            model = body.get("model", "")
             for queue in self.queues:
-                if any(marker in user_text for marker in queue["match"]):
+                matched_model = model in queue["matchModels"]
+                matched_text = any(marker in user_text for marker in queue["match"])
+                if matched_model or matched_text:
                     entry = queue["responses"][min(queue["index"], len(queue["responses"]) - 1)]
                     queue["index"] += 1
                     return queue["name"], entry
@@ -176,6 +185,16 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 + "\n"
             )
+        # Optional scripted provider failure: `{"error": "<message>",
+        # "status": 400}` answers with a non-2xx status and the OpenAI
+        # error body, so a flow can script provider failures (overflow
+        # probes included) identically for both binaries.
+        if "error" in entry:
+            error_body = {"message": entry["error"]}
+            if entry.get("errorType"):
+                error_body["type"] = entry["errorType"]
+            self._json(int(entry.get("status") or 400), {"error": error_body})
+            return
         # Optional scripted delay: the response starts streaming after
         # `delayMs`, so a battery flow can hold a session mid-turn.
         delay_ms = float(entry.get("delayMs") or 0)

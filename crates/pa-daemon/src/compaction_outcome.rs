@@ -10,7 +10,7 @@
 use serde_json::Value;
 
 use crate::agent_engine::AgentSessionEngine;
-use crate::compaction::compaction_end_payload;
+use crate::compaction::compaction_end_unsuccessful;
 use crate::engine::EngineEvent;
 use crate::session_commands::custom_message_value;
 use pa_core::session_engine::messages::{CompactionOutcomeKind, CompactionOutcomeReason};
@@ -21,12 +21,14 @@ impl AgentSessionEngine {
     /// `_endCompactionUnsuccessfully`: the disclosure row's message pair
     /// goes out first, the end event second; both carry `willRetry: false`).
     /// Returns `false` when the emitter asked to stop.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn emit_unsuccessful_compaction(
         &self,
         reason: CompactionOutcomeReason,
         outcome: CompactionOutcomeKind,
         message: &str,
         error_severity: Option<&str>,
+        custom_instructions: Option<&str>,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) -> bool {
         // The durable row + live-context insertion (TS
@@ -48,13 +50,12 @@ impl AgentSessionEngine {
                 return false;
             }
         }
-        let event = compaction_end_payload(
+        let event = compaction_end_unsuccessful(
             reason.wire(),
-            None,
             false,
             Some(message),
             error_severity,
-            None,
+            custom_instructions,
         );
         emit(EngineEvent::Compaction {
             entry: Value::Null,

@@ -86,6 +86,9 @@ SCALE_RESUME_MAX_READY_S = 30.0
 SCALE_RESUME_MAX_RATIO = 2.0
 
 HELLO_TEXT = "battery hello from mock"
+# The scripted Anthropic-style overflow error (B-31): an error-pattern text
+# both overflow classifiers detect, so the compact-and-retry arm fires.
+OVERFLOW_ERROR_TEXT = "prompt is too long: 213462 tokens > 200000 maximum"
 # The dashboard status-line model the TS daemon asks after each turn (B-7).
 STATUSLINE_MODEL_ID = "qwen/qwen3-30b-a3b-instruct-2507"
 AGENT_STATUS_SYSTEM_PROMPT_PREFIX = "You generate a status line for an AI coding agent dashboard."
@@ -746,6 +749,57 @@ class Battery:
                 evidence="statusline-requests.json",
             )
 
+    def overflow_wire_projection(self, events: list) -> list:
+        """The overflow-relevant wire surface of one session: the
+        compaction event pair and the compaction_outcome rows, in order
+        (token counts, ids, and timestamps differ per side; the error
+        message text of the scripted provider failure is normalized to its
+        overflow phrase)."""
+        rows = []
+        for frame in events:
+            if not isinstance(frame, dict) or frame.get("type") != "session_event":
+                continue
+            event = frame.get("event") or {}
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") == "compaction_start":
+                rows.append(
+                    {"type": "compaction_start", "reason": event.get("reason")}
+                )
+            elif event.get("type") == "compaction_end":
+                rows.append(
+                    {
+                        "type": "compaction_end",
+                        "reason": event.get("reason"),
+                        "willRetry": event.get("willRetry"),
+                        "hasResult": bool(event.get("result")),
+                        "errorMessage": event.get("errorMessage"),
+                        "errorSeverity": event.get("errorSeverity"),
+                    }
+                )
+            elif event.get("type") in ("message_start", "message_end"):
+                message = event.get("message") or {}
+                if not isinstance(message, dict):
+                    continue
+                if message.get("customType") == "compaction_outcome":
+                    rows.append(
+                        {
+                            "type": "compaction_outcome",
+                            "content": message.get("content"),
+                            "details": message.get("details"),
+                            "display": message.get("display"),
+                        }
+                    )
+                elif message.get("role") == "assistant" and message.get("stopReason") == "error":
+                    error_text = message.get("errorMessage") or ""
+                    rows.append(
+                        {
+                            "type": "assistant_error",
+                            "overflow": OVERFLOW_ERROR_TEXT in error_text,
+                        }
+                    )
+        return rows
+
     def ensure_daemon(self, side: B.Side) -> None:
         """A daemon must be listening on the side socket; start one if not."""
         try:
@@ -978,8 +1032,137 @@ class Battery:
                     f"{side.name}: daemon 'compact' failed: {json.dumps(compact)[:300]}",
                     evidence=side.root / flow / "compact-response.json",
                 )
-            wire.close()
-            self.copy_sessions(side, flow)
+
+        # B-31 differential: the overflow compact-and-retry arm (TS
+        # `_checkCompaction` Case 1). A scripted Anthropic-style overflow
+        # error triggers one compaction (compaction_start + compaction_end,
+        # reason "overflow", willRetry true) and the turn re-issues on the
+        # compacted context; the second overflow ends the run with the
+        # reported failure surface — the durable compaction_outcome row and
+        # the compaction_end failure — on both sides. A shrunken
+        # keep-recent budget gives the recovery pre-cut history to summarize
+        # (the default 64k keeps a one-turn session whole, and the recovery
+        # would skip — covered by the durable rows either way).
+        overflow_replies = {}
+        for side in (self.sides["ts"], self.sides["rust"]):
+            self.ensure_daemon(side)
+            settings_path = side.agent_dir / "settings.json"
+            prior_settings = (
+                settings_path.read_text() if settings_path.exists() else None
+            )
+            settings_path.write_text(
+                json.dumps({"compaction": {"keepRecentTokens": 10, "reserveTokens": 1000}})
+            )
+            try:
+                wire = B.Wire(side.daemon_socket)
+                create = wire.request(
+                    "oc1",
+                    {
+                        "type": "create",
+                        "name": "battery-overflow",
+                        "config": self.session_config(side),
+                    },
+                    timeout=120,
+                )
+                side.evidence_json(flow, "overflow-create-response.json", create)
+                session_id = (
+                    create.get("data", {}).get("activeSessionId") or create.get("data", {}).get("id") or ""
+                )
+                if create.get("success") is not True:
+                    self.record(
+                        flow,
+                        "protocol",
+                        f"{side.name}: overflow session create failed: {json.dumps(create)[:300]}",
+                    )
+                    wire.close()
+                    continue
+                # An attached client receives the compaction event pair; the
+                # prompting connection only carries the command responses.
+                attacher = B.Wire(side.daemon_socket)
+                attach = attacher.request(
+                    "oa1",
+                    {"type": "attach", "activeSessionId": session_id},
+                    timeout=60,
+                )
+                side.evidence_json(flow, "overflow-attach-response.json", attach)
+                # Model-routed queue: seed turn, probe error, summarizer,
+                # and the retry error all draw from the scripted sequence;
+                # the dashboard status-line model falls through to the
+                # default queue.
+                side.mock.set_responses(
+                    [{"text": "statusline filler"}],
+                    queues=[
+                        {
+                            "name": "overflow",
+                            "matchModels": ["mock-1"],
+                            "responses": [
+                                {"text": "seed reply"},
+                                {"error": OVERFLOW_ERROR_TEXT},
+                                {"text": "the overflow summary"},
+                                {"error": OVERFLOW_ERROR_TEXT},
+                            ],
+                        }
+                    ],
+                )
+                seed = wire.request(
+                    "os1",
+                    {
+                        "type": "prompt_and_wait",
+                        "activeSessionId": session_id,
+                        "message": "seed turn before the overflow probe",
+                    },
+                    timeout=240,
+                )
+                side.evidence_json(flow, "overflow-seed-response.json", seed)
+                attacher.drain(3.0)
+                attacher.events.clear()
+                mark = len(side.mock.requests())
+                # A seed turn plus a probe past the keep-recent budget give
+                # the recovery pre-cut history to summarize (the cut lands
+                # at the probe turn, leaving the seed turn to summarize).
+                prompt = wire.request(
+                    "op1",
+                    {
+                        "type": "prompt_and_wait",
+                        "activeSessionId": session_id,
+                        "message": "overflow probe " + ("x" * 400),
+                    },
+                    timeout=240,
+                )
+                side.evidence_json(flow, "overflow-prompt-response.json", prompt)
+                attacher.drain(5.0)
+                overflow_replies[side.name] = self.overflow_wire_projection(attacher.events)
+                side.evidence_json(flow, "overflow-wire-projection.json", overflow_replies[side.name])
+                side.evidence_json(flow, "overflow-attach-events.json", attacher.events)
+                side.evidence_json(flow, "overflow-mock-requests.json", self.new_mock_requests(side, mark))
+                wire.close()
+                attacher.close()
+                self.copy_sessions(side, flow)
+            finally:
+                if prior_settings is None:
+                    settings_path.unlink(missing_ok=True)
+                else:
+                    settings_path.write_text(prior_settings)
+        if overflow_replies.get("ts") is not None and overflow_replies.get("rust") is not None:
+            if overflow_replies["ts"] == overflow_replies["rust"] and overflow_replies["ts"]:
+                self.record(
+                    flow,
+                    "behavior",
+                    "overflow compact-and-retry wire surface identical: "
+                    f"{json.dumps(overflow_replies['ts'])[:300]}",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow,
+                    "behavior",
+                    f"overflow compact-and-retry wire surface differs: ts={json.dumps(overflow_replies.get('ts'))[:400]} "
+                    f"rust={json.dumps(overflow_replies.get('rust'))[:400]}",
+                    evidence=[
+                        side.root / flow / "overflow-wire-projection.json"
+                        for side in self.sides.values()
+                    ],
+                )
 
     def f8_resume(self) -> None:
         """Exit + resume: headless session persisted, then continued in both."""

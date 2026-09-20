@@ -105,8 +105,10 @@ class MockProvider:
     def set_responses(self, responses: list[dict], queues: list[dict] | None = None) -> None:
         """Write the mock script. `responses` is the default queue; each
         entry of `queues` is a session-scoped queue ({"name", "match",
-        "responses"}) served to requests whose user-message text contains
-        one of its markers (mock_provider.py picks per request)."""
+        "matchModels", "responses"}) served to requests whose model id
+        (matchModels) or user-message text (match markers) selects it
+        (mock_provider.py picks per request). An entry may also be a
+        scripted provider failure: {"error": "<message>", "status": 400}."""
         script = {"responses": responses}
         if queues:
             script["queues"] = queues
