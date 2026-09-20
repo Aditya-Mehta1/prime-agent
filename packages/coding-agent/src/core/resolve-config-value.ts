@@ -3,10 +3,26 @@
  * Used by auth-storage.ts and model-registry.ts.
  */
 
-import { execSyncHidden, spawnSyncHidden } from "../utils/child-process.js";
+import { execFileHidden, execHidden, execSyncHidden, spawnSyncHidden } from "../utils/child-process.js";
 import { getShellConfig } from "../utils/shell.js";
 
 const commandResultCache = new Map<string, string | undefined>();
+
+/**
+ * How long a `!command` result stays cached for the per-request async path.
+ * Rotation commands change their output between requests; a short TTL plus
+ * auth-failure invalidation bounds staleness while removing the per-request
+ * shell spawn.
+ */
+export const COMMAND_RESULT_TTL_MS = 10_000;
+
+interface CommandTtlEntry {
+	value: string | undefined;
+	expiresAt: number;
+}
+
+const commandTtlCache = new Map<string, CommandTtlEntry>();
+const commandTtlInFlight = new Map<string, Promise<string | undefined>>();
 
 /**
  * Resolve a config value (API key, header value, etc.) to an actual value.
@@ -81,6 +97,94 @@ function executeCommandUncached(commandConfig: string): string | undefined {
 		: executeWithDefaultShell(command);
 }
 
+function executeWithDefaultShellAsync(command: string): Promise<string | undefined> {
+	return new Promise((resolvePromise) => {
+		execHidden(command, { encoding: "utf-8", timeout: 10000 }, (error, stdout) => {
+			resolvePromise(error ? undefined : stdout.trim() || undefined);
+		}).stdin?.end();
+	});
+}
+
+function executeWithConfiguredShellAsync(command: string): Promise<{ executed: boolean; value: string | undefined }> {
+	return new Promise((resolvePromise) => {
+		let shell: string;
+		let shellArgs: string[];
+		try {
+			({ shell, args: shellArgs } = getShellConfig());
+		} catch {
+			resolvePromise({ executed: false, value: undefined });
+			return;
+		}
+		execFileHidden(shell, [...shellArgs, command], { encoding: "utf-8", timeout: 10000 }, (error, stdout) => {
+			if (error) {
+				const code = (error as NodeJS.ErrnoException).code;
+				resolvePromise({ executed: code !== "ENOENT", value: undefined });
+				return;
+			}
+			resolvePromise({ executed: true, value: stdout.trim() || undefined });
+		}).stdin?.end();
+	});
+}
+
+async function executeCommandUncachedAsync(commandConfig: string): Promise<string | undefined> {
+	const command = commandConfig.slice(1);
+	if (process.platform !== "win32") {
+		return executeWithDefaultShellAsync(command);
+	}
+	const configuredResult = await executeWithConfiguredShellAsync(command);
+	return configuredResult.executed ? configuredResult.value : executeWithDefaultShellAsync(command);
+}
+
+async function resolveCommandConfigValueTtl(commandConfig: string): Promise<string | undefined> {
+	const cached = commandTtlCache.get(commandConfig);
+	if (cached && Date.now() < cached.expiresAt) {
+		return cached.value;
+	}
+	const inFlight = commandTtlInFlight.get(commandConfig);
+	if (inFlight) return inFlight;
+	const pending = executeCommandUncachedAsync(commandConfig)
+		.then((value) => {
+			// Cache only defined results (failures self-heal on the next request) and
+			// only while this exec is still the current one: an invalidation during
+			// the exec disowned it, so its possibly pre-rotation output is not cached.
+			if (value !== undefined && commandTtlInFlight.get(commandConfig) === pending) {
+				commandTtlCache.set(commandConfig, { value, expiresAt: Date.now() + COMMAND_RESULT_TTL_MS });
+			}
+			return value;
+		})
+		.finally(() => {
+			if (commandTtlInFlight.get(commandConfig) === pending) {
+				commandTtlInFlight.delete(commandConfig);
+			}
+		});
+	commandTtlInFlight.set(commandConfig, pending);
+	return pending;
+}
+
+/**
+ * Resolve a config value without blocking the event loop: `!command` configs
+ * exec asynchronously and share one result per TTL window (plus in-flight
+ * dedupe); env vars and literals resolve as in the sync path.
+ */
+export function resolveConfigValueAsync(config: string): Promise<string | undefined> {
+	if (config.startsWith("!")) {
+		return resolveCommandConfigValueTtl(config);
+	}
+	return Promise.resolve(resolveEnvOrLiteral(config));
+}
+
+/**
+ * Drop the cached result of a `!command` config, and disown an exec still in
+ * flight (its output may predate the rotation), so the next resolution re-runs
+ * the command (auth failures, rotation).
+ */
+export function invalidateCommandTtlCacheEntry(config: string): void {
+	if (config.startsWith("!")) {
+		commandTtlCache.delete(config);
+		commandTtlInFlight.delete(config);
+	}
+}
+
 function executeCommand(commandConfig: string): string | undefined {
 	if (commandResultCache.has(commandConfig)) {
 		return commandResultCache.get(commandConfig);
@@ -103,6 +207,20 @@ export function resolveConfigValueUncached(config: string): string | undefined {
 
 export function resolveConfigValueOrThrow(config: string, description: string): string {
 	const resolvedValue = resolveConfigValueUncached(config);
+	if (resolvedValue !== undefined) {
+		return resolvedValue;
+	}
+
+	if (config.startsWith("!")) {
+		throw new Error(`Failed to resolve ${description} from shell command: ${config.slice(1)}`);
+	}
+
+	throw new Error(`Failed to resolve ${description}`);
+}
+
+/** Async variant of resolveConfigValueOrThrow for per-request resolution on the event loop. */
+export async function resolveConfigValueOrThrowAsync(config: string, description: string): Promise<string> {
+	const resolvedValue = await resolveConfigValueAsync(config);
 	if (resolvedValue !== undefined) {
 		return resolvedValue;
 	}
@@ -137,6 +255,19 @@ export function resolveHeadersOrThrow(
 	const resolved: Record<string, string> = {};
 	for (const [key, value] of Object.entries(headers)) {
 		resolved[key] = resolveConfigValueOrThrow(value, `${description} header "${key}"`);
+	}
+	return Object.keys(resolved).length > 0 ? resolved : undefined;
+}
+
+/** Async variant of resolveHeadersOrThrow for per-request resolution on the event loop. */
+export async function resolveHeadersOrThrowAsync(
+	headers: Record<string, string> | undefined,
+	description: string,
+): Promise<Record<string, string> | undefined> {
+	if (!headers) return undefined;
+	const resolved: Record<string, string> = {};
+	for (const [key, value] of Object.entries(headers)) {
+		resolved[key] = await resolveConfigValueOrThrowAsync(value, `${description} header "${key}"`);
 	}
 	return Object.keys(resolved).length > 0 ? resolved : undefined;
 }
