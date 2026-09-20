@@ -150,6 +150,24 @@ impl AgentSession {
         self.compaction = settings;
     }
 
+    /// Whether an automatic threshold compaction is due at a turn boundary
+    /// (the TS `_checkCompaction` threshold arm, fired at `agent_end` and
+    /// before the next admitted prompt): the live loop context over the
+    /// model's context window and the compaction reserve headroom. Usage
+    /// from before the latest compaction never re-triggers.
+    pub async fn auto_compaction_due(&self, context_window: u64) -> bool {
+        let state = self.agent.state().await;
+        // The live loop context is the agent's message list (the same JSON
+        // round-trip `compact` uses for its rebuilt context).
+        let messages: Vec<SessionAgentMessage> = state
+            .messages
+            .iter()
+            .filter_map(|message| serde_json::to_value(message).ok())
+            .filter_map(|value| serde_json::from_value(value).ok())
+            .collect();
+        compaction::threshold_compaction_due(&messages, context_window, &self.compaction)
+    }
+
     /// Execute `/compact`: summarize the pre-cut prefix, persist the
     /// compaction entry, and rebuild the loop context summary-first. A skip
     /// (already compacted, or nothing to summarize) leaves the session

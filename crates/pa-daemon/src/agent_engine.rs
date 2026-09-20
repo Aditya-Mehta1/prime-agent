@@ -28,6 +28,7 @@ use pa_core::session_engine::session_commands::{
 };
 use pa_types::ai::Model;
 
+use crate::auto_compaction::AutoCompactionRun;
 use crate::engine::{
     BranchSummaryOutcome, BranchSummaryRequest, BranchSummaryRun, CompactionOutcome,
     CompactionRequest, CompactionRun, EngineEvent, EngineModelSelection, PromptRequest,
@@ -423,7 +424,7 @@ impl AgentSessionEngine {
     /// registers once per engine: its queued responses then span the whole
     /// session (multi-turn scripts), instead of replaying from the top on
     /// every model resolution.
-    fn resolve_model(&self) -> anyhow::Result<Model> {
+    pub(crate) fn resolve_model(&self) -> anyhow::Result<Model> {
         if let Some(script) = &self.config.faux_script {
             if let Some(model) = self.faux_model.get() {
                 return Ok(model.clone());
@@ -478,7 +479,7 @@ impl AgentSessionEngine {
     /// TS `setRuntimeApiKey` path), else the registry's auth resolution
     /// (auth storage, then the models.json provider `apiKey` — the same
     /// sources `getApiKeyAndHeaders` merges in the TS product).
-    fn resolve_request_api_key(&self, model: &Model) -> Option<String> {
+    pub(crate) fn resolve_request_api_key(&self, model: &Model) -> Option<String> {
         if let Some(api_key) = &self.current_selection().api_key {
             return Some(api_key.clone());
         }
@@ -2176,6 +2177,12 @@ impl AgentSessionEngine {
         loop {
             let images: &[pa_agent::types::ImageContent] = if first { first_images } else { &[] };
             first = false;
+            // TS `_runPreTurnCompaction` (`beforeModelSelection` for queued
+            // prompts): a threshold crossing that predates this admission
+            // compacts before the turn runs; the turn then proceeds.
+            if self.run_auto_compaction(emit) == AutoCompactionRun::Cancelled {
+                return;
+            }
             let turn = self.run_model_turn(&prompt, images, aborted, emit);
             let assistant = match turn {
                 TurnResult::Message(assistant) => assistant,
@@ -2203,6 +2210,15 @@ impl AgentSessionEngine {
                     return;
                 }
                 BoundaryRun::Proceed => {}
+            }
+            // TS agent_end `_checkCompaction` threshold arm (after the
+            // requested arm, which never falls through to it): the settled
+            // turn's usage crossing the reserve headroom auto-compacts;
+            // the autonomous continuation decision below still runs, so a
+            // continuation the driver queues continues after the
+            // compaction like the TS queued continuation.
+            if self.run_auto_compaction(emit) == AutoCompactionRun::Cancelled {
+                return;
             }
             match self.autonomous_follow_up(&assistant) {
                 AutonomousFollowUp::Inactive => {
@@ -2815,6 +2831,235 @@ mod tests {
             telemetry_disabled: None,
         })
         .unwrap()
+    }
+
+    /// A settings.json with an explicit compaction reserve (the f14 battery
+    /// shape: `reserveTokens` set so a seeded usage crosses the headroom).
+    fn write_compaction_settings(dir: &std::path::Path, reserve_tokens: u64) {
+        std::fs::create_dir_all(dir.join("agent")).unwrap();
+        std::fs::write(
+            dir.join("agent").join("settings.json"),
+            serde_json::json!({ "compaction": { "enabled": true, "reserveTokens": reserve_tokens, "keepRecentTokens": 10 } })
+                .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// One faux-driven engine over its own tempdir (settings written before
+    /// the first prompt so the session build resolves them).
+    fn faux_engine_with_settings(
+        script: serde_json::Value,
+        reserve_tokens: u64,
+    ) -> (AgentSessionEngine, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_compaction_settings(dir.path(), reserve_tokens);
+        let engine = AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir: dir.path().join("agent"),
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: None,
+            faux_script: Some(script.to_string()),
+            supervisor_link: None,
+            telemetry_disabled: None,
+        })
+        .unwrap();
+        (engine, dir)
+    }
+
+    /// Admit one prompt through the engine, collecting its events.
+    fn admit(engine: &AgentSessionEngine, message: String, events: &mut Vec<EngineEvent>) {
+        engine.run_prompt(
+            0,
+            PromptRequest {
+                images: Vec::new(),
+                message,
+                source: "user".to_string(),
+                agent_message_id: None,
+                custom_message: None,
+            },
+            &|| false,
+            &mut |event| {
+                events.push(event);
+                true
+            },
+        );
+    }
+
+    /// The automatic threshold compaction at the turn boundary (TS
+    /// `_checkCompaction` threshold arm): a settled turn whose usage
+    /// crosses the reserve headroom emits the `compaction_start` /
+    /// `compaction_end` pair with the `threshold` reason, runs the
+    /// summarizer, and rewrites the loop context.
+    ///
+    /// The faux provider estimates usage from the serialized context (the
+    /// f14 battery's mock-provider shape is not part of the faux script),
+    /// so the probe engine first measures one baseline turn's usage and the
+    /// threshold engine places the headroom halfway between that baseline
+    /// and the baseline plus the big prompt (~12k tokens of `x`s) —
+    /// environment-independent margins on both sides.
+    #[test]
+    fn threshold_crossing_auto_compacts_with_the_event_pair() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Probe: the baseline turn's total usage (system prompt included).
+        let (probe, _probe_dir) = faux_engine_with_settings(
+            serde_json::json!({ "responses": [{"text": "seed reply"}] }),
+            1,
+        );
+        let mut probe_events: Vec<EngineEvent> = Vec::new();
+        admit(&probe, "seed turn".to_string(), &mut probe_events);
+        let baseline = probe_events
+            .iter()
+            .find_map(|event| match event {
+                EngineEvent::AssistantMessage(message) => message["usage"]["totalTokens"].as_u64(),
+                _ => None,
+            })
+            .expect("probe turn produced usage");
+        assert!(
+            baseline < 100_000,
+            "the probe baseline is implausibly large: {baseline}"
+        );
+        drop(probe);
+
+        // ~12k tokens of deterministic extra context on the crossing turn.
+        let big_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
+        let big_tokens = (48_000 + "seed turn  crossing".len() as u64).div_ceil(4);
+        // The headroom sits between the two turns' usage (the f14 battery
+        // shape: reserveTokens so exactly the seeded crossing fires).
+        let headroom = baseline + big_tokens / 2;
+        let (engine, _engine_dir) = faux_engine_with_settings(
+            serde_json::json!({
+                "responses": [
+                    {"text": "seed reply"},
+                    {"text": "crossing reply"},
+                    {"text": "the summary"},
+                ],
+            }),
+            128_000u64.saturating_sub(headroom).max(1),
+        );
+
+        let mut events: Vec<EngineEvent> = Vec::new();
+        // The seed turn stays below the headroom: no compaction events.
+        admit(&engine, "seed turn".to_string(), &mut events);
+        assert_eq!(
+            assistant_texts(&events),
+            vec!["seed reply".to_string()],
+            "the seed turn answered"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                EngineEvent::CompactionStart { .. } | EngineEvent::Compaction { .. }
+            )),
+            "no compaction below the headroom"
+        );
+        // The threshold-crossing turn: the settled usage fires the
+        // `compaction_start`/`compaction_end` pair with the `threshold`
+        // reason, after the assistant message (TS agent_end order).
+        admit(&engine, big_prompt, &mut events);
+        let assistant_index = events
+            .iter()
+            .rposition(|event| matches!(event, EngineEvent::AssistantMessage(_)))
+            .expect("assistant message emitted");
+        let start_index = events
+            .iter()
+            .position(|event| {
+                matches!(event, EngineEvent::CompactionStart { event } if event["reason"] == "threshold")
+            })
+            .expect("threshold compaction_start emitted");
+        assert!(
+            start_index > assistant_index,
+            "the check fires at the settled turn boundary"
+        );
+        let EngineEvent::CompactionStart { event } = &events[start_index] else {
+            unreachable!();
+        };
+        assert_eq!(
+            event,
+            &serde_json::json!({ "type": "compaction_start", "reason": "threshold" })
+        );
+        // The durable end event carries the entry and the client-facing
+        // result with the summarizer's text (the summarizer consumed the
+        // third scripted response).
+        let compaction_index = events
+            .iter()
+            .position(|event| matches!(event, EngineEvent::Compaction { .. }))
+            .expect("compaction_end emitted");
+        let EngineEvent::Compaction { entry, event } = &events[compaction_index] else {
+            unreachable!();
+        };
+        assert!(compaction_index > start_index);
+        assert_eq!(event["reason"], "threshold");
+        assert_eq!(event["result"]["summary"], "the summary");
+        assert!(entry["firstKeptEntryId"].is_string());
+        // Exactly one pair for the admission: the pre-turn check on the
+        // first iteration sees no built session (nothing to compact), and
+        // the post-turn check fires once — no double compaction.
+        let start_count = events
+            .iter()
+            .filter(|event| matches!(event, EngineEvent::CompactionStart { .. }))
+            .count();
+        let end_count = events
+            .iter()
+            .filter(|event| matches!(event, EngineEvent::Compaction { .. }))
+            .count();
+        assert_eq!((start_count, end_count), (1, 1));
+    }
+
+    /// Below the headroom nothing fires: the threshold check stays silent
+    /// for turns whose usage fits the default 16k reserve (a 111k headroom
+    /// on the 128k window).
+    #[test]
+    fn threshold_below_the_headroom_stays_silent() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir: dir.path().join("agent"),
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: None,
+            faux_script: Some(
+                serde_json::json!({ "responses": [{"text": "plain reply"}] }).to_string(),
+            ),
+            supervisor_link: None,
+            telemetry_disabled: None,
+        })
+        .unwrap();
+        let mut events: Vec<EngineEvent> = Vec::new();
+        engine.run_prompt(
+            0,
+            PromptRequest {
+                images: Vec::new(),
+                message: "a small turn".to_string(),
+                source: "user".to_string(),
+                agent_message_id: None,
+                custom_message: None,
+            },
+            &|| false,
+            &mut |event| {
+                events.push(event);
+                true
+            },
+        );
+        assert_eq!(assistant_texts(&events), vec!["plain reply".to_string()]);
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                EngineEvent::CompactionStart { .. } | EngineEvent::Compaction { .. }
+            )),
+            "no compaction events below the headroom"
+        );
     }
 
     /// A prompt with images records the attachments as multimodal content

@@ -45,7 +45,8 @@ pub(crate) fn run_session_command(
     }
     if is_compact {
         let custom_instructions = compact_custom_instructions(&command);
-        let start = crate::compaction::compaction_start_event(custom_instructions.as_deref());
+        let start =
+            crate::compaction::compaction_start_event("manual", custom_instructions.as_deref());
         if !emit(EngineEvent::CompactionStart { event: start }) {
             return None;
         }

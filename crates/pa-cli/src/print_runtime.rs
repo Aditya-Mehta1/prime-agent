@@ -650,6 +650,21 @@ async fn run_prompts_and_emit(
         if let Some(Err(error)) = &consumption.refinement {
             eprintln!("pa-cli: requested refinement failed: {error:#}");
         }
+        // The automatic threshold compaction at the same quiescent
+        // boundary (TS `_checkCompaction` threshold arm at `agent_end`):
+        // the settled turn's usage crossing the reserve headroom
+        // compacts before the next prompt. The outcome persists in the
+        // session entries the headless terminal result reads
+        // (compaction outcomes surface like `/compact` runs).
+        if engine
+            .session
+            .auto_compaction_due(model.context_window)
+            .await
+        {
+            if let Err(error) = engine.session.compact(None, model, api_key.clone()).await {
+                eprintln!("pa-cli: auto-compaction failed: {error:#}");
+            }
+        }
         if let Some(run) = &autonomous {
             if let Some(row) = run
                 .drive(engine)

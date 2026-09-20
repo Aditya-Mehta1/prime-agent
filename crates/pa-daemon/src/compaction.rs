@@ -83,7 +83,7 @@ impl CompactionManager {
             let mut core = self.core.lock().unwrap();
             core.compacting = true;
         }
-        let start = compaction_start_event(custom_instructions.as_deref());
+        let start = compaction_start_event("manual", custom_instructions.as_deref());
         let _ = self.emit_session_event(start);
 
         let engine = Arc::clone(&self.engine);
@@ -237,10 +237,12 @@ impl CompactionManager {
 }
 
 /// The `compaction_start` event payload (TS `AgentSessionEvent`). Shared by
-/// every compaction surface: the `compact` RPC and the `/compact` session
-/// command both emit the same shape.
-pub(crate) fn compaction_start_event(custom_instructions: Option<&str>) -> Value {
-    let mut event = json!({ "type": "compaction_start", "reason": "manual" });
+/// every compaction surface: the `compact` RPC, the `/compact` session
+/// command, and the automatic threshold compaction all emit the same shape
+/// with their own `reason` (`manual` / `threshold`; TS
+/// `CompactionOutcomeReason`).
+pub(crate) fn compaction_start_event(reason: &str, custom_instructions: Option<&str>) -> Value {
+    let mut event = json!({ "type": "compaction_start", "reason": reason });
     if let Some(custom_instructions) = custom_instructions {
         event["customInstructions"] = json!(custom_instructions);
     }
@@ -335,7 +337,7 @@ mod tests {
             usage: None,
         };
         assert_eq!(
-            compaction_start_event(Some("focus on the goal")),
+            compaction_start_event("manual", Some("focus on the goal")),
             json!({
                 "type": "compaction_start",
                 "reason": "manual",
@@ -343,7 +345,7 @@ mod tests {
             })
         );
         assert_eq!(
-            compaction_start_event(None),
+            compaction_start_event("manual", None),
             json!({ "type": "compaction_start", "reason": "manual" })
         );
         assert_eq!(

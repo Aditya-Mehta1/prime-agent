@@ -143,6 +143,103 @@ pub fn should_compact(
     context_tokens > context_window.saturating_sub(settings.reserve_tokens)
 }
 
+/// The message-anchored context estimate over the live loop context (TS
+/// `estimateContextTokens`): the last valid assistant usage anchors the
+/// estimate, and messages after it add their chars/4 heuristic estimates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextTokensEstimate {
+    /// Usage tokens plus trailing estimates (TS `estimate.tokens`).
+    pub tokens: u64,
+    /// The live-message index the estimate anchored on (TS `lastUsageIndex`;
+    /// `None` when the context carries no valid assistant usage).
+    pub last_usage_index: Option<usize>,
+}
+
+pub fn estimate_context_tokens(messages: &[AgentMessage]) -> ContextTokensEstimate {
+    match messages
+        .iter()
+        .rposition(|message| assistant_usage(message).is_some())
+    {
+        Some(index) => {
+            let usage = assistant_usage(&messages[index]).expect("index from rposition");
+            let trailing: u64 = messages[index + 1..].iter().map(estimate_tokens).sum();
+            ContextTokensEstimate {
+                tokens: calculate_context_tokens(&usage) + trailing,
+                last_usage_index: Some(index),
+            }
+        }
+        None => ContextTokensEstimate {
+            tokens: messages.iter().map(estimate_tokens).sum(),
+            last_usage_index: None,
+        },
+    }
+}
+
+/// A message's timestamp (millis since the epoch; every role carries one).
+fn message_timestamp(message: &AgentMessage) -> u64 {
+    match message {
+        AgentMessage::User(user) => user.timestamp,
+        AgentMessage::Assistant(assistant) => assistant.timestamp,
+        AgentMessage::Custom(custom) => custom.timestamp,
+        AgentMessage::ToolResult(result) => result.timestamp,
+        AgentMessage::BashExecution(bash) => bash.timestamp,
+        AgentMessage::BranchSummary(summary) => summary.timestamp,
+        AgentMessage::CompactionSummary(summary) => summary.timestamp,
+    }
+}
+
+/// The threshold-crossing check behind the TS `_checkCompaction` threshold
+/// arm (TS `_getThresholdContextTokens` + `shouldCompact`): whether the
+/// live context crossed the reserve headroom and an automatic compaction
+/// should run. `messages` is the session's live loop context; the newest
+/// `CompactionSummary` in it is the latest compaction boundary — usage from
+/// before it reflects the pre-compaction context and never re-triggers
+/// (the TS `assistantIsFromBeforeCompaction` / stale-usage guards).
+pub fn threshold_compaction_due(
+    messages: &[AgentMessage],
+    context_window: u64,
+    settings: &CompactionSettings,
+) -> bool {
+    if !settings.enabled || context_window == 0 {
+        return false;
+    }
+    let compaction_timestamp = messages.iter().rev().find_map(|message| match message {
+        AgentMessage::CompactionSummary(summary) => Some(summary.timestamp),
+        _ => None,
+    });
+    let estimate = estimate_context_tokens(messages);
+    let context_tokens = match estimate.last_usage_index {
+        Some(index) => {
+            // The usage anchor must postdate the latest compaction.
+            if compaction_timestamp
+                .is_some_and(|timestamp| message_timestamp(&messages[index]) <= timestamp)
+            {
+                return false;
+            }
+            estimate.tokens
+        }
+        // TS fallback: no valid usage in the context — the last assistant
+        // message's raw usage decides; error turns never trigger.
+        None => {
+            let Some(AgentMessage::Assistant(assistant)) = messages
+                .iter()
+                .rev()
+                .find(|message| matches!(message, AgentMessage::Assistant(_)))
+            else {
+                return false;
+            };
+            if assistant.stop_reason == pa_types::ai::StopReason::Error {
+                return false;
+            }
+            if compaction_timestamp.is_some_and(|timestamp| assistant.timestamp <= timestamp) {
+                return false;
+            }
+            calculate_context_tokens(&assistant.usage)
+        }
+    };
+    should_compact(context_tokens, context_window, settings)
+}
+
 /// Valid cut point indices: user/assistant/custom/branch/compaction-summary
 /// messages plus branch_summary and custom_message entries. Never tool results.
 pub fn find_valid_cut_points(
@@ -361,6 +458,131 @@ mod tests {
                 rest: Default::default(),
             }),
         )
+    }
+
+    fn user_message(text: &str, timestamp: u64) -> AgentMessage {
+        AgentMessage::User(pa_types::ai::UserMessage {
+            content: pa_types::ai::UserContent::Text(text.to_string()),
+            timestamp,
+            rest: Default::default(),
+        })
+    }
+
+    fn assistant_message(usage_total: u64, timestamp: u64) -> AgentMessage {
+        AgentMessage::Assistant(pa_types::ai::AssistantMessage {
+            content: vec![pa_types::ai::AssistantContentBlock::Text(
+                pa_types::ai::TextContent {
+                    text: "ok".to_string(),
+                    text_signature: None,
+                    rest: Default::default(),
+                },
+            )],
+            api: "openai-completions".to_string(),
+            provider: "p".to_string(),
+            model: "m".to_string(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            usage: pa_types::ai::Usage {
+                input: usage_total,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0,
+                total_tokens: usage_total,
+                cost: Default::default(),
+            },
+            stop_reason: pa_types::ai::StopReason::Stop,
+            stop_reason_raw: None,
+            error_message: None,
+            timestamp,
+            rest: Default::default(),
+        })
+    }
+
+    fn compaction_summary(timestamp: u64) -> AgentMessage {
+        AgentMessage::CompactionSummary(pa_types::session::CompactionSummaryMessage {
+            summary: "the story so far".to_string(),
+            tokens_before: 100,
+            retained_message_count: None,
+            custom_instructions: None,
+            harness_digest: None,
+            timestamp,
+        })
+    }
+
+    #[test]
+    fn estimate_context_tokens_anchors_on_the_last_valid_usage() {
+        // The last valid assistant usage anchors the estimate; messages
+        // after it add their chars/4 estimates (TS estimateContextTokens).
+        let messages = vec![
+            user_message("turn one", 1),
+            assistant_message(1_000, 2),
+            user_message("12345678", 3), // 8 chars -> 2 trailing tokens
+        ];
+        let estimate = estimate_context_tokens(&messages);
+        assert_eq!(estimate.last_usage_index, Some(1));
+        assert_eq!(estimate.tokens, 1_002);
+        // No valid usage: everything falls back to the chars/4 heuristic.
+        let messages = vec![user_message("12345678", 1)];
+        let estimate = estimate_context_tokens(&messages);
+        assert_eq!(estimate.last_usage_index, None);
+        assert_eq!(estimate.tokens, 2);
+    }
+
+    #[test]
+    fn threshold_crosses_the_reserve_headroom() {
+        // The f14 battery shape: 126_010 tokens on a 128k window with a
+        // 127_500 reserve leaves a 500-token headroom — the crossing fires.
+        let settings = CompactionSettings {
+            enabled: true,
+            reserve_tokens: 127_500,
+            keep_recent_tokens: 10,
+        };
+        let messages = vec![
+            user_message("f14 auto seed turn", 1),
+            assistant_message(110, 2),
+            user_message("f14 threshold crossing turn", 3),
+            assistant_message(126_010, 4),
+        ];
+        assert!(threshold_compaction_due(&messages, 128_000, &settings));
+        // Below the headroom nothing fires (the seed turn's default usage).
+        let messages = vec![
+            user_message("f14 auto seed turn", 1),
+            assistant_message(110, 2),
+        ];
+        assert!(!threshold_compaction_due(&messages, 128_000, &settings));
+        // Disabled settings and unknown windows never compact.
+        let disabled = CompactionSettings {
+            enabled: false,
+            reserve_tokens: 127_500,
+            keep_recent_tokens: 10,
+        };
+        assert!(!threshold_compaction_due(&messages, 128_000, &disabled));
+        assert!(!threshold_compaction_due(&messages, 0, &settings));
+    }
+
+    #[test]
+    fn stale_pre_compaction_usage_never_retriggers() {
+        // After a compaction the retained tail still carries its
+        // pre-compaction usage; the newer compaction boundary guards it.
+        let settings = CompactionSettings {
+            enabled: true,
+            reserve_tokens: 127_500,
+            keep_recent_tokens: 10,
+        };
+        let messages = vec![
+            compaction_summary(10),
+            user_message("kept turn", 5),
+            assistant_message(126_010, 6),
+        ];
+        assert!(!threshold_compaction_due(&messages, 128_000, &settings));
+        // A post-compaction usage crossing still fires.
+        let messages = vec![
+            compaction_summary(10),
+            user_message("new turn", 11),
+            assistant_message(126_010, 12),
+        ];
+        assert!(threshold_compaction_due(&messages, 128_000, &settings));
     }
 
     #[test]
