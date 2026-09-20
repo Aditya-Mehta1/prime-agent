@@ -1,5 +1,6 @@
 import type { ChildProcess } from "node:child_process";
-import { signalProcessGroupOrProcess, spawnHidden, spawnSyncHidden } from "../../utils/child-process.js";
+import { signalProcessGroupOrProcess, spawnHidden } from "../../utils/child-process.js";
+import { killOrphanProcess } from "../orphan-process-journal.js";
 import {
 	isRecord,
 	type RouterCloseOptions,
@@ -95,7 +96,10 @@ export class StdioRouterEnvironment implements RouterEnvironment {
 		child.on("error", (error) => {
 			this.failAll(new Error(`environment adapter failed to start: ${error.message}`));
 		});
-		child.on("exit", (code) => {
+		// "close", not "exit": the exit event can fire while stdout data from the
+		// adapter's final reply is still in flight; failing on close guarantees
+		// every reply line is dispatched (and the stderr tail captured) first.
+		child.on("close", (code) => {
 			if (!this.closed) {
 				this.failAll(
 					new Error(`environment adapter exited early (code ${code ?? "null"}): ${this.stderrTail.trim()}`),
@@ -225,7 +229,12 @@ export class StdioRouterEnvironment implements RouterEnvironment {
 		}
 		const budgetEndsAt =
 			Date.now() + (options.budgetMs === undefined ? Number.POSITIVE_INFINITY : Math.max(0, options.budgetMs));
-		const remainingBudget = (waitMs: number) => Math.min(waitMs, Math.max(0, budgetEndsAt - Date.now()));
+		// Half the budget is reserved for the SIGTERM wait: an adapter that
+		// ignores the close request but forwards SIGTERM (docker run) still
+		// gets its stop relayed before the SIGKILL. Large budgets are unaffected.
+		const sigtermReserveMs = Math.min(1_000, Math.floor(Math.max(0, options.budgetMs ?? 0) / 2));
+		const remainingBudget = (waitMs: number, reserveMs = 0) =>
+			Math.min(waitMs, Math.max(0, budgetEndsAt - Date.now() - reserveMs));
 		// Ask the adapter to exit, then enforce a bounded shutdown.
 		child.stdin?.end(`${JSON.stringify({ id: this.nextId, type: "close" })}\n`);
 		const exited = new Promise<void>((resolve) => {
@@ -234,7 +243,7 @@ export class StdioRouterEnvironment implements RouterEnvironment {
 		await Promise.race([
 			exited,
 			new Promise<void>((resolve) => {
-				const timer = setTimeout(() => resolve(), remainingBudget(1_500));
+				const timer = setTimeout(() => resolve(), remainingBudget(1_500, sigtermReserveMs));
 				if (typeof timer === "object" && "unref" in timer) timer.unref();
 			}),
 		]);
@@ -247,9 +256,10 @@ export class StdioRouterEnvironment implements RouterEnvironment {
 			const pid = child.pid;
 			if (pid) {
 				if (process.platform === "win32") {
-					// Windows has no signalable process groups; taskkill /T /F
-					// takes the launcher's descendants down with it.
-					spawnSyncHidden("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
+					// Windows has no signalable process groups; the hardened
+					// System32 taskkill /T tree kill takes the launcher's
+					// descendants down, bounded by the remaining budget.
+					killOrphanProcess(pid, remainingBudget(10_000));
 				} else {
 					signalProcessGroupOrProcess(pid, "SIGTERM");
 					const terminated = new Promise<void>((resolve) => {

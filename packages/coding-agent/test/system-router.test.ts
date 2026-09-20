@@ -890,8 +890,7 @@ describe("runSystemRouterLoop budgets (fake timers)", () => {
 		const run = runLoop(env, { decide, timeoutMs: 5_000 });
 		run.catch(() => {});
 		await vi.advanceTimersByTimeAsync(0); // reset + observe + decide started
-		// Clock past the deadline without firing the timer: no post-deadline dispatch.
-		vi.setSystemTime(Date.now() + 5_001);
+		vi.setSystemTime(Date.now() + 5_001); // clock past the deadline, timer un-fired
 		resolveDecide?.(decision({ action: "press_a", confidence: 0.9 }));
 		const result = await run;
 		expect(result).toMatchObject({ status: "incomplete", reason: "timeout", executed: 0, steps: 0 });
@@ -1157,6 +1156,22 @@ describe("StdioRouterEnvironment (real subprocess)", () => {
 		}
 	});
 
+	it("gives a SIGTERM-forwarding adapter part of the cleanup budget on the timeout path", async () => {
+		const script = `
+			process.on("SIGTERM", () => { setTimeout(() => process.exit(0), 100); });
+			require("readline").createInterface({ input: process.stdin }).on("line", () => {});
+			setInterval(() => {}, 1000);
+		`;
+		const env = new StdioRouterEnvironment({ command: echoAdapter(script), requestTimeoutMs: 2_000 });
+		const decide = scriptedDecide([decision({ action: FINISH_ACTION, confidence: 1 })]);
+		const result = await runLoop(env, { decide, timeoutMs: 200 });
+		expect(result.status).toBe("incomplete");
+		const child = (env as unknown as { child: ChildProcess }).child;
+		await waitForChildProcess(child);
+		// Without the reserved SIGTERM wait, SIGKILL lands first (exitCode null).
+		expect(child.exitCode).toBe(0);
+	});
+
 	it("ends the segment at its wall-clock budget and kills the adapter tree, descendants included", async () => {
 		if (process.platform !== "win32") {
 			const script = `
@@ -1177,7 +1192,6 @@ describe("StdioRouterEnvironment (real subprocess)", () => {
 			const decide = scriptedDecide([decision({ action: FINISH_ACTION, confidence: 1 })]);
 			const started = Date.now();
 			const result = await runLoop(env, { decide, timeoutMs: 200 });
-			// Old code: unbounded cleanup (+~2.5s) and an orphaned grandchild.
 			expect(result.status).toBe("done");
 			expect(Date.now() - started).toBeLessThan(2_000);
 			await waitForChildProcess((env as unknown as { child: ChildProcess }).child);
