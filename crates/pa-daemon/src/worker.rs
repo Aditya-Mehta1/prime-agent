@@ -543,6 +543,11 @@ pub struct Worker {
     pub(crate) supervisor_claims: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) core: Arc<Mutex<SessionCore>>,
     pub(crate) engine: std::sync::Arc<dyn SessionEngine>,
+    /// The real agent engine behind `engine`, when the worker runs one (the
+    /// scripted harness engines are not it): the create command's eager
+    /// session build (TS `createAgentSessionFromServices` parity — the
+    /// kernel prewarm starts at create) runs through the concrete handle.
+    pub(crate) agent_engine: Option<std::sync::Arc<crate::agent_engine::AgentSessionEngine>>,
     pub(crate) work_notify: Arc<Notify>,
     idle_notify: Arc<Notify>,
     pub(crate) events: Arc<EventPump>,
@@ -662,9 +667,14 @@ impl Worker {
         // The turn runner runs for the whole process lifetime. The command
         // dispatcher keeps the engine handle too (model metadata for the
         // stats commands).
-        let engine: std::sync::Arc<dyn SessionEngine> = {
+        let (engine, agent_engine): (
+            std::sync::Arc<dyn SessionEngine>,
+            Option<std::sync::Arc<crate::agent_engine::AgentSessionEngine>>,
+        ) = {
             // Scripted sessions serve the integration harness; sessions
             // without a script run the real agent engine.
+            let mut agent_engine: Option<std::sync::Arc<crate::agent_engine::AgentSessionEngine>> =
+                None;
             let engine: std::sync::Arc<dyn SessionEngine> = match &script {
                 // A `{"engine": "faux", ...}` script drives the real agent
                 // engine over the scripted faux provider (full turns with
@@ -686,7 +696,11 @@ impl Worker {
                         supervisor_link: Some(supervisor_link_config(&config)),
                         telemetry_disabled: config.telemetry_disabled,
                     }) {
-                        Ok(engine) => std::sync::Arc::new(engine),
+                        Ok(engine) => {
+                            let concrete = std::sync::Arc::new(engine);
+                            agent_engine = Some(std::sync::Arc::clone(&concrete));
+                            concrete
+                        }
                         // Runtime construction failed: degrade to the echo engine.
                         Err(_) => std::sync::Arc::new(ScriptedEngine::default()),
                     }
@@ -710,7 +724,11 @@ impl Worker {
                         supervisor_link: Some(supervisor_link_config(&config)),
                         telemetry_disabled: config.telemetry_disabled,
                     }) {
-                        Ok(engine) => std::sync::Arc::new(engine),
+                        Ok(engine) => {
+                            let concrete = std::sync::Arc::new(engine);
+                            agent_engine = Some(std::sync::Arc::clone(&concrete));
+                            concrete
+                        }
                         // Runtime construction failed: degrade to the echo engine.
                         Err(_) => std::sync::Arc::new(ScriptedEngine::default()),
                     }
@@ -737,7 +755,7 @@ impl Worker {
             tokio::spawn(async move {
                 runner.run().await;
             });
-            engine
+            (engine, agent_engine)
         };
         let side_questions = crate::side_question::SideQuestionManager::new(
             std::sync::Arc::clone(&engine),
@@ -789,6 +807,7 @@ impl Worker {
             supervisor_claims,
             core,
             engine,
+            agent_engine,
             work_notify,
             idle_notify,
             events,
@@ -1767,6 +1786,23 @@ impl Worker {
         // of worker-to-worker agent messages.
         if let Ok(summary_value) = serde_json::to_value(&summary) {
             self.engine.set_session_summary(summary_value);
+        }
+        // TS create builds the AgentSession eagerly
+        // (`createAgentSessionFromServices` inside the create handler —
+        // where the kernel prewarm fires). The Rust worker keeps the
+        // create response model-independent, so the build runs in the
+        // background instead: the prewarm starts at create, the build
+        // gate deduplicates it against any racing demand seam, and a
+        // build failure still surfaces on the first demand seam exactly
+        // as before. Scripted harness engines have no session to build.
+        if let Some(agent_engine) = &self.agent_engine {
+            let engine = std::sync::Arc::clone(agent_engine);
+            tokio::spawn(async move {
+                let Ok(model) = engine.resolve_model() else {
+                    return;
+                };
+                let _ = engine.ensure_core_session_async(&model).await;
+            });
         }
         // Seed the status line from the latest persisted verdict (a respawned
         // worker resumes with the pre-crash verdict).

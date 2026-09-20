@@ -1987,20 +1987,49 @@ deliberately left out (TS `prompt-highlight.ts`):
   overflow arm (all `EngineEvent::CustomMessage`, which the worker persists
   + frames), and pa-cli print json mode (`message_start`/`message_end`
   before `compaction_end`).
-- Known adjacent gap (documented, not fixed here): TS `createDefaultRuntimeFactory`
-  sets `prewarmIpythonKernel: true` — every daemon-hosted main session boots
-  its kernel in the background at creation (subagents stay lazy) — so a TS
-  daemon session has a running kernel even without ipython tool use, while
-  the Rust daemon keeps the lazy first-call start. A battery session (no
-  ipython turn) therefore lands no notice row on the Rust side; a session
-  that ran the ipython tool behaves identically on both. Kernel prewarm is a
-  separate lane (kernel lifecycle/telemetry timing).
+- Kernel prewarm (the adjacent gap, closed by the kernel-prewarm lane):
+  TS `createDefaultRuntimeFactory` sets `prewarmIpythonKernel: true`, and
+  the session gates it with `rlmDepth === 0` + an active `ipython` tool
+  (`agent-session.ts` `_buildRuntime`: `(prewarmIpythonKernel || hasSnapshot)
+  && activeToolNames.includes("ipython")` -> `provisioner.prewarm()`, a
+  fire-and-forget `void ensure().catch(() => {})`). The Rust port rides
+  `SessionEngineConfig::prewarm_ipython_kernel`: the daemon worker and the
+  headless/print product path pass `Some(true)` (the TS factory's callers),
+  the engine applies the depth-0 + active-ipython gate and fires the
+  provisioner prewarm at create; boot failures stay swallowed (the next
+  `ensure()` surfaces a fresh attempt — the lazy first-call start intact),
+  subagent sessions (rlmDepth > 0) stay lazy, and Rust-only verification
+  harnesses (faux print) pass `None`. Two TS arms remain inert by
+  construction: the `hasSnapshot` resume prewarm (the Rust session path
+  wires `snapshot_dir: None` — no session can arrive with a snapshot to
+  revive until kernel namespace snapshots land) and the /reload rebuild's
+  dispose+prewarm (no Rust /reload surface yet). The daemon side needed a
+  second fix the prewarm verifier caught: the Rust worker built its core
+  session lazily on the first demand seam, so even with the flag the
+  prewarm fired at the first turn, not at create (a TS daemon session has
+  its kernel from creation on; the battery's no-tool-use scenario landed
+  the notice on TS only). The wire `create` handler now starts the same
+  build in the background at create — TS builds its AgentSession eagerly
+  inside the create handler — behind a one-build gate
+  (`AgentSessionEngine::session_build`) so the eager build and every
+  demand seam meet at one session, while the create response stays
+  model-independent (a build failure still surfaces on the first demand
+  seam).
 - Verifiers: pa-core unit tests (content shape arms, row wire shape,
   capture guards, the append point after the compaction entry + live
   context, the back-to-back second compaction RUNNING again with a running
-  kernel and skipping "Already compacted" without one), the battery f7
-  kernel-notice differential (daemon + mock provider: one scripted ipython
-  tool call boots the kernel, two back-to-back wire `compact` commands —
-  both sides must land the notice rows after each compaction entry and
-  succeed on the second compact, with identical update-mode summarizer
-  requests).
+  kernel and skipping "Already compacted" without one), the provisioner
+  prewarm unit test (failure swallowed, `ensure()` retries fresh), pa-core
+  live-kernel integration tests (`tests/kernel_prewarm.rs`: a prewarmed
+  main session boots its kernel at create — observed through the `kernel
+  bootstrap` telemetry event — and a compaction with NO ipython tool use
+  lands the notice row with the durable entry; a depth-1 session with the
+  flag still set stays lazy and keeps the lazy ipython tool), and the
+  battery f7 kernel-notice differential in two scenarios (daemon + mock
+  provider, two back-to-back wire `compact` commands each: the #227
+  residue scenario — one scripted ipython tool call boots the kernel — and
+  the #230 prewarm sibling — no tool use at all, a 15s post-create settle
+  window on both sides (a warm sandbox boot measured ~7s), then two text
+  turns; both sides must land the notice rows after each compaction
+  entry, succeed on the second compact, and send identical update-mode
+  summarizer requests).

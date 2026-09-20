@@ -1,0 +1,43 @@
+{
+ "command": "create",
+ "data": {
+  "activeSessionId": "cfc36e1c5e8b",
+  "activity": "idle",
+  "attachedClients": 0,
+  "created": "2026-09-20T22:14:41.119Z",
+  "cwd": "/repo/scripts/battery/runs/20260920T221429Z/rust/work",
+  "hasRegisteredCronJob": false,
+  "id": "cfc36e1c5e8b",
+  "isBashRunning": false,
+  "isCompacting": false,
+  "isSessionActive": false,
+  "isStreaming": false,
+  "lastActivityAt": "2026-09-20T22:14:41.133Z",
+  "lifecycle": "draft",
+  "messageCount": 0,
+  "model": {
+   "id": "mock-1",
+   "name": "Mock 1",
+   "provider": "prime-inference",
+   "reasoning": false
+  },
+  "modified": "2026-09-20T22:14:41.133Z",
+  "rlmDepth": 0,
+  "runtimeKind": "top-level",
+  "sessionActions": {
+   "followUps": [],
+   "queuedCount": 0,
+   "steering": []
+  },
+  "sessionFile": "/repo/scripts/battery/runs/20260920T221429Z/rust/agent/sessions/01a0c0e2-c0df-74f8-85d1-698b5df5c39e.jsonl",
+  "sessionId": "01a0c0e2-c0df-74f8-85d1-698b5df5c39e",
+  "sessionName": "battery-overflow",
+  "thinkingLevel": "off",
+  "unfinishedActionCount": 0,
+  "workerPid": 49821,
+  "workerState": "ready"
+ },
+ "id": "oc1",
+ "success": true,
+ "type": "response"
+}

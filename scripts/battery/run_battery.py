@@ -1676,10 +1676,79 @@ class Battery:
         # between runs again (update mode) instead of skipping "Already
         # compacted". Both sides must keep the kernel through compaction,
         # land the notice row on the durable branch after each compaction
-        # entry, and succeed on the second back-to-back compact. The
-        # notice's live-names detail depends on each side's kernel
-        # namespace, so the compared shape is the row envelope plus the
-        # persistence sentence, never the name list.
+        # entry, and succeed on the second back-to-back compact.
+        self._kernel_notice_scenario(
+            flow,
+            {
+                "name": "battery-ipython-notice",
+                "queue": "notice",
+                "marker": "notice_var",
+                "evidence": "notice",
+                # One tool-call turn boots the kernel explicitly (the
+                # #227 residue verifier: the notice follows a kernel the
+                # model itself started), then a history turn the first
+                # compaction summarizes.
+                "settle_seconds": 0.0,
+                "responses": [
+                    {
+                        "toolCall": {
+                            "name": "ipython",
+                            "arguments": {"code": "notice_var = 'kept through compaction'"},
+                        }
+                    },
+                    {"text": "kernel started"},
+                    {"text": "history turn the first compaction summarizes"},
+                    {"text": "the notice first compaction summary"},
+                    {"text": "the notice second compaction summary"},
+                ],
+                "turns": [
+                    ("np1", "start the kernel and define notice_var"),
+                    ("np2", "history turn for the summary"),
+                ],
+            },
+        )
+        # The prewarm sibling (the #230 residue): a session with NO ipython
+        # tool use at all still has a running kernel — TS prewarms at daemon
+        # session creation, and the Rust daemon now does too — so the
+        # kernel-less case lands the notice rows identically on both sides.
+        # The settle window after create lets both products finish the
+        # background boot (purely internal; TS races it the same way).
+        self._kernel_notice_scenario(
+            flow,
+            {
+                "name": "battery-ipython-prewarm",
+                "queue": "prewarm-notice",
+                "marker": "prewarm history turn",
+                "evidence": "prewarm-notice",
+                "settle_seconds": 15.0,
+                "responses": [
+                    {"text": "prewarm history turn one noted"},
+                    {"text": "prewarm history turn two noted"},
+                    {"text": "the prewarm first compaction summary"},
+                    {"text": "the prewarm second compaction summary"},
+                ],
+                "turns": [
+                    ("pw1", "prewarm history turn one for the summary"),
+                    ("pw2", "prewarm history turn two for the summary"),
+                ],
+            },
+        )
+
+    def _kernel_notice_scenario(self, flow: str, scenario: dict) -> None:
+        """One kernel-notice differential (`ipython_state` after every
+        compaction a running kernel survives), both sides.
+
+        The scenario drives one daemon session per side: scripted responses
+        through a model-routed queue (the session-model calls draw their
+        responses in order while the daemon status-line model falls through
+        to the default queue — background calls must not shift the scripted
+        cursors), two `compact` wire commands back-to-back, and the durable
+        notice rows compared by envelope plus the persistence sentence (the
+        kernel-namespace detail is side-dependent). The second compact must
+        run again (update mode, `<previous-summary>` in its summarizer
+        request) instead of skipping "Already compacted" — the notice row
+        keeps the session branch from ending on the compaction entry.
+        """
         notice: dict[str, dict] = {}
         for side in (self.sides["ts"], self.sides["rust"]):
             self.ensure_daemon(side)
@@ -1698,15 +1767,15 @@ class Battery:
             try:
                 wire = B.Wire(side.daemon_socket)
                 create = wire.request(
-                    "nc1",
+                    scenario["name"][:4] + "-c1",
                     {
                         "type": "create",
-                        "name": "battery-ipython-notice",
+                        "name": scenario["name"],
                         "config": self.session_config(side),
                     },
                     timeout=120,
                 )
-                side.evidence_json(flow, "notice-create-response.json", create)
+                side.evidence_json(flow, f'{scenario["evidence"]}-create-response.json', create)
                 session_id = (
                     create.get("data", {}).get("activeSessionId")
                     or create.get("data", {}).get("id")
@@ -1716,91 +1785,73 @@ class Battery:
                     self.record(
                         flow,
                         "protocol",
-                        f"{side.name}: kernel-notice session create failed: {json.dumps(create)[:300]}",
+                        f'{side.name}: {scenario["name"]} session create failed: {json.dumps(create)[:300]}',
                     )
                     wire.close()
                     continue
-                # One tool-call turn boots the kernel (the only way the
-                # Rust daemon gets a running kernel today; TS prewarms),
-                # then a history turn the first compaction summarizes.
-                # Model-routed queue (same shape as the overflow probe
-                # below): the session-model calls (turns + compaction
-                # summarizers) draw their scripted responses in order, while
-                # the daemon status-line model falls through to the default
-                # queue — background calls must not shift the scripted
-                # cursors (a shifted turn reply changes the cut and with it
-                # the whole differential).
+                # The prewarm settle window: a scenario whose kernel starts
+                # in the background at creation waits it out on both sides
+                # (a no-tool-use turn never joins the boot like a tool call
+                # does).
+                if scenario["settle_seconds"]:
+                    time.sleep(scenario["settle_seconds"])
                 side.mock.set_responses(
                     [{"text": "statusline filler"}],
                     queues=[
                         {
-                            "name": "notice",
+                            "name": scenario["queue"],
                             "matchModels": ["mock-1"],
-                            "responses": [
-                                {
-                                    "toolCall": {
-                                        "name": "ipython",
-                                        "arguments": {
-                                            "code": "notice_var = 'kept through compaction'"
-                                        },
-                                    }
-                                },
-                                {"text": "kernel started"},
-                                {"text": "history turn the first compaction summarizes"},
-                                {"text": "the notice first compaction summary"},
-                                {"text": "the notice second compaction summary"},
-                            ],
+                            "responses": scenario["responses"],
                         }
                     ],
                 )
-                tool_turn = wire.request(
-                    "np1",
-                    {
-                        "type": "prompt_and_wait",
-                        "activeSessionId": session_id,
-                        "message": "start the kernel and define notice_var",
-                    },
-                    timeout=240,
-                )
-                side.evidence_json(flow, "notice-tool-turn-response.json", tool_turn)
-                history_turn = wire.request(
-                    "np2",
-                    {
-                        "type": "prompt_and_wait",
-                        "activeSessionId": session_id,
-                        "message": "history turn for the summary",
-                    },
-                    timeout=240,
-                )
-                side.evidence_json(flow, "notice-history-turn-response.json", history_turn)
+                for request_id, message in scenario["turns"]:
+                    turn = wire.request(
+                        request_id,
+                        {
+                            "type": "prompt_and_wait",
+                            "activeSessionId": session_id,
+                            "message": message,
+                        },
+                        timeout=240,
+                    )
+                    side.evidence_json(
+                        flow,
+                        f'{scenario["evidence"]}-turn-{request_id}-response.json',
+                        turn,
+                    )
                 first = wire.request(
-                    "nk1",
+                    f'{scenario["evidence"]}-k1',
                     {"type": "compact", "activeSessionId": session_id},
                     timeout=240,
                 )
-                side.evidence_json(flow, "notice-compact-one-response.json", first)
+                side.evidence_json(flow, f'{scenario["evidence"]}-compact-one-response.json', first)
                 # Back-to-back: nothing between the two compacts.
                 mark = len(side.mock.requests())
                 second = wire.request(
-                    "nk2",
+                    f'{scenario["evidence"]}-k2',
                     {"type": "compact", "activeSessionId": session_id},
                     timeout=240,
                 )
-                side.evidence_json(flow, "notice-compact-two-response.json", second)
+                side.evidence_json(flow, f'{scenario["evidence"]}-compact-two-response.json', second)
                 wire.close()
-                # Only the session-model requests (the `notice` queue):
+                # Only the session-model requests (the scenario queue):
                 # background status-line calls fall through to the default
                 # queue and differ in count between the products.
                 second_requests = [
                     request
                     for request in self.new_mock_requests(side, mark)
-                    if request.get("queue") == "notice"
+                    if request.get("queue") == scenario["queue"]
                 ]
-                side.evidence_json(flow, "notice-second-requests.json", second_requests)
+                side.evidence_json(
+                    flow,
+                    f'{scenario["evidence"]}-second-requests.json',
+                    second_requests,
+                )
                 # Private sessions copy: the shared `sessions` evidence
                 # belongs to the durable wire-diff above, and this
                 # session's tool rows must not pollute it.
-                dst = side.root / flow / "notice-sessions"
+                dst = side.root / flow / f'{scenario["evidence"]}-sessions'
                 if dst.exists():
                     shutil.rmtree(dst)
                 src = side.sessions_dir()
@@ -1810,10 +1861,10 @@ class Battery:
                 ordered_tail = []
                 for path in sorted(dst.glob("*.jsonl")) if dst.exists() else []:
                     body = path.read_text()
-                    # The TS daemon prewarms its kernel, so EVERY session in
-                    # the copy carries notice rows; scope to this scenario's
-                    # session (the only one that ran the notice_var turn).
-                    if "notice_var" not in body:
+                    # The daemon prewarms its kernel, so EVERY session in
+                    # the copy may carry notice rows; scope to this
+                    # scenario's session (the marker only its turns carry).
+                    if scenario["marker"] not in body:
                         continue
                     for line in body.splitlines():
                         try:
@@ -1854,6 +1905,7 @@ class Battery:
                 else:
                     settings_path.write_text(prior_settings)
         if notice.get("ts") and notice.get("rust"):
+
             def notice_shape(rows: list) -> list:
                 shaped = []
                 for row in rows:
@@ -1903,7 +1955,7 @@ class Battery:
                 self.record(
                     flow,
                     "behavior",
-                    "kernel-notice parity: ipython_state row after each compaction, back-to-back second compact runs (update mode): "
+                    f'{scenario["name"]} parity: ipython_state row after each compaction, back-to-back second compact runs (update mode): '
                     + json.dumps(shapes["ts"])[:300],
                     gap=False,
                 )
@@ -1911,14 +1963,14 @@ class Battery:
                 self.record(
                     flow,
                     "behavior",
-                    "kernel-notice differential differs: "
+                    f'{scenario["name"]} differential differs: '
                     f"second_compact ts={notice['ts']['second_success']} rust={notice['rust']['second_success']} "
                     f"row_counts ts={len(shapes['ts'])} rust={len(shapes['rust'])} "
                     f"rows ts={json.dumps(shapes['ts'])[:400]} rust={json.dumps(shapes['rust'])[:400]} "
                     f"second-requests-equal={requests['ts'] == requests['rust']} "
                     f"ts={json.dumps(requests['ts'])[:150]} rust={json.dumps(requests['rust'])[:150]}",
                     evidence=[
-                        self.sides[name].root / flow / "notice-compact-two-response.json"
+                        self.sides[name].root / flow / f'{scenario["evidence"]}-compact-two-response.json'
                         for name in ("ts", "rust")
                     ],
                 )

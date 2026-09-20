@@ -848,4 +848,35 @@ mod tests {
         provisioner.dispose(None).await;
         assert!(clone.ensure(None, None).await.is_err());
     }
+
+    /// The prewarm contract (TS `prewarm(): void this.ensure().catch(() =>
+    /// {})`): a background boot never surfaces its failure at the call site,
+    /// and the swallowed failure stays recoverable — the next `ensure()` runs
+    /// (and surfaces) a fresh attempt, the lazy first-call start.
+    #[tokio::test]
+    async fn prewarm_swallows_failure_and_keeps_lazy_fallback() {
+        let options = IpythonKernelProvisionerOptions {
+            python: Some(PathBuf::from("/nonexistent/kernel-python-for-test")),
+            ..Default::default()
+        };
+        let provisioner = IpythonKernelProvisioner::new("/tmp", options);
+        // Returns immediately; the background boot fails on its own.
+        provisioner.prewarm();
+        // Let the background startup settle into its failure.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !provisioner.has_running_kernel(),
+            "the failed prewarm must not leave a running kernel"
+        );
+        // The next ensure() surfaces the prewarm's swallowed cause (or a
+        // fresh attempt's identical one) instead of hanging on the memo.
+        let error = provisioner
+            .ensure(None, None)
+            .await
+            .expect_err("the bogus python must fail ensure too");
+        assert!(
+            format!("{error:#}").contains("failed to spawn"),
+            "ensure must surface the spawn cause: {error:#}"
+        );
+    }
 }

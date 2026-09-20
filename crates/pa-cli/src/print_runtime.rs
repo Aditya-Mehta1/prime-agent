@@ -279,6 +279,11 @@ async fn build_headless_engine_parts(options: &RunOptions) -> Result<HeadlessEng
                 .map(|path| path.display().to_string())
                 .collect(),
             extension_tool_allow_list: config.tools.clone(),
+            // TS print/headless sessions build through the same
+            // `createDefaultRuntimeFactory` runtime (prewarmIpythonKernel:
+            // true), so the kernel boots in the background at creation;
+            // the engine's depth-0 gate matches the TS session's.
+            prewarm_ipython_kernel: Some(true),
         },
     )
     .await
@@ -1051,6 +1056,9 @@ async fn build_faux_engine_parts(
                 .map(|path| path.display().to_string())
                 .collect(),
             extension_tool_allow_list: config.tools.clone(),
+            // The faux engine is a Rust-only verification harness, not a
+            // product surface: no background kernel boot in tests.
+            prewarm_ipython_kernel: None,
         },
     )
     .await

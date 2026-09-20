@@ -118,6 +118,11 @@ pub struct AgentSessionEngine {
     effective_thinking: std::sync::RwLock<Option<pa_types::ai::ModelThinkingLevel>>,
     /// Built once on the first prompt, reused across prompts.
     pub(crate) session: tokio::sync::Mutex<Option<CoreSessionEngine>>,
+    /// The session-build gate: at most one `build_session` in flight. The
+    /// eager create-time build (TS parity: the prewarm starts at create)
+    /// races the first demand seam; the guard makes them meet at one
+    /// build instead of constructing two sessions.
+    pub(crate) session_build: tokio::sync::Mutex<()>,
     /// A branch move (tree navigation or fork) that landed before the first
     /// turn built the session: consumed at build so the session starts on
     /// the moved branch (TS rebuilds context from the durable branch).
@@ -281,6 +286,7 @@ impl AgentSessionEngine {
             selection: std::sync::RwLock::new(selection),
             effective_thinking: std::sync::RwLock::new(None),
             session: tokio::sync::Mutex::new(None),
+            session_build: tokio::sync::Mutex::new(()),
             pending_branch: std::sync::Mutex::new(None),
             provider_target: std::sync::Arc::new(std::sync::RwLock::new(None)),
             own_summary: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -316,8 +322,10 @@ impl AgentSessionEngine {
     /// The async build of the core session (the same funnel as
     /// `ensure_core_session`, awaited on the caller's runtime instead of
     /// parked on the engine's own): read seams (`get_system_prompt`)
-    /// reaching an unbuilt session build it here.
+    /// reaching an unbuilt session build it here. The build gate makes the
+    /// eager create-time build and every demand seam meet at one build.
     pub(crate) async fn ensure_core_session_async(&self, model: &Model) -> anyhow::Result<()> {
+        let _build = self.session_build.lock().await;
         {
             let guard = self.session.lock().await;
             if guard.is_some() {
@@ -330,20 +338,11 @@ impl AgentSessionEngine {
         Ok(())
     }
 
-    /// Build the core session once (same once-only rule as `session_agent`).
+    /// Build the core session once (same once-only rule as `session_agent`),
+    /// through the same guarded funnel.
     pub(crate) fn ensure_core_session(&self, model: &Model) -> anyhow::Result<()> {
-        {
-            let guard = self.session.blocking_lock();
-            if guard.is_some() {
-                return Ok(());
-            }
-        }
-        let built = self
-            .runtime
-            .block_on(async { self.build_session(model).await })?;
-        self.mirror_goal_runtime(&built);
-        self.session.blocking_lock().replace(built);
-        Ok(())
+        self.runtime
+            .block_on(async { self.ensure_core_session_async(model).await })
     }
 
     /// Execute one session slash command against the built session: resolve
@@ -603,6 +602,12 @@ impl AgentSessionEngine {
             // TUI/ACP surfaces do not carry `-e` flags today).
             cli_extension_sources: vec![],
             extension_tool_allow_list: None,
+            // TS main.ts `createDefaultRuntimeFactory` passes
+            // `prewarmIpythonKernel: true` for every session it hosts; the
+            // engine's depth gate keeps subagent workers (rlmDepth > 0) on
+            // the lazy first-call start, exactly like the TS session's
+            // `rlmDepth === 0` check.
+            prewarm_ipython_kernel: Some(true),
         })
         .await
     }
@@ -4531,8 +4536,14 @@ fn compact_session_command_emits_the_result_on_success() {
     );
     assert!(result.get("usage").is_none());
     // The durable rows stay minimal (TS's queued `/compact` catch arm
-    // records no result row): the echo row is the only custom row.
-    let rows = custom_rows(&events);
+    // records no result row): the echo row is the only custom row — except
+    // the `ipython_state` notice, which follows the compaction whenever the
+    // session's prewarmed kernel finished booting on this machine in time
+    // (kernel-dependent, so it is scoped out of this assertion).
+    let rows: Vec<_> = custom_rows(&events)
+        .into_iter()
+        .filter(|row| row["customType"] != "ipython_state")
+        .collect();
     assert_eq!(rows.len(), 1, "the /compact echo only: {rows:?}");
     assert_eq!(rows[0]["customType"], "session_slash_command");
 }

@@ -76,6 +76,14 @@ pub struct SessionEngineConfig {
     /// Session telemetry wiring (PostHog client + execution mode). `None`
     /// (opt-out) installs nothing; non-depth-0 sessions never install.
     pub telemetry: Option<super::telemetry::TelemetryWiring>,
+    /// Boot the session's kernel in the background at creation (TS
+    /// `prewarmIpythonKernel` from `createDefaultRuntimeFactory`): a main
+    /// session (depth 0, the engine's gate like the TS `rlmDepth === 0`
+    /// check) whose `ipython` tool is active starts its kernel without
+    /// waiting for the first tool call. Boot failures are swallowed (they
+    /// surface on the next `ensure()`), and the lazy first-call start
+    /// stays intact.
+    pub prewarm_ipython_kernel: Option<bool>,
     /// An externally owned MCP manager (the daemon worker's session store):
     /// the engine adopts it instead of building its own, so ACP-admitted
     /// servers reach the prompt's MCP gating through the same store the
@@ -392,6 +400,25 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     }
     let active_tool_names: Vec<String> = tools.iter().map(|tool| tool.name().to_string()).collect();
 
+    // The TS prewarm (agent-session.ts `_buildRuntime`, behind
+    // `createDefaultRuntimeFactory`'s `prewarmIpythonKernel: true`): a main
+    // session (depth 0 — the session gate TS applies at
+    // `this._prewarmIpythonKernel = config.prewarmIpythonKernel && rlmDepth
+    // === 0`) boots its kernel in the background once the tool registry
+    // shows `ipython` active. Failures are swallowed there and surface on
+    // the next `ensure()`, and an already-started kernel short-circuits it,
+    // so the lazy first-call start stays the fallback. The TS `hasSnapshot`
+    // arm (prewarm a resumed session so its namespace revives before the
+    // first turn) has nothing to do here yet: the session path wires
+    // `snapshot_dir: None`, so no Rust session can arrive with a snapshot
+    // to restore.
+    if config.prewarm_ipython_kernel.unwrap_or(false)
+        && config.rlm_depth.unwrap_or(0) == 0
+        && active_tool_names.iter().any(|name| name == "ipython")
+    {
+        provisioner.prewarm();
+    }
+
     // Extension tool prompt guidelines flow into the prompt exactly like
     // TS `_rebuildSystemPrompt` (agent-session.ts L5091+): normalized
     // guidelines of the active tools append to the configured ones.
@@ -693,6 +720,7 @@ mod tests {
             model_info: None,
             cli_extension_sources: vec![],
             extension_tool_allow_list: None,
+            prewarm_ipython_kernel: None,
         })
         .await
         .unwrap();
@@ -796,6 +824,7 @@ mod tests {
                 model_info: None,
                 cli_extension_sources: vec![],
                 extension_tool_allow_list: None,
+                prewarm_ipython_kernel: None,
             }
         }
 

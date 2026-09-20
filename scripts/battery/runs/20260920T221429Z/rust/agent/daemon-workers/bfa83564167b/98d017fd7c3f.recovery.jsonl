@@ -1,0 +1,6 @@
+{"activeSessionId":"98d017fd7c3f","busy":true,"operation":"create","recordedAt":"2026-09-20T22:15:33.546Z","sessionFile":"/repo/scripts/battery/runs/20260920T221429Z/rust/agent/sessions/01a0c0e3-8d9b-71ff-b78c-b64fef59b88a.jsonl","sessionId":"01a0c0e3-8d9b-71ff-b78c-b64fef59b88a"}
+{"active_session_id":"98d017fd7c3f","follow_up":[],"recorded_at":"2026-09-20T22:15:48.588Z","steering":["prewarm history turn one for the summary"],"type":"queue_snapshot","version":1}
+{"active_session_id":"98d017fd7c3f","follow_up":[],"recorded_at":"2026-09-20T22:15:48.633Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"98d017fd7c3f","follow_up":[],"recorded_at":"2026-09-20T22:15:48.633Z","steering":["prewarm history turn two for the summary"],"type":"queue_snapshot","version":1}
+{"active_session_id":"98d017fd7c3f","follow_up":[],"recorded_at":"2026-09-20T22:15:48.678Z","steering":[],"type":"queue_snapshot","version":1}
+{"activeSessionId":"98d017fd7c3f","busy":false,"operation":"shutdown","recordedAt":"2026-09-20T22:15:50.730Z","sessionFile":"/repo/scripts/battery/runs/20260920T221429Z/rust/agent/sessions/01a0c0e3-8d9b-71ff-b78c-b64fef59b88a.jsonl","sessionId":"01a0c0e3-8d9b-71ff-b78c-b64fef59b88a"}

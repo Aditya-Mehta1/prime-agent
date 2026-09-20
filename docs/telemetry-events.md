@@ -179,7 +179,9 @@ Per tool execution. Tool name only — never arguments or results.
 ### `kernel bootstrap`
 
 One per actual kernel boot (memoized startups report once): process spawn,
-handshake, namespace restore, and runtime bootstrap.
+handshake, namespace restore, and runtime bootstrap. With the session-create
+prewarm, daemon-hosted and headless main sessions report this at creation
+(no `ipython` tool use needed); subagents report at their first cell.
 
 | property | type | notes |
 |---|---|---|

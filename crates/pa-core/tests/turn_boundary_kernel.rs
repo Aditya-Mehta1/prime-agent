@@ -241,6 +241,7 @@ async fn turn_boundary_host_requests_round_trip_through_a_real_kernel() {
         cli_extension_sources: Vec::new(),
         extension_tool_allow_list: None,
         mcp_manager: None,
+        prewarm_ipython_kernel: None,
     })
     .await
     .expect("create_session");

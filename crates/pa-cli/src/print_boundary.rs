@@ -1098,6 +1098,7 @@ mod tests {
             model_info: Some(model.clone()),
             cli_extension_sources: Vec::new(),
             extension_tool_allow_list: None,
+            prewarm_ipython_kernel: None,
         })
         .await
         .expect("the faux session assembles");
