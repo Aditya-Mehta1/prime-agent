@@ -19,7 +19,11 @@ Each run writes `scripts/battery/runs/<UTC stamp>/` with per-side evidence
 and a built Rust binary (default `target/release/prime-agent`).
 
 Files: `run_battery.py` (driver), `batterylib.py` (shared harness), 
-`mock_provider.py` (deterministic mock provider), `perf.py` (f10 perf rows),
+`mock_provider.py` (deterministic mock provider; responses are
+session-scoped queues — a queue is selected per request by markers in the
+request's user-message text, so a parent session and a concurrently running
+spawned child each get their own scripted responses deterministically),
+`perf.py` (f10 perf rows),
 `framediff_first_run.py` (first-run frame diff),
 `streaming_render.py` (live token-stream rendering verifier: pane captures
 must grow progressively mid-turn over a paced faux provider, TS vs Rust

@@ -102,9 +102,16 @@ class MockProvider:
         self._holder = port_offset_holder
         self._proc = None
 
-    def set_responses(self, responses: list[dict]) -> None:
+    def set_responses(self, responses: list[dict], queues: list[dict] | None = None) -> None:
+        """Write the mock script. `responses` is the default queue; each
+        entry of `queues` is a session-scoped queue ({"name", "match",
+        "responses"}) served to requests whose user-message text contains
+        one of its markers (mock_provider.py picks per request)."""
+        script = {"responses": responses}
+        if queues:
+            script["queues"] = queues
         with open(self.script_path, "w") as f:
-            json.dump({"responses": responses}, f)
+            json.dump(script, f)
 
     def start(self) -> int:
         here = Path(__file__).parent

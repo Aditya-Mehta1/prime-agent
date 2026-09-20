@@ -158,7 +158,7 @@ Per-lane EXPECTED-FAIL triage (44 rows, run 20260919T011717Z):
 | model-picker-2 | f17 | 1 | `/model` selector, confirm row, and `/effort` surface fixed (run `20260919T040417Z`: 8 of 9 f17 checks pass, the `model-selected` and `effort-picker` frames normalized byte-identical); the remaining `model-selector` frame diff needs the TS inline menu-panel rendering plus live prime-inference catalog parity (TS lists 1282 live-fetched models, rust lists the bundled catalog) |
 | goal-autonomous | f18 | 8 | `goal.complete()` executes (session shows `status: complete`) but no completion row renders; all 7 goal/autonomous frame diffs differ. Note: the completed goal's recorded objective is the literal `/goal resume` text — rust appears to re-create the goal on `/goal resume` instead of resuming it |
 | heartbeat-tui | f19 | 6 | no `Heartbeat set` row on `/heartbeat`; fired heartbeat shows no `♥ Heartbeat prompt` row; `/heartbeats` opens no manager view |
-| subagents-tui | f20 | 6 | `rlm.spawn` works (`RLMSpawnHandle` with `rlm_child_id` in the session) but no spawn summary line, no `RLM child status` terminal notice, and the scoped-agents view does not list the child |
+| subagents-tui | f20 | 6 | CLOSED by the session-scoped-mock lane (ruling from #201's f20 residue): the subagents-tui lane had already landed the summary line, the `RLM child status` terminal notice, and the scoped-agents view; the last two EXPECTED-FAIL rows (spawn, child-status frame diffs) failed only because the battery mock popped one shared scripted-response queue to whichever of the parent's post-tool continuation and the child's first model request arrived first — TS itself flips that order between runs. The mock is now session-scoped (a queue per recipient, selected by markers in the request's user-message text; the parent's tool results and tool-call arguments are excluded from matching), so the spawn turn routes deterministically: runs `20260920T024329Z`/`20260920T024419Z`/`20260920T024505Z` show all 11 f20 checks pass, the spawn/child-status/scoped-agents frame diffs byte-identical after normalization, and the f20 lane tag is retired |
 | worker-recovery | f21 | 5 | CLOSED by the worker-recovery lane (ruling in the f21 flow docstring): TS is ground truth for its own unowned-session failure (`Session worker is failed`, no respawn — it cannot relaunch without an owner's launch env) and stays EXPECTED-FAIL; Rust keeps the supervisor respawn (new pid, workerState ready) and now completes the post-recovery turn: the TUI re-attaches over the supervisor on link loss with the TS reconnect surface (`Daemon connection lost; reconnecting…` → resync → `Daemon reconnected`) instead of hanging on a silent spinner; the frame diffs differ by design |
 
 Run history for this unit: 20260918T231155Z (first run, committed; found the
@@ -169,4 +169,7 @@ checks pass — the selector, confirm-row, and effort rows flipped; the
 `model-selected`/`effort-picker` frames are normalized byte-identical after
 the transcript-frame normalizer learned the `~`-form path and the per-build
 version banner), 20260919T042122Z (f17 re-run on the tree merged with #161:
-the same 8 of 9 hold).
+the same 8 of 9 hold), 20260920T024329Z/024419Z/024505Z (f20 only,
+session-scoped-mock lane: with the session-scoped mock all 11 f20 checks
+pass — the spawn and child-status frame diffs flipped to identical, and the
+subagents-tui EXPECTED-FAIL tag is retired).

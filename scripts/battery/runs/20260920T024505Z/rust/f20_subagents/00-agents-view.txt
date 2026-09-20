@@ -1,0 +1,36 @@
+
+                  ▗▄▄█▀
+    ███▄       ▗▄███▀
+   ▗█▛▐█▙   ▗▄█▀▗█▀       prime agent v0.1.0
+  ▗█▛ ▟██▙▄██▛ ▟▛         agents 0 running, 1 idle, 0 inactive
+  ▗▟▌ ▐███▛▘▗▄█▖          cwd ~/lane-worktrees/session-scoped-mock/scripts/battery/runs/20260920T024505Z/rust/work
+ ▟███▄  ▄▄▟███▀
+ ▜█▛▀▘  ▜█▛▀▘
+
+ >   Search sessions
+
+Session                       Model         Activity                                                           Cost  Age
+
+Idle (1)
+• battery-f20                 mock-1                                                                          $0.00   2s
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+↑/↓ navigate   Enter/→ open   Ctrl+N new

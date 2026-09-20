@@ -42,6 +42,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 import batterylib as B  # noqa: E402
 import perf as P  # noqa: E402
+from mock_provider import user_message_text  # noqa: E402
 
 NL = chr(10)
 
@@ -60,7 +61,6 @@ FLOW_LANES = {
     "f17_slash_model": "model-picker-2",
     "f18_goal_autonomous": "goal-autonomous",
     "f19_heartbeat": "heartbeat-tui",
-    "f20_subagents": "subagents-tui",
     "f21_worker_recovery": "worker-recovery",
     "f23_keybindings": "keybindings",
 }
@@ -3155,11 +3155,20 @@ class Battery:
                 B.tmux_kill(view)
                 continue
             # Kernel rlm.spawn through the attached editor: the ipython cell
-            # spawns one named child. The child's own model turn pops the next
-            # mock response (plain text), so the child finishes without an
-            # agent_message reply and the parent receives the no-reply
-            # terminal notice.
+            # spawns one named child. The child's own model turn and the
+            # parent's post-tool continuation hit the mock concurrently and
+            # TS itself flips their arrival order between runs, so a single
+            # shared response queue makes the transcript race on which side
+            # pops which text. The script is SESSION-SCOPED: the child's
+            # [task from parent] user message routes its requests to a
+            # child queue (child_reply), while the parent stays on the
+            # default queue (tool call, then its own continuation replies),
+            # so both sides deterministically render the parent's fixture
+            # reply around the child-exited notice turn. The child finishes
+            # without an agent_message reply and the parent receives the
+            # no-reply terminal notice.
             self.settle_mock(side)
+            mark = len(side.mock.requests())
             code = (
                 "import rlm; await rlm.spawn("
                 "'f20 child task: reply with the fixture summary', "
@@ -3168,9 +3177,20 @@ class Battery:
             side.mock.set_responses(
                 [
                     {"toolCall": {"name": "ipython", "arguments": {"code": code}}},
-                    {"text": child_reply},
+                    # The parent's post-tool continuation, then its
+                    # [child-exited: no-reply] notice turn: same fixture
+                    # reply both times (the status-line requests that can
+                    # interleave pop the same text harmlessly).
                     {"text": reply},
-                ]
+                    {"text": reply},
+                ],
+                queues=[
+                    {
+                        "name": child_name,
+                        "match": ["f20 child task"],
+                        "responses": [{"text": child_reply}],
+                    }
+                ],
             )
             self.tui_send(view, "f20 spawn the subagent now")
             spawned = B.tmux_wait_text(view, "subagents", timeout=180)
@@ -3189,7 +3209,7 @@ class Battery:
                     flow, "visual",
                     f"{side.name}: a kernel rlm.spawn produced no visible subagent summary line",
                     evidence=side.root / flow / "02-spawn-settled.txt",
-                    lane=FLOW_LANES[flow],
+                    lane=FLOW_LANES.get(flow),
                 )
             # Child completion without a reply: the `RLM child status`
             # terminal-notice row in the parent transcript.
@@ -3209,7 +3229,7 @@ class Battery:
                     flow, "visual",
                     f"{side.name}: the completed child produced no 'RLM child status' terminal-notice row",
                     evidence=side.root / flow / "04-child-status-settled.txt",
-                    lane=FLOW_LANES[flow],
+                    lane=FLOW_LANES.get(flow),
                 )
             # The scoped agents view: alt+a focuses the summary line,
             # confirm opens the child list.
@@ -3234,7 +3254,38 @@ class Battery:
                     flow, "visual",
                     f"{side.name}: the scoped agents view did not list the spawned child",
                     evidence=side.root / flow / "07-scoped-agents-settled.txt",
-                    lane=FLOW_LANES[flow],
+                    lane=FLOW_LANES.get(flow),
+                )
+            # Deterministic-routing evidence: the session-scoped mock split
+            # the spawn turn by session — every request the child queue
+            # served carries the child's task user message, and no request
+            # carrying it was served from the default queue.
+            turn_requests = [
+                req
+                for req in self.new_mock_requests(side, mark)
+                if req["body"].get("model") == "mock-1" and not is_statusline_request(req)
+            ]
+            child_queued = [req for req in turn_requests if req.get("queue") == child_name]
+            default_queued = [req for req in turn_requests if req.get("queue") == "default"]
+            misrouted_child = [
+                req for req in child_queued if "f20 child task" not in user_message_text(req["body"])
+            ]
+            misrouted_parent = [
+                req for req in default_queued if "f20 child task" in user_message_text(req["body"])
+            ]
+            if len(child_queued) >= 1 and not misrouted_child and not misrouted_parent:
+                self.record(
+                    flow, "behavior",
+                    f"{side.name}: the session-scoped mock routed the spawn turn deterministically "
+                    f"({len(child_queued)} child-session request(s) to the child queue, {len(default_queued)} parent-session request(s) to the default queue)",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow, "behavior",
+                    f"{side.name}: the session-scoped mock misrouted the spawn turn "
+                    f"(child-queue requests: {len(child_queued)}, misrouted child: {len(misrouted_child)}, misrouted parent: {len(misrouted_parent)})",
+                    evidence=side.root / flow / "01-spawn.txt",
                 )
             B.tmux_kill(view)
             self.copy_sessions(side, flow)

@@ -12,14 +12,29 @@ Script file format:
         {"text": "hello"},
         {"toolCall": {"name": "bash", "arguments": {"command": "echo hi"}}},
         {"text": "done", "delayMs": 500, "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110, "prompt_tokens_details": {"cached_tokens": 80}}}
+      ],
+      "queues": [
+        {"name": "child", "match": ["child task text"], "responses": [{"text": "child reply"}]}
       ]
     }
 Optional per-response keys: `delayMs` (stream starts after the delay) and
 `usage` (overrides the reported token usage, so a flow can push the session
 past a context/compaction threshold deterministically).
-Each POST to /chat/completions pops the next scripted response (round-robin
-when the script runs dry: the last entry repeats). Every request and the raw
-request bodies are logged to `<script>.requests.jsonl` for wire-level diffs.
+
+Responses are SESSION-SCOPED, not global. The chat-completions wire carries
+no session id, so a queue is selected per request by its `match` markers
+against the concatenated text of the request's user-role messages: the first
+queue whose marker appears there serves the request; a request that matches
+no queue falls through to the default `responses` queue. This keeps a parent
+session and a spawned child session (which race the provider concurrently)
+on independent scripted response cursors instead of popping one shared
+queue in arrival order. User-role text is the discriminator because a
+parent's post-tool continuation embeds the child's task text in tool-call
+arguments and tool results; matching those would misroute the parent.
+Each queue pops its next scripted response per matching request
+(round-robin when a queue runs dry: its last entry repeats). Every request,
+the raw request body, and the serving queue's name are logged to
+`<script>.requests.jsonl` for wire-level diffs.
 """
 
 from __future__ import annotations
@@ -32,19 +47,40 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
+def user_message_text(body: dict) -> str:
+    """Concatenated text of the request's user-role messages (string or
+    content-part form). Tool results and tool-call arguments are excluded:
+    a parent's post-tool continuation embeds the child's task text there,
+    so those would misroute the parent into the child's queue."""
+    parts = []
+    for message in body.get("messages", []):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("text"):
+                    parts.append(part["text"])
+    return chr(10).join(parts)
+
+
 class MockState:
     def __init__(self, script_path: str):
         self.script_path = script_path
         self.script_mtime = None
         self.responses = []
         self.index = 0
+        # Session-scoped queues: [{"name", "match", "responses", "index"}]
+        self.queues = []
         self.request_log_path = script_path + ".requests.jsonl"
         self.lock = threading.Lock()
         self._reload_if_changed()
 
     def _reload_if_changed(self):
         """Reload the script when the file changes; a new script restarts
-        the response cursor at 0, so each battery flow can swap scripts
+        every response cursor at 0, so each battery flow can swap scripts
         against one long-lived provider process."""
         mtime = os.stat(self.script_path).st_mtime
         if mtime != self.script_mtime:
@@ -53,13 +89,33 @@ class MockState:
             self.script_mtime = mtime
             self.responses = script["responses"]
             self.index = 0
+            self.queues = []
+            for queue in script.get("queues", []):
+                self.queues.append(
+                    {
+                        "name": queue["name"],
+                        "match": queue.get("match", []),
+                        "responses": queue["responses"],
+                        "index": 0,
+                    }
+                )
 
-    def next_response(self):
+    def next_response(self, body: dict):
+        """Pop the next scripted response for this request's session: the
+        first queue whose markers appear in the request's user-message
+        text serves it; no match falls through to the default queue.
+        Returns the serving queue's name and the scripted entry."""
         with self.lock:
             self._reload_if_changed()
+            user_text = user_message_text(body)
+            for queue in self.queues:
+                if any(marker in user_text for marker in queue["match"]):
+                    entry = queue["responses"][min(queue["index"], len(queue["responses"]) - 1)]
+                    queue["index"] += 1
+                    return queue["name"], entry
             entry = self.responses[min(self.index, len(self.responses) - 1)]
             self.index += 1
-            return entry
+            return "default", entry
 
 
 def chunk_delta(delta, finish_reason=None):
@@ -104,17 +160,22 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self._json(400, {"error": {"message": "invalid json"}})
             return
-        with open(self.state.request_log_path, "a") as f:
-            f.write(
-                json.dumps(
-                    {"path": self.path, "body": body, "auth": self.headers.get("Authorization", "")}
-                )
-                + "\n"
-            )
         if "/chat/completions" not in self.path:
             self._json(404, {"error": {"message": f"unknown path {self.path}"}})
             return
-        entry = self.state.next_response()
+        queue_name, entry = self.state.next_response(body)
+        with open(self.state.request_log_path, "a") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "path": self.path,
+                        "body": body,
+                        "auth": self.headers.get("Authorization", ""),
+                        "queue": queue_name,
+                    }
+                )
+                + "\n"
+            )
         # Optional scripted delay: the response starts streaming after
         # `delayMs`, so a battery flow can hold a session mid-turn.
         delay_ms = float(entry.get("delayMs") or 0)
