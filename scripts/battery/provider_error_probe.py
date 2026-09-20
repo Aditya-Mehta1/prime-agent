@@ -54,6 +54,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import batterylib  # the shared daemon-reap sweep (same dir)
 import ts_identity  # the shared PATH-binary identity guard (same dir)
 
 SCRUB_ENV_PREFIXES = ("PRIME_AGENT", "PI_", "OPENAI_", "ANTHROPIC_", "MISTRAL_", "GOOGLE_", "AWS_")
@@ -867,6 +868,13 @@ def main() -> int:
         agent_dir = root / scenario["name"] / "agent"
         provider_id = prepare_agent_dir(agent_dir, api, base_url, api_key)
         run = run_scenario(args.binary, agent_dir, root / scenario["name"] / "tmp", provider_id, extra)
+        # The TS print run spawns a daemon (plus its supervisor) that
+        # outlives the CLI; sweep this scenario's tree so a long probe
+        # never stacks daemons, and an exit never leaks one onto a
+        # deleted socket (#223).
+        batterylib.reap_daemons(
+            needles=[str(root / scenario["name"])], cwd_roots=[str(root / scenario["name"])]
+        )
         entry = {"scenario": scenario["name"], "api": api, "run": run}
         entry.update(session_evidence(agent_dir))
         evidence.append(entry)

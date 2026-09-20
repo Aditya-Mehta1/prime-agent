@@ -38,6 +38,7 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "battery"))
+import batterylib  # noqa: E402  (the shared daemon-reap sweep)
 import ts_identity  # noqa: E402  (the shared PATH-binary identity guard)
 
 SIZES = [("120", "36")]
@@ -303,12 +304,13 @@ def run_ts(session_path, sandbox, size, out_dir):
     tmux("new-session", "-d", "-s", session, "-x", size[0], "-y", size[1], "-c", sandbox["cwd"])
     env = (
         f"HOME={sandbox['home']} "
+        f"TMPDIR={sandbox['tmp']} "
         f"PRIME_AGENT_CODING_AGENT_DIR={sandbox['agent']} "
         "PRIME_AGENT_DISABLE_ANALYTICS=1"
     )
-    # A dedicated daemon socket keeps the sandbox supervisor off the shared
-    # TMPDIR path (visual_parity.py does the same); without it the sandbox
-    # daemon collides with any other prime-agent daemon on the box.
+    # A dedicated daemon socket keeps the sandbox main daemon off the
+    # shared socket path; the isolated TMPDIR keeps its supervisor off
+    # the shared box root too, so the cleanup reap can sweep both.
     command = (
         f"{env} prime-agent --daemon-socket {sandbox['agent']}/daemon.sock "
         f"--offline -r {session_path}"
@@ -361,11 +363,16 @@ def prepare_sandbox(base):
     for binary in ("ts", "rust"):
         home = os.path.join(base, binary, "home")
         agent = os.path.join(base, binary, "agent")
+        tmp = os.path.join(base, binary, "tmp")
         os.makedirs(home, exist_ok=True)
+        os.makedirs(tmp, exist_ok=True)
         os.makedirs(os.path.join(agent, "sessions"), exist_ok=True)
         with open(os.path.join(agent, "settings.json"), "w") as f:
             json.dump({"onboardingCompleted": True}, f)
-        sandboxes[binary] = {"home": home, "agent": agent, "cwd": cwd}
+        # The isolated TMPDIR keeps the TS supervisor's socket (the
+        # default daemon-socket dir) off the shared box root, so the
+        # cleanup reap can sweep the side's daemons by path alone.
+        sandboxes[binary] = {"home": home, "agent": agent, "cwd": cwd, "tmp": tmp}
     return sandboxes
 
 
@@ -418,6 +425,10 @@ def main():
                     print(f"  diff: {report}")
                     failures.append(name)
     finally:
+        # Rmtree alone leaks the scenario daemons (a killed TUI pane does
+        # not take its detached daemon/supervisor pair down; #223): sweep
+        # every daemon this run spawned before deleting the sandbox.
+        batterylib.reap_daemons(needles=[base], cwd_roots=[base])
         if not args.keep:
             shutil.rmtree(base, ignore_errors=True)
     if failures:

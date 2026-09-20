@@ -34,6 +34,8 @@ import termios
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "battery"))
+import batterylib  # noqa: E402  (the shared daemon-reap sweep)
 import visual_parity as vp
 
 WIDTH, HEIGHT = 120, 36
@@ -90,6 +92,10 @@ def capture(binary, sandbox, shared_cwd, script_path):
     agent = sandbox["agent"]
     common = {
         "HOME": sandbox["home"],
+        # Isolated TMPDIR: the TS supervisor's socket (the default
+        # daemon-socket dir) stays under this run's sandbox, so the
+        # cleanup reap can sweep by path alone.
+        "TMPDIR": sandbox["tmp"],
         "PRIME_AGENT_CODING_AGENT_DIR": agent,
         "PRIME_AGENT_FAUX_SCRIPT": script_path,
         "PRIME_AGENT_DISABLE_ANALYTICS": "1",
@@ -171,6 +177,10 @@ def main():
         print(f"PASS: both binaries mark the same rows (A {ts_a}, B/C {ts_b})")
         return 0
     finally:
+        # Rmtree alone leaks the scenario daemons (the pty kill does not
+        # take the detached daemon/supervisor pair down; #223): sweep
+        # every daemon this run spawned before deleting the sandbox.
+        batterylib.reap_daemons(needles=[base], cwd_roots=[base])
         if not args.keep:
             shutil.rmtree(base, ignore_errors=True)
 

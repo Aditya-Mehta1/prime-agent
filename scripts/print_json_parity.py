@@ -66,6 +66,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "battery"))
+import batterylib  # noqa: E402  (the shared daemon-reap sweep)
 import ts_identity  # noqa: E402  (the shared PATH-binary identity guard)
 
 TS_FAUX_EXTENSION = open(
@@ -91,7 +92,9 @@ def find_runtime_package_dir():
 def prepare_sandbox(base, binary, settings):
     home = os.path.join(base, binary, "home")
     agent = os.path.join(base, binary, "agent")
+    tmp = os.path.join(base, binary, "tmp")
     os.makedirs(home, exist_ok=True)
+    os.makedirs(tmp, exist_ok=True)
     os.makedirs(os.path.join(agent, "sessions"), exist_ok=True)
     os.makedirs(os.path.join(agent, "extensions"), exist_ok=True)
     write_settings(agent, settings)
@@ -100,7 +103,10 @@ def prepare_sandbox(base, binary, settings):
         # provider is a sandbox extension.
         with open(os.path.join(agent, "extensions", "print-faux.js"), "w") as handle:
             handle.write(TS_FAUX_EXTENSION)
-    return {"home": home, "agent": agent}
+    # The isolated TMPDIR keeps the TS supervisor's socket (the default
+    # daemon-socket dir) under this run's sandbox, so the cleanup reap
+    # can sweep the side's daemons by path alone.
+    return {"home": home, "agent": agent, "tmp": tmp}
 
 
 def write_settings(agent, settings):
@@ -117,6 +123,7 @@ def run_scenario(binary, sandbox, script_path, prompts, cwd, extra_args, socket_
     env.update(
         {
             "HOME": sandbox["home"],
+            "TMPDIR": sandbox["tmp"],
             "PRIME_AGENT_CODING_AGENT_DIR": sandbox["agent"],
             "PRIME_AGENT_FAUX_SCRIPT": script_path,
             "PRIME_AGENT_DISABLE_ANALYTICS": "1",
@@ -548,52 +555,63 @@ def main():
     out_dir = args.out or tempfile.mkdtemp(prefix="print-json-captures-")
     os.makedirs(out_dir, exist_ok=True)
     failures = []
-    for name, scenario in SCENARIOS.items():
-        if args.scenario and name != args.scenario:
-            continue
-        print(f"== scenario {name}")
-        shared_cwd = os.path.join(base, f"{name}-cwd")
-        os.makedirs(shared_cwd, exist_ok=True)
-        # captures[binary][run_index] = the normalized events of that run.
-        captures = {"ts": [], "rust": []}
-        for binary in ("ts", "rust"):
-            if args.only and binary != args.only:
+    try:
+        for name, scenario in SCENARIOS.items():
+            if args.scenario and name != args.scenario:
                 continue
-            sandbox = prepare_sandbox(os.path.join(base, name), binary, scenario["runs"][0]["settings"])
-            for index, run in enumerate(scenario["runs"]):
-                # A later run may change the settings (the resume scenario
-                # enables compaction for run two); the agent dir - and its
-                # session store - stays shared across the runs.
-                if index > 0:
-                    write_settings(sandbox["agent"], run["settings"])
-                script_path = os.path.join(base, f"{name}-run{index}-faux-script.json")
-                with open(script_path, "w") as handle:
-                    json.dump(run["script"], handle)
-                # One daemon socket per run: a previous run's worker must
-                # not pin the session the next run resumes.
-                socket_path = os.path.join(sandbox["agent"], f"daemon-run{index}.sock")
-                code, stdout, stderr = run_scenario(
-                    binary, sandbox, script_path, run["prompts"], shared_cwd, run["args"], socket_path
-                )
-                suffix = "" if index == 0 else f"-run{index}"
-                with open(os.path.join(out_dir, f"{binary}-{name}{suffix}.jsonl"), "w") as handle:
-                    handle.write(stdout)
-                with open(os.path.join(out_dir, f"{binary}-{name}{suffix}.stderr"), "w") as handle:
-                    handle.write(stderr)
-                captures[binary].append(normalize_events(stdout, os.path.join(base, name)))
-        if not (captures["ts"] and captures["rust"]):
-            continue
-        for index in range(len(scenario["runs"])):
-            label = name if index == 0 else f"{name}/run{index}"
-            diff = diff_events(captures["ts"][index], captures["rust"][index])
-            if diff:
-                failures.append(label)
-                print(diff)
-                with open(os.path.join(out_dir, f"{label.replace('/', '-')}-diff.txt"), "w") as handle:
-                    handle.write(diff)
-                print(f"FAIL {label} (captures in {out_dir})")
-            else:
-                print(f"PASS {label} ({len(captures['ts'][index])} events, both sides)")
+            print(f"== scenario {name}")
+            shared_cwd = os.path.join(base, f"{name}-cwd")
+            os.makedirs(shared_cwd, exist_ok=True)
+            # captures[binary][run_index] = the normalized events of that run.
+            captures = {"ts": [], "rust": []}
+            for binary in ("ts", "rust"):
+                if args.only and binary != args.only:
+                    continue
+                sandbox = prepare_sandbox(os.path.join(base, name), binary, scenario["runs"][0]["settings"])
+                for index, run in enumerate(scenario["runs"]):
+                    # A later run may change the settings (the resume scenario
+                    # enables compaction for run two); the agent dir - and its
+                    # session store - stays shared across the runs.
+                    if index > 0:
+                        write_settings(sandbox["agent"], run["settings"])
+                    script_path = os.path.join(base, f"{name}-run{index}-faux-script.json")
+                    with open(script_path, "w") as handle:
+                        json.dump(run["script"], handle)
+                    # One daemon socket per run: a previous run's worker must
+                    # not pin the session the next run resumes.
+                    socket_path = os.path.join(sandbox["agent"], f"daemon-run{index}.sock")
+                    code, stdout, stderr = run_scenario(
+                        binary, sandbox, script_path, run["prompts"], shared_cwd, run["args"], socket_path
+                    )
+                    # The TS print run spawns a daemon (plus its supervisor) on
+                    # this run's socket; reap it right away so a multi-run
+                    # scenario never stacks daemons, and an exit never leaks
+                    # one onto a deleted socket (#223).
+                    batterylib.reap_daemons(needles=[os.path.join(base, name)], cwd_roots=[os.path.join(base, name)])
+                    suffix = "" if index == 0 else f"-run{index}"
+                    with open(os.path.join(out_dir, f"{binary}-{name}{suffix}.jsonl"), "w") as handle:
+                        handle.write(stdout)
+                    with open(os.path.join(out_dir, f"{binary}-{name}{suffix}.stderr"), "w") as handle:
+                        handle.write(stderr)
+                    captures[binary].append(normalize_events(stdout, os.path.join(base, name)))
+            if not (captures["ts"] and captures["rust"]):
+                continue
+            for index in range(len(scenario["runs"])):
+                label = name if index == 0 else f"{name}/run{index}"
+                diff = diff_events(captures["ts"][index], captures["rust"][index])
+                if diff:
+                    failures.append(label)
+                    print(diff)
+                    with open(os.path.join(out_dir, f"{label.replace('/', '-')}-diff.txt"), "w") as handle:
+                        handle.write(diff)
+                    print(f"FAIL {label} (captures in {out_dir})")
+                else:
+                    print(f"PASS {label} ({len(captures['ts'][index])} events, both sides)")
+    finally:
+        # Sweep anything a failed run left behind (an exception mid-run
+        # skips the per-run reap above), so the sandbox never dies with a
+        # live daemon still pointing at it.
+        batterylib.reap_daemons(needles=[base], cwd_roots=[base])
     if not args.keep:
         shutil.rmtree(base, ignore_errors=True)
     if failures:

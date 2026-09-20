@@ -295,78 +295,135 @@ class Side:
         raise RuntimeError(f"{self.name} daemon socket never appeared")
 
     def stop_daemon(self) -> None:
-        """Shut this side's daemon down and reap its whole tree.
+        """Shut this side's daemon down and reap its whole tree (the
+        shared `reap_daemons` sweep; see its docstring for the leak
+        history). Only processes whose argv references this side's unique
+        socket paths are touched, never unrelated daemons."""
+        needles = [str(self.daemon_socket)]
+        tmpdir = self.env.get("TMPDIR")
+        if tmpdir:
+            needles.append(tmpdir.rstrip("/"))
+        reap_daemons(socket_paths=[self.daemon_socket], needles=needles, proc=self.daemon_proc)
 
-        A bare terminate() leaks: the TS product runs a per-run supervisor
-        (its own `--mode daemon` process on a socket under the side's
-        TMPDIR) that RESPAWNS a killed main daemon, so SIGTERM alone
-        leaves the pair behind (run 20260920: every wire-harness pass
-        leaked two daemons). The graceful `sd` wire shutdown (both
-        products implement it) goes first; the sweep then kills anything
-        still holding this side's unique socket paths — a respawned main
-        or a detached supervisor. Only processes whose argv references
-        those paths are touched, never unrelated daemons."""
+    def own_daemon_pids(self) -> list[int]:
+        """Daemon processes whose argv references this side's daemon
+        socket or its TMPDIR (the supervisor's socket lives there)."""
+        exclude = {self.daemon_proc.pid} if self.daemon_proc else set()
+        needles = [str(self.daemon_socket)]
+        tmpdir = self.env.get("TMPDIR")
+        if tmpdir:
+            needles.append(tmpdir.rstrip("/"))
+        return daemon_pids_matching(needles, exclude_pids=exclude)
+
+
+def daemon_pids_matching(needles, exclude_pids=()) -> list[int]:
+    """Live `--mode daemon` processes whose argv references any of
+    `needles` (daemon socket paths, isolated TMPDIR roots, or a harness
+    sandbox root containing either). Empty-string needles are dropped: a
+    bare "" would match every process."""
+    seen: list[int] = []
+    live_needles = [needle for needle in needles if needle]
+    for proc_dir in Path("/proc").iterdir():
+        if not proc_dir.name.isdigit():
+            continue
+        pid = int(proc_dir.name)
+        if pid in (1, os.getpid()) or pid in exclude_pids:
+            continue
         try:
-            wire = Wire(self.daemon_socket)
+            argv = [
+                part.decode(errors="replace")
+                for part in (proc_dir / "cmdline").read_bytes().split(b"\0")
+                if part
+            ]
+        except OSError:
+            continue
+        if "--mode" not in argv or "daemon" not in argv:
+            continue
+        if any(needle in part for part in argv for needle in live_needles):
+            seen.append(pid)
+    return seen
+
+
+def worker_pids_under(cwd_roots=(), exclude_pids=()) -> list[int]:
+    """Processes whose working directory sits under any of `cwd_roots`
+    (normalized, trailing-separator-safe). The products' detached session
+    workers run as `<binary> worker` with no sandbox path in their argv,
+    but with the session's cwd (the side's work dir), so cwd is the only
+    scope that reaches them."""
+    roots = []
+    for root in cwd_roots:
+        if root:
+            text = str(root).rstrip("/") + "/"
+            roots.append(text)
+    seen: list[int] = []
+    for proc_dir in Path("/proc").iterdir():
+        if not proc_dir.name.isdigit():
+            continue
+        pid = int(proc_dir.name)
+        if pid in (1, os.getpid()) or pid in exclude_pids:
+            continue
+        try:
+            cwd = os.readlink(proc_dir / "cwd")
+        except OSError:
+            continue
+        if any(cwd.startswith(root) for root in roots):
+            seen.append(pid)
+    return seen
+
+
+def reap_daemons(socket_paths=(), needles=(), proc=None, cwd_roots=()) -> None:
+    """Reap a harness's daemon tree (the #221 pattern, lifted so every
+    standalone harness shares it).
+
+    A bare terminate() leaks: the TS product runs a per-run supervisor
+    (its own `--mode daemon` process on a socket under the side's TMPDIR)
+    that RESPAWNS a killed main daemon, so SIGTERM alone leaves the pair
+    behind (run 20260920: every wire-harness pass leaked two daemons; the
+    #223 close-out: a standalone harness rmtree'd its tempdir and left a
+    daemon spinning at 74% CPU on the deleted socket). The graceful `sd` wire
+    shutdown (both products implement it) goes first for every
+    `socket_paths` entry; `proc` (a directly spawned daemon) is then
+    terminated; then the sweep kills every `--mode daemon` process whose
+    argv references any of `needles` — a respawned main or a detached
+    supervisor — and finally every process whose cwd sits under any of
+    `cwd_roots` (the detached session workers: `<binary> worker` carries
+    no sandbox path in its argv, only in its cwd). SIGTERM first,
+    escalate to SIGKILL, re-check for a respawned main until the
+    supervisor is gone."""
+    for socket_path in socket_paths:
+        try:
+            wire = Wire(Path(socket_path))
             wire.send_command("sd", {"type": "shutdown"})
             wire.close()
             time.sleep(2)
         except Exception:
             pass
-        if self.daemon_proc and self.daemon_proc.poll() is None:
-            self.daemon_proc.terminate()
+    if proc and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    exclude = {proc.pid} if proc else set()
+    for _ in range(3):
+        pids = daemon_pids_matching(needles, exclude_pids=exclude)
+        pids += worker_pids_under(cwd_roots, exclude_pids=exclude)
+        if not pids:
+            return
+        for pid in pids:
             try:
-                self.daemon_proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.daemon_proc.kill()
-        # Sweep: SIGTERM first, escalate to SIGKILL, re-check for a
-        # respawned main until the supervisor is gone.
-        for _ in range(3):
-            pids = self.own_daemon_pids()
-            if not pids:
-                return
-            for pid in pids:
-                try:
-                    os.kill(pid, 15)
-                except (ProcessLookupError, PermissionError):
-                    pass
-            time.sleep(1.0)
-            for pid in self.own_daemon_pids():
-                try:
-                    os.kill(pid, 9)
-                except (ProcessLookupError, PermissionError):
-                    pass
-            time.sleep(0.5)
-
-    def own_daemon_pids(self) -> list[int]:
-        """Daemon processes whose argv references this side's daemon
-        socket or its TMPDIR (the supervisor's socket lives there)."""
-        needles = [str(self.daemon_socket)]
-        tmpdir = self.env.get("TMPDIR")
-        if tmpdir:
-            needles.append(tmpdir.rstrip("/"))
-        mine: list[int] = []
-        for proc_dir in Path("/proc").iterdir():
-            if not proc_dir.name.isdigit():
-                continue
-            pid = int(proc_dir.name)
-            if pid in (1, os.getpid()) or (
-                self.daemon_proc and pid == self.daemon_proc.pid
-            ):
-                continue
+                os.kill(pid, 15)
+            except (ProcessLookupError, PermissionError):
+                pass
+        time.sleep(1.0)
+        for pid in daemon_pids_matching(needles, exclude_pids=exclude) + worker_pids_under(
+            cwd_roots, exclude_pids=exclude
+        ):
             try:
-                argv = [
-                    part.decode(errors="replace")
-                    for part in (proc_dir / "cmdline").read_bytes().split(b"\0")
-                    if part
-                ]
-            except OSError:
-                continue
-            if "--mode" not in argv or "daemon" not in argv:
-                continue
-            if any(needle in part for part in argv for needle in needles):
-                mine.append(pid)
-        return mine
+                os.kill(pid, 9)
+            except (ProcessLookupError, PermissionError):
+                pass
+        time.sleep(0.5)
 
 
 class Wire:

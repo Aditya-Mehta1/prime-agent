@@ -50,6 +50,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import visual_parity as vp
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "battery"))
+import batterylib  # noqa: E402  (the shared daemon-reap sweep)
 import ts_identity  # noqa: E402  (the shared PATH-binary identity guard)
 
 # Turn 1/4 stream slowly (6 tokens/s) so the window stays open for the
@@ -214,6 +215,7 @@ def run_queue_session(binary, sandbox, shared_cwd, script_path, size, out_dir, p
     vp.tmux("new-session", "-d", "-s", session, "-x", width, "-y", height, "-c", shared_cwd)
     env = (
         f"HOME={sandbox['home']} "
+        f"TMPDIR={sandbox['tmp']} "
         f"PRIME_AGENT_CODING_AGENT_DIR={sandbox['agent']} "
         f"PRIME_AGENT_FAUX_SCRIPT={script_path} "
         "PRIME_AGENT_DISABLE_ANALYTICS=1"
@@ -353,6 +355,7 @@ def run_hotkeys_session(binary, sandbox, shared_cwd, script_path, out_dir, prefi
     )
     env = (
         f"HOME={sandbox['home']} "
+        f"TMPDIR={sandbox['tmp']} "
         f"PRIME_AGENT_CODING_AGENT_DIR={sandbox['agent']} "
         f"PRIME_AGENT_FAUX_SCRIPT={script_path} "
         "PRIME_AGENT_DISABLE_ANALYTICS=1"
@@ -555,6 +558,10 @@ def main():
         print(f"all queue/editor states match; captures in {out_dir}")
         return 0
     finally:
+        # Rmtree alone leaks the scenario daemons (a killed TUI pane does
+        # not take its detached daemon/supervisor pair down; #223): sweep
+        # every daemon this run spawned before deleting the sandbox.
+        batterylib.reap_daemons(needles=[base], cwd_roots=[base])
         if not args.keep:
             shutil.rmtree(base, ignore_errors=True)
 

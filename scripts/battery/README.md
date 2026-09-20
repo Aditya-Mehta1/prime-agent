@@ -18,7 +18,17 @@ Each run writes `scripts/battery/runs/<UTC stamp>/` with per-side evidence
 `findings.json`. Requires the TS binary `prime-agent` on PATH (ground truth)
 and a built Rust binary (default `target/release/prime-agent`).
 
-Files: `run_battery.py` (driver), `batterylib.py` (shared harness),
+Files: `run_battery.py` (driver), `batterylib.py` (shared harness; also
+owns the daemon-reap sweep every standalone parity harness reuses:
+`reap_daemons(needles=[...])` sweeps any `--mode daemon` process whose
+argv references the given paths — the graceful `sd` shutdown first, then
+the SIGTERM/SIGKILL rounds until a respawned main is gone. Every
+standalone harness (visual, osc, queue, compact, tool-card,
+custom-message, print-json, compaction-abort, provider-error) reaps in
+its cleanup path — a sandbox tempdir must never outlive its daemons
+(#223: one was observed spinning at 74% CPU on a deleted socket); the
+harness sandboxes pin an isolated per-side TMPDIR so the TS supervisor's
+socket lands under the sandbox root the sweep can name),
 `ts_identity.py` (shared ts-identity guard: every PATH-driven parity
 harness refuses to run when its "ts" binary is this repo's Rust product —
 e.g. a stale Rust build symlinked onto PATH as `prime-agent`), 

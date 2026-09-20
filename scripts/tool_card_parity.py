@@ -34,6 +34,7 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "battery"))
+import batterylib  # noqa: E402  (the shared daemon-reap sweep)
 import ts_identity  # noqa: E402  (the shared PATH-binary identity guard)
 
 SIZES = [("120", "36")]
@@ -194,12 +195,17 @@ def prepare_sandbox(base):
     for binary in ("ts", "rust"):
         home = os.path.join(base, binary, "home")
         agent = os.path.join(base, binary, "agent")
+        tmp = os.path.join(base, binary, "tmp")
         os.makedirs(home, exist_ok=True)
+        os.makedirs(tmp, exist_ok=True)
         os.makedirs(os.path.join(agent, "extensions"), exist_ok=True)
         os.makedirs(os.path.join(agent, "sessions"), exist_ok=True)
         with open(os.path.join(agent, "settings.json"), "w") as f:
             json.dump({"onboardingCompleted": True}, f)
-        sandboxes[binary] = {"home": home, "agent": agent}
+        # The isolated TMPDIR keeps the TS supervisor's socket (the
+        # default daemon-socket dir) off the shared box root, so the
+        # cleanup reap can sweep this side's daemons by path alone.
+        sandboxes[binary] = {"home": home, "agent": agent, "tmp": tmp}
     with open(os.path.join(sandboxes["ts"]["agent"], "extensions", "tool-card-faux.js"), "w") as f:
         f.write(TS_FAUX_EXTENSION)
     return shared_cwd, script_path, sandboxes
@@ -221,6 +227,7 @@ def run_session(binary, sandbox, shared_cwd, script_path, size, out_dir):
     tmux("new-session", "-d", "-s", session, "-x", width, "-y", height, "-c", shared_cwd)
     env = (
         f"HOME={sandbox['home']} "
+        f"TMPDIR={sandbox['tmp']} "
         f"PRIME_AGENT_CODING_AGENT_DIR={sandbox['agent']} "
         f"PRIME_AGENT_FAUX_SCRIPT={script_path} "
         "PRIME_AGENT_DISABLE_ANALYTICS=1"
@@ -349,6 +356,10 @@ def main():
                     print(f"  diff: {report}")
                     failures.append(name)
     finally:
+        # Rmtree alone leaks the scenario daemons (a killed TUI pane does
+        # not take its detached daemon/supervisor pair down; #223): sweep
+        # every daemon this run spawned before deleting the sandbox.
+        batterylib.reap_daemons(needles=[base], cwd_roots=[base])
         if not args.keep:
             shutil.rmtree(base, ignore_errors=True)
     if failures:

@@ -23,6 +23,7 @@ Usage: python3 scripts/protocol_breadth_parity.py [path-to-pa-daemon]
 import json, os, socket, subprocess, sys, tempfile, time, uuid
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "battery"))
+import batterylib  # noqa: E402  (the shared daemon-reap sweep)
 import ts_identity  # noqa: E402  (the shared PATH-binary identity guard)
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -404,3 +405,7 @@ finally:
             child.wait(timeout=5)
         except subprocess.TimeoutExpired:
             child.kill()
+    # The TS supervisor can have been replaced mid-run (the respawn
+    # surfaces a fresh `--mode daemon` the terminate above never saw);
+    # sweep this run's tmp root so no daemon outlives the verifier (#223).
+    batterylib.reap_daemons(needles=[tmp], cwd_roots=[tmp])
