@@ -228,6 +228,30 @@ pub trait SessionEngine: Send + Sync {
         branch_entries: Vec<pa_types::session::FileEntry>,
     ) -> Result<()>;
 
+    /// The TS replacement flows' teardown pass
+    /// (`AgentSessionRuntime.teardownForReplacement` ->
+    /// `teardownCurrent` -> `session.disposeAsync()`): retire the live
+    /// session runtime before the replacement rebuilds onto the new file.
+    /// The session's kernel disposes first - one final namespace snapshot
+    /// flush, drained host requests, then the `python -m rlm.repl`
+    /// process exits - and the built session drops, so the next engine use
+    /// rebuilds a fresh session against the replacement file. A
+    /// replacement flow must never keep the old kernel: TS treats the
+    /// moved-to session as a new runtime, so the old kernel's namespace
+    /// and process would leak across what TS starts cold.
+    ///
+    /// Only the whole-runtime replacements run this (`new_session`,
+    /// `switch_session`, `import_jsonl`, `fork`); the tree moves
+    /// (`navigate_tree`) never do - TS rebuilds the branch context in
+    /// place on the same session and the kernel stays warm. Engines
+    /// without a live session (the scripted harness) have nothing to
+    /// retire and keep the no-op default.
+    fn teardown_for_replacement(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+
     /// Context window (tokens) of the engine's resolved model, when known.
     /// Drives the `contextUsage` estimate in `get_session_stats`; engines
     /// without model metadata report `None` and the field is omitted.

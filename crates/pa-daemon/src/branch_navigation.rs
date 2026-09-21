@@ -14,7 +14,7 @@ use crate::engine::{BranchSummaryRequest, SessionEngine};
 use crate::protocol::{response_failure, response_success, DaemonResponse};
 use crate::session_store::{SessionEntry, SessionFile};
 use crate::session_tree;
-use crate::worker::SessionCore;
+use crate::worker::{SessionCore, Worker};
 use pa_agent::abort::AbortController;
 
 pub(crate) struct TreeNavigation {
@@ -125,6 +125,13 @@ impl TreeNavigation {
     /// summarizing the abandoned branch first (TS `_navigateTree`). The
     /// response carries `editorText` when the target was a user message or
     /// custom message (the text re-enters the input bar).
+    /// `navigate_tree` (TS `AgentSession.navigateTree`): a tree move is
+    /// NOT a runtime replacement - TS rebuilds the branch context in
+    /// place on the live session (`agent.state.messages =
+    /// sessionContext.messages`), so the kernel stays warm: same process,
+    /// same namespace. No teardown runs here (the replacement ruling in
+    /// `session_navigation` covers `fork`, the only tree flow that
+    /// replaces the runtime).
     pub(crate) async fn navigate_tree(&self, payload: &Value) -> DaemonResponse {
         let target_id = payload
             .get("targetId")
@@ -326,12 +333,21 @@ impl TreeNavigation {
         response_success(None, "navigate_tree", Some(data))
     }
 
-    /// `fork`: copy the active path up to the target point into a new
-    /// session file and switch this worker's session onto it (TS
-    /// `AgentSessionRuntime.fork`). `position: "before"` (default) forks
-    /// from a user message with its text returned as `selectedText`;
-    /// `"at"` keeps the path through the entry itself.
-    pub(crate) async fn fork(&self, payload: &Value) -> DaemonResponse {
+    /// `fork`'s prepare phase (TS `AgentSessionRuntime.fork` before its
+    /// `teardownForReplacement`): settle the running turn first (the
+    /// branch copy below reads the store; a turn must not append entries
+    /// mid-copy), resolve the fork point, and copy the active path up to
+    /// the target into the new session file. `position: "before"`
+    /// (default) forks from a user message with its text returned as
+    /// `selectedText`; `"at"` keeps the path through the entry itself. A
+    /// failed prepare never tears the live session down (the TS entry
+    /// errors answer before the runtime teardown), so the live kernel
+    /// and any in-flight work stay untouched.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn prepare_fork(
+        &self,
+        payload: &Value,
+    ) -> Result<(SessionFile, Option<String>), DaemonResponse> {
         let entry_id = payload
             .get("entryId")
             .and_then(Value::as_str)
@@ -344,21 +360,31 @@ impl TreeNavigation {
         let (target_leaf, selected_text, store, cwd) = {
             let core = self.core.lock().unwrap();
             let Some(store) = core.store.as_ref() else {
-                return response_failure(None, "fork", "Session is still initializing", None);
+                return Err(response_failure(
+                    None,
+                    "fork",
+                    "Session is still initializing",
+                    None,
+                ));
             };
             let Some(target) = store.entry(entry_id) else {
-                return response_failure(None, "fork", "Invalid entry ID for forking", None);
+                return Err(response_failure(
+                    None,
+                    "fork",
+                    "Invalid entry ID for forking",
+                    None,
+                ));
             };
             let (target_leaf, selected_text) = match position {
                 Some("at") => (Some(entry_id.to_string()), None),
                 _ => {
                     let Some(text) = session_tree::user_entry_text(target) else {
-                        return response_failure(
+                        return Err(response_failure(
                             None,
                             "fork",
                             "Invalid entry ID for forking",
                             None,
-                        );
+                        ));
                     };
                     (target.parent_id.clone(), Some(text))
                 }
@@ -381,7 +407,7 @@ impl TreeNavigation {
                         .join(crate::session_store::session_file_name(forked.session_id()));
                     forked.set_path(file);
                     if let Err(error) = forked.rewrite() {
-                        return response_failure(None, "fork", &error.to_string(), None);
+                        return Err(response_failure(None, "fork", &error.to_string(), None));
                     }
                 }
                 forked
@@ -392,7 +418,7 @@ impl TreeNavigation {
                     // place (TS non-persisted `createBranchedSession`).
                     let mut forked = store.clone();
                     if let Err(error) = forked.replace_with_branch(Some(leaf_id)) {
-                        return response_failure(None, "fork", &error.to_string(), None);
+                        return Err(response_failure(None, "fork", &error.to_string(), None));
                     }
                     forked
                 } else {
@@ -400,13 +426,23 @@ impl TreeNavigation {
                     match store.create_branched_file(leaf_id, session_dir) {
                         Ok(forked) => forked,
                         Err(error) => {
-                            return response_failure(None, "fork", &error.to_string(), None)
+                            return Err(response_failure(None, "fork", &error.to_string(), None))
                         }
                     }
                 }
             }
         };
 
+        Ok((forked, selected_text))
+    }
+
+    /// `fork`'s swap phase (TS `buildAndApplyReplacement`): the store,
+    /// the engine's session file, and the rebuilt context move onto the
+    /// prepared fork file. The worker runs its replacement teardown
+    /// between the prepare and this swap, so the parked context lands on
+    /// the fresh, unbuilt session and its first build adopts the fork's
+    /// branch.
+    pub(crate) async fn replace_with_fork(&self, forked: SessionFile) -> Result<(), String> {
         let branch_entries = forked.branch_file_entries();
         let new_path = forked.path.clone();
         {
@@ -414,14 +450,7 @@ impl TreeNavigation {
             core.store = Some(forked);
         }
         self.engine.set_session_file(new_path);
-        if let Err(error) = rebuild_engine_context(&self.engine, branch_entries).await {
-            return response_failure(None, "fork", &error, None);
-        }
-        let mut data = json!({ "cancelled": false });
-        if let Some(selected_text) = selected_text {
-            data["selectedText"] = json!(selected_text);
-        }
-        response_success(None, "fork", Some(data))
+        rebuild_engine_context(&self.engine, branch_entries).await
     }
 
     /// Wait until the running turn (if any) has settled (the compaction
@@ -492,5 +521,33 @@ fn custom_message_text(entry: &SessionEntry) -> Option<String> {
             Some(text).filter(|text| !text.is_empty())
         }
         _ => None,
+    }
+}
+
+impl Worker {
+    /// `fork` (TS `AgentSessionRuntime.fork`): a whole-runtime
+    /// replacement - prepare the fork file (the branch copy), retire the
+    /// live runtime (the kernel disposes; the fresh session's kernel
+    /// starts cold), swap the store, and prewarm the replacement session.
+    /// The tree moves (`navigate_tree`) are the contrast ruling: TS
+    /// rebuilds the branch context in place on the live session and never
+    /// runs this teardown, so the kernel stays warm there.
+    pub(crate) async fn handle_fork(&self, payload: &Value) -> DaemonResponse {
+        let (forked, selected_text) = match self.tree_navigation.prepare_fork(payload).await {
+            Ok(prepared) => prepared,
+            Err(response) => return response,
+        };
+        self.teardown_for_replacement().await;
+        match self.tree_navigation.replace_with_fork(forked).await {
+            Ok(()) => {
+                self.prewarm_replacement_session();
+                let mut data = json!({ "cancelled": false });
+                if let Some(selected_text) = selected_text {
+                    data["selectedText"] = json!(selected_text);
+                }
+                response_success(None, "fork", Some(data))
+            }
+            Err(error) => response_failure(None, "fork", &error, None),
+        }
     }
 }

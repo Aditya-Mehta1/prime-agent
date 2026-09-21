@@ -2154,3 +2154,60 @@ process (process-table diff against the pre-test baseline; every path ends
 the worker process too, so a missing dispose leaves an orphaned kernel that
 the diff catches). The seam itself is pinned by the pa-core
 `kernel_teardown.rs` dispose tests from #235.
+
+- lane `replacement-kernel`: replacement-flow kernel dispose (TS
+  `teardownForReplacement` ruling per flow).
+  TS ground truth (`packages/coding-agent/src/core/agent-session-runtime.ts`):
+  every whole-runtime replacement — `newSession` ("new"), `switchSession`
+  ("resume"), `fork` ("fork"), `importFromJsonl` ("resume") — runs
+  `teardownForReplacement` -> `teardownCurrent` -> `session.disposeAsync()`
+  before `buildAndApplyReplacement`: the old session's kernel disposes
+  (final namespace snapshot flush, then the `python -m rlm.repl` process
+  exits), and the fresh runtime built onto the replacement file prewarms a
+  cold kernel (its namespace revives only from the moved-to session's own
+  kernel-state snapshot, when one exists; a fresh `/new` or a branched fork
+  has none — `createBranchedSession` copies no kernel state). The tree
+  moves (`navigateTree`) are NOT replacements: TS rebuilds the branch
+  context in place (`agent.state.messages = sessionContext.messages`) and
+  the kernel stays warm. The prepare/teardown order matters: TS opens and
+  validates the replacement session file BEFORE the teardown, so a failed
+  prepare (missing switch target, bad fork entry) leaves the live session
+  and its kernel untouched.
+  Port: the ruling above resolves the divergence #236 had documented.
+  The worker runs `teardown_for_replacement` between the prepare and the
+  swap for new_session/switch_session/import_jsonl (session_navigation.rs)
+  and fork (branch_navigation.rs): cancel the queued session actions
+  (TS dispose rejects every queued action), abort the compaction and
+  branch-summary runs, settle the turn, then retire the runtime —
+  `AgentSessionEngine::retire_session_runtime` disposes the built
+  session's kernel and drops the built session (with its mirrored goal
+  handles and published goal state) under the build gate, so the next
+  demand seam rebuilds a fresh session against the moved file and the
+  background `prewarm_replacement_session` build fires the fresh kernel's
+  prewarm at the replacement (TS `buildAndApplyReplacement` ->
+  `createRuntime`). `navigate_tree` keeps the kernel warm — no teardown
+  there, ever. The build funnel (`ensure_core_session_async` /
+  `session_agent`) now shares one post-build adoption step
+  (`adopt_built_session`: goal mirror, parked depth override, parked
+  replacement branch), so a read-seam build cannot strand a parked
+  replacement branch (pre-existing latent gap: only the turn-driven build
+  consumed it before).
+  Remaining documented divergence (out of this lane's scope): TS
+  `teardownCurrent` also disposes the session's hosted RLM subagent
+  runtimes on replacement; the Rust port's RLM children are separate
+  daemon workers under the supervisor, so their lifecycle on a parent
+  replacement belongs to the rlm-children surface. TS `session.reload()`
+  disposes the kernel provisioner (a previous provisioner's final snapshot
+  flush gates the next read); the Rust `reload` arm is not yet implemented
+  (no daemon `reload` command exists) — the ruling will apply when it lands.
+  Verifiers: `pa-daemon/tests/replacement_kernel_e2e.rs` — per flow
+  against a live kernel: `new_session` and `fork` must turn the kernel
+  over (old pid gone, fresh pid alive from the replacement prewarm) and
+  the fresh namespace must be COLD (a marker variable set before the
+  replacement is gone); `switch_session` must turn over on a prepared
+  target AND a missing target must keep the kernel alive untouched (the
+  prepare precedes the teardown); `navigate_tree` must keep the SAME
+  kernel pid alive with a WARM namespace. Unit: the engine retire rebuild
+  (`agent_engine::replacement_teardown_retires_the_session_and_the_funnel_adopts_the_branch`)
+  and the worker flow ruling
+  (`session_navigation::tests::replacement_flows_retire_only_on_a_prepared_file`).

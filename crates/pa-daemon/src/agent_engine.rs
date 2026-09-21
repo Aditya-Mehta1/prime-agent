@@ -333,9 +333,71 @@ impl AgentSessionEngine {
             }
         }
         let built = self.build_session(model).await?;
-        self.mirror_goal_runtime(&built);
+        self.adopt_built_session(&built).await?;
         self.session.lock().await.replace(built);
         Ok(())
+    }
+
+    /// Post-build adoption, shared by every build path (the async funnel
+    /// and the turn-driven `session_agent` build): mirror the goal
+    /// runtime, flush a depth override that landed before the build, and
+    /// consume a parked replacement branch. A replacement flow retires
+    /// the built session (see [`Self::retire_session_runtime`]) and parks
+    /// the moved branch in `pending_branch`; whichever build path runs
+    /// first must adopt it, or a read-seam build would strand the parked
+    /// branch and the session would start off the moved branch's entries.
+    async fn adopt_built_session(&self, built: &CoreSessionEngine) -> anyhow::Result<()> {
+        self.mirror_goal_runtime(built);
+        // A `set_rlm_max_depth` that landed before the build parks its
+        // durable entry; the built session owns the store now.
+        {
+            let handles = self.goal_runtime.lock().expect("goal runtime lock").clone();
+            if let Some(handles) = handles {
+                let mut manager = handles.session.lock().await;
+                self.flush_pending_max_depth(&mut manager);
+            }
+        }
+        // A branch move that landed before the first turn built the
+        // session (tree navigation/fork/replacement with no turn yet)
+        // re-seeds the session onto the moved branch.
+        let pending_branch = self
+            .pending_branch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(entries) = pending_branch {
+            built.session.rebuild_branch_context(entries).await?;
+        }
+        Ok(())
+    }
+
+    /// The TS replacement teardown (`teardownForReplacement` ->
+    /// `teardownCurrent` -> `session.disposeAsync()`): retire the live
+    /// runtime so the next demand seam rebuilds a fresh session against
+    /// the moved session file. The built session's kernel disposes first -
+    /// one final namespace snapshot flush, drained host requests, then the
+    /// process exits; a kernel that survived here would carry the old
+    /// session's namespace into what TS treats as a new session - and the
+    /// built session drops together with its mirrored goal handles and the
+    /// last published goal state (a read before the next build reports
+    /// the fresh runtime's empty state, not the retired session's). The
+    /// build gate is held across the teardown so no racing demand seam
+    /// rebuilds mid-dispose; the kernel dispose happens after the session
+    /// is taken, so the fresh build it enables starts from nothing.
+    pub(crate) async fn retire_session_runtime(&self) {
+        let _build = self.session_build.lock().await;
+        let built = self.session.lock().await.take();
+        *self.goal_runtime.lock().expect("goal runtime lock") = None;
+        *self.published_goal.lock().expect("published goal lock") = None;
+        if let Some(engine) = built {
+            // The session's telemetry ends with it (the TS dispose
+            // callback the replacement teardown runs); best-effort like
+            // every end path, a failed flush never fails the teardown.
+            if let Some(telemetry) = &engine.telemetry {
+                let _ = telemetry.end().await;
+            }
+            engine.dispose_kernel().await;
+        }
     }
 
     /// Tear the built session's kernel down (TS `closeSession` ->
@@ -905,6 +967,18 @@ impl SessionEngine for AgentSessionEngine {
                 return;
             };
             let _ = telemetry.end().await;
+        })
+    }
+
+    /// The TS replacement teardown (see
+    /// [`Self::retire_session_runtime`]): the replacement flows retire the
+    /// live runtime - kernel dispose plus the built session's drop - so
+    /// the moved-to session rebuilds cold against its new file.
+    fn teardown_for_replacement(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            self.retire_session_runtime().await;
         })
     }
 
@@ -2532,39 +2606,16 @@ impl AgentSessionEngine {
         &self,
         model: &Model,
     ) -> anyhow::Result<std::sync::Arc<pa_agent::agent::Agent>> {
-        // Build (once) without holding the lock across the await.
+        // Build (once) through the shared gated funnel, so the
+        // turn-driven build and the read-seam builds (and the replacement
+        // teardown's fresh rebuild) all adopt the same pre-build state -
+        // goal mirrors, a parked depth override, and a parked replacement
+        // branch.
         {
             let guard = self.session.blocking_lock();
             if guard.is_none() {
                 drop(guard);
-                let built = self
-                    .runtime
-                    .block_on(async { self.build_session(model).await })?;
-                self.mirror_goal_runtime(&built);
-                // A `set_rlm_max_depth` that landed before the build parks
-                // its durable entry; the built session owns the store now.
-                {
-                    let handles = self.goal_runtime.lock().expect("goal runtime lock").clone();
-                    if let Some(handles) = handles {
-                        let mut manager = self
-                            .runtime
-                            .block_on(async { handles.session.lock().await });
-                        self.flush_pending_max_depth(&mut manager);
-                    }
-                }
-                // A branch move that landed before the first turn (tree
-                // navigation/fork with no turn yet) re-seeds the session
-                // onto the moved branch.
-                let pending_branch = self
-                    .pending_branch
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take();
-                if let Some(entries) = pending_branch {
-                    self.runtime
-                        .block_on(async { built.session.rebuild_branch_context(entries).await })?;
-                }
-                self.session.blocking_lock().replace(built);
+                self.ensure_core_session(model)?;
             }
         }
         let guard = self.session.blocking_lock();
@@ -4357,6 +4408,110 @@ fn run_prompts(
         );
     }
     (engine, events)
+}
+
+/// The TS replacement teardown (`teardownForReplacement` -> `teardownCurrent`
+/// -> `session.disposeAsync()`): retiring the built session drops it (the
+/// session's kernel disposes with it), and the replacement branch parked
+/// while the session was unbuilt is adopted by the async build funnel -
+/// the read-seam build, not just the turn-driven one, must consume the
+/// parked branch, or a read seam that rebuilt first would strand the
+/// replacement's context.
+#[tokio::test]
+async fn replacement_teardown_retires_the_session_and_the_funnel_adopts_the_branch() {
+    let engine = {
+        let (engine, _events) = tokio::task::spawn_blocking(|| {
+            run_prompts(
+                json!({ "engine": "faux", "responses": [{ "text": "first" }] }),
+                &["hello"],
+            )
+        })
+        .await
+        .expect("prompt join");
+        std::sync::Arc::new(engine)
+    };
+    // The prompt built the session.
+    assert!(engine.session.lock().await.is_some());
+
+    // Retire: the built session drops with its mirrored goal handles (the
+    // kernel dispose runs under the build gate; the harness session has
+    // no live kernel).
+    engine.retire_session_runtime().await;
+    assert!(engine.session.lock().await.is_none());
+    assert!(engine
+        .goal_runtime
+        .lock()
+        .expect("goal runtime lock")
+        .is_none());
+
+    // The replacement tail parks the moved branch on the unbuilt engine
+    // (the worker parks it on a blocking thread; so does the test).
+    let mut store = crate::session_store::SessionFile::create("/tmp", None, 0);
+    store.append_message(json!({
+        "role": "user",
+        "content": "moved branch marker",
+        "timestamp": 1u64,
+    }));
+    let branch = store.branch_file_entries();
+    {
+        let engine = std::sync::Arc::clone(&engine);
+        tokio::task::spawn_blocking(move || {
+            use crate::engine::SessionEngine as _;
+            engine.rebuild_session_context(branch)
+        })
+        .await
+        .expect("park join")
+        .expect("park branch");
+    }
+    assert!(engine
+        .pending_branch
+        .lock()
+        .expect("pending branch lock")
+        .is_some());
+
+    // The async funnel's build adopts the parked branch: the fresh
+    // session starts on the moved branch, not the retired session's
+    // context.
+    let model = engine.resolve_model().expect("model");
+    engine
+        .ensure_core_session_async(&model)
+        .await
+        .expect("rebuild");
+    assert!(engine
+        .pending_branch
+        .lock()
+        .expect("pending branch lock")
+        .is_none());
+    let session = engine.session.lock().await;
+    let built = session.as_ref().expect("rebuilt session");
+    let state = built.session.agent().state().await;
+    let texts: Vec<String> = state
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            pa_agent::types::AgentMessage::Standard(pa_agent::types::Message::User(user)) => {
+                match &user.content {
+                    pa_agent::types::UserContent::Text(text) => Some(text.clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.contains("moved branch marker")),
+        "the rebuilt session did not adopt the parked branch: {texts:?}"
+    );
+    drop(texts);
+    drop(state);
+    drop(session);
+    // The engine owns a private runtime; dropping it from an async
+    // context panics, so the teardown rides a blocking thread.
+    tokio::task::spawn_blocking(move || drop(engine))
+        .await
+        .expect("engine drop join");
 }
 
 /// The user rows emitted by one run (message texts in order).

@@ -580,7 +580,7 @@ pub struct Worker {
     /// Compaction runs: abort slot, events, durable entry persistence.
     pub(crate) compaction: crate::compaction::CompactionManager,
     /// Session-tree navigation: `/tree` moves, branch summaries, forks.
-    tree_navigation: crate::branch_navigation::TreeNavigation,
+    pub(crate) tree_navigation: crate::branch_navigation::TreeNavigation,
     /// Session export: the `/export` HTML and JSONL branches.
     exports: crate::session_export::ExportCommands,
     /// Session-scoped ACP MCP servers for engines without their own store
@@ -817,7 +817,6 @@ impl Worker {
         let navigation = crate::session_navigation::SessionNavigation::new(
             std::sync::Arc::clone(&engine),
             Arc::clone(&core),
-            Arc::clone(&idle_notify),
             std::sync::Arc::clone(&scheduled),
         );
         Worker {
@@ -1380,7 +1379,7 @@ impl Worker {
             "get_user_messages_for_forking" => self.tree_navigation.get_user_messages_for_forking(),
             "set_session_entry_label" => self.tree_navigation.set_session_entry_label(payload),
             "navigate_tree" => self.tree_navigation.navigate_tree(payload).await,
-            "fork" => self.tree_navigation.fork(payload).await,
+            "fork" => self.handle_fork(payload).await,
             "abort_branch_summary" => {
                 self.tree_navigation.abort();
                 response_success(None, "abort_branch_summary", None)
@@ -2484,6 +2483,79 @@ impl Worker {
                 }
             }
             notified.await;
+        }
+    }
+
+    /// The TS replacement teardown (`teardownForReplacement`): the
+    /// whole-runtime replacement flows (`new_session` /
+    /// `switch_session` / `import_jsonl` / `fork`) retire the live
+    /// session before swapping onto the replacement file. The settle
+    /// cancels the queued session actions first (TS dispose rejects every
+    /// queued action, and the turn runner clears the abort flag when it
+    /// pops an item, so the cancel must land before the park), aborts the
+    /// compaction and branch-summary runs, and parks until the turn and
+    /// compaction settle; then the engine retires the runtime - the
+    /// kernel disposes (its final namespace snapshot flushes before the
+    /// process exits) and the built session drops, so the replacement
+    /// rebuilds a fresh session against the moved file exactly like the
+    /// TS fresh runtime. The tree moves (`navigate_tree`) never run
+    /// this: TS rebuilds the branch context in place and the kernel
+    /// stays warm.
+    pub(crate) async fn teardown_for_replacement(&self) {
+        {
+            let mut core = self.core.lock().unwrap();
+            core.steering.clear();
+            core.follow_up.clear();
+        }
+        self.compaction.abort();
+        self.tree_navigation.abort();
+        self.await_replacement_settled().await;
+        self.engine.teardown_for_replacement().await;
+    }
+
+    /// Wait until the replacement teardown can retire the runtime: no
+    /// turn and no compaction in flight. Like the navigation settle, the
+    /// park rides a timeout backstop - the turn runner notifies the idle
+    /// notify when a run settles, but a compaction settle does not, so a
+    /// missed wake must not hang the replacement.
+    async fn await_replacement_settled(&self) {
+        loop {
+            let busy = {
+                let mut core = self.core.lock().unwrap();
+                let busy = core.busy || core.compacting;
+                if busy {
+                    core.abort_requested = true;
+                }
+                busy
+            };
+            if !busy {
+                return;
+            }
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                self.idle_notify.notified(),
+            )
+            .await;
+        }
+    }
+
+    /// The replacement rebuild (TS `buildAndApplyReplacement` ->
+    /// `createRuntime`, which prewarms the new session's kernel): the
+    /// fresh session builds in the background like the create-time build,
+    /// so the replacement session's kernel prewarm fires at the
+    /// replacement, not at the first turn. The build gate deduplicates it
+    /// against any racing demand seam, and a build failure surfaces on
+    /// the first demand seam. Scripted harness engines have no session
+    /// to build.
+    pub(crate) fn prewarm_replacement_session(&self) {
+        if let Some(agent_engine) = &self.agent_engine {
+            let engine = std::sync::Arc::clone(agent_engine);
+            tokio::spawn(async move {
+                let Ok(model) = engine.resolve_model() else {
+                    return;
+                };
+                let _ = engine.ensure_core_session_async(&model).await;
+            });
         }
     }
 
