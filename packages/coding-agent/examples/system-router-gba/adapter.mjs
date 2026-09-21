@@ -32,7 +32,7 @@ function actionSpace() {
   const actions = {
     wait: {
       description:
-        "Run the game for about half a second without pressing anything. Use when the screen is mid-animation or a dialog is advancing on its own.",
+        "Run the game for about one second (60 frames) without pressing anything. Use when the screen is mid-animation or a dialog is advancing on its own.",
     },
   };
   for (const button of BUTTONS) {
