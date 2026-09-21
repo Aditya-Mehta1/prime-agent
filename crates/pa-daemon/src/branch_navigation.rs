@@ -461,13 +461,18 @@ impl TreeNavigation {
                 let mut core = self.core.lock().unwrap();
                 if core.busy {
                     core.abort_requested = true;
+                    // The interrupted turn's aborted row stays off the wire
+                    // and out of the store (TS's navigation path never
+                    // surfaces one — the compact-style teardown shape; the
+                    // gate's aborted-row exception stays closed).
+                    core.suppress_aborted_row = true;
                     true
                 } else {
                     false
                 }
             };
             if !busy {
-                return;
+                break;
             }
             // The interrupt-and-settle loop, like the compaction flow's:
             // the engine abort cancels the in-flight fetch now (TS
@@ -479,6 +484,9 @@ impl TreeNavigation {
             )
             .await;
         }
+        // The interrupted turn settled; the suppression owns only that
+        // drain window.
+        self.core.lock().unwrap().suppress_aborted_row = false;
     }
 }
 

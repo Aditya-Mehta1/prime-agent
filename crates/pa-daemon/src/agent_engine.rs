@@ -3222,6 +3222,14 @@ impl AgentSessionEngine {
             agent.abort();
             let _ = (&mut admitted).await;
         }
+        // The settled run's tail still holds the aborted assistant row: the
+        // abort finalize emits the row after the cancel (TS
+        // `createAbortedAssistantMessage`), so every queued event drains
+        // through the emit gate — the row's frames pass (broadcast +
+        // persist), the post-abort stragglers drop.
+        while let Ok(event) = rx.try_recv() {
+            let _ = emit(event);
+        }
         let _ = subscription.unsubscribe().await;
         if aborted {
             return Ok(TurnOnce::Aborted);
@@ -5716,6 +5724,155 @@ fn abort_in_flight_turn_cancels_a_mid_provider_wait() {
     assert_eq!(assistant["usage"]["totalTokens"], json!(0));
     assert_eq!(assistant["usage"]["input"], json!(0));
     assert_eq!(assistant["usage"]["output"], json!(0));
+}
+
+/// The aborted turn's goal accounting (TS
+/// `_accountGoalUsageForAssistantMessage`'s aborted guard): an active
+/// goal's turn aborted mid-provider-wait settles on its aborted row —
+/// broadcast through the engine's stream as the message_start/
+/// message_end pair (the row's own start frame plus the settled row,
+/// `createAbortedAssistantMessage`'s shape: empty content, the abort
+/// error, EMPTY usage) — and the row persists, yet the goal accounting
+/// skips it: the goal state the goal-start turn left is the state the
+/// abort returns (same status, same tokens, same continuation count).
+#[test]
+fn active_goal_aborted_turn_row_broadcasts_and_goal_accounting_skips_it() {
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = AgentSessionEngine::new(AgentEngineConfig {
+        cwd: dir.path().to_path_buf(),
+        agent_dir: dir.path().join("agent"),
+        provider: None,
+        model: None,
+        api_key: None,
+        thinking: None,
+        session_dir: None,
+        session_file: None,
+        faux_script: Some(
+            json!({
+                "engine": "faux",
+                "responses": [
+                    { "text": "goal start reply" },
+                    { "text": "held reply", "delayMs": 60000 },
+                ],
+            })
+            .to_string(),
+        ),
+        supervisor_link: None,
+        telemetry_disabled: None,
+    })
+    .unwrap();
+    let engine = std::sync::Arc::new(engine);
+    // No worker owns the queue here: minted continuation work collects
+    // instead of running, so the held turn below is the only live one.
+    let _goal_work = tests::goal_admission_collector(&engine);
+    let mut events: Vec<EngineEvent> = Vec::new();
+    tests::admit(
+        &engine,
+        "/goal land the aborted row accounting".to_string(),
+        &mut events,
+    );
+    // The goal-start continuation turn ran inside the command's prompt and
+    // its usage was accounted (faux usage is nonzero).
+    let before = engine.goal_state_value();
+    assert_eq!(before["status"], json!("active"), "state: {before:?}");
+    assert!(
+        before["tokensUsed"].as_u64().unwrap_or(0) > 0,
+        "the goal-start turn's usage accounted: {before:?}"
+    );
+    // The second turn holds mid-provider-wait; the abort cancels the fetch
+    // (the eager funnel) and the turn settles on the aborted row.
+    let turn_engine = std::sync::Arc::clone(&engine);
+    let turn_events: std::sync::Arc<std::sync::Mutex<Vec<EngineEvent>>> = Default::default();
+    let row_events = std::sync::Arc::clone(&turn_events);
+    let turn = std::thread::spawn(move || {
+        turn_engine.run_prompt(
+            0,
+            PromptRequest {
+                images: Vec::new(),
+                message: "held turn".to_string(),
+                source: "user".to_string(),
+                agent_message_id: None,
+                custom_message: None,
+            },
+            &|| false,
+            &mut |event| {
+                row_events.lock().unwrap().push(event);
+                true
+            },
+        );
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let agent = engine.turn_agent.lock().expect("turn agent lock").clone();
+        if let Some(agent) = agent {
+            let state = engine.runtime.block_on(agent.state());
+            if state.is_streaming {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the held turn never started streaming"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    engine.abort_in_flight_turn();
+    turn.join().expect("the aborted turn settles");
+    // The aborted row broadcast as a pair: the row's own start frame (the
+    // no-partial abort begins a new message) plus the settled end row.
+    let events = turn_events.lock().unwrap();
+    let aborted_start = events
+        .iter()
+        .find_map(|event| match event {
+            EngineEvent::AssistantUpdate {
+                message,
+                stream_event,
+            } => (message.get("stopReason").and_then(Value::as_str) == Some("aborted")
+                && stream_event
+                    .as_ref()
+                    .and_then(|event| event.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("start"))
+            .then_some(message.clone()),
+            _ => None,
+        })
+        .expect("the aborted row's start frame broadcast");
+    assert_eq!(aborted_start["role"], json!("assistant"));
+    assert_eq!(aborted_start["errorMessage"], json!("Request was aborted"));
+    let aborted_end = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            EngineEvent::AssistantMessage(message)
+                if message.get("stopReason").and_then(Value::as_str) == Some("aborted") =>
+            {
+                Some(message.clone())
+            }
+            _ => None,
+        })
+        .expect("the aborted row's settled frame broadcast");
+    assert_eq!(aborted_end["role"], json!("assistant"));
+    assert_eq!(aborted_end["stopReason"], json!("aborted"));
+    assert_eq!(aborted_end["errorMessage"], json!("Request was aborted"));
+    assert_eq!(
+        aborted_end["content"],
+        json!([{ "type": "text", "text": "" }]),
+        "the no-partial abort carries empty content"
+    );
+    assert_eq!(aborted_end["usage"]["totalTokens"], json!(0));
+    assert_eq!(aborted_end["usage"]["input"], json!(0));
+    assert_eq!(aborted_end["usage"]["output"], json!(0));
+    // The goal accounting skipped the aborted row: the goal state the
+    // goal-start turn left is unchanged (the wall-clock fields are
+    // time-based, so the accounting fields compare).
+    let after = engine.goal_state_value();
+    assert_eq!(after["status"], json!("active"), "state: {after:?}");
+    assert_eq!(after["objective"], before["objective"]);
+    assert_eq!(after["tokensUsed"], before["tokensUsed"]);
+    assert_eq!(after["continuationsUsed"], before["continuationsUsed"]);
 }
 
 /// A driver loop test harness: faux script + collected events. Holds the

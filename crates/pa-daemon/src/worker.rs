@@ -217,6 +217,14 @@ pub(crate) struct SessionCore {
     pub(crate) created: bool,
     attached_client_ids: Vec<String>,
     pub(crate) abort_requested: bool,
+    /// A flow that detaches from the interrupted turn's events (TS
+    /// `compact()`'s `_disconnectFromAgent()` before `abort()` — and the
+    /// branch-navigation interrupt, the same teardown shape) swallowed the
+    /// aborted turn's assistant row on the TS wire and in the session
+    /// file, so the gate's aborted-row exception stays closed while such a
+    /// flow settles its turn. Owned by the interrupt-and-settle helper that
+    /// set it; cleared once the turn settled.
+    pub(crate) suppress_aborted_row: bool,
     pub(crate) shutdown_requested: bool,
     /// True while a compaction run is in flight (TS `isCompacting`).
     pub(crate) compacting: bool,
@@ -298,6 +306,7 @@ impl SessionCore {
             created: true,
             attached_client_ids: Vec::new(),
             abort_requested: false,
+            suppress_aborted_row: false,
             shutdown_requested: false,
             compacting: false,
             auto_compaction_enabled: true,
@@ -643,6 +652,7 @@ impl Worker {
             created: false,
             attached_client_ids: Vec::new(),
             abort_requested: false,
+            suppress_aborted_row: false,
             shutdown_requested: false,
             compacting: false,
             auto_compaction_enabled: true,
@@ -3907,10 +3917,22 @@ impl TurnRunner {
             let mut done = done;
             let mut emit = |mut event: EngineEvent| -> bool {
                 // Sequence + persist under the core lock, then broadcast.
-                // The abort flag lives on the session core (`abort` command):
-                // a cancelled turn stops consuming its own events.
+                // The abort flag lives on the session core (`abort`
+                // command): a cancelled turn stops consuming its own
+                // events — except the aborted assistant row itself. TS
+                // `createAbortedAssistantMessage`'s message_start/
+                // message_end pair reaches the listeners and
+                // `appendMessage` persists it, so the row's frames pass
+                // the gate (persist + broadcast) while the turn still
+                // unwinds; every other post-abort event stays dropped.
+                let aborted_row = matches!(
+                    &event,
+                    EngineEvent::AssistantMessage(message)
+                        | EngineEvent::AssistantUpdate { message, .. }
+                        if message.get("stopReason").and_then(Value::as_str) == Some("aborted")
+                );
                 let mut core = core.lock().unwrap();
-                if core.abort_requested {
+                if core.abort_requested && !(aborted_row && !core.suppress_aborted_row) {
                     return false;
                 }
                 // The engine cuts its in-memory entries; its
@@ -5383,6 +5405,269 @@ mod tests {
         assert!(plain.success, "a post-goal prompt failed: {plain:?}");
     }
 
+    /// The aborted turn's row through the worker gate (the #245 flagged
+    /// gap: TS broadcasts AND persists it, the gate used to drop it): a
+    /// turn aborted mid-provider-wait settles on its aborted assistant
+    /// row, and the gate forwards the row — the attached client sees the
+    /// row's message_start/message_end pair (stopReason "aborted", the
+    /// abort error, EMPTY usage) and the session file holds the same
+    /// row — while the active goal's accounting skips it (the state the
+    /// goal-start turn left is unchanged after the abort).
+    #[allow(clippy::await_holding_lock)] // the faux registry is process-global: the guard must span the async flow
+    #[tokio::test]
+    async fn aborted_turn_row_broadcasts_and_persists_through_the_worker_gate() {
+        let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("pa-worker-aborted-row-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "aborted-row-session".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({
+                "engine": "faux",
+                "responses": [
+                    "goal start reply",
+                    { "text": "held reply", "delayMs": 60000 },
+                ],
+            })),
+        };
+        let worker = std::sync::Arc::new(Worker::new(config, None));
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({ "noSession": true, "cwd": "/tmp", "name": "aborted-row" }),
+            )
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        let mut subscription = worker.events.subscribe();
+        // `/goal`: the goal-start continuation turn runs to completion
+        // inside the prompt, its usage accounted.
+        let start = worker
+            .dispatch(
+                "prompt_and_wait",
+                &json!({
+                    "activeSessionId": "aborted-row-session",
+                    "message": "/goal land the aborted row accounting",
+                }),
+            )
+            .await;
+        assert!(start.success, "the goal start failed: {start:?}");
+        let goal_before = worker.engine.goal_state_value();
+        assert_eq!(
+            goal_before["status"],
+            json!("active"),
+            "state: {goal_before:?}"
+        );
+        assert!(
+            goal_before["tokensUsed"].as_u64().unwrap_or(0) > 0,
+            "the goal-start turn's usage accounted: {goal_before:?}"
+        );
+        // The turn-end mint queues the next continuation; the runner
+        // admits it and its goal-context row rides the wire, then the
+        // provider fetch holds (the 60s reply).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let events = session_events_since(&mut subscription);
+            let admitted = events.iter().any(|event| {
+                event.get("type").and_then(Value::as_str) == Some("message_start")
+                    && event["message"]["customType"] == "goal_context"
+                    && event["message"]["details"]["continuationsUsed"] == json!(1)
+            });
+            if admitted {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the continuation turn was never admitted"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        // Let the admitted turn reach the provider: the held reply keeps
+        // the fetch in flight, so the abort lands mid-provider-wait (the
+        // eager fetch cancel) and the turn settles on its aborted row.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let abort = worker.dispatch("abort", &json!({})).await;
+        assert!(abort.success, "abort failed: {abort:?}");
+        let idle = worker.dispatch("wait_for_idle", &json!({})).await;
+        assert!(idle.success, "never went idle: {idle:?}");
+        // The attached client saw the row's pair: the row's own start
+        // frame (a no-partial abort begins a new message) and the settled
+        // end frame with the aborted shape.
+        let events = session_events_since(&mut subscription);
+        let aborted_start = events
+            .iter()
+            .find(|event| {
+                event.get("type").and_then(Value::as_str) == Some("message_start")
+                    && event["message"]["role"] == "assistant"
+                    && event["message"]["stopReason"] == json!("aborted")
+            })
+            .cloned()
+            .expect("the aborted row's start frame reached the wire");
+        assert_eq!(
+            aborted_start["message"]["errorMessage"],
+            json!("Request was aborted")
+        );
+        let aborted_end = events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.get("type").and_then(Value::as_str) == Some("message_end")
+                    && event["message"]["role"] == "assistant"
+                    && event["message"]["stopReason"] == json!("aborted")
+            })
+            .cloned()
+            .expect("the aborted row's end frame reached the wire");
+        let row = &aborted_end["message"];
+        assert_eq!(row["errorMessage"], json!("Request was aborted"));
+        assert_eq!(row["usage"]["totalTokens"], json!(0));
+        assert_eq!(row["usage"]["input"], json!(0));
+        assert_eq!(row["usage"]["output"], json!(0));
+        assert_eq!(row["content"], json!([{ "type": "text", "text": "" }]));
+        // The row persisted: the session file holds the same aborted
+        // assistant row (TS `appendMessage` at the message_end hook).
+        let store_row = {
+            let core = worker.core.lock().unwrap();
+            core.store
+                .as_ref()
+                .expect("the worker owns a session file")
+                .messages()
+                .into_iter()
+                .rev()
+                .find(|message| {
+                    message.get("role").and_then(Value::as_str) == Some("assistant")
+                        && message.get("stopReason").and_then(Value::as_str) == Some("aborted")
+                })
+                .expect("the aborted row persisted in the session file")
+        };
+        assert_eq!(store_row["errorMessage"], json!("Request was aborted"));
+        assert_eq!(store_row["usage"]["totalTokens"], json!(0));
+        assert_eq!(
+            store_row["content"],
+            json!([{ "type": "text", "text": "" }])
+        );
+        // The goal accounting skipped the row (TS
+        // `_accountGoalUsageForAssistantMessage`'s aborted guard): the
+        // accounting fields are the state the goal-start turn left (the
+        // wall-clock fields are time-based).
+        let goal_after = worker.engine.goal_state_value();
+        assert_eq!(
+            goal_after["status"],
+            json!("active"),
+            "state: {goal_after:?}"
+        );
+        assert_eq!(goal_after["tokensUsed"], goal_before["tokensUsed"]);
+        assert_eq!(
+            goal_after["continuationsUsed"],
+            goal_before["continuationsUsed"]
+        );
+        assert_eq!(goal_after["objective"], goal_before["objective"]);
+    }
+
+    /// The compact path swallows the interrupted turn's aborted row (TS
+    /// `compact()` detaches from agent events — `_disconnectFromAgent()`
+    /// — before the abort, so the row never reaches the wire or the
+    /// session file): a turn aborted by the `compact` command's
+    /// interrupt-and-settle shows no aborted assistant row on either
+    /// surface, while the same abort through the `abort` command
+    /// broadcasts it (the previous test).
+    #[allow(clippy::await_holding_lock)] // the faux registry is process-global: the guard must span the async flow
+    #[tokio::test]
+    async fn compact_interrupt_swallows_the_aborted_row() {
+        let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("pa-worker-compact-abort-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "compact-abort-session".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({
+                "engine": "faux",
+                "responses": [{ "text": "held reply", "delayMs": 60000 }],
+            })),
+        };
+        let worker = std::sync::Arc::new(Worker::new(config, None));
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({ "noSession": true, "cwd": "/tmp", "name": "compact-abort" }),
+            )
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        let mut subscription = worker.events.subscribe();
+        let turn = worker
+            .dispatch(
+                "prompt",
+                &json!({
+                    "activeSessionId": "compact-abort-session",
+                    "message": "held turn for the compact interrupt",
+                }),
+            )
+            .await;
+        assert!(turn.success, "the prompt failed: {turn:?}");
+        // Let the admitted turn reach the provider (the 60s hold), then
+        // compact: the interrupt aborts the in-flight fetch and the
+        // aborted row must stay off the wire (TS `_disconnectFromAgent`).
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let compact = worker
+            .dispatch(
+                "compact",
+                &json!({ "activeSessionId": "compact-abort-session" }),
+            )
+            .await;
+        // The scripted faux engine's compact outcome is not the claim
+        // here; either way the turn settled before it.
+        let _ = compact;
+        let idle = worker.dispatch("wait_for_idle", &json!({})).await;
+        assert!(idle.success, "never went idle: {idle:?}");
+        let events = session_events_since(&mut subscription);
+        let aborted_rows = events
+            .iter()
+            .filter(|event| {
+                event.get("type").and_then(Value::as_str) == Some("message_end")
+                    && event["message"]["role"] == "assistant"
+                    && event["message"]["stopReason"] == "aborted"
+            })
+            .count();
+        assert_eq!(
+            aborted_rows, 0,
+            "the compact path swallows the aborted row: {events:?}"
+        );
+        // And out of the session file.
+        let aborted_store_rows = {
+            let core = worker.core.lock().unwrap();
+            core.store
+                .as_ref()
+                .expect("the worker owns a session file")
+                .messages()
+                .into_iter()
+                .filter(|message| {
+                    message.get("role").and_then(Value::as_str) == Some("assistant")
+                        && message.get("stopReason").and_then(Value::as_str) == Some("aborted")
+                })
+                .count()
+        };
+        assert_eq!(
+            aborted_store_rows, 0,
+            "the compact path never persists the aborted row"
+        );
+    }
+
     /// The pause withdraws the queued minted continuation (TS
     /// `_pauseGoal` -> `_clearQueuedGoalContexts`): a prompt arriving right
     /// after the goal start runs within a turn or two of the loop, the
@@ -5774,6 +6059,7 @@ mod turn_stream_tests {
             created: false,
             attached_client_ids: Vec::new(),
             abort_requested: false,
+            suppress_aborted_row: false,
             shutdown_requested: false,
             compacting: false,
             auto_compaction_enabled: true,

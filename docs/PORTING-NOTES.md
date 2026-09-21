@@ -679,3 +679,83 @@ one store: resume opens the session file into the branch).
   `killed_mid_goal_worker_rehydrates_the_goal_with_counts` e2e's
   post-recovery compact (the second compaction entry lands durably and
   the mint continues the rehydrated count to `continuationsUsed` 2).
+
+## Aborted-turn row broadcast + persist (2026-09-20, the #245 flagged gap)
+
+Reference: TS `agent-loop.ts` (`createAbortedAssistantMessage` +
+`finishAbortedMessage`: the abort racing the turn pushes the aborted
+assistant row — the partial's content/usage when one streamed, otherwise
+empty text and `EMPTY_USAGE` — onto the context and emits its
+message_start/message_end pair), `agent-session.ts` (`_processAgentEvent`:
+every assistant `message_end` reaches the listeners AND
+`sessionManager.appendMessage`, stopReason included; the goal accounting's
+`_accountGoalUsageForAssistantMessage` skips `error`/`aborted` rows while
+the autonomous accounting counts everything non-error).
+
+- The Rust engine already produced the row (the agent loop port's
+  `create_aborted_assistant_message`); #245's eager fetch abort made the
+  settle land mid-provider-wait. The gap was the worker gate: the turn
+  emit closure's `abort_requested` check returned false for every event
+  of a cancelled turn, so the aborted row — which TS broadcasts and
+  persists — was dropped from the wire and the store, and a turn whose
+  cancel landed mid-stream never surfaced its final row at all.
+- Fix: the gate forwards the row's own events (an
+  `EngineEvent::AssistantMessage`/`AssistantUpdate` whose message carries
+  `stopReason: "aborted"`) through the persist+broadcast path — the row's
+  start frame rides the wire, the settled row persists as a `message`
+  entry exactly like any other assistant row, and the turn still unwinds
+  (the gate keeps returning false for every other post-abort event).
+  `run_turn_once` drains the settled run's tail through the same gate, so
+  the row emitted after the cancel reaches the wire in both cancel
+  orders (mid-wait and mid-stream).
+- Accounting unchanged (the #245 ruling): the row persists but the goal
+  accounting skips it (the subscription's aborted guard sees the row's
+  EMPTY usage and never touches the goal state); the autonomous
+  accounting counts it like TS's non-error guard.
+- Surface matrix (probe-verified against the TS binary,
+  `scripts/battery/aborted_row_probe.py` — a daemon wire/store probe over
+  a held mid-provider-wait turn): `abort` and `abort_and_clear_queue`
+  broadcast + persist the row (TS `requestAbort` keeps the session
+  subscribed), and so does the close family (`kill`; shutdown rides the
+  same TS close path) — the gate forwards the row on all of them. The
+  `compact` path does NOT: TS `compact()` detaches from agent events
+  (`_disconnectFromAgent()`) before `abort()`, so the row vanishes there —
+  the interrupt-and-settle helpers (compaction + branch navigation) set
+  `SessionCore::suppress_aborted_row`, closing the gate's exception for
+  that turn exactly like the detach. The branch-navigation interrupt
+  keeps the same suppression (TS's navigation waits out the in-flight
+  turn — `agent.waitForIdle()` — and never surfaces a row).
+- Verifiers: `active_goal_aborted_turn_row_broadcasts_and_goal_accounting_skips_it`
+  (pa-daemon unit — the goal-start turn accounted, the held turn aborted
+  mid-provider-wait, the row broadcasts as the start+end pair with the
+  aborted shape, and the goal state is unchanged),
+  `aborted_turn_row_broadcasts_and_persists_through_the_worker_gate`
+  (pa-daemon worker unit — the real faux engine through the worker gate:
+  the attached client sees the row's pair, the session file holds the
+  same row, and the goal state is unchanged),
+  `compact_interrupt_swallows_the_aborted_row` (pa-daemon worker unit —
+  the compact interrupt's row stays off the wire and out of the store),
+  and the probe run (all four abort surfaces compared against the TS
+  binary, wire + session file).
+- Flagged residue (probe evidence, `runs/` style, not this lane): the
+  Rust `kill` on a busy session BLOCKS on the core session mutex inside
+  `archive_session_telemetry` — the mutex a running turn holds across
+  its admission — so the abort lands only after the turn settles
+  naturally (the probe shows the held turn streaming its full reply 15s
+  after the kill). TS `closeSessionOnce("killed")` awaits
+  `session.abort()` before the dispose, killing the fetch mid-wait. Also
+  unowned: the Rust `turn_end` wire frame carries no message payload
+  (TS sends `turn_end` with the aborted/terminal message), and on an
+  aborted turn Rust drops the frame entirely while TS emits it.
+- Flagged residue (pre-existing, proven on the MAIN binary — run
+  `20260921T061150Z` in `scripts/battery/runs/`): the f7 goal-continue
+  projection's completion rows — TS emits the completion turn's
+  `message_end` before the `goal_update` (complete), the Rust engine's
+  drain can lag the agent loop (the unbounded channel lets the tool
+  execution and the kernel's `goal.complete()` host request land before
+  the loop forwards the streamed rows), so the announcement can precede
+  the row (3/3 lane-binary runs and the main baseline both show it).
+  Owner: the #244 goal-continuation surface. The same baseline run also
+  reproduces the split-turn summarizer request-order flip (the battery's
+  own nondeterministic-arrival note) and the suspension compact's
+  too-short/compacted flip — run-to-run flakes, not this lane.

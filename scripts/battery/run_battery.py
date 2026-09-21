@@ -822,7 +822,8 @@ class Battery:
 
     def goal_continue_projection(self, events: list) -> list:
         """The post-compact goal-continue wire window (the #234 residue):
-        from the manual compaction's start, the compaction pair, the
+        from the aborted row of the turn the compact aborted (it
+        broadcasts before `compaction_start`), the compaction pair, the
         mint's `goal_update`, the continuation turn's goal-context row and
         its assistant rows, and the completion's `goal_update` — in order.
         Ids, timestamps, usage, and token counts differ per side, so the
@@ -841,6 +842,20 @@ class Battery:
             event_type = event.get("type")
             if event_type == "compaction_start":
                 started = True
+            # Canary for the aborted row of the turn the compact
+            # interrupts: TS `compact()` detaches from agent events before
+            # the abort (`_disconnectFromAgent`), so the row never surfaces
+            # on either side in this window — the projection opens early if
+            # one ever does (a one-sided row is a parity bug: the Rust gate
+            # must swallow the compact interrupt's row exactly like TS).
+            if event_type in ("message_start", "message_end") and not started:
+                message = event.get("message") or {}
+                if (
+                    isinstance(message, dict)
+                    and message.get("role") == "assistant"
+                    and message.get("stopReason") == "aborted"
+                ):
+                    started = True
             if not started:
                 continue
             if event_type == "compaction_start":

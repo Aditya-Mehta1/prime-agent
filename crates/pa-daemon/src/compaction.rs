@@ -148,13 +148,20 @@ impl CompactionManager {
                 let mut core = self.core.lock().unwrap();
                 if core.busy {
                     core.abort_requested = true;
+                    // TS `compact()` detaches from agent events
+                    // (`_disconnectFromAgent()`) before the abort, so the
+                    // interrupted turn's aborted assistant row never
+                    // reaches the wire or the session file on the compact
+                    // path — the gate's aborted-row exception stays closed
+                    // for this turn.
+                    core.suppress_aborted_row = true;
                     true
                 } else {
                     false
                 }
             };
             if !busy {
-                return;
+                break;
             }
             // The parked flag gates the turn's events; the engine abort
             // cancels the in-flight provider fetch immediately (TS
@@ -169,6 +176,9 @@ impl CompactionManager {
                 tokio::time::timeout(std::time::Duration::from_millis(50), idle_notify.notified())
                     .await;
         }
+        // The interrupted turn settled (its row swallowed exactly like the
+        // TS compact path); the suppression owns only that drain window.
+        self.core.lock().unwrap().suppress_aborted_row = false;
     }
 
     /// Append the durable compaction entry to the worker's session store

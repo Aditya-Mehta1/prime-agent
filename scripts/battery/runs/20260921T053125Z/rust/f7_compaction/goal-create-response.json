@@ -1,0 +1,43 @@
+{
+ "command": "create",
+ "data": {
+  "activeSessionId": "3659228bfbb1",
+  "activity": "idle",
+  "attachedClients": 0,
+  "created": "2026-09-21T05:32:03.912Z",
+  "cwd": "/home/ubuntu/lane-worktrees/aborted-row/scripts/battery/runs/20260921T053125Z/rust/work",
+  "hasRegisteredCronJob": false,
+  "id": "3659228bfbb1",
+  "isBashRunning": false,
+  "isCompacting": false,
+  "isSessionActive": false,
+  "isStreaming": false,
+  "lastActivityAt": "2026-09-21T05:32:03.917Z",
+  "lifecycle": "draft",
+  "messageCount": 0,
+  "model": {
+   "id": "mock-1",
+   "name": "Mock 1",
+   "provider": "prime-inference",
+   "reasoning": false
+  },
+  "modified": "2026-09-21T05:32:03.917Z",
+  "rlmDepth": 0,
+  "runtimeKind": "top-level",
+  "sessionActions": {
+   "followUps": [],
+   "queuedCount": 0,
+   "steering": []
+  },
+  "sessionFile": "/home/ubuntu/lane-worktrees/aborted-row/scripts/battery/runs/20260921T053125Z/rust/agent/sessions/01a0c273-2fc8-7751-93b4-035477b95fc0.jsonl",
+  "sessionId": "01a0c273-2fc8-7751-93b4-035477b95fc0",
+  "sessionName": "battery-goal-continue",
+  "thinkingLevel": "off",
+  "unfinishedActionCount": 0,
+  "workerPid": 1734387,
+  "workerState": "ready"
+ },
+ "id": "gc1",
+ "success": true,
+ "type": "response"
+}

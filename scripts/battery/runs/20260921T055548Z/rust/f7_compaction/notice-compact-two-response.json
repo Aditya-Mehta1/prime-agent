@@ -1,0 +1,15 @@
+{
+ "command": "compact",
+ "data": {
+  "details": {
+   "modifiedFiles": [],
+   "readFiles": []
+  },
+  "firstKeptEntryId": "563aefc7",
+  "summary": "the notice compaction summary",
+  "tokensBefore": 179
+ },
+ "id": "notice-k2",
+ "success": true,
+ "type": "response"
+}
