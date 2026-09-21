@@ -189,9 +189,9 @@ Schema rules:
 Mounted entries are read-only overlays:
 
 - They appear in the continual harness digest with a `package:` label and provenance (configured source, install scope, package revision, and package-relative file). Provenance never leaks local filesystem paths.
-- They are never copied into editable harness state or refinement history. `rlm.harness` CRUD and `/refine` cannot update or delete them; both only see editable stores. `/refine` may create an editable local or global entry with the same kind and id to override a package entry.
+- They are never copied into editable harness state or refinement history. `rlm.harness` CRUD and `/refine` cannot update or delete them; `/refine` planning includes them as read-only package entries, while writes target only editable stores. `/refine` may create an editable local or global entry with the same kind and id to override a package entry.
 - Editable local and global entries with the same `(kind, id)` shadow the package entry. Across packages, a project-scope package beats a user-scope package; remaining collisions produce a diagnostic.
-- `/reload`, `prime-agent package update`, and `prime-agent package remove` re-mount or unmount package entries without touching editable harness state.
+- `/reload` re-mounts or unmounts package entries without touching editable harness state. `prime-agent package update` and `prime-agent package remove` run in a separate process: in an active session, run `/reload` (or restart) for the overlay changes to take effect.
 
 ## Dependencies
 

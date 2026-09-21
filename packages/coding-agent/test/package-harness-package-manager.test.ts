@@ -76,6 +76,35 @@ describe("package harness discovery", () => {
 		expect(resolved.harness.every((resource) => resource.metadata.baseDir === packageDir)).toBe(true);
 	});
 
+	// test-policy: allow explicit-test-timeout -- real package-manager resolution runs disk I/O in a temp root
+	it("ignores a non-array pi.harness declaration instead of aborting package resolution", {
+		timeout: 10_000,
+	}, async () => {
+		// The fabricated install keeps resolve() on the npm branch, which has no
+		// per-source catch: before the manifest guard, a throw here aborted the
+		// whole resolve() and none of the package's resources loaded.
+		const installedDir = join(tempDir, ".prime", "agent", "npm", "node_modules", "malformed-package");
+		mkdirSync(join(installedDir, "skills", "demo"), { recursive: true });
+		mkdirSync(join(installedDir, "harness", "memory"), { recursive: true });
+		writeFileSync(
+			join(installedDir, "package.json"),
+			JSON.stringify({ name: "malformed-package", pi: { harness: "not-an-array", skills: ["./skills"] } }),
+		);
+		writeFileSync(
+			join(installedDir, "skills", "demo", "SKILL.md"),
+			"---\nname: demo\ndescription: Demo skill\n---\nDemo body.\n",
+		);
+		writeFileSync(join(installedDir, "harness", "memory", "reviewer.json"), harnessJson("memory", "reviewer"));
+		settingsManager.setProjectPackages(["npm:malformed-package"]);
+
+		const resolved = await packageManager.resolve();
+
+		expect(resolved.harness).toEqual([]);
+		expect(resolved.skills.map((resource) => resource.path)).toContain(
+			join(installedDir, "skills", "demo", "SKILL.md"),
+		);
+	});
+
 	// test-policy: allow explicit-test-timeout -- real package-manager discovery runs subprocess and disk I/O in a temp root
 	it("auto-discovers a conventional harness/ directory without a pi manifest", { timeout: 10_000 }, async () => {
 		const packageDir = join(tempDir, "conventional-package");

@@ -2065,7 +2065,9 @@ export class DefaultPackageManager implements PackageManager {
 		target: Map<string, { metadata: PathMetadata; enabled: boolean }>,
 		metadata: PathMetadata,
 	): void {
-		if (!entries) return;
+		// A non-array manifest declaration is ignored, not fatal: for npm/git
+		// packages the throw would otherwise abort the whole resolve().
+		if (!Array.isArray(entries)) return;
 
 		const allFiles = this.collectFilesFromManifestEntries(entries, root, resourceType);
 		const patterns = entries.filter(isOverridePattern);

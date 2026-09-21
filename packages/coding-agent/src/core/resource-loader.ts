@@ -379,7 +379,12 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const enabledThemes = getEnabledPaths(resolvedPaths.themes);
 		// Package harness overlays are re-mounted on every reload: package updates
 		// and removals flow through without touching editable harness state.
-		const enabledHarnessResources = getEnabledResources(resolvedPaths.harness);
+		// CLI `-e` packages contribute harness overlays like every other resource
+		// type they provide, so merge their resolved paths into the mount.
+		const enabledHarnessResources = [
+			...getEnabledResources(resolvedPaths.harness),
+			...getEnabledResources(cliExtensionPaths.harness),
+		];
 		this.packageHarness = loadPackageHarness(enabledHarnessResources);
 
 		const mapSkillPath = (resource: { path: string; metadata: PathMetadata }): string => {

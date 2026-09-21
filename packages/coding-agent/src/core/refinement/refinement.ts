@@ -749,7 +749,7 @@ export function formatHarnessStateForPrompt(
 			if (queryTerms !== undefined && queryTerms.size > 0) {
 				return compareRankedHarnessEntries(a, b, queryTerms, idf);
 			}
-			return [a.path, a.title, a.id].join("\0").localeCompare([b.path, b.title, a.id].join("\0"));
+			return [a.path, a.title, a.id].join("\0").localeCompare([b.path, b.title, b.id].join("\0"));
 		});
 		totalEntries += entries.length;
 		// Render subagent specs as a task-shaped roster the model can match against — the
@@ -827,8 +827,10 @@ export function formatHarnessStateForPrompt(
  * cold boundaries can skip digest re-delivery with a state comparison instead
  * of a rendered-text comparison that query-term relevance keeps invalidating.
  *
- * Covered: entry identity and content (entry order is normalized away, as is
- * the call contract on non-skill entries, which the formatter never prints),
+ * Covered: entry identity, content, and package provenance (entry order is
+ * normalized away, as is the call contract on non-skill entries, which the
+ * formatter never prints; provenance participates because the label and the
+ * provenance line render from it),
  * plus the render flags and each refinement's printed fields in stored order
  * (a malformed event's printed fields are its skip-line label and reason),
  * since the formatter renders a positional newest tail. The shell-examples
@@ -856,6 +858,9 @@ export function harnessDigestFingerprint(
 			path: entry.path,
 			version: entry.version,
 			content: entry.content,
+			// The label and provenance line render from provenance, so a
+			// package update that only changes provenance re-renders the digest.
+			provenance: entry.provenance,
 			// Only skills render the kernel call contract, so another kind can
 			// change these fields without changing a single digest byte.
 			reference: entry.kind === "skill" ? entry.reference : undefined,

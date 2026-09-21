@@ -9,6 +9,7 @@ import {
 	formatHarnessStateForPrompt,
 	type HarnessEntry,
 	type HarnessState,
+	harnessDigestFingerprint,
 	loadPackageHarness,
 	mergeHarnessStates,
 	type RefinementProposal,
@@ -415,6 +416,41 @@ describe("package harness overlays in harness state", () => {
 		expect(digest).not.toContain(tmpdir());
 		// Editable entries render ahead of package overlays.
 		expect(digest.indexOf("[local:session_policy]")).toBeLessThan(digest.indexOf("[package:team_policy]"));
+	});
+
+	it("orders entries that share path and title by id in the digest", () => {
+		const state = harnessState([
+			editableEntry("memory", "bravo", { path: "Team policy", title: "shared title" }),
+			editableEntry("memory", "alpha", { path: "Team policy", title: "shared title" }),
+		]);
+
+		const digest = formatHarnessStateForPrompt(state, { includeIpythonExamples: true });
+
+		expect(digest.indexOf("alpha")).toBeLessThan(digest.indexOf("bravo"));
+	});
+
+	it("re-fingerprints the digest when package provenance changes without content changes", () => {
+		const renderFlags = {
+			includeIpythonExamples: true,
+			includeShellExamples: false,
+			includeRefineExamples: true,
+		};
+		const fingerprint = harnessDigestFingerprint(harnessState([packageEntry("memory", "team_policy")]), renderFlags);
+		expect(fingerprint).toBe(
+			harnessDigestFingerprint(harnessState([packageEntry("memory", "team_policy")]), renderFlags),
+		);
+
+		const revisionBumped = packageEntry("memory", "team_policy", {
+			provenance: {
+				origin: "package",
+				source: "git:git@github.com:PrimeIntellect-ai/example-package.git",
+				scope: "user",
+				file: "harness/memory/team_policy.json",
+				revision: "v2.0.0",
+				readOnly: true,
+			},
+		});
+		expect(harnessDigestFingerprint(harnessState([revisionBumped]), renderFlags)).not.toBe(fingerprint);
 	});
 
 	// test-policy: allow explicit-test-timeout -- renders the digest over real package-controlled fields loaded from disk
