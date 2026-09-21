@@ -425,8 +425,7 @@ describe("Agent", () => {
 				return stream;
 			},
 		});
-		const routed = { ...agent.state.model, id: "routed" };
-		agent.modelOverride = { model: routed, thinkingLevel: "off", serviceTier: null };
+		agent.modelOverride = { model: { ...agent.state.model, id: "routed" }, thinkingLevel: "off", serviceTier: null };
 		const events: string[] = [];
 		agent.subscribe((event) => {
 			events.push(event.type);

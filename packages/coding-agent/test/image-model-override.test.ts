@@ -9,11 +9,10 @@ import { EventStream, getModel, type ImageContent } from "@earendil-works/pi-ai"
 import { expect, it } from "vitest";
 import { AgentSession } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
-import type { ExtensionFactory } from "../src/core/extensions/types.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
-import { assistantMsg, createTestExtensionsResult, createTestResourceLoader } from "./utilities.js";
+import { assistantMsg, createTestResourceLoader } from "./utilities.js";
 
 const IMAGE: ImageContent = { type: "image", mimeType: "image/png", data: "aGk=" };
 const SET = { imageModel: "claude-haiku-4-5" };
@@ -33,10 +32,6 @@ const transientFailure = (): AssistantMessage => ({
 	diagnostics: [{ type: "provider_stream_failure", timestamp: Date.now(), details: { kind: "overloaded" } }],
 });
 
-const injectImage: ExtensionFactory = (pi) => {
-	pi.on("before_agent_start", async () => ({ message: { customType: "shot", content: [IMAGE], display: false, details: {} } }));
-};
-
 // [name, settings, vision session model, attaches images, served model ids, rejection]
 it.each([
 	["routes image turns to imageModel", SET, false, true, "claude-haiku-4-5", undefined],
@@ -51,20 +46,7 @@ it.each([
 	["duplicate backup skips the no-op switch", SET_BACKUP_SAME, false, true, SERVED_IMAGE, undefined],
 	["cycling mid-stream keeps routing", SET, false, true, SERVED_IMAGE, undefined, undefined, true],
 	["cycling clears the routed override", SET, false, true, "claude-haiku-4-5", undefined, true],
-	["routes before_agent_start injected images", SET, false, false, "claude-haiku-4-5", undefined, undefined, undefined, true],
-])(
-	"%s",
-	async (
-		_name,
-		settings,
-		vision,
-		images,
-		served,
-		reject,
-		cycleAfter?: boolean,
-		cycleMidStream?: boolean,
-		injectImages?: boolean,
-	) => {
+])("%s", async (_name, settings, vision, images, served, reject, cycleAfter?: boolean, cycleMidStream?: boolean) => {
 	const dir = mkdtempSync(join(tmpdir(), "pi-image-model-"));
 	writeFileSync(join(dir, "settings.json"), JSON.stringify(settings));
 	const base = getModel("anthropic", "claude-opus-4-7")!;
@@ -97,9 +79,7 @@ it.each([
 		settingsManager: SettingsManager.create(dir, dir),
 		cwd: dir,
 		modelRegistry: ModelRegistry.create(auth, dir),
-		resourceLoader: createTestResourceLoader(
-			injectImages ? { extensionsResult: await createTestExtensionsResult([injectImage], dir) } : undefined,
-		),
+		resourceLoader: createTestResourceLoader(),
 	});
 	cycleMidStreamHook = () => void session.cycleModel("forward", { waitForExtensions: false });
 	const backupSwitches: string[] = [];

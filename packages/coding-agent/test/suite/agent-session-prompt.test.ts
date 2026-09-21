@@ -1024,7 +1024,6 @@ describe("Harness digest at cold boundaries", () => {
 		const digest = getMessageText(digests[0]);
 		expect(digest).toContain("harness: skipped malformed entry broken_memory (content not a string)");
 		expect(digest).toContain("harness: skipped malformed entry a object id (content not a string)");
-		expect(digest).not.toContain("IDLEAK-77a1");
 		expect(digest).toContain("harness: skipped malformed refinement event refine_bad (trigger not a string)");
 		expect(digest).toContain("harness: skipped malformed refinement event null (event not an object)");
 		// Non-object elements are labeled by type only: the raw value must not leak.

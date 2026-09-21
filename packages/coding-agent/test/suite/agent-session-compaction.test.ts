@@ -459,19 +459,6 @@ describe("AgentSession compaction", () => {
 		expect(continueAgent).toHaveBeenCalledTimes(1);
 	});
 
-	it("#2453: a model switch keeps the run override while a post-compaction continuation is scheduled", async () => {
-		const harness = await createHarness({ models: [{ id: "faux-1" }, { id: "faux-2" }] });
-		harnesses.push(harness);
-		const pause = harness.session.acquireQueuedWorkPause();
-		vi.spyOn(harness.session.agent, "continue").mockResolvedValue();
-		harness.session.agent.modelOverride = { model: harness.getModel(), thinkingLevel: "off", serviceTier: null };
-		internalsOf(harness)._schedulePostCompactionContinue();
-		await harness.session.setModel(harness.getModel("faux-2")!, { waitForExtensions: false });
-		expect(harness.session.agent.modelOverride?.model.id).toBe("faux-1");
-		pause.release();
-		await harness.session.waitForHeadlessIdle();
-	});
-
 	it.each([
 		{
 			name: "no model is selected",

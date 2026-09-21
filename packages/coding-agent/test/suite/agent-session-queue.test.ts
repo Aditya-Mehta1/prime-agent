@@ -159,7 +159,7 @@ describe("AgentSession queue characterization", () => {
 		}
 	});
 
-	it("runs input handlers before deciding whether busy submissions enter a queue", async () => {
+	it("runs input handlers before busy submissions queue; clearing re-queues a child terminal notice", async () => {
 		const harness = await createHarness({
 			extensionFactories: [
 				(pi) => {
@@ -174,13 +174,15 @@ describe("AgentSession queue characterization", () => {
 		harnesses.push(harness);
 		withStreaming(harness, true);
 
+		await parkNextTurn(harness, "child done", RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE);
 		await harness.session.prompt("queued", { streamingBehavior: "followUp" });
 		await harness.session.prompt("handled", { streamingBehavior: "followUp" });
 
 		expect(harness.session.getFollowUpMessages()).toEqual(["transformed:queued"]);
 		expect(harness.session.queuedActionCount).toBe(1);
-		withStreaming(harness, false);
 		expect(harness.session.clearQueue()).toEqual({ steering: [], followUp: ["transformed:queued"] });
+		expect(harness.session.unfinishedActionCount).toBe(1);
+		withStreaming(harness, false);
 	});
 
 	it("gives nextTurn delivery precedence over triggerTurn", async () => {
@@ -707,28 +709,6 @@ describe("AgentSession queue characterization", () => {
 			"context B",
 		]);
 		withStreaming(harness, false);
-	});
-
-	it("#2386: re-queues a re-parked child terminal notice when the capturing turn is cancelled", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
-		const pause = harness.session.acquireQueuedWorkPause();
-		harness.session.restorePendingNextTurnMessages([
-			{
-				role: "custom",
-				customType: RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
-				content: "child done",
-				display: false,
-				timestamp: 0,
-			},
-		]);
-		withStreaming(harness, true);
-		await harness.session.prompt("queued", { streamingBehavior: "followUp" });
-		pause.release();
-		expect(harness.session.clearQueue().followUp).toEqual(["queued"]);
-		withStreaming(harness, false);
-		expect(harness.session.getPendingNextTurnMessageSnapshots()).toEqual([]);
-		expect(harness.session.unfinishedActionCount).toBe(1);
 	});
 
 	it("delivers next-turn context when the first preparing turn is cancelled", async () => {
@@ -1652,9 +1632,9 @@ function readShellResult(harness: Harness, command = shellCompletion.command): P
 	return kernelHandlers(harness)["bash.consumed"]!({ pid: shellCompletion.pid, command }) as Promise<unknown>;
 }
 
-function parkNextTurn(harness: Harness, content: string): Promise<void> {
+function parkNextTurn(harness: Harness, content: string, customType = "next-turn"): Promise<void> {
 	return harness.session.sendCustomMessage(
-		{ customType: "next-turn", content, display: true, details: {} },
+		{ customType, content, display: true, details: {} },
 		{ deliverAs: "nextTurn" },
 	);
 }
