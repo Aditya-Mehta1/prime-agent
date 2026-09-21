@@ -357,7 +357,10 @@ pub trait SessionEngine: Send + Sync {
     }
 
     /// The daemon `kill` path: emit `session archived` then finalize
-    /// (`agent session ended` + flush). Best-effort like `end_telemetry`.
+    /// (`agent session ended` + flush), after the turn settles (TS runs the
+    /// dispose-callback telemetry after the awaited `session.abort()`).
+    /// Best-effort like `end_telemetry`: never blocks a close on a live
+    /// turn — the kill handler aborts the in-flight run first.
     fn archive_session_telemetry(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {

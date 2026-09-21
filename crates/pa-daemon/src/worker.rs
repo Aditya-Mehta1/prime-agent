@@ -3219,13 +3219,17 @@ impl Worker {
         if let Err(error) = self.close_rlm_children().await {
             eprintln!("pa-daemon: RLM child close at kill failed: {error:#}");
         }
-        // `session archived` (schema v1) + the session-ended finalization:
-        // kill disposes the session like the TS dispose callback does.
-        self.engine.archive_session_telemetry().await;
-        // The persist (TS archive-before-abort). The guard rides a block, not
-        // an explicit drop: a `drop(core)` does not end the guard's slot in
-        // an async generator, so the later awaits would make the future
-        // non-Send.
+        // The persist (TS `archiveSession` -> `appendSessionState`, before
+        // `session.abort()`): synchronous in TS, so the `archived` entry
+        // lands while the turn still holds its provider wait. The turn can
+        // only append its aborted row once the abort flag below opens the
+        // gate, so the file order (archived, then the aborted row) stays
+        // the TS one. The core lock never blocks on the in-flight turn:
+        // the turn runner holds it only for the instants it persists an
+        // event, never across the provider wait. The guard rides a block,
+        // not an explicit drop: a `drop(core)` does not end the guard's
+        // slot in an async generator, so the later awaits would make the
+        // future non-Send.
         {
             let mut core = self.core.lock().unwrap();
             if let Some(store) = core.store.as_mut() {
@@ -3234,29 +3238,41 @@ impl Worker {
             }
             core.created = false;
         }
-        // TS `closeSessionOnce("killed")`: the persist precedes the abort,
-        // the awaited `session.abort()` settles the in-flight turn and
-        // compaction, and only then does the runtime dispose run — the
-        // kernel teardown must not race a live run.
+        // The abort funnel fires BEFORE every close step that can wait on
+        // the session mutex the running turn holds across its provider
+        // wait. TS `session.abort()` starts with `requestAbort()` ->
+        // `agent.abort()`, which cancels the in-flight fetch immediately,
+        // so the later awaits in the close (the settle, the telemetry
+        // archive, the kernel dispose) settle on an already-cancelled
+        // turn instead of waiting out the stream. TS dispose cancels the
+        // queued session actions and clears the agent queues
+        // (`requestAbort` parks the input pump, `dispose` rejects every
+        // queued action): nothing may feed another turn after the close
+        // below (and the turn runner clears the abort flag when it pops
+        // an item, so the cancel must land first).
         {
             let mut core = self.core.lock().unwrap();
             core.abort_requested = true;
-            // TS dispose cancels the queued session actions and clears the
-            // agent queues (`requestAbort` parks the input pump, `dispose`
-            // rejects every queued action): nothing may feed another turn
-            // after the close below (and the turn runner clears the abort
-            // flag when it pops an item, so the cancel must land first).
             core.steering.clear();
             core.follow_up.clear();
         }
         self.work_notify.notify_one();
         self.compaction.abort();
         self.tree_navigation.abort();
-        // The `session.abort()` the close awaits cancels the in-flight
-        // fetch immediately (`requestAbort` -> `agent.abort()`), so the
-        // settle below does not wait out a pending provider response.
         self.engine.abort_in_flight_turn();
+        // The awaited `session.abort()` settles the cancelled in-flight
+        // turn and compaction: the aborted turn's row broadcasts and
+        // persists here (the #247 gate's aborted-row exception), and only
+        // then does the runtime dispose run — the kernel teardown must
+        // not race a live run.
         self.await_session_work_settled().await;
+        // `session archived` (schema v1) + the session-ended finalization:
+        // kill disposes the session like the TS dispose callback, which
+        // TS runs AFTER the awaited `session.abort()` — so the ended-run
+        // accounting includes the aborted turn, and the settle above has
+        // released the turn's hold on the session mutex: this never waits
+        // out a pending provider response.
+        self.engine.archive_session_telemetry().await;
         // The runtime dispose of the TS close path
         // (`closeSessionOnce` -> `runtime.dispose()` ->
         // `session.disposeAsync` -> `IpythonKernelProvisioner.dispose`,
@@ -5569,6 +5585,172 @@ mod tests {
             goal_before["continuationsUsed"]
         );
         assert_eq!(goal_after["objective"], goal_before["objective"]);
+    }
+
+    /// The `kill` path (the #247 residue, probe-verified): TS
+    /// `closeSessionOnce("killed")` fires `session.abort()` —
+    /// `requestAbort()` -> `agent.abort()` — whose run-cancel lands before
+    /// every close step that can wait on the running turn, so a kill during
+    /// a mid-provider-wait turn cancels the fetch immediately instead of
+    /// streaming the held reply out and answering the kill only after the
+    /// turn settled naturally (the probe showed the blocked archive
+    /// holding the kill 15s past the request). The #247 matrix holds:
+    /// the aborted row still broadcasts and persists, the `archived`
+    /// lifecycle entry lands ahead of the row in the session file (TS
+    /// `archiveSession` precedes the abort), and the close reaches the
+    /// wire as a `session_closed` frame.
+    #[allow(clippy::await_holding_lock)] // the faux registry is process-global: the guard must span the async flow
+    #[tokio::test]
+    async fn kill_cancels_a_mid_provider_wait_turn_and_surfaces_the_aborted_row() {
+        let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("pa-worker-kill-path-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "kill-path-session".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({
+                "engine": "faux",
+                "responses": [
+                    { "text": "held reply", "delayMs": 60000 },
+                ],
+            })),
+        };
+        let worker = std::sync::Arc::new(Worker::new(config, None));
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({ "noSession": true, "cwd": "/tmp", "name": "kill-path" }),
+            )
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        let mut subscription = worker.events.subscribe();
+        // The turn runs detached (`prompt` answers immediately): its fetch
+        // holds on the 60s reply, so the kill below lands mid-provider-wait.
+        let prompt = worker
+            .dispatch(
+                "prompt",
+                &json!({
+                    "activeSessionId": "kill-path-session",
+                    "message": "held turn for the kill probe",
+                }),
+            )
+            .await;
+        assert!(prompt.success, "prompt failed: {prompt:?}");
+        // The turn is mid-provider-wait once the runner is busy on it: the
+        // held reply (60s) keeps the fetch in flight, so no assistant
+        // message_start arrives before the kill (the row only starts at
+        // the abort). The busy flag is the runner's own admission marker
+        // (`await_session_work_settled` parks on the same flag).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if worker.core.lock().unwrap().busy {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the held turn was never admitted"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // The kill must answer on the cancelled turn, not the 60s hold:
+        // the abort funnel fires before the archive/dispose work waits on
+        // the session mutex the turn holds.
+        let started = std::time::Instant::now();
+        let killed = worker.dispatch("kill", &json!({})).await;
+        assert!(killed.success, "kill failed: {killed:?}");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "kill waited out the held provider response ({elapsed:?})"
+        );
+        // The aborted row surfaced (the #247 matrix): the wire carries its
+        // message_start/message_end pair with the aborted shape. Drain
+        // every session-event frame: wrapped session events expose their
+        // inner `event`; the close rides the same outbound type as the
+        // whole frame (`emit_session_closed` sends the SessionClosed
+        // payload without an `event` wrapper), so it must surface whole.
+        let mut events = Vec::new();
+        while let Ok(frame) = subscription.try_recv() {
+            if frame.outbound_type != "session_event" {
+                continue;
+            }
+            let Ok(outbound) = serde_json::from_slice::<Value>(&frame.payload) else {
+                continue;
+            };
+            match outbound.get("event") {
+                Some(event) if event.is_object() => events.push(event.clone()),
+                _ => events.push(outbound),
+            }
+        }
+        let aborted_end = events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.get("type").and_then(Value::as_str) == Some("message_end")
+                    && event["message"]["role"] == "assistant"
+                    && event["message"]["stopReason"] == json!("aborted")
+            })
+            .cloned()
+            .expect("the aborted row's end frame reached the wire");
+        assert_eq!(
+            aborted_end["message"]["errorMessage"],
+            json!("Request was aborted")
+        );
+        // The close reached the wire as `session_closed` (reason "killed").
+        assert!(
+            events.iter().any(|event| {
+                event.get("type").and_then(Value::as_str) == Some("session_closed")
+                    && event.get("reason").and_then(Value::as_str) == Some("killed")
+            }),
+            "the kill closed the session on the wire: {events:?}"
+        );
+        // The durable store: the aborted assistant row persisted, and the
+        // `archived` lifecycle entry lands ahead of it (TS
+        // `archiveSession` -> `appendSessionState` runs before the abort
+        // settles the row).
+        let entries = {
+            let core = worker.core.lock().unwrap();
+            core.store
+                .as_ref()
+                .expect("the worker owns a session file")
+                .entries()
+                .to_vec()
+        };
+        let archived_at = entries
+            .iter()
+            .position(|entry| {
+                entry.type_ == "session_state"
+                    && entry.fields["state"]["status"] == json!("archived")
+            })
+            .expect("the session archived on kill");
+        let aborted_at = entries
+            .iter()
+            .position(|entry| {
+                entry.type_ == "message"
+                    && entry.fields["message"]["role"] == json!("assistant")
+                    && entry.fields["message"]["stopReason"] == json!("aborted")
+            })
+            .expect("the aborted row persisted in the session file");
+        assert!(
+            archived_at < aborted_at,
+            "the archived lifecycle entry must precede the aborted row"
+        );
+        assert_eq!(
+            entries[aborted_at].fields["message"]["errorMessage"],
+            json!("Request was aborted")
+        );
+        // The session is closed: `created` fell with the archive.
+        assert!(!worker.core.lock().unwrap().created);
     }
 
     /// The compact path swallows the interrupted turn's aborted row (TS
