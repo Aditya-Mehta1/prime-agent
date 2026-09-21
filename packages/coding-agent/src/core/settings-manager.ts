@@ -257,6 +257,8 @@ export interface Settings {
 	markdown?: MarkdownSettings;
 	warnings?: WarningSettings;
 	sessionDir?: string; // Custom session storage directory (same format as --session-dir CLI flag)
+	/** Log per-request provider timing phases to the diagnostic log. Default: false */
+	requestTiming?: boolean;
 }
 
 export interface AgentTracesSettings {
@@ -1366,6 +1368,10 @@ export class SettingsManager {
 
 	getBlockImages(): boolean {
 		return this.settings.images?.blockImages ?? false;
+	}
+
+	getRequestTiming(): boolean {
+		return this.settings.requestTiming ?? false;
 	}
 
 	setBlockImages(blocked: boolean): void {
