@@ -186,7 +186,13 @@ pub async fn execute_session_command(
     command: &SessionSlashCommand,
 ) -> SessionCommandExecution {
     let mut execution = SessionCommandExecution::default();
-    execution.push_message(session_command_echo_row(command));
+    // TS `_appendDurableSessionCommandMessage` records the attempted
+    // command BEFORE the queue runs it, so the command's own work (the
+    // compaction branch, the refinement snapshot) sees the echo row in the
+    // session branch.
+    let echo = session_command_echo_row(command);
+    execution.push_message(echo.clone());
+    persist_rows(engine, std::iter::once(&echo)).await;
     // Telemetry adoption seam: builtin session commands carry their usage
     // event from the single dispatch point (canonical name only).
     if let Some(telemetry) = &engine.telemetry {
@@ -210,8 +216,32 @@ pub async fn execute_session_command(
         ));
         execution.error = Some(message);
     }
-    persist_execution(engine, &execution).await;
+    // The echo row is already durable (persisted ahead of the command);
+    // the result and status rows follow in order.
+    persist_rows(engine, execution.messages.iter().skip(1)).await;
+    sync_live_context(engine).await;
     execution
+}
+
+/// The live agent context mirrors the durable rows (TS
+/// `_appendDurableSessionCommandMessage` pushes each row onto
+/// `agent.state.messages`, so the next admitted turn's request and every
+/// state snapshot carry them). The post-execution rebuild is idempotent
+/// for the compaction and refinement paths, which rebuild mid-execution.
+async fn sync_live_context(engine: &SessionEngine) {
+    let session = engine.session.session_handle().clone();
+    let rebuilt = {
+        let session = session.lock().await;
+        let entries = session.get_all_entries();
+        crate::session::build_session_context(entries, session.get_leaf_id()).messages
+    };
+    // The raw session messages (not the LLM view): custom rows keep their
+    // wire identity in the live context, like TS's state push.
+    let loop_messages: Vec<pa_agent::types::AgentMessage> = rebuilt
+        .iter()
+        .filter_map(super::session_message_to_loop)
+        .collect();
+    engine.session.agent().set_messages(loop_messages).await;
 }
 
 /// `/compact`: summarize and cut, or skip silently (TS `CompactionSkippedError`).
@@ -385,13 +415,16 @@ fn execute_autonomous(
     Ok(())
 }
 
-/// The messages are durable in the session's own entry chain as well: the
-/// live context rebuild and a later `/compact` see the same rows the host
+/// The rows are durable in the session's own entry chain: the live
+/// context rebuild and a later `/compact` see the same rows the host
 /// runtime persists (TS pushes each row onto `agent.state.messages`).
-async fn persist_execution(engine: &SessionEngine, execution: &SessionCommandExecution) {
+async fn persist_rows<'a>(
+    engine: &SessionEngine,
+    messages: impl Iterator<Item = &'a CustomMessage>,
+) {
     let session = engine.session.session_handle().clone();
     let mut session = session.lock().await;
-    for message in &execution.messages {
+    for message in messages {
         session.append_custom_message(
             &message.custom_type,
             message.content.clone(),

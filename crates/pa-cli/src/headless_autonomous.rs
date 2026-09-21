@@ -64,6 +64,12 @@ impl HeadlessAutonomous {
         }
     }
 
+    /// The runtime state handle (the session-command executor mutates the
+    /// same state the accounting subscription and the drive loop read).
+    pub(crate) fn state_handle(&self) -> Arc<tokio::sync::Mutex<AutonomousRuntimeState>> {
+        Arc::clone(&self.state)
+    }
+
     /// Per-message usage accounting: every settled assistant message is
     /// forwarded to the driver as it arrives (the daemon worker runs the
     /// same policy through its own subscription).

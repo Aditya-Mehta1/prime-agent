@@ -830,11 +830,73 @@ async fn run_prompts_and_emit(
     let global_harness_dir =
         pa_core::refinement::get_global_harness_state_dir(&options.config.agent_dir);
     let mut boundary = crate::print_boundary::TurnBoundary::new(json_mode);
-    for prompt in options
+    // The autonomous runtime state the session-command executor mutates:
+    // the CLI-flag run's state when one exists, the TS default (disabled)
+    // state otherwise — the session always carries one (TS
+    // `createAgentSession`), and `/autonomous` rewrites it live.
+    let autonomous_state: std::sync::Arc<
+        tokio::sync::Mutex<pa_core::autonomous::AutonomousRuntimeState>,
+    > = autonomous
+        .as_ref()
+        .map(|run| run.state_handle())
+        .unwrap_or_else(|| {
+            std::sync::Arc::new(tokio::sync::Mutex::new(
+                pa_core::autonomous::create_autonomous_runtime_state(None, None),
+            ))
+        });
+    // A failed session command rejects the prompt wait (TS print-mode's
+    // catch): the raw error prints to stderr and the run exits 1 without
+    // the later prompts or the terminal selection.
+    let mut command_failure: Option<String> = None;
+    'prompts: for prompt in options
         .initial_message
         .iter()
         .chain(options.messages.iter())
     {
+        // Session commands (TS `_normalizeSubmission`'s `sessionCommand`
+        // arm) never reach the model loop: the pre-turn boundary stays
+        // theirs to skip and the prompt's turn never exists.
+        if let Some(command) = engine.session.classify_session_command(prompt) {
+            let execution = crate::print_session_command::execute_prompt_session_command(
+                engine,
+                &goal,
+                model,
+                api_key.clone(),
+                global_harness_dir.clone(),
+                &autonomous_state,
+                &command,
+            )
+            .await;
+            if let Some(error) = execution.error {
+                command_failure = Some(error);
+                break 'prompts;
+            }
+            // A `/goal` start (or resume) scheduled its continuation as
+            // queued session input: the prompt wait drains it inside the
+            // same wait, as the queued turn with its action frames.
+            if let Some(continuation) = execution.continuation_message {
+                goal.run_session_command_continuation(
+                    engine,
+                    &mut boundary,
+                    model,
+                    api_key.clone(),
+                    global_harness_dir.clone(),
+                    &continuation,
+                )
+                .await?;
+            }
+            // The same queue drain a settled turn gets: held continuations
+            // and armed steers run as this prompt's follow-up turns.
+            goal.drive_boundary(
+                engine,
+                &mut boundary,
+                model,
+                api_key.clone(),
+                global_harness_dir.clone(),
+            )
+            .await?;
+            continue;
+        }
         // The pre-turn boundary (TS `_runPreTurnCompaction`, the full
         // `_checkCompaction` pass): an aborted trailing turn drops pending
         // requests, a stale overflow error from a previous run gets its
@@ -903,6 +965,16 @@ async fn run_prompts_and_emit(
     }
     if let Some(subscription) = unsubscribe {
         subscription.unsubscribe().await;
+    }
+    // The rejected prompt wait (TS print-mode's catch): print the raw
+    // command error to stderr and exit 1 — no later prompts ran, the
+    // terminal selection is skipped, and the disposal drain still runs.
+    if let Some(error) = command_failure {
+        eprintln!("{error}");
+        boundary
+            .drain_compact_auto_refine_at_disposal(engine, model, api_key, global_harness_dir)
+            .await;
+        return Ok(1);
     }
     let state = engine.session.agent().state().await;
     let messages: Vec<pa_types::session::AgentMessage> =

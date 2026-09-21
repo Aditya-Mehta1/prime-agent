@@ -115,6 +115,11 @@ pub(crate) struct PrintGoalSurface {
     /// The label of the action the driver is admitting (the `running` frame
     /// the agent's `agent_start` completes; `None` when nothing is active).
     active_label: Mutex<Option<String>>,
+    /// The next queued-turn drain completes its `running` frame at the
+    /// loop's `turn_start` instead of `agent_start` (the TS order the
+    /// session-command continuation drain shows, probed against the TS
+    /// binary; the steer drain keeps the `agent_start` position).
+    running_frame_at_turn_start: AtomicBool,
     /// The last `session_action_update` snapshot emitted (TS `_emitQueueUpdate`
     /// stays silent on an unchanged projection).
     last_action_snapshot: Mutex<Value>,
@@ -130,6 +135,7 @@ impl PrintGoalSurface {
             budget_crossed: AtomicBool::new(false),
             queued: Mutex::new(None),
             active_label: Mutex::new(None),
+            running_frame_at_turn_start: AtomicBool::new(false),
             last_action_snapshot: Mutex::new(Value::Null),
             last_published_goal: Mutex::new(pa_types::goal::empty_goal_state()),
         }
@@ -145,6 +151,7 @@ impl PrintGoalSurface {
             budget_crossed: AtomicBool::new(false),
             queued: Mutex::new(None),
             active_label: Mutex::new(None),
+            running_frame_at_turn_start: AtomicBool::new(false),
             last_action_snapshot: Mutex::new(Value::Null),
             last_published_goal: Mutex::new(pa_types::goal::empty_goal_state()),
         }
@@ -311,6 +318,102 @@ impl PrintGoalSurface {
         .await;
     }
 
+    /// The `session_command` action's phase frame (TS
+    /// `_executeSelectedSessionCommand`'s `preparing`/`running`
+    /// transitions: the snapshot's `active` entry, kind `session_command`).
+    pub(crate) async fn emit_command_phase(&self, phase: &str, label: &str) {
+        self.emit_action_snapshot(json!({
+            "queuedCount": 0,
+            "steering": [],
+            "followUps": [],
+            "active": { "kind": "session_command", "phase": phase, "label": label },
+        }))
+        .await;
+    }
+
+    /// The queue frame of a session command that scheduled a goal
+    /// continuation: the queued preview rides while the command action is
+    /// still the active one (TS `_runOrQueueGoalContext` ->
+    /// `_emitQueueUpdate`).
+    pub(crate) async fn emit_command_queue_hold(
+        &self,
+        command_label: &str,
+        continuation: &CustomMessage,
+    ) {
+        let preview = custom_message_text(continuation);
+        self.emit_action_snapshot(json!({
+            "queuedCount": 1,
+            "steering": [],
+            "followUps": [preview],
+            "active": {
+                "kind": "session_command",
+                "phase": "running",
+                "label": command_label,
+            },
+        }))
+        .await;
+    }
+
+    /// The settled command's queue frame: the action completed, the queued
+    /// continuation stays (TS `_emitQueueUpdate` after the command action
+    /// settles, ahead of the queued turn's admission).
+    pub(crate) async fn emit_command_queue_drain(&self, continuation: &CustomMessage) {
+        let preview = custom_message_text(continuation);
+        self.emit_action_snapshot(json!({
+            "queuedCount": 1,
+            "steering": [],
+            "followUps": [preview],
+        }))
+        .await;
+    }
+
+    /// The empty-projection idle frame (a settled command that scheduled
+    /// nothing; TS `_emitQueueUpdate` with the empty queue).
+    pub(crate) async fn emit_queue_idle(&self) {
+        self.emit_action_snapshot(json!({
+            "queuedCount": 0,
+            "steering": [],
+            "followUps": [],
+        }))
+        .await;
+    }
+
+    /// One durable row's `message_start`/`message_end` pair on the stream
+    /// (rows appended outside the agent loop — the session-command echo,
+    /// result, and status rows).
+    pub(crate) fn emit_row_pair(&self, row: &CustomMessage) {
+        let value = crate::headless_autonomous::stop_row_wire_value(row);
+        for event_type in ["message_start", "message_end"] {
+            self.emit(json!({ "type": event_type, "message": value }));
+        }
+    }
+
+    /// One raw stream event (the session-command events:
+    /// `compaction_start`, `compaction_end`, `refine_complete`,
+    /// `refine_failed`).
+    pub(crate) fn emit_stream_event(&self, event: Value) {
+        self.emit(event);
+    }
+
+    /// The unconditional goal-state publish (TS `_emitGoalUpdate` in the
+    /// goal command arms): the dedupe baseline follows the published state
+    /// so later settled-turn publishes stay quiet until it changes again.
+    pub(crate) async fn publish_goal_update_forced(&self, engine: &SessionEngine) {
+        let goal = engine.goal_state().await;
+        *self.last_published_goal.lock().await = goal.clone();
+        self.emit(json!({
+            "type": "goal_update",
+            "goal": serde_json::to_value(&goal).unwrap_or(Value::Null),
+        }));
+    }
+
+    /// Arm the `running`-frame-at-`turn_start` position for the next
+    /// queued-turn drain (the session-command continuation's TS order).
+    pub(crate) fn arm_running_frame_at_turn_start(&self) {
+        self.running_frame_at_turn_start
+            .store(true, Ordering::SeqCst);
+    }
+
     /// The drained-queue frame (the admitted action completed; TS
     /// `_emitQueueUpdate` with the empty projection).
     async fn emit_action_drained(&self) {
@@ -373,7 +476,16 @@ impl PrintGoalSurface {
                             }
                         }
                     }
-                    if matches!(event, AgentEvent::AgentStart) {
+                    if matches!(event, AgentEvent::AgentStart)
+                        && !surface.running_frame_at_turn_start.load(Ordering::SeqCst)
+                    {
+                        surface.emit_action_running_if_armed().await;
+                    }
+                    if matches!(event, AgentEvent::TurnStart)
+                        && surface
+                            .running_frame_at_turn_start
+                            .swap(false, Ordering::SeqCst)
+                    {
                         surface.emit_action_running_if_armed().await;
                     }
                     // A goal state change from any other source (a kernel-side
@@ -512,6 +624,53 @@ impl PrintGoalSurface {
             }
             return Ok(engine.goal_state().await.status == pa_types::goal::GoalStatus::Active);
         }
+    }
+
+    /// Admit a session command's scheduled continuation (a `/goal` start or
+    /// resume) as the print invocation's next run — the TS
+    /// `promptAndWait` drain, with the command surface's frame order: the
+    /// action's `preparing`/`committing` frames ahead of the turn, the
+    /// `running` frame at the turn's `turn_start` (the probed TS order for
+    /// the command-continuation admission), the settled boundary's arms
+    /// (`_checkCompaction` at `agent_end`), then the terminal-error goal
+    /// fail's `goal_update`, then the drained-queue frame (the pump
+    /// completing the action after the run settled).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_session_command_continuation(
+        &self,
+        engine: &SessionEngine,
+        boundary: &mut crate::print_boundary::TurnBoundary,
+        model: &pa_types::ai::Model,
+        api_key: Option<String>,
+        global_harness_dir: std::path::PathBuf,
+        message: &CustomMessage,
+    ) -> Result<(), String> {
+        let label = compact_rlm_text(&custom_message_text(message), 160);
+        self.arm_running_frame_at_turn_start();
+        self.emit_action_preparing(&label).await;
+        self.emit_action_committing(&label).await;
+        boundary
+            .run_pre_turn(engine, model, api_key.clone())
+            .await?;
+        engine
+            .session
+            .prompt_injected_message(message)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        engine.session.agent().wait_for_idle().await;
+        boundary
+            .run_at_settled_turn(engine, model, api_key.clone(), global_harness_dir)
+            .await?;
+        if let Some(error_message) =
+            crate::headless_autonomous::latest_assistant_error(engine).await
+        {
+            engine
+                .fail_goal_for_terminal_error(error_message.as_deref())
+                .await;
+            self.publish_goal_update(engine).await;
+        }
+        self.emit_action_drained().await;
+        Ok(())
     }
 
     /// Admit one queued goal turn as the print invocation's next run (the

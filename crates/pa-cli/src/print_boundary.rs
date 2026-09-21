@@ -691,7 +691,7 @@ impl TurnBoundary {
     /// outcome row, then the model-facing notice when edits applied; both
     /// land in that order, so the tail scan reads them in TS emission
     /// order).
-    async fn refinement_rows_since(
+    pub(crate) async fn refinement_rows_since(
         engine: &SessionEngine,
         entries_before: usize,
     ) -> Vec<pa_types::session::CustomMessage> {

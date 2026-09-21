@@ -32,6 +32,20 @@ inside the one agent run; the budget-limit steer and the threshold-held
 continuation drain as this invocation's follow-up runs with the TS
 session-action phase frames. The goal has exclusive priority over the
 autonomous arm (TS `_getContinuationMessages`).
+Session slash commands (`print_session_command.rs`, the #253 residue): print
+prompts that are `/compact`, `/refine`, `/goal`, or `/autonomous` execute
+through the pa-core session-command executor (the daemon worker's seam — no
+parallel implementation), streaming the TS shapes: the
+`session_action_update` phase frames around the durable echo row, the
+per-command events (`compaction_start`/`compaction_end` for `/compact`, the
+refinement rows plus `refine_complete`/`refine_failed` for `/refine`, the
+unconditional `goal_update` publish for `/goal`), the result rows, and the
+settled queue frame. A `/goal` start (or resume) drains its scheduled
+continuation inside the same prompt wait; a failed command rejects the
+prompt wait (the raw error to stderr, exit 1, no later prompts). Client
+commands (`/model`, `/tree`, ...) stay model prompts — TS
+`_normalizeSubmission` classifies only the four session commands before
+admission, so they never cross the turn boundary.
 The json stream emits the TS session-event surface byte-for-shape: the
 session header row (version 3), the `message_update` streaming deltas with
 the slim `assistantMessageEvent` (the daemon wire drops the nested
@@ -40,8 +54,10 @@ the first-turn boundary, the compaction `compaction_start`/`compaction_end`
 pairs with their durable outcome rows, the `goal_update`/`session_action_update`
 frames of the goal loop, and the refinement rows with
 `refine_complete`/`refine_failed`. Verifier: `scripts/print_json_parity.py`
-(the TS binary differential, the goal-budget/goal-natural scenarios) plus the
-`print_runtime_e2e` rows.
+(the TS binary differential, the goal-budget/goal-natural plus the
+session-command scenarios — the harness supports split runs: `--only ts`
+on the TS host, `--only rust` against the sandbox build, both against one
+`--out`) plus the `print_runtime_e2e` rows.
 
 ## Daemon client
 The daemon-backed public commands (`list`, `stop`, `rename`, `send`, `schedule`) talk to the

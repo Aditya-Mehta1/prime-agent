@@ -65,6 +65,42 @@ decline, so its disposal round stays silent on both sides at the enabled
 default). The settings gate is the product's own switch, so nothing else
 differs.
 
+  - goal-status: `/goal status` with no goal: the session-command surface
+    the print path dropped before this lane — the `session_action_update`
+    phase frames (kind `session_command`) around the durable echo row, the
+    `goal_update` publish, the `No active goal.` result row, the settled
+    idle frame. No model turn.
+  - goal-start: `/goal ship the feature`: the same frames, then the
+    goal_update, the queued continuation's preview frame, the result row,
+    and the continuation admitted as the queued turn (its `running` frame
+    at the turn's turn_start) — the in-run goal loop continues to the faux
+    queue's exhaustion, the terminal error fails the goal (the error
+    goal_update after the settled boundary), and the drained frame closes.
+  - compact-skip: a short session's `/compact`: the echo row, the
+    `compaction_start`, the skip's `compaction_end` (warning), no result
+    row (TS `CompactionSkippedError` records nothing).
+  - compact-manual: a compactable session's
+    `/compact focus on the essentials`: the compaction runs (start event
+    with the instructions, the settled end with the result), the next
+    prompt's turn runs on the compacted context.
+  - model-passthrough: `/model` (a client command, not a session command):
+    the print path never parses it — it runs to the model as a plain
+    prompt turn (the parse-but-drop regression guard).
+  - autonomous-status: `/autonomous status`: the echo row plus the durable
+    `autonomous_status` row pair.
+  - refine-command: `/refine <instructions>` after a work turn: the
+    scripted review approves, the refinement rows stream
+    (`refinement_outcome` pair plus `refine_complete`), and the
+    display-only result row lands on the wire ahead of the idle frame.
+
+The Rust build cannot run on the parity host (sandbox glibc), so the
+harness supports split runs: `--only ts` on the TS host and `--only
+rust` with PA_RUST_BINARY pointing at the sandbox build (PI_PACKAGE_DIR
+set to the sidecar) each persist their normalized captures plus a
+sandbox-root meta into --out; when one side's captures already exist
+there, the run diffs them and reports (the same diff the one-process
+flow produces).
+
 Exit code is non-zero when any event sequence differs. Use --keep to keep
 the sandbox trees, --out to pin captures.
 """
@@ -597,6 +633,143 @@ SCENARIOS = {
             }
         ]
     },
+    "goal-status": {
+        "runs": [
+            {
+                # The no-goal status command: frames, echo, goal_update,
+                # result row, idle frame — then a plain prompt whose turn
+                # runs on the context that carries the command rows (TS
+                # pushes them onto the live agent state).
+                "settings": {
+                    "onboardingCompleted": True,
+                    "compaction": {"enabled": False},
+                },
+                "script": faux_script([{"text": "hello reply"}], 128000),
+                "prompts": ["/goal status", "hello"],
+                "args": [],
+            }
+        ]
+    },
+    "goal-start": {
+        "runs": [
+            {
+                # The goal start command: the continuation schedules as
+                # queued session input and drains inside the same prompt
+                # wait; the in-run loop continues to the queue's
+                # exhaustion, the terminal error fails the goal.
+                "settings": {
+                    "onboardingCompleted": True,
+                    "compaction": {"enabled": False},
+                },
+                "script": faux_script(
+                    [
+                        {"text": "goal turn reply"},
+                        {"text": "second turn reply"},
+                        {"text": "third turn reply"},
+                    ],
+                    128000,
+                ),
+                "prompts": ["/goal ship the feature"],
+                "args": [],
+            }
+        ]
+    },
+    "compact-skip": {
+        "runs": [
+            {
+                # A short session's /compact: the skip's warning
+                # compaction_end, no result row.
+                "settings": {
+                    "onboardingCompleted": True,
+                    "compaction": {"enabled": True, "reserveTokens": 1, "keepRecentTokens": 10},
+                },
+                "script": faux_script([{"text": "seed reply"}], 128000),
+                "prompts": ["hello", "/compact"],
+                "args": [],
+            }
+        ]
+    },
+    "compact-manual": {
+        "runs": [
+            {
+                # A compactable session's /compact with instructions: the
+                # compaction runs, the next prompt's turn continues on the
+                # compacted context.
+                "settings": {
+                    "onboardingCompleted": True,
+                    "compaction": {"enabled": True, "reserveTokens": 1, "keepRecentTokens": 10},
+                    "autoRefine": {"enabled": False},
+                },
+                "script": faux_script(
+                    [
+                        {"text": "seed reply one"},
+                        {"text": "seed reply two"},
+                        {"text": "the compaction summary"},
+                        {"text": "after compact reply"},
+                    ],
+                    200000,
+                ),
+                "prompts": [
+                    "seed turn one " + "x" * 15000,
+                    "seed turn two " + "x" * 15000,
+                    "/compact focus on the essentials",
+                    "after prompt",
+                ],
+                "args": [],
+            }
+        ]
+    },
+    "model-passthrough": {
+        "runs": [
+            {
+                # A client command (/model) is not a session command: it
+                # runs to the model as a plain prompt (the parse-but-drop
+                # regression guard).
+                "settings": {"onboardingCompleted": True},
+                "script": faux_script([{"text": "a reply about the model command"}], 128000),
+                "prompts": ["/model"],
+                "args": [],
+            }
+        ]
+    },
+    "autonomous-status": {
+        "runs": [
+            {
+                # The autonomous status command: the echo row plus the
+                # durable autonomous_status row pair.
+                "settings": {
+                    "onboardingCompleted": True,
+                    "compaction": {"enabled": False},
+                },
+                "script": faux_script([], 128000),
+                "prompts": ["/autonomous status"],
+                "args": [],
+            }
+        ]
+    },
+    "refine-command": {
+        "runs": [
+            {
+                # The manual /refine after a work turn: the scripted review
+                # approves, the refinement runs (rows plus refine_complete
+                # on the wire), the display-only result row follows.
+                "settings": {
+                    "onboardingCompleted": True,
+                    "compaction": {"enabled": False},
+                },
+                "script": faux_script(
+                    [
+                        {"text": "work reply"},
+                        '{"shouldRefine": true, "rationale": "the pattern is reusable", "instructions": "record it"}',
+                        '{"summary":"note","rationale":"repeated","expectedOutcome":"recall","edits":[{"action":"create","kind":"memory","id":"m1","title":"Tactic","content":"Use tactic A"}]}',
+                    ],
+                    128000,
+                ),
+                "prompts": ["do some work", "/refine record the pattern"],
+                "args": [],
+            }
+        ]
+    },
     "compact-refine-decline": {
         "runs": [
             {
@@ -623,6 +796,39 @@ SCENARIOS = {
         ]
     },
 }
+
+
+def capture_paths(out_dir, binary, name, index):
+    """The persisted normalized-capture and meta paths for one run."""
+    suffix = "" if index == 0 else f"-run{index}"
+    return (
+        os.path.join(out_dir, f"{binary}-{name}{suffix}.norm.json"),
+        os.path.join(out_dir, f"{binary}-{name}{suffix}.meta.json"),
+    )
+
+
+def save_captures(out_dir, binary, name, normalized_list, sandbox_root):
+    """Persist one side's normalized captures plus the sandbox root (the
+    split-run compare loads them back)."""
+    for index, events in enumerate(normalized_list):
+        norm_path, meta_path = capture_paths(out_dir, binary, name, index)
+        with open(norm_path, "w") as handle:
+            json.dump(events, handle)
+        with open(meta_path, "w") as handle:
+            json.dump({"sandbox_root": sandbox_root}, handle)
+
+
+def load_captures(out_dir, binary, name, run_count):
+    """The other side's persisted normalized captures, or None when any
+    run is missing."""
+    loaded = []
+    for index in range(run_count):
+        norm_path, _ = capture_paths(out_dir, binary, name, index)
+        if not os.path.exists(norm_path):
+            return None
+        with open(norm_path) as handle:
+            loaded.append(json.load(handle))
+    return loaded
 
 
 def main():
@@ -681,7 +887,20 @@ def main():
                     with open(os.path.join(out_dir, f"{binary}-{name}{suffix}.stderr"), "w") as handle:
                         handle.write(stderr)
                     captures[binary].append(normalize_events(stdout, os.path.join(base, name)))
+            # Persist each in-process side's normalized captures (the
+            # split-run compare: one side runs on the TS host, the other in
+            # the rust build sandbox, both against the same --out).
+            for binary in ("ts", "rust"):
+                if captures[binary]:
+                    save_captures(out_dir, binary, name, captures[binary], os.path.join(base, name))
+            if args.only:
+                other = "rust" if args.only == "ts" else "ts"
+                if not captures[other]:
+                    loaded = load_captures(out_dir, other, name, len(scenario["runs"]))
+                    if loaded is not None:
+                        captures[other] = loaded
             if not (captures["ts"] and captures["rust"]):
+                print(f"SKIP {name} (only one side captured; run the other side with the same --out)")
                 continue
             for index in range(len(scenario["runs"])):
                 label = name if index == 0 else f"{name}/run{index}"

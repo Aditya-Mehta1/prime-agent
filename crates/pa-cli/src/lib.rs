@@ -33,6 +33,7 @@ pub use mode::{AppMode, MissingSubsystem, RunOptions, Runtime, UnavailableRuntim
 pub(crate) mod print_boundary;
 pub(crate) mod print_goal;
 pub mod print_runtime;
+pub(crate) mod print_session_command;
 pub mod update_flow;
 pub mod util_time;
 pub use print_runtime::PrintRuntime;
