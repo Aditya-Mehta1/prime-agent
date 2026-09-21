@@ -2597,3 +2597,94 @@ Verifiers:
   #246 replacement e2e stays green (the death close is the supervisor
   arm of the same close semantics). Mutation-checked: disabling the
   death close fails the e2e.
+
+
+## Direct-ACP goal continuation (acp-continuation lane, the #244 ambiguity)
+
+TS ruling (the direct, non-daemon ACP embedding): the TS ACP mode DOES
+host the goal continuation loop — not as a mode-level construct, but
+inside the session's own turn run. `AgentSession` installs
+`agent.getContinuationMessages` (`_installAgentContinuationHook`); the
+agent loop consults the hook at its natural turn end (`runLoop`); the
+in-process `promptAndWait` runs that loop directly, so the direct ACP
+drives every continuation INSIDE the one `session/prompt` request — the
+continuation turns surface as events of the same prompt turn, and the
+response settles only after the goal run ends (complete / paused /
+budget_limited / error, or nothing more to do). The daemon-attached
+transport rides the worker's queue instead (the #244 lane); the TS ACP
+mode itself never re-prompts or owns a queue — evidence:
+in-process-agent-connection.ts `promptAndWait` -> `session.promptAndWait`,
+agent-loop.ts lines 429-443, agent-session.ts 1898-1899 / 4044-4085.
+
+Rust port (`crates/pa-daemon/src/acp/goal_continuation.rs` + the prompt
+turn's settle loop + the arms): the direct ACP's settle loop consults
+the same TS arms per settled boundary, with the goal taking exclusive
+priority over the autonomous arm:
+
+- Budget-limit wrap-up steer: the usage listener arms the crossing
+  (`record_assistant_usage` -> `BudgetReached`; error/aborted turns are
+  excluded like TS `_accountGoalUsageForAssistantMessage`), the boundary
+  mints the budget-limit context and runs it as the prompt's next model
+  segment (TS `_shouldStopAfterTurn`'s budget arm, the steer with
+  `resumeIfIdle`).
+- Natural continuation mint (TS `_getGoalContinuationMessages`): an
+  active goal mints one goal-context turn per settled boundary and runs
+  it as the next turn of the same prompt via the injected-row admission
+  (the #240 single representation). The mint's `continuationsUsed` bump
+  publishes `_meta.goal` before the turn starts (TS `_setGoalState` ->
+  `_emitGoalUpdate`).
+- Terminal error: a failed turn fails the goal (TS
+  `_finishGoalForTerminalAssistantMessage` at `agent_end`; an abort
+  keeps the goal).
+- Threshold-arm goal queue (TS
+  `_queueGoalContinuationForThresholdCompaction`): a crossing turn with
+  an active goal mints BEFORE the compaction runs (the mint's goal
+  frame precedes the compaction frames, the TS event order), the held
+  turn runs as the post-compaction turn (TS
+  `_schedulePostCompactionContinue`), a cancelled compaction withdraws
+  the mint with a slot rollback (TS
+  `_clearQueuedGoalContinuationAfterCancelledThresholdCompaction`), and
+  skip/failure keep it (TS `resumeAfterFailure`). The pre-turn check
+  never queues (TS `_runPreTurnCompaction` passes
+  `queueAutonomousContinuation = false`). A held continuation defers the
+  compact-trigger review to the continuation turn's own boundary (TS
+  `_scheduleAutoRefineAfterCompaction(willContinue)`).
+- Compact-with-active-goal continue (TS `compact()`'s `didCompact`
+  finally arm, the #238 residue scoped to this lane): a successful
+  `/compact` session command with an active goal mints the continuation
+  (the `||= !hasQueuedMessages()` arm — the direct ACP never queues work
+  behind a session command) and runs it as the command turn's model
+  segment.
+
+Two TS gates hold trivially on this surface and therefore have no port:
+the RLM quiescence deferral (`_hasUnsettledRlmQuiescenceWork` — the
+in-process engine runs with `NoRlmChildren`, so no descendant work can
+exist) and the queued-input deferral/arrival-epoch rollback
+(`queuedActionCount > 0` — the ACP connection admits one prompt turn at
+a time, so no session input can queue behind the running turn).
+
+Adjacent gap, NOT this lane's surface: the direct ACP rejects a second
+`session/prompt` while a turn is live where TS queues it behind the
+injected work with follow-up semantics (acp-mode.ts lines 881-884); the
+one-prompt-turn admission is the pre-existing #229 surface. Also out of
+scope: the print mode's goal surface (no continuation loop there
+either; the #241 goal-state persistence works, the loop needs the same
+settle-hook pattern in the print runner — its own lane).
+
+Verifiers: `pa-daemon` unit `acp::goal_continuation::tests` — the
+natural loop (one mint per settled turn, every continuation inside the
+one prompt request, the failed turn fails the goal), the budget steer
+(the steer runs as the second segment, `budget_limited` settles
+`end_turn`, no slot consumed), the threshold queue (the mint frame
+precedes the ran compaction, the held turn runs after it), the compact
+continue (the minted segment runs after a ran `/compact`, the
+compact-trigger review services at its boundary), and the cancelled
+arm (the mint rolls back). `pa-cli` e2e
+`acp_goal_command_publishes_goal_meta_and_runs_the_continuation`
+pinned to the budget-bounded loop. Differential: the
+`acp_compaction_parity.py` "goal" scenario byte-compares the TS binary
+vs the Rust direct ACP for the `/goal --budget 5` prompt — the
+goal-start continuation segment, the `budget_limited` flip, the
+wrap-up steer segment, and the `end_turn` response (8 frames identical
+after the #182 token-estimate normalization). The threshold/overflow
+scenarios stay green (the arm surface is unregressed).

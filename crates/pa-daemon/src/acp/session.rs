@@ -45,6 +45,10 @@ pub struct AcpSession {
     /// state. Shared with the arm implementation
     /// (compaction_arms.rs).
     pub(super) arms: Arc<CompactionArms>,
+    /// Whether the latest turn's usage crossed the goal's token budget
+    /// (the usage listener arms it on `BudgetReached`, the settle loop's
+    /// goal boundary consumes it): TS `_shouldStopAfterTurn`'s budget arm.
+    goal_budget_crossed: Arc<AtomicBool>,
 }
 
 impl AcpSession {
@@ -65,6 +69,7 @@ impl AcpSession {
         // a user row that starts an agent run resets the overflow
         // recovery machine at its `message_start` (TS `startsAgentRun`).
         let arms = Arc::new(CompactionArms::new());
+        let goal_budget_crossed = Arc::new(AtomicBool::new(false));
         let subscription = subscribe_engine_events(
             &engine,
             producer.clone(),
@@ -73,6 +78,7 @@ impl AcpSession {
             autonomous_driver.clone(),
             last_published_goal.clone(),
             arms.clone(),
+            goal_budget_crossed.clone(),
         )
         .await;
         AcpSession {
@@ -86,6 +92,7 @@ impl AcpSession {
             engine,
             last_published_goal,
             arms,
+            goal_budget_crossed,
         }
     }
 
@@ -109,6 +116,13 @@ impl AcpSession {
 
     pub fn request_cancel(&self) {
         self.cancel_requested.store(true, Ordering::SeqCst);
+    }
+
+    /// Consume the goal-budget crossing the latest turn's usage armed
+    /// (the settle loop's budget-steer read; TS `_shouldStopAfterTurn`'s
+    /// budget arm).
+    pub fn take_goal_budget_crossed(&self) -> bool {
+        self.goal_budget_crossed.swap(false, Ordering::SeqCst)
     }
 
     pub fn producer(&self) -> &Arc<UpdateProducer> {
@@ -178,6 +192,7 @@ impl AcpSession {
 /// Message-end hooks mirror the TS session's message_end listeners:
 /// per-message autonomous usage accounting, and goal usage recording with a
 /// `_meta.goal` update whenever the goal state changes mid-turn.
+#[allow(clippy::too_many_arguments)]
 async fn subscribe_engine_events(
     engine: &Arc<pa_core::session_engine::engine::SessionEngine>,
     producer: Arc<UpdateProducer>,
@@ -186,6 +201,7 @@ async fn subscribe_engine_events(
     autonomous_driver: Arc<dyn pa_core::autonomous::AutonomousDriver>,
     last_published_goal: Arc<Mutex<pa_core::goals::GoalState>>,
     arms: Arc<CompactionArms>,
+    goal_budget_crossed: Arc<AtomicBool>,
 ) -> Subscription {
     let agent = engine.session.agent().clone();
     let goal_driver = engine.goal_driver.clone();
@@ -200,6 +216,7 @@ async fn subscribe_engine_events(
             let session = session.clone();
             let last_published_goal = last_published_goal.clone();
             let arms = arms.clone();
+            let goal_budget_crossed = goal_budget_crossed.clone();
             Box::pin(async move {
                 // A user row that starts an agent run resets the overflow
                 // recovery machine (TS `startsAgentRun` at
@@ -239,15 +256,33 @@ async fn subscribe_engine_events(
                             let mut state = autonomous.lock().await;
                             autonomous_driver.account_message(&mut state, &wire);
                         }
-                        // Goal usage recording while the goal is active; a
-                        // state change publishes a `_meta.goal` update.
-                        let mut driver = goal_driver.lock().await;
-                        let mut persistence = session.lock().await;
-                        // Timestamp is the message identity for the
-                        // double-counting guard: the loop does not assign
-                        // message ids in-process.
-                        let message_id = format!("a-{}", wire.timestamp);
-                        driver.record_assistant_usage(&mut persistence, &message_id, &wire.usage);
+                        // Goal usage recording mirrors the TS guard
+                        // (`_accountGoalUsageForAssistantMessage`): only
+                        // turns that were neither errors nor aborted spend
+                        // the goal's budget, and only while the goal is
+                        // active; a budget crossing moves the goal to
+                        // `budget_limited` (the state change publishes
+                        // below) and arms the settle loop's wrap-up steer.
+                        if !matches!(
+                            wire.stop_reason,
+                            pa_types::ai::StopReason::Error | pa_types::ai::StopReason::Aborted
+                        ) {
+                            let mut driver = goal_driver.lock().await;
+                            let mut persistence = session.lock().await;
+                            // Timestamp is the message identity for the
+                            // double-counting guard: the loop does not
+                            // assign message ids in-process.
+                            let message_id = format!("a-{}", wire.timestamp);
+                            if driver.record_assistant_usage(
+                                &mut persistence,
+                                &message_id,
+                                &wire.usage,
+                            )
+                                == pa_core::session_engine::goal_driver::UsageOutcome::BudgetReached
+                            {
+                                goal_budget_crossed.store(true, Ordering::SeqCst);
+                            }
+                        }
                     }
                 }
                 // A goal state change (usage recorded, budget reached, or a

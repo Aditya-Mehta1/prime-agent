@@ -12,6 +12,7 @@ mod autorefine;
 mod compaction_arms;
 pub mod daemon;
 mod events;
+mod goal_continuation;
 mod jsonrpc;
 mod mcp;
 mod meta;

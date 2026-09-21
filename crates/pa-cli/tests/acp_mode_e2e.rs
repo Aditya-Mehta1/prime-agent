@@ -925,7 +925,12 @@ fn acp_goal_command_publishes_goal_meta_and_runs_the_continuation() {
     // `/goal` start schedules its continuation as the turn's model segment:
     // the goal meta frame precedes the streamed answer, and the usage
     // accounting publishes a second goal frame after the message settles.
-    let script = json!({ "responses": ["GOAL-PROGRESS"] });
+    // The tiny budget bounds the goal loop the direct-ACP settle loop now
+    // hosts (TS parity: the continuation loop runs inside the same
+    // session/prompt request): the crossing turn's budget-limit steer is
+    // the second model segment, and the budget_limited goal settles the
+    // prompt with end_turn instead of looping forever.
+    let script = json!({ "responses": ["GOAL-PROGRESS", "WRAP-UP"] });
     let mut client = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);
     let init = client.request("initialize", initialize_params());
     let _ = client.wait_response(init, TIMEOUT);
@@ -938,7 +943,7 @@ fn acp_goal_command_publishes_goal_meta_and_runs_the_continuation() {
 
     let prompt = client.request(
         "session/prompt",
-        json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "/goal reply with exactly: GOAL-DONE" }] }),
+        json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "/goal --budget 5 reply with exactly: GOAL-PROGRESS" }] }),
     );
     let (prompt_response, updates) = client.wait_response(prompt, TIMEOUT);
 
@@ -953,14 +958,26 @@ fn acp_goal_command_publishes_goal_meta_and_runs_the_continuation() {
     let first =
         &goal_frames[0]["params"]["update"]["_meta"]["ai.primeintellect.prime-agent"]["goal"];
     assert_eq!(first["status"], "active");
-    assert_eq!(first["objective"], "reply with exactly: GOAL-DONE");
+    assert_eq!(first["objective"], "reply with exactly: GOAL-PROGRESS");
     assert_eq!(first["tokensUsed"], 0);
-    // A usage update follows the settled message.
+    // A usage update follows the settled message: the tiny budget
+    // crosses at the first turn, so the goal is budget_limited before
+    // the wrap-up steer segment runs.
     assert!(goal_frames.len() >= 2, "goal frames: {goal_frames:?}");
     let second =
         &goal_frames[1]["params"]["update"]["_meta"]["ai.primeintellect.prime-agent"]["goal"];
-    assert_eq!(second["status"], "active");
+    assert_eq!(second["status"], "budget_limited");
     assert!(second["tokensUsed"].as_u64().unwrap_or(0) > 0);
+    // The budget-limit wrap-up steer ran as the prompt's second model
+    // segment (its streamed answer is the second scripted response; the
+    // faux pacing may split one answer into chunks, so the joined text
+    // carries the observable contract).
+    let streamed: String = updates
+        .iter()
+        .filter_map(|update| update["params"]["update"]["content"]["text"].as_str())
+        .collect();
+    assert!(streamed.contains("GOAL-PROGRESS"), "updates: {updates:?}");
+    assert!(streamed.contains("WRAP-UP"), "updates: {updates:?}");
     assert_eq!(
         prompt_response["result"],
         json!({ "stopReason": "end_turn" })

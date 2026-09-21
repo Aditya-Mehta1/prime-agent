@@ -15,7 +15,8 @@ use pa_core::session_engine::session_commands::execute_session_command;
 use pa_core::session_engine::session_commands::SessionCommandParams;
 use pa_core::session_engine::{PromptOptions, PromptOutcome, StreamingBehavior};
 
-use super::compaction_arms::CompactionCheckRun;
+use super::compaction_arms::{CompactionCheckRun, ThresholdGoalQueue};
+use super::goal_continuation;
 use super::internal_error;
 use super::meta::{self, PrimeAgentAutonomousMeta, PrimeAgentEventPhase, PrimeAgentOutcome};
 use super::session::{self, AcpSession, TurnBoundary};
@@ -259,9 +260,20 @@ async fn run_prompt_turn(
         }
         // TS `_checkCompaction` at `agent_end`: the overflow arm (Case 1,
         // with its compact-and-retry), then the requested arm (which
-        // stops the run on purpose), then the threshold arm.
-        let check = session.check_compaction(&mode, &final_message).await;
+        // stops the run on purpose), then the threshold arm (which, under
+        // the settled boundary's queue policy, mints the goal continuation
+        // before it compacts — the held turn runs after the boundary like
+        // the TS post-compaction continue).
+        let (check, threshold_continuation) = session
+            .check_compaction(&mode, &final_message, ThresholdGoalQueue::Queue)
+            .await;
         if session.cancel_requested() {
+            if threshold_continuation.is_some() {
+                // A cancellation between the mint and the run withdraws
+                // the queued continuation (the TS cancel clears the
+                // queue and rolls the slot back).
+                goal_continuation::rollback_goal_mint(&mode).await;
+            }
             break;
         }
         if check == CompactionCheckRun::OverflowRetry {
@@ -278,13 +290,27 @@ async fn run_prompt_turn(
         // TS consumes the requested refinement whenever the compaction
         // check did not report a will-retry (`_consumePendingRequestedRefine`
         // at `agent_end`), then the serialized checkpoint's compact step
-        // services an armed compact-trigger review (autorefine.rs).
+        // services an armed compact-trigger review (autorefine.rs). The
+        // compact-trigger round defers behind a held goal continuation
+        // (TS `_scheduleAutoRefineAfterCompaction(willContinue)`): the
+        // continuation turn's own boundary services it.
         session.consume_requested_refine(&mode).await;
-        session.consume_compact_auto_refine(&mode).await;
+        if threshold_continuation.is_none() {
+            session.consume_compact_auto_refine(&mode).await;
+        }
         // A failed turn ends the run with its error once the boundary
         // check could not save it (an overflow recovery that re-issued
         // handled it above).
         if final_message.stop_reason == pa_types::ai::StopReason::Error {
+            // TS `_finishGoalForTerminalAssistantMessage` at `agent_end`:
+            // the failed turn fails an active goal (the state change
+            // publishes before the response settles).
+            goal_continuation::fail_goal_for_terminal_error(
+                &mode,
+                &session,
+                final_message.error_message.as_deref(),
+            )
+            .await;
             turn_failure = Some(
                 final_message
                     .error_message
@@ -298,39 +324,75 @@ async fn run_prompt_turn(
         if check == CompactionCheckRun::RequestedStop {
             break;
         }
+        // The threshold arm's held goal continuation runs as the
+        // post-compaction turn (TS `_schedulePostCompactionContinue` over
+        // the queued follow-up): the pre-turn compaction arms run before
+        // it like any admitted prompt, and its own settled boundary
+        // re-enters this loop.
+        if let Some(message) = threshold_continuation {
+            session.run_pre_turn_compaction(&mode).await;
+            if let Err(error) = mode.engine.session.prompt_injected_message(&message).await {
+                turn_failure = Some(format!("{error:#}"));
+                break;
+            }
+            mode.engine.session.agent().wait_for_idle().await;
+            continue;
+        }
         if session.cancel_requested() {
             break;
         }
-        match session.autonomous_follow_up(&final_message).await {
-            AutonomousFollowUp::Inactive => break,
-            AutonomousFollowUp::Continue { text } => {
-                // An injected continuation runs as the next turn of the
-                // same prompt (a fresh user row: the pre-turn compaction
-                // arms run before it, like any admitted prompt); its
-                // failure settles the prompt.
+        // TS `_getContinuationMessages` at the agent loop's natural turn
+        // end: the goal arm runs before the autonomous arm with exclusive
+        // priority — the budget-limit wrap-up steer first (the turn that
+        // crossed the goal budget), then the natural continuation mint
+        // (an active goal mints one continuation per settled boundary).
+        // A minted turn runs as the next turn of the same prompt (the
+        // pre-turn compaction arms run before it like any admitted
+        // prompt); no active goal falls through to the autonomous arm.
+        match goal_continuation::goal_follow_up(&mode, &session).await {
+            goal_continuation::GoalFollowUp::Turn(message) => {
                 session.run_pre_turn_compaction(&mode).await;
-                if let Err(error) = mode
-                    .engine
-                    .session
-                    .prompt(
-                        &text,
-                        PromptOptions {
-                            streaming_behavior: Some(StreamingBehavior::FollowUp),
-                            queue_if_busy: true,
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                {
+                if let Err(error) = mode.engine.session.prompt_injected_message(&message).await {
                     turn_failure = Some(format!("{error:#}"));
                     break;
                 }
                 mode.engine.session.agent().wait_for_idle().await;
+                continue;
             }
-            AutonomousFollowUp::Stop { reason, status } => {
-                persist_autonomous_stop_row(&mode, &reason, &status).await;
-                autonomous_stop = Some((reason, status));
-                break;
+            goal_continuation::GoalFollowUp::None => {
+                match session.autonomous_follow_up(&final_message).await {
+                    AutonomousFollowUp::Inactive => break,
+                    AutonomousFollowUp::Continue { text } => {
+                        // An injected continuation runs as the next turn
+                        // of the same prompt (a fresh user row: the
+                        // pre-turn compaction arms run before it, like
+                        // any admitted prompt); its failure settles the
+                        // prompt.
+                        session.run_pre_turn_compaction(&mode).await;
+                        if let Err(error) = mode
+                            .engine
+                            .session
+                            .prompt(
+                                &text,
+                                PromptOptions {
+                                    streaming_behavior: Some(StreamingBehavior::FollowUp),
+                                    queue_if_busy: true,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                        {
+                            turn_failure = Some(format!("{error:#}"));
+                            break;
+                        }
+                        mode.engine.session.agent().wait_for_idle().await;
+                    }
+                    AutonomousFollowUp::Stop { reason, status } => {
+                        persist_autonomous_stop_row(&mode, &reason, &status).await;
+                        autonomous_stop = Some((reason, status));
+                        break;
+                    }
+                }
             }
         }
     }
@@ -404,6 +466,17 @@ async fn run_session_command_segment(
     // or the session-close drain (autorefine.rs).
     if command.name == "compact" && execution.compaction.is_some() {
         mode.engine.session.mark_compact_auto_refine_pending();
+        // TS `compact()`'s `didCompact` + active-goal finally arm: a
+        // successful manual compact with an active goal mints the owed
+        // continuation (the `||= !hasQueuedMessages()` arm — the direct
+        // ACP never queues work behind a session command) and the
+        // continuation runs as the turn's model segment, the scheduled
+        // continue over the queued follow-up. The compact-trigger review
+        // defers behind it (the continuation turn's boundary services
+        // it, like the goal-start segment below).
+        if let Some(message) = goal_continuation::mint_goal_continuation(mode, session).await {
+            return run_goal_continuation_segment(mode, session, message, turn_failure).await;
+        }
     }
 
     // Refinement outcomes publish complete/failed events; option-parse
@@ -447,23 +520,32 @@ async fn run_session_command_segment(
     session.publish_goal_update().await;
 
     // A scheduled goal continuation runs as the turn's model segment; its
-    // settled turn participates in the autonomous follow-up like any model
-    // turn. The pre-turn compaction arms run before it, like any admitted
-    // prompt (TS `_runPreTurnCompaction`).
+    // settled turn participates in the settle loop like any model turn.
     if let Some(message) = execution.continuation_message {
-        session.run_pre_turn_compaction(mode).await;
-        // The goal continuation is an injected custom row (TS's
-        // prepared-turn primary record): the loop carries the row itself,
-        // so the transcript holds one representation of the turn.
-        let result = mode.engine.session.prompt_injected_message(&message).await;
-        if let Err(error) = result {
-            *turn_failure = Some(format!("{error:#}"));
-            return Ok(false);
-        }
-        mode.engine.session.agent().wait_for_idle().await;
-        return Ok(true);
+        return run_goal_continuation_segment(mode, session, message, turn_failure).await;
     }
     Ok(false)
+}
+
+/// Run one goal-continuation segment (a goal-context row minted by the
+/// goal commands or the compact-with-active-goal continue) as the turn's
+/// model segment: the pre-turn compaction arms run before it like any
+/// admitted prompt (TS `_runPreTurnCompaction`), the injected custom row
+/// is the turn's one representation (TS's prepared-turn primary record),
+/// and the settled turn's boundary re-enters the settle loop.
+async fn run_goal_continuation_segment(
+    mode: &AcpModeState,
+    session: &Arc<AcpSession>,
+    message: pa_types::session::CustomMessage,
+    turn_failure: &mut Option<String>,
+) -> anyhow::Result<bool> {
+    session.run_pre_turn_compaction(mode).await;
+    if let Err(error) = mode.engine.session.prompt_injected_message(&message).await {
+        *turn_failure = Some(format!("{error:#}"));
+        return Ok(false);
+    }
+    mode.engine.session.agent().wait_for_idle().await;
+    Ok(true)
 }
 
 /// Publish one adapter event through the session producer at the active

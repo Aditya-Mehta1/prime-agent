@@ -42,6 +42,19 @@ use super::events::AcpEngineEvent;
 use super::session::AcpSession;
 use super::AcpModeState;
 
+/// Whether the threshold arm queues the goal continuation before it
+/// compacts (TS `_checkCompaction`'s `queueAutonomousContinuation`
+/// parameter): the settled-turn boundary queues (the minted turn drives
+/// the post-compaction continue), the pre-turn check does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ThresholdGoalQueue {
+    /// The settled-turn policy (TS default `true`): mint the goal
+    /// continuation before the threshold compaction runs.
+    Queue,
+    /// The pre-turn policy (TS `_runPreTurnCompaction` passes `false`).
+    Skip,
+}
+
 /// What the settled-turn check decided for the turn loop (the TS
 /// `_checkCompaction` outcome plus the stop semantics the TS loop derives
 /// from it).
@@ -156,29 +169,35 @@ impl AcpSession {
     /// then the requested arm (which never falls through to the threshold
     /// arm), then the threshold arm. `assistant` is the turn's settled
     /// message; an aborted message never reaches here (the turn loop
-    /// classifies aborts first, dropping the boundary requests).
+    /// classifies aborts first, dropping the boundary requests). The
+    /// return carries the threshold arm's held goal continuation (the
+    /// goal-queue mint before the compaction; the settle loop runs it as
+    /// the post-compaction turn).
     pub(super) async fn check_compaction(
         &self,
         mode: &AcpModeState,
         assistant: &AssistantMessage,
-    ) -> CompactionCheckRun {
+        goal_queue: ThresholdGoalQueue,
+    ) -> (CompactionCheckRun, Option<pa_types::session::CustomMessage>) {
         let Some(model) = mode.model.clone() else {
             // TS reads `this.model?.contextWindow ?? 0`: a session
             // without a resolvable model never crosses a threshold.
-            return CompactionCheckRun::Proceed;
+            return (CompactionCheckRun::Proceed, None);
         };
         match self.overflow_attempt(mode, assistant).await {
-            OverflowAttempt::Retry => return CompactionCheckRun::OverflowRetry,
+            OverflowAttempt::Retry => return (CompactionCheckRun::OverflowRetry, None),
             // A matched case is done (TS `return false`): the requested
             // and threshold arms never fire after it.
-            OverflowAttempt::Done => return CompactionCheckRun::Proceed,
+            OverflowAttempt::Done => return (CompactionCheckRun::Proceed, None),
             OverflowAttempt::Continue => {}
         }
         if self.requested_arm(mode, &model).await.was_consumed() {
-            return CompactionCheckRun::RequestedStop;
+            return (CompactionCheckRun::RequestedStop, None);
         }
-        self.threshold_arm(mode, &model).await;
-        CompactionCheckRun::Proceed
+        let held = self
+            .threshold_arm(mode, &model, assistant, goal_queue)
+            .await;
+        (CompactionCheckRun::Proceed, held)
     }
 
     /// TS `_runPreTurnCompaction` before an admitted prompt: the same
@@ -198,7 +217,14 @@ impl AcpSession {
             // requests drop, then the checks continue.
             mode.engine.turn_boundary.clear_pending().await;
         }
-        self.check_compaction(mode, &assistant).await;
+        // A pre-turn threshold compaction never queues the goal
+        // continuation (TS `_runPreTurnCompaction` passes
+        // `queueAutonomousContinuation = false`), so the check holds
+        // nothing.
+        let (_, held) = self
+            .check_compaction(mode, &assistant, ThresholdGoalQueue::Skip)
+            .await;
+        drop(held);
     }
 
     /// TS `_consumePendingRequestedRefine`: taken regardless of outcome,
@@ -254,19 +280,56 @@ impl AcpSession {
 
     /// The TS `_checkCompaction` threshold arm: the live context over
     /// the reserve headroom (the pa-core decision), one compaction when
-    /// it crossed, the `compaction_end` mapping either way.
-    async fn threshold_arm(&self, mode: &AcpModeState, model: &Model) {
+    /// it crossed, the `compaction_end` mapping either way. Under the
+    /// settled boundary's queue policy (TS
+    /// `_queueGoalContinuationForThresholdCompaction`), an active goal's
+    /// continuation is minted BEFORE the compaction runs — the minted
+    /// turn is what drives the post-compaction continue, and the mint's
+    /// `goal_update` publishes ahead of the compaction frames like the
+    /// TS event order. A cancelled compaction withdraws the mint (the
+    /// slot rolls back); skip and failure keep it (TS
+    /// `resumeAfterFailure`).
+    async fn threshold_arm(
+        &self,
+        mode: &AcpModeState,
+        model: &Model,
+        assistant: &AssistantMessage,
+        goal_queue: ThresholdGoalQueue,
+    ) -> Option<pa_types::session::CustomMessage> {
         let engine = &mode.engine;
         if !engine
             .session
             .auto_compaction_due(model.context_window)
             .await
         {
-            return;
+            return None;
         }
+        // TS's queue-site guard: error and aborted turns never queue the
+        // goal continuation.
+        let settled_turn = !matches!(
+            assistant.stop_reason,
+            pa_types::ai::StopReason::Error | pa_types::ai::StopReason::Aborted
+        );
+        let held = match goal_queue {
+            ThresholdGoalQueue::Queue if settled_turn => {
+                super::goal_continuation::mint_goal_continuation(mode, self).await
+            }
+            _ => None,
+        };
         let outcome = run_compaction(self, engine, model, mode.api_key.clone(), None).await;
+        let cancelled = outcome
+            .as_ref()
+            .err()
+            .is_some_and(pa_agent::abort::is_abort_error);
         self.finish_compaction(engine, CompactionOutcomeReason::Threshold, outcome)
             .await;
+        if cancelled && held.is_some() {
+            // TS `_clearQueuedGoalContinuationAfterCancelledThresholdCompaction`:
+            // withdraw the queued continuation and roll the slot back.
+            super::goal_continuation::rollback_goal_mint(mode).await;
+            return None;
+        }
+        held
     }
 
     /// The TS `_checkCompaction` requested arm: a pending `compact.run`

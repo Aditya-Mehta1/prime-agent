@@ -16,13 +16,21 @@ HOME/agent-dir sandboxes; the TS side reads the script through the shared
 faux extension, the Rust side through PRIME_AGENT_FAUX_SCRIPT — which also
 forces the Rust in-process transport, bypassing the daemon-attached one):
 
-  - turn one (8k chars, ~2k tokens over the 500-token headroom on the
-    128k window): the threshold arm fires at the settled boundary and the
-    single-turn compaction skips — the skip is observable as the empty
-    `compaction: {}` meta,
-  - turn two: the pre-turn arm skips again (still nothing before turn one
-    to summarize), then the settled boundary compaction runs, summarizing
-    turn one and publishing `tokensBefore` + the scripted summary.
+  - threshold: turn one (8k chars, ~2k tokens over the 500-token headroom
+    on the 128k window): the threshold arm fires at the settled boundary
+    and the single-turn compaction skips — the skip is observable as the
+    empty `compaction: {}` meta,
+  - threshold turn two: the pre-turn arm skips again (still nothing
+    before turn one to summarize), then the settled boundary compaction
+    runs, summarizing turn one and publishing `tokensBefore` + the
+    scripted summary.
+  - goal: `/goal --budget 5 ...` (compaction disabled) drives the direct
+    ACP goal continuation surface the TS session hosts inside the one
+    `session/prompt` run: the goal-start continuation segment streams,
+    the crossing turn's usage flips the goal to `budget_limited`, and the
+    budget-limit wrap-up steer runs as the prompt's second model segment
+    before the end_turn response. Byte-compared against the TS binary
+    (the #244 direct-ACP ruling).
 
 Every frame after `session/new` (notifications and responses alike) is
 captured per side, normalized for volatile content (session ids, request
@@ -82,6 +90,9 @@ OVERFLOW_ERROR = {
     "stopReason": "error",
     "errorMessage": "prompt is too long: 213462 tokens > 200000 maximum",
 }
+
+# The ACP meta namespace (the goal frames' home).
+NAMESPACE = "ai.primeintellect.prime-agent"
 
 TIMEOUT = 180
 
@@ -233,6 +244,13 @@ def normalize(frames):
         text = json.dumps(payload, sort_keys=True)
         text = re.sub(r'"sessionId": "[0-9a-f-]{36}"', '"sessionId": "<sid>"', text)
         text = re.sub(r'"tokensBefore": \d+', '"tokensBefore": "<n>"', text)
+        # Goal usage is a per-side token estimate (the #182 normalization
+        # class): the goal metas and the goal-context texts carry the
+        # same scrub as the f7 goal-continue battery.
+        text = re.sub(r'"tokensUsed": \d+', '"tokensUsed": "<n>"', text)
+        text = re.sub(r"- tokens used: -?\d+", "- tokens used: <n>", text)
+        text = re.sub(r"- remaining tokens: -?\d+", "- remaining tokens: <n>", text)
+        text = re.sub(r"- time used seconds: \d+", "- time used seconds: <n>", text)
         frame = json.loads(text)
         params = frame.get("params")
         if isinstance(params, dict):
@@ -254,6 +272,27 @@ def scenario(name):
             "script": FAUX_SCRIPT,
             "settings": SETTINGS,
             "prompts": [TURN_ONE, TURN_TWO],
+        }
+    if name == "goal":
+        # The budget-bounded goal loop: the start segment streams, the
+        # crossing flips the goal to budget_limited, the wrap-up steer
+        # runs as the second segment, and the prompt settles end_turn.
+        # Compaction stays out of the picture (the goal frames are the
+        # diff target).
+        return {
+            "script": {
+                "engine": "faux",
+                "modelId": "faux-1",
+                "modelName": "Faux Model",
+                "reasoning": False,
+                "contextWindow": 128000,
+                "responses": [
+                    {"text": "goal turn reply"},
+                    {"text": "wrap-up reply"},
+                ],
+            },
+            "settings": {"compaction": {"enabled": False}},
+            "prompts": ["/goal --budget 5 finish the work"],
         }
     return {
         "script": {
@@ -353,7 +392,7 @@ def drive(binary, base, script_path, settings, prompts, out_dir):
 def main():
     ts_identity.assert_ts_side_is_the_ts_product()
     failures = 0
-    for name in ("threshold", "overflow"):
+    for name in ("threshold", "overflow", "goal"):
         if run_scenario(name):
             print(f"ACP auto-compaction parity ({name}): PASS")
         else:
@@ -399,6 +438,9 @@ def _run_scenario(name, base):
     # The scenario must exercise the arms on both sides; the expected
     # metas differ per scenario.
     expectations = {
+        # The goal scenario asserts on goal frames below, not compaction
+        # metas (its compaction is disabled).
+        "goal": [],
         "threshold": [
             ("a skipped-compaction frame (the single-turn skip)", lambda m: m == {}),
             (
@@ -432,6 +474,37 @@ def _run_scenario(name, base):
             frame for frame in frames
             if "result" in frame or "error" in frame
         ]
+
+    # The goal scenario must drive the continuation surface on both
+    # sides: the goal flips to budget_limited, the wrap-up steer streams
+    # its scripted answer, and the prompt settles end_turn.
+    if name == "goal":
+        for side, frames in (("ts", ts_frames), ("rust", rust_frames)):
+            goals = [
+                frame["params"]["update"]["_meta"][NAMESPACE]["goal"]
+                for frame in frames
+                if frame.get("params", {})
+                .get("update", {})
+                .get("_meta", {})
+                .get(NAMESPACE, {})
+                .get("goal")
+            ]
+            assert any(goal.get("status") == "budget_limited" for goal in goals), (
+                f"the {side} side never published the budget_limited goal: {goals!r}"
+            )
+            replies = responses(frames)
+            assert len(replies) == 1, f"{side}: expected one prompt reply, got {replies!r}"
+            assert replies[0]["result"]["stopReason"] == "end_turn", (
+                f"the {side} side's goal prompt did not settle end_turn: {replies[0]!r}"
+            )
+            streamed = "".join(
+                frame["params"]["update"].get("content", {}).get("text", "")
+                for frame in frames
+                if "content" in frame.get("params", {}).get("update", {})
+            )
+            assert "wrap-up reply" in streamed, (
+                f"the {side} side's wrap-up steer never streamed: {streamed!r}"
+            )
 
     # The overflow scenario's probe turn must recover on both sides.
     if name == "overflow":

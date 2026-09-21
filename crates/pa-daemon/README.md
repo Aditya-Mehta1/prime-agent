@@ -24,7 +24,15 @@ the gated review - TS `_scheduleAutoRefineAfterCompaction` plus the
 background `_maybeAutoRefine("compact")`; `acp/autorefine.rs` for ACP:
 the serialized checkpoint consumes the armed trigger after the
 requested refine.run and session close drains what no turn serviced -
-TS's serialized scheduling for the acp app mode).
+TS's serialized scheduling for the acp app mode). The direct-ACP goal
+continuation boundary owns its surface here too (`acp/goal_continuation.rs`:
+the TS session's continuation hook `_getContinuationMessages` runs inside
+the one `session/prompt` request on the in-process path — the goal arm with
+exclusive priority over the autonomous arm, the budget-limit wrap-up steer,
+the natural continuation mint per settled boundary, the terminal-error
+goal failure, the threshold-arm goal queue before its compaction (with
+the cancel rollback), and the compact-with-active-goal continue; the
+daemon-attached transport rides the worker's #244 loop instead).
 Supervisor process (one worker process per active session), restart/backoff
 supervision, session registry/roster + worker self-registration (session
 identity survives supervisor restarts: workers re-register with backoff and
