@@ -39,6 +39,7 @@ describe("package harness discovery", () => {
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
+	// test-policy: allow explicit-test-timeout -- real package-manager discovery runs subprocess and disk I/O in a temp root
 	it("discovers pi.harness resources alongside pi.skills", { timeout: 10_000 }, async () => {
 		const packageDir = join(tempDir, "combined-package");
 		mkdirSync(packageDir, { recursive: true });
@@ -75,6 +76,7 @@ describe("package harness discovery", () => {
 		expect(resolved.harness.every((resource) => resource.metadata.baseDir === packageDir)).toBe(true);
 	});
 
+	// test-policy: allow explicit-test-timeout -- real package-manager discovery runs subprocess and disk I/O in a temp root
 	it("auto-discovers a conventional harness/ directory without a pi manifest", { timeout: 10_000 }, async () => {
 		const packageDir = join(tempDir, "conventional-package");
 		mkdirSync(packageDir, { recursive: true });
@@ -92,6 +94,7 @@ describe("package harness discovery", () => {
 		expect(resolved.harness[0]?.enabled).toBe(true);
 	});
 
+	// test-policy: allow explicit-test-timeout -- real package-manager discovery runs subprocess and disk I/O in a temp root
 	it("applies PackageSource harness filters independently of other resources", { timeout: 10_000 }, async () => {
 		const packageDir = join(tempDir, "filtered-package");
 		mkdirSync(packageDir, { recursive: true });
@@ -121,6 +124,7 @@ describe("package harness discovery", () => {
 		expect(resolved.skills).toContainEqual(expect.objectContaining({ path: skillPath, enabled: true }));
 	});
 
+	// test-policy: allow explicit-test-timeout -- real package-manager discovery runs subprocess and disk I/O in a temp root
 	it("disables package harness resources with an explicit empty filter", { timeout: 10_000 }, async () => {
 		const packageDir = join(tempDir, "disabled-package");
 		mkdirSync(packageDir, { recursive: true });
@@ -133,6 +137,7 @@ describe("package harness discovery", () => {
 		expect(resolved.harness).toContainEqual(expect.objectContaining({ path: memoryPath, enabled: false }));
 	});
 
+	// test-policy: allow explicit-test-timeout -- real package-manager discovery runs subprocess and disk I/O in a temp root
 	it("ranks project-scope package harness resources ahead of user-scope ones", { timeout: 10_000 }, async () => {
 		const projectDir = join(tempDir, "project-package");
 		const userDir = join(tempDir, "user-package");
@@ -151,6 +156,7 @@ describe("package harness discovery", () => {
 		expect(resolved.harness[1]).toMatchObject({ path: userPath, metadata: { scope: "user" } });
 	});
 
+	// test-policy: allow explicit-test-timeout -- real package-manager discovery runs subprocess and disk I/O in a temp root
 	it("resolves no harness resources when no packages are configured", { timeout: 10_000 }, async () => {
 		const resolved = await packageManager.resolve();
 

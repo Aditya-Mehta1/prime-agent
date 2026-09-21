@@ -1,16 +1,20 @@
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+	closeSync,
 	copyFileSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	openSync,
 	readdirSync,
 	readFileSync,
+	readSync,
 	realpathSync,
 	rmSync,
 	symlinkSync,
 	writeFileSync,
+	writeSync,
 } from "node:fs";
 import { createServer } from "node:http2";
 import { tmpdir } from "node:os";
@@ -18,6 +22,11 @@ import { basename, dirname, join, resolve } from "node:path";
 import { deflateSync } from "node:zlib";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
+
+// Keep process-local failure deadlines below Vitest's default budget so failures report their
+// stderr instead of being replaced by a suite-wide timeout.
+const RUN_TIMEOUT = 25000;
+const CONNECT_TIMEOUT = 5000;
 
 const archive = process.env.PRIME_AGENT_TEST_ARCHIVE;
 const uv = process.env.PRIME_AGENT_TEST_UV;
@@ -30,7 +39,16 @@ let cwd = "";
 let socket = "";
 let environment: NodeJS.ProcessEnv;
 
-async function run(args: string[], extraEnv: NodeJS.ProcessEnv = {}, timeout = 30000, input?: string) {
+/** SIGKILL is a deterministic teardown signal and cannot be blocked by the supervisor. */
+function terminateSupervisor(pid: number): void {
+	try {
+		process.kill(pid, "SIGKILL");
+	} catch {
+		/* The supervisor already exited after acknowledging shutdown. */
+	}
+}
+
+async function run(args: string[], extraEnv: NodeJS.ProcessEnv = {}, timeout = RUN_TIMEOUT, input?: string) {
 	const child = spawn(binary, args, { cwd, env: { ...environment, ...extraEnv }, stdio: ["pipe", "pipe", "pipe"] });
 	children.add(child);
 	let stdout = "";
@@ -100,6 +118,9 @@ describe.skipIf(!archive)("extracted standalone archive", () => {
 		mkdirSync(extracted);
 		execFileSync("tar", ["-xzf", resolve(archive!), "-C", extracted]);
 		binary = join(extracted, "prime-agent");
+		if (process.platform === "darwin") {
+			execFileSync("/usr/bin/codesign", ["--verify", "--deep", "--strict", "--verbose=4", binary]);
+		}
 		const bin = join(root, "bin");
 		mkdirSync(bin);
 		for (const command of [
@@ -159,32 +180,23 @@ describe.skipIf(!archive)("extracted standalone archive", () => {
 	afterEach(async () => {
 		for (const child of children) child.kill("SIGTERM");
 		const client = new DaemonClient(socket);
+		let supervisorPid: number | undefined;
+		let shutdownError: unknown;
 		try {
-			await client.connect(1000);
-			const hello = await client.waitForHello();
+			await client.connect(CONNECT_TIMEOUT);
+			supervisorPid = (await client.waitForHello()).supervisorPid;
 			await client.request({ type: "shutdown", force: true });
-			if (hello.supervisorPid) {
-				await expect
-					.poll(
-						() => {
-							try {
-								process.kill(hello.supervisorPid!, 0);
-								return false;
-							} catch {
-								return true;
-							}
-						},
-						{ timeout: 10000 },
-					)
-					.toBe(true);
-			}
 		} catch (error) {
-			if (existsSync(socket)) throw error;
+			if (existsSync(socket)) shutdownError = error;
 		} finally {
 			client.close();
 		}
+		// The supervisor is terminated even when the shutdown request failed, so an unresponsive
+		// daemon reports its own error instead of leaking a process into the next test.
+		if (supervisorPid !== undefined) terminateSupervisor(supervisorPid);
 		for (const child of children) if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
 		children.clear();
+		if (shutdownError) throw shutdownError;
 	});
 	afterAll(() => {
 		if (root) rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
@@ -210,6 +222,47 @@ describe.skipIf(!archive)("extracted standalone archive", () => {
 		const help = await run(["--help"]);
 		expect(help.code, help.stderr).toBe(0);
 		expect(help.stdout).toContain("Python REPL");
+	});
+
+	it.skipIf(process.platform !== "darwin")("rejects a tampered copy without changing the verified executable", () => {
+		const originalHash = createHash("sha256").update(readFileSync(binary)).digest("hex");
+		const tampered = join(home, "tampered-prime-agent");
+		copyFileSync(binary, tampered);
+		const descriptor = openSync(tampered, "r+");
+		try {
+			const byte = Buffer.alloc(1);
+			expect(readSync(descriptor, byte, 0, 1, 4096)).toBe(1);
+			byte[0] ^= 1;
+			writeSync(descriptor, byte, 0, 1, 4096);
+		} finally {
+			closeSync(descriptor);
+		}
+		expect(() =>
+			execFileSync("/usr/bin/codesign", ["--verify", "--deep", "--strict", "--verbose=4", tampered], {
+				stdio: "pipe",
+			}),
+		).toThrow();
+		expect(createHash("sha256").update(readFileSync(binary)).digest("hex")).toBe(originalHash);
+	});
+
+	it("executes hot JavaScript in the extracted runtime, not only help/version startup", async () => {
+		const extensionPath = join(cwd, "extension.ts");
+		writeFileSync(
+			extensionPath,
+			`${readFileSync(extensionPath, "utf8")}
+const hot = new Function("value", "for (let i = 0; i < 128; i++) value = (Math.imul(value, 1664525) + 1013904223) >>> 0; return value;");
+let value = 1;
+for (let i = 0; i < 100000; i++) value = hot(value);
+writeFileSync(join(process.cwd(), "hot-runtime.json"), JSON.stringify({ value, executable: process.execPath }));
+`,
+		);
+		const result = await run([...sessionArgs(), "--no-tools", "-p", "artifact hot runtime"]);
+		expect(result.code, result.stderr).toBe(0);
+		expect(JSON.parse(readFileSync(join(cwd, "hot-runtime.json"), "utf8"))).toEqual({
+			value: 1000067073,
+			executable: binary,
+		});
+		expect(result.stdout.trim()).toBe(`artifact-ok:${"x".repeat(131072)}:complete`);
 	});
 
 	it("loads extensions and skills, flushes piped output, and starts an owned daemon", async () => {
@@ -266,7 +319,7 @@ describe.skipIf(!archive)("extracted standalone archive", () => {
 		]
 			.map((command) => `${JSON.stringify(command)}\n`)
 			.join("");
-		const result = await run([...sessionArgs(), "--no-tools", "--mode", "rpc"], {}, 30000, input);
+		const result = await run([...sessionArgs(), "--no-tools", "--mode", "rpc"], {}, RUN_TIMEOUT, input);
 		expect(result.code, result.stderr).toBe(0);
 		const frames = result.stdout
 			.trim()

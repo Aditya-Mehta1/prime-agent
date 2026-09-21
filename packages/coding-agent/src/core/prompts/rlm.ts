@@ -72,6 +72,11 @@ export function buildChildAgentDoctrine(options: ChildAgentDoctrineOptions): str
 			'When a task calls for an answer, reply explicitly with `await agent_message.send(message, receiver_role="parent")`. Not every message or task needs a reply; continue cleanup after sending and go idle normally.',
 		);
 	}
+	if (hasIpython) {
+		lines.push(
+			"For long-running work, report brief progress with `await rlm.progress_note('...')` (at most 512 characters, throttled to about one note per 10 seconds); the parent sees notes without needing a reply.",
+		);
+	}
 	return lines.join("\n");
 }
 
@@ -218,11 +223,15 @@ export function buildSubagentGuidance(
 		);
 	}
 	lines.push("Use `await rlm.list_subagents()` after kernel restart or compaction.");
+	lines.push(
+		"Long-running children can report in-flight status with `await rlm.progress_note(...)`; `rlm.list_subagents()` shows each child's activity, latest progress note, and staleness.",
+	);
 	if (options.hasAgentObserve) {
 		lines.push("Use `agent_observe` for bounded transcript inspection.");
 	}
 	lines.push(
-		"Have children write files and read those files for fan-in.",
+		"Fan-in results with `await rlm.collect(targets, timeout_ms=0)`: it returns typed snapshots of direct children (status, answer preview, error) without steering anyone; an explicit timeout blocks only that call until the children settle or the deadline passes.",
+		"Large child outputs belong in files that you read selectively; `collect` snapshots are previews, not full results.",
 		"Delegate parallel context-heavy research or independent implementation; do a single known lookup, edit, or command inline.",
 	);
 	if (options.includeRefineExamples ?? true) {

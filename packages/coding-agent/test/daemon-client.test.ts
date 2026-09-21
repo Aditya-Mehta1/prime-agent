@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { DaemonHello } from "../src/modes/daemon/daemon-client.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
 import {
 	DAEMON_COMMAND_COMPATIBILITY,
 	DAEMON_PROTOCOL_VERSION,
 	DAEMON_SCHEMA_REVISION,
 } from "../src/modes/daemon/daemon-protocol.js";
+import { listDaemonHeartbeats } from "../src/modes/daemon/heartbeat-catalog.js";
 
 const netMock = vi.hoisted(() => {
 	type Listener = (...args: unknown[]) => void;
@@ -589,6 +591,75 @@ describe("DaemonClient", () => {
 		client.close();
 	});
 
+	it("accepts an errored task state on the saved-session list wire", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+
+		const connect = client.connect();
+		expect(netMock.sockets).toHaveLength(1);
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket);
+
+		let discoveredStatus: unknown;
+		const response = client.request(
+			{ type: "list_saved_sessions", activeSessionId: "active-1", scope: "current" },
+			30000,
+			{
+				onProgress: (message) => {
+					if (message.type === "session_list_item") {
+						discoveredStatus = message.session.agentStatus;
+					}
+				},
+			},
+		);
+		expect(socket.writes).toHaveLength(1);
+		const envelope = JSON.parse(socket.writes[0]!.trim()) as { id?: string };
+
+		socket.emit(
+			"data",
+			`${JSON.stringify({
+				id: envelope.id,
+				type: "session_list_item",
+				command: "list_saved_sessions",
+				activeSessionId: "active-1",
+				session: {
+					path: "/tmp/session-errored.jsonl",
+					id: "session-errored",
+					cwd: "/tmp",
+					created: "2026-01-01T00:00:00.000Z",
+					modified: "2026-01-02T00:00:00.000Z",
+					messageCount: 2,
+					firstMessage: "hello",
+					allMessagesText: "hello",
+					agentStatus: {
+						summary: "Model request failed: 400 enable_thinking not supported",
+						taskState: "error",
+						basedOnMessageCount: 2,
+					},
+				},
+			})}\n`,
+		);
+		socket.emit(
+			"data",
+			`${JSON.stringify({
+				id: envelope.id,
+				type: "response",
+				command: "list_saved_sessions",
+				success: true,
+				data: { sessions: [] },
+			})}\n`,
+		);
+
+		await expect(response).resolves.toMatchObject({ success: true });
+		expect(discoveredStatus).toEqual({
+			summary: "Model request failed: 400 enable_thinking not supported",
+			taskState: "error",
+			basedOnMessageCount: 2,
+		});
+		client.close();
+	});
+
 	it("serializes per-session config for create commands", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 
@@ -969,3 +1040,38 @@ async function captureRejection(promise: Promise<void>): Promise<Error> {
 	}
 	throw new Error("Expected daemon client connect attempt to reject");
 }
+
+describe("daemon heartbeat catalog", () => {
+	it("waits for the daemon hello before checking heartbeat capabilities", async () => {
+		let greeted = false;
+		const heartbeat = { job: { id: "heartbeat" } };
+		const client = {
+			hello: undefined,
+			waitForHello: vi.fn(async (): Promise<DaemonHello> => {
+				greeted = true;
+				return {
+					type: "daemon_hello",
+					socketPath: "/tmp/daemon.sock",
+					protocol: { name: "prime-agent.daemon", version: DAEMON_PROTOCOL_VERSION },
+					schemaId: "test",
+					appVersion: "test",
+					runtime: { buildId: "test", executablePath: "node" },
+					clientId: "client",
+					serverCapabilities: ["heartbeat_catalog"],
+				};
+			}),
+			supportsServerCapability: vi.fn(() => greeted),
+			request: vi.fn(async () => ({
+				id: "request",
+				type: "response",
+				command: "heartbeats_list",
+				success: true,
+				data: { heartbeats: [heartbeat] },
+			})),
+		} as unknown as DaemonClient;
+
+		await expect(listDaemonHeartbeats(client)).resolves.toEqual([heartbeat]);
+		expect(client.waitForHello).toHaveBeenCalledOnce();
+		expect(client.request).toHaveBeenCalledWith({ type: "heartbeats_list" });
+	});
+});

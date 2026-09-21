@@ -18,8 +18,9 @@ from pydantic import ValidationError
 from cli import completed_report, main, validate_completion, workflow_source
 from controller import Canceled, Controller, cleanup, labels
 from github import TITLE, GitHub
-from report import MARKER, METRICS, RUNTIME_METRICS, comparison, render
+from report import MARKER, METRICS, RUNTIME_METRICS, TRANSPORT_METRICS, UI_METRICS, comparison, render
 from schema import (
+    UI_METRIC_KEYS,
     Config,
     Observation,
     ProcessMemory,
@@ -176,7 +177,7 @@ class ReportTests(unittest.TestCase):
     def test_compact_tables_summarize_outcomes_without_treating_missing_samples_as_unchanged(self):
         report = fixture()
         report.status = "partial"
-        for definition in (*METRICS, *RUNTIME_METRICS):
+        for definition in (*METRICS, *RUNTIME_METRICS, *TRANSPORT_METRICS):
             count = 1 if definition.key in ("bundle", "disk") else (3 if definition.key == "install" else 10)
             report.main.metrics[definition.key] = observations(*([2.0] * count))
             report.pr_head.metrics[definition.key] = observations(*([2.0] * count))
@@ -186,11 +187,12 @@ class ReportTests(unittest.TestCase):
         report.pr_head.metrics["bundle"] = []
         text = render(report)
         self.assertIn(
-            "**Overall: 1 regressed · 1 improved · 13 no clear change · 1 incomplete · 1 unavailable.**",
+            "**Overall: 1 regressed · 1 improved · 14 no clear change · 1 incomplete · "
+            f"{len(UI_METRICS) + 1} unavailable.**",
             text,
         )
         tables = text.split("<details>")[0]
-        self.assertEqual(tables.count("| Metric | Main | This PR | Change |"), 2)
+        self.assertEqual(tables.count("| Metric | Main | This PR | Change |"), 4)
         for row in tables.splitlines():
             if row.startswith("|"):
                 self.assertEqual(len(row.strip("|").split("|")), 4)
@@ -224,7 +226,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("0/0", text)
         self.assertNotIn("TTFT", text)
         self.assertNotIn("Pinference", text)
-        for definition in RUNTIME_METRICS:
+        for definition in (*RUNTIME_METRICS, *TRANSPORT_METRICS):
             self.assertIn(definition.title, text)
 
     def test_schema_rejects_nonfinite_negative_duplicate_and_wrong_revision(self):
@@ -424,7 +426,7 @@ class PublishingTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.TestCase):
-    def test_sandbox_creation_does_not_inject_credentials(self):
+    def test_sandbox_creation_does_not_inject_credentials_or_pin_vm(self):
         with (
             tempfile.TemporaryDirectory() as directory,
             patch.dict(os.environ, {"PRIME_SANDBOX_API_KEY": "fake", "PINFERENCE_API_KEY": "must-not-use"}),
@@ -439,6 +441,7 @@ class LifecycleTests(unittest.TestCase):
             request = controller.client.create.call_args.args[0]
             self.assertIsNone(request.secrets)
             self.assertIsNone(request.environment_vars)
+            self.assertNotIn("vm", request.model_fields_set)
 
     def test_invalid_results_get_a_failure_notice_and_missing_results_preserve_pending_trust(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -711,14 +714,18 @@ class MeasurementTests(unittest.TestCase):
 
     def test_completion_requires_every_metric(self):
         side = Side(sha=SHA)
-        for definition in (*METRICS, *RUNTIME_METRICS):
-            count = 1 if definition.key in ("bundle", "disk") else (3 if definition.key == "install" else 10)
+        for definition in (*METRICS, *RUNTIME_METRICS, *TRANSPORT_METRICS, *UI_METRICS):
+            count = (
+                1
+                if definition.key in ("bundle", "disk")
+                else (3 if definition.key == "install" else (2 if definition.key in UI_METRIC_KEYS else 10))
+            )
             side.metrics[definition.key] = observations(*([1] * count))
-        self.assertTrue(side_complete(side, 10, 3))
-        for definition in (*METRICS, *RUNTIME_METRICS):
+        self.assertTrue(side_complete(side, 10, 3, 2))
+        for definition in (*METRICS, *RUNTIME_METRICS, *TRANSPORT_METRICS, *UI_METRICS):
             incomplete = side.model_copy(deep=True)
             incomplete.metrics[definition.key][-1] = Observation(trial=0, error="failed")
-            self.assertFalse(side_complete(incomplete, 10, 3))
+            self.assertFalse(side_complete(incomplete, 10, 3, 2))
 
 
 if __name__ == "__main__":

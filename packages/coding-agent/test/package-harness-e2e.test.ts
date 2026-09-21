@@ -94,6 +94,7 @@ describe("package harness overlay lifecycle", () => {
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
+	// test-policy: allow explicit-test-timeout -- real package install, mount, and unmount subprocess I/O bound the run, not the assertion
 	it("installs a pi.harness package, mounts skills plus all four harness kinds read-only, and unmounts on remove", {
 		timeout: 20_000,
 	}, async () => {
@@ -150,6 +151,7 @@ describe("package harness overlay lifecycle", () => {
 		expect(removed.diagnostics).toEqual([]);
 	});
 
+	// test-policy: allow explicit-test-timeout -- full install-then-resolve path does real package-manager subprocess and disk I/O
 	it("keeps editable entries shadowing package overlays across the full merge path", { timeout: 20_000 }, async () => {
 		await packageManager.installAndPersist(packageDir);
 		const mounted = await reloadAndGetHarness();
@@ -178,6 +180,7 @@ describe("package harness overlay lifecycle", () => {
 		expect(merged.entries.memory.team_policy?.provenance).toBeUndefined();
 	});
 
+	// test-policy: allow explicit-test-timeout -- mounting a malformed real package does file and subprocess I/O in a temp root
 	it("reports diagnostics for malformed package harness files without failing the mount", {
 		timeout: 20_000,
 	}, async () => {

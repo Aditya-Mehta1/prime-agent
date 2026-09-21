@@ -24,6 +24,7 @@ import { keyHint } from "./keybinding-hints.js";
 import {
 	getInlineTrailingWidth,
 	getMenuListLayout,
+	inlineMenuPanelTopRuleRows,
 	MenuList,
 	MenuPanel,
 	MenuRow,
@@ -172,6 +173,9 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	private activeModels: ModelItem[] = [];
 	private filteredModels: ModelItem[] = [];
 	private selectedIndex: number = 0;
+	// True once the user moves into the list with up or down; left/right then
+	// adjust the highlighted model's effort instead of the search cursor.
+	private navigatedIntoList = false;
 	private searchQuery = "";
 	private currentModel?: Model<any>;
 	private modelRegistry: ModelRegistry;
@@ -203,6 +207,8 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	});
 	private responsiveLayoutKey = "";
 	private readonly viewport: MenuViewportProvider;
+	/** Rows the inline MenuPanel draws above its children (separator rule). */
+	private inlineTopRuleRows = 0;
 	private readonly getHeaderRows: () => number;
 
 	constructor(
@@ -269,6 +275,11 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		// Create list container
 		this.listContainer = new MenuList({ compact: () => this.listLayout.compact, inline: this.inline });
 		this.panel.addChild(this.listContainer);
+		// The inline panel opens with its separator rule; budget it.
+		this.inlineTopRuleRows = inlineMenuPanelTopRuleRows({
+			subtitle: options.subtitle,
+			children: this.panel.children,
+		});
 		this.updateResponsiveLayout();
 
 		this.loadModels();
@@ -700,9 +711,10 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			}
 			return;
 		}
-		// Keep arrows available for editing a filter; an empty filter controls effort.
+		// Keep arrows available for editing a filter; an empty filter or an
+		// explicit move into the list controls effort.
 		if (
-			this.searchInput.getValue() === "" &&
+			(this.searchInput.getValue() === "" || this.navigatedIntoList) &&
 			(kb.matches(keyData, "tui.editor.cursorLeft") || kb.matches(keyData, "tui.editor.cursorRight"))
 		) {
 			const direction = kb.matches(keyData, "tui.editor.cursorLeft") ? -1 : 1;
@@ -717,6 +729,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		if (kb.matches(keyData, "tui.select.up")) {
 			const selectableCount = this.getSelectableCount();
 			if (selectableCount === 0) return;
+			this.navigatedIntoList = true;
 			this.selectedIndex = this.selectedIndex === 0 ? selectableCount - 1 : this.selectedIndex - 1;
 			this.updateList();
 		}
@@ -724,10 +737,12 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		else if (kb.matches(keyData, "tui.select.down")) {
 			const selectableCount = this.getSelectableCount();
 			if (selectableCount === 0) return;
+			this.navigatedIntoList = true;
 			this.selectedIndex = this.selectedIndex === selectableCount - 1 ? 0 : this.selectedIndex + 1;
 			this.updateList();
 		} else if (kb.matches(keyData, "tui.select.pageUp") || kb.matches(keyData, "tui.select.pageDown")) {
 			const direction = kb.matches(keyData, "tui.select.pageUp") ? -1 : 1;
+			this.navigatedIntoList = true;
 			this.selectedIndex = Math.max(
 				0,
 				Math.min(this.filteredModels.length - 1, this.selectedIndex + direction * this.listLayout.visibleItems),
@@ -746,7 +761,10 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		else {
 			const previousQuery = this.searchInput.getValue();
 			this.searchInput.handleInput(keyData);
-			if (previousQuery !== this.searchInput.getValue()) this.filterModels(this.searchInput.getValue());
+			if (previousQuery !== this.searchInput.getValue()) {
+				this.navigatedIntoList = false;
+				this.filterModels(this.searchInput.getValue());
+			}
 		}
 	}
 
@@ -786,7 +804,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 				getRows: this.viewport.getRows,
 				preferredVisibleItems: 8,
 				totalItems: this.filteredModels.length,
-				reservedRows: this.getHeaderRows() + 3 + scopeRows + detailRows,
+				reservedRows: this.getHeaderRows() + 3 + scopeRows + detailRows + this.inlineTopRuleRows,
 				comfortableItemRows: 1,
 				comfortableListPaddingRows: 0,
 				scrollIndicatorRows: 1,

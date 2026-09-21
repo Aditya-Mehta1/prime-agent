@@ -153,7 +153,7 @@ Type `/` in the editor to trigger commands. [Extensions](#extensions) can regist
 | `/login`, `/logout` | OAuth authentication |
 | `/model` | Switch models |
 | `/effort` | Set reasoning/thinking level |
-| `/scoped-models` | Enable/disable models for Ctrl+P cycling |
+| `/scoped-models` | Enable/disable models for Alt+M cycling |
 | `/settings` | Thinking level, theme, message delivery, transport |
 | `/resume [id\|path]` | Open the agents view, or resume a session directly |
 | `/new`, `/clear` | Start a new session |
@@ -161,6 +161,7 @@ Type `/` in the editor to trigger commands. [Extensions](#extensions) can regist
 | `/session` | Show session info (file, ID, messages) |
 | `/traces [status\|on\|off\|preview\|upload-current\|upload-all\|login]` | Preview traces, run one-shot current/all uploads, and manage automatic sharing (`upload` aliases `upload-current`) |
 | `/usage` | Show token, cost, and context usage |
+| `/speed [on\|off]` | Toggle footer readout of model output tok/sec (latest response and session average) |
 | `/tree` | Jump to any point in the session and continue from there |
 | `/fork` | Create a new session from a previous user message |
 | `/clone` | Duplicate the current active branch into a new session |
@@ -189,6 +190,7 @@ See `/hotkeys` for the full list. Customize via `~/.prime/agent/keybindings.json
 | Escape | Clear the input without interrupting active work |
 | Escape twice | Open `/tree` |
 | Ctrl+L | Open model selector |
+| Alt+M / Shift+Alt+M | Cycle scoped models forward/backward |
 | Ctrl+O | Cycle overview → thinking and file diffs → all output |
 
 ### Message Queue
@@ -385,6 +387,8 @@ export default function (pi: ExtensionAPI) {
 
 The default export can also be `async`. Prime Agent waits for async extension factories before startup continues, which is useful for one-time initialization such as fetching remote model lists before calling `pi.registerProvider()`.
 
+Schedule timers via `ctx.setTimeout`/`ctx.setInterval` (error-isolated, auto-cancelled on unload); raw global timers are unsupported for scheduling extension work.
+
 **What's possible:**
 - Custom tools (or replace built-in tools entirely)
 - Additional orchestration workflows and plan modes
@@ -562,7 +566,7 @@ cat README.md | prime-agent -p "Summarize this text"
 | `--model <pattern>` | Model pattern or ID (supports `provider/id` and optional `:<thinking>`) |
 | `--api-key <key>` | API key (overrides env vars) |
 | `--thinking <level>` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh` |
-| `--models <patterns>` | Comma-separated patterns for Ctrl+P cycling |
+| `--models <patterns>` | Comma-separated patterns for Alt+M cycling |
 
 Use `prime-agent model list [search]` to list available models.
 

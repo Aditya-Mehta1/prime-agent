@@ -113,6 +113,7 @@ describe("loadPackageHarness", () => {
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
+	// test-policy: allow explicit-test-timeout -- mounts real overlay files from disk in a temp project root
 	it("mounts all four harness kinds with read-only provenance", { timeout: 10_000 }, () => {
 		const skillPath = writeHarnessFile(packageRoot, "skill", "shared_skill", {
 			...minimalEntry("skill", "shared_skill"),
@@ -156,6 +157,7 @@ describe("loadPackageHarness", () => {
 		expect(skill.reference).toEqual({ type: "python", import: "shared_skill", callable: "run" });
 	});
 
+	// test-policy: allow explicit-test-timeout -- probing revision from a real git checkout does subprocess I/O
 	it("derives revision from a git checkout", { timeout: 10_000 }, () => {
 		const gitDir = join(packageRoot, ".git");
 		mkdirSync(gitDir);
@@ -170,6 +172,7 @@ describe("loadPackageHarness", () => {
 		expect(state.entries.memory.rev_policy?.provenance?.revision).toBe("0123456789ab");
 	});
 
+	// test-policy: allow explicit-test-timeout -- reads revision fallback metadata from real package files on disk
 	it("derives revision from package.json version when no git metadata exists", { timeout: 10_000 }, () => {
 		writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ name: "example", version: "1.2.3" }));
 		const memoryPath = writeHarnessFile(
@@ -184,6 +187,7 @@ describe("loadPackageHarness", () => {
 		expect(state.entries.memory.versioned_policy?.provenance?.revision).toBe("v1.2.3");
 	});
 
+	// test-policy: allow explicit-test-timeout -- mounts real malformed package files from disk in a temp root
 	it("rejects invalid entry shapes with warning diagnostics", { timeout: 10_000 }, () => {
 		const badKind = writeHarnessFile(packageRoot, "prompt", "mixed_kind", minimalEntry("memory", "mixed_kind"));
 		const badId = writeHarnessFile(packageRoot, "memory", "mismatched_id", minimalEntry("memory", "other_id"));
@@ -239,6 +243,7 @@ describe("loadPackageHarness", () => {
 		);
 	});
 
+	// test-policy: allow explicit-test-timeout -- mounts real out-of-layout package files from disk in a temp root
 	it("rejects files outside the harness/<kind>/<id>.json layout and reserved ids", { timeout: 10_000 }, () => {
 		const nested = join(packageRoot, "harness", "memory", "nested", "deep.json");
 		mkdirSync(join(packageRoot, "harness", "memory", "nested"), { recursive: true });
@@ -263,6 +268,7 @@ describe("loadPackageHarness", () => {
 		);
 	});
 
+	// test-policy: allow explicit-test-timeout -- mounts two real package roots from disk in a temp project
 	it("keeps the first package entry on cross-package collisions and diagnoses them", { timeout: 10_000 }, () => {
 		const projectRoot = join(tempDir, "project-package");
 		mkdirSync(projectRoot, { recursive: true });
@@ -299,6 +305,7 @@ describe("loadPackageHarness", () => {
 		});
 	});
 
+	// test-policy: allow explicit-test-timeout -- mounts real package files and reads source metadata from disk
 	it("skips disabled resources and sanitizes credential-bearing sources", { timeout: 10_000 }, () => {
 		const memoryPath = writeHarnessFile(
 			packageRoot,
@@ -339,6 +346,7 @@ describe("loadPackageHarness", () => {
 		expect(queryProvenance?.source).not.toContain("secret");
 	});
 
+	// test-policy: allow explicit-test-timeout -- reads package labels and provenance from real files on disk
 	it("describes local-path packages by directory name, not their filesystem path", { timeout: 10_000 }, () => {
 		const memoryPath = writeHarnessFile(
 			packageRoot,
@@ -358,6 +366,7 @@ describe("loadPackageHarness", () => {
 });
 
 describe("package harness overlays in harness state", () => {
+	// test-policy: allow explicit-test-timeout -- merges real editable and package entries loaded from disk
 	it("merge editable entries ahead of package entries and shadow same-id packages", { timeout: 10_000 }, () => {
 		const globalState = harnessState([editableEntry("memory", "user_policy", { scope: "global" })]);
 		const localState = harnessState([editableEntry("memory", "session_policy")]);
@@ -374,6 +383,7 @@ describe("package harness overlays in harness state", () => {
 		expect(merged.entries.memory.team_policy?.provenance?.origin).toBe("package");
 	});
 
+	// test-policy: allow explicit-test-timeout -- renders the digest over real package files loaded from disk
 	it("render package labels, provenance, and no local filesystem paths in the digest", { timeout: 10_000 }, () => {
 		const localState = harnessState([editableEntry("memory", "session_policy")]);
 		const packageState = harnessState([
@@ -407,6 +417,7 @@ describe("package harness overlays in harness state", () => {
 		expect(digest.indexOf("[local:session_policy]")).toBeLessThan(digest.indexOf("[package:team_policy]"));
 	});
 
+	// test-policy: allow explicit-test-timeout -- renders the digest over real package-controlled fields loaded from disk
 	it("bounds package-controlled title, path, version, and revision in the digest", { timeout: 10_000 }, () => {
 		const packageState = harnessState([
 			packageEntry("memory", "bloat", {
@@ -440,6 +451,7 @@ describe("package harness overlays in harness state", () => {
 		expect(digest).not.toContain("123456789012345");
 	});
 
+	// test-policy: allow explicit-test-timeout -- update and delete go through real writes into a temp harness root
 	it("guard update and delete of package entries but allow same-id overrides", { timeout: 10_000 }, () => {
 		const editableState = harnessState();
 		const packageState = harnessState([packageEntry("memory", "team_policy")]);
@@ -470,6 +482,7 @@ describe("package harness overlays in harness state", () => {
 		expect(packageState.entries.memory.team_policy?.title).toBe("team_policy title");
 	});
 
+	// test-policy: allow explicit-test-timeout -- update goes through a real write into a temp harness root
 	it("allow updates of an editable entry that overrides a package id", { timeout: 10_000 }, () => {
 		const editableState = harnessState([editableEntry("memory", "team_policy", { title: "editable override" })]);
 		const packageState = harnessState([packageEntry("memory", "team_policy")]);

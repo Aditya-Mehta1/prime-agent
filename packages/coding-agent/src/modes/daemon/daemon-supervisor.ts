@@ -76,7 +76,13 @@ import {
 import { CommandRecoveryJournal, createCommandIdempotencyKey } from "./command-recovery-journal.js";
 import { CompactAssistantStreamReconstructor, isCompactAssistantDelta } from "./compact-session-stream.js";
 import { DAEMON_CATALOG_ROLE_ENV, DaemonCatalogClient } from "./daemon-catalog-process.js";
-import { DaemonSessionRecoveringError, deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
+import {
+	DaemonSessionRecoveringError,
+	deserializeDaemonError,
+	serializeDaemonError,
+	UPDATE_RESTART_PREPARING_ERROR_INFO,
+	UPDATE_RESTART_PREPARING_MESSAGE,
+} from "./daemon-errors.js";
 import {
 	collectDaemonClientEnv,
 	createDaemonEventMeta,
@@ -202,6 +208,10 @@ export const HEARTBEAT_LIST_LAUNCH_WAIT_MS = 15_000;
 // worker request default (24h) would turn a stuck worker into a client transport
 // timeout instead of a daemon-side failure.
 export const HEARTBEAT_LIST_FORWARD_TIMEOUT_MS = 25_000;
+// A served scheduled-jobs snapshot older than this refreshes in the background
+// (stale-while-revalidate) so external artifact writes converge without ever
+// blocking a catalog response behind a fresh saved-session disk scan.
+const PASSIVE_SCHEDULED_JOBS_REFRESH_MS = 5_000;
 const INPUT_PAUSE_CLEANUP_TIMEOUT_MS = 5_000;
 const UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS = 80_000;
 const UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS = 90_000;
@@ -272,6 +282,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"agent_messages_resume",
 	"agent_messages_clear",
 	"abort",
+	"abort_and_send_queued",
 	"start_side_question",
 	"abort_side_question",
 	"execute_bash",
@@ -418,6 +429,18 @@ interface PersistedSupervisorConfig {
 interface WorkerMatch {
 	worker: ResidentWorker;
 	summary: SessionSummary;
+}
+
+/** A durable scheduled job whose owning session has no resident worker. */
+interface PassiveScheduledJob {
+	rootSessionFile: string;
+	job: AgentCronJob;
+	info: SessionInfo;
+}
+
+/** Catalog rows keep the same status filter a fresh scan applies. */
+function activeScheduledJobs(rows: PassiveScheduledJob[]): PassiveScheduledJob[] {
+	return rows.filter((row) => row.job.status === "active" || row.job.status === "paused");
 }
 
 interface WorkerAttachData {
@@ -767,6 +790,16 @@ export class DaemonSupervisor {
 	private scheduledWakeRecompute?: Promise<void>;
 	private scheduledWakeRecomputeQueued = false;
 	private readonly scheduledWakeFailures = new Map<string, number>();
+	/** Shared passive scheduled-jobs snapshot; undefined before the first scan and after each invalidation. */
+	private passiveScheduledJobs?: { rows: PassiveScheduledJob[]; scannedAt: number };
+	/** One in-flight scan shared by every concurrent catalog read. */
+	private passiveScheduledJobsScan?: Promise<PassiveScheduledJob[]>;
+	/**
+	 * Monotonic epoch claimed at each scan start and at each invalidation: only
+	 * the newest claim may publish, so an older scan cannot overwrite a newer
+	 * scan's rows and a scan that raced a mutation cannot republish stale rows.
+	 */
+	private passiveScheduledJobsEpoch = 0;
 
 	constructor(
 		private readonly socketPath: string,
@@ -845,7 +878,6 @@ export class DaemonSupervisor {
 			if (migratedJobs > 0) {
 				this.log(`Migrated ${migratedJobs} scheduled jobs into session artifacts`);
 			}
-			await this.catalog.start().catch((error) => this.log(`Could not start daemon catalog: ${String(error)}`));
 			this.assertSocketLeaseHeld();
 			await this.seedRosterLedger();
 			let adoptionFailure: unknown;
@@ -945,10 +977,109 @@ export class DaemonSupervisor {
 			});
 	}
 
-	/** Durable truth: the ledger family (fork headers stripped) plus each session's scheduled-jobs artifact. */
-	private async collectPassiveScheduledJobs(
-		includeInactive = false,
-	): Promise<Array<{ rootSessionFile: string; job: AgentCronJob; info: SessionInfo }>> {
+	/**
+	 * Durable truth: the ledger family (fork headers stripped) plus each session's
+	 * scheduled-jobs artifact. Always scans fresh per caller: management
+	 * decisions, wake recomputes, and the ephemeral-cancel retries they drive
+	 * must see the latest disk state. Every completed scan opportunistically
+	 * refreshes the snapshot that heartbeats_list serves, but only while it is
+	 * still the newest scan: an older scan loses the publish race.
+	 */
+	private async collectPassiveScheduledJobs(includeInactive = false): Promise<PassiveScheduledJob[]> {
+		const epoch = this.claimPassiveScheduledJobsEpoch();
+		const rows = await this.scanPassiveScheduledJobs();
+		this.storePassiveScheduledJobs(epoch, rows);
+		return includeInactive ? rows : activeScheduledJobs(rows);
+	}
+
+	/**
+	 * Snapshot-served rows for heartbeats_list responses, where per-request
+	 * freshness matters less than not queueing: with hundreds of saved sessions,
+	 * N concurrent catalog requests used to enqueue N full scans and push the
+	 * last response past the client's 30s transport timeout. Daemon-owned
+	 * mutations drop the snapshot and detach the in-flight shared scan
+	 * (broadcastHeartbeatsChanged and the saved-session delete/rename paths);
+	 * the next list or the wake recompute armed by the same broadcast rescans,
+	 * and concurrent cold lists share one in-flight scan. A served snapshot
+	 * older than PASSIVE_SCHEDULED_JOBS_REFRESH_MS refreshes in the background
+	 * without being dropped, so lists that arrive during the refresh keep
+	 * serving bounded-stale rows and external artifact writes converge without
+	 * blocking a response.
+	 */
+	private async catalogPassiveScheduledJobs(): Promise<PassiveScheduledJob[]> {
+		const cached = this.passiveScheduledJobs;
+		if (cached) {
+			if (Date.now() - cached.scannedAt >= PASSIVE_SCHEDULED_JOBS_REFRESH_MS && !this.shuttingDown) {
+				// Stale-while-revalidate: serve the snapshot now and refresh in the
+				// background without dropping it, so requests that arrive during the
+				// refresh keep answering from bounded-stale rows instead of queueing
+				// behind the scan. A failure only logs; the next read retries.
+				void this.sharedPassiveScheduledJobsScan().catch((error: unknown) =>
+					this.log(`Passive scheduled-jobs refresh failed: ${String(error)}`),
+				);
+			}
+			return activeScheduledJobs(cached.rows);
+		}
+		return activeScheduledJobs(await this.sharedPassiveScheduledJobsScan());
+	}
+
+	private sharedPassiveScheduledJobsScan(): Promise<PassiveScheduledJob[]> {
+		this.passiveScheduledJobsScan ??= this.startSharedPassiveScheduledJobsScan();
+		return this.passiveScheduledJobsScan;
+	}
+
+	/**
+	 * Claims the publish epoch when the scan actually starts, so callers that
+	 * join an existing in-flight scan keep its rows, while a caller that starts
+	 * after an invalidation never adopts the detached pre-mutation scan.
+	 */
+	private startSharedPassiveScheduledJobsScan(): Promise<PassiveScheduledJob[]> {
+		const epoch = this.claimPassiveScheduledJobsEpoch();
+		const scan = this.scanPassiveScheduledJobs()
+			.then((rows) => {
+				this.storePassiveScheduledJobs(epoch, rows);
+				return rows;
+			})
+			.finally(() => {
+				// An invalidation may have detached this promise and let a newer
+				// scan take the slot; clear it only while it is still ours.
+				if (this.passiveScheduledJobsScan === scan) {
+					this.passiveScheduledJobsScan = undefined;
+				}
+			});
+		return scan;
+	}
+
+	/**
+	 * Compare-and-swap publish: a scan may store only while it still owns the
+	 * newest epoch, so an older scan cannot overwrite a newer snapshot and a
+	 * scan that raced an invalidation cannot republish pre-mutation rows.
+	 */
+	private storePassiveScheduledJobs(epoch: number, rows: PassiveScheduledJob[]): void {
+		if (epoch === this.passiveScheduledJobsEpoch) {
+			this.passiveScheduledJobs = { rows, scannedAt: Date.now() };
+		}
+	}
+
+	private claimPassiveScheduledJobsEpoch(): number {
+		this.passiveScheduledJobsEpoch += 1;
+		return this.passiveScheduledJobsEpoch;
+	}
+
+	/**
+	 * Daemon-owned mutations invalidate: claim the epoch so in-flight scans can
+	 * no longer publish, drop the cached snapshot, and detach the shared
+	 * in-flight promise so a list that starts after the mutation rescans
+	 * instead of awaiting pre-mutation rows.
+	 */
+	private invalidatePassiveScheduledJobs(): void {
+		this.claimPassiveScheduledJobsEpoch();
+		this.passiveScheduledJobs = undefined;
+		this.passiveScheduledJobsScan = undefined;
+	}
+
+	/** The uncached disk scan; all statuses load so one row set serves every caller's filter. */
+	private async scanPassiveScheduledJobs(): Promise<PassiveScheduledJob[]> {
 		const pendingCancelRoots = new Set<string>();
 		for (const intent of this.collectEphemeralCancelIntents()) {
 			const context = this.workerSessionArtifactContext(intent);
@@ -961,7 +1092,7 @@ export class DaemonSupervisor {
 				pendingCancelRoots.add(canonicalSessionPath(context.sessionFile));
 			}
 		}
-		const infos = await this.rlmSpawnLedger().family();
+		const infos = await this.rlmSpawnLedger().family(SESSION_SCHEDULED_JOBS_FILENAME);
 		const infoByPath = new Map(infos.map((info) => [canonicalSessionPath(info.path), info] as const));
 		const storeBySessionId = new Map<string, AgentCronJobStore>();
 		const infoBySessionId = new Map<string, SessionInfo>();
@@ -992,7 +1123,7 @@ export class DaemonSupervisor {
 			}
 			return current.path;
 		};
-		const results: Array<{ rootSessionFile: string; job: AgentCronJob; info: SessionInfo }> = [];
+		const results: PassiveScheduledJob[] = [];
 		for (const [artifactSessionId, store] of storeBySessionId) {
 			let jobs: AgentCronJob[];
 			try {
@@ -1002,7 +1133,6 @@ export class DaemonSupervisor {
 				continue;
 			}
 			for (const job of jobs) {
-				if (!includeInactive && job.status !== "active" && job.status !== "paused") continue;
 				const info = infoBySessionId.get(job.sessionId);
 				if (!info) continue;
 				const rootSessionFile = uncoveredRootFor(info);
@@ -1773,7 +1903,10 @@ export class DaemonSupervisor {
 		const command = preParsed.command;
 		const parsedAdmission = preParsed.admission;
 		if (command.type === "cancel_prompt_admission" && this.updateRestartPhase !== undefined) {
-			this.write(client, failure(command.id, command.type, "Daemon is preparing an update restart"));
+			this.write(
+				client,
+				failure(command.id, command.type, UPDATE_RESTART_PREPARING_MESSAGE, UPDATE_RESTART_PREPARING_ERROR_INFO),
+			);
 			return;
 		}
 		const cancellationAdmission =
@@ -1854,7 +1987,10 @@ export class DaemonSupervisor {
 				: phase !== undefined && !(phase === "prepared" && command.type === "shutdown");
 		if (restartRejected && mutation) {
 			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
-			this.write(client, failure(command.id, command.type, "Daemon is preparing an update restart"));
+			this.write(
+				client,
+				failure(command.id, command.type, UPDATE_RESTART_PREPARING_MESSAGE, UPDATE_RESTART_PREPARING_ERROR_INFO),
+			);
 			return;
 		}
 		if (mutation && !UPDATE_RESTART_DRAIN_COMMANDS.has(command.type)) {
@@ -2248,9 +2384,14 @@ export class DaemonSupervisor {
 			case "restart":
 				setImmediate(() => void this.shutdown(0, false, true, false, "update"));
 				return success(command.id, command.type);
-			case "shutdown":
-				setImmediate(() => void this.shutdown(0, true, false, command.force === true, "shutdown"));
+			case "shutdown": {
+				// An update-restart coordinator stops a prepared daemon with this command;
+				// attached windows need the "update" reason to recover instead of dying.
+				// Capture the reason now: a later phase change must not rewrite it.
+				const closingReason: DaemonClosingReason = this.updateRestartPhase === "prepared" ? "update" : "shutdown";
+				setImmediate(() => void this.shutdown(0, true, false, command.force === true, closingReason));
 				return success(command.id, "shutdown");
+			}
 			case "prepare_update_restart": {
 				const manifest = await this.prepareUpdateRestart();
 				return success(command.id, "prepare_update_restart", manifest);
@@ -2386,7 +2527,7 @@ export class DaemonSupervisor {
 					}
 				}
 				// Passivated sessions keep their armed heartbeats; no worker can list them.
-				for (const { job, info } of await this.collectPassiveScheduledJobs()) {
+				for (const { job, info } of await this.catalogPassiveScheduledJobs()) {
 					if (!isHeartbeatCronJob(job) || heartbeats.has(job.id)) continue;
 					heartbeats.set(job.id, {
 						job,
@@ -2527,6 +2668,9 @@ export class DaemonSupervisor {
 						if (entry) {
 							this.writeRosterEntry({ ...entry, summary: { ...entry.summary, sessionName: target.name } });
 						}
+						// Heartbeat rows carry the owning session's display name;
+						// drop the snapshot so the next list shows the new one.
+						this.invalidatePassiveScheduledJobs();
 						return success(command.id, command.type);
 					}
 					const match = await this.findWorkerForClient(client, command.activeSessionId);
@@ -2561,6 +2705,9 @@ export class DaemonSupervisor {
 					if (result.ok && entry && this.roster().get(entry.agentId) === entry) {
 						this.roster().delete(entry.agentId);
 					}
+					// The deleted session's armed heartbeats must leave the catalog
+					// snapshot too; their rows would otherwise linger until the TTL.
+					if (result.ok) this.invalidatePassiveScheduledJobs();
 					return success(command.id, command.type, result);
 				}
 				break;
@@ -4139,11 +4286,19 @@ export class DaemonSupervisor {
 			throw new SupervisorRecoveryCancelledError("Worker recovery was cancelled before interruption was recorded");
 		}
 		await Promise.all(
-			[...interruptedSessions.values()].map((interrupted) =>
-				this.catalog.markInterrupted(interrupted.sessionFile, interrupted.activeSessionId, [
-					...interrupted.operations,
-				]),
-			),
+			[...interruptedSessions.values()].map(async (interrupted) => {
+				try {
+					await this.catalog.markInterrupted(interrupted.sessionFile, interrupted.activeSessionId, [
+						...interrupted.operations,
+					]);
+				} catch (error) {
+					// The notice is advisory: an unwritable session file must not abort
+					// the orphan reap, the journal resolution, or the recovery retry.
+					this.log(
+						`Could not record the interrupted session notice for ${interrupted.sessionFile}: ${String(error)}`,
+					);
+				}
+			}),
 		);
 		await this.assertRecoveryAllowed();
 		if (this.isWorkerCleanupCancelled(worker)) {
@@ -6958,6 +7113,10 @@ export class DaemonSupervisor {
 	}
 
 	private broadcastHeartbeatsChanged(): void {
+		// Every daemon-owned scheduled-job mutation and worker residency change
+		// lands here: drop the shared snapshot so the next catalog read (or the
+		// recompute armed below) rescans instead of serving pre-mutation rows.
+		this.invalidatePassiveScheduledJobs();
 		this.scheduleScheduledSessionWakeRecompute();
 		for (const client of this.clients) {
 			this.write(client, { type: "heartbeats_changed" });

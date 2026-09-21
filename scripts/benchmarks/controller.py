@@ -26,7 +26,16 @@ from schema import (
 
 REMOTE = "/opt/prime-benchmark"
 OWNER_LABEL = "prime-agent-benchmarks-v1"
-FILES = ("schema.py", "terminal.py", "kernel.py", "worker.py", "pyproject.toml", "uv.lock")
+FILES = (
+    "schema.py",
+    "terminal.py",
+    "kernel.py",
+    "worker.py",
+    "ui.py",
+    "frame-decode-bench.mjs",
+    "pyproject.toml",
+    "uv.lock",
+)
 
 
 def elapsed_seconds(start: datetime) -> float:
@@ -128,7 +137,6 @@ class Controller:
                 cpu_cores=config.cpu_cores,
                 memory_gb=config.memory_gb,
                 disk_size_gb=config.disk_gb,
-                vm=False,
                 region=config.region,
                 timeout_minutes=config.ttl_minutes,
                 labels=labels(self.report.repository, self.report.run_id, self.report.attempt)
@@ -279,10 +287,12 @@ class Controller:
                 ("install", self.report.config.install_trials),
                 ("measure", self.report.config.trials),
                 ("runtime", self.report.config.trials),
+                ("transport", self.report.config.trials),
+                ("ui", self.report.config.ui_trials),
             ):
                 blocked: set[str] = set()
                 failures: dict[str, tuple[str, int]] = {}
-                if phase in ("measure", "runtime"):
+                if phase in ("measure", "runtime", "ui"):
                     for role in ready:
                         side = self.report.main if role == "main" else self.report.pr_head
                         if not any(
