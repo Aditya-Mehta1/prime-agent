@@ -23,8 +23,8 @@ import {
 	type RlmChildFailureDetails,
 	type RlmChildTerminalNoticeDetails,
 } from "../../../core/messages.js";
+import { expandCollapseHint } from "../../../core/rendering/keybinding-hints.js";
 import { getMarkdownTheme, theme } from "../../../core/theme/theme.js";
-import { expandCollapseHint } from "./keybinding-hints.js";
 import { ShellCompletionComponent } from "./shell-completion.js";
 
 type InjectedPromptDetails =

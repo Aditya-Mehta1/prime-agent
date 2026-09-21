@@ -3,9 +3,9 @@ import { Box, type Component, Container, Spacer, Text, wrapTextWithAnsi } from "
 import { constants } from "fs";
 import { access as fsAccess, readFile as fsReadFile, writeFile as fsWriteFile } from "fs/promises";
 import { type Static, Type } from "typebox";
-import { renderDiff } from "../../modes/interactive/components/diff.js";
-import { countChangedLines, formatFileChangeSummaryLine } from "../../modes/interactive/components/edit-summary.js";
 import type { ToolDefinition } from "../extensions/types.js";
+import { renderDiff } from "../rendering/diff.js";
+import { countChangedLines, formatFileChangeSummaryLine } from "../rendering/edit-summary.js";
 import type { Theme } from "../theme/theme.js";
 import {
 	applyEditsToNormalizedContent,

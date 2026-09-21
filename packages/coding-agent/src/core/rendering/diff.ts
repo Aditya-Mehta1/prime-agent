@@ -1,6 +1,6 @@
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import * as Diff from "diff";
-import { highlightCode, theme } from "../../../core/theme/theme.js";
+import { highlightCode, theme } from "../theme/theme.js";
 
 /**
  * Parse diff line to extract prefix, line number, and content.

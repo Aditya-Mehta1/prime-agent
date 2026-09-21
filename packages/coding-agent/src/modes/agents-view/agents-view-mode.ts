@@ -16,6 +16,7 @@ import {
 import { APP_TITLE, appendRotatingLog, getAgentDir, getClientErrorLogPath, VERSION } from "../../config.js";
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import { KeybindingsManager } from "../../core/keybindings.js";
+import { keyText } from "../../core/rendering/keybinding-hints.js";
 import { SessionManager } from "../../core/session-manager.js";
 import {
 	BUILTIN_SLASH_COMMANDS,
@@ -56,7 +57,6 @@ import {
 	renameDaemonSavedSession,
 } from "../daemon/saved-session-catalog.js";
 import { CustomEditor } from "../interactive/components/custom-editor.js";
-import { keyText } from "../interactive/components/keybinding-hints.js";
 import { BrandSplashHeader, InteractiveMode } from "../interactive/interactive-mode.js";
 import type { InteractiveModeUiServices } from "../interactive/interactive-mode-services.js";
 import { ClientPromptStashStore } from "../interactive/prompt-stash-state.js";

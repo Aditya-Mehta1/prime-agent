@@ -158,6 +158,18 @@ import { parseNewSessionCommand } from "../../core/new-session-command.js";
 import { PRIME_INFERENCE_PROVIDER_ID, resolvePrimeAgentTracesBaseUrl } from "../../core/prime-inference-auth.js";
 import { resolvePrimeInferencePostLoginModelAction } from "../../core/prime-inference-model-selection.js";
 import { parseCommandArgs } from "../../core/prompt-templates.js";
+import {
+	type FileChangeSummary,
+	formatTotalChangeSummary,
+	mergeTurnFileChanges,
+} from "../../core/rendering/edit-summary.js";
+import {
+	formatConversationDetailStatus,
+	formatKeyText,
+	keyHint,
+	keyText,
+	rawKeyHint,
+} from "../../core/rendering/keybinding-hints.js";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.js";
 import { SessionImportFileNotFoundError } from "../../core/session-import-errors.js";
 import { resolveSessionPath, SessionSelectorError, SessionSelectorNotFoundError } from "../../core/session-resolver.js";
@@ -258,20 +270,12 @@ import { CustomMessageComponent } from "./components/custom-message.js";
 import { DaxnutsComponent } from "./components/daxnuts.js";
 import { DynamicBorder } from "./components/dynamic-border.js";
 import { EarendilAnnouncementComponent } from "./components/earendil-announcement.js";
-import { type FileChangeSummary, formatTotalChangeSummary, mergeTurnFileChanges } from "./components/edit-summary.js";
 import { ExtensionEditorComponent } from "./components/extension-editor.js";
 import { ExtensionInputComponent } from "./components/extension-input.js";
 import { ExtensionSelectorComponent } from "./components/extension-selector.js";
 import { FooterComponent } from "./components/footer.js";
 import { HeartbeatManagerComponent } from "./components/heartbeat-manager.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./components/injected-prompt-message.js";
-import {
-	formatConversationDetailStatus,
-	formatKeyText,
-	keyHint,
-	keyText,
-	rawKeyHint,
-} from "./components/keybinding-hints.js";
 import {
 	MalformedMcpConnectionOutcomeMessageComponent,
 	McpConnectionOutcomeMessageComponent,

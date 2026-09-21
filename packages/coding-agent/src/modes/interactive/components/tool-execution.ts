@@ -2,6 +2,7 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { type Component, Container, Image, Text, type TUI } from "@earendil-works/pi-tui";
 import type { ToolDefinition, ToolRenderContext, ToolRenderResultOptions } from "../../../core/extensions/types.js";
 import type { KernelSentAgentMessage } from "../../../core/kernel/index.js";
+import { expandCollapseHint } from "../../../core/rendering/keybinding-hints.js";
 import { type Theme, theme } from "../../../core/theme/theme.js";
 import { getWorkingPulseFrame, workingIconFrame } from "../../../core/theme/working-icon.js";
 import { createBashToolDefinition } from "../../../core/tools/bash.js";
@@ -10,7 +11,6 @@ import { createAllToolDefinitions } from "../../../core/tools/index.js";
 import { getTextOutput as getRenderedTextOutput } from "../../../core/tools/render-utils.js";
 import type { AgentConnectionToolDefinition } from "../../agent-connection/index.js";
 import { getIpythonCodeFromArgs, IPythonCellComponent } from "./ipython-cell.js";
-import { expandCollapseHint } from "./keybinding-hints.js";
 import {
 	type BackgroundShellHandle,
 	readAssignedShellCommand,
