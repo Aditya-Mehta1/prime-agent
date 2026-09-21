@@ -2964,8 +2964,14 @@ impl AgentSessionEngine {
         // session's own mutex is held across the turn's admission.
         let goal_runtime = self.goal_runtime.lock().expect("goal runtime lock").clone();
         let goal_budget_crossed = std::sync::Arc::clone(&self.goal_budget_crossed);
+        // The loop's entry emits the run's opening `turn_start` (TS
+        // `runAgentLoop`), which the worker's own run-opening frames carry;
+        // only the inner-turn starts (after the first `turn_end`) reach the
+        // wire through this subscription.
+        let inner_turn_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let subscription = {
             let tx = tx.clone();
+            let inner_turn_started = std::sync::Arc::clone(&inner_turn_started);
             // Per-message usage accounting runs on every settled assistant
             // message (whatever the stop reason except errors), matching the
             // TS message_end hook. The driver owns the policy; this loop
@@ -2980,6 +2986,7 @@ impl AgentSessionEngine {
             agent
                 .subscribe(move |event, _signal| {
                     let tx = tx.clone();
+                    let inner_turn_started = std::sync::Arc::clone(&inner_turn_started);
                     let autonomous_state = std::sync::Arc::clone(&autonomous_state);
                     let autonomous_driver = std::sync::Arc::clone(&autonomous_driver);
                     let goal_runtime = goal_runtime.clone();
@@ -3104,6 +3111,41 @@ impl AgentSessionEngine {
                                         }
                                     }
                                     _ => {}
+                                }
+                            }
+                            // The turn-boundary frames (TS `turn_start` /
+                            // `turn_end`): the entry's opening `turn_start`
+                            // stays with the worker's run-opening frames
+                            // (the `inner_turn_started` gate above), and
+                            // `turn_end` carries the terminal assistant
+                            // message plus the turn's tool-result messages
+                            // (the rows themselves persist and broadcast
+                            // through their own events; this frame is the
+                            // terminal payload, in the session wire shape).
+                            AgentEvent::TurnStart => {
+                                if inner_turn_started.load(std::sync::atomic::Ordering::SeqCst) {
+                                    let _ = tx.send(EngineEvent::TurnStart);
+                                }
+                            }
+                            AgentEvent::TurnEnd {
+                                message,
+                                tool_results,
+                            } => {
+                                if let Some(message) = session_wire_value(message) {
+                                    let tool_results = tool_results
+                                        .iter()
+                                        .filter_map(|result| {
+                                            session_wire_value(&pa_agent::types::AgentMessage::from(
+                                                result.clone(),
+                                            ))
+                                        })
+                                        .collect::<Vec<Value>>();
+                                    inner_turn_started
+                                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                                    let _ = tx.send(EngineEvent::TurnEnd {
+                                        message,
+                                        tool_results,
+                                    });
                                 }
                             }
                             AgentEvent::ToolExecutionStart {
@@ -5724,6 +5766,79 @@ fn abort_in_flight_turn_cancels_a_mid_provider_wait() {
     assert_eq!(assistant["usage"]["totalTokens"], json!(0));
     assert_eq!(assistant["usage"]["input"], json!(0));
     assert_eq!(assistant["usage"]["output"], json!(0));
+    // The terminal `turn_end` frame follows the aborted row's message
+    // pair (TS `turn_end` on an aborted turn): the aborted assistant
+    // message is the payload, the tool-result list is empty, and the
+    // frame precedes the trailing `Done`.
+    let turn_end_index = events
+        .iter()
+        .position(|event| {
+            matches!(event, EngineEvent::TurnEnd { message, .. }
+                if message["stopReason"] == json!("aborted"))
+        })
+        .expect("the aborted turn's turn_end event");
+    let EngineEvent::TurnEnd {
+        message,
+        tool_results,
+    } = &events[turn_end_index]
+    else {
+        unreachable!();
+    };
+    assert_eq!(message, &assistant, "the aborted row is the payload");
+    assert!(tool_results.is_empty(), "the aborted turn ran no tools");
+    let done_index = events
+        .iter()
+        .position(|event| matches!(event, EngineEvent::Done(_)))
+        .expect("the run's trailing Done");
+    assert!(turn_end_index < done_index, "turn_end precedes the Done");
+}
+
+/// The settled turn's terminal frame (TS `turn_end`): the loop's boundary
+/// event carries the final assistant message as its payload with the
+/// turn's (empty) tool-result list, positioned between the final
+/// `AssistantMessage` and the trailing `Done` — the worker frames it as
+/// the wire `turn_end` with the TS shape.
+#[test]
+fn settled_turn_emits_the_terminal_turn_end_payload() {
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (engine, _engine_dir) = tests::faux_engine_with_settings(
+        serde_json::json!({ "responses": [{"text": "settled reply"}] }),
+        1,
+    );
+    let mut events: Vec<EngineEvent> = Vec::new();
+    tests::admit(&engine, "plain turn".to_string(), &mut events);
+    let assistant_index = events
+        .iter()
+        .position(|event| {
+            matches!(event, EngineEvent::AssistantMessage(message) if message["content"] == json!([{ "type": "text", "text": "settled reply" }]))
+        })
+        .expect("the settled assistant message");
+    let turn_end_index = events
+        .iter()
+        .position(|event| matches!(event, EngineEvent::TurnEnd { .. }))
+        .expect("the settled turn's turn_end event");
+    let done_index = events
+        .iter()
+        .position(|event| matches!(event, EngineEvent::Done(_)))
+        .expect("the trailing Done");
+    assert!(
+        assistant_index < turn_end_index && turn_end_index < done_index,
+        "turn_end sits between the final message and the Done: {events:?}"
+    );
+    let EngineEvent::TurnEnd {
+        message,
+        tool_results,
+    } = &events[turn_end_index]
+    else {
+        unreachable!();
+    };
+    let EngineEvent::AssistantMessage(assistant) = &events[assistant_index] else {
+        unreachable!();
+    };
+    assert_eq!(message, assistant, "the terminal message is the payload");
+    assert!(tool_results.is_empty(), "the text-only turn ran no tools");
 }
 
 /// The aborted turn's goal accounting (TS

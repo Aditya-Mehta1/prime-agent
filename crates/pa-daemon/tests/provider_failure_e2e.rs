@@ -456,17 +456,27 @@ fn provider_failure_is_retried_then_surfaced_to_attached_clients() {
         .expect("error message")
         .contains("mock provider overloaded"));
 
-    // The turn ends with the error for headless callers.
+    // The turn ends with the TS `turn_end` shape: the terminal frame
+    // carries the failed assistant message as its payload (no separate
+    // error field on the frame — TS `turn_end` never carries one).
     let turn_end = client
         .events
         .iter()
         .rev()
         .find(|event| event.get("type").and_then(Value::as_str) == Some("turn_end"))
         .expect("turn_end");
-    assert!(turn_end["error"]
+    assert_eq!(turn_end["message"]["role"], "assistant");
+    assert_eq!(turn_end["message"]["stopReason"], "error");
+    assert!(turn_end["message"]["errorMessage"]
         .as_str()
         .expect("turn error")
         .contains("mock provider overloaded"));
+    assert_eq!(turn_end.get("error"), None, "turn_end: {turn_end}");
+    assert_eq!(
+        turn_end["toolResults"].as_array().map(Vec::len),
+        Some(0),
+        "the failed turn ran no tools"
+    );
 }
 
 /// A direct-transport client (thin-supervisor stage 2): ticket from the

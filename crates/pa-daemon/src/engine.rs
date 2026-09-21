@@ -79,6 +79,21 @@ pub enum EngineEvent {
     /// session store and framed to clients as a `message_start` +
     /// `message_end` pair, matching the TS session's loop-event forwarding.
     ToolResultMessage(Value),
+    /// A turn of the model loop started (TS wire `turn_start`; the loop
+    /// emits it for every turn after the first, so the worker's own
+    /// run-opening `turn_start` stays the first turn's frame).
+    TurnStart,
+    /// A turn of the model loop ended (TS wire `turn_end`): the terminal
+    /// assistant message plus the turn's tool-result messages, in the
+    /// session wire shapes. Emitted for every settled turn — aborts and
+    /// provider errors included (the aborted/error assistant row with
+    /// empty tool results), like the TS session's loop-event forwarding.
+    /// The rows themselves persist and broadcast through their own events;
+    /// this frame carries only the terminal payload.
+    TurnEnd {
+        message: Value,
+        tool_results: Vec<Value>,
+    },
     /// A durable custom message (wire `role: "custom"`): recorded into the
     /// session store and shown to attached clients. Emitted as a
     /// `message_start` + `message_end` pair, matching the TS session's
@@ -1086,9 +1101,17 @@ impl SessionEngine for ScriptedEngine {
             emit(cancelled());
             return;
         }
-        if !emit(EngineEvent::AssistantMessage(
-            json!({"role": "assistant", "content": text, "provider": "scripted", "model": "faux-1", "usage": usage, "timestamp": crate::util::now_ms()}),
-        )) {
+        let final_message = json!({"role": "assistant", "content": text, "provider": "scripted", "model": "faux-1", "usage": usage, "timestamp": crate::util::now_ms()});
+        if !emit(EngineEvent::AssistantMessage(final_message.clone())) {
+            emit(cancelled());
+            return;
+        }
+        // The loop's terminal frame (TS `turn_end`): the final assistant
+        // message as the payload, no tool results in the scripted shape.
+        if !emit(EngineEvent::TurnEnd {
+            message: final_message,
+            tool_results: Vec::new(),
+        }) {
             emit(cancelled());
             return;
         }

@@ -1,0 +1,281 @@
+[
+ {
+  "activeSessionId": "e3658de80893",
+  "event": {
+   "type": "agent_start"
+  },
+  "meta": {
+   "activeSessionId": "e3658de80893",
+   "cursor": {
+    "generation": "2768a3c7db4d",
+    "sequence": 1
+   },
+   "emittedAt": "2026-09-21T08:02:48.317Z",
+   "id": "e3658de80893:1",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 1
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "e3658de80893",
+  "event": {
+   "type": "turn_start"
+  },
+  "meta": {
+   "activeSessionId": "e3658de80893",
+   "cursor": {
+    "generation": "2768a3c7db4d",
+    "sequence": 2
+   },
+   "emittedAt": "2026-09-21T08:02:48.317Z",
+   "id": "e3658de80893:2",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 2
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "e3658de80893",
+  "event": {
+   "message": {
+    "content": [
+     {
+      "text": "held turn for the abort probe",
+      "type": "text"
+     }
+    ],
+    "role": "user",
+    "timestamp": 1789977768317
+   },
+   "type": "message_start"
+  },
+  "meta": {
+   "activeSessionId": "e3658de80893",
+   "cursor": {
+    "generation": "2768a3c7db4d",
+    "sequence": 3
+   },
+   "emittedAt": "2026-09-21T08:02:48.319Z",
+   "id": "e3658de80893:3",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 3
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "e3658de80893",
+  "event": {
+   "message": {
+    "content": [
+     {
+      "text": "held turn for the abort probe",
+      "type": "text"
+     }
+    ],
+    "role": "user",
+    "timestamp": 1789977768317
+   },
+   "type": "message_end"
+  },
+  "meta": {
+   "activeSessionId": "e3658de80893",
+   "cursor": {
+    "generation": "2768a3c7db4d",
+    "sequence": 4
+   },
+   "emittedAt": "2026-09-21T08:02:48.319Z",
+   "id": "e3658de80893:4",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 4
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "e3658de80893",
+  "event": {
+   "assistantMessageEvent": {
+    "type": "start"
+   },
+   "message": {
+    "api": "openai-completions",
+    "content": [
+     {
+      "text": "",
+      "type": "text"
+     }
+    ],
+    "errorMessage": "Request was aborted",
+    "model": "mock-1",
+    "provider": "prime-inference",
+    "role": "assistant",
+    "stopReason": "aborted",
+    "timestamp": 1789977769111,
+    "usage": {
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "cost": {
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "input": 0,
+      "output": 0,
+      "total": 0
+     },
+     "input": 0,
+     "output": 0,
+     "totalTokens": 0
+    }
+   },
+   "type": "message_start"
+  },
+  "meta": {
+   "activeSessionId": "e3658de80893",
+   "cursor": {
+    "generation": "2768a3c7db4d",
+    "sequence": 5
+   },
+   "emittedAt": "2026-09-21T08:02:49.111Z",
+   "id": "e3658de80893:5",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 5
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "e3658de80893",
+  "event": {
+   "message": {
+    "api": "openai-completions",
+    "content": [
+     {
+      "text": "",
+      "type": "text"
+     }
+    ],
+    "errorMessage": "Request was aborted",
+    "model": "mock-1",
+    "provider": "prime-inference",
+    "role": "assistant",
+    "stopReason": "aborted",
+    "timestamp": 1789977769111,
+    "usage": {
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "cost": {
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "input": 0,
+      "output": 0,
+      "total": 0
+     },
+     "input": 0,
+     "output": 0,
+     "totalTokens": 0
+    }
+   },
+   "type": "message_end"
+  },
+  "meta": {
+   "activeSessionId": "e3658de80893",
+   "cursor": {
+    "generation": "2768a3c7db4d",
+    "sequence": 6
+   },
+   "emittedAt": "2026-09-21T08:02:49.115Z",
+   "id": "e3658de80893:6",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 6
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "e3658de80893",
+  "event": {
+   "message": {
+    "api": "openai-completions",
+    "content": [
+     {
+      "text": "",
+      "type": "text"
+     }
+    ],
+    "errorMessage": "Request was aborted",
+    "model": "mock-1",
+    "provider": "prime-inference",
+    "role": "assistant",
+    "stopReason": "aborted",
+    "timestamp": 1789977769111,
+    "usage": {
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "cost": {
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "input": 0,
+      "output": 0,
+      "total": 0
+     },
+     "input": 0,
+     "output": 0,
+     "totalTokens": 0
+    }
+   },
+   "toolResults": [],
+   "type": "turn_end"
+  },
+  "meta": {
+   "activeSessionId": "e3658de80893",
+   "cursor": {
+    "generation": "2768a3c7db4d",
+    "sequence": 7
+   },
+   "emittedAt": "2026-09-21T08:02:49.115Z",
+   "id": "e3658de80893:7",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 7
+  },
+  "type": "session_event"
+ },
+ {
+  "activeSessionId": "e3658de80893",
+  "event": {
+   "type": "agent_end"
+  },
+  "meta": {
+   "activeSessionId": "e3658de80893",
+   "cursor": {
+    "generation": "2768a3c7db4d",
+    "sequence": 8
+   },
+   "emittedAt": "2026-09-21T08:02:49.136Z",
+   "id": "e3658de80893:8",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "sequence": 8
+  },
+  "type": "session_event"
+ }
+]

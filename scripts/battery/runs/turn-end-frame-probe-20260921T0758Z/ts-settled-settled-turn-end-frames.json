@@ -1,0 +1,34 @@
+[
+ {
+  "type": "turn_end",
+  "message": {
+   "role": "assistant",
+   "content": [
+    {
+     "type": "text",
+     "text": "settled reply"
+    }
+   ],
+   "api": "openai-completions",
+   "provider": "prime-inference",
+   "model": "mock-1",
+   "usage": {
+    "input": 20,
+    "output": 10,
+    "cacheRead": 80,
+    "cacheWrite": 0,
+    "totalTokens": 110,
+    "cost": {
+     "input": 0,
+     "output": 0,
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "total": 0
+    }
+   },
+   "stopReason": "stop",
+   "responseId": "chatcmpl-battery"
+  },
+  "toolResults": []
+ }
+]

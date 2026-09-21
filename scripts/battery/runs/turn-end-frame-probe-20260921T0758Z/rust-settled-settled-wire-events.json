@@ -1,0 +1,58 @@
+[
+ {
+  "wire": "message_start",
+  "role": "user",
+  "stopReason": null,
+  "errorMessage": null,
+  "text": "settled turn for the frame probe"
+ },
+ {
+  "wire": "message_end",
+  "role": "user",
+  "stopReason": null,
+  "errorMessage": null,
+  "text": "settled turn for the frame probe"
+ },
+ {
+  "wire": "message_start",
+  "role": "assistant",
+  "stopReason": "stop",
+  "errorMessage": null,
+  "text": ""
+ },
+ {
+  "wire": "message_update",
+  "role": "assistant",
+  "stopReason": "stop",
+  "errorMessage": null,
+  "text": "settled reply"
+ },
+ {
+  "wire": "message_update",
+  "role": "assistant",
+  "stopReason": "stop",
+  "errorMessage": null,
+  "text": "settled reply"
+ },
+ {
+  "wire": "message_end",
+  "role": "assistant",
+  "stopReason": "stop",
+  "errorMessage": null,
+  "text": "settled reply"
+ },
+ {
+  "wire": "turn_end",
+  "role": "assistant",
+  "stopReason": "stop",
+  "errorMessage": null,
+  "text": "settled reply"
+ },
+ {
+  "wire": "agent_end",
+  "role": null,
+  "stopReason": null,
+  "errorMessage": null,
+  "text": ""
+ }
+]

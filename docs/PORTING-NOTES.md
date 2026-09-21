@@ -502,7 +502,16 @@ Two TS wire behaviors are deliberately out of that row's scope and still open:
   (f3/f8 resume surfaces) — model-surface lane.
 - TS `turn_end` carries the final assistant message (and `agent_end` the message
   list); the Rust worker emits both bare. Same coupling: the payload is the
-  durable turn record, owned by the session engine.
+  durable turn record, owned by the session engine. The `turn_end` half landed
+  (lane turn-end-frame, 2026-09-21): the engine forwards the loop's
+  `TurnEnd`/inner `TurnStart` boundary events and the worker frames them in
+  the TS shapes — the terminal assistant message plus the turn's
+  `toolResults` on every settled turn (aborts and provider errors included,
+  probe-verified cross-side on settled/abort/compact/kill/abort_and_clear_queue
+  in `scripts/battery/aborted_row_probe.py`). The `agent_end` `messages`
+  payload is still open. The worker's Done-synthesized frames are now a
+  fallback for runs that ended without a model turn (session commands,
+  pre-model failures) and stay silent once the engine's own `turn_end` passed.
 
 Both are wire-projection only (no request/cache-prefix effect). The battery
 filter that excludes them is annotated in `run_battery.py` and must be removed
@@ -743,10 +752,9 @@ the autonomous accounting counts everything non-error).
   its admission — so the abort lands only after the turn settles
   naturally (the probe shows the held turn streaming its full reply 15s
   after the kill). TS `closeSessionOnce("killed")` awaits
-  `session.abort()` before the dispose, killing the fetch mid-wait. Also
-  unowned: the Rust `turn_end` wire frame carries no message payload
-  (TS sends `turn_end` with the aborted/terminal message), and on an
-  aborted turn Rust drops the frame entirely while TS emits it.
+  `session.abort()` before the dispose, killing the fetch mid-wait. The
+  flagged turn_end residue landed (lane turn-end-frame): the frame now
+  carries the terminal/aborted message payload and survives aborted turns.
 - Flagged residue (pre-existing, proven on the MAIN binary — run
   `20260921T061150Z` in `scripts/battery/runs/`): the f7 goal-continue
   projection's completion rows — TS emits the completion turn's

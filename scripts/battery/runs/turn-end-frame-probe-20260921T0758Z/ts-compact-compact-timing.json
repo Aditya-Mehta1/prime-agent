@@ -1,0 +1,5 @@
+{
+ "command": "compact",
+ "command_seconds": 0.025,
+ "hold_seconds": 15
+}

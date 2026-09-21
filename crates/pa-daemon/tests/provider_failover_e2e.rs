@@ -450,8 +450,9 @@ fn provider_failure_fails_over_to_the_next_provider_and_recovers() {
         .expect("backup assistant message_end");
     assert_eq!(answer["message"]["provider"], "prime-backup");
 
-    // The turn ends clean: no error, and the request the backup answered
-    // carried the same model id.
+    // The turn ends clean with the TS `turn_end` payload: the terminal
+    // assistant message (the backup provider's answer) and the turn's
+    // empty tool-result list, no error anywhere.
     let turn_end = client
         .events
         .iter()
@@ -459,6 +460,24 @@ fn provider_failure_fails_over_to_the_next_provider_and_recovers() {
         .find(|event| event.get("type").and_then(Value::as_str) == Some("turn_end"))
         .expect("turn_end");
     assert_eq!(turn_end.get("error"), None, "turn_end: {turn_end}");
+    assert_eq!(turn_end["message"]["role"], "assistant");
+    assert_eq!(turn_end["message"]["stopReason"], "stop");
+    assert_eq!(turn_end["message"]["provider"], "prime-backup");
+    assert!(
+        turn_end["message"]["content"]
+            .as_array()
+            .is_some_and(|content| {
+                content
+                    .iter()
+                    .any(|block| block["text"].as_str() == Some("recovered on the backup provider"))
+            }),
+        "turn_end carries the terminal assistant message: {turn_end}"
+    );
+    assert_eq!(
+        turn_end["toolResults"].as_array().map(Vec::len),
+        Some(0),
+        "the recovered turn ran no tools"
+    );
 }
 
 #[test]
@@ -519,8 +538,12 @@ fn every_provider_failing_surfaces_the_final_error() {
         .rev()
         .find(|event| event.get("type").and_then(Value::as_str) == Some("turn_end"))
         .expect("turn_end");
-    assert!(turn_end["error"]
+    // The TS `turn_end` shape: the terminal frame carries the failed
+    // assistant message as its payload (no separate error field).
+    assert_eq!(turn_end["message"]["stopReason"], "error");
+    assert!(turn_end["message"]["errorMessage"]
         .as_str()
         .expect("turn error")
         .contains("mock provider overloaded"));
+    assert_eq!(turn_end.get("error"), None, "turn_end: {turn_end}");
 }

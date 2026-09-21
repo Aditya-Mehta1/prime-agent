@@ -3931,20 +3931,33 @@ impl TurnRunner {
         let done = item.done;
         let turn = tokio::task::spawn_blocking(move || {
             let mut done = done;
+            // Whether the engine already emitted its own terminal
+            // `turn_end` frame this run (the loop emits one per turn —
+            // settled, aborted, and failed alike). The trailing `Done`
+            // fallback frame stays silent then; it exists only for runs
+            // that end without a model turn (session commands, pre-model
+            // failures).
+            let mut engine_turn_ended = false;
             let mut emit = |mut event: EngineEvent| -> bool {
                 // Sequence + persist under the core lock, then broadcast.
                 // The abort flag lives on the session core (`abort`
                 // command): a cancelled turn stops consuming its own
-                // events — except the aborted assistant row itself. TS
-                // `createAbortedAssistantMessage`'s message_start/
-                // message_end pair reaches the listeners and
-                // `appendMessage` persists it, so the row's frames pass
-                // the gate (persist + broadcast) while the turn still
-                // unwinds; every other post-abort event stays dropped.
+                // events — except the aborted assistant row and its
+                // `turn_end` frame. TS `createAbortedAssistantMessage`'s
+                // message_start/message_end pair reaches the listeners and
+                // `appendMessage` persists it, and the loop's trailing
+                // `turn_end` carries that row as the terminal payload, so
+                // the row's frames pass the gate (persist + broadcast)
+                // while the turn still unwinds; every other post-abort
+                // event stays dropped.
+                if matches!(event, EngineEvent::TurnEnd { .. }) {
+                    engine_turn_ended = true;
+                }
                 let aborted_row = matches!(
                     &event,
                     EngineEvent::AssistantMessage(message)
                         | EngineEvent::AssistantUpdate { message, .. }
+                        | EngineEvent::TurnEnd { message, .. }
                         if message.get("stopReason").and_then(Value::as_str) == Some("aborted")
                 );
                 let mut core = core.lock().unwrap();
@@ -4118,10 +4131,32 @@ impl TurnRunner {
                         "type": "goal_update",
                         "goal": goal,
                     })],
-                    EngineEvent::Done(Ok(())) => vec![json!({ "type": "turn_end" })],
-                    EngineEvent::Done(Err(error)) => {
+                    // The loop's turn-boundary frames (TS `turn_start`/
+                    // `turn_end`): the terminal assistant message and the
+                    // turn's tool-result messages ride `turn_end`; the rows
+                    // themselves already went out through their own events,
+                    // so no persist here.
+                    EngineEvent::TurnStart => vec![json!({ "type": "turn_start" })],
+                    EngineEvent::TurnEnd {
+                        message,
+                        tool_results,
+                    } => vec![json!({
+                        "type": "turn_end",
+                        "message": message,
+                        "toolResults": tool_results,
+                    })],
+                    // The fallback terminal frame for runs that ended
+                    // without the engine's own `turn_end` (session
+                    // commands, pre-model failures): unchanged shape, and
+                    // silent once the engine's frame covered the run.
+                    EngineEvent::Done(Ok(())) if !engine_turn_ended => {
+                        vec![json!({ "type": "turn_end" })]
+                    }
+                    EngineEvent::Done(Ok(())) => Vec::new(),
+                    EngineEvent::Done(Err(error)) if !engine_turn_ended => {
                         vec![json!({ "type": "turn_end", "error": error })]
                     }
+                    EngineEvent::Done(Err(_)) => Vec::new(),
                     EngineEvent::AutoRetryStart {
                         attempt,
                         max_attempts,
@@ -5547,6 +5582,33 @@ mod tests {
         assert_eq!(row["usage"]["input"], json!(0));
         assert_eq!(row["usage"]["output"], json!(0));
         assert_eq!(row["content"], json!([{ "type": "text", "text": "" }]));
+        // The terminal `turn_end` frame follows the row's pair (TS
+        // `turn_end` on an aborted turn): the aborted assistant row is
+        // the frame's payload with the turn's empty tool-result list, and
+        // the trailing `Done` stays silent (no second, bare frame).
+        let aborted_turn_end = events
+            .iter()
+            .rev()
+            .find(|event| event.get("type").and_then(Value::as_str) == Some("turn_end"))
+            .cloned()
+            .expect("the aborted turn's turn_end frame reached the wire");
+        assert_eq!(aborted_turn_end["message"], *row);
+        assert_eq!(aborted_turn_end["toolResults"], json!([]));
+        assert_eq!(aborted_turn_end.get("error"), None);
+        // No bare trailing frame after the payload one: the aborted
+        // turn's terminal `turn_end` is the only frame of this window's
+        // aborted turn (the `Done` fallback stays silent).
+        let bare_turn_end_count = events
+            .iter()
+            .filter(|event| {
+                event.get("type").and_then(Value::as_str) == Some("turn_end")
+                    && event.get("message").is_none()
+            })
+            .count();
+        assert_eq!(
+            bare_turn_end_count, 0,
+            "no bare turn_end frames: {events:?}"
+        );
         // The row persisted: the session file holds the same aborted
         // assistant row (TS `appendMessage` at the message_end hook).
         let store_row = {

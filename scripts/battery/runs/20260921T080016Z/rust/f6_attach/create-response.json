@@ -1,0 +1,43 @@
+{
+ "command": "create",
+ "data": {
+  "activeSessionId": "35d5ea9f4323",
+  "activity": "idle",
+  "attachedClients": 0,
+  "created": "2026-09-21T08:00:44.437Z",
+  "cwd": "/home/ubuntu/lane-worktrees/turn-end-frame/scripts/battery/runs/20260921T080016Z/rust/work",
+  "hasRegisteredCronJob": false,
+  "id": "35d5ea9f4323",
+  "isBashRunning": false,
+  "isCompacting": false,
+  "isSessionActive": false,
+  "isStreaming": false,
+  "lastActivityAt": "2026-09-21T08:00:44.448Z",
+  "lifecycle": "draft",
+  "messageCount": 0,
+  "model": {
+   "id": "mock-1",
+   "name": "Mock 1",
+   "provider": "prime-inference",
+   "reasoning": false
+  },
+  "modified": "2026-09-21T08:00:44.448Z",
+  "rlmDepth": 0,
+  "runtimeKind": "top-level",
+  "sessionActions": {
+   "followUps": [],
+   "queuedCount": 0,
+   "steering": []
+  },
+  "sessionFile": "/home/ubuntu/lane-worktrees/turn-end-frame/scripts/battery/runs/20260921T080016Z/rust/agent/sessions/01a0c2fb-4d95-72da-aa2e-ba98e18db0e8.jsonl",
+  "sessionId": "01a0c2fb-4d95-72da-aa2e-ba98e18db0e8",
+  "sessionName": "battery-attach",
+  "thinkingLevel": "off",
+  "unfinishedActionCount": 0,
+  "workerPid": 1838176,
+  "workerState": "ready"
+ },
+ "id": "c1",
+ "success": true,
+ "type": "response"
+}
