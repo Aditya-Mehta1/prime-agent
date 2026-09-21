@@ -58,6 +58,15 @@ export async function runRouterSegment(
 			if (error instanceof RouterSegmentInitTimeoutError) throw error;
 			throw new Error(`environment adapter init failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
+		// Init can win the race in the same tick the budget expires; a
+		// leftover budget below 1ms must not hand the loop a 1ms deadline
+		// that still dispatches reset past the declared segment timeout.
+		const loopBudgetMs = spec.timeoutMs - (Date.now() - segmentStartedAt);
+		if (loopBudgetMs <= 0) {
+			throw new RouterSegmentInitTimeoutError(
+				`environment adapter init exceeded the segment timeout of ${spec.timeoutMs}ms`,
+			);
+		}
 		const actions = parseEnvironmentActions(spec.actions, environment?.actions);
 		if (!actions) {
 			throw new Error("system_router.run has no action space: declare one or use an adapter that supplies its own");
@@ -84,7 +93,7 @@ export async function runRouterSegment(
 			gate: spec.gate,
 			maxSteps: spec.maxSteps,
 			// The loop's deadline covers the remaining segment budget after init.
-			timeoutMs: Math.max(1, spec.timeoutMs - (Date.now() - segmentStartedAt)),
+			timeoutMs: loopBudgetMs,
 			historySteps: spec.historySteps,
 			observationChars: spec.observationChars,
 		});

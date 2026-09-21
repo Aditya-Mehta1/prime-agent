@@ -755,26 +755,31 @@ describe("runRouterSegment wiring", () => {
 		expect(log).toContain("execute:wait");
 	});
 
-	it("bounds adapter init by the segment timeout and still closes the adapter", async () => {
-		const spec = parseSystemRouterRunSpec({
-			goal: "seg goal",
-			environment: { stdio: { command: ["true"] } },
-			timeoutMs: 5,
-		});
-		const log: string[] = [];
-		const env: RouterSegmentEnvironment = {
-			init: () => new Promise(() => {}),
-			reset: async () => {},
-			observe: async () => ({ text: "x" }),
-			execute: async () => ({ text: "y" }),
-			close: async () => {
-				log.push("close");
-			},
-		};
-		await expect(runRouterSegment(spec, { model, env })).rejects.toThrow(
-			/environment adapter init exceeded the segment timeout of 5ms/,
-		);
-		expect(log).toEqual(["close"]);
+	it.each<[string, () => Promise<undefined>]>([
+		["init never settles", () => new Promise<undefined>(() => {})],
+		[
+			"init settles after the budget",
+			() =>
+				Promise.resolve().then(() => {
+					vi.setSystemTime(new Date(Date.now() + 5));
+					return undefined;
+				}),
+		],
+	])("bounds adapter init by the segment timeout (%s) and still closes the adapter", async (_label, makeInit) => {
+		const spec = parseSystemRouterRunSpec({ goal: "g", environment: { stdio: { command: ["true"] } }, timeoutMs: 5 });
+		const env = new FakeEnvironment(["x"]);
+		(env as unknown as { init: () => Promise<undefined> }).init = makeInit;
+		vi.useFakeTimers();
+		try {
+			const run = runRouterSegment(spec, { model, env: env as unknown as RouterSegmentEnvironment });
+			// Attach the rejection handler before advancing any timer.
+			run.catch(() => {});
+			await vi.advanceTimersByTimeAsync(5);
+			await expect(run).rejects.toThrow(/environment adapter init exceeded the segment timeout of 5ms/);
+		} finally {
+			vi.useRealTimers();
+		}
+		expect(env.closeCalls).toBe(1);
 	});
 
 	it.each([
