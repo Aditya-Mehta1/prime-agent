@@ -33,6 +33,7 @@ function actionSpace() {
     wait: {
       description:
         "Run the game for about one second (60 frames) without pressing anything. Use when the screen is mid-animation or a dialog is advancing on its own.",
+      risk: "read",
     },
   };
   for (const button of BUTTONS) {
