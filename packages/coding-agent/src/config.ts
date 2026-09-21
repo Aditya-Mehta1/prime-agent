@@ -485,7 +485,7 @@ interface PackageJson {
 
 const pkg = JSON.parse(readFileSync(getPackageJsonPath(), "utf-8")) as PackageJson;
 
-const piConfigName: string | undefined = pkg.piConfig?.name;
+const piConfigName: string | undefined = process.env.PRIME_AGENT_APP_NAME || pkg.piConfig?.name;
 const envPrefix =
 	(piConfigName || "pi")
 		.toUpperCase()
@@ -494,7 +494,7 @@ const envPrefix =
 export const PACKAGE_NAME: string = pkg.name || "@earendil-works/pi-coding-agent";
 export const APP_NAME: string = piConfigName || "pi";
 export const APP_TITLE: string = piConfigName ? APP_NAME : "π";
-export const CONFIG_DIR_NAME: string = pkg.piConfig?.configDir || ".prime/agent";
+export const CONFIG_DIR_NAME: string = process.env.PRIME_AGENT_CONFIG_DIR || pkg.piConfig?.configDir || ".prime/agent";
 export const VERSION: string = pkg.version || "0.0.0";
 
 // e.g., PI_CODING_AGENT_DIR or PRIME_AGENT_CODING_AGENT_DIR
