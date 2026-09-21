@@ -2688,3 +2688,81 @@ goal-start continuation segment, the `budget_limited` flip, the
 wrap-up steer segment, and the `end_turn` response (8 frames identical
 after the #182 token-estimate normalization). The threshold/overflow
 scenarios stay green (the arm surface is unregressed).
+
+## Print-mode goal continuation (print-continuation lane, the #252 residue)
+
+TS ruling (probed against the installed TS binary over the shared
+faux-provider harness, `prime-agent --mode json --goal <objective>
+[--goal-token-budget <n>] -p <prompt>`): the print path DOES run goal
+continuations inside the one print invocation. `--goal` seeds the goal at
+session construction (main.ts passes `initialGoal` only for depth-0; the
+TS constructor seeds only a branch with bootstrap entries and no persisted
+goal) and queues the goal-context continuation row into
+`_pendingNextTurnMessages`, so it rides the FIRST turn ahead of the user
+row. The session's message-end handler records usage
+(`_accountGoalUsageForAssistantMessage`) and publishes `goal_update`; the
+budget crossing queues the `[goal: budget-limit]` wrap-up steer as session
+input (`session_action_update` with the queued steering preview) between
+the crossing turn's `message_end` and `turn_end`; the agent loop's
+`getContinuationMessages` hook (installed by
+`_installAgentContinuationHook`) mints one continuation context per natural
+turn end and runs it INSIDE the same agent run (`turn_end -> goal_update ->
+turn_start`, no run boundary); a requested compaction or a threshold
+crossing stops the loop at `_shouldStopForThresholdCompaction`, the
+threshold arm minting its continuation BEFORE the compaction (the bump
+precedes the compaction frames); a failed terminal assistant message fails
+the goal AFTER `_checkCompaction` (the error `goal_update` follows the
+run's `agent_end`). Evidence: the two probe captures
+(`/tmp/ts-goal-probe.jsonl`, the budget-bounded run; the unbounded run
+loops natural mints to the queue-exhaustion error).
+
+Rust port:
+- pa-agent: the continuation hook is settable after construction
+  (`Agent::set_continuation_hook`, the TS `agent.getContinuationMessages`
+  seam) - the embedding that owns the goal arms wires it once its state
+  exists.
+- pa-core (`session_engine::goal_boundary.rs`): the engine owns the arms -
+  `seed_initial_goal` (the TS constructor seed + the next-turn row queue,
+  `AgentSession::queue_next_turn_row` = `_pendingNextTurnMessages`),
+  `record_goal_usage`, `goal_budget_limit_steer`, `mint_goal_continuation`,
+  `rollback_goal_continuation_mint`, `fail_goal_for_terminal_error`. The
+  transports drive the one goal driver through these methods.
+- pa-cli (`print_goal.rs`): the print surface wires an in-loop hook on the
+  agent - the natural mint runs continuations in-run (full TS framing);
+  queued input (the armed steer), a pending requested compaction, or a
+  threshold crossing defer to the turn boundary (the threshold arm mints
+  its held continuation ahead of the boundary's compaction); the driver's
+  boundary drain runs the steer and the held continuation as this
+  invocation's follow-up turns with the TS `session_action_update` phase
+  frames (queued preview, preparing/committing/running, drain), and a
+  terminal error fails the goal after the arms. The goal owns the boundary
+  exclusively (the autonomous arm is never consulted while a goal is
+  active, TS `_getContinuationMessages`). Text mode runs the same loop
+  silently.
+- `--goal`/`--goal-token-budget`: parsed since the CLI lane; the print
+  runtime now consumes them (the seed runs before the stream wires, so the
+  construction-time state never announces itself on the json stream).
+
+Verifiers: `pa-cli` unit `print_goal::tests` - the seed riding the first
+turn (slot zero, ahead of the user row, silent), the branch-seed gate, the
+natural loop (one agent run, one mint per settled turn, terminal-error
+fail), the budget steer (budget_limited, the queued preview + phase frames,
+a second run, no slot consumed), and the threshold hold (a resumed session
+with an active goal: the mint's slot bump immediately precedes the
+compaction, the held context row follows it, queue frames, post-compaction
+context back under the headroom). Differential:
+`scripts/print_json_parity.py` gained two scenarios - `goal-budget`
+(33 events byte-identical after the volatile scrubs) and `goal-natural`
+(36 events) - and the existing scenarios stay green (stream, threshold,
+resume, compact-refine, compact-refine-decline). The normalizations are
+the #182 class only: `tokensUsed`/`timeUsedSeconds`/`createdAt`/`updatedAt`
+plus the goal-context text lines (each side estimates its own context).
+
+Adjacent gaps, NOT this lane: print-mode session-command execution
+(`/goal ...`, `/compact ...` as prompts are parsed but dropped in the
+Rust print path where TS executes them through the session's command
+queue); the compact-with-active-goal continue arm (TS `compact()`'s
+didCompact finally arm) rides that missing session-command surface; the
+autonomous continuation loop keeps its separate-run framing (pre-existing,
+unverified against TS).
+

@@ -203,6 +203,16 @@ async fn latest_assistant(engine: &SessionEngine) -> Option<pa_types::ai::Assist
         })
 }
 
+/// The latest settled assistant message's error text, when the loop's
+/// terminal state is a failed model request (the goal's terminal-error
+/// surface: a failed turn fails an active goal, an abort keeps it).
+pub(crate) async fn latest_assistant_error(engine: &SessionEngine) -> Option<Option<String>> {
+    latest_assistant(engine).await.and_then(|message| {
+        (message.stop_reason == pa_types::ai::StopReason::Error)
+            .then(|| message.error_message.clone())
+    })
+}
+
 /// Persist the durable stop row into the session state (same session, same
 /// flush, as the session-command executor's rows).
 async fn persist_stop_row(engine: &SessionEngine, row: &CustomMessage) {

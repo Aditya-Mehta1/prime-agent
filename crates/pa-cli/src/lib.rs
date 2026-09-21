@@ -23,7 +23,6 @@ pub(crate) mod mcp_command;
 pub(crate) mod mcp_login;
 pub(crate) mod mode;
 pub(crate) mod package_command;
-pub(crate) mod print_boundary;
 pub(crate) mod prompt_command;
 pub(crate) mod public_command;
 pub(crate) mod session_export;
@@ -31,6 +30,8 @@ pub(crate) mod session_export;
 /// The runtime boundary: everything a mode-runner crate implements to plug
 /// into the `prime-agent` binary, plus the entry point that drives it.
 pub use mode::{AppMode, MissingSubsystem, RunOptions, Runtime, UnavailableRuntime};
+pub(crate) mod print_boundary;
+pub(crate) mod print_goal;
 pub mod print_runtime;
 pub mod update_flow;
 pub mod util_time;

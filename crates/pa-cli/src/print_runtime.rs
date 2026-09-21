@@ -180,13 +180,19 @@ fn run_print_mode(options: &RunOptions) -> Result<i32, String> {
 
 async fn print_mode_main(options: &RunOptions) -> Result<i32, String> {
     let headless = build_headless_engine(options).await?;
-    run_prompts_and_emit(
-        &headless.engine,
-        &headless.model,
-        headless.api_key.clone(),
-        options,
-    )
-    .await
+    let engine = std::sync::Arc::new(headless.engine);
+    // The CLI `--goal` seed (TS constructor seeding): a fresh root branch
+    // starts the goal and queues its continuation context as the first
+    // turn's leading row; a resumed or already-seeded branch keeps its
+    // persisted goal. Depth 0 only — the print session is a root session
+    // (TS main.ts gates `initialGoal` on `rlmDepth === 0` the same way).
+    if let Some(goal) = &options.config.initial_goal {
+        engine
+            .seed_initial_goal(&goal.objective, goal.token_budget.map(u64::from))
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+    }
+    run_prompts_and_emit(&engine, &headless.model, headless.api_key.clone(), options).await
 }
 
 /// Assemble the in-process session engine for a headless run: model
@@ -768,7 +774,7 @@ fn builtin_tools(_cwd: &std::path::Path) -> Vec<Arc<dyn pa_agent::types::AgentTo
 /// stop surfaces the durable `autonomous_status` row as a `message_end`
 /// event before the process exits.
 async fn run_prompts_and_emit(
-    engine: &pa_core::session_engine::engine::SessionEngine,
+    engine: &std::sync::Arc<pa_core::session_engine::engine::SessionEngine>,
     model: &Model,
     api_key: Option<String>,
     options: &RunOptions,
@@ -794,6 +800,22 @@ async fn run_prompts_and_emit(
                 .await,
         );
     }
+    // The goal continuation surface (the #252 residue): the usage
+    // accounting publishes `goal_update` frames, the in-loop hook runs an
+    // active goal's continuations inside the same agent run (the TS
+    // `getContinuationMessages` seam), and the driver drains the queued
+    // turns (the budget-limit steer, the threshold-held continuation) as
+    // this invocation's follow-up runs. Wired in every output mode — the
+    // loop runs identically in text mode, only silently.
+    let goal = std::sync::Arc::new(crate::print_goal::PrintGoalSurface::new(json_mode));
+    goal.seed_publish_baseline(engine).await;
+    let goal_accounting = goal.wire_accounting(engine, engine.session.agent()).await;
+    crate::print_goal::PrintGoalSurface::wire_continuation_hook(
+        engine,
+        engine.session.agent(),
+        model,
+        &goal,
+    );
     // The autonomous run from the CLI flags (the verifier/eval composition
     // seam): per-message accounting plus the gate continuation loop.
     let autonomous = options
@@ -836,22 +858,46 @@ async fn run_prompts_and_emit(
         boundary
             .run_at_settled_turn(engine, model, api_key.clone(), global_harness_dir.clone())
             .await?;
-        if let Some(run) = &autonomous {
-            if let Some(row) = run
-                .drive(
-                    engine,
-                    &mut boundary,
-                    model,
-                    api_key.clone(),
-                    global_harness_dir.clone(),
-                )
-                .await
-                .map_err(|error| format!("{error:#}"))?
-            {
-                emit_stop_row_events(json_mode, &row);
+        // The goal boundary's queue drain: the threshold-held continuation
+        // (minted ahead of the boundary's compaction) and the budget-limit
+        // steer (armed at the crossing turn's message end) run as this
+        // invocation's follow-up turns, each crossing the same boundary
+        // pair; a turn that still ends in a terminal error fails an active
+        // goal once the arms could not save it (TS
+        // `_finishGoalForTerminalAssistantMessage` at `agent_end`, after
+        // `_checkCompaction`).
+        let goal_owns_boundary = goal
+            .drive_boundary(
+                engine,
+                &mut boundary,
+                model,
+                api_key.clone(),
+                global_harness_dir.clone(),
+            )
+            .await?;
+        // The autonomous arm runs only when the goal does not own the
+        // boundary (TS `_getContinuationMessages`: the goal arm takes
+        // exclusive priority; autonomous is never consulted while a goal
+        // is active).
+        if !goal_owns_boundary {
+            if let Some(run) = &autonomous {
+                if let Some(row) = run
+                    .drive(
+                        engine,
+                        &mut boundary,
+                        model,
+                        api_key.clone(),
+                        global_harness_dir.clone(),
+                    )
+                    .await
+                    .map_err(|error| format!("{error:#}"))?
+                {
+                    emit_stop_row_events(json_mode, &row);
+                }
             }
         }
     }
+    goal_accounting.unsubscribe().await;
     if let Some(subscription) = accounting {
         subscription.unsubscribe().await;
     }

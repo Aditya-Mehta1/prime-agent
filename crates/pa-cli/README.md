@@ -25,14 +25,23 @@ Every turn the loop issues crosses the boundary pair: the autonomous
 continuation loop (`headless_autonomous.rs`) admits its follow-up turns
 through `TurnBoundary::admit_continuation`, so continuation turns run the
 same arms CLI prompts do (TS: the session loop owns the arms).
+Goal continuation (print_goal.rs, the #252 residue): the `--goal` seed rides
+the first turn; the in-loop continuation hook (the pa-agent loop's
+`getContinuationMessages` seam) runs an active goal's natural continuations
+inside the one agent run; the budget-limit steer and the threshold-held
+continuation drain as this invocation's follow-up runs with the TS
+session-action phase frames. The goal has exclusive priority over the
+autonomous arm (TS `_getContinuationMessages`).
 The json stream emits the TS session-event surface byte-for-shape: the
 session header row (version 3), the `message_update` streaming deltas with
 the slim `assistantMessageEvent` (the daemon wire drops the nested
 `partial`), `tool_execution_update`, the harness digest's message pair at
 the first-turn boundary, the compaction `compaction_start`/`compaction_end`
-pairs with their durable outcome rows, and the refinement rows with
+pairs with their durable outcome rows, the `goal_update`/`session_action_update`
+frames of the goal loop, and the refinement rows with
 `refine_complete`/`refine_failed`. Verifier: `scripts/print_json_parity.py`
-(the TS binary differential) plus the `print_runtime_e2e` rows.
+(the TS binary differential, the goal-budget/goal-natural scenarios) plus the
+`print_runtime_e2e` rows.
 
 ## Daemon client
 The daemon-backed public commands (`list`, `stop`, `rename`, `send`, `schedule`) talk to the

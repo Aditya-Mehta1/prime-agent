@@ -35,6 +35,20 @@ one or more sequential runs over the same shared session store):
     the TS binary).
   - compact-refine-decline: the same overflow shape with a declining
     review - no refinement rows, no refine events, identical streams.
+  - goal-budget: `--goal <objective> --goal-token-budget 5` drives the
+    print-mode goal continuation surface the TS session hosts inside the
+    one print run: the seeded goal's continuation context rides the first
+    turn ahead of the user row, the settled turn's usage crossing publishes
+    the budget_limited goal_update and queues the `[goal: budget-limit]`
+    wrap-up steer (the queued session_action_update), the run ends, and
+    the steer drains as its own run (preparing/committing/running phase
+    frames) before the process exits. Compaction stays off (the goal
+    frames are the diff target).
+  - goal-natural: the same seed with an unbounded-budget goal loops the
+    natural continuation mints INSIDE the one run (turn_end -> mint
+    goal_update -> turn_start, no run boundary between continuation turns)
+    until the faux queue exhausts and the terminal error fails the goal
+    (the error goal_update after the run's agent_end).
 
 The Rust run rides the harness digest row through the loop's prompt input
 (the same TS design), so `agent_end.messages` includes it on both sides and
@@ -173,7 +187,22 @@ def normalize(value, sandbox_root):
 
 def normalize_value(key, item, sandbox_root):
     if isinstance(item, (int, float)) and not isinstance(item, bool):
-        if key in ("timestamp", "tokensBefore", "tokens", "totalTokens", "input", "output", "cacheRead", "cacheWrite"):
+        if key in (
+            "timestamp",
+            "tokensBefore",
+            "tokens",
+            "totalTokens",
+            "input",
+            "output",
+            "cacheRead",
+            "cacheWrite",
+            # The goal accounting's per-side token estimates (the #182
+            # normalization class: each side estimates its own context).
+            "tokensUsed",
+            "timeUsedSeconds",
+            "createdAt",
+            "updatedAt",
+        ):
             return "<N>"
         return item
     if isinstance(item, str):
@@ -189,6 +218,11 @@ def normalize_value(key, item, sandbox_root):
             return "<TS>"
         if key in ("firstKeptEntryId", "id", "refinementId"):
             return "<ID>"
+        # The goal context texts (message contents, queue previews, action
+        # labels) carry the same per-side token estimates inline.
+        item = re.sub(r"- tokens used: -?\d+", "- tokens used: <n>", item)
+        item = re.sub(r"- remaining tokens: -?\d+", "- remaining tokens: <n>", item)
+        item = re.sub(r"- time used seconds: -?\d+", "- time used seconds: <n>", item)
         return item
     if isinstance(item, list):
         return [normalize_value(key, entry, sandbox_root) for entry in item]
@@ -507,6 +541,59 @@ SCENARIOS = {
                 ),
                 "prompts": ["seed turn " + "x" * 48000, "overflow probe " + "x" * 48000],
                 "args": [],
+            }
+        ]
+    },
+    "goal-budget": {
+        "runs": [
+            {
+                # The budget-bounded goal loop: the seeded continuation
+                # context rides turn one, the crossing flips the goal to
+                # budget_limited (goal_update + the queued steering
+                # preview), the run ends, and the wrap-up steer drains as
+                # its own run (preparing/committing/running frames) before
+                # the empty-queue frame settles the stream. Compaction
+                # stays off; the goal frames are the diff target.
+                "settings": {
+                    "onboardingCompleted": True,
+                    "compaction": {"enabled": False},
+                },
+                "script": faux_script(
+                    [
+                        {"text": "goal turn reply"},
+                        {"text": "wrap-up reply"},
+                    ],
+                    128000,
+                ),
+                "prompts": ["work"],
+                "args": ["--goal", "finish the work", "--goal-token-budget", "5"],
+            }
+        ]
+    },
+    "goal-natural": {
+        "runs": [
+            {
+                # The natural continuation loop inside the one run: each
+                # settled turn mints the next continuation context (the
+                # continuationsUsed bump goal_update between turn_end and
+                # turn_start, no run boundary), until the faux queue
+                # exhausts and the terminal error fails the goal (the
+                # error goal_update after the run's agent_end - both
+                # providers raise the same "No more faux responses
+                # queued"). No token budget, so no wrap-up steer.
+                "settings": {
+                    "onboardingCompleted": True,
+                    "compaction": {"enabled": False},
+                },
+                "script": faux_script(
+                    [
+                        {"text": "turn one reply"},
+                        {"text": "turn two reply"},
+                    ],
+                    128000,
+                ),
+                "prompts": ["work"],
+                "args": ["--goal", "finish the work"],
             }
         ]
     },

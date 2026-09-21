@@ -16,6 +16,7 @@ pub mod compaction;
 pub mod compaction_exec;
 pub mod compaction_utils;
 pub mod engine;
+pub mod goal_boundary;
 pub mod goal_driver;
 pub mod harness_digest;
 pub mod headless;
@@ -134,6 +135,11 @@ pub struct AgentSession {
     /// notice (TS `_ipythonKernelProvisioner`): `None` in sessions without
     /// a kernel (verification harnesses) — no notice lands.
     kernel_state: Option<std::sync::Arc<dyn ipython_state::CompactionKernelProbe>>,
+    /// TS `_pendingNextTurnMessages`: custom rows the NEXT admitted turn
+    /// carries ahead of its own prompt row (the CLI `--goal` seed's
+    /// continuation context, pushed at construction; taken by the next
+    /// prompt or injected turn, exactly like the TS prepared-messages take).
+    pending_next_turn_rows: tokio::sync::Mutex<Vec<pa_types::session::CustomMessage>>,
 }
 
 impl AgentSession {
@@ -183,6 +189,7 @@ impl AgentSession {
             auto_refine: refine::AutoRefineGates::default(),
             compact_auto_refine: std::sync::Mutex::default(),
             kernel_state: None,
+            pending_next_turn_rows: tokio::sync::Mutex::new(Vec::new()),
         };
         this.ensure_harness_digest_context().await?;
         Ok(this)
@@ -551,6 +558,7 @@ impl AgentSession {
         if let Some(digest_row) = self.pending_digest_prompt_row().await? {
             prompt_messages.push(digest_row);
         }
+        prompt_messages.extend(self.take_next_turn_rows().await);
         let custom_row = session_message_to_loop(&SessionAgentMessage::Custom(message.clone()))
             .ok_or_else(|| anyhow::anyhow!("injected custom message conversion failed"))?;
         prompt_messages.push(custom_row);
@@ -619,12 +627,32 @@ impl AgentSession {
             if let Some(digest_row) = self.pending_digest_prompt_row().await? {
                 prompt_messages.push(digest_row);
             }
+            prompt_messages.extend(self.take_next_turn_rows().await);
             prompt_messages.push(user_prompt_message(&normalized, &images));
             self.agent
                 .prompt(pa_agent::agent::AgentPromptInput::Messages(prompt_messages))
                 .await?;
         }
         Ok(PromptOutcome::Prompt)
+    }
+
+    /// Queue one custom row for the next admitted turn (TS
+    /// `_pendingNextTurnMessages.push`): the row rides the turn's prompt
+    /// messages ahead of the prompt's own user row.
+    pub async fn queue_next_turn_row(&self, message: pa_types::session::CustomMessage) {
+        self.pending_next_turn_rows.lock().await.push(message);
+    }
+
+    /// Drain the queued next-turn rows (TS `_takePendingNextTurnMessages`):
+    /// the admitting turn owns them; an empty take leaves nothing for later
+    /// turns.
+    pub async fn take_next_turn_rows(&self) -> Vec<pa_agent::types::AgentMessage> {
+        self.pending_next_turn_rows
+            .lock()
+            .await
+            .drain(..)
+            .filter_map(|row| session_message_to_loop(&SessionAgentMessage::Custom(row)))
+            .collect()
     }
 
     /// Session id (persistence identity).

@@ -303,7 +303,12 @@ struct AgentInner {
     after_tool_call: Option<AfterToolCallFn>,
     should_stop_after_turn: Option<ShouldStopAfterTurnFn>,
     should_stop_before_turn: Option<ShouldStopBeforeTurnFn>,
-    get_continuation_messages: Option<GetContinuationMessagesFn>,
+    /// The natural-turn-end continuation hook (TS `agent.getContinuationMessages`):
+    /// settable after construction so embeddings that assemble the session
+    /// engine first (the goal continuation arms) can install it once their
+    /// own state exists. A plain mutex: cloned at run-config build, never
+    /// held across an await.
+    get_continuation_messages: Mutex<Option<GetContinuationMessagesFn>>,
     session_id: Option<String>,
     tool_execution: ToolExecutionMode,
 }
@@ -475,7 +480,7 @@ impl AgentInner {
                     as crate::BoxFut<'static, anyhow::Result<Vec<AgentMessage>>>
             }) as PollMessagesFn
         };
-        let continuation = self.get_continuation_messages.clone();
+        let continuation = self.get_continuation_messages.lock().unwrap().clone();
         let should_stop_after_turn = self.should_stop_after_turn.clone();
 
         let mut config =
@@ -694,7 +699,7 @@ impl Agent {
             after_tool_call: options.after_tool_call,
             should_stop_after_turn: options.should_stop_after_turn,
             should_stop_before_turn: options.should_stop_before_turn,
-            get_continuation_messages: options.get_continuation_messages,
+            get_continuation_messages: Mutex::new(options.get_continuation_messages),
             session_id: options.session_id,
             tool_execution: options
                 .tool_execution
@@ -794,6 +799,14 @@ impl Agent {
 
     pub fn follow_up_mode(&self) -> QueueMode {
         self.inner.follow_up_queue.lock().unwrap().mode
+    }
+
+    /// Install or replace the natural-turn-end continuation hook (TS
+    /// `_installAgentContinuationHook`'s seam: the embedding that owns the
+    /// goal/autonomous continuation policy wires it after the agent exists).
+    /// `None` uninstalls the hook; the loop's natural stop returns.
+    pub fn set_continuation_hook(&self, hook: Option<GetContinuationMessagesFn>) {
+        *self.inner.get_continuation_messages.lock().unwrap() = hook;
     }
 
     pub fn set_follow_up_mode(&self, mode: QueueMode) {
