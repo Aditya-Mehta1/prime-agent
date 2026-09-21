@@ -978,6 +978,19 @@ async def _handle_list_names(req: dict[str, Any], ns: dict[str, Any]) -> None:
     _send({"event": "done", "id": req["id"], "status": "ok", "names": _list_names(ns)})
 
 
+async def _handle_mcp_status(req: dict[str, Any], ns: dict[str, Any]) -> None:
+    from . import mcp as mcp_mod
+
+    servers = req.get("servers")
+    if not isinstance(servers, list) or not all(isinstance(name, str) for name in servers):
+        raise ValueError("mcp_status requires a list of server names")
+    timeout_ms = req.get("timeout_ms", 10_000)
+    if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, (int, float)) or timeout_ms <= 0:
+        raise ValueError("mcp_status timeout_ms must be a positive number")
+    connections = await mcp_mod.status(servers, float(timeout_ms))
+    _send({"event": "done", "id": req["id"], "status": "ok", "connections": connections})
+
+
 async def _handle_request(
     handler: Callable[[dict[str, Any], dict[str, Any]], Awaitable[None]],
     req: dict[str, Any],
@@ -1031,6 +1044,8 @@ async def _serve(queue: asyncio.Queue[dict[str, Any]], ns: dict[str, Any]) -> No
             await _handle_request(_handle_state, req, ns)
         elif rtype == "list_names":
             await _handle_request(_handle_list_names, req, ns)
+        elif rtype == "mcp_status":
+            await _handle_request(_handle_mcp_status, req, ns)
 
 
 _REQUIRED_FIELDS = {
@@ -1038,6 +1053,9 @@ _REQUIRED_FIELDS = {
     "snapshot": ("id", "path", "manifest_path"),
     "restore": ("id", "path"),
     "list_names": ("id",),
+    # mcp_status's server list is a JSON array, so only its id is a
+    # string-required field; the handler validates the list itself.
+    "mcp_status": ("id",),
     "shutdown": (),
 }
 

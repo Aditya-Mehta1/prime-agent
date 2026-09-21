@@ -25,6 +25,7 @@ pub(crate) mod goal_state_persist;
 pub mod input_pause_lease;
 pub mod journal;
 pub mod lease;
+pub mod mcp_connections;
 pub mod mcp_login;
 pub(crate) mod messaging;
 pub(crate) mod model_switch;

@@ -112,6 +112,10 @@ pub struct AgentView {
     /// The `/effort` inline picker (TS `ThinkingSelectorComponent` seam):
     /// while set, it owns the whole frame like the model picker.
     pub effort_picker: Option<crate::effort_picker::EffortPicker>,
+    /// The `/mcp` inline connections view (TS the configuration menu's
+    /// MCP Connections tab): while set, it owns the editor dock like the
+    /// model picker.
+    pub mcp_view: Option<crate::mcp_view::McpView>,
     /// A `/share` gist upload in flight (TS `BorderedLoader`): while set,
     /// it replaces the editor with the cancellable loader rows.
     pub share_loader: Option<ShareLoader>,
@@ -184,6 +188,7 @@ impl AgentView {
             provider_auth: None,
             fork_selector: None,
             effort_picker: None,
+            mcp_view: None,
             share_loader: None,
             shortcut_guide: None,
             show_images: true,
@@ -1056,6 +1061,10 @@ impl AgentView {
         } else if let Some(picker) = &self.effort_picker {
             let mut dock = prompt_context;
             dock.extend(picker.render(&self.theme, width));
+            Some(dock)
+        } else if let Some(mcp_view) = self.mcp_view.as_mut() {
+            let mut dock = prompt_context;
+            dock.extend(mcp_view.render(&self.theme, width, self.editor.keybindings()));
             Some(dock)
         } else {
             None

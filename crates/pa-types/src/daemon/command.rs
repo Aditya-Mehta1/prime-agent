@@ -564,6 +564,13 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    GetMcpConnections {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
     ReplaceAcpMcpServers {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,

@@ -141,6 +141,7 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "get_worker_peer_transport",
     "commit_update_restart",
     "update_restore_status",
+    "get_mcp_connections",
 ];
 
 /// Parsed client command envelope.
@@ -600,6 +601,9 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         | DaemonCommand::GetResourceSnapshot {
             active_session_id, ..
         }
+        | DaemonCommand::GetMcpConnections {
+            active_session_id, ..
+        }
         | DaemonCommand::ReplaceAcpMcpServers {
             active_session_id, ..
         }
@@ -854,6 +858,7 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::GetContextTree { .. } => "get_context_tree",
         DaemonCommand::GetCommands { .. } => "get_commands",
         DaemonCommand::GetResourceSnapshot { .. } => "get_resource_snapshot",
+        DaemonCommand::GetMcpConnections { .. } => "get_mcp_connections",
         DaemonCommand::ReplaceAcpMcpServers { .. } => "replace_acp_mcp_servers",
         DaemonCommand::GetModelCatalog { .. } => "get_model_catalog",
         DaemonCommand::GetAvailableModels { .. } => "get_available_models",

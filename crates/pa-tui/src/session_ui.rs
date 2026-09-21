@@ -298,6 +298,11 @@ pub(crate) struct SessionUi {
     /// process-group suspend: the interactive loop performs the cycle
     /// right after dispatch, because the renderer is the loop's terminal.
     suspend_requested: bool,
+    /// A client command a selector resolved to (the `/mcp` view's Enter:
+    /// TS `authenticate` runs the login flow): the interactive loop
+    /// dispatches it through the ordinary submit path right after the key,
+    /// so the terminal-suspending auth flows keep their bracket.
+    pending_client_command: Option<String>,
     /// Whether this run already reported its first suspend cycle.
     suspend_adoption_emitted: bool,
     /// The armed selection auto-scroll (TS `selectionAutoScroll*`): a drag
@@ -408,6 +413,7 @@ impl SessionUi {
             escape_repeat_action: None,
             escape_repeat_until: None,
             suspend_requested: false,
+            pending_client_command: None,
             suspend_adoption_emitted: false,
             selection_auto_scroll: None,
             selection_adoption_emitted: false,
@@ -2747,20 +2753,94 @@ impl SessionUi {
         self.escape_repeat_until = Some(Instant::now() + ESCAPE_REPEAT_WINDOW_MS);
     }
 
-    /// `/mcp <login|logout> <name>` (TS `handleMcpCommand`): usage errors,
-    /// then the composition root's auth flow. Only the login prompts on
-    /// the terminal, so `needs_terminal_suspension` covers it.
+    /// `/mcp` (TS `handleMcpCommand`): the bare command opens the inline
+    /// connections view over the daemon's roster (TS opens the
+    /// configuration menu's MCP Connections tab); `login`/`logout <name>`
+    /// run the composition root's auth flow (only the login prompts on
+    /// the terminal, so `needs_terminal_suspension` covers it); anything
+    /// else keeps the usage note.
     async fn handle_mcp_command(
         &mut self,
         resolved: &pa_types::slash_commands::ResolvedSlashCommand,
         view: &mut AgentView,
     ) -> Result<()> {
+        self.track_command_used("mcp");
+        if resolved.args.trim().is_empty() {
+            return self.open_mcp_view(view).await;
+        }
         let Some(auth) = self.client_auth.clone() else {
             self.note("/mcp is not available in this client yet", view);
             return Ok(());
         };
         let note = crate::client_auth::run_mcp_auth_command(auth.0.as_ref(), &resolved.args).await;
         self.note(&note, view);
+        Ok(())
+    }
+
+    /// Open the inline `/mcp` connections view over the daemon's
+    /// `get_mcp_connections` roster. The request carries the kernel's tool
+    /// listing (it opens each connected generic server, bounded), so it
+    /// gets the wider deadline.
+    async fn open_mcp_view(&mut self, view: &mut AgentView) -> Result<()> {
+        let data = match self
+            .bounded_request(
+                Duration::from_millis(UI_REQUEST_TIMEOUT_MS * 4),
+                DaemonCommand::GetMcpConnections {
+                    id: None,
+                    active_session_id: self.active_session_id.clone(),
+                    rest: Default::default(),
+                },
+            )
+            .await
+        {
+            Ok(data) => data,
+            Err(error) => {
+                self.note(&format!("/mcp failed: {error:#}"), view);
+                return Ok(());
+            }
+        };
+        view.mcp_view = Some(crate::mcp_view::McpView::from_response(
+            &data,
+            picker_viewport_rows(view.terminal_rows()),
+        ));
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// One key press while the `/mcp` connections view is open: Esc or
+    /// Ctrl+C close it; Enter resolves to the selected connection's login
+    /// (dispatched as a client command after the key returns, so the auth
+    /// flow keeps the terminal-suspension bracket); everything else
+    /// navigates or edits the search field.
+    async fn handle_mcp_view_key(&mut self, key: KeyEvent, view: &mut AgentView) -> Result<()> {
+        let Some(id) = key_event_to_id(&key) else {
+            return Ok(());
+        };
+        // The view consumes Ctrl+C (close, not exit): report the handled
+        // press so the force-quit guard can disarm once the whole pair was
+        // consumed with TS semantics.
+        if id == "ctrl+c" {
+            self.exit_guard.note_ctrl_c_handled();
+        }
+        let action = view
+            .mcp_view
+            .as_mut()
+            .map(|mcp_view| mcp_view.handle_key(&id, view.editor.keybindings()));
+        match action {
+            Some(crate::mcp_view::McpViewAction::None) => {}
+            Some(crate::mcp_view::McpViewAction::Cancel) => {
+                view.mcp_view = None;
+                self.dirty = true;
+            }
+            Some(crate::mcp_view::McpViewAction::Select(server)) => {
+                view.mcp_view = None;
+                self.dirty = true;
+                // TS `authenticate`: Enter runs the connection's login
+                // flow — the same command path as `/mcp login <name>`.
+                self.pending_client_command = Some(format!("/mcp login {server}"));
+            }
+            None => {}
+        }
         Ok(())
     }
 
@@ -3002,13 +3082,15 @@ impl SessionUi {
             return;
         }
         // TS `isFullscreenOverlayFocused`: the `/model` and `/effort`
-        // pickers, the `/tree` and `/fork` selectors, and the `/share`
-        // loader own the frame like the TS overlays.
+        // pickers, the `/tree` and `/fork` selectors, the `/mcp`
+        // connections view, and the `/share` loader own the frame like the
+        // TS overlays.
         let overlay_focused = view.model_picker.is_some()
             || view.effort_picker.is_some()
             || view.tree_selector.is_some()
             || view.fork_selector.is_some()
-            || view.share_loader.is_some();
+            || view.share_loader.is_some()
+            || view.mcp_view.is_some();
         // Wheel turns scroll only on the session surface; a pane owns the
         // frame, the turn is consumed without scrolling.
         if let Some(delta) = crate::mouse::wheel_scroll_delta(&event) {
@@ -3154,6 +3236,11 @@ impl SessionUi {
     pub(crate) fn handle_paste(&mut self, text: &str, view: &mut AgentView) {
         if let Some(picker) = view.model_picker.as_mut() {
             picker.paste(text);
+            self.dirty = true;
+            return;
+        }
+        if let Some(mcp_view) = view.mcp_view.as_mut() {
+            mcp_view.paste(text);
             self.dirty = true;
             return;
         }
@@ -3560,6 +3647,13 @@ impl SessionUi {
         std::mem::take(&mut self.suspend_requested)
     }
 
+    /// Take the pending client command a selector resolved to (the `/mcp`
+    /// view's Enter): the interactive loop dispatches it through the
+    /// ordinary submit path, so the auth flows keep the suspend bracket.
+    pub(crate) fn take_pending_client_command(&mut self) -> Option<String> {
+        self.pending_client_command.take()
+    }
+
     /// Report the run's first suspend cycle (`tui suspend used`),
     /// fire-and-forget like the scroll event: the keypress never waits on
     /// the telemetry flush. `outcome` is `resumed` (the SIGCONT
@@ -3602,6 +3696,10 @@ impl SessionUi {
         // The `/effort` picker owns the frame the same way.
         if view.effort_picker.is_some() {
             return self.handle_effort_picker_key(key, view).await;
+        }
+        // The `/mcp` connections view owns the frame the same way.
+        if view.mcp_view.is_some() {
+            return self.handle_mcp_view_key(key, view).await;
         }
         // The `/tree` and `/fork` selectors own the frame the same way.
         if view.tree_selector.is_some() {

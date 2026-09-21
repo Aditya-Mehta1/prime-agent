@@ -34,6 +34,10 @@ pub enum Request {
         path: String,
     },
     ListNames,
+    McpStatus {
+        servers: Vec<String>,
+        timeout_ms: u64,
+    },
     Shutdown,
 }
 
@@ -46,6 +50,7 @@ impl Request {
             Request::Snapshot { .. } => "snapshot",
             Request::Restore { .. } => "restore",
             Request::ListNames => "list_names",
+            Request::McpStatus { .. } => "mcp_status",
             Request::Shutdown => "shutdown",
         }
     }
@@ -71,6 +76,14 @@ impl Request {
             }),
             Request::Restore { path } => json!({ "type": "restore", "path": path }),
             Request::ListNames => json!({ "type": "list_names" }),
+            Request::McpStatus {
+                servers,
+                timeout_ms,
+            } => json!({
+                "type": "mcp_status",
+                "servers": servers,
+                "timeout_ms": timeout_ms,
+            }),
             Request::Shutdown => json!({ "type": "shutdown" }),
         }
     }

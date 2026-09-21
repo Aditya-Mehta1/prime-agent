@@ -1203,6 +1203,20 @@ class ReplTest(unittest.TestCase):
         self.assertNotIn("rlm", done["names"])
         self.assertEqual(done["names"], sorted(done["names"]))
 
+    def test_mcp_status_without_servers(self):
+        self.repl.send({"type": "mcp_status", "id": "ms1", "servers": []})
+        done = one(self.repl.until_done("ms1"), "done")
+        self.assertEqual(done["status"], "ok")
+        self.assertEqual(done["connections"], [])
+
+    def test_mcp_status_requires_a_server_list(self):
+        self.repl.send({"type": "mcp_status", "id": "ms2", "servers": "fixture-echo"})
+        events = self.repl.until_done("ms2")
+        self.assertEqual(one(events, "done")["status"], "error")
+        self.assertIn("mcp_status", one(events, "error")["evalue"])
+        events = self.repl.execute("ms3", "'alive'")
+        self.assertEqual(one(events, "result")["text"], "'alive'")
+
     def test_list_names_skips_non_string_keys(self):
         self.repl.execute("lnk1", "globals()[1] = 1\nbeta = 2")
         self.repl.send({"type": "list_names", "id": "lnk2"})

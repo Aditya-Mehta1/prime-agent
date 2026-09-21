@@ -1395,6 +1395,7 @@ impl Worker {
             "abort_and_clear_queue" => self.handle_abort_and_clear_queue(),
             "get_last_assistant_text" => self.handle_get_last_assistant_text(),
             "get_connection_state" => self.handle_get_connection_state(),
+            "get_mcp_connections" => self.handle_get_mcp_connections().await,
             "get_rlm_children" => self.handle_get_rlm_children().await,
             "get_context_tree" => self.handle_get_context_tree().await,
             "get_commands" => self.handle_get_commands().await,

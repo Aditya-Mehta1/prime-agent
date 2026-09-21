@@ -88,6 +88,7 @@ pub fn command_plane(command_type: &str) -> DaemonCommandPlane {
         | "get_context_tree"
         | "get_commands"
         | "get_resource_snapshot"
+        | "get_mcp_connections"
         | "replace_acp_mcp_servers"
         | "get_model_catalog"
         | "get_available_models"
@@ -166,6 +167,7 @@ const READ_ONLY_DAEMON_COMMANDS: &[&str] = &[
     "get_context_tree",
     "get_commands",
     "get_resource_snapshot",
+    "get_mcp_connections",
     "get_model_catalog",
     "get_available_models",
     "get_queue",

@@ -98,6 +98,38 @@ class McpRegistryTest(unittest.TestCase):
         run(generation.discover())
         return generation
 
+    def test_status_reports_tools_and_errors_per_server(self):
+        async def ok_listing(server):
+            return [{"name": f"{server}.tool", "description": "fixture description", "inputSchema": {}}]
+
+        with mock.patch.object(mcp, "list_tools", ok_listing):
+            result = run(mcp.status(["alpha", "beta"], 60_000.0))
+        self.assertEqual(
+            result,
+            [
+                {"server": "alpha", "tools": [{"name": "alpha.tool", "description": "fixture description"}], "error": None},
+                {"server": "beta", "tools": [{"name": "beta.tool", "description": "fixture description"}], "error": None},
+            ],
+        )
+
+    def test_status_isolates_failures_and_timeouts(self):
+        async def failing_listing(server):
+            raise RuntimeError(f"no config for {server}")
+
+        async def slow_listing(server):
+            await asyncio.sleep(1.0)
+            return []
+
+        with mock.patch.object(mcp, "list_tools", failing_listing):
+            result = run(mcp.status(["broken"], 60_000.0))
+        self.assertIsNone(result[0]["tools"])
+        self.assertEqual(result[0]["error"], "RuntimeError: no config for broken")
+
+        with mock.patch.object(mcp, "list_tools", slow_listing):
+            result = run(mcp.status(["slow"], 50.0))
+        self.assertIsNone(result[0]["tools"])
+        self.assertIn("TimeoutError", result[0]["error"])
+
     def test_schema_alias_and_exact_names(self):
         schema = {"type": "object", "properties": {"x": {"const": 1}}}
         tool = SimpleNamespace(name="raw.tool/name", description="raw", input_schema=schema)

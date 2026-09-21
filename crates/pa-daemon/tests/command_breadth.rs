@@ -522,6 +522,10 @@ const WIRE_FIXTURES: &[(&str, &str)] = &[
         "update_restore_status",
         r#"{"type": "update_restore_status"}"#,
     ),
+    (
+        "get_mcp_connections",
+        r#"{"type": "get_mcp_connections", "activeSessionId": "sess"}"#,
+    ),
 ];
 
 /// The accept list is the TS list, in TS order, followed by the Rust-native
@@ -544,6 +548,7 @@ fn known_command_types_match_the_ts_list() {
                     | "get_worker_peer_transport"
                     | "commit_update_restart"
                     | "update_restore_status"
+                    | "get_mcp_connections"
             ),
             "unexpected non-TS command type: {extra}"
         );

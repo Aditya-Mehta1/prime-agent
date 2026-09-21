@@ -607,6 +607,50 @@ impl McpManager {
         servers
     }
 
+    /// The connections roster for the `/mcp` connections view: every
+    /// resolved integration (built-in catalog plus user-declared servers)
+    /// with its connected state, display kind, transport, and whether it
+    /// surfaces through the generic kernel API (whose tools the view can
+    /// list). Sorted by label.
+    pub fn connection_roster(&self) -> Vec<McpConnectionEntry> {
+        let generic: std::collections::HashSet<String> = self
+            .get_enabled_persistent_generic_servers()
+            .into_iter()
+            .collect();
+        let mut entries: Vec<McpConnectionEntry> = self
+            .integrations
+            .values()
+            .map(|integration| {
+                let transport = integration.config.server_type().to_string();
+                let auth_kind = if integration.uses_oauth {
+                    "subscription"
+                } else if matches!(
+                    &integration.config,
+                    McpServerConfig::Http {
+                        bearer_token_env_var: Some(_),
+                        ..
+                    }
+                ) {
+                    "api key"
+                } else {
+                    transport.as_str()
+                };
+                McpConnectionEntry {
+                    server: integration.server.clone(),
+                    label: integration.label.clone(),
+                    connected: self.is_authed(integration),
+                    uses_oauth: integration.uses_oauth,
+                    auth_kind: auth_kind.to_string(),
+                    transport,
+                    user_declared: integration.user_declared,
+                    generic: generic.contains(&integration.server),
+                }
+            })
+            .collect();
+        entries.sort_by_key(|entry| entry.label.to_lowercase());
+        entries
+    }
+
     /// Status for the `/mcp list` command.
     pub fn list_status(&self) -> Vec<McpServerStatus> {
         self.integrations
@@ -629,6 +673,30 @@ pub struct McpServerStatus {
     pub label: String,
     pub enabled: bool,
     pub uses_oauth: bool,
+}
+
+/// One `/mcp` connections-view row (the daemon's `get_mcp_connections`
+/// response): the roster entry plus the tool listing the kernel reported
+/// for it. `tools` is `None` when the listing was unavailable (no kernel,
+/// session busy) or the server failed; `error` carries the failure text.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpConnectionEntry {
+    pub server: String,
+    pub label: String,
+    /// Connected: credentials present and the server enabled.
+    pub connected: bool,
+    pub uses_oauth: bool,
+    /// The auth kind the view shows (`subscription` / `api key`), or the
+    /// transport for credential-less stdio/http servers.
+    pub auth_kind: String,
+    /// The transport (`http` / `stdio`).
+    pub transport: String,
+    /// True for a user-declared `mcpServers` entry (false: built-in).
+    pub user_declared: bool,
+    /// True when the server surfaces through the generic kernel API (its
+    /// tools are listable through `mcp.list_tools`).
+    pub generic: bool,
 }
 
 fn is_generic_server_name(name: &str) -> bool {
@@ -683,6 +751,73 @@ mod tests {
             startup_timeout_ms: None,
             call_timeout_ms: None,
         }
+    }
+
+    #[test]
+    fn connection_roster_covers_builtins_and_user_servers() {
+        // The /mcp view's roster: built-ins with their catalog kind, user
+        // stdio servers with their transport, label-sorted.
+        let mut user_servers = HashMap::new();
+        user_servers.insert(
+            "fixture-echo".to_string(),
+            McpServerConfig::Stdio {
+                command: "python3".to_string(),
+                args: None,
+                cwd: None,
+                env: None,
+                enabled: None,
+                enabled_tools: None,
+                disabled_tools: None,
+                startup_timeout_ms: None,
+                call_timeout_ms: None,
+            },
+        );
+        let manager = manager_with(Some(user_servers));
+        let roster = manager.connection_roster();
+        let names: Vec<&str> = roster.iter().map(|entry| entry.server.as_str()).collect();
+        assert_eq!(names, vec!["fixture-echo", "linear", "notion"]);
+        let fixture = &roster[0];
+        assert!(fixture.connected);
+        assert!(fixture.generic);
+        assert!(fixture.user_declared);
+        assert_eq!(fixture.auth_kind, "stdio");
+        assert_eq!(fixture.transport, "stdio");
+        let linear = roster
+            .iter()
+            .find(|entry| entry.server == "linear")
+            .expect("linear");
+        assert!(!linear.connected);
+        assert!(!linear.generic);
+        assert!(!linear.user_declared);
+        assert_eq!(linear.auth_kind, "subscription");
+        assert_eq!(linear.transport, "http");
+        // An OAuth-bearing user server keeps the TS auth-kind cell.
+        let mut oauth_servers = HashMap::new();
+        oauth_servers.insert(
+            "hooked".to_string(),
+            http_config("https://hooked.example/mcp", Some(true), None),
+        );
+        let manager = manager_with(Some(oauth_servers));
+        let roster = manager.connection_roster();
+        let hooked = roster
+            .iter()
+            .find(|entry| entry.server == "hooked")
+            .expect("hooked");
+        assert_eq!(hooked.auth_kind, "subscription");
+        assert!(!hooked.connected, "no stored credentials yet");
+        // A bearer-token env server reports the TS api-key kind.
+        let mut env_servers = HashMap::new();
+        env_servers.insert(
+            "search".to_string(),
+            http_config("https://search.example/mcp", None, Some("SEARCH_TOKEN")),
+        );
+        let manager = manager_with(Some(env_servers));
+        let roster = manager.connection_roster();
+        let search = roster
+            .iter()
+            .find(|entry| entry.server == "search")
+            .expect("search");
+        assert_eq!(search.auth_kind, "api key");
     }
 
     #[test]

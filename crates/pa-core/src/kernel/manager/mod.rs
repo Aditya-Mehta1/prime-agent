@@ -534,6 +534,58 @@ impl ReplKernelManager {
         }
     }
 
+    /// Per-server MCP tool listing for the host's connections view (the
+    /// runtime `mcp_status` request): one entry per requested server with
+    /// its tool names/descriptions, or the error string when that server
+    /// failed or timed out. `None` when the kernel isn't running.
+    ///
+    /// The listing opens each not-yet-connected server (bounded by
+    /// `per_server_timeout_ms`), so the call can take seconds; callers
+    /// bound it with their own deadline.
+    pub async fn mcp_tool_listing(
+        &self,
+        servers: &[String],
+        per_server_timeout_ms: u64,
+    ) -> Option<Vec<Value>> {
+        if !self.is_running() {
+            return None;
+        }
+        if servers.is_empty() {
+            return Some(Vec::new());
+        }
+        let opts = ExecuteOptions {
+            internal: true,
+            ..ExecuteOptions::default()
+        };
+        let request = Request::McpStatus {
+            servers: servers.to_vec(),
+            timeout_ms: per_server_timeout_ms,
+        };
+        match self.enqueue_request(request, "", opts, None).await {
+            Ok(r) if r.result.status == ExecuteStatus::Ok => {
+                let connections = r
+                    .done_fields
+                    .as_ref()
+                    .and_then(|fields| fields.get("connections"))
+                    .and_then(Value::as_array)
+                    .cloned();
+                Some(connections.unwrap_or_default())
+            }
+            Ok(r) => {
+                self.inner.append_diagnostic(&format!(
+                    "mcp tool listing failed: {}",
+                    describe_failure(&r.result)
+                ));
+                None
+            }
+            Err(error) => {
+                self.inner
+                    .append_diagnostic(&format!("mcp tool listing error: {error:#}"));
+                None
+            }
+        }
+    }
+
     // ----------------------------------------------------- lifecycle (rest)
 
     /// Resolves `true` when this call performed the cleanup (false: a

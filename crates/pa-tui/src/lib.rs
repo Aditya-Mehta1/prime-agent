@@ -43,6 +43,7 @@ pub mod keybindings;
 pub mod keys;
 pub mod markdown;
 pub mod markdown_table;
+pub mod mcp_view;
 mod menu_panel;
 pub mod model_picker;
 pub(crate) mod mouse;
