@@ -638,6 +638,23 @@ pub struct Worker {
     pub(crate) scheduled: std::sync::Arc<crate::scheduled_jobs::ScheduledJobs>,
 }
 
+/// The kernel cron wiring the worker hands its session engine (TS
+/// daemon-mode wires its `AgentCronJobStore.forSessionArtifacts()` into
+/// the session runtime): the shared scheduled-jobs store, the durable
+/// binding the engine enriches per build, and the mutation hook the
+/// kernel's `rlm_heartbeat.*` host handlers invoke after every
+/// create/update/delete (TS `removeQueuedHeartbeatFollowUp` +
+/// `cronScheduler.wake()` inside the daemon's rlm heartbeat controllers).
+fn kernel_cron_wiring(
+    scheduled: &std::sync::Arc<crate::scheduled_jobs::ScheduledJobs>,
+) -> pa_core::session_engine::runtime_wiring::KernelCronWiring {
+    pa_core::session_engine::runtime_wiring::KernelCronWiring {
+        store: std::sync::Arc::clone(scheduled.store()),
+        binding: None,
+        mutation_hook: Some(scheduled.mutation_hook()),
+    }
+}
+
 /// Supervisor-link coordinates for a worker's agent engine: where the
 /// supervisor listens and who this worker is on it.
 fn supervisor_link_config(config: &WorkerConfig) -> SupervisorLinkConfig {
@@ -757,12 +774,7 @@ impl Worker {
                         faux_script: Some(script.to_string()),
                         supervisor_link: Some(supervisor_link_config(&config)),
                         telemetry_disabled: config.telemetry_disabled,
-                        cron_store: Some(
-                            pa_core::session_engine::runtime_wiring::KernelCronWiring {
-                                store: std::sync::Arc::clone(scheduled.store()),
-                                binding: None,
-                            },
-                        ),
+                        cron_store: Some(kernel_cron_wiring(&scheduled)),
                     }) {
                         Ok(engine) => {
                             let concrete = std::sync::Arc::new(engine);
@@ -791,12 +803,7 @@ impl Worker {
                         faux_script: None,
                         supervisor_link: Some(supervisor_link_config(&config)),
                         telemetry_disabled: config.telemetry_disabled,
-                        cron_store: Some(
-                            pa_core::session_engine::runtime_wiring::KernelCronWiring {
-                                store: std::sync::Arc::clone(scheduled.store()),
-                                binding: None,
-                            },
-                        ),
+                        cron_store: Some(kernel_cron_wiring(&scheduled)),
                     }) {
                         Ok(engine) => {
                             let concrete = std::sync::Arc::new(engine);

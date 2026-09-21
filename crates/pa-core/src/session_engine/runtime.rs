@@ -15,7 +15,8 @@ use crate::session::manager::SessionManager;
 
 use super::goal_driver::GoalDriver;
 use super::host_requests::{
-    handle_goal_host_request, handle_rlm_heartbeat_host_request, SessionBinding,
+    handle_goal_host_request, handle_rlm_heartbeat_host_request, RlmHeartbeatMutationHook,
+    SessionBinding,
 };
 
 /// The host-side purge of queued goal-context turns (TS
@@ -35,6 +36,11 @@ pub struct SessionRuntime {
     /// `_completeGoalFromHost` -> `_clearQueuedGoalContexts`); `None` when
     /// the embedding owns no queued goal contexts.
     goal_complete_purge: Option<QueuedGoalContextPurge>,
+    /// Invoked after a kernel `rlm_heartbeat.*` mutation (TS daemon-mode's
+    /// `removeQueuedHeartbeatFollowUp` + `cronScheduler.wake()` inside its
+    /// rlm heartbeat controllers); `None` when the embedding owns no
+    /// scheduler to re-arm.
+    cron_mutation_hook: Option<RlmHeartbeatMutationHook>,
 }
 
 impl SessionRuntime {
@@ -51,6 +57,7 @@ impl SessionRuntime {
             active_session_id,
             binding,
             goal_complete_purge: None,
+            cron_mutation_hook: None,
         }
     }
 
@@ -58,6 +65,12 @@ impl SessionRuntime {
     /// purge).
     pub fn set_goal_complete_purge(&mut self, purge: QueuedGoalContextPurge) {
         self.goal_complete_purge = Some(purge);
+    }
+
+    /// Set the rlm heartbeat mutation hook (the daemon worker's queued-fire
+    /// withdrawal + scheduler re-arm).
+    pub fn set_cron_mutation_hook(&mut self, hook: RlmHeartbeatMutationHook) {
+        self.cron_mutation_hook = Some(hook);
     }
 
     pub fn goal_driver(&self) -> &Arc<Mutex<GoalDriver>> {
@@ -153,6 +166,7 @@ impl SessionRuntime {
         let binding_session_id = self.binding.session_id.clone();
         let binding_session_file = self.binding.session_file.clone();
         let binding_cwd = self.binding.cwd.clone();
+        let cron_mutation_hook = self.cron_mutation_hook.clone();
         for request_type in [
             "rlm_heartbeat.list",
             "rlm_heartbeat.create",
@@ -164,6 +178,7 @@ impl SessionRuntime {
             let session_id = binding_session_id.clone();
             let session_file = binding_session_file.clone();
             let cwd = binding_cwd.clone();
+            let mutation_hook = cron_mutation_hook.clone();
             handlers.register(
                 request_type,
                 host_handler(move |payload| {
@@ -174,8 +189,9 @@ impl SessionRuntime {
                         session_file: session_file.clone(),
                         cwd: cwd.clone(),
                     };
+                    let mutation_hook = mutation_hook.clone();
                     Box::pin(async move {
-                        let response = handle_rlm_heartbeat_host_request(
+                        let outcome = handle_rlm_heartbeat_host_request(
                             payload
                                 .data
                                 .get("type")
@@ -186,7 +202,15 @@ impl SessionRuntime {
                             &active_session_id,
                             &binding,
                         )?;
-                        Ok(response)
+                        // The embedding's post-mutation work (TS daemon-mode
+                        // withdraws the queued fire and re-arms its cron
+                        // scheduler inside the controller methods).
+                        if let Some(mutation) = outcome.mutation {
+                            if let Some(hook) = &mutation_hook {
+                                hook(mutation).await;
+                            }
+                        }
+                        Ok(outcome.response)
                     })
                 }),
             );
@@ -319,5 +343,87 @@ mod tests {
         // The heartbeat file holds the job.
         let jobs = runtime.cron_store().list_rlm_heartbeats("live-1", true);
         assert_eq!(jobs.len(), 1);
+    }
+
+    /// The kernel `rlm_heartbeat.*` handlers invoke the mutation hook with
+    /// the changed job (the daemon worker's queued-fire withdrawal +
+    /// scheduler re-arm, TS daemon-mode's controller call sites); catalog
+    /// reads announce nothing.
+    #[tokio::test]
+    async fn rlm_heartbeat_mutations_invoke_the_cron_mutation_hook() {
+        let session = Arc::new(Mutex::new(persisted_session()));
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut runtime = SessionRuntime::new(
+            &*session.lock().await,
+            Arc::new(AgentCronJobStore::new(dir.path().join("jobs.json"))),
+            "live-1".to_string(),
+            SessionBinding {
+                session_id: "session-1".to_string(),
+                session_file: "/w/s.jsonl".to_string(),
+                cwd: "/w".to_string(),
+            },
+        );
+        let mutations: Arc<Mutex<Vec<super::super::host_requests::RlmHeartbeatMutation>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sink = mutations.clone();
+        runtime.set_cron_mutation_hook(Arc::new(move |mutation| {
+            let sink = sink.clone();
+            Box::pin(async move {
+                sink.lock().await.push(mutation);
+            })
+        }));
+        let mut handlers = HostRequestHandlers::default();
+        runtime.register_host_handlers(session, &mut handlers);
+
+        // Create announces the job (never withdrawing a queued fire).
+        let create = handlers.get("rlm_heartbeat.create").unwrap().clone();
+        let response = create(payload(serde_json::json!({
+            "type": "rlm_heartbeat.create",
+            "instruction": "watch the mission",
+            "interval": "every 15m"
+        })))
+        .await
+        .unwrap();
+        let id = response["heartbeat"]["id"].as_str().unwrap().to_string();
+        let seen = mutations.lock().await;
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].job.id, id);
+        assert_eq!(seen[0].job.source.as_deref(), Some("rlm_heartbeat"));
+        assert!(!seen[0].drop_queued);
+        drop(seen);
+
+        // A catalog read announces nothing.
+        let list = handlers.get("rlm_heartbeat.list").unwrap().clone();
+        let response = list(payload(serde_json::json!({ "type": "rlm_heartbeat.list" })))
+            .await
+            .unwrap();
+        assert!(response["heartbeats"].as_array().unwrap().len() == 1);
+        assert!(mutations.lock().await.len() == 1);
+
+        // A pause withdraws the queued fire (TS `updateRlmHeartbeatForState`).
+        let update = handlers.get("rlm_heartbeat.update").unwrap().clone();
+        update(payload(serde_json::json!({
+            "type": "rlm_heartbeat.update",
+            "id": id,
+            "status": "pause"
+        })))
+        .await
+        .unwrap();
+        let seen = mutations.lock().await;
+        assert_eq!(seen.len(), 2);
+        assert!(seen[1].drop_queued);
+        drop(seen);
+
+        // A delete always withdraws it.
+        let delete = handlers.get("rlm_heartbeat.delete").unwrap().clone();
+        delete(payload(serde_json::json!({
+            "type": "rlm_heartbeat.delete",
+            "id": id
+        })))
+        .await
+        .unwrap();
+        let seen = mutations.lock().await;
+        assert_eq!(seen.len(), 3);
+        assert!(seen[2].drop_queued);
     }
 }

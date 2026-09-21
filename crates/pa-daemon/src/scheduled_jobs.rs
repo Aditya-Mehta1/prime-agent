@@ -227,6 +227,29 @@ impl ScheduledJobs {
         }
     }
 
+    /// The kernel rlm heartbeat mutation hook (TS daemon-mode's
+    /// controller post-mutation work: `removeQueuedHeartbeatFollowUp`
+    /// where the mutation withdraws the queued fire, then
+    /// `cronScheduler.wake()`): installed by the worker onto the session
+    /// engine's kernel cron wiring, invoked by the `rlm_heartbeat.*` host
+    /// handlers after every create/update/delete. Without the wake the
+    /// bind-time arm — taken over an empty store — leaves no timer, and a
+    /// heartbeat created afterwards never fires.
+    pub(crate) fn mutation_hook(
+        self: &std::sync::Arc<Self>,
+    ) -> pa_core::session_engine::host_requests::RlmHeartbeatMutationHook {
+        let scheduled = std::sync::Arc::clone(self);
+        std::sync::Arc::new(move |mutation| {
+            let scheduled = std::sync::Arc::clone(&scheduled);
+            Box::pin(async move {
+                if mutation.drop_queued {
+                    scheduled.remove_queued_heartbeat_follow_up(&mutation.job);
+                }
+                scheduled.wake().await;
+            })
+        })
+    }
+
     /// `removeQueuedHeartbeatFollowUp` (TS daemon-mode): drop the queued
     /// fire of a heartbeat job from the session's queue.
     pub(crate) fn remove_queued_heartbeat_follow_up(&self, job: &AgentCronJob) {
@@ -676,5 +699,143 @@ impl Worker {
             "heartbeat_update",
             Some(json!({ "heartbeat": heartbeat })),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::Worker;
+    use std::sync::Arc;
+
+    fn persisted_worker_config(dir: &std::path::Path) -> crate::worker::WorkerConfig {
+        crate::worker::WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: std::path::PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "hb-fire-session".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(serde_json::json!({ "responses": ["ack", "ack", "ack", "ack"] })),
+        }
+    }
+
+    /// The fire-chain e2e behind the dogfood P0 (a heartbeat created by
+    /// the kernel never fired): the kernel's `rlm_heartbeat.create` store
+    /// mutation plus the mutation hook the worker installs must re-arm the
+    /// bind-time (empty) scheduler, fire the job on schedule, deliver its
+    /// prompt onto the session's steer lane, and record the run.
+    #[tokio::test]
+    async fn rlm_heartbeat_mutation_hook_fires_into_the_session_queue() {
+        let dir = std::env::temp_dir().join(format!("pa-hb-fire-{}", uuid::Uuid::new_v4()));
+        let sessions_dir = dir.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let worker = Arc::new(Worker::new(persisted_worker_config(&dir), None));
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({
+                    "cwd": dir.to_string_lossy(),
+                    "sessionDir": sessions_dir.to_string_lossy(),
+                }),
+            )
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+
+        // The kernel host handler's store mutation (the same live binding
+        // the engine's kernel cron wiring binds): `rlm_heartbeat.create`
+        // through the shared session-artifacts store.
+        let job = {
+            let core = worker
+                .core
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (binding, _) = live_binding(&core).expect("the created session is persisted");
+            worker
+                .scheduled
+                .store()
+                .create_rlm_heartbeat(&CreateAgentCronJobInput {
+                    active_session_id: binding.active_session_id,
+                    session_id: binding.session_id,
+                    session_file: binding.session_file,
+                    cwd: binding.cwd,
+                    source: Some("rlm_heartbeat".to_string()),
+                    prompt: "print hello world".to_string(),
+                    schedule_text: "every 10s".to_string(),
+                    delivery_mode: Some(DeliveryMode::Steer),
+                    ..Default::default()
+                })
+                .expect("rlm heartbeat create")
+        };
+        assert_eq!(job.status, JobStatus::Active);
+
+        // The mutation hook the worker installs on the engine's kernel
+        // cron wiring (the handler invokes it right after the store
+        // mutation): withdraws dropped queued fires, then re-arms the
+        // scheduler (TS `removeQueuedHeartbeatFollowUp` +
+        // `cronScheduler.wake()`).
+        let hook = worker.scheduled.mutation_hook();
+        hook(
+            pa_core::session_engine::host_requests::RlmHeartbeatMutation {
+                job: job.clone(),
+                drop_queued: false,
+            },
+        )
+        .await;
+
+        // The re-armed timer fires within the interval: the job's prompt
+        // lands on the session's steer lane, the turn runs, and the store
+        // records the run (`runCount` + `lastRunAt`).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        loop {
+            let recorded = worker
+                .scheduled
+                .store()
+                .list()
+                .into_iter()
+                .find(|listed| listed.id == job.id);
+            let Some(recorded) = recorded else {
+                panic!("the created heartbeat vanished from the store");
+            };
+            if recorded.run_count >= 1 {
+                assert!(recorded.last_run_at.is_some());
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the heartbeat never fired: {recorded:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // The fired prompt ran as the session's turn: the instruction
+        // persisted as the turn's user message.
+        let prompted = {
+            let core = worker
+                .core
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(store) = core.store.as_ref() else {
+                panic!("the session store vanished");
+            };
+            store
+                .entries()
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .fields
+                        .get("message")
+                        .and_then(|message| message.get("content"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|content| content.contains("print hello world"))
+                })
+                .count()
+        };
+        assert!(
+            prompted >= 1,
+            "the heartbeat prompt never reached the session"
+        );
     }
 }

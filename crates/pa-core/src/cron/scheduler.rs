@@ -288,6 +288,43 @@ mod tests {
         }
     }
 
+    /// The re-arm regression behind the dogfood P0 (a heartbeat created
+    /// after the bind-time arm never fires): starting on an empty store
+    /// arms no timer (`schedule_next` returns without one), so the
+    /// mutation's wake — TS `cronScheduler.wake()` — must re-arm and fire
+    /// the job created afterwards.
+    #[tokio::test]
+    async fn wake_rearms_a_timer_for_a_job_created_after_start() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(AgentCronJobStore::new(dir.path().join("jobs.json")));
+        let now = 1_700_000_000_000;
+        let runs = Arc::new(AtomicUsize::new(0));
+        let hooks = Arc::new(CountingHooks {
+            runs: runs.clone(),
+            outcomes: Mutex::new(vec!["ran"]),
+        });
+        let scheduler = AgentCronScheduler::new(store.clone(), hooks);
+        // Empty store: the bind-time arm leaves no timer running.
+        scheduler.start().await;
+        // A later mutation's job (created already-due on the fixed test
+        // clock, like the sibling tests' "in 1m" inputs, so the re-armed
+        // timer fires within milliseconds).
+        store
+            .create(&input("tick", "in 1m", now - 61_000))
+            .expect("create job");
+        // The mutation's wake re-arms; the timer fires within milliseconds.
+        scheduler.wake().await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while runs.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            runs.load(Ordering::SeqCst) >= 1,
+            "the woken timer never fired"
+        );
+        scheduler.stop().await;
+    }
+
     #[tokio::test]
     async fn claims_and_runs_due_jobs() {
         let dir = tempfile::TempDir::new().unwrap();

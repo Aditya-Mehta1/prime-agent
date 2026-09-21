@@ -51,6 +51,12 @@ pub struct KernelCronWiring {
     /// embedding knows it (the engine falls back to the in-memory
     /// manager's identity).
     pub binding: Option<KernelCronBinding>,
+    /// The post-mutation seam for kernel `rlm_heartbeat.*` requests (TS
+    /// daemon-mode's `removeQueuedHeartbeatFollowUp` +
+    /// `cronScheduler.wake()` inside its rlm heartbeat controllers):
+    /// the daemon worker's hook; `None` leaves mutations unannounced
+    /// (the embedded/standalone default).
+    pub mutation_hook: Option<super::host_requests::RlmHeartbeatMutationHook>,
 }
 
 /// The live/durable session identity for kernel-created rlm heartbeats.
@@ -137,12 +143,18 @@ pub fn wire_session_runtime(
     // replaces the engine-private one, so kernel `rlm_heartbeat.*` writes
     // reach the daemon catalog; the private file store remains the
     // embedded/standalone default.
+    let mutation_hook = cron_store
+        .as_ref()
+        .and_then(|wiring| wiring.mutation_hook.clone());
     let cron_store = cron_store
         .map(|wiring| wiring.store)
         .unwrap_or_else(|| Arc::new(AgentCronJobStore::new(agent_dir.join("cron-jobs.json"))));
     let mut runtime = SessionRuntime::new(&session, cron_store, active_session_id, binding);
     if let Some(purge) = goal_complete_purge {
         runtime.set_goal_complete_purge(purge);
+    }
+    if let Some(hook) = mutation_hook {
+        runtime.set_cron_mutation_hook(hook);
     }
     let runtime = Arc::new(runtime);
     let session = Arc::new(tokio::sync::Mutex::new(session));
