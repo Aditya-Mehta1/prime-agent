@@ -242,12 +242,10 @@ describe("IpythonKernelProvisioner", () => {
 		try {
 			const first = await provisioner.ensure();
 			expect(countRuns()).toBe(1);
-			writeFileSync(snapshotPathIn(snapshotDir), "{}");
-			// Not awaited: the follow-up ensure() must wait for the snapshot flush itself.
-			const stopping = provisioner.stopKernel({ snapshot: true });
-			const revived = await provisioner.ensure();
+			await provisioner.stopKernel({ snapshot: true });
 			expect(existsSync(marker)).toBe(true);
-			await stopping;
+			writeFileSync(snapshotPathIn(snapshotDir), "{}");
+			const revived = await provisioner.ensure();
 			expect(countRuns()).toBe(2);
 			expect(revived).not.toBe(first);
 			expect(provisioner.lastRestore?.restored).toEqual([]);
@@ -255,6 +253,23 @@ describe("IpythonKernelProvisioner", () => {
 		} finally {
 			await provisioner.dispose();
 		}
+	});
+
+	it("ensure() after an unawaited stopKernel() waits for the shutdown before spawning", async () => {
+		const { python } = writeFakePython();
+		const provisioner = new IpythonKernelProvisioner(tempDir, { python });
+		let release: () => void = () => {};
+		const flushing = new Promise<void>((r) => {
+			release = r;
+		});
+		Reflect.set(provisioner, "managerPromise", Promise.resolve({ shutdown: () => flushing }));
+		const stopping = provisioner.stopKernel({ snapshot: true });
+		const onProgress = vi.fn();
+		const started = provisioner.ensure(onProgress).catch(() => {});
+		expect(onProgress).not.toHaveBeenCalled(); // ungated, startKernel reports the spawn synchronously
+		release();
+		await Promise.all([stopping, started]);
+		expect(onProgress).toHaveBeenCalledWith("Starting Python kernel...");
 	});
 
 	it("dispose() before the boot slot prevents the kernel from spawning", async () => {
