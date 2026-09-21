@@ -1,0 +1,43 @@
+{
+ "command": "create",
+ "data": {
+  "activeSessionId": "75d990d39b39",
+  "activity": "idle",
+  "attachedClients": 0,
+  "created": "2026-09-21T02:50:25.727Z",
+  "cwd": "/tmp/nd-runs/20260921T025005Z/rust/work",
+  "hasRegisteredCronJob": false,
+  "id": "75d990d39b39",
+  "isBashRunning": false,
+  "isCompacting": false,
+  "isSessionActive": false,
+  "isStreaming": false,
+  "lastActivityAt": "2026-09-21T02:50:25.731Z",
+  "lifecycle": "draft",
+  "messageCount": 0,
+  "model": {
+   "id": "mock-1",
+   "name": "Mock 1",
+   "provider": "prime-inference",
+   "reasoning": false
+  },
+  "modified": "2026-09-21T02:50:25.731Z",
+  "rlmDepth": 0,
+  "runtimeKind": "top-level",
+  "sessionActions": {
+   "followUps": [],
+   "queuedCount": 0,
+   "steering": []
+  },
+  "sessionFile": "/tmp/nd-runs/20260921T025005Z/rust/agent/sessions/01a0c1df-343f-71c1-8362-f746c58321f4.jsonl",
+  "sessionId": "01a0c1df-343f-71c1-8362-f746c58321f4",
+  "sessionName": "battery-iterative",
+  "thinkingLevel": "off",
+  "unfinishedActionCount": 0,
+  "workerPid": 1581805,
+  "workerState": "ready"
+ },
+ "id": "ic1",
+ "success": true,
+ "type": "response"
+}

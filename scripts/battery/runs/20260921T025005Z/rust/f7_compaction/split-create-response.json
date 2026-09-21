@@ -1,0 +1,43 @@
+{
+ "command": "create",
+ "data": {
+  "activeSessionId": "3384aa7407b5",
+  "activity": "idle",
+  "attachedClients": 0,
+  "created": "2026-09-21T02:50:24.672Z",
+  "cwd": "/tmp/nd-runs/20260921T025005Z/rust/work",
+  "hasRegisteredCronJob": false,
+  "id": "3384aa7407b5",
+  "isBashRunning": false,
+  "isCompacting": false,
+  "isSessionActive": false,
+  "isStreaming": false,
+  "lastActivityAt": "2026-09-21T02:50:24.679Z",
+  "lifecycle": "draft",
+  "messageCount": 0,
+  "model": {
+   "id": "mock-1",
+   "name": "Mock 1",
+   "provider": "prime-inference",
+   "reasoning": false
+  },
+  "modified": "2026-09-21T02:50:24.679Z",
+  "rlmDepth": 0,
+  "runtimeKind": "top-level",
+  "sessionActions": {
+   "followUps": [],
+   "queuedCount": 0,
+   "steering": []
+  },
+  "sessionFile": "/tmp/nd-runs/20260921T025005Z/rust/agent/sessions/01a0c1df-3020-72e2-8b55-2bf5b29ddb7c.jsonl",
+  "sessionId": "01a0c1df-3020-72e2-8b55-2bf5b29ddb7c",
+  "sessionName": "battery-split",
+  "thinkingLevel": "off",
+  "unfinishedActionCount": 0,
+  "workerPid": 1581660,
+  "workerState": "ready"
+ },
+ "id": "sc1",
+ "success": true,
+ "type": "response"
+}

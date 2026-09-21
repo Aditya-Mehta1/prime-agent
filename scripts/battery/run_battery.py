@@ -2332,8 +2332,19 @@ class Battery:
                     },
                     {"text": "kernel started"},
                     {"text": "history turn the first compaction summarizes"},
-                    {"text": "the notice first compaction summary"},
-                    {"text": "the notice second compaction summary"},
+                    # The first compaction is a SPLIT on both sides (the
+                    # tool-call turn pushes the keep-recent walk mid-turn),
+                    # so its two concurrent summarizer calls pop these
+                    # next two entries in arrival order: tokio::join /
+                    # Promise.all races the shared queue, and which
+                    # response becomes the history summary (embedded in
+                    # the second compact's <previous-summary>) is a coin
+                    # flip per side. Identical texts make the draw
+                    # unobservable — the scenario's purpose is the notice
+                    # row, not the summary content (same de-flake
+                    # treatment as the #227 split differential).
+                    {"text": "the notice compaction summary"},
+                    {"text": "the notice compaction summary"},
                 ],
                 "turns": [
                     ("np1", "start the kernel and define notice_var"),

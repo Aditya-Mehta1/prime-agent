@@ -1,0 +1,8 @@
+{"activeSessionId":"75d990d39b39","busy":true,"operation":"create","recordedAt":"2026-09-21T02:50:25.747Z","sessionFile":"/tmp/nd-runs/20260921T025005Z/rust/agent/sessions/01a0c1df-343f-71c1-8362-f746c58321f4.jsonl","sessionId":"01a0c1df-343f-71c1-8362-f746c58321f4"}
+{"active_session_id":"75d990d39b39","follow_up":[],"recorded_at":"2026-09-21T02:50:25.827Z","steering":["history turn one to be summarized by the first compact"],"type":"queue_snapshot","version":1}
+{"active_session_id":"75d990d39b39","follow_up":[],"recorded_at":"2026-09-21T02:50:25.889Z","steering":["history turn two kept by the first compact"],"type":"queue_snapshot","version":1}
+{"active_session_id":"75d990d39b39","follow_up":[],"recorded_at":"2026-09-21T02:50:25.890Z","steering":["history turn two kept by the first compact"],"type":"queue_snapshot","version":1}
+{"active_session_id":"75d990d39b39","follow_up":[],"recorded_at":"2026-09-21T02:50:25.949Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"75d990d39b39","follow_up":[],"recorded_at":"2026-09-21T02:50:26.014Z","steering":["turn three after the first compaction"],"type":"queue_snapshot","version":1}
+{"active_session_id":"75d990d39b39","follow_up":[],"recorded_at":"2026-09-21T02:50:26.074Z","steering":[],"type":"queue_snapshot","version":1}
+{"activeSessionId":"75d990d39b39","busy":false,"operation":"shutdown","recordedAt":"2026-09-21T02:51:36.562Z","sessionFile":"/tmp/nd-runs/20260921T025005Z/rust/agent/sessions/01a0c1df-343f-71c1-8362-f746c58321f4.jsonl","sessionId":"01a0c1df-343f-71c1-8362-f746c58321f4"}

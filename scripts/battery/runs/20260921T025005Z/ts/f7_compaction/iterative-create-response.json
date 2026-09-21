@@ -1,0 +1,58 @@
+{
+ "id": "ic1",
+ "type": "response",
+ "command": "create",
+ "success": true,
+ "data": {
+  "id": "c002f61bdbef",
+  "lifecycle": "draft",
+  "activity": "idle",
+  "isSessionActive": false,
+  "lastActivityAt": "2026-09-21T02:50:25.319Z",
+  "runtimeKind": "top-level",
+  "rlmDepth": 0,
+  "activeSessionId": "c002f61bdbef",
+  "sessionId": "01a0c1df-3270-76fa-8c8a-d26a8cb32cec",
+  "sessionFile": "/tmp/nd-runs/20260921T025005Z/ts/agent/sessions/01a0c1df-3270-76fa-8c8a-d26a8cb32cec.jsonl",
+  "sessionName": "battery-iterative",
+  "cwd": "/tmp/nd-runs/20260921T025005Z/ts/work",
+  "model": {
+   "id": "mock-1",
+   "name": "Mock 1",
+   "api": "openai-completions",
+   "provider": "prime-inference",
+   "baseUrl": "http://127.0.0.1:37637/v1",
+   "reasoning": false,
+   "input": [
+    "text"
+   ],
+   "cost": {
+    "input": 0,
+    "output": 0,
+    "cacheRead": 0,
+    "cacheWrite": 0
+   },
+   "contextWindow": 128000,
+   "maxTokens": 4096
+  },
+  "thinkingLevel": "off",
+  "isStreaming": false,
+  "isCompacting": false,
+  "isBashRunning": false,
+  "hasRunningRlmChildren": false,
+  "isRunningTools": false,
+  "attachedClients": 0,
+  "messageCount": 0,
+  "unfinishedActionCount": 0,
+  "created": "2026-09-21T02:50:25.264Z",
+  "modified": "2026-09-21T02:50:25.319Z",
+  "sessionActions": {
+   "queuedCount": 0,
+   "steering": [],
+   "followUps": []
+  },
+  "rosterStatus": "idle",
+  "workerState": "ready",
+  "workerPid": 1581724
+ }
+}

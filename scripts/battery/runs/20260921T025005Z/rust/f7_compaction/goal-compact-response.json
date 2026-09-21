@@ -1,0 +1,15 @@
+{
+ "command": "compact",
+ "data": {
+  "details": {
+   "modifiedFiles": [],
+   "readFiles": []
+  },
+  "firstKeptEntryId": "dd0c7045",
+  "summary": "the post-compact goal continuation summary",
+  "tokensBefore": 399
+ },
+ "id": "gk1",
+ "success": true,
+ "type": "response"
+}
